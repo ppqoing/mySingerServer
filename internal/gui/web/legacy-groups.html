@@ -1,0 +1,849 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>重复媒体组</title>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, sans-serif; color: #172033; }
+    body { margin: 0 auto; max-width: 1280px; padding: 24px; background: #f6f8fb; }
+    a { color: #185adb; }
+    h1 { margin-bottom: 8px; font-size: 26px; }
+    .tabs, .pager { display: flex; align-items: center; gap: 8px; margin: 18px 0; }
+    button { cursor: pointer; border: 1px solid #9ba8bd; border-radius: 7px; padding: 8px 12px; background: white; color: #172033; }
+    button[aria-selected="true"] { border-color: #185adb; background: #185adb; color: white; }
+    button:disabled { cursor: default; opacity: .45; }
+    button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid #f59e0b; outline-offset: 2px; }
+    table { width: 100%; border-collapse: collapse; background: white; }
+    th, td { padding: 9px 10px; border-bottom: 1px solid #dce3ee; text-align: left; vertical-align: top; }
+    th { background: #eaf0f8; color: #44516a; }
+    .status { min-height: 24px; margin: 10px 0; }
+    .error { color: #b42318; font-weight: 650; }
+    .muted { color: #667085; }
+    .mono, pre { font-family: ui-monospace, Consolas, monospace; overflow-wrap: anywhere; }
+    .representative { color: #087443; font-weight: 700; }
+    .detail { background: #fbfcfe; }
+    .detail table { margin: 4px 0; font-size: 13px; }
+    .delete-controls, .delete-panel { margin: 18px 0; padding: 16px; border: 1px solid #cbd5e1; border-radius: 10px; background: white; }
+    .delete-controls h2, .delete-panel h2 { margin: 0 0 10px; font-size: 19px; }
+    .delete-controls-row, .delete-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
+    .delete-actions { justify-content: flex-end; margin-top: 16px; }
+    .delete-button { border-color: #b42318; background: #b42318; color: white; font-weight: 700; }
+    .delete-summary { max-height: 260px; overflow: auto; padding: 10px; border: 1px solid #dce3ee; border-radius: 7px; background: #fbfcfe; }
+    .delete-summary ul { margin: 6px 0; padding-left: 22px; }
+    .delete-mode { margin: 14px 0; padding: 12px; border: 1px solid #dce3ee; border-radius: 7px; }
+    .delete-mode label { display: block; margin: 8px 0; }
+    .hard-warning { color: #b42318; font-weight: 750; }
+    .modal-backdrop { position: fixed; inset: 0; z-index: 20; display: grid; place-items: center; padding: 20px; background: rgb(15 23 42 / 62%); }
+    .modal-card { width: min(720px, 100%); max-height: calc(100vh - 40px); overflow: auto; padding: 20px; border-radius: 12px; background: white; box-shadow: 0 20px 50px rgb(15 23 42 / 30%); }
+    .modal-card h2 { margin-top: 0; }
+    .delete-panel h3 { margin: 16px 0 8px; font-size: 16px; }
+    .delete-panel table { font-size: 13px; }
+    .delete-problem-path { min-width: 220px; }
+    [hidden] { display: none !important; }
+    pre { margin: 0; white-space: pre-wrap; font-size: 12px; }
+    @media (max-width: 760px) {
+      body { padding: 12px; }
+      .table-wrap { overflow-x: auto; }
+    }
+  </style>
+</head>
+<body>
+  <nav><a href="/">返回扫描控制台</a></nav>
+  <h1>重复媒体组</h1>
+  <div class="tabs" role="tablist" aria-label="重复组类型">
+    <button type="button" role="tab" data-kind="exact" aria-selected="true">精确重复</button>
+    <button type="button" role="tab" data-kind="image" aria-selected="false">相似图片</button>
+    <button type="button" role="tab" data-kind="video" aria-selected="false">相似视频</button>
+  </div>
+
+  <section class="delete-controls" aria-labelledby="deleteSelectionTitle">
+    <h2 id="deleteSelectionTitle">安全删除所选成员</h2>
+    <div class="delete-controls-row" role="status" aria-live="polite">
+      <span id="selectedCount">已选 0 个文件</span>
+      <span id="selectedBytes">共 0 字节</span>
+      <button id="deleteSelected" class="delete-button" type="button" disabled>删除所选</button>
+    </div>
+    <p id="deleteRequestError" class="error" role="alert" hidden></p>
+  </section>
+
+  <section id="deleteProgressPanel" class="delete-panel" aria-labelledby="deleteProgressTitle" hidden>
+    <h2 id="deleteProgressTitle">删除进度</h2>
+    <p id="deleteProgress" role="status" aria-live="polite"></p>
+    <button id="deletePollRetry" type="button" hidden>重试获取进度</button>
+    <div id="deleteMachineResults"></div>
+    <div id="deleteErrorCodes"></div>
+  </section>
+
+  <section id="deleteProblemPanel" class="delete-panel" aria-labelledby="deleteProblemTitle" hidden>
+    <h2 id="deleteProblemTitle">失败与问题</h2>
+    <div id="deleteProblems"></div>
+  </section>
+
+  <p id="status" class="status" role="status" aria-live="polite">加载中…</p>
+  <div class="table-wrap">
+    <table aria-describedby="status">
+      <thead>
+        <tr>
+          <th>成员</th>
+          <th>代表机器</th>
+          <th>代表路径</th>
+          <th>涉及机器</th>
+          <th>创建时间</th>
+          <th>详情</th>
+        </tr>
+      </thead>
+      <tbody id="groupRows"></tbody>
+    </table>
+  </div>
+  <div class="pager" aria-label="分页">
+    <button id="previous" type="button">上一页</button>
+    <span id="pageLabel"></span>
+    <button id="next" type="button">下一页</button>
+  </div>
+
+  <div id="deleteModal" class="modal-backdrop" role="dialog" aria-modal="true"
+       tabindex="-1" aria-labelledby="deleteModalTitle" hidden>
+    <div class="modal-card">
+      <h2 id="deleteModalTitle">二次确认删除</h2>
+      <div id="deleteSummary" class="delete-summary"></div>
+      <fieldset class="delete-mode">
+        <legend>删除方式</legend>
+        <label>
+          <input id="deleteSoftMode" type="radio" name="deleteMode" value="soft" checked>
+          软删除（默认，可在回收目录中恢复）
+        </label>
+        <label>
+          <input id="deleteHardMode" type="radio" name="deleteMode" value="hard">
+          硬删除
+        </label>
+        <p id="deleteHardWarning" class="hard-warning">警告：硬删除会永久移除文件，无法通过回收目录恢复。</p>
+      </fieldset>
+      <p id="deleteModalError" class="error" role="alert" hidden></p>
+      <div class="delete-actions">
+        <button id="deleteCancel" type="button">取消</button>
+        <button id="deleteConfirm" class="delete-button" type="button">最终确认删除</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const state = {
+      kind: 'exact',
+      page: 1,
+      size: 50,
+      total: 0,
+      generation: 0
+    };
+    const deleteState = {
+      selected: new Map(),
+      confirmToken: '',
+      taskID: '',
+      pollGeneration: 0
+    };
+    const rowsNode = document.querySelector('#groupRows');
+    const statusNode = document.querySelector('#status');
+    const pageLabel = document.querySelector('#pageLabel');
+    const previousButton = document.querySelector('#previous');
+    const nextButton = document.querySelector('#next');
+    const selectedCountNode = document.querySelector('#selectedCount');
+    const selectedBytesNode = document.querySelector('#selectedBytes');
+    const deleteButton = document.querySelector('#deleteSelected');
+    const deleteRequestError = document.querySelector('#deleteRequestError');
+    const deleteModal = document.querySelector('#deleteModal');
+    const deleteSummary = document.querySelector('#deleteSummary');
+    const deleteSoftMode = document.querySelector('#deleteSoftMode');
+    const deleteHardMode = document.querySelector('#deleteHardMode');
+    const deleteModalError = document.querySelector('#deleteModalError');
+    const deleteCancel = document.querySelector('#deleteCancel');
+    const deleteConfirm = document.querySelector('#deleteConfirm');
+    const deleteProgressPanel = document.querySelector('#deleteProgressPanel');
+    const deleteProgress = document.querySelector('#deleteProgress');
+    const deletePollRetry = document.querySelector('#deletePollRetry');
+    const deleteMachineResults = document.querySelector('#deleteMachineResults');
+    const deleteErrorCodes = document.querySelector('#deleteErrorCodes');
+    const deleteProblemPanel = document.querySelector('#deleteProblemPanel');
+    const deleteProblems = document.querySelector('#deleteProblems');
+    let deleteBusy = false;
+    let deleteExecutePending = false;
+    let deleteRequestGeneration = 0;
+    let deleteReturnFocus = null;
+
+    async function requestJSON(url, options) {
+      const response = await fetch(url, options);
+      let body;
+      try {
+        body = await response.json();
+      } catch (_) {
+        throw new Error('服务器返回了无效 JSON');
+      }
+      if (!response.ok) {
+        throw new Error(body.error || `HTTP ${response.status}`);
+      }
+      return body;
+    }
+
+    function cell(text, className) {
+      const node = document.createElement('td');
+      node.textContent = String(text ?? '');
+      if (className) node.className = className;
+      return node;
+    }
+
+    function setStatus(text, isError) {
+      statusNode.textContent = text;
+      statusNode.className = isError ? 'status error' : 'status muted';
+    }
+
+    function updatePager() {
+      pageLabel.textContent = `第 ${state.page} 页 · 共 ${state.total} 组`;
+      previousButton.disabled = deleteExecutePending || state.page <= 1;
+      nextButton.disabled =
+        deleteExecutePending || state.page * state.size >= state.total;
+    }
+
+    function setDeleteExecutePending(pending) {
+      deleteExecutePending = pending;
+      document.querySelectorAll('[role="tab"]').forEach(tab => {
+        tab.disabled = pending;
+      });
+      updatePager();
+    }
+
+    function updateRenderedSelection() {
+      document.querySelectorAll('.member-delete-select').forEach(checkbox => {
+        if (checkbox.disabled) {
+          checkbox.checked = false;
+          return;
+        }
+        const fileID = Number(checkbox.dataset.fileId);
+        checkbox.checked = deleteState.selected.has(fileID);
+      });
+    }
+
+    function updateSelectionControls() {
+      let bytes = 0;
+      for (const selected of deleteState.selected.values()) {
+        const size = Number(selected.size);
+        if (Number.isFinite(size) && size > 0) bytes += size;
+      }
+      selectedCountNode.textContent =
+        `已选 ${deleteState.selected.size} 个文件`;
+      selectedBytesNode.textContent = `共 ${bytes} 字节`;
+      deleteButton.disabled =
+        deleteState.selected.size === 0 ||
+        deleteBusy ||
+        deleteState.taskID !== '';
+      updateRenderedSelection();
+    }
+
+    function clearDeleteRequestError() {
+      deleteRequestError.textContent = '';
+      deleteRequestError.hidden = true;
+    }
+
+    function showDeleteRequestError(text) {
+      deleteRequestError.textContent = text;
+      deleteRequestError.hidden = false;
+    }
+
+    function setDeleteModalBusy(busy) {
+      deleteBusy = busy;
+      deleteCancel.disabled = busy;
+      deleteConfirm.disabled = busy;
+      deleteSoftMode.disabled = busy;
+      deleteHardMode.disabled = busy;
+      if (busy && !deleteModal.hidden) deleteModal.focus();
+      updateSelectionControls();
+    }
+
+    function deleteModalFocusables() {
+      return [deleteSoftMode, deleteHardMode, deleteCancel, deleteConfirm]
+        .filter(node => !node.disabled && !node.hidden);
+    }
+
+    function closeDeleteModal(returnFocus) {
+      deleteModal.hidden = true;
+      deleteModalError.textContent = '';
+      deleteModalError.hidden = true;
+      if (returnFocus && deleteReturnFocus && deleteReturnFocus.isConnected) {
+        deleteReturnFocus.focus();
+      }
+      deleteReturnFocus = null;
+    }
+
+    function cancelDeleteConfirmation(returnFocus) {
+      deleteRequestGeneration += 1;
+      deleteState.confirmToken = '';
+      setDeleteModalBusy(false);
+      closeDeleteModal(returnFocus);
+    }
+
+    function renderDeleteSummary(summary) {
+      deleteSummary.replaceChildren();
+
+      const totals = document.createElement('p');
+      totals.textContent =
+        `服务端重新确认：${String(summary.total_files ?? 0)} 个文件，` +
+        `${String(summary.total_bytes ?? 0)} 字节。`;
+      deleteSummary.append(totals);
+
+      const machineHeading = document.createElement('h3');
+      machineHeading.textContent = '按机器统计';
+      deleteSummary.append(machineHeading);
+      const machineList = document.createElement('ul');
+      const machines = summary.by_machine || {};
+      for (const machineID of Object.keys(machines).sort()) {
+        const item = document.createElement('li');
+        item.textContent =
+          `${machineID}：${String(machines[machineID] ?? 0)} 个文件`;
+        machineList.append(item);
+      }
+      if (machineList.childElementCount === 0) {
+        const item = document.createElement('li');
+        item.textContent = '无机器明细';
+        machineList.append(item);
+      }
+      deleteSummary.append(machineList);
+
+      const sampleHeading = document.createElement('h3');
+      sampleHeading.textContent = '路径样本';
+      deleteSummary.append(sampleHeading);
+      const sampleList = document.createElement('ul');
+      for (const sample of summary.samples || []) {
+        const item = document.createElement('li');
+        item.className = 'mono';
+        item.textContent = String(sample ?? '');
+        sampleList.append(item);
+      }
+      if (sampleList.childElementCount === 0) {
+        const item = document.createElement('li');
+        item.textContent = '无路径样本';
+        sampleList.append(item);
+      }
+      deleteSummary.append(sampleList);
+    }
+
+    function openDeleteModal(summary) {
+      renderDeleteSummary(summary);
+      deleteSoftMode.checked = true;
+      deleteHardMode.checked = false;
+      deleteModalError.textContent = '';
+      deleteModalError.hidden = true;
+      deleteReturnFocus = deleteButton;
+      deleteModal.hidden = false;
+      deleteSoftMode.focus();
+    }
+
+    async function prepareDelete() {
+      if (
+        deleteBusy ||
+        deleteState.taskID !== '' ||
+        deleteState.selected.size === 0
+      ) {
+        return;
+      }
+      const generation = ++deleteRequestGeneration;
+      const memberIDs = Array.from(deleteState.selected.keys())
+        .sort((left, right) => left - right);
+      clearDeleteRequestError();
+      setDeleteModalBusy(true);
+      try {
+        const prepared = await requestJSON('/api/delete/prepare', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ member_ids: memberIDs })
+        });
+        if (generation !== deleteRequestGeneration) return;
+        if (
+          typeof prepared.confirm_token !== 'string' ||
+          prepared.confirm_token === '' ||
+          !prepared.summary
+        ) {
+          throw new Error('invalid prepare response');
+        }
+        deleteState.confirmToken = prepared.confirm_token;
+        setDeleteModalBusy(false);
+        openDeleteModal(prepared.summary);
+      } catch (_) {
+        if (generation !== deleteRequestGeneration) return;
+        deleteState.confirmToken = '';
+        showDeleteRequestError('无法准备删除，请稍后重试。');
+      } finally {
+        if (generation === deleteRequestGeneration) {
+          setDeleteModalBusy(false);
+        }
+      }
+    }
+
+    function createDeleteTable(headers, rows) {
+      const table = document.createElement('table');
+      const head = document.createElement('thead');
+      const headRow = document.createElement('tr');
+      for (const label of headers) {
+        const heading = document.createElement('th');
+        heading.textContent = label;
+        headRow.append(heading);
+      }
+      head.append(headRow);
+      table.append(head);
+      const body = document.createElement('tbody');
+      for (const values of rows) {
+        const row = document.createElement('tr');
+        for (const value of values) row.append(cell(value));
+        body.append(row);
+      }
+      table.append(body);
+      return table;
+    }
+
+    function renderDeleteMachineStatus(status) {
+      deleteMachineResults.replaceChildren();
+      const heading = document.createElement('h3');
+      heading.textContent = '机器与序列';
+      deleteMachineResults.append(heading);
+
+      const rows = [];
+      const machines = status.by_machine || {};
+      for (const mapMachineID of Object.keys(machines).sort()) {
+        const machine = machines[mapMachineID] || {};
+        const sequenceTexts = [];
+        const sequences = machine.sequences || {};
+        const sequenceKeys = Object.keys(sequences).sort(
+          (left, right) => Number(left) - Number(right)
+        );
+        for (const key of sequenceKeys) {
+          const sequence = sequences[key] || {};
+          sequenceTexts.push(
+            `序列 ${String(sequence.sequence ?? key)} / ` +
+            `${String(sequence.last_seq ?? 0)}：` +
+            `${sequence.received ? '已接收' : '等待'}，` +
+            `总数 ${String(sequence.total ?? 0)}，` +
+            `成功 ${String(sequence.ok ?? 0)}，` +
+            `失败 ${String(sequence.failed ?? 0)}，` +
+            `不确定 ${String(sequence.uncertain ?? 0)}`
+          );
+        }
+        rows.push([
+          String(machine.machine_id ?? mapMachineID),
+          String(machine.total ?? 0),
+          String(machine.ok ?? 0),
+          String(machine.failed ?? 0),
+          String(machine.uncertain ?? 0),
+          String(machine.pending ?? 0),
+          String(machine.state_sync_failures ?? 0),
+          sequenceTexts.join('；')
+        ]);
+      }
+      if (rows.length === 0) {
+        rows.push(['无机器明细', '0', '0', '0', '0', '0', '0', '']);
+      }
+      deleteMachineResults.append(createDeleteTable(
+        ['机器', '总数', '成功', '失败', '不确定', '待处理', '状态同步失败', '序列明细'],
+        rows
+      ));
+    }
+
+    function renderDeleteErrorCodes(status) {
+      deleteErrorCodes.replaceChildren();
+      const heading = document.createElement('h3');
+      heading.textContent = '错误代码统计';
+      deleteErrorCodes.append(heading);
+      const codes = status.error_codes || {};
+      const rows = Object.keys(codes).sort().map(code => [
+        code,
+        String(codes[code] ?? 0)
+      ]);
+      if (rows.length === 0) rows.push(['无', '0']);
+      deleteErrorCodes.append(createDeleteTable(['错误代码', '数量'], rows));
+    }
+
+    function renderDeleteProblems(status) {
+      deleteProblems.replaceChildren();
+      const problems = Array.isArray(status.problems) ? status.problems : [];
+      const showProblems =
+        problems.length > 0 ||
+        Number(status.failed) > 0 ||
+        Number(status.state_sync_failures) > 0;
+      deleteProblemPanel.hidden = !showProblems;
+      if (!showProblems) return;
+
+      if (problems.length === 0) {
+        const message = document.createElement('p');
+        message.textContent = '任务报告了失败，但没有可显示的文件明细。';
+        deleteProblems.append(message);
+        return;
+      }
+      const rows = problems.map(problem => [
+        String(problem.machine_id ?? ''),
+        String(problem.sequence ?? 0),
+        String(problem.path ?? ''),
+        String(problem.error_code ?? ''),
+        String(problem.error_message ?? ''),
+        problem.uncertain ? '是' : '否',
+        String(problem.state_sync_err ?? '')
+      ]);
+      const table = createDeleteTable(
+        ['机器', '序列', '路径', '错误代码', '错误', '不确定', '状态同步错误'],
+        rows
+      );
+      table.querySelectorAll('tbody tr').forEach(row => {
+        if (row.children[2]) row.children[2].className = 'mono delete-problem-path';
+      });
+      deleteProblems.append(table);
+    }
+
+    function renderDeleteStatus(status) {
+      deleteProgressPanel.hidden = false;
+      deletePollRetry.hidden = true;
+      deletePollRetry.disabled = true;
+      deleteProgress.textContent =
+        `总数 ${String(status.total ?? 0)} · ` +
+        `成功 ${String(status.ok ?? 0)} · ` +
+        `失败 ${String(status.failed ?? 0)} · ` +
+        `不确定 ${String(status.uncertain ?? 0)} · ` +
+        `待处理 ${String(status.pending ?? 0)}`;
+      renderDeleteMachineStatus(status);
+      renderDeleteErrorCodes(status);
+      renderDeleteProblems(status);
+    }
+
+    function renderDeletePollError() {
+      deleteProgressPanel.hidden = false;
+      deleteProgress.textContent =
+        '无法获取删除进度。请重试获取进度以继续跟踪同一任务。';
+      deletePollRetry.disabled = false;
+      deletePollRetry.hidden = false;
+      deleteMachineResults.replaceChildren();
+      deleteErrorCodes.replaceChildren();
+      deleteProblemPanel.hidden = false;
+      deleteProblems.replaceChildren();
+      const message = document.createElement('p');
+      message.textContent =
+        '进度请求失败；不会发起或重放新的删除操作。';
+      deleteProblems.append(message);
+    }
+
+    function startDeletePolling(taskID) {
+      const generation = ++deleteState.pollGeneration;
+      deleteState.taskID = taskID;
+      deletePollRetry.hidden = true;
+      deletePollRetry.disabled = true;
+      updateSelectionControls();
+
+      const poll = async () => {
+        if (
+          generation !== deleteState.pollGeneration ||
+          deleteState.taskID !== taskID
+        ) {
+          return;
+        }
+        try {
+          const status = await requestJSON(
+            '/api/delete/tasks/' + encodeURIComponent(taskID)
+          );
+          if (
+            generation !== deleteState.pollGeneration ||
+            deleteState.taskID !== taskID
+          ) {
+            return;
+          }
+          renderDeleteStatus(status);
+          if (status.complete === true) {
+            deleteState.pollGeneration += 1;
+            deleteState.taskID = '';
+            deleteState.selected.clear();
+            deletePollRetry.hidden = true;
+            deletePollRetry.disabled = true;
+            updateSelectionControls();
+            loadGroups();
+            return;
+          }
+          window.setTimeout(() => {
+            if (
+              generation === deleteState.pollGeneration &&
+              deleteState.taskID === taskID
+            ) {
+              poll();
+            }
+          }, 1000);
+        } catch (_) {
+          if (
+            generation !== deleteState.pollGeneration ||
+            deleteState.taskID !== taskID
+          ) {
+            return;
+          }
+          deleteState.pollGeneration += 1;
+          renderDeletePollError();
+          updateSelectionControls();
+        }
+      };
+      poll();
+    }
+
+    async function executeDelete() {
+      if (deleteBusy || deleteState.confirmToken === '') return;
+      const token = deleteState.confirmToken;
+      const mode = deleteHardMode.checked ? 'hard' : 'soft';
+      deleteModalError.textContent = '';
+      deleteModalError.hidden = true;
+      setDeleteExecutePending(true);
+      setDeleteModalBusy(true);
+      try {
+        const accepted = await requestJSON('/api/delete/execute', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            confirm_token: token,
+            mode: mode
+          })
+        });
+        if (typeof accepted.task_id !== 'string' || accepted.task_id === '') {
+          throw new Error('invalid execute response');
+        }
+        deleteState.confirmToken = '';
+        closeDeleteModal(true);
+        startDeletePolling(accepted.task_id);
+      } catch (_) {
+        deleteModalError.textContent = '无法提交删除任务，请重试。';
+        deleteModalError.hidden = false;
+      } finally {
+        setDeleteModalBusy(false);
+        setDeleteExecutePending(false);
+      }
+    }
+
+    async function loadGroups() {
+      const generation = ++state.generation;
+      rowsNode.replaceChildren();
+      setStatus('加载中…', false);
+      previousButton.disabled = true;
+      nextButton.disabled = true;
+      try {
+        const query = new URLSearchParams({
+          kind: state.kind,
+          page: String(state.page),
+          size: String(state.size)
+        });
+        const data = await requestJSON('/api/groups?' + query.toString());
+        if (generation !== state.generation) return;
+        state.total = data.total;
+        if (data.groups.length === 0) {
+          setStatus('暂无重复组', false);
+        } else {
+          setStatus(`已加载 ${data.groups.length} 组`, false);
+        }
+        for (const group of data.groups) {
+          const row = document.createElement('tr');
+          row.append(
+            cell(group.member_count),
+            cell(group.rep_machine),
+            cell(group.rep_path, 'mono'),
+            cell(group.machines.join('、')),
+            cell(group.created_at)
+          );
+          const action = document.createElement('td');
+          const toggle = document.createElement('button');
+          toggle.type = 'button';
+          toggle.textContent = '展开成员';
+          toggle.setAttribute('aria-expanded', 'false');
+          toggle.addEventListener('click', () => toggleDetail(row, group.id, toggle));
+          action.append(toggle);
+          row.append(action);
+          rowsNode.append(row);
+        }
+        updatePager();
+      } catch (error) {
+        if (generation !== state.generation) return;
+        state.total = 0;
+        updatePager();
+        setStatus(`请求失败：${error.message}`, true);
+      }
+    }
+
+    async function toggleDetail(groupRow, groupID, toggle) {
+      const generation = state.generation;
+      const existing = groupRow.nextElementSibling;
+      if (existing && existing.classList.contains('detail')) {
+        existing.remove();
+        toggle.textContent = '展开成员';
+        toggle.setAttribute('aria-expanded', 'false');
+        return;
+      }
+      toggle.disabled = true;
+      toggle.textContent = '加载成员…';
+      try {
+        const detail = await requestJSON('/api/groups/' + encodeURIComponent(String(groupID)));
+        if (generation !== state.generation || !groupRow.isConnected) return;
+        const detailRow = document.createElement('tr');
+        detailRow.className = 'detail';
+        const detailCell = document.createElement('td');
+        detailCell.colSpan = 6;
+        const table = document.createElement('table');
+        const head = document.createElement('thead');
+        const headRow = document.createElement('tr');
+        for (const label of ['选择', '角色', '机器', '路径', '大小', '修改时间', '分数明细']) {
+          const heading = document.createElement('th');
+          heading.textContent = label;
+          headRow.append(heading);
+        }
+        head.append(headRow);
+        table.append(head);
+        const body = document.createElement('tbody');
+        let effectiveRepresentativeFileID = detail.representative_file_id;
+        if (!detail.members.some(
+          member => member.file_id === effectiveRepresentativeFileID
+        )) {
+          effectiveRepresentativeFileID =
+            detail.members.length > 0 ? detail.members[0].file_id : null;
+        }
+        if (
+          Number.isSafeInteger(effectiveRepresentativeFileID) &&
+          effectiveRepresentativeFileID > 0
+        ) {
+          deleteState.selected.delete(effectiveRepresentativeFileID);
+        }
+        for (const member of detail.members) {
+          const memberRow = document.createElement('tr');
+          const isRepresentative =
+            member.file_id === effectiveRepresentativeFileID;
+          const selectionCell = document.createElement('td');
+          const selection = document.createElement('input');
+          selection.type = 'checkbox';
+          selection.className = 'member-delete-select';
+          selection.setAttribute('aria-label', '选择此成员进行删除');
+          const selectable =
+            !isRepresentative &&
+            Number.isSafeInteger(member.file_id) &&
+            member.file_id > 0;
+          selection.dataset.fileId = String(member.file_id);
+          selection.disabled = !selectable;
+          selection.checked =
+            selectable && deleteState.selected.has(member.file_id);
+          if (selectable) {
+            selection.addEventListener('change', () => {
+              if (selection.checked) {
+                deleteState.selected.set(member.file_id, {
+                  size: member.size
+                });
+              } else {
+                deleteState.selected.delete(member.file_id);
+              }
+              updateSelectionControls();
+            });
+          }
+          selectionCell.append(selection);
+          memberRow.append(
+            selectionCell,
+            cell(isRepresentative ? '代表' : '成员', isRepresentative ? 'representative' : ''),
+            cell(member.machine_id),
+            cell(member.path, 'mono'),
+            cell(member.size),
+            cell(member.mtime)
+          );
+          const scoreCell = document.createElement('td');
+          const score = document.createElement('pre');
+          score.textContent = JSON.stringify(member.score_json, null, 2);
+          scoreCell.append(score);
+          memberRow.append(scoreCell);
+          body.append(memberRow);
+        }
+        table.append(body);
+        detailCell.append(table);
+        detailRow.append(detailCell);
+        groupRow.after(detailRow);
+        updateSelectionControls();
+        toggle.textContent = '收起成员';
+        toggle.setAttribute('aria-expanded', 'true');
+      } catch (error) {
+        if (generation !== state.generation || !groupRow.isConnected) return;
+        setStatus(`请求失败：${error.message}`, true);
+        toggle.textContent = '重试展开';
+      } finally {
+        if (generation === state.generation && groupRow.isConnected) {
+          toggle.disabled = false;
+        }
+      }
+    }
+
+    document.querySelectorAll('[role="tab"]').forEach(tab => {
+      tab.addEventListener('click', () => {
+        if (deleteExecutePending) return;
+        const nextKind = tab.dataset.kind;
+        if (nextKind !== state.kind) {
+          deleteRequestGeneration += 1;
+          deleteState.selected.clear();
+          deleteState.confirmToken = '';
+          setDeleteModalBusy(false);
+          closeDeleteModal(false);
+          updateSelectionControls();
+        }
+        state.kind = nextKind;
+        state.page = 1;
+        document.querySelectorAll('[role="tab"]').forEach(other => {
+          other.setAttribute('aria-selected', String(other === tab));
+        });
+        loadGroups();
+      });
+    });
+    previousButton.addEventListener('click', () => {
+      if (deleteExecutePending) return;
+      if (state.page > 1) {
+        state.page -= 1;
+        loadGroups();
+      }
+    });
+    nextButton.addEventListener('click', () => {
+      if (deleteExecutePending) return;
+      if (state.page * state.size < state.total) {
+        state.page += 1;
+        loadGroups();
+      }
+    });
+    deleteButton.addEventListener('click', prepareDelete);
+    deleteCancel.addEventListener('click', () => {
+      if (!deleteBusy) cancelDeleteConfirmation(true);
+    });
+    deleteConfirm.addEventListener('click', executeDelete);
+    deletePollRetry.addEventListener('click', () => {
+      if (deleteState.taskID === '') return;
+      const taskID = deleteState.taskID;
+      deletePollRetry.disabled = true;
+      startDeletePolling(taskID);
+    });
+    deleteModal.addEventListener('keydown', event => {
+      if (event.key === 'Escape') {
+        if (!deleteBusy) {
+          event.preventDefault();
+          cancelDeleteConfirmation(true);
+        }
+        return;
+      }
+      if (event.key !== 'Tab') return;
+      const focusables = deleteModalFocusables();
+      if (focusables.length === 0) {
+        event.preventDefault();
+        return;
+      }
+      event.preventDefault();
+      const currentIndex = focusables.indexOf(document.activeElement);
+      if (currentIndex < 0) {
+        focusables[event.shiftKey ? focusables.length - 1 : 0].focus();
+        return;
+      }
+      const direction = event.shiftKey ? -1 : 1;
+      const nextIndex =
+        (currentIndex + direction + focusables.length) % focusables.length;
+      focusables[nextIndex].focus();
+    });
+    window.addEventListener('pagehide', () => {
+      deleteRequestGeneration += 1;
+      deleteState.pollGeneration += 1;
+      deleteState.taskID = '';
+    });
+    updateSelectionControls();
+    loadGroups();
+  </script>
+</body>
+</html>

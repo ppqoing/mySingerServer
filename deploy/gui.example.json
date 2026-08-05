@@ -1,0 +1,22 @@
+{
+  "listen_addr": "127.0.0.1:8080",
+  "pg_dsn": "postgres://dedup@127.0.0.1:5432/dedup",
+  "heartbeat_s": 15,
+  "firstscreen": {
+    "hamming_max": 31,
+    "aspect_tolerance": 0.10,
+    "video_duration_window_ms": 2000,
+    "image_quality_min": 50,
+    "read_page_size": 50000,
+    "group_insert_batch": 1000,
+    "sha_resolve_chunk": 10000
+  },
+  "agents": [
+    {
+      "addr": "127.0.0.1:9101"
+    },
+    {
+      "addr": "192.168.1.102:9101"
+    }
+  ]
+}

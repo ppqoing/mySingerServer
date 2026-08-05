@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mysingerserver.local/schemas/webview2-bootstrapper-cache-v1.json",
+  "title": "MySingerServer WebView2 Evergreen Bootstrapper cache manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "filename",
+    "official_source_url",
+    "official_distribution_documentation_url",
+    "actual_cache_origin",
+    "sha256",
+    "size",
+    "acquired_utc",
+    "notice_path",
+    "authenticode"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "filename": {
+      "const": "MicrosoftEdgeWebview2Setup.exe"
+    },
+    "official_source_url": {
+      "const": "https://go.microsoft.com/fwlink/p/?LinkId=2124703"
+    },
+    "official_distribution_documentation_url": {
+      "const": "https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/distribution"
+    },
+    "actual_cache_origin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "module",
+        "wails_version",
+        "module_sum",
+        "embedded_asset_path"
+      ],
+      "properties": {
+        "kind": {
+          "const": "wails_module_embedded_asset"
+        },
+        "module": {
+          "const": "github.com/wailsapp/wails/v2"
+        },
+        "wails_version": {
+          "const": "v2.12.0"
+        },
+        "module_sum": {
+          "const": "h1:BHO/kLNWFHYjCzucxbzAYZWUjub1Tvb4cSguQozHn5c="
+        },
+        "embedded_asset_path": {
+          "const": "internal/webview2runtime/MicrosoftEdgeWebview2Setup.exe"
+        }
+      }
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "size": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "acquired_utc": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "notice_path": {
+      "const": "NOTICE.md"
+    },
+    "authenticode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "signer_subject",
+        "signer_thumbprint",
+        "timestamp_subject"
+      ],
+      "properties": {
+        "status": {
+          "const": "Valid"
+        },
+        "signer_subject": {
+          "type": "string",
+          "minLength": 1
+        },
+        "signer_thumbprint": {
+          "type": "string",
+          "pattern": "^[0-9A-F]{40}$"
+        },
+        "timestamp_subject": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

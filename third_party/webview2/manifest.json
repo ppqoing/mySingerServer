@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "filename": "MicrosoftEdgeWebview2Setup.exe",
+  "official_source_url": "https://go.microsoft.com/fwlink/p/?LinkId=2124703",
+  "official_distribution_documentation_url": "https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/distribution",
+  "actual_cache_origin": {
+    "kind": "wails_module_embedded_asset",
+    "module": "github.com/wailsapp/wails/v2",
+    "wails_version": "v2.12.0",
+    "module_sum": "h1:BHO/kLNWFHYjCzucxbzAYZWUjub1Tvb4cSguQozHn5c=",
+    "embedded_asset_path": "internal/webview2runtime/MicrosoftEdgeWebview2Setup.exe"
+  },
+  "sha256": "7ebc4ce80143ef89cea86a61ea151502868db6caaa678b8b43660a66ace11c3a",
+  "size": 1793816,
+  "acquired_utc": "2026-08-02T23:29:40.8130361Z",
+  "notice_path": "NOTICE.md",
+  "authenticode": {
+    "status": "Valid",
+    "signer_subject": "CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US",
+    "signer_thumbprint": "C774204049D25D30AF9AC2F116B3C1FB88EE00A4",
+    "timestamp_subject": "CN=Microsoft Time-Stamp Service, OU=Thales TSS ESN:0A56-E329-4D4D, OU=Microsoft Operations Puerto Rico, O=Microsoft Corporation, L=Redmond, S=Washington, C=US"
+  }
+}

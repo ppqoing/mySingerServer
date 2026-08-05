@@ -1,0 +1,522 @@
+package gui
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io/fs"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"path"
+	"reflect"
+	"regexp"
+	"strings"
+	"testing"
+	"testing/fstest"
+
+	"dedup/internal/config"
+	"dedup/internal/proto"
+)
+
+var embeddedStaticTag = regexp.MustCompile(
+	`(?is)<\s*(script|link)\b[^>]*>`,
+)
+
+var embeddedStaticAttribute = regexp.MustCompile(
+	`(?is)\b([a-z][a-z0-9:_-]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>]+))`,
+)
+
+var embeddedHTTPURL = regexp.MustCompile(`(?i)https?://`)
+var embeddedCSSURL = regexp.MustCompile(
+	`(?is)url\(\s*(?:"([^"]*)"|'([^']*)'|([^'")]*))\s*\)`,
+)
+var embeddedCSSImport = regexp.MustCompile(`(?i)@import\b`)
+
+type embeddedStaticReference struct {
+	kind string
+	url  string
+}
+
+func TestEmbeddedHTMLReferenceParserEnumeratesOnlyScriptsAndStylesheets(t *testing.T) {
+	html := `
+		<script src="//cdn.example/remote.js"></script>
+		<SCRIPT SRC="HTTPS://cdn.example/upper.js"></SCRIPT>
+		<script src="./extra.js"></script>
+		<img src="/assets/impostor.js">
+		<a href="/assets/impostor.css">download</a>
+		<script src="/assets/app.js"></script>
+		<link rel="stylesheet" href="/assets/app.css">
+	`
+	references := embeddedScriptAndStylesheetReferences(html)
+	got := make([]string, 0, len(references))
+	for _, reference := range references {
+		got = append(got, reference.kind+":"+reference.url)
+	}
+	want := []string{
+		"script://cdn.example/remote.js",
+		"script:HTTPS://cdn.example/upper.js",
+		"script:./extra.js",
+		"script:/assets/app.js",
+		"stylesheet:/assets/app.css",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("references=%q, want scripts/styles only %q", got, want)
+	}
+}
+
+func TestEmbeddedHTMLAssetValidationRejectsEveryInvalidReference(t *testing.T) {
+	assets := fstest.MapFS{
+		"assets/app.js":    {Data: []byte("console.log('ok')")},
+		"assets/app.css":   {Data: []byte("body{}")},
+		"assets/empty.css": {Data: nil},
+	}
+	validScript := `<script src="/assets/app.js"></script>`
+	validStyle := `<link rel="stylesheet" href="/assets/app.css">`
+	tests := []struct {
+		name string
+		html string
+	}{
+		{"protocol relative script", `<script src="//cdn.example/app.js"></script>` + validStyle},
+		{"uppercase https script", `<SCRIPT SRC="HTTPS://cdn.example/app.js"></SCRIPT>` + validStyle},
+		{"relative script", `<script src="./extra.js"></script>` + validStyle},
+		{"script must be javascript", `<script src="/assets/app.css"></script>` + validStyle},
+		{"stylesheet must be css", validScript + `<link rel="stylesheet" href="/assets/app.js">`},
+		{"referenced script must exist", `<script src="/assets/missing.js"></script>` + validStyle},
+		{"referenced stylesheet must be nonempty", validScript + `<link rel="stylesheet" href="/assets/empty.css">`},
+		{"React entry cannot contain a plain remote URL", validScript + validStyle + `<p>HTTPS://example.invalid/</p>`},
+		{"images and anchors cannot impersonate assets", `
+			<img src="/assets/app.js">
+			<a href="/assets/app.css">download</a>
+		`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := validateEmbeddedHTMLAssets(assets, test.html, "synthetic.html"); err == nil {
+				t.Fatal("invalid script/stylesheet references were accepted")
+			}
+		})
+	}
+
+	validWithImpostors := `
+		<img src="/assets/missing.js">
+		<a href="/assets/missing.css">download</a>
+	` + validScript + validStyle
+	if err := validateEmbeddedHTMLAssets(assets, validWithImpostors, "valid.html"); err != nil {
+		t.Fatalf("valid script/stylesheet references rejected: %v", err)
+	}
+
+	for _, test := range []struct {
+		name   string
+		assets fstest.MapFS
+	}{
+		{
+			name: "stylesheet missing nested asset",
+			assets: fstest.MapFS{
+				"assets/app.js":  {Data: []byte("console.log('ok')")},
+				"assets/app.css": {Data: []byte(`body{background:url("/assets/missing.png")}`)},
+			},
+		},
+		{
+			name: "stylesheet remote nested asset",
+			assets: fstest.MapFS{
+				"assets/app.js":  {Data: []byte("console.log('ok')")},
+				"assets/app.css": {Data: []byte(`body{background:url(https://example.invalid/remote.png)}`)},
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := validateEmbeddedHTMLAssets(
+				test.assets, validScript+validStyle, "nested.html",
+			); err == nil {
+				t.Fatal("invalid nested stylesheet asset was accepted")
+			}
+		})
+	}
+
+	nestedValid := fstest.MapFS{
+		"assets/app.js":  {Data: []byte("console.log('ok')")},
+		"assets/app.css": {Data: []byte(`body{background:url("/assets/pixel.png")}`)},
+		"assets/pixel.png": {
+			Data: []byte("synthetic image"),
+		},
+	}
+	if err := validateEmbeddedHTMLAssets(
+		nestedValid, validScript+validStyle, "nested-valid.html",
+	); err != nil {
+		t.Fatalf("valid nested stylesheet asset rejected: %v", err)
+	}
+}
+
+func TestEmbeddedHTMLRemoteDependencyDetectionIsCaseInsensitive(t *testing.T) {
+	for _, html := range []string{
+		`<SCRIPT SRC="//cdn.example/app.js"></SCRIPT>`,
+		`<link REL="stylesheet" HREF="HTTPS://cdn.example/app.css">`,
+		`<script src="hTtP://cdn.example/app.js"></script>`,
+	} {
+		if !hasRemoteScriptOrStylesheet(html) {
+			t.Fatalf("remote dependency was not detected in %s", html)
+		}
+	}
+	if hasRemoteScriptOrStylesheet(`
+		<p>Documentation: HTTPS://example.invalid/</p>
+		<script src="/assets/app.js"></script>
+		<link rel="stylesheet" href="/assets/app.css">
+	`) {
+		t.Fatal("plain text URL was treated as a remote script or stylesheet")
+	}
+}
+
+func TestEmbeddedReactEntriesServeOnlyLocalAssets(t *testing.T) {
+	api := NewAPI(nil, nil, nil)
+	for _, route := range []string{"/", "/groups"} {
+		request := httptest.NewRequest(http.MethodGet, route, nil)
+		response := httptest.NewRecorder()
+		api.Routes().ServeHTTP(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("%s status=%d body=%s", route, response.Code, response.Body.String())
+		}
+		if !strings.Contains(response.Body.String(), `id="root"`) {
+			t.Fatalf("%s is not a React entry: %s", route, response.Body.String())
+		}
+	}
+
+	entries := []string{"index.html", "groups.html"}
+	for _, entry := range entries {
+		body := readEmbeddedStaticFile(t, entry)
+		if err := validateEmbeddedHTMLAssets(webFS(), body, entry); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestEmbeddedStaticPagesKeepLegacyFallbacksAndNoRemoteDependencies(t *testing.T) {
+	api := NewAPI(nil, nil, nil)
+	for _, route := range []string{"/legacy.html", "/legacy-groups.html"} {
+		request := httptest.NewRequest(http.MethodGet, route, nil)
+		response := httptest.NewRecorder()
+		api.Routes().ServeHTTP(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("%s status=%d body=%s", route, response.Code, response.Body.String())
+		}
+	}
+
+	for _, page := range []string{
+		"index.html", "groups.html", "legacy.html", "legacy-groups.html",
+	} {
+		body := readEmbeddedStaticFile(t, page)
+		if hasRemoteScriptOrStylesheet(body) {
+			t.Fatalf("embedded page %s references a remote script or stylesheet", page)
+		}
+	}
+}
+
+func embeddedScriptAndStylesheetReferences(html string) []embeddedStaticReference {
+	tags := embeddedStaticTag.FindAllStringSubmatch(html, -1)
+	references := make([]embeddedStaticReference, 0, len(tags))
+	for _, tag := range tags {
+		attributes := make(map[string]string)
+		for _, attribute := range embeddedStaticAttribute.FindAllStringSubmatch(tag[0], -1) {
+			value := attribute[2]
+			if value == "" {
+				value = attribute[3]
+			}
+			if value == "" {
+				value = attribute[4]
+			}
+			attributes[strings.ToLower(attribute[1])] = value
+		}
+
+		switch strings.ToLower(tag[1]) {
+		case "script":
+			if url, ok := attributes["src"]; ok {
+				references = append(references, embeddedStaticReference{
+					kind: "script",
+					url:  url,
+				})
+			}
+		case "link":
+			if !containsHTMLRelToken(attributes["rel"], "stylesheet") {
+				continue
+			}
+			if url, ok := attributes["href"]; ok {
+				references = append(references, embeddedStaticReference{
+					kind: "stylesheet",
+					url:  url,
+				})
+			}
+		}
+	}
+	return references
+}
+
+func containsHTMLRelToken(value string, want string) bool {
+	for _, token := range strings.Fields(value) {
+		if strings.EqualFold(token, want) {
+			return true
+		}
+	}
+	return false
+}
+
+func validateEmbeddedHTMLAssets(fileSystem fs.FS, html string, entry string) error {
+	if embeddedHTTPURL.MatchString(html) {
+		return fmt.Errorf("%s contains an HTTP(S) URL", entry)
+	}
+	foundScript := false
+	foundStylesheet := false
+	for _, reference := range embeddedScriptAndStylesheetReferences(html) {
+		url := strings.TrimSpace(reference.url)
+		if !strings.HasPrefix(url, "/assets/") {
+			return fmt.Errorf("%s has non-local %s URL %q", entry, reference.kind, reference.url)
+		}
+		switch reference.kind {
+		case "script":
+			if !strings.HasSuffix(strings.ToLower(url), ".js") {
+				return fmt.Errorf("%s script URL is not JavaScript: %q", entry, reference.url)
+			}
+			foundScript = true
+		case "stylesheet":
+			if !strings.HasSuffix(strings.ToLower(url), ".css") {
+				return fmt.Errorf("%s stylesheet URL is not CSS: %q", entry, reference.url)
+			}
+			foundStylesheet = true
+		default:
+			return fmt.Errorf("%s has unknown static reference kind %q", entry, reference.kind)
+		}
+
+		content, err := fs.ReadFile(fileSystem, strings.TrimPrefix(url, "/"))
+		if err != nil {
+			return fmt.Errorf("%s references unreadable %s %q: %w",
+				entry, reference.kind, reference.url, err)
+		}
+		if len(content) == 0 {
+			return fmt.Errorf("%s references empty %s %q", entry, reference.kind, reference.url)
+		}
+		if reference.kind == "stylesheet" {
+			if err := validateEmbeddedCSSAssets(
+				fileSystem, string(content), reference.url,
+			); err != nil {
+				return err
+			}
+		}
+	}
+	if !foundScript || !foundStylesheet {
+		return fmt.Errorf("%s local assets: JavaScript=%t CSS=%t",
+			entry, foundScript, foundStylesheet)
+	}
+	return nil
+}
+
+func validateEmbeddedCSSAssets(fileSystem fs.FS, css string, entry string) error {
+	if embeddedCSSImport.MatchString(css) {
+		return fmt.Errorf("%s contains a forbidden CSS @import", entry)
+	}
+	for _, match := range embeddedCSSURL.FindAllStringSubmatch(css, -1) {
+		url := strings.TrimSpace(match[1])
+		if url == "" {
+			url = strings.TrimSpace(match[2])
+		}
+		if url == "" {
+			url = strings.TrimSpace(match[3])
+		}
+		if strings.HasPrefix(url, "data:") || strings.HasPrefix(url, "#") {
+			continue
+		}
+		if !strings.HasPrefix(url, "/assets/") ||
+			strings.Contains(url, `\`) ||
+			strings.Contains(url, "://") ||
+			strings.HasPrefix(url, "//") {
+			return fmt.Errorf("%s contains invalid CSS asset URL %q", entry, url)
+		}
+		clean := path.Clean(strings.TrimPrefix(url, "/"))
+		if clean != strings.TrimPrefix(url, "/") ||
+			!strings.HasPrefix(clean, "assets/") {
+			return fmt.Errorf("%s CSS asset resolves outside assets: %q", entry, url)
+		}
+		content, err := fs.ReadFile(fileSystem, clean)
+		if err != nil {
+			return fmt.Errorf("%s references unreadable CSS asset %q: %w", entry, url, err)
+		}
+		if len(content) == 0 {
+			return fmt.Errorf("%s references empty CSS asset %q", entry, url)
+		}
+	}
+	return nil
+}
+
+func hasRemoteScriptOrStylesheet(html string) bool {
+	for _, reference := range embeddedScriptAndStylesheetReferences(html) {
+		url := strings.ToLower(strings.TrimSpace(reference.url))
+		if strings.HasPrefix(url, "http://") ||
+			strings.HasPrefix(url, "https://") ||
+			strings.HasPrefix(url, "//") {
+			return true
+		}
+	}
+	return false
+}
+
+func readEmbeddedStaticFile(t *testing.T, name string) string {
+	t.Helper()
+	content, err := fs.ReadFile(webFS(), name)
+	if err != nil {
+		t.Fatalf("read embedded %s: %v", name, err)
+	}
+	return string(content)
+}
+
+func TestGroupsUnavailableDatabaseIs503AndLegacyRoutesRemainRegistered(t *testing.T) {
+	api := NewAPI(nil, nil, nil)
+	for _, url := range []string{
+		"/api/groups?kind=exact",
+		"/api/groups/1",
+		"/api/dup_groups",
+		"/api/dup_groups/" + strings.Repeat("a", 128),
+	} {
+		request := httptest.NewRequest(http.MethodGet, url, nil)
+		response := httptest.NewRecorder()
+		api.Routes().ServeHTTP(response, request)
+		if response.Code != http.StatusServiceUnavailable {
+			t.Fatalf("%s status=%d body=%s",
+				url, response.Code, response.Body.String())
+		}
+	}
+}
+
+func TestDeleteHTTPNewAPIPreservesLegacyRouteRegistration(t *testing.T) {
+	api := NewAPI(nil, nil, nil)
+	deleteResponse := deleteHTTPResponse(
+		api,
+		http.MethodPost,
+		"/api/delete/prepare",
+		"application/json",
+		`{"member_ids":[1]}`,
+	)
+	if deleteResponse.Code != http.StatusServiceUnavailable {
+		t.Fatalf("delete status=%d body=%s", deleteResponse.Code, deleteResponse.Body.String())
+	}
+	legacyResponse := deleteHTTPResponse(
+		api,
+		http.MethodGet,
+		"/api/groups?kind=exact",
+		"",
+		"",
+	)
+	if legacyResponse.Code != http.StatusServiceUnavailable {
+		t.Fatalf("legacy status=%d body=%s", legacyResponse.Code, legacyResponse.Body.String())
+	}
+}
+
+func TestScanAPIReusesProvidedTaskIDForResume(t *testing.T) {
+	serverSide, guiSide := net.Pipe()
+	defer serverSide.Close()
+	defer guiSide.Close()
+	agent := &AgentConn{
+		ep: config.AgentEndpoint{Addr: "pipe"}, conn: proto.NewConn(guiSide),
+		machineID: machineA, identityState: IdentityClaimed, online: true,
+	}
+	pool := &Pool{
+		byAddr:      map[string]*AgentConn{"pipe": agent},
+		byMachineID: map[string]*AgentConn{machineA: agent},
+	}
+	registry := NewTaskRegistry(nil, testLogger())
+	api := NewAPI(pool, registry, nil)
+
+	received := make(chan proto.ScanTask, 1)
+	go func() {
+		msgType, body, err := proto.NewConn(serverSide).ReadFrame()
+		if err != nil {
+			return
+		}
+		message, err := proto.Decode(msgType, body)
+		if err == nil {
+			received <- *message.(*proto.ScanTask)
+		}
+	}()
+	body := bytes.NewBufferString(`{
+		"task_id":"b7b0ba1c-1ec1-4be4-b769-cbe40607fe25",
+		"machine_id":"node-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		"roots":["D:\\media"],
+		"phase":1
+	}`)
+	request := httptest.NewRequest(http.MethodPost, "/api/scan", body)
+	response := httptest.NewRecorder()
+	api.Routes().ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+	var result map[string]string
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result["task_id"] != "b7b0ba1c-1ec1-4be4-b769-cbe40607fe25" {
+		t.Fatalf("response = %#v", result)
+	}
+	task := <-received
+	if task.TaskID != result["task_id"] || task.Roots[0] != `D:\media` {
+		t.Fatalf("wire task = %#v", task)
+	}
+	if got := registry.List(); len(got) != 1 || got[0].TaskID != task.TaskID {
+		t.Fatalf("registry = %#v", got)
+	}
+}
+
+func TestScanAPIReportsOfflineAgentAndRecordsFailure(t *testing.T) {
+	pool := NewPool([]config.AgentEndpoint{{
+		Addr: "127.0.0.1:1",
+	}}, testLogger(), func(string, *AgentConn, any) {})
+	registry := NewTaskRegistry(nil, testLogger())
+	api := NewAPI(pool, registry, nil)
+	request := httptest.NewRequest(http.MethodPost, "/api/scan",
+		bytes.NewBufferString(`{"machine_id":"machine-a","roots":["D:\\media"],"phase":1}`))
+	response := httptest.NewRecorder()
+	api.Routes().ServeHTTP(response, request)
+	if response.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+	tasks := registry.List()
+	if len(tasks) != 1 || tasks[0].Status != "failed" {
+		t.Fatalf("tasks = %#v", tasks)
+	}
+}
+
+func TestScanAPIRejectsMalformedResumeTaskID(t *testing.T) {
+	api := NewAPI(NewPool(nil, testLogger(), nil),
+		NewTaskRegistry(nil, testLogger()), nil)
+	request := httptest.NewRequest(http.MethodPost, "/api/scan",
+		bytes.NewBufferString(`{
+			"task_id":"not-a-uuid",
+			"machine_id":"machine-a",
+			"roots":["D:\\media"]
+		}`))
+	response := httptest.NewRecorder()
+	api.Routes().ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestScanAPIRejectsTaskIDReusedWithDifferentEnvelope(t *testing.T) {
+	registry := NewTaskRegistry(nil, testLogger())
+	const taskID = "b7b0ba1c-1ec1-4be4-b769-cbe40607fe25"
+	if err := registry.Register(&TaskInfo{
+		TaskID: taskID, MachineID: "machine-a", Phase: 1,
+		Roots: []string{`D:\one`}, Status: "sent",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	api := NewAPI(NewPool(nil, testLogger(), nil), registry, nil)
+	request := httptest.NewRequest(http.MethodPost, "/api/scan",
+		bytes.NewBufferString(`{
+			"task_id":"b7b0ba1c-1ec1-4be4-b769-cbe40607fe25",
+			"machine_id":"machine-a",
+			"roots":["D:\\two"],
+			"phase":1
+		}`))
+	response := httptest.NewRecorder()
+	api.Routes().ServeHTTP(response, request)
+	if response.Code != http.StatusConflict {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+}

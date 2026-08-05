@@ -1,0 +1,18 @@
+FFmpeg SDK license evidence status
+==================================
+
+RELEASE BLOCKED
+
+This file is an evidence record, not a replacement for the license text and
+not a grant of rights.
+
+The local `ffmpeg.exe -L` output identifies GNU GPL version 3 or later. The
+local executables also consistently report both `--enable-gpl` and
+`--enable-version3` in their embedded configure line. The manifest therefore
+uses the locally evidenced classification `gpl-3.0-or-later`.
+
+The SDK directory supplied to this repository did not contain a distributor
+license bundle or the corresponding third-party license notices. Those
+materials have not been reconstructed or guessed. `license.evidence_complete`
+and `redistributable` remain false until authoritative license materials for
+this exact build are supplied and reviewed.

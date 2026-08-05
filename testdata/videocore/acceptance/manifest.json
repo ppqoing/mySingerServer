@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "fixture_manifest": "../compat/manifest.json",
+  "generated_corpus_committed": false,
+  "required_cases": [
+    "empty_path",
+    "worker_crash_recovery",
+    "worker_hang_120000ms_recovery"
+  ]
+}

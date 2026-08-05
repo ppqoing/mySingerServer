@@ -1,0 +1,49 @@
+// Archived acceptance verifier; not part of a production Go package.
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+
+	"dedup/internal/diskmap"
+)
+
+type result struct {
+	Root  string        `json:"root"`
+	Info  *diskmap.Info `json:"info,omitempty"`
+	Error string        `json:"error,omitempty"`
+}
+
+func main() {
+	if len(os.Args) < 2 {
+		fmt.Fprintln(os.Stderr, "usage: diskmap-verifier <root>...")
+		os.Exit(2)
+	}
+	results := make([]result, 0, len(os.Args)-1)
+	failed := false
+	for _, root := range os.Args[1:] {
+		mountPoint, err := diskmap.MountPointOf(root)
+		if err != nil {
+			results = append(results, result{Root: root, Error: err.Error()})
+			failed = true
+			continue
+		}
+		info, err := diskmap.Resolve(mountPoint)
+		if err != nil {
+			results = append(results, result{Root: root, Error: err.Error()})
+			failed = true
+			continue
+		}
+		results = append(results, result{Root: root, Info: info})
+	}
+	encoder := json.NewEncoder(os.Stdout)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(results); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if failed {
+		os.Exit(1)
+	}
+}

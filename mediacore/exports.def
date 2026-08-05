@@ -1,0 +1,17 @@
+LIBRARY mediacore
+EXPORTS
+    mc_version
+    mc_sha512_new
+    mc_sha512_free
+    mc_sha512_update
+    mc_sha512_final
+    mc_decode_gray
+    mc_free_image
+    mc_pdq256_from_gray
+    mc_hamming_distance
+    mc_image_phase1
+    mc_phash_parts
+    mc_sobel_hist
+    mc_phase2_image
+    mc_debug_crash
+    mc_debug_sleep_ms

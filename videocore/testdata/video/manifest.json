@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "sourceRoot": "testdata/videocore/compat/videos",
+  "scaleMaxSide": 512,
+  "fixtures": [
+    {"path":"h264-standard.mp4","sha256":"178c45dcd02e750715404938c180b32007a9c52c8ff4f85844a225cc88c3ddb3","durationMs":2417,"sampleTimesMs":[201,604,1007,1409,1812,2215],"display":"512x288","completedMask":63,"topStatus":0},
+    {"path":"h264-bframes.mp4","sha256":"be0b75f5b7566954b2832d19777fba827fddb69af1f335bf043acc152e4b2a92","durationMs":2417,"sampleTimesMs":[201,604,1007,1409,1812,2215],"display":"512x279","completedMask":63,"topStatus":0},
+    {"path":"h264-rotate90.mp4","sha256":"7fb6353447eae980dfddaa07e2a6f0a1e8eb8f80b753e3a60da47ca7a0f54c68","durationMs":1800,"sampleTimesMs":[150,450,750,1050,1350,1650],"display":"288x512","completedMask":63,"topStatus":0},
+    {"path":"h264-sar-4x3.mp4","sha256":"e64a912e502339e24e6b59e1b98b5fdf77e6cbae71fa5041f80904f7040ff827","durationMs":1800,"sampleTimesMs":[150,450,750,1050,1350,1650],"display":"512x256","completedMask":63,"topStatus":0},
+    {"path":"h264-short.mp4","sha256":"20aa6e049c07e7b1729dcb9afc8e8a22b78914d359403e996c87772cacf377a9","durationMs":417,"sampleTimesMs":[34,104,173,243,312,382],"display":"512x288","completedMask":31,"topStatus":0},
+    {"path":"truncated-container.mp4","sha256":"a1ae5e557f02a1de64ae7ce3935556850a4a455bfce0dd18e64a616b2e238a22","durationMs":2417,"sampleTimesMs":[201,604,1007,1409,1812,2215],"display":"512x288","completedMask":15,"topStatus":0},
+    {"path":"corrupt-packet.ts","sha256":"2d562f83b7c7eae4788655e4eb31bbcd3b96102842d3c5c73c28d18949bb884c","durationMs":2000,"sampleTimesMs":[166,500,833,1166,1500,1833],"display":"512x288","completedMask":63,"topStatus":0},
+    {"path":"audio-only.m4a","sha256":"28959f5b6943424e1367574e52c7c02a0542c495302f0877895f4b4762ce6b25","durationMs":1400,"sampleTimesMs":[116,350,583,816,1050,1283],"display":"none","completedMask":0,"topStatus":-9}
+  ]
+}

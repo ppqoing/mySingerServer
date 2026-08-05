@@ -1,0 +1,127 @@
+// Archived acceptance verifier; not part of a production Go package.
+package main
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"unicode/utf16"
+
+	"dedup/internal/agent"
+	fileenum "dedup/internal/enum"
+)
+
+const (
+	literalContents = "M1 long-path acceptance literal contents\n"
+	expectedSHA512  = "5cd7106951cbfd05c3a6cf6061b94be001c6736fef31c353f441bfd02555ba57913e20cf12a93337a2fa8b8415fd65d0a53fb244bef2bb8e6345e9340e165d0a"
+)
+
+func main() {
+	root := filepath.Join(".tmp", "m1-acceptance-longpath", "tree")
+	segment := "nested-segment-0123456789"
+	parts := []string{root}
+	for range 14 {
+		parts = append(parts, segment)
+	}
+	target := filepath.Join(append(parts, "unicode-目录-文件.txt")...)
+
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(target, []byte(literalContents), 0o600); err != nil {
+		fatalf("WriteFile: %v", err)
+	}
+	absoluteTarget, err := filepath.Abs(target)
+	if err != nil {
+		fatalf("Abs target: %v", err)
+	}
+	pathLength := len(utf16.Encode([]rune(absoluteTarget)))
+	if pathLength <= 260 {
+		fatalf("target UTF-16 length=%d, want >260", pathLength)
+	}
+
+	var walkerRecords []fileenum.FileRecord
+	if err := (fileenum.WalkerEnumerator{}).Enum(root, func(record fileenum.FileRecord) error {
+		walkerRecords = append(walkerRecords, record)
+		return nil
+	}); err != nil {
+		fatalf("WalkerEnumerator.Enum: %v", err)
+	}
+	walkerTarget, found := findTarget(walkerRecords, absoluteTarget)
+	if !found {
+		fatalf("WalkerEnumerator did not return target %q; records=%#v", absoluteTarget, walkerRecords)
+	}
+	if strings.HasPrefix(walkerTarget.Path, `\\?\`) {
+		fatalf("WalkerEnumerator leaked long-path prefix: %q", walkerTarget.Path)
+	}
+
+	actualSHA512, err := (agent.GoHasher{}).HashFile(absoluteTarget)
+	if err != nil {
+		fatalf("GoHasher.HashFile: %v", err)
+	}
+	if actualSHA512 != expectedSHA512 {
+		fatalf("GoHasher SHA-512=%s, want %s", actualSHA512, expectedSHA512)
+	}
+
+	fmt.Printf("literal_contents_go_quoted=%q\n", literalContents)
+	fmt.Printf("literal_contents_utf8_hex=%x\n", []byte(literalContents))
+	fmt.Printf("literal_contents_byte_count=%d\n", len([]byte(literalContents)))
+	fmt.Printf("target_path=%s\n", absoluteTarget)
+	fmt.Printf("target_utf16_length=%d\n", pathLength)
+	fmt.Printf("walker_record_path=%s\n", walkerTarget.Path)
+	fmt.Printf("walker_record_count=%d\n", len(walkerRecords))
+	fmt.Printf("sha512_expected=%s\n", expectedSHA512)
+	fmt.Printf("sha512_actual=%s\n", actualSHA512)
+
+	dll := os.Getenv("M1_EVERYTHING_DLL")
+	if dll == "" {
+		fmt.Println("resilient_branch=skipped_no_sdk_dll")
+		return
+	}
+	everything := fileenum.NewEverythingEnumeratorAt(dll)
+	availableErr := everything.Available()
+	var fallbackCause error
+	resilient := fileenum.NewResilientEnumerator(
+		everything,
+		fileenum.WalkerEnumerator{},
+		func(_ string, cause error) { fallbackCause = cause },
+	)
+	var resilientRecords []fileenum.FileRecord
+	if err := resilient.Enum(root, func(record fileenum.FileRecord) error {
+		resilientRecords = append(resilientRecords, record)
+		return nil
+	}); err != nil {
+		fatalf("ResilientEnumerator.Enum: %v", err)
+	}
+	resilientTarget, found := findTarget(resilientRecords, absoluteTarget)
+	if !found {
+		fatalf("ResilientEnumerator did not return target %q; records=%#v", absoluteTarget, resilientRecords)
+	}
+	if strings.HasPrefix(resilientTarget.Path, `\\?\`) {
+		fatalf("ResilientEnumerator leaked long-path prefix: %q", resilientTarget.Path)
+	}
+	branch := "everything"
+	if fallbackCause != nil {
+		branch = "walker_fallback"
+	}
+	fmt.Printf("everything_available_error=%v\n", availableErr)
+	fmt.Printf("resilient_branch=%s\n", branch)
+	fmt.Printf("resilient_fallback_cause=%v\n", fallbackCause)
+	fmt.Printf("resilient_record_path=%s\n", resilientTarget.Path)
+	fmt.Printf("resilient_record_count=%d\n", len(resilientRecords))
+}
+
+func findTarget(records []fileenum.FileRecord, target string) (fileenum.FileRecord, bool) {
+	for _, record := range records {
+		if strings.EqualFold(filepath.Clean(record.Path), filepath.Clean(target)) {
+			return record, true
+		}
+	}
+	return fileenum.FileRecord{}, false
+}
+
+func fatalf(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, format+"\n", args...)
+	os.Exit(1)
+}

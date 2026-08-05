@@ -1,0 +1,63 @@
+// Archived acceptance observer; not part of a production Go package.
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+
+	"dedup/internal/store"
+)
+
+type snapshot struct {
+	Pending int64                `json:"pending"`
+	Queue   []store.SyncQueueRow `json:"queue"`
+	Files   []store.FileRow      `json:"files"`
+}
+
+func main() {
+	if len(os.Args) != 2 {
+		fmt.Fprintln(os.Stderr, "usage: observer <agent.db>")
+		os.Exit(2)
+	}
+	db, err := store.Open(os.Args[1])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	pending, err := db.PendingSyncCount(ctx)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	queue, err := db.PendingSyncRows(ctx, "files", 100)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	ids := make([]string, len(queue))
+	for index, row := range queue {
+		ids[index] = row.RowPK
+	}
+	var files []store.FileRow
+	if len(ids) > 0 {
+		files, err = db.LoadFilesByIDs(ctx, ids)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	}
+	encoder := json.NewEncoder(os.Stdout)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(snapshot{
+		Pending: pending,
+		Queue:   queue,
+		Files:   files,
+	}); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}

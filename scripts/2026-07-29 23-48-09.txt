@@ -1,0 +1,5 @@
+pwsh -NoProfile -File scripts/run_m6_short_benchmark.ps1 `
+  -RootA 'I:\tmp' `
+  -RootB 'H:\pik\00000000000' `
+  -MaxFilesPerRoot 10000 `
+  -MaximumMinutes 30

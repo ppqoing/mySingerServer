@@ -1,0 +1,1104 @@
+package agent
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"log/slog"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"dedup/internal/config"
+	fileenum "dedup/internal/enum"
+	"dedup/internal/proto"
+	"dedup/internal/store"
+	"dedup/internal/worker"
+)
+
+func TestScanManagerRejectsInvalidTasks(t *testing.T) {
+	manager, cleanup := newTestScanManager(t, nil, nil)
+	defer cleanup()
+	for _, task := range []proto.ScanTask{
+		{TaskID: "phase-2", Roots: []string{`D:\media`}, Phase: 2},
+		{TaskID: "empty", Phase: 1},
+		{TaskID: "", Roots: []string{`D:\media`}, Phase: 1},
+	} {
+		ack := manager.Handle(task, nil)
+		if ack.Accepted || ack.Reason == "" {
+			t.Fatalf("Handle(%#v) = %#v, want rejected reason", task, ack)
+		}
+	}
+}
+
+func TestScanTaskResumesAndCompletesWithoutRestarting(t *testing.T) {
+	hashStarted := make(chan struct{})
+	releaseHash := make(chan struct{})
+	var once sync.Once
+	hasher := hasherFunc(func(string) (string, error) {
+		once.Do(func() { close(hashStarted) })
+		<-releaseHash
+		return "hash", nil
+	})
+	enumr := &fakeEnumerator{records: map[string][]fileenum.FileRecord{
+		`D:\media`: {{Path: `D:\media\a.bin`, Size: 1, MTime: 100}},
+	}}
+	manager, cleanup := newTestScanManager(t, enumr, hasher)
+	defer cleanup()
+
+	done := make(chan proto.TaskDone, 1)
+	sender := captureTaskDone(done)
+	task := proto.ScanTask{TaskID: "task-1", Roots: []string{`D:\media`}, Phase: 1}
+	if ack := manager.Handle(task, sender); !ack.Accepted || ack.Reason != "accepted" {
+		t.Fatalf("first ack = %#v", ack)
+	}
+	select {
+	case <-hashStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("hash did not start")
+	}
+	if ack := manager.Handle(task, sender); !ack.Accepted || ack.Reason != "resumed" {
+		t.Fatalf("resume ack = %#v", ack)
+	}
+	close(releaseHash)
+	select {
+	case result := <-done:
+		if result.Stats.Done != 1 || result.Stats.Failed != 0 {
+			t.Fatalf("TaskDone stats = %#v", result.Stats)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("scan did not finish")
+	}
+	if enumr.callCount() != 1 {
+		t.Fatalf("enumerator calls = %d, want 1", enumr.callCount())
+	}
+	if ack := manager.Handle(task, sender); !ack.Accepted || ack.Reason != "already_done" {
+		t.Fatalf("done ack = %#v", ack)
+	}
+}
+
+func TestCompletedScanAckCarriesFinalStats(t *testing.T) {
+	enumr := &fakeEnumerator{records: map[string][]fileenum.FileRecord{
+		`D:\media`: {{Path: `D:\media\a.bin`, Size: 1, MTime: 100}},
+	}}
+	manager, cleanup := newTestScanManager(t, enumr, nil)
+	defer cleanup()
+	done := make(chan proto.TaskDone, 1)
+	task := proto.ScanTask{
+		TaskID: "task-completed-ack", Roots: []string{`D:\media`}, Phase: 1,
+	}
+	if ack := manager.Handle(task, captureTaskDone(done)); !ack.Accepted {
+		t.Fatalf("first ack = %#v", ack)
+	}
+	var final proto.TaskDone
+	select {
+	case final = <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("scan did not finish")
+	}
+
+	ack := manager.Handle(task, nil)
+	if ack.Reason != "already_done" || ack.Stats == nil ||
+		*ack.Stats != final.Stats {
+		t.Fatalf("completed ack = %#v, final = %#v", ack, final.Stats)
+	}
+}
+
+func TestScanManagerRejectsTaskIDReusedWithDifferentEnvelope(t *testing.T) {
+	hashStarted := make(chan struct{})
+	releaseHash := make(chan struct{})
+	var once sync.Once
+	hasher := hasherFunc(func(string) (string, error) {
+		once.Do(func() { close(hashStarted) })
+		<-releaseHash
+		return "hash", nil
+	})
+	enumr := &fakeEnumerator{records: map[string][]fileenum.FileRecord{
+		`D:\one`: {{Path: `D:\one\a.bin`, Size: 1, MTime: 100}},
+	}}
+	manager, cleanup := newTestScanManager(t, enumr, hasher)
+	defer cleanup()
+
+	original := proto.ScanTask{
+		TaskID: "task-envelope", Roots: []string{`D:\one`}, Phase: 1,
+	}
+	if ack := manager.Handle(original, nil); !ack.Accepted {
+		t.Fatalf("original ack = %#v", ack)
+	}
+	select {
+	case <-hashStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("hash did not start")
+	}
+	conflict := original
+	conflict.Roots = []string{`D:\two`}
+	ack := manager.Handle(conflict, nil)
+	if ack.Accepted || !strings.Contains(ack.Reason, "envelope mismatch") {
+		t.Fatalf("conflicting ack = %#v, want rejection", ack)
+	}
+	close(releaseHash)
+}
+
+func TestPreparedScanStartsOnlyAfterAckAndCanStartOnResume(t *testing.T) {
+	hashStarted := make(chan struct{})
+	hasher := hasherFunc(func(string) (string, error) {
+		close(hashStarted)
+		return "hash", nil
+	})
+	enumr := &fakeEnumerator{records: map[string][]fileenum.FileRecord{
+		`D:\one`: {{Path: `D:\one\a.bin`, Size: 1, MTime: 100}},
+	}}
+	manager, cleanup := newTestScanManager(t, enumr, hasher)
+	defer cleanup()
+	task := proto.ScanTask{
+		TaskID: "task-prepared", Roots: []string{`D:\one`}, Phase: 1,
+	}
+
+	ack, _ := manager.Prepare(task, nil)
+	if !ack.Accepted || ack.Reason != "accepted" {
+		t.Fatalf("prepared ack = %#v", ack)
+	}
+	select {
+	case <-hashStarted:
+		t.Fatal("scan started before ACK callback")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	ack, start := manager.Prepare(task, nil)
+	if !ack.Accepted || ack.Reason != "resumed" || start == nil {
+		t.Fatalf("resumed prepared ack = %#v start=%v", ack, start != nil)
+	}
+	start()
+	select {
+	case <-hashStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("resumed prepared scan did not start")
+	}
+}
+
+func TestScanContinuesAfterHashFailureAndOnlyIncludesRequestedRoot(t *testing.T) {
+	enumr := &fakeEnumerator{records: map[string][]fileenum.FileRecord{
+		`D:\one`: {
+			{Path: `D:\one\a.bin`, Size: 10, MTime: 10},
+			{Path: `D:\one\bad.bin`, Size: 20, MTime: 20},
+		},
+	}}
+	hasher := hasherFunc(func(path string) (string, error) {
+		if filepath.Base(path) == "bad.bin" {
+			return "", errors.New("access denied")
+		}
+		return "goodhash", nil
+	})
+	manager, cleanup := newTestScanManager(t, enumr, hasher)
+	defer cleanup()
+
+	// Seed a pending file outside the requested root. A D:\one scan must not
+	// accidentally consume unrelated backlog from D:\two.
+	if err := manager.st.UpsertEnumerated(context.Background(), []store.EnumUpsert{{
+		MachineID: "machine-a", DiskNo: 1, Path: `D:\two\pending.bin`,
+		Size: 1, MTime: 1, MissingBase: proto.FieldSHA512,
+	}, {
+		MachineID: "machine-a", DiskNo: 1, Path: `D:\one\stale.bin`,
+		Size: 1, MTime: 1, MissingBase: proto.FieldSHA512,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	var messagesMu sync.Mutex
+	var messages []any
+	done := make(chan proto.TaskDone, 1)
+	sender := func(msgType uint8, value any) error {
+		messagesMu.Lock()
+		messages = append(messages, value)
+		messagesMu.Unlock()
+		if msgType == proto.MsgTaskDone {
+			done <- *value.(*proto.TaskDone)
+		}
+		return nil
+	}
+	task := proto.ScanTask{TaskID: "task-root", Roots: []string{`D:\one`}, Phase: 1}
+	if ack := manager.Handle(task, sender); !ack.Accepted {
+		t.Fatalf("ack = %#v", ack)
+	}
+	select {
+	case result := <-done:
+		if result.Stats.Done != 2 || result.Stats.Failed != 1 {
+			t.Fatalf("stats = %#v", result.Stats)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("scan did not finish")
+	}
+
+	pending, err := manager.st.PendingSnapshot(context.Background(), "machine-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var outsideStillPending, staleStillPending bool
+	for _, files := range pending {
+		for _, file := range files {
+			if file.Path == `D:\two\pending.bin` {
+				outsideStillPending = true
+			}
+			if file.Path == `D:\one\stale.bin` {
+				staleStillPending = true
+			}
+		}
+	}
+	if !outsideStillPending {
+		t.Fatal("scan consumed a pending file outside its requested root")
+	}
+	if !staleStillPending {
+		t.Fatal("scan consumed a stale database path not seen by this enumeration")
+	}
+
+	messagesMu.Lock()
+	defer messagesMu.Unlock()
+	var sawError, sawGood, sawBad bool
+	for _, message := range messages {
+		switch value := message.(type) {
+		case *proto.Error:
+			sawError = value.Path == `D:\one\bad.bin` && value.Stage == "hash"
+		case *proto.FeatureResult:
+			for _, item := range value.Items {
+				if item.Path == `D:\one\a.bin` && item.Status == proto.StatusDone &&
+					item.Size == 10 && item.MTime == 10 {
+					sawGood = true
+				}
+				if item.Path == `D:\one\bad.bin` && item.Status == proto.StatusFailed {
+					sawBad = true
+				}
+			}
+		}
+	}
+	if !sawError || !sawGood || !sawBad {
+		t.Fatalf("messages missing error/good/bad result: %#v", messages)
+	}
+}
+
+func TestScanDoesNotReportDurableSuccessWhenResultCommitFails(t *testing.T) {
+	enumr := &fakeEnumerator{records: map[string][]fileenum.FileRecord{
+		`D:\media`: {{Path: `D:\media\a.bin`, Size: 10, MTime: 20}},
+	}}
+	var manager *ScanManager
+	hasher := hasherFunc(func(string) (string, error) {
+		if err := manager.st.Close(); err != nil {
+			return "", err
+		}
+		return "hash-not-persisted", nil
+	})
+	var cleanup func()
+	manager, cleanup = newTestScanManager(t, enumr, hasher)
+	defer cleanup()
+
+	var messagesMu sync.Mutex
+	var messages []any
+	done := make(chan proto.TaskDone, 1)
+	sender := func(msgType uint8, value any) error {
+		messagesMu.Lock()
+		messages = append(messages, value)
+		messagesMu.Unlock()
+		if msgType == proto.MsgTaskDone {
+			done <- *value.(*proto.TaskDone)
+		}
+		return nil
+	}
+	task := proto.ScanTask{
+		TaskID: "task-store-failure", Roots: []string{`D:\media`}, Phase: 1,
+	}
+	if ack := manager.Handle(task, sender); !ack.Accepted {
+		t.Fatalf("ack = %#v", ack)
+	}
+	select {
+	case result := <-done:
+		if result.Stats.Failed != 1 || result.Stats.ScanErrors != 1 {
+			t.Fatalf("TaskDone stats = %#v, want one persistence failure", result.Stats)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("scan did not finish")
+	}
+
+	messagesMu.Lock()
+	defer messagesMu.Unlock()
+	var sawStoreError, sawFailedResult, sawFalseSuccess bool
+	for _, message := range messages {
+		switch value := message.(type) {
+		case *proto.Error:
+			sawStoreError = sawStoreError || value.Stage == "store"
+		case *proto.FeatureResult:
+			for _, item := range value.Items {
+				if item.Path != `D:\media\a.bin` {
+					continue
+				}
+				sawFailedResult = item.Status == proto.StatusFailed && item.Err != ""
+				sawFalseSuccess = item.Status == proto.StatusDone
+			}
+		}
+	}
+	if !sawStoreError || !sawFailedResult || sawFalseSuccess {
+		t.Fatalf(
+			"messages storeError=%v failedResult=%v falseSuccess=%v: %#v",
+			sawStoreError,
+			sawFailedResult,
+			sawFalseSuccess,
+			messages,
+		)
+	}
+}
+
+func TestScanCountsDiskResolutionFailure(t *testing.T) {
+	manager, cleanup := newTestScanManager(t, nil, nil)
+	defer cleanup()
+	manager.resolver = func(string) (int64, bool, error) {
+		return -1, false, errors.New("volume unavailable")
+	}
+
+	done := make(chan proto.TaskDone, 1)
+	task := proto.ScanTask{
+		TaskID: "task-bad-volume", Roots: []string{`Z:\missing`}, Phase: 1,
+	}
+	if ack := manager.Handle(task, captureTaskDone(done)); !ack.Accepted {
+		t.Fatalf("ack = %#v", ack)
+	}
+	select {
+	case result := <-done:
+		if result.Stats.Failed != 1 || result.Stats.ScanErrors != 1 ||
+			result.Stats.Total != 0 {
+			t.Fatalf("TaskDone stats = %#v, want one root failure", result.Stats)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("scan did not finish")
+	}
+}
+
+func TestScanCountsEnumerationFailure(t *testing.T) {
+	enumr := &fakeEnumerator{
+		records: map[string][]fileenum.FileRecord{
+			`D:\media`: {{Path: `D:\media\partial.bin`, Size: 1, MTime: 1}},
+		},
+		errors: map[string]error{
+			`D:\media`: errors.New("walk interrupted"),
+		},
+	}
+	manager, cleanup := newTestScanManager(t, enumr, nil)
+	defer cleanup()
+
+	done := make(chan proto.TaskDone, 1)
+	task := proto.ScanTask{
+		TaskID: "task-enum-failure", Roots: []string{`D:\media`}, Phase: 1,
+	}
+	if ack := manager.Handle(task, captureTaskDone(done)); !ack.Accepted {
+		t.Fatalf("ack = %#v", ack)
+	}
+	select {
+	case result := <-done:
+		if result.Stats.Failed != 1 || result.Stats.ScanErrors != 1 {
+			t.Fatalf("TaskDone stats = %#v, want one enumeration failure", result.Stats)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("scan did not finish")
+	}
+}
+
+func TestFailedOldSenderDoesNotUnbindNewlyResumedConnection(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	newSenderCalled := make(chan struct{}, 1)
+	makeSender := func(old bool) Sender {
+		return func(uint8, any) error {
+			if old {
+				close(started)
+				<-release
+				return errors.New("old connection closed")
+			}
+			newSenderCalled <- struct{}{}
+			return nil
+		}
+	}
+	state := &ScanState{}
+	state.bindSender(makeSender(true))
+	oldDone := make(chan struct{})
+	go func() {
+		defer close(oldDone)
+		state.send(proto.MsgTaskProgress, &proto.TaskProgress{})
+	}()
+	<-started
+	state.bindSender(makeSender(false))
+	close(release)
+	<-oldDone
+	state.send(proto.MsgTaskProgress, &proto.TaskProgress{})
+	select {
+	case <-newSenderCalled:
+	case <-time.After(time.Second):
+		t.Fatal("old sender failure cleared the newly resumed sender")
+	}
+}
+
+func TestFeatureResultSequenceAllocationAndSendAreLinearized(t *testing.T) {
+	state := &ScanState{Task: proto.ScanTask{TaskID: "task-seq"}}
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	received := make(chan uint64, 2)
+	state.bindSender(func(msgType uint8, value any) error {
+		if msgType != proto.MsgFeatureResult {
+			return nil
+		}
+		sequence := value.(*proto.FeatureResult).Seq
+		if sequence == 1 {
+			close(firstEntered)
+			<-releaseFirst
+		}
+		received <- sequence
+		return nil
+	})
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		state.publishFeatures([]proto.FeatureItem{{Path: "first"}})
+	}()
+	<-firstEntered
+	secondDone := make(chan struct{})
+	go func() {
+		defer close(secondDone)
+		state.publishFeatures([]proto.FeatureItem{{Path: "second"}})
+	}()
+	select {
+	case sequence := <-received:
+		t.Fatalf("sequence %d was sent before sequence 1 completed", sequence)
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(releaseFirst)
+	<-firstDone
+	<-secondDone
+	if first, second := <-received, <-received; first != 1 || second != 2 {
+		t.Fatalf("send order = [%d %d], want [1 2]", first, second)
+	}
+}
+
+func TestExtensionFilterIsCaseInsensitive(t *testing.T) {
+	if !extIn(`D:\photo.JPG`, []string{".jpg"}) {
+		t.Fatal("uppercase extension did not match lowercase filter")
+	}
+	if extIn(`D:\photo.png`, []string{".jpg"}) {
+		t.Fatal("wrong extension matched")
+	}
+}
+
+func TestScanRoutesMediaToPoolWithMissingMaskAndKnownSHAWhileOtherFilesUseGoHasher(t *testing.T) {
+	knownSHAHex := strings.Repeat("ab", 64)
+	enumr := &fakeEnumerator{records: map[string][]fileenum.FileRecord{
+		`D:\media`: {
+			{Path: `D:\media\known.jpg`, Size: 10, MTime: 20},
+			{Path: `D:\media\clip.mp4`, Size: 30, MTime: 40},
+			{Path: `D:\media\plain.txt`, Size: 50, MTime: 60},
+		},
+	}}
+	var hashed []string
+	manager, cleanup := newTestScanManager(t, enumr, hasherFunc(func(path string) (string, error) {
+		hashed = append(hashed, path)
+		return strings.Repeat("cd", 64), nil
+	}))
+	defer cleanup()
+	if err := manager.st.UpsertEnumerated(context.Background(), []store.EnumUpsert{{
+		MachineID: "machine-a", DiskNo: 1, Path: `D:\media\known.jpg`,
+		Size: 10, MTime: 20, MissingBase: proto.FieldSHA512 | proto.FieldPDQ256,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.st.ApplyHashResults(context.Background(), "machine-a", []store.HashResult{{
+		Path: `D:\media\known.jpg`, SHA512: knownSHAHex,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	pool := newFakeScanPool()
+	pool.addMetrics(worker.MetricsSnapshot{
+		FilesDone: 40, FilesFailed: 30, DecodeCalls: 20,
+		ReadAttempts: 50, DecodeAttempts: 20,
+		ReadNS: 100_000_000, DecodeNS: 200_000_000,
+		ThumbGenerated: 10, ThumbCacheHits: 9,
+		SingleFlightHits: 8, Crashes: 7,
+	})
+	pool.onSubmit = func(job worker.JobMsg) {
+		result := &worker.JobResultMsg{
+			JobID: job.JobID, ScanTaskID: job.ScanTaskID,
+			Path: job.Path, Kind: job.Kind, Phase: job.Phase,
+			SHA512:     append([]byte(nil), job.KnownSHA...),
+			FieldsDone: job.FieldsMask,
+		}
+		if job.FieldsMask&worker.MaskSHA512 != 0 {
+			result.SHA512 = bytes.Repeat([]byte{0x11}, 64)
+		}
+		if job.Kind == worker.MediaImage {
+			result.PDQ = bytes.Repeat([]byte{0x22}, 32)
+			result.Quality, result.Width, result.Height = 88, 640, 480
+		} else {
+			duration, quality := int64(5000), int32(91)
+			result.DurationMS, result.ThumbQuality = &duration, &quality
+			result.ThumbPath = `D:\cache\clip.jpg`
+			result.ThumbPDQ = bytes.Repeat([]byte{0x33}, 32)
+		}
+		pool.addMetrics(worker.MetricsSnapshot{
+			FilesDone: 1, DecodeCalls: 1, ReadAttempts: 1, DecodeAttempts: 1,
+			ReadNS: 12_000_000, DecodeNS: 34_000_000,
+		})
+		pool.results <- result
+	}
+	manager.pool = pool
+	var taskLog bytes.Buffer
+	manager.log = slog.New(slog.NewJSONHandler(&taskLog, nil))
+
+	done := make(chan proto.TaskDone, 1)
+	var mu sync.Mutex
+	var features []proto.FeatureItem
+	sender := func(msgType uint8, value any) error {
+		switch msgType {
+		case proto.MsgFeatureResult:
+			mu.Lock()
+			features = append(features, value.(*proto.FeatureResult).Items...)
+			mu.Unlock()
+		case proto.MsgTaskDone:
+			done <- *value.(*proto.TaskDone)
+		}
+		return nil
+	}
+	task := proto.ScanTask{TaskID: "task-media-routing", Roots: []string{`D:\media`}, Phase: 1}
+	if ack := manager.Handle(task, sender); !ack.Accepted {
+		t.Fatalf("ack = %#v", ack)
+	}
+	select {
+	case final := <-done:
+		if final.Stats.Done != 3 || final.Stats.FilesDone != 2 ||
+			final.Stats.DecodeCalls != 2 ||
+			final.Stats.AvgReadMS != 12 || final.Stats.AvgDecodeMS != 34 {
+			t.Fatalf("TaskDone stats = %#v", final.Stats)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("scan did not finish")
+	}
+	if len(hashed) != 1 || hashed[0] != `D:\media\plain.txt` {
+		t.Fatalf("Go hasher paths = %#v, want only non-media", hashed)
+	}
+	submitted := pool.submittedSnapshot()
+	if len(submitted) != 2 {
+		t.Fatalf("pool submissions = %#v", submitted)
+	}
+	var known, video *worker.JobMsg
+	for index := range submitted {
+		switch submitted[index].Path {
+		case `D:\media\known.jpg`:
+			known = &submitted[index]
+		case `D:\media\clip.mp4`:
+			video = &submitted[index]
+		}
+	}
+	if known == nil || known.FieldsMask != worker.MaskImagePDQ ||
+		len(known.KnownSHA) != 64 || known.ScanTaskID != task.TaskID {
+		t.Fatalf("known-SHA image job = %#v", known)
+	}
+	if video == nil || video.FieldsMask != worker.MaskAllVideo ||
+		len(video.KnownSHA) != 0 || video.ScanTaskID != task.TaskID {
+		t.Fatalf("video job = %#v", video)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(features) != 3 {
+		t.Fatalf("feature items = %#v", features)
+	}
+	var record map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(taskLog.Bytes()), &record); err != nil {
+		t.Fatalf("scan summary log = %q: %v", taskLog.Bytes(), err)
+	}
+	for key, want := range map[string]float64{
+		"files_done": 2, "files_failed": 0, "decode_calls": 2,
+		"thumb_generated": 0, "thumb_cache_hits": 0,
+		"singleflight_hits": 0, "crashes": 0,
+	} {
+		if got := record[key]; got != want {
+			t.Fatalf("scan summary %s = %#v, want %#v; record=%#v", key, got, want, record)
+		}
+	}
+	if _, exists := record["elapsed_ms"]; !exists {
+		t.Fatalf("scan summary missing elapsed_ms: %#v", record)
+	}
+}
+
+func TestPreparePendingSkipsMediaRowsWhosePhase1MaskIsZero(t *testing.T) {
+	manager, cleanup := newTestScanManager(t, nil, nil)
+	defer cleanup()
+	pool := newFakeScanPool()
+	manager.pool = pool
+	state := &ScanState{Task: proto.ScanTask{TaskID: "task-mask-zero"}}
+	work, routes := manager.preparePending(state, map[int64][]store.PendingFile{
+		1: {{
+			Path:        `D:\media\complete.jpg`,
+			MissingMask: proto.FieldPHashParts,
+		}},
+	})
+	if len(work) != 0 || len(routes) != 0 || len(pool.submittedSnapshot()) != 0 {
+		t.Fatalf("mask-zero prepare = work %#v routes %#v submits %#v", work, routes, pool.submittedSnapshot())
+	}
+}
+
+func TestMetricAveragesUseAttemptDenominatorsAndNanosecondPrecision(t *testing.T) {
+	readMS, decodeMS := metricAveragesMS(worker.MetricsSnapshot{
+		FilesDone:      1,
+		FilesFailed:    3,
+		Crashes:        1,
+		DecodeCalls:    0,
+		ReadAttempts:   2,
+		DecodeAttempts: 1,
+		ReadNS:         1_500_000,
+		DecodeNS:       250_000,
+	})
+	if readMS != 0.75 || decodeMS != 0.25 {
+		t.Fatalf("attempt averages = read:%v decode:%v, want 0.75/0.25", readMS, decodeMS)
+	}
+
+	readMS, decodeMS = metricAveragesMS(worker.MetricsSnapshot{
+		FilesFailed: 1,
+		Crashes:     1,
+	})
+	if readMS != 0 || decodeMS != 0 {
+		t.Fatalf("crash without reported attempts changed averages = read:%v decode:%v", readMS, decodeMS)
+	}
+}
+
+func TestScanForwardsPartialAndStoreFailureWithoutDoubleCompleting(t *testing.T) {
+	enumr := &fakeEnumerator{records: map[string][]fileenum.FileRecord{
+		`D:\media`: {
+			{Path: `D:\media\partial.jpg`, Size: 10, MTime: 20},
+			{Path: `D:\media\store-fail.jpg`, Size: 30, MTime: 40},
+		},
+	}}
+	manager, cleanup := newTestScanManager(t, enumr, nil)
+	defer cleanup()
+	pool := newFakeScanPool()
+	pool.onSubmit = func(job worker.JobMsg) {
+		result := &worker.JobResultMsg{
+			JobID: job.JobID, ScanTaskID: job.ScanTaskID,
+			Path: job.Path, Kind: job.Kind, Phase: job.Phase,
+		}
+		if strings.Contains(job.Path, "partial") {
+			result.SHA512 = bytes.Repeat([]byte{0x44}, 64)
+			result.FieldsDone = worker.MaskSHA512
+			result.Errors = []worker.FieldError{{
+				Field: worker.MaskImagePDQ,
+				Stage: "decode",
+				Msg:   "bad pixels",
+			}}
+		} else {
+			result.Errors = []worker.FieldError{{
+				Field: job.FieldsMask,
+				Stage: "store",
+				Msg:   "sqlite commit failed",
+			}}
+		}
+		pool.addMetrics(worker.MetricsSnapshot{FilesFailed: 1})
+		pool.results <- result
+	}
+	manager.pool = pool
+	done := make(chan proto.TaskDone, 1)
+	items := make(chan proto.FeatureItem, 2)
+	sender := func(msgType uint8, value any) error {
+		if msgType == proto.MsgFeatureResult {
+			for _, item := range value.(*proto.FeatureResult).Items {
+				items <- item
+			}
+		}
+		if msgType == proto.MsgTaskDone {
+			done <- *value.(*proto.TaskDone)
+		}
+		return nil
+	}
+	manager.Handle(proto.ScanTask{
+		TaskID: "task-partial-store", Roots: []string{`D:\media`}, Phase: 1,
+	}, sender)
+	select {
+	case final := <-done:
+		if final.Stats.Done != 2 || final.Stats.Failed != 2 ||
+			final.Stats.FilesFailed != 2 {
+			t.Fatalf("TaskDone = %#v", final)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("scan did not finish")
+	}
+	got := map[string]proto.FeatureItem{}
+	for range 2 {
+		item := <-items
+		got[item.Path] = item
+	}
+	partial := got[`D:\media\partial.jpg`]
+	if partial.Status != proto.StatusPartial ||
+		partial.FieldsDone != proto.FieldSHA512 ||
+		len(partial.FieldErrors) != 1 ||
+		partial.FieldErrors[0].Stage != "decode" {
+		t.Fatalf("partial item = %#v", partial)
+	}
+	failed := got[`D:\media\store-fail.jpg`]
+	if failed.Status != proto.StatusFailed || failed.FieldsDone != 0 ||
+		len(failed.FieldErrors) != 1 ||
+		failed.FieldErrors[0].Stage != "store" {
+		t.Fatalf("store-failure item = %#v", failed)
+	}
+}
+
+func TestScanVideoDurationOnlySuccessIsPartialAndForwardsDuration(t *testing.T) {
+	enumr := &fakeEnumerator{records: map[string][]fileenum.FileRecord{
+		`D:\media`: {{Path: `D:\media\duration-only.mp4`, Size: 30, MTime: 40}},
+	}}
+	manager, cleanup := newTestScanManager(t, enumr, nil)
+	defer cleanup()
+	pool := newFakeScanPool()
+	pool.onSubmit = func(job worker.JobMsg) {
+		duration := int64(5432)
+		pool.addMetrics(worker.MetricsSnapshot{FilesFailed: 1})
+		pool.results <- &worker.JobResultMsg{
+			JobID: job.JobID, ScanTaskID: job.ScanTaskID,
+			Path: job.Path, Kind: worker.MediaVideo, Phase: job.Phase,
+			SHA512:     bytes.Repeat([]byte{0x55}, 64),
+			DurationMS: &duration,
+			Errors: []worker.FieldError{{
+				Field: worker.MaskVideoThumb,
+				Stage: "ffmpeg",
+				Msg:   "thumbnail failed",
+			}},
+		}
+	}
+	manager.pool = pool
+	done := make(chan proto.TaskDone, 1)
+	items := make(chan proto.FeatureItem, 1)
+	manager.Handle(proto.ScanTask{
+		TaskID: "task-duration-partial", Roots: []string{`D:\media`}, Phase: 1,
+	}, func(msgType uint8, value any) error {
+		if msgType == proto.MsgFeatureResult {
+			items <- value.(*proto.FeatureResult).Items[0]
+		}
+		if msgType == proto.MsgTaskDone {
+			done <- *value.(*proto.TaskDone)
+		}
+		return nil
+	})
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("scan did not finish")
+	}
+	item := <-items
+	if item.Status != proto.StatusPartial ||
+		item.DurationMS == nil || *item.DurationMS != 5432 ||
+		len(item.FieldErrors) != 1 ||
+		item.FieldErrors[0].Stage != "ffmpeg" {
+		t.Fatalf("duration-only item = %#v", item)
+	}
+}
+
+func TestScanInvalidPersistedSHAIsPerFileFailureWithoutPoolSubmission(t *testing.T) {
+	enumr := &fakeEnumerator{records: map[string][]fileenum.FileRecord{
+		`D:\media`: {{Path: `D:\media\bad.jpg`, Size: 10, MTime: 20}},
+	}}
+	manager, cleanup := newTestScanManager(t, enumr, nil)
+	defer cleanup()
+	if err := manager.st.UpsertEnumerated(context.Background(), []store.EnumUpsert{{
+		MachineID: "machine-a", DiskNo: 1, Path: `D:\media\bad.jpg`,
+		Size: 10, MTime: 20, MissingBase: proto.FieldSHA512 | proto.FieldPDQ256,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.st.ApplyHashResults(context.Background(), "machine-a", []store.HashResult{{
+		Path: `D:\media\bad.jpg`, SHA512: "not-hex",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	pool := newFakeScanPool()
+	manager.pool = pool
+	done := make(chan proto.TaskDone, 1)
+	var failed bool
+	sender := func(msgType uint8, value any) error {
+		if msgType == proto.MsgFeatureResult {
+			for _, item := range value.(*proto.FeatureResult).Items {
+				failed = failed || item.Path == `D:\media\bad.jpg` &&
+					item.Status == proto.StatusFailed &&
+					strings.Contains(item.Err, "persisted SHA-512")
+			}
+		}
+		if msgType == proto.MsgTaskDone {
+			done <- *value.(*proto.TaskDone)
+		}
+		return nil
+	}
+	manager.Handle(proto.ScanTask{
+		TaskID: "task-invalid-sha", Roots: []string{`D:\media`}, Phase: 1,
+	}, sender)
+	select {
+	case final := <-done:
+		if final.Stats.Done != 1 || final.Stats.Failed != 1 {
+			t.Fatalf("stats = %#v", final.Stats)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("scan did not finish")
+	}
+	if len(pool.submittedSnapshot()) != 0 || !failed {
+		t.Fatalf("submissions=%#v failed=%t", pool.submittedSnapshot(), failed)
+	}
+}
+
+func TestScanCorrelatesMediaTerminalEventAndForwardsCrashNoticeToReboundSender(t *testing.T) {
+	enumr := &fakeEnumerator{records: map[string][]fileenum.FileRecord{
+		`D:\media`: {{Path: `D:\media\crash.jpg`, Size: 10, MTime: 20}},
+	}}
+	manager, cleanup := newTestScanManager(t, enumr, nil)
+	defer cleanup()
+	pool := newFakeScanPool()
+	pool.onSubmit = func(job worker.JobMsg) {
+		pool.results <- &worker.JobResultMsg{
+			JobID: job.JobID + 999, ScanTaskID: "foreign-task",
+			Path: `D:\foreign.jpg`, Kind: worker.MediaImage,
+		}
+		pool.addMetrics(worker.MetricsSnapshot{FilesFailed: 1, Crashes: 1})
+		pool.crashes <- worker.CrashRecord{
+			JobID: job.JobID, ScanTaskID: job.ScanTaskID, File: job.Path,
+			PID: 4321, ExitCode: -1073741819, Reason: "exit_code",
+		}
+	}
+	manager.pool = pool
+	oldBlocked := make(chan struct{})
+	oldRelease := make(chan struct{})
+	oldSender := func(msgType uint8, _ any) error {
+		if msgType == proto.MsgTaskProgress {
+			close(oldBlocked)
+			<-oldRelease
+			return errors.New("disconnected")
+		}
+		return nil
+	}
+	task := proto.ScanTask{TaskID: "task-crash", Roots: []string{`D:\media`}, Phase: 1}
+	ack, start := manager.Prepare(task, oldSender)
+	if !ack.Accepted {
+		t.Fatalf("ack = %#v", ack)
+	}
+	start()
+	<-oldBlocked
+	done := make(chan proto.TaskDone, 1)
+	crashNotices := make(chan proto.CrashNotice, 1)
+	newSender := func(msgType uint8, value any) error {
+		switch msgType {
+		case proto.MsgCrashNotice:
+			crashNotices <- *value.(*proto.CrashNotice)
+		case proto.MsgTaskDone:
+			done <- *value.(*proto.TaskDone)
+		}
+		return nil
+	}
+	resume, _ := manager.Prepare(task, newSender)
+	if !resume.Accepted || resume.Reason != "resumed" {
+		t.Fatalf("resume = %#v", resume)
+	}
+	close(oldRelease)
+	select {
+	case notice := <-crashNotices:
+		if notice.TaskID != task.TaskID || notice.Path != `D:\media\crash.jpg` ||
+			notice.PID != 4321 || notice.ExitCode != -1073741819 {
+			t.Fatalf("CrashNotice = %#v", notice)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no crash notice")
+	}
+	select {
+	case final := <-done:
+		if final.Stats.Done != 1 || final.Stats.Failed != 1 ||
+			final.Stats.Crashes != 1 {
+			t.Fatalf("TaskDone = %#v", final)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("scan did not finish")
+	}
+}
+
+func TestScanDrainsStaleCrashBeforeActiveTerminalAndCompletesRoute(t *testing.T) {
+	enumr := &fakeEnumerator{records: map[string][]fileenum.FileRecord{
+		`D:\media`: {{Path: `D:\media\active-crash.jpg`, Size: 10, MTime: 20}},
+	}}
+	manager, cleanup := newTestScanManager(t, enumr, nil)
+	defer cleanup()
+	pool := newFakeScanPool()
+	pool.crashes = make(chan worker.CrashRecord, 1)
+	pool.crashes <- worker.CrashRecord{
+		JobID: 999, ScanTaskID: "task-stale", File: `D:\media\stale.jpg`,
+	}
+	pool.onSubmit = func(job worker.JobMsg) {
+		pool.addMetrics(worker.MetricsSnapshot{FilesFailed: 1, Crashes: 1})
+		// This models Pool's reliable bounded active-terminal send: it waits
+		// until collectMedia drains the stale notification already buffered.
+		pool.crashes <- worker.CrashRecord{
+			JobID: job.JobID, ScanTaskID: job.ScanTaskID, File: job.Path,
+			PID: 9876, ExitCode: -1, Reason: "watchdog_image",
+		}
+	}
+	manager.pool = pool
+	done := make(chan proto.TaskDone, 1)
+	items := make(chan proto.FeatureItem, 1)
+	manager.Handle(proto.ScanTask{
+		TaskID: "task-active", Roots: []string{`D:\media`}, Phase: 1,
+	}, func(msgType uint8, value any) error {
+		switch msgType {
+		case proto.MsgFeatureResult:
+			items <- value.(*proto.FeatureResult).Items[0]
+		case proto.MsgTaskDone:
+			done <- *value.(*proto.TaskDone)
+		}
+		return nil
+	})
+	select {
+	case item := <-items:
+		if item.Path != `D:\media\active-crash.jpg` ||
+			item.Status != proto.StatusCrash {
+			t.Fatalf("active crash item=%#v", item)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("active crash did not terminate its media route")
+	}
+	select {
+	case final := <-done:
+		if final.Stats.Done != 1 || final.Stats.Failed != 1 ||
+			final.Stats.Crashes != 1 {
+			t.Fatalf("TaskDone=%#v", final)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("scan did not complete after active crash terminal")
+	}
+}
+
+type fakeScanPool struct {
+	mu        sync.Mutex
+	submitted []worker.JobMsg
+	metrics   worker.MetricsSnapshot
+	results   chan *worker.JobResultMsg
+	crashes   chan worker.CrashRecord
+	onSubmit  func(worker.JobMsg)
+}
+
+func newFakeScanPool() *fakeScanPool {
+	return &fakeScanPool{
+		results: make(chan *worker.JobResultMsg, 32),
+		crashes: make(chan worker.CrashRecord, 32),
+	}
+}
+
+func (p *fakeScanPool) Submit(job *worker.JobMsg) error {
+	copy := *job
+	copy.KnownSHA = append([]byte(nil), job.KnownSHA...)
+	p.mu.Lock()
+	p.submitted = append(p.submitted, copy)
+	onSubmit := p.onSubmit
+	p.mu.Unlock()
+	if onSubmit != nil {
+		onSubmit(copy)
+	}
+	return nil
+}
+
+func (p *fakeScanPool) Results() <-chan *worker.JobResultMsg { return p.results }
+func (p *fakeScanPool) Crashes() <-chan worker.CrashRecord   { return p.crashes }
+func (p *fakeScanPool) Metrics() worker.MetricsSnapshot {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.metrics
+}
+func (p *fakeScanPool) addMetrics(delta worker.MetricsSnapshot) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.metrics.FilesDone += delta.FilesDone
+	p.metrics.FilesFailed += delta.FilesFailed
+	p.metrics.DecodeCalls += delta.DecodeCalls
+	p.metrics.ReadAttempts += delta.ReadAttempts
+	p.metrics.DecodeAttempts += delta.DecodeAttempts
+	p.metrics.ReadNS += delta.ReadNS
+	p.metrics.DecodeNS += delta.DecodeNS
+	p.metrics.ThumbGenerated += delta.ThumbGenerated
+	p.metrics.ThumbCacheHits += delta.ThumbCacheHits
+	p.metrics.SingleFlightHits += delta.SingleFlightHits
+	p.metrics.Crashes += delta.Crashes
+}
+func (p *fakeScanPool) submittedSnapshot() []worker.JobMsg {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]worker.JobMsg(nil), p.submitted...)
+}
+
+func newTestScanManager(
+	t *testing.T,
+	enumr fileenum.Enumerator,
+	hasher Hasher,
+) (*ScanManager, func()) {
+	t.Helper()
+	if enumr == nil {
+		enumr = &fakeEnumerator{records: map[string][]fileenum.FileRecord{}}
+	}
+	if hasher == nil {
+		hasher = hasherFunc(func(string) (string, error) { return "hash", nil })
+	}
+	db, err := store.Open(filepath.Join(t.TempDir(), "agent.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.DefaultAgent()
+	cfg.MachineID = "machine-a"
+	cfg.Scan.HDDStreams = 2
+	cfg.Scan.SSDStreams = 4
+	var logOutput bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&logOutput, nil))
+	manager := NewScanManagerWithResolver(
+		cfg,
+		db,
+		enumr,
+		hasher,
+		log,
+		log,
+		func(string) (int64, bool, error) { return 1, false, nil },
+	)
+	return manager, func() { _ = db.Close() }
+}
+
+func captureTaskDone(done chan<- proto.TaskDone) Sender {
+	return func(msgType uint8, value any) error {
+		if msgType == proto.MsgTaskDone {
+			done <- *value.(*proto.TaskDone)
+		}
+		return nil
+	}
+}
+
+type hasherFunc func(string) (string, error)
+
+func (fn hasherFunc) HashFile(path string) (string, error) { return fn(path) }
+
+type fakeEnumerator struct {
+	mu      sync.Mutex
+	calls   int
+	records map[string][]fileenum.FileRecord
+	errors  map[string]error
+}
+
+func (f *fakeEnumerator) Name() string     { return "fake" }
+func (f *fakeEnumerator) Available() error { return nil }
+func (f *fakeEnumerator) Enum(root string, visit func(fileenum.FileRecord) error) error {
+	f.mu.Lock()
+	f.calls++
+	records := append([]fileenum.FileRecord(nil), f.records[root]...)
+	f.mu.Unlock()
+	for _, record := range records {
+		if err := visit(record); err != nil {
+			return err
+		}
+	}
+	return f.errors[root]
+}
+
+func (f *fakeEnumerator) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}

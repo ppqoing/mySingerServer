@@ -1,0 +1,162 @@
+.gui-settings__form,
+.gui-settings__section,
+.gui-settings__agents {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-4);
+}
+
+.gui-settings__section h2,
+.gui-settings__section p,
+.gui-settings__field p {
+  margin: 0;
+}
+
+.gui-settings__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 18rem), 1fr));
+  gap: var(--space-3) var(--space-4);
+}
+
+.gui-settings__field {
+  display: grid;
+  min-width: 0;
+  align-content: start;
+  gap: var(--space-1);
+}
+
+.gui-settings__field > label {
+  color: var(--color-muted);
+  font-size: var(--font-size-sm);
+  font-weight: 700;
+}
+
+.gui-settings__field input:not([type="checkbox"]) {
+  width: 100%;
+  min-width: 0;
+  padding: var(--space-2) var(--space-3);
+  color: var(--color-ink);
+  background: var(--color-surface-raised);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-control);
+}
+
+.gui-settings__field input[aria-invalid="true"] {
+  border-color: var(--color-danger);
+}
+
+.gui-settings__field-error {
+  color: var(--color-danger);
+  font-size: var(--font-size-sm);
+}
+
+.gui-settings__field-note {
+  color: var(--color-muted);
+  font-size: var(--font-size-xs);
+}
+
+.gui-settings__dsn-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: var(--space-3);
+}
+
+.gui-settings__section-heading,
+.gui-settings__actions,
+.gui-settings__agent-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.gui-settings__section-heading {
+  justify-content: space-between;
+}
+
+.gui-settings__agent {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: repeat(2, minmax(0, 1fr)) auto;
+  align-items: end;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-control);
+}
+
+.gui-settings__agent legend {
+  padding: 0 var(--space-1);
+  color: var(--color-muted);
+  font-size: var(--font-size-sm);
+  font-weight: 700;
+}
+
+.gui-settings .gui-settings__secondary {
+  color: var(--color-primary-strong);
+  background: var(--color-primary-soft);
+  border-color: var(--color-border);
+}
+
+.gui-settings .gui-settings__danger {
+  color: var(--color-danger);
+  background: var(--color-surface-raised);
+  border-color: var(--color-danger);
+}
+
+.gui-settings__checkbox {
+  align-content: center;
+}
+
+.gui-settings__checkbox label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.gui-settings__actions {
+  position: sticky;
+  z-index: 2;
+  bottom: var(--space-3);
+  justify-content: flex-end;
+}
+
+.gui-settings__actions > div {
+  flex: 1 1 20rem;
+}
+
+.gui-settings__notice,
+.gui-settings__dirty,
+.gui-settings__restart {
+  color: var(--color-success);
+}
+
+.gui-settings__dirty {
+  color: var(--color-primary-strong);
+}
+
+@media (max-width: 54rem) {
+  .gui-settings__agent {
+    grid-template-columns: 1fr;
+  }
+
+  .gui-settings__agent-actions {
+    justify-content: flex-start;
+  }
+}
+
+@media (max-width: 42rem) {
+  .gui-settings__dsn-row {
+    grid-template-columns: 1fr;
+  }
+
+  .gui-settings__dsn-row > button,
+  .gui-settings__actions > button {
+    width: 100%;
+  }
+
+  .gui-settings__actions {
+    position: static;
+  }
+}

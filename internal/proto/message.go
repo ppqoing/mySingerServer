@@ -1,0 +1,391 @@
+package proto
+
+import (
+	"fmt"
+
+	"github.com/vmihailenco/msgpack/v5"
+)
+
+// Message types are split into connection management, GUI-to-Agent, and
+// Agent-to-GUI ranges. New protocol versions may append fields and message
+// types, but must not repurpose an existing value.
+const (
+	MsgPing     uint8 = 1
+	MsgPong     uint8 = 2
+	MsgHello    uint8 = 3
+	MsgShutdown uint8 = 4
+
+	MsgScanTask   uint8 = 10
+	MsgTaskAck    uint8 = 11
+	MsgPhase2Task uint8 = 12
+	MsgDeleteTask uint8 = 13
+	MsgConfigPush uint8 = 14
+	MsgStatsQuery uint8 = 15
+
+	MsgTaskProgress  uint8 = 20
+	MsgFeatureResult uint8 = 21
+	MsgTaskDone      uint8 = 22
+	MsgError         uint8 = 23
+	MsgCrashNotice   uint8 = 24
+	MsgDeleteReport  uint8 = 25
+	MsgStatsReport   uint8 = 26
+)
+
+const ProtocolVersion = 1
+
+const (
+	FieldSHA512 uint32 = 1 << 0
+	FieldPDQ256 uint32 = 1 << 1
+	// Deprecated: FieldThumb retains legacy bit 2 for wire compatibility.
+	FieldThumb             uint32 = 1 << 2
+	FieldPHashParts        uint32 = 1 << 3
+	FieldSobelHist         uint32 = 1 << 4
+	FieldVideo6F           uint32 = 1 << 5
+	FieldVideoDuration     uint32 = 1 << 6
+	FieldVideoContactSheet uint32 = 1 << 7
+)
+
+const FrameMaskFull uint8 = 0x3f
+
+const (
+	KindImage uint8 = 1
+	KindVideo uint8 = 2
+)
+
+const (
+	StatusPending = "pending"
+	StatusDone    = "done"
+	StatusPartial = "partial"
+	StatusFailed  = "failed"
+	StatusCrash   = "crash"
+	StatusDeleted = "deleted"
+)
+
+const (
+	ModeSoft = "soft"
+	ModeHard = "hard"
+)
+
+const (
+	DeleteErrNotFound      = "E_NOT_FOUND"
+	DeleteErrBadPath       = "E_BAD_PATH"
+	DeleteErrPathDenied    = "E_PATH_DENIED"
+	DeleteErrNotConfirmed  = "E_NOT_CONFIRMED"
+	DeleteErrReadonly      = "E_READONLY"
+	DeleteErrAccessDenied  = "E_ACCESS_DENIED"
+	DeleteErrDeleteFailed  = "E_DELETE_FAILED"
+	DeleteErrRecycleFailed = "E_RECYCLE_FAILED"
+	DeleteErrInUse         = "E_IN_USE"
+	DeleteErrReparse       = "E_REPARSE"
+	DeleteErrBadMode       = "E_BAD_MODE"
+	DeleteErrHelperLost    = "E_HELPER_LOST"
+)
+
+type Ping struct {
+	TS int64 `msgpack:"ts"`
+}
+
+type Pong struct {
+	TS int64 `msgpack:"ts"`
+}
+
+type Hello struct {
+	Version   int    `msgpack:"version"`
+	MachineID string `msgpack:"machine_id,omitempty"`
+	Hostname  string `msgpack:"hostname,omitempty"`
+	PID       int    `msgpack:"pid"`
+	Role      string `msgpack:"role,omitempty"`
+}
+
+type ScanTask struct {
+	TaskID  string      `msgpack:"task_id"`
+	Roots   []string    `msgpack:"roots"`
+	Phase   uint8       `msgpack:"phase"`
+	Options ScanOptions `msgpack:"options"`
+}
+
+type ScanOptions struct {
+	Rescan     bool     `msgpack:"rescan"`
+	Extensions []string `msgpack:"extensions,omitempty"`
+}
+
+type TaskAck struct {
+	TaskID   string     `msgpack:"task_id"`
+	Accepted bool       `msgpack:"accepted"`
+	Reason   string     `msgpack:"reason"`
+	Total    int64      `msgpack:"total"`
+	Stats    *TaskStats `msgpack:"stats,omitempty"`
+}
+
+type Phase2Item struct {
+	Path       string `msgpack:"path"`
+	FieldsMask uint32 `msgpack:"fields_mask"`
+	MachineID  string `msgpack:"machine_id"`
+	SHA512     string `msgpack:"sha512"`
+	Size       int64  `msgpack:"size"`
+	MTimeMS    int64  `msgpack:"mtime_ms"`
+	Kind       uint8  `msgpack:"kind"`
+	FrameMask  uint8  `msgpack:"frame_mask"`
+	DurationMS int64  `msgpack:"duration_ms"`
+}
+
+func (item Phase2Item) Validate() error {
+	if item.MachineID == "" {
+		return fmt.Errorf("proto: phase2 item machine_id required")
+	}
+	if item.Path == "" {
+		return fmt.Errorf("proto: phase2 item path required")
+	}
+	if !isCanonicalSHA512(item.SHA512) {
+		return fmt.Errorf("proto: phase2 item sha512 must be 128 lowercase hexadecimal characters")
+	}
+	if item.Size < 0 || item.MTimeMS < 0 {
+		return fmt.Errorf("proto: phase2 item size and mtime_ms must not be negative")
+	}
+	if item.FrameMask&^FrameMaskFull != 0 {
+		return fmt.Errorf("proto: phase2 item frame_mask uses bits outside six frames")
+	}
+	if item.FieldsMask == 0 || item.FieldsMask&^(FieldPHashParts|FieldSobelHist|FieldVideo6F) != 0 {
+		return fmt.Errorf("proto: phase2 item fields_mask must contain only phase-2 fields")
+	}
+	switch item.Kind {
+	case KindImage:
+		if item.FieldsMask&FieldVideo6F != 0 {
+			return fmt.Errorf("proto: image phase2 item cannot request video frames")
+		}
+	case KindVideo:
+		if item.FieldsMask != FieldVideo6F {
+			return fmt.Errorf("proto: video phase2 item must request video frames")
+		}
+		if item.DurationMS <= 0 {
+			return fmt.Errorf("proto: video phase2 item duration_ms must be positive")
+		}
+	default:
+		return fmt.Errorf("proto: phase2 item kind %d is invalid", item.Kind)
+	}
+	return nil
+}
+
+func isCanonicalSHA512(value string) bool {
+	if len(value) != 128 {
+		return false
+	}
+	for _, ch := range value {
+		if !(ch >= '0' && ch <= '9') && !(ch >= 'a' && ch <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+type Phase2Task struct {
+	TaskID string       `msgpack:"task_id"`
+	Items  []Phase2Item `msgpack:"items"`
+}
+
+type DeleteTask struct {
+	TaskID    string   `msgpack:"task_id"`
+	Seq       uint32   `msgpack:"seq,omitempty"`
+	LastSeq   uint32   `msgpack:"last_seq,omitempty"`
+	Mode      string   `msgpack:"mode,omitempty"`
+	Confirmed bool     `msgpack:"confirmed,omitempty"`
+	Entries   []string `msgpack:"entries"`
+}
+
+type ConfigPush struct {
+	KV map[string]string `msgpack:"kv"`
+}
+
+// StatsQuery and StatsReport were reserved by architecture-plan v1.2 for M6.
+type StatsQuery struct {
+	WindowSeconds int `msgpack:"window_seconds,omitempty"`
+}
+
+type Shutdown struct{}
+
+type DiskStats struct {
+	DiskNo       int64   `msgpack:"disk_no"`
+	ReadBPS      float64 `msgpack:"read_bps"`
+	BusyFraction float64 `msgpack:"busy_frac"`
+	FilesDone    int64   `msgpack:"files_done,omitempty"`
+	PendingBytes int64   `msgpack:"pending_bytes,omitempty"`
+}
+
+type StatsReport struct {
+	Disks        []DiskStats `msgpack:"disks,omitempty"`
+	CPU          float64     `msgpack:"cpu"`
+	Workers      int         `msgpack:"workers"`
+	WindowS      int         `msgpack:"window_s,omitempty"`
+	RSSBytes     uint64      `msgpack:"rss_bytes,omitempty"`
+	HeapBytes    uint64      `msgpack:"heap_bytes,omitempty"`
+	Handles      uint64      `msgpack:"handles,omitempty"`
+	PendingBytes int64       `msgpack:"pending_bytes,omitempty"`
+	FilesDone    int64       `msgpack:"files_done,omitempty"`
+	FilesFailed  int64       `msgpack:"files_failed,omitempty"`
+	Crashes      int64       `msgpack:"crashes,omitempty"`
+	ReadP95MS    float64     `msgpack:"read_p95_ms,omitempty"`
+	DecodeP95MS  float64     `msgpack:"decode_p95_ms,omitempty"`
+}
+
+type TaskProgress struct {
+	TaskID string  `msgpack:"task_id"`
+	Done   int64   `msgpack:"done"`
+	Total  int64   `msgpack:"total"`
+	Speed  float64 `msgpack:"speed"`
+}
+
+type FeatureItem struct {
+	Path         string         `msgpack:"path"`
+	SHA512       string         `msgpack:"sha512,omitempty"`
+	Size         int64          `msgpack:"size"`
+	MTime        int64          `msgpack:"mtime"`
+	Status       string         `msgpack:"status"`
+	Err          string         `msgpack:"err,omitempty"`
+	FieldsDone   uint32         `msgpack:"fields_done,omitempty"`
+	PDQ256       string         `msgpack:"pdq256,omitempty"`
+	Quality      int32          `msgpack:"quality,omitempty"`
+	Width        int32          `msgpack:"width,omitempty"`
+	Height       int32          `msgpack:"height,omitempty"`
+	DurationMS   *int64         `msgpack:"duration_ms,omitempty"`
+	ThumbPath    string         `msgpack:"thumb_path,omitempty"`
+	ThumbPDQ256  string         `msgpack:"thumb_pdq256,omitempty"`
+	ThumbQuality *int32         `msgpack:"thumb_quality,omitempty"`
+	FieldErrors  []FieldError   `msgpack:"field_errors,omitempty"`
+	PHashParts   []byte         `msgpack:"phash_parts,omitempty"`
+	SobelHist    []byte         `msgpack:"sobel_hist,omitempty"`
+	Frames       []FrameFeature `msgpack:"frames,omitempty"`
+}
+
+type FrameFeature struct {
+	FrameIdx   int    `msgpack:"frame_idx"`
+	TimeMS     int64  `msgpack:"time_ms"`
+	PDQ256     []byte `msgpack:"pdq256,omitempty"`
+	Quality    int32  `msgpack:"quality,omitempty"`
+	PHashParts []byte `msgpack:"phash_parts,omitempty"`
+	SobelHist  []byte `msgpack:"sobel_hist,omitempty"`
+	Error      string `msgpack:"error,omitempty"`
+}
+
+type FieldError struct {
+	Field uint32 `msgpack:"field"`
+	Stage string `msgpack:"stage"`
+	Msg   string `msgpack:"msg"`
+}
+
+type FeatureResult struct {
+	TaskID string        `msgpack:"task_id"`
+	Seq    uint64        `msgpack:"seq"`
+	Items  []FeatureItem `msgpack:"items"`
+}
+
+type TaskStats struct {
+	Total            int64   `msgpack:"total"`
+	Done             int64   `msgpack:"done"`
+	Skipped          int64   `msgpack:"skipped"`
+	Failed           int64   `msgpack:"failed"`
+	ScanErrors       int64   `msgpack:"scan_errors,omitempty"`
+	ElapsedMS        int64   `msgpack:"elapsed_ms"`
+	FilesDone        int64   `msgpack:"files_done,omitempty"`
+	FilesFailed      int64   `msgpack:"files_failed,omitempty"`
+	DecodeCalls      int64   `msgpack:"decode_calls,omitempty"`
+	ReadAttempts     int64   `msgpack:"read_attempts,omitempty"`
+	DecodeAttempts   int64   `msgpack:"decode_attempts,omitempty"`
+	AvgReadMS        float64 `msgpack:"avg_read_ms,omitempty"`
+	AvgDecodeMS      float64 `msgpack:"avg_decode_ms,omitempty"`
+	ThumbGenerated   int64   `msgpack:"thumb_generated,omitempty"`
+	ThumbCacheHits   int64   `msgpack:"thumb_cache_hits,omitempty"`
+	SingleFlightHits int64   `msgpack:"singleflight_hits,omitempty"`
+	Crashes          int64   `msgpack:"crashes,omitempty"`
+}
+
+type TaskDone struct {
+	TaskID string    `msgpack:"task_id"`
+	Stats  TaskStats `msgpack:"stats"`
+}
+
+type Error struct {
+	TaskID string `msgpack:"task_id,omitempty"`
+	Path   string `msgpack:"path,omitempty"`
+	Stage  string `msgpack:"stage"`
+	Msg    string `msgpack:"msg"`
+}
+
+type CrashNotice struct {
+	TaskID   string `msgpack:"task_id,omitempty"`
+	PID      int    `msgpack:"pid"`
+	Path     string `msgpack:"path"`
+	ExitCode int    `msgpack:"exit_code"`
+}
+
+type DeleteResult struct {
+	Path            string `msgpack:"path"`
+	OK              bool   `msgpack:"ok"`
+	ErrCode         string `msgpack:"err_code,omitempty"`
+	Err             string `msgpack:"err,omitempty"`
+	ReadonlyCleared bool   `msgpack:"readonly_cleared,omitempty"`
+	RecycledTo      string `msgpack:"recycled_to,omitempty"`
+	Uncertain       bool   `msgpack:"uncertain,omitempty"`
+	StateSyncErr    string `msgpack:"state_sync_err,omitempty"`
+}
+
+type DeleteStats struct {
+	Total     int `msgpack:"total"`
+	OK        int `msgpack:"ok"`
+	Failed    int `msgpack:"failed"`
+	Uncertain int `msgpack:"uncertain,omitempty"`
+}
+
+type DeleteReport struct {
+	TaskID  string         `msgpack:"task_id"`
+	Seq     uint32         `msgpack:"seq,omitempty"`
+	LastSeq uint32         `msgpack:"last_seq,omitempty"`
+	Stats   DeleteStats    `msgpack:"stats"`
+	Entries []DeleteResult `msgpack:"entries"`
+}
+
+// Decode unmarshals a message body into the concrete map-encoded message type.
+func Decode(msgType uint8, body []byte) (any, error) {
+	var value any
+	switch msgType {
+	case MsgPing:
+		value = &Ping{}
+	case MsgPong:
+		value = &Pong{}
+	case MsgHello:
+		value = &Hello{}
+	case MsgShutdown:
+		value = &Shutdown{}
+	case MsgScanTask:
+		value = &ScanTask{}
+	case MsgTaskAck:
+		value = &TaskAck{}
+	case MsgPhase2Task:
+		value = &Phase2Task{}
+	case MsgDeleteTask:
+		value = &DeleteTask{}
+	case MsgConfigPush:
+		value = &ConfigPush{}
+	case MsgStatsQuery:
+		value = &StatsQuery{}
+	case MsgTaskProgress:
+		value = &TaskProgress{}
+	case MsgFeatureResult:
+		value = &FeatureResult{}
+	case MsgTaskDone:
+		value = &TaskDone{}
+	case MsgError:
+		value = &Error{}
+	case MsgCrashNotice:
+		value = &CrashNotice{}
+	case MsgDeleteReport:
+		value = &DeleteReport{}
+	case MsgStatsReport:
+		value = &StatsReport{}
+	default:
+		return nil, fmt.Errorf("proto: unknown message type %d", msgType)
+	}
+	if err := msgpack.Unmarshal(body, value); err != nil {
+		return nil, fmt.Errorf("proto: decode type=%d: %w", msgType, err)
+	}
+	return value, nil
+}

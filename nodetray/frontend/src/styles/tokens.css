@@ -1,0 +1,36 @@
+:root {
+  color-scheme: light;
+  font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif;
+  font-size: 14px;
+
+  --color-canvas: #f4f6f9;
+  --color-surface: #ffffff;
+  --color-surface-muted: #eef2f7;
+  --color-border: #d8dee8;
+  --color-text: #1f2937;
+  --color-text-muted: #667085;
+  --color-accent: #1769d2;
+  --color-accent-strong: #0f55ad;
+  --color-success: #237a45;
+  --color-warning: #9a5b00;
+  --color-danger: #b42318;
+  --color-neutral: #667085;
+  --color-focus: #0b63ce;
+
+  --space-1: 8px;
+  --space-2: 16px;
+  --space-3: 24px;
+  --space-4: 32px;
+  --space-5: 40px;
+
+  --radius-small: 6px;
+  --radius-medium: 10px;
+  --radius-large: 14px;
+
+  --font-body: 14px;
+  --font-heading-small: 18px;
+  --font-heading-large: 24px;
+  --line-body: 1.5;
+
+  --shadow-card: 0 1px 3px rgb(31 41 55 / 10%);
+}

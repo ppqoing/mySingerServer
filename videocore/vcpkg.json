@@ -1,0 +1,9 @@
+{
+  "name": "videocore",
+  "version-string": "1.0.0",
+  "dependencies": [
+    "libjpeg-turbo",
+    "libpng",
+    "libwebp"
+  ]
+}

@@ -1,0 +1,137 @@
+{
+  "schemaVersion": 1,
+  "images": [
+    {
+      "path": "images/synthetic-pattern.jpg",
+      "sha256": "ddc728bc21f6c68a6fe2016543f4d859bbdfde741106662e08b2f9ac07799861",
+      "mediaType": "image",
+      "codec": "jpeg",
+      "durationMicros": 0,
+      "rotation": 0,
+      "sar": "1:1",
+      "scenarios": ["jpeg", "synthetic", "phase1", "phase2"]
+    },
+    {
+      "path": "images/synthetic-bars.png",
+      "sha256": "168321cb901df4cfa0ddfa48baa44abddefd7ccecfe20024f915311734a4bcdd",
+      "mediaType": "image",
+      "codec": "png",
+      "durationMicros": 0,
+      "rotation": 0,
+      "sar": "1:1",
+      "scenarios": ["png", "synthetic", "phase1", "phase2"]
+    },
+    {
+      "path": "images/synthetic-portrait.webp",
+      "sha256": "2a54cea44b12ced0b519583bc41d5a2e3fba85ffb0e482d3491ae5d31a0831c2",
+      "mediaType": "image",
+      "codec": "webp",
+      "durationMicros": 0,
+      "rotation": 0,
+      "sar": "n/a",
+      "scenarios": ["webp", "synthetic", "portrait", "phase1", "phase2"]
+    }
+  ],
+  "videos": [
+    {
+      "path": "videos/h264-standard.mp4",
+      "sha256": "178c45dcd02e750715404938c180b32007a9c52c8ff4f85844a225cc88c3ddb3",
+      "mediaType": "video",
+      "codec": "h264",
+      "durationMicros": 2416667,
+      "rotation": 0,
+      "sar": "1:1",
+      "scenarios": ["h264", "synthetic", "no_b_frames"]
+    },
+    {
+      "path": "videos/h264-bframes.mp4",
+      "sha256": "be0b75f5b7566954b2832d19777fba827fddb69af1f335bf043acc152e4b2a92",
+      "mediaType": "video",
+      "codec": "h264",
+      "durationMicros": 2416667,
+      "rotation": 0,
+      "sar": "1:1",
+      "scenarios": ["h264", "b_frames", "synthetic"]
+    },
+    {
+      "path": "videos/h264-rotate90.mp4",
+      "sha256": "7fb6353447eae980dfddaa07e2a6f0a1e8eb8f80b753e3a60da47ca7a0f54c68",
+      "mediaType": "video",
+      "codec": "h264",
+      "durationMicros": 1800000,
+      "rotation": 90,
+      "sar": "1:1",
+      "scenarios": ["h264", "rotation_90", "portrait", "synthetic"]
+    },
+    {
+      "path": "videos/h264-sar-4x3.mp4",
+      "sha256": "e64a912e502339e24e6b59e1b98b5fdf77e6cbae71fa5041f80904f7040ff827",
+      "mediaType": "video",
+      "codec": "h264",
+      "durationMicros": 1800000,
+      "rotation": 0,
+      "sar": "4:3",
+      "scenarios": ["h264", "non_square_sar", "synthetic"]
+    },
+    {
+      "path": "videos/h264-short.mp4",
+      "sha256": "20aa6e049c07e7b1729dcb9afc8e8a22b78914d359403e996c87772cacf377a9",
+      "mediaType": "video",
+      "codec": "h264",
+      "durationMicros": 416667,
+      "rotation": 0,
+      "sar": "1:1",
+      "scenarios": ["h264", "short_video", "synthetic"]
+    },
+    {
+      "path": "videos/vp9-portrait.webm",
+      "sha256": "f1ce224e7409a1e93e722ada872143a8f6e0375ca1fa2a5460272dfdcb7d5864",
+      "mediaType": "video",
+      "codec": "vp9",
+      "durationMicros": 1600000,
+      "rotation": 0,
+      "sar": "1:1",
+      "scenarios": ["vp9", "portrait", "synthetic"]
+    },
+    {
+      "path": "videos/hevc-standard.mkv",
+      "sha256": "0fb8e4a5ac6684051c7460f9a0d5c1f7acd0ff944601dc0e8cdb5a92dd82b31d",
+      "mediaType": "video",
+      "codec": "hevc",
+      "durationMicros": 1600000,
+      "rotation": 0,
+      "sar": "1:1",
+      "scenarios": ["hevc", "synthetic"]
+    },
+    {
+      "path": "videos/audio-only.m4a",
+      "sha256": "28959f5b6943424e1367574e52c7c02a0542c495302f0877895f4b4762ce6b25",
+      "mediaType": "audio",
+      "codec": "aac",
+      "durationMicros": 1400000,
+      "rotation": 0,
+      "sar": "n/a",
+      "scenarios": ["audio_only", "synthetic", "expected_no_video_stream"]
+    },
+    {
+      "path": "videos/truncated-container.mp4",
+      "sha256": "a1ae5e557f02a1de64ae7ce3935556850a4a455bfce0dd18e64a616b2e238a22",
+      "mediaType": "video",
+      "codec": "h264",
+      "durationMicros": 2416667,
+      "rotation": 0,
+      "sar": "1:1",
+      "scenarios": ["h264", "truncated_container", "synthetic", "expected_partial_decode"]
+    },
+    {
+      "path": "videos/corrupt-packet.ts",
+      "sha256": "2d562f83b7c7eae4788655e4eb31bbcd3b96102842d3c5c73c28d18949bb884c",
+      "mediaType": "video",
+      "codec": "h264",
+      "durationMicros": 2000000,
+      "rotation": 0,
+      "sar": "1:1",
+      "scenarios": ["h264", "b_frames", "corrupt_packet", "synthetic", "expected_decode_error"]
+    }
+  ]
+}

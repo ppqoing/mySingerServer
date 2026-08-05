@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>媒体去重 · M1</title>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, sans-serif; color: #1f2937; }
+    body { margin: 0 auto; max-width: 1200px; padding: 24px; background: #f8fafc; }
+    h1 { font-size: 24px; } h2 { margin-top: 28px; font-size: 17px; }
+    .panel { background: white; border: 1px solid #e2e8f0; border-radius: 10px; padding: 16px; }
+    table { border-collapse: collapse; width: 100%; font-size: 13px; background: white; }
+    th, td { border-bottom: 1px solid #e2e8f0; padding: 7px 9px; text-align: left; }
+    th { color: #475569; background: #f1f5f9; }
+    input, select, button { font: inherit; padding: 7px 9px; }
+    input[type=text] { min-width: 420px; }
+    button { cursor: pointer; border: 0; border-radius: 6px; color: white; background: #2563eb; }
+    .on { color: #15803d; font-weight: 700; } .off, .err { color: #b91c1c; }
+    .mono { font-family: ui-monospace, Consolas, monospace; }
+  </style>
+</head>
+<body>
+  <h1>多机器媒体文件去重 — M1 骨架</h1>
+  <p><a href="/groups">查看精确重复、相似图片与相似视频组</a></p>
+  <h2>Agent 连接状态</h2>
+  <table id="agents"><thead><tr><th>machine_id</th><th>地址</th><th>状态</th><th>最近错误</th></tr></thead><tbody></tbody></table>
+
+  <h2>下发扫描任务</h2>
+  <div class="panel">
+    <select id="machine"></select>
+    <input id="roots" type="text" placeholder="多个根路径用 | 分隔，如 D:\media|E:\photos">
+    <label><input id="rescan" type="checkbox"> 强制重算</label>
+    <button type="button" onclick="startScan()">开始普扫</button>
+    <span id="scanMsg"></span>
+  </div>
+
+  <h2>任务进度</h2>
+  <table id="tasks"><thead><tr><th>task_id</th><th>机器</th><th>状态</th><th>进度</th><th>跳过</th><th>失败</th><th>速度</th><th>最近错误</th></tr></thead><tbody></tbody></table>
+
+  <h2>精确重复组</h2>
+  <table id="groups"><thead><tr><th>SHA-512</th><th>副本</th><th>机器</th><th>总大小</th><th>浪费空间</th></tr></thead><tbody></tbody></table>
+  <div id="members"></div>
+
+  <script>
+    const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({
+      '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
+    })[c]);
+    async function requestJSON(url, options) {
+      const response = await fetch(url, options);
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.error || response.statusText);
+      return body;
+    }
+    function bytes(value) {
+      const units = ['B','KB','MB','GB','TB']; let unit = 0;
+      while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++; }
+      return `${value.toFixed(1)} ${units[unit]}`;
+    }
+    async function refreshAgents() {
+      const agents = await requestJSON('/api/agents');
+      document.querySelector('#agents tbody').innerHTML = agents.map(agent =>
+        `<tr><td>${esc(agent.machine_id)}</td><td>${esc(agent.addr)}</td>` +
+        `<td class="${agent.online ? 'on' : 'off'}">${agent.online ? '在线' : '离线'}</td>` +
+        `<td class="err">${esc(agent.last_err)}</td></tr>`).join('');
+      document.querySelector('#machine').innerHTML = agents.filter(a => a.online)
+        .map(a => `<option value="${esc(a.machine_id)}">${esc(a.machine_id)}</option>`).join('');
+    }
+    async function refreshTasks() {
+      const tasks = await requestJSON('/api/tasks');
+      document.querySelector('#tasks tbody').innerHTML = tasks.map(task =>
+        `<tr><td class="mono">${esc(task.task_id.slice(0,8))}</td><td>${esc(task.machine_id)}</td>` +
+        `<td>${esc(task.status)} ${esc(task.ack_reason || '')}</td>` +
+        `<td>${task.done}/${task.total < 0 ? '?' : task.total}</td>` +
+        `<td>${task.skipped || 0}</td><td class="${task.failed ? 'err' : ''}">${task.failed || 0}</td>` +
+        `<td>${task.speed ? task.speed.toFixed(1) + ' 文件/s' : ''}</td>` +
+        `<td class="err">${esc(task.last_err)}</td></tr>`).join('');
+    }
+    async function refreshGroups() {
+      const groups = await requestJSON('/api/dup_groups?limit=200');
+      document.querySelector('#groups tbody').innerHTML = groups.map(group =>
+        `<tr data-sha="${esc(group.sha512)}"><td class="mono">${esc(group.sha512.slice(0,16))}…</td>` +
+        `<td>${group.member_count}</td><td>${group.machines}</td>` +
+        `<td>${bytes(group.total_bytes)}</td><td>${bytes(group.wasted_bytes)}</td></tr>`).join('');
+      document.querySelectorAll('#groups tbody tr').forEach(row =>
+        row.addEventListener('click', () => showMembers(row.dataset.sha)));
+    }
+    async function showMembers(sha) {
+      const members = await requestJSON('/api/dup_groups/' + encodeURIComponent(sha));
+      document.querySelector('#members').innerHTML =
+        `<h3>组 ${esc(sha.slice(0,16))}…</h3><table><thead><tr><th>机器</th><th>路径</th><th>大小</th><th>修改时间</th></tr></thead><tbody>` +
+        members.map(member => `<tr><td>${esc(member.machine_id)}</td><td class="mono">${esc(member.path)}</td>` +
+        `<td>${bytes(member.size)}</td><td>${new Date(member.mtime * 1000).toLocaleString()}</td></tr>`).join('') +
+        '</tbody></table>';
+    }
+    async function startScan() {
+      const payload = {
+        machine_id: document.querySelector('#machine').value,
+        roots: document.querySelector('#roots').value.split('|').map(s => s.trim()).filter(Boolean),
+        phase: 1,
+        rescan: document.querySelector('#rescan').checked
+      };
+      try {
+        const result = await requestJSON('/api/scan', {
+          method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload)
+        });
+        document.querySelector('#scanMsg').textContent = `已下发 ${result.task_id.slice(0,8)}`;
+      } catch (error) {
+        document.querySelector('#scanMsg').textContent = `失败：${error.message}`;
+      }
+    }
+    async function tick() {
+      try { await Promise.all([refreshAgents(), refreshTasks(), refreshGroups()]); }
+      catch (error) { console.error(error); }
+    }
+    tick(); setInterval(tick, 2000);
+  </script>
+</body>
+</html>
