@@ -4,6 +4,7 @@
 /.tmp/
 /.tmp-*/
 /.superpowers/
+/.worktrees/
 /node_modules/
 /.pnpm-store/
 /webui/node_modules/
