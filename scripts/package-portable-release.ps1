@@ -197,7 +197,16 @@ catch {
     throw
 }
 finally {
-    if (Test-Path -LiteralPath $candidateRoot) {
-        Remove-Item -LiteralPath $candidateRoot -Recurse -Force
+    try {
+        if (Test-Path -LiteralPath $candidateRoot) {
+            Invoke-TestPublishHook -Context ([pscustomobject]@{
+                    Phase = 'BeforeCandidateCleanup'
+                    CandidateRoot = $candidateRoot
+                })
+            Remove-Item -LiteralPath $candidateRoot -Recurse -Force
+        }
+    }
+    catch {
+        Write-Warning 'PORTABLE_RELEASE_CANDIDATE_CLEANUP_WARNING'
     }
 }

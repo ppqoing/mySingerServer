@@ -146,6 +146,28 @@ try {
     Assert-True (Test-Path -LiteralPath (Join-Path $rollbackOutput 'MySingerServer-compute-win-x64-rollback.zip.sha256') -PathType Leaf) 'cleanup-injected file was unexpectedly deleted'
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $rollbackOutput 'MySingerServer-manager-win-x64-rollback.zip') -PathType Leaf)) 'rollback stopped after one cleanup item failed'
 
+    $candidateCleanupOutput = Join-Path $testRoot 'candidate-cleanup-release'
+    $candidateCleanupState = [pscustomobject]@{ HookRan = $false }
+    $candidateCleanupError = ''
+    $candidateCleanupWarnings = @()
+    try {
+        & $packageScript -StageDir $stage -OutputDir $candidateCleanupOutput -ReleaseId 'candidate-cleanup' -BuildDate '2026-08-11' -TestPublishHook {
+            param($context)
+            if ($context.Phase -ceq 'AfterMove' -and $context.MoveIndex -eq 1) {
+                throw 'INJECTED_PUBLISH_FAILURE_FOR_CANDIDATE_CLEANUP'
+            }
+            if ($context.Phase -ceq 'BeforeCandidateCleanup') {
+                $candidateCleanupState.HookRan = $true
+                throw 'INJECTED_CANDIDATE_CLEANUP_FAILURE'
+            }
+        } -WarningVariable +candidateCleanupWarnings
+    } catch {
+        $candidateCleanupError = $_.Exception.Message
+    }
+    Assert-True $candidateCleanupState.HookRan 'candidate cleanup failure injection did not run'
+    Assert-True ($candidateCleanupError -match 'PORTABLE_RELEASE_PUBLISH_FAILED.*INJECTED_PUBLISH_FAILURE_FOR_CANDIDATE_CLEANUP') 'candidate cleanup failure replaced the original publish error'
+    Assert-True (@($candidateCleanupWarnings | Where-Object Message -Match 'PORTABLE_RELEASE_CANDIDATE_CLEANUP_WARNING').Count -eq 1) 'candidate cleanup failure did not emit the stable warning'
+
     Write-Host 'PORTABLE RELEASE PACKAGE CONTRACT PASS'
 }
 finally {
