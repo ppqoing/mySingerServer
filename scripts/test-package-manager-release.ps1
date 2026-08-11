@@ -94,6 +94,17 @@ try {
     $tokenTemplate = Join-Path $testRoot 'token.json'
     Write-Utf8NoBom -Path $tokenTemplate -Value '{"pg_dsn":"postgres://dedup@127.0.0.1:5432/dedup?token=secret","agents":[{"addr":"127.0.0.1:9101"}]}'
     Invoke-RejectedPackage -TemplatePath $tokenTemplate -ReleaseId 'token'
+    foreach ($queryCase in @(
+            [ordered]@{ name = 'token-no-value'; query = 'token' },
+            [ordered]@{ name = 'encoded-token'; query = 'to%6ben=secret' },
+            [ordered]@{ name = 'mixed-case-access-token'; query = 'AcCeSs_ToKeN=secret' },
+            [ordered]@{ name = 'encoded-api-key-no-value'; query = 'api%5Fkey' })) {
+        $queryTemplate = Join-Path $testRoot ("query-{0}.json" -f $queryCase.name)
+        Write-Utf8NoBom -Path $queryTemplate -Value (
+            '{"pg_dsn":"postgres://dedup@127.0.0.1:5432/dedup?' + $queryCase.query +
+            '","agents":[{"addr":"127.0.0.1:9101"}]}')
+        Invoke-RejectedPackage -TemplatePath $queryTemplate -ReleaseId $queryCase.name
+    }
     $lanTemplate = Join-Path $testRoot 'lan.json'
     Write-Utf8NoBom -Path $lanTemplate -Value '{"pg_dsn":"postgres://dedup@127.0.0.1:5432/dedup","agents":[{"addr":"127.0.0.1:9101"},{"addr":"192.168.1.20:9101"}]}'
     Invoke-RejectedPackage -TemplatePath $lanTemplate -ReleaseId 'lan'

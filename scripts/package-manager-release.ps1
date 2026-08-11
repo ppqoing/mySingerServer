@@ -82,8 +82,26 @@ function Assert-SanitizedGuiExample {
     } catch {
         throw "MANAGER_RELEASE_SENSITIVE_CONFIG invalid_gui_example path=$Path"
     }
-    if ($uri.UserInfo -match ':' -or $uri.Query -match '(?i)(^|[?&])(password|passwd|pwd|token|secret)=') {
+    if ($uri.UserInfo -match ':') {
         throw "MANAGER_RELEASE_SENSITIVE_CONFIG credential_in_pg_dsn path=$Path"
+    }
+    $sensitiveQueryKeys = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::OrdinalIgnoreCase)
+    foreach ($key in @('password', 'passwd', 'pwd', 'token', 'access_token', 'api_key', 'key', 'secret')) {
+        [void]$sensitiveQueryKeys.Add($key)
+    }
+    try {
+        $encodedQuery = $uri.GetComponents([UriComponents]::Query, [UriFormat]::UriEscaped)
+        foreach ($segment in $encodedQuery -split '&') {
+            if ([string]::IsNullOrEmpty($segment)) { continue }
+            $encodedName = ($segment -split '=', 2)[0]
+            $name = [Uri]::UnescapeDataString($encodedName)
+            if ($sensitiveQueryKeys.Contains($name)) {
+                throw 'sensitive_query_key'
+            }
+        }
+    } catch {
+        throw "MANAGER_RELEASE_SENSITIVE_CONFIG invalid_or_sensitive_pg_dsn_query path=$Path"
     }
     $agents = @($config.agents)
     if ($agents.Count -ne 1 -or [string]$agents[0].addr -cne '127.0.0.1:9101') {
