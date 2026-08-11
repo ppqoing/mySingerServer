@@ -3,6 +3,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot 'standard-dependency-paths.ps1')
 
 function Assert-DirectChildPath {
     param(
@@ -296,6 +297,9 @@ if ($VerifyEmbedded) {
 
 $node = Resolve-Application -Name "node" -Label "node"
 $npm = Resolve-Application -Name "npm" -Label "npm"
+$dependencyPaths = Resolve-StandardDependencyPaths `
+    -RepositoryRoot $repo -NpmExecutable $npm
+Write-Host "npm cache: $($dependencyPaths.NpmCache)"
 
 Write-Host "node version: $(& $node --version)"
 if ($LASTEXITCODE -ne 0) { throw "node --version failed" }

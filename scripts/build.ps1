@@ -15,6 +15,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'standard-dependency-paths.ps1')
 
 function Resolve-Application {
     param(
@@ -76,6 +77,12 @@ function Resolve-CMakeExecutable {
 if ($MyInvocation.InvocationName -eq '.') {
     return
 }
+
+$dependencyPaths = Resolve-StandardDependencyPaths `
+    -RepositoryRoot $repo -GoExecutable $Go -VcpkgRoot $VcpkgRoot
+Write-Host "Go module cache: $($dependencyPaths.GoModCache)"
+Write-Host "Go build cache: $($dependencyPaths.GoBuildCache)"
+Write-Host "vcpkg installed: $($dependencyPaths.VcpkgInstalled)"
 
 if ($VideoCoreOnly -and $MediacoreOnly) {
     throw "VIDEOCORE_BUILD_MODE_CONFLICT"

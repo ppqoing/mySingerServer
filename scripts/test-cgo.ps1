@@ -11,6 +11,11 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'standard-dependency-paths.ps1')
+$dependencyPaths = Resolve-StandardDependencyPaths `
+    -RepositoryRoot $repo -GoExecutable $Go
+Write-Host "Go module cache: $($dependencyPaths.GoModCache)"
+Write-Host "Go build cache: $($dependencyPaths.GoBuildCache)"
 if ([System.IO.Path]::IsPathRooted($DllDir)) {
     $dllPath = $DllDir
 } else {
