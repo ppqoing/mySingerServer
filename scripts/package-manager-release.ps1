@@ -82,6 +82,10 @@ function Assert-SanitizedGuiExample {
     } catch {
         throw "MANAGER_RELEASE_SENSITIVE_CONFIG invalid_gui_example path=$Path"
     }
+    if (($uri.Scheme -cne 'postgres' -and $uri.Scheme -cne 'postgresql') -or
+        ($uri.Host -cne '127.0.0.1' -and $uri.Host -cne 'localhost')) {
+        throw "MANAGER_RELEASE_SENSITIVE_CONFIG unsafe_pg_dsn_endpoint path=$Path"
+    }
     if ($uri.UserInfo -match ':') {
         throw "MANAGER_RELEASE_SENSITIVE_CONFIG credential_in_pg_dsn path=$Path"
     }

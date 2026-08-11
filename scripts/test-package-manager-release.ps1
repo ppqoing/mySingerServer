@@ -108,6 +108,27 @@ try {
     $lanTemplate = Join-Path $testRoot 'lan.json'
     Write-Utf8NoBom -Path $lanTemplate -Value '{"pg_dsn":"postgres://dedup@127.0.0.1:5432/dedup","agents":[{"addr":"127.0.0.1:9101"},{"addr":"192.168.1.20:9101"}]}'
     Invoke-RejectedPackage -TemplatePath $lanTemplate -ReleaseId 'lan'
+    foreach ($dsnCase in @(
+            [ordered]@{ name = 'postgres-lan-host'; dsn = 'postgres://dedup@192.168.1.20:5432/dedup' },
+            [ordered]@{ name = 'postgres-internal-dns'; dsn = 'postgresql://dedup@db.internal.example:5432/dedup' },
+            [ordered]@{ name = 'wrong-dsn-scheme'; dsn = 'https://dedup@127.0.0.1:5432/dedup' })) {
+        $dsnTemplate = Join-Path $testRoot ("{0}.json" -f $dsnCase.name)
+        Write-Utf8NoBom -Path $dsnTemplate -Value (
+            '{"pg_dsn":"' + $dsnCase.dsn +
+            '","agents":[{"addr":"127.0.0.1:9101"}]}')
+        Invoke-RejectedPackage -TemplatePath $dsnTemplate -ReleaseId $dsnCase.name
+    }
+    $safePlaceholderTemplate = Join-Path $testRoot 'safe-placeholder.json'
+    Write-Utf8NoBom -Path $safePlaceholderTemplate -Value `
+        '{"pg_dsn":"postgresql://dedup@localhost:5432/dedup","agents":[{"addr":"127.0.0.1:9101"}]}'
+    $safePlaceholderOutput = Join-Path $testRoot 'safe-placeholder-release'
+    & $packageScript -StageDir $stage -OutputDir $safePlaceholderOutput `
+        -ReleaseId 'safe-placeholder' -BuildDate '2026-08-11' `
+        -SourceRevision 'N/A_NO_GIT_METADATA' `
+        -GuiExamplePath $safePlaceholderTemplate
+    Assert-True (Test-Path -LiteralPath (Join-Path $safePlaceholderOutput `
+            'MySingerServer-manager-win-x64-safe-placeholder.zip') -PathType Leaf) `
+        'postgresql localhost placeholder was rejected'
 
     Write-Host "MANAGER RELEASE PACKAGE CONTRACT PASS files=$($actualFiles.Count)"
 }

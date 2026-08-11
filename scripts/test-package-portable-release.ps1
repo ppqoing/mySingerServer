@@ -146,6 +146,39 @@ try {
     Assert-True (Test-Path -LiteralPath (Join-Path $rollbackOutput 'MySingerServer-compute-win-x64-rollback.zip.sha256') -PathType Leaf) 'cleanup-injected file was unexpectedly deleted'
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $rollbackOutput 'MySingerServer-manager-win-x64-rollback.zip') -PathType Leaf)) 'rollback stopped after one cleanup item failed'
 
+    $rollbackRaceOutput = Join-Path $testRoot 'rollback-race-release'
+    $rollbackRaceTarget = Join-Path $rollbackRaceOutput 'MySingerServer-compute-win-x64-rollback-race.zip'
+    $rollbackRaceOriginal = "$rollbackRaceTarget.published-original"
+    $rollbackRaceState = [pscustomobject]@{ HookRan = $false }
+    $rollbackRaceRejected = $false
+    try {
+        & $packageScript -StageDir $stage -OutputDir $rollbackRaceOutput -ReleaseId 'rollback-race' -BuildDate '2026-08-11' -TestPublishHook {
+            param($context)
+            if ($context.Phase -ceq 'AfterMove' -and $context.MoveIndex -eq 3) {
+                throw 'INJECTED_ROLLBACK_RACE_PUBLISH_FAILURE'
+            }
+        } -TestRollbackHook {
+            param($context)
+            if ($context.Path -ceq $rollbackRaceTarget) {
+                [IO.File]::Move($context.Path, $rollbackRaceOriginal, $false)
+                Write-Utf8NoBom -Path $context.Path -Value 'user-replacement-after-verified-hash'
+                $rollbackRaceState.HookRan = $true
+            }
+        }
+    } catch {
+        $rollbackRaceRejected = $_.Exception.Message -match `
+            'PORTABLE_RELEASE_PUBLISH_FAILED.*INJECTED_ROLLBACK_RACE_PUBLISH_FAILURE'
+    }
+    Assert-True $rollbackRaceRejected 'hash/delete race did not keep the stable publish failure'
+    Assert-True $rollbackRaceState.HookRan 'hash/delete race hook did not replace the verified path'
+    Assert-True (Test-Path -LiteralPath $rollbackRaceTarget -PathType Leaf) `
+        'rollback deleted the user file that replaced the verified path'
+    Assert-True ((Get-Content -Raw -LiteralPath $rollbackRaceTarget) -ceq `
+            'user-replacement-after-verified-hash') `
+        'rollback changed the user file that replaced the verified path'
+    Assert-True (-not (Test-Path -LiteralPath $rollbackRaceOriginal)) `
+        'rollback did not delete the original verified file object'
+
     $candidateCleanupOutput = Join-Path $testRoot 'candidate-cleanup-release'
     $candidateCleanupState = [pscustomobject]@{ HookRan = $false }
     $candidateCleanupError = ''

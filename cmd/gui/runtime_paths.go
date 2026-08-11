@@ -19,6 +19,24 @@ type guiRuntimePaths struct {
 	LogPath    string
 }
 
+func resolveGUIExecutablePath(
+	executablePath func() (string, error),
+	finalPath func(string) (string, error),
+) (string, error) {
+	if executablePath == nil || finalPath == nil {
+		return "", fmt.Errorf("GUI executable path resolver is unavailable")
+	}
+	executable, err := executablePath()
+	if err != nil {
+		return "", fmt.Errorf("resolve GUI executable path: %w", err)
+	}
+	resolved, err := finalPath(executable)
+	if err != nil {
+		return "", fmt.Errorf("resolve GUI executable final path: %w", err)
+	}
+	return resolved, nil
+}
+
 func resolveGUIRuntimePaths(executable, requestedConfig string) (guiRuntimePaths, error) {
 	absExecutable, err := filepath.Abs(executable)
 	if err != nil {

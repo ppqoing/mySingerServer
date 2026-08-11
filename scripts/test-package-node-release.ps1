@@ -117,7 +117,6 @@ try {
         'agent.exe',
         'avcodec-fixture.dll',
         'data/agent/.gitkeep',
-        'data/helper/.gitkeep',
         'data/nodetray/.gitkeep',
         'helper.example.json',
         'helper.exe',
@@ -135,6 +134,9 @@ try {
     $difference = @(Compare-Object -ReferenceObject $expectedFiles -DifferenceObject $actualFiles)
     Assert-True ($difference.Count -eq 0) (
         'ZIP file list differs: ' + (($difference | Out-String).Trim()))
+    Assert-True (-not (Test-Path -LiteralPath (
+            Join-Path $payloadRoot 'data\helper'))) `
+        'fresh Compute package must not pre-create data\helper'
 
     foreach ($forbidden in @(
             'gui.exe',

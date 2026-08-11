@@ -9,6 +9,8 @@ import (
 	"strings"
 	"unsafe"
 
+	"dedup/internal/shared/finalpath"
+
 	"golang.org/x/sys/windows"
 )
 
@@ -187,41 +189,11 @@ func inspectWindowsHandle(handle windows.Handle, pid int) (Identity, error) {
 	if err := windows.QueryFullProcessImageName(handle, 0, &image[0], &size); err != nil {
 		return Identity{}, fmt.Errorf("query process image: %w", err)
 	}
-	finalPath, err := resolveFinalPath(windows.UTF16ToString(image[:size]))
+	finalPath, err := finalpath.ResolveExisting(windows.UTF16ToString(image[:size]))
 	if err != nil {
 		return Identity{}, err
 	}
 	return Identity{PID: pid, StartedAtUnixMS: created.Nanoseconds() / 1_000_000, ExecutablePath: finalPath}, nil
-}
-
-func resolveFinalPath(image string) (string, error) {
-	path, err := windows.UTF16PtrFromString(image)
-	if err != nil {
-		return "", errors.New("process image path is invalid")
-	}
-	file, err := windows.CreateFile(path, windows.FILE_READ_ATTRIBUTES,
-		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
-		nil, windows.OPEN_EXISTING, 0, 0)
-	if err != nil {
-		return "", fmt.Errorf("open process image final path: %w", err)
-	}
-	defer windows.CloseHandle(file)
-	buffer := make([]uint16, 32768)
-	n, err := windows.GetFinalPathNameByHandle(file, &buffer[0], uint32(len(buffer)), 0)
-	if err != nil {
-		return "", fmt.Errorf("query process image final path: %w", err)
-	}
-	if n == 0 || n >= uint32(len(buffer)) {
-		return "", errors.New("process image final path exceeds supported length")
-	}
-	return stripExtendedPrefix(windows.UTF16ToString(buffer[:n])), nil
-}
-
-func stripExtendedPrefix(value string) string {
-	if strings.HasPrefix(value, `\\?\UNC\`) {
-		return `\\` + strings.TrimPrefix(value, `\\?\UNC\`)
-	}
-	return strings.TrimPrefix(value, `\\?\`)
 }
 
 var compareStringOrdinal = windows.NewLazySystemDLL("kernel32.dll").NewProc("CompareStringOrdinal")

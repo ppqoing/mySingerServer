@@ -6,7 +6,7 @@
 
 1. 将压缩包内完整的 `MySingerServer-Compute` 文件夹解压到任意本地、当前用户可写的目录，例如 `D:\Apps\MySingerServer-Compute`。不要只复制单个 EXE，也不要从压缩包内直接运行。
 2. 不能解压到 UNC 网络路径（如 `\\server\share\...`）；可使用本地磁盘或可移动磁盘。
-3. 确认 `nodetray.exe`、所有同级 EXE/DLL、`data` 目录和许可证目录都保留在同一个包根目录。
+3. 确认 `nodetray.exe`、所有同级 EXE/DLL、`data` 目录和许可证目录都保留在同一个包根目录。新包不会预建 `data\helper`。
 4. 启动 `nodetray.exe`。
 5. 在托盘界面的配置页签中交互式填写 Agent 参数并保存。不要直接修改生产 JSON 配置文件。
 6. 根据需要选择自动或手动启动，并决定是否启用开机启动。
@@ -26,6 +26,8 @@
 
 Helper 必须与 Agent 位于同一台机器，建议由同一账号运行，并需要管理员权限。只在确实需要删除辅助功能时启用，并在界面中把 `allowed_roots` 配置为明确、窄范围的媒体目录。默认采用 soft 删除；是否允许硬删除由用户在配置界面中明确决定。
 
+首次解压后不要手工创建 `data\helper` 或复制 `helper.json`。NodeTray 的普通用户进程不会创建或放宽该目录；只有用户在界面中保存 Helper 配置时，提权写入器才会首次安全创建受保护的 `data\helper` 并写入配置。
+
 当包根允许普通用户写入时，启用 Helper 会带来额外的提权风险：管理员任务会从该包根启动 `helper.exe`。只应在受信任的本地目录中启用它，并限制该目录的写入权限；移动、替换或允许不受信任用户写入包根后，应先禁用并重新检查 Helper 配置和任务。
 
 ## 便携数据、配置和日志目录
@@ -37,7 +39,7 @@ Helper 必须与 Agent 位于同一台机器，建议由同一账号运行，并
 | Helper 配置与日志 | `data\helper\` 与 `data\helper\logs\` |
 | NodeTray 设置与 WebView2 数据 | `data\nodetray\` 与 `data\nodetray\webview2\` |
 
-包内 `data\agent`、`data\helper` 和 `data\nodetray` 是空的起始结构；`agent.example.json` 和 `helper.example.json` 仅为脱敏示例。实际配置由 NodeTray 界面生成并保存在上述包内数据目录。所有默认运行路径都相对包根，不依赖系统安装目录或用户配置目录。
+包内只预置空的 `data\agent` 和 `data\nodetray` 起始结构，不包含 `data\helper` 目录或空目录项；`agent.example.json` 和 `helper.example.json` 仅为脱敏示例。实际配置由 NodeTray 界面生成并保存在上述包内数据目录，Helper 目录由提权写入器首次安全创建。所有默认运行路径都相对包根，不依赖系统安装目录或用户配置目录。
 
 如需移动整个计算包，请先通过 NodeTray 停止组件，再完整移动整个目录。移动后在 NodeTray 中检查并修复登录启动；若曾启用 Helper，也要检查并重新保存其任务配置，使其指向新目录。不要混用旧目录中的 `data`。
 

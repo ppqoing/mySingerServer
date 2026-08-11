@@ -143,7 +143,7 @@ $complete = $false
 
 try {
     New-Item -ItemType Directory -Path $payload | Out-Null
-    foreach ($relativeDirectory in @('data\\agent', 'data\\helper', 'data\\nodetray')) {
+    foreach ($relativeDirectory in @('data\\agent', 'data\\nodetray')) {
         $directory = Join-Path $payload $relativeDirectory
         New-Item -ItemType Directory -Path $directory -Force | Out-Null
         Write-Utf8NoBom -Path (Join-Path $directory '.gitkeep') -Value ''

@@ -4,9 +4,16 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"syscall"
 	"unsafe"
+
+	"dedup/internal/shared/finalpath"
 )
+
+func finalGUIExecutablePath() (string, error) {
+	return resolveGUIExecutablePath(os.Executable, finalpath.ResolveExisting)
+}
 
 func openGUIBrowser(rawURL string) error {
 	shell32 := syscall.NewLazyDLL("shell32.dll")

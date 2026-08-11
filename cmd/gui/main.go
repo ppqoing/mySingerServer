@@ -129,7 +129,7 @@ type guiHTTPServer interface {
 }
 
 var (
-	guiExecutablePath   = os.Executable
+	guiExecutablePath   = finalGUIExecutablePath
 	guiListen           = net.Listen
 	guiOpenBrowser      = openGUIBrowser
 	guiShowStartupError = showGUIStartupError

@@ -65,8 +65,8 @@ flowchart LR
   Agent、Worker、可选的管理员 Helper、媒体依赖和节点配置示例。Worker 始终由
   Agent 管理，不应手工启动。
 - **Manager（管理端包）**：部署到中央管理机器，包含 `gui.exe`、受限的
-  `gui.example.json` 和启动脚本；解压后双击 `Start-Manager.ps1` 会启动 GUI 并
-  自动打开浏览器。
+  `gui.example.json` 和启动脚本；配置完成后可直接双击 `gui.exe`，或在
+  PowerShell 中运行 `./Start-Manager.ps1`，监听成功后会自动打开浏览器。
 
 从完整 stage 目录生成两个包时使用同一个 ReleaseId；入口会先在专用候选目录
 生成并复核全部 ZIP 与 SHA-256 sidecar，确认四个最终目标都不存在后才一起发布：
@@ -87,12 +87,12 @@ pwsh -NoProfile -File .\scripts\package-portable-release.ps1 `
 - `MySingerServer-manager-win-x64-<ReleaseId>.zip`
 - `MySingerServer-manager-win-x64-<ReleaseId>.zip.sha256`
 
-分别解压到各自固定的可写目录。不要直接修改或覆盖 `*.example.json`：首次部署时
-手工复制为运行配置，再填写实际外部 PostgreSQL DSN 和机器地址。例如，计算节点
-按包内 `README-节点部署.md` 准备 `agent.json`、`helper.json` 后启动
-`nodetray.exe`；管理端复制 `gui.example.json` 为 `gui.json`，填写同一 PostgreSQL
-DSN 与可信 Agent 地址后双击 `Start-Manager.ps1`。升级时保留已有运行配置，仅替换
-程序文件并按需迁移配置。
+分别解压到各自固定的可写目录。计算节点完整解压后直接启动 `nodetray.exe`，再由
+NodeTray UI 生成 Agent 与可选 Helper 的生产配置；不要手工预建 `data\helper` 或写入
+`helper.json`。管理端不要直接修改模板：先复制 `gui.example.json` 为 `gui.json`，
+填写实际外部 PostgreSQL DSN 与可信 Agent 地址，然后直接双击 `gui.exe`，或在
+PowerShell 中运行 `./Start-Manager.ps1`。升级时保留已有运行配置，仅替换程序文件并
+按需迁移配置。
 
 ## 节点托盘快速开始
 
