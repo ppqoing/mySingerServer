@@ -45,6 +45,7 @@ function Get-CommandTexts {
 
 $required = @(
     "scripts\build-nodetray.ps1",
+    "scripts\package-manager-release.ps1",
     "third_party\webview2\manifest.schema.json",
     "third_party\webview2\manifest.json",
     "third_party\webview2\NOTICE.md",
@@ -54,11 +55,38 @@ $required = @(
     "third_party\everything\NOTICE.md",
     "third_party\everything\manifest.json",
     "nodetray\frontend\package-lock.json",
-    "nodetray\build\windows\nodetray.manifest"
+    "nodetray\build\windows\nodetray.manifest",
+    "deploy\gui.example.json",
+    "deploy\Start-Manager.ps1",
+    "deploy\README-管理端部署.md"
 )
 foreach ($relative in $required) {
     Assert-True (Test-Path -LiteralPath (Join-Path $repo $relative) -PathType Leaf) `
         ("REQUIRED_FILE_MISSING path={0}" -f $relative)
+}
+
+$guiExamplePath = Join-Path $repo 'deploy\gui.example.json'
+if (Test-Path -LiteralPath $guiExamplePath -PathType Leaf) {
+    try {
+        $guiExample = Get-Content -Raw -LiteralPath $guiExamplePath | ConvertFrom-Json
+        $guiDsn = [Uri]::new([string]$guiExample.pg_dsn)
+        Assert-True ($guiDsn.UserInfo -notmatch ':') 'GUI_EXAMPLE_DSN_CONTAINS_PASSWORD'
+        Assert-True ($guiDsn.Query -notmatch '(?i)(^|[?&])(password|passwd|pwd|token|secret)=') `
+            'GUI_EXAMPLE_DSN_CONTAINS_SECRET_QUERY'
+        $guiAgents = @($guiExample.agents)
+        Assert-True ($guiAgents.Count -eq 1 -and [string]$guiAgents[0].addr -ceq '127.0.0.1:9101') `
+            'GUI_EXAMPLE_AGENT_NOT_LOOPBACK_ONLY'
+    } catch {
+        Add-GateFailure 'GUI_EXAMPLE_INVALID'
+    }
+}
+
+$managerStartPath = Join-Path $repo 'deploy\Start-Manager.ps1'
+if (Test-Path -LiteralPath $managerStartPath -PathType Leaf) {
+    $managerStartText = Get-Content -Raw -LiteralPath $managerStartPath
+    Assert-True ($managerStartText -match 'Join-Path \$root ''gui.exe''') 'MANAGER_START_GUI_EXE_MISSING'
+    Assert-True ($managerStartText -match 'Join-Path \$root ''gui.json''') 'MANAGER_START_GUI_CONFIG_MISSING'
+    Assert-True ($managerStartText -match '& \$exe -config \$config @args') 'MANAGER_START_CONFIG_ARGUMENT_MISSING'
 }
 
 $buildNodeTray = Join-Path $repo "scripts\build-nodetray.ps1"

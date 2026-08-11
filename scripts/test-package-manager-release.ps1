@@ -1,0 +1,105 @@
+param()
+
+$ErrorActionPreference = 'Stop'
+$repo = Split-Path -Parent $PSScriptRoot
+$packageScript = Join-Path $PSScriptRoot 'package-manager-release.ps1'
+
+function Assert-True {
+    param([bool]$Condition, [string]$Message)
+    if (-not $Condition) { throw "ASSERTION_FAILED: $Message" }
+}
+
+function Write-Utf8NoBom {
+    param([string]$Path, [string]$Value)
+    [IO.File]::WriteAllText($Path, $Value, [Text.UTF8Encoding]::new($false))
+}
+
+function Invoke-RejectedPackage {
+    param([string]$TemplatePath, [string]$ReleaseId)
+    $rejected = $false
+    try {
+        & $packageScript -StageDir $stage -OutputDir (Join-Path $testRoot $ReleaseId) `
+            -ReleaseId $ReleaseId -BuildDate '2026-08-11' `
+            -SourceRevision 'N/A_NO_GIT_METADATA' -GuiExamplePath $TemplatePath
+    } catch {
+        $rejected = $_.Exception.Message -match 'MANAGER_RELEASE_SENSITIVE_CONFIG'
+    }
+    Assert-True $rejected "unsafe manager template was accepted: $ReleaseId"
+}
+
+$testRoot = Join-Path $repo ('.tmp\test-package-manager-release-{0}' -f [Guid]::NewGuid().ToString('N'))
+$stage = Join-Path $testRoot 'stage'
+$output = Join-Path $testRoot 'release'
+$extract = Join-Path $testRoot 'extract'
+
+try {
+    New-Item -ItemType Directory -Path $stage -Force | Out-Null
+    Write-Utf8NoBom -Path (Join-Path $stage 'gui.exe') -Value 'fixture:gui.exe'
+    foreach ($name in @('agent.exe', 'worker.exe', 'helper.exe', 'nodetray.exe',
+            'Everything.exe', 'ffmpeg.exe', 'videocore.dll', 'WebView2Loader.dll', 'gui.json')) {
+        Write-Utf8NoBom -Path (Join-Path $stage $name) -Value "must-not-ship:$name"
+    }
+
+    if (-not (Test-Path -LiteralPath $packageScript -PathType Leaf)) {
+        throw 'PACKAGE_SCRIPT_MISSING'
+    }
+    & $packageScript -StageDir $stage -OutputDir $output -ReleaseId 'contract-test' `
+        -BuildDate '2026-08-11' -SourceRevision 'N/A_NO_GIT_METADATA'
+
+    $zipName = 'MySingerServer-manager-win-x64-contract-test.zip'
+    $zipPath = Join-Path $output $zipName
+    $sidecarPath = "$zipPath.sha256"
+    Assert-True (Test-Path -LiteralPath $zipPath -PathType Leaf) 'ZIP was not created'
+    Assert-True (Test-Path -LiteralPath $sidecarPath -PathType Leaf) 'ZIP SHA-256 sidecar was not created'
+
+    Expand-Archive -LiteralPath $zipPath -DestinationPath $extract
+    $payloadRoot = Join-Path $extract 'MySingerServer-Manager'
+    Assert-True (Test-Path -LiteralPath $payloadRoot -PathType Container) 'ZIP lacks manager top-level directory'
+    $topLevel = @(Get-ChildItem -LiteralPath $extract -Force)
+    Assert-True ($topLevel.Count -eq 1 -and $topLevel[0].PSIsContainer -and
+        $topLevel[0].Name -ceq 'MySingerServer-Manager') 'ZIP must contain exactly one manager top-level directory'
+
+    $actualFiles = @(Get-ChildItem -LiteralPath $payloadRoot -Recurse -File | ForEach-Object {
+        [IO.Path]::GetRelativePath($payloadRoot, $_.FullName).Replace('\', '/')
+    } | Sort-Object)
+    $expectedFiles = @('gui.exe', 'gui.example.json', 'Start-Manager.ps1',
+        'README-管理端部署.md', 'release-manifest.json') | Sort-Object
+    Assert-True (@(Compare-Object -ReferenceObject $expectedFiles -DifferenceObject $actualFiles).Count -eq 0) `
+        'ZIP file list differs from the portable manager contract'
+    foreach ($forbidden in @('agent.exe', 'worker.exe', 'helper.exe', 'nodetray.exe',
+            'Everything.exe', 'ffmpeg.exe', 'videocore.dll', 'WebView2Loader.dll', 'gui.json')) {
+        Assert-True (-not ($actualFiles -contains $forbidden)) "forbidden file shipped: $forbidden"
+    }
+    $startScript = Get-Content -Raw -LiteralPath (Join-Path $payloadRoot 'Start-Manager.ps1')
+    Assert-True ($startScript -match '& \$exe -config \$config @args') `
+        'manager launch script must forward arguments to gui.exe'
+
+    $manifest = Get-Content -Raw -LiteralPath (Join-Path $payloadRoot 'release-manifest.json') | ConvertFrom-Json
+    Assert-True ($manifest.release_kind -ceq 'remote-manager-portable') 'wrong release kind'
+    Assert-True ($manifest.portable_root -ceq '.') 'wrong portable root'
+    $manifestFiles = @($manifest.files)
+    Assert-True ($manifestFiles.Count -eq 4) 'manifest must list every payload file except itself'
+    foreach ($file in $manifestFiles) {
+        $path = Join-Path $payloadRoot ([string]$file.path).Replace('/', '\\')
+        Assert-True (Test-Path -LiteralPath $path -PathType Leaf) "manifest file missing: $($file.path)"
+        Assert-True ([long]$file.size -eq (Get-Item -LiteralPath $path).Length) "manifest size mismatch: $($file.path)"
+        Assert-True ([string]$file.sha256 -ceq (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()) "manifest hash mismatch: $($file.path)"
+    }
+    $zipHash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    Assert-True ((Get-Content -Raw -LiteralPath $sidecarPath).Trim() -ceq "$zipHash  $zipName") 'ZIP SHA-256 sidecar mismatch'
+
+    $passwordTemplate = Join-Path $testRoot 'password.json'
+    Write-Utf8NoBom -Path $passwordTemplate -Value '{"pg_dsn":"postgres://dedup:secret@127.0.0.1:5432/dedup","agents":[{"addr":"127.0.0.1:9101"}]}'
+    Invoke-RejectedPackage -TemplatePath $passwordTemplate -ReleaseId 'password'
+    $tokenTemplate = Join-Path $testRoot 'token.json'
+    Write-Utf8NoBom -Path $tokenTemplate -Value '{"pg_dsn":"postgres://dedup@127.0.0.1:5432/dedup?token=secret","agents":[{"addr":"127.0.0.1:9101"}]}'
+    Invoke-RejectedPackage -TemplatePath $tokenTemplate -ReleaseId 'token'
+    $lanTemplate = Join-Path $testRoot 'lan.json'
+    Write-Utf8NoBom -Path $lanTemplate -Value '{"pg_dsn":"postgres://dedup@127.0.0.1:5432/dedup","agents":[{"addr":"127.0.0.1:9101"},{"addr":"192.168.1.20:9101"}]}'
+    Invoke-RejectedPackage -TemplatePath $lanTemplate -ReleaseId 'lan'
+
+    Write-Host "MANAGER RELEASE PACKAGE CONTRACT PASS files=$($actualFiles.Count)"
+}
+finally {
+    if (Test-Path -LiteralPath $testRoot) { Remove-Item -LiteralPath $testRoot -Recurse -Force }
+}

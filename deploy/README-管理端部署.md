@@ -1,0 +1,27 @@
+# MySingerServer 管理端便携包
+
+本压缩包只包含管理端 `gui.exe`，不包含计算节点、Everything、本地 PostgreSQL 或任何媒体处理组件。请先在可访问 PostgreSQL 与 Agent 的 Windows 电脑上解压到一个可写目录。
+
+## 配置与启动
+
+1. 手工复制 `gui.example.json` 为 `gui.json`。
+2. 编辑 `gui.json`，填写外部 PostgreSQL 的连接地址和可访问的 Agent 地址。示例没有密码；如需密码，请仅写入本机的 `gui.json`，不要提交或分发它。
+3. 可直接双击 `gui.exe`，或在 PowerShell 中执行 `./Start-Manager.ps1`。启动脚本会使用同目录的 `gui.json`。
+
+如果不希望自动打开浏览器，可执行：
+
+```powershell
+./Start-Manager.ps1 -no-browser
+```
+
+管理端所需的 PostgreSQL 是外部服务，本包不会安装、启动或保存本地数据库。运行产生的便携日志位于解压目录及 `gui.json` 配置指定的位置；请确保该目录允许当前用户写入。
+
+## 完整性验证
+
+同目录的 `.zip.sha256` 记录整个 ZIP 的 SHA-256。解压前可执行：
+
+```powershell
+(Get-FileHash .\MySingerServer-manager-win-x64-*.zip -Algorithm SHA256).Hash
+```
+
+结果应与对应的 `.zip.sha256` 文件中记录的哈希一致。包内 `release-manifest.json` 还记录每个发布文件的大小和 SHA-256。
