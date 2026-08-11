@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -24,6 +25,82 @@ import (
 	"dedup/internal/phase2"
 	"dedup/internal/proto"
 )
+
+type noopAnalysisLifecycle struct{}
+
+func (noopAnalysisLifecycle) BeginAnalysisShutdown() {}
+func (noopAnalysisLifecycle) WaitForAnalysis()       {}
+
+func TestGUIOpensBrowserOnlyAfterListenerIsBound(t *testing.T) {
+	originalListen, originalBrowser := guiListen, guiOpenBrowser
+	defer func() { guiListen, guiOpenBrowser = originalListen, originalBrowser }()
+	events := []string{}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	guiListen = func(network, address string) (net.Listener, error) {
+		events = append(events, "listen")
+		return listener, nil
+	}
+	guiOpenBrowser = func(string) error { events = append(events, "browser"); return nil }
+	server := newFakeGUIServer(http.ErrServerClosed, false)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := serveGUIAfterBind(ctx, cancel, server, &noopAnalysisLifecycle{}, time.Second, "127.0.0.1:8080", false, slog.Default()); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(events, []string{"listen", "browser"}) {
+		t.Fatalf("events = %v", events)
+	}
+}
+
+func TestGUINoBrowserFlagSuppressesBrowserLaunch(t *testing.T) {
+	originalListen, originalBrowser := guiListen, guiOpenBrowser
+	defer func() { guiListen, guiOpenBrowser = originalListen, originalBrowser }()
+	events := []string{}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	guiListen = func(network, address string) (net.Listener, error) {
+		events = append(events, "listen")
+		return listener, nil
+	}
+	guiOpenBrowser = func(string) error { events = append(events, "browser"); return nil }
+	server := newFakeGUIServer(http.ErrServerClosed, false)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := serveGUIAfterBind(ctx, cancel, server, &noopAnalysisLifecycle{}, time.Second, "127.0.0.1:8080", true, slog.Default()); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(events, []string{"listen"}) {
+		t.Fatalf("events = %v", events)
+	}
+}
+
+func TestGUIStartupFailureIsLoggedBeforeInteractiveNotification(t *testing.T) {
+	originalExecutable, originalNotify := guiExecutablePath, guiShowStartupError
+	defer func() { guiExecutablePath, guiShowStartupError = originalExecutable, originalNotify }()
+	root := t.TempDir()
+	guiExecutablePath = func() (string, error) { return filepath.Join(root, "gui.exe"), nil }
+	var notification string
+	guiShowStartupError = func(message string) {
+		notification = message
+		content, err := os.ReadFile(filepath.Join(root, "data", "logs", "gui.log"))
+		if err != nil || !strings.Contains(string(content), "gui startup failed") {
+			t.Fatalf("log before notification: %v %q", err, content)
+		}
+	}
+	if err := executeGUI(nil); err == nil {
+		t.Fatal("expected missing configuration error")
+	}
+	if notification == "" || strings.Contains(notification, root) || strings.Contains(notification, "postgres") {
+		t.Fatalf("unsafe notification = %q", notification)
+	}
+}
 
 func TestLoadGUIRuntimeReturnsAbsoluteNonDefaultPath(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "custom-gui.json")
@@ -309,7 +386,7 @@ func newFakeGUIServer(serveErr error, waitShutdown bool) *fakeGUIServer {
 	}
 }
 
-func (s *fakeGUIServer) ListenAndServe() error {
+func (s *fakeGUIServer) Serve(net.Listener) error {
 	close(s.serveStarted)
 	if s.waitShutdown {
 		<-s.shutdown
@@ -375,6 +452,7 @@ func TestFirstScreenServeErrorDrainsAcceptedRunBeforeReturning(t *testing.T) {
 		processContext,
 		cancelAndRecord,
 		server,
+		nil,
 		lifecycle,
 		time.Second,
 	)
@@ -440,6 +518,7 @@ func TestServeErrorCancelsAdmittedSuccessHookBeforeWaiting(t *testing.T) {
 			processContext,
 			cancelProcess,
 			newFakeGUIServer(serveErr, false),
+			nil,
 			api,
 			time.Second,
 		)
@@ -488,6 +567,7 @@ func TestFirstScreenSignalServerCloseIsNotReportedAsError(t *testing.T) {
 			processContext,
 			cancelProcess,
 			server,
+			nil,
 			lifecycle,
 			time.Second,
 		)
@@ -518,6 +598,7 @@ func TestFirstScreenNilServeReturnStillRunsCommonDrain(t *testing.T) {
 		processContext,
 		cancelProcess,
 		server,
+		nil,
 		lifecycle,
 		time.Second,
 	); err != nil {

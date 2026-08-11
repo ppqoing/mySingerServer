@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -123,9 +124,16 @@ func firstScreenConfig(cfg config.FirstScreenConfig) firstscreen.Config {
 }
 
 type guiHTTPServer interface {
-	ListenAndServe() error
+	Serve(net.Listener) error
 	Shutdown(context.Context) error
 }
+
+var (
+	guiExecutablePath   = os.Executable
+	guiListen           = net.Listen
+	guiOpenBrowser      = openGUIBrowser
+	guiShowStartupError = showGUIStartupError
+)
 
 type analysisLifecycle interface {
 	BeginAnalysisShutdown()
@@ -500,6 +508,7 @@ func serveAndDrain(
 	processContext context.Context,
 	cancelProcess context.CancelFunc,
 	server guiHTTPServer,
+	listener net.Listener,
 	analysis analysisLifecycle,
 	shutdownTimeout time.Duration,
 ) error {
@@ -515,7 +524,7 @@ func serveAndDrain(
 		shutdownResult <- server.Shutdown(shutdownContext)
 	}()
 
-	serveErr := server.ListenAndServe()
+	serveErr := server.Serve(listener)
 	analysis.BeginAnalysisShutdown()
 	cancelProcess()
 	analysis.WaitForAnalysis()
@@ -530,11 +539,46 @@ func serveAndDrain(
 	return nil
 }
 
+func serveGUIAfterBind(
+	processContext context.Context,
+	cancelProcess context.CancelFunc,
+	server guiHTTPServer,
+	analysis analysisLifecycle,
+	shutdownTimeout time.Duration,
+	listenAddr string,
+	noBrowser bool,
+	logger *slog.Logger,
+) error {
+	listener, err := guiListen("tcp", listenAddr)
+	if err != nil {
+		return fmt.Errorf("bind GUI listener: %w", err)
+	}
+	defer listener.Close()
+	logger.Info("gui listening", "addr", listener.Addr().String())
+	if !noBrowser {
+		browserURL, urlErr := localBrowserURL(listenAddr)
+		if urlErr != nil {
+			logger.Warn("GUI browser URL unavailable", "err", urlErr)
+		} else if openErr := guiOpenBrowser(browserURL); openErr != nil {
+			logger.Warn("open GUI browser", "err", openErr)
+		}
+	}
+	return serveAndDrain(processContext, cancelProcess, server, listener, analysis, shutdownTimeout)
+}
+
 func main() {
-	if err := run(os.Args[1:]); err != nil {
+	if err := executeGUI(os.Args[1:]); err != nil {
 		slog.Error("gui exited", "err", err)
 		os.Exit(1)
 	}
+}
+
+func executeGUI(args []string) error {
+	err := run(args)
+	if err != nil {
+		guiShowStartupError("GUI 启动失败，请检查便携目录中的 gui.json 和 data\\logs\\gui.log。")
+	}
+	return err
 }
 
 func loadGUIRuntime(path string) (string, *config.GUIConfig, error) {
@@ -551,20 +595,35 @@ func loadGUIRuntime(path string) (string, *config.GUIConfig, error) {
 
 func run(args []string) error {
 	flags := flag.NewFlagSet("gui", flag.ContinueOnError)
-	configPath := flags.String("config", "gui.json", "配置文件路径")
+	configPath := flags.String("config", "", "配置文件路径（默认：EXE 同目录 gui.json）")
+	noBrowser := flags.Bool("no-browser", false, "不自动打开浏览器")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 
-	absoluteConfigPath, cfg, err := loadGUIRuntime(*configPath)
+	executable, err := guiExecutablePath()
 	if err != nil {
+		return fmt.Errorf("resolve GUI executable path: %w", err)
+	}
+	runtimePaths, err := resolveGUIRuntimePaths(executable, *configPath)
+	if err != nil {
+		return err
+	}
+	logger, closeLogger, err := newGUIRuntimeLogger(runtimePaths.LogPath, os.Stdout)
+	if err != nil {
+		return err
+	}
+	defer closeLogger()
+	cfg, err := config.LoadGUI(runtimePaths.ConfigPath)
+	if err != nil {
+		logger.Error("gui startup failed", "stage", "load config", "err", err)
 		return fmt.Errorf("load config: %w", err)
 	}
-	configService, err := gui.NewGUIConfigService(absoluteConfigPath, cfg)
+	configService, err := gui.NewGUIConfigService(runtimePaths.ConfigPath, cfg)
 	if err != nil {
+		logger.Error("gui startup failed", "stage", "initialize config service", "err", err)
 		return fmt.Errorf("initialize GUI config service: %w", err)
 	}
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	pg, err := pgxpool.New(context.Background(), cfg.PGDSN)
 	if err != nil {
 		return fmt.Errorf("parse postgres DSN: %w", err)
@@ -684,13 +743,15 @@ func run(args []string) error {
 		Handler:           api.Routes(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-	logger.Info("gui listening", "addr", cfg.ListenAddr)
-	serveErr := serveAndDrain(
+	serveErr := serveGUIAfterBind(
 		processContext,
 		cancelProcess,
 		server,
 		api,
 		5*time.Second,
+		cfg.ListenAddr,
+		*noBrowser,
+		logger,
 	)
 	phase2Router.Wait()
 	return serveErr
