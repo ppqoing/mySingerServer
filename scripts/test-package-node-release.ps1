@@ -89,15 +89,15 @@ try {
         -BuildDate '2026-08-03' `
         -SourceRevision 'N/A_NO_GIT_METADATA'
 
-    $zipName = 'MySingerServer-node-win-x64-contract-test.zip'
+    $zipName = 'MySingerServer-compute-win-x64-contract-test.zip'
     $zipPath = Join-Path $output $zipName
     $sidecarPath = "$zipPath.sha256"
     Assert-True (Test-Path -LiteralPath $zipPath -PathType Leaf) 'ZIP was not created'
     Assert-True (Test-Path -LiteralPath $sidecarPath -PathType Leaf) 'ZIP SHA-256 sidecar was not created'
 
     Expand-Archive -LiteralPath $zipPath -DestinationPath $extract
-    $payloadRoot = Join-Path $extract 'MySingerServer'
-    Assert-True (Test-Path -LiteralPath $payloadRoot -PathType Container) 'ZIP lacks MySingerServer top-level directory'
+    $payloadRoot = Join-Path $extract 'MySingerServer-Compute'
+    Assert-True (Test-Path -LiteralPath $payloadRoot -PathType Container) 'ZIP lacks MySingerServer-Compute top-level directory'
     $topLevel = @(Get-ChildItem -LiteralPath $extract -Force)
     Assert-True ($topLevel.Count -eq 1 -and $topLevel[0].PSIsContainer) 'ZIP must contain exactly one top-level directory'
 
@@ -116,6 +116,9 @@ try {
         'agent.example.json',
         'agent.exe',
         'avcodec-fixture.dll',
+        'data/agent/.gitkeep',
+        'data/helper/.gitkeep',
+        'data/nodetray/.gitkeep',
         'helper.example.json',
         'helper.exe',
         'licenses/ffmpeg-LICENSE.txt',
@@ -133,14 +136,21 @@ try {
     Assert-True ($difference.Count -eq 0) (
         'ZIP file list differs: ' + (($difference | Out-String).Trim()))
 
-    foreach ($forbidden in @('gui.exe', 'agent.json', 'helper.json', 'gui.json')) {
+    foreach ($forbidden in @(
+            'gui.exe',
+            'agent.json',
+            'helper.json',
+            'gui.json',
+            'gui.example.json',
+            'Start-Manager.ps1')) {
         Assert-True (-not ($actualFiles -contains $forbidden)) "forbidden file shipped: $forbidden"
     }
 
     $releaseManifest = Get-Content -Raw -LiteralPath (
         Join-Path $payloadRoot 'release-manifest.json') | ConvertFrom-Json
-    Assert-True ($releaseManifest.release_kind -ceq 'media-node-minimal') 'wrong release kind'
-    Assert-True ($releaseManifest.install_root -ceq 'C:\Program Files\MySingerServer\') 'wrong fixed install root'
+    Assert-True ($releaseManifest.release_kind -ceq 'compute-node-portable') 'wrong release kind'
+    Assert-True ($releaseManifest.portable_root -ceq '.') 'wrong portable root'
+    Assert-True ($null -eq $releaseManifest.PSObject.Properties['install_root']) 'fixed install root must not be present'
     Assert-True ($releaseManifest.helper.default_enabled -eq $false) 'Helper must be disabled by default'
     Assert-True ($releaseManifest.helper.requires_administrator -eq $true) 'Helper must record its administrator requirement'
     Assert-True ($releaseManifest.source_revision -ceq 'N/A_NO_GIT_METADATA') 'wrong source revision marker'
