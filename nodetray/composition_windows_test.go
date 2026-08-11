@@ -6,9 +6,11 @@ import (
 	"context"
 	"errors"
 	"net"
+	"os"
 	"strings"
 	"testing"
 
+	"dedup/internal/machineid"
 	trayapp "dedup/internal/nodetray/app"
 	trayconfig "dedup/internal/nodetray/config"
 	"dedup/internal/nodetray/process"
@@ -49,6 +51,18 @@ func (windowsCompositionInspector) Wait(context.Context, process.Identity) (int,
 	return 0, errors.New("not called")
 }
 
+type inspectedWindowsCompositionInspector struct{ self process.Identity }
+
+func (i inspectedWindowsCompositionInspector) Inspect(pid int) (process.Identity, error) {
+	if pid != os.Getpid() {
+		return process.Identity{}, errors.New("unexpected process inspection")
+	}
+	return i.self, nil
+}
+func (inspectedWindowsCompositionInspector) Wait(context.Context, process.Identity) (int, error) {
+	return 0, errors.New("not called")
+}
+
 type windowsCompositionLauncher struct{ calls int }
 
 func (l *windowsCompositionLauncher) Start(context.Context, string, []string, []string) (process.Identity, error) {
@@ -86,28 +100,47 @@ func (t *windowsCompositionTask) Stop(context.Context) error   { t.calls++; retu
 
 func TestWindowsProductionCompositionUsesInspectedPortableExecutable(t *testing.T) {
 	self := process.Identity{PID: 4242, StartedAtUnixMS: 100, ExecutablePath: `D:\便携 工具\Compute\nodetray.exe`}
-	layout, err := production.ResolvePortableLayout(self.ExecutablePath)
-	if err != nil {
-		t.Fatalf("ResolvePortableLayout: %v", err)
-	}
 	store := &windowsCompositionStore{}
+	taskService := &windowsCompositionTask{}
+	login := compositionLoginStart{}
 	native := windowsProductionNative{
 		Store: store, Inspector: windowsCompositionInspector{},
 		AgentLauncher: &windowsCompositionLauncher{}, HelperLauncher: &windowsCompositionLauncher{}, Terminator: &windowsCompositionTerminator{},
 		Dialer: &windowsCompositionDialer{}, MachineID: "node-" + strings.Repeat("1", 64),
-		Task: &windowsCompositionTask{}, Elevation: compositionElevation{}, LoginStart: compositionLoginStart{},
+		Task: taskService, Elevation: compositionElevation{}, LoginStart: login,
 		Instance: compositionInstance{}, UI: compositionUI{}, Opener: compositionOpener{},
 		Emitter: func(context.Context, string, any) {}, Show: func(context.Context) {}, Quit: func(context.Context) {},
 	}
-	inputs, err := buildWindowsProductionInputs(layout, "S-1-5-21-101-202-303-1001", native)
+	inspector := inspectedWindowsCompositionInspector{self: self}
+	var inputs productionCompositionInputs
+	backend, err := composeWindowsProductionBackendWith(windowsProductionCompositionDependencies{
+		MachineIdentity: func() (machineid.Result, error) { return machineid.Result{ID: native.MachineID}, nil },
+		Inspector:       inspector,
+		FinalPath:       func(path string) (string, error) { return path, nil },
+		UserSID:         func(process.Identity) (string, error) { return "S-1-5-21-101-202-303-1001", nil },
+		BuildInputs: func(layout production.Layout, userSID string, gotInspector process.Inspector, identity machineid.Result) (productionCompositionInputs, error) {
+			if layout.TrayExecutable != self.ExecutablePath || gotInspector != inspector || identity.ID != native.MachineID {
+				t.Fatalf("entry dependencies layout=%#v inspector=%T identity=%#v", layout, gotInspector, identity)
+			}
+			var err error
+			inputs, err = buildWindowsProductionInputs(layout, userSID, native)
+			return inputs, err
+		},
+	})
 	if err != nil {
-		t.Fatalf("buildWindowsProductionInputs: %v", err)
+		t.Fatalf("composeWindowsProductionBackendWith: %v", err)
+	}
+	if backend == nil || backend.service == nil || backend.webViewDataPath != `D:\便携 工具\Compute\data\nodetray\webview2` {
+		t.Fatalf("backend=%#v", backend)
 	}
 	if inputs.PortableRoot != `D:\便携 工具\Compute` || inputs.WebViewDataPath != `D:\便携 工具\Compute\data\nodetray\webview2` {
 		t.Fatalf("portable inputs = root %q webview %q", inputs.PortableRoot, inputs.WebViewDataPath)
 	}
 	if inputs.TrayExecutable != self.ExecutablePath || inputs.TaskDefinition.HelperExecutable != `D:\便携 工具\Compute\helper.exe` || inputs.TaskDefinition.HelperConfig != `D:\便携 工具\Compute\data\helper\helper.json` {
 		t.Fatalf("portable executable authority = tray %q task %#v", inputs.TrayExecutable, inputs.TaskDefinition)
+	}
+	if inputs.Store != store || inputs.Task != taskService || inputs.LoginStart != login || inputs.Agent == nil || inputs.Helper == nil {
+		t.Fatalf("portable composition components store=%T agent=%T helper=%T login=%T task=%T", inputs.Store, inputs.Agent, inputs.Helper, inputs.LoginStart, inputs.Task)
 	}
 	paths, err := inputs.Paths.Resolve(context.Background())
 	if err != nil || paths.TraySettings != `D:\便携 工具\Compute\data\nodetray\tray.json` || paths.AgentConfig != `D:\便携 工具\Compute\data\agent\agent.json` || paths.HelperConfig != `D:\便携 工具\Compute\data\helper\helper.json` {

@@ -54,20 +54,41 @@ type windowsProductionNative struct {
 	Quit           func(context.Context)
 }
 
+type windowsProductionCompositionDependencies struct {
+	MachineIdentity func() (machineid.Result, error)
+	Inspector       process.Inspector
+	FinalPath       func(string) (string, error)
+	UserSID         func(process.Identity) (string, error)
+	BuildInputs     func(production.Layout, string, process.Inspector, machineid.Result) (productionCompositionInputs, error)
+}
+
 func init() {
 	composeBackend = composeWindowsProductionBackend
 }
 
 func composeWindowsProductionBackend() (*Backend, error) {
-	identity, err := machineid.Current()
+	inspector := process.NewInspector()
+	return composeWindowsProductionBackendWith(windowsProductionCompositionDependencies{
+		MachineIdentity: machineid.Current,
+		Inspector:       inspector,
+		FinalPath:       (bootstrap.OSFinalPathResolver{}).Final,
+		UserSID:         process.UserSIDForProcess,
+		BuildInputs:     buildWindowsProductionInputsForLayout,
+	})
+}
+
+func composeWindowsProductionBackendWith(dependencies windowsProductionCompositionDependencies) (*Backend, error) {
+	if dependencies.MachineIdentity == nil || dependencies.Inspector == nil || dependencies.FinalPath == nil || dependencies.UserSID == nil || dependencies.BuildInputs == nil {
+		return nil, errors.New("production composition: Windows dependencies unavailable")
+	}
+	identity, err := dependencies.MachineIdentity()
 	if err != nil {
 		return nil, errors.New("production composition: machine identity unavailable")
 	}
 	for _, warning := range identity.Warnings {
 		log.Print("nodetray_machine_identity_warning " + warning)
 	}
-	inspector := process.NewInspector()
-	self, err := inspector.Inspect(os.Getpid())
+	self, err := dependencies.Inspector.Inspect(os.Getpid())
 	if err != nil {
 		return nil, errors.New("production composition: current process identity unavailable")
 	}
@@ -75,7 +96,7 @@ func composeWindowsProductionBackend() (*Backend, error) {
 	if err != nil {
 		return nil, errors.New("production composition: portable layout unavailable")
 	}
-	finalTray, err := (bootstrap.OSFinalPathResolver{}).Final(layout.TrayExecutable)
+	finalTray, err := dependencies.FinalPath(layout.TrayExecutable)
 	if err != nil {
 		return nil, errors.New("production composition: portable tray executable unavailable")
 	}
@@ -84,32 +105,40 @@ func composeWindowsProductionBackend() (*Backend, error) {
 	if !process.SameProcess(expected, self) {
 		return nil, errors.New("production composition: current executable is outside portable deployment")
 	}
-	userSID, err := process.UserSIDForProcess(self)
+	userSID, err := dependencies.UserSID(self)
 	if err != nil {
 		return nil, errors.New("production composition: current user identity unavailable")
 	}
+	inputs, err := dependencies.BuildInputs(layout, userSID, dependencies.Inspector, identity)
+	if err != nil {
+		return nil, err
+	}
+	return composeProductionBackendWith(inputs)
+}
+
+func buildWindowsProductionInputsForLayout(layout production.Layout, userSID string, inspector process.Inspector, identity machineid.Result) (productionCompositionInputs, error) {
 	store, err := trayconfig.NewStore(trayconfig.Paths{
 		TraySettings: layout.TraySettings, AgentConfig: layout.AgentConfig, HelperConfig: layout.HelperConfig,
 		AgentExecutable: layout.AgentExecutable, HelperExecutable: layout.HelperExecutable,
 	})
 	if err != nil {
-		return nil, errors.New("production composition: configuration store unavailable")
+		return productionCompositionInputs{}, errors.New("production composition: configuration store unavailable")
 	}
 	userTask, err := task.New(task.CapabilityUser)
 	if err != nil {
-		return nil, errors.New("production composition: task service unavailable")
+		return productionCompositionInputs{}, errors.New("production composition: task service unavailable")
 	}
 	login, err := loginstart.New(layout.TrayExecutable)
 	if err != nil {
-		return nil, errors.New("production composition: login-start service unavailable")
+		return productionCompositionInputs{}, errors.New("production composition: login-start service unavailable")
 	}
 	elevationClient, err := elevation.NewClient(layout.TrayExecutable, inspector)
 	if err != nil {
-		return nil, errors.New("production composition: elevation client unavailable")
+		return productionCompositionInputs{}, errors.New("production composition: elevation client unavailable")
 	}
 	handleInspector, ok := inspector.(process.HandleInspector)
 	if !ok {
-		return nil, errors.New("production composition: process handle inspector unavailable")
+		return productionCompositionInputs{}, errors.New("production composition: process handle inspector unavailable")
 	}
 	native := windowsProductionNative{
 		Store: store, Inspector: inspector,
@@ -127,11 +156,7 @@ func composeWindowsProductionBackend() (*Backend, error) {
 		Show: showNodeWindow,
 		Quit: wailsQuitAdapter,
 	}
-	inputs, err := buildWindowsProductionInputs(layout, userSID, native)
-	if err != nil {
-		return nil, err
-	}
-	return composeProductionBackendWith(inputs)
+	return buildWindowsProductionInputs(layout, userSID, native)
 }
 
 func buildWindowsProductionInputs(layout production.Layout, userSID string, native windowsProductionNative) (productionCompositionInputs, error) {
