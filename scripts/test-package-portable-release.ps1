@@ -83,6 +83,69 @@ try {
     Assert-True ((Get-Content -Raw -LiteralPath $collisionPath) -ceq 'user-owned-existing-file') 'existing target was overwritten'
     Assert-True (@(Get-ChildItem -LiteralPath $collisionOutput -Force).Count -eq 1) 'collision started candidate construction or created extra output'
 
+    $lateCollisionOutput = Join-Path $testRoot 'late-collision-release'
+    $lateCollisionTarget = Join-Path $lateCollisionOutput 'MySingerServer-compute-win-x64-late-collision.zip'
+    $lateCollisionRejected = $false
+    try {
+        & $packageScript -StageDir $stage -OutputDir $lateCollisionOutput -ReleaseId 'late-collision' -BuildDate '2026-08-11' -TestPublishHook {
+            param($context)
+            if ($context.Phase -ceq 'BeforeSecondPreflight') {
+                New-Item -ItemType Directory -Path $context.FinalPaths[0] -Force | Out-Null
+            }
+        }
+    } catch {
+        $lateCollisionRejected = $_.Exception.Message -match 'PORTABLE_RELEASE_OUTPUT_EXISTS'
+    }
+    Assert-True $lateCollisionRejected 'post-candidate directory collision was accepted'
+    Assert-True (Test-Path -LiteralPath $lateCollisionTarget -PathType Container) 'post-candidate collision directory was changed'
+    Assert-True (@(Get-ChildItem -LiteralPath $lateCollisionOutput -Force).Count -eq 1) 'post-candidate collision published another artifact'
+
+    $raceCollisionOutput = Join-Path $testRoot 'race-collision-release'
+    $raceCollisionTarget = Join-Path $raceCollisionOutput 'MySingerServer-compute-win-x64-race-collision.zip'
+    $raceCollisionRejected = $false
+    try {
+        & $packageScript -StageDir $stage -OutputDir $raceCollisionOutput -ReleaseId 'race-collision' -BuildDate '2026-08-11' -TestPublishHook {
+            param($context)
+            if ($context.Phase -ceq 'BeforeMove' -and $context.MoveIndex -eq 1) {
+                New-Item -ItemType Directory -Path $context.Destination -Force | Out-Null
+            }
+        }
+    } catch {
+        $raceCollisionRejected = $_.Exception.Message -match 'PORTABLE_RELEASE_PUBLISH_FAILED'
+    }
+    Assert-True $raceCollisionRejected 'atomic move race collision did not return the stable publish error'
+    Assert-True (Test-Path -LiteralPath $raceCollisionTarget -PathType Container) 'atomic move race collision directory was changed'
+    Assert-True (@(Get-ChildItem -LiteralPath $raceCollisionOutput -File -ErrorAction SilentlyContinue).Count -eq 0) 'atomic move race collision published a file'
+
+    $rollbackOutput = Join-Path $testRoot 'rollback-release'
+    $rollbackState = [pscustomobject]@{ FirstMovedPath = $null }
+    $rollbackRejected = $false
+    $rollbackError = ''
+    try {
+        & $packageScript -StageDir $stage -OutputDir $rollbackOutput -ReleaseId 'rollback' -BuildDate '2026-08-11' -TestPublishHook {
+            param($context)
+            if ($context.Phase -ceq 'AfterMove' -and $context.MoveIndex -eq 1) {
+                $rollbackState.FirstMovedPath = $context.Destination
+                Write-Utf8NoBom -Path $context.Destination -Value 'user-replaced-after-publish'
+            }
+            if ($context.Phase -ceq 'AfterMove' -and $context.MoveIndex -eq 3) {
+                throw 'INJECTED_PUBLISH_FAILURE'
+            }
+        } -TestRollbackHook {
+            param($context)
+            if ($context.Path -like '*.zip.sha256') { throw 'INJECTED_CLEANUP_FAILURE' }
+        }
+    } catch {
+        $rollbackError = $_.Exception.Message
+        $rollbackRejected = $_.Exception.Message -match 'PORTABLE_RELEASE_PUBLISH_FAILED.*INJECTED_PUBLISH_FAILURE'
+    }
+    Assert-True $rollbackRejected 'partial publish failure did not keep the stable original error code'
+    Assert-True ($rollbackError -match 'cleanup_warnings=.*INJECTED_CLEANUP_FAILURE') 'cleanup warning did not preserve the original publish failure'
+    Assert-True (Test-Path -LiteralPath $rollbackState.FirstMovedPath -PathType Leaf) 'user-modified published file was deleted'
+    Assert-True ((Get-Content -Raw -LiteralPath $rollbackState.FirstMovedPath) -ceq 'user-replaced-after-publish') 'user-modified published file was changed during rollback'
+    Assert-True (Test-Path -LiteralPath (Join-Path $rollbackOutput 'MySingerServer-compute-win-x64-rollback.zip.sha256') -PathType Leaf) 'cleanup-injected file was unexpectedly deleted'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $rollbackOutput 'MySingerServer-manager-win-x64-rollback.zip') -PathType Leaf)) 'rollback stopped after one cleanup item failed'
+
     Write-Host 'PORTABLE RELEASE PACKAGE CONTRACT PASS'
 }
 finally {

@@ -11,7 +11,11 @@ param(
     [ValidatePattern('^\d{4}-\d{2}-\d{2}$')]
     [string]$BuildDate = (Get-Date -Format 'yyyy-MM-dd'),
 
-    [string]$SourceRevision = 'N/A_NO_GIT_METADATA'
+    [string]$SourceRevision = 'N/A_NO_GIT_METADATA',
+
+    [scriptblock]$TestPublishHook = $null,
+
+    [scriptblock]$TestRollbackHook = $null
 )
 
 $ErrorActionPreference = 'Stop'
@@ -39,6 +43,25 @@ function Resolve-OutputDirectory {
 function Get-Sha256 {
     param([string]$Path)
     (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+function Assert-FinalPathsAvailable {
+    param([string[]]$Paths)
+    foreach ($path in $Paths) {
+        if (Test-Path -LiteralPath $path) {
+            throw "PORTABLE_RELEASE_OUTPUT_EXISTS path=$path"
+        }
+    }
+}
+
+function Invoke-TestPublishHook {
+    param([object]$Context)
+    if ($null -ne $TestPublishHook) { & $TestPublishHook $Context }
+}
+
+function Invoke-TestRollbackHook {
+    param([object]$Context)
+    if ($null -ne $TestRollbackHook) { & $TestRollbackHook $Context }
 }
 
 function Assert-CandidatePackage {
@@ -85,14 +108,13 @@ $finalPaths = @(
         Join-Path $output ($artifact.Name + '.sha256')
     }
 )
-foreach ($path in $finalPaths) {
-    if (Test-Path -LiteralPath $path) { throw "PORTABLE_RELEASE_OUTPUT_EXISTS path=$path" }
-}
+Assert-FinalPathsAvailable -Paths $finalPaths
 
 $candidateRoot = Join-Path $repo ('.tmp\.portable-release-work-{0}' -f [Guid]::NewGuid().ToString('N'))
 $verifyRoot = Join-Path $candidateRoot 'verify'
 $published = @()
 $publishStarted = $false
+$moveIndex = 0
 
 try {
     New-Item -ItemType Directory -Path $candidateRoot -Force | Out-Null
@@ -105,16 +127,34 @@ try {
         Assert-CandidatePackage -ZipPath $zip -SidecarPath $sidecar -ExpectedReleaseKind $artifact.Kind -VerificationRoot (Join-Path $verifyRoot $artifact.Kind)
     }
 
+    Invoke-TestPublishHook -Context ([pscustomobject]@{
+            Phase = 'BeforeSecondPreflight'
+            FinalPaths = $finalPaths
+        })
+    Assert-FinalPathsAvailable -Paths $finalPaths
     $publishStarted = $true
     foreach ($artifact in $artifacts) {
         $candidatePaths = @()
         $candidatePaths += Join-Path $candidateRoot $artifact.Name
         $candidatePaths += Join-Path $candidateRoot ($artifact.Name + '.sha256')
         foreach ($candidate in $candidatePaths) {
+            $moveIndex++
             $destination = Join-Path $output ([IO.Path]::GetFileName($candidate))
             $hash = Get-Sha256 -Path $candidate
-            Move-Item -LiteralPath $candidate -Destination $destination
+            Invoke-TestPublishHook -Context ([pscustomobject]@{
+                    Phase = 'BeforeMove'
+                    MoveIndex = $moveIndex
+                    Candidate = $candidate
+                    Destination = $destination
+                })
+            [IO.File]::Move($candidate, $destination, $false)
             $published += [ordered]@{ Path = $destination; Hash = $hash }
+            Invoke-TestPublishHook -Context ([pscustomobject]@{
+                    Phase = 'AfterMove'
+                    MoveIndex = $moveIndex
+                    Candidate = $candidate
+                    Destination = $destination
+                })
         }
     }
     Write-Host "PORTABLE RELEASE PACKAGE PASS output=$output release_id=$ReleaseId"
@@ -122,13 +162,37 @@ try {
 catch {
     $failure = $_
     if ($publishStarted) {
+        $cleanupWarnings = @()
         foreach ($artifact in @($published)) {
-            if ((Test-Path -LiteralPath $artifact.Path -PathType Leaf) -and
-                (Get-Sha256 -Path $artifact.Path) -ceq $artifact.Hash) {
+            try {
+                $exists = Test-Path -LiteralPath $artifact.Path -PathType Leaf
+            }
+            catch {
+                $cleanupWarnings += "exists path=$($artifact.Path) error=$($_.Exception.Message)"
+                continue
+            }
+            if (-not $exists) { continue }
+            try {
+                $actualHash = Get-Sha256 -Path $artifact.Path
+            }
+            catch {
+                $cleanupWarnings += "hash path=$($artifact.Path) error=$($_.Exception.Message)"
+                continue
+            }
+            if ($actualHash -cne $artifact.Hash) { continue }
+            try {
+                Invoke-TestRollbackHook -Context ([pscustomobject]@{
+                        Path = $artifact.Path
+                        ExpectedHash = $artifact.Hash
+                    })
                 Remove-Item -LiteralPath $artifact.Path -Force
             }
+            catch {
+                $cleanupWarnings += "remove path=$($artifact.Path) error=$($_.Exception.Message)"
+            }
         }
-        throw "PORTABLE_RELEASE_PUBLISH_FAILED: $($failure.Exception.Message)"
+        $cleanupSuffix = if ($cleanupWarnings.Count -eq 0) { '' } else { " cleanup_warnings=$($cleanupWarnings -join ' | ')" }
+        throw "PORTABLE_RELEASE_PUBLISH_FAILED: $($failure.Exception.Message)$cleanupSuffix"
     }
     throw
 }
