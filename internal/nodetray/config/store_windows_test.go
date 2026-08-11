@@ -258,7 +258,13 @@ func assertRestrictedWritableACL(t *testing.T, path, currentSID string) {
 	}
 	trustees := map[string]bool{}
 	for _, match := range regexp.MustCompile(`\([AD];[^)]*;;;([^)]+)\)`).FindAllStringSubmatch(sddl, -1) {
-		trustees[match[1]] = true
+		trustee := match[1]
+		if trustee == "LA" {
+			if sid, err := windows.StringToSid(currentSID); err == nil && sid.IsWellKnown(windows.WinAccountAdministratorSid) {
+				trustee = currentSID
+			}
+		}
+		trustees[trustee] = true
 	}
 	for _, wanted := range []string{"SY", "BA", currentSID} {
 		if !trustees[wanted] {
