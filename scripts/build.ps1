@@ -142,6 +142,7 @@ if ($useVideoCore) {
         -A x64 `
         "-DCMAKE_TOOLCHAIN_FILE=$toolchainCMake" `
         -DVCPKG_TARGET_TRIPLET=x64-windows-static `
+        "-DVCPKG_INSTALLED_DIR=$($dependencyPaths.VcpkgInstalled)" `
         "-DVC_FFMPEG_ROOT=$ffmpegRootCMake"
     if ($LASTEXITCODE -ne 0) { throw "VIDEOCORE_CONFIGURE_FAILED" }
 
@@ -260,7 +261,8 @@ if ($MediacoreOnly) {
         -G "Visual Studio 17 2022" `
         -A x64 `
         "-DCMAKE_TOOLCHAIN_FILE=$($toolchain -replace '\\', '/')" `
-        -DVCPKG_TARGET_TRIPLET=x64-windows-static
+        -DVCPKG_TARGET_TRIPLET=x64-windows-static `
+        "-DVCPKG_INSTALLED_DIR=$($dependencyPaths.VcpkgInstalled)"
     if ($LASTEXITCODE -ne 0) { throw "mediacore configure failed" }
     & $cmakeExe --build $mediacoreBuild --config Release
     if ($LASTEXITCODE -ne 0) { throw "mediacore Release build failed" }
