@@ -52,6 +52,96 @@ function Get-CacheTargetInfo {
     }
 }
 
+function Invoke-CacheGit {
+    param(
+        [Parameter(Mandatory)]
+        [string[]]$Arguments,
+        [Parameter(Mandatory)]
+        [string]$Operation
+    )
+
+    try {
+        $output = @(& git -C $repo @Arguments 2>&1)
+        $exitCode = $LASTEXITCODE
+    } catch {
+        throw (
+            'CACHE_GIT_PREFLIGHT_FAILED operation={0} detail={1}' -f
+            $Operation, $_.Exception.Message
+        )
+    }
+    if ($exitCode -ne 0) {
+        throw (
+            'CACHE_GIT_PREFLIGHT_FAILED operation={0} exit={1} detail={2}' -f
+            $Operation, $exitCode, ($output -join ' ')
+        )
+    }
+    return $output
+}
+
+function Assert-CacheRepositoryGitRoot {
+    $topLevelOutput = @(
+        Invoke-CacheGit -Operation 'resolve-root' `
+            -Arguments @('rev-parse', '--show-toplevel')
+    )
+    if ($topLevelOutput.Count -ne 1) {
+        throw 'CACHE_GIT_PREFLIGHT_FAILED operation=resolve-root output-count'
+    }
+    $gitRoot = [IO.Path]::GetFullPath($topLevelOutput[0]).TrimEnd('\')
+    if (-not $gitRoot.Equals($repo, [StringComparison]::OrdinalIgnoreCase)) {
+        throw (
+            'CACHE_GIT_PREFLIGHT_FAILED operation=resolve-root ' +
+            "expected=$repo actual=$gitRoot"
+        )
+    }
+}
+
+function Assert-CacheTargetGitSafe {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Target
+    )
+
+    $relativeTarget = [IO.Path]::GetRelativePath($repo, $Target)
+    $relativeTarget = $relativeTarget.Replace('\', '/')
+    $tracked = @(
+        Invoke-CacheGit -Operation 'tracked-content' -Arguments @(
+            '--literal-pathspecs', 'ls-files', '--', $relativeTarget
+        )
+    )
+    if ($tracked.Count -gt 0) {
+        throw "CACHE_TARGET_HAS_TRACKED_CONTENT path=$Target"
+    }
+
+    $userContent = @(
+        Invoke-CacheGit -Operation 'user-content' -Arguments @(
+            '--literal-pathspecs', 'status', '--porcelain=v1',
+            '--untracked-files=all', '--', $relativeTarget
+        )
+    )
+    if ($userContent.Count -gt 0) {
+        throw "CACHE_TARGET_HAS_USER_CONTENT path=$Target"
+    }
+}
+
+function Assert-CacheTargetHasNoReparsePoint {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Target
+    )
+
+    $targetItem = Get-Item -LiteralPath $Target -Force
+    if ($targetItem.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        throw "CACHE_TARGET_REPARSE_POINT path=$Target"
+    }
+    if ($targetItem.PSIsContainer) {
+        $nestedReparsePoint = Get-ChildItem -LiteralPath $Target -Force `
+            -Recurse -Attributes ReparsePoint | Select-Object -First 1
+        if ($null -ne $nestedReparsePoint) {
+            throw "CACHE_TARGET_REPARSE_POINT path=$($nestedReparsePoint.FullName)"
+        }
+    }
+}
+
 $fixedRelativeTargets = @(
     '.tmp',
     '.superpowers\tmp',
@@ -107,6 +197,7 @@ $targets = @(
     foreach ($candidate in $candidates) {
         $target = Resolve-CacheTarget -Candidate $candidate
         if ($seen.Add($target) -and (Test-Path -LiteralPath $target)) {
+            Assert-CacheTargetHasNoReparsePoint -Target $target
             Get-CacheTargetInfo -Target $target
         }
     }
@@ -128,6 +219,11 @@ if (-not $Apply) {
         $targets.Count, $totalFiles, $totalBytes
     )
     return
+}
+
+Assert-CacheRepositoryGitRoot
+foreach ($target in $targets) {
+    Assert-CacheTargetGitSafe -Target $target.Path
 }
 
 $processes = @(Get-CimInstance -ClassName Win32_Process `
