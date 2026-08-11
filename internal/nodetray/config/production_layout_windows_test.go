@@ -12,13 +12,9 @@ import (
 
 func TestProductionLayoutCanInitializeConfigStore(t *testing.T) {
 	root := t.TempDir()
-	layout, err := production.ResolveLayout(
-		filepath.Join(root, "program-files"),
-		filepath.Join(root, "program-data"),
-		filepath.Join(root, "local-app-data"),
-	)
+	layout, err := production.ResolvePortableLayout(filepath.Join(root, "compute", "nodetray.exe"))
 	if err != nil {
-		t.Fatalf("ResolveLayout: %v", err)
+		t.Fatalf("ResolvePortableLayout: %v", err)
 	}
 
 	_, err = trayconfig.NewStore(trayconfig.Paths{

@@ -22,16 +22,17 @@ var (
 )
 
 type Backend struct {
-	ctx            context.Context
-	service        *trayapp.Service
-	lifecycle      BackendLifecycle
-	lifeMu         sync.Mutex
-	started        bool
-	closed         bool
-	startup        BackendStartup
-	closeErr       error
-	quit           func(context.Context)
-	exitAuthorized atomic.Bool
+	ctx             context.Context
+	service         *trayapp.Service
+	lifecycle       BackendLifecycle
+	lifeMu          sync.Mutex
+	started         bool
+	closed          bool
+	startup         BackendStartup
+	closeErr        error
+	quit            func(context.Context)
+	webViewDataPath string
+	exitAuthorized  atomic.Bool
 }
 
 type BackendLifecycle interface {

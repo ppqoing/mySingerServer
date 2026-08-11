@@ -16,7 +16,6 @@ import (
 	"dedup/internal/nodetray/supervisor"
 	"dedup/internal/nodetray/traymodel"
 	"dedup/internal/nodetray/windows/task"
-	"golang.org/x/sys/windows"
 )
 
 type windowsCompositionStore struct {
@@ -85,40 +84,46 @@ func (t *windowsCompositionTask) Remove(context.Context) error { t.calls++; retu
 func (t *windowsCompositionTask) Run(context.Context) error    { t.calls++; return nil }
 func (t *windowsCompositionTask) Stop(context.Context) error   { t.calls++; return nil }
 
-func TestResolveWindowsLayoutUsesKnownFoldersOnly(t *testing.T) {
-	called := make(map[*windows.KNOWNFOLDERID]int)
-	lookup := func(id *windows.KNOWNFOLDERID, _ uint32) (string, error) {
-		called[id]++
-		switch id {
-		case windows.FOLDERID_ProgramFiles:
-			return `C:\Program Files`, nil
-		case windows.FOLDERID_ProgramData:
-			return `C:\ProgramData`, nil
-		case windows.FOLDERID_LocalAppData:
-			return `C:\Users\u\AppData\Local`, nil
-		default:
-			return "", errors.New("unexpected known folder")
-		}
-	}
-
-	layout, err := resolveWindowsLayout(lookup)
+func TestWindowsProductionCompositionUsesInspectedPortableExecutable(t *testing.T) {
+	self := process.Identity{PID: 4242, StartedAtUnixMS: 100, ExecutablePath: `D:\便携 工具\Compute\nodetray.exe`}
+	layout, err := production.ResolvePortableLayout(self.ExecutablePath)
 	if err != nil {
-		t.Fatalf("resolveWindowsLayout: %v", err)
+		t.Fatalf("ResolvePortableLayout: %v", err)
 	}
-	if layout.TrayExecutable != `C:\Program Files\MySingerServer\nodetray.exe` ||
-		layout.AgentConfig != `C:\ProgramData\MySingerServer\Node\agent.json` ||
-		layout.TraySettings != `C:\Users\u\AppData\Local\MySingerServer\NodeTray\tray.json` {
-		t.Fatalf("unexpected fixed layout: %#v", layout)
+	store := &windowsCompositionStore{}
+	native := windowsProductionNative{
+		Store: store, Inspector: windowsCompositionInspector{},
+		AgentLauncher: &windowsCompositionLauncher{}, HelperLauncher: &windowsCompositionLauncher{}, Terminator: &windowsCompositionTerminator{},
+		Dialer: &windowsCompositionDialer{}, MachineID: "node-" + strings.Repeat("1", 64),
+		Task: &windowsCompositionTask{}, Elevation: compositionElevation{}, LoginStart: compositionLoginStart{},
+		Instance: compositionInstance{}, UI: compositionUI{}, Opener: compositionOpener{},
+		Emitter: func(context.Context, string, any) {}, Show: func(context.Context) {}, Quit: func(context.Context) {},
 	}
-	if len(called) != 3 {
-		t.Fatalf("known folder calls=%v", called)
+	inputs, err := buildWindowsProductionInputs(layout, "S-1-5-21-101-202-303-1001", native)
+	if err != nil {
+		t.Fatalf("buildWindowsProductionInputs: %v", err)
+	}
+	if inputs.PortableRoot != `D:\便携 工具\Compute` || inputs.WebViewDataPath != `D:\便携 工具\Compute\data\nodetray\webview2` {
+		t.Fatalf("portable inputs = root %q webview %q", inputs.PortableRoot, inputs.WebViewDataPath)
+	}
+	if inputs.TrayExecutable != self.ExecutablePath || inputs.TaskDefinition.HelperExecutable != `D:\便携 工具\Compute\helper.exe` || inputs.TaskDefinition.HelperConfig != `D:\便携 工具\Compute\data\helper\helper.json` {
+		t.Fatalf("portable executable authority = tray %q task %#v", inputs.TrayExecutable, inputs.TaskDefinition)
+	}
+	paths, err := inputs.Paths.Resolve(context.Background())
+	if err != nil || paths.TraySettings != `D:\便携 工具\Compute\data\nodetray\tray.json` || paths.AgentConfig != `D:\便携 工具\Compute\data\agent\agent.json` || paths.HelperConfig != `D:\便携 工具\Compute\data\helper\helper.json` {
+		t.Fatalf("portable store paths = %#v err=%v", paths, err)
+	}
+	for kind, location := range inputs.Locations {
+		if !strings.HasPrefix(location.Path, `D:\便携 工具\Compute\data\`) || !strings.HasPrefix(location.Root, `D:\便携 工具\Compute\data\`) {
+			t.Fatalf("location %s escaped portable root: %#v", kind, location)
+		}
 	}
 }
 
 func TestWindowsProductionInputsShareFactoryAndPerformNoActionsDuringConstruction(t *testing.T) {
-	layout, err := production.ResolveLayout(`C:\Program Files`, `C:\ProgramData`, `C:\Users\u\AppData\Local`)
+	layout, err := production.ResolvePortableLayout(`D:\便携 工具\Compute\nodetray.exe`)
 	if err != nil {
-		t.Fatalf("ResolveLayout: %v", err)
+		t.Fatalf("ResolvePortableLayout: %v", err)
 	}
 	store := &windowsCompositionStore{}
 	agentLauncher := &windowsCompositionLauncher{}
@@ -154,10 +159,10 @@ func TestWindowsProductionInputsShareFactoryAndPerformNoActionsDuringConstructio
 		t.Fatalf("task authority=%#v", inputs.TaskDefinition)
 	}
 	wantLocations := map[traymodel.LocationKind]trayapp.Location{
-		traymodel.AgentLogs:    {Path: layout.AgentLogs, Root: `C:\ProgramData\MySingerServer\Node`},
-		traymodel.HelperLogs:   {Path: layout.HelperLogs, Root: `C:\ProgramData\MySingerServer\Helper`},
-		traymodel.AgentBackup:  {Path: layout.AgentConfig + ".last-good", Root: `C:\ProgramData\MySingerServer\Node`},
-		traymodel.HelperBackup: {Path: layout.HelperConfig + ".last-good", Root: `C:\ProgramData\MySingerServer\Helper`},
+		traymodel.AgentLogs:    {Path: layout.AgentLogs, Root: `D:\便携 工具\Compute\data\agent`},
+		traymodel.HelperLogs:   {Path: layout.HelperLogs, Root: `D:\便携 工具\Compute\data\helper`},
+		traymodel.AgentBackup:  {Path: layout.AgentConfig + ".last-good", Root: `D:\便携 工具\Compute\data\agent`},
+		traymodel.HelperBackup: {Path: layout.HelperConfig + ".last-good", Root: `D:\便携 工具\Compute\data\helper`},
 	}
 	for kind, want := range wantLocations {
 		if got := inputs.Locations[kind]; got != want {

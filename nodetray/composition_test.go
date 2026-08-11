@@ -142,9 +142,9 @@ func (compositionUI) Ready(context.Context) error { return nil }
 func validCompositionInputs() productionCompositionInputs {
 	component := &compositionComponent{}
 	paths := bootstrap.Paths{
-		TraySettings: `C:\Users\u\AppData\Local\MySingerServer\NodeTray\tray.json`,
-		AgentConfig:  `C:\ProgramData\MySingerServer\Node\agent.json`,
-		HelperConfig: `C:\ProgramData\MySingerServer\Helper\helper.json`,
+		TraySettings: `C:\Portable\Compute\data\nodetray\tray.json`,
+		AgentConfig:  `C:\Portable\Compute\data\agent\agent.json`,
+		HelperConfig: `C:\Portable\Compute\data\helper\helper.json`,
 	}
 	return productionCompositionInputs{
 		Store:             compositionStore{},
@@ -157,17 +157,19 @@ func validCompositionInputs() productionCompositionInputs {
 		Task:              compositionTask{},
 		Elevation:         compositionElevation{},
 		LoginStart:        compositionLoginStart{},
-		TrayExecutable:    `C:\Program Files\MySingerServer\nodetray.exe`,
+		PortableRoot:      `C:\Portable\Compute`,
+		WebViewDataPath:   `C:\Portable\Compute\data\nodetray\webview2`,
+		TrayExecutable:    `C:\Portable\Compute\nodetray.exe`,
 		TaskDefinition: task.Definition{
-			HelperExecutable: `C:\Program Files\MySingerServer\helper.exe`,
+			HelperExecutable: `C:\Portable\Compute\helper.exe`,
 			HelperConfig:     paths.HelperConfig,
 			UserSID:          "S-1-5-21-101-202-303-1001",
 		},
 		Locations: map[traymodel.LocationKind]trayapp.Location{
-			traymodel.AgentLogs:    {Path: `C:\ProgramData\MySingerServer\Node\logs`, Root: `C:\ProgramData\MySingerServer\Node`},
-			traymodel.HelperLogs:   {Path: `C:\ProgramData\MySingerServer\Helper\logs`, Root: `C:\ProgramData\MySingerServer\Helper`},
-			traymodel.AgentBackup:  {Path: paths.AgentConfig + ".last-good", Root: `C:\ProgramData\MySingerServer\Node`},
-			traymodel.HelperBackup: {Path: paths.HelperConfig + ".last-good", Root: `C:\ProgramData\MySingerServer\Helper`},
+			traymodel.AgentLogs:    {Path: `C:\Portable\Compute\data\agent\logs`, Root: `C:\Portable\Compute\data\agent`},
+			traymodel.HelperLogs:   {Path: `C:\Portable\Compute\data\helper\logs`, Root: `C:\Portable\Compute\data\helper`},
+			traymodel.AgentBackup:  {Path: paths.AgentConfig + ".last-good", Root: `C:\Portable\Compute\data\agent`},
+			traymodel.HelperBackup: {Path: paths.HelperConfig + ".last-good", Root: `C:\Portable\Compute\data\helper`},
 		},
 		FinalPaths:    compositionFinalPaths{},
 		Opener:        compositionOpener{},

@@ -27,12 +27,14 @@ type productionCompositionInputs struct {
 		trayapp.TaskController
 		bootstrap.TaskRunner
 	}
-	Elevation      trayapp.ElevationClient
-	LoginStart     trayapp.LoginStart
-	TrayExecutable string
-	TaskDefinition task.Definition
-	Locations      map[traymodel.LocationKind]trayapp.Location
-	FinalPaths     interface {
+	Elevation       trayapp.ElevationClient
+	LoginStart      trayapp.LoginStart
+	PortableRoot    string
+	WebViewDataPath string
+	TrayExecutable  string
+	TaskDefinition  task.Definition
+	Locations       map[traymodel.LocationKind]trayapp.Location
+	FinalPaths      interface {
 		trayapp.PathResolver
 		bootstrap.FinalPathResolver
 	}
@@ -83,7 +85,7 @@ func composeProductionBackendWith(inputs productionCompositionInputs) (*Backend,
 		Locations: inputs.Locations, PathResolver: inputs.FinalPaths,
 		Opener: inputs.Opener, Workers: inputs.Workers, ProcessWaiter: inputs.ProcessWaiter,
 	})
-	return &Backend{ctx: state, service: service, lifecycle: lifecycle, quit: inputs.Quit}, nil
+	return &Backend{ctx: state, service: service, lifecycle: lifecycle, quit: inputs.Quit, webViewDataPath: inputs.WebViewDataPath}, nil
 }
 
 func validateProductionComposition(inputs productionCompositionInputs) error {
@@ -102,6 +104,9 @@ func validateProductionComposition(inputs productionCompositionInputs) error {
 		!strings.HasPrefix(inputs.TaskDefinition.UserSID, "S-1-") {
 		return errors.New("production composition: fixed authority invalid")
 	}
+	if !validCompositionDirectory(inputs.PortableRoot) || !strictlyWithinCompositionRoot(inputs.WebViewDataPath, inputs.PortableRoot) {
+		return errors.New("production composition: portable data invalid")
+	}
 	for _, kind := range []traymodel.LocationKind{
 		traymodel.AgentLogs, traymodel.HelperLogs, traymodel.AgentBackup, traymodel.HelperBackup,
 	} {
@@ -119,6 +124,16 @@ func validCompositionExecutable(value, base string) bool {
 
 func validCompositionFile(value string) bool {
 	return value != "" && filepath.IsAbs(value) && filepath.Clean(value) == value && filepath.Base(value) != "."
+}
+
+func validCompositionDirectory(value string) bool { return validCompositionFile(value) }
+
+func strictlyWithinCompositionRoot(path, root string) bool {
+	if !validCompositionFile(path) || !validCompositionDirectory(root) {
+		return false
+	}
+	relative, err := filepath.Rel(strings.ToLower(filepath.Clean(root)), strings.ToLower(filepath.Clean(path)))
+	return err == nil && relative != "." && relative != ".." && !filepath.IsAbs(relative) && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
 }
 
 type preparedRuntimeLifecycle struct {

@@ -745,18 +745,19 @@ func TestMainReportsWailsInitializationFailureWithOnlyStableCode(t *testing.T) {
 
 	originalCompose := composeBackend
 	originalWailsRun := wailsRunAdapter
-	originalUserConfig := userConfigDirAdapter
 	originalNormalTray := runNormalTray
 	originalFailureLog := startupFailureLogAdapter
 	t.Cleanup(func() {
 		composeBackend = originalCompose
 		wailsRunAdapter = originalWailsRun
-		userConfigDirAdapter = originalUserConfig
 		runNormalTray = originalNormalTray
 		startupFailureLogAdapter = originalFailureLog
 	})
-	composeBackend = func() (*Backend, error) { return NewBackend(service), nil }
-	userConfigDirAdapter = func() (string, error) { return t.TempDir(), nil }
+	composeBackend = func() (*Backend, error) {
+		backend := NewBackend(service)
+		backend.webViewDataPath = `D:\便携 工具\Compute\data\nodetray\webview2`
+		return backend, nil
+	}
 	wailsRunAdapter = func(*options.App) error { return rawFailure }
 	runNormalTray = runNormalWails
 	var logs []string
@@ -776,6 +777,28 @@ func TestMainReportsWailsInitializationFailureWithOnlyStableCode(t *testing.T) {
 	}
 	if calls := recorder.snapshot(); len(calls) != 0 {
 		t.Fatalf("Wails pre-start failure reached component services: %v", calls)
+	}
+}
+
+func TestRunNormalWailsUsesBackendPortableWebViewData(t *testing.T) {
+	service, _, _ := newBackendTestService(t)
+	originalCompose, originalWailsRun, originalNormalTray := composeBackend, wailsRunAdapter, runNormalTray
+	t.Cleanup(func() {
+		composeBackend, wailsRunAdapter, runNormalTray = originalCompose, originalWailsRun, originalNormalTray
+	})
+	composeBackend = func() (*Backend, error) {
+		backend := NewBackend(service)
+		backend.webViewDataPath = `D:\便携 工具\Compute\data\nodetray\webview2`
+		return backend, nil
+	}
+	var gotPath string
+	wailsRunAdapter = func(app *options.App) error { gotPath = app.Windows.WebviewUserDataPath; return nil }
+	runNormalTray = runNormalWails
+	if err := runNormalWails(false); err != nil {
+		t.Fatalf("runNormalWails: %v", err)
+	}
+	if gotPath != `D:\便携 工具\Compute\data\nodetray\webview2` {
+		t.Fatalf("WebView2 data path = %q", gotPath)
 	}
 }
 

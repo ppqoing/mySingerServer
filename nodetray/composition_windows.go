@@ -25,10 +25,7 @@ import (
 	"dedup/internal/nodetray/windows/loginstart"
 	"dedup/internal/nodetray/windows/singleinstance"
 	"dedup/internal/nodetray/windows/task"
-	"golang.org/x/sys/windows"
 )
-
-type windowsKnownFolderLookup func(*windows.KNOWNFOLDERID, uint32) (string, error)
 
 type windowsProductionStore interface {
 	trayapp.Store
@@ -62,10 +59,6 @@ func init() {
 }
 
 func composeWindowsProductionBackend() (*Backend, error) {
-	layout, err := resolveWindowsLayout(windows.KnownFolderPath)
-	if err != nil {
-		return nil, err
-	}
 	identity, err := machineid.Current()
 	if err != nil {
 		return nil, errors.New("production composition: machine identity unavailable")
@@ -78,14 +71,18 @@ func composeWindowsProductionBackend() (*Backend, error) {
 	if err != nil {
 		return nil, errors.New("production composition: current process identity unavailable")
 	}
+	layout, err := production.ResolvePortableLayout(self.ExecutablePath)
+	if err != nil {
+		return nil, errors.New("production composition: portable layout unavailable")
+	}
 	finalTray, err := (bootstrap.OSFinalPathResolver{}).Final(layout.TrayExecutable)
 	if err != nil {
-		return nil, errors.New("production composition: fixed tray executable unavailable")
+		return nil, errors.New("production composition: portable tray executable unavailable")
 	}
 	expected := self
 	expected.ExecutablePath = finalTray
 	if !process.SameProcess(expected, self) {
-		return nil, errors.New("production composition: current executable is outside fixed deployment")
+		return nil, errors.New("production composition: current executable is outside portable deployment")
 	}
 	userSID, err := process.UserSIDForProcess(self)
 	if err != nil {
@@ -137,25 +134,6 @@ func composeWindowsProductionBackend() (*Backend, error) {
 	return composeProductionBackendWith(inputs)
 }
 
-func resolveWindowsLayout(lookup windowsKnownFolderLookup) (production.Layout, error) {
-	if lookup == nil {
-		return production.Layout{}, errors.New("production composition: known-folder resolver unavailable")
-	}
-	programFiles, err := lookup(windows.FOLDERID_ProgramFiles, 0)
-	if err != nil {
-		return production.Layout{}, errors.New("production composition: Program Files unavailable")
-	}
-	programData, err := lookup(windows.FOLDERID_ProgramData, 0)
-	if err != nil {
-		return production.Layout{}, errors.New("production composition: ProgramData unavailable")
-	}
-	localAppData, err := lookup(windows.FOLDERID_LocalAppData, 0)
-	if err != nil {
-		return production.Layout{}, errors.New("production composition: LocalAppData unavailable")
-	}
-	return production.ResolveLayout(programFiles, programData, localAppData)
-}
-
 func buildWindowsProductionInputs(layout production.Layout, userSID string, native windowsProductionNative) (productionCompositionInputs, error) {
 	if native.Store == nil || native.Inspector == nil || native.AgentLauncher == nil || native.HelperLauncher == nil ||
 		native.Terminator == nil || native.Dialer == nil || !machineid.Valid(native.MachineID) || native.Task == nil ||
@@ -195,6 +173,7 @@ func buildWindowsProductionInputs(layout production.Layout, userSID string, nati
 		Agent:     factory.Agent(), Helper: factory.Helper(),
 		AgentFingerprint: factory.Agent(), HelperFingerprint: factory.Helper(),
 		Task: native.Task, Elevation: native.Elevation, LoginStart: native.LoginStart,
+		PortableRoot: layout.Root, WebViewDataPath: layout.WebViewData,
 		TrayExecutable: layout.TrayExecutable,
 		TaskDefinition: task.Definition{HelperExecutable: layout.HelperExecutable, HelperConfig: layout.HelperConfig, UserSID: userSID},
 		Locations:      fixedCompositionLocations(layout),
