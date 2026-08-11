@@ -102,6 +102,33 @@ func TestGUIStartupFailureIsLoggedBeforeInteractiveNotification(t *testing.T) {
 	}
 }
 
+func TestGUIPingFailureIsLoggedBeforeInteractiveNotification(t *testing.T) {
+	originalExecutable, originalNotify := guiExecutablePath, guiShowStartupError
+	defer func() { guiExecutablePath, guiShowStartupError = originalExecutable, originalNotify }()
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "gui.json"), []byte(`{
+        "pg_dsn":"postgres://user:secret@127.0.0.1:1/dedup?connect_timeout=1",
+        "agents":[{"addr":"127.0.0.1:9101"}]
+    }`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	guiExecutablePath = func() (string, error) { return filepath.Join(root, "gui.exe"), nil }
+	var notification string
+	guiShowStartupError = func(message string) {
+		notification = message
+		content, err := os.ReadFile(filepath.Join(root, "data", "logs", "gui.log"))
+		if err != nil || !strings.Contains(string(content), "ping postgres") {
+			t.Fatalf("ping failure was not logged before notification: %v %q", err, content)
+		}
+	}
+	if err := executeGUI(nil); err == nil {
+		t.Fatal("expected postgres ping error")
+	}
+	if notification == "" || strings.Contains(notification, "secret") || strings.Contains(notification, root) {
+		t.Fatalf("unsafe notification = %q", notification)
+	}
+}
+
 func TestLoadGUIRuntimeReturnsAbsoluteNonDefaultPath(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "custom-gui.json")
 	if err := os.WriteFile(path, []byte(`{

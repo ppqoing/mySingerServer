@@ -551,6 +551,7 @@ func serveGUIAfterBind(
 ) error {
 	listener, err := guiListen("tcp", listenAddr)
 	if err != nil {
+		logger.Error("gui startup failed", "stage", "bind GUI listener", "err", err)
 		return fmt.Errorf("bind GUI listener: %w", err)
 	}
 	defer listener.Close()
@@ -579,6 +580,11 @@ func executeGUI(args []string) error {
 		guiShowStartupError("GUI 启动失败，请检查便携目录中的 gui.json 和 data\\logs\\gui.log。")
 	}
 	return err
+}
+
+func guiStartupFailure(logger *slog.Logger, stage string, err error) error {
+	logger.Error("gui startup failed", "stage", stage, "err", err)
+	return fmt.Errorf("%s: %w", stage, err)
 }
 
 func loadGUIRuntime(path string) (string, *config.GUIConfig, error) {
@@ -616,23 +622,21 @@ func run(args []string) error {
 	defer closeLogger()
 	cfg, err := config.LoadGUI(runtimePaths.ConfigPath)
 	if err != nil {
-		logger.Error("gui startup failed", "stage", "load config", "err", err)
-		return fmt.Errorf("load config: %w", err)
+		return guiStartupFailure(logger, "load config", err)
 	}
 	configService, err := gui.NewGUIConfigService(runtimePaths.ConfigPath, cfg)
 	if err != nil {
-		logger.Error("gui startup failed", "stage", "initialize config service", "err", err)
-		return fmt.Errorf("initialize GUI config service: %w", err)
+		return guiStartupFailure(logger, "initialize GUI config service", err)
 	}
 	pg, err := pgxpool.New(context.Background(), cfg.PGDSN)
 	if err != nil {
-		return fmt.Errorf("parse postgres DSN: %w", err)
+		return guiStartupFailure(logger, "parse postgres DSN", err)
 	}
 	defer pg.Close()
 	pingContext, cancelPing := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelPing()
 	if err := pg.Ping(pingContext); err != nil {
-		return fmt.Errorf("postgres unreachable: %w", err)
+		return guiStartupFailure(logger, "ping postgres", err)
 	}
 	cancelPing()
 
@@ -644,7 +648,7 @@ func run(args []string) error {
 	defer cancelProcess()
 	tasks := gui.NewTaskRegistry(pg, logger)
 	if err := tasks.Restore(processContext); err != nil {
-		return fmt.Errorf("restore scan tasks: %w", err)
+		return guiStartupFailure(logger, "restore scan tasks", err)
 	}
 	var phase2Dispatcher *phase2.Dispatcher
 	var phase2Rescreener *phase2.Rescreener
@@ -684,7 +688,7 @@ func run(args []string) error {
 		logger,
 	)
 	if err := phase2Dispatcher.RestorePending(processContext); err != nil {
-		return fmt.Errorf("restore phase2 tasks: %w", err)
+		return guiStartupFailure(logger, "restore phase2 tasks", err)
 	}
 	phase2Rescreener = phase2.NewRescreener(pg, cfg.Phase2, logger)
 	restoreContext, cancelRestore := context.WithTimeout(
@@ -693,7 +697,7 @@ func run(args []string) error {
 	)
 	if err := phase2Rescreener.Restore(restoreContext); err != nil {
 		cancelRestore()
-		return fmt.Errorf("restore phase2 rescreener: %w", err)
+		return guiStartupFailure(logger, "restore phase2 rescreener", err)
 	}
 	phase2Router = newPhase2Orchestration(
 		phase2Rescreener,

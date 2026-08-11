@@ -37,3 +37,9 @@ git diff --check
 
 - 未在真实 Windows 桌面环境点击 MessageBox 或验证默认浏览器实际启动；自动化测试仅验证调用顺序和错误边界。
 - 未验证真实 PostgreSQL、真实配置和长期服务关闭流程；这些不属于本 Task 3 的单元/静态验证范围。
+
+## 追加修正：启动失败日志
+
+审查发现 logger 创建后的 PostgreSQL 解析/连通性与任务恢复路径并不都写入本次便携日志。先新增 `TestGUIPingFailureIsLoggedBeforeInteractiveNotification`：有效 GUI 配置指向不可达 PostgreSQL 时，旧实现的 RED 为通知前无法读取含 `ping postgres` 的 `data\\logs\\gui.log`。
+
+GREEN 将 logger 创建后的启动失败统一经 `guiStartupFailure` 记录稳定阶段名和内部 error，覆盖配置服务、DSN 解析、PostgreSQL Ping、扫描任务恢复、Phase 2 恢复与重筛恢复；监听绑定失败也在返回前记录。通知仍为固定脱敏中文摘要。新增测试通过。
