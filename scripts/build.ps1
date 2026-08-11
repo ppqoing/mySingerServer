@@ -133,6 +133,10 @@ if ($useVideoCore) {
         -B $videoCoreBuild `
         -G "Visual Studio 17 2022" `
         -A x64 `
+        "-DCMAKE_EXE_LINKER_FLAGS=" `
+        "-DCMAKE_SHARED_LINKER_FLAGS=" `
+        "-DCMAKE_MODULE_LINKER_FLAGS=" `
+        "-DCMAKE_STATIC_LINKER_FLAGS=" `
         "-DCMAKE_TOOLCHAIN_FILE=$toolchainCMake" `
         -DVCPKG_TARGET_TRIPLET=x64-windows-static `
         "-DVC_FFMPEG_ROOT=$ffmpegRootCMake"
