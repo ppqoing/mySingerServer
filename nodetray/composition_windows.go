@@ -59,7 +59,42 @@ type windowsProductionCompositionDependencies struct {
 	Inspector       process.Inspector
 	FinalPath       func(string) (string, error)
 	UserSID         func(process.Identity) (string, error)
-	BuildInputs     func(production.Layout, string, process.Inspector, machineid.Result) (productionCompositionInputs, error)
+	Constructors    windowsProductionConstructors
+}
+
+type windowsProductionConstructors struct {
+	NewStore          func(trayconfig.Paths) (windowsProductionStore, error)
+	NewTask           func(task.Capability) (task.Service, error)
+	NewLoginStart     func(string) (trayapp.LoginStart, error)
+	NewElevation      func(string, process.Inspector) (trayapp.ElevationClient, error)
+	NewAgentLauncher  func(process.Inspector) supervisor.Launcher
+	NewHelperLauncher func(process.HandleInspector) supervisor.Launcher
+}
+
+func defaultWindowsProductionConstructors() windowsProductionConstructors {
+	return windowsProductionConstructors{
+		NewStore: func(paths trayconfig.Paths) (windowsProductionStore, error) {
+			return trayconfig.NewStore(paths)
+		},
+		NewTask: task.New,
+		NewLoginStart: func(executable string) (trayapp.LoginStart, error) {
+			return loginstart.New(executable)
+		},
+		NewElevation: func(executable string, inspector process.Inspector) (trayapp.ElevationClient, error) {
+			return elevation.NewClient(executable, inspector)
+		},
+		NewAgentLauncher: func(inspector process.Inspector) supervisor.Launcher {
+			return process.NewAgentLauncher(inspector)
+		},
+		NewHelperLauncher: func(inspector process.HandleInspector) supervisor.Launcher {
+			return process.NewManualHelperLauncher(nil, inspector)
+		},
+	}
+}
+
+func (constructors windowsProductionConstructors) available() bool {
+	return constructors.NewStore != nil && constructors.NewTask != nil && constructors.NewLoginStart != nil &&
+		constructors.NewElevation != nil && constructors.NewAgentLauncher != nil && constructors.NewHelperLauncher != nil
 }
 
 func init() {
@@ -73,12 +108,12 @@ func composeWindowsProductionBackend() (*Backend, error) {
 		Inspector:       inspector,
 		FinalPath:       (bootstrap.OSFinalPathResolver{}).Final,
 		UserSID:         process.UserSIDForProcess,
-		BuildInputs:     buildWindowsProductionInputsForLayout,
+		Constructors:    defaultWindowsProductionConstructors(),
 	})
 }
 
 func composeWindowsProductionBackendWith(dependencies windowsProductionCompositionDependencies) (*Backend, error) {
-	if dependencies.MachineIdentity == nil || dependencies.Inspector == nil || dependencies.FinalPath == nil || dependencies.UserSID == nil || dependencies.BuildInputs == nil {
+	if dependencies.MachineIdentity == nil || dependencies.Inspector == nil || dependencies.FinalPath == nil || dependencies.UserSID == nil || !dependencies.Constructors.available() {
 		return nil, errors.New("production composition: Windows dependencies unavailable")
 	}
 	identity, err := dependencies.MachineIdentity()
@@ -109,30 +144,30 @@ func composeWindowsProductionBackendWith(dependencies windowsProductionCompositi
 	if err != nil {
 		return nil, errors.New("production composition: current user identity unavailable")
 	}
-	inputs, err := dependencies.BuildInputs(layout, userSID, dependencies.Inspector, identity)
+	inputs, err := buildWindowsProductionInputsForLayout(layout, userSID, dependencies.Inspector, identity, dependencies.Constructors)
 	if err != nil {
 		return nil, err
 	}
 	return composeProductionBackendWith(inputs)
 }
 
-func buildWindowsProductionInputsForLayout(layout production.Layout, userSID string, inspector process.Inspector, identity machineid.Result) (productionCompositionInputs, error) {
-	store, err := trayconfig.NewStore(trayconfig.Paths{
+func buildWindowsProductionInputsForLayout(layout production.Layout, userSID string, inspector process.Inspector, identity machineid.Result, constructors windowsProductionConstructors) (productionCompositionInputs, error) {
+	store, err := constructors.NewStore(trayconfig.Paths{
 		TraySettings: layout.TraySettings, AgentConfig: layout.AgentConfig, HelperConfig: layout.HelperConfig,
 		AgentExecutable: layout.AgentExecutable, HelperExecutable: layout.HelperExecutable,
 	})
 	if err != nil {
 		return productionCompositionInputs{}, errors.New("production composition: configuration store unavailable")
 	}
-	userTask, err := task.New(task.CapabilityUser)
+	userTask, err := constructors.NewTask(task.CapabilityUser)
 	if err != nil {
 		return productionCompositionInputs{}, errors.New("production composition: task service unavailable")
 	}
-	login, err := loginstart.New(layout.TrayExecutable)
+	login, err := constructors.NewLoginStart(layout.TrayExecutable)
 	if err != nil {
 		return productionCompositionInputs{}, errors.New("production composition: login-start service unavailable")
 	}
-	elevationClient, err := elevation.NewClient(layout.TrayExecutable, inspector)
+	elevationClient, err := constructors.NewElevation(layout.TrayExecutable, inspector)
 	if err != nil {
 		return productionCompositionInputs{}, errors.New("production composition: elevation client unavailable")
 	}
@@ -142,8 +177,8 @@ func buildWindowsProductionInputsForLayout(layout production.Layout, userSID str
 	}
 	native := windowsProductionNative{
 		Store: store, Inspector: inspector,
-		AgentLauncher:  process.NewAgentLauncher(inspector),
-		HelperLauncher: process.NewManualHelperLauncher(nil, handleInspector),
+		AgentLauncher:  constructors.NewAgentLauncher(inspector),
+		HelperLauncher: constructors.NewHelperLauncher(handleInspector),
 		Terminator:     process.NewDirectTerminator(),
 		Dialer:         nodectlDialer{}, MachineID: identity.ID,
 		Task: userTask, Elevation: elevationClient, LoginStart: login,

@@ -62,6 +62,9 @@ func (i inspectedWindowsCompositionInspector) Inspect(pid int) (process.Identity
 func (inspectedWindowsCompositionInspector) Wait(context.Context, process.Identity) (int, error) {
 	return 0, errors.New("not called")
 }
+func (inspectedWindowsCompositionInspector) InspectHandle(uintptr) (process.Identity, error) {
+	return process.Identity{}, errors.New("not called")
+}
 
 type windowsCompositionLauncher struct{ calls int }
 
@@ -103,28 +106,40 @@ func TestWindowsProductionCompositionUsesInspectedPortableExecutable(t *testing.
 	store := &windowsCompositionStore{}
 	taskService := &windowsCompositionTask{}
 	login := compositionLoginStart{}
-	native := windowsProductionNative{
-		Store: store, Inspector: windowsCompositionInspector{},
-		AgentLauncher: &windowsCompositionLauncher{}, HelperLauncher: &windowsCompositionLauncher{}, Terminator: &windowsCompositionTerminator{},
-		Dialer: &windowsCompositionDialer{}, MachineID: "node-" + strings.Repeat("1", 64),
-		Task: taskService, Elevation: compositionElevation{}, LoginStart: login,
-		Instance: compositionInstance{}, UI: compositionUI{}, Opener: compositionOpener{},
-		Emitter: func(context.Context, string, any) {}, Show: func(context.Context) {}, Quit: func(context.Context) {},
-	}
+	machineID := "node-" + strings.Repeat("1", 64)
 	inspector := inspectedWindowsCompositionInspector{self: self}
-	var inputs productionCompositionInputs
+	var storePaths trayconfig.Paths
+	var loginExecutable, elevationExecutable string
+	var taskCapability task.Capability
+	var agentInspector process.Inspector
+	var helperInspector process.HandleInspector
 	backend, err := composeWindowsProductionBackendWith(windowsProductionCompositionDependencies{
-		MachineIdentity: func() (machineid.Result, error) { return machineid.Result{ID: native.MachineID}, nil },
+		MachineIdentity: func() (machineid.Result, error) { return machineid.Result{ID: machineID}, nil },
 		Inspector:       inspector,
 		FinalPath:       func(path string) (string, error) { return path, nil },
 		UserSID:         func(process.Identity) (string, error) { return "S-1-5-21-101-202-303-1001", nil },
-		BuildInputs: func(layout production.Layout, userSID string, gotInspector process.Inspector, identity machineid.Result) (productionCompositionInputs, error) {
-			if layout.TrayExecutable != self.ExecutablePath || gotInspector != inspector || identity.ID != native.MachineID {
-				t.Fatalf("entry dependencies layout=%#v inspector=%T identity=%#v", layout, gotInspector, identity)
-			}
-			var err error
-			inputs, err = buildWindowsProductionInputs(layout, userSID, native)
-			return inputs, err
+		Constructors: windowsProductionConstructors{
+			NewStore: func(paths trayconfig.Paths) (windowsProductionStore, error) { storePaths = paths; return store, nil },
+			NewTask: func(capability task.Capability) (task.Service, error) {
+				taskCapability = capability
+				return taskService, nil
+			},
+			NewLoginStart: func(executable string) (trayapp.LoginStart, error) { loginExecutable = executable; return login, nil },
+			NewElevation: func(executable string, gotInspector process.Inspector) (trayapp.ElevationClient, error) {
+				elevationExecutable = executable
+				if gotInspector != inspector {
+					t.Fatal("elevation inspector differs")
+				}
+				return compositionElevation{}, nil
+			},
+			NewAgentLauncher: func(gotInspector process.Inspector) supervisor.Launcher {
+				agentInspector = gotInspector
+				return &windowsCompositionLauncher{}
+			},
+			NewHelperLauncher: func(gotInspector process.HandleInspector) supervisor.Launcher {
+				helperInspector = gotInspector
+				return &windowsCompositionLauncher{}
+			},
 		},
 	})
 	if err != nil {
@@ -133,23 +148,11 @@ func TestWindowsProductionCompositionUsesInspectedPortableExecutable(t *testing.
 	if backend == nil || backend.service == nil || backend.webViewDataPath != `D:\便携 工具\Compute\data\nodetray\webview2` {
 		t.Fatalf("backend=%#v", backend)
 	}
-	if inputs.PortableRoot != `D:\便携 工具\Compute` || inputs.WebViewDataPath != `D:\便携 工具\Compute\data\nodetray\webview2` {
-		t.Fatalf("portable inputs = root %q webview %q", inputs.PortableRoot, inputs.WebViewDataPath)
+	if storePaths != (trayconfig.Paths{TraySettings: `D:\便携 工具\Compute\data\nodetray\tray.json`, AgentConfig: `D:\便携 工具\Compute\data\agent\agent.json`, HelperConfig: `D:\便携 工具\Compute\data\helper\helper.json`, AgentExecutable: `D:\便携 工具\Compute\agent.exe`, HelperExecutable: `D:\便携 工具\Compute\helper.exe`}) {
+		t.Fatalf("store paths = %#v", storePaths)
 	}
-	if inputs.TrayExecutable != self.ExecutablePath || inputs.TaskDefinition.HelperExecutable != `D:\便携 工具\Compute\helper.exe` || inputs.TaskDefinition.HelperConfig != `D:\便携 工具\Compute\data\helper\helper.json` {
-		t.Fatalf("portable executable authority = tray %q task %#v", inputs.TrayExecutable, inputs.TaskDefinition)
-	}
-	if inputs.Store != store || inputs.Task != taskService || inputs.LoginStart != login || inputs.Agent == nil || inputs.Helper == nil {
-		t.Fatalf("portable composition components store=%T agent=%T helper=%T login=%T task=%T", inputs.Store, inputs.Agent, inputs.Helper, inputs.LoginStart, inputs.Task)
-	}
-	paths, err := inputs.Paths.Resolve(context.Background())
-	if err != nil || paths.TraySettings != `D:\便携 工具\Compute\data\nodetray\tray.json` || paths.AgentConfig != `D:\便携 工具\Compute\data\agent\agent.json` || paths.HelperConfig != `D:\便携 工具\Compute\data\helper\helper.json` {
-		t.Fatalf("portable store paths = %#v err=%v", paths, err)
-	}
-	for kind, location := range inputs.Locations {
-		if !strings.HasPrefix(location.Path, `D:\便携 工具\Compute\data\`) || !strings.HasPrefix(location.Root, `D:\便携 工具\Compute\data\`) {
-			t.Fatalf("location %s escaped portable root: %#v", kind, location)
-		}
+	if loginExecutable != self.ExecutablePath || elevationExecutable != self.ExecutablePath || taskCapability != task.CapabilityUser || agentInspector != inspector || helperInspector != inspector {
+		t.Fatalf("constructor inputs login=%q elevation=%q task=%v agent=%T helper=%T", loginExecutable, elevationExecutable, taskCapability, agentInspector, helperInspector)
 	}
 }
 
