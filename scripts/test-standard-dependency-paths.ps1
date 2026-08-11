@@ -34,7 +34,7 @@ function Assert-EntryRejectsRepositoryCache {
     if ($output -notmatch "DEPENDENCY_PATH_INSIDE_REPOSITORY label=$ExpectedLabel") {
         throw "STANDARD_PATH_ENTRY_REJECTION_MISSING entry=$Entry label=$ExpectedLabel output=$output"
     }
-    if ($output -match 'COSTLY_FAKE_(GO|NPM|NODE)_CALLED') {
+    if ($output -match 'COSTLY_FAKE_(GO|NPM|NODE|CMAKE)_CALLED') {
         throw "STANDARD_PATH_ENTRY_DID_NOT_FAIL_EARLY entry=$Entry output=$output"
     }
 }
@@ -131,7 +131,7 @@ try {
     Set-Content -LiteralPath $fakeCmake -Value @(
         '@echo off',
         'echo COSTLY_FAKE_CMAKE_CALLED',
-        'exit /b 17'
+        'exit /b 0'
     )
     Set-Content -LiteralPath (Join-Path $fakeTools 'ctest.exe') -Value 'fixture'
 
