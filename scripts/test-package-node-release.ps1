@@ -38,12 +38,19 @@ try {
             'agent.exe',
             'worker.exe',
             'helper.exe',
+            'Everything.exe',
             'Everything64.dll',
             'MicrosoftEdgeWebview2Setup.exe',
             'videocore.dll',
             'avcodec-fixture.dll')) {
         Write-Utf8NoBom -Path (Join-Path $stage $name) -Value "fixture:$name"
     }
+    $licenses = Join-Path $stage 'licenses'
+    New-Item -ItemType Directory -Path $licenses | Out-Null
+    Write-Utf8NoBom -Path (Join-Path $licenses 'everything-LICENSE.txt') `
+        -Value 'fixture:everything-license'
+    Write-Utf8NoBom -Path (Join-Path $licenses 'everything-NOTICE.md') `
+        -Value 'fixture:everything-notice'
     Copy-Item -LiteralPath (Join-Path $repo 'deploy\agent.example.json') `
         -Destination (Join-Path $stage 'agent.example.json')
     Copy-Item -LiteralPath (Join-Path $repo 'deploy\helper.example.json') `
@@ -102,6 +109,7 @@ try {
             Sort-Object
     )
     $expectedFiles = @(
+        'Everything.exe',
         'Everything64.dll',
         'MicrosoftEdgeWebview2Setup.exe',
         'README-节点部署.md',
@@ -112,6 +120,8 @@ try {
         'helper.exe',
         'licenses/ffmpeg-LICENSE.txt',
         'licenses/ffmpeg-NOTICE.md',
+        'licenses/everything-LICENSE.txt',
+        'licenses/everything-NOTICE.md',
         'licenses/webview2-NOTICE.md',
         'native-dependencies.json',
         'nodetray.exe',

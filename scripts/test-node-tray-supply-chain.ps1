@@ -49,6 +49,10 @@ $required = @(
     "third_party\webview2\manifest.json",
     "third_party\webview2\NOTICE.md",
     "third_party\webview2\MicrosoftEdgeWebview2Setup.exe",
+    "third_party\everything\Everything.exe",
+    "third_party\everything\LICENSE.txt",
+    "third_party\everything\NOTICE.md",
+    "third_party\everything\manifest.json",
     "nodetray\frontend\package-lock.json",
     "nodetray\build\windows\nodetray.manifest"
 )
@@ -170,6 +174,9 @@ if (Test-Path -LiteralPath $coreBuild -PathType Leaf) {
     foreach ($name in @(
         'nodetray.exe',
         'MicrosoftEdgeWebview2Setup.exe',
+        'Everything.exe',
+        'everything-LICENSE.txt',
+        'everything-NOTICE.md',
         'agent.example.json',
         'helper.example.json'
     )) {

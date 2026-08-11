@@ -413,9 +413,52 @@ if ($SkipNodeTrayBuild) {
     }
 }
 
-Copy-Item -Force `
-    (Join-Path $repo "third_party\everything_sdk\Everything64.dll") `
-    (Join-Path $out "Everything64.dll")
+$everythingRoot = Join-Path $repo "third_party\everything"
+$everythingManifestPath = Join-Path $everythingRoot "manifest.json"
+if (-not (Test-Path -LiteralPath $everythingManifestPath -PathType Leaf)) {
+    throw "EVERYTHING_MANIFEST_NOT_FOUND path=$everythingManifestPath"
+}
+$everythingManifest = Get-Content -Raw -LiteralPath $everythingManifestPath |
+    ConvertFrom-Json
+if ($everythingManifest.schema_version -ne 1 -or
+    [string]$everythingManifest.version -cne "1.4.1.1032" -or
+    [string]$everythingManifest.architecture -cne "x64") {
+    throw "EVERYTHING_MANIFEST_INVALID"
+}
+foreach ($name in @("Everything.exe", "LICENSE.txt")) {
+    $entry = @($everythingManifest.files | Where-Object path -CEQ $name)
+    if ($entry.Count -ne 1) {
+        throw "EVERYTHING_MANIFEST_FILE_INVALID name=$name"
+    }
+    $source = Join-Path $everythingRoot $name
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+        throw "EVERYTHING_SOURCE_NOT_FOUND path=$source"
+    }
+    $item = Get-Item -LiteralPath $source
+    $hash = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($item.Length -ne [long]$entry[0].size -or
+        $hash -cne [string]$entry[0].sha256) {
+        throw "EVERYTHING_SOURCE_HASH_MISMATCH name=$name"
+    }
+}
+$everythingNotice = Join-Path $everythingRoot "NOTICE.md"
+if (-not (Test-Path -LiteralPath $everythingNotice -PathType Leaf)) {
+    throw "EVERYTHING_NOTICE_NOT_FOUND path=$everythingNotice"
+}
+$everythingSDK = Join-Path $repo "third_party\everything_sdk\Everything64.dll"
+if (-not (Test-Path -LiteralPath $everythingSDK -PathType Leaf)) {
+    throw "EVERYTHING_SDK_NOT_FOUND path=$everythingSDK"
+}
+$everythingLicenses = Join-Path $out "licenses"
+New-Item -ItemType Directory -Path $everythingLicenses -Force | Out-Null
+Copy-Item -LiteralPath (Join-Path $everythingRoot "Everything.exe") `
+    -Destination (Join-Path $out "Everything.exe")
+Copy-Item -LiteralPath $everythingSDK `
+    -Destination (Join-Path $out "Everything64.dll")
+Copy-Item -LiteralPath (Join-Path $everythingRoot "LICENSE.txt") `
+    -Destination (Join-Path $everythingLicenses "everything-LICENSE.txt")
+Copy-Item -LiteralPath $everythingNotice `
+    -Destination (Join-Path $everythingLicenses "everything-NOTICE.md")
 
 foreach ($name in @("agent", "gui")) {
     $example = Join-Path $repo "deploy\$name.example.json"
@@ -442,6 +485,10 @@ $requiredStageFiles = @(
     "helper.exe",
     "worker.exe",
     "videocore.dll",
+    "Everything.exe",
+    "Everything64.dll",
+    "licenses\everything-LICENSE.txt",
+    "licenses\everything-NOTICE.md",
     "agent.example.json",
     "helper.example.json"
 )

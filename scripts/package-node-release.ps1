@@ -192,7 +192,10 @@ try {
             'agent.exe',
             'worker.exe',
             'helper.exe',
+            'Everything.exe',
             'Everything64.dll',
+            'licenses\everything-LICENSE.txt',
+            'licenses\everything-NOTICE.md',
             'MicrosoftEdgeWebview2Setup.exe',
             'agent.example.json',
             'helper.example.json')) {
