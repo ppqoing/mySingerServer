@@ -22,9 +22,91 @@ import (
 	agentdelete "dedup/internal/agent/delete"
 	"dedup/internal/agentcontrol"
 	"dedup/internal/config"
+	fileenum "dedup/internal/enum"
 	"dedup/internal/machineid"
 	"dedup/internal/proto"
 )
+
+func TestNewAgentEnumeratorDisabledUsesWalker(t *testing.T) {
+	primary := &agentAvailabilityProbe{
+		called: make(chan struct{}),
+		err:    fileenum.ErrIndexNotReady,
+	}
+	enumr := newAgentEnumerator(context.Background(), agentEnumeratorOptions{
+		Enabled: false,
+		Primary: primary,
+	})
+	if enumr.Name() != "walker" {
+		t.Fatalf("enumerator name = %q, want walker", enumr.Name())
+	}
+	select {
+	case <-primary.called:
+		t.Fatal("disabled Everything configuration started a readiness probe")
+	default:
+	}
+}
+
+func TestNewAgentEnumeratorEnabledDoesNotBlockStartup(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	primary := &agentAvailabilityProbe{
+		called: make(chan struct{}),
+		err:    fileenum.ErrIndexNotReady,
+	}
+	startCalls := 0
+	returned := make(chan fileenum.Enumerator, 1)
+	go func() {
+		returned <- newAgentEnumerator(ctx, agentEnumeratorOptions{
+			Enabled:  true,
+			Primary:  primary,
+			Fallback: fileenum.WalkerEnumerator{},
+			StartClient: func() error {
+				startCalls++
+				return nil
+			},
+			Poll: func(ctx context.Context) error {
+				<-ctx.Done()
+				return ctx.Err()
+			},
+			Logger: slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)),
+		})
+	}()
+
+	select {
+	case enumr := <-returned:
+		if enumr.Name() == "walker" {
+			t.Fatalf("enabled enumerator name = %q, want Everything wrapper", enumr.Name())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("newAgentEnumerator blocked Agent startup while index was not ready")
+	}
+	select {
+	case <-primary.called:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Everything readiness probe did not start in background")
+	}
+	if startCalls != 0 {
+		t.Fatalf("StartClient calls = %d, want 0 for a running client", startCalls)
+	}
+}
+
+type agentAvailabilityProbe struct {
+	called chan struct{}
+	once   sync.Once
+	err    error
+}
+
+func (e *agentAvailabilityProbe) Name() string { return "everything" }
+func (e *agentAvailabilityProbe) Available() error {
+	e.once.Do(func() { close(e.called) })
+	return e.err
+}
+func (e *agentAvailabilityProbe) Enum(
+	_ string,
+	_ func(fileenum.FileRecord) error,
+) error {
+	return nil
+}
 
 func fixedMachineIdentity(fill string) machineIdentityProvider {
 	return func() (machineid.Result, error) {

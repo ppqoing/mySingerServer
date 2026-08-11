@@ -51,6 +51,68 @@ type deleteLoggerFactory func(
 
 type machineIdentityProvider func() (machineid.Result, error)
 
+type agentEnumeratorOptions struct {
+	Enabled     bool
+	Primary     fileenum.Enumerator
+	Fallback    fileenum.Enumerator
+	StartClient func() error
+	Poll        func(context.Context) error
+	Logger      *slog.Logger
+}
+
+func newAgentEnumerator(
+	ctx context.Context,
+	options agentEnumeratorOptions,
+) fileenum.Enumerator {
+	if !options.Enabled {
+		return fileenum.WalkerEnumerator{}
+	}
+	if options.Fallback == nil {
+		options.Fallback = fileenum.WalkerEnumerator{}
+	}
+	if options.Logger == nil {
+		options.Logger = slog.Default()
+	}
+
+	var waitingMu sync.Mutex
+	var lastWaitingLog time.Time
+	enumerator := fileenum.NewAutoStartEnumerator(fileenum.AutoStartOptions{
+		Context:     ctx,
+		Primary:     options.Primary,
+		Fallback:    options.Fallback,
+		StartClient: options.StartClient,
+		Poll:        options.Poll,
+		OnWaiting: func(err error) {
+			waitingMu.Lock()
+			defer waitingMu.Unlock()
+			now := time.Now()
+			if !lastWaitingLog.IsZero() && now.Sub(lastWaitingLog) < 30*time.Second {
+				return
+			}
+			lastWaitingLog = now
+			options.Logger.Info("waiting for everything index", "err", err)
+		},
+		OnFallback: func(err error) {
+			options.Logger.Warn(
+				"everything unavailable, fallback to walker",
+				"err", err,
+			)
+		},
+		OnReady: func() {
+			options.Logger.Info("everything enumerator ready")
+		},
+		OnRootFallback: func(root string, cause error) {
+			options.Logger.Warn(
+				"everything root unavailable, fallback to walker",
+				"root", root,
+				"err", cause,
+			)
+		},
+	})
+	enumerator.Start()
+	return enumerator
+}
+
 func runWithDeleteLogger(
 	configPath string,
 	openDeleteLogger deleteLoggerFactory,
@@ -129,26 +191,23 @@ func runWithDependencies(
 		crashLogger,
 	)
 
-	var enumerator fileenum.Enumerator = fileenum.WalkerEnumerator{}
-	if cfg.UseEverything {
-		everything := fileenum.NewEverythingEnumerator()
-		if err := everything.Available(); err != nil {
-			logger.Warn("everything unavailable, fallback to walker", "err", err)
-		} else {
-			enumerator = fileenum.NewResilientEnumerator(
-				everything,
-				fileenum.WalkerEnumerator{},
-				func(root string, cause error) {
-					logger.Warn(
-						"everything root unavailable, fallback to walker",
-						"root", root,
-						"err", cause,
-					)
-				},
-			)
-		}
-	}
-	logger.Info("enumerator ready", "name", enumerator.Name())
+	ctx, stop := signal.NotifyContext(
+		context.Background(),
+		os.Interrupt,
+		syscall.SIGTERM,
+	)
+	defer stop()
+	everythingPath := filepath.Join(filepath.Dir(executablePath), "Everything.exe")
+	enumerator := newAgentEnumerator(ctx, agentEnumeratorOptions{
+		Enabled:  cfg.UseEverything,
+		Primary:  fileenum.NewEverythingEnumerator(),
+		Fallback: fileenum.WalkerEnumerator{},
+		StartClient: func() error {
+			return fileenum.StartEverythingClientAt(everythingPath)
+		},
+		Logger: logger,
+	})
+	logger.Info("enumerator configured", "name", enumerator.Name())
 
 	pg, err := pgxpool.New(context.Background(), cfg.PGDSN)
 	if err != nil {
@@ -165,12 +224,6 @@ func runWithDependencies(
 	}
 	cancelPing()
 
-	ctx, stop := signal.NotifyContext(
-		context.Background(),
-		os.Interrupt,
-		syscall.SIGTERM,
-	)
-	defer stop()
 	var statistics *stats.Collector
 	var statsSink *stats.JSONLSink
 	if cfg.Tuning.StatsEnabled {
