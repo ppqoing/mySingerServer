@@ -160,7 +160,7 @@ try {
                 $candidateCleanupState.HookRan = $true
                 throw 'INJECTED_CANDIDATE_CLEANUP_FAILURE'
             }
-        } -WarningVariable +candidateCleanupWarnings
+        } -WarningAction Stop -WarningVariable +candidateCleanupWarnings
     } catch {
         $candidateCleanupError = $_.Exception.Message
     }

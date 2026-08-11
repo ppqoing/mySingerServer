@@ -207,6 +207,6 @@ finally {
         }
     }
     catch {
-        Write-Warning 'PORTABLE_RELEASE_CANDIDATE_CLEANUP_WARNING'
+        Write-Warning 'PORTABLE_RELEASE_CANDIDATE_CLEANUP_WARNING' -WarningAction Continue
     }
 }
