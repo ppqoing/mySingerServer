@@ -6,6 +6,7 @@ param(
     [string]$OutDir = "bin",
     [string]$CMake = "",
     [string]$VcpkgRoot = "C:\vcpkg",
+    [string]$Vcpkg = "",
     [switch]$MediacoreOnly,
     [switch]$VideoCoreOnly,
     [string]$StageDir = "",
@@ -126,6 +127,9 @@ $toolchain = Join-Path $VcpkgRoot "scripts\buildsystems\vcpkg.cmake"
 if (-not (Test-Path -LiteralPath $toolchain -PathType Leaf)) {
     throw "vcpkg toolchain not found: $toolchain"
 }
+$provisionVcpkg = Join-Path $PSScriptRoot "provision-standard-vcpkg.ps1"
+& $provisionVcpkg -VcpkgRoot $VcpkgRoot -VcpkgExecutable $Vcpkg
+if ($LASTEXITCODE -ne 0) { throw "STANDARD_VCPKG_PROVISION_FAILED" }
 
 $ccExe = $null
 if ($useVideoCore) {
@@ -143,6 +147,7 @@ if ($useVideoCore) {
         "-DCMAKE_TOOLCHAIN_FILE=$toolchainCMake" `
         -DVCPKG_TARGET_TRIPLET=x64-windows-static `
         "-DVCPKG_INSTALLED_DIR=$($dependencyPaths.VcpkgInstalled)" `
+        -DVCPKG_MANIFEST_MODE=OFF `
         "-DVC_FFMPEG_ROOT=$ffmpegRootCMake"
     if ($LASTEXITCODE -ne 0) { throw "VIDEOCORE_CONFIGURE_FAILED" }
 
@@ -262,7 +267,8 @@ if ($MediacoreOnly) {
         -A x64 `
         "-DCMAKE_TOOLCHAIN_FILE=$($toolchain -replace '\\', '/')" `
         -DVCPKG_TARGET_TRIPLET=x64-windows-static `
-        "-DVCPKG_INSTALLED_DIR=$($dependencyPaths.VcpkgInstalled)"
+        "-DVCPKG_INSTALLED_DIR=$($dependencyPaths.VcpkgInstalled)" `
+        -DVCPKG_MANIFEST_MODE=OFF
     if ($LASTEXITCODE -ne 0) { throw "mediacore configure failed" }
     & $cmakeExe --build $mediacoreBuild --config Release
     if ($LASTEXITCODE -ne 0) { throw "mediacore Release build failed" }

@@ -43,6 +43,8 @@ function Assert-ConfigurePassesStandardInstalledDir {
     Assert-Contains -Actual @(Get-Content -LiteralPath $CaptureFile) `
         -Expected ("-DVCPKG_INSTALLED_DIR=" + $ExpectedInstalledDir) `
         -Label $Label
+    Assert-Contains -Actual @(Get-Content -LiteralPath $CaptureFile) `
+        -Expected '-DVCPKG_MANIFEST_MODE=OFF' -Label $Label
 }
 
 $fixture = Join-Path ([IO.Path]::GetTempPath()) `
@@ -78,6 +80,12 @@ try {
         '> "%MY_SINGER_FAKE_CMAKE_ARGS%" echo %*',
         'exit /b 23'
     )
+    $fakeVcpkg = Join-Path $fakeTools 'vcpkg.cmd'
+    Set-Content -LiteralPath $fakeVcpkg -Value @(
+        '@echo off',
+        'if /I "%1"=="list" echo fixture:x64-windows 1.0.0',
+        'exit /b 0'
+    )
     Set-Content -LiteralPath (Join-Path $fakeTools 'ctest.exe') -Value 'fixture'
 
     $root = Split-Path -Parent $PSScriptRoot
@@ -86,15 +94,15 @@ try {
 
     Assert-ConfigurePassesStandardInstalledDir `
         -Entry (Join-Path $PSScriptRoot 'build.ps1') `
-        -EntryArguments @('-Go', $go, '-Cmake', $cmake, '-VcpkgRoot', $vcpkg, '-VideoCoreOnly', '-StageDir', (Join-Path $fixture 'video-stage'), '-SkipWebBuild', '-SkipNodeTrayBuild') `
+        -EntryArguments @('-Go', $go, '-Cmake', $cmake, '-VcpkgRoot', $vcpkg, '-Vcpkg', $fakeVcpkg, '-VideoCoreOnly', '-StageDir', (Join-Path $fixture 'video-stage'), '-SkipWebBuild', '-SkipNodeTrayBuild') `
         -Label 'build-videocore' -CaptureFile $capture -ExpectedInstalledDir $installed
     Assert-ConfigurePassesStandardInstalledDir `
         -Entry (Join-Path $PSScriptRoot 'build.ps1') `
-        -EntryArguments @('-Go', $go, '-Cmake', $cmake, '-VcpkgRoot', $vcpkg, '-MediacoreOnly', '-OutDir', '.') `
+        -EntryArguments @('-Go', $go, '-Cmake', $cmake, '-VcpkgRoot', $vcpkg, '-Vcpkg', $fakeVcpkg, '-MediacoreOnly', '-OutDir', '.') `
         -Label 'build-mediacore' -CaptureFile $capture -ExpectedInstalledDir $installed
     Assert-ConfigurePassesStandardInstalledDir `
         -Entry (Join-Path $PSScriptRoot 'verify_videocore_native.ps1') `
-        -EntryArguments @('-CMake', $cmake, '-VcpkgRoot', $vcpkg, '-EvidenceDir', (Join-Path $fixture 'verify-evidence')) `
+        -EntryArguments @('-CMake', $cmake, '-VcpkgRoot', $vcpkg, '-Vcpkg', $fakeVcpkg, '-EvidenceDir', (Join-Path $fixture 'verify-evidence')) `
         -Label 'verify-videocore-native' -CaptureFile $capture -ExpectedInstalledDir $installed
 } finally {
     if (Test-Path -LiteralPath $fixture) {
