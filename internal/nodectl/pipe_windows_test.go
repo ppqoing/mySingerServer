@@ -73,8 +73,16 @@ type pipeAcceptResult struct {
 }
 
 func allowsReadWrite(sddl, sid string) bool {
-	return strings.Contains(sddl, "(A;;GA;;;"+sid+")") ||
-		strings.Contains(sddl, "(A;;FA;;;"+sid+")")
+	if strings.Contains(sddl, "(A;;GA;;;"+sid+")") ||
+		strings.Contains(sddl, "(A;;FA;;;"+sid+")") {
+		return true
+	}
+	parsed, err := windows.StringToSid(sid)
+	if err != nil || !parsed.IsWellKnown(windows.WinAccountAdministratorSid) {
+		return false
+	}
+	return strings.Contains(sddl, "(A;;GA;;;LA)") ||
+		strings.Contains(sddl, "(A;;FA;;;LA)")
 }
 
 func allowsAnyAccess(sddl, sid string) bool {
