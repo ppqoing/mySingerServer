@@ -10,10 +10,12 @@ import (
 // Agent-to-GUI ranges. New protocol versions may append fields and message
 // types, but must not repurpose an existing value.
 const (
-	MsgPing     uint8 = 1
-	MsgPong     uint8 = 2
-	MsgHello    uint8 = 3
-	MsgShutdown uint8 = 4
+	MsgPing             uint8 = 1
+	MsgPong             uint8 = 2
+	MsgHello            uint8 = 3
+	MsgShutdown         uint8 = 4
+	MsgClientAuth       uint8 = 5
+	MsgClientAuthResult uint8 = 6
 
 	MsgScanTask   uint8 = 10
 	MsgTaskAck    uint8 = 11
@@ -29,6 +31,10 @@ const (
 	MsgCrashNotice   uint8 = 24
 	MsgDeleteReport  uint8 = 25
 	MsgStatsReport   uint8 = 26
+
+	MsgLocalRequest  uint8 = 30
+	MsgLocalResponse uint8 = 31
+	MsgLocalEvent    uint8 = 32
 )
 
 const ProtocolVersion = 1
@@ -43,6 +49,8 @@ const (
 	FieldVideo6F           uint32 = 1 << 5
 	FieldVideoDuration     uint32 = 1 << 6
 	FieldVideoContactSheet uint32 = 1 << 7
+	FieldVideo6FPHash      uint32 = 1 << 8
+	FieldVideo6FSobel      uint32 = 1 << 9
 )
 
 const FrameMaskFull uint8 = 0x3f
@@ -50,6 +58,12 @@ const FrameMaskFull uint8 = 0x3f
 const (
 	KindImage uint8 = 1
 	KindVideo uint8 = 2
+)
+
+const (
+	ScreenStageLegacy uint8 = 0
+	ScreenStageTwo    uint8 = 2
+	ScreenStageThree  uint8 = 3
 )
 
 const (
@@ -130,6 +144,10 @@ type Phase2Item struct {
 }
 
 func (item Phase2Item) Validate() error {
+	return item.validateForStage(ScreenStageLegacy)
+}
+
+func (item Phase2Item) validateForStage(stage uint8) error {
 	if item.MachineID == "" {
 		return fmt.Errorf("proto: phase2 item machine_id required")
 	}
@@ -145,17 +163,38 @@ func (item Phase2Item) Validate() error {
 	if item.FrameMask&^FrameMaskFull != 0 {
 		return fmt.Errorf("proto: phase2 item frame_mask uses bits outside six frames")
 	}
-	if item.FieldsMask == 0 || item.FieldsMask&^(FieldPHashParts|FieldSobelHist|FieldVideo6F) != 0 {
-		return fmt.Errorf("proto: phase2 item fields_mask must contain only phase-2 fields")
-	}
 	switch item.Kind {
 	case KindImage:
-		if item.FieldsMask&FieldVideo6F != 0 {
-			return fmt.Errorf("proto: image phase2 item cannot request video frames")
+		switch stage {
+		case ScreenStageLegacy:
+			if item.FieldsMask == 0 || item.FieldsMask&^(FieldPHashParts|FieldSobelHist) != 0 {
+				return fmt.Errorf("proto: legacy image phase2 item must request image fields")
+			}
+		case ScreenStageTwo:
+			if item.FieldsMask != FieldPHashParts {
+				return fmt.Errorf("proto: stage-two image phase2 item must request pHash fields")
+			}
+		case ScreenStageThree:
+			if item.FieldsMask != FieldSobelHist {
+				return fmt.Errorf("proto: stage-three image phase2 item must request Sobel fields")
+			}
+		default:
+			return fmt.Errorf("proto: phase2 stage %d is invalid", stage)
 		}
 	case KindVideo:
-		if item.FieldsMask != FieldVideo6F {
-			return fmt.Errorf("proto: video phase2 item must request video frames")
+		var expected uint32
+		switch stage {
+		case ScreenStageLegacy:
+			expected = FieldVideo6F
+		case ScreenStageTwo:
+			expected = FieldVideo6FPHash
+		case ScreenStageThree:
+			expected = FieldVideo6FSobel
+		default:
+			return fmt.Errorf("proto: phase2 stage %d is invalid", stage)
+		}
+		if item.FieldsMask != expected {
+			return fmt.Errorf("proto: video phase2 item must request fields for stage %d", stage)
 		}
 		if item.DurationMS <= 0 {
 			return fmt.Errorf("proto: video phase2 item duration_ms must be positive")
@@ -180,7 +219,22 @@ func isCanonicalSHA512(value string) bool {
 
 type Phase2Task struct {
 	TaskID string       `msgpack:"task_id"`
+	Stage  uint8        `msgpack:"stage,omitempty"`
 	Items  []Phase2Item `msgpack:"items"`
+}
+
+func (task Phase2Task) Validate() error {
+	switch task.Stage {
+	case ScreenStageLegacy, ScreenStageTwo, ScreenStageThree:
+	default:
+		return fmt.Errorf("proto: phase2 stage %d is invalid", task.Stage)
+	}
+	for _, item := range task.Items {
+		if err := item.validateForStage(task.Stage); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 type DeleteTask struct {
@@ -355,6 +409,10 @@ func Decode(msgType uint8, body []byte) (any, error) {
 		value = &Hello{}
 	case MsgShutdown:
 		value = &Shutdown{}
+	case MsgClientAuth:
+		value = &ClientAuth{}
+	case MsgClientAuthResult:
+		value = &ClientAuthResult{}
 	case MsgScanTask:
 		value = &ScanTask{}
 	case MsgTaskAck:
@@ -381,6 +439,12 @@ func Decode(msgType uint8, body []byte) (any, error) {
 		value = &DeleteReport{}
 	case MsgStatsReport:
 		value = &StatsReport{}
+	case MsgLocalRequest:
+		value = &LocalRequest{}
+	case MsgLocalResponse:
+		value = &LocalResponse{}
+	case MsgLocalEvent:
+		value = &LocalEvent{}
 	default:
 		return nil, fmt.Errorf("proto: unknown message type %d", msgType)
 	}
