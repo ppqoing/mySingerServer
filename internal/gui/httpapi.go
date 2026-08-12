@@ -71,8 +71,8 @@ func (api *API) SetAnalysisSuccessHook(hook func() error) {
 func (api *API) Routes() *http.ServeMux {
 	legacy := http.NewServeMux()
 	legacy.HandleFunc("GET /api/agents", api.handleAgents)
-	legacy.HandleFunc("GET /api/config", api.handleConfigGet)
-	legacy.HandleFunc("PUT /api/config", api.handleConfigPut)
+	legacy.Handle("GET /api/config", newConfigHTTP(api.config))
+	legacy.Handle("PUT /api/config", newConfigHTTP(api.config))
 	legacy.HandleFunc("POST /api/scan", api.handleScan)
 	legacy.HandleFunc("GET /api/tasks", api.handleTasks)
 	legacy.HandleFunc("GET /api/dup_groups", api.handleDupGroups)

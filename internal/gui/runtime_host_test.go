@@ -1,0 +1,78 @@
+package gui
+
+import (
+	"encoding/json"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"syscall"
+	"testing"
+
+	"dedup/internal/config"
+)
+
+func TestRuntimeHostServesConfigurationWhileDatabaseIsUnavailable(t *testing.T) {
+	host := NewRuntimeHost(&fakeGUIConfigStore{loadSnapshot: GUIConfigSnapshot{
+		Config: testGUIConfig(),
+	}}, []config.AgentEndpoint{{Addr: "127.0.0.1:9101"}})
+	host.SetDatabaseFailure(&net.OpError{Op: "dial", Err: syscall.ECONNREFUSED})
+
+	assertRuntimeHostStatus(t, host, http.MethodGet, "/", http.StatusOK)
+	assertRuntimeHostStatus(t, host, http.MethodGet, "/api/config", http.StatusOK)
+	assertRuntimeHostStatus(t, host, http.MethodGet, "/api/runtime/status", http.StatusOK)
+
+	tasks := assertRuntimeHostStatus(t, host, http.MethodGet, "/api/tasks", http.StatusServiceUnavailable)
+	if got := tasks.Body.String(); got != "{\"error\":\"database_unavailable\"}\n" {
+		t.Fatalf("503 body=%q", got)
+	}
+
+	agents := assertRuntimeHostStatus(t, host, http.MethodGet, "/api/agents", http.StatusOK)
+	var snapshot []AgentStatus
+	if err := json.Unmarshal(agents.Body.Bytes(), &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot) != 1 || snapshot[0].Addr != "127.0.0.1:9101" || snapshot[0].Online {
+		t.Fatalf("offline agents=%#v", snapshot)
+	}
+
+	health := assertRuntimeHostStatus(t, host, http.MethodGet, "/api/restart/health", http.StatusOK)
+	if got := health.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Fatalf("health CORS=%q", got)
+	}
+}
+
+func TestRuntimeHostInstallsAndSafelyStopsCompleteRuntime(t *testing.T) {
+	host := NewRuntimeHost(&fakeGUIConfigStore{}, nil)
+	host.BeginAnalysisShutdown()
+	host.WaitForAnalysis()
+
+	api := NewAPI(nil, NewTaskRegistry(nil, testLogger()), nil)
+	host.Install(api)
+	assertRuntimeHostStatus(t, host, http.MethodGet, "/api/tasks", http.StatusOK)
+	host.BeginAnalysisShutdown()
+	host.WaitForAnalysis()
+}
+
+func TestRuntimeHostReportsRestartState(t *testing.T) {
+	host := NewRuntimeHost(&fakeGUIConfigStore{}, nil)
+	host.SetDatabaseConnecting()
+	host.SetRestartState(true, "http://127.0.0.1:8080/api/restart/health")
+
+	response := assertRuntimeHostStatus(t, host, http.MethodGet, "/api/runtime/status", http.StatusOK)
+	if !strings.Contains(response.Body.String(), "\"database_state\":\"connecting\"") ||
+		!strings.Contains(response.Body.String(), "\"restarting\":true") ||
+		!strings.Contains(response.Body.String(), "\"recovery_url\":\"http://127.0.0.1:8080/api/restart/health\"") {
+		t.Fatalf("status=%s", response.Body.String())
+	}
+}
+
+func assertRuntimeHostStatus(t *testing.T, host http.Handler, method, target string, want int) *httptest.ResponseRecorder {
+	t.Helper()
+	response := httptest.NewRecorder()
+	host.ServeHTTP(response, httptest.NewRequest(method, target, nil))
+	if response.Code != want {
+		t.Fatalf("%s %s status=%d want=%d body=%s", method, target, response.Code, want, response.Body.String())
+	}
+	return response
+}
