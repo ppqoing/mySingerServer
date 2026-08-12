@@ -159,11 +159,15 @@ func (d *DB) lookupVideoContent(
 		var duration sql.NullInt64
 		var thumbPath sql.NullString
 		var thumbPDQ []byte
-		var thumbQuality sql.NullInt64
+		var thumbQuality, thumbWidth, thumbHeight sql.NullInt64
 		err := d.db.QueryRowContext(ctx, `
-			SELECT sha512, duration_ms, thumb_path, thumb_pdq256, thumb_quality
+			SELECT sha512, duration_ms, thumb_path, thumb_pdq256, thumb_quality,
+			       thumb_width, thumb_height
 			FROM video_features WHERE sha512=?1`, shaText,
-		).Scan(&storedSHA, &duration, &thumbPath, &thumbPDQ, &thumbQuality)
+		).Scan(
+			&storedSHA, &duration, &thumbPath, &thumbPDQ, &thumbQuality,
+			&thumbWidth, &thumbHeight,
+		)
 		if err != nil && err != sql.ErrNoRows {
 			return fmt.Errorf("store: lookup video content: %w", err)
 		}
@@ -174,7 +178,9 @@ func (d *DB) lookupVideoContent(
 				durationOK := duration.Valid && duration.Int64 >= 0
 				contactOK := thumbPath.Valid && thumbPath.String != "" &&
 					len(thumbPDQ) == 32 && thumbQuality.Valid &&
-					thumbQuality.Int64 >= 0 && thumbQuality.Int64 <= 100
+					thumbQuality.Int64 >= 0 && thumbQuality.Int64 <= 100 &&
+					thumbWidth.Valid && thumbWidth.Int64 > 0 &&
+					thumbHeight.Valid && thumbHeight.Int64 > 0
 				if durationOK && (requestedFields&(proto.FieldVideoDuration|proto.FieldThumb) != 0) {
 					value := duration.Int64
 					feature.DurationMS = &value
@@ -184,6 +190,10 @@ func (d *DB) lookupVideoContent(
 					feature.ThumbPath = thumbPath.String
 					feature.ThumbPDQ = append([]byte(nil), thumbPDQ...)
 					feature.ThumbQuality = &value
+					width := int32(thumbWidth.Int64)
+					height := int32(thumbHeight.Int64)
+					feature.ThumbWidth = &width
+					feature.ThumbHeight = &height
 				}
 				if requestedFields&proto.FieldVideoDuration != 0 && durationOK {
 					state.FieldsPresent |= proto.FieldVideoDuration

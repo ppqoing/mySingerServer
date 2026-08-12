@@ -176,6 +176,13 @@ func processMediaWithDeps(ctx context.Context, cfg Config, job *worker.JobMsg, d
 			if missingFields&worker.MaskVideoThumb != 0 {
 				result.FieldsDone |= worker.MaskVideoThumb
 			}
+			quality := int32(analysis.ContactSheetFeatures.PDQQuality)
+			result.ThumbPath = paths.JPEG
+			result.ThumbPDQ = append(
+				[]byte(nil), analysis.ContactSheetFeatures.PDQ[:]...,
+			)
+			result.ThumbQuality = &quality
+			result.ThumbGenerated = true
 		}
 	}
 	return result, nil

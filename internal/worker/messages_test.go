@@ -47,6 +47,19 @@ func TestMessageRoundTrip(t *testing.T) {
 	}
 }
 
+func TestDefaultStageOneWorkerMasksUseExplicitVideoFields(t *testing.T) {
+	if MaskAllImage != MaskSHA512|MaskImagePDQ {
+		t.Fatalf("image stage-one mask = %#x", uint32(MaskAllImage))
+	}
+	wantVideo := uint32(MaskSHA512 | MaskVideoDuration | MaskVideoContactSheet)
+	if MaskAllVideo != wantVideo {
+		t.Fatalf("video stage-one mask = %#x, want %#x", uint32(MaskAllVideo), wantVideo)
+	}
+	if MaskAllVideo&MaskVideoThumb != 0 {
+		t.Fatalf("video stage-one mask retained legacy thumbnail bit %#x", uint32(MaskAllVideo))
+	}
+}
+
 func TestExtendedWorkerMessagesUseLiteralMapAdditionsAndOldShapeDefaults(t *testing.T) {
 	readyBody, err := msgpack.Marshal(ReadyMsg{
 		PID: 41, WorkerIndex: 3,

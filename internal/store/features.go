@@ -140,6 +140,9 @@ func (d *DB) LookupVideo(ctx context.Context, sha []byte) (*VideoFeature, error)
 }
 
 func (d *DB) SavePhase1(ctx context.Context, result Phase1Result) error {
+	if err := validatePhase1FeaturePayload(result); err != nil {
+		return err
+	}
 	var sha string
 	var shaValue any
 	switch {
@@ -192,29 +195,43 @@ func (d *DB) SavePhase1(ctx context.Context, result Phase1Result) error {
 			succeeded |= proto.FieldPDQ256
 		}
 	case MediaVideo:
-		if result.FieldsDone&proto.FieldThumb != 0 &&
-			(result.DurationMS != nil || result.ThumbPath != "" || len(result.ThumbPDQ) != 0 || result.ThumbQuality != nil) {
+		if result.FieldsDone&(proto.FieldThumb|proto.FieldVideoDuration) != 0 &&
+			result.DurationMS != nil {
 			var duration any
 			if result.DurationMS != nil {
 				duration = *result.DurationMS
 			}
+			if _, err := tx.ExecContext(ctx, `
+				INSERT INTO video_features (sha512, duration_ms) VALUES (?1, ?2)
+				ON CONFLICT (sha512) DO UPDATE SET duration_ms=excluded.duration_ms;`,
+				sha, duration,
+			); err != nil {
+				return fmt.Errorf("store: save video duration: %w", err)
+			}
+			succeeded |= result.FieldsDone & (proto.FieldThumb | proto.FieldVideoDuration)
+		}
+		if result.FieldsDone&(proto.FieldThumb|proto.FieldVideoContactSheet) != 0 &&
+			(result.ThumbPath != "" || len(result.ThumbPDQ) != 0 || result.ThumbQuality != nil) {
 			var quality any
 			if result.ThumbQuality != nil {
 				quality = *result.ThumbQuality
 			}
 			if _, err := tx.ExecContext(ctx, `
-				INSERT INTO video_features (sha512, duration_ms, thumb_path, thumb_pdq256, thumb_quality)
-				VALUES (?1, ?2, NULLIF(?3, ''), ?4, ?5)
+				INSERT INTO video_features
+					(sha512, thumb_path, thumb_pdq256, thumb_quality, thumb_width, thumb_height)
+				VALUES (?1, NULLIF(?2, ''), ?3, ?4, ?5, ?6)
 				ON CONFLICT (sha512) DO UPDATE SET
-					duration_ms=COALESCE(excluded.duration_ms, video_features.duration_ms),
 					thumb_path=COALESCE(excluded.thumb_path, video_features.thumb_path),
 					thumb_pdq256=COALESCE(excluded.thumb_pdq256, video_features.thumb_pdq256),
-					thumb_quality=COALESCE(excluded.thumb_quality, video_features.thumb_quality);`,
-				sha, duration, result.ThumbPath, nullableBytes(result.ThumbPDQ), quality,
+					thumb_quality=COALESCE(excluded.thumb_quality, video_features.thumb_quality),
+					thumb_width=COALESCE(excluded.thumb_width, video_features.thumb_width),
+					thumb_height=COALESCE(excluded.thumb_height, video_features.thumb_height);`,
+				sha, result.ThumbPath, nullableBytes(result.ThumbPDQ), quality,
+				nullablePositiveInt32(result.Width), nullablePositiveInt32(result.Height),
 			); err != nil {
-				return fmt.Errorf("store: save video feature: %w", err)
+				return fmt.Errorf("store: save video contact sheet: %w", err)
 			}
-			succeeded |= proto.FieldThumb
+			succeeded |= result.FieldsDone & (proto.FieldThumb | proto.FieldVideoContactSheet)
 		}
 	}
 
@@ -225,10 +242,10 @@ func (d *DB) SavePhase1(ctx context.Context, result Phase1Result) error {
 	if sha != "" && result.Kind == MediaImage && imageFeatureExists(ctx, tx, sha) {
 		updatedMissing &^= proto.FieldPDQ256
 	}
-	if sha != "" && result.Kind == MediaVideo && videoFeatureComplete(ctx, tx, sha) {
-		updatedMissing &^= proto.FieldThumb
+	if sha != "" && result.Kind == MediaVideo {
+		updatedMissing &^= videoFeatureFields(ctx, tx, sha)
 	}
-	phase1Done := updatedMissing&(proto.FieldSHA512|proto.FieldPDQ256|proto.FieldThumb) == 0
+	phase1Done := updatedMissing&phase1RequiredMask(result.Kind, updatedMissing) == 0
 	status := phase1Status(result.Kind, updatedMissing, succeeded, result.Errors)
 	var errorText any
 	if status != proto.StatusDone && len(result.Errors) != 0 {
@@ -252,7 +269,7 @@ func (d *DB) SavePhase1(ctx context.Context, result Phase1Result) error {
 				return err
 			}
 		}
-		if result.Kind == MediaVideo && succeeded&proto.FieldThumb != 0 {
+		if result.Kind == MediaVideo && succeeded&(proto.FieldThumb|proto.FieldVideoDuration|proto.FieldVideoContactSheet) != 0 {
 			if err := enqueuePhase1Sync(ctx, tx, "video_features", sha, now); err != nil {
 				return err
 			}
@@ -286,6 +303,29 @@ func validPreSHAFailure(result Phase1Result) bool {
 		}
 	}
 	return true
+}
+
+func validatePhase1FeaturePayload(result Phase1Result) error {
+	switch result.Kind {
+	case MediaImage:
+		if result.FieldsDone&proto.FieldPDQ256 != 0 &&
+			(len(result.PDQ) != 32 || result.Quality < 0 || result.Quality > 100 ||
+				result.Width <= 0 || result.Height <= 0) {
+			return fmt.Errorf("store: invalid phase1 image PDQ payload")
+		}
+	case MediaVideo:
+		if result.FieldsDone&proto.FieldVideoDuration != 0 &&
+			(result.DurationMS == nil || *result.DurationMS < 0) {
+			return fmt.Errorf("store: invalid phase1 video duration payload")
+		}
+		if result.FieldsDone&proto.FieldVideoContactSheet != 0 &&
+			(result.ThumbPath == "" || len(result.ThumbPDQ) != 32 ||
+				result.ThumbQuality == nil || *result.ThumbQuality < 0 || *result.ThumbQuality > 100 ||
+				result.Width <= 0 || result.Height <= 0) {
+			return fmt.Errorf("store: invalid phase1 video contact sheet payload")
+		}
+	}
+	return nil
 }
 
 func (d *DB) MarkCrash(ctx context.Context, machineID, path, message string) error {
@@ -337,23 +377,52 @@ func nullableBytes(value []byte) any {
 }
 
 func imageFeatureExists(ctx context.Context, tx *sql.Tx, sha string) bool {
+	var width, height, quality int32
 	var pdq []byte
-	return tx.QueryRowContext(ctx, `SELECT pdq256 FROM image_features WHERE sha512=?1`, sha).Scan(&pdq) == nil && len(pdq) != 0
+	return tx.QueryRowContext(ctx, `
+		SELECT width, height, pdq256, pdq_quality FROM image_features WHERE sha512=?1`, sha,
+	).Scan(&width, &height, &pdq, &quality) == nil && len(pdq) == 32 &&
+		width > 0 && height > 0 && quality >= 0 && quality <= 100
 }
 
-func videoFeatureComplete(ctx context.Context, tx *sql.Tx, sha string) bool {
+func nullablePositiveInt32(value int32) any {
+	if value <= 0 {
+		return nil
+	}
+	return value
+}
+
+func videoFeatureFields(ctx context.Context, tx *sql.Tx, sha string) uint32 {
 	var duration sql.NullInt64
 	var path sql.NullString
 	var pdq []byte
-	var quality sql.NullInt64
+	var quality, width, height sql.NullInt64
 	err := tx.QueryRowContext(ctx, `
-		SELECT duration_ms, thumb_path, thumb_pdq256, thumb_quality FROM video_features WHERE sha512=?1`, sha,
-	).Scan(&duration, &path, &pdq, &quality)
-	return err == nil && duration.Valid && path.Valid && path.String != "" && len(pdq) != 0 && quality.Valid
+		SELECT duration_ms, thumb_path, thumb_pdq256, thumb_quality, thumb_width, thumb_height
+		FROM video_features WHERE sha512=?1`, sha,
+	).Scan(&duration, &path, &pdq, &quality, &width, &height)
+	if err != nil {
+		return 0
+	}
+	fields := uint32(0)
+	durationOK := duration.Valid && duration.Int64 >= 0
+	legacyContactOK := path.Valid && path.String != "" && len(pdq) != 0 &&
+		quality.Valid && quality.Int64 >= 0 && quality.Int64 <= 100
+	if durationOK {
+		fields |= proto.FieldVideoDuration
+	}
+	if legacyContactOK && width.Valid && width.Int64 > 0 && height.Valid && height.Int64 > 0 {
+		fields |= proto.FieldVideoContactSheet
+	}
+	if durationOK && legacyContactOK {
+		fields |= proto.FieldThumb
+	}
+	return fields
 }
 
 func phase1Status(kind MediaKind, missing, succeeded uint32, errors []FieldError) string {
-	if missing&(proto.FieldSHA512|proto.FieldPDQ256|proto.FieldThumb) == 0 {
+	required := phase1RequiredMask(kind, missing)
+	if missing&required == 0 {
 		return proto.StatusDone
 	}
 	if succeeded != 0 || phase1Mask(kind)&^missing != 0 {
@@ -363,6 +432,13 @@ func phase1Status(kind MediaKind, missing, succeeded uint32, errors []FieldError
 		return proto.StatusFailed
 	}
 	return proto.StatusPartial
+}
+
+func phase1RequiredMask(kind MediaKind, missing uint32) uint32 {
+	if kind == MediaVideo && missing&proto.FieldThumb != 0 {
+		return proto.FieldSHA512 | proto.FieldThumb
+	}
+	return RequiredStageOneMask(kind)
 }
 
 func fieldErrorsText(errors []FieldError) string {

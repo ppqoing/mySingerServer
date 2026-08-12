@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"dedup/internal/proto"
 )
 
 type FileRow struct {
@@ -97,8 +99,57 @@ func (d *DB) UpsertEnumerated(ctx context.Context, records []EnumUpsert) error {
 		); err != nil {
 			return fmt.Errorf("store: upsert %s: %w", record.Path, err)
 		}
+		if err := revalidateEnumeratedPhase1(ctx, tx, record); err != nil {
+			return fmt.Errorf("store: revalidate %s: %w", record.Path, err)
+		}
 	}
 	return tx.Commit()
+}
+
+func revalidateEnumeratedPhase1(ctx context.Context, tx *sql.Tx, record EnumUpsert) error {
+	var sha sql.NullString
+	var currentMissing uint32
+	if err := tx.QueryRowContext(ctx, `
+		SELECT sha512, missing_mask FROM files WHERE machine_id=?1 AND path=?2`,
+		record.MachineID, record.Path,
+	).Scan(&sha, &currentMissing); err != nil {
+		return err
+	}
+	if !sha.Valid || sha.String == "" {
+		return nil
+	}
+
+	kind := MediaKind("")
+	switch {
+	case record.MissingBase&proto.FieldPDQ256 != 0:
+		kind = MediaImage
+	case record.MissingBase&(proto.FieldThumb|proto.FieldVideoDuration|proto.FieldVideoContactSheet) != 0:
+		kind = MediaVideo
+	}
+	row := FileRow{
+		MachineID: record.MachineID,
+		Path:      record.Path,
+		Size:      record.Size,
+		MTime:     record.MTime,
+		SHA512:    &sha.String,
+	}
+	missing, err := missingPhase1(ctx, tx, row, kind, record.MissingBase)
+	if err != nil {
+		return err
+	}
+	updatedMissing := currentMissing&^phaseOneFieldsMask | missing
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE files SET
+			missing_mask=?3,
+			phase1_done=?4,
+			status=CASE WHEN ?4=0 THEN 'pending' ELSE status END,
+			error=CASE WHEN ?4=0 THEN NULL ELSE error END
+		WHERE machine_id=?1 AND path=?2`,
+		record.MachineID, record.Path, updatedMissing, boolToInt(missing == 0),
+	); err != nil {
+		return err
+	}
+	return nil
 }
 
 type PendingFile struct {
@@ -119,8 +170,8 @@ func (d *DB) PendingSnapshot(
 		FROM files
 		WHERE machine_id = ?1
 		  AND status != 'deleted'
-		  AND (missing_mask & 7) != 0
-		ORDER BY disk_no, path;`, machineID)
+		  AND (missing_mask & ?2) != 0
+		ORDER BY disk_no, path;`, machineID, phaseOneFieldsMask)
 	if err != nil {
 		return nil, err
 	}
@@ -160,7 +211,7 @@ type HashResult struct {
 const markHashOKSQL = `
 UPDATE files SET sha512 = ?3, status = 'done', error = NULL,
     missing_mask = missing_mask & ~1,
-    phase1_done = CASE WHEN ((missing_mask & ~1) & 7) = 0 THEN 1 ELSE 0 END,
+	phase1_done = CASE WHEN ((missing_mask & ~1) & ?5) = 0 THEN 1 ELSE 0 END,
     updated_at = ?4
 WHERE machine_id = ?1 AND path = ?2;`
 
@@ -258,7 +309,7 @@ func (d *DB) ApplyHashResults(
 	for _, result := range results {
 		if result.Err == "" {
 			_, err = tx.ExecContext(
-				ctx, markHashOKSQL, machineID, result.Path, result.SHA512, now,
+				ctx, markHashOKSQL, machineID, result.Path, result.SHA512, now, phaseOneFieldsMask,
 			)
 		} else {
 			_, err = tx.ExecContext(

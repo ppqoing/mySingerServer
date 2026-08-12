@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"net"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -117,6 +118,79 @@ func TestServeDispatchesPhase2ThroughSessionPipeline(t *testing.T) {
 	}
 	if code := <-done; code != 0 {
 		t.Fatalf("serve shutdown exit = %d, want 0", code)
+	}
+}
+
+func TestImageNoThumbnailServeUsesImagePipelineEvenWithSessionConfigured(t *testing.T) {
+	file := newFakeFile([]byte("pixels"), 6, 123)
+	imageDeps, imageState := testPipelineDeps(file)
+	imageDeps.runtime = testReadyRuntimeInfo
+	imageDeps.query = nil
+	cacheDir := t.TempDir()
+	cfg := testConfig()
+	cfg.ThumbCacheDir = cacheDir
+	_, sessionDeps, sessionFake := newSessionPipelineTest(
+		t, worker.MediaImage, worker.MaskAllImage, 0,
+	)
+	sessionDeps.query = nil
+	imageDeps.session = &sessionDeps
+
+	server, parent := net.Pipe()
+	done := make(chan int, 1)
+	go func() { done <- serve(server, 14, cfg, imageDeps) }()
+	conn := worker.NewIPCConn(parent)
+	if _, err := conn.Read(); err != nil {
+		t.Fatal(err)
+	}
+	job := worker.JobMsg{
+		JobID: 1401, Path: `C:\media\no-thumb.jpg`, Kind: worker.MediaImage,
+		Phase: worker.Phase1, FieldsMask: worker.MaskAllImage,
+		Size: 6, MTimeUnix: 123,
+	}
+	if err := conn.Write(worker.MsgJob, job); err != nil {
+		t.Fatal(err)
+	}
+	envelope, err := conn.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	query, err := worker.DecodeBody[worker.SHAQueryMsg](envelope)
+	if err != nil || envelope.Type != worker.MsgSHAQuery {
+		t.Fatalf("image query = type %q %#v err=%v", envelope.Type, query, err)
+	}
+	if err := conn.Write(worker.MsgSHAReply, worker.SHAReplyMsg{JobID: query.JobID}); err != nil {
+		t.Fatal(err)
+	}
+	envelope, err = conn.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := worker.DecodeBody[worker.JobResultMsg](envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Type != worker.MsgResult || result.FieldsDone != worker.MaskAllImage ||
+		len(result.PDQ) != 32 || result.Width <= 0 || result.Height <= 0 ||
+		result.ThumbPath != "" || result.ThumbGenerated || result.ThumbCacheHit {
+		t.Fatalf("image result = type %q %#v", envelope.Type, result)
+	}
+	if imageState.decodeCalls != 1 || sessionFake.opens != 0 || sessionFake.analyzes != 0 ||
+		sessionFake.closes != 0 {
+		t.Fatalf("image/session calls = decode:%d open/analyze/close:%d/%d/%d",
+			imageState.decodeCalls, sessionFake.opens, sessionFake.analyzes, sessionFake.closes)
+	}
+	entries, err := os.ReadDir(cacheDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("image pipeline created thumbnail cache entries: %#v", entries)
+	}
+	if err := conn.Write(worker.MsgShutdown, struct{}{}); err != nil {
+		t.Fatal(err)
+	}
+	if code := <-done; code != 0 {
+		t.Fatalf("serve exit = %d", code)
 	}
 }
 
@@ -264,6 +338,7 @@ func TestServeRoutesVideoJobsThroughVideoPipeline(t *testing.T) {
 		t.Fatal(err)
 	}
 	job := *testVideoJob(711)
+	job.FieldsMask = legacyPhase1VideoMask
 	if err := conn.Write(worker.MsgJob, job); err != nil {
 		t.Fatal(err)
 	}
@@ -289,7 +364,7 @@ func TestServeRoutesVideoJobsThroughVideoPipeline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if envelope.Type != worker.MsgResult || result.Kind != worker.MediaVideo || result.FieldsDone != worker.MaskAllVideo {
+	if envelope.Type != worker.MsgResult || result.Kind != worker.MediaVideo || result.FieldsDone != legacyPhase1VideoMask {
 		t.Fatalf("video result = type %q body %#v", envelope.Type, result)
 	}
 	if got := strings.Join(state.events, ","); got != "probe,cache,ffmpeg,thumb-read,thumb-pdq" {

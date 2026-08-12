@@ -91,11 +91,13 @@ func serve(conn net.Conn, index int, cfg Config, deps pipelineDeps) int {
 			return pumpSHAReply(ipc, query)
 		})
 	}
-	if !useSessionPipeline && deps.open == nil {
-		deps = defaultPipelineDeps(func(query *worker.SHAQueryMsg) (*worker.SHAReplyMsg, error) {
+	if deps.open == nil {
+		imageDeps := defaultPipelineDeps(func(query *worker.SHAQueryMsg) (*worker.SHAReplyMsg, error) {
 			return pumpSHAReply(ipc, query)
 		})
-	} else if !useSessionPipeline && deps.query == nil {
+		imageDeps.runtime = deps.runtime
+		deps = imageDeps
+	} else if deps.query == nil {
 		deps.query = func(query *worker.SHAQueryMsg) (*worker.SHAReplyMsg, error) {
 			return pumpSHAReply(ipc, query)
 		}
@@ -145,7 +147,9 @@ func serve(conn net.Conn, index int, cfg Config, deps pipelineDeps) int {
 				}
 			}
 			var result *worker.JobResultMsg
-			if useSessionPipeline {
+			if useSessionPipeline && job.Phase == worker.Phase1 && job.Kind == worker.MediaImage {
+				result, err = processImageWithDeps(cfg, &job, deps)
+			} else if useSessionPipeline {
 				if job.Phase != worker.Phase1 && job.Phase != worker.Phase2 {
 					result = invalidDispatchResult(&job, "phase", "unsupported worker phase")
 				} else if job.Kind != worker.MediaImage && job.Kind != worker.MediaVideo {

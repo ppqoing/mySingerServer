@@ -1,6 +1,10 @@
 package worker
 
-import "fmt"
+import (
+	"fmt"
+
+	"dedup/internal/store"
+)
 
 const (
 	MsgReady    = "ready"
@@ -47,8 +51,11 @@ const (
 	MaskVideo6F           uint32 = 1 << 5
 	MaskVideoDuration     uint32 = 1 << 6
 	MaskVideoContactSheet uint32 = 1 << 7
-	MaskAllImage                 = MaskSHA512 | MaskImagePDQ
-	MaskAllVideo                 = MaskSHA512 | MaskVideoThumb
+)
+
+var (
+	MaskAllImage = store.RequiredStageOneMask(store.MediaImage)
+	MaskAllVideo = store.RequiredStageOneMask(store.MediaVideo)
 )
 
 const (

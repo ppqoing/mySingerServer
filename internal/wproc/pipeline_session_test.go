@@ -258,6 +258,54 @@ func TestSessionPipelineLegacyThumbValidatesAndPublishes(t *testing.T) {
 	})
 }
 
+func TestVideoBaseFeaturesSessionPublishesCompleteContactPayload(t *testing.T) {
+	job, deps, fake := newSessionPipelineTest(
+		t, worker.MediaVideo, worker.MaskAllVideo, 0,
+	)
+	root := t.TempDir()
+	paths := ContactSheetPaths{
+		JPEG: filepath.Join(root, "grid.jpg"), Sidecar: filepath.Join(root, "grid.jpg.json"),
+		TempJPEG: filepath.Join(root, "grid.tmp.jpg"), TempSidecar: filepath.Join(root, "grid.tmp.json"),
+	}
+	deps.contactSheetPaths = func(string, [64]byte, int, int64, string) (ContactSheetPaths, error) {
+		return paths, nil
+	}
+	deps.query = sessionPipelineMissingReply(
+		job, worker.MaskVideoDuration|worker.MaskVideoContactSheet, 0,
+	)
+	published := 0
+	deps.publishContactSheet = func(got ContactSheetPaths, _ ContactSheetMeta, validate func() error) error {
+		published++
+		if got != paths {
+			t.Fatalf("publish paths = %#v, want %#v", got, paths)
+		}
+		return validate()
+	}
+	fake.result = videocore.AnalysisResult{
+		MediaType: 2, DurationStatus: videocore.StatusOK, DurationMS: 4321,
+		ContactSheetStatus: videocore.StatusOK, ContactSheetWidth: 960, ContactSheetHeight: 540,
+		ContactSheetFeatures: videocore.FeatureSet{PDQ: [32]byte{7}, PDQQuality: 88},
+		CompletedFrameMask:   1,
+		Frames:               [6]videocore.FrameResult{{StandardIndex: 0, Status: videocore.StatusOK, SampleTimeMS: 1000}},
+	}
+	fake.onAnalyze = func(request videocore.AnalysisRequest) {
+		if err := os.WriteFile(request.TempJPEGPath, []byte("jpeg"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	result, err := processMediaWithDeps(context.Background(), sessionPipelineTestConfig(), job, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if published != 1 || result.FieldsDone != worker.MaskAllVideo ||
+		result.DurationMS == nil || *result.DurationMS != 4321 ||
+		result.ThumbPath != paths.JPEG || len(result.ThumbPDQ) != 32 || result.ThumbPDQ[0] != 7 ||
+		result.ThumbQuality == nil || *result.ThumbQuality != 88 ||
+		result.ContactSheetWidth != 960 || result.ContactSheetHeight != 540 || !result.ThumbGenerated {
+		t.Fatalf("video base result = published:%d %#v", published, result)
+	}
+}
+
 func TestSessionPipelineImagePhase2Features(t *testing.T) {
 	job, deps, fake := newSessionPipelineTest(t, worker.MediaImage, worker.MaskSHA512|worker.MaskImagePDQ|worker.MaskPHashParts|worker.MaskSobelHist, 0)
 	deps.query = sessionPipelineMissingReply(job, worker.MaskImagePDQ|worker.MaskPHashParts|worker.MaskSobelHist, 0)

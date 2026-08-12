@@ -258,7 +258,8 @@ func (d *Deduper) lookupFeature(ctx context.Context, query SHAQueryMsg) (SHARepl
 			return reply, false, nil
 		}
 		reply := missingReply(query)
-		present := query.RequestedFields & (MaskSHA512 | MaskVideoThumb)
+		present := query.RequestedFields & (MaskSHA512 | MaskVideoThumb |
+			MaskVideoDuration | MaskVideoContactSheet)
 		reply.FieldsPresent |= present
 		reply.MissingFields &^= present
 		reply.DurationMS = cloneInt64(feature.DurationMS)

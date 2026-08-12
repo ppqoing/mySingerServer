@@ -182,6 +182,32 @@ func TestDeduperStoreHit(t *testing.T) {
 	}
 }
 
+func TestVideoBaseFeaturesLegacyLookupAdapterCoversExplicitRequestedFields(t *testing.T) {
+	sha := bytes64(0x3a)
+	duration, quality := int64(9100), int32(72)
+	d := NewDeduper(&lookupStub{
+		image: func(context.Context, []byte) (*store.ImageFeature, error) { return nil, nil },
+		video: func(context.Context, []byte) (*store.VideoFeature, error) {
+			return &store.VideoFeature{
+				SHA512: sha, DurationMS: &duration, ThumbPath: "thumb.jpg",
+				ThumbPDQ: bytes.Repeat([]byte{5}, 32), ThumbQuality: &quality,
+			}, nil
+		},
+	})
+	reply, err := d.Ask(context.Background(), SHAQueryMsg{
+		JobID: 203, SHA512: sha, Kind: MediaVideo,
+		RequestedFields: MaskSHA512 | MaskVideoDuration | MaskVideoContactSheet,
+	})
+	if err != nil {
+		t.Fatalf("Ask: %v", err)
+	}
+	want := uint32(MaskSHA512 | MaskVideoDuration | MaskVideoContactSheet)
+	if !reply.Found || reply.FieldsPresent != want || reply.MissingFields != 0 {
+		t.Fatalf("legacy adapter masks = found:%t present:%#x missing:%#x, want true/%#x/0",
+			reply.Found, reply.FieldsPresent, reply.MissingFields, want)
+	}
+}
+
 func TestDeduperMarksOnlyActiveFlightWaitersAsSingleFlightReuse(t *testing.T) {
 	sha := bytes64(32)
 	d := NewDeduper(missLookup())

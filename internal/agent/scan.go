@@ -747,6 +747,10 @@ func featureItemFromWorker(
 	item.Quality = result.Quality
 	item.Width = result.Width
 	item.Height = result.Height
+	if job.Kind == worker.MediaVideo {
+		item.Width = result.ContactSheetWidth
+		item.Height = result.ContactSheetHeight
+	}
 	item.DurationMS = cloneInt64(result.DurationMS)
 	item.ThumbPath = result.ThumbPath
 	if len(result.ThumbPDQ) != 0 {
@@ -790,7 +794,9 @@ func videoPartialPayload(job *worker.JobMsg, result *worker.JobResultMsg) bool {
 	return result.DurationMS != nil ||
 		result.ThumbPath != "" ||
 		len(result.ThumbPDQ) != 0 ||
-		result.ThumbQuality != nil
+		result.ThumbQuality != nil ||
+		result.ContactSheetWidth != 0 ||
+		result.ContactSheetHeight != 0
 }
 
 func cloneInt64(value *int64) *int64 {

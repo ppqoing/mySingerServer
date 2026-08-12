@@ -79,6 +79,55 @@ func TestLookupContentVideoDurationOnlyIgnoresUnrequestedContactSheet(t *testing
 	}
 }
 
+func TestVideoBaseFeaturesLookupContentRequiresContactDimensions(t *testing.T) {
+	db := openContentTestDB(t)
+	sha := bytes.Repeat([]byte{0x34}, 64)
+	if _, err := db.db.Exec(`
+		INSERT INTO video_features
+			(sha512, duration_ms, thumb_path, thumb_pdq256, thumb_quality)
+		VALUES (?1, 12345, 'contact.jpg', ?2, 80)`,
+		hex.EncodeToString(sha), bytes.Repeat([]byte{0xaa}, 32),
+	); err != nil {
+		t.Fatalf("insert video feature: %v", err)
+	}
+
+	state, err := db.LookupContent(
+		context.Background(), sha, MediaVideo,
+		proto.FieldVideoDuration|proto.FieldVideoContactSheet, 0,
+	)
+	if err != nil {
+		t.Fatalf("LookupContent: %v", err)
+	}
+	if state.FieldsPresent != proto.FieldVideoDuration ||
+		state.MissingFields != proto.FieldVideoContactSheet {
+		t.Fatalf("dimensionless contact masks = present %#x missing %#x",
+			state.FieldsPresent, state.MissingFields)
+	}
+	if state.Video == nil || state.Video.ThumbPath != "" ||
+		state.Video.ThumbWidth != nil || state.Video.ThumbHeight != nil {
+		t.Fatalf("dimensionless contact payload leaked: %#v", state.Video)
+	}
+
+	if _, err := db.db.Exec(`
+		UPDATE video_features SET thumb_width=960, thumb_height=540
+		WHERE sha512=?1`, hex.EncodeToString(sha)); err != nil {
+		t.Fatal(err)
+	}
+	state, err = db.LookupContent(
+		context.Background(), sha, MediaVideo,
+		proto.FieldVideoDuration|proto.FieldVideoContactSheet, 0,
+	)
+	if err != nil {
+		t.Fatalf("LookupContent complete: %v", err)
+	}
+	if state.FieldsPresent != proto.FieldVideoDuration|proto.FieldVideoContactSheet ||
+		state.MissingFields != 0 || state.Video == nil ||
+		state.Video.ThumbWidth == nil || *state.Video.ThumbWidth != 960 ||
+		state.Video.ThumbHeight == nil || *state.Video.ThumbHeight != 540 {
+		t.Fatalf("complete contact state = %#v", state)
+	}
+}
+
 func TestLookupContentVideoFiveOfSixFramesPreservesExactPartialState(t *testing.T) {
 	db := openContentTestDB(t)
 	sha := bytes.Repeat([]byte{0x44}, 64)

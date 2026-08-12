@@ -24,7 +24,7 @@ func TestSavePhase1Idempotent(t *testing.T) {
 	}
 	result := Phase1Result{
 		MachineID: "m", Path: `D:\image.jpg`, Kind: MediaImage, SHA512: phase1TestSHA(),
-		FieldsDone: 3, PDQ: []byte{1, 2}, Quality: 91, Width: 640, Height: 480,
+		FieldsDone: 3, PDQ: make([]byte, 32), Quality: 91, Width: 640, Height: 480,
 	}
 	if err := db.SavePhase1(ctx, result); err != nil {
 		t.Fatalf("first SavePhase1: %v", err)
@@ -586,5 +586,69 @@ func TestSaveAnalysisVideoDimensionsFlowThroughLookupAndSyncLoader(t *testing.T)
 	if len(rows) != 1 || rows[0].ThumbWidth == nil || *rows[0].ThumbWidth != width ||
 		rows[0].ThumbHeight == nil || *rows[0].ThumbHeight != height {
 		t.Fatalf("sync dimensions = %#v", rows)
+	}
+}
+
+func TestImageNoThumbnailPhase1RejectsIncompletePDQPayload(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(filepath.Join(t.TempDir(), "agent.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	path := `D:\image-no-thumb.jpg`
+	if err := db.UpsertEnumerated(ctx, []EnumUpsert{{
+		MachineID: "m", Path: path, Size: 10, MTime: 20,
+		MissingBase: proto.FieldSHA512 | proto.FieldPDQ256,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	err = db.SavePhase1(ctx, Phase1Result{
+		MachineID: "m", Path: path, Kind: MediaImage,
+		SHA512: phase1TestSHA(), FieldsDone: proto.FieldSHA512 | proto.FieldPDQ256,
+		PDQ: []byte{1}, Quality: 80,
+	})
+	if err == nil {
+		t.Fatal("SavePhase1 accepted an incomplete successful image PDQ payload")
+	}
+}
+
+func TestVideoBaseFeaturesSavePhase1PersistsContactDimensions(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(filepath.Join(t.TempDir(), "agent.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	path := `D:\video-base.mp4`
+	required := RequiredStageOneMask(MediaVideo)
+	if err := db.UpsertEnumerated(ctx, []EnumUpsert{{
+		MachineID: "m", Path: path, Size: 10, MTime: 20, MissingBase: required,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	duration, quality := int64(1234), int32(88)
+	if err := db.SavePhase1(ctx, Phase1Result{
+		MachineID: "m", Path: path, Kind: MediaVideo,
+		SHA512: phase1TestSHA(), FieldsDone: required,
+		DurationMS: &duration, ThumbPath: `D:\cache\contact.jpg`,
+		ThumbPDQ: make([]byte, 32), ThumbQuality: &quality,
+		Width: 960, Height: 540,
+	}); err != nil {
+		t.Fatalf("SavePhase1: %v", err)
+	}
+	var width, height int32
+	var status string
+	var phase1 int
+	if err := db.db.QueryRowContext(ctx, `
+		SELECT video_features.thumb_width, video_features.thumb_height,
+		       files.status, files.phase1_done
+		FROM files JOIN video_features ON video_features.sha512=files.sha512
+		WHERE files.path=?1`, path,
+	).Scan(&width, &height, &status, &phase1); err != nil {
+		t.Fatal(err)
+	}
+	if width != 960 || height != 540 || status != proto.StatusDone || phase1 != 1 {
+		t.Fatalf("stored video width/height/status/phase1 = %d/%d/%q/%d", width, height, status, phase1)
 	}
 }

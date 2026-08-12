@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -131,6 +132,85 @@ func TestEnumerationChangesAndForcedRescanBecomePending(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertPendingSHA(t, db, rec.Path)
+}
+
+func TestDefaultStageOneUnchangedVideoReusesOnlyCompleteContactCache(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(filepath.Join(t.TempDir(), "agent.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	required := RequiredStageOneMask(MediaVideo)
+	record := EnumUpsert{
+		MachineID: "machine-a", DiskNo: 1, Path: `D:\complete.mp4`,
+		Size: 10, MTime: 20, MissingBase: required,
+	}
+	if err := db.UpsertEnumerated(ctx, []EnumUpsert{record}); err != nil {
+		t.Fatal(err)
+	}
+	duration, quality := int64(1234), int32(88)
+	width, height := int32(960), int32(540)
+	sha := phase1TestSHA()
+	if _, err := db.SaveAnalysis(ctx, AnalysisResult{
+		MachineID: record.MachineID, Path: record.Path, Kind: MediaVideo,
+		Size: record.Size, MTime: record.MTime, SHA512: sha,
+		RequestedFields: required, FieldsDone: required,
+		DurationMS: &duration, ThumbPath: `D:\cache\contact.jpg`,
+		ThumbPDQ: make([]byte, 32), ThumbQuality: &quality,
+		ThumbWidth: &width, ThumbHeight: &height,
+	}); err != nil {
+		t.Fatalf("SaveAnalysis: %v", err)
+	}
+	if err := db.UpsertEnumerated(ctx, []EnumUpsert{record}); err != nil {
+		t.Fatal(err)
+	}
+	assertStageOneFileState(t, db, record.Path, proto.StatusDone, 0, true, true)
+
+	if _, err := db.db.ExecContext(ctx, `
+		UPDATE video_features SET thumb_width=NULL, thumb_height=NULL
+		WHERE sha512=?1`, hex.EncodeToString(sha)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertEnumerated(ctx, []EnumUpsert{record}); err != nil {
+		t.Fatal(err)
+	}
+	assertStageOneFileState(
+		t, db, record.Path, proto.StatusPending,
+		proto.FieldVideoContactSheet, false, true,
+	)
+	pending, err := db.PendingSnapshot(ctx, record.MachineID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending[record.DiskNo]) != 1 ||
+		pending[record.DiskNo][0].MissingMask != proto.FieldVideoContactSheet {
+		t.Fatalf("pending explicit video fields = %#v", pending)
+	}
+}
+
+func assertStageOneFileState(
+	t *testing.T,
+	db *DB,
+	path string,
+	wantStatus string,
+	wantMissing uint32,
+	wantDone bool,
+	wantSHA bool,
+) {
+	t.Helper()
+	var status string
+	var missing uint32
+	var done int
+	var sha sql.NullString
+	if err := db.db.QueryRow(`
+		SELECT status, missing_mask, phase1_done, sha512 FROM files WHERE path=?1`, path,
+	).Scan(&status, &missing, &done, &sha); err != nil {
+		t.Fatal(err)
+	}
+	if status != wantStatus || missing != wantMissing || done != boolToInt(wantDone) || sha.Valid != wantSHA {
+		t.Fatalf("file state = status:%q missing:%#x done:%d sha:%#v", status, missing, done, sha)
+	}
 }
 
 func TestApplyHashResultsPreservesRetryAndDeduplicatesSyncQueue(t *testing.T) {
