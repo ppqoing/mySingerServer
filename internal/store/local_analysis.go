@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 )
 
@@ -40,6 +41,109 @@ type LocalPairScore struct {
 	Stage2JSON  *string
 	Stage3JSON  *string
 	Verdict     string
+}
+
+type LocalAnalysisMember struct {
+	FileID int64
+	SHA512 string
+}
+
+type LocalAnalysisGroup struct {
+	GroupID              string
+	Category             string
+	RepresentativeFileID int64
+	Members              []LocalAnalysisMember
+}
+
+// ReplaceLocalAnalysisGroups atomically replaces only the final groups of a
+// building run. Existing published generations are never touched.
+func (d *DB) ReplaceLocalAnalysisGroups(ctx context.Context, runID string, groups []LocalAnalysisGroup) error {
+	if runID == "" {
+		return fmt.Errorf("store: replace local analysis groups: empty run ID")
+	}
+	normalized := make([]LocalAnalysisGroup, len(groups))
+	seenGroups := make(map[string]struct{}, len(groups))
+	for index, group := range groups {
+		if group.GroupID == "" || (group.Category != "exact" && group.Category != "image" && group.Category != "video") || len(group.Members) < 2 {
+			return fmt.Errorf("store: replace local analysis groups: invalid group")
+		}
+		if _, exists := seenGroups[group.GroupID]; exists {
+			return fmt.Errorf("store: replace local analysis groups: duplicate group ID")
+		}
+		seenGroups[group.GroupID] = struct{}{}
+		normalized[index] = group
+		normalized[index].Members = append([]LocalAnalysisMember(nil), group.Members...)
+		sort.Slice(normalized[index].Members, func(i, j int) bool {
+			if normalized[index].Members[i].SHA512 != normalized[index].Members[j].SHA512 {
+				return normalized[index].Members[i].SHA512 < normalized[index].Members[j].SHA512
+			}
+			return normalized[index].Members[i].FileID < normalized[index].Members[j].FileID
+		})
+		seenMembers := make(map[int64]struct{}, len(group.Members))
+		representativeFound := false
+		for _, member := range normalized[index].Members {
+			if member.FileID <= 0 || member.SHA512 == "" {
+				return fmt.Errorf("store: replace local analysis groups: invalid member")
+			}
+			if _, exists := seenMembers[member.FileID]; exists {
+				return fmt.Errorf("store: replace local analysis groups: duplicate member")
+			}
+			seenMembers[member.FileID] = struct{}{}
+			if member.FileID == group.RepresentativeFileID {
+				representativeFound = true
+			}
+		}
+		if !representativeFound {
+			return fmt.Errorf("store: replace local analysis groups: representative is not a member")
+		}
+	}
+	sort.Slice(normalized, func(i, j int) bool { return normalized[i].GroupID < normalized[j].GroupID })
+
+	tx, err := d.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var machineID, status string
+	var generation int64
+	if err := tx.QueryRowContext(ctx, `SELECT machine_id,generation,status FROM local_analysis_runs WHERE run_id=?1`, runID).Scan(&machineID, &generation, &status); err != nil {
+		return fmt.Errorf("store: replace local analysis groups: load run: %w", err)
+	}
+	if status != "building" {
+		return fmt.Errorf("store: replace local analysis groups: run is not building")
+	}
+	for _, group := range normalized {
+		for _, member := range group.Members {
+			var storedSHA string
+			if err := tx.QueryRowContext(ctx, `SELECT sha512 FROM files WHERE machine_id=?1 AND id=?2 AND status!='deleted'`, machineID, member.FileID).Scan(&storedSHA); err != nil || storedSHA != member.SHA512 {
+				if err == nil {
+					err = fmt.Errorf("SHA mismatch")
+				}
+				return fmt.Errorf("store: replace local analysis groups: member identity: %w", err)
+			}
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM local_dup_members WHERE run_id=?1`, runID); err != nil {
+		return fmt.Errorf("store: replace local analysis groups: delete members: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM local_dup_groups WHERE run_id=?1`, runID); err != nil {
+		return fmt.Errorf("store: replace local analysis groups: delete groups: %w", err)
+	}
+	now := time.Now().UnixMilli()
+	for _, group := range normalized {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO local_dup_groups(group_id,machine_id,run_id,generation,category,verdict,created_at) VALUES (?1,?2,?3,?4,?5,'duplicate',?6)`, group.GroupID, machineID, runID, generation, group.Category, now); err != nil {
+			return fmt.Errorf("store: replace local analysis groups: insert group: %w", err)
+		}
+		for _, member := range group.Members {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO local_dup_members(group_id,machine_id,run_id,generation,file_id,sha512,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)`, group.GroupID, machineID, runID, generation, member.FileID, member.SHA512, now); err != nil {
+				return fmt.Errorf("store: replace local analysis groups: insert member: %w", err)
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("store: replace local analysis groups: commit: %w", err)
+	}
+	return nil
 }
 
 func (d *DB) BeginLocalAnalysis(ctx context.Context, machineID, taskID string) (LocalAnalysisRun, error) {

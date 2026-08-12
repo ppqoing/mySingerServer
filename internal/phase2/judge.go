@@ -6,7 +6,157 @@ import (
 
 	"dedup/internal/config"
 	"dedup/internal/features"
+	"dedup/internal/proto"
 )
+
+// Config is the shared three-stage threshold configuration.
+type Config = config.Phase2Config
+
+// StageScore is the stable, display-safe result of one independent screen.
+type StageScore struct {
+	Verdict      Verdict            `json:"verdict"`
+	Reason       string             `json:"reason"`
+	PassRatio    float64            `json:"pass_ratio,omitempty"`
+	Similarity   float64            `json:"similarity,omitempty"`
+	ValidFrames  int                `json:"valid_frames,omitempty"`
+	PassedFrames int                `json:"passed_frames,omitempty"`
+	Frames       [6]StageFrameScore `json:"frames,omitempty"`
+}
+
+type StageFrameScore struct {
+	Valid      bool    `json:"valid"`
+	PassRatio  float64 `json:"pass_ratio,omitempty"`
+	Similarity float64 `json:"similarity,omitempty"`
+	Passed     bool    `json:"passed"`
+}
+
+func JudgeImageStage2(a, b []byte, cfg Config) StageScore {
+	if err := validateJudgeConfig(cfg); err != nil {
+		return StageScore{Verdict: VerdictInconclusive, Reason: "invalid_config"}
+	}
+	left, err := features.DecodePHashParts(a)
+	if err != nil {
+		return StageScore{Verdict: VerdictInconclusive, Reason: "invalid_phash"}
+	}
+	right, err := features.DecodePHashParts(b)
+	if err != nil {
+		return StageScore{Verdict: VerdictInconclusive, Reason: "invalid_phash"}
+	}
+	ratio := pHashPassRatio(left, right, cfg.PHashPartThreshold)
+	if ratio < cfg.PHashPassT2 {
+		return StageScore{Verdict: VerdictNo, Reason: "phash_below_threshold", PassRatio: ratio}
+	}
+	return StageScore{Verdict: VerdictYes, Reason: "phash_passed", PassRatio: ratio}
+}
+
+func JudgeImageStage3(a, b []byte, cfg Config) StageScore {
+	if err := validateJudgeConfig(cfg); err != nil {
+		return StageScore{Verdict: VerdictInconclusive, Reason: "invalid_config"}
+	}
+	left, err := features.DecodeSobelHist(a)
+	if err != nil || validateSobelHist(left, "left image") != nil {
+		return StageScore{Verdict: VerdictInconclusive, Reason: "invalid_sobel"}
+	}
+	right, err := features.DecodeSobelHist(b)
+	if err != nil || validateSobelHist(right, "right image") != nil {
+		return StageScore{Verdict: VerdictInconclusive, Reason: "invalid_sobel"}
+	}
+	similarity := features.SobelCosine(left, right)
+	if similarity < cfg.SobelT3 {
+		return StageScore{Verdict: VerdictNo, Reason: "sobel_below_threshold", Similarity: similarity}
+	}
+	return StageScore{Verdict: VerdictYes, Reason: "sobel_passed", Similarity: similarity}
+}
+
+func JudgeVideoStage2(a, b []proto.FrameFeature, cfg Config) StageScore {
+	return judgeVideoStage(a, b, cfg, true)
+}
+
+func JudgeVideoStage3(a, b []proto.FrameFeature, cfg Config) StageScore {
+	return judgeVideoStage(a, b, cfg, false)
+}
+
+func judgeVideoStage(a, b []proto.FrameFeature, cfg Config, phash bool) StageScore {
+	if err := validateJudgeConfig(cfg); err != nil {
+		return StageScore{Verdict: VerdictInconclusive, Reason: "invalid_config"}
+	}
+	left, leftOK := indexedFrames(a)
+	right, rightOK := indexedFrames(b)
+	if !leftOK || !rightOK {
+		return StageScore{Verdict: VerdictInconclusive, Reason: "invalid_frames"}
+	}
+	score := StageScore{}
+	var sum float64
+	for index := 0; index < cfg.VideoFrames; index++ {
+		lf, lok := left[index]
+		rf, rok := right[index]
+		if !lok || !rok {
+			continue
+		}
+		score.ValidFrames++
+		score.Frames[index].Valid = true
+		if phash {
+			lp, err1 := features.DecodePHashParts(lf.PHashParts)
+			rp, err2 := features.DecodePHashParts(rf.PHashParts)
+			if err1 != nil || err2 != nil {
+				return StageScore{Verdict: VerdictInconclusive, Reason: "invalid_phash"}
+			}
+			ratio := pHashPassRatio(lp, rp, cfg.PHashPartThreshold)
+			score.Frames[index].PassRatio = ratio
+			sum += ratio
+			score.Frames[index].Passed = ratio >= cfg.PHashPassT2
+			if score.Frames[index].Passed {
+				score.PassedFrames++
+			}
+		} else {
+			lh, err1 := features.DecodeSobelHist(lf.SobelHist)
+			rh, err2 := features.DecodeSobelHist(rf.SobelHist)
+			if err1 != nil || err2 != nil || validateSobelHist(lh, "left frame") != nil || validateSobelHist(rh, "right frame") != nil {
+				return StageScore{Verdict: VerdictInconclusive, Reason: "invalid_sobel"}
+			}
+			sim := features.SobelCosine(lh, rh)
+			score.Frames[index].Similarity = sim
+			sum += sim
+			score.Frames[index].Passed = sim >= cfg.SobelT3
+			if score.Frames[index].Passed {
+				score.PassedFrames++
+			}
+		}
+	}
+	if score.ValidFrames < cfg.VideoMinValid {
+		score.Verdict, score.Reason = VerdictInconclusive, "insufficient_valid_frames"
+		return score
+	}
+	score.Similarity = sum / float64(score.ValidFrames)
+	if phash {
+		if score.Similarity >= cfg.PHashPassT2 || score.PassedFrames >= cfg.VideoMinPassed {
+			score.Verdict, score.Reason = VerdictYes, "phash_passed"
+		} else {
+			score.Verdict, score.Reason = VerdictNo, "phash_below_threshold"
+		}
+		return score
+	}
+	if score.Similarity >= cfg.VideoAvgT4 || score.PassedFrames >= cfg.VideoMinPassed {
+		score.Verdict, score.Reason = VerdictYes, "sobel_passed"
+	} else {
+		score.Verdict, score.Reason = VerdictNo, "sobel_below_threshold"
+	}
+	return score
+}
+
+func indexedFrames(frames []proto.FrameFeature) (map[int]proto.FrameFeature, bool) {
+	result := make(map[int]proto.FrameFeature, len(frames))
+	for _, frame := range frames {
+		if frame.FrameIdx < 0 || frame.FrameIdx >= 6 {
+			return nil, false
+		}
+		if _, exists := result[frame.FrameIdx]; exists {
+			return nil, false
+		}
+		result[frame.FrameIdx] = frame
+	}
+	return result, true
+}
 
 // Verdict is the explicit outcome of a phase-2 pair comparison.
 type Verdict uint8
@@ -71,19 +221,22 @@ func JudgeImagePair(
 		return ImagePairScore{}, err
 	}
 
-	score := ImagePairScore{
-		PHashPassRatio: pHashPassRatio(aParts, bParts, cfg.PHashPartThreshold),
-		Verdict:        VerdictNo,
-	}
-	if score.PHashPassRatio < cfg.PHashPassT2 {
+	stage2 := JudgeImageStage2(
+		features.EncodePHashParts(aParts),
+		features.EncodePHashParts(bParts),
+		cfg,
+	)
+	score := ImagePairScore{PHashPassRatio: stage2.PassRatio, Verdict: VerdictNo}
+	if stage2.Verdict != VerdictYes {
 		return score, nil
 	}
 
+	aRaw, _ := features.EncodeSobelHist(aHist)
+	bRaw, _ := features.EncodeSobelHist(bHist)
+	stage3 := JudgeImageStage3(aRaw, bRaw, cfg)
 	score.SobelEvaluated = true
-	score.SobelCosine = features.SobelCosine(aHist, bHist)
-	if score.SobelCosine >= cfg.SobelT3 {
-		score.Verdict = VerdictYes
-	}
+	score.SobelCosine = stage3.Similarity
+	score.Verdict = stage3.Verdict
 	return score, nil
 }
 
@@ -110,28 +263,38 @@ func JudgeVideoPair(
 		}
 	}
 
+	leftStage2, rightStage2 := make([]proto.FrameFeature, 0, len(aFrames)), make([]proto.FrameFeature, 0, len(bFrames))
+	leftStage3, rightStage3 := make([]proto.FrameFeature, 0, len(aFrames)), make([]proto.FrameFeature, 0, len(bFrames))
+	for index := range aFrames {
+		if aFrames[index] != nil {
+			aSobel, _ := features.EncodeSobelHist(aFrames[index].SobelHist)
+			leftStage2 = append(leftStage2, proto.FrameFeature{FrameIdx: index, PHashParts: features.EncodePHashParts(aFrames[index].PHashParts)})
+			leftStage3 = append(leftStage3, proto.FrameFeature{FrameIdx: index, SobelHist: aSobel})
+		}
+		if bFrames[index] != nil {
+			bSobel, _ := features.EncodeSobelHist(bFrames[index].SobelHist)
+			rightStage2 = append(rightStage2, proto.FrameFeature{FrameIdx: index, PHashParts: features.EncodePHashParts(bFrames[index].PHashParts)})
+			rightStage3 = append(rightStage3, proto.FrameFeature{FrameIdx: index, SobelHist: bSobel})
+		}
+	}
+	stage2 := JudgeVideoStage2(leftStage2, rightStage2, cfg)
+	stage3 := JudgeVideoStage3(leftStage3, rightStage3, cfg)
+
 	var score VideoPairScore
 	var similaritySum float64
 	for index := 0; index < len(score.Frames); index++ {
-		frameScore := FrameScore{FrameIdx: index}
-		left, right := aFrames[index], bFrames[index]
-		if left == nil || right == nil {
+		frameScore := FrameScore{FrameIdx: index, Valid: stage2.Frames[index].Valid}
+		if !frameScore.Valid {
 			score.Frames[index] = frameScore
 			continue
 		}
-
-		frameScore.Valid = true
 		score.ValidFrames++
-		frameScore.PHashPassRatio = pHashPassRatio(
-			left.PHashParts,
-			right.PHashParts,
-			cfg.PHashPartThreshold,
-		)
-		if frameScore.PHashPassRatio >= cfg.PHashPassT2 {
+		frameScore.PHashPassRatio = stage2.Frames[index].PassRatio
+		if stage2.Frames[index].Passed {
 			frameScore.SobelEvaluated = true
-			frameScore.SobelCosine = features.SobelCosine(left.SobelHist, right.SobelHist)
+			frameScore.SobelCosine = stage3.Frames[index].Similarity
 			frameScore.Sim = frameScore.SobelCosine
-			frameScore.Passed = frameScore.Sim >= cfg.SobelT3
+			frameScore.Passed = stage3.Frames[index].Passed
 		}
 		if frameScore.Passed {
 			score.PassedFrames++

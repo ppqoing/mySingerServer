@@ -75,6 +75,94 @@ func TestLocalAnalysisGenerationIsMonotonicAndPublishRollsBackCurrentOnFailure(t
 	}
 }
 
+func TestReplaceLocalAnalysisGroupsRejectsNonBuildingAndPreservesHistory(t *testing.T) {
+	db := openLocalTestDB(t)
+	ctx := context.Background()
+	createAnalysisTask(t, db, "old-task", "machine-a")
+	old := createLocalRunFixture(t, db, "old-history")
+	oldFile := insertLocalFileFixture(t, db, "machine-a", "old", "old-sha")
+	insertLocalGroupFixture(t, db, old, "old-group")
+	if err := insertLocalMemberFixture(t, db, old, "old-group", "machine-a", oldFile, "old-sha"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CompleteLocalAnalysis(ctx, old.RunID); err != nil {
+		t.Fatal(err)
+	}
+
+	err := db.ReplaceLocalAnalysisGroups(ctx, old.RunID, []LocalAnalysisGroup{{
+		GroupID: "replacement", Category: "exact", RepresentativeFileID: oldFile,
+		Members: []LocalAnalysisMember{{FileID: oldFile, SHA512: "old-sha"}},
+	}})
+	if err == nil {
+		t.Fatal("non-building run accepted final groups")
+	}
+	var oldCount int
+	if err := db.db.QueryRow(`SELECT count(*) FROM local_dup_groups WHERE run_id=? AND group_id='old-group'`, old.RunID).Scan(&oldCount); err != nil {
+		t.Fatal(err)
+	}
+	if oldCount != 1 {
+		t.Fatalf("historical group count = %d, want 1", oldCount)
+	}
+}
+
+func TestReplaceLocalAnalysisGroupsRollsBackWholeReplacement(t *testing.T) {
+	db := openLocalTestDB(t)
+	run := createLocalRunFixture(t, db, "replace-rollback")
+	left := insertLocalFileFixture(t, db, "machine-a", "left-final", "sha-left-final")
+	right := insertLocalFileFixture(t, db, "machine-a", "right-final", "sha-right-final")
+	insertLocalGroupFixture(t, db, run, "candidate-old")
+	if err := insertLocalMemberFixture(t, db, run, "candidate-old", "machine-a", left, "sha-left-final"); err != nil {
+		t.Fatal(err)
+	}
+	trigger := fmt.Sprintf(`CREATE TRIGGER fail_final_member BEFORE INSERT ON local_dup_members WHEN NEW.file_id=%d BEGIN SELECT RAISE(ABORT, 'injected final member failure'); END;`, right)
+	if _, err := db.db.Exec(trigger); err != nil {
+		t.Fatal(err)
+	}
+
+	err := db.ReplaceLocalAnalysisGroups(context.Background(), run.RunID, []LocalAnalysisGroup{{
+		GroupID: "deterministic-final", Category: "image", RepresentativeFileID: left,
+		Members: []LocalAnalysisMember{{FileID: left, SHA512: "sha-left-final"}, {FileID: right, SHA512: "sha-right-final"}},
+	}})
+	if err == nil {
+		t.Fatal("injected member failure returned nil")
+	}
+	var oldCount, finalCount int
+	if err := db.db.QueryRow(`SELECT count(*) FROM local_dup_groups WHERE run_id=? AND group_id='candidate-old'`, run.RunID).Scan(&oldCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.db.QueryRow(`SELECT count(*) FROM local_dup_groups WHERE run_id=? AND group_id='deterministic-final'`, run.RunID).Scan(&finalCount); err != nil {
+		t.Fatal(err)
+	}
+	if oldCount != 1 || finalCount != 0 {
+		t.Fatalf("groups after rollback old/final = %d/%d", oldCount, finalCount)
+	}
+}
+
+func TestReplaceLocalAnalysisGroupsRejectsForeignIdentityBeforeDelete(t *testing.T) {
+	db := openLocalTestDB(t)
+	run := createLocalRunFixture(t, db, "replace-identity")
+	local := insertLocalFileFixture(t, db, "machine-a", "local", "sha-local")
+	foreign := insertLocalFileFixture(t, db, "machine-b", "foreign", "sha-foreign")
+	insertLocalGroupFixture(t, db, run, "candidate-keep")
+	if err := insertLocalMemberFixture(t, db, run, "candidate-keep", "machine-a", local, "sha-local"); err != nil {
+		t.Fatal(err)
+	}
+	err := db.ReplaceLocalAnalysisGroups(context.Background(), run.RunID, []LocalAnalysisGroup{{
+		GroupID: "foreign-final", Category: "image", RepresentativeFileID: foreign,
+		Members: []LocalAnalysisMember{{FileID: local, SHA512: "wrong-sha"}, {FileID: foreign, SHA512: "sha-foreign"}},
+	}})
+	if err == nil {
+		t.Fatal("foreign or mismatched group identity was accepted")
+	}
+	var count int
+	if err := db.db.QueryRow(`SELECT count(*) FROM local_dup_groups WHERE run_id=? AND group_id='candidate-keep'`, run.RunID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("candidate group count after rejected input = %d", count)
+	}
+}
+
 func TestLocalAnalysisPublishesOnlyCompleteRun(t *testing.T) {
 	db := openLocalTestDB(t)
 	createAnalysisTask(t, db, "task", "machine-a")

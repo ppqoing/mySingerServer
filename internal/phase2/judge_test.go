@@ -6,7 +6,76 @@ import (
 
 	"dedup/internal/config"
 	"dedup/internal/features"
+	"dedup/internal/proto"
 )
+
+func TestJudgeImageStage2AndStage3AreIndependent(t *testing.T) {
+	a, b := partsWithPassCount(7)
+	stage2 := JudgeImageStage2(features.EncodePHashParts(a), features.EncodePHashParts(b), validJudgeConfig())
+	if stage2.Verdict != VerdictNo || stage2.Reason != "phash_below_threshold" {
+		t.Fatalf("stage 2 = %#v", stage2)
+	}
+	hist := unitHist()
+	raw, err := features.EncodeSobelHist(hist)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stage3 := JudgeImageStage3(raw, raw, validJudgeConfig())
+	if stage3.Verdict != VerdictYes || stage3.Reason != "sobel_passed" {
+		t.Fatalf("stage 3 = %#v", stage3)
+	}
+}
+
+func TestJudgeVideoStage3StableInconclusiveReason(t *testing.T) {
+	raw, err := features.EncodeSobelHist(unitHist())
+	if err != nil {
+		t.Fatal(err)
+	}
+	frames := []proto.FrameFeature{
+		{FrameIdx: 0, SobelHist: raw},
+		{FrameIdx: 2, SobelHist: raw},
+		{FrameIdx: 5, SobelHist: raw},
+	}
+	score := JudgeVideoStage3(frames, frames, validJudgeConfig())
+	if score.Verdict != VerdictInconclusive || score.Reason != "insufficient_valid_frames" {
+		t.Fatalf("stage 3 = %#v", score)
+	}
+}
+
+func TestJudgePairCompatibilityWrappersComposeIndependentStages(t *testing.T) {
+	cfg := validJudgeConfig()
+	aParts, bParts := partsWithPassCount(9)
+	aHist, bHist := cosineHalfHists()
+	image, err := JudgeImagePair(aParts, bParts, aHist, bHist, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aPHash, bPHash := features.EncodePHashParts(aParts), features.EncodePHashParts(bParts)
+	aSobel, _ := features.EncodeSobelHist(aHist)
+	bSobel, _ := features.EncodeSobelHist(bHist)
+	stage2, stage3 := JudgeImageStage2(aPHash, bPHash, cfg), JudgeImageStage3(aSobel, bSobel, cfg)
+	if image.PHashPassRatio != stage2.PassRatio || image.SobelCosine != stage3.Similarity || image.Verdict != stage3.Verdict {
+		t.Fatalf("image wrapper = %#v; stages = %#v/%#v", image, stage2, stage3)
+	}
+
+	var left, right [6]*FramePhase2
+	leftFrames, rightFrames := make([]proto.FrameFeature, 0, 6), make([]proto.FrameFeature, 0, 6)
+	for index := 0; index < 6; index++ {
+		left[index], right[index] = identicalFrame(), identicalFrame()
+		pHash := features.EncodePHashParts(left[index].PHashParts)
+		sobel, _ := features.EncodeSobelHist(left[index].SobelHist)
+		leftFrames = append(leftFrames, proto.FrameFeature{FrameIdx: index, PHashParts: pHash, SobelHist: sobel})
+		rightFrames = append(rightFrames, proto.FrameFeature{FrameIdx: index, PHashParts: pHash, SobelHist: sobel})
+	}
+	video, err := JudgeVideoPair(left, right, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	video2, video3 := JudgeVideoStage2(leftFrames, rightFrames, cfg), JudgeVideoStage3(leftFrames, rightFrames, cfg)
+	if video.ValidFrames != video2.ValidFrames || video.PassedFrames != video3.PassedFrames || video.AvgSim != video3.Similarity || video.Verdict != video3.Verdict {
+		t.Fatalf("video wrapper = %#v; stages = %#v/%#v", video, video2, video3)
+	}
+}
 
 func TestJudgeImagePairHammingTenPassesAndElevenFailsPart(t *testing.T) {
 	cfg := validJudgeConfig()
