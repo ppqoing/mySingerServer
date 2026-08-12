@@ -25,4 +25,8 @@ func guiStartReplacement(string, []string) error {
 	return errors.New("restarting the GUI is unsupported on this platform")
 }
 
+func guiPrepareReplacement(string, []string) (guiPreparedReplacement, error) {
+	return nil, errors.New("restarting the GUI is unsupported on this platform")
+}
+
 func showGUIStartupError(string) {}

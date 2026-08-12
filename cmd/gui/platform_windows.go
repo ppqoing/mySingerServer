@@ -16,6 +16,12 @@ import (
 
 type guiReplacementProcess interface {
 	Release() error
+	Kill() error
+	Wait() (*os.ProcessState, error)
+}
+
+type startedGUIReplacement struct {
+	process guiReplacementProcess
 }
 
 var (
@@ -70,15 +76,39 @@ func guiWaitForParent(pid int) error {
 }
 
 func guiStartReplacement(executable string, args []string) error {
+	replacement, err := guiPrepareReplacement(executable, args)
+	if err != nil {
+		return err
+	}
+	return replacement.Commit()
+}
+
+func guiPrepareReplacement(executable string, args []string) (guiPreparedReplacement, error) {
 	if !filepath.IsAbs(executable) {
-		return fmt.Errorf("replacement executable is not absolute: %s", executable)
+		return nil, fmt.Errorf("replacement executable is not absolute: %s", executable)
 	}
 	process, err := guiStartProcess(executable, args)
 	if err != nil {
-		return fmt.Errorf("start replacement GUI: %w", err)
+		return nil, fmt.Errorf("start replacement GUI: %w", err)
 	}
-	if err := process.Release(); err != nil {
+	return &startedGUIReplacement{process: process}, nil
+}
+
+func (replacement *startedGUIReplacement) Commit() error {
+	if err := replacement.process.Release(); err != nil {
 		return fmt.Errorf("release replacement GUI process: %w", err)
+	}
+	return nil
+}
+
+func (replacement *startedGUIReplacement) Abort() error {
+	killErr := replacement.process.Kill()
+	_, waitErr := replacement.process.Wait()
+	if killErr != nil {
+		return fmt.Errorf("terminate replacement GUI process: %w", killErr)
+	}
+	if waitErr != nil {
+		return fmt.Errorf("wait for terminated replacement GUI process: %w", waitErr)
 	}
 	return nil
 }

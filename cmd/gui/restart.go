@@ -16,22 +16,33 @@ import (
 var errGUIRestartInProgress = errors.New("GUI restart is already in progress")
 
 type guiRestartCoordinator interface {
+	Begin() bool
+	End()
 	Pending() bool
 	Prepare(*config.GUIConfig) (string, error)
 	Commit()
+	Abort()
+}
+
+type guiPreparedReplacement interface {
+	Commit() error
+	Abort() error
 }
 
 type atomicGUIRestartCoordinator struct {
-	executable string
-	configPath string
-	parentPID  int
-	cancel     context.CancelFunc
-	start      func(string, []string) error
-	pending    atomic.Bool
-	commitOnce sync.Once
+	executable  string
+	configPath  string
+	parentPID   int
+	cancel      context.CancelFunc
+	start       func(string, []string) (guiPreparedReplacement, error)
+	requestMu   sync.Mutex
+	replaceMu   sync.Mutex
+	replacement guiPreparedReplacement
+	pending     atomic.Bool
+	commitOnce  sync.Once
 }
 
-var guiLaunchReplacement = guiStartReplacement
+var guiPrepareReplacementLaunch = guiPrepareReplacement
 
 func newGUIRestartCoordinator(
 	executable, configPath string,
@@ -43,8 +54,21 @@ func newGUIRestartCoordinator(
 		configPath: configPath,
 		parentPID:  parentPID,
 		cancel:     cancel,
-		start:      guiLaunchReplacement,
+		start:      guiPrepareReplacementLaunch,
 	}
+}
+
+func (c *atomicGUIRestartCoordinator) Begin() bool {
+	c.requestMu.Lock()
+	if c.pending.Load() {
+		c.requestMu.Unlock()
+		return false
+	}
+	return true
+}
+
+func (c *atomicGUIRestartCoordinator) End() {
+	c.requestMu.Unlock()
 }
 
 func (c *atomicGUIRestartCoordinator) Pending() bool {
@@ -75,16 +99,42 @@ func (c *atomicGUIRestartCoordinator) Prepare(cfg *config.GUIConfig) (string, er
 		"-no-browser",
 		"-wait-parent-pid", strconv.Itoa(c.parentPID),
 	}
-	if err := c.start(c.executable, args); err != nil {
+	replacement, err := c.start(c.executable, args)
+	if err != nil {
 		c.pending.Store(false)
 		return "", err
 	}
+	c.replaceMu.Lock()
+	c.replacement = replacement
+	c.replaceMu.Unlock()
 	return strings.TrimSuffix(browserURL, "/") + "/api/restart/health", nil
 }
 
 func (c *atomicGUIRestartCoordinator) Commit() {
-	if !c.pending.Load() || c.cancel == nil {
+	if !c.pending.Load() {
 		return
 	}
-	c.commitOnce.Do(c.cancel)
+	c.commitOnce.Do(func() {
+		if replacement := c.takeReplacement(); replacement != nil {
+			_ = replacement.Commit()
+		}
+		if c.cancel != nil {
+			c.cancel()
+		}
+	})
+}
+
+func (c *atomicGUIRestartCoordinator) Abort() {
+	if replacement := c.takeReplacement(); replacement != nil {
+		_ = replacement.Abort()
+	}
+	c.pending.Store(false)
+}
+
+func (c *atomicGUIRestartCoordinator) takeReplacement() guiPreparedReplacement {
+	c.replaceMu.Lock()
+	defer c.replaceMu.Unlock()
+	replacement := c.replacement
+	c.replacement = nil
+	return replacement
 }

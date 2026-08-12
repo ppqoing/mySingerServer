@@ -17,9 +17,23 @@ import (
 	"dedup/internal/config"
 )
 
+type fakePreparedGUIReplacement struct {
+	events *[]string
+}
+
+func (r *fakePreparedGUIReplacement) Commit() error {
+	*r.events = append(*r.events, "replacement commit")
+	return nil
+}
+
+func (r *fakePreparedGUIReplacement) Abort() error {
+	*r.events = append(*r.events, "replacement abort")
+	return nil
+}
+
 func TestGUIRestartAlwaysStartsReplacementWithExplicitConfigAndParentWait(t *testing.T) {
-	originalStart := guiLaunchReplacement
-	defer func() { guiLaunchReplacement = originalStart }()
+	originalStart := guiPrepareReplacementLaunch
+	defer func() { guiPrepareReplacementLaunch = originalStart }()
 
 	root := t.TempDir()
 	executable := filepath.Join(root, "gui.exe")
@@ -27,10 +41,11 @@ func TestGUIRestartAlwaysStartsReplacementWithExplicitConfigAndParentWait(t *tes
 	parentPID := os.Getpid()
 	var gotExecutable string
 	var gotArgs []string
-	guiLaunchReplacement = func(exe string, args []string) error {
+	events := []string{}
+	guiPrepareReplacementLaunch = func(exe string, args []string) (guiPreparedReplacement, error) {
 		gotExecutable = exe
 		gotArgs = append([]string(nil), args...)
-		return nil
+		return &fakePreparedGUIReplacement{events: &events}, nil
 	}
 	cancelCalls := 0
 	restart := newGUIRestartCoordinator(executable, configPath, parentPID, func() {
@@ -59,18 +74,19 @@ func TestGUIRestartAlwaysStartsReplacementWithExplicitConfigAndParentWait(t *tes
 	}
 	restart.Commit()
 	restart.Commit()
-	if cancelCalls != 1 {
-		t.Fatalf("cancel calls=%d want=1", cancelCalls)
+	if cancelCalls != 1 || !reflect.DeepEqual(events, []string{"replacement commit"}) {
+		t.Fatalf("cancel calls=%d events=%v", cancelCalls, events)
 	}
 }
 
 func TestGUIRestartRejectsDuplicatePrepare(t *testing.T) {
-	originalStart := guiLaunchReplacement
-	defer func() { guiLaunchReplacement = originalStart }()
+	originalStart := guiPrepareReplacementLaunch
+	defer func() { guiPrepareReplacementLaunch = originalStart }()
 	var starts int
-	guiLaunchReplacement = func(string, []string) error {
+	events := []string{}
+	guiPrepareReplacementLaunch = func(string, []string) (guiPreparedReplacement, error) {
 		starts++
-		return nil
+		return &fakePreparedGUIReplacement{events: &events}, nil
 	}
 	restart := newGUIRestartCoordinator(
 		filepath.Join(t.TempDir(), "gui.exe"),
@@ -92,10 +108,12 @@ func TestGUIRestartRejectsDuplicatePrepare(t *testing.T) {
 }
 
 func TestGUIRestartLaunchFailureClearsPendingForRetry(t *testing.T) {
-	originalStart := guiLaunchReplacement
-	defer func() { guiLaunchReplacement = originalStart }()
+	originalStart := guiPrepareReplacementLaunch
+	defer func() { guiPrepareReplacementLaunch = originalStart }()
 	launchErr := errors.New("CreateProcess failed")
-	guiLaunchReplacement = func(string, []string) error { return launchErr }
+	guiPrepareReplacementLaunch = func(string, []string) (guiPreparedReplacement, error) {
+		return nil, launchErr
+	}
 	restart := newGUIRestartCoordinator(
 		filepath.Join(t.TempDir(), "gui.exe"),
 		filepath.Join(t.TempDir(), "gui.json"),
@@ -108,6 +126,46 @@ func TestGUIRestartLaunchFailureClearsPendingForRetry(t *testing.T) {
 	}
 	if restart.Pending() {
 		t.Fatal("failed replacement launch left restart pending")
+	}
+}
+
+func TestGUIRestartAbortTerminatesPreparedReplacementAndAllowsRetry(t *testing.T) {
+	originalStart := guiPrepareReplacementLaunch
+	defer func() { guiPrepareReplacementLaunch = originalStart }()
+	events := []string{}
+	guiPrepareReplacementLaunch = func(string, []string) (guiPreparedReplacement, error) {
+		return &fakePreparedGUIReplacement{events: &events}, nil
+	}
+	cancelCalls := 0
+	restart := newGUIRestartCoordinator(
+		filepath.Join(t.TempDir(), "gui.exe"),
+		filepath.Join(t.TempDir(), "gui.json"),
+		os.Getpid(),
+		func() { cancelCalls++ },
+	)
+
+	if !restart.Begin() {
+		t.Fatal("initial restart transaction was not reserved")
+	}
+	if _, err := restart.Prepare(config.DefaultGUI()); err != nil {
+		t.Fatal(err)
+	}
+	restart.Abort()
+	restart.End()
+	if restart.Pending() || cancelCalls != 0 || !reflect.DeepEqual(events, []string{"replacement abort"}) {
+		t.Fatalf("pending=%t cancelCalls=%d events=%v", restart.Pending(), cancelCalls, events)
+	}
+
+	if !restart.Begin() {
+		t.Fatal("restart reservation was not released after Abort")
+	}
+	if _, err := restart.Prepare(config.DefaultGUI()); err != nil {
+		t.Fatal(err)
+	}
+	restart.Commit()
+	restart.End()
+	if cancelCalls != 1 || !reflect.DeepEqual(events, []string{"replacement abort", "replacement commit"}) {
+		t.Fatalf("cancelCalls=%d events=%v", cancelCalls, events)
 	}
 }
 

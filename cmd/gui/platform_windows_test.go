@@ -3,6 +3,7 @@
 package main
 
 import (
+	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -17,6 +18,16 @@ type fakeGUIReplacementProcess struct {
 func (p *fakeGUIReplacementProcess) Release() error {
 	*p.events = append(*p.events, "release")
 	return nil
+}
+
+func (p *fakeGUIReplacementProcess) Kill() error {
+	*p.events = append(*p.events, "kill")
+	return nil
+}
+
+func (p *fakeGUIReplacementProcess) Wait() (*os.ProcessState, error) {
+	*p.events = append(*p.events, "wait")
+	return nil, nil
 }
 
 func TestResolveGUIExecutablePathUsesFinalImageInsteadOfLaunchAlias(t *testing.T) {
@@ -87,6 +98,27 @@ func TestGUIRestartStartsAbsoluteExecutableAndReleasesHandle(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(events, []string{"start", "release"}) {
+		t.Fatalf("events=%v", events)
+	}
+}
+
+func TestGUIPreparedReplacementAbortKillsAndWaitsWithoutSleep(t *testing.T) {
+	originalStart := guiStartProcess
+	defer func() { guiStartProcess = originalStart }()
+	events := []string{}
+	guiStartProcess = func(string, []string) (guiReplacementProcess, error) {
+		events = append(events, "start")
+		return &fakeGUIReplacementProcess{events: &events}, nil
+	}
+
+	replacement, err := guiPrepareReplacement(filepath.Join(t.TempDir(), "gui.exe"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := replacement.Abort(); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(events, []string{"start", "kill", "wait"}) {
 		t.Fatalf("events=%v", events)
 	}
 }
