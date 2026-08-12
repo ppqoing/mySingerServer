@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -58,18 +59,23 @@ func TestGUIRestartAlwaysStartsReplacementWithExplicitConfigAndParentWait(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantArgs := []string{
-		"-config", configPath,
-		"-no-browser",
-		"-wait-parent-pid", strconv.Itoa(parentPID),
-	}
 	if gotExecutable != executable || !filepath.IsAbs(gotExecutable) {
 		t.Fatalf("executable=%q want final absolute %q", gotExecutable, executable)
 	}
-	if !reflect.DeepEqual(gotArgs, wantArgs) {
-		t.Fatalf("args=%q want=%q", gotArgs, wantArgs)
+	if len(gotArgs) != 7 || !reflect.DeepEqual(gotArgs[:5], []string{
+		"-config", configPath,
+		"-no-browser",
+		"-wait-parent-pid", strconv.Itoa(parentPID),
+	}) || gotArgs[5] != "-restart-token" || gotArgs[6] == "" {
+		t.Fatalf("replacement args=%q", gotArgs)
 	}
-	if recoveryURL != "http://127.0.0.1:18081/api/restart/health" || !restart.Pending() {
+	parsedRecoveryURL, err := url.Parse(recoveryURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsedRecoveryURL.Scheme != "http" || parsedRecoveryURL.Host != "127.0.0.1:18081" ||
+		parsedRecoveryURL.Path != "/api/restart/health" ||
+		parsedRecoveryURL.Query().Get("restart_token") != gotArgs[6] || !restart.Pending() {
 		t.Fatalf("recoveryURL=%q pending=%t", recoveryURL, restart.Pending())
 	}
 	restart.Commit()

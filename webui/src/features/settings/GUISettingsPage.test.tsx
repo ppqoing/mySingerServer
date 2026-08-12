@@ -183,16 +183,17 @@ test("aborts the latest manual configuration reload when the settings page unmou
 
 test("waits for the replacement Manager then navigates to its settings page", async () => {
   const navigate = vi.fn();
+  const recoveryURL = "http://127.0.0.1:28081/api/restart/health?restart_token=replacement-instance";
   const saveGUIConfig = vi.fn().mockResolvedValue({
     saved: true,
     restartRequired: true,
     restarting: true,
-    recoveryURL: "http://127.0.0.1:28081/api/restart/health"
+    recoveryURL
   });
-  let resolveHealth: (response: Response) => void;
-  vi.stubGlobal("fetch", vi.fn().mockImplementation(() => new Promise<Response>(resolve => {
-    resolveHealth = resolve;
-  })));
+  const fetchMock = vi.fn()
+    .mockResolvedValueOnce(new Response("{\"ok\":true,\"restart_token\":\"unrelated-instance\",\"restarting\":false}", { status: 200 }))
+    .mockResolvedValueOnce(new Response("{\"ok\":true,\"restart_token\":\"replacement-instance\",\"restarting\":false}", { status: 200 }));
+  vi.stubGlobal("fetch", fetchMock);
   const user = userEvent.setup();
   render(<GUISettingsPage api={apiFor({ saveGUIConfig })} navigate={navigate} />);
 
@@ -202,8 +203,9 @@ test("waits for the replacement Manager then navigates to its settings page", as
   expect(await screen.findByText("配置已保存，Manager 正在自动重启")).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "正在保存…" })).toBeDisabled();
   expect(screen.getByRole("button", { name: "重新加载" })).toBeDisabled();
-  resolveHealth!(new Response("{\"ok\":true,\"restarting\":false}", { status: 200 }));
   await waitFor(() => expect(navigate).toHaveBeenCalledWith("http://127.0.0.1:28081/#/settings"));
+  expect(fetchMock).toHaveBeenCalledTimes(2);
+  expect(fetchMock).toHaveBeenCalledWith(recoveryURL, expect.objectContaining({ credentials: "omit" }));
 });
 
 test("shows a recovery error when the replacement Manager does not listen in time", async () => {

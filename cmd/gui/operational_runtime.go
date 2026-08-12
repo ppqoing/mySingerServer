@@ -277,6 +277,7 @@ func initializeOperationalRuntime(
 	cfg *config.GUIConfig,
 	host *gui.RuntimeHost,
 	logger *slog.Logger,
+	httpDrained <-chan struct{},
 ) {
 	runtime, err := guiBuildOperationalRuntime(ctx, cfg, logger)
 	if err != nil {
@@ -295,5 +296,8 @@ func initializeOperationalRuntime(
 	}
 	host.Install(runtime.API())
 	<-ctx.Done()
+	if httpDrained != nil {
+		<-httpDrained
+	}
 	runtime.Close()
 }

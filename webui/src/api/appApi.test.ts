@@ -413,17 +413,19 @@ test.each([
   });
 });
 
-test("waits past the old Manager health response until restarting is false", async () => {
+test("waits past an unrelated Manager until the replacement restart token matches", async () => {
   vi.useFakeTimers();
   const fetchMock = vi.fn()
-    .mockResolvedValueOnce(jsonResponse({ ok: true, restarting: true }))
-    .mockResolvedValueOnce(jsonResponse({ ok: true, restarting: false }));
+    .mockResolvedValueOnce(jsonResponse({ ok: true, restart_token: "unrelated-instance", restarting: false }))
+    .mockResolvedValueOnce(jsonResponse({ ok: true, restart_token: "replacement-instance", restarting: false }));
   vi.stubGlobal("fetch", fetchMock);
-  const waiting = waitForManager("http://127.0.0.1:28081/api/restart/health");
+  const recoveryURL = "http://127.0.0.1:28081/api/restart/health?restart_token=replacement-instance";
+  const waiting = waitForManager(recoveryURL);
 
   await vi.advanceTimersByTimeAsync(250);
   await expect(waiting).resolves.toBeUndefined();
   expect(fetchMock).toHaveBeenCalledTimes(2);
+  expect(fetchMock).toHaveBeenCalledWith(recoveryURL, expect.objectContaining({ credentials: "omit" }));
   vi.useRealTimers();
 });
 

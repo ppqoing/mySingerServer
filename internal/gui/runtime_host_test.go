@@ -8,9 +8,59 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"dedup/internal/config"
 )
+
+func TestRuntimeHostWaitsForAdmittedRequestBeforeHTTPDrainCompletes(t *testing.T) {
+	host := NewRuntimeHost(&fakeGUIConfigStore{}, nil)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	host.static = http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		close(started)
+		<-release
+	})
+	requestDone := make(chan struct{})
+	go func() {
+		defer close(requestDone)
+		host.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("request did not enter RuntimeHost")
+	}
+
+	host.BeginHTTPShutdown()
+	drainDone := make(chan struct{})
+	go func() {
+		host.WaitForHTTP()
+		close(drainDone)
+	}()
+	select {
+	case <-drainDone:
+		t.Fatal("HTTP drain completed while an admitted request was active")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	rejected := httptest.NewRecorder()
+	host.ServeHTTP(rejected, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rejected.Code != http.StatusServiceUnavailable {
+		t.Fatalf("request admitted after HTTP shutdown: status=%d", rejected.Code)
+	}
+	close(release)
+	select {
+	case <-requestDone:
+	case <-time.After(time.Second):
+		t.Fatal("admitted request did not finish")
+	}
+	select {
+	case <-drainDone:
+	case <-time.After(time.Second):
+		t.Fatal("HTTP drain did not complete after admitted request finished")
+	}
+}
 
 func TestRuntimeHostServesConfigurationWhileDatabaseIsUnavailable(t *testing.T) {
 	host := NewRuntimeHost(&fakeGUIConfigStore{loadSnapshot: GUIConfigSnapshot{
@@ -44,7 +94,11 @@ func TestRuntimeHostServesConfigurationWhileDatabaseIsUnavailable(t *testing.T) 
 
 func TestRuntimeHostUsesFrontendRuntimeWireStatesAndRestartHealth(t *testing.T) {
 	restart := &fakeGUIRestartCoordinator{}
-	host := NewRuntimeHost(&fakeGUIConfigStore{restart: restart}, []config.AgentEndpoint{{Addr: "127.0.0.1:9101"}})
+	host := NewRuntimeHost(
+		&fakeGUIConfigStore{restart: restart},
+		[]config.AgentEndpoint{{Addr: "127.0.0.1:9101"}},
+		"replacement-instance-token",
+	)
 	host.Install(NewAPI(nil, NewTaskRegistry(nil, testLogger()), nil))
 	connected := assertRuntimeHostStatus(t, host, http.MethodGet, "/api/runtime/status", http.StatusOK)
 	if !strings.Contains(connected.Body.String(), "\"database_state\":\"connected\"") || !strings.Contains(connected.Body.String(), "\"identity_state\":\"pending\"") {
@@ -57,12 +111,12 @@ func TestRuntimeHostUsesFrontendRuntimeWireStatesAndRestartHealth(t *testing.T) 
 	}
 	restart.pending = true
 	pending := assertRuntimeHostStatus(t, host, http.MethodGet, "/api/restart/health", http.StatusOK)
-	if got := pending.Body.String(); got != "{\"ok\":true,\"restarting\":true}\n" {
+	if got := pending.Body.String(); got != "{\"ok\":true,\"restart_token\":\"replacement-instance-token\",\"restarting\":true}\n" {
 		t.Fatalf("pending health=%s", got)
 	}
 	restart.pending = false
 	ready := assertRuntimeHostStatus(t, host, http.MethodGet, "/api/restart/health", http.StatusOK)
-	if got := ready.Body.String(); got != "{\"ok\":true,\"restarting\":false}\n" {
+	if got := ready.Body.String(); got != "{\"ok\":true,\"restart_token\":\"replacement-instance-token\",\"restarting\":false}\n" {
 		t.Fatalf("ready health=%s", got)
 	}
 }

@@ -126,6 +126,7 @@ func firstScreenConfig(cfg config.FirstScreenConfig) firstscreen.Config {
 type guiHTTPServer interface {
 	Serve(net.Listener) error
 	Shutdown(context.Context) error
+	Close() error
 }
 
 type serveEntryHTTPServer struct {
@@ -161,6 +162,11 @@ func newGUIHTTPServer(addr string, handler http.Handler) guiHTTPServer {
 type analysisLifecycle interface {
 	BeginAnalysisShutdown()
 	WaitForAnalysis()
+}
+
+type httpLifecycle interface {
+	BeginHTTPShutdown()
+	WaitForHTTP()
 }
 
 type phase2MessageDispatcher interface {
@@ -538,13 +544,26 @@ func serveAndDrain(
 	shutdownResult := make(chan error, 1)
 	go func() {
 		<-processContext.Done()
+		httpRequests, tracksHTTP := analysis.(httpLifecycle)
+		if tracksHTTP {
+			httpRequests.BeginHTTPShutdown()
+		}
 		analysis.BeginAnalysisShutdown()
 		shutdownContext, cancelShutdown := context.WithTimeout(
 			context.Background(),
 			shutdownTimeout,
 		)
 		defer cancelShutdown()
-		shutdownResult <- server.Shutdown(shutdownContext)
+		shutdownErr := server.Shutdown(shutdownContext)
+		if shutdownErr != nil {
+			if closeErr := server.Close(); closeErr != nil {
+				shutdownErr = errors.Join(shutdownErr, closeErr)
+			}
+		}
+		if tracksHTTP {
+			httpRequests.WaitForHTTP()
+		}
+		shutdownResult <- shutdownErr
 	}()
 
 	serveErr := server.Serve(listener)
@@ -631,6 +650,7 @@ func run(args []string) error {
 	configPath := flags.String("config", "", "配置文件路径（默认：EXE 同目录 gui.json）")
 	noBrowser := flags.Bool("no-browser", false, "不自动打开浏览器")
 	waitParentPID := flags.Int("wait-parent-pid", 0, "等待父 GUI 进程退出后再启动")
+	restartToken := flags.String("restart-token", "", "内部 Manager 重启实例令牌")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -673,18 +693,19 @@ func run(args []string) error {
 		os.Getpid(),
 		cancelProcess,
 	))
-	host := gui.NewRuntimeHost(configService, cfg.Agents)
+	host := gui.NewRuntimeHost(configService, cfg.Agents, *restartToken)
 	listener, err := guiListen("tcp", cfg.ListenAddr)
 	if err != nil {
 		return guiStartupFailure(logger, "bind GUI listener", err)
 	}
 	server := guiNewHTTPServer(cfg.ListenAddr, host)
 	serveEntered := make(chan struct{})
+	httpDrained := make(chan struct{})
 	initializationDone := make(chan struct{})
 	go func() {
 		defer close(initializationDone)
 		<-serveEntered
-		initializeOperationalRuntime(processContext, cfg, host, logger)
+		initializeOperationalRuntime(processContext, cfg, host, logger, httpDrained)
 	}()
 	serveErr := serveBoundGUI(
 		processContext,
@@ -701,6 +722,7 @@ func run(args []string) error {
 			close(serveEntered)
 		},
 	)
+	close(httpDrained)
 	<-initializationDone
 	return serveErr
 }

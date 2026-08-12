@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"net/url"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -88,6 +91,11 @@ func (c *atomicGUIRestartCoordinator) Prepare(cfg *config.GUIConfig) (string, er
 	if !c.pending.CompareAndSwap(false, true) {
 		return "", errGUIRestartInProgress
 	}
+	restartToken, err := generateGUIRestartToken()
+	if err != nil {
+		c.pending.Store(false)
+		return "", err
+	}
 
 	browserURL, err := localBrowserURL(cfg.ListenAddr)
 	if err != nil {
@@ -98,6 +106,7 @@ func (c *atomicGUIRestartCoordinator) Prepare(cfg *config.GUIConfig) (string, er
 		"-config", c.configPath,
 		"-no-browser",
 		"-wait-parent-pid", strconv.Itoa(c.parentPID),
+		"-restart-token", restartToken,
 	}
 	replacement, err := c.start(c.executable, args)
 	if err != nil {
@@ -107,7 +116,15 @@ func (c *atomicGUIRestartCoordinator) Prepare(cfg *config.GUIConfig) (string, er
 	c.replaceMu.Lock()
 	c.replacement = replacement
 	c.replaceMu.Unlock()
-	return strings.TrimSuffix(browserURL, "/") + "/api/restart/health", nil
+	return strings.TrimSuffix(browserURL, "/") + "/api/restart/health?restart_token=" + url.QueryEscape(restartToken), nil
+}
+
+func generateGUIRestartToken() (string, error) {
+	bytes := make([]byte, 32)
+	if _, err := rand.Read(bytes); err != nil {
+		return "", fmt.Errorf("generate restart token: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(bytes), nil
 }
 
 func (c *atomicGUIRestartCoordinator) Commit() {

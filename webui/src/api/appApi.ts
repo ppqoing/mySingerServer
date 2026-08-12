@@ -104,8 +104,8 @@ const managerRecoveryPollIntervalMs = 250;
 const managerRecoveryTimeoutMs = 30_000;
 
 export async function waitForManager(recoveryURL: string, signal?: AbortSignal): Promise<void> {
-  const origin = new URL(recoveryURL).origin;
-  const healthURL = `${origin}/api/restart/health`;
+  const expectedRestartToken = new URL(recoveryURL).searchParams.get("restart_token");
+  const healthURL = recoveryURL;
   const controller = new AbortController();
   let timedOut = false;
   const timeout = setTimeout(() => { timedOut = true; controller.abort(); }, managerRecoveryTimeoutMs);
@@ -116,7 +116,7 @@ export async function waitForManager(recoveryURL: string, signal?: AbortSignal):
     while (true) {
       try {
         const response = await fetch(healthURL, { credentials: "omit", signal: controller.signal });
-        if (response.ok && await recoveryHealthReady(response)) return;
+        if (response.ok && await recoveryHealthReady(response, expectedRestartToken)) return;
       } catch (error) {
         if (timedOut) throw new Error("Manager restart timed out", { cause: error });
         if (isAbortError(error) || signal?.aborted) throw error;
@@ -132,12 +132,13 @@ export async function waitForManager(recoveryURL: string, signal?: AbortSignal):
   }
 }
 
-async function recoveryHealthReady(response: Response): Promise<boolean> {
+async function recoveryHealthReady(response: Response, expectedRestartToken: string | null): Promise<boolean> {
   try {
     const value: unknown = await response.json();
     if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
-    const health = value as { ok?: unknown; restarting?: unknown };
-    return health.ok === true && health.restarting === false;
+    const health = value as { ok?: unknown; restart_token?: unknown; restarting?: unknown };
+    return expectedRestartToken !== null && expectedRestartToken !== "" &&
+      health.ok === true && health.restart_token === expectedRestartToken && health.restarting === false;
   } catch {
     return false;
   }

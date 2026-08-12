@@ -131,6 +131,68 @@ func TestGUIMissingConfigurationIsCreatedBeforeServing(t *testing.T) {
 	}
 }
 
+func TestGUIRestartTokenFlagIsExposedByReplacementHealth(t *testing.T) {
+	originalExecutable := guiExecutablePath
+	originalListen := guiListen
+	originalServer := guiNewHTTPServer
+	originalBuilder := guiBuildOperationalRuntime
+	defer func() {
+		guiExecutablePath = originalExecutable
+		guiListen = originalListen
+		guiNewHTTPServer = originalServer
+		guiBuildOperationalRuntime = originalBuilder
+	}()
+
+	root := t.TempDir()
+	guiExecutablePath = func() (string, error) { return filepath.Join(root, "gui.exe"), nil }
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	guiListen = func(string, string) (net.Listener, error) { return listener, nil }
+	guiBuildOperationalRuntime = func(context.Context, *config.GUIConfig, *slog.Logger) (*operationalRuntime, error) {
+		return nil, errors.New("postgres unavailable")
+	}
+	server := newFakeGUIServer(http.ErrServerClosed, true)
+	defer server.Shutdown(context.Background())
+	handlers := make(chan http.Handler, 1)
+	guiNewHTTPServer = func(_ string, handler http.Handler) guiHTTPServer {
+		handlers <- handler
+		return server
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		result <- run([]string{"-no-browser", "-restart-token", "replacement-instance-token"})
+	}()
+	var handler http.Handler
+	select {
+	case handler = <-handlers:
+	case err := <-result:
+		t.Fatalf("run returned before exposing restart health: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("GUI did not create its runtime host")
+	}
+
+	health := httptest.NewRecorder()
+	handler.ServeHTTP(health, httptest.NewRequest(http.MethodGet, "/api/restart/health", nil))
+	if got := health.Body.String(); got != "{\"ok\":true,\"restart_token\":\"replacement-instance-token\",\"restarting\":false}\n" {
+		t.Fatalf("restart health=%s", got)
+	}
+	if err := server.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("run: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("GUI did not stop")
+	}
+}
+
 func TestGUIPingFailureIsLoggedBeforeInteractiveNotification(t *testing.T) {
 	originalExecutable := guiExecutablePath
 	originalNotify := guiShowStartupError
@@ -328,6 +390,10 @@ func (s *recordingCancelableGUIServer) Shutdown(context.Context) error {
 	return nil
 }
 
+func (s *recordingCancelableGUIServer) Close() error {
+	return s.Shutdown(context.Background())
+}
+
 type runtimeFailureGUIServer struct {
 	failureLogged <-chan struct{}
 	shutdown      chan struct{}
@@ -347,6 +413,10 @@ func (s *runtimeFailureGUIServer) Serve(net.Listener) error {
 func (s *runtimeFailureGUIServer) Shutdown(context.Context) error {
 	s.shutdownOnce.Do(func() { close(s.shutdown) })
 	return nil
+}
+
+func (s *runtimeFailureGUIServer) Close() error {
+	return s.Shutdown(context.Background())
 }
 
 type startupEventLogHandler struct {
@@ -696,6 +766,10 @@ func (s *fakeGUIServer) Shutdown(context.Context) error {
 	return nil
 }
 
+func (s *fakeGUIServer) Close() error {
+	return s.Shutdown(context.Background())
+}
+
 func TestFirstScreenServeErrorDrainsAcceptedRunBeforeReturning(t *testing.T) {
 	events := &orderedEvents{}
 	processContext, cancelProcess := context.WithCancel(context.Background())
@@ -905,6 +979,94 @@ func TestFirstScreenNilServeReturnStillRunsCommonDrain(t *testing.T) {
 	beginCalls, waitCalls := lifecycle.counts()
 	if beginCalls == 0 || waitCalls != 1 {
 		t.Fatalf("lifecycle calls = begin:%d wait:%d", beginCalls, waitCalls)
+	}
+}
+
+type shutdownTimeoutGUIServer struct {
+	serveStarted chan struct{}
+	forceClosed  chan struct{}
+	closeOnce    sync.Once
+}
+
+func newShutdownTimeoutGUIServer() *shutdownTimeoutGUIServer {
+	return &shutdownTimeoutGUIServer{
+		serveStarted: make(chan struct{}),
+		forceClosed:  make(chan struct{}),
+	}
+}
+
+func (s *shutdownTimeoutGUIServer) Serve(net.Listener) error {
+	close(s.serveStarted)
+	<-s.forceClosed
+	return http.ErrServerClosed
+}
+
+func (*shutdownTimeoutGUIServer) Shutdown(context.Context) error {
+	return context.DeadlineExceeded
+}
+
+func (s *shutdownTimeoutGUIServer) Close() error {
+	s.closeOnce.Do(func() { close(s.forceClosed) })
+	return nil
+}
+
+type recordingHTTPDrainLifecycle struct {
+	events *orderedEvents
+}
+
+func (l *recordingHTTPDrainLifecycle) BeginAnalysisShutdown() {
+	l.events.add("analysis begin")
+}
+
+func (l *recordingHTTPDrainLifecycle) WaitForAnalysis() {
+	l.events.add("analysis wait")
+}
+
+func (l *recordingHTTPDrainLifecycle) BeginHTTPShutdown() {
+	l.events.add("http begin")
+}
+
+func (l *recordingHTTPDrainLifecycle) WaitForHTTP() {
+	l.events.add("http wait")
+}
+
+func TestShutdownTimeoutForceClosesServerAndWaitsForHTTPHandlers(t *testing.T) {
+	processContext, cancelProcess := context.WithCancel(context.Background())
+	server := newShutdownTimeoutGUIServer()
+	events := &orderedEvents{}
+	lifecycle := &recordingHTTPDrainLifecycle{events: events}
+	result := make(chan error, 1)
+	go func() {
+		result <- serveAndDrain(
+			processContext,
+			cancelProcess,
+			server,
+			nil,
+			lifecycle,
+			50*time.Millisecond,
+		)
+	}()
+	select {
+	case <-server.serveStarted:
+	case <-time.After(time.Second):
+		t.Fatal("server did not start")
+	}
+	cancelProcess()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("serveAndDrain error=%v, want shutdown deadline", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("shutdown timeout did not force-close the server")
+	}
+	if got := events.snapshot(); !equalEventOrder(got, []string{
+		"http begin",
+		"analysis begin",
+		"http wait",
+		"analysis wait",
+	}) {
+		t.Fatalf("shutdown events=%v", got)
 	}
 }
 

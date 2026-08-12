@@ -9,25 +9,34 @@ import (
 )
 
 type RuntimeHost struct {
-	mu        sync.RWMutex
-	api       *API
-	configAPI http.Handler
-	static    http.Handler
-	restart   guiRestartCoordinator
-	status    RuntimeStatus
+	mu           sync.RWMutex
+	api          *API
+	configAPI    http.Handler
+	static       http.Handler
+	restart      guiRestartCoordinator
+	restartToken string
+	status       RuntimeStatus
+	httpMu       sync.Mutex
+	httpStopping bool
+	httpActive   sync.WaitGroup
 
 	afterRuntimeSnapshot func()
 }
 
-func NewRuntimeHost(config guiConfigStore, configuredAgents []config.AgentEndpoint) *RuntimeHost {
+func NewRuntimeHost(config guiConfigStore, configuredAgents []config.AgentEndpoint, restartTokens ...string) *RuntimeHost {
+	restartToken := ""
+	if len(restartTokens) > 0 {
+		restartToken = restartTokens[0]
+	}
 	agents := make([]AgentStatus, 0, len(configuredAgents))
 	for _, agent := range configuredAgents {
 		agents = append(agents, AgentStatus{Addr: agent.Addr, Online: false, IdentityState: IdentityPending})
 	}
 	return &RuntimeHost{
-		configAPI: newConfigHTTP(config),
-		static:    http.FileServerFS(webFS()),
-		restart:   restartCoordinatorFor(config),
+		configAPI:    newConfigHTTP(config),
+		static:       http.FileServerFS(webFS()),
+		restart:      restartCoordinatorFor(config),
+		restartToken: restartToken,
 		status: RuntimeStatus{
 			DatabaseState: "connecting",
 			Agents:        agents,
@@ -79,7 +88,27 @@ func (h *RuntimeHost) WaitForAnalysis() {
 	}
 }
 
+func (h *RuntimeHost) BeginHTTPShutdown() {
+	h.httpMu.Lock()
+	h.httpStopping = true
+	h.httpMu.Unlock()
+}
+
+func (h *RuntimeHost) WaitForHTTP() {
+	h.httpActive.Wait()
+}
+
 func (h *RuntimeHost) ServeHTTP(response http.ResponseWriter, request *http.Request) {
+	h.httpMu.Lock()
+	if h.httpStopping {
+		h.httpMu.Unlock()
+		writeJSON(response, http.StatusServiceUnavailable, map[string]string{"error": "server_shutting_down"})
+		return
+	}
+	h.httpActive.Add(1)
+	h.httpMu.Unlock()
+	defer h.httpActive.Done()
+
 	api := h.current()
 	if h.afterRuntimeSnapshot != nil {
 		h.afterRuntimeSnapshot()
@@ -121,7 +150,15 @@ func (h *RuntimeHost) handleRestartHealth(response http.ResponseWriter, _ *http.
 	h.mu.RLock()
 	restart := h.restart
 	h.mu.RUnlock()
-	writeJSON(response, http.StatusOK, map[string]bool{"ok": true, "restarting": restart != nil && restart.Pending()})
+	writeJSON(response, http.StatusOK, struct {
+		OK           bool   `json:"ok"`
+		RestartToken string `json:"restart_token"`
+		Restarting   bool   `json:"restarting"`
+	}{
+		OK:           true,
+		RestartToken: h.restartToken,
+		Restarting:   restart != nil && restart.Pending(),
+	})
 }
 
 func (h *RuntimeHost) handleOfflineAgents(response http.ResponseWriter, _ *http.Request) {

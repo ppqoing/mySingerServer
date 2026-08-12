@@ -30,6 +30,7 @@ type GUIConfigService struct {
 	path             string
 	runtimeCanonical []byte
 	replace          func(source, destination string) error
+	restrict         func(file *os.File) error
 	restart          guiRestartCoordinator
 }
 
@@ -58,6 +59,7 @@ func NewGUIConfigService(path string, runtime *config.GUIConfig) (*GUIConfigServ
 		path:             absolute,
 		runtimeCanonical: runtimeCanonical,
 		replace:          replaceFileAtomically,
+		restrict:         restrictGUIConfigPermissions,
 	}, nil
 }
 
@@ -108,13 +110,13 @@ func (s *GUIConfigService) Save(ctx context.Context, cfg *config.GUIConfig) (GUI
 	if err := ctx.Err(); err != nil {
 		return GUIConfigSaveResult{}, err
 	}
-	if err := writeCanonicalGUIConfig(s.path, canonical, s.replace, ctx.Err); err != nil {
+	if err := writeCanonicalGUIConfig(s.path, canonical, s.replace, s.restrict, ctx.Err); err != nil {
 		return GUIConfigSaveResult{}, err
 	}
 	return GUIConfigSaveResult{Saved: true, RestartRequired: restartRequired}, nil
 }
 
-func writeCanonicalGUIConfig(path string, canonical []byte, replace func(source, destination string) error, beforeReplace func() error) error {
+func writeCanonicalGUIConfig(path string, canonical []byte, replace func(source, destination string) error, restrict func(file *os.File) error, beforeReplace func() error) error {
 	temp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*.tmp")
 	if err != nil {
 		return fmt.Errorf("create temporary config for %s: %w", filepath.Base(path), err)
@@ -122,7 +124,7 @@ func writeCanonicalGUIConfig(path string, canonical []byte, replace func(source,
 	tempPath := temp.Name()
 	defer os.Remove(tempPath)
 
-	if err := temp.Chmod(0o600); err != nil {
+	if err := restrict(temp); err != nil {
 		_ = temp.Close()
 		return fmt.Errorf("set temporary config permissions for %s: %w", filepath.Base(path), err)
 	}

@@ -50,7 +50,7 @@ func LoadOrCreateGUIConfig(path string) (_ *config.GUIConfig, err error) {
 	if err != nil {
 		return nil, fmt.Errorf("validate default %s: %w", filepath.Base(absolute), err)
 	}
-	if err := writeCanonicalGUIConfig(absolute, canonical, replaceFileAtomically, nil); err != nil {
+	if err := writeCanonicalGUIConfig(absolute, canonical, replaceFileAtomically, restrictGUIConfigPermissions, nil); err != nil {
 		return nil, err
 	}
 	return cfg, nil

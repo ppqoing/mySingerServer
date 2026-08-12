@@ -146,7 +146,7 @@ func TestInitializeOperationalRuntimeDoesNotInstallAfterCancellation(t *testing.
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		initializeOperationalRuntime(ctx, cfg, host, testOperationalLogger())
+		initializeOperationalRuntime(ctx, cfg, host, testOperationalLogger(), nil)
 	}()
 	waitOperationalSignal(t, buildStarted, "runtime build start")
 	cancel()
@@ -160,6 +160,52 @@ func TestInitializeOperationalRuntimeDoesNotInstallAfterCancellation(t *testing.
 	if response.Code != http.StatusServiceUnavailable {
 		t.Fatalf("tasks status = %d, want %d", response.Code, http.StatusServiceUnavailable)
 	}
+}
+
+func TestInitializeOperationalRuntimeWaitsForHTTPDrainBeforeClose(t *testing.T) {
+	originalBuilder := guiBuildOperationalRuntime
+	defer func() { guiBuildOperationalRuntime = originalBuilder }()
+	cfg := config.DefaultGUI()
+	configService, err := gui.NewGUIConfigService(
+		filepath.Join(t.TempDir(), "gui.json"),
+		cfg,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host := gui.NewRuntimeHost(configService, cfg.Agents, "")
+	built := make(chan struct{})
+	closed := make(chan struct{})
+	guiBuildOperationalRuntime = func(
+		context.Context,
+		*config.GUIConfig,
+		*slog.Logger,
+	) (*operationalRuntime, error) {
+		close(built)
+		return &operationalRuntime{
+			api: gui.NewAPI(nil, nil, nil),
+			closeRuntime: func() {
+				close(closed)
+			},
+		}, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	drained := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		initializeOperationalRuntime(ctx, cfg, host, testOperationalLogger(), drained)
+	}()
+	waitOperationalSignal(t, built, "runtime build")
+	cancel()
+	select {
+	case <-closed:
+		t.Fatal("runtime closed before HTTP drain completed")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(drained)
+	waitOperationalSignal(t, closed, "runtime close after HTTP drain")
+	waitOperationalSignal(t, done, "runtime initializer exit")
 }
 
 type fakeOperationalRuntimeResources struct {
