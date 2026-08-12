@@ -240,12 +240,9 @@ func (e *Engine) compute(ctx context.Context, taskID string, file firstscreen.Fi
 }
 
 func validateStagePayload(job *worker.JobMsg, result *worker.JobResultMsg) error {
-	if result.FieldsDone != job.FieldsMask || result.FramesDone != job.FrameMask {
-		return fmt.Errorf("stage coverage mismatch")
-	}
 	switch job.Kind {
 	case worker.MediaImage:
-		if result.FramesDone != 0 || len(result.Frames) != 0 {
+		if result.FieldsDone != job.FieldsMask || result.FramesDone != 0 || len(result.Frames) != 0 {
 			return fmt.Errorf("image contains video frames")
 		}
 		switch job.ScreenStage {
@@ -261,6 +258,16 @@ func validateStagePayload(job *worker.JobMsg, result *worker.JobResultMsg) error
 			return fmt.Errorf("invalid image stage")
 		}
 	case worker.MediaVideo:
+		if result.FieldsDone&^job.FieldsMask != 0 || result.FramesDone&^job.FrameMask != 0 {
+			return fmt.Errorf("video coverage contains extra bits")
+		}
+		if result.FramesDone == job.FrameMask {
+			if result.FieldsDone != job.FieldsMask {
+				return fmt.Errorf("complete video field coverage mismatch")
+			}
+		} else if result.FieldsDone != 0 {
+			return fmt.Errorf("partial video contains completed field")
+		}
 		if len(result.PHashParts) != 0 || len(result.SobelHist) != 0 {
 			return fmt.Errorf("video contains image payload")
 		}
@@ -273,11 +280,18 @@ func validateStagePayload(job *worker.JobMsg, result *worker.JobResultMsg) error
 				return fmt.Errorf("duplicate video frame")
 			}
 			seen[frame.FrameIdx] = struct{}{}
-			if frame.Error != "" {
+			done := result.FramesDone&(1<<uint(frame.FrameIdx)) != 0
+			if !done {
+				if frame.Error == "" {
+					return fmt.Errorf("unsuccessful video frame lacks error")
+				}
 				if len(frame.PDQ256) != 0 || frame.Quality != 0 || len(frame.PHashParts) != 0 || len(frame.SobelHist) != 0 {
 					return fmt.Errorf("errored video frame contains payload")
 				}
 				continue
+			}
+			if frame.Error != "" {
+				return fmt.Errorf("successful video frame contains error")
 			}
 			switch job.ScreenStage {
 			case worker.ScreenStageTwo:

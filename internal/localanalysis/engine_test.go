@@ -237,6 +237,22 @@ func TestEngineComputeRejectsVideoCoverageAndPayloadCrossover(t *testing.T) {
 		{"fields crossed", func(result *worker.JobResultMsg) { result.FieldsDone = worker.MaskVideo6FSobel }},
 		{"frames missing", func(result *worker.JobResultMsg) { result.FramesDone &^= 1 << 5 }},
 		{"frames extra", func(result *worker.JobResultMsg) { result.FramesDone |= 1 << 6 }},
+		{"partial fields done", func(result *worker.JobResultMsg) {
+			result.FramesDone &^= 1 << 5
+			result.Frames[5].PHashParts = nil
+			result.Frames[5].Error = "native_status_-20"
+		}},
+		{"successful frame has error", func(result *worker.JobResultMsg) { result.Frames[0].Error = "native_status_-20" }},
+		{"failed frame lacks error", func(result *worker.JobResultMsg) {
+			result.FieldsDone = 0
+			result.FramesDone &^= 1 << 5
+			result.Frames[5].PHashParts = nil
+		}},
+		{"failed frame carries payload", func(result *worker.JobResultMsg) {
+			result.FieldsDone = 0
+			result.FramesDone &^= 1 << 5
+			result.Frames[5].Error = "native_status_-20"
+		}},
 		{"frame payload crossed", func(result *worker.JobResultMsg) { result.Frames[0].SobelHist = []byte{1} }},
 		{"frame payload missing", func(result *worker.JobResultMsg) { result.Frames[0].PHashParts = nil }},
 	}
@@ -253,6 +269,71 @@ func TestEngineComputeRejectsVideoCoverageAndPayloadCrossover(t *testing.T) {
 				t.Fatal("crossed video coverage or payload was accepted")
 			} else if strings.Contains(strings.ToLower(err.Error()), "clip.mp4") || strings.Contains(strings.ToLower(err.Error()), "private") {
 				t.Fatalf("error leaked media path: %v", err)
+			}
+		})
+	}
+}
+
+func TestEngineAcceptsExplicitPartialVideoFrames(t *testing.T) {
+	tests := []struct {
+		name         string
+		partialStage worker.ScreenStage
+		healthy      int
+		wantStage2   string
+		wantStage3   string
+		wantVerdict  string
+		wantGroups   int
+	}{
+		{name: "stage two five healthy frames pass", partialStage: worker.ScreenStageTwo, healthy: 5, wantStage2: `"verdict":"yes"`, wantStage3: `"verdict":"yes"`, wantVerdict: "duplicate", wantGroups: 1},
+		{name: "stage three five healthy frames pass", partialStage: worker.ScreenStageThree, healthy: 5, wantStage2: `"verdict":"yes"`, wantStage3: `"verdict":"yes"`, wantVerdict: "duplicate", wantGroups: 1},
+		{name: "stage two three healthy frames are inconclusive", partialStage: worker.ScreenStageTwo, healthy: 3, wantStage2: `"verdict":"inconclusive"`, wantVerdict: "uncertain"},
+		{name: "stage three three healthy frames are inconclusive", partialStage: worker.ScreenStageThree, healthy: 3, wantStage2: `"verdict":"yes"`, wantStage3: `"verdict":"inconclusive"`, wantVerdict: "uncertain"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			w := &engineWorker{makeResult: func(job *worker.JobMsg) *worker.JobResultMsg {
+				result := validEngineStageResult(job)
+				if job.ScreenStage != test.partialStage {
+					return result
+				}
+				result.FieldsDone = 0
+				result.FramesDone = uint8(1<<uint(test.healthy)) - 1
+				for index := test.healthy; index < len(result.Frames); index++ {
+					result.Frames[index].PHashParts = nil
+					result.Frames[index].SobelHist = nil
+					result.Frames[index].Error = "native_status_-20"
+				}
+				return result
+			}}
+			s := &engineStore{run: store.LocalAnalysisRun{RunID: "run-video-partial", MachineID: "machine-a", Generation: 7, TaskID: "task-video-partial", Status: "building"}, fail: map[string]error{}}
+			engine := NewEngine("machine-a", engineStageOne{result: engineVideoCandidateResult()}, s, w, testPhase2Config())
+			engine.fileMetadata = func(string) (int64, int64, error) { return 10, 20, nil }
+
+			if err := engine.Run(context.Background(), "task-video-partial"); err != nil {
+				t.Fatalf("Run() error = %v", err)
+			}
+			if len(s.pairs) == 0 {
+				t.Fatal("partial video pair was not persisted")
+			}
+			first, final := s.pairs[0], s.pairs[len(s.pairs)-1]
+			if first.Stage2JSON == nil || !strings.Contains(*first.Stage2JSON, test.wantStage2) {
+				t.Fatalf("stage2 JSON = %v, want %s", first.Stage2JSON, test.wantStage2)
+			}
+			if test.wantStage3 == "" {
+				if len(s.pairs) != 1 || final.Stage3JSON != nil {
+					t.Fatalf("inconclusive stage2 entered stage3: %#v", s.pairs)
+				}
+			} else if final.Stage3JSON == nil || !strings.Contains(*final.Stage3JSON, test.wantStage3) {
+				t.Fatalf("stage3 JSON = %v, want %s", final.Stage3JSON, test.wantStage3)
+			}
+			if final.Verdict != test.wantVerdict || len(s.groups) != test.wantGroups {
+				t.Fatalf("final verdict/groups = %q/%d, want %q/%d", final.Verdict, len(s.groups), test.wantVerdict, test.wantGroups)
+			}
+			if test.wantGroups == 1 && s.groups[0].Category != "video" {
+				t.Fatalf("duplicate group = %#v, want video", s.groups[0])
+			}
+			if s.calls[len(s.calls)-1] != "publish" {
+				t.Fatalf("last call = %q, want publish", s.calls[len(s.calls)-1])
 			}
 		})
 	}
@@ -351,6 +432,17 @@ func engineTwoCandidateResult() firstscreen.Result {
 			{Kind: firstscreen.KindImageCandidate, ShaA: a, ShaB: b, QualityA: 80, QualityB: 70},
 			{Kind: firstscreen.KindImageCandidate, ShaA: c, ShaB: d, QualityA: 60, QualityB: 50},
 		},
+	}
+}
+
+func engineVideoCandidateResult() firstscreen.Result {
+	a, b := [64]byte{5}, [64]byte{6}
+	return firstscreen.Result{
+		Files: []firstscreen.File{
+			{FileRef: firstscreen.FileRef{ID: 5, MachineID: "machine-a", Path: `D:\a.mp4`}, SHA512: a},
+			{FileRef: firstscreen.FileRef{ID: 6, MachineID: "machine-a", Path: `D:\b.mp4`}, SHA512: b},
+		},
+		CandidatePairs: []firstscreen.CandidatePair{{Kind: firstscreen.KindVideoCandidate, ShaA: a, ShaB: b, QualityA: 80, QualityB: 70}},
 	}
 }
 
