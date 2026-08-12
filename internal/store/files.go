@@ -138,14 +138,15 @@ func revalidateEnumeratedPhase1(ctx context.Context, tx *sql.Tx, record EnumUpse
 		return err
 	}
 	updatedMissing := currentMissing&^phaseOneFieldsMask | missing
+	status, phase1Done := stageOneState(kind, updatedMissing, false)
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE files SET
 			missing_mask=?3,
 			phase1_done=?4,
-			status=CASE WHEN ?4=0 THEN 'pending' ELSE status END,
-			error=CASE WHEN ?4=0 THEN NULL ELSE error END
+			status=CASE WHEN ?4=0 THEN ?5 WHEN ?3=0 THEN 'done' ELSE status END,
+			error=CASE WHEN ?3=0 THEN NULL ELSE error END
 		WHERE machine_id=?1 AND path=?2`,
-		record.MachineID, record.Path, updatedMissing, boolToInt(missing == 0),
+		record.MachineID, record.Path, updatedMissing, boolToInt(phase1Done), status,
 	); err != nil {
 		return err
 	}

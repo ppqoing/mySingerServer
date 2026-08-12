@@ -412,6 +412,26 @@ func TestWorkerResultAndSHAQueryValidationRejectForeignOrMalformedPayloads(t *te
 	}
 }
 
+func TestVideoBaseFeaturesValidatorAcceptsContactFailurePartial(t *testing.T) {
+	job := &JobMsg{
+		JobID: 811, ScanTaskID: "task-contact-partial", Path: `D:\media\partial.mp4`,
+		Kind: MediaVideo, Phase: Phase1,
+		FieldsMask: store.RequiredStageOneMask(store.MediaVideo),
+	}
+	duration := int64(4321)
+	result := &JobResultMsg{
+		JobID: job.JobID, ScanTaskID: job.ScanTaskID, Path: job.Path, Kind: job.Kind,
+		SHA512: bytes64(0x51), FieldsDone: MaskSHA512 | MaskVideoDuration,
+		DurationMS: &duration,
+		Errors: []FieldError{{
+			Field: MaskVideoContactSheet, Stage: "thumb_cache", Msg: "publish failed",
+		}},
+	}
+	if err := validateWorkerResult(job, result); err != nil {
+		t.Fatalf("valid contact failure partial rejected: %v", err)
+	}
+}
+
 func TestValidateWorkerResultAcceptsOnlyRequestedPhase2ImagePayload(t *testing.T) {
 	knownSHA := bytes64(0x62)
 	validPHash, validSobel := validPhase2Blobs(t)

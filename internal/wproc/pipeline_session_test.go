@@ -306,6 +306,83 @@ func TestVideoBaseFeaturesSessionPublishesCompleteContactPayload(t *testing.T) {
 	}
 }
 
+func TestVideoBaseFeaturesUnpublishedContactPreservesDurationPartial(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*sessionPipelineDeps, *videocore.AnalysisResult)
+	}{
+		{
+			name: "runtime lookup failure",
+			configure: func(deps *sessionPipelineDeps, _ *videocore.AnalysisResult) {
+				deps.runtime = func() (videocore.RuntimeInfo, error) {
+					return videocore.RuntimeInfo{}, errors.New("runtime unavailable")
+				}
+			},
+		},
+		{
+			name: "invalid metadata",
+			configure: func(_ *sessionPipelineDeps, analysis *videocore.AnalysisResult) {
+				analysis.ContactSheetWidth = 2
+				analysis.ContactSheetHeight = 1
+			},
+		},
+		{
+			name: "publish failure",
+			configure: func(deps *sessionPipelineDeps, _ *videocore.AnalysisResult) {
+				deps.publishContactSheet = func(ContactSheetPaths, ContactSheetMeta, func() error) error {
+					return errors.New("publish failed")
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			job, deps, fake := newSessionPipelineTest(
+				t, worker.MediaVideo, worker.MaskAllVideo, 0,
+			)
+			root := t.TempDir()
+			paths := ContactSheetPaths{
+				JPEG: filepath.Join(root, "grid.jpg"), Sidecar: filepath.Join(root, "grid.jpg.json"),
+				TempJPEG: filepath.Join(root, "grid.tmp.jpg"), TempSidecar: filepath.Join(root, "grid.tmp.json"),
+			}
+			deps.contactSheetPaths = func(string, [64]byte, int, int64, string) (ContactSheetPaths, error) {
+				return paths, nil
+			}
+			deps.query = sessionPipelineMissingReply(
+				job, worker.MaskVideoDuration|worker.MaskVideoContactSheet, 0,
+			)
+			fake.result = videocore.AnalysisResult{
+				MediaType: 2, DurationStatus: videocore.StatusOK, DurationMS: 4321,
+				ContactSheetStatus: videocore.StatusOK, ContactSheetWidth: 960, ContactSheetHeight: 540,
+				ContactSheetFeatures: videocore.FeatureSet{PDQ: [32]byte{7}, PDQQuality: 88},
+				CompletedFrameMask:   1,
+				Frames:               [6]videocore.FrameResult{{StandardIndex: 0, Status: videocore.StatusOK, SampleTimeMS: 1000}},
+			}
+			fake.onAnalyze = func(request videocore.AnalysisRequest) {
+				if err := os.WriteFile(request.TempJPEGPath, []byte("jpeg"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			tt.configure(&deps, &fake.result)
+
+			result, err := processMediaWithDeps(
+				context.Background(), sessionPipelineTestConfig(), job, deps,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantDone := uint32(worker.MaskSHA512 | worker.MaskVideoDuration)
+			if result.FieldsDone != wantDone || result.DurationMS == nil || *result.DurationMS != 4321 ||
+				result.ContactSheetStatus != 0 || result.ContactSheetWidth != 0 || result.ContactSheetHeight != 0 ||
+				result.ThumbPath != "" || len(result.ThumbPDQ) != 0 || result.ThumbQuality != nil ||
+				result.ThumbGenerated || len(result.Errors) != 1 ||
+				result.Errors[0].Field != worker.MaskVideoContactSheet {
+				t.Fatalf("unpublished contact result = %#v", result)
+			}
+		})
+	}
+}
+
 func TestSessionPipelineImagePhase2Features(t *testing.T) {
 	job, deps, fake := newSessionPipelineTest(t, worker.MediaImage, worker.MaskSHA512|worker.MaskImagePDQ|worker.MaskPHashParts|worker.MaskSobelHist, 0)
 	deps.query = sessionPipelineMissingReply(job, worker.MaskImagePDQ|worker.MaskPHashParts|worker.MaskSobelHist, 0)

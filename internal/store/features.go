@@ -245,8 +245,7 @@ func (d *DB) SavePhase1(ctx context.Context, result Phase1Result) error {
 	if sha != "" && result.Kind == MediaVideo {
 		updatedMissing &^= videoFeatureFields(ctx, tx, sha)
 	}
-	phase1Done := updatedMissing&phase1RequiredMask(result.Kind, updatedMissing) == 0
-	status := phase1Status(result.Kind, updatedMissing, succeeded, result.Errors)
+	status, phase1Done := stageOneState(result.Kind, updatedMissing, len(result.Errors) != 0)
 	var errorText any
 	if status != proto.StatusDone && len(result.Errors) != 0 {
 		errorText = fieldErrorsText(result.Errors)
@@ -406,7 +405,7 @@ func videoFeatureFields(ctx context.Context, tx *sql.Tx, sha string) uint32 {
 	}
 	fields := uint32(0)
 	durationOK := duration.Valid && duration.Int64 >= 0
-	legacyContactOK := path.Valid && path.String != "" && len(pdq) != 0 &&
+	legacyContactOK := path.Valid && path.String != "" && len(pdq) == 32 &&
 		quality.Valid && quality.Int64 >= 0 && quality.Int64 <= 100
 	if durationOK {
 		fields |= proto.FieldVideoDuration
@@ -418,27 +417,6 @@ func videoFeatureFields(ctx context.Context, tx *sql.Tx, sha string) uint32 {
 		fields |= proto.FieldThumb
 	}
 	return fields
-}
-
-func phase1Status(kind MediaKind, missing, succeeded uint32, errors []FieldError) string {
-	required := phase1RequiredMask(kind, missing)
-	if missing&required == 0 {
-		return proto.StatusDone
-	}
-	if succeeded != 0 || phase1Mask(kind)&^missing != 0 {
-		return proto.StatusPartial
-	}
-	if len(errors) != 0 {
-		return proto.StatusFailed
-	}
-	return proto.StatusPartial
-}
-
-func phase1RequiredMask(kind MediaKind, missing uint32) uint32 {
-	if kind == MediaVideo && missing&proto.FieldThumb != 0 {
-		return proto.FieldSHA512 | proto.FieldThumb
-	}
-	return RequiredStageOneMask(kind)
 }
 
 func fieldErrorsText(errors []FieldError) string {

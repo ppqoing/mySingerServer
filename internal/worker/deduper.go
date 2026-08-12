@@ -249,18 +249,29 @@ func (d *Deduper) lookupFeature(ctx context.Context, query SHAQueryMsg) (SHARepl
 		if err != nil {
 			return SHAReplyMsg{}, false, fmt.Errorf("worker deduper: lookup video: %w", err)
 		}
-		if feature == nil || !completeVideoFeature(feature) {
-			reply := missingReply(query)
-			if query.RequestedFields&MaskSHA512 != 0 {
-				reply.FieldsPresent |= MaskSHA512
-				reply.MissingFields &^= MaskSHA512
-			}
+		reply := missingReply(query)
+		if feature == nil {
 			return reply, false, nil
 		}
-		reply := missingReply(query)
-		present := query.RequestedFields & (MaskSHA512 | MaskVideoThumb |
-			MaskVideoDuration | MaskVideoContactSheet)
-		reply.FieldsPresent |= present
+		durationOK := feature.DurationMS != nil && *feature.DurationMS >= 0
+		legacyContactOK := durationOK && feature.ThumbPath != "" && len(feature.ThumbPDQ) == 32 &&
+			feature.ThumbQuality != nil && *feature.ThumbQuality >= 0 && *feature.ThumbQuality <= 100
+		contactOK := legacyContactOK && feature.ThumbWidth != nil && *feature.ThumbWidth > 0 &&
+			feature.ThumbHeight != nil && *feature.ThumbHeight > 0
+		present := uint32(0)
+		if query.RequestedFields&MaskSHA512 != 0 && len(feature.SHA512) == 64 {
+			present |= MaskSHA512
+		}
+		if query.RequestedFields&MaskVideoDuration != 0 && durationOK {
+			present |= MaskVideoDuration
+		}
+		if query.RequestedFields&MaskVideoThumb != 0 && legacyContactOK {
+			present |= MaskVideoThumb
+		}
+		if query.RequestedFields&MaskVideoContactSheet != 0 && contactOK {
+			present |= MaskVideoContactSheet
+		}
+		reply.FieldsPresent = present
 		reply.MissingFields &^= present
 		reply.DurationMS = cloneInt64(feature.DurationMS)
 		reply.ThumbPath = feature.ThumbPath
@@ -307,9 +318,9 @@ func dedupeKeyForTask(taskID string, kind MediaKind, sha []byte) (dedupeKey, err
 	if len(sha) != 64 {
 		return dedupeKey{}, fmt.Errorf("worker deduper: SHA-512 must be exactly 64 bytes, got %d", len(sha))
 	}
-	fields := uint32(MaskAllImage)
+	fields := store.RequiredStageOneMask(store.MediaImage)
 	if kind == MediaVideo {
-		fields = MaskAllVideo
+		fields = store.RequiredStageOneMask(store.MediaVideo)
 	}
 	return dedupeKey{
 		task: taskID, kind: kind, sha: shaKey(sha), fields: fields,
@@ -333,14 +344,14 @@ func normalizeSHAQuery(query SHAQueryMsg) (SHAQueryMsg, error) {
 	switch query.Kind {
 	case MediaImage:
 		if query.RequestedFields == 0 {
-			query.RequestedFields = MaskAllImage
+			query.RequestedFields = store.RequiredStageOneMask(store.MediaImage)
 		}
 		if query.RequestedFrames != 0 {
 			return query, fmt.Errorf("worker deduper: image query cannot request video frames")
 		}
 	case MediaVideo:
 		if query.RequestedFields == 0 {
-			query.RequestedFields = MaskAllVideo
+			query.RequestedFields = store.RequiredStageOneMask(store.MediaVideo)
 		}
 		if query.RequestedFields&MaskVideo6F != 0 && query.RequestedFrames == 0 {
 			query.RequestedFrames = FrameMaskFull
@@ -402,10 +413,6 @@ func shaKey(sha []byte) [64]byte {
 	var result [64]byte
 	copy(result[:], sha)
 	return result
-}
-
-func completeVideoFeature(feature *store.VideoFeature) bool {
-	return feature.DurationMS != nil && feature.ThumbPath != "" && len(feature.ThumbPDQ) != 0 && feature.ThumbQuality != nil
 }
 
 func replyFromCommittedResult(result JobResultMsg, key dedupeKey) (SHAReplyMsg, bool) {

@@ -176,24 +176,29 @@ func (d *DB) lookupVideoContent(
 			if decodeErr == nil && len(decodedSHA) == 64 {
 				feature := &VideoFeature{SHA512: decodedSHA}
 				durationOK := duration.Valid && duration.Int64 >= 0
-				contactOK := thumbPath.Valid && thumbPath.String != "" &&
+				legacyContactOK := durationOK && thumbPath.Valid && thumbPath.String != "" &&
 					len(thumbPDQ) == 32 && thumbQuality.Valid &&
-					thumbQuality.Int64 >= 0 && thumbQuality.Int64 <= 100 &&
+					thumbQuality.Int64 >= 0 && thumbQuality.Int64 <= 100
+				contactOK := legacyContactOK &&
 					thumbWidth.Valid && thumbWidth.Int64 > 0 &&
 					thumbHeight.Valid && thumbHeight.Int64 > 0
 				if durationOK && (requestedFields&(proto.FieldVideoDuration|proto.FieldThumb) != 0) {
 					value := duration.Int64
 					feature.DurationMS = &value
 				}
-				if contactOK && (requestedFields&(proto.FieldVideoContactSheet|proto.FieldThumb) != 0) {
+				wantsLegacyContact := requestedFields&proto.FieldThumb != 0 && legacyContactOK
+				wantsContact := requestedFields&proto.FieldVideoContactSheet != 0 && contactOK
+				if wantsLegacyContact || wantsContact {
 					value := int32(thumbQuality.Int64)
 					feature.ThumbPath = thumbPath.String
 					feature.ThumbPDQ = append([]byte(nil), thumbPDQ...)
 					feature.ThumbQuality = &value
-					width := int32(thumbWidth.Int64)
-					height := int32(thumbHeight.Int64)
-					feature.ThumbWidth = &width
-					feature.ThumbHeight = &height
+					if contactOK {
+						width := int32(thumbWidth.Int64)
+						height := int32(thumbHeight.Int64)
+						feature.ThumbWidth = &width
+						feature.ThumbHeight = &height
+					}
 				}
 				if requestedFields&proto.FieldVideoDuration != 0 && durationOK {
 					state.FieldsPresent |= proto.FieldVideoDuration
@@ -203,7 +208,7 @@ func (d *DB) lookupVideoContent(
 					state.FieldsPresent |= proto.FieldVideoContactSheet
 					state.MissingFields &^= proto.FieldVideoContactSheet
 				}
-				if requestedFields&proto.FieldThumb != 0 && durationOK && contactOK {
+				if requestedFields&proto.FieldThumb != 0 && legacyContactOK {
 					state.FieldsPresent |= proto.FieldThumb
 					state.MissingFields &^= proto.FieldThumb
 				}

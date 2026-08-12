@@ -160,12 +160,17 @@ func TestDeduperStoreHit(t *testing.T) {
 	sha := bytes64(30)
 	duration := int64(9100)
 	quality := int32(72)
+	width, height := int32(960), int32(540)
 	lookup := &lookupStub{
 		image: func(context.Context, []byte) (*store.ImageFeature, error) {
 			return &store.ImageFeature{SHA512: sha, PDQ: []byte{3, 4}, Quality: 70, Width: 640, Height: 480}, nil
 		},
 		video: func(context.Context, []byte) (*store.VideoFeature, error) {
-			return &store.VideoFeature{SHA512: sha, DurationMS: &duration, ThumbPath: "thumb.jpg", ThumbPDQ: []byte{5, 6}, ThumbQuality: &quality}, nil
+			return &store.VideoFeature{
+				SHA512: sha, DurationMS: &duration, ThumbPath: "thumb.jpg",
+				ThumbPDQ: bytes.Repeat([]byte{5}, 32), ThumbQuality: &quality,
+				ThumbWidth: &width, ThumbHeight: &height,
+			}, nil
 		},
 	}
 	d := NewDeduper(lookup)
@@ -174,7 +179,7 @@ func TestDeduperStoreHit(t *testing.T) {
 		t.Fatalf("image store hit = (%+v, %v)", image, err)
 	}
 	video, err := d.Ask(context.Background(), SHAQueryMsg{JobID: 202, SHA512: sha, Kind: MediaVideo})
-	if err != nil || !video.Found || video.DurationMS == nil || *video.DurationMS != 9100 || video.ThumbPath != "thumb.jpg" || video.ThumbQuality == nil || *video.ThumbQuality != 72 || fmt.Sprint(video.ThumbPDQ) != "[5 6]" {
+	if err != nil || !video.Found || video.DurationMS == nil || *video.DurationMS != 9100 || video.ThumbPath != "thumb.jpg" || video.ThumbQuality == nil || *video.ThumbQuality != 72 || len(video.ThumbPDQ) != 32 || video.ThumbPDQ[0] != 5 {
 		t.Fatalf("video store hit = (%+v, %v)", video, err)
 	}
 	if d.flightCount() != 0 {
@@ -182,29 +187,77 @@ func TestDeduperStoreHit(t *testing.T) {
 	}
 }
 
-func TestVideoBaseFeaturesLegacyLookupAdapterCoversExplicitRequestedFields(t *testing.T) {
+func TestVideoBaseFeaturesLegacyLookupAdapterSeparatesLegacyThumbAndContact(t *testing.T) {
 	sha := bytes64(0x3a)
 	duration, quality := int64(9100), int32(72)
-	d := NewDeduper(&lookupStub{
-		image: func(context.Context, []byte) (*store.ImageFeature, error) { return nil, nil },
-		video: func(context.Context, []byte) (*store.VideoFeature, error) {
-			return &store.VideoFeature{
+	width, height := int32(960), int32(540)
+	tests := []struct {
+		name        string
+		requested   uint32
+		withDims    bool
+		wantPresent uint32
+		wantMissing uint32
+		wantFound   bool
+	}{
+		{
+			name: "legacy thumbnail without dimensions", requested: MaskSHA512 | MaskVideoThumb,
+			wantPresent: MaskSHA512 | MaskVideoThumb, wantFound: true,
+		},
+		{
+			name: "new contact without dimensions", requested: MaskSHA512 | MaskVideoDuration | MaskVideoContactSheet,
+			wantPresent: MaskSHA512 | MaskVideoDuration, wantMissing: MaskVideoContactSheet,
+		},
+		{
+			name: "new contact with dimensions", requested: MaskSHA512 | MaskVideoDuration | MaskVideoContactSheet,
+			withDims: true, wantPresent: MaskSHA512 | MaskVideoDuration | MaskVideoContactSheet, wantFound: true,
+		},
+	}
+	for index, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			feature := &store.VideoFeature{
 				SHA512: sha, DurationMS: &duration, ThumbPath: "thumb.jpg",
 				ThumbPDQ: bytes.Repeat([]byte{5}, 32), ThumbQuality: &quality,
-			}, nil
-		},
-	})
-	reply, err := d.Ask(context.Background(), SHAQueryMsg{
-		JobID: 203, SHA512: sha, Kind: MediaVideo,
-		RequestedFields: MaskSHA512 | MaskVideoDuration | MaskVideoContactSheet,
-	})
-	if err != nil {
-		t.Fatalf("Ask: %v", err)
+			}
+			if tt.withDims {
+				feature.ThumbWidth, feature.ThumbHeight = &width, &height
+			}
+			d := NewDeduper(&lookupStub{
+				image: func(context.Context, []byte) (*store.ImageFeature, error) { return nil, nil },
+				video: func(context.Context, []byte) (*store.VideoFeature, error) { return feature, nil },
+			})
+			reply, err := d.Ask(context.Background(), SHAQueryMsg{
+				JobID: int64(203 + index), SHA512: sha, Kind: MediaVideo,
+				RequestedFields: tt.requested,
+			})
+			if err != nil {
+				t.Fatalf("Ask: %v", err)
+			}
+			if reply.Found != tt.wantFound || reply.FieldsPresent != tt.wantPresent ||
+				reply.MissingFields != tt.wantMissing {
+				t.Fatalf("legacy adapter masks = found:%t present:%#x missing:%#x, want %t/%#x/%#x",
+					reply.Found, reply.FieldsPresent, reply.MissingFields,
+					tt.wantFound, tt.wantPresent, tt.wantMissing)
+			}
+		})
 	}
-	want := uint32(MaskSHA512 | MaskVideoDuration | MaskVideoContactSheet)
-	if !reply.Found || reply.FieldsPresent != want || reply.MissingFields != 0 {
-		t.Fatalf("legacy adapter masks = found:%t present:%#x missing:%#x, want true/%#x/0",
-			reply.Found, reply.FieldsPresent, reply.MissingFields, want)
+}
+
+func TestDefaultStageOneDeduperDoesNotDependOnMutableMaskAliases(t *testing.T) {
+	originalImage, originalVideo := MaskAllImage, MaskAllVideo
+	MaskAllImage, MaskAllVideo = 0, MaskVideoThumb
+	t.Cleanup(func() { MaskAllImage, MaskAllVideo = originalImage, originalVideo })
+	image, err := normalizeSHAQuery(SHAQueryMsg{Kind: MediaImage})
+	if err != nil {
+		t.Fatal(err)
+	}
+	video, err := normalizeSHAQuery(SHAQueryMsg{Kind: MediaVideo})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if image.RequestedFields != store.RequiredStageOneMask(store.MediaImage) ||
+		video.RequestedFields != store.RequiredStageOneMask(store.MediaVideo) {
+		t.Fatalf("deduper defaults = image:%#x video:%#x",
+			image.RequestedFields, video.RequestedFields)
 	}
 }
 
@@ -285,8 +338,13 @@ func TestDeduperPartialVideoStoreHitBecomesOwner(t *testing.T) {
 	sha := bytes64(31)
 	duration := int64(42)
 	quality := int32(73)
+	width, height := int32(960), int32(540)
 	complete := func() *store.VideoFeature {
-		return &store.VideoFeature{SHA512: sha, DurationMS: &duration, ThumbPath: "thumb.jpg", ThumbPDQ: []byte{1, 2}, ThumbQuality: &quality}
+		return &store.VideoFeature{
+			SHA512: sha, DurationMS: &duration, ThumbPath: "thumb.jpg",
+			ThumbPDQ: bytes.Repeat([]byte{1}, 32), ThumbQuality: &quality,
+			ThumbWidth: &width, ThumbHeight: &height,
+		}
 	}
 	cases := []struct {
 		name  string
@@ -297,6 +355,8 @@ func TestDeduperPartialVideoStoreHitBecomesOwner(t *testing.T) {
 		{"missing thumbnail path", func(feature *store.VideoFeature) { feature.ThumbPath = "" }, false},
 		{"missing thumbnail PDQ", func(feature *store.VideoFeature) { feature.ThumbPDQ = nil }, false},
 		{"missing thumbnail quality", func(feature *store.VideoFeature) { feature.ThumbQuality = nil }, false},
+		{"missing contact width", func(feature *store.VideoFeature) { feature.ThumbWidth = nil }, false},
+		{"missing contact height", func(feature *store.VideoFeature) { feature.ThumbHeight = nil }, false},
 		{"complete bundle", func(*store.VideoFeature) {}, true},
 	}
 	for i, tc := range cases {

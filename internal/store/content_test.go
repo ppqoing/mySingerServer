@@ -79,6 +79,34 @@ func TestLookupContentVideoDurationOnlyIgnoresUnrequestedContactSheet(t *testing
 	}
 }
 
+func TestLookupContentLegacyThumbDoesNotRequireContactDimensions(t *testing.T) {
+	db := openContentTestDB(t)
+	sha := bytes.Repeat([]byte{0x35}, 64)
+	pdq := bytes.Repeat([]byte{0xab}, 32)
+	if _, err := db.db.Exec(`
+		INSERT INTO video_features
+			(sha512, duration_ms, thumb_path, thumb_pdq256, thumb_quality)
+		VALUES (?1, 12345, 'legacy-thumb.jpg', ?2, 80)`,
+		hex.EncodeToString(sha), pdq,
+	); err != nil {
+		t.Fatalf("insert legacy video feature: %v", err)
+	}
+
+	state, err := db.LookupContent(
+		context.Background(), sha, MediaVideo, proto.FieldThumb, 0,
+	)
+	if err != nil {
+		t.Fatalf("LookupContent: %v", err)
+	}
+	if state.FieldsPresent != proto.FieldThumb || state.MissingFields != 0 ||
+		state.Video == nil || state.Video.DurationMS == nil ||
+		state.Video.ThumbPath != "legacy-thumb.jpg" ||
+		!bytes.Equal(state.Video.ThumbPDQ, pdq) || state.Video.ThumbQuality == nil ||
+		state.Video.ThumbWidth != nil || state.Video.ThumbHeight != nil {
+		t.Fatalf("legacy thumbnail state = %#v", state)
+	}
+}
+
 func TestVideoBaseFeaturesLookupContentRequiresContactDimensions(t *testing.T) {
 	db := openContentTestDB(t)
 	sha := bytes.Repeat([]byte{0x34}, 64)

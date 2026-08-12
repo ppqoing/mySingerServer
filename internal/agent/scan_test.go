@@ -642,6 +642,28 @@ func TestPreparePendingSkipsMediaRowsWhosePhase1MaskIsZero(t *testing.T) {
 	}
 }
 
+func TestDefaultStageOnePreparePendingDoesNotDependOnMutableWorkerAliases(t *testing.T) {
+	originalImage, originalVideo := worker.MaskAllImage, worker.MaskAllVideo
+	worker.MaskAllImage, worker.MaskAllVideo = 0, worker.MaskVideoThumb
+	t.Cleanup(func() {
+		worker.MaskAllImage, worker.MaskAllVideo = originalImage, originalVideo
+	})
+	m, cleanup := newTestScanManager(t, nil, nil)
+	defer cleanup()
+	m.pool = newFakeScanPool()
+	state := &ScanState{Task: proto.ScanTask{TaskID: "task-required-mask"}}
+	pending := map[int64][]store.PendingFile{1: {
+		{Path: `D:\image.jpg`, MissingMask: store.RequiredStageOneMask(store.MediaImage)},
+		{Path: `D:\video.mp4`, MissingMask: store.RequiredStageOneMask(store.MediaVideo)},
+	}}
+	work, _ := m.preparePending(state, pending)
+	if len(work[1]) != 2 || work[1][0].media == nil || work[1][1].media == nil ||
+		work[1][0].media.FieldsMask != store.RequiredStageOneMask(store.MediaImage) ||
+		work[1][1].media.FieldsMask != store.RequiredStageOneMask(store.MediaVideo) {
+		t.Fatalf("prepared required masks = %#v", work[1])
+	}
+}
+
 func TestImageNoThumbnailFeatureItemKeepsImageDimensionsOnly(t *testing.T) {
 	job := &worker.JobMsg{
 		Path: `D:\media\photo.jpg`, Kind: worker.MediaImage,

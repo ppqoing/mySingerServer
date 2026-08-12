@@ -193,14 +193,13 @@ func (d *DB) SaveAnalysis(ctx context.Context, result AnalysisResult) (Committed
 		return CommittedState{}, err
 	}
 	updatedMissing := priorMissing&^result.RequestedFields | state.MissingFields
-	phase1Done := analysisPhase1Done(result.Kind, updatedMissing)
+	stageOneStatus, phase1Done := stageOneState(
+		result.Kind, updatedMissing, len(result.Errors) != 0 || hasAnalysisFrameErrors(result.Frames),
+	)
 	phase2Done := updatedMissing&phase2Mask(result.Kind) == 0
-	status := proto.StatusPartial
-	if updatedMissing == 0 {
-		status = proto.StatusDone
-	} else if state.FieldsPresent == 0 && state.FramesPresent == 0 &&
-		(len(result.Errors) != 0 || hasAnalysisFrameErrors(result.Frames)) {
-		status = proto.StatusFailed
+	status := stageOneStatus
+	if updatedMissing&RequiredStageOneMask(result.Kind) == 0 && updatedMissing != 0 {
+		status = proto.StatusPartial
 	}
 	var errorValue any
 	if status != proto.StatusDone {
@@ -534,15 +533,7 @@ func committedFrameMask(ctx context.Context, tx *sql.Tx, sha string) (uint8, err
 }
 
 func analysisPhase1Done(kind MediaKind, missing uint32) bool {
-	switch kind {
-	case MediaImage:
-		return missing&(proto.FieldSHA512|proto.FieldPDQ256) == 0
-	case MediaVideo:
-		return missing&(proto.FieldSHA512|proto.FieldThumb|
-			proto.FieldVideoDuration|proto.FieldVideoContactSheet) == 0
-	default:
-		return false
-	}
+	return missing&RequiredStageOneMask(kind) == 0
 }
 
 func hasAnalysisFrameErrors(frames []Phase2Frame) bool {

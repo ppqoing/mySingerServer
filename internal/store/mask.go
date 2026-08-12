@@ -33,6 +33,28 @@ func RequiredStageOneMask(kind MediaKind) uint32 {
 
 func phase1Mask(kind MediaKind) uint32 { return RequiredStageOneMask(kind) }
 
+func stageOneState(kind MediaKind, missing uint32, hasErrors bool) (string, bool) {
+	required := stageOneRequiredMask(kind, missing)
+	requiredMissing := missing & required
+	if requiredMissing == 0 {
+		return proto.StatusDone, true
+	}
+	if required&^requiredMissing != 0 {
+		return proto.StatusPartial, false
+	}
+	if hasErrors {
+		return proto.StatusFailed, false
+	}
+	return proto.StatusPending, false
+}
+
+func stageOneRequiredMask(kind MediaKind, missing uint32) uint32 {
+	if kind == MediaVideo && missing&proto.FieldThumb != 0 {
+		return proto.FieldSHA512 | proto.FieldThumb
+	}
+	return RequiredStageOneMask(kind)
+}
+
 func (d *DB) MissingPhase1(ctx context.Context, row FileRow, kind MediaKind) (uint32, error) {
 	return missingPhase1(ctx, d.db, row, kind, phase1Mask(kind))
 }

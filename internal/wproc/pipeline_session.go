@@ -130,7 +130,7 @@ func processMediaWithDeps(ctx context.Context, cfg Config, job *worker.JobMsg, d
 	if analysisFields&worker.MaskVideoContactSheet != 0 {
 		paths, err = deps.contactSheetPaths(cfg.ThumbCacheDir, sha, deps.pid(), job.JobID, deps.nonce())
 		if err != nil {
-			return sessionPipelineFileError(result, worker.MaskVideoContactSheet, "thumb_cache", err), nil
+			return sessionPipelineContactError(result, missingFields, "thumb_cache", err), nil
 		}
 		request.TempJPEGPath = paths.TempJPEG
 	}
@@ -154,36 +154,49 @@ func processMediaWithDeps(ctx context.Context, cfg Config, job *worker.JobMsg, d
 	}
 	sessionPipelineMergeAnalysis(result, job, missingFields, analysisFields, missingFrames, analysis)
 
-	if request.TempJPEGPath != "" && analysis.ContactSheetStatus == videocore.StatusOK && contactSheetHasSuccessfulSample(analysis) {
+	if request.TempJPEGPath != "" {
+		if analysis.ContactSheetStatus != videocore.StatusOK {
+			return sessionPipelineContactError(
+				result, missingFields, "video_contact_sheet", errors.New("contact sheet analysis failed"),
+			), nil
+		}
+		if !contactSheetHasSuccessfulSample(analysis) {
+			return sessionPipelineContactError(
+				result, missingFields, "video_contact_sheet", errors.New("contact sheet has no successful sample"),
+			), nil
+		}
 		runtime, runtimeErr := deps.runtime()
 		if runtimeErr != nil {
-			return sessionPipelineFileError(result, worker.MaskVideoContactSheet, "thumb_cache", runtimeErr), nil
+			return sessionPipelineContactError(result, missingFields, "thumb_cache", runtimeErr), nil
 		}
 		meta := contactSheetMetaFromAnalysis(sha, job.Size, runtime, analysis)
-		if meta.CanvasWidth > 0 && meta.CanvasHeight > 0 && meta.TileWidth > 0 && meta.TileHeight > 0 {
-			if err := deps.publishContactSheet(paths, meta, func() error {
-				info, err := deps.stat(path)
-				if err != nil || !deps.sameFile(before, info) || !sameFileState(before, info) || !matchesDispatchedFile(info, job) {
-					return fmt.Errorf("source drift before contact sheet publish")
-				}
-				return nil
-			}); err != nil {
-				return sessionPipelineFileError(result, worker.MaskVideoContactSheet, "thumb_cache", err), nil
-			}
-			if missingFields&worker.MaskVideoContactSheet != 0 {
-				result.FieldsDone |= worker.MaskVideoContactSheet
-			}
-			if missingFields&worker.MaskVideoThumb != 0 {
-				result.FieldsDone |= worker.MaskVideoThumb
-			}
-			quality := int32(analysis.ContactSheetFeatures.PDQQuality)
-			result.ThumbPath = paths.JPEG
-			result.ThumbPDQ = append(
-				[]byte(nil), analysis.ContactSheetFeatures.PDQ[:]...,
-			)
-			result.ThumbQuality = &quality
-			result.ThumbGenerated = true
+		if meta.CanvasWidth <= 0 || meta.CanvasHeight <= 0 || meta.TileWidth <= 0 || meta.TileHeight <= 0 {
+			return sessionPipelineContactError(
+				result, missingFields, "thumb_cache", errors.New("invalid contact sheet metadata"),
+			), nil
 		}
+		if err := deps.publishContactSheet(paths, meta, func() error {
+			info, err := deps.stat(path)
+			if err != nil || !deps.sameFile(before, info) || !sameFileState(before, info) || !matchesDispatchedFile(info, job) {
+				return fmt.Errorf("source drift before contact sheet publish")
+			}
+			return nil
+		}); err != nil {
+			return sessionPipelineContactError(result, missingFields, "thumb_cache", err), nil
+		}
+		if missingFields&worker.MaskVideoContactSheet != 0 {
+			result.FieldsDone |= worker.MaskVideoContactSheet
+		}
+		if missingFields&worker.MaskVideoThumb != 0 {
+			result.FieldsDone |= worker.MaskVideoThumb
+		}
+		quality := int32(analysis.ContactSheetFeatures.PDQQuality)
+		result.ThumbPath = paths.JPEG
+		result.ThumbPDQ = append(
+			[]byte(nil), analysis.ContactSheetFeatures.PDQ[:]...,
+		)
+		result.ThumbQuality = &quality
+		result.ThumbGenerated = true
 	}
 	return result, nil
 }
@@ -378,6 +391,23 @@ func sessionPipelineFileError(result *worker.JobResultMsg, fields uint32, stage 
 	}
 	result.Errors = append(result.Errors, worker.FieldError{Field: fields, Stage: stage, Msg: err.Error()})
 	return result
+}
+
+func sessionPipelineContactError(
+	result *worker.JobResultMsg,
+	missingFields uint32,
+	stage string,
+	err error,
+) *worker.JobResultMsg {
+	result.FieldsDone &^= worker.MaskVideoThumb | worker.MaskVideoContactSheet
+	result.ContactSheetStatus, result.ContactSheetWidth, result.ContactSheetHeight = 0, 0, 0
+	result.ThumbPath, result.ThumbPDQ, result.ThumbQuality = "", nil, nil
+	result.ThumbGenerated, result.ThumbCacheHit = false, false
+	field := uint32(worker.MaskVideoContactSheet)
+	if missingFields&worker.MaskVideoContactSheet == 0 && missingFields&worker.MaskVideoThumb != 0 {
+		field = worker.MaskVideoThumb
+	}
+	return sessionPipelineFileError(result, field, stage, err)
 }
 
 func sessionPipelineCancelled(result *worker.JobResultMsg, paths ContactSheetPaths) *worker.JobResultMsg {

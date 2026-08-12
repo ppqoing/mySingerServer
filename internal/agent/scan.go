@@ -478,10 +478,10 @@ func (m *ScanManager) preparePending(
 			mask := file.MissingMask
 			mediaKind := worker.MediaImage
 			if kind == "image" {
-				mask &= worker.MaskAllImage
+				mask &= store.RequiredStageOneMask(store.MediaImage)
 			} else {
 				mediaKind = worker.MediaVideo
-				mask &= worker.MaskAllVideo
+				mask &= store.RequiredStageOneMask(store.MediaVideo)
 			}
 			if mask == 0 {
 				continue

@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"path/filepath"
@@ -122,6 +123,44 @@ func TestSaveAnalysisPartialFrames(t *testing.T) {
 	}
 	if !bytes.Equal(gotOld, old.PDQ256) || !bytes.Equal(gotSecond, second.PDQ256) {
 		t.Fatalf("frame persistence old=%x second=%x", gotOld, gotSecond)
+	}
+}
+
+func TestSaveAnalysisContactRetryFailureKeepsExistingStageOnePartial(t *testing.T) {
+	db := openAnalysisTestStore(t)
+	ctx := context.Background()
+	sha := analysisTestSHA(0x37)
+	path := `D:\analysis\contact-retry.mp4`
+	required := RequiredStageOneMask(MediaVideo)
+	seedAnalysisFile(t, db, path, sha, proto.FieldVideoContactSheet)
+	if _, err := db.db.ExecContext(ctx, `
+		INSERT INTO video_features (sha512, duration_ms) VALUES (?1, 1234)`,
+		hex.EncodeToString(sha),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SaveAnalysis(ctx, AnalysisResult{
+		MachineID: "m", Path: path, Kind: MediaVideo, Size: 10, MTime: 20, SHA512: sha,
+		RequestedFields: proto.FieldVideoContactSheet,
+		Errors: []FieldError{{
+			Field: proto.FieldVideoContactSheet, Stage: "contact_sheet", Msg: "retry failed",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var status string
+	var errorText sql.NullString
+	var missing uint32
+	var phase1 int
+	if err := db.db.QueryRowContext(ctx, `
+		SELECT status, error, missing_mask, phase1_done FROM files WHERE path=?1`, path,
+	).Scan(&status, &errorText, &missing, &phase1); err != nil {
+		t.Fatal(err)
+	}
+	if status != proto.StatusPartial || !errorText.Valid ||
+		missing != proto.FieldVideoContactSheet || phase1 != 0 {
+		t.Fatalf("retry failure = %q/%#v/%#x/%d, want partial/error/%#x/0 (required %#x)",
+			status, errorText, missing, phase1, proto.FieldVideoContactSheet, required)
 	}
 }
 
