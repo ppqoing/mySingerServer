@@ -1,6 +1,6 @@
 # MySingerServer 管理端便携包
 
-本压缩包只包含管理端 `gui.exe`，不包含计算节点、Everything、本地 PostgreSQL 或任何媒体处理组件。请先在可访问 PostgreSQL 与 Agent 的 Windows 电脑上解压到一个可写目录。
+本压缩包只包含管理端 `gui.exe`，不包含计算节点、Everything、本地 PostgreSQL 或任何媒体处理组件。解压到 Windows 电脑的可写目录即可启动并配置；PostgreSQL 与 Agent 可在启动后再连接。
 
 ## 配置与启动
 

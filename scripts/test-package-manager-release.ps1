@@ -14,6 +14,30 @@ function Write-Utf8NoBom {
     [IO.File]::WriteAllText($Path, $Value, [Text.UTF8Encoding]::new($false))
 }
 
+function Test-ManagerStartAllowsMissingConfig {
+    param([string]$Text)
+    $tokens = $null
+    $errors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseInput(
+        $Text, [ref]$tokens, [ref]$errors)
+    if (@($errors).Count -gt 0) { return $false }
+    $throws = @($ast.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.ThrowStatementAst]
+    }, $true))
+    return $throws.Count -eq 0
+}
+
+function Test-ManagerReadmeContract {
+    param([string]$Text)
+    return ($Text -match '首次双击.*自动生成.*gui\.json') -and
+        ($Text -match 'PostgreSQL.*Agent.*不可用.*设置页') -and
+        ($Text -match '保存.*自动重启') -and
+        ($Text -notmatch '(?is)(必须|需要|请|先).{0,12}(手工|手动)?复制.{0,24}gui\.example\.json') -and
+        ($Text -notmatch '(?is)(缺少|缺失|没有).{0,12}gui\.json.{0,12}(不能|无法|不可).{0,8}(启动|运行)') -and
+        ($Text -notmatch '(?is)(请先|必须|需要).{0,40}(PostgreSQL.{0,20}Agent|Agent.{0,20}PostgreSQL).{0,30}(解压|启动)')
+}
+
 function Invoke-RejectedPackage {
     param([string]$TemplatePath, [string]$ReleaseId)
     $rejected = $false
@@ -79,16 +103,30 @@ try {
     Assert-True ($startScript -match `
         '& \(Join-Path \$root ''gui\.exe''\) -config \(Join-Path \$root ''gui\.json''\) @args') `
         'manager launch script must invoke gui.exe with the absolute sibling gui.json path'
-    Assert-True ($startScript -notmatch '(?im)^\s*throw\b') `
+    Assert-True (Test-ManagerStartAllowsMissingConfig -Text $startScript) `
         'manager launch script must not reject a missing gui.json'
 
     $readme = Get-Content -Raw -LiteralPath (Join-Path $payloadRoot 'README-管理端部署.md')
-    Assert-True ($readme -match '首次双击.*自动生成.*gui\.json') `
-        'manager README must explain first-run gui.json creation'
-    Assert-True ($readme -match 'PostgreSQL.*Agent.*不可用.*设置页') `
-        'manager README must explain degraded startup into settings'
-    Assert-True ($readme -match '保存.*自动重启') `
-        'manager README must explain automatic restart after saving settings'
+    Assert-True (Test-ManagerReadmeContract -Text $readme) `
+        'manager README must document the non-blocking first-run flow without contradictions'
+
+    $acceptedMutations = [Collections.Generic.List[string]]::new()
+    $inlineThrowMutation = $startScript + `
+        "`nif (-not (Test-Path -LiteralPath 'gui.json')) { throw 'missing config' }"
+    if (Test-ManagerStartAllowsMissingConfig -Text $inlineThrowMutation) {
+        $acceptedMutations.Add('inline-throw')
+    }
+    foreach ($readmeMutation in @(
+            [ordered]@{ name = 'manual-copy'; text = '必须手工复制 gui.example.json 为 gui.json 才能启动。' },
+            [ordered]@{ name = 'missing-config-blocks-start'; text = '缺少 gui.json 时不能启动。' },
+            [ordered]@{ name = 'dependencies-required-before-extract'; text = '请先在可访问 PostgreSQL 与 Agent 的 Windows 电脑上解压。' })) {
+        if (Test-ManagerReadmeContract -Text ($readme + "`n" + $readmeMutation.text)) {
+            $acceptedMutations.Add([string]$readmeMutation.name)
+        }
+    }
+    Assert-True ($acceptedMutations.Count -eq 0) `
+        ("manager release contract accepted contradictory mutations: {0}" -f `
+            ($acceptedMutations -join ','))
 
     $manifest = Get-Content -Raw -LiteralPath (Join-Path $payloadRoot 'release-manifest.json') | ConvertFrom-Json
     Assert-True ($manifest.release_kind -ceq 'remote-manager-portable') 'wrong release kind'

@@ -21,6 +21,20 @@ function Assert-True {
     if (-not $Condition) { Add-GateFailure $Code }
 }
 
+function Test-ManagerStartAllowsMissingConfig {
+    param([string]$Text)
+    $tokens = $null
+    $errors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseInput(
+        $Text, [ref]$tokens, [ref]$errors)
+    if (@($errors).Count -gt 0) { return $false }
+    $throws = @($ast.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.ThrowStatementAst]
+    }, $true))
+    return $throws.Count -eq 0
+}
+
 function Get-ParsedScript {
     param([string]$Path)
     $tokens = $null
@@ -91,7 +105,12 @@ if (Test-Path -LiteralPath $managerStartPath -PathType Leaf) {
     Assert-True ($managerStartText -match `
         '& \(Join-Path \$root ''gui\.exe''\) -config \(Join-Path \$root ''gui\.json''\) @args') `
         'MANAGER_START_CONFIG_ARGUMENT_MISSING'
-    Assert-True ($managerStartText -notmatch '(?im)^\s*throw\b') 'MANAGER_START_REJECTS_MISSING_CONFIG'
+    Assert-True (Test-ManagerStartAllowsMissingConfig -Text $managerStartText) `
+        'MANAGER_START_REJECTS_MISSING_CONFIG'
+    $inlineThrowMutation = $managerStartText + `
+        "`nif (-not (Test-Path -LiteralPath 'gui.json')) { throw 'missing config' }"
+    Assert-True (-not (Test-ManagerStartAllowsMissingConfig -Text $inlineThrowMutation)) `
+        'MANAGER_START_INLINE_THROW_MUTATION_ACCEPTED'
 }
 
 $buildNodeTray = Join-Path $repo "scripts\build-nodetray.ps1"
