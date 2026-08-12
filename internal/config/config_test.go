@@ -423,6 +423,18 @@ func TestValidateGUIAcceptsDefaultedLoadableConfig(t *testing.T) {
 	}
 }
 
+func TestDefaultGUIIsACompletePortableFirstRunConfiguration(t *testing.T) {
+	cfg := DefaultGUI()
+	if err := ValidateGUI(cfg); err != nil {
+		t.Fatalf("DefaultGUI: %v", err)
+	}
+	if cfg.ListenAddr != "127.0.0.1:18081" ||
+		cfg.PGDSN != "postgres://dedup@127.0.0.1:5432/dedup" ||
+		len(cfg.Agents) != 1 || cfg.Agents[0].Addr != "127.0.0.1:9101" {
+		t.Fatalf("incomplete portable defaults: %#v", cfg)
+	}
+}
+
 func TestValidateGUIRejectsNetworkAndDSNFieldsWithStablePaths(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -542,7 +554,7 @@ func TestLoadGUIAppliesDefaultsAndValidatesEndpoints(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadGUI: %v", err)
 	}
-	if cfg.ListenAddr != "127.0.0.1:8080" || cfg.HeartbeatS != 15 {
+	if cfg.ListenAddr != "127.0.0.1:18081" || cfg.HeartbeatS != 15 {
 		t.Fatalf("unexpected GUI defaults: %#v", cfg)
 	}
 	if cfg.FirstScreen != (FirstScreenConfig{

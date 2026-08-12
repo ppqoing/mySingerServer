@@ -70,7 +70,9 @@ type AgentEndpoint struct {
 
 func DefaultGUI() *GUIConfig {
 	return &GUIConfig{
-		ListenAddr:  "127.0.0.1:8080",
+		ListenAddr:  "127.0.0.1:18081",
+		PGDSN:       "postgres://dedup@127.0.0.1:5432/dedup",
+		Agents:      []AgentEndpoint{{Addr: "127.0.0.1:9101"}},
 		HeartbeatS:  15,
 		FirstScreen: defaultFirstScreen(),
 		Phase2:      defaultPhase2(),
