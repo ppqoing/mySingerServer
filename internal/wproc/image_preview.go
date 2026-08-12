@@ -23,7 +23,7 @@ var errPreviewTooLarge = errors.New("preview exceeds response limit")
 
 // generateImagePreview runs only in the Worker process. It independently binds
 // the source path to Agent's immutable identity and returns encoded bytes only.
-func generateImagePreview(ctx context.Context, job *worker.JobMsg) *worker.JobResultMsg {
+func generateImagePreview(ctx context.Context, job *worker.JobMsg, memoryBudget int64) *worker.JobResultMsg {
 	result := previewResult(job)
 	if ctx == nil || job == nil || job.Kind != worker.MediaImage ||
 		job.Phase != worker.PhasePreview || job.Size < 0 || job.MTimeUnix <= 0 ||
@@ -31,6 +31,9 @@ func generateImagePreview(ctx context.Context, job *worker.JobMsg) *worker.JobRe
 		job.PreviewMaxHeight <= 0 || job.PreviewQuality < 1 || job.PreviewQuality > 100 ||
 		(job.PreviewFormat != worker.PreviewFormatJPEG && job.PreviewFormat != worker.PreviewFormatWebP) {
 		return previewFailure(result, "preview_encode_failed")
+	}
+	if memoryBudget <= 0 || job.Size > memoryBudget {
+		return previewFailure(result, "preview_memory_limit")
 	}
 	if err := ctx.Err(); err != nil {
 		return previewFailure(result, "preview_io_failed")
@@ -72,6 +75,14 @@ func generateImagePreview(ctx context.Context, job *worker.JobMsg) *worker.JobRe
 		return previewFailure(result, "stale_preview")
 	}
 
+	config, err := decodePreviewConfig(data)
+	if err != nil {
+		return previewFailure(result, "preview_decode_failed")
+	}
+	if !previewFitsMemoryBudget(job.Size, config.Width, config.Height,
+		int(job.PreviewMaxWidth), int(job.PreviewMaxHeight), memoryBudget) {
+		return previewFailure(result, "preview_memory_limit")
+	}
 	decoded, err := decodePreview(data)
 	if err != nil {
 		return previewFailure(result, "preview_decode_failed")
@@ -90,6 +101,65 @@ func generateImagePreview(ctx context.Context, job *worker.JobMsg) *worker.JobRe
 	result.PreviewHeight = int32(bounds.Dy())
 	result.PreviewBytes = encoded
 	return result
+}
+
+func decodePreviewConfig(data []byte) (image.Config, error) {
+	if len(data) >= 12 && string(data[:4]) == "RIFF" && string(data[8:12]) == "WEBP" {
+		return webpcodec.DecodeConfig(bytes.NewReader(data))
+	}
+	config, _, err := image.DecodeConfig(bytes.NewReader(data))
+	return config, err
+}
+
+func previewFitsMemoryBudget(sourceBytes int64, width, height, maxWidth, maxHeight int, budget int64) bool {
+	if sourceBytes < 0 || width <= 0 || height <= 0 || maxWidth <= 0 || maxHeight <= 0 || budget <= 0 {
+		return false
+	}
+	decodedPixels, ok := safePreviewProduct(int64(width), int64(height))
+	if !ok {
+		return false
+	}
+	decodedBytes, ok := safePreviewProduct(decodedPixels, 8)
+	if !ok {
+		return false
+	}
+	targetWidth, targetHeight := resizeDimensions(width, height, maxWidth, maxHeight)
+	resizedPixels, ok := safePreviewProduct(int64(targetWidth), int64(targetHeight))
+	if !ok {
+		return false
+	}
+	resizedBytes, ok := safePreviewProduct(resizedPixels, 4)
+	if !ok {
+		return false
+	}
+	total := int64(0)
+	for _, amount := range []int64{sourceBytes, decodedBytes, resizedBytes, int64(worker.MaxPreviewBytes)} {
+		if amount > budget-total {
+			return false
+		}
+		total += amount
+	}
+	return true
+}
+
+func safePreviewProduct(left, right int64) (int64, bool) {
+	if left < 0 || right < 0 || left != 0 && right > int64(^uint64(0)>>1)/left {
+		return 0, false
+	}
+	return left * right, true
+}
+
+func resizeDimensions(width, height, maxWidth, maxHeight int) (int, int) {
+	targetWidth, targetHeight := width, height
+	if targetWidth > maxWidth {
+		targetHeight = max(1, targetHeight*maxWidth/targetWidth)
+		targetWidth = maxWidth
+	}
+	if targetHeight > maxHeight {
+		targetWidth = max(1, targetWidth*maxHeight/targetHeight)
+		targetHeight = maxHeight
+	}
+	return targetWidth, targetHeight
 }
 
 func previewResult(job *worker.JobMsg) *worker.JobResultMsg {
@@ -168,15 +238,7 @@ func decodePreview(data []byte) (image.Image, error) {
 func resizeWithin(source image.Image, maxWidth, maxHeight int) image.Image {
 	bounds := source.Bounds()
 	width, height := bounds.Dx(), bounds.Dy()
-	targetWidth, targetHeight := width, height
-	if targetWidth > maxWidth {
-		targetHeight = max(1, targetHeight*maxWidth/targetWidth)
-		targetWidth = maxWidth
-	}
-	if targetHeight > maxHeight {
-		targetWidth = max(1, targetWidth*maxHeight/targetHeight)
-		targetHeight = maxHeight
-	}
+	targetWidth, targetHeight := resizeDimensions(width, height, maxWidth, maxHeight)
 	if targetWidth == width && targetHeight == height {
 		return source
 	}

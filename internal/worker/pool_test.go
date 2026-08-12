@@ -1023,6 +1023,39 @@ func TestPoolWatchdogUsesStableReasonForMediaKind(t *testing.T) {
 	}
 }
 
+// Break caught: an ephemeral preview timeout is persisted as a scan crash,
+// changing files.status/sync state even though preview is not analysis work.
+func TestPoolPreviewCrashPublishesTerminalWithoutPersistingOrFileMetrics(t *testing.T) {
+	h := newLifecycleHarness(t, workerScript{ready: true, hangJob: true})
+	p := h.newPool(Config{
+		MachineID: "machine-a", WorkerCount: 1,
+		ImageTimeout: 30 * time.Second, RespawnDelay: 500 * time.Millisecond,
+	})
+	p.Start()
+	t.Cleanup(p.Close)
+	h.ready(t)
+	job := JobMsg{
+		JobID: 72, ScanTaskID: "preview-timeout", Path: `D:\media\preview.jpg`,
+		Kind: MediaImage, Phase: PhasePreview, ScreenStage: ScreenStagePreview,
+		Source: JobSourceLocal,
+	}
+	if err := p.Submit(&job); err != nil {
+		t.Fatal(err)
+	}
+	h.dispatched(t)
+	h.clock.next(t, 30*time.Second).fire()
+	crash := h.crash(t)
+	if crash.JobID != job.JobID || crash.ScanTaskID != job.ScanTaskID || crash.Reason != "watchdog_image" {
+		t.Fatalf("preview terminal = %#v", crash)
+	}
+	if got := h.store.crashCount(); got != 0 {
+		t.Fatalf("preview crash persisted through MarkCrash %d times", got)
+	}
+	if got := p.Metrics(); got.FilesDone != 0 || got.FilesFailed != 0 {
+		t.Fatalf("preview crash changed scan file metrics: %#v", got)
+	}
+}
+
 func TestPoolCloseSendsShutdownAndNormalEOFDoesNotCrashOrRespawn(t *testing.T) {
 	h := newLifecycleHarness(t, workerScript{ready: true, exitOnShutdown: true})
 	p := h.newPool(Config{WorkerCount: 1, ReadyTimeout: 10 * time.Second, ShutdownTimeout: 3 * time.Second})
@@ -2852,6 +2885,17 @@ func TestImagePreviewPoolBypassesFeatureStore(t *testing.T) {
 		}
 	default:
 		t.Fatal("preview result was not published")
+	}
+	if got := pool.Metrics(); got.FilesDone != 0 || got.FilesFailed != 0 {
+		t.Fatalf("successful preview changed scan file metrics: %#v", got)
+	}
+	pool.saveResult(job, JobResultMsg{
+		JobID: job.JobID, Path: job.Path, Kind: job.Kind,
+		SHA512: bytes64(0x72), PreviewErrorCode: "preview_too_large",
+	})
+	<-pool.results
+	if got := pool.Metrics(); got.FilesDone != 0 || got.FilesFailed != 0 {
+		t.Fatalf("failed preview changed scan file metrics: %#v", got)
 	}
 }
 

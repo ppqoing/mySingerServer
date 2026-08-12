@@ -144,7 +144,7 @@ func (handler *LocalResultHandler) HandleLocal(ctx context.Context, request prot
 			return localTaskFailure(request.RequestID, "local_preview_unavailable")
 		}
 		var input proto.LocalImagePreviewRequest
-		if err := proto.DecodeLocalPayload(request.Payload, &input); err != nil || input.Validate() != nil {
+		if err := proto.DecodeLocalImagePreviewPayload(request.Payload, &input); err != nil || input.Validate() != nil {
 			return localTaskFailure(request.RequestID, "invalid_preview")
 		}
 		preview, err := handler.previews.Preview(ctx, input)
@@ -162,7 +162,7 @@ func safePreviewError(err error) string {
 		return ""
 	}
 	switch err.Error() {
-	case "stale_preview", "preview_not_available", "preview_too_large":
+	case "stale_preview", "preview_not_available", "preview_too_large", "preview_memory_limit":
 		return err.Error()
 	default:
 		return "preview_failed"

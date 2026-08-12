@@ -79,6 +79,43 @@ type LocalPreviewSource struct {
 	MTime     int64
 }
 
+const localResultCTE = `
+	WITH result_groups(machine_id,run_id,generation,group_id,category,verdict) AS (
+		SELECT g.machine_id,g.run_id,g.generation,g.group_id,g.category,g.verdict
+		FROM local_dup_groups g
+		UNION ALL
+		SELECT p.machine_id,p.run_id,p.generation,
+		       'inconclusive:'||p.run_id||':'||p.pair_key,'uncertain',p.final_verdict
+		FROM local_pair_scores p
+		WHERE p.final_verdict='uncertain' AND NOT EXISTS (
+			SELECT 1 FROM local_dup_groups stored
+			WHERE stored.machine_id=p.machine_id AND stored.run_id=p.run_id
+			  AND stored.group_id='inconclusive:'||p.run_id||':'||p.pair_key
+		)
+	),
+	result_members(machine_id,run_id,generation,group_id,file_id) AS (
+		SELECT m.machine_id,m.run_id,m.generation,m.group_id,m.file_id
+		FROM local_dup_members m
+		UNION ALL
+		SELECT p.machine_id,p.run_id,p.generation,
+		       'inconclusive:'||p.run_id||':'||p.pair_key,p.left_file_id
+		FROM local_pair_scores p
+		WHERE p.final_verdict='uncertain' AND NOT EXISTS (
+			SELECT 1 FROM local_dup_groups stored
+			WHERE stored.machine_id=p.machine_id AND stored.run_id=p.run_id
+			  AND stored.group_id='inconclusive:'||p.run_id||':'||p.pair_key
+		)
+		UNION ALL
+		SELECT p.machine_id,p.run_id,p.generation,
+		       'inconclusive:'||p.run_id||':'||p.pair_key,p.right_file_id
+		FROM local_pair_scores p
+		WHERE p.final_verdict='uncertain' AND NOT EXISTS (
+			SELECT 1 FROM local_dup_groups stored
+			WHERE stored.machine_id=p.machine_id AND stored.run_id=p.run_id
+			  AND stored.group_id='inconclusive:'||p.run_id||':'||p.pair_key
+		)
+	)`
+
 func (d *DB) ListLocalGroups(ctx context.Context, query LocalGroupQuery) (LocalGroupPage, error) {
 	if d == nil || d.db == nil || query.MachineID == "" || query.Offset < 0 ||
 		query.Limit < 0 || query.Limit > MaxLocalPageSize {
@@ -100,10 +137,11 @@ func (d *DB) ListLocalGroups(ctx context.Context, query LocalGroupQuery) (LocalG
 	}
 
 	var sqlText strings.Builder
+	sqlText.WriteString(localResultCTE)
 	sqlText.WriteString(`
 		SELECT DISTINCT g.run_id,g.generation,g.group_id,g.category,g.verdict
-		FROM local_dup_groups g
-		JOIN local_dup_members m
+		FROM result_groups g
+		JOIN result_members m
 		  ON m.machine_id=g.machine_id AND m.run_id=g.run_id AND m.group_id=g.group_id
 		JOIN files f ON f.machine_id=m.machine_id AND f.id=m.file_id
 		LEFT JOIN local_reviews r
@@ -153,7 +191,7 @@ func (d *DB) ListLocalGroups(ctx context.Context, query LocalGroupQuery) (LocalG
 		sqlText.WriteString(` AND coalesce(r.decision,'undecided')='undecided'`)
 	case "reviewed":
 		sqlText.WriteString(` AND NOT EXISTS (
-			SELECT 1 FROM local_dup_members rm
+			SELECT 1 FROM result_members rm
 			JOIN files rf ON rf.machine_id=rm.machine_id AND rf.id=rm.file_id
 			LEFT JOIN local_reviews rr
 			  ON rr.machine_id=rm.machine_id AND rr.run_id=rm.run_id
@@ -213,10 +251,10 @@ func (d *DB) ListLocalGroups(ctx context.Context, query LocalGroupQuery) (LocalG
 }
 
 func (d *DB) loadLocalGroupMembers(ctx context.Context, machineID, runID, groupID string, activeOnly bool) ([]LocalGroupMember, string, error) {
-	query := `
+	query := localResultCTE + `
 		SELECT f.id,f.path,f.size,f.status,f.sha512,
 		       coalesce(r.decision,'undecided'),coalesce(v.thumb_path,'')
-		FROM local_dup_members m
+		FROM result_members m
 		JOIN files f ON f.machine_id=m.machine_id AND f.id=m.file_id
 		LEFT JOIN local_reviews r ON r.machine_id=m.machine_id AND r.run_id=m.run_id AND r.group_id=m.group_id AND r.file_id=m.file_id
 		LEFT JOIN video_features v ON v.sha512=f.sha512
@@ -224,7 +262,7 @@ func (d *DB) loadLocalGroupMembers(ctx context.Context, machineID, runID, groupI
 	if activeOnly {
 		query += ` AND f.status<>'deleted'`
 	}
-	query += ` ORDER BY f.id ASC`
+	query += ` ORDER BY f.sha512 ASC,f.id ASC`
 	rows, err := d.db.QueryContext(ctx, query, machineID, runID, groupID)
 	if err != nil {
 		return nil, "", err
@@ -258,8 +296,8 @@ func (d *DB) LoadLocalGroup(ctx context.Context, machineID, runID, groupID strin
 	if d == nil || d.db == nil || machineID == "" || groupID == "" || (!current && runID == "") {
 		return LocalResultGroup{}, fmt.Errorf("store: invalid local group identity")
 	}
-	query := `SELECT g.run_id,g.generation,g.group_id,g.category,g.verdict
-		FROM local_dup_groups g`
+	query := localResultCTE + ` SELECT g.run_id,g.generation,g.group_id,g.category,g.verdict
+		FROM result_groups g`
 	if current {
 		query += ` JOIN local_current_analysis c
 			ON c.machine_id=g.machine_id AND c.run_id=g.run_id AND c.generation=g.generation
@@ -307,7 +345,17 @@ func (d *DB) CommitLocalReview(ctx context.Context, commit LocalReviewCommit) er
 	defer tx.Rollback()
 	var generation int64
 	var category, verdict string
-	if err := tx.QueryRowContext(ctx, `SELECT generation,category,verdict FROM local_dup_groups WHERE machine_id=?1 AND run_id=?2 AND group_id=?3`, commit.MachineID, commit.RunID, commit.GroupID).Scan(&generation, &category, &verdict); err != nil {
+	loadGroup := func() error {
+		return tx.QueryRowContext(ctx, `SELECT generation,category,verdict FROM local_dup_groups WHERE machine_id=?1 AND run_id=?2 AND group_id=?3`, commit.MachineID, commit.RunID, commit.GroupID).Scan(&generation, &category, &verdict)
+	}
+	if err := loadGroup(); err == sql.ErrNoRows {
+		if err := materializeInconclusiveGroup(ctx, tx, commit); err != nil {
+			return err
+		}
+		if err := loadGroup(); err != nil {
+			return err
+		}
+	} else if err != nil {
 		if err == sql.ErrNoRows {
 			return ErrLocalResultNotFound
 		}
@@ -393,6 +441,47 @@ func (d *DB) CommitLocalReview(ctx context.Context, commit LocalReviewCommit) er
 		return fmt.Errorf("store: commit local review outbox: %w", err)
 	}
 	return tx.Commit()
+}
+
+func materializeInconclusiveGroup(ctx context.Context, tx *sql.Tx, commit LocalReviewCommit) error {
+	prefix := "inconclusive:" + commit.RunID + ":"
+	if !strings.HasPrefix(commit.GroupID, prefix) || len(commit.GroupID) == len(prefix) {
+		return ErrLocalResultNotFound
+	}
+	pairKey := strings.TrimPrefix(commit.GroupID, prefix)
+	var generation, leftFileID, rightFileID int64
+	var leftSHA, rightSHA string
+	if err := tx.QueryRowContext(ctx, `
+		SELECT generation,left_file_id,right_file_id,left_sha512,right_sha512
+		FROM local_pair_scores
+		WHERE machine_id=?1 AND run_id=?2 AND pair_key=?3 AND final_verdict='uncertain'`,
+		commit.MachineID, commit.RunID, pairKey,
+	).Scan(&generation, &leftFileID, &rightFileID, &leftSHA, &rightSHA); err != nil {
+		if err == sql.ErrNoRows {
+			return ErrLocalResultNotFound
+		}
+		return err
+	}
+	now := time.Now().UnixMilli()
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO local_dup_groups(group_id,machine_id,run_id,generation,category,verdict,created_at)
+		VALUES (?1,?2,?3,?4,'uncertain','uncertain',?5)`,
+		commit.GroupID, commit.MachineID, commit.RunID, generation, now); err != nil {
+		return fmt.Errorf("store: materialize inconclusive group: %w", err)
+	}
+	for _, member := range []struct {
+		fileID int64
+		sha    string
+	}{{leftFileID, leftSHA}, {rightFileID, rightSHA}} {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO local_dup_members(group_id,machine_id,run_id,generation,file_id,sha512,created_at)
+			VALUES (?1,?2,?3,?4,?5,?6,?7)`,
+			commit.GroupID, commit.MachineID, commit.RunID, generation,
+			member.fileID, member.sha, now); err != nil {
+			return fmt.Errorf("store: materialize inconclusive member: %w", err)
+		}
+	}
+	return nil
 }
 
 func (d *DB) LoadLocalPreviewSource(ctx context.Context, machineID string, fileID int64) (LocalPreviewSource, error) {

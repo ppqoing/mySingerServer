@@ -384,6 +384,16 @@ func DecodeLocalPayload(payload []byte, destination any) error {
 	if len(payload) > LocalPayloadMaxBytes {
 		return errors.New(LocalPayloadTooLargeErrorCode)
 	}
+	return msgpack.Unmarshal(payload, destination)
+}
+
+func DecodeLocalImagePreviewPayload(payload []byte, destination *LocalImagePreviewRequest) error {
+	if len(payload) > LocalPayloadMaxBytes {
+		return errors.New(LocalPayloadTooLargeErrorCode)
+	}
+	if destination == nil {
+		return errors.New("invalid_preview")
+	}
 	decoder := msgpack.NewDecoder(bytes.NewReader(payload))
 	decoder.DisallowUnknownFields(true)
 	return decoder.Decode(destination)

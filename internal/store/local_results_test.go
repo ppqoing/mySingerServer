@@ -124,6 +124,80 @@ func TestLoadLocalGroupDoesNotDependOnFirstListPage(t *testing.T) {
 	}
 }
 
+// Break caught: production persists inconclusive comparisons only in
+// local_pair_scores, so querying local_dup_groups alone hides them entirely.
+func TestLocalGroupQuerySynthesizesStableInconclusivePairFromPersistedScore(t *testing.T) {
+	db := openLocalTestDB(t)
+	run := createLocalRunFixture(t, db, "inconclusive-results")
+	ctx := context.Background()
+	for _, file := range []struct {
+		id   int64
+		path string
+		sha  string
+	}{
+		{901, `D:\Maybe\left.jpg`, "zz-left"},
+		{902, `D:\Maybe\right.jpg`, "aa-right"},
+	} {
+		if _, err := db.db.Exec(`INSERT INTO files(id,machine_id,path,size,mtime,sha512,status) VALUES (?,'machine-a',?,100,1000,?,'done')`, file.id, file.path, file.sha); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.SaveLocalPairScore(ctx, LocalPairScore{
+		RunID: run.RunID, PairKey: "image:uncertain-pair",
+		LeftFileID: 901, RightFileID: 902, LeftSHA512: "zz-left", RightSHA512: "aa-right",
+		Stage1JSON: `{"kind":"image"}`, Verdict: "uncertain",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CompleteLocalAnalysis(ctx, run.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PublishLocalAnalysis(ctx, run.RunID); err != nil {
+		t.Fatal(err)
+	}
+
+	page, err := db.ListLocalGroups(ctx, LocalGroupQuery{
+		MachineID: "machine-a", Scope: "current", Category: "inconclusive", Limit: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Groups) != 1 {
+		t.Fatalf("inconclusive groups = %#v", page.Groups)
+	}
+	group := page.Groups[0]
+	wantID := "inconclusive:" + run.RunID + ":image:uncertain-pair"
+	if group.GroupID != wantID || group.Category != "inconclusive" || group.Verdict != "uncertain" ||
+		group.ReviewStatus != "undecided" || len(group.Members) != 2 ||
+		group.Members[0].FileID != 902 || group.Members[1].FileID != 901 {
+		t.Fatalf("synthesized group = %#v", group)
+	}
+	detail, err := db.LoadLocalGroup(ctx, "machine-a", "", wantID, true)
+	if err != nil || detail.GroupID != wantID || len(detail.Members) != 2 {
+		t.Fatalf("current detail = %#v, %v", detail, err)
+	}
+	if err := db.CommitLocalReview(ctx, LocalReviewCommit{
+		MachineID: "machine-a", RunID: run.RunID, GroupID: wantID, Reviewer: "user",
+		Decisions: []LocalReviewChoice{{FileID: 902, Decision: "keep"}},
+	}); err != nil {
+		t.Fatalf("review synthesized group: %v", err)
+	}
+	if countRows(t, db, `SELECT count(*) FROM local_reviews WHERE group_id='`+wantID+`'`) != 2 {
+		t.Fatal("synthesized review did not materialize both member decisions")
+	}
+	if _, err := db.db.Exec(`UPDATE files SET status='deleted' WHERE machine_id='machine-a' AND id=901`); err != nil {
+		t.Fatal(err)
+	}
+	current, err := db.LoadLocalGroup(ctx, "machine-a", "", wantID, true)
+	if err != nil || len(current.Members) != 1 || current.Members[0].FileID != 902 {
+		t.Fatalf("current deleted filtering = %#v, %v", current, err)
+	}
+	history, err := db.LoadLocalGroup(ctx, "machine-a", run.RunID, wantID, false)
+	if err != nil || len(history.Members) != 2 {
+		t.Fatalf("history deleted retention = %#v, %v", history, err)
+	}
+}
+
 // Break caught: partial review rows are committed without an explicit keep,
 // an ineligible delete is accepted, or outbox failure leaves reviews behind.
 func TestLocalReviewCommitValidatesGroupAndAtomicallyWritesOutbox(t *testing.T) {

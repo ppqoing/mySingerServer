@@ -46,6 +46,20 @@ func TestLocalResultHandlerDispatchesGroupsReviewAndFileIDOnlyPreview(t *testing
 	}
 }
 
+func TestLocalResultHandlerPreservesStablePreviewMemoryLimit(t *testing.T) {
+	previews := &fakeLocalPreviewService{err: errors.New("preview_memory_limit")}
+	handler := NewLocalResultHandler(&fakeLocalReviewService{}, previews)
+	payload, _ := proto.EncodeLocalPayload(proto.LocalImagePreviewRequest{
+		FileID: 1, MaxWidth: 10, MaxHeight: 10, Format: "jpeg", Quality: 80,
+	})
+	response := handler.HandleLocal(context.Background(), proto.LocalRequest{
+		RequestID: "budget", Operation: proto.LocalOperationPreviewImage, Payload: payload,
+	})
+	if response.OK || response.ErrorCode != "preview_memory_limit" {
+		t.Fatalf("memory limit response = %#v", response)
+	}
+}
+
 // Break caught: NodeTray-only result APIs accidentally inherit Manager/non-
 // loopback privileges from the regular Agent protocol.
 func TestLocalResultSocketRequiresLoopbackNodeTrayAuth(t *testing.T) {
@@ -103,11 +117,14 @@ func (fake *fakeLocalReviewService) Save(context.Context, proto.LocalReviewSaveR
 	return proto.LocalReviewSaveResponse{Saved: true}, nil
 }
 
-type fakeLocalPreviewService struct{ calls int }
+type fakeLocalPreviewService struct {
+	calls int
+	err   error
+}
 
 func (fake *fakeLocalPreviewService) Preview(context.Context, proto.LocalImagePreviewRequest) (proto.LocalImagePreviewResponse, error) {
 	fake.calls++
-	return proto.LocalImagePreviewResponse{MIME: "image/jpeg", Width: 1, Height: 1, Bytes: []byte{1}}, nil
+	return proto.LocalImagePreviewResponse{MIME: "image/jpeg", Width: 1, Height: 1, Bytes: []byte{1}}, fake.err
 }
 
 // Break caught: a local StageWorker consumes the process-wide Results channel

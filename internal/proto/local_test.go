@@ -163,8 +163,26 @@ func TestLocalImagePreviewRequestStrictDecodeRejectsUnknownPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	var request LocalImagePreviewRequest
-	if err := DecodeLocalPayload(payload, &request); err == nil {
+	if err := DecodeLocalImagePreviewPayload(payload, &request); err == nil {
 		t.Fatal("preview request accepted unknown path field")
+	}
+}
+
+// Break caught: making preview strict globally rejects additive fields on all
+// existing local-control DTOs and breaks rolling NodeTray/Agent compatibility.
+func TestDecodeLocalPayloadKeepsUnknownFieldCompatibilityOutsidePreview(t *testing.T) {
+	payload, err := msgpack.Marshal(map[string]any{
+		"offset": 0, "limit": 20, "future_optional_field": true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var request LocalTaskListRequest
+	if err := DecodeLocalPayload(payload, &request); err != nil {
+		t.Fatalf("additive local field was rejected: %v", err)
+	}
+	if request.Offset != 0 || request.Limit != 20 {
+		t.Fatalf("decoded request = %#v", request)
 	}
 }
 

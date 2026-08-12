@@ -6,6 +6,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha512"
+	"encoding/binary"
+	"hash/crc32"
 	"image"
 	"image/color"
 	"image/jpeg"
@@ -32,7 +34,7 @@ func TestImagePreviewWorkerEncodesJPEGAndWebPWithoutCreatingFiles(t *testing.T) 
 	for _, format := range []string{worker.PreviewFormatJPEG, worker.PreviewFormatWebP} {
 		t.Run(format, func(t *testing.T) {
 			job := previewJobForFile(t, path, format)
-			result := generateImagePreview(context.Background(), &job)
+			result := generateImagePreview(context.Background(), &job, 256<<20)
 			if result.PreviewErrorCode != "" {
 				t.Fatalf("generateImagePreview error = %q", result.PreviewErrorCode)
 			}
@@ -77,7 +79,7 @@ func TestStalePreviewWorkerRejectsImmutableIdentityMismatch(t *testing.T) {
 			job := base
 			job.KnownSHA = append([]byte(nil), base.KnownSHA...)
 			test.mutate(&job)
-			result := generateImagePreview(context.Background(), &job)
+			result := generateImagePreview(context.Background(), &job, 256<<20)
 			if result.PreviewErrorCode != "stale_preview" || len(result.PreviewBytes) != 0 {
 				t.Fatalf("stale result = code:%q bytes:%d", result.PreviewErrorCode, len(result.PreviewBytes))
 			}
@@ -95,10 +97,33 @@ func TestImagePreviewWorkerEnforcesFourMiBWhileEncoding(t *testing.T) {
 	job.PreviewMaxWidth = 2600
 	job.PreviewMaxHeight = 2600
 	job.PreviewQuality = 100
-	result := generateImagePreview(context.Background(), &job)
+	result := generateImagePreview(context.Background(), &job, 256<<20)
 	if result.PreviewErrorCode != "preview_too_large" || len(result.PreviewBytes) != 0 {
 		t.Fatalf("large preview = code:%q bytes:%d", result.PreviewErrorCode, len(result.PreviewBytes))
 	}
+}
+
+// Break caught: a tiny compressed image with forged huge dimensions reaches
+// image.Decode and allocates independently of WPROC_IMAGE_MEM_MB.
+func TestImagePreviewWorkerRejectsSourceAndDecodedPixelsOutsideMemoryBudget(t *testing.T) {
+	t.Run("source bytes", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "source.jpg")
+		writePreviewJPEG(t, path, 20, 10, false)
+		job := previewJobForFile(t, path, worker.PreviewFormatJPEG)
+		result := generateImagePreview(context.Background(), &job, job.Size-1)
+		if result.PreviewErrorCode != "preview_memory_limit" || len(result.PreviewBytes) != 0 {
+			t.Fatalf("source budget result = code:%q bytes:%d", result.PreviewErrorCode, len(result.PreviewBytes))
+		}
+	})
+	t.Run("decoded pixels", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "bomb.png")
+		writeHugePreviewPNGHeader(t, path, 100000, 100000)
+		job := previewJobForFile(t, path, worker.PreviewFormatJPEG)
+		result := generateImagePreview(context.Background(), &job, 8<<20)
+		if result.PreviewErrorCode != "preview_memory_limit" || len(result.PreviewBytes) != 0 {
+			t.Fatalf("decoded budget result = code:%q bytes:%d", result.PreviewErrorCode, len(result.PreviewBytes))
+		}
+	})
 }
 
 func previewJobForFile(t *testing.T, path, format string) worker.JobMsg {
@@ -144,6 +169,23 @@ func writePreviewJPEG(t *testing.T, path string, width, height int, noisy bool) 
 		t.Fatal(err)
 	}
 	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeHugePreviewPNGHeader(t *testing.T, path string, width, height uint32) {
+	t.Helper()
+	data := []byte{
+		0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n',
+		0, 0, 0, 13, 'I', 'H', 'D', 'R',
+		0, 0, 0, 1, 0, 0, 0, 1,
+		8, 2, 0, 0, 0,
+		0, 0, 0, 0,
+	}
+	binary.BigEndian.PutUint32(data[16:20], width)
+	binary.BigEndian.PutUint32(data[20:24], height)
+	binary.BigEndian.PutUint32(data[29:33], crc32.ChecksumIEEE(data[12:29]))
+	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
 }

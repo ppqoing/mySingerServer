@@ -25,6 +25,15 @@ func TestImagePreviewProtocolValidatesIdentityDimensionsAndFourMiBLimit(t *testi
 	if err := validateWorkerResult(job, valid); err != nil {
 		t.Fatalf("valid preview result: %v", err)
 	}
+	memoryFailure := *valid
+	memoryFailure.PreviewFormat = ""
+	memoryFailure.PreviewWidth = 0
+	memoryFailure.PreviewHeight = 0
+	memoryFailure.PreviewBytes = nil
+	memoryFailure.PreviewErrorCode = "preview_memory_limit"
+	if err := validateWorkerResult(job, &memoryFailure); err != nil {
+		t.Fatalf("stable preview memory failure: %v", err)
+	}
 
 	tests := []struct {
 		name   string

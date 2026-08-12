@@ -685,10 +685,10 @@ func (worker *workerProc) claim(reason string, exitCode int32, cause error, owne
 		record.ScanTaskID = job.ScanTaskID
 	}
 	worker.pool.metrics.crashes.Add(1)
-	if job != nil {
+	if job != nil && job.Phase != PhasePreview {
 		worker.pool.metrics.filesFailed.Add(1)
 	}
-	if job != nil && worker.pool.store != nil {
+	if job != nil && job.Phase != PhasePreview && worker.pool.store != nil {
 		message := reason
 		if cause != nil {
 			message += ": " + cause.Error()
@@ -705,7 +705,7 @@ func (worker *workerProc) claim(reason string, exitCode int32, cause error, owne
 			)
 		}
 	}
-	if job != nil {
+	if job != nil && job.Phase != PhasePreview {
 		worker.pool.dedup.FailByJob(job.JobID)
 	}
 	if worker.pool.deps.crash != nil {
@@ -865,7 +865,7 @@ func validPreviewFormat(format string) bool {
 func validPreviewErrorCode(code string) bool {
 	switch code {
 	case "stale_preview", "preview_io_failed", "preview_decode_failed",
-		"preview_encode_failed", "preview_too_large":
+		"preview_encode_failed", "preview_too_large", "preview_memory_limit":
 		return true
 	default:
 		return false

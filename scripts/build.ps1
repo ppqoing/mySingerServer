@@ -365,7 +365,8 @@ try {
 
     $env:CGO_ENABLED = "1"
     $env:CC = $ccExe
-    & $Go -C $repo build -trimpath -o (Join-Path $out "worker.exe") ./cmd/worker
+    & $Go -C $repo build -trimpath -tags nodynamic `
+        -o (Join-Path $out "worker.exe") ./cmd/worker
     if ($LASTEXITCODE -ne 0) { throw "worker build failed" }
 }
 finally {

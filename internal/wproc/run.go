@@ -148,7 +148,7 @@ func serve(conn net.Conn, index int, cfg Config, deps pipelineDeps) int {
 			}
 			var result *worker.JobResultMsg
 			if job.Phase == worker.PhasePreview {
-				result = generateImagePreview(context.Background(), &job)
+				result = generateImagePreview(context.Background(), &job, cfg.ImageMemBytes)
 			} else if useSessionPipeline && job.Phase == worker.Phase1 && job.Kind == worker.MediaImage {
 				result, err = processImageWithDeps(cfg, &job, deps)
 			} else if useSessionPipeline {

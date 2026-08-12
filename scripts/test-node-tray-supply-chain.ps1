@@ -236,6 +236,26 @@ if (Test-Path -LiteralPath $coreBuild -PathType Leaf) {
             ("FULL_BUILD_RELEASE_FILE_MISSING name={0}" -f $name)
     }
     Assert-True ($coreText -match 'build-nodetray\.ps1') "FULL_BUILD_NODETRAY_INTEGRATION_MISSING"
+
+    $coreCommands = Get-CommandTexts $coreAst
+    $workerBuildCommands = @($coreCommands | Where-Object {
+        $_ -match '(?i)\bbuild\b' -and $_ -match '(?i)\./cmd/worker\b'
+    })
+    Assert-True ($workerBuildCommands.Count -eq 1) `
+        "WORKER_BUILD_COMMAND_NOT_EXACTLY_ONE"
+    if ($workerBuildCommands.Count -eq 1) {
+        Assert-True ($workerBuildCommands[0] -match '(?i)(^|\s)-tags\s+nodynamic(\s|$)') `
+            "WORKER_BUILD_NODYNAMIC_TAG_MISSING"
+    }
+    $agentBuildCommands = @($coreCommands | Where-Object {
+        $_ -match '(?i)\bbuild\b' -and $_ -match '(?i)\./cmd/agent\b'
+    })
+    Assert-True ($agentBuildCommands.Count -eq 1) `
+        "AGENT_BUILD_COMMAND_NOT_EXACTLY_ONE"
+    if ($agentBuildCommands.Count -eq 1) {
+        Assert-True ($agentBuildCommands[0] -notmatch '(?i)(^|\s)-tags\s+nodynamic(\s|$)') `
+            "AGENT_BUILD_UNEXPECTED_NODYNAMIC_TAG"
+    }
 }
 
 if ((Get-Command Publish-FreshNodeTrayStage -ErrorAction SilentlyContinue)) {

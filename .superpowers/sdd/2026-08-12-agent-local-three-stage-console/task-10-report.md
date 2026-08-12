@@ -6,7 +6,7 @@
 
 审核要求每组显式至少一个 `keep`，未传成员写为 `undecided`；`delete` 仅允许 exact 组或最终 verdict=`duplicate` 的组。`local_reviews` 与 `local_outbox` 在同一 SQLite 事务中写入，outbox 失败时审核记录整体回滚，只有保存操作会生成 `local.review` outbox。
 
-图片预览 wire 请求只包含 `file_id`、目标尺寸、格式和质量，不含 path，msgpack 对未知字段严格拒绝。Agent 先按 machine/file 读取数据库 canonical path、图片类型、非 deleted 状态、SHA-512、size、mtime，再把 path-bearing job 交给 Worker。实际图片读取、二次不可变身份校验、解码、缩放以及 JPEG/WebP 编码全部位于 Windows Worker 的 `internal/wproc`；Agent 依赖图不包含 `github.com/gen2brain/webp`。预览字节只在内存中返回，不创建源目录或 TEMP 缩略图，编码响应预留 wire 开销并限制总 payload 不超过 4 MiB。
+图片预览 wire 请求只包含 `file_id`、目标尺寸、格式和质量，不含 path；仅该请求使用专用 strict msgpack decoder 拒绝未知字段，其他本地 DTO 保持可向前扩展的未知字段兼容。Agent 先按 machine/file 读取数据库 canonical path、图片类型、非 deleted 状态、SHA-512、size、mtime，再把 path-bearing job 交给 Worker。实际图片读取、二次不可变身份校验、解码、缩放以及 JPEG/WebP 编码全部位于 Windows Worker 的 `internal/wproc`；Agent 依赖图不包含 `github.com/gen2brain/webp`。预览字节只在内存中返回，不创建源目录或 TEMP 缩略图，编码响应预留 wire 开销并限制总 payload 不超过 4 MiB。Worker 同时用 `WPROC_IMAGE_MEM_MB` 的 `ImageMemBytes` 限制源文件读取，并在完整解码前以 `DecodeConfig` 和安全乘法估算 source、decode、resize、encode 峰值，超限稳定返回 `preview_memory_limit`。
 
 视频查询只返回 Stage 1 已持久化的 contact sheet 路径，本任务不重建视频预览缓存。生产错误和日志不输出 canonical path；Worker 协议错误使用 PathID。
 
@@ -30,12 +30,21 @@
 - 组详情曾通过首个 200 行列表页查找，第 201 行以后误报不存在；改为按 machine/current-or-run/group 直接查询。
 - `reviewed` 曾表示任一成员已决定；改为当前/历史范围内全部成员均已决定，并保留 `undecided` 的组级语义。
 
+独立 review fix round 1/5 的 RED → GREEN：
+
+- Preview timeout/crash 曾进入 `MarkCrash`，并改变扫描 `FilesFailed`；现仍发布 terminal crash 供请求结束，但不持久化 file/sync 状态、不触碰 deduper，也不计 `FilesDone/FilesFailed`。Preview 业务成功和失败同样不进入扫描文件指标。
+- 生产 final groups 只包含 exact/yes，`final_verdict='uncertain'` 曾无法查询；现从真实 `SaveLocalPairScore` 入口保存的 pair 为 current/history 合成确定性 `inconclusive:<run_id>:<pair_key>` 组，成员按 SHA/file ID 稳定排序。当前查询排除 deleted、历史保留 deleted；首次审核在同一 SQLite 事务内物化组/成员后写 reviews+outbox，默认仍为 undecided。
+- Preview 曾绕过 `ImageMemBytes`；增加源字节上限和 DecodeConfig 后的安全峰值预算。真实小文件/超大 PNG 像素头及源文件超预算测试先 RED 后 GREEN，未进入大像素分配。
+- 通用 `DecodeLocalPayload` 曾全局 strict，破坏追加字段兼容；现恢复宽松解码，仅 `DecodeLocalImagePreviewPayload` 严格拒绝未知字段，恶意 `path` 仍在服务调用前拒绝。
+- 官方 Worker build 曾缺少 `nodynamic`；供应链 AST 门禁先以 `WORKER_BUILD_NODYNAMIC_TAG_MISSING` RED，随后 `scripts/build.ps1` 的唯一 Worker 命令强制 `-tags nodynamic`，Agent 等其他 build 命令不受影响，门禁 GREEN。
+
 ## 验证摘要
 
 - 默认标签完整相关包：`go test -count=1 ./internal/localreview ./internal/localpreview ./internal/store ./internal/proto ./internal/agent ./internal/worker ./internal/wproc ./cmd/worker ./cmd/agent`：PASS。
 - 强制 fallback：同一矩阵加 `-tags nodynamic`：PASS；真实 JPEG 与 WebP 编解码、MIME、尺寸、stale identity、无文件副作用和 4 MiB 限制均通过。
 - Race：`localreview/localpreview/store/proto/agent/worker/wproc/cmd/agent`：PASS；WProc 使用发布目录 native runtime 闭包和显式 WinLibs `CC`。
 - Windows 构建：`go build -tags nodynamic ./cmd/agent ./cmd/worker`：PASS；`go list -tags nodynamic -deps ./cmd/agent` 不含 WebP codec。
+- 官方供应链：`scripts/test-node-tray-supply-chain.ps1`：PASS；Worker build 恰有一个且含 `-tags nodynamic`，Agent build 不含该 tag。
 - 静态门禁：`git diff --check` PASS；生产 preview 代码无 `Create/CreateTemp/WriteFile/Mkdir/Rename`；相关生产代码无 path 日志。
 - Linux/CGO=0：`localreview` 与 `proto` 可编译；包含 `localpreview` 的组合被既有 `internal/worker` Windows-only `supervisorDeps/workerProc` 边界阻断，属于非目标平台 PARTIAL，未扩范围修改。
 
@@ -43,7 +52,7 @@
 
 `go` directive 从 1.22 调整为 1.23，仅满足 `github.com/gen2brain/webp v0.6.4` 的依赖要求，不再升级；当前 Go 1.26.5 Windows 工具链兼容。新增依赖为固定 tagged 版本 `github.com/gen2brain/webp v0.6.4`（MIT），间接使用 `github.com/ebitengine/purego v0.10.1`，不新增外部 DLL 或运行时文件。
 
-Task 14 的 Windows release build 必须统一传入 `-tags nodynamic`，确保 ZIP 内的 Worker 始终使用 bundled CGo-free fallback，且不会探测宿主机 `libwebp`。Agent 已通过包边界与依赖图证明不链接或执行编码器。
+官方 `scripts/build.ps1` 已对 Worker 强制传入 `-tags nodynamic`，确保 ZIP 内的 Worker 始终使用 bundled CGo-free fallback，且不会探测宿主机 `libwebp`。Agent 已通过包边界与依赖图证明不链接或执行编码器。Task 14 仍需同步 README 中的 Go 最低版本说明（1.22 → 1.23）；该文档修改不在本轮白名单内。
 
 ## 文件与提交
 
@@ -57,6 +66,7 @@ Task 14 的 Windows release build 必须统一传入 `-tags nodynamic`，确保 
 - `internal/worker/messages.go`、`internal/worker/messages_test.go`、`internal/worker/supervisor.go`、`internal/worker/supervisor_test.go`、`internal/worker/pool.go`、`internal/worker/pool_test.go`
 - `internal/agent/local_handler.go`、`internal/agent/local_handler_test.go`、`internal/agent/pool_router.go`、`internal/agent/pool_router_test.go`
 - `cmd/agent/main.go`、`cmd/agent/main_test.go`、`go.mod`、`go.sum`
+- `scripts/build.ps1`、`scripts/test-node-tray-supply-chain.ps1`
 - 本报告及 `progress.md` ledger。
 
 提交信息固定为 `feat: review local results with memory previews`，本报告随该提交一并落库。
@@ -64,5 +74,5 @@ Task 14 的 Windows release build 必须统一传入 `-tags nodynamic`，确保 
 ## Concerns
 
 - Linux Worker/Agent 仍受项目既有 Windows-only Worker supervisor 实现约束；Task 10 的交付目标和发布门禁为 Windows portable。
-- Task 14 若漏传 `-tags nodynamic`，默认 WebP 包允许探测宿主动态库；因此 release 脚本必须把该 tag 作为强制条件。
+- README 仍标示旧 Go 最低版本，须由 Task 14 与发布文档同步到 Go 1.23。
 - 未执行 NodeTray GUI 人工操作验收；socket 认证、strict payload、查询/审核/预览生产组合链已由自动化测试覆盖。
