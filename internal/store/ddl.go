@@ -76,6 +76,7 @@ CREATE TABLE IF NOT EXISTS local_tasks (
     status             TEXT    NOT NULL CHECK (status IN
                                ('pending','running','waiting_recovery','succeeded','failed','cancelled')),
     envelope_digest    TEXT    NOT NULL,
+    envelope           BLOB    NOT NULL DEFAULT X'',
     progress_completed INTEGER NOT NULL DEFAULT 0 CHECK (progress_completed >= 0),
     progress_total     INTEGER NOT NULL DEFAULT 0 CHECK (progress_total >= 0),
     stats_json         TEXT    NOT NULL DEFAULT '{}' CHECK (json_valid(stats_json)),

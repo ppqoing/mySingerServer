@@ -266,7 +266,7 @@ func TestLocalTaskConcurrentCreateIsIdempotentAndConflictsOnEnvelope(t *testing.
 	ctx := context.Background()
 	in := LocalTaskCreate{
 		TaskID: "task-1", MachineID: "machine-a", Source: "local",
-		Type: "analysis", Stage: 1, EnvelopeDigest: "digest-a",
+		Type: "analysis", Stage: 1, EnvelopeDigest: "digest-a", Envelope: []byte("envelope-a"),
 	}
 
 	const callers = 12
@@ -310,13 +310,108 @@ func TestLocalTaskConcurrentCreateIsIdempotentAndConflictsOnEnvelope(t *testing.
 	}
 }
 
+// Break caught: recovery used to retain only a digest, making the accepted
+// scan roots and mode impossible to reconstruct after an Agent restart.
+func TestLocalTaskPersistsOpaqueEnvelopeAndConflictsOnDifferentBytes(t *testing.T) {
+	db := openLocalTestDB(t)
+	ctx := context.Background()
+	in := LocalTaskCreate{TaskID: "task-envelope", MachineID: "machine-a", Source: "local", Type: "scan", EnvelopeDigest: "digest", Envelope: []byte{1, 2, 3}}
+	task, err := db.CreateOrLoadLocalTask(ctx, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(task.Envelope, in.Envelope) {
+		t.Fatalf("envelope = %v, want %v", task.Envelope, in.Envelope)
+	}
+	in.Envelope = []byte{1, 2, 4}
+	if _, err := db.CreateOrLoadLocalTask(ctx, in); !errors.Is(err, ErrLocalTaskConflict) {
+		t.Fatalf("different opaque envelope error = %v, want task conflict", err)
+	}
+	if _, err := db.CreateOrLoadLocalTask(ctx, LocalTaskCreate{TaskID: "empty", MachineID: "machine-a", Source: "local", Type: "scan", EnvelopeDigest: "digest"}); err == nil {
+		t.Fatal("new empty envelope was accepted")
+	}
+}
+
+// Break caught: unrestricted UPDATEs permit progress rollback and invalid
+// terminal-to-running transitions, which makes retries and recovery ambiguous.
+func TestLocalTaskLifecycleUsesExplicitTransitionsAndStablePagination(t *testing.T) {
+	db := openLocalTestDB(t)
+	ctx := context.Background()
+	for _, id := range []string{"task-c", "task-a", "task-b"} {
+		if _, err := db.CreateOrLoadLocalTask(ctx, LocalTaskCreate{TaskID: id, MachineID: "machine-a", Source: "local", Type: "scan", EnvelopeDigest: id, Envelope: []byte(id)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.CreateOrLoadLocalTask(ctx, LocalTaskCreate{TaskID: "foreign", MachineID: "machine-b", Source: "local", Type: "scan", EnvelopeDigest: "foreign", Envelope: []byte("foreign")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.TransitionLocalTask(ctx, "machine-a", "task-a", LocalTaskUpdate{Status: "running", Stage: 1, ProgressComplete: 4, ProgressTotal: 10}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.TransitionLocalTask(ctx, "machine-a", "task-a", LocalTaskUpdate{Status: "running", Stage: 1, ProgressComplete: 3, ProgressTotal: 10}); !errors.Is(err, ErrLocalTaskProgressRollback) {
+		t.Fatalf("progress rollback error = %v", err)
+	}
+	page, err := db.ListLocalTasks(ctx, "machine-a", 0, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page) != 2 || page[0].TaskID != "task-a" || page[1].TaskID != "task-b" {
+		t.Fatalf("first page = %#v", page)
+	}
+	if err := db.CancelLocalTask(ctx, "machine-a", "task-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CancelLocalTask(ctx, "machine-a", "task-a"); err != nil {
+		t.Fatalf("idempotent CancelLocalTask: %v", err)
+	}
+	retried, err := db.RetryLocalTask(ctx, "machine-a", "task-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retried.TaskID != "task-a" || retried.Status != "pending" || retried.Stage != 1 || string(retried.Envelope) != "task-a" {
+		t.Fatalf("retried = %#v", retried)
+	}
+}
+
+// Break caught: trusting a caller-provided source-state allowlist lets a
+// succeeded task reopen, a stage move backward, or a known total drift.
+func TestLocalTaskTransitionGraphIsOwnedByStore(t *testing.T) {
+	db := openLocalTestDB(t)
+	ctx := context.Background()
+	if _, err := db.CreateOrLoadLocalTask(ctx, LocalTaskCreate{TaskID: "graph", MachineID: "machine-a", Source: "local", Type: "analysis", EnvelopeDigest: "digest", Envelope: []byte("envelope")}); err != nil {
+		t.Fatal(err)
+	}
+	transitions := []LocalTaskUpdate{
+		{Status: "running", Stage: 1, ProgressComplete: 2, ProgressTotal: 10},
+		{Status: "waiting_recovery", Stage: 1, ProgressComplete: 2, ProgressTotal: 10},
+		{Status: "running", Stage: 1, ProgressComplete: 2, ProgressTotal: 10},
+		{Status: "succeeded", Stage: 2, ProgressComplete: 10, ProgressTotal: 10},
+	}
+	for _, update := range transitions {
+		if _, err := db.TransitionLocalTask(ctx, "machine-a", "graph", update); err != nil {
+			t.Fatalf("transition to %s: %v", update.Status, err)
+		}
+	}
+	for name, update := range map[string]LocalTaskUpdate{
+		"terminal reopen": {Status: "running", Stage: 2, ProgressComplete: 10, ProgressTotal: 10},
+		"stage rollback":  {Status: "succeeded", Stage: 1, ProgressComplete: 10, ProgressTotal: 10},
+		"total drift":     {Status: "succeeded", Stage: 2, ProgressComplete: 10, ProgressTotal: 11},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := db.TransitionLocalTask(ctx, "machine-a", "graph", update); !errors.Is(err, ErrLocalTaskTransition) {
+				t.Fatalf("error = %v, want transition rejection", err)
+			}
+		})
+	}
+}
+
 func TestLocalTaskRecoveryChangesOnlyRunningTasksForMachine(t *testing.T) {
 	db := openLocalTestDB(t)
 	ctx := context.Background()
 	for _, task := range []LocalTaskCreate{
-		{TaskID: "run-a", MachineID: "machine-a", Source: "local", Type: "analysis", Stage: 1, EnvelopeDigest: "a"},
-		{TaskID: "done-a", MachineID: "machine-a", Source: "local", Type: "analysis", Stage: 1, EnvelopeDigest: "b"},
-		{TaskID: "run-b", MachineID: "machine-b", Source: "manager", Type: "stage2", Stage: 2, EnvelopeDigest: "c"},
+		{TaskID: "run-a", MachineID: "machine-a", Source: "local", Type: "analysis", Stage: 1, EnvelopeDigest: "a", Envelope: []byte("a")},
+		{TaskID: "done-a", MachineID: "machine-a", Source: "local", Type: "analysis", Stage: 1, EnvelopeDigest: "b", Envelope: []byte("b")},
+		{TaskID: "run-b", MachineID: "machine-b", Source: "manager", Type: "stage2", Stage: 2, EnvelopeDigest: "c", Envelope: []byte("c")},
 	} {
 		if _, err := db.CreateOrLoadLocalTask(ctx, task); err != nil {
 			t.Fatal(err)

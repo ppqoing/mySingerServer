@@ -13,6 +13,7 @@ func createAnalysisTask(t *testing.T, db *DB, taskID, machineID string) {
 	_, err := db.CreateOrLoadLocalTask(context.Background(), LocalTaskCreate{
 		TaskID: taskID, MachineID: machineID, Source: "local",
 		Type: "analysis", Stage: 1, EnvelopeDigest: "digest-" + taskID,
+		Envelope: []byte("envelope-" + taskID),
 	})
 	if err != nil {
 		t.Fatalf("CreateOrLoadLocalTask: %v", err)

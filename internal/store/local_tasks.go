@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -9,6 +10,8 @@ import (
 )
 
 var ErrLocalTaskConflict = errors.New("task_conflict")
+var ErrLocalTaskProgressRollback = errors.New("task_progress_rollback")
+var ErrLocalTaskTransition = errors.New("task_transition")
 
 type LocalTaskCreate struct {
 	TaskID         string
@@ -17,6 +20,7 @@ type LocalTaskCreate struct {
 	Type           string
 	Stage          int
 	EnvelopeDigest string
+	Envelope       []byte
 }
 
 type LocalTask struct {
@@ -27,6 +31,7 @@ type LocalTask struct {
 	Stage            int
 	Status           string
 	EnvelopeDigest   string
+	Envelope         []byte
 	ProgressComplete int64
 	ProgressTotal    int64
 	StatsJSON        string
@@ -43,10 +48,10 @@ func (d *DB) CreateOrLoadLocalTask(ctx context.Context, in LocalTaskCreate) (Loc
 	now := time.Now().UnixMilli()
 	if _, err := d.db.ExecContext(ctx, `
 		INSERT INTO local_tasks
-			(task_id,machine_id,source,type,stage,status,envelope_digest,created_at,updated_at)
-		VALUES (?1,?2,?3,?4,?5,'pending',?6,?7,?7)
+			(task_id,machine_id,source,type,stage,status,envelope_digest,envelope,created_at,updated_at)
+		VALUES (?1,?2,?3,?4,?5,'pending',?6,?7,?8,?8)
 		ON CONFLICT(task_id) DO NOTHING`,
-		in.TaskID, in.MachineID, in.Source, in.Type, in.Stage, in.EnvelopeDigest, now,
+		in.TaskID, in.MachineID, in.Source, in.Type, in.Stage, in.EnvelopeDigest, in.Envelope, now,
 	); err != nil {
 		return LocalTask{}, fmt.Errorf("store: create local task: %w", err)
 	}
@@ -56,14 +61,14 @@ func (d *DB) CreateOrLoadLocalTask(ctx context.Context, in LocalTaskCreate) (Loc
 	}
 	if task.MachineID != in.MachineID || task.Source != in.Source ||
 		task.Type != in.Type || task.Stage != in.Stage ||
-		task.EnvelopeDigest != in.EnvelopeDigest {
+		task.EnvelopeDigest != in.EnvelopeDigest || !bytes.Equal(task.Envelope, in.Envelope) {
 		return LocalTask{}, fmt.Errorf("%w: task %s", ErrLocalTaskConflict, in.TaskID)
 	}
 	return task, nil
 }
 
 func validateLocalTaskCreate(in LocalTaskCreate) error {
-	if in.TaskID == "" || in.MachineID == "" || in.EnvelopeDigest == "" {
+	if in.TaskID == "" || in.MachineID == "" || in.EnvelopeDigest == "" || len(in.Envelope) == 0 {
 		return fmt.Errorf("store: local task requires task, machine, and envelope digest")
 	}
 	if in.Source != "local" && in.Source != "manager" {
@@ -84,12 +89,12 @@ func (d *DB) loadLocalTask(ctx context.Context, taskID string) (LocalTask, error
 	var task LocalTask
 	var errorCode, errorMessage sql.NullString
 	err := d.db.QueryRowContext(ctx, `
-		SELECT task_id,machine_id,source,type,stage,status,envelope_digest,
+		SELECT task_id,machine_id,source,type,stage,status,envelope_digest,envelope,
 		       progress_completed,progress_total,stats_json,
 		       safe_error_code,safe_error_message,created_at,updated_at
 		FROM local_tasks WHERE task_id=?1`, taskID).Scan(
 		&task.TaskID, &task.MachineID, &task.Source, &task.Type, &task.Stage,
-		&task.Status, &task.EnvelopeDigest, &task.ProgressComplete,
+		&task.Status, &task.EnvelopeDigest, &task.Envelope, &task.ProgressComplete,
 		&task.ProgressTotal, &task.StatsJSON, &errorCode, &errorMessage,
 		&task.CreatedAt, &task.UpdatedAt,
 	)
@@ -145,4 +150,136 @@ func (d *DB) RecoverLocalTasks(ctx context.Context, machineID string) ([]LocalTa
 		result = append(result, task)
 	}
 	return result, nil
+}
+
+type LocalTaskUpdate struct {
+	Status           string
+	Stage            int
+	ProgressComplete int64
+	ProgressTotal    int64
+	StatsJSON        string
+	SafeErrorCode    *string
+	SafeErrorMessage *string
+}
+
+func (d *DB) ListLocalTasks(ctx context.Context, machineID string, offset, limit int) ([]LocalTask, error) {
+	if machineID == "" || offset < 0 {
+		return nil, fmt.Errorf("store: invalid local task list")
+	}
+	if limit <= 0 || limit > 200 {
+		limit = 200
+	}
+	rows, err := d.db.QueryContext(ctx, `SELECT task_id FROM local_tasks WHERE machine_id=?1 ORDER BY task_id LIMIT ?2 OFFSET ?3`, machineID, limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("store: list local tasks: %w", err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	tasks := make([]LocalTask, 0, len(ids))
+	for _, id := range ids {
+		task, err := d.loadLocalTask(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		tasks = append(tasks, task)
+	}
+	return tasks, nil
+}
+
+func (d *DB) TransitionLocalTask(ctx context.Context, machineID, taskID string, update LocalTaskUpdate) (LocalTask, error) {
+	if machineID == "" || taskID == "" || !validLocalTaskStatus(update.Status) || update.Stage < 0 || update.Stage > 3 || update.ProgressComplete < 0 || update.ProgressTotal < 0 || (update.ProgressTotal > 0 && update.ProgressComplete > update.ProgressTotal) {
+		return LocalTask{}, fmt.Errorf("%w: invalid update", ErrLocalTaskTransition)
+	}
+	if update.StatsJSON == "" {
+		update.StatsJSON = "{}"
+	}
+	tx, err := d.db.BeginTx(ctx, nil)
+	if err != nil {
+		return LocalTask{}, err
+	}
+	defer tx.Rollback()
+	var status string
+	var completed, total int64
+	var stage int
+	if err := tx.QueryRowContext(ctx, `SELECT status,stage,progress_completed,progress_total FROM local_tasks WHERE machine_id=?1 AND task_id=?2`, machineID, taskID).Scan(&status, &stage, &completed, &total); err != nil {
+		return LocalTask{}, fmt.Errorf("store: load local task transition: %w", err)
+	}
+	if !allowedLocalTaskTransition(status, update.Status) || update.Stage < stage || (total != 0 && update.ProgressTotal != total) {
+		return LocalTask{}, fmt.Errorf("%w: %s to %s", ErrLocalTaskTransition, status, update.Status)
+	}
+	if update.ProgressComplete < completed {
+		return LocalTask{}, ErrLocalTaskProgressRollback
+	}
+	now := time.Now().UnixMilli()
+	_, err = tx.ExecContext(ctx, `UPDATE local_tasks SET status=?3,stage=?4,progress_completed=?5,progress_total=?6,stats_json=?7,safe_error_code=?8,safe_error_message=?9,updated_at=?10,started_at=CASE WHEN ?3='running' THEN COALESCE(started_at,?10) ELSE started_at END,completed_at=CASE WHEN ?3 IN ('succeeded','failed','cancelled') THEN ?10 ELSE NULL END WHERE machine_id=?1 AND task_id=?2`, machineID, taskID, update.Status, update.Stage, update.ProgressComplete, update.ProgressTotal, update.StatsJSON, update.SafeErrorCode, update.SafeErrorMessage, now)
+	if err != nil {
+		return LocalTask{}, fmt.Errorf("store: transition local task: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return LocalTask{}, err
+	}
+	return d.loadLocalTask(ctx, taskID)
+}
+
+func (d *DB) CancelLocalTask(ctx context.Context, machineID, taskID string) error {
+	task, err := d.loadLocalTask(ctx, taskID)
+	if err != nil {
+		return err
+	}
+	if task.MachineID != machineID {
+		return sql.ErrNoRows
+	}
+	if task.Status == "cancelled" {
+		return nil
+	}
+	_, err = d.TransitionLocalTask(ctx, machineID, taskID, LocalTaskUpdate{Status: "cancelled", Stage: task.Stage, ProgressComplete: task.ProgressComplete, ProgressTotal: task.ProgressTotal, StatsJSON: task.StatsJSON})
+	return err
+}
+
+func (d *DB) RetryLocalTask(ctx context.Context, machineID, taskID string) (LocalTask, error) {
+	task, err := d.loadLocalTask(ctx, taskID)
+	if err != nil {
+		return LocalTask{}, err
+	}
+	if task.MachineID != machineID {
+		return LocalTask{}, sql.ErrNoRows
+	}
+	return d.TransitionLocalTask(ctx, machineID, taskID, LocalTaskUpdate{Status: "pending", Stage: task.Stage, ProgressComplete: task.ProgressComplete, ProgressTotal: task.ProgressTotal, StatsJSON: task.StatsJSON})
+}
+
+func allowedLocalTaskTransition(from, to string) bool {
+	if from == to {
+		return from == "running"
+	}
+	switch from {
+	case "pending":
+		return to == "running" || to == "cancelled"
+	case "running":
+		return to == "waiting_recovery" || to == "succeeded" || to == "failed" || to == "cancelled"
+	case "waiting_recovery":
+		return to == "running" || to == "cancelled" || to == "failed"
+	case "failed", "cancelled":
+		return to == "pending"
+	default:
+		return false
+	}
+}
+
+func validLocalTaskStatus(status string) bool {
+	switch status {
+	case "pending", "running", "waiting_recovery", "succeeded", "failed", "cancelled":
+		return true
+	default:
+		return false
+	}
 }

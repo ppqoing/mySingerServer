@@ -56,6 +56,12 @@ func TestLocalLifecyclePayloadsRoundTripWithoutNewMessageTypes(t *testing.T) {
 		LocalConfigValidateResponse{Valid: true, SHA256: strings.Repeat("c", 64), RestartRequired: true},
 		LocalConfigSaveResponse{SHA256: strings.Repeat("d", 64), RestartRequired: true},
 		LocalShutdownResponse{Accepted: true},
+		LocalTaskCreateRequest{TaskID: "task-1", Roots: []string{`D:\\media`}, Mode: LocalTaskModeScanThenAnalysis, Rescan: true, Extensions: []string{".jpg", ".mp4"}},
+		LocalTaskCreateResponse{Task: LocalTask{TaskID: "task-1", Mode: LocalTaskModeScanOnly, Status: "pending"}},
+		LocalTaskListRequest{Offset: 2, Limit: 20},
+		LocalTaskListResponse{Tasks: []LocalTask{{TaskID: "task-1", Status: "running"}}, Offset: 2, NextOffset: 3},
+		LocalTaskIDRequest{TaskID: "task-1"},
+		LocalTaskRetryResponse{Task: LocalTask{TaskID: "task-1", Status: "pending"}},
 	}
 	for _, want := range tests {
 		encoded, err := msgpack.Marshal(want)
@@ -69,5 +75,44 @@ func TestLocalLifecyclePayloadsRoundTripWithoutNewMessageTypes(t *testing.T) {
 		if !reflect.DeepEqual(reflect.ValueOf(got).Elem().Interface(), want) {
 			t.Fatalf("round trip %T = %#v, want %#v", want, got, want)
 		}
+	}
+}
+
+// Break caught: malformed or ambiguous task envelopes otherwise produce
+// unstable digests and can recover a different scan after restart.
+func TestLocalTaskCreateRequestValidateRejectsNonCanonicalEnvelope(t *testing.T) {
+	valid := LocalTaskCreateRequest{
+		TaskID: "task-1", Roots: []string{`D:\\media`, `E:\\archive`},
+		Mode: LocalTaskModeScanThenAnalysis, Extensions: []string{".jpg", ".mp4"},
+	}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("valid request: %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*LocalTaskCreateRequest)
+	}{
+		{"empty task", func(in *LocalTaskCreateRequest) { in.TaskID = "" }},
+		{"task whitespace", func(in *LocalTaskCreateRequest) { in.TaskID = " task-1" }},
+		{"empty roots", func(in *LocalTaskCreateRequest) { in.Roots = nil }},
+		{"blank root", func(in *LocalTaskCreateRequest) { in.Roots[0] = " " }},
+		{"duplicate roots", func(in *LocalTaskCreateRequest) { in.Roots[1] = `d:/media` }},
+		{"invalid mode", func(in *LocalTaskCreateRequest) { in.Mode = "scan_and_guess" }},
+		{"extension whitespace", func(in *LocalTaskCreateRequest) { in.Extensions[0] = " .jpg" }},
+		{"extension without dot", func(in *LocalTaskCreateRequest) { in.Extensions[0] = "jpg" }},
+		{"uppercase extension", func(in *LocalTaskCreateRequest) { in.Extensions[0] = ".JPG" }},
+		{"duplicate extension", func(in *LocalTaskCreateRequest) { in.Extensions[1] = ".jpg" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			input := valid
+			input.Roots = append([]string(nil), valid.Roots...)
+			input.Extensions = append([]string(nil), valid.Extensions...)
+			test.mutate(&input)
+			if err := input.Validate(); err == nil {
+				t.Fatal("Validate succeeded")
+			}
+		})
 	}
 }

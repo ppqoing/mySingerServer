@@ -30,7 +30,10 @@ import (
 	"dedup/internal/agentinstance"
 	"dedup/internal/config"
 	fileenum "dedup/internal/enum"
+	"dedup/internal/firstscreen"
+	"dedup/internal/localanalysis"
 	"dedup/internal/localcontrol"
+	"dedup/internal/localtask"
 	"dedup/internal/machineid"
 	"dedup/internal/nodectl"
 	"dedup/internal/proto"
@@ -223,20 +226,11 @@ func runWithDependencies(
 	})
 	logger.Info("enumerator configured", "name", enumerator.Name())
 
-	pg, err := pgxpool.New(context.Background(), cfg.PGDSN)
-	if err != nil {
-		return fmt.Errorf("parse postgres DSN: %w", err)
-	}
-	defer pg.Close()
 	syncHealth := newSyncHealthState()
-	pingContext, cancelPing := context.WithTimeout(context.Background(), 5*time.Second)
-	if err := pg.Ping(pingContext); err != nil {
-		logger.Warn("postgres unreachable at startup, syncer will retry", "err", err)
-		syncHealth.set(false, err.Error())
-	} else {
-		syncHealth.set(true, "")
+	pg := initializePostgres(context.Background(), cfg.PGDSN, syncHealth, logger)
+	if pg != nil {
+		defer pg.Close()
 	}
-	cancelPing()
 
 	var statistics *stats.Collector
 	var statsSink *stats.JSONLSink
@@ -260,23 +254,27 @@ func runWithDependencies(
 			logger.Warn("start pprof failed", "err", err)
 		}
 	}
-	uploader := syncer.New(local, pg, syncer.Config{
-		Interval:    cfg.SyncInterval(),
-		TriggerRows: int64(cfg.Sync.TriggerRows),
-		UpsertBatch: cfg.Sync.UpsertBatch,
-		OnHealth: func(update syncer.HealthUpdate) {
-			syncHealth.set(update.Healthy, update.ErrorSummary)
-		},
-	}, logger)
-	go uploader.Run(ctx)
+	if pg != nil {
+		uploader := syncer.New(local, pg, syncer.Config{
+			Interval:    cfg.SyncInterval(),
+			TriggerRows: int64(cfg.Sync.TriggerRows),
+			UpsertBatch: cfg.Sync.UpsertBatch,
+			OnHealth: func(update syncer.HealthUpdate) {
+				syncHealth.set(update.Healthy, update.ErrorSummary)
+			},
+		}, logger)
+		go uploader.Run(ctx)
+	}
 
-	router := agent.NewPoolRouter(workerPool, logger)
+	fairPool := localtask.NewFairScheduler(workerPool)
+	defer fairPool.Close()
+	router := agent.NewPoolRouter(fairPool, logger)
 	scans := agent.NewScanManagerWithPoolRouter(
 		cfg,
 		local,
 		enumerator,
 		agent.GoHasher{},
-		workerPool,
+		fairPool,
 		router,
 		logger,
 		errorLogger,
@@ -287,11 +285,19 @@ func runWithDependencies(
 	phase2 := agent.NewPhase2ManagerWithRuntime(
 		cfg.MachineID,
 		local,
-		workerPool,
+		fairPool,
 		router,
 		nil,
 		logger,
 	)
+	stageOne := localanalysis.NewStageOne(local, local, firstscreen.DefaultConfig(), logger)
+	stageWorker := agent.NewLocalStageWorker(fairPool, router)
+	analysisEngine := localanalysis.NewEngine(cfg.MachineID, stageOne, local, stageWorker, config.DefaultGUI().Phase2)
+	tasks := localtask.NewService(cfg.MachineID, local, &agentLocalTaskRunner{scans: scans, analysis: analysisEngine})
+	resumeLocalTasks, err := prepareLocalTaskLifecycle(ctx, tasks, logger)
+	if err != nil {
+		return fmt.Errorf("prepare local task recovery: %w", err)
+	}
 	dialer := agentdelete.NewPipeDialer(cfg.Delete.PipeName)
 	forwarder := buildDeleteForwarder(
 		cfg,
@@ -314,6 +320,7 @@ func runWithDependencies(
 		Status: provider.ControlStatus, Shutdown: stop,
 		ConfigPath: configPath, ExecutablePath: executablePath, CPUCount: runtime.NumCPU(),
 		EffectiveConfigSHA256: configSHA256,
+		Tasks:                 agent.NewLocalTaskHandler(tasks),
 	})
 	return runService(
 		workerPool,
@@ -322,6 +329,7 @@ func runWithDependencies(
 				next: logger.Handler(),
 				ready: func() {
 					listenerReady.Store(true)
+					resumeLocalTasks()
 				},
 			})
 			server := agent.NewServer(cfg, scans, businessLogger, phase2)
@@ -385,6 +393,43 @@ func drainPhase2(manager phase2Shutdowner, timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	return manager.Shutdown(ctx)
+}
+
+func initializePostgres(ctx context.Context, dsn string, health *syncHealthState, logger *slog.Logger) *pgxpool.Pool {
+	pg, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		health.set(false, safeAgentSummary(err.Error()))
+		if logger != nil {
+			logger.Warn("postgres initialization degraded", "err", safeAgentSummary(err.Error()))
+		}
+		return nil
+	}
+	health.set(false, "sync_pending")
+	return pg
+}
+
+type localTaskLifecycle interface {
+	PrepareRecovery(context.Context) error
+	Resume(context.Context) error
+}
+
+func prepareLocalTaskLifecycle(ctx context.Context, tasks localTaskLifecycle, logger *slog.Logger) (func(), error) {
+	if tasks == nil {
+		return nil, errors.New("local task lifecycle is required")
+	}
+	if err := tasks.PrepareRecovery(ctx); err != nil {
+		return nil, err
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			go func() {
+				if err := tasks.Resume(ctx); err != nil && logger != nil {
+					logger.Error("resume local tasks failed", "err", safeAgentSummary(err.Error()))
+				}
+			}()
+		})
+	}, nil
 }
 
 type managedPool interface {
@@ -586,6 +631,7 @@ type agentLocalHandlerInputs struct {
 	ExecutablePath        string
 	CPUCount              int
 	EffectiveConfigSHA256 string
+	Tasks                 agent.LocalHandler
 }
 
 type agentLocalHandler struct {
@@ -654,8 +700,67 @@ func (h *agentLocalHandler) HandleLocal(ctx context.Context, request proto.Local
 		})
 		return localAgentSuccess(request.RequestID, proto.LocalShutdownResponse{Accepted: true})
 	default:
+		if h.inputs.Tasks != nil && (strings.HasPrefix(request.Operation, "local.task.") || strings.HasPrefix(request.Operation, "local.analysis.")) {
+			return h.inputs.Tasks.HandleLocal(ctx, request)
+		}
 		return localAgentFailure(request.RequestID, proto.UnsupportedOperationErrorCode)
 	}
+}
+
+type localAnalysisRunner interface {
+	Run(context.Context, string) error
+}
+
+type localScanRunner interface {
+	Prepare(proto.ScanTask, agent.Sender) (proto.TaskAck, func())
+}
+
+type agentLocalTaskRunner struct {
+	scans    localScanRunner
+	analysis localAnalysisRunner
+}
+
+func (r *agentLocalTaskRunner) Run(ctx context.Context, request localtask.CreateRequest, stage int, advance func(int) error) error {
+	if r == nil || r.scans == nil || r.analysis == nil {
+		return errors.New("local task runner unavailable")
+	}
+	if stage < 1 {
+		terminal := make(chan error, 1)
+		ack, start := r.scans.Prepare(proto.ScanTask{TaskID: request.TaskID, Roots: append([]string(nil), request.Roots...), Phase: 1, Options: proto.ScanOptions{Rescan: request.Rescan, Extensions: append([]string(nil), request.Extensions...)}}, func(messageType uint8, value any) error {
+			if messageType == proto.MsgTaskDone {
+				select {
+				case terminal <- nil:
+				default:
+				}
+			}
+			return nil
+		})
+		if !ack.Accepted {
+			return errors.New("local scan rejected")
+		}
+		if start != nil {
+			start()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case err := <-terminal:
+				if err != nil {
+					return err
+				}
+			}
+		}
+		if err := advance(1); err != nil {
+			return err
+		}
+		stage = 1
+	}
+	if request.Mode == proto.LocalTaskModeScanThenAnalysis && stage < 3 {
+		if err := r.analysis.Run(ctx, request.TaskID); err != nil {
+			return err
+		}
+		return advance(3)
+	}
+	return nil
 }
 
 func (h *agentLocalHandler) loadConfig() (*config.AgentConfig, []byte, string, error) {

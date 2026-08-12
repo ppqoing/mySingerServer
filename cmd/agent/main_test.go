@@ -253,6 +253,76 @@ func TestRunServiceDrainsPhase2BeforeClosingPool(t *testing.T) {
 	}
 }
 
+func TestLocalTaskRunnerRecoverySkipsScanAndCompletesStageThree(t *testing.T) {
+	scans := &recordingLocalScanRunner{}
+	analysis := &recordingLocalAnalysisRunner{}
+	runner := &agentLocalTaskRunner{scans: scans, analysis: analysis}
+	var stages []int
+	request := proto.LocalTaskCreateRequest{TaskID: "recover", Roots: []string{`D:\media`}, Mode: proto.LocalTaskModeScanThenAnalysis}
+	if err := runner.Run(context.Background(), request, 1, func(stage int) error { stages = append(stages, stage); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if scans.calls != 0 || analysis.calls != 1 || !reflect.DeepEqual(stages, []int{3}) {
+		t.Fatalf("scan=%d analysis=%d stages=%v", scans.calls, analysis.calls, stages)
+	}
+	stages = nil
+	if err := runner.Run(context.Background(), request, 2, func(stage int) error { stages = append(stages, stage); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if scans.calls != 0 || analysis.calls != 2 || !reflect.DeepEqual(stages, []int{3}) {
+		t.Fatalf("stage2 recovery scan=%d analysis=%d stages=%v", scans.calls, analysis.calls, stages)
+	}
+}
+
+func TestLocalTaskRunnerScanOnlyEndsAtStageOne(t *testing.T) {
+	scans := &recordingLocalScanRunner{}
+	runner := &agentLocalTaskRunner{scans: scans, analysis: &recordingLocalAnalysisRunner{}}
+	var stages []int
+	request := proto.LocalTaskCreateRequest{TaskID: "scan", Roots: []string{`D:\media`}, Mode: proto.LocalTaskModeScanOnly}
+	if err := runner.Run(context.Background(), request, 0, func(stage int) error { stages = append(stages, stage); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if scans.calls != 1 || !reflect.DeepEqual(stages, []int{1}) {
+		t.Fatalf("scan=%d stages=%v", scans.calls, stages)
+	}
+}
+
+func TestPostgresParseFailureIsImmediateDegradedState(t *testing.T) {
+	health := newSyncHealthState()
+	started := time.Now()
+	if pool := initializePostgres(context.Background(), "://invalid-postgres-dsn", health, nil); pool != nil {
+		pool.Close()
+		t.Fatal("invalid DSN returned pool")
+	}
+	if time.Since(started) > 100*time.Millisecond || health.snapshot().Healthy {
+		t.Fatalf("parse failure blocked or reported healthy: elapsed=%v health=%#v", time.Since(started), health.snapshot())
+	}
+}
+
+func TestLocalTaskRecoveryRegistersBeforeListenerAndResumesAfterReady(t *testing.T) {
+	lifecycle := &recordingLocalTaskLifecycle{prepared: make(chan struct{}), resumed: make(chan struct{})}
+	ready, err := prepareLocalTaskLifecycle(context.Background(), lifecycle, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-lifecycle.prepared:
+	default:
+		t.Fatal("PrepareRecovery did not finish synchronously before listener setup")
+	}
+	select {
+	case <-lifecycle.resumed:
+		t.Fatal("Resume ran before listener-ready callback")
+	default:
+	}
+	ready()
+	select {
+	case <-lifecycle.resumed:
+	case <-time.After(time.Second):
+		t.Fatal("Resume did not run asynchronously after listener ready")
+	}
+}
+
 func TestControlBusinessReadinessDoesNotDependOnInfoLogFiltering(t *testing.T) {
 	ready := make(chan struct{}, 1)
 	logger := slog.New(&listenerReadyHandler{
@@ -620,8 +690,14 @@ func TestControlStartupRejectsOversizedExecutablePathBeforeOpeningResources(t *t
 
 func TestSingleInstanceReleasedWhenAgentStartupFails(t *testing.T) {
 	root := t.TempDir()
+	blockedListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blockedListener.Close()
 	cfg := config.DefaultAgent()
 	cfg.PGDSN = "://invalid-postgres-dsn"
+	cfg.ListenAddr = blockedListener.Addr().String()
 	cfg.DataDir = filepath.Join(root, "data")
 	cfg.UseEverything = false
 	body, err := json.Marshal(cfg)
@@ -634,7 +710,7 @@ func TestSingleInstanceReleasedWhenAgentStartupFails(t *testing.T) {
 	}
 	resolveIdentity := fixedMachineIdentity("a")
 	if err := runWithDependencies(configPath, agent.NewDeleteLogger, resolveIdentity); err == nil {
-		t.Fatal("run unexpectedly accepted invalid PostgreSQL DSN")
+		t.Fatal("run unexpectedly accepted invalid listen address")
 	}
 	identity, err := resolveIdentity()
 	if err != nil {
@@ -675,9 +751,15 @@ func TestDrainPhase2UsesBoundedProductionContext(t *testing.T) {
 
 func TestRunClosesOpenedResourcesWhenPostgresConfigurationFails(t *testing.T) {
 	root := t.TempDir()
+	blockedListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blockedListener.Close()
 	cfg := config.DefaultAgent()
 	cfg.MachineID = "machine-cleanup"
 	cfg.PGDSN = "://invalid-postgres-dsn"
+	cfg.ListenAddr = blockedListener.Addr().String()
 	cfg.DataDir = filepath.Join(root, "data")
 	cfg.UseEverything = false
 	body, err := json.Marshal(cfg)
@@ -689,7 +771,7 @@ func TestRunClosesOpenedResourcesWhenPostgresConfigurationFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := runWithDependencies(configPath, agent.NewDeleteLogger, fixedMachineIdentity("b")); err == nil {
-		t.Fatal("run unexpectedly accepted invalid PostgreSQL DSN")
+		t.Fatal("run unexpectedly accepted invalid listen address")
 	}
 	for _, name := range []string{
 		"agent.db", "agent.log", "errors.log", "crash.log", "delete.log",
@@ -880,9 +962,15 @@ func TestAgentDeleteWiringMapsDialTimeoutFromLoadedConfig(t *testing.T) {
 
 func TestAgentDeleteWiringClosesDedicatedLoggerOnLaterStartupError(t *testing.T) {
 	root := t.TempDir()
+	blockedListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blockedListener.Close()
 	cfg := config.DefaultAgent()
 	cfg.MachineID = "machine-delete-cleanup"
 	cfg.PGDSN = "://invalid-postgres-dsn"
+	cfg.ListenAddr = blockedListener.Addr().String()
 	cfg.DataDir = filepath.Join(root, "data")
 	cfg.UseEverything = false
 	body, err := json.Marshal(cfg)
@@ -905,7 +993,7 @@ func TestAgentDeleteWiringClosesDedicatedLoggerOnLaterStartupError(t *testing.T)
 		}, nil
 	}
 	if err := runWithDependencies(configPath, openDeleteLogger, fixedMachineIdentity("c")); err == nil {
-		t.Fatal("run unexpectedly accepted invalid PostgreSQL DSN")
+		t.Fatal("run unexpectedly accepted invalid listen address")
 	}
 	if acquisitions != 1 || closes != 1 {
 		t.Fatalf("delete logger lifecycle acquisitions=%d closes=%d, want 1/1",
@@ -916,6 +1004,36 @@ func TestAgentDeleteWiringClosesDedicatedLoggerOnLaterStartupError(t *testing.T)
 type lifecyclePool struct {
 	starts int
 	closes int
+}
+
+type recordingLocalScanRunner struct{ calls int }
+
+func (r *recordingLocalScanRunner) Prepare(task proto.ScanTask, sender agent.Sender) (proto.TaskAck, func()) {
+	r.calls++
+	return proto.TaskAck{TaskID: task.TaskID, Accepted: true}, func() {
+		_ = sender(proto.MsgTaskDone, &proto.TaskDone{TaskID: task.TaskID})
+	}
+}
+
+type recordingLocalAnalysisRunner struct{ calls int }
+
+func (r *recordingLocalAnalysisRunner) Run(context.Context, string) error {
+	r.calls++
+	return nil
+}
+
+type recordingLocalTaskLifecycle struct {
+	prepared chan struct{}
+	resumed  chan struct{}
+}
+
+func (r *recordingLocalTaskLifecycle) PrepareRecovery(context.Context) error {
+	close(r.prepared)
+	return nil
+}
+func (r *recordingLocalTaskLifecycle) Resume(context.Context) error {
+	close(r.resumed)
+	return nil
 }
 
 type disabledInfoHandler struct{}

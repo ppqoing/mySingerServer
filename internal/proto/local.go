@@ -2,6 +2,8 @@ package proto
 
 import (
 	"errors"
+	"fmt"
+	"path/filepath"
 	"strings"
 
 	"github.com/vmihailenco/msgpack/v5"
@@ -111,6 +113,102 @@ type LocalConfigSaveResponse struct {
 
 type LocalShutdownResponse struct {
 	Accepted bool `msgpack:"accepted"`
+}
+
+const (
+	LocalTaskModeScanOnly         = "scan_only"
+	LocalTaskModeScanThenAnalysis = "scan_then_analysis"
+)
+
+type LocalTaskCreateRequest struct {
+	TaskID     string   `msgpack:"task_id"`
+	Roots      []string `msgpack:"roots"`
+	Mode       string   `msgpack:"mode"`
+	Rescan     bool     `msgpack:"rescan"`
+	Extensions []string `msgpack:"extensions,omitempty"`
+}
+
+func (request LocalTaskCreateRequest) Validate() error {
+	if request.TaskID == "" || strings.TrimSpace(request.TaskID) != request.TaskID {
+		return fmt.Errorf("invalid_task_id")
+	}
+	if request.Mode != LocalTaskModeScanOnly && request.Mode != LocalTaskModeScanThenAnalysis {
+		return fmt.Errorf("invalid_task_mode")
+	}
+	if len(request.Roots) == 0 {
+		return fmt.Errorf("invalid_roots")
+	}
+	roots := make(map[string]struct{}, len(request.Roots))
+	for _, root := range request.Roots {
+		if root == "" || strings.TrimSpace(root) != root {
+			return fmt.Errorf("invalid_roots")
+		}
+		key := strings.ToLower(filepath.Clean(root))
+		if _, exists := roots[key]; exists {
+			return fmt.Errorf("duplicate_root")
+		}
+		roots[key] = struct{}{}
+	}
+	extensions := make(map[string]struct{}, len(request.Extensions))
+	for _, extension := range request.Extensions {
+		if extension == "" || strings.TrimSpace(extension) != extension ||
+			!strings.HasPrefix(extension, ".") || extension != strings.ToLower(extension) {
+			return fmt.Errorf("invalid_extension")
+		}
+		if _, exists := extensions[extension]; exists {
+			return fmt.Errorf("duplicate_extension")
+		}
+		extensions[extension] = struct{}{}
+	}
+	return nil
+}
+
+type LocalTask struct {
+	TaskID           string   `msgpack:"task_id"`
+	Source           string   `msgpack:"source"`
+	Mode             string   `msgpack:"mode"`
+	Stage            int      `msgpack:"stage"`
+	Status           string   `msgpack:"status"`
+	Roots            []string `msgpack:"roots,omitempty"`
+	Rescan           bool     `msgpack:"rescan,omitempty"`
+	Extensions       []string `msgpack:"extensions,omitempty"`
+	ProgressComplete int64    `msgpack:"progress_complete"`
+	ProgressTotal    int64    `msgpack:"progress_total"`
+	StatsJSON        string   `msgpack:"stats_json"`
+	SafeErrorCode    string   `msgpack:"safe_error_code,omitempty"`
+	SafeErrorMessage string   `msgpack:"safe_error_message,omitempty"`
+	CreatedAt        int64    `msgpack:"created_at"`
+	UpdatedAt        int64    `msgpack:"updated_at"`
+}
+
+type LocalTaskCreateResponse struct {
+	Task LocalTask `msgpack:"task"`
+}
+
+type LocalTaskListRequest struct {
+	Offset int `msgpack:"offset"`
+	Limit  int `msgpack:"limit"`
+}
+
+type LocalTaskListResponse struct {
+	Tasks      []LocalTask `msgpack:"tasks"`
+	Offset     int         `msgpack:"offset"`
+	NextOffset int         `msgpack:"next_offset"`
+}
+
+type LocalTaskIDRequest struct {
+	TaskID string `msgpack:"task_id"`
+}
+
+func (request LocalTaskIDRequest) Validate() error {
+	if request.TaskID == "" || strings.TrimSpace(request.TaskID) != request.TaskID {
+		return fmt.Errorf("invalid_task_id")
+	}
+	return nil
+}
+
+type LocalTaskRetryResponse struct {
+	Task LocalTask `msgpack:"task"`
 }
 
 func EncodeLocalPayload(value any) ([]byte, error) {
