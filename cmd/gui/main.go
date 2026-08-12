@@ -128,10 +128,23 @@ type guiHTTPServer interface {
 	Shutdown(context.Context) error
 }
 
+type serveEntryHTTPServer struct {
+	guiHTTPServer
+	onServe func()
+}
+
+func (server *serveEntryHTTPServer) Serve(listener net.Listener) error {
+	if server.onServe != nil {
+		server.onServe()
+	}
+	return server.guiHTTPServer.Serve(listener)
+}
+
 var (
 	guiExecutablePath   = finalGUIExecutablePath
 	guiListen           = net.Listen
 	guiNewHTTPServer    = newGUIHTTPServer
+	guiNewRuntimeLogger = newGUIRuntimeLogger
 	guiOpenBrowser      = openGUIBrowser
 	guiShowStartupError = showGUIStartupError
 )
@@ -558,6 +571,7 @@ func serveBoundGUI(
 	listenAddr string,
 	noBrowser bool,
 	logger *slog.Logger,
+	onServe func(),
 ) error {
 	defer listener.Close()
 	logger.Info("gui listening", "addr", listener.Addr().String())
@@ -569,7 +583,14 @@ func serveBoundGUI(
 			logger.Warn("open GUI browser", "err", openErr)
 		}
 	}
-	return serveAndDrain(processContext, cancelProcess, server, listener, analysis, shutdownTimeout)
+	return serveAndDrain(
+		processContext,
+		cancelProcess,
+		&serveEntryHTTPServer{guiHTTPServer: server, onServe: onServe},
+		listener,
+		analysis,
+		shutdownTimeout,
+	)
 }
 
 func main() {
@@ -620,7 +641,7 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
-	logger, closeLogger, err := newGUIRuntimeLogger(runtimePaths.LogPath, os.Stdout)
+	logger, closeLogger, err := guiNewRuntimeLogger(runtimePaths.LogPath, os.Stdout)
 	if err != nil {
 		return err
 	}
@@ -645,9 +666,11 @@ func run(args []string) error {
 		return guiStartupFailure(logger, "bind GUI listener", err)
 	}
 	server := guiNewHTTPServer(cfg.ListenAddr, host)
+	serveEntered := make(chan struct{})
 	initializationDone := make(chan struct{})
 	go func() {
 		defer close(initializationDone)
+		<-serveEntered
 		initializeOperationalRuntime(processContext, cfg, host, logger)
 	}()
 	serveErr := serveBoundGUI(
@@ -660,6 +683,10 @@ func run(args []string) error {
 		cfg.ListenAddr,
 		*noBrowser,
 		logger,
+		func() {
+			logger.Info("gui serving", "addr", listener.Addr().String())
+			close(serveEntered)
+		},
 	)
 	<-initializationDone
 	return serveErr

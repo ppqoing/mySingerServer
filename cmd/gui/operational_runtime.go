@@ -20,6 +20,51 @@ type operationalRuntime struct {
 	closeRuntime func()
 }
 
+type operationalRuntimeResources interface {
+	Ping(context.Context) error
+	RestoreTasks(context.Context) error
+	RestorePhase2(context.Context) error
+	Start(context.Context) error
+	API() *gui.API
+	BeginAnalysisShutdown()
+	WaitForAnalysis()
+	WaitForPhase2()
+	StopPool()
+	ShutdownPhase2()
+	ClosePostgres()
+}
+
+type postgresOperationalRuntimeResources struct {
+	cfg    *config.GUIConfig
+	logger *slog.Logger
+	pg     *pgxpool.Pool
+
+	tasks            *gui.TaskRegistry
+	pool             *gui.Pool
+	deleteService    *gui.DeleteService
+	phase2Dispatcher *phase2.Dispatcher
+	phase2Router     *phase2Orchestration
+	api              *gui.API
+}
+
+func newOperationalRuntimeResources(
+	ctx context.Context,
+	cfg *config.GUIConfig,
+	logger *slog.Logger,
+) (operationalRuntimeResources, error) {
+	pg, err := pgxpool.New(ctx, cfg.PGDSN)
+	if err != nil {
+		return nil, err
+	}
+	return &postgresOperationalRuntimeResources{
+		cfg:    cfg,
+		logger: logger,
+		pg:     pg,
+	}, nil
+}
+
+var guiNewOperationalRuntimeResources = newOperationalRuntimeResources
+
 func (runtime *operationalRuntime) API() *gui.API {
 	if runtime == nil {
 		return nil
@@ -43,134 +88,186 @@ func buildOperationalRuntime(
 	cfg *config.GUIConfig,
 	logger *slog.Logger,
 ) (_ *operationalRuntime, err error) {
-	pg, err := pgxpool.New(ctx, cfg.PGDSN)
+	resources, err := guiNewOperationalRuntimeResources(ctx, cfg, logger)
 	if err != nil {
 		return nil, fmt.Errorf("parse postgres DSN: %w", err)
 	}
-	var (
-		pool             *gui.Pool
-		phase2Dispatcher *phase2.Dispatcher
-	)
 	defer func() {
-		if err == nil {
-			return
+		if err != nil {
+			closeOperationalRuntimeResources(resources)
 		}
-		if pool != nil {
-			pool.StopReconnects()
-		}
-		if phase2Dispatcher != nil {
-			phase2Dispatcher.Shutdown()
-		}
-		pg.Close()
 	}()
-
-	pingContext, cancelPing := context.WithTimeout(ctx, 5*time.Second)
-	err = pg.Ping(pingContext)
-	cancelPing()
-	if err != nil {
+	if err = resources.Ping(ctx); err != nil {
 		return nil, fmt.Errorf("ping postgres: %w", err)
 	}
-
-	tasks := gui.NewTaskRegistry(pg, logger)
-	if err = tasks.Restore(ctx); err != nil {
+	if err = resources.RestoreTasks(ctx); err != nil {
 		return nil, fmt.Errorf("restore scan tasks: %w", err)
 	}
+	if err = resources.RestorePhase2(ctx); err != nil {
+		return nil, fmt.Errorf("restore phase2 runtime: %w", err)
+	}
+	if err = resources.Start(ctx); err != nil {
+		return nil, fmt.Errorf("start operational runtime: %w", err)
+	}
+	return &operationalRuntime{
+		api: resources.API(),
+		closeRuntime: func() {
+			closeOperationalRuntimeResources(resources)
+		},
+	}, nil
+}
 
-	var (
-		phase2Router  *phase2Orchestration
-		deleteService *gui.DeleteService
-	)
-	pool = gui.NewPool(
-		cfg.Agents,
-		logger,
+func closeOperationalRuntimeResources(resources operationalRuntimeResources) {
+	resources.BeginAnalysisShutdown()
+	resources.WaitForAnalysis()
+	resources.WaitForPhase2()
+	resources.StopPool()
+	resources.ShutdownPhase2()
+	resources.ClosePostgres()
+}
+
+func (resources *postgresOperationalRuntimeResources) Ping(ctx context.Context) error {
+	pingContext, cancelPing := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelPing()
+	return resources.pg.Ping(pingContext)
+}
+
+func (resources *postgresOperationalRuntimeResources) RestoreTasks(ctx context.Context) error {
+	resources.tasks = gui.NewTaskRegistry(resources.pg, resources.logger)
+	return resources.tasks.Restore(ctx)
+}
+
+func (resources *postgresOperationalRuntimeResources) RestorePhase2(ctx context.Context) error {
+	resources.pool = gui.NewPool(
+		resources.cfg.Agents,
+		resources.logger,
 		func(machineID string, _ *gui.AgentConn, message any) {
-			if phase2Dispatcher != nil && phase2Router != nil {
+			if resources.phase2Dispatcher != nil && resources.phase2Router != nil {
 				routeAgentMessage(
 					ctx,
 					machineID,
 					message,
-					phase2Dispatcher,
-					phase2Router,
-					tasks,
-					logger,
-					deleteService,
+					resources.phase2Dispatcher,
+					resources.phase2Router,
+					resources.tasks,
+					resources.logger,
+					resources.deleteService,
 				)
 				return
 			}
-			tasks.Dispatch(machineID, message)
+			resources.tasks.Dispatch(machineID, message)
 		},
 	)
-	deleteService, _ = newDeleteRuntime(
-		pg,
-		pool,
+	resources.deleteService, _ = newDeleteRuntime(
+		resources.pg,
+		resources.pool,
 		time.Minute,
 		time.Now,
-		logger,
+		resources.logger,
 	)
-	phase2Dispatcher = phase2.NewDispatcher(
-		pg,
-		pool,
-		cfg.Phase2,
-		logger,
+	resources.phase2Dispatcher = phase2.NewDispatcher(
+		resources.pg,
+		resources.pool,
+		resources.cfg.Phase2,
+		resources.logger,
 	)
-	if err = phase2Dispatcher.RestorePending(ctx); err != nil {
-		return nil, fmt.Errorf("restore phase2 tasks: %w", err)
+	if err := resources.phase2Dispatcher.RestorePending(ctx); err != nil {
+		return fmt.Errorf("restore phase2 tasks: %w", err)
 	}
-	phase2Rescreener := phase2.NewRescreener(pg, cfg.Phase2, logger)
+	phase2Rescreener := phase2.NewRescreener(
+		resources.pg,
+		resources.cfg.Phase2,
+		resources.logger,
+	)
 	restoreContext, cancelRestore := context.WithTimeout(ctx, 5*time.Minute)
-	err = phase2Rescreener.Restore(restoreContext)
+	err := phase2Rescreener.Restore(restoreContext)
 	cancelRestore()
 	if err != nil {
-		return nil, fmt.Errorf("restore phase2 rescreener: %w", err)
+		return fmt.Errorf("restore phase2 rescreener: %w", err)
 	}
-	phase2Router = newPhase2Orchestration(
+	resources.phase2Router = newPhase2Orchestration(
 		phase2Rescreener,
-		phase2Dispatcher,
-		phase2.NewGroupRebuilder(pg),
+		resources.phase2Dispatcher,
+		phase2.NewGroupRebuilder(resources.pg),
 	)
-	phase2Router.Start(ctx, logger, phase2FinalizeWorkerConfig{})
-	phase2Router.SignalFinalize()
+	return nil
+}
 
-	pool.SetOnConnectContext(func(connectContext context.Context, machineID string) {
+func (resources *postgresOperationalRuntimeResources) Start(ctx context.Context) error {
+	resources.phase2Router.Start(ctx, resources.logger, phase2FinalizeWorkerConfig{})
+	resources.phase2Router.SignalFinalize()
+	resources.pool.SetOnConnectContext(func(connectContext context.Context, machineID string) {
 		resumeAgentWork(
 			connectContext,
 			machineID,
-			tasks,
-			pool,
-			phase2Dispatcher,
-			logger,
+			resources.tasks,
+			resources.pool,
+			resources.phase2Dispatcher,
+			resources.logger,
 		)
 	})
-	pool.Start(ctx, time.Duration(cfg.HeartbeatS)*time.Second)
+	resources.pool.Start(ctx, time.Duration(resources.cfg.HeartbeatS)*time.Second)
 	analysisRunner := newPooledAnalysisRunner(
 		ctx,
-		pgxAnalysisPool{pool: pg},
-		firstScreenConfig(cfg.FirstScreen),
-		logger,
+		pgxAnalysisPool{pool: resources.pg},
+		firstScreenConfig(resources.cfg.FirstScreen),
+		resources.logger,
 	)
-	api := gui.NewAPI(pool, tasks, pg, analysisRunner)
-	api.SetDeleteService(deleteService)
-	api.SetAnalysisSuccessHook(func() error {
+	resources.api = gui.NewAPI(
+		resources.pool,
+		resources.tasks,
+		resources.pg,
+		analysisRunner,
+	)
+	resources.api.SetDeleteService(resources.deleteService)
+	resources.api.SetAnalysisSuccessHook(func() error {
 		hookContext, cancelHook := context.WithTimeout(ctx, 5*time.Minute)
 		defer cancelHook()
 		return reloadDispatchAndFinalize(
 			hookContext,
-			phase2Router,
-			cfg.Phase2.AutoDispatch,
+			resources.phase2Router,
+			resources.cfg.Phase2.AutoDispatch,
 		)
 	})
+	return nil
+}
 
-	return &operationalRuntime{
-		api: api,
-		closeRuntime: func() {
-			api.BeginAnalysisShutdown()
-			api.WaitForAnalysis()
-			phase2Router.Wait()
-			pool.StopReconnects()
-			phase2Dispatcher.Shutdown()
-			pg.Close()
-		},
-	}, nil
+func (resources *postgresOperationalRuntimeResources) API() *gui.API {
+	return resources.api
+}
+
+func (resources *postgresOperationalRuntimeResources) BeginAnalysisShutdown() {
+	if resources.api != nil {
+		resources.api.BeginAnalysisShutdown()
+	}
+}
+
+func (resources *postgresOperationalRuntimeResources) WaitForAnalysis() {
+	if resources.api != nil {
+		resources.api.WaitForAnalysis()
+	}
+}
+
+func (resources *postgresOperationalRuntimeResources) WaitForPhase2() {
+	if resources.phase2Router != nil {
+		resources.phase2Router.Wait()
+	}
+}
+
+func (resources *postgresOperationalRuntimeResources) StopPool() {
+	if resources.pool != nil {
+		resources.pool.StopReconnects()
+	}
+}
+
+func (resources *postgresOperationalRuntimeResources) ShutdownPhase2() {
+	if resources.phase2Dispatcher != nil {
+		resources.phase2Dispatcher.Shutdown()
+	}
+}
+
+func (resources *postgresOperationalRuntimeResources) ClosePostgres() {
+	resources.pg.Close()
 }
 
 var guiBuildOperationalRuntime = buildOperationalRuntime

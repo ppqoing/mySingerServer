@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -44,7 +45,7 @@ func TestGUIOpensBrowserOnlyAfterListenerIsBound(t *testing.T) {
 	server := newFakeGUIServer(http.ErrServerClosed, false)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	if err := serveBoundGUI(ctx, cancel, server, listener, &noopAnalysisLifecycle{}, time.Second, "127.0.0.1:8080", false, slog.Default()); err != nil {
+	if err := serveBoundGUI(ctx, cancel, server, listener, &noopAnalysisLifecycle{}, time.Second, "127.0.0.1:8080", false, slog.Default(), nil); err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(events, []string{"listen", "browser"}) {
@@ -65,7 +66,7 @@ func TestGUINoBrowserFlagSuppressesBrowserLaunch(t *testing.T) {
 	server := newFakeGUIServer(http.ErrServerClosed, false)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	if err := serveBoundGUI(ctx, cancel, server, listener, &noopAnalysisLifecycle{}, time.Second, "127.0.0.1:8080", true, slog.Default()); err != nil {
+	if err := serveBoundGUI(ctx, cancel, server, listener, &noopAnalysisLifecycle{}, time.Second, "127.0.0.1:8080", true, slog.Default(), nil); err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(events, []string{"listen"}) {
@@ -135,11 +136,13 @@ func TestGUIPingFailureIsLoggedBeforeInteractiveNotification(t *testing.T) {
 	originalNotify := guiShowStartupError
 	originalListen := guiListen
 	originalServer := guiNewHTTPServer
+	originalLogger := guiNewRuntimeLogger
 	defer func() {
 		guiExecutablePath = originalExecutable
 		guiShowStartupError = originalNotify
 		guiListen = originalListen
 		guiNewHTTPServer = originalServer
+		guiNewRuntimeLogger = originalLogger
 	}()
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "gui.json"), []byte(`{
@@ -151,6 +154,14 @@ func TestGUIPingFailureIsLoggedBeforeInteractiveNotification(t *testing.T) {
 	}
 	guiExecutablePath = func() (string, error) { return filepath.Join(root, "gui.exe"), nil }
 	events := &orderedEvents{}
+	failureLogged := make(chan struct{})
+	logHandler := &startupEventLogHandler{
+		events:        events,
+		failureLogged: failureLogged,
+	}
+	guiNewRuntimeLogger = func(string, io.Writer) (*slog.Logger, func() error, error) {
+		return slog.New(logHandler), func() error { return nil }, nil
+	}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -160,10 +171,10 @@ func TestGUIPingFailureIsLoggedBeforeInteractiveNotification(t *testing.T) {
 		events.add("listen")
 		return listener, nil
 	}
-	server := &recordingCancelableGUIServer{
-		events:  events,
-		release: make(chan struct{}),
-		started: make(chan struct{}),
+	server := &runtimeFailureGUIServer{
+		failureLogged: failureLogged,
+		shutdown:      make(chan struct{}),
+		started:       make(chan struct{}),
 	}
 	defer server.Shutdown(context.Background())
 	guiNewHTTPServer = func(string, http.Handler) guiHTTPServer { return server }
@@ -176,15 +187,6 @@ func TestGUIPingFailureIsLoggedBeforeInteractiveNotification(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("GUI did not begin serving before PostgreSQL initialization")
 	}
-	logPath := filepath.Join(root, "data", "logs", "gui.log")
-	content := waitForLogContent(t, logPath, "postgres_unavailable")
-	events.add("postgres-error")
-	if strings.Contains(content, "secret") || strings.Contains(content, "postgres://") {
-		t.Fatalf("runtime failure log leaked DSN: %s", content)
-	}
-	if err := server.Shutdown(context.Background()); err != nil {
-		t.Fatal(err)
-	}
 	select {
 	case err := <-result:
 		if err != nil {
@@ -195,6 +197,10 @@ func TestGUIPingFailureIsLoggedBeforeInteractiveNotification(t *testing.T) {
 	}
 	if notification != "" {
 		t.Fatalf("database failure triggered startup notification %q", notification)
+	}
+	content := logHandler.snapshot()
+	if strings.Contains(content, "secret") || strings.Contains(content, "postgres://") {
+		t.Fatalf("runtime failure log leaked DSN: %s", content)
 	}
 	want := []string{"listen", "serve", "postgres-error"}
 	if got := events.snapshot(); !reflect.DeepEqual(got, want) {
@@ -322,19 +328,73 @@ func (s *recordingCancelableGUIServer) Shutdown(context.Context) error {
 	return nil
 }
 
-func waitForLogContent(t *testing.T, path, substring string) string {
-	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		content, err := os.ReadFile(path)
-		if err == nil && strings.Contains(string(content), substring) {
-			return string(content)
-		}
-		time.Sleep(10 * time.Millisecond)
+type runtimeFailureGUIServer struct {
+	failureLogged <-chan struct{}
+	shutdown      chan struct{}
+	started       chan struct{}
+	shutdownOnce  sync.Once
+}
+
+func (s *runtimeFailureGUIServer) Serve(net.Listener) error {
+	close(s.started)
+	select {
+	case <-s.failureLogged:
+	case <-s.shutdown:
 	}
-	content, err := os.ReadFile(path)
-	t.Fatalf("log %q did not contain %q: err=%v content=%q", path, substring, err, content)
-	return ""
+	return http.ErrServerClosed
+}
+
+func (s *runtimeFailureGUIServer) Shutdown(context.Context) error {
+	s.shutdownOnce.Do(func() { close(s.shutdown) })
+	return nil
+}
+
+type startupEventLogHandler struct {
+	events        *orderedEvents
+	failureLogged chan struct{}
+	failureOnce   sync.Once
+
+	mu      sync.Mutex
+	records []string
+}
+
+func (*startupEventLogHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (handler *startupEventLogHandler) Handle(_ context.Context, record slog.Record) error {
+	var fields strings.Builder
+	fields.WriteString(record.Message)
+	record.Attrs(func(attr slog.Attr) bool {
+		fields.WriteByte(' ')
+		fields.WriteString(attr.Key)
+		fields.WriteByte('=')
+		fields.WriteString(attr.Value.String())
+		return true
+	})
+	handler.mu.Lock()
+	handler.records = append(handler.records, fields.String())
+	handler.mu.Unlock()
+	switch record.Message {
+	case "gui serving":
+		handler.events.add("serve")
+	case "operational runtime unavailable":
+		handler.events.add("postgres-error")
+		handler.failureOnce.Do(func() { close(handler.failureLogged) })
+	}
+	return nil
+}
+
+func (handler *startupEventLogHandler) WithAttrs([]slog.Attr) slog.Handler {
+	return handler
+}
+
+func (handler *startupEventLogHandler) WithGroup(string) slog.Handler {
+	return handler
+}
+
+func (handler *startupEventLogHandler) snapshot() string {
+	handler.mu.Lock()
+	defer handler.mu.Unlock()
+	return strings.Join(handler.records, "\n")
 }
 
 func TestLoadGUIRuntimeReturnsAbsoluteNonDefaultPath(t *testing.T) {
