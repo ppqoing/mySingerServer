@@ -246,6 +246,60 @@ func TestServerLocalResponseDoesNotLeakControlToken(t *testing.T) {
 	}
 }
 
+func TestServerAllLocalResponseBranchesCleanControlTokenFromRequestID(t *testing.T) {
+	const token = "request-id-must-not-leak-this-token"
+	tests := []struct {
+		name         string
+		authenticate bool
+		operation    string
+		wantError    string
+	}{
+		{
+			name:      "unauthenticated",
+			operation: proto.LocalOperationStatusGet,
+			wantError: "unauthorized",
+		},
+		{
+			name:         "invalid request",
+			authenticate: true,
+			operation:    "local.invalid",
+			wantError:    proto.UnsupportedOperationErrorCode,
+		},
+		{
+			name:         "local unavailable",
+			authenticate: true,
+			operation:    proto.LocalOperationStatusGet,
+			wantError:    "local_unavailable",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server, _ := newLocalControlTestServer(t)
+			server.SetLocalControl(token, nil)
+			client, cleanup := startLocalControlTestConnection(t, server, net.ParseIP("127.0.0.1"))
+			defer cleanup()
+			if test.authenticate {
+				writeLocalControlTestAuth(t, client, proto.ClientAuth{
+					Role: "nodetray", Token: token, Version: proto.ProtocolVersion,
+				})
+				if result := readDeleteTestMessage(t, client).(*proto.ClientAuthResult); !result.Accepted {
+					t.Fatalf("auth result = %#v", result)
+				}
+			}
+			if err := client.WriteFrame(proto.MsgLocalRequest, &proto.LocalRequest{
+				RequestID: token, Operation: test.operation,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			response := readDeleteTestMessage(t, client).(*proto.LocalResponse)
+			if strings.Contains(response.RequestID, token) || response.ErrorCode != test.wantError {
+				t.Fatalf("local response = %#v, want cleaned request ID and error %q", response, test.wantError)
+			}
+		})
+	}
+}
+
 type recordingStatsProvider struct {
 	window int
 	report proto.StatsReport

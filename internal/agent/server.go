@@ -192,6 +192,11 @@ func (s *Server) handleConn(parent context.Context, connection net.Conn) {
 	sender := func(msgType uint8, value any) error {
 		return conn.WriteFrame(msgType, value)
 	}
+	sendLocalResponse := func(response proto.LocalResponse) error {
+		token, _ := s.localControl()
+		response = protectLocalResponse(response, token)
+		return sender(proto.MsgLocalResponse, &response)
+	}
 	var detachPhase2 []func()
 	authenticatedNodeTray := false
 	defer func() {
@@ -239,22 +244,22 @@ func (s *Server) handleConn(parent context.Context, connection net.Conn) {
 			}
 		case *proto.LocalRequest:
 			if !authenticatedNodeTray {
-				_ = sender(proto.MsgLocalResponse, &proto.LocalResponse{
+				_ = sendLocalResponse(proto.LocalResponse{
 					RequestID: value.RequestID,
 					ErrorCode: "unauthorized",
 				})
 				continue
 			}
 			if err := value.Validate(); err != nil {
-				_ = sender(proto.MsgLocalResponse, &proto.LocalResponse{
+				_ = sendLocalResponse(proto.LocalResponse{
 					RequestID: value.RequestID,
 					ErrorCode: err.Error(),
 				})
 				continue
 			}
-			token, handler := s.localControl()
+			_, handler := s.localControl()
 			if handler == nil {
-				_ = sender(proto.MsgLocalResponse, &proto.LocalResponse{
+				_ = sendLocalResponse(proto.LocalResponse{
 					RequestID: value.RequestID,
 					ErrorCode: "local_unavailable",
 				})
@@ -262,14 +267,13 @@ func (s *Server) handleConn(parent context.Context, connection net.Conn) {
 			}
 			response := handler.HandleLocal(connectionContext, *value)
 			response.RequestID = value.RequestID
-			response = protectLocalResponse(response, token)
 			if err := response.Validate(); err != nil {
 				response = proto.LocalResponse{
 					RequestID: value.RequestID,
 					ErrorCode: err.Error(),
 				}
 			}
-			if err := sender(proto.MsgLocalResponse, &response); err != nil {
+			if err := sendLocalResponse(response); err != nil {
 				return
 			}
 		case *proto.Shutdown:
