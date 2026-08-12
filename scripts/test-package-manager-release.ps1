@@ -70,9 +70,25 @@ try {
             'Everything.exe', 'ffmpeg.exe', 'videocore.dll', 'WebView2Loader.dll', 'gui.json')) {
         Assert-True (-not ($actualFiles -contains $forbidden)) "forbidden file shipped: $forbidden"
     }
+    $guiExample = Get-Content -Raw -LiteralPath (Join-Path $payloadRoot 'gui.example.json') |
+        ConvertFrom-Json
+    Assert-True ([string]$guiExample.listen_addr -ceq '127.0.0.1:18081') `
+        'manager template must use the dedicated loopback port 18081'
+
     $startScript = Get-Content -Raw -LiteralPath (Join-Path $payloadRoot 'Start-Manager.ps1')
-    Assert-True ($startScript -match '& \$exe -config \$config @args') `
-        'manager launch script must forward arguments to gui.exe'
+    Assert-True ($startScript -match `
+        '& \(Join-Path \$root ''gui\.exe''\) -config \(Join-Path \$root ''gui\.json''\) @args') `
+        'manager launch script must invoke gui.exe with the absolute sibling gui.json path'
+    Assert-True ($startScript -notmatch '(?im)^\s*throw\b') `
+        'manager launch script must not reject a missing gui.json'
+
+    $readme = Get-Content -Raw -LiteralPath (Join-Path $payloadRoot 'README-管理端部署.md')
+    Assert-True ($readme -match '首次双击.*自动生成.*gui\.json') `
+        'manager README must explain first-run gui.json creation'
+    Assert-True ($readme -match 'PostgreSQL.*Agent.*不可用.*设置页') `
+        'manager README must explain degraded startup into settings'
+    Assert-True ($readme -match '保存.*自动重启') `
+        'manager README must explain automatic restart after saving settings'
 
     $manifest = Get-Content -Raw -LiteralPath (Join-Path $payloadRoot 'release-manifest.json') | ConvertFrom-Json
     Assert-True ($manifest.release_kind -ceq 'remote-manager-portable') 'wrong release kind'

@@ -73,6 +73,8 @@ if (Test-Path -LiteralPath $guiExamplePath -PathType Leaf) {
         Assert-True ($guiDsn.UserInfo -notmatch ':') 'GUI_EXAMPLE_DSN_CONTAINS_PASSWORD'
         Assert-True ($guiDsn.Query -notmatch '(?i)(^|[?&])(password|passwd|pwd|token|secret)=') `
             'GUI_EXAMPLE_DSN_CONTAINS_SECRET_QUERY'
+        Assert-True ([string]$guiExample.listen_addr -ceq '127.0.0.1:18081') `
+            'GUI_EXAMPLE_LISTEN_ADDR_NOT_DEDICATED_LOOPBACK'
         $guiAgents = @($guiExample.agents)
         Assert-True ($guiAgents.Count -eq 1 -and [string]$guiAgents[0].addr -ceq '127.0.0.1:9101') `
             'GUI_EXAMPLE_AGENT_NOT_LOOPBACK_ONLY'
@@ -86,7 +88,10 @@ if (Test-Path -LiteralPath $managerStartPath -PathType Leaf) {
     $managerStartText = Get-Content -Raw -LiteralPath $managerStartPath
     Assert-True ($managerStartText -match 'Join-Path \$root ''gui.exe''') 'MANAGER_START_GUI_EXE_MISSING'
     Assert-True ($managerStartText -match 'Join-Path \$root ''gui.json''') 'MANAGER_START_GUI_CONFIG_MISSING'
-    Assert-True ($managerStartText -match '& \$exe -config \$config @args') 'MANAGER_START_CONFIG_ARGUMENT_MISSING'
+    Assert-True ($managerStartText -match `
+        '& \(Join-Path \$root ''gui\.exe''\) -config \(Join-Path \$root ''gui\.json''\) @args') `
+        'MANAGER_START_CONFIG_ARGUMENT_MISSING'
+    Assert-True ($managerStartText -notmatch '(?im)^\s*throw\b') 'MANAGER_START_REJECTS_MISSING_CONFIG'
 }
 
 $buildNodeTray = Join-Path $repo "scripts\build-nodetray.ps1"

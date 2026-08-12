@@ -1,5 +1,5 @@
 {
-  "listen_addr": "127.0.0.1:8080",
+  "listen_addr": "127.0.0.1:18081",
   "pg_dsn": "postgres://dedup@127.0.0.1:5432/dedup",
   "heartbeat_s": 15,
   "firstscreen": {
