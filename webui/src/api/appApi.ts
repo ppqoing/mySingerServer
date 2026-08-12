@@ -474,7 +474,7 @@ function guiConfigInput(value: GUIConfig): Record<string, unknown> {
   };
 }
 
-function guiConfigSaveResponse(value: unknown): GUIConfigSaveResult {
+function guiConfigSaveResponse(value: unknown, status = httpStatusOK): GUIConfigSaveResult {
   const raw = record(value, "GUI config save response");
   if (raw.error === "config_invalid") {
     throw new GUIConfigValidationError(configFieldErrors(raw.fields));
@@ -486,7 +486,7 @@ function guiConfigSaveResponse(value: unknown): GUIConfigSaveResult {
     );
   }
   if (typeof raw.error === "string") {
-    throw new ApiError(400, raw.error, false);
+    throw new ApiError(status, raw.error, status >= 500);
   }
   return {
     saved: boolean(raw.saved, "GUI config saved"),
@@ -495,6 +495,8 @@ function guiConfigSaveResponse(value: unknown): GUIConfigSaveResult {
     recoveryURL: text(raw.recovery_url, "GUI config recovery_url")
   };
 }
+
+const httpStatusOK = 200;
 
 function runtimeStatus(value: unknown): RuntimeStatus {
   const raw = record(value, "runtime status");

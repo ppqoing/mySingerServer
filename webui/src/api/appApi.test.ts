@@ -467,6 +467,25 @@ test("preserves a saved configuration when automatic restart launch fails", asyn
   })).rejects.toMatchObject({ name: "GUIConfigRestartError", saved: true, restartRequired: true });
 });
 
+test("preserves the retryable HTTP 500 semantics for a generic GUI save failure", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse({ error: "config_save_failed" }, 500)));
+
+  await expect(createAppApi().saveGUIConfig({
+    listenAddr: "127.0.0.1:18080", pgDsn: "postgres://user:pass@127.0.0.1:5432/dedup", agents: [{ addr: "192.168.1.10:9101" }], heartbeatS: 15,
+    firstScreen: { hammingMax: 31, aspectTolerance: 0.1, videoDurationWindowMs: 2000, imageQualityMin: 50, readPageSize: 50000, groupInsertBatch: 1000, shaResolveChunk: 10000 },
+    phase2: { phashPassT2: 0.8, phashPartThreshold: 10, sobelT3: 0.85, videoFrames: 6, videoAvgT4: 0.8, videoMinPassed: 4, videoMinValid: 4, videoFileTimeoutS: 120, videoFrameCommandTimeoutS: 20, imageFileTimeoutS: 30, taskShardSize: 5000, autoDispatch: true }
+  })).rejects.toMatchObject({ name: "ApiError", status: 500, message: "config_save_failed", retryable: true });
+});
+
+test.each(["invalid_request", "config_invalid"])("keeps %s as a 400 GUI save failure", async error => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse({ error }, 400)));
+  await expect(createAppApi().saveGUIConfig({
+    listenAddr: "127.0.0.1:18080", pgDsn: "postgres://user:pass@127.0.0.1:5432/dedup", agents: [{ addr: "192.168.1.10:9101" }], heartbeatS: 15,
+    firstScreen: { hammingMax: 31, aspectTolerance: 0.1, videoDurationWindowMs: 2000, imageQualityMin: 50, readPageSize: 50000, groupInsertBatch: 1000, shaResolveChunk: 10000 },
+    phase2: { phashPassT2: 0.8, phashPartThreshold: 10, sobelT3: 0.85, videoFrames: 6, videoAvgT4: 0.8, videoMinPassed: 4, videoMinValid: 4, videoFileTimeoutS: 120, videoFrameCommandTimeoutS: 20, imageFileTimeoutS: 30, taskShardSize: 5000, autoDispatch: true }
+  })).rejects.toMatchObject({ status: 400, retryable: false });
+});
+
 test("preserves structured GUI configuration field errors", async () => {
   vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse({
     error: "config_invalid",

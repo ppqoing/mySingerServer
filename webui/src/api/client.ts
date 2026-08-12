@@ -25,7 +25,7 @@ export function isAbortError(error: unknown): boolean {
 export async function requestJson<T>(
   url: string,
   options: JsonRequestOptions,
-  decode: (value: unknown) => T
+  decode: (value: unknown, status?: number) => T
 ): Promise<T> {
   let response: Response;
   try {
@@ -39,7 +39,7 @@ export async function requestJson<T>(
 
   const value = await parseResponse(response, false, options.decodeStatuses);
   try {
-    return decode(value);
+    return decode(value, response.status);
   } catch (error) {
     if (error instanceof ApiError || isAbortError(error)) {
       throw error;
