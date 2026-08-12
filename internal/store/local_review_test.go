@@ -22,13 +22,13 @@ func TestLocalReviewSavesExplicitDecisionAndEnforcesForeignKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := db.db.Exec(`
-		INSERT INTO local_dup_groups(group_id,run_id,generation,category,verdict,created_at)
-		VALUES ('group-1',?,?, 'exact','duplicate',1)`, run.RunID, run.Generation); err != nil {
+		INSERT INTO local_dup_groups(group_id,machine_id,run_id,generation,category,verdict,created_at)
+		VALUES ('group-1','machine-a',?,?, 'exact','duplicate',1)`, run.RunID, run.Generation); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.db.Exec(`
-		INSERT INTO local_dup_members(group_id,run_id,generation,file_id,sha512,created_at)
-		VALUES ('group-1',?,?,?,'sha-a',1)`, run.RunID, run.Generation, fileID); err != nil {
+		INSERT INTO local_dup_members(group_id,machine_id,run_id,generation,file_id,sha512,created_at)
+		VALUES ('group-1','machine-a',?,?,?,'sha-a',1)`, run.RunID, run.Generation, fileID); err != nil {
 		t.Fatal(err)
 	}
 
@@ -76,11 +76,11 @@ func TestLocalDeleteAuditSchemaModelsFailureAndUncertainWithoutChangingFile(t *t
 		(batch_id,machine_id,confirmation_digest,status,created_at,updated_at)
 		VALUES ('batch-1','machine-a','confirm','failed',1,2);
 		INSERT INTO local_delete_items
-		(batch_id,file_id,path_snapshot,sha512,result,error_code,error_message,uncertain,created_at,updated_at)
-		VALUES ('batch-1',?1,'D:\\keep.jpg','sha-keep','failed','access_denied','denied',0,1,2);
+		(batch_id,machine_id,file_id,path_snapshot,sha512,result,error_code,error_message,uncertain,created_at,updated_at)
+		VALUES ('batch-1','machine-a',?1,'D:\\keep.jpg','sha-keep','failed','access_denied','denied',0,1,2);
 		INSERT INTO local_delete_items
-		(batch_id,file_id,path_snapshot,sha512,result,error_code,error_message,uncertain,created_at,updated_at)
-		VALUES ('batch-1',?1,'D:\\keep.jpg','sha-keep','uncertain','unknown','unknown result',1,1,2);`, fileID); err == nil {
+		(batch_id,machine_id,file_id,path_snapshot,sha512,result,error_code,error_message,uncertain,created_at,updated_at)
+		VALUES ('batch-1','machine-a',?1,'D:\\keep.jpg','sha-keep','uncertain','unknown','unknown result',1,1,2);`, fileID); err == nil {
 		t.Fatal("duplicate batch/file audit item was accepted")
 	}
 	var status string
@@ -92,8 +92,8 @@ func TestLocalDeleteAuditSchemaModelsFailureAndUncertainWithoutChangingFile(t *t
 	}
 	if _, err := db.db.Exec(`
 		INSERT INTO local_delete_items
-		(batch_id,file_id,path_snapshot,sha512,result,uncertain,created_at,updated_at)
-		VALUES ('missing',?,'D:\\keep.jpg','sha-keep','failed',0,1,1)`, fileID); err == nil {
+		(batch_id,machine_id,file_id,path_snapshot,sha512,result,uncertain,created_at,updated_at)
+		VALUES ('missing','machine-a',?,'D:\\keep.jpg','sha-keep','failed',0,1,1)`, fileID); err == nil {
 		t.Fatal("delete item without batch was accepted")
 	}
 }

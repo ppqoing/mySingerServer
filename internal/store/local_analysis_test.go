@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"testing"
 )
@@ -86,6 +87,52 @@ func TestLocalAnalysisPublishesOnlyCompleteRun(t *testing.T) {
 	}
 	if _, err := db.CurrentLocalAnalysis(context.Background(), "machine-a"); err != sql.ErrNoRows {
 		t.Fatalf("current error = %v, want sql.ErrNoRows", err)
+	}
+}
+
+func TestLocalAnalysisRejectsPublishingOlderGeneration(t *testing.T) {
+	db := openLocalTestDB(t)
+	ctx := context.Background()
+	createAnalysisTask(t, db, "task-1", "machine-a")
+	createAnalysisTask(t, db, "task-2", "machine-a")
+	first, err := db.BeginLocalAnalysis(ctx, "machine-a", "task-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := db.BeginLocalAnalysis(ctx, "machine-a", "task-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CompleteLocalAnalysis(ctx, first.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CompleteLocalAnalysis(ctx, second.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PublishLocalAnalysis(ctx, second.RunID); err != nil {
+		t.Fatalf("Publish newer generation: %v", err)
+	}
+
+	err = db.PublishLocalAnalysis(ctx, first.RunID)
+	if !errors.Is(err, ErrStaleLocalAnalysisGeneration) {
+		t.Fatalf("Publish older generation error = %v, want stable stale_generation", err)
+	}
+	current, err := db.CurrentLocalAnalysis(ctx, "machine-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.RunID != second.RunID || current.Generation != second.Generation {
+		t.Fatalf("current = %#v, want generation 2 %#v", current, second)
+	}
+	var firstStatus, secondStatus string
+	if err := db.db.QueryRow(`SELECT status FROM local_analysis_runs WHERE run_id=?`, first.RunID).Scan(&firstStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.db.QueryRow(`SELECT status FROM local_analysis_runs WHERE run_id=?`, second.RunID).Scan(&secondStatus); err != nil {
+		t.Fatal(err)
+	}
+	if firstStatus != "complete" || secondStatus != "published" {
+		t.Fatalf("statuses after stale publish = %q/%q, want complete/published", firstStatus, secondStatus)
 	}
 }
 
@@ -174,4 +221,130 @@ func TestLocalAnalysisCurrentPairsAreMachineScopedStableAndCapped(t *testing.T) 
 	if len(bPage) != 1 || bPage[0].MachineID != "machine-b" || bPage[0].RunID != runB.RunID {
 		t.Fatalf("machine-b page = %#v", bPage)
 	}
+}
+
+func TestLocalSchemaRejectsCrossMachineOwnership(t *testing.T) {
+	t.Run("task to run", func(t *testing.T) {
+		db := openLocalTestDB(t)
+		createAnalysisTask(t, db, "task-a", "machine-a")
+		_, err := db.db.Exec(`
+			INSERT INTO local_analysis_runs(run_id,machine_id,generation,task_id,status,created_at)
+			VALUES ('cross-run','machine-b',1,'task-a','building',1)`)
+		if err == nil {
+			t.Fatal("run owned by a different machine than its task was accepted")
+		}
+	})
+
+	t.Run("pair to file", func(t *testing.T) {
+		db := openLocalTestDB(t)
+		run := createLocalRunFixture(t, db, "pair")
+		leftID := insertLocalFileFixture(t, db, "machine-a", "left", "sha-left")
+		rightID := insertLocalFileFixture(t, db, "machine-b", "right", "sha-right")
+		_, err := db.db.Exec(`
+			INSERT INTO local_pair_scores
+			(machine_id,run_id,generation,pair_key,left_file_id,right_file_id,left_sha512,right_sha512,stage1_json,created_at,updated_at)
+			VALUES ('machine-a',?,?, 'cross',?,?,'sha-left','sha-right','{}',1,1)`,
+			run.RunID, run.Generation, leftID, rightID)
+		if err == nil {
+			t.Fatal("pair referencing a file from another machine was accepted")
+		}
+	})
+
+	t.Run("member to file", func(t *testing.T) {
+		db := openLocalTestDB(t)
+		run := createLocalRunFixture(t, db, "member")
+		insertLocalGroupFixture(t, db, run, "group-member")
+		fileID := insertLocalFileFixture(t, db, "machine-b", "member", "sha-member")
+		err := insertLocalMemberFixture(t, db, run, "group-member", "machine-a", fileID, "sha-member")
+		if err == nil {
+			t.Fatal("group member referencing a file from another machine was accepted")
+		}
+	})
+
+	t.Run("review to member", func(t *testing.T) {
+		db := openLocalTestDB(t)
+		run := createLocalRunFixture(t, db, "review")
+		insertLocalGroupFixture(t, db, run, "group-review")
+		fileID := insertLocalFileFixture(t, db, "machine-b", "review", "sha-review")
+		if _, err := db.db.Exec(`PRAGMA foreign_keys=OFF`); err != nil {
+			t.Fatal(err)
+		}
+		memberMachine := "machine-b"
+		if err := insertLocalMemberFixture(t, db, run, "group-review", memberMachine, fileID, "sha-review"); err != nil {
+			t.Fatalf("insert controlled invalid member with foreign keys disabled: %v", err)
+		}
+		if _, err := db.db.Exec(`PRAGMA foreign_keys=ON`); err != nil {
+			t.Fatal(err)
+		}
+		_, err := db.db.Exec(`
+			INSERT INTO local_reviews
+			(review_id,machine_id,run_id,generation,group_id,file_id,decision,reviewer,reviewed_at)
+			VALUES ('cross-review','machine-a',?,?, 'group-review',?,'keep','tester',1)`,
+			run.RunID, run.Generation, fileID)
+		if err == nil {
+			t.Fatal("review referencing a member from another machine was accepted")
+		}
+	})
+
+	t.Run("delete item to file", func(t *testing.T) {
+		db := openLocalTestDB(t)
+		fileID := insertLocalFileFixture(t, db, "machine-b", "delete", "sha-delete")
+		if _, err := db.db.Exec(`
+			INSERT INTO local_delete_batches
+			(batch_id,machine_id,confirmation_digest,status,requested_count,created_at,updated_at)
+			VALUES ('batch-a','machine-a','digest','pending',1,1,1)`); err != nil {
+			t.Fatal(err)
+		}
+		_, err := db.db.Exec(`
+			INSERT INTO local_delete_items
+			(batch_id,machine_id,file_id,path_snapshot,sha512,result,created_at,updated_at)
+			VALUES ('batch-a','machine-a',?,'D:\\cross.jpg','sha-delete','pending',1,1)`, fileID)
+		if err == nil {
+			t.Fatal("delete item referencing a file from another machine was accepted")
+		}
+	})
+}
+
+func createLocalRunFixture(t *testing.T, db *DB, suffix string) LocalAnalysisRun {
+	t.Helper()
+	taskID := "task-" + suffix
+	createAnalysisTask(t, db, taskID, "machine-a")
+	run, err := db.BeginLocalAnalysis(context.Background(), "machine-a", taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return run
+}
+
+func insertLocalFileFixture(t *testing.T, db *DB, machineID, suffix, sha string) int64 {
+	t.Helper()
+	result, err := db.db.Exec(`
+		INSERT INTO files(machine_id,path,sha512,status)
+		VALUES (?,? ,?,'done')`, machineID, `D:\\`+suffix+`.jpg`, sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func insertLocalGroupFixture(t *testing.T, db *DB, run LocalAnalysisRun, groupID string) {
+	t.Helper()
+	_, err := db.db.Exec(`
+		INSERT INTO local_dup_groups(group_id,machine_id,run_id,generation,category,verdict,created_at)
+		VALUES (?,'machine-a',?,?,'exact','duplicate',1)`, groupID, run.RunID, run.Generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func insertLocalMemberFixture(t *testing.T, db *DB, run LocalAnalysisRun, groupID, machineID string, fileID int64, sha string) error {
+	t.Helper()
+	_, err := db.db.Exec(`
+		INSERT INTO local_dup_members(group_id,machine_id,run_id,generation,file_id,sha512,created_at)
+		VALUES (?,?,?,?,?,?,1)`, groupID, machineID, run.RunID, run.Generation, fileID, sha)
+	return err
 }

@@ -25,6 +25,8 @@ CREATE TABLE IF NOT EXISTS files (
 CREATE INDEX IF NOT EXISTS idx_files_sha512      ON files (sha512);
 CREATE INDEX IF NOT EXISTS idx_files_status      ON files (status);
 CREATE INDEX IF NOT EXISTS idx_files_disk_status ON files (disk_no, status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_files_machine_id
+    ON files (machine_id, id);
 
 CREATE TABLE IF NOT EXISTS image_features (
     sha512       TEXT PRIMARY KEY,
@@ -83,6 +85,7 @@ CREATE TABLE IF NOT EXISTS local_tasks (
     updated_at         INTEGER NOT NULL,
     started_at         INTEGER,
     completed_at       INTEGER,
+    UNIQUE (machine_id, task_id),
     CHECK (progress_total = 0 OR progress_completed <= progress_total)
 );
 CREATE INDEX IF NOT EXISTS idx_local_tasks_machine_status
@@ -100,13 +103,16 @@ CREATE TABLE IF NOT EXISTS local_analysis_runs (
     UNIQUE (machine_id, generation),
     UNIQUE (machine_id, run_id),
     UNIQUE (run_id, generation),
-    FOREIGN KEY (task_id) REFERENCES local_tasks(task_id) ON DELETE RESTRICT
+    UNIQUE (machine_id, run_id, generation),
+    FOREIGN KEY (machine_id, task_id)
+        REFERENCES local_tasks(machine_id, task_id) ON DELETE RESTRICT
 );
 CREATE INDEX IF NOT EXISTS idx_local_analysis_machine_status
     ON local_analysis_runs (machine_id, status, generation);
 
 CREATE TABLE IF NOT EXISTS local_pair_scores (
     pair_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    machine_id       TEXT    NOT NULL,
     run_id           TEXT    NOT NULL,
     generation       INTEGER NOT NULL CHECK (generation > 0),
     pair_key         TEXT    NOT NULL,
@@ -123,10 +129,12 @@ CREATE TABLE IF NOT EXISTS local_pair_scores (
     updated_at       INTEGER NOT NULL,
     UNIQUE (run_id, pair_key),
     CHECK (left_file_id <> right_file_id),
-    FOREIGN KEY (run_id, generation)
-        REFERENCES local_analysis_runs(run_id, generation) ON DELETE RESTRICT,
-    FOREIGN KEY (left_file_id) REFERENCES files(id) ON DELETE RESTRICT,
-    FOREIGN KEY (right_file_id) REFERENCES files(id) ON DELETE RESTRICT
+    FOREIGN KEY (machine_id, run_id, generation)
+        REFERENCES local_analysis_runs(machine_id, run_id, generation) ON DELETE RESTRICT,
+    FOREIGN KEY (machine_id, left_file_id)
+        REFERENCES files(machine_id, id) ON DELETE RESTRICT,
+    FOREIGN KEY (machine_id, right_file_id)
+        REFERENCES files(machine_id, id) ON DELETE RESTRICT
 );
 CREATE INDEX IF NOT EXISTS idx_local_pair_scores_run_order
     ON local_pair_scores (run_id, generation, pair_key, pair_id);
@@ -135,31 +143,36 @@ CREATE INDEX IF NOT EXISTS idx_local_pair_scores_sha
 
 CREATE TABLE IF NOT EXISTS local_dup_groups (
     group_id    TEXT    PRIMARY KEY,
+    machine_id  TEXT    NOT NULL,
     run_id      TEXT    NOT NULL,
     generation  INTEGER NOT NULL CHECK (generation > 0),
     category    TEXT    NOT NULL CHECK (category IN ('exact','image','video','uncertain')),
     verdict     TEXT    NOT NULL CHECK (verdict IN ('duplicate','not_duplicate','uncertain')),
     created_at  INTEGER NOT NULL,
     UNIQUE (run_id, group_id),
-    FOREIGN KEY (run_id, generation)
-        REFERENCES local_analysis_runs(run_id, generation) ON DELETE RESTRICT
+    UNIQUE (machine_id, run_id, group_id),
+    FOREIGN KEY (machine_id, run_id, generation)
+        REFERENCES local_analysis_runs(machine_id, run_id, generation) ON DELETE RESTRICT
 );
 CREATE INDEX IF NOT EXISTS idx_local_dup_groups_run
     ON local_dup_groups (run_id, generation, group_id);
 
 CREATE TABLE IF NOT EXISTS local_dup_members (
     group_id    TEXT    NOT NULL,
+    machine_id  TEXT    NOT NULL,
     run_id      TEXT    NOT NULL,
     generation  INTEGER NOT NULL CHECK (generation > 0),
     file_id     INTEGER NOT NULL,
     sha512      TEXT    NOT NULL,
     created_at  INTEGER NOT NULL,
     PRIMARY KEY (group_id, file_id),
-    FOREIGN KEY (run_id, group_id)
-        REFERENCES local_dup_groups(run_id, group_id) ON DELETE RESTRICT,
-    FOREIGN KEY (run_id, generation)
-        REFERENCES local_analysis_runs(run_id, generation) ON DELETE RESTRICT,
-    FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE RESTRICT
+    UNIQUE (machine_id, group_id, file_id),
+    FOREIGN KEY (machine_id, run_id, group_id)
+        REFERENCES local_dup_groups(machine_id, run_id, group_id) ON DELETE RESTRICT,
+    FOREIGN KEY (machine_id, run_id, generation)
+        REFERENCES local_analysis_runs(machine_id, run_id, generation) ON DELETE RESTRICT,
+    FOREIGN KEY (machine_id, file_id)
+        REFERENCES files(machine_id, id) ON DELETE RESTRICT
 );
 CREATE INDEX IF NOT EXISTS idx_local_dup_members_run
     ON local_dup_members (run_id, generation, group_id, file_id);
@@ -187,12 +200,12 @@ CREATE TABLE IF NOT EXISTS local_reviews (
     note       TEXT    NOT NULL DEFAULT '',
     reviewed_at INTEGER NOT NULL,
     UNIQUE (run_id, group_id, file_id),
-    FOREIGN KEY (machine_id, run_id)
-        REFERENCES local_analysis_runs(machine_id, run_id) ON DELETE RESTRICT,
-    FOREIGN KEY (run_id, group_id)
-        REFERENCES local_dup_groups(run_id, group_id) ON DELETE RESTRICT,
-    FOREIGN KEY (group_id, file_id)
-        REFERENCES local_dup_members(group_id, file_id) ON DELETE RESTRICT
+    FOREIGN KEY (machine_id, run_id, generation)
+        REFERENCES local_analysis_runs(machine_id, run_id, generation) ON DELETE RESTRICT,
+    FOREIGN KEY (machine_id, run_id, group_id)
+        REFERENCES local_dup_groups(machine_id, run_id, group_id) ON DELETE RESTRICT,
+    FOREIGN KEY (machine_id, group_id, file_id)
+        REFERENCES local_dup_members(machine_id, group_id, file_id) ON DELETE RESTRICT
 );
 CREATE INDEX IF NOT EXISTS idx_local_reviews_run
     ON local_reviews (run_id, group_id, file_id);
@@ -211,6 +224,7 @@ CREATE TABLE IF NOT EXISTS local_delete_batches (
     created_at           INTEGER NOT NULL,
     updated_at           INTEGER NOT NULL,
     completed_at         INTEGER,
+    UNIQUE (machine_id, batch_id),
     FOREIGN KEY (machine_id, run_id)
         REFERENCES local_analysis_runs(machine_id, run_id) ON DELETE RESTRICT,
     CHECK (succeeded_count + failed_count + uncertain_count <= requested_count)
@@ -221,6 +235,7 @@ CREATE INDEX IF NOT EXISTS idx_local_delete_batches_machine
 CREATE TABLE IF NOT EXISTS local_delete_items (
     item_id        INTEGER PRIMARY KEY AUTOINCREMENT,
     batch_id       TEXT    NOT NULL,
+    machine_id     TEXT    NOT NULL,
     file_id        INTEGER NOT NULL,
     path_snapshot  TEXT    NOT NULL,
     sha512         TEXT    NOT NULL,
@@ -232,8 +247,10 @@ CREATE TABLE IF NOT EXISTS local_delete_items (
     updated_at     INTEGER NOT NULL,
     completed_at   INTEGER,
     UNIQUE (batch_id, file_id),
-    FOREIGN KEY (batch_id) REFERENCES local_delete_batches(batch_id) ON DELETE RESTRICT,
-    FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE RESTRICT,
+    FOREIGN KEY (machine_id, batch_id)
+        REFERENCES local_delete_batches(machine_id, batch_id) ON DELETE RESTRICT,
+    FOREIGN KEY (machine_id, file_id)
+        REFERENCES files(machine_id, id) ON DELETE RESTRICT,
     CHECK ((result = 'uncertain' AND uncertain = 1) OR
            (result <> 'uncertain' AND uncertain = 0))
 );

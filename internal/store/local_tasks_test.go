@@ -6,6 +6,8 @@ import (
 	"errors"
 	"path/filepath"
 	"reflect"
+	"sort"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -53,10 +55,13 @@ func TestLocalMigrationNewAndLegacyDatabasesHaveSameSchema(t *testing.T) {
 	}
 	defer upgraded.Close()
 
-	wantTables := []string{
-		"local_analysis_runs", "local_current_analysis", "local_delete_batches",
-		"local_delete_items", "local_dup_groups", "local_dup_members",
-		"local_outbox", "local_pair_scores", "local_reviews", "local_tasks",
+	newSchema := normalizedLocalSchema(t, newDB)
+	upgradedSchema := normalizedLocalSchema(t, upgraded)
+	if !reflect.DeepEqual(upgradedSchema, newSchema) {
+		t.Fatalf("upgraded local sqlite_schema differs from new schema\nnew: %#v\nupgraded: %#v", newSchema, upgradedSchema)
+	}
+	if len(newSchema) < 20 {
+		t.Fatalf("local sqlite_schema has only %d objects, indexes were not included", len(newSchema))
 	}
 	for label, db := range map[string]*DB{"new": newDB, "upgraded": upgraded} {
 		var version int
@@ -66,29 +71,194 @@ func TestLocalMigrationNewAndLegacyDatabasesHaveSameSchema(t *testing.T) {
 		if version != localSchemaVersion {
 			t.Fatalf("%s user_version = %d, want %d", label, version, localSchemaVersion)
 		}
-		rows, err := db.db.Query(`
-			SELECT name FROM sqlite_schema
-			WHERE type='table' AND name LIKE 'local_%'
-			ORDER BY name`)
+		for _, check := range []struct {
+			table  string
+			column string
+		}{
+			{"local_pair_scores", "machine_id"},
+			{"local_dup_groups", "machine_id"},
+			{"local_dup_members", "machine_id"},
+			{"local_delete_items", "machine_id"},
+		} {
+			if !pragmaColumnNotNull(t, db, check.table, check.column) {
+				t.Fatalf("%s %s.%s is absent or nullable", label, check.table, check.column)
+			}
+		}
+		for table, want := range map[string][]string{
+			"local_analysis_runs": {
+				"local_tasks:machine_id->machine_id", "local_tasks:task_id->task_id",
+			},
+			"local_pair_scores": {
+				"files:machine_id->machine_id", "files:left_file_id->id",
+				"files:machine_id->machine_id", "files:right_file_id->id",
+				"local_analysis_runs:machine_id->machine_id", "local_analysis_runs:run_id->run_id",
+				"local_analysis_runs:generation->generation",
+			},
+			"local_reviews": {
+				"local_analysis_runs:machine_id->machine_id", "local_analysis_runs:run_id->run_id",
+				"local_analysis_runs:generation->generation",
+				"local_dup_groups:machine_id->machine_id", "local_dup_groups:run_id->run_id",
+				"local_dup_groups:group_id->group_id",
+				"local_dup_members:machine_id->machine_id", "local_dup_members:group_id->group_id",
+				"local_dup_members:file_id->file_id",
+			},
+			"local_delete_items": {
+				"files:machine_id->machine_id", "files:file_id->id",
+				"local_delete_batches:machine_id->machine_id", "local_delete_batches:batch_id->batch_id",
+			},
+		} {
+			got := pragmaForeignKeyMappings(t, db, table)
+			sort.Strings(want)
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("%s foreign keys for %s = %v, want %v", label, table, got, want)
+			}
+		}
+		if !pragmaHasUniqueIndex(t, db, "files", []string{"machine_id", "id"}) {
+			t.Fatalf("%s files lacks UNIQUE(machine_id,id)", label)
+		}
+		if !pragmaHasIndex(t, db, "local_outbox", "idx_local_outbox_pending") {
+			t.Fatalf("%s local_outbox pending index missing", label)
+		}
+		if _, err := db.db.Exec(`
+			INSERT INTO local_outbox(topic,entity_key,generation,payload_json,created_at,updated_at)
+			VALUES ('bad','bad',1,'{broken',1,1)`); err == nil {
+			t.Fatalf("%s malformed JSON bypassed CHECK", label)
+		}
+	}
+}
+
+type localSchemaObject struct {
+	Type  string
+	Name  string
+	Table string
+	SQL   string
+}
+
+func normalizedLocalSchema(t *testing.T, db *DB) []localSchemaObject {
+	t.Helper()
+	rows, err := db.db.Query(`
+		SELECT type,name,tbl_name,sql
+		FROM sqlite_schema
+		WHERE name LIKE 'local_%' OR tbl_name LIKE 'local_%' OR name='idx_files_machine_id'
+		ORDER BY type,name,tbl_name`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var result []localSchemaObject
+	for rows.Next() {
+		var object localSchemaObject
+		var sqlText sql.NullString
+		if err := rows.Scan(&object.Type, &object.Name, &object.Table, &sqlText); err != nil {
+			t.Fatal(err)
+		}
+		if sqlText.Valid {
+			object.SQL = strings.Join(strings.Fields(sqlText.String), " ")
+		}
+		result = append(result, object)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+func pragmaColumnNotNull(t *testing.T, db *DB, table, column string) bool {
+	t.Helper()
+	var notNull int
+	err := db.db.QueryRow(`SELECT "notnull" FROM pragma_table_info(?) WHERE name=?`, table, column).Scan(&notNull)
+	if err == sql.ErrNoRows {
+		return false
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return notNull == 1
+}
+
+func pragmaForeignKeyMappings(t *testing.T, db *DB, table string) []string {
+	t.Helper()
+	rows, err := db.db.Query(`SELECT "table","from","to" FROM pragma_foreign_key_list(?)`, table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var result []string
+	for rows.Next() {
+		var parent, from, to string
+		if err := rows.Scan(&parent, &from, &to); err != nil {
+			t.Fatal(err)
+		}
+		result = append(result, parent+":"+from+"->"+to)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func pragmaHasUniqueIndex(t *testing.T, db *DB, table string, want []string) bool {
+	t.Helper()
+	rows, err := db.db.Query(`SELECT name,"unique" FROM pragma_index_list(?)`, table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var uniqueNames []string
+	for rows.Next() {
+		var name string
+		var unique int
+		if err := rows.Scan(&name, &unique); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		if unique == 1 {
+			uniqueNames = append(uniqueNames, name)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		t.Fatal(err)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range uniqueNames {
+		columns, err := pragmaIndexColumns(db, name)
 		if err != nil {
 			t.Fatal(err)
 		}
-		var got []string
-		for rows.Next() {
-			var name string
-			if err := rows.Scan(&name); err != nil {
-				rows.Close()
-				t.Fatal(err)
-			}
-			got = append(got, name)
-		}
-		if err := rows.Close(); err != nil {
-			t.Fatal(err)
-		}
-		if !reflect.DeepEqual(got, wantTables) {
-			t.Fatalf("%s local tables = %v, want %v", label, got, wantTables)
+		if reflect.DeepEqual(columns, want) {
+			return true
 		}
 	}
+	return false
+}
+
+func pragmaHasIndex(t *testing.T, db *DB, table, wantName string) bool {
+	t.Helper()
+	var count int
+	if err := db.db.QueryRow(`SELECT count(*) FROM pragma_index_list(?) WHERE name=?`, table, wantName).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	return count == 1
+}
+
+func pragmaIndexColumns(db *DB, index string) ([]string, error) {
+	rows, err := db.db.Query(`SELECT name FROM pragma_index_info(?) ORDER BY seqno`, index)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		result = append(result, name)
+	}
+	return result, rows.Err()
 }
 
 func TestLocalTaskConcurrentCreateIsIdempotentAndConflictsOnEnvelope(t *testing.T) {

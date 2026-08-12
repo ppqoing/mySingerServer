@@ -6,11 +6,14 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 )
 
 const MaxLocalPageSize = 200
+
+var ErrStaleLocalAnalysisGeneration = errors.New("stale_generation")
 
 type LocalAnalysisRun struct {
 	RunID       string
@@ -191,13 +194,22 @@ func (d *DB) PublishLocalAnalysis(ctx context.Context, runID string) error {
 		WHERE run_id=?1 AND status='complete'`, runID, now); err != nil {
 		return fmt.Errorf("store: mark local analysis published: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `
+	result, err := tx.ExecContext(ctx, `
 		INSERT INTO local_current_analysis(machine_id,run_id,generation,published_at)
 		VALUES (?1,?2,?3,?4)
 		ON CONFLICT(machine_id) DO UPDATE SET
-			run_id=excluded.run_id,generation=excluded.generation,published_at=excluded.published_at`,
-		machineID, runID, generation, now); err != nil {
+			run_id=excluded.run_id,generation=excluded.generation,published_at=excluded.published_at
+		WHERE excluded.generation > local_current_analysis.generation`,
+		machineID, runID, generation, now)
+	if err != nil {
 		return fmt.Errorf("store: switch local current analysis: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: inspect local current switch: %w", err)
+	}
+	if changed != 1 {
+		return fmt.Errorf("%w: machine %s generation %d", ErrStaleLocalAnalysisGeneration, machineID, generation)
 	}
 	return tx.Commit()
 }
@@ -247,9 +259,9 @@ func (d *DB) SaveLocalPairScore(ctx context.Context, pair LocalPairScore) error 
 	now := time.Now().UnixMilli()
 	result, err := d.db.ExecContext(ctx, `
 		INSERT INTO local_pair_scores
-			(run_id,generation,pair_key,left_file_id,right_file_id,left_sha512,right_sha512,
+			(machine_id,run_id,generation,pair_key,left_file_id,right_file_id,left_sha512,right_sha512,
 			 stage1_json,stage2_json,stage3_json,final_verdict,created_at,updated_at)
-		SELECT r.run_id,r.generation,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?11
+		SELECT r.machine_id,r.run_id,r.generation,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?11
 		FROM local_analysis_runs r
 		JOIN files lf ON lf.id=?3 AND lf.machine_id=r.machine_id AND lf.sha512=?5
 		JOIN files rf ON rf.id=?4 AND rf.machine_id=r.machine_id AND rf.sha512=?6
@@ -289,12 +301,12 @@ func (d *DB) ListCurrentLocalPairScores(ctx context.Context, machineID string, o
 		limit = MaxLocalPageSize
 	}
 	rows, err := d.db.QueryContext(ctx, `
-		SELECT p.pair_id,c.machine_id,p.run_id,p.generation,p.pair_key,
+		SELECT p.pair_id,p.machine_id,p.run_id,p.generation,p.pair_key,
 		       p.left_file_id,p.right_file_id,p.left_sha512,p.right_sha512,
 		       p.stage1_json,p.stage2_json,p.stage3_json,p.final_verdict
 		FROM local_current_analysis c
 		JOIN local_pair_scores p ON p.run_id=c.run_id AND p.generation=c.generation
-		WHERE c.machine_id=?1
+		WHERE c.machine_id=?1 AND p.machine_id=c.machine_id
 		ORDER BY p.pair_key,p.pair_id
 		LIMIT ?2 OFFSET ?3`, machineID, limit, offset)
 	if err != nil {
