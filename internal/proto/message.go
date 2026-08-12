@@ -163,12 +163,15 @@ func (item Phase2Item) validateForStage(stage uint8) error {
 	if item.FrameMask&^FrameMaskFull != 0 {
 		return fmt.Errorf("proto: phase2 item frame_mask uses bits outside six frames")
 	}
+	if stage == ScreenStageLegacy && (item.FieldsMask == 0 || item.FieldsMask&^(FieldPHashParts|FieldSobelHist|FieldVideo6F) != 0) {
+		return fmt.Errorf("proto: phase2 item fields_mask must contain only phase-2 fields")
+	}
 	switch item.Kind {
 	case KindImage:
 		switch stage {
 		case ScreenStageLegacy:
-			if item.FieldsMask == 0 || item.FieldsMask&^(FieldPHashParts|FieldSobelHist) != 0 {
-				return fmt.Errorf("proto: legacy image phase2 item must request image fields")
+			if item.FieldsMask&FieldVideo6F != 0 {
+				return fmt.Errorf("proto: image phase2 item cannot request video frames")
 			}
 		case ScreenStageTwo:
 			if item.FieldsMask != FieldPHashParts {
@@ -194,6 +197,9 @@ func (item Phase2Item) validateForStage(stage uint8) error {
 			return fmt.Errorf("proto: phase2 stage %d is invalid", stage)
 		}
 		if item.FieldsMask != expected {
+			if stage == ScreenStageLegacy {
+				return fmt.Errorf("proto: video phase2 item must request video frames")
+			}
 			return fmt.Errorf("proto: video phase2 item must request fields for stage %d", stage)
 		}
 		if item.DurationMS <= 0 {
