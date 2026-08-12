@@ -1,6 +1,7 @@
 package localanalysis
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -9,6 +10,7 @@ import (
 	"sort"
 
 	"dedup/internal/config"
+	"dedup/internal/features"
 	"dedup/internal/firstscreen"
 	"dedup/internal/phase2"
 	"dedup/internal/proto"
@@ -87,8 +89,14 @@ func (e *Engine) Run(ctx context.Context, taskID string) error {
 			return filesBySHA[sha][i].ID < filesBySHA[sha][j].ID
 		})
 	}
-	decisions := make([]PairDecision, 0, len(result.CandidatePairs))
-	stage2Count, stage3Count := 0, 0
+	type stagedPair struct {
+		category  string
+		kind      worker.MediaKind
+		left      firstscreen.File
+		right     firstscreen.File
+		persisted store.LocalPairScore
+	}
+	stage2Passed := make([]stagedPair, 0, len(result.CandidatePairs))
 	for _, pair := range result.CandidatePairs {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -111,39 +119,53 @@ func (e *Engine) Run(ctx context.Context, taskID string) error {
 			return err
 		}
 		stage2 := judgeResult(kind, worker.ScreenStageTwo, left2, right2, e.cfg)
-		stage2Count++
-		stage1JSON, _ := json.Marshal(map[string]any{"kind": pair.Kind, "hamming": pair.Hamming, "quality_a": pair.QualityA, "quality_b": pair.QualityB, "duration_diff_ms": pair.DurationDiffMs})
-		stage2JSON, _ := json.Marshal(stage2)
-		localPair := store.LocalPairScore{RunID: run.RunID, PairKey: pairKey(pair), LeftFileID: leftFiles[0].ID, RightFileID: rightFiles[0].ID, LeftSHA512: hex.EncodeToString(pair.ShaA[:]), RightSHA512: hex.EncodeToString(pair.ShaB[:]), Stage1JSON: string(stage1JSON), Stage2JSON: stringPointer(string(stage2JSON)), Verdict: "undecided"}
-		if stage2.Verdict != phase2.VerdictYes {
-			localPair.Verdict = localVerdict(stage2.Verdict)
-			if err := e.store.SaveLocalPairScore(ctx, localPair); err != nil {
-				return fmt.Errorf("localanalysis: save stage two: %w", err)
-			}
-			continue
+		stage1JSON, err := json.Marshal(map[string]any{"kind": pair.Kind, "hamming": pair.Hamming, "quality_a": pair.QualityA, "quality_b": pair.QualityB, "duration_diff_ms": pair.DurationDiffMs})
+		if err != nil {
+			return fmt.Errorf("localanalysis: marshal stage one: %w", err)
 		}
-		left3, err := e.compute(ctx, run.TaskID, leftFiles[0], kind, worker.ScreenStageThree)
+		stage2JSON, err := json.Marshal(stage2)
+		if err != nil {
+			return fmt.Errorf("localanalysis: marshal stage two: %w", err)
+		}
+		localPair := store.LocalPairScore{RunID: run.RunID, PairKey: pairKey(pair), LeftFileID: leftFiles[0].ID, RightFileID: rightFiles[0].ID, LeftSHA512: hex.EncodeToString(pair.ShaA[:]), RightSHA512: hex.EncodeToString(pair.ShaB[:]), Stage1JSON: string(stage1JSON), Stage2JSON: stringPointer(string(stage2JSON)), Verdict: localVerdict(stage2.Verdict)}
+		if err := e.store.SaveLocalPairScore(ctx, localPair); err != nil {
+			return fmt.Errorf("localanalysis: save stage two: %w", err)
+		}
+		if stage2.Verdict == phase2.VerdictYes {
+			stage2Passed = append(stage2Passed, stagedPair{category: category, kind: kind, left: leftFiles[0], right: rightFiles[0], persisted: localPair})
+		}
+	}
+	if err = e.event(ctx, run, "stage2", map[string]int{"pairs": len(result.CandidatePairs)}); err != nil {
+		return err
+	}
+
+	decisions := make([]PairDecision, 0, len(stage2Passed))
+	for _, staged := range stage2Passed {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		left3, err := e.compute(ctx, run.TaskID, staged.left, staged.kind, worker.ScreenStageThree)
 		if err != nil {
 			return err
 		}
-		right3, err := e.compute(ctx, run.TaskID, rightFiles[0], kind, worker.ScreenStageThree)
+		right3, err := e.compute(ctx, run.TaskID, staged.right, staged.kind, worker.ScreenStageThree)
 		if err != nil {
 			return err
 		}
-		stage3 := judgeResult(kind, worker.ScreenStageThree, left3, right3, e.cfg)
-		stage3Count++
-		stage3JSON, _ := json.Marshal(stage3)
+		stage3 := judgeResult(staged.kind, worker.ScreenStageThree, left3, right3, e.cfg)
+		stage3JSON, err := json.Marshal(stage3)
+		if err != nil {
+			return fmt.Errorf("localanalysis: marshal stage three: %w", err)
+		}
+		localPair := staged.persisted
 		localPair.Stage3JSON = stringPointer(string(stage3JSON))
 		localPair.Verdict = localVerdict(stage3.Verdict)
 		if err := e.store.SaveLocalPairScore(ctx, localPair); err != nil {
 			return fmt.Errorf("localanalysis: save stage three: %w", err)
 		}
-		decisions = append(decisions, PairDecision{Category: category, SHAA: localPair.LeftSHA512, SHAB: localPair.RightSHA512, Verdict: verdictText(stage3.Verdict)})
+		decisions = append(decisions, PairDecision{Category: staged.category, SHAA: localPair.LeftSHA512, SHAB: localPair.RightSHA512, Verdict: verdictText(stage3.Verdict)})
 	}
-	if err = e.event(ctx, run, "stage2", map[string]int{"pairs": stage2Count}); err != nil {
-		return err
-	}
-	if err = e.event(ctx, run, "stage3", map[string]int{"pairs": stage3Count}); err != nil {
+	if err = e.event(ctx, run, "stage3", map[string]int{"pairs": len(stage2Passed)}); err != nil {
 		return err
 	}
 	groupFiles := make([]GroupFile, 0, len(result.Files))
@@ -202,13 +224,85 @@ func (e *Engine) compute(ctx context.Context, taskID string, file firstscreen.Fi
 		}
 		return nil, fmt.Errorf("localanalysis: execute stage %d job: %s", stage, worker.RedactKnownPath(err.Error(), file.Path))
 	}
-	if result == nil || result.ScreenStage != stage || result.Source != worker.JobSourceLocal || result.Kind != kind {
+	if result == nil || job.JobID <= 0 || result.JobID != job.JobID || result.ScanTaskID != job.ScanTaskID ||
+		result.Path != job.Path || result.Kind != job.Kind || result.Phase != job.Phase ||
+		result.ScreenStage != job.ScreenStage || result.Source != job.Source ||
+		!bytes.Equal(result.SHA512, job.KnownSHA) {
 		return nil, fmt.Errorf("localanalysis: worker result identity mismatch")
 	}
 	if len(result.Errors) > 0 {
 		return nil, fmt.Errorf("localanalysis: worker stage %d failed", stage)
 	}
+	if err := validateStagePayload(job, result); err != nil {
+		return nil, fmt.Errorf("localanalysis: worker stage %d payload invalid", stage)
+	}
 	return result, nil
+}
+
+func validateStagePayload(job *worker.JobMsg, result *worker.JobResultMsg) error {
+	if result.FieldsDone != job.FieldsMask || result.FramesDone != job.FrameMask {
+		return fmt.Errorf("stage coverage mismatch")
+	}
+	switch job.Kind {
+	case worker.MediaImage:
+		if result.FramesDone != 0 || len(result.Frames) != 0 {
+			return fmt.Errorf("image contains video frames")
+		}
+		switch job.ScreenStage {
+		case worker.ScreenStageTwo:
+			if _, err := features.DecodePHashParts(result.PHashParts); err != nil || len(result.SobelHist) != 0 {
+				return fmt.Errorf("stage two image payload mismatch")
+			}
+		case worker.ScreenStageThree:
+			if _, err := features.DecodeSobelHist(result.SobelHist); err != nil || len(result.PHashParts) != 0 {
+				return fmt.Errorf("stage three image payload mismatch")
+			}
+		default:
+			return fmt.Errorf("invalid image stage")
+		}
+	case worker.MediaVideo:
+		if len(result.PHashParts) != 0 || len(result.SobelHist) != 0 {
+			return fmt.Errorf("video contains image payload")
+		}
+		seen := make(map[int]struct{}, len(result.Frames))
+		for _, frame := range result.Frames {
+			if frame.FrameIdx < 0 || frame.FrameIdx >= 6 || job.FrameMask&(1<<uint(frame.FrameIdx)) == 0 {
+				return fmt.Errorf("video frame identity mismatch")
+			}
+			if _, exists := seen[frame.FrameIdx]; exists {
+				return fmt.Errorf("duplicate video frame")
+			}
+			seen[frame.FrameIdx] = struct{}{}
+			if frame.Error != "" {
+				if len(frame.PDQ256) != 0 || frame.Quality != 0 || len(frame.PHashParts) != 0 || len(frame.SobelHist) != 0 {
+					return fmt.Errorf("errored video frame contains payload")
+				}
+				continue
+			}
+			switch job.ScreenStage {
+			case worker.ScreenStageTwo:
+				if _, err := features.DecodePHashParts(frame.PHashParts); err != nil || len(frame.SobelHist) != 0 || len(frame.PDQ256) != 0 || frame.Quality != 0 {
+					return fmt.Errorf("stage two video payload mismatch")
+				}
+			case worker.ScreenStageThree:
+				if _, err := features.DecodeSobelHist(frame.SobelHist); err != nil || len(frame.PHashParts) != 0 || len(frame.PDQ256) != 0 || frame.Quality != 0 {
+					return fmt.Errorf("stage three video payload mismatch")
+				}
+			default:
+				return fmt.Errorf("invalid video stage")
+			}
+		}
+		for index := 0; index < 6; index++ {
+			if job.FrameMask&(1<<uint(index)) != 0 {
+				if _, exists := seen[index]; !exists {
+					return fmt.Errorf("video frame missing")
+				}
+			}
+		}
+	default:
+		return fmt.Errorf("invalid media kind")
+	}
+	return nil
 }
 
 func judgeResult(kind worker.MediaKind, stage worker.ScreenStage, left, right *worker.JobResultMsg, cfg config.Phase2Config) phase2.StageScore {

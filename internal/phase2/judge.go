@@ -90,7 +90,7 @@ func judgeVideoStage(a, b []proto.FrameFeature, cfg Config, phash bool) StageSco
 	for index := 0; index < cfg.VideoFrames; index++ {
 		lf, lok := left[index]
 		rf, rok := right[index]
-		if !lok || !rok {
+		if !lok || !rok || lf.Error != "" || rf.Error != "" {
 			continue
 		}
 		score.ValidFrames++
@@ -166,6 +166,19 @@ const (
 	VerdictYes
 	VerdictInconclusive
 )
+
+func (verdict Verdict) MarshalJSON() ([]byte, error) {
+	switch verdict {
+	case VerdictNo:
+		return []byte(`"no"`), nil
+	case VerdictYes:
+		return []byte(`"yes"`), nil
+	case VerdictInconclusive:
+		return []byte(`"inconclusive"`), nil
+	default:
+		return nil, fmt.Errorf("phase2: invalid verdict %d", verdict)
+	}
+}
 
 // ImagePairScore contains every score used to judge an image pair.
 type ImagePairScore struct {

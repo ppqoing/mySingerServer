@@ -1,6 +1,7 @@
 package phase2
 
 import (
+	"encoding/json"
 	"math"
 	"testing"
 
@@ -8,6 +9,32 @@ import (
 	"dedup/internal/features"
 	"dedup/internal/proto"
 )
+
+func TestStageScoreJSONUsesStableVerdictTextAndReason(t *testing.T) {
+	raw, err := json.Marshal(StageScore{Verdict: VerdictYes, Reason: "sobel_passed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := json.Unmarshal(raw, &document); err != nil {
+		t.Fatal(err)
+	}
+	if document["verdict"] != "yes" || document["reason"] != "sobel_passed" {
+		t.Fatalf("stage JSON = %s, want textual yes and stable reason", raw)
+	}
+
+	for verdict, want := range map[Verdict]string{
+		VerdictNo: "no", VerdictYes: "yes", VerdictInconclusive: "inconclusive",
+	} {
+		raw, err := json.Marshal(verdict)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(raw) != `"`+want+`"` {
+			t.Fatalf("verdict %d JSON = %s, want %q", verdict, raw, want)
+		}
+	}
+}
 
 func TestJudgeImageStage2AndStage3AreIndependent(t *testing.T) {
 	a, b := partsWithPassCount(7)
@@ -39,6 +66,76 @@ func TestJudgeVideoStage3StableInconclusiveReason(t *testing.T) {
 	score := JudgeVideoStage3(frames, frames, validJudgeConfig())
 	if score.Verdict != VerdictInconclusive || score.Reason != "insufficient_valid_frames" {
 		t.Fatalf("stage 3 = %#v", score)
+	}
+}
+
+func TestJudgeVideoStagesExcludeExplicitErrorFramesFromValidCount(t *testing.T) {
+	pHash := features.EncodePHashParts([9]uint64{})
+	sobel, err := features.EncodeSobelHist(unitHist())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name  string
+		judge func([]proto.FrameFeature, []proto.FrameFeature, Config) StageScore
+		field func(int, bool) proto.FrameFeature
+	}{
+		{
+			name: "stage2", judge: JudgeVideoStage2,
+			field: func(index int, failed bool) proto.FrameFeature {
+				frame := proto.FrameFeature{FrameIdx: index, PHashParts: pHash}
+				if failed {
+					frame.PHashParts, frame.Error = nil, "decode_failed"
+				}
+				return frame
+			},
+		},
+		{
+			name: "stage3", judge: JudgeVideoStage3,
+			field: func(index int, failed bool) proto.FrameFeature {
+				frame := proto.FrameFeature{FrameIdx: index, SobelHist: sobel}
+				if failed {
+					frame.SobelHist, frame.Error = nil, "decode_failed"
+				}
+				return frame
+			},
+		},
+	} {
+		t.Run(test.name+" five healthy", func(t *testing.T) {
+			var left, right []proto.FrameFeature
+			for index := 0; index < 6; index++ {
+				left = append(left, test.field(index, index == 5))
+				right = append(right, test.field(index, false))
+			}
+			score := test.judge(left, right, validJudgeConfig())
+			if score.ValidFrames != 5 || score.Verdict != VerdictYes {
+				t.Fatalf("score = %#v, want five valid and yes", score)
+			}
+		})
+		t.Run(test.name+" three healthy", func(t *testing.T) {
+			var left, right []proto.FrameFeature
+			for index := 0; index < 6; index++ {
+				left = append(left, test.field(index, index >= 3))
+				right = append(right, test.field(index, false))
+			}
+			score := test.judge(left, right, validJudgeConfig())
+			if score.ValidFrames != 3 || score.Verdict != VerdictInconclusive || score.Reason != "insufficient_valid_frames" {
+				t.Fatalf("score = %#v, want three valid and stable inconclusive", score)
+			}
+		})
+		t.Run(test.name+" malformed without error", func(t *testing.T) {
+			left := []proto.FrameFeature{test.field(0, false)}
+			right := []proto.FrameFeature{test.field(0, false)}
+			if test.name == "stage2" {
+				left[0].PHashParts = []byte{1}
+			} else {
+				left[0].SobelHist = []byte{1}
+			}
+			score := test.judge(left, right, validJudgeConfig())
+			if score.Verdict != VerdictInconclusive || score.Reason == "insufficient_valid_frames" {
+				t.Fatalf("malformed payload score = %#v, want fail-closed payload reason", score)
+			}
+		})
 	}
 }
 
