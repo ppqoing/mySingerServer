@@ -13,6 +13,8 @@ import (
 	"dedup/internal/firstscreen"
 )
 
+const localFeatureSHABatchSize = 500
+
 func (d *DB) StreamActiveFiles(ctx context.Context, machineID string, visit func(firstscreen.File) error) error {
 	if machineID == "" {
 		return fmt.Errorf("store: stream active candidates: empty machine ID")
@@ -46,60 +48,79 @@ func (d *DB) StreamActiveFiles(ctx context.Context, machineID string, visit func
 
 func (d *DB) LoadImageFeatures(ctx context.Context, shas []string) (map[string]firstscreen.ImageFeature, error) {
 	result := make(map[string]firstscreen.ImageFeature)
-	if len(shas) == 0 {
-		return result, nil
-	}
-	rows, err := d.db.QueryContext(ctx, `
-		SELECT sha512,width,height,pdq256,pdq_quality FROM image_features
-		WHERE sha512 IN (`+sqlPlaceholders(len(shas))+`)`, stringsToAny(shas)...)
-	if err != nil {
-		return nil, fmt.Errorf("store: query local image features: %w", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var text string
-		var width, height, quality int
-		var pdqBytes []byte
-		if err := rows.Scan(&text, &width, &height, &pdqBytes, &quality); err != nil {
-			return nil, fmt.Errorf("store: scan local image feature: %w", err)
+	for start := 0; start < len(shas); start += localFeatureSHABatchSize {
+		end := min(start+localFeatureSHABatchSize, len(shas))
+		rows, err := d.db.QueryContext(ctx, `
+			SELECT sha512,width,height,pdq256,pdq_quality FROM image_features
+			WHERE sha512 IN (`+sqlPlaceholders(end-start)+`)`, stringsToAny(shas[start:end])...)
+		if err != nil {
+			return nil, fmt.Errorf("store: query local image features: %w", err)
 		}
-		sha, shaOK := firstscreenSHA(text)
-		pdq, pdqOK := firstscreenPDQ(pdqBytes)
-		if !shaOK || !pdqOK || width <= 0 || height <= 0 || quality < 0 || quality > 100 {
-			continue
+		for rows.Next() {
+			var text string
+			var width, height, quality int
+			var pdqBytes []byte
+			if err := rows.Scan(&text, &width, &height, &pdqBytes, &quality); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("store: scan local image feature: %w", err)
+			}
+			sha, shaOK := firstscreenSHA(text)
+			pdq, pdqOK := firstscreenPDQ(pdqBytes)
+			if !shaOK || !pdqOK {
+				continue
+			}
+			result[text] = firstscreen.ImageFeature{SHA512: sha, PDQ: pdq, Quality: quality, Width: width, Height: height}
 		}
-		result[text] = firstscreen.ImageFeature{SHA512: sha, PDQ: pdq, Quality: quality, Width: width, Height: height}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
 	}
-	return result, rows.Err()
+	return result, nil
 }
 
 func (d *DB) LoadVideoFeatures(ctx context.Context, shas []string) (map[string]firstscreen.VideoFeature, error) {
 	result := make(map[string]firstscreen.VideoFeature)
-	if len(shas) == 0 {
-		return result, nil
-	}
-	rows, err := d.db.QueryContext(ctx, `
-		SELECT sha512,duration_ms,thumb_path,thumb_pdq256,thumb_quality,thumb_width,thumb_height
-		FROM video_features WHERE sha512 IN (`+sqlPlaceholders(len(shas))+`)`, stringsToAny(shas)...)
-	if err != nil {
-		return nil, fmt.Errorf("store: query local video features: %w", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var text, path sql.NullString
-		var duration, quality, width, height sql.NullInt64
-		var pdqBytes []byte
-		if err := rows.Scan(&text, &duration, &path, &pdqBytes, &quality, &width, &height); err != nil {
-			return nil, fmt.Errorf("store: scan local video feature: %w", err)
+	for start := 0; start < len(shas); start += localFeatureSHABatchSize {
+		end := min(start+localFeatureSHABatchSize, len(shas))
+		rows, err := d.db.QueryContext(ctx, `
+			SELECT sha512,duration_ms,thumb_pdq256,thumb_quality
+			FROM video_features WHERE sha512 IN (`+sqlPlaceholders(end-start)+`)`, stringsToAny(shas[start:end])...)
+		if err != nil {
+			return nil, fmt.Errorf("store: query local video features: %w", err)
 		}
-		sha, shaOK := firstscreenSHA(text.String)
-		pdq, pdqOK := firstscreenPDQ(pdqBytes)
-		if !text.Valid || !shaOK || !pdqOK || !duration.Valid || duration.Int64 < 0 || !path.Valid || path.String == "" || !quality.Valid || quality.Int64 < 0 || quality.Int64 > 100 || !width.Valid || width.Int64 <= 0 || !height.Valid || height.Int64 <= 0 {
-			continue
+		for rows.Next() {
+			var text string
+			var duration sql.NullInt64
+			var quality sql.NullInt64
+			var pdqBytes []byte
+			if err := rows.Scan(&text, &duration, &pdqBytes, &quality); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("store: scan local video feature: %w", err)
+			}
+			sha, shaOK := firstscreenSHA(text)
+			pdq, pdqOK := firstscreenPDQ(pdqBytes)
+			if !shaOK || !pdqOK || !duration.Valid {
+				continue
+			}
+			feature := firstscreen.VideoFeature{SHA512: sha, DurationMs: duration.Int64, ThumbPDQ: pdq}
+			if quality.Valid {
+				feature.ThumbQuality = int(quality.Int64)
+			}
+			result[text] = feature
 		}
-		result[text.String] = firstscreen.VideoFeature{SHA512: sha, DurationMs: duration.Int64, ThumbPDQ: pdq, ThumbQuality: int(quality.Int64)}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
 	}
-	return result, rows.Err()
+	return result, nil
 }
 
 func (d *DB) ReplaceStageOne(ctx context.Context, runID string, result firstscreen.Result) error {

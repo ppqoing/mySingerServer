@@ -185,6 +185,36 @@ func TestAnalyzerRunsStagesInOrderAndReportsMetrics(t *testing.T) {
 	}
 }
 
+func TestPostgresAnalyzerStillWritesExactAndBothScreenCandidateKinds(t *testing.T) {
+	shaExact := testAnalyzerSHA(0x31)
+	shaImageA, shaImageB := testAnalyzerSHA(0x32), testAnalyzerSHA(0x33)
+	shaVideoA, shaVideoB := testAnalyzerSHA(0x34), testAnalyzerSHA(0x35)
+	store := &fakeAnalyzerStore{
+		files: []analyzerFileRow{
+			{sha: shaExact, file: FileRef{ID: 1}}, {sha: shaExact, file: FileRef{ID: 2}},
+		},
+		imageFeatures: []ImageFeature{
+			{SHA512: shaImageA, PDQ: [4]uint64{1}, Quality: 80, Width: 100, Height: 100},
+			{SHA512: shaImageB, PDQ: [4]uint64{3}, Quality: 80, Width: 100, Height: 100},
+		},
+		videoFeatures: []VideoFeature{
+			{SHA512: shaVideoA, DurationMs: 1000, ThumbPDQ: [4]uint64{5}, ThumbQuality: 70},
+			{SHA512: shaVideoB, DurationMs: 1500, ThumbPDQ: [4]uint64{7}, ThumbQuality: 70},
+		},
+	}
+	stats, err := newAnalyzer(store, DefaultConfig(), nil).Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.ExactGroups != 1 || stats.ImagePairs != 1 || stats.VideoPairs != 1 {
+		t.Fatalf("PostgreSQL analyzer stats = %#v, want one exact/image/video result", stats)
+	}
+	if len(store.writtenExact) != 1 || len(store.writtenPairs) != 2 ||
+		store.writtenPairs[0].Kind != KindImageCandidate || store.writtenPairs[1].Kind != KindVideoCandidate {
+		t.Fatalf("PostgreSQL analyzer output = exact:%#v pairs:%#v", store.writtenExact, store.writtenPairs)
+	}
+}
+
 func TestAnalyzerReturnsStageQualifiedErrorsAndPartialStats(t *testing.T) {
 	stages := []string{
 		"exact_group",

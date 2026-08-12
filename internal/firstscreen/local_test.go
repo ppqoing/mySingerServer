@@ -41,7 +41,7 @@ func TestCandidateSourceCreatesExactYesAndSimilarityCandidatesForOneMachine(t *t
 	shaExact := testAnalyzerSHA(1)
 	shaImageA, shaImageB := testAnalyzerSHA(2), testAnalyzerSHA(3)
 	shaVideoA, shaVideoB := testAnalyzerSHA(4), testAnalyzerSHA(5)
-	foreignSHA := testAnalyzerSHA(6)
+	foreignSHA := shaExact
 
 	imagePDQ := [4]uint64{1}
 	videoPDQ := [4]uint64{9}
@@ -88,6 +88,21 @@ func TestCandidateSourceCreatesExactYesAndSimilarityCandidatesForOneMachine(t *t
 	}
 	if len(result.Files) != 6 || len(sink.got.Files) != 6 {
 		t.Fatalf("machine scoped files = %d/%d, want foreign machine excluded", len(result.Files), len(sink.got.Files))
+	}
+}
+
+func TestCandidateSourceNeverGroupsSameSHAFromAnotherMachine(t *testing.T) {
+	sha := testAnalyzerSHA(0x44)
+	source := candidateSourceFixture{files: []File{
+		{FileRef: FileRef{ID: 1, MachineID: "machine-a"}, SHA512: sha},
+		{FileRef: FileRef{ID: 2, MachineID: "machine-b"}, SHA512: sha},
+	}}
+	result, err := NewCandidateAnalyzer(source, &candidateSinkFixture{}, DefaultConfig(), nil).Run(context.Background(), "machine-a", "run-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.ExactGroups) != 0 || len(result.Files) != 1 {
+		t.Fatalf("same-SHA cross-machine result = %#v, want no exact group and one local file", result)
 	}
 }
 
