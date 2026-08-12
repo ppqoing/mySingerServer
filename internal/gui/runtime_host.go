@@ -14,6 +14,8 @@ type RuntimeHost struct {
 	configAPI http.Handler
 	static    http.Handler
 	status    RuntimeStatus
+
+	afterRuntimeSnapshot func()
 }
 
 func NewRuntimeHost(config guiConfigStore, configuredAgents []config.AgentEndpoint) *RuntimeHost {
@@ -76,6 +78,10 @@ func (h *RuntimeHost) WaitForAnalysis() {
 }
 
 func (h *RuntimeHost) ServeHTTP(response http.ResponseWriter, request *http.Request) {
+	api := h.current()
+	if h.afterRuntimeSnapshot != nil {
+		h.afterRuntimeSnapshot()
+	}
 	switch {
 	case request.URL.Path == "/api/config":
 		h.configAPI.ServeHTTP(response, request)
@@ -83,12 +89,12 @@ func (h *RuntimeHost) ServeHTTP(response http.ResponseWriter, request *http.Requ
 		h.handleRuntimeStatus(response, request)
 	case request.URL.Path == "/api/restart/health":
 		h.handleRestartHealth(response, request)
-	case request.URL.Path == "/api/agents" && h.current() == nil:
+	case request.URL.Path == "/api/agents" && api == nil:
 		h.handleOfflineAgents(response, request)
-	case strings.HasPrefix(request.URL.Path, "/api/") && h.current() == nil:
+	case strings.HasPrefix(request.URL.Path, "/api/") && api == nil:
 		writeJSON(response, http.StatusServiceUnavailable, map[string]string{"error": "database_unavailable"})
-	case h.current() != nil:
-		h.current().Routes().ServeHTTP(response, request)
+	case api != nil:
+		api.Routes().ServeHTTP(response, request)
 	default:
 		h.static.ServeHTTP(response, request)
 	}

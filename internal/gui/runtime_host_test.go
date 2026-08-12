@@ -54,6 +54,19 @@ func TestRuntimeHostInstallsAndSafelyStopsCompleteRuntime(t *testing.T) {
 	host.WaitForAnalysis()
 }
 
+func TestRuntimeHostUsesFixedDelegationSnapshotForSingleRequest(t *testing.T) {
+	host := NewRuntimeHost(&fakeGUIConfigStore{}, nil)
+	host.Install(NewAPI(nil, NewTaskRegistry(nil, testLogger()), nil))
+	host.afterRuntimeSnapshot = func() {
+		host.Install(nil)
+	}
+
+	assertRuntimeHostStatus(t, host, http.MethodGet, "/api/tasks", http.StatusOK)
+	if current := host.current(); current != nil {
+		t.Fatalf("runtime after replacement=%#v, want nil", current)
+	}
+}
+
 func TestRuntimeHostReportsRestartState(t *testing.T) {
 	host := NewRuntimeHost(&fakeGUIConfigStore{}, nil)
 	host.SetDatabaseConnecting()
