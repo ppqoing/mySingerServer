@@ -1,5 +1,5 @@
 import { ApiError } from "./client";
-import { createAppApi, GUIConfigValidationError } from "./appApi";
+import { createAppApi, GUIConfigValidationError, waitForManager } from "./appApi";
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -393,9 +393,9 @@ test("decodes automatic restart recovery details from a saved GUI configuration"
 });
 
 test.each([
-  ["connecting", "", []],
+  ["connecting", "", [{ machine_id: "", addr: "10.0.0.1:9101", online: false, identity_state: "pending" }]],
   ["connected", "", [{ machine_id: "node-a", addr: "10.0.0.1:9101", online: true, identity_state: "claimed" }]],
-  ["error", "database_unavailable", []]
+  ["error", "database_unavailable", [{ machine_id: "", addr: "10.0.0.1:9101", online: false, identity_state: "pending" }]]
 ])("decodes runtime status %s", async (databaseState, databaseErrorCode, agents) => {
   vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse({
     database_state: databaseState,
@@ -413,6 +413,37 @@ test.each([
   });
 });
 
+test("waits past the old Manager health response until restarting is false", async () => {
+  vi.useFakeTimers();
+  const fetchMock = vi.fn()
+    .mockResolvedValueOnce(jsonResponse({ ok: true, restarting: true }))
+    .mockResolvedValueOnce(jsonResponse({ ok: true, restarting: false }));
+  vi.stubGlobal("fetch", fetchMock);
+  const waiting = waitForManager("http://127.0.0.1:28081/api/restart/health");
+
+  await vi.advanceTimersByTimeAsync(250);
+  await expect(waiting).resolves.toBeUndefined();
+  expect(fetchMock).toHaveBeenCalledTimes(2);
+  vi.useRealTimers();
+});
+
+test("aborts a hung recovery health fetch at the global deadline", async () => {
+  vi.useFakeTimers();
+  let healthSignal: AbortSignal | undefined;
+  vi.stubGlobal("fetch", vi.fn().mockImplementation((_url, options: RequestInit) => new Promise((_resolve, reject) => {
+    healthSignal = options.signal ?? undefined;
+    healthSignal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+  })));
+  const waiting = waitForManager("http://127.0.0.1:28081/api/restart/health");
+  const rejected = expect(waiting).rejects.toThrow("Manager restart timed out");
+
+  await Promise.resolve();
+  await vi.advanceTimersByTimeAsync(30_000);
+  expect(healthSignal?.aborted).toBe(true);
+  await rejected;
+  vi.useRealTimers();
+});
+
 test("rejects a GUI save response missing recovery fields", async () => {
   vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse({ saved: true, restart_required: true })));
 
@@ -422,6 +453,18 @@ test("rejects a GUI save response missing recovery fields", async () => {
     firstScreen: { hammingMax: 31, aspectTolerance: 0.1, videoDurationWindowMs: 2000, imageQualityMin: 50, readPageSize: 50000, groupInsertBatch: 1000, shaResolveChunk: 10000 },
     phase2: { phashPassT2: 0.8, phashPartThreshold: 10, sobelT3: 0.85, videoFrames: 6, videoAvgT4: 0.8, videoMinPassed: 4, videoMinValid: 4, videoFileTimeoutS: 120, videoFrameCommandTimeoutS: 20, imageFileTimeoutS: 30, taskShardSize: 5000, autoDispatch: true }
   })).rejects.toBeInstanceOf(ApiError);
+});
+
+test("preserves a saved configuration when automatic restart launch fails", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse({
+    error: "restart_launch_failed", saved: true, restart_required: true, restarting: false, recovery_url: ""
+  }, 500)));
+
+  await expect(createAppApi().saveGUIConfig({
+    listenAddr: "127.0.0.1:18080", pgDsn: "postgres://user:pass@127.0.0.1:5432/dedup", agents: [{ addr: "192.168.1.10:9101" }], heartbeatS: 15,
+    firstScreen: { hammingMax: 31, aspectTolerance: 0.1, videoDurationWindowMs: 2000, imageQualityMin: 50, readPageSize: 50000, groupInsertBatch: 1000, shaResolveChunk: 10000 },
+    phase2: { phashPassT2: 0.8, phashPartThreshold: 10, sobelT3: 0.85, videoFrames: 6, videoAvgT4: 0.8, videoMinPassed: 4, videoMinValid: 4, videoFileTimeoutS: 120, videoFrameCommandTimeoutS: 20, imageFileTimeoutS: 30, taskShardSize: 5000, autoDispatch: true }
+  })).rejects.toMatchObject({ name: "GUIConfigRestartError", saved: true, restartRequired: true });
 });
 
 test("preserves structured GUI configuration field errors", async () => {

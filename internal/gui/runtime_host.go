@@ -13,6 +13,7 @@ type RuntimeHost struct {
 	api       *API
 	configAPI http.Handler
 	static    http.Handler
+	restart   guiRestartCoordinator
 	status    RuntimeStatus
 
 	afterRuntimeSnapshot func()
@@ -21,11 +22,12 @@ type RuntimeHost struct {
 func NewRuntimeHost(config guiConfigStore, configuredAgents []config.AgentEndpoint) *RuntimeHost {
 	agents := make([]AgentStatus, 0, len(configuredAgents))
 	for _, agent := range configuredAgents {
-		agents = append(agents, AgentStatus{Addr: agent.Addr, Online: false})
+		agents = append(agents, AgentStatus{Addr: agent.Addr, Online: false, IdentityState: IdentityPending})
 	}
 	return &RuntimeHost{
 		configAPI: newConfigHTTP(config),
 		static:    http.FileServerFS(webFS()),
+		restart:   restartCoordinatorFor(config),
 		status: RuntimeStatus{
 			DatabaseState: "connecting",
 			Agents:        agents,
@@ -38,7 +40,7 @@ func (h *RuntimeHost) Install(api *API) {
 	defer h.mu.Unlock()
 	h.api = api
 	if api != nil {
-		h.status.DatabaseState = "ready"
+		h.status.DatabaseState = "connected"
 		h.status.DatabaseErrorCode = ""
 	}
 }
@@ -54,7 +56,7 @@ func (h *RuntimeHost) SetDatabaseFailure(err error) {
 	failure := ClassifyRuntimeFailure(err)
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.status.DatabaseState = "failed"
+	h.status.DatabaseState = "error"
 	h.status.DatabaseErrorCode = failure.Code
 }
 
@@ -116,7 +118,10 @@ func (h *RuntimeHost) handleRuntimeStatus(response http.ResponseWriter, _ *http.
 
 func (h *RuntimeHost) handleRestartHealth(response http.ResponseWriter, _ *http.Request) {
 	response.Header().Set("Access-Control-Allow-Origin", "*")
-	writeJSON(response, http.StatusOK, map[string]bool{"ok": true})
+	h.mu.RLock()
+	restart := h.restart
+	h.mu.RUnlock()
+	writeJSON(response, http.StatusOK, map[string]bool{"ok": true, "restarting": restart != nil && restart.Pending()})
 }
 
 func (h *RuntimeHost) handleOfflineAgents(response http.ResponseWriter, _ *http.Request) {

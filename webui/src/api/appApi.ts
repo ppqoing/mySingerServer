@@ -79,11 +79,23 @@ export function createAppApi(): AppApi {
     loadGUIConfig: signal => requestJson("/api/config", get(signal), guiConfigSnapshot),
     saveGUIConfig: (configValue, signal) => requestJson(
       "/api/config",
-      { ...jsonPut(guiConfigInput(configValue), signal), decodeStatuses: [400] },
+      { ...jsonPut(guiConfigInput(configValue), signal), decodeStatuses: [400, 500] },
       guiConfigSaveResponse
     ),
     getRuntimeStatus: signal => requestJson("/api/runtime/status", get(signal), runtimeStatus)
   };
+}
+
+export class GUIConfigRestartError extends ApiError {
+  readonly saved: boolean;
+  readonly restartRequired: boolean;
+
+  constructor(saved: boolean, restartRequired: boolean) {
+    super(500, "restart_launch_failed", false);
+    this.name = "GUIConfigRestartError";
+    this.saved = saved;
+    this.restartRequired = restartRequired;
+  }
 }
 
 export const appApi: AppApi = createAppApi();
@@ -94,19 +106,40 @@ const managerRecoveryTimeoutMs = 30_000;
 export async function waitForManager(recoveryURL: string, signal?: AbortSignal): Promise<void> {
   const origin = new URL(recoveryURL).origin;
   const healthURL = `${origin}/api/restart/health`;
-  const deadline = Date.now() + managerRecoveryTimeoutMs;
-
-  while (true) {
-    if (signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
-    try {
-      const response = await fetch(healthURL, { credentials: "omit", signal });
-      if (response.ok) return;
-    } catch (error) {
-      if (isAbortError(error) || signal?.aborted) throw error;
+  const controller = new AbortController();
+  let timedOut = false;
+  const timeout = setTimeout(() => { timedOut = true; controller.abort(); }, managerRecoveryTimeoutMs);
+  const abort = () => controller.abort();
+  signal?.addEventListener("abort", abort, { once: true });
+  if (signal?.aborted) controller.abort();
+  try {
+    while (true) {
+      try {
+        const response = await fetch(healthURL, { credentials: "omit", signal: controller.signal });
+        if (response.ok && await recoveryHealthReady(response)) return;
+      } catch (error) {
+        if (timedOut) throw new Error("Manager restart timed out", { cause: error });
+        if (isAbortError(error) || signal?.aborted) throw error;
+      }
+      await waitFor(managerRecoveryPollIntervalMs, controller.signal);
     }
-    const remaining = deadline - Date.now();
-    if (remaining <= 0) throw new Error("Manager restart timed out");
-    await waitFor(Math.min(managerRecoveryPollIntervalMs, remaining), signal);
+  } catch (error) {
+    if (timedOut) throw new Error("Manager restart timed out", { cause: error });
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+    signal?.removeEventListener("abort", abort);
+  }
+}
+
+async function recoveryHealthReady(response: Response): Promise<boolean> {
+  try {
+    const value: unknown = await response.json();
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+    const health = value as { ok?: unknown; restarting?: unknown };
+    return health.ok === true && health.restarting === false;
+  } catch {
+    return false;
   }
 }
 
@@ -445,6 +478,12 @@ function guiConfigSaveResponse(value: unknown): GUIConfigSaveResult {
   const raw = record(value, "GUI config save response");
   if (raw.error === "config_invalid") {
     throw new GUIConfigValidationError(configFieldErrors(raw.fields));
+  }
+  if (raw.error === "restart_launch_failed") {
+    throw new GUIConfigRestartError(
+      boolean(raw.saved, "GUI config saved"),
+      boolean(raw.restart_required, "GUI config restart_required")
+    );
   }
   if (typeof raw.error === "string") {
     throw new ApiError(400, raw.error, false);

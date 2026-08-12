@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
-import { appApi, GUIConfigValidationError, waitForManager, type AppApi } from "../../api/appApi";
+import { appApi, GUIConfigRestartError, GUIConfigValidationError, waitForManager, type AppApi } from "../../api/appApi";
 import { isAbortError } from "../../api/client";
 import type {
   GUIConfig,
@@ -133,7 +133,7 @@ export function GUISettingsPage({ api = appApi, navigate = target => window.loca
       setLoadState("error");
     });
     return () => {
-      controller.abort();
+      loadController.current?.abort();
       saveController.current?.abort();
     };
   }, [api]);
@@ -236,11 +236,19 @@ export function GUISettingsPage({ api = appApi, navigate = target => window.loca
         await waitForManager(result.recoveryURL, controller.signal);
         if (!controller.signal.aborted) navigate(`${new URL(result.recoveryURL).origin}/#/settings`);
       } else {
-        setNotice(result.saved ? "配置已保存，当前无需重启" : "配置未变化");
+        setNotice(!result.saved ? "配置未变化" : result.restartRequired
+          ? "配置已保存，请手动重启 GUI 后生效"
+          : "配置已保存，当前无需重启");
       }
     } catch (error) {
       if (isAbortError(error) || controller.signal.aborted) return;
-      if (error instanceof GUIConfigValidationError) {
+      if (error instanceof GUIConfigRestartError) {
+        setBaseline(config);
+        setDiskRestartRequired(error.restartRequired);
+        setNotice(error.saved
+          ? "配置已保存，但自动重启失败，请检查 data\\logs\\gui.log"
+          : "自动重启失败，请检查 data\\logs\\gui.log");
+      } else if (error instanceof GUIConfigValidationError) {
         setFieldErrors(Object.fromEntries(error.fields.map(field => [field.field, field.message])));
       } else {
         setPageError(error instanceof Error && error.message === "Manager restart timed out"

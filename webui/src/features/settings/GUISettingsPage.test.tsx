@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { AppApi, GUIConfig } from "../../api/contracts";
-import { GUIConfigValidationError } from "../../api/appApi";
+import { GUIConfigRestartError, GUIConfigValidationError } from "../../api/appApi";
 import { GUISettingsPage } from "./GUISettingsPage";
 
 const baseConfig: GUIConfig = {
@@ -131,7 +131,7 @@ test("reloads disk configuration and clears dirty state", async () => {
   expect(loadGUIConfig).toHaveBeenCalledTimes(2);
 });
 
-test("shows a saved notice when the server does not restart automatically", async () => {
+test("shows a manual restart notice when an applied configuration could not restart automatically", async () => {
   const saveGUIConfig = vi.fn().mockResolvedValue({ saved: true, restartRequired: true, restarting: false, recoveryURL: "" });
   const user = userEvent.setup();
   render(<GUISettingsPage api={apiFor({ saveGUIConfig })} />);
@@ -140,7 +140,7 @@ test("shows a saved notice when the server does not restart automatically", asyn
   await user.type(listen, "127.0.0.1:28080");
   await user.click(screen.getByRole("button", { name: "保存配置" }));
 
-  expect(await screen.findByText("配置已保存，当前无需重启")).toBeInTheDocument();
+  expect(await screen.findByText("配置已保存，请手动重启 GUI 后生效")).toBeInTheDocument();
   expect(saveGUIConfig).toHaveBeenCalledWith(
     expect.objectContaining({ listenAddr: "127.0.0.1:28080" }),
     expect.any(AbortSignal)
@@ -156,6 +156,29 @@ test("shows unchanged message when saved configuration matches runtime", async (
   await user.click(screen.getByRole("button", { name: "保存配置" }));
 
   expect(await screen.findByText("配置未变化")).toBeInTheDocument();
+});
+
+test("keeps the saved fact visible when automatic restart launch fails", async () => {
+  const user = userEvent.setup();
+  render(<GUISettingsPage api={apiFor({ saveGUIConfig: vi.fn().mockRejectedValue(new GUIConfigRestartError(true, true)) })} />);
+  await screen.findByLabelText("监听地址");
+  await user.click(screen.getByRole("button", { name: "保存配置" }));
+
+  expect(await screen.findByText("配置已保存，但自动重启失败，请检查 data\\logs\\gui.log")).toBeInTheDocument();
+});
+
+test("aborts the latest manual configuration reload when the settings page unmounts", async () => {
+  let reloadSignal: AbortSignal | undefined;
+  const loadGUIConfig = vi.fn()
+    .mockResolvedValueOnce({ config: copyConfig(), restartRequired: false })
+    .mockImplementationOnce((signal?: AbortSignal) => new Promise(() => { reloadSignal = signal; }));
+  const user = userEvent.setup();
+  const view = render(<GUISettingsPage api={apiFor({ loadGUIConfig })} />);
+  await screen.findByLabelText("监听地址");
+  await user.click(screen.getByRole("button", { name: "重新加载" }));
+
+  view.unmount();
+  expect(reloadSignal?.aborted).toBe(true);
 });
 
 test("waits for the replacement Manager then navigates to its settings page", async () => {
@@ -179,7 +202,7 @@ test("waits for the replacement Manager then navigates to its settings page", as
   expect(await screen.findByText("配置已保存，Manager 正在自动重启")).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "正在保存…" })).toBeDisabled();
   expect(screen.getByRole("button", { name: "重新加载" })).toBeDisabled();
-  resolveHealth!(new Response("{}", { status: 200 }));
+  resolveHealth!(new Response("{\"ok\":true,\"restarting\":false}", { status: 200 }));
   await waitFor(() => expect(navigate).toHaveBeenCalledWith("http://127.0.0.1:28081/#/settings"));
 });
 
