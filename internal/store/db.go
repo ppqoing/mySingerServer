@@ -16,7 +16,7 @@ type DB struct {
 
 func Open(path string) (*DB, error) {
 	dsn := fmt.Sprintf(
-		"file:%s?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)",
+		"file:%s?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)",
 		filepath.ToSlash(path),
 	)
 	sqlDB, err := sql.Open("sqlite", dsn)
