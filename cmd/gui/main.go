@@ -147,6 +147,7 @@ var (
 	guiNewRuntimeLogger = newGUIRuntimeLogger
 	guiOpenBrowser      = openGUIBrowser
 	guiShowStartupError = showGUIStartupError
+	guiWaitParent       = guiWaitForParent
 )
 
 func newGUIHTTPServer(addr string, handler http.Handler) guiHTTPServer {
@@ -629,6 +630,7 @@ func run(args []string) error {
 	flags := flag.NewFlagSet("gui", flag.ContinueOnError)
 	configPath := flags.String("config", "", "配置文件路径（默认：EXE 同目录 gui.json）")
 	noBrowser := flags.Bool("no-browser", false, "不自动打开浏览器")
+	waitParentPID := flags.Int("wait-parent-pid", 0, "等待父 GUI 进程退出后再启动")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -640,6 +642,11 @@ func run(args []string) error {
 	runtimePaths, err := resolveGUIRuntimePaths(executable, *configPath)
 	if err != nil {
 		return err
+	}
+	if *waitParentPID > 0 {
+		if err := guiWaitParent(*waitParentPID); err != nil {
+			return fmt.Errorf("wait for parent GUI: %w", err)
+		}
 	}
 	logger, closeLogger, err := guiNewRuntimeLogger(runtimePaths.LogPath, os.Stdout)
 	if err != nil {
@@ -660,6 +667,12 @@ func run(args []string) error {
 		syscall.SIGTERM,
 	)
 	defer cancelProcess()
+	configService.SetRestartCoordinator(newGUIRestartCoordinator(
+		executable,
+		runtimePaths.ConfigPath,
+		os.Getpid(),
+		cancelProcess,
+	))
 	host := gui.NewRuntimeHost(configService, cfg.Agents)
 	listener, err := guiListen("tcp", cfg.ListenAddr)
 	if err != nil {

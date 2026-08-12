@@ -19,8 +19,10 @@ type GUIConfigSnapshot struct {
 }
 
 type GUIConfigSaveResult struct {
-	Saved           bool `json:"saved"`
-	RestartRequired bool `json:"restart_required"`
+	Saved           bool   `json:"saved"`
+	RestartRequired bool   `json:"restart_required"`
+	Restarting      bool   `json:"restarting"`
+	RecoveryURL     string `json:"recovery_url"`
 }
 
 type GUIConfigService struct {
@@ -28,6 +30,19 @@ type GUIConfigService struct {
 	path             string
 	runtimeCanonical []byte
 	replace          func(source, destination string) error
+	restart          guiRestartCoordinator
+}
+
+func (s *GUIConfigService) SetRestartCoordinator(restart guiRestartCoordinator) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.restart = restart
+}
+
+func (s *GUIConfigService) RestartCoordinator() guiRestartCoordinator {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.restart
 }
 
 func NewGUIConfigService(path string, runtime *config.GUIConfig) (*GUIConfigService, error) {

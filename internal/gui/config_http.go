@@ -15,9 +15,24 @@ type guiConfigStore interface {
 	Save(context.Context, *config.GUIConfig) (GUIConfigSaveResult, error)
 }
 
+type guiRestartCoordinator interface {
+	Pending() bool
+	Prepare(*config.GUIConfig) (string, error)
+	Commit()
+}
+
+type guiRestartProvider interface {
+	RestartCoordinator() guiRestartCoordinator
+}
+
 type guiConfigErrorResponse struct {
 	Error  string              `json:"error"`
 	Fields []config.FieldError `json:"fields,omitempty"`
+}
+
+type guiConfigRestartErrorResponse struct {
+	GUIConfigSaveResult
+	Error string `json:"error"`
 }
 
 type configHTTP struct {
@@ -69,6 +84,11 @@ func (handler configHTTP) handlePut(response http.ResponseWriter, request *http.
 		writeJSON(response, http.StatusServiceUnavailable, guiConfigErrorResponse{Error: "config_unavailable"})
 		return
 	}
+	restart := restartCoordinatorFor(handler.config)
+	if restart != nil && restart.Pending() {
+		writeJSON(response, http.StatusConflict, guiConfigErrorResponse{Error: "restart_in_progress"})
+		return
+	}
 	var cfg config.GUIConfig
 	decoder := json.NewDecoder(request.Body)
 	decoder.DisallowUnknownFields()
@@ -95,5 +115,31 @@ func (handler configHTTP) handlePut(response http.ResponseWriter, request *http.
 		writeJSON(response, http.StatusInternalServerError, guiConfigErrorResponse{Error: "config_save_failed"})
 		return
 	}
+	if result.RestartRequired && restart != nil {
+		recoveryURL, prepareErr := restart.Prepare(&cfg)
+		if prepareErr != nil {
+			writeJSON(response, http.StatusInternalServerError, guiConfigRestartErrorResponse{
+				GUIConfigSaveResult: result,
+				Error:               "restart_launch_failed",
+			})
+			return
+		}
+		result.Restarting = true
+		result.RecoveryURL = recoveryURL
+		writeJSON(response, http.StatusOK, result)
+		if flusher, ok := response.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		restart.Commit()
+		return
+	}
 	writeJSON(response, http.StatusOK, result)
+}
+
+func restartCoordinatorFor(store guiConfigStore) guiRestartCoordinator {
+	provider, ok := store.(guiRestartProvider)
+	if !ok {
+		return nil
+	}
+	return provider.RestartCoordinator()
 }

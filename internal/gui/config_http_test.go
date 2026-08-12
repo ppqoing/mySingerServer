@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -20,6 +21,8 @@ type fakeGUIConfigStore struct {
 	saveErr      error
 	saved        *config.GUIConfig
 	saveCalls    int
+	restart      guiRestartCoordinator
+	events       *[]string
 }
 
 func (s *fakeGUIConfigStore) Load() (GUIConfigSnapshot, error) {
@@ -29,7 +32,70 @@ func (s *fakeGUIConfigStore) Load() (GUIConfigSnapshot, error) {
 func (s *fakeGUIConfigStore) Save(_ context.Context, cfg *config.GUIConfig) (GUIConfigSaveResult, error) {
 	s.saveCalls++
 	s.saved = cfg
+	if s.events != nil {
+		*s.events = append(*s.events, "save")
+	}
 	return s.saveResult, s.saveErr
+}
+
+func (s *fakeGUIConfigStore) RestartCoordinator() guiRestartCoordinator {
+	return s.restart
+}
+
+type fakeGUIRestartCoordinator struct {
+	pending     bool
+	prepareErr  error
+	recoveryURL string
+	prepared    *config.GUIConfig
+	commits     int
+	events      *[]string
+}
+
+func (c *fakeGUIRestartCoordinator) Pending() bool {
+	return c.pending
+}
+
+func (c *fakeGUIRestartCoordinator) Prepare(cfg *config.GUIConfig) (string, error) {
+	c.prepared = cfg
+	if c.events != nil {
+		*c.events = append(*c.events, "prepare")
+	}
+	return c.recoveryURL, c.prepareErr
+}
+
+func (c *fakeGUIRestartCoordinator) Commit() {
+	c.commits++
+	if c.events != nil {
+		*c.events = append(*c.events, "commit")
+	}
+}
+
+type recordingRestartResponseWriter struct {
+	header http.Header
+	status int
+	body   bytes.Buffer
+	wrote  bool
+	events *[]string
+}
+
+func (w *recordingRestartResponseWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *recordingRestartResponseWriter) WriteHeader(status int) {
+	w.status = status
+}
+
+func (w *recordingRestartResponseWriter) Write(data []byte) (int, error) {
+	if !w.wrote {
+		w.wrote = true
+		*w.events = append(*w.events, "write")
+	}
+	return w.body.Write(data)
+}
+
+func (w *recordingRestartResponseWriter) Flush() {
+	*w.events = append(*w.events, "flush")
 }
 
 func serveGUIConfigRequest(t *testing.T, api *API, method, target string, body []byte) *httptest.ResponseRecorder {
@@ -91,6 +157,103 @@ func TestGUIConfigHTTPPutSavesCompleteConfig(t *testing.T) {
 	}
 	if !result.Saved || !result.RestartRequired {
 		t.Fatalf("result=%#v", result)
+	}
+}
+
+func TestGUIConfigHTTPPutRestartWritesAndFlushesResponseBeforeCommit(t *testing.T) {
+	cfg := testGUIConfig()
+	cfg.ListenAddr = "127.0.0.1:18081"
+	body, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := []string{}
+	restart := &fakeGUIRestartCoordinator{
+		recoveryURL: "http://127.0.0.1:18081/api/restart/health",
+		events:      &events,
+	}
+	store := &fakeGUIConfigStore{
+		saveResult: GUIConfigSaveResult{Saved: true, RestartRequired: true},
+		restart:    restart,
+		events:     &events,
+	}
+	api := NewAPI(nil, nil, nil)
+	api.SetConfigService(store)
+	response := &recordingRestartResponseWriter{header: make(http.Header), events: &events}
+	request := httptest.NewRequest(http.MethodPut, "/api/config", bytes.NewReader(body))
+
+	api.Routes().ServeHTTP(response, request)
+
+	wantEvents := []string{"save", "prepare", "write", "flush", "commit"}
+	if !reflect.DeepEqual(events, wantEvents) {
+		t.Fatalf("events=%v want=%v", events, wantEvents)
+	}
+	if response.status != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.status, response.body.String())
+	}
+	var result GUIConfigSaveResult
+	if err := json.Unmarshal(response.body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if !result.Saved || !result.RestartRequired || !result.Restarting || result.RecoveryURL != restart.recoveryURL {
+		t.Fatalf("result=%#v", result)
+	}
+	if restart.prepared == nil || restart.prepared.ListenAddr != cfg.ListenAddr || restart.commits != 1 {
+		t.Fatalf("restart=%#v", restart)
+	}
+}
+
+func TestGUIConfigHTTPPutRestartInProgressReturnsConflict(t *testing.T) {
+	body, err := json.Marshal(testGUIConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &fakeGUIConfigStore{restart: &fakeGUIRestartCoordinator{pending: true}}
+	api := NewAPI(nil, nil, nil)
+	api.SetConfigService(store)
+
+	response := serveGUIConfigRequest(t, api, http.MethodPut, "/api/config", body)
+
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "restart_in_progress") {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if store.saveCalls != 0 {
+		t.Fatalf("restart conflict saved config %d times", store.saveCalls)
+	}
+}
+
+func TestGUIConfigHTTPPutRestartLaunchFailureKeepsSavedResult(t *testing.T) {
+	cfg := testGUIConfig()
+	cfg.ListenAddr = "127.0.0.1:18081"
+	body, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restart := &fakeGUIRestartCoordinator{prepareErr: errors.New("CreateProcess failed")}
+	store := &fakeGUIConfigStore{
+		saveResult: GUIConfigSaveResult{Saved: true, RestartRequired: true},
+		restart:    restart,
+	}
+	api := NewAPI(nil, nil, nil)
+	api.SetConfigService(store)
+
+	response := serveGUIConfigRequest(t, api, http.MethodPut, "/api/config", body)
+
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var got struct {
+		GUIConfigSaveResult
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Error != "restart_launch_failed" || !got.Saved || !got.RestartRequired || got.Restarting {
+		t.Fatalf("response=%#v", got)
+	}
+	if store.saveCalls != 1 || restart.commits != 0 {
+		t.Fatalf("saveCalls=%d restart=%#v", store.saveCalls, restart)
 	}
 }
 
