@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"dedup/internal/store"
@@ -24,33 +25,28 @@ func RedactKnownPath(text, path string) string {
 	if path == "" {
 		return text
 	}
-	redacted := replaceEqualFold(text, path, "<path>")
-	redacted = replaceEqualFold(redacted, strings.ReplaceAll(path, `\`, "/"), "<path>")
-	redacted = replaceEqualFold(redacted, strings.ReplaceAll(path, "/", `\`), "<path>")
-	canonical := strings.ReplaceAll(path, "/", `\`)
-	if index := strings.LastIndex(canonical, `\`); index >= 0 && index+1 < len(canonical) {
-		redacted = replaceEqualFold(redacted, canonical[index+1:], "<path>")
+	redacted := replaceWindowsPath(text, path)
+	if index := strings.LastIndexAny(path, `/\`); index >= 0 && index+1 < len(path) {
+		redacted = replaceWindowsPath(redacted, path[index+1:])
 	}
 	return redacted
 }
 
-func replaceEqualFold(text, target, replacement string) string {
+func replaceWindowsPath(text, target string) string {
 	if target == "" {
 		return text
 	}
-	lowerText, lowerTarget := strings.ToLower(text), strings.ToLower(target)
-	var out strings.Builder
-	for {
-		index := strings.Index(lowerText, lowerTarget)
-		if index < 0 {
-			out.WriteString(text)
-			return out.String()
+	var pattern strings.Builder
+	start := 0
+	for index, char := range target {
+		if char == '/' || char == '\\' {
+			pattern.WriteString(regexp.QuoteMeta(target[start:index]))
+			pattern.WriteString(`[\\/]`)
+			start = index + 1
 		}
-		out.WriteString(text[:index])
-		out.WriteString(replacement)
-		text = text[index+len(target):]
-		lowerText = lowerText[index+len(target):]
 	}
+	pattern.WriteString(regexp.QuoteMeta(target[start:]))
+	return regexp.MustCompile(`(?i)`+pattern.String()).ReplaceAllString(text, "<path>")
 }
 
 const (

@@ -2,10 +2,45 @@ package worker
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/vmihailenco/msgpack/v5"
 )
+
+func TestRedactKnownPathHandlesMixedSeparatorsAndUnicode(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		text string
+	}{
+		{
+			name: "mixed separators",
+			path: `D:\Private\Album\Secret.JPG`,
+			text: `open D:/Private\Album/Secret.JPG failed`,
+		},
+		{
+			name: "unicode case mapping",
+			path: `D:\İstanbul\Album\Secret.JPG`,
+			text: `open D:\İstanbul\Album\Secret.JPG failed`,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			redacted := RedactKnownPath(test.text, test.path)
+			lower := strings.ToLower(redacted)
+			for _, secret := range []string{"private", "stanbul", "album", "secret.jpg"} {
+				if strings.Contains(lower, secret) {
+					t.Fatalf("redacted text leaked %q: %q", secret, redacted)
+				}
+			}
+			if !strings.Contains(redacted, "<path>") {
+				t.Fatalf("redacted text = %q, want path marker", redacted)
+			}
+		})
+	}
+}
 
 func TestMessageRoundTrip(t *testing.T) {
 	duration := int64(6543)

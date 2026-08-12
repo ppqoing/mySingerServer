@@ -67,6 +67,20 @@ Race 首轮唯一失败来自新增 Agent 日志测试直接并发读取 `bytes.
 - `CC=C:\Tools\WinLibs\mingw64\bin\gcc.exe go test -race -count=1 -timeout 150s ./internal/agent ./internal/worker ./internal/store` — PASS（2.625s / 4.597s / 8.971s）
 - `git diff --check` — PASS；只有 LF→CRLF 提示，无 whitespace error。
 
+## Fix round 3/5
+
+| 修复合同 | RED 证据 | GREEN 结果 |
+| --- | --- | --- |
+| Windows 混合分隔符脱敏 | `open D:/Private\Album/Secret.JPG failed` 只替换 basename，RED 保留 `D:/Private\Album/` | 从已知路径构造大小写不敏感正则，每个原分隔符位置使用 `[\\/]`，任意混合分隔符的完整目录均替换为 `<path>` |
+| Unicode 安全与协议语义 | 带 `İ` 的路径使旧 lower-byte-index 替换产生错位残片，Scan RED 仍泄露 `İstanbul\PRIVATE/ALBUM` | 正则直接使用原字符串索引，不再按 lower 后的 byte index 切片；日志不含目录或文件名，`path_id`、stage/source 保留，授权协议响应的 Path/Msg/Stage 原样返回 |
+
+修复轮 RED / GREEN 与最终门禁：
+
+- RED：`go test ./internal/worker ./internal/agent -run 'TestRedactKnownPathHandlesMixedSeparatorsAndUnicode|TestScanReportErrLogsSafePathIdentityAcrossWindowsVariants' -count=1` — FAIL；Worker 报 `leaked "private": "open D:/Private\\Album/<path> failed"`，Agent 报 `leaked "stanbul"`。
+- GREEN：同一 focused 命令 — PASS（0.013s / 0.033s）。
+- `go test -count=1 -timeout 120s ./internal/agent ./internal/worker ./internal/wproc ./internal/store ./cmd/worker` — PASS（0.703s / 0.354s / 0.384s / 1.438s / no test files）。
+- `CC=C:\Tools\WinLibs\mingw64\bin\gcc.exe go test -race -count=1 -timeout 150s ./internal/agent ./internal/worker ./internal/store` — PASS（2.612s / 4.589s / 8.248s）。
+
 ## Concerns
 
 - Task 6 只提供分阶段计算、路由、缓存和持久化合同。Stage 2 通过后是否创建 Stage 3 由 Task 8 的本地 Engine 决定；本实现不会从 Stage 2 隐式追加 Stage 3。

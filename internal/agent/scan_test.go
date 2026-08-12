@@ -37,8 +37,8 @@ func TestScanManagerRejectsInvalidTasks(t *testing.T) {
 func TestScanReportErrLogsSafePathIdentityAcrossWindowsVariants(t *testing.T) {
 	var output bytes.Buffer
 	manager := &ScanManager{errLog: slog.New(slog.NewJSONHandler(&output, nil))}
-	path := `D:\Private\Album\Secret.JPG`
-	message := `open d:/PRIVATE/ALBUM/SECRET.jpg failed; retry SECRET.JPG`
+	path := `D:\İstanbul\Private\Album\Secret.JPG`
+	message := `open d:/İstanbul\PRIVATE/ALBUM\SECRET.jpg failed; retry SECRET.JPG`
 	state := &ScanState{Task: proto.ScanTask{TaskID: "scan-private-log"}}
 	responses := make(chan proto.Error, 1)
 	state.bindSender(func(msgType uint8, value any) error {
@@ -50,8 +50,10 @@ func TestScanReportErrLogsSafePathIdentityAcrossWindowsVariants(t *testing.T) {
 
 	manager.reportErr(state, path, "hash", errors.New(message))
 	logged := output.String()
-	if strings.Contains(strings.ToLower(logged), "private") || strings.Contains(strings.ToLower(logged), "secret.jpg") {
-		t.Fatalf("scan error log leaked Windows path variant: %s", logged)
+	for _, secret := range []string{"stanbul", "private", "album", "secret.jpg"} {
+		if strings.Contains(strings.ToLower(logged), secret) {
+			t.Fatalf("scan error log leaked %q from Windows path variant: %s", secret, logged)
+		}
 	}
 	var record map[string]any
 	if err := json.Unmarshal(bytes.TrimSpace(output.Bytes()), &record); err != nil {
