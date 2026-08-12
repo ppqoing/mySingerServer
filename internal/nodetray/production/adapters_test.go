@@ -10,30 +10,71 @@ import (
 	"testing"
 
 	"dedup/internal/nodectl"
+	"dedup/internal/nodetray/agentclient"
+	trayapp "dedup/internal/nodetray/app"
 	trayconfig "dedup/internal/nodetray/config"
 	"dedup/internal/nodetray/traymodel"
 	"dedup/internal/proto"
 )
 
 type fakeValidationStore struct {
-	agent  []trayconfig.FieldError
 	helper []trayconfig.FieldError
 }
 
-func (f fakeValidationStore) ValidateAgentForm(trayconfig.AgentForm) []trayconfig.FieldError {
-	return append([]trayconfig.FieldError(nil), f.agent...)
+type fakeAgentConfigurationController struct {
+	ctx      context.Context
+	form     trayconfig.AgentForm
+	result   agentclient.ConfigSaveResult
+	promoted bool
 }
+
+func (f *fakeAgentConfigurationController) LoadAgentForm(ctx context.Context) (trayconfig.AgentForm, error) {
+	f.ctx = ctx
+	return f.form, nil
+}
+func (f *fakeAgentConfigurationController) ValidateAgentForm(ctx context.Context, _ trayconfig.AgentForm) []trayconfig.FieldError {
+	f.ctx = ctx
+	return nil
+}
+func (f *fakeAgentConfigurationController) SaveAgentForm(ctx context.Context, _ trayconfig.AgentForm) (agentclient.ConfigSaveResult, error) {
+	f.ctx = ctx
+	return f.result, nil
+}
+func (f *fakeAgentConfigurationController) PromotePendingEndpoint() { f.promoted = true }
+
+func TestAgentConfigGatewayAdaptsSocketControllerWithoutLocalStore(t *testing.T) {
+	wantForm := trayconfig.AgentForm{DataDir: "socket-agent"}
+	wantSHA := strings.Repeat("c", 64)
+	controller := &fakeAgentConfigurationController{
+		form:   wantForm,
+		result: agentclient.ConfigSaveResult{SHA256: wantSHA, RestartRequired: true},
+	}
+	gateway := NewAgentConfigGateway(controller)
+	var _ trayapp.AgentConfigGateway = gateway
+	ctx := context.WithValue(context.Background(), struct{ key string }{"gateway"}, "marker")
+	if got, err := gateway.LoadAgentForm(ctx); err != nil || !reflect.DeepEqual(got, wantForm) {
+		t.Fatalf("LoadAgentForm = %#v, %v", got, err)
+	}
+	if fields := gateway.ValidateAgentForm(ctx, wantForm); len(fields) != 0 {
+		t.Fatalf("ValidateAgentForm = %#v", fields)
+	}
+	result, err := gateway.SaveAgentForm(ctx, wantForm)
+	if err != nil || result != (trayapp.AgentConfigSaveResult{SHA256: wantSHA, RestartRequired: true}) {
+		t.Fatalf("SaveAgentForm = %#v, %v", result, err)
+	}
+	gateway.PromotePendingEndpoint()
+	if controller.ctx != ctx || !controller.promoted {
+		t.Fatal("gateway lost request context or endpoint promotion")
+	}
+}
+
 func (f fakeValidationStore) ValidateHelperForm(trayconfig.HelperForm) []trayconfig.FieldError {
 	return append([]trayconfig.FieldError(nil), f.helper...)
 }
 
 func TestValidatorDelegatesToStoreSharedPureValidation(t *testing.T) {
-	wantAgent := []trayconfig.FieldError{{Field: "agent", Code: "invalid", Message: "Agent 配置无效"}}
 	wantHelper := []trayconfig.FieldError{{Field: "helper", Code: "invalid", Message: "Helper 配置无效"}}
-	validator := NewValidator(fakeValidationStore{agent: wantAgent, helper: wantHelper})
-	if got := validator.ValidateAgent(trayconfig.AgentForm{}); !reflect.DeepEqual(got, wantAgent) {
-		t.Fatalf("ValidateAgent = %#v", got)
-	}
+	validator := NewValidator(fakeValidationStore{helper: wantHelper})
 	if got := validator.ValidateHelper(trayconfig.HelperForm{}); !reflect.DeepEqual(got, wantHelper) {
 		t.Fatalf("ValidateHelper = %#v", got)
 	}

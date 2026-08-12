@@ -44,7 +44,6 @@ type backendTestStore struct {
 	recorder    *backendTestRecorder
 	settings    traymodel.TraySettings
 	settingsErr error
-	agent       trayconfig.AgentForm
 	helper      trayconfig.HelperForm
 }
 
@@ -58,20 +57,29 @@ func (s *backendTestStore) SaveTraySettings(traymodel.TraySettings) error {
 	return nil
 }
 
-func (s *backendTestStore) LoadAgentForm() (trayconfig.AgentForm, error) {
-	s.recorder.add("load-agent")
-	return s.agent, nil
-}
-
-func (s *backendTestStore) SaveAgentForm(trayconfig.AgentForm) (string, error) {
-	s.recorder.add("save-agent")
-	return strings.Repeat("a", 64), nil
-}
-
 func (s *backendTestStore) LoadHelperForm() (trayconfig.HelperForm, error) {
 	s.recorder.add("load-helper")
 	return s.helper, nil
 }
+
+type backendTestAgentConfig struct {
+	recorder *backendTestRecorder
+	form     trayconfig.AgentForm
+}
+
+func (g *backendTestAgentConfig) LoadAgentForm(context.Context) (trayconfig.AgentForm, error) {
+	g.recorder.add("load-agent")
+	return g.form, nil
+}
+func (g *backendTestAgentConfig) ValidateAgentForm(context.Context, trayconfig.AgentForm) []trayconfig.FieldError {
+	g.recorder.add("validate-agent")
+	return nil
+}
+func (g *backendTestAgentConfig) SaveAgentForm(context.Context, trayconfig.AgentForm) (trayapp.AgentConfigSaveResult, error) {
+	g.recorder.add("save-agent")
+	return trayapp.AgentConfigSaveResult{SHA256: strings.Repeat("a", 64)}, nil
+}
+func (g *backendTestAgentConfig) PromotePendingEndpoint() { g.recorder.add("promote-agent-endpoint") }
 
 func (s *backendTestStore) PrepareHelperWrite(trayconfig.HelperForm) (trayconfig.PreparedWrite, error) {
 	s.recorder.add("prepare-helper")
@@ -83,11 +91,6 @@ func (s *backendTestStore) PrepareHelperWrite(trayconfig.HelperForm) (trayconfig
 }
 
 type backendTestValidator struct{ recorder *backendTestRecorder }
-
-func (v backendTestValidator) ValidateAgent(trayconfig.AgentForm) []trayconfig.FieldError {
-	v.recorder.add("validate-agent")
-	return nil
-}
 
 func (v backendTestValidator) ValidateHelper(trayconfig.HelperForm) []trayconfig.FieldError {
 	v.recorder.add("validate-helper")
@@ -263,15 +266,16 @@ func newBackendTestService(t *testing.T) (*trayapp.Service, *backendTestRecorder
 	store := &backendTestStore{
 		recorder: recorder,
 		settings: backendTestSettings(),
-		agent:    trayconfig.AgentForm{},
 		helper:   trayconfig.HelperForm{PipeName: "helper-pipe"},
 	}
+	agentConfig := &backendTestAgentConfig{recorder: recorder}
 	agent := &backendTestComponent{name: "agent", recorder: recorder}
 	helper := &backendTestComponent{name: "helper", recorder: recorder}
 	root := t.TempDir()
 	return trayapp.NewService(trayapp.Dependencies{
 		Store:             store,
 		Validator:         backendTestValidator{recorder: recorder},
+		AgentConfig:       agentConfig,
 		MachineID:         "node-" + strings.Repeat("1", 64),
 		Agent:             agent,
 		Helper:            helper,
@@ -376,10 +380,11 @@ func TestBackendForwardsEveryPublicOperationExactlyOnce(t *testing.T) {
 
 	wantCounts := map[string]int{
 		"load-settings": 7, "load-agent": 1, "load-helper": 1,
-		"agent-refresh": 3, "helper-refresh": 2, "workers-snapshot": 1,
+		"agent-refresh": 1, "helper-refresh": 2, "workers-snapshot": 1,
 		"task-inspect": 1, "login-enabled": 2,
 		"validate-agent": 3, "save-agent": 2,
-		"agent-start": 2, "agent-stop": 2, "agent-restart": 1, "agent-force": 1,
+		"promote-agent-endpoint": 1,
+		"agent-start":            2, "agent-stop": 2, "agent-restart": 1, "agent-force": 1,
 		"validate-helper": 2, "prepare-helper": 1,
 		"elevate-write_helper_config": 1,
 		"helper-start":                1, "helper-stop": 1, "helper-restart": 1, "helper-force": 1,
@@ -590,12 +595,13 @@ func backendTestSettingsWithClose(closeToTray bool) traymodel.TraySettings {
 func newBackendTestServiceWithSettings(t *testing.T, settings traymodel.TraySettings, settingsErr error) (*trayapp.Service, *backendTestRecorder, *backendTestComponent) {
 	t.Helper()
 	recorder := &backendTestRecorder{}
-	store := &backendTestStore{recorder: recorder, settings: settings, settingsErr: settingsErr, agent: trayconfig.AgentForm{}, helper: trayconfig.HelperForm{PipeName: "helper-pipe"}}
+	store := &backendTestStore{recorder: recorder, settings: settings, settingsErr: settingsErr, helper: trayconfig.HelperForm{PipeName: "helper-pipe"}}
+	agentConfig := &backendTestAgentConfig{recorder: recorder}
 	agent := &backendTestComponent{name: "agent", recorder: recorder}
 	helper := &backendTestComponent{name: "helper", recorder: recorder}
 	root := t.TempDir()
 	return trayapp.NewService(trayapp.Dependencies{
-		Store: store, Validator: backendTestValidator{recorder: recorder}, Agent: agent, Helper: helper,
+		Store: store, Validator: backendTestValidator{recorder: recorder}, AgentConfig: agentConfig, Agent: agent, Helper: helper,
 		MachineID: "node-" + strings.Repeat("1", 64), AgentFingerprint: backendTestUpdater{}, HelperFingerprint: backendTestUpdater{},
 		Task: backendTestTask{recorder: recorder}, Elevation: backendTestElevation{recorder: recorder}, LoginStart: backendTestLoginStart{recorder: recorder},
 		TrayExecutable: filepath.Join(root, "nodetray.exe"), TaskDefinition: nodetask.Definition{HelperExecutable: filepath.Join(root, "helper.exe"), HelperConfig: filepath.Join(root, "helper.json"), UserSID: "S-1-5-21-1"},

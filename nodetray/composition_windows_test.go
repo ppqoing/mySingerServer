@@ -4,13 +4,18 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	agentconfig "dedup/internal/config"
 	"dedup/internal/machineid"
+	"dedup/internal/nodectl"
 	trayapp "dedup/internal/nodetray/app"
 	trayconfig "dedup/internal/nodetray/config"
 	"dedup/internal/nodetray/process"
@@ -18,6 +23,7 @@ import (
 	"dedup/internal/nodetray/supervisor"
 	"dedup/internal/nodetray/traymodel"
 	"dedup/internal/nodetray/windows/task"
+	"dedup/internal/proto"
 )
 
 type windowsCompositionStore struct {
@@ -25,9 +31,6 @@ type windowsCompositionStore struct {
 	ensureCalls int
 }
 
-func (*windowsCompositionStore) ValidateAgentForm(trayconfig.AgentForm) []trayconfig.FieldError {
-	return nil
-}
 func (*windowsCompositionStore) ValidateHelperForm(trayconfig.HelperForm) []trayconfig.FieldError {
 	return nil
 }
@@ -118,6 +121,9 @@ func TestWindowsProductionCompositionUsesInspectedPortableExecutable(t *testing.
 		Inspector:       inspector,
 		FinalPath:       func(path string) (string, error) { return path, nil },
 		UserSID:         func(process.Identity) (string, error) { return "S-1-5-21-101-202-303-1001", nil },
+		AgentConnectionSource: func(context.Context) (string, string, error) {
+			return "127.0.0.1:1", "composition-token", nil
+		},
 		Constructors: windowsProductionConstructors{
 			NewStore: func(paths trayconfig.Paths) (windowsProductionStore, error) { storePaths = paths; return store, nil },
 			NewTask: func(capability task.Capability) (task.Service, error) {
@@ -174,6 +180,9 @@ func TestWindowsProductionInputsShareFactoryAndPerformNoActionsDuringConstructio
 		Task: taskService, Elevation: compositionElevation{}, LoginStart: compositionLoginStart{},
 		Instance: compositionInstance{}, UI: compositionUI{}, Opener: compositionOpener{},
 		Emitter: func(context.Context, string, any) {}, Show: func(context.Context) {}, Quit: func(context.Context) {},
+		AgentConnectionSource: func(context.Context) (string, string, error) {
+			return "127.0.0.1:1", "construction-token", nil
+		},
 	}
 
 	inputs, err := buildWindowsProductionInputs(layout, "S-1-5-21-101-202-303-1001", native)
@@ -208,6 +217,155 @@ func TestWindowsProductionInputsShareFactoryAndPerformNoActionsDuringConstructio
 	if err := inputs.Prepare(); err != nil || store.ensureCalls != 1 {
 		t.Fatalf("Prepare err=%v calls=%d", err, store.ensureCalls)
 	}
+}
+
+func TestWindowsProductionInputsShareAndCloseOneAgentSocketController(t *testing.T) {
+	layout, err := production.ResolvePortableLayout(`D:\Portable\Compute\nodetray.exe`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	machineID := "node-" + strings.Repeat("7", 64)
+	token := "shared-controller-token"
+	base := agentconfig.DefaultAgent()
+	base.ListenAddr = listener.Addr().String()
+	base.DataDir = `D:\Portable\Compute\data\agent\data`
+	base.PGDSN = "postgres://127.0.0.1:5432/dedup?sslmode=prefer"
+	base.Worker.Count = 2
+	base.Worker.ExePath = layout.AgentExecutable
+	base.Thumb.CacheDir = `D:\Portable\Compute\data\agent\thumbcache`
+	canonical, err := json.MarshalIndent(base, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical = append(canonical, '\n')
+	status := nodectl.Status{
+		Component: nodectl.ComponentAgent, MachineID: machineID, PID: 1001,
+		StartedAtUnixMS: 123, ExecutablePath: layout.AgentExecutable,
+		ConfigSHA256: strings.Repeat("a", 64), Lifecycle: "running",
+		ServiceReady: true, Ready: true, SyncHealthy: true,
+	}
+	var connections atomic.Int32
+	operations := make(chan string, 4)
+	closed := make(chan struct{}, 4)
+	serverErr := make(chan error, 4)
+	go func() {
+		for {
+			connection, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			connections.Add(1)
+			go func(conn net.Conn) {
+				defer func() { _ = conn.Close(); closed <- struct{}{} }()
+				framed := proto.NewConn(conn)
+				if writeErr := framed.WriteFrame(proto.MsgHello, &proto.Hello{Version: proto.ProtocolVersion, MachineID: machineID, PID: 1001}); writeErr != nil {
+					serverErr <- writeErr
+					return
+				}
+				messageType, body, readErr := framed.ReadFrame()
+				if readErr != nil {
+					serverErr <- readErr
+					return
+				}
+				decoded, decodeErr := proto.Decode(messageType, body)
+				if decodeErr != nil {
+					serverErr <- decodeErr
+					return
+				}
+				auth, ok := decoded.(*proto.ClientAuth)
+				if !ok || auth.Token != token {
+					serverErr <- errors.New("unexpected Agent authentication")
+					return
+				}
+				if writeErr := framed.WriteFrame(proto.MsgClientAuthResult, &proto.ClientAuthResult{Accepted: true}); writeErr != nil {
+					serverErr <- writeErr
+					return
+				}
+				for {
+					messageType, body, readErr = framed.ReadFrame()
+					if readErr != nil {
+						return
+					}
+					decoded, decodeErr = proto.Decode(messageType, body)
+					if decodeErr != nil {
+						serverErr <- decodeErr
+						return
+					}
+					request := decoded.(*proto.LocalRequest)
+					operations <- request.Operation
+					var response proto.LocalResponse
+					switch request.Operation {
+					case proto.LocalOperationConfigGet:
+						response = windowsLocalSuccess(request.RequestID, proto.LocalConfigGetResponse{CanonicalJSON: canonical, SHA256: strings.Repeat("a", 64)})
+					case proto.LocalOperationStatusGet:
+						response = windowsLocalSuccess(request.RequestID, proto.LocalStatusGetResponse{Status: status})
+					default:
+						response = proto.LocalResponse{RequestID: request.RequestID, ErrorCode: "unsupported_operation"}
+					}
+					if writeErr := framed.WriteFrame(proto.MsgLocalResponse, &response); writeErr != nil {
+						serverErr <- writeErr
+						return
+					}
+				}
+			}(connection)
+		}
+	}()
+
+	store := &windowsCompositionStore{}
+	native := windowsProductionNative{
+		Store: store, Inspector: windowsCompositionInspector{},
+		AgentLauncher: &windowsCompositionLauncher{}, HelperLauncher: &windowsCompositionLauncher{},
+		Terminator: &windowsCompositionTerminator{}, Dialer: &windowsCompositionDialer{}, MachineID: machineID,
+		Task: &windowsCompositionTask{}, Elevation: compositionElevation{}, LoginStart: compositionLoginStart{},
+		Instance: compositionInstance{}, UI: compositionUI{}, Opener: compositionOpener{},
+		Emitter: func(context.Context, string, any) {}, Show: func(context.Context) {}, Quit: func(context.Context) {},
+		AgentConnectionSource: func(context.Context) (string, string, error) { return listener.Addr().String(), token, nil },
+	}
+	inputs, err := buildWindowsProductionInputs(layout, "S-1-5-21-101-202-303-1001", native)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := inputs.AgentConfig.LoadAgentForm(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := inputs.Workers.Snapshot(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		select {
+		case <-operations:
+		case err := <-serverErr:
+			t.Fatal(err)
+		case <-time.After(time.Second):
+			t.Fatal("Agent Socket operation timed out")
+		}
+	}
+	if got := connections.Load(); got != 1 {
+		t.Fatalf("Agent Socket connections = %d, want one shared controller", got)
+	}
+	if err := inputs.CloseAgentControl(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-closed:
+	case err := <-serverErr:
+		t.Fatal(err)
+	case <-time.After(time.Second):
+		t.Fatal("shared Agent Socket connection was not closed")
+	}
+}
+
+func windowsLocalSuccess(requestID string, value any) proto.LocalResponse {
+	payload, err := proto.EncodeLocalPayload(value)
+	if err != nil {
+		panic(err)
+	}
+	return proto.LocalResponse{RequestID: requestID, OK: true, Payload: payload}
 }
 
 var _ supervisor.Launcher = (*windowsCompositionLauncher)(nil)

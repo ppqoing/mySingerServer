@@ -18,6 +18,7 @@ import (
 type productionCompositionInputs struct {
 	Store             trayapp.Store
 	Validator         trayapp.Validator
+	AgentConfig       trayapp.AgentConfigGateway
 	MachineID         string
 	Agent             trayapp.Component
 	Helper            trayapp.Component
@@ -38,19 +39,20 @@ type productionCompositionInputs struct {
 		trayapp.PathResolver
 		bootstrap.FinalPathResolver
 	}
-	Opener         trayapp.LocationOpener
-	Workers        trayapp.WorkerProvider
-	ProcessWaiter  trayapp.ProcessWaiter
-	Paths          bootstrap.PathResolver
-	Instance       bootstrap.InstanceService
-	Factory        bootstrap.Factory
-	Scheduler      bootstrap.RefreshScheduler
-	UI             bootstrap.UI
-	Emitter        production.EventEmitter
-	Prepare        func() error
-	Show           func(context.Context)
-	Quit           func(context.Context)
-	StartBootstrap production.BootstrapStarter
+	Opener            trayapp.LocationOpener
+	Workers           trayapp.WorkerProvider
+	ProcessWaiter     trayapp.ProcessWaiter
+	Paths             bootstrap.PathResolver
+	Instance          bootstrap.InstanceService
+	Factory           bootstrap.Factory
+	Scheduler         bootstrap.RefreshScheduler
+	UI                bootstrap.UI
+	Emitter           production.EventEmitter
+	Prepare           func() error
+	Show              func(context.Context)
+	Quit              func(context.Context)
+	StartBootstrap    production.BootstrapStarter
+	CloseAgentControl func() error
 }
 
 func composeProductionBackendWith(inputs productionCompositionInputs) (*Backend, error) {
@@ -73,9 +75,9 @@ func composeProductionBackendWith(inputs productionCompositionInputs) (*Backend,
 		Events: events, Emitter: inputs.Emitter, EventBuffer: 16,
 		StartBootstrap: inputs.StartBootstrap,
 	})
-	lifecycle := &preparedRuntimeLifecycle{prepare: inputs.Prepare, runtime: runtimeLifecycle, events: events}
+	lifecycle := &preparedRuntimeLifecycle{prepare: inputs.Prepare, runtime: runtimeLifecycle, events: events, closeAgentControl: inputs.CloseAgentControl}
 	service := trayapp.NewService(trayapp.Dependencies{
-		Store: inputs.Store, Validator: inputs.Validator,
+		Store: inputs.Store, Validator: inputs.Validator, AgentConfig: inputs.AgentConfig,
 		MachineID: inputs.MachineID,
 		Agent:     inputs.Agent, Helper: inputs.Helper,
 		AgentFingerprint:  inputs.AgentFingerprint,
@@ -89,12 +91,12 @@ func composeProductionBackendWith(inputs productionCompositionInputs) (*Backend,
 }
 
 func validateProductionComposition(inputs productionCompositionInputs) error {
-	if inputs.Store == nil || inputs.Validator == nil || inputs.Agent == nil || inputs.Helper == nil ||
+	if inputs.Store == nil || inputs.Validator == nil || inputs.AgentConfig == nil || inputs.Agent == nil || inputs.Helper == nil ||
 		!machineid.Valid(inputs.MachineID) || inputs.AgentFingerprint == nil || inputs.HelperFingerprint == nil ||
 		inputs.Task == nil || inputs.Elevation == nil || inputs.LoginStart == nil || inputs.FinalPaths == nil ||
 		inputs.Opener == nil || inputs.Workers == nil || inputs.ProcessWaiter == nil || inputs.Paths == nil || inputs.Instance == nil ||
 		inputs.Factory == nil || inputs.Scheduler == nil || inputs.UI == nil || inputs.Emitter == nil ||
-		inputs.Prepare == nil || inputs.Show == nil || inputs.Quit == nil {
+		inputs.Prepare == nil || inputs.Show == nil || inputs.Quit == nil || inputs.CloseAgentControl == nil {
 		return errors.New("production composition: required dependency unavailable")
 	}
 	if !validCompositionExecutable(inputs.TrayExecutable, "nodetray.exe") ||
@@ -137,13 +139,14 @@ func strictlyWithinCompositionRoot(path, root string) bool {
 }
 
 type preparedRuntimeLifecycle struct {
-	prepare     func() error
-	runtime     *production.Runtime
-	events      *trayapp.EventBus
-	prepareOnce sync.Once
-	prepareErr  error
-	closeOnce   sync.Once
-	closeErr    error
+	prepare           func() error
+	runtime           *production.Runtime
+	events            *trayapp.EventBus
+	closeAgentControl func() error
+	prepareOnce       sync.Once
+	prepareErr        error
+	closeOnce         sync.Once
+	closeErr          error
 }
 
 func (l *preparedRuntimeLifecycle) Start(ctx context.Context) (*bootstrap.Runtime, error) {
@@ -167,6 +170,11 @@ func (l *preparedRuntimeLifecycle) Close() error {
 		}
 		if l.events != nil {
 			l.events.Close()
+		}
+		if l.closeAgentControl != nil {
+			if err := l.closeAgentControl(); l.closeErr == nil {
+				l.closeErr = err
+			}
 		}
 	})
 	return l.closeErr

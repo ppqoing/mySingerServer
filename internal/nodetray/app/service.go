@@ -19,16 +19,27 @@ import (
 type Store interface {
 	LoadTraySettings() (traymodel.TraySettings, error)
 	SaveTraySettings(traymodel.TraySettings) error
-	LoadAgentForm() (config.AgentForm, error)
-	SaveAgentForm(config.AgentForm) (string, error)
 	LoadHelperForm() (config.HelperForm, error)
 	PrepareHelperWrite(config.HelperForm) (config.PreparedWrite, error)
 }
 
-// Validator is the injected pure Task 1 form-validation boundary. It must not
-// persist configuration or start components.
+type AgentConfigSaveResult struct {
+	SHA256          string
+	RestartRequired bool
+}
+
+// AgentConfigGateway is the authenticated, context-aware Socket boundary for
+// every interactive Agent configuration operation.
+type AgentConfigGateway interface {
+	LoadAgentForm(context.Context) (config.AgentForm, error)
+	ValidateAgentForm(context.Context, config.AgentForm) []config.FieldError
+	SaveAgentForm(context.Context, config.AgentForm) (AgentConfigSaveResult, error)
+	PromotePendingEndpoint()
+}
+
+// Validator is the local pure Helper form-validation boundary. Agent
+// validation belongs to AgentConfigGateway.
 type Validator interface {
-	ValidateAgent(config.AgentForm) []config.FieldError
 	ValidateHelper(config.HelperForm) []config.FieldError
 }
 
@@ -79,6 +90,7 @@ type Location struct {
 type Dependencies struct {
 	Store             Store
 	Validator         Validator
+	AgentConfig       AgentConfigGateway
 	MachineID         string
 	Agent             Component
 	Helper            Component
@@ -100,6 +112,7 @@ type Service struct {
 	agentConfigMu     sync.Mutex
 	store             Store
 	validator         Validator
+	agentConfig       AgentConfigGateway
 	machineID         string
 	agent             Component
 	helper            Component
@@ -123,7 +136,7 @@ func NewService(dependencies Dependencies) *Service {
 		locations[kind] = location
 	}
 	return &Service{
-		store: dependencies.Store, validator: dependencies.Validator,
+		store: dependencies.Store, validator: dependencies.Validator, agentConfig: dependencies.AgentConfig,
 		machineID: dependencies.MachineID,
 		agent:     dependencies.Agent, helper: dependencies.Helper, task: dependencies.Task,
 		agentFingerprint: dependencies.AgentFingerprint, helperFingerprint: dependencies.HelperFingerprint,
@@ -199,19 +212,19 @@ func (s *Service) GetOverview(ctx context.Context) (traymodel.Overview, error) {
 	return overview, nil
 }
 
-func (s *Service) GetAgentForm(context.Context) (config.AgentForm, error) {
-	if s == nil || s.store == nil {
+func (s *Service) GetAgentForm(ctx context.Context) (config.AgentForm, error) {
+	if s == nil || s.agentConfig == nil {
 		return config.AgentForm{}, errors.New("app unavailable")
 	}
-	value, err := s.store.LoadAgentForm()
+	value, err := s.agentConfig.LoadAgentForm(ctx)
 	return value, safeUIError(err)
 }
 
-func (s *Service) ValidateAgent(_ context.Context, value config.AgentForm) []config.FieldError {
-	if s == nil || s.validator == nil {
+func (s *Service) ValidateAgent(ctx context.Context, value config.AgentForm) []config.FieldError {
+	if s == nil || s.agentConfig == nil {
 		return []config.FieldError{{Field: "agent", Code: "unavailable", Message: "验证服务不可用"}}
 	}
-	return sanitizeFieldErrors(s.validator.ValidateAgent(value))
+	return sanitizeFieldErrors(s.agentConfig.ValidateAgentForm(ctx, value))
 }
 
 func (s *Service) SaveAgent(ctx context.Context, value config.AgentForm) traymodel.ConfigApplyResult {
@@ -227,10 +240,10 @@ func (s *Service) saveAgentLocked(ctx context.Context, value config.AgentForm) t
 	if fields := s.ValidateAgent(ctx, value); len(fields) != 0 {
 		return configApplyFailure("invalid_config", fields[0].Message)
 	}
-	if s == nil || s.store == nil {
+	if s == nil || s.agentConfig == nil {
 		return configApplyFailure("unavailable", "配置服务不可用")
 	}
-	digest, err := s.store.SaveAgentForm(value)
+	saved, err := s.agentConfig.SaveAgentForm(ctx, value)
 	if err != nil {
 		if errors.Is(err, config.ErrSaveVerify) {
 			return configApplyFailure("save_verify_failed", err.Error())
@@ -238,16 +251,12 @@ func (s *Service) saveAgentLocked(ctx context.Context, value config.AgentForm) t
 		return configApplyFailure("save_failed", err.Error())
 	}
 	if s.agentFingerprint == nil {
-		return savedConfigApplyFailure("unavailable", "Agent 摘要更新服务不可用", digest, true)
+		return savedConfigApplyFailure("unavailable", "Agent 摘要更新服务不可用", saved.SHA256, true)
 	}
-	if updated := sanitizeOperation(s.agentFingerprint.UpdateExpectedSHA256(digest)); !updated.OK {
-		return savedConfigApplyFailure(updated.ErrorCode, updated.ErrorSummary, digest, true)
+	if updated := sanitizeOperation(s.agentFingerprint.UpdateExpectedSHA256(saved.SHA256)); !updated.OK {
+		return savedConfigApplyFailure(updated.ErrorCode, updated.ErrorSummary, saved.SHA256, true)
 	}
-	needsRestart := false
-	if s.agent != nil {
-		needsRestart = s.agent.Refresh(ctx).NeedsRestart
-	}
-	return traymodel.ConfigApplyResult{OK: true, Saved: true, SHA256: digest, NeedsRestart: needsRestart}
+	return traymodel.ConfigApplyResult{OK: true, Saved: true, SHA256: saved.SHA256, NeedsRestart: saved.RestartRequired}
 }
 
 func (s *Service) SaveAndRestartAgent(ctx context.Context, value config.AgentForm) traymodel.ConfigApplyResult {
@@ -264,6 +273,7 @@ func (s *Service) SaveAndRestartAgent(ctx context.Context, value config.AgentFor
 	if !stopped.OK {
 		return savedConfigApplyFailure(stopped.ErrorCode, stopped.ErrorSummary, saved.SHA256, true)
 	}
+	s.agentConfig.PromotePendingEndpoint()
 	started := s.StartAgent(ctx)
 	if !started.OK {
 		return savedConfigApplyFailure(started.ErrorCode, started.ErrorSummary, saved.SHA256, true)

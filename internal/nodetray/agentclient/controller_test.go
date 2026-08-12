@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -194,6 +195,99 @@ func TestAgentControllerConfigUsesCanonicalRawJSONAndPreservesStoredPassword(t *
 	if err := <-serverErr; err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestAgentControllerStagesSavedPortUntilOldShutdownThenReconnectsToNewPort(t *testing.T) {
+	machineID := testMachineID("6")
+	token := "endpoint-transition-token"
+	oldListener := listenAgentClientTestTCP(t)
+	newListener := listenAgentClientTestTCP(t)
+	_, oldPort, err := net.SplitHostPort(oldListener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, newPort, err := net.SplitHostPort(newListener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := validControllerAgentConfig()
+	base.ListenAddr = net.JoinHostPort("0.0.0.0", oldPort)
+	canonical, err := json.MarshalIndent(base, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical = append(canonical, '\n')
+	oldStatus := validAgentStatus(machineID)
+	oldStatus.PID = 1001
+	newStatus := validAgentStatus(machineID)
+	newStatus.PID = 2002
+	oldOperations := make(chan string, 4)
+	oldServerErr := make(chan error, 1)
+	go serveAgentControllerConnection(oldListener, token, machineID, 4, func(request proto.LocalRequest) proto.LocalResponse {
+		oldOperations <- request.Operation
+		switch request.Operation {
+		case proto.LocalOperationConfigGet:
+			return localSuccess(request.RequestID, proto.LocalConfigGetResponse{CanonicalJSON: canonical, SHA256: strings.Repeat("a", 64)})
+		case proto.LocalOperationConfigSave:
+			return localSuccess(request.RequestID, proto.LocalConfigSaveResponse{SHA256: strings.Repeat("b", 64), RestartRequired: true})
+		case proto.LocalOperationStatusGet:
+			return localSuccess(request.RequestID, proto.LocalStatusGetResponse{Status: oldStatus})
+		case proto.LocalOperationShutdown:
+			return localSuccess(request.RequestID, proto.LocalShutdownResponse{Accepted: true})
+		default:
+			return proto.LocalResponse{RequestID: request.RequestID, ErrorCode: "unsupported_operation"}
+		}
+	}, oldServerErr)
+	newServerErr := make(chan error, 1)
+	go serveAgentControllerConnection(newListener, token, machineID, 1, func(request proto.LocalRequest) proto.LocalResponse {
+		if request.Operation != proto.LocalOperationStatusGet {
+			return proto.LocalResponse{RequestID: request.RequestID, ErrorCode: "unsupported_operation"}
+		}
+		return localSuccess(request.RequestID, proto.LocalStatusGetResponse{Status: newStatus})
+	}, newServerErr)
+
+	controller, err := NewController(oldListener.Addr().String(), token, machineID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	form, err := controller.LoadAgentForm(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	form.ListenPort = mustAgentClientPort(t, newPort)
+	if _, err := controller.SaveAgentForm(context.Background(), form); err != nil {
+		t.Fatal(err)
+	}
+	if status, err := controller.Status(context.Background()); err != nil || status.PID != oldStatus.PID {
+		t.Fatalf("Status before shutdown = %#v, %v", status, err)
+	}
+	if err := controller.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if status, err := controller.Status(context.Background()); err != nil || status.PID != newStatus.PID {
+		t.Fatalf("Status after shutdown = %#v, %v", status, err)
+	}
+	_ = controller.Close()
+	if got := []string{<-oldOperations, <-oldOperations, <-oldOperations, <-oldOperations}; !reflect.DeepEqual(got, []string{
+		proto.LocalOperationConfigGet, proto.LocalOperationConfigSave, proto.LocalOperationStatusGet, proto.LocalOperationShutdown,
+	}) {
+		t.Fatalf("old endpoint operations = %v", got)
+	}
+	if err := <-oldServerErr; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-newServerErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func mustAgentClientPort(t *testing.T, value string) int {
+	t.Helper()
+	port, err := strconv.Atoi(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return port
 }
 
 func validAgentStatus(machineID string) nodectl.Status {

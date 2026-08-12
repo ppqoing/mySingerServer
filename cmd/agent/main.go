@@ -34,6 +34,7 @@ import (
 	"dedup/internal/machineid"
 	"dedup/internal/nodectl"
 	"dedup/internal/proto"
+	"dedup/internal/securefile"
 	"dedup/internal/stats"
 	"dedup/internal/store"
 	"dedup/internal/syncer"
@@ -714,39 +715,7 @@ func canonicalAgentConfig(cfg *config.AgentConfig) ([]byte, error) {
 }
 
 func writeAgentConfigAtomic(path string, canonical []byte) (err error) {
-	directory := filepath.Dir(path)
-	temporary, err := os.CreateTemp(directory, "."+filepath.Base(path)+".*.tmp")
-	if err != nil {
-		return err
-	}
-	temporaryPath := temporary.Name()
-	defer func() {
-		_ = temporary.Close()
-		_ = os.Remove(temporaryPath)
-	}()
-	if err := temporary.Chmod(0o600); err != nil {
-		return err
-	}
-	if _, err := temporary.Write(canonical); err != nil {
-		return err
-	}
-	if err := temporary.Sync(); err != nil {
-		return err
-	}
-	if err := temporary.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(temporaryPath, path); err != nil {
-		return err
-	}
-	written, err := os.ReadFile(path)
-	if err != nil || !bytes.Equal(written, canonical) {
-		if err != nil {
-			return err
-		}
-		return errors.New("saved Agent configuration verification failed")
-	}
-	return nil
+	return securefile.WriteAtomic(path, canonical, os.ReadFile)
 }
 
 func localAgentSuccess(requestID string, payload any) proto.LocalResponse {

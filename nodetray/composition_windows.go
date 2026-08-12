@@ -36,30 +36,32 @@ type windowsProductionStore interface {
 }
 
 type windowsProductionNative struct {
-	Store          windowsProductionStore
-	Inspector      process.Inspector
-	AgentLauncher  supervisor.Launcher
-	HelperLauncher supervisor.Launcher
-	Terminator     supervisor.Terminator
-	Dialer         production.Dialer
-	MachineID      string
-	Task           task.Service
-	Elevation      trayapp.ElevationClient
-	LoginStart     trayapp.LoginStart
-	Instance       bootstrap.InstanceService
-	UI             bootstrap.UI
-	Opener         trayapp.LocationOpener
-	Emitter        production.EventEmitter
-	Show           func(context.Context)
-	Quit           func(context.Context)
+	Store                 windowsProductionStore
+	Inspector             process.Inspector
+	AgentLauncher         supervisor.Launcher
+	HelperLauncher        supervisor.Launcher
+	Terminator            supervisor.Terminator
+	Dialer                production.Dialer
+	MachineID             string
+	Task                  task.Service
+	Elevation             trayapp.ElevationClient
+	LoginStart            trayapp.LoginStart
+	Instance              bootstrap.InstanceService
+	UI                    bootstrap.UI
+	Opener                trayapp.LocationOpener
+	Emitter               production.EventEmitter
+	Show                  func(context.Context)
+	Quit                  func(context.Context)
+	AgentConnectionSource production.AgentConnectionSource
 }
 
 type windowsProductionCompositionDependencies struct {
-	MachineIdentity func() (machineid.Result, error)
-	Inspector       process.Inspector
-	FinalPath       func(string) (string, error)
-	UserSID         func(process.Identity) (string, error)
-	Constructors    windowsProductionConstructors
+	MachineIdentity       func() (machineid.Result, error)
+	Inspector             process.Inspector
+	FinalPath             func(string) (string, error)
+	UserSID               func(process.Identity) (string, error)
+	Constructors          windowsProductionConstructors
+	AgentConnectionSource production.AgentConnectionSource
 }
 
 type windowsProductionConstructors struct {
@@ -144,14 +146,14 @@ func composeWindowsProductionBackendWith(dependencies windowsProductionCompositi
 	if err != nil {
 		return nil, errors.New("production composition: current user identity unavailable")
 	}
-	inputs, err := buildWindowsProductionInputsForLayout(layout, userSID, dependencies.Inspector, identity, dependencies.Constructors)
+	inputs, err := buildWindowsProductionInputsForLayout(layout, userSID, dependencies.Inspector, identity, dependencies.Constructors, dependencies.AgentConnectionSource)
 	if err != nil {
 		return nil, err
 	}
 	return composeProductionBackendWith(inputs)
 }
 
-func buildWindowsProductionInputsForLayout(layout production.Layout, userSID string, inspector process.Inspector, identity machineid.Result, constructors windowsProductionConstructors) (productionCompositionInputs, error) {
+func buildWindowsProductionInputsForLayout(layout production.Layout, userSID string, inspector process.Inspector, identity machineid.Result, constructors windowsProductionConstructors, agentConnectionSource production.AgentConnectionSource) (productionCompositionInputs, error) {
 	store, err := constructors.NewStore(trayconfig.Paths{
 		TraySettings: layout.TraySettings, AgentConfig: layout.AgentConfig, HelperConfig: layout.HelperConfig,
 		AgentExecutable: layout.AgentExecutable, HelperExecutable: layout.HelperExecutable,
@@ -188,8 +190,9 @@ func buildWindowsProductionInputsForLayout(layout production.Layout, userSID str
 		Emitter: newContextEventEmitter(func(ctx context.Context, name string, payload any) {
 			eventsEmitAdapter(ctx, name, payload)
 		}),
-		Show: showNodeWindow,
-		Quit: wailsQuitAdapter,
+		Show:                  showNodeWindow,
+		Quit:                  wailsQuitAdapter,
+		AgentConnectionSource: agentConnectionSource,
 	}
 	return buildWindowsProductionInputs(layout, userSID, native)
 }
@@ -202,9 +205,15 @@ func buildWindowsProductionInputs(layout production.Layout, userSID string, nati
 		userSID == "" || strings.TrimSpace(userSID) != userSID || !strings.HasPrefix(userSID, "S-1-") {
 		return productionCompositionInputs{}, errors.New("production composition: Windows dependencies unavailable")
 	}
-	agentController := func(context.Context) (supervisor.Controller, error) {
-		return production.NewAgentController(native.Dialer, native.MachineID)
+	controllerSources := []production.AgentConnectionSource(nil)
+	if native.AgentConnectionSource != nil {
+		controllerSources = append(controllerSources, native.AgentConnectionSource)
 	}
+	sharedAgentController, err := production.NewAgentController(native.Dialer, native.MachineID, controllerSources...)
+	if err != nil {
+		return productionCompositionInputs{}, errors.New("production composition: Agent controller unavailable")
+	}
+	agentController := func(context.Context) (supervisor.Controller, error) { return sharedAgentController, nil }
 	helperController := func(context.Context) (supervisor.Controller, error) {
 		return production.NewHelperController(native.Dialer, native.MachineID)
 	}
@@ -228,7 +237,7 @@ func buildWindowsProductionInputs(layout production.Layout, userSID string, nati
 	}
 	finalPaths := bootstrap.OSFinalPathResolver{}
 	return productionCompositionInputs{
-		Store: native.Store, Validator: production.NewValidator(native.Store),
+		Store: native.Store, Validator: production.NewValidator(native.Store), AgentConfig: production.NewAgentConfigGateway(sharedAgentController),
 		MachineID: native.MachineID,
 		Agent:     factory.Agent(), Helper: factory.Helper(),
 		AgentFingerprint: factory.Agent(), HelperFingerprint: factory.Helper(),
@@ -238,7 +247,7 @@ func buildWindowsProductionInputs(layout production.Layout, userSID string, nati
 		TaskDefinition: task.Definition{HelperExecutable: layout.HelperExecutable, HelperConfig: layout.HelperConfig, UserSID: userSID},
 		Locations:      fixedCompositionLocations(layout),
 		FinalPaths:     finalPaths, Opener: native.Opener,
-		Workers:       &lazyAgentWorkers{dialer: native.Dialer, machineID: native.MachineID},
+		Workers:       production.NewWorkerProvider(sharedAgentController),
 		ProcessWaiter: process.NewPIDWaiter(),
 		Paths: fixedCompositionPaths{paths: bootstrap.Paths{
 			TraySettings: layout.TraySettings, AgentConfig: layout.AgentConfig, HelperConfig: layout.HelperConfig,
@@ -247,6 +256,7 @@ func buildWindowsProductionInputs(layout production.Layout, userSID string, nati
 		Emitter: native.Emitter,
 		Prepare: func() error { return native.Store.EnsureTraySettings(production.DefaultTraySettings()) },
 		Show:    native.Show, Quit: native.Quit,
+		CloseAgentControl: sharedAgentController.Close,
 	}, nil
 }
 
@@ -269,19 +279,6 @@ type nodectlDialer struct{}
 
 func (nodectlDialer) Dial(ctx context.Context, name string) (net.Conn, error) {
 	return nodectl.Dial(ctx, name)
-}
-
-type lazyAgentWorkers struct {
-	dialer    production.Dialer
-	machineID string
-}
-
-func (p *lazyAgentWorkers) Snapshot(ctx context.Context) ([]traymodel.WorkerState, error) {
-	controller, err := production.NewAgentController(p.dialer, p.machineID)
-	if err != nil {
-		return nil, errors.New("production workers: Agent controller unavailable")
-	}
-	return production.NewWorkerProvider(controller).Snapshot(ctx)
 }
 
 type windowsCompositionUI struct{}

@@ -16,6 +16,7 @@ import (
 	agentconfig "dedup/internal/config"
 	"dedup/internal/helper"
 	"dedup/internal/nodetray/traymodel"
+	"dedup/internal/securefile"
 )
 
 var ErrSaveVerify = errors.New("save_verify_failed")
@@ -422,6 +423,15 @@ func (s *Store) saveLocked(target string, data []byte, loader canonicalLoader) e
 }
 
 func (s *Store) writeAtomic(target string, data []byte, loader canonicalLoader) (err error) {
+	if s.testHooks.afterSync == nil && s.testHooks.beforeReplace == nil && s.testHooks.replace == nil {
+		if err := securefile.WriteAtomic(target, data, securefile.Loader(loader)); err != nil {
+			if errors.Is(err, securefile.ErrVerify) {
+				return fmt.Errorf("%w: formal target invalid", ErrSaveVerify)
+			}
+			return err
+		}
+		return nil
+	}
 	directory := filepath.Dir(target)
 	temp, err := os.CreateTemp(directory, "."+filepath.Base(target)+".tmp-*")
 	if err != nil {

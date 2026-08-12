@@ -17,9 +17,10 @@ import (
 )
 
 type Controller struct {
-	endpoint  string
-	token     string
-	machineID string
+	endpoint        string
+	pendingEndpoint string
+	token           string
+	machineID       string
 
 	mu     sync.Mutex
 	client *Client
@@ -71,6 +72,7 @@ func (c *Controller) Shutdown(ctx context.Context) error {
 	if !payload.Accepted {
 		return errors.New("agent_shutdown_rejected")
 	}
+	c.PromotePendingEndpoint()
 	return nil
 }
 
@@ -114,13 +116,38 @@ func (c *Controller) SaveAgentForm(ctx context.Context, value trayconfig.AgentFo
 	if err := c.call(ctx, proto.LocalOperationConfigSave, proto.LocalConfigRequest{CanonicalJSON: canonical}, &payload); err != nil {
 		return ConfigSaveResult{}, err
 	}
-	cfg, err := decodeCanonicalAgent(canonical)
-	if err == nil {
-		c.mu.Lock()
-		c.base = cfg
-		c.mu.Unlock()
+	pendingEndpoint, err := LoopbackEndpoint(net.JoinHostPort(value.ListenHost, strconv.Itoa(value.ListenPort)))
+	if err != nil {
+		return ConfigSaveResult{}, errors.New("agent_config_invalid")
 	}
+	cfg, err := decodeCanonicalAgent(canonical)
+	c.mu.Lock()
+	if err == nil {
+		c.base = cfg
+	}
+	c.pendingEndpoint = pendingEndpoint
+	c.mu.Unlock()
 	return ConfigSaveResult{SHA256: payload.SHA256, RestartRequired: payload.RestartRequired}, nil
+}
+
+// PromotePendingEndpoint makes the endpoint from the most recent successful
+// save active for future dials. It also retires any connection to the old
+// Agent, so a successful shutdown can never be followed by a stale call.
+func (c *Controller) PromotePendingEndpoint() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	if c.pendingEndpoint != "" {
+		c.endpoint = c.pendingEndpoint
+		c.pendingEndpoint = ""
+	}
+	client := c.client
+	c.client = nil
+	c.mu.Unlock()
+	if client != nil {
+		_ = client.Close()
+	}
 }
 
 func (c *Controller) Close() error {
