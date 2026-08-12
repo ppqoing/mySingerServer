@@ -13,20 +13,14 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-func TestAgentPipeName(t *testing.T) {
-	if got, want := AgentPipeName(), `\\.\pipe\mysingerserver-agent-control-v1`; got != want {
-		t.Fatalf("AgentPipeName() = %q, want %q", got, want)
-	}
-}
-
 func TestHelperPipeName(t *testing.T) {
 	if got, want := HelperPipeName(), `\\.\pipe\mysingerserver-helper-control-v1`; got != want {
 		t.Fatalf("HelperPipeName() = %q, want %q", got, want)
 	}
 }
 
-func TestPipeACL(t *testing.T) {
-	for _, name := range []string{AgentPipeName(), HelperPipeName()} {
+func TestHelperPipeACL(t *testing.T) {
+	for _, name := range []string{HelperPipeName()} {
 		t.Run(name, func(t *testing.T) {
 			listener, err := Listen(name)
 			if err != nil {
@@ -102,8 +96,8 @@ func TestPipeListenRejectsNonFrozenName(t *testing.T) {
 	}
 }
 
-func TestPipeDoesNotPermitSecondListener(t *testing.T) {
-	for _, name := range []string{AgentPipeName(), HelperPipeName()} {
+func TestHelperPipeDoesNotPermitSecondListener(t *testing.T) {
+	for _, name := range []string{HelperPipeName()} {
 		t.Run(name, func(t *testing.T) {
 			first, err := Listen(name)
 			if err != nil {
@@ -120,10 +114,10 @@ func TestPipeDoesNotPermitSecondListener(t *testing.T) {
 	}
 }
 
-func TestPipeDialUsesCallerContext(t *testing.T) {
+func TestHelperPipeDialUsesCallerContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	conn, err := Dial(ctx, AgentPipeName())
+	conn, err := Dial(ctx, HelperPipeName())
 	if conn != nil {
 		_ = conn.Close()
 		t.Fatal("Dial returned a connection for a canceled context")

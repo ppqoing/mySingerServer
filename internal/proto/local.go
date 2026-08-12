@@ -3,6 +3,10 @@ package proto
 import (
 	"errors"
 	"strings"
+
+	"github.com/vmihailenco/msgpack/v5"
+
+	"dedup/internal/nodectl"
 )
 
 const LocalPayloadMaxBytes = 4 * 1024 * 1024
@@ -79,6 +83,52 @@ type LocalEvent struct {
 	Sequence uint64 `msgpack:"sequence"`
 	Topic    string `msgpack:"topic"`
 	Payload  []byte `msgpack:"payload,omitempty"`
+}
+
+type LocalStatusGetResponse struct {
+	Status nodectl.Status `msgpack:"status"`
+}
+
+type LocalConfigGetResponse struct {
+	CanonicalJSON []byte `msgpack:"canonical_json"`
+	SHA256        string `msgpack:"sha256"`
+}
+
+type LocalConfigRequest struct {
+	CanonicalJSON []byte `msgpack:"canonical_json"`
+}
+
+type LocalConfigValidateResponse struct {
+	Valid           bool   `msgpack:"valid"`
+	SHA256          string `msgpack:"sha256"`
+	RestartRequired bool   `msgpack:"restart_required"`
+}
+
+type LocalConfigSaveResponse struct {
+	SHA256          string `msgpack:"sha256"`
+	RestartRequired bool   `msgpack:"restart_required"`
+}
+
+type LocalShutdownResponse struct {
+	Accepted bool `msgpack:"accepted"`
+}
+
+func EncodeLocalPayload(value any) ([]byte, error) {
+	payload, err := msgpack.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	if len(payload) > LocalPayloadMaxBytes {
+		return nil, errors.New(LocalPayloadTooLargeErrorCode)
+	}
+	return payload, nil
+}
+
+func DecodeLocalPayload(payload []byte, destination any) error {
+	if len(payload) > LocalPayloadMaxBytes {
+		return errors.New(LocalPayloadTooLargeErrorCode)
+	}
+	return msgpack.Unmarshal(payload, destination)
 }
 
 func (event LocalEvent) Validate() error {

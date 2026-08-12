@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -8,24 +9,31 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
+	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"dedup/internal/agent"
 	agentdelete "dedup/internal/agent/delete"
-	"dedup/internal/agentcontrol"
+	"dedup/internal/agentinstance"
 	"dedup/internal/config"
 	fileenum "dedup/internal/enum"
+	"dedup/internal/localcontrol"
 	"dedup/internal/machineid"
 	"dedup/internal/nodectl"
+	"dedup/internal/proto"
 	"dedup/internal/stats"
 	"dedup/internal/store"
 	"dedup/internal/syncer"
@@ -148,7 +156,7 @@ func runWithDependencies(
 	if err := validateAgentControlIdentity(cfg, executablePath); err != nil {
 		return err
 	}
-	instance, err := agentcontrol.AcquireSingleInstance(cfg.MachineID)
+	instance, err := agentinstance.AcquireSingleInstance(cfg.MachineID)
 	if err != nil {
 		return fmt.Errorf("acquire Agent single-instance lock: %w", err)
 	}
@@ -158,6 +166,11 @@ func runWithDependencies(
 		return fmt.Errorf("fingerprint effective config: %w", err)
 	}
 	startedAt := time.Now()
+	portableRoot := filepath.Dir(executablePath)
+	controlToken, err := (localcontrol.FileTokenStore{}).LoadOrCreate(localcontrol.TokenPath(portableRoot))
+	if err != nil {
+		return fmt.Errorf("load local control token: %w", err)
+	}
 	logger, errorLogger, closeLogs, err := agent.NewLoggers(cfg.DataDir, os.Stdout)
 	if err != nil {
 		return fmt.Errorf("open logs: %w", err)
@@ -287,7 +300,7 @@ func runWithDependencies(
 		logger,
 	)
 	var listenerReady atomic.Bool
-	provider := agentcontrol.NewProvider(agentcontrol.Inputs{
+	provider := newAgentStatusProvider(agentStatusInputs{
 		MachineID:      cfg.MachineID,
 		ExecutablePath: executablePath,
 		ConfigSHA256:   configSHA256,
@@ -296,20 +309,22 @@ func runWithDependencies(
 		Workers:        workerPool,
 		SyncHealth:     syncHealth.snapshot,
 	})
-	controlService := agentcontrol.New(provider, nodectl.ShutdownFunc(stop))
-	return runControlledService(
-		ctx,
-		stop,
+	localHandler := newAgentLocalHandler(agentLocalHandlerInputs{
+		Status: provider.ControlStatus, Shutdown: stop,
+		ConfigPath: configPath, ExecutablePath: executablePath, CPUCount: runtime.NumCPU(),
+		EffectiveConfigSHA256: configSHA256,
+	})
+	return runService(
 		workerPool,
-		func(ctx context.Context, ready func()) error {
+		func() error {
 			businessLogger := slog.New(&listenerReadyHandler{
 				next: logger.Handler(),
 				ready: func() {
 					listenerReady.Store(true)
-					ready()
 				},
 			})
 			server := agent.NewServer(cfg, scans, businessLogger, phase2)
+			server.SetLocalControl(controlToken, localHandler)
 			if statistics != nil {
 				server.SetStatsProvider(statistics)
 			}
@@ -320,7 +335,6 @@ func runWithDependencies(
 			}
 			return nil
 		},
-		controlService.Run,
 		func() error { return drainPhase2(phase2, phase2DrainTimeout(cfg)) },
 	)
 }
@@ -375,85 +389,6 @@ func drainPhase2(manager phase2Shutdowner, timeout time.Duration) error {
 type managedPool interface {
 	Start()
 	Close()
-}
-
-type contextualService func(context.Context, func()) error
-
-func runControlledService(
-	ctx context.Context,
-	cancel context.CancelFunc,
-	pool managedPool,
-	business contextualService,
-	control func(context.Context) error,
-	drain ...func() error,
-) error {
-	pool.Start()
-	defer pool.Close()
-
-	ready := make(chan struct{})
-	var readyOnce sync.Once
-	businessResult := make(chan error, 1)
-	go func() {
-		businessResult <- business(ctx, func() { readyOnce.Do(func() { close(ready) }) })
-	}()
-
-	var primary error
-	businessDone := false
-	controlDone := false
-	controlStarted := false
-	controlResult := make(chan error, 1)
-	select {
-	case <-ctx.Done():
-	case err := <-businessResult:
-		businessDone = true
-		primary = unexpectedServiceExit("business", err, ctx)
-	case <-ready:
-		controlStarted = true
-		go func() { controlResult <- control(ctx) }()
-	}
-
-	if controlStarted && primary == nil && ctx.Err() == nil {
-		select {
-		case <-ctx.Done():
-		case err := <-businessResult:
-			businessDone = true
-			primary = unexpectedServiceExit("business", err, ctx)
-		case err := <-controlResult:
-			controlDone = true
-			primary = unexpectedServiceExit("control", err, ctx)
-		}
-	}
-	cancel()
-	if !businessDone {
-		<-businessResult
-	}
-	if controlStarted && !controlDone {
-		<-controlResult
-	}
-
-	var drainErr error
-	for _, wait := range drain {
-		if wait == nil {
-			continue
-		}
-		if err := wait(); err != nil && drainErr == nil {
-			drainErr = err
-		}
-	}
-	if primary != nil {
-		return primary
-	}
-	return drainErr
-}
-
-func unexpectedServiceExit(name string, err error, root context.Context) error {
-	if root.Err() != nil && (err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
-		return nil
-	}
-	if err == nil {
-		return fmt.Errorf("%s service exited unexpectedly", name)
-	}
-	return fmt.Errorf("%s service exited: %w", name, err)
 }
 
 func runService(
@@ -532,10 +467,298 @@ func (s *syncHealthState) set(healthy bool, summary string) {
 	s.mu.Unlock()
 }
 
-func (s *syncHealthState) snapshot() agentcontrol.SyncHealth {
+func (s *syncHealthState) snapshot() agentSyncHealth {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return agentcontrol.SyncHealth{Healthy: s.healthy, ErrorSummary: s.error}
+	return agentSyncHealth{Healthy: s.healthy, ErrorSummary: s.error}
+}
+
+const maxReportedWorkers = 1024
+
+var (
+	mediaPathSummary = regexp.MustCompile(`(?i)(?:[a-z]:\\|/)[^\r\n]*?\.(?:mp4|mkv|avi|mov|wmv|flv|webm|mp3|wav|flac|m4a|aac|jpg|jpeg|png|gif|webp|bmp|tif|tiff)(?:\b|$)`)
+	envSummary       = regexp.MustCompile(`(?i)\benv(?:ironment)?\s*[:=]\s*[^[:space:],;}\]]+`)
+)
+
+type agentStatusInputs struct {
+	MachineID      string
+	ExecutablePath string
+	ConfigSHA256   string
+	StartedAt      time.Time
+	ListenerReady  func() bool
+	Workers        interface{ RuntimeSnapshot() worker.RuntimeSnapshot }
+	SyncHealth     func() agentSyncHealth
+}
+
+type agentSyncHealth struct {
+	Healthy      bool
+	ErrorSummary string
+}
+
+type agentStatusProvider struct{ inputs agentStatusInputs }
+
+func newAgentStatusProvider(inputs agentStatusInputs) *agentStatusProvider {
+	return &agentStatusProvider{inputs: inputs}
+}
+
+func (p *agentStatusProvider) ControlStatus() nodectl.Status {
+	serviceReady := p != nil && p.inputs.ListenerReady != nil && p.inputs.ListenerReady()
+	var runtimeSnapshot worker.RuntimeSnapshot
+	if p != nil && p.inputs.Workers != nil {
+		runtimeSnapshot = p.inputs.Workers.RuntimeSnapshot()
+	}
+	expected := runtimeSnapshot.Expected
+	if expected < 0 {
+		expected = 0
+	}
+	if expected > maxReportedWorkers {
+		expected = maxReportedWorkers
+	}
+	mapped := make([]nodectl.WorkerStatus, expected)
+	for index := range mapped {
+		mapped[index].Index = index
+	}
+	for _, source := range runtimeSnapshot.Workers {
+		if source.Index < 0 || source.Index >= expected {
+			continue
+		}
+		pid := source.PID
+		if pid < 0 {
+			pid = 0
+		}
+		mapped[source.Index] = nodectl.WorkerStatus{
+			Index: source.Index, PID: pid, Ready: source.Ready,
+			CurrentTaskSummary: boundedAgentSummary(source.CurrentTaskSummary, 96),
+			LastErrorSummary:   boundedAgentSummary(source.LastErrorSummary, 192),
+		}
+	}
+	ready := 0
+	for _, status := range mapped {
+		if status.Ready {
+			ready++
+		}
+	}
+	syncHealth := agentSyncHealth{}
+	if p != nil && p.inputs.SyncHealth != nil {
+		syncHealth = p.inputs.SyncHealth()
+	}
+	fullyReady := serviceReady && ready == expected
+	lifecycle := "starting"
+	if fullyReady {
+		lifecycle = "running"
+	}
+	return nodectl.Status{
+		Component: nodectl.ComponentAgent, MachineID: p.inputs.MachineID, PID: os.Getpid(),
+		StartedAtUnixMS: p.inputs.StartedAt.UnixMilli(), ExecutablePath: p.inputs.ExecutablePath,
+		ConfigSHA256: strings.ToLower(p.inputs.ConfigSHA256), Lifecycle: lifecycle,
+		ServiceReady: serviceReady, Ready: fullyReady,
+		WorkerExpected: expected, WorkerReady: ready, Workers: mapped,
+		SyncHealthy: syncHealth.Healthy, SyncErrorSummary: safeAgentSummary(syncHealth.ErrorSummary),
+		LastErrorSummary: safeAgentSummary(runtimeSnapshot.LastErrorSummary),
+	}
+}
+
+func safeAgentSummary(value string) string {
+	value = nodectl.SanitizeSummary(value)
+	value = mediaPathSummary.ReplaceAllString(value, "[REDACTED_PATH]")
+	value = envSummary.ReplaceAllString(value, "env=[REDACTED]")
+	return nodectl.SanitizeSummary(value)
+}
+
+func boundedAgentSummary(value string, maxBytes int) string {
+	value = safeAgentSummary(value)
+	if len(value) <= maxBytes {
+		return value
+	}
+	value = value[:maxBytes]
+	for !utf8.ValidString(value) {
+		value = value[:len(value)-1]
+	}
+	return value
+}
+
+type agentLocalHandlerInputs struct {
+	Status                func() nodectl.Status
+	Shutdown              context.CancelFunc
+	ShutdownDelay         time.Duration
+	ConfigPath            string
+	ExecutablePath        string
+	CPUCount              int
+	EffectiveConfigSHA256 string
+}
+
+type agentLocalHandler struct {
+	inputs agentLocalHandlerInputs
+	mu     sync.Mutex
+	once   sync.Once
+}
+
+func newAgentLocalHandler(inputs agentLocalHandlerInputs) *agentLocalHandler {
+	if inputs.ShutdownDelay <= 0 {
+		inputs.ShutdownDelay = 25 * time.Millisecond
+	}
+	return &agentLocalHandler{inputs: inputs}
+}
+
+func (h *agentLocalHandler) HandleLocal(ctx context.Context, request proto.LocalRequest) proto.LocalResponse {
+	if h == nil || ctx == nil || ctx.Err() != nil {
+		return localAgentFailure(request.RequestID, "local_unavailable")
+	}
+	switch request.Operation {
+	case proto.LocalOperationStatusGet:
+		if h.inputs.Status == nil {
+			return localAgentFailure(request.RequestID, "status_unavailable")
+		}
+		status := h.inputs.Status()
+		if err := status.Validate(); err != nil {
+			return localAgentFailure(request.RequestID, "status_unavailable")
+		}
+		return localAgentSuccess(request.RequestID, proto.LocalStatusGetResponse{Status: status})
+	case proto.LocalOperationConfigGet:
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		_, canonical, digest, err := h.loadConfig()
+		if err != nil {
+			return localAgentFailure(request.RequestID, "config_unavailable")
+		}
+		return localAgentSuccess(request.RequestID, proto.LocalConfigGetResponse{CanonicalJSON: canonical, SHA256: digest})
+	case proto.LocalOperationConfigValidate:
+		_, _, digest, err := h.decodeConfigRequest(request.Payload)
+		if err != nil {
+			return localAgentFailure(request.RequestID, "invalid_config")
+		}
+		return localAgentSuccess(request.RequestID, proto.LocalConfigValidateResponse{
+			Valid: true, SHA256: digest, RestartRequired: digest != h.inputs.EffectiveConfigSHA256,
+		})
+	case proto.LocalOperationConfigSave:
+		_, canonical, digest, err := h.decodeConfigRequest(request.Payload)
+		if err != nil {
+			return localAgentFailure(request.RequestID, "invalid_config")
+		}
+		h.mu.Lock()
+		err = writeAgentConfigAtomic(h.inputs.ConfigPath, canonical)
+		h.mu.Unlock()
+		if err != nil {
+			return localAgentFailure(request.RequestID, "config_save_failed")
+		}
+		return localAgentSuccess(request.RequestID, proto.LocalConfigSaveResponse{
+			SHA256: digest, RestartRequired: digest != h.inputs.EffectiveConfigSHA256,
+		})
+	case proto.LocalOperationShutdown:
+		if h.inputs.Shutdown == nil {
+			return localAgentFailure(request.RequestID, "shutdown_unavailable")
+		}
+		h.once.Do(func() {
+			time.AfterFunc(h.inputs.ShutdownDelay, h.inputs.Shutdown)
+		})
+		return localAgentSuccess(request.RequestID, proto.LocalShutdownResponse{Accepted: true})
+	default:
+		return localAgentFailure(request.RequestID, proto.UnsupportedOperationErrorCode)
+	}
+}
+
+func (h *agentLocalHandler) loadConfig() (*config.AgentConfig, []byte, string, error) {
+	data, err := os.ReadFile(h.inputs.ConfigPath)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	return h.validateCanonicalConfig(data, false)
+}
+
+func (h *agentLocalHandler) decodeConfigRequest(payload []byte) (*config.AgentConfig, []byte, string, error) {
+	var request proto.LocalConfigRequest
+	if err := proto.DecodeLocalPayload(payload, &request); err != nil {
+		return nil, nil, "", err
+	}
+	return h.validateCanonicalConfig(request.CanonicalJSON, true)
+}
+
+func (h *agentLocalHandler) validateCanonicalConfig(data []byte, requireCanonical bool) (*config.AgentConfig, []byte, string, error) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	cfg := config.DefaultAgent()
+	if err := decoder.Decode(cfg); err != nil {
+		return nil, nil, "", err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			err = errors.New("trailing Agent configuration")
+		}
+		return nil, nil, "", err
+	}
+	if requireCanonical {
+		inputCanonical, err := canonicalAgentConfig(cfg)
+		if err != nil || !bytes.Equal(inputCanonical, data) {
+			return nil, nil, "", errors.New("Agent configuration is not canonical")
+		}
+	}
+	validated, err := config.ValidateAgent(cfg, h.inputs.ExecutablePath, h.inputs.CPUCount)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	canonical, err := canonicalAgentConfig(validated)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	digest := sha256.Sum256(canonical)
+	return validated, canonical, hex.EncodeToString(digest[:]), nil
+}
+
+func canonicalAgentConfig(cfg *config.AgentConfig) ([]byte, error) {
+	canonical, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(canonical, '\n'), nil
+}
+
+func writeAgentConfigAtomic(path string, canonical []byte) (err error) {
+	directory := filepath.Dir(path)
+	temporary, err := os.CreateTemp(directory, "."+filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer func() {
+		_ = temporary.Close()
+		_ = os.Remove(temporaryPath)
+	}()
+	if err := temporary.Chmod(0o600); err != nil {
+		return err
+	}
+	if _, err := temporary.Write(canonical); err != nil {
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(temporaryPath, path); err != nil {
+		return err
+	}
+	written, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(written, canonical) {
+		if err != nil {
+			return err
+		}
+		return errors.New("saved Agent configuration verification failed")
+	}
+	return nil
+}
+
+func localAgentSuccess(requestID string, payload any) proto.LocalResponse {
+	encoded, err := proto.EncodeLocalPayload(payload)
+	if err != nil {
+		return localAgentFailure(requestID, "internal_error")
+	}
+	return proto.LocalResponse{RequestID: requestID, OK: true, Payload: encoded}
+}
+
+func localAgentFailure(requestID, code string) proto.LocalResponse {
+	return proto.LocalResponse{RequestID: requestID, ErrorCode: code}
 }
 
 func workerPoolConfig(cfg *config.AgentConfig) worker.Config {

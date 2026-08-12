@@ -4,11 +4,15 @@ import (
 	"context"
 	"errors"
 	"net"
+	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 
+	"dedup/internal/localcontrol"
 	"dedup/internal/machineid"
 	"dedup/internal/nodectl"
+	"dedup/internal/nodetray/agentclient"
 	trayconfig "dedup/internal/nodetray/config"
 	"dedup/internal/nodetray/traymodel"
 )
@@ -47,12 +51,63 @@ type FixedController struct {
 	machineID string
 }
 
-func NewAgentController(dialer Dialer, machineID string) (*FixedController, error) {
-	return newFixedController(dialer, nodectl.AgentPipeName(), nodectl.ComponentAgent, machineID)
+type AgentConnectionSource func(context.Context) (configuredEndpoint, token string, err error)
+
+func NewAgentController(_ Dialer, machineID string, sources ...AgentConnectionSource) (*agentclient.Controller, error) {
+	if !validMachineID(machineID) || len(sources) > 1 {
+		return nil, errors.New("production controller: fixed identity unavailable")
+	}
+	source := defaultAgentConnectionSource
+	if len(sources) == 1 {
+		source = sources[0]
+	}
+	if source == nil {
+		return nil, errors.New("production controller: Agent connection unavailable")
+	}
+	endpoint, token, err := source(context.Background())
+	if err != nil {
+		return nil, errors.New("production controller: Agent connection unavailable")
+	}
+	controller, err := agentclient.NewController(endpoint, token, machineID)
+	if err != nil {
+		return nil, errors.New("production controller: Agent connection unavailable")
+	}
+	return controller, nil
 }
 
 func NewHelperController(dialer Dialer, machineID string) (*FixedController, error) {
 	return newFixedController(dialer, nodectl.HelperPipeName(), nodectl.ComponentHelper, machineID)
+}
+
+func defaultAgentConnectionSource(context.Context) (string, string, error) {
+	executable, err := os.Executable()
+	if err != nil {
+		return "", "", err
+	}
+	executable, err = filepath.Abs(executable)
+	if err != nil {
+		return "", "", err
+	}
+	layout, err := ResolvePortableLayout(executable)
+	if err != nil {
+		return "", "", err
+	}
+	store, err := trayconfig.NewStore(trayconfig.Paths{
+		TraySettings: layout.TraySettings, AgentConfig: layout.AgentConfig, HelperConfig: layout.HelperConfig,
+		AgentExecutable: layout.AgentExecutable, HelperExecutable: layout.HelperExecutable,
+	})
+	if err != nil {
+		return "", "", err
+	}
+	form, err := store.LoadAgentForm()
+	if err != nil {
+		return "", "", err
+	}
+	token, err := (localcontrol.FileTokenStore{}).LoadOrCreate(localcontrol.TokenPath(layout.Root))
+	if err != nil {
+		return "", "", err
+	}
+	return net.JoinHostPort(form.ListenHost, strconv.Itoa(form.ListenPort)), token, nil
 }
 
 func newFixedController(dialer Dialer, pipeName string, component nodectl.Component, machineID string) (*FixedController, error) {

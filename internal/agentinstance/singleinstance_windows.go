@@ -1,6 +1,6 @@
 //go:build windows
 
-package agentcontrol
+package agentinstance
 
 import (
 	"crypto/sha256"
