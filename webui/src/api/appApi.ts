@@ -1,4 +1,4 @@
-import { ApiError, requestJson, requestVoid } from "./client";
+import { ApiError, isAbortError, requestJson, requestVoid } from "./client";
 import type {
   AgentStatus,
   AnalysisStats,
@@ -21,6 +21,7 @@ import type {
   GroupPage,
   GroupQuery,
   GroupSummary,
+  RuntimeStatus,
   ScanTask,
   StartScanInput
 } from "./contracts";
@@ -80,11 +81,49 @@ export function createAppApi(): AppApi {
       "/api/config",
       { ...jsonPut(guiConfigInput(configValue), signal), decodeStatuses: [400] },
       guiConfigSaveResponse
-    )
+    ),
+    getRuntimeStatus: signal => requestJson("/api/runtime/status", get(signal), runtimeStatus)
   };
 }
 
 export const appApi: AppApi = createAppApi();
+
+const managerRecoveryPollIntervalMs = 250;
+const managerRecoveryTimeoutMs = 30_000;
+
+export async function waitForManager(recoveryURL: string, signal?: AbortSignal): Promise<void> {
+  const origin = new URL(recoveryURL).origin;
+  const healthURL = `${origin}/api/restart/health`;
+  const deadline = Date.now() + managerRecoveryTimeoutMs;
+
+  while (true) {
+    if (signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
+    try {
+      const response = await fetch(healthURL, { credentials: "omit", signal });
+      if (response.ok) return;
+    } catch (error) {
+      if (isAbortError(error) || signal?.aborted) throw error;
+    }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new Error("Manager restart timed out");
+    await waitFor(Math.min(managerRecoveryPollIntervalMs, remaining), signal);
+  }
+}
+
+function waitFor(milliseconds: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(complete, milliseconds);
+    const abort = () => {
+      clearTimeout(timer);
+      reject(new DOMException("The operation was aborted", "AbortError"));
+    };
+    function complete() {
+      signal?.removeEventListener("abort", abort);
+      resolve();
+    }
+    if (signal) signal.addEventListener("abort", abort, { once: true });
+  });
+}
 
 function get(signal?: AbortSignal): RequestInit {
   return { method: "GET", body: undefined, signal };
@@ -412,7 +451,20 @@ function guiConfigSaveResponse(value: unknown): GUIConfigSaveResult {
   }
   return {
     saved: boolean(raw.saved, "GUI config saved"),
-    restartRequired: boolean(raw.restart_required, "GUI config restart_required")
+    restartRequired: boolean(raw.restart_required, "GUI config restart_required"),
+    restarting: boolean(raw.restarting, "GUI config restarting"),
+    recoveryURL: text(raw.recovery_url, "GUI config recovery_url")
+  };
+}
+
+function runtimeStatus(value: unknown): RuntimeStatus {
+  const raw = record(value, "runtime status");
+  return {
+    databaseState: runtimeDatabaseState(raw.database_state),
+    databaseErrorCode: text(raw.database_error_code, "runtime database_error_code"),
+    agents: agents(raw.agents),
+    restarting: boolean(raw.restarting, "runtime restarting"),
+    recoveryURL: text(raw.recovery_url, "runtime recovery_url")
   };
 }
 
@@ -543,6 +595,13 @@ function agentIdentityState(value: unknown): AgentStatus["identityState"] {
     return value;
   }
   throw new TypeError("agent.identity_state is invalid");
+}
+
+function runtimeDatabaseState(value: unknown): RuntimeStatus["databaseState"] {
+  if (value === "connecting" || value === "connected" || value === "error") {
+    return value;
+  }
+  throw new TypeError("runtime database_state is invalid");
 }
 
 function deleteMode(value: unknown): DeleteMode {

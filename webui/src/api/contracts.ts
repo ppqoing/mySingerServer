@@ -217,6 +217,18 @@ export interface GUIConfigSnapshot {
 export interface GUIConfigSaveResult {
   saved: boolean;
   restartRequired: boolean;
+  restarting: boolean;
+  recoveryURL: string;
+}
+
+export type RuntimeDatabaseState = "connecting" | "connected" | "error";
+
+export interface RuntimeStatus {
+  databaseState: RuntimeDatabaseState;
+  databaseErrorCode: string;
+  agents: AgentStatus[];
+  restarting: boolean;
+  recoveryURL: string;
 }
 
 export interface ConfigFieldError {
@@ -238,4 +250,5 @@ export interface AppApi {
   getDeleteStatus(taskId: string, signal?: AbortSignal): Promise<DeleteTaskStatus>;
   loadGUIConfig(signal?: AbortSignal): Promise<GUIConfigSnapshot>;
   saveGUIConfig(config: GUIConfig, signal?: AbortSignal): Promise<GUIConfigSaveResult>;
+  getRuntimeStatus(signal?: AbortSignal): Promise<RuntimeStatus>;
 }
