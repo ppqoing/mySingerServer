@@ -570,6 +570,37 @@ func TestLoadGUIAppliesDefaultsAndValidatesEndpoints(t *testing.T) {
 	}
 }
 
+func TestLoadGUIRejectsExistingFilesMissingRequiredConnectionFields(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "empty", body: `{}`},
+		{name: "missing DSN", body: `{"listen_addr":"127.0.0.1:18081","agents":[{"addr":"127.0.0.1:9101"}]}`},
+		{name: "missing Agent", body: `{"listen_addr":"127.0.0.1:18081","pg_dsn":"postgres://dedup@127.0.0.1:5432/dedup"}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "gui.json")
+			original := []byte(test.body)
+			if err := os.WriteFile(path, original, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := LoadGUI(path); err == nil {
+				t.Fatal("LoadGUI accepted an existing configuration missing required fields")
+			}
+			current, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(current, original) {
+				t.Fatalf("LoadGUI rewrote invalid existing configuration:\n got %q\nwant %q", current, original)
+			}
+		})
+	}
+}
+
 func TestLoadGUIKeepsOmittedFirstScreenFieldsAtDefaults(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "gui.json")
 	if err := os.WriteFile(path, []byte(`{

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 
@@ -54,6 +55,36 @@ func TestLoadOrCreateGUIConfigDoesNotRewriteExistingFile(t *testing.T) {
 	}
 	if !bytes.Equal(current, original) {
 		t.Fatalf("existing configuration was rewritten:\n got %q\nwant %q", current, original)
+	}
+}
+
+func TestLoadOrCreateGUIConfigRejectsExistingInvalidFileWithoutLeakingPath(t *testing.T) {
+	const secret = "manager-config-test-secret"
+	dir := filepath.Join(t.TempDir(), secret)
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "gui.json")
+	original := []byte(`{`)
+	if err := os.WriteFile(path, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := LoadOrCreateGUIConfig(path)
+	if err == nil {
+		t.Fatal("LoadOrCreateGUIConfig accepted an existing invalid configuration")
+	}
+	for _, forbidden := range []string{path, dir, secret} {
+		if strings.Contains(err.Error(), forbidden) {
+			t.Fatalf("error leaked path detail %q: %v", forbidden, err)
+		}
+	}
+	current, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !bytes.Equal(current, original) {
+		t.Fatalf("LoadOrCreateGUIConfig rewrote invalid existing configuration:\n got %q\nwant %q", current, original)
 	}
 }
 
