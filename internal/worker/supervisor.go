@@ -701,7 +701,7 @@ func (worker *workerProc) claim(reason string, exitCode int32, cause error, owne
 				"screen_stage", job.ScreenStage,
 				"source", job.Source,
 				"reason", reason,
-				"err", redactKnownPath(err.Error(), job.Path),
+				"err", RedactKnownPath(err.Error(), job.Path),
 			)
 		}
 	}

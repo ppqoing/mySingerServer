@@ -52,6 +52,21 @@ PASS。Manager 的 Stage 2/Stage 3 已映射为带 `screen_stage` 与 `source` �
 
 Race 首轮唯一失败来自新增 Agent 日志测试直接并发读取 `bytes.Buffer`；改用 mutex-safe 捕获器后定向 race 与完整 race 均通过，生产代码未出现 race。
 
+## Fix round 2/5
+
+| 修复合同 | RED 证据 | GREEN 结果 |
+| --- | --- | --- |
+| 独立真重哈希 | native session 的第二次 `Hash()` 可复用内部缓存，内容替换仍可能返回首次 digest | `sessionPipelineDeps.rehash` 使用新 `os.Open` 句柄和 Go SHA-512 逐字节读取；读前、句柄读前/读后、path 读后均校验 identity/size/mtime，并支持 context 取消 |
+| contact 原子提交时序 | Analyze 后同 size/mtime 改写源文件时，旧 guard 可能在 JPEG 已提交后才判 stale | 真 rehash guard 放入 `publishContactSheet` 的 `validateSource` 回调，紧邻原子 JPEG commit；成功 publish 后不再做事后 guard；漂移时 final JPEG/sidecar 均不存在 |
+| Scan 日志隐私 | `ScanManager.reportErr` 记录完整 path，且大小写、`/`/`\` 变体错误文本可绕过简单替换 | 导出共用 robust redaction helper，大小写与分隔符不敏感地替换完整路径和 basename；Scan 日志只含 `path_id`、legacy stage、scan source 和安全文本，授权协议响应不变 |
+| SavePhase2 split 状态 | split Stage 2+3 保存后旧 legacy missing 位残留，`phase2_done=0`、status partial | 任意顺序完成后 split missing 与兼容 file-state legacy 位清零、`phase2_done=1`；其他一筛 missing 保留且 status partial；legacy cache lookup 仍严格要求 PDQ+pHash+Sobel |
+
+修复轮最终门禁：
+
+- `go test -count=1 -timeout 120s ./internal/agent ./internal/worker ./internal/wproc ./internal/store ./cmd/worker` — PASS（0.723s / 0.355s / 0.428s / 1.490s / no test files）
+- `CC=C:\Tools\WinLibs\mingw64\bin\gcc.exe go test -race -count=1 -timeout 150s ./internal/agent ./internal/worker ./internal/store` — PASS（2.625s / 4.597s / 8.971s）
+- `git diff --check` — PASS；只有 LF→CRLF 提示，无 whitespace error。
+
 ## Concerns
 
 - Task 6 只提供分阶段计算、路由、缓存和持久化合同。Stage 2 通过后是否创建 Stage 3 由 Task 8 的本地 Engine 决定；本实现不会从 Stage 2 隐式追加 Stage 3。

@@ -3,6 +3,7 @@ package wproc
 import (
 	"bytes"
 	"context"
+	"crypto/sha512"
 	"errors"
 	"io/fs"
 	"os"
@@ -28,8 +29,8 @@ func TestSessionPipelineOneOpenOneHashOneAnalyze(t *testing.T) {
 	if _, err := processMediaWithDeps(context.Background(), sessionPipelineTestConfig(), job, deps); err != nil {
 		t.Fatal(err)
 	}
-	if fake.opens != 1 || fake.hashes != 2 || fake.analyzes != 1 || fake.closes != 1 {
-		t.Fatalf("calls open/hash/analyze/close = %d/%d/%d/%d, want 1/2/1/1", fake.opens, fake.hashes, fake.analyzes, fake.closes)
+	if fake.opens != 1 || fake.hashes != 1 || fake.rehashes != 1 || fake.analyzes != 1 || fake.closes != 1 {
+		t.Fatalf("calls open/hash/rehash/analyze/close = %d/%d/%d/%d/%d, want 1/1/1/1/1", fake.opens, fake.hashes, fake.rehashes, fake.analyzes, fake.closes)
 	}
 }
 
@@ -51,8 +52,8 @@ func TestSessionPipelineCompleteHitSkipsAnalyze(t *testing.T) {
 	if _, err := processMediaWithDeps(context.Background(), sessionPipelineTestConfig(), job, deps); err != nil {
 		t.Fatal(err)
 	}
-	if fake.opens != 1 || fake.hashes != 2 || fake.analyzes != 0 || fake.closes != 1 {
-		t.Fatalf("calls open/hash/analyze/close = %d/%d/%d/%d, want 1/2/0/1", fake.opens, fake.hashes, fake.analyzes, fake.closes)
+	if fake.opens != 1 || fake.hashes != 1 || fake.rehashes != 1 || fake.analyzes != 0 || fake.closes != 1 {
+		t.Fatalf("calls open/hash/rehash/analyze/close = %d/%d/%d/%d/%d, want 1/1/1/0/1", fake.opens, fake.hashes, fake.rehashes, fake.analyzes, fake.closes)
 	}
 }
 
@@ -81,8 +82,8 @@ func TestSessionPipelineFinalIdentityRejectsDriftAfterCacheQuery(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertSessionPipelineStalePayload(t, result)
-	if fake.analyzes != 0 || fake.hashes != 1 {
-		t.Fatalf("analyze/hash = %d/%d, want cache-only drift detected before final hash", fake.analyzes, fake.hashes)
+	if fake.analyzes != 0 || fake.hashes != 1 || fake.rehashes != 0 {
+		t.Fatalf("analyze/hash/rehash = %d/%d/%d, want metadata drift before rehash", fake.analyzes, fake.hashes, fake.rehashes)
 	}
 }
 
@@ -94,19 +95,89 @@ func TestSessionPipelineFinalIdentityRejectsSameMetadataContentReplacementAfterA
 		MediaType: 1, ImageStatus: videocore.StatusOK,
 		ImageFeatures: videocore.FeatureSet{PHash: [9]uint64{1}},
 	}
-	fake.onAnalyze = func(videocore.AnalysisRequest) {
-		changed := fake.sha
-		changed[0] ^= 0xff
-		fake.finalSHA = &changed
-	}
+	changed := fake.sha
+	changed[0] ^= 0xff
+	fake.rehashSHA = &changed
 
 	result, err := processMediaWithDeps(context.Background(), sessionPipelineTestConfig(), job, deps)
 	if err != nil {
 		t.Fatal(err)
 	}
 	assertSessionPipelineStalePayload(t, result)
-	if fake.analyzes != 1 || fake.hashes != 2 {
-		t.Fatalf("analyze/hash = %d/%d, want 1/2", fake.analyzes, fake.hashes)
+	if fake.analyzes != 1 || fake.hashes != 1 || fake.rehashes != 1 {
+		t.Fatalf("analyze/hash/rehash = %d/%d/%d, want 1/1/1", fake.analyzes, fake.hashes, fake.rehashes)
+	}
+}
+
+func TestDefaultSessionPipelineRehashReadsFreshBytesAndHonorsCancellation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "media.bin")
+	first := bytes.Repeat([]byte{1}, 8192)
+	second := bytes.Repeat([]byte{2}, len(first))
+	if err := os.WriteFile(path, first, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := &worker.JobMsg{Size: before.Size(), MTimeUnix: before.ModTime().Unix(), MTimeMS: before.ModTime().UnixMilli()}
+	deps := defaultSessionPipelineDeps(nil)
+	firstDigest, err := deps.rehash(context.Background(), path, before, job)
+	if err != nil || firstDigest != sha512.Sum512(first) {
+		t.Fatalf("first rehash=%x err=%v", firstDigest, err)
+	}
+	if err := os.WriteFile(path, second, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, before.ModTime(), before.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	secondDigest, err := deps.rehash(context.Background(), path, before, job)
+	if err != nil || secondDigest != sha512.Sum512(second) || secondDigest == firstDigest {
+		t.Fatalf("fresh rehash=%x first=%x err=%v", secondDigest, firstDigest, err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := deps.rehash(ctx, path, before, job); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled rehash error=%v, want context.Canceled", err)
+	}
+}
+
+func TestSessionPipelineContactGuardRejectsDriftBeforeAtomicPublish(t *testing.T) {
+	job, deps, fake := newSessionPipelineTest(t, worker.MediaVideo,
+		worker.MaskSHA512|worker.MaskVideoDuration|worker.MaskVideoContactSheet, 0)
+	root := t.TempDir()
+	paths, err := contactSheetPaths(root, fake.sha, 99, job.JobID, "guard")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deps.contactSheetPaths = func(string, [64]byte, int, int64, string) (ContactSheetPaths, error) { return paths, nil }
+	deps.publishContactSheet = publishContactSheet
+	deps.query = sessionPipelineMissingReply(job, worker.MaskVideoDuration|worker.MaskVideoContactSheet, 0)
+	changed := fake.sha
+	changed[0] ^= 0xff
+	fake.rehashSHA = &changed
+	fake.result = videocore.AnalysisResult{
+		MediaType: 2, DurationStatus: videocore.StatusOK, DurationMS: 4321,
+		ContactSheetStatus: videocore.StatusOK, ContactSheetWidth: 960, ContactSheetHeight: 540,
+		ContactSheetFeatures: videocore.FeatureSet{PDQ: [32]byte{7}, PDQQuality: 88},
+		CompletedFrameMask:   1,
+		Frames:               [6]videocore.FrameResult{{StandardIndex: 0, Status: videocore.StatusOK}},
+	}
+	fake.onAnalyze = func(request videocore.AnalysisRequest) {
+		if err := os.WriteFile(request.TempJPEGPath, []byte("jpeg"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	result, err := processMediaWithDeps(context.Background(), sessionPipelineTestConfig(), job, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSessionPipelineStalePayload(t, result)
+	for _, path := range []string{paths.JPEG, paths.Sidecar} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("stale contact published final %q: %v", path, err)
+		}
 	}
 }
 
@@ -134,8 +205,8 @@ func TestSessionPipelinePartialMask(t *testing.T) {
 	if fake.analyzes != 1 || fake.request.Fields != worker.MaskVideo6F|worker.MaskVideoContactSheet || fake.request.FrameMask != worker.FrameMaskFull {
 		t.Fatalf("analyze = %d request=%#v, want exactly missing fields and six frames", fake.analyzes, fake.request)
 	}
-	if fake.opens != 1 || fake.hashes != 2 || fake.closes != 1 {
-		t.Fatalf("calls open/hash/close = %d/%d/%d, want 1/2/1", fake.opens, fake.hashes, fake.closes)
+	if fake.opens != 1 || fake.hashes != 1 || fake.rehashes != 1 || fake.closes != 1 {
+		t.Fatalf("calls open/hash/rehash/close = %d/%d/%d/%d, want 1/1/1/1", fake.opens, fake.hashes, fake.rehashes, fake.closes)
 	}
 }
 
@@ -633,14 +704,13 @@ type sessionPipelineFake struct {
 	request    videocore.AnalysisRequest
 	onAnalyze  func(videocore.AnalysisRequest)
 	analyzeErr error
-	finalSHA   *[64]byte
+	rehashes   int
+	rehashSHA  *[64]byte
+	rehashErr  error
 }
 
 func (fake *sessionPipelineFake) Hash() ([64]byte, error) {
 	fake.hashes++
-	if fake.hashes > 1 && fake.finalSHA != nil {
-		return *fake.finalSHA, nil
-	}
 	return fake.sha, nil
 }
 
@@ -726,6 +796,16 @@ func newSessionPipelineTest(t *testing.T, kind worker.MediaKind, fields uint32, 
 		open: func(context.Context, string, videocore.OpenOptions) (mediaSession, error) {
 			fake.opens++
 			return fake, nil
+		},
+		rehash: func(context.Context, string, fs.FileInfo, *worker.JobMsg) ([64]byte, error) {
+			fake.rehashes++
+			if fake.rehashErr != nil {
+				return [64]byte{}, fake.rehashErr
+			}
+			if fake.rehashSHA != nil {
+				return *fake.rehashSHA, nil
+			}
+			return fake.sha, nil
 		},
 		query:              func(*worker.SHAQueryMsg) (*worker.SHAReplyMsg, error) { return nil, nil },
 		contactSheetLookup: contactSheetLookupNoop,

@@ -3,9 +3,11 @@ package wproc
 import (
 	"bytes"
 	"context"
+	"crypto/sha512"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"strconv"
@@ -27,6 +29,7 @@ type sessionPipelineDeps struct {
 	sameFile            func(fs.FileInfo, fs.FileInfo) bool
 	runtime             func() (videocore.RuntimeInfo, error)
 	open                func(context.Context, string, videocore.OpenOptions) (mediaSession, error)
+	rehash              func(context.Context, string, fs.FileInfo, *worker.JobMsg) ([64]byte, error)
 	query               func(*worker.SHAQueryMsg) (*worker.SHAReplyMsg, error)
 	contactSheetLookup  func(string, [64]byte) (ContactSheetMeta, bool, error)
 	contactSheetPaths   func(string, [64]byte, int, int64, string) (ContactSheetPaths, error)
@@ -44,6 +47,7 @@ func defaultSessionPipelineDeps(query func(*worker.SHAQueryMsg) (*worker.SHARepl
 		open: func(ctx context.Context, path string, options videocore.OpenOptions) (mediaSession, error) {
 			return videocore.Open(ctx, path, options)
 		},
+		rehash:              rehashMediaFile,
 		query:               query,
 		contactSheetLookup:  lookupContactSheet,
 		contactSheetPaths:   contactSheetPaths,
@@ -124,7 +128,7 @@ func processMediaWithDeps(ctx context.Context, cfg Config, job *worker.JobMsg, d
 	}
 	sessionPipelineMergeCached(result, reply, cachedPresent, cachedContact)
 	if missingFields == 0 && missingFrames == 0 {
-		return sessionPipelineFinalIdentity(result, job, path, before, sha, session, deps, ContactSheetPaths{}), nil
+		return sessionPipelineFinalIdentity(ctx, result, job, path, before, sha, deps, ContactSheetPaths{})
 	}
 
 	analysisFields := sessionPipelineAnalysisFields(missingFields)
@@ -180,12 +184,14 @@ func processMediaWithDeps(ctx context.Context, cfg Config, job *worker.JobMsg, d
 			), nil
 		}
 		if err := deps.publishContactSheet(paths, meta, func() error {
-			info, err := deps.stat(path)
-			if err != nil || !deps.sameFile(before, info) || !sameFileState(before, info) || !matchesSessionDispatchedFile(info, job) {
-				return fmt.Errorf("source drift before contact sheet publish")
-			}
-			return nil
+			return sessionPipelineFinalIdentityError(ctx, job, path, before, sha, deps)
 		}); err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return sessionPipelineCancelled(result, paths), err
+			}
+			if errors.Is(err, errSessionPipelineStale) {
+				return sessionPipelineStale(result, job, paths), nil
+			}
 			return sessionPipelineContactError(result, missingFields, "thumb_cache", err), nil
 		}
 		if missingFields&worker.MaskVideoContactSheet != 0 {
@@ -201,30 +207,106 @@ func processMediaWithDeps(ctx context.Context, cfg Config, job *worker.JobMsg, d
 		)
 		result.ThumbQuality = &quality
 		result.ThumbGenerated = true
+		return result, nil
 	}
-	return sessionPipelineFinalIdentity(result, job, path, before, sha, session, deps, paths), nil
+	return sessionPipelineFinalIdentity(ctx, result, job, path, before, sha, deps, paths)
 }
 
+var errSessionPipelineStale = errors.New("session pipeline stale identity")
+
 func sessionPipelineFinalIdentity(
+	ctx context.Context,
 	result *worker.JobResultMsg,
 	job *worker.JobMsg,
 	path string,
 	before fs.FileInfo,
 	initialSHA [64]byte,
-	session mediaSession,
 	deps sessionPipelineDeps,
 	paths ContactSheetPaths,
-) *worker.JobResultMsg {
+) (*worker.JobResultMsg, error) {
+	err := sessionPipelineFinalIdentityError(ctx, job, path, before, initialSHA, deps)
+	if err == nil {
+		return result, nil
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return sessionPipelineCancelled(result, paths), err
+	}
+	return sessionPipelineStale(result, job, paths), nil
+}
+
+func sessionPipelineFinalIdentityError(
+	ctx context.Context,
+	job *worker.JobMsg,
+	path string,
+	before fs.FileInfo,
+	initialSHA [64]byte,
+	deps sessionPipelineDeps,
+) error {
 	after, err := deps.stat(path)
 	if err != nil || !deps.sameFile(before, after) || !sameFileState(before, after) || !matchesSessionDispatchedFile(after, job) {
-		return sessionPipelineStale(result, job, paths)
+		return errSessionPipelineStale
 	}
-	finalSHA, err := session.Hash()
+	finalSHA, err := deps.rehash(ctx, path, before, job)
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
 	if err != nil || !bytes.Equal(finalSHA[:], initialSHA[:]) ||
 		(len(job.KnownSHA) != 0 && !bytes.Equal(finalSHA[:], job.KnownSHA)) {
-		return sessionPipelineStale(result, job, paths)
+		return errSessionPipelineStale
 	}
-	return result
+	return nil
+}
+
+func rehashMediaFile(ctx context.Context, path string, before fs.FileInfo, job *worker.JobMsg) ([64]byte, error) {
+	var digest [64]byte
+	if err := ctx.Err(); err != nil {
+		return digest, err
+	}
+	pathBefore, err := os.Stat(path)
+	if err != nil || !sameRehashIdentity(before, pathBefore, job) {
+		return digest, errSessionPipelineStale
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return digest, err
+	}
+	defer file.Close()
+	handleBefore, err := file.Stat()
+	if err != nil || !sameRehashIdentity(before, handleBefore, job) || !os.SameFile(pathBefore, handleBefore) {
+		return digest, errSessionPipelineStale
+	}
+	hash := sha512.New()
+	buffer := make([]byte, 1024*1024)
+	for {
+		if err := ctx.Err(); err != nil {
+			return digest, err
+		}
+		read, readErr := file.Read(buffer)
+		if read != 0 {
+			_, _ = hash.Write(buffer[:read])
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			return digest, readErr
+		}
+	}
+	handleAfter, err := file.Stat()
+	if err != nil || !sameRehashIdentity(before, handleAfter, job) || !os.SameFile(handleBefore, handleAfter) {
+		return digest, errSessionPipelineStale
+	}
+	pathAfter, err := os.Stat(path)
+	if err != nil || !sameRehashIdentity(before, pathAfter, job) || !os.SameFile(handleAfter, pathAfter) {
+		return digest, errSessionPipelineStale
+	}
+	copy(digest[:], hash.Sum(nil))
+	return digest, nil
+}
+
+func sameRehashIdentity(before, current fs.FileInfo, job *worker.JobMsg) bool {
+	return before != nil && current != nil && job != nil &&
+		os.SameFile(before, current) && sameFileState(before, current) && matchesSessionDispatchedFile(current, job)
 }
 
 func newSessionPipelineResult(job *worker.JobMsg) *worker.JobResultMsg {
@@ -295,7 +377,7 @@ func matchesSessionDispatchedFile(info os.FileInfo, job *worker.JobMsg) bool {
 }
 
 func validateSessionPipelineDeps(deps sessionPipelineDeps) error {
-	if deps.stat == nil || deps.sameFile == nil || deps.runtime == nil || deps.open == nil || deps.query == nil || deps.contactSheetLookup == nil || deps.contactSheetPaths == nil || deps.publishContactSheet == nil || deps.pid == nil || deps.nonce == nil || deps.now == nil {
+	if deps.stat == nil || deps.sameFile == nil || deps.runtime == nil || deps.open == nil || deps.rehash == nil || deps.query == nil || deps.contactSheetLookup == nil || deps.contactSheetPaths == nil || deps.publishContactSheet == nil || deps.pid == nil || deps.nonce == nil || deps.now == nil {
 		return fmt.Errorf("session pipeline dependency is unavailable")
 	}
 	return nil

@@ -18,15 +18,39 @@ func PathID(path string) string {
 	return hex.EncodeToString(sum[:8])
 }
 
-func redactKnownPath(text, path string) string {
+// RedactKnownPath removes a known Windows path and basename without depending
+// on case or slash direction. It is intended for operational logs only.
+func RedactKnownPath(text, path string) string {
 	if path == "" {
 		return text
 	}
-	redacted := strings.ReplaceAll(text, path, "<path>")
-	if base := filepath.Base(path); base != "." && base != string(filepath.Separator) {
-		redacted = strings.ReplaceAll(redacted, base, "<path>")
+	redacted := replaceEqualFold(text, path, "<path>")
+	redacted = replaceEqualFold(redacted, strings.ReplaceAll(path, `\`, "/"), "<path>")
+	redacted = replaceEqualFold(redacted, strings.ReplaceAll(path, "/", `\`), "<path>")
+	canonical := strings.ReplaceAll(path, "/", `\`)
+	if index := strings.LastIndex(canonical, `\`); index >= 0 && index+1 < len(canonical) {
+		redacted = replaceEqualFold(redacted, canonical[index+1:], "<path>")
 	}
 	return redacted
+}
+
+func replaceEqualFold(text, target, replacement string) string {
+	if target == "" {
+		return text
+	}
+	lowerText, lowerTarget := strings.ToLower(text), strings.ToLower(target)
+	var out strings.Builder
+	for {
+		index := strings.Index(lowerText, lowerTarget)
+		if index < 0 {
+			out.WriteString(text)
+			return out.String()
+		}
+		out.WriteString(text[:index])
+		out.WriteString(replacement)
+		text = text[index+len(target):]
+		lowerText = lowerText[index+len(target):]
+	}
 }
 
 const (

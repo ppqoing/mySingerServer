@@ -148,7 +148,7 @@ func NewPool(cfg Config, store FeatureStore, logger, errorLogger, crashLogger *s
 				"worker_index", record.WorkerIndex,
 				"path_id", PathID(record.File),
 				"exit_code", record.ExitCode,
-				"reason", redactKnownPath(record.Reason, record.File),
+				"reason", RedactKnownPath(record.Reason, record.File),
 			)
 		}
 	}
@@ -476,7 +476,7 @@ func (p *Pool) saveResult(job JobMsg, result JobResultMsg) {
 			"screen_stage", job.ScreenStage,
 			"source", job.Source,
 			"field_mask", fieldError.Field,
-			"err", redactKnownPath(fieldError.Msg, result.Path),
+			"err", RedactKnownPath(fieldError.Msg, result.Path),
 			"worker_pid", result.WorkerPID,
 		)
 	}
@@ -488,7 +488,7 @@ func (p *Pool) saveResult(job JobMsg, result JobResultMsg) {
 			"screen_stage", job.ScreenStage,
 			"source", job.Source,
 			"frame_idx", frame.FrameIdx,
-			"err", redactKnownPath(frame.Error, result.Path),
+			"err", RedactKnownPath(frame.Error, result.Path),
 			"worker_pid", result.WorkerPID,
 		)
 	}
@@ -559,7 +559,7 @@ func (p *Pool) saveAnalysisResult(job JobMsg, result *JobResultMsg) {
 				"path_id", PathID(result.Path),
 				"screen_stage", job.ScreenStage,
 				"source", job.Source,
-				"err", redactKnownPath(err.Error(), result.Path),
+				"err", RedactKnownPath(err.Error(), result.Path),
 			)
 		}
 		result.Errors = append(result.Errors, FieldError{Field: 0, Stage: "store", Msg: err.Error()})

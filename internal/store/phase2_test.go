@@ -240,8 +240,41 @@ func TestSavePhase2VideoStageColumnsMergeInEitherOrder(t *testing.T) {
 			if count != 6 {
 				t.Fatalf("merged frame count=%d, want 6", count)
 			}
+			assertPhase2FileState(t, db, path, 0, true, true, proto.StatusDone, "")
+			legacy, err := db.Phase2CommittedStateForFields(ctx, "m", path, MediaVideo, proto.FieldVideo6F)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if legacy.MissingFields != proto.FieldVideo6F || legacy.MissingFrames != proto.FrameMaskFull {
+				t.Fatalf("split-only legacy cache state=%#v, want strict legacy PDQ miss", legacy)
+			}
 		})
 	}
+}
+
+func TestSavePhase2SplitCompletionPreservesUnrelatedMissingState(t *testing.T) {
+	db := openPhase2TestStore(t)
+	ctx := context.Background()
+	sha := phase2TestSHA(0x58)
+	path := `D:\phase2\split-other-missing.mp4`
+	seedPhase2File(t, db, path, MediaVideo, sha,
+		proto.FieldSHA512|proto.FieldVideo6FPHash|proto.FieldVideo6FSobel, false)
+	pHash, sobel := phase2TestBlobs(t, 51)
+	for _, field := range []uint32{proto.FieldVideo6FSobel, proto.FieldVideo6FPHash} {
+		frames := make([]Phase2Frame, 6)
+		for index := range frames {
+			frames[index].FrameIdx = index
+			if field == proto.FieldVideo6FPHash {
+				frames[index].PHashParts = pHash
+			} else {
+				frames[index].SobelHist = sobel
+			}
+		}
+		if err := db.SavePhase2(ctx, Phase2Result{MachineID: "m", Path: path, Kind: MediaVideo, SHA512: sha, FieldsDone: field, Frames: frames}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertPhase2FileState(t, db, path, proto.FieldSHA512, true, false, proto.StatusPartial, "")
 }
 
 func TestPhase2CommittedStateDerivesMissingImageFieldsAndCompleteVideoFrames(t *testing.T) {

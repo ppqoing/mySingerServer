@@ -142,16 +142,28 @@ func (d *DB) SavePhase2(ctx context.Context, result Phase2Result) error {
 	if err != nil {
 		return err
 	}
-	fieldsToDerive := phase2Mask(result.Kind) | result.FieldsDone
+	fieldsToDerive := result.FieldsDone
+	if result.Kind == MediaImage {
+		fieldsToDerive |= phase2Mask(result.Kind)
+	}
+	if result.Kind == MediaVideo &&
+		missing&proto.FieldVideo6F != 0 &&
+		derivedMissing&(proto.FieldVideo6FPHash|proto.FieldVideo6FSobel) == 0 {
+		fieldsToDerive |= proto.FieldVideo6F
+		derivedMissing &^= proto.FieldVideo6F
+	}
 	updatedMissing := missing&^fieldsToDerive | derivedMissing&fieldsToDerive
 	phase2Done := updatedMissing&saveMask == 0
 	status := proto.StatusPartial
 	var errorValue any
+	splitVideoComplete := result.Kind == MediaVideo &&
+		result.FieldsDone&(proto.FieldVideo6FPHash|proto.FieldVideo6FSobel) != 0 &&
+		updatedMissing&(proto.FieldVideo6FPHash|proto.FieldVideo6FSobel) == 0
 	if updatedMissing == 0 {
 		status = proto.StatusDone
 	} else if summary := phase2ErrorText(result); summary != "" {
 		errorValue = summary
-	} else if priorError.Valid {
+	} else if priorError.Valid && !splitVideoComplete {
 		errorValue = priorError.String
 	}
 	if _, err := tx.ExecContext(ctx, `

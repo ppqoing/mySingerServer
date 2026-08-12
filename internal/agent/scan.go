@@ -1048,9 +1048,11 @@ func (m *ScanManager) reportErr(
 ) {
 	m.errLog.Error(
 		"file error",
-		"path", path,
+		"path_id", worker.PathID(path),
 		"stage", stage,
-		"err", err.Error(),
+		"screen_stage", worker.ScreenStageLegacy,
+		"source", worker.JobSourceScan,
+		"err", worker.RedactKnownPath(err.Error(), path),
 	)
 	state.send(proto.MsgError, &proto.Error{
 		TaskID: state.Task.TaskID,
