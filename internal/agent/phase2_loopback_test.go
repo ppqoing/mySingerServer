@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log/slog"
@@ -13,6 +14,94 @@ import (
 	"dedup/internal/store"
 	"dedup/internal/worker"
 )
+
+func TestPhase2RealTCPLoopbackSeparatesStageTwoAndStageThreePayloads(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		stage   uint8
+		field   uint32
+		payload []byte
+	}{
+		{name: "stage-two", stage: proto.ScreenStageTwo, field: proto.FieldPHashParts, payload: []byte{2, 2}},
+		{name: "stage-three", stage: proto.ScreenStageThree, field: proto.FieldSobelHist, payload: []byte{3, 3}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			pool := newPhase2FakePool()
+			defer close(pool.results)
+			log := slog.New(slog.NewTextHandler(io.Discard, nil))
+			router := NewPoolRouter(pool, log)
+			path := `D:\loopback\` + test.name + `.jpg`
+			phase2 := NewPhase2ManagerWithRuntime(
+				"machine-a",
+				&phase2CommittedFake{states: map[string]store.Phase2Committed{path: {MissingFields: 0}}},
+				pool, router,
+				func(string) (int64, bool, error) { return 1, false, nil }, log,
+			)
+			defer phase2.Shutdown(context.Background())
+			pool.onSubmit = func(job worker.JobMsg) {
+				result := &worker.JobResultMsg{
+					JobID: job.JobID, ScanTaskID: job.ScanTaskID, Path: job.Path, Kind: job.Kind,
+					Phase: job.Phase, ScreenStage: job.ScreenStage, Source: job.Source,
+					SHA512: append([]byte(nil), job.KnownSHA...), FieldsDone: job.FieldsMask,
+				}
+				if test.field == proto.FieldPHashParts {
+					result.PHashParts = append([]byte(nil), test.payload...)
+				} else {
+					result.SobelHist = append([]byte(nil), test.payload...)
+				}
+				pool.results <- result
+			}
+			cfg := config.DefaultAgent()
+			cfg.MachineID, cfg.Proto.HeartbeatS = "machine-a", 60
+			server := NewServer(cfg, scanHandlerFunc(func(task proto.ScanTask, sender Sender) (proto.TaskAck, func()) {
+				return rejectedAck(task.TaskID, "not used"), nil
+			}), log, phase2)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			serverDone := make(chan struct{})
+			go func() {
+				defer close(serverDone)
+				conn, acceptErr := listener.Accept()
+				if acceptErr == nil {
+					server.handleConn(ctx, conn)
+				}
+			}()
+			conn := dialPhase2Loopback(t, listener.Addr().String())
+			readLoopbackHello(t, conn)
+			item := validPhase2Image(path)
+			item.FieldsMask = test.field
+			task := proto.Phase2Task{TaskID: "tcp-" + test.name, Stage: test.stage, Items: []proto.Phase2Item{item}}
+			if err := conn.WriteFrame(proto.MsgPhase2Task, &task); err != nil {
+				t.Fatal(err)
+			}
+			ack, feature := readPhase2FeatureStream(t, conn)
+			if !ack.Accepted || ack.Reason != "accepted" || feature.FieldsDone != test.field || feature.Status != proto.StatusDone {
+				t.Fatalf("ack=%#v feature=%#v", ack, feature)
+			}
+			if test.field == proto.FieldPHashParts {
+				if !bytes.Equal(feature.PHashParts, test.payload) || len(feature.SobelHist) != 0 {
+					t.Fatalf("stage-two payload=%#v", feature)
+				}
+			} else if !bytes.Equal(feature.SobelHist, test.payload) || len(feature.PHashParts) != 0 {
+				t.Fatalf("stage-three payload=%#v", feature)
+			}
+			if submitted := pool.submittedSnapshot(); len(submitted) != 1 || submitted[0].ScreenStage != worker.ScreenStage(test.stage) {
+				t.Fatalf("TCP submitted=%#v", submitted)
+			}
+			_ = conn.Close()
+			select {
+			case <-serverDone:
+			case <-time.After(time.Second):
+				t.Fatal("TCP server did not detach")
+			}
+		})
+	}
+}
 
 func TestPhase2RealTCPLoopbackReconnectReplaysWithoutResubmission(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -177,6 +266,33 @@ func readPhase2TaskStream(
 			sequences = append(sequences, value.Seq)
 		case *proto.TaskDone:
 			return types, sequences, ack
+		}
+	}
+}
+
+func readPhase2FeatureStream(t *testing.T, connection *proto.Conn) (proto.TaskAck, proto.FeatureItem) {
+	t.Helper()
+	var ack proto.TaskAck
+	var feature proto.FeatureItem
+	for {
+		msgType, body, err := connection.ReadFrame()
+		if err != nil {
+			t.Fatal(err)
+		}
+		message, err := proto.Decode(msgType, body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch value := message.(type) {
+		case *proto.TaskAck:
+			ack = *value
+		case *proto.FeatureResult:
+			if len(value.Items) != 1 {
+				t.Fatalf("FeatureResult items=%d, want 1", len(value.Items))
+			}
+			feature = value.Items[0]
+		case *proto.TaskDone:
+			return ack, feature
 		}
 	}
 }

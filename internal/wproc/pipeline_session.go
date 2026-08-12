@@ -124,7 +124,7 @@ func processMediaWithDeps(ctx context.Context, cfg Config, job *worker.JobMsg, d
 	}
 	sessionPipelineMergeCached(result, reply, cachedPresent, cachedContact)
 	if missingFields == 0 && missingFrames == 0 {
-		return result, nil
+		return sessionPipelineFinalIdentity(result, job, path, before, sha, session, deps, ContactSheetPaths{}), nil
 	}
 
 	analysisFields := sessionPipelineAnalysisFields(missingFields)
@@ -202,7 +202,29 @@ func processMediaWithDeps(ctx context.Context, cfg Config, job *worker.JobMsg, d
 		result.ThumbQuality = &quality
 		result.ThumbGenerated = true
 	}
-	return result, nil
+	return sessionPipelineFinalIdentity(result, job, path, before, sha, session, deps, paths), nil
+}
+
+func sessionPipelineFinalIdentity(
+	result *worker.JobResultMsg,
+	job *worker.JobMsg,
+	path string,
+	before fs.FileInfo,
+	initialSHA [64]byte,
+	session mediaSession,
+	deps sessionPipelineDeps,
+	paths ContactSheetPaths,
+) *worker.JobResultMsg {
+	after, err := deps.stat(path)
+	if err != nil || !deps.sameFile(before, after) || !sameFileState(before, after) || !matchesSessionDispatchedFile(after, job) {
+		return sessionPipelineStale(result, job, paths)
+	}
+	finalSHA, err := session.Hash()
+	if err != nil || !bytes.Equal(finalSHA[:], initialSHA[:]) ||
+		(len(job.KnownSHA) != 0 && !bytes.Equal(finalSHA[:], job.KnownSHA)) {
+		return sessionPipelineStale(result, job, paths)
+	}
+	return result
 }
 
 func newSessionPipelineResult(job *worker.JobMsg) *worker.JobResultMsg {

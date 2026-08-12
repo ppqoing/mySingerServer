@@ -110,7 +110,8 @@ func TestServeDispatchesPhase2ThroughSessionPipeline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.JobID != job.JobID || result.Kind != worker.MediaImage || len(result.SHA512) != sha512.Size || fake.opens != 1 || fake.hashes != 1 || fake.analyzes != 0 || fake.closes != 1 {
+	// The second hash is the final identity guard after the cache reply.
+	if result.JobID != job.JobID || result.Kind != worker.MediaImage || len(result.SHA512) != sha512.Size || fake.opens != 1 || fake.hashes != 2 || fake.analyzes != 0 || fake.closes != 1 {
 		t.Fatalf("phase-2 result/session = %#v; %d/%d/%d/%d", result, fake.opens, fake.hashes, fake.analyzes, fake.closes)
 	}
 	if err := conn.Write(worker.MsgShutdown, struct{}{}); err != nil {

@@ -697,9 +697,11 @@ func (worker *workerProc) claim(reason string, exitCode int32, cause error, owne
 			worker.pool.deps.logger.Error("mark crash failed",
 				"worker_index", worker.index,
 				"pid", worker.proc.PID(),
-				"path", job.Path,
+				"path_id", PathID(job.Path),
+				"screen_stage", job.ScreenStage,
+				"source", job.Source,
 				"reason", reason,
-				"err", err,
+				"err", redactKnownPath(err.Error(), job.Path),
 			)
 		}
 	}
@@ -787,11 +789,11 @@ func validateWorkerResult(job *JobMsg, result *JobResultMsg) error {
 		result.Path != job.Path ||
 		result.Kind != job.Kind {
 		return fmt.Errorf(
-			"worker protocol: result identity mismatch job=%d/%d path=%q/%q kind=%d/%d",
+			"worker protocol: result identity mismatch job=%d/%d result_path_id=%s job_path_id=%s kind=%d/%d",
 			result.JobID,
 			job.JobID,
-			result.Path,
-			job.Path,
+			PathID(result.Path),
+			PathID(job.Path),
 			result.Kind,
 			job.Kind,
 		)

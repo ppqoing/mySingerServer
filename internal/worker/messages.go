@@ -1,10 +1,33 @@
 package worker
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"path/filepath"
+	"strings"
 
 	"dedup/internal/store"
 )
+
+// PathID is a stable, non-reversible identifier for correlating media logs
+// without disclosing a directory or filename.
+func PathID(path string) string {
+	canonical := strings.ToLower(strings.ReplaceAll(filepath.Clean(path), "/", `\`))
+	sum := sha256.Sum256([]byte(canonical))
+	return hex.EncodeToString(sum[:8])
+}
+
+func redactKnownPath(text, path string) string {
+	if path == "" {
+		return text
+	}
+	redacted := strings.ReplaceAll(text, path, "<path>")
+	if base := filepath.Base(path); base != "." && base != string(filepath.Separator) {
+		redacted = strings.ReplaceAll(redacted, base, "<path>")
+	}
+	return redacted
+}
 
 const (
 	MsgReady    = "ready"

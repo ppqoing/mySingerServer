@@ -146,9 +146,9 @@ func NewPool(cfg Config, store FeatureStore, logger, errorLogger, crashLogger *s
 			crashLogger.Error("worker crash",
 				"pid", record.PID,
 				"worker_index", record.WorkerIndex,
-				"file", record.File,
+				"path_id", PathID(record.File),
 				"exit_code", record.ExitCode,
-				"reason", record.Reason,
+				"reason", redactKnownPath(record.Reason, record.File),
 			)
 		}
 	}
@@ -466,26 +466,29 @@ func (p *Pool) watchdogDuration(kind MediaKind) time.Duration {
 }
 
 func (p *Pool) saveResult(job JobMsg, result JobResultMsg) {
+	materializeFixedFrameResults(job, &result)
 	frameErrors := erroredFrames(result.Frames)
 	p.saveAnalysisResult(job, &result)
 	for _, fieldError := range result.Errors {
 		p.deps.errorLogger.Error("file error",
-			"path", result.Path,
+			"path_id", PathID(result.Path),
 			"stage", fieldError.Stage,
+			"screen_stage", job.ScreenStage,
+			"source", job.Source,
 			"field_mask", fieldError.Field,
-			"err", fieldError.Msg,
+			"err", redactKnownPath(fieldError.Msg, result.Path),
 			"worker_pid", result.WorkerPID,
 		)
 	}
 	for _, frame := range frameErrors {
 		p.deps.errorLogger.Error("file error",
-			"path", result.Path,
+			"path_id", PathID(result.Path),
 			"stage", "frame",
 			"field_mask", job.FieldsMask&videoSixFrameWorkerFields(),
 			"screen_stage", job.ScreenStage,
 			"source", job.Source,
 			"frame_idx", frame.FrameIdx,
-			"err", frame.Error,
+			"err", redactKnownPath(frame.Error, result.Path),
 			"worker_pid", result.WorkerPID,
 		)
 	}
@@ -513,6 +516,31 @@ func (p *Pool) saveResult(job JobMsg, result JobResultMsg) {
 	}
 }
 
+func materializeFixedFrameResults(job JobMsg, result *JobResultMsg) {
+	if result == nil || len(result.Frames) != 0 || job.Kind != MediaVideo ||
+		job.FieldsMask&videoSixFrameWorkerFields() == 0 {
+		return
+	}
+	requested := normalizedRequestedFrames(job)
+	result.Frames = make([]FrameFeature, 0, 6)
+	for index, frame := range result.FrameResults {
+		bit := uint8(1 << uint(index))
+		if requested&bit == 0 {
+			continue
+		}
+		converted := FrameFeature{FrameIdx: index, TimeMS: frame.TimeMS}
+		if result.FramesDone&bit != 0 {
+			converted.PDQ256 = cloneBytes(frame.PDQ256)
+			converted.Quality = frame.Quality
+			converted.PHashParts = cloneBytes(frame.PHashParts)
+			converted.SobelHist = cloneBytes(frame.SobelHist)
+		} else {
+			converted.Error = fmt.Sprintf("native_status_%d", frame.Status)
+		}
+		result.Frames = append(result.Frames, converted)
+	}
+}
+
 func (p *Pool) saveAnalysisResult(job JobMsg, result *JobResultMsg) {
 	if p.store == nil {
 		p.dedup.Resolve(*result)
@@ -527,7 +555,12 @@ func (p *Pool) saveAnalysisResult(job JobMsg, result *JobResultMsg) {
 			return
 		}
 		if !errors.Is(err, context.Canceled) {
-			p.deps.logger.Error("save analysis failed", "path", result.Path, "err", err)
+			p.deps.logger.Error("save analysis failed",
+				"path_id", PathID(result.Path),
+				"screen_stage", job.ScreenStage,
+				"source", job.Source,
+				"err", redactKnownPath(err.Error(), result.Path),
+			)
 		}
 		result.Errors = append(result.Errors, FieldError{Field: 0, Stage: "store", Msg: err.Error()})
 		return
@@ -647,9 +680,21 @@ func pruneUncommittedPayload(result *JobResultMsg) {
 			result.FrameResults[index] = FrameResult{}
 		}
 	}
-	if result.FieldsDone&videoSixFrameWorkerFields() == 0 {
-		result.Frames = nil
+	keptFrames := result.Frames[:0]
+	for _, frame := range result.Frames {
+		bit := uint8(1 << uint(frame.FrameIdx))
+		if frame.FrameIdx < 0 || frame.FrameIdx >= 6 {
+			continue
+		}
+		if result.FramesDone&bit == 0 {
+			frame.PDQ256, frame.Quality, frame.PHashParts, frame.SobelHist = nil, 0, nil, nil
+			if frame.Error == "" {
+				continue
+			}
+		}
+		keptFrames = append(keptFrames, frame)
 	}
+	result.Frames = keptFrames
 }
 
 func clearFeaturePayload(result *JobResultMsg) {

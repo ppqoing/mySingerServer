@@ -570,23 +570,12 @@ func (m *Phase2Manager) prepareWork(
 			),
 		), false
 	}
-	fieldsMask := item.FieldsMask & committed.MissingFields
+	fieldsMask := item.FieldsMask
 	frameMask := item.FrameMask
 	if item.Kind == proto.KindVideo {
 		if frameMask == 0 {
 			frameMask = proto.FrameMaskFull
 		}
-		frameMask &= committed.MissingFrames
-		if frameMask == 0 {
-			fieldsMask = 0
-		}
-	}
-	if fieldsMask == 0 {
-		return work, phase2Outcome{
-			index:   index,
-			item:    basePhase2Feature(item, proto.StatusDone),
-			skipped: true,
-		}, false
 	}
 	knownSHA, err := hex.DecodeString(item.SHA512)
 	if err != nil || len(knownSHA) != 64 {
@@ -778,7 +767,8 @@ func phase2FeatureFromWorker(
 		effectiveFrameMask = proto.FrameMaskFull
 	}
 	workerFrames := result.Frames
-	if len(workerFrames) == 0 && result.FramesDone != 0 {
+	if len(workerFrames) == 0 && job.Kind == worker.MediaVideo &&
+		job.FieldsMask&(worker.MaskVideo6F|worker.MaskVideo6FPHash|worker.MaskVideo6FSobel) != 0 {
 		workerFrames = make([]worker.FrameFeature, 0, 6)
 		for index, frame := range result.FrameResults {
 			bit := uint8(1 << uint(index))
@@ -792,7 +782,7 @@ func phase2FeatureFromWorker(
 				SobelHist:  append([]byte(nil), frame.SobelHist...),
 			}
 			if result.FramesDone&bit == 0 {
-				converted.Error = fmt.Sprintf("native status %d", frame.Status)
+				converted.Error = fmt.Sprintf("native_status_%d", frame.Status)
 			}
 			workerFrames = append(workerFrames, converted)
 		}

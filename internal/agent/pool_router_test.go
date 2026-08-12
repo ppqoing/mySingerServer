@@ -1,8 +1,10 @@
 package agent
 
 import (
+	"bytes"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -186,6 +188,60 @@ func TestPoolRouterRejectsForeignStageAndSourceResult(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("matching stage/source result was not routed")
 	}
+}
+
+func TestPoolRouterForeignLogsDoNotExposePaths(t *testing.T) {
+	pool := newPhase2FakePool()
+	var output synchronizedBuffer
+	router := NewPoolRouter(pool, slog.New(slog.NewJSONHandler(&output, nil)))
+	path := `D:\private\customer-album\secret-name.jpg`
+	job := worker.JobMsg{
+		JobID: router.NextJobID(), ScanTaskID: "private-log", Path: path,
+		Kind: worker.MediaImage, Phase: worker.Phase2,
+		ScreenStage: worker.ScreenStageThree, Source: worker.JobSourceManager,
+	}
+	_, cancel, err := router.Register(&job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+	pool.results <- &worker.JobResultMsg{
+		JobID: job.JobID, ScanTaskID: job.ScanTaskID, Path: path + ".foreign", Kind: job.Kind,
+		Phase: job.Phase, ScreenStage: job.ScreenStage, Source: job.Source,
+	}
+	pool.crashes <- worker.CrashRecord{JobID: job.JobID, ScanTaskID: job.ScanTaskID, File: path + ".foreign"}
+	var logged string
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		logged = output.String()
+		if strings.Count(logged, worker.PathID(path+".foreign")) == 2 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if strings.Contains(logged, "customer-album") || strings.Contains(logged, "secret-name.jpg") {
+		t.Fatalf("router log leaked sensitive path: %s", logged)
+	}
+	if !strings.Contains(logged, worker.PathID(path+".foreign")) || !strings.Contains(logged, `"screen_stage":3`) || !strings.Contains(logged, `"source":"manager"`) {
+		t.Fatalf("router log missing safe identity context: %s", logged)
+	}
+}
+
+type synchronizedBuffer struct {
+	mu sync.Mutex
+	bytes.Buffer
+}
+
+func (b *synchronizedBuffer) Write(data []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.Buffer.Write(data)
+}
+
+func (b *synchronizedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.Buffer.String()
 }
 
 type phase2FakePool struct {

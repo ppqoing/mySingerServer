@@ -1,6 +1,7 @@
 package wproc
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io/fs"
@@ -27,8 +28,8 @@ func TestSessionPipelineOneOpenOneHashOneAnalyze(t *testing.T) {
 	if _, err := processMediaWithDeps(context.Background(), sessionPipelineTestConfig(), job, deps); err != nil {
 		t.Fatal(err)
 	}
-	if fake.opens != 1 || fake.hashes != 1 || fake.analyzes != 1 || fake.closes != 1 {
-		t.Fatalf("calls open/hash/analyze/close = %d/%d/%d/%d, want 1/1/1/1", fake.opens, fake.hashes, fake.analyzes, fake.closes)
+	if fake.opens != 1 || fake.hashes != 2 || fake.analyzes != 1 || fake.closes != 1 {
+		t.Fatalf("calls open/hash/analyze/close = %d/%d/%d/%d, want 1/2/1/1", fake.opens, fake.hashes, fake.analyzes, fake.closes)
 	}
 }
 
@@ -50,8 +51,62 @@ func TestSessionPipelineCompleteHitSkipsAnalyze(t *testing.T) {
 	if _, err := processMediaWithDeps(context.Background(), sessionPipelineTestConfig(), job, deps); err != nil {
 		t.Fatal(err)
 	}
-	if fake.opens != 1 || fake.hashes != 1 || fake.analyzes != 0 || fake.closes != 1 {
-		t.Fatalf("calls open/hash/analyze/close = %d/%d/%d/%d, want 1/1/0/1", fake.opens, fake.hashes, fake.analyzes, fake.closes)
+	if fake.opens != 1 || fake.hashes != 2 || fake.analyzes != 0 || fake.closes != 1 {
+		t.Fatalf("calls open/hash/analyze/close = %d/%d/%d/%d, want 1/2/0/1", fake.opens, fake.hashes, fake.analyzes, fake.closes)
+	}
+}
+
+func TestSessionPipelineFinalIdentityRejectsDriftAfterCacheQuery(t *testing.T) {
+	job, deps, fake := newSessionPipelineTest(t, worker.MediaImage,
+		worker.MaskImagePDQ, 0)
+	before := sessionPipelineTestInfo{size: job.Size, mtime: time.UnixMilli(job.MTimeMS)}
+	after := sessionPipelineTestInfo{size: job.Size + 1, mtime: time.UnixMilli(job.MTimeMS + 1)}
+	current := fs.FileInfo(before)
+	deps.stat = func(string) (fs.FileInfo, error) { return current, nil }
+	deps.query = func(*worker.SHAQueryMsg) (*worker.SHAReplyMsg, error) {
+		current = after
+		return &worker.SHAReplyMsg{
+			JobID: job.JobID, Found: true,
+			RequestedFields: worker.MaskImagePDQ,
+			FieldsPresent:   worker.MaskImagePDQ,
+			PDQ:             bytes.Repeat([]byte{7}, 32),
+			Quality:         80,
+			Width:           640,
+			Height:          360,
+		}, nil
+	}
+
+	result, err := processMediaWithDeps(context.Background(), sessionPipelineTestConfig(), job, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSessionPipelineStalePayload(t, result)
+	if fake.analyzes != 0 || fake.hashes != 1 {
+		t.Fatalf("analyze/hash = %d/%d, want cache-only drift detected before final hash", fake.analyzes, fake.hashes)
+	}
+}
+
+func TestSessionPipelineFinalIdentityRejectsSameMetadataContentReplacementAfterAnalyze(t *testing.T) {
+	job, deps, fake := newSessionPipelineTest(t, worker.MediaImage,
+		worker.MaskPHashParts, 0)
+	deps.query = sessionPipelineMissingReply(job, worker.MaskPHashParts, 0)
+	fake.result = videocore.AnalysisResult{
+		MediaType: 1, ImageStatus: videocore.StatusOK,
+		ImageFeatures: videocore.FeatureSet{PHash: [9]uint64{1}},
+	}
+	fake.onAnalyze = func(videocore.AnalysisRequest) {
+		changed := fake.sha
+		changed[0] ^= 0xff
+		fake.finalSHA = &changed
+	}
+
+	result, err := processMediaWithDeps(context.Background(), sessionPipelineTestConfig(), job, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSessionPipelineStalePayload(t, result)
+	if fake.analyzes != 1 || fake.hashes != 2 {
+		t.Fatalf("analyze/hash = %d/%d, want 1/2", fake.analyzes, fake.hashes)
 	}
 }
 
@@ -79,8 +134,8 @@ func TestSessionPipelinePartialMask(t *testing.T) {
 	if fake.analyzes != 1 || fake.request.Fields != worker.MaskVideo6F|worker.MaskVideoContactSheet || fake.request.FrameMask != worker.FrameMaskFull {
 		t.Fatalf("analyze = %d request=%#v, want exactly missing fields and six frames", fake.analyzes, fake.request)
 	}
-	if fake.opens != 1 || fake.hashes != 1 || fake.closes != 1 {
-		t.Fatalf("calls open/hash/close = %d/%d/%d, want 1/1/1", fake.opens, fake.hashes, fake.closes)
+	if fake.opens != 1 || fake.hashes != 2 || fake.closes != 1 {
+		t.Fatalf("calls open/hash/close = %d/%d/%d, want 1/2/1", fake.opens, fake.hashes, fake.closes)
 	}
 }
 
@@ -578,10 +633,14 @@ type sessionPipelineFake struct {
 	request    videocore.AnalysisRequest
 	onAnalyze  func(videocore.AnalysisRequest)
 	analyzeErr error
+	finalSHA   *[64]byte
 }
 
 func (fake *sessionPipelineFake) Hash() ([64]byte, error) {
 	fake.hashes++
+	if fake.hashes > 1 && fake.finalSHA != nil {
+		return *fake.finalSHA, nil
+	}
 	return fake.sha, nil
 }
 
@@ -620,6 +679,18 @@ func assertSessionPipelineCleared(t *testing.T, result *worker.JobResultMsg, fak
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Fatalf("cancellation/stale left temp %q: %v", path, err)
 		}
+	}
+}
+
+func assertSessionPipelineStalePayload(t *testing.T, result *worker.JobResultMsg) {
+	t.Helper()
+	if result == nil || result.FieldsDone != 0 || result.FramesDone != 0 || len(result.PDQ) != 0 ||
+		len(result.PHashParts) != 0 || len(result.SobelHist) != 0 || result.DurationMS != nil ||
+		len(result.ThumbPDQ) != 0 || result.ThumbQuality != nil {
+		t.Fatalf("stale result retained payload: %#v", result)
+	}
+	if len(result.Errors) != 1 || result.Errors[0].Stage != "stale" {
+		t.Fatalf("stale errors = %#v, want stable stale", result.Errors)
 	}
 }
 

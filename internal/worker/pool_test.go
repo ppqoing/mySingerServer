@@ -1432,7 +1432,7 @@ func TestPoolMarkCrashFailureIsLoggedWithoutDuplicateClassificationOrRedispatch(
 	for key, want := range map[string]any{
 		"worker_index": float64(0),
 		"pid":          float64(1000),
-		"path":         job.Path,
+		"path_id":      PathID(job.Path),
 		"reason":       "watchdog_image",
 		"err":          sentinel.Error(),
 	} {
@@ -1520,7 +1520,7 @@ func TestPoolMetricsReflectResultAndSingleFlight(t *testing.T) {
 		t.Fatalf("errors.log record is not JSON: %v", err)
 	}
 	for key, want := range map[string]any{
-		"path": result.Path, "stage": "decode", "field_mask": float64(MaskImagePDQ), "err": "partial",
+		"path_id": PathID(result.Path), "stage": "decode", "field_mask": float64(MaskImagePDQ), "err": "partial",
 	} {
 		if value := errorRecord[key]; value != want {
 			t.Fatalf("errors.log %s = %#v, want %#v", key, value, want)
@@ -2016,6 +2016,74 @@ func TestPoolPhase2LogsEachTopLevelAndErroredFrameOnce(t *testing.T) {
 	}
 	if got := p.Metrics(); got.FilesFailed != 1 || got.FilesDone != 0 {
 		t.Fatalf("phase2 errored frame metrics=%#v", got)
+	}
+}
+
+func TestPoolPhase2ErrorLogsUsePathIDAndStageContext(t *testing.T) {
+	h := newLifecycleHarness(t)
+	h.store.phase2MissingMask = MaskVideo6FPHash
+	p := h.newPool(Config{MachineID: "machine-private-log"})
+	t.Cleanup(p.Close)
+	path := `D:\private\customer-album\secret-name.mp4`
+	p.saveResult(JobMsg{
+		JobID: 922, Path: path, Kind: MediaVideo, Phase: Phase2,
+		FieldsMask: MaskVideo6FPHash, FrameMask: 1,
+		ScreenStage: ScreenStageTwo, Source: JobSourceManager, KnownSHA: bytes64(0xa2),
+	}, JobResultMsg{
+		JobID: 922, Path: path, Kind: MediaVideo, Phase: Phase2,
+		ScreenStage: ScreenStageTwo, Source: JobSourceManager, SHA512: bytes64(0xa2),
+		Errors: []FieldError{{Field: MaskVideo6FPHash, Stage: "video_frame", Msg: "decode failed for " + path}},
+		Frames: []FrameFeature{{FrameIdx: 0, Error: "native failed for " + path}},
+	})
+	<-p.Results()
+	if strings.Contains(h.errorLog.String(), "customer-album") || strings.Contains(h.errorLog.String(), "secret-name.mp4") {
+		t.Fatalf("error log leaked sensitive path: %s", h.errorLog.String())
+	}
+	for _, record := range jsonLogRecords(t, h.errorLog.String()) {
+		if record["path_id"] != PathID(path) || record["screen_stage"] != float64(ScreenStageTwo) || record["source"] != string(JobSourceManager) {
+			t.Fatalf("safe log context = %#v", record)
+		}
+	}
+}
+
+func TestPoolAllFrameFailuresPersistPublishAndLogStableErrors(t *testing.T) {
+	h := newLifecycleHarness(t)
+	h.store.phase2MissingMask = MaskVideo6FPHash
+	h.store.missingFrames = FrameMaskFull
+	p := h.newPool(Config{MachineID: "machine-all-frame-errors"})
+	t.Cleanup(p.Close)
+	path := `D:\private\all-failed.mp4`
+	frames := [6]FrameResult{}
+	for index := range frames {
+		frames[index] = FrameResult{FrameIdx: index, Status: -20 - int32(index), TimeMS: int64(index) * 1000}
+	}
+	p.saveResult(JobMsg{
+		JobID: 923, Path: path, Kind: MediaVideo, Phase: Phase2,
+		FieldsMask: MaskVideo6FPHash, FrameMask: FrameMaskFull,
+		ScreenStage: ScreenStageTwo, Source: JobSourceManager, KnownSHA: bytes64(0xa3),
+	}, JobResultMsg{
+		JobID: 923, Path: path, Kind: MediaVideo, Phase: Phase2,
+		ScreenStage: ScreenStageTwo, Source: JobSourceManager, SHA512: bytes64(0xa3),
+		FrameResults: frames,
+	})
+	published := <-p.Results()
+	if len(published.Frames) != 6 || published.FieldsDone != 0 {
+		t.Fatalf("all-failed result=%#v, want six error-only frames", published)
+	}
+	for index, frame := range published.Frames {
+		if frame.FrameIdx != index || frame.Error != fmt.Sprintf("native_status_%d", -20-int32(index)) ||
+			len(frame.PDQ256) != 0 || len(frame.PHashParts) != 0 || len(frame.SobelHist) != 0 {
+			t.Fatalf("failed frame[%d]=%#v", index, frame)
+		}
+	}
+	records := jsonLogRecords(t, h.errorLog.String())
+	if len(records) != 6 {
+		t.Fatalf("all-failed logs=%d %#v, want six", len(records), records)
+	}
+	for _, record := range records {
+		if record["path_id"] != PathID(path) || record["screen_stage"] != float64(ScreenStageTwo) || record["source"] != string(JobSourceManager) {
+			t.Fatalf("all-failed log context=%#v", record)
+		}
 	}
 }
 
@@ -2746,6 +2814,7 @@ type poolTestStore struct {
 	blockSave          bool
 	missingMask        uint32
 	phase2MissingMask  uint32
+	missingFrames      uint8
 	saveStarted        chan struct{}
 	saveOnce           sync.Once
 	saveCount          int
@@ -2772,7 +2841,7 @@ func (s *poolTestStore) LookupContent(_ context.Context, _ []byte, kind store.Me
 }
 
 func (s *poolTestStore) SaveAnalysis(ctx context.Context, result store.AnalysisResult) (store.CommittedState, error) {
-	isPhase2 := result.RequestedFields&(MaskPHashParts|MaskSobelHist|MaskVideo6F) != 0 && result.RequestedFields&(MaskSHA512|MaskImagePDQ|MaskVideoThumb|MaskVideoDuration|MaskVideoContactSheet) == 0
+	isPhase2 := result.RequestedFields&(MaskPHashParts|MaskSobelHist|videoSixFrameWorkerFields()) != 0 && result.RequestedFields&(MaskSHA512|MaskImagePDQ|MaskVideoThumb|MaskVideoDuration|MaskVideoContactSheet) == 0
 	s.mu.Lock()
 	if isPhase2 {
 		s.phase2SaveCount++
@@ -2799,7 +2868,7 @@ func (s *poolTestStore) SaveAnalysis(ctx context.Context, result store.AnalysisR
 	if isPhase2 {
 		missing = s.phase2MissingMask
 	}
-	return store.CommittedState{FieldsPresent: result.RequestedFields &^ missing, MissingFields: missing, FramesPresent: result.RequestedFrames, MissingFrames: 0}, nil
+	return store.CommittedState{FieldsPresent: result.RequestedFields &^ missing, MissingFields: missing, FramesPresent: result.RequestedFrames &^ s.missingFrames, MissingFrames: s.missingFrames}, nil
 }
 
 func (s *poolTestStore) Phase1MissingMask(context.Context, string, string) (uint32, error) {

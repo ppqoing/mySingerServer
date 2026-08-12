@@ -136,7 +136,9 @@ func (r *PoolRouter) routeResult(result *worker.JobResultMsg) {
 				"ignored foreign worker result",
 				"job_id", result.JobID,
 				"task_id", result.ScanTaskID,
-				"path", result.Path,
+				"path_id", worker.PathID(result.Path),
+				"screen_stage", result.ScreenStage,
+				"source", result.Source,
 			)
 		}
 		return
@@ -158,11 +160,17 @@ func (r *PoolRouter) routeCrash(crash worker.CrashRecord) {
 		crash.File != route.job.Path {
 		r.mu.Unlock()
 		if r.log != nil {
+			stage, source := worker.ScreenStageLegacy, worker.JobSource("")
+			if exists {
+				stage, source = route.job.ScreenStage, route.job.Source
+			}
 			r.log.Warn(
 				"ignored foreign worker crash",
 				"job_id", crash.JobID,
 				"task_id", crash.ScanTaskID,
-				"path", crash.File,
+				"path_id", worker.PathID(crash.File),
+				"screen_stage", stage,
+				"source", source,
 			)
 		}
 		return

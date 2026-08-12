@@ -6,7 +6,7 @@ PASS。Manager 的 Stage 2/Stage 3 已映射为带 `screen_stage` 与 `source` �
 
 ## Commit
 
-提交说明：`feat: split second and third screen computation`。提交哈希见任务回执。
+基础提交：`9dccf3edd53673a31d541dc662c002d51044f41e`（`feat: split second and third screen computation`）。修复提交说明：`fix: validate staged media identity and cache replies`，哈希见任务回执。
 
 ## RED / GREEN
 
@@ -31,6 +31,26 @@ PASS。Manager 的 Stage 2/Stage 3 已映射为带 `screen_stage` 与 `source` �
 - `git diff --check` — PASS；仅 Git 的 LF→CRLF 工作区提示，无 whitespace error。
 
 一次合并包命令曾因旧 Phase2 fake result 缺少 stage/source 导致 loopback 测试等待至命令超时；该问题已定位并修复，随后按包拆分运行全部通过，未把命令超时误记为测试断言失败。
+
+## Fix round 1/5
+
+| 修复合同 | RED 证据 | GREEN 结果 |
+| --- | --- | --- |
+| final identity guard | 完整缓存查询后 stat 漂移、native Analyze 后同 size/mtime 内容替换均返回成功 payload | 所有成功出口重新 stat/sameFile/size/mtime 并二次 Hash；与首次 Hash 或 KnownSHA 不同即清 payload 并返回稳定 stale |
+| 日志隐私 | Worker file/crash/store 与 Agent foreign route 日志泄露完整目录和文件名 | 使用规范路径 SHA-256 截断 `path_id`，错误中的已知路径替换为 `<path>`，计算/帧错误带 `screen_stage` 和 `source` |
+| cache payload | committed 完整命中被 Agent 提前跳过并产生空 FeatureItem；部分视频仅提交 missing frame mask | 每个请求提交恰好一个原始 stage/field/frame job；Worker 缓存返回完整请求 payload，完整命中不调用 native |
+| 六帧全失败 | `FramesDone=0` 时固定帧错误未进入 Store、日志或 FeatureResult | 固定帧统一转换为六个 `native_status_<code>` error-only Frames；prune 只清成功 payload，不清错误帧 |
+| TCP 分阶段验收 | 真实 TCP 仅覆盖旧 Stage 0 重连 | 新增 Stage 2 image pHash 与 Stage 3 image Sobel 的 accepted、严格 payload、TaskDone 与单作业验收；旧重连继续通过 |
+| 旧 SavePhase2 | 视频 split 位被拒绝，分阶段保存会覆盖另一列 | 旧入口识别 split 位、逐列 `COALESCE`，2→3 与 3→2 均保留两列；legacy mask 行为不变 |
+
+修复轮最终门禁：
+
+- `go test -count=1 -timeout 90s ./internal/wproc ./internal/store ./cmd/worker` — PASS（0.378s / 1.383s / no test files）
+- `go test -count=1 -timeout 90s ./internal/worker ./internal/agent` — PASS（0.338s / 0.681s）
+- `CC=C:\Tools\WinLibs\mingw64\bin\gcc.exe go test -race -count=1 -timeout 120s ./internal/agent ./internal/worker ./internal/store` — PASS（2.677s / 4.610s / 8.247s）
+- `git diff --check` — PASS；只有 LF→CRLF 提示，无 whitespace error。
+
+Race 首轮唯一失败来自新增 Agent 日志测试直接并发读取 `bytes.Buffer`；改用 mutex-safe 捕获器后定向 race 与完整 race 均通过，生产代码未出现 race。
 
 ## Concerns
 
