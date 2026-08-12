@@ -2823,6 +2823,38 @@ type poolTestStore struct {
 	phase2Results      []store.Phase2Result
 }
 
+// Break caught: a preview result is sent through SaveAnalysis and persists
+// thumbnail-like data instead of remaining an in-memory response.
+func TestImagePreviewPoolBypassesFeatureStore(t *testing.T) {
+	backend := &poolTestStore{}
+	pool := &Pool{
+		ctx: context.Background(), store: backend, dedup: NewDeduper(backend),
+		results: make(chan *JobResultMsg, 1), quit: make(chan struct{}),
+	}
+	job := JobMsg{
+		JobID: 702, Path: `D:\media\source.jpg`, Kind: MediaImage,
+		Phase: PhasePreview, ScreenStage: ScreenStagePreview, Source: JobSourceLocal,
+		KnownSHA: bytes64(0x72), PreviewFormat: PreviewFormatJPEG,
+		PreviewMaxWidth: 100, PreviewMaxHeight: 100, PreviewQuality: 80,
+	}
+	pool.saveResult(job, JobResultMsg{
+		JobID: job.JobID, Path: job.Path, Kind: job.Kind,
+		SHA512: bytes64(0x72), PreviewFormat: PreviewFormatJPEG,
+		PreviewWidth: 50, PreviewHeight: 40, PreviewBytes: []byte{1, 2, 3},
+	})
+	if got := backend.saveCountValue() + backend.phase2SaveCountValue(); got != 0 {
+		t.Fatalf("preview persisted through feature store %d times", got)
+	}
+	select {
+	case result := <-pool.results:
+		if len(result.PreviewBytes) != 3 {
+			t.Fatalf("published preview bytes = %d", len(result.PreviewBytes))
+		}
+	default:
+		t.Fatal("preview result was not published")
+	}
+}
+
 func (s *poolTestStore) LookupContent(_ context.Context, _ []byte, kind store.MediaKind, requestedFields uint32, requestedFrames uint8) (store.ContentState, error) {
 	if s.lookupErr != nil {
 		return store.ContentState{}, s.lookupErr

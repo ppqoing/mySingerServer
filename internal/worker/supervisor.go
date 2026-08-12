@@ -815,10 +815,61 @@ func validateWorkerResult(job *JobMsg, result *JobResultMsg) error {
 			job.FieldsMask,
 		)
 	}
-	if job.Phase != Phase1 && job.Phase != Phase2 {
+	if job.Phase != Phase1 && job.Phase != Phase2 && job.Phase != PhasePreview {
 		return fmt.Errorf("worker protocol: invalid job phase %d", job.Phase)
 	}
+	if job.Phase == PhasePreview {
+		return validateImagePreviewResult(job, result)
+	}
 	return validateMergedWorkerResult(job, result)
+}
+
+func validateImagePreviewResult(job *JobMsg, result *JobResultMsg) error {
+	if job.Kind != MediaImage || job.Source != JobSourceLocal ||
+		job.ScreenStage != ScreenStagePreview || job.FieldsMask != 0 ||
+		job.FrameMask != 0 || job.Size < 0 || job.MTimeUnix <= 0 ||
+		len(job.KnownSHA) != 64 || job.PreviewMaxWidth <= 0 ||
+		job.PreviewMaxHeight <= 0 || job.PreviewQuality < 1 ||
+		job.PreviewQuality > 100 || !validPreviewFormat(job.PreviewFormat) {
+		return fmt.Errorf("worker protocol: invalid image preview request")
+	}
+	if len(result.SHA512) != 64 || !bytes.Equal(job.KnownSHA, result.SHA512) {
+		return fmt.Errorf("worker protocol: image preview SHA-512 mismatch")
+	}
+	if result.FieldsDone != 0 || result.FramesDone != 0 || len(result.Errors) != 0 ||
+		len(result.PDQ) != 0 || len(result.PHashParts) != 0 ||
+		len(result.SobelHist) != 0 || len(result.Frames) != 0 {
+		return fmt.Errorf("worker protocol: image preview carried feature payload")
+	}
+	if result.PreviewErrorCode != "" {
+		if !validPreviewErrorCode(result.PreviewErrorCode) ||
+			result.PreviewFormat != "" || result.PreviewWidth != 0 ||
+			result.PreviewHeight != 0 || len(result.PreviewBytes) != 0 {
+			return fmt.Errorf("worker protocol: invalid image preview failure")
+		}
+		return nil
+	}
+	if result.PreviewFormat != job.PreviewFormat || result.PreviewWidth <= 0 ||
+		result.PreviewHeight <= 0 || result.PreviewWidth > job.PreviewMaxWidth ||
+		result.PreviewHeight > job.PreviewMaxHeight || len(result.PreviewBytes) == 0 ||
+		len(result.PreviewBytes) > MaxPreviewBytes {
+		return fmt.Errorf("worker protocol: invalid image preview response")
+	}
+	return nil
+}
+
+func validPreviewFormat(format string) bool {
+	return format == PreviewFormatJPEG || format == PreviewFormatWebP
+}
+
+func validPreviewErrorCode(code string) bool {
+	switch code {
+	case "stale_preview", "preview_io_failed", "preview_decode_failed",
+		"preview_encode_failed", "preview_too_large":
+		return true
+	default:
+		return false
+	}
 }
 
 func validateMergedWorkerResult(job *JobMsg, result *JobResultMsg) error {

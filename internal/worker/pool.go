@@ -466,6 +466,19 @@ func (p *Pool) watchdogDuration(kind MediaKind) time.Duration {
 }
 
 func (p *Pool) saveResult(job JobMsg, result JobResultMsg) {
+	if job.Phase == PhasePreview {
+		result.PreviewBytes = cloneBytes(result.PreviewBytes)
+		if result.PreviewErrorCode == "" {
+			p.metrics.filesDone.Add(1)
+		} else {
+			p.metrics.filesFailed.Add(1)
+		}
+		select {
+		case p.results <- &result:
+		case <-p.quit:
+		}
+		return
+	}
 	materializeFixedFrameResults(job, &result)
 	frameErrors := erroredFrames(result.Frames)
 	p.saveAnalysisResult(job, &result)

@@ -116,3 +116,103 @@ func TestLocalTaskCreateRequestValidateRejectsNonCanonicalEnvelope(t *testing.T)
 		})
 	}
 }
+
+// Break caught: local.preview.image accepts a caller-controlled path or
+// unbounded dimensions instead of only a database file ID and safe options.
+func TestLocalImagePreviewRequestWireHasNoPathAndValidatesBounds(t *testing.T) {
+	request := LocalImagePreviewRequest{
+		FileID: 41, MaxWidth: 640, MaxHeight: 480, Format: "webp", Quality: 82,
+	}
+	if err := request.Validate(); err != nil {
+		t.Fatalf("valid request: %v", err)
+	}
+	payload, err := EncodeLocalPayload(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]msgpack.RawMessage
+	if err := msgpack.Unmarshal(payload, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := raw["path"]; exists {
+		t.Fatal("preview request exposed a path field")
+	}
+	for _, mutate := range []func(*LocalImagePreviewRequest){
+		func(in *LocalImagePreviewRequest) { in.FileID = 0 },
+		func(in *LocalImagePreviewRequest) { in.MaxWidth = 0 },
+		func(in *LocalImagePreviewRequest) { in.MaxHeight = 8193 },
+		func(in *LocalImagePreviewRequest) { in.Format = "png" },
+		func(in *LocalImagePreviewRequest) { in.Quality = 101 },
+	} {
+		invalid := request
+		mutate(&invalid)
+		if err := invalid.Validate(); err == nil {
+			t.Fatalf("invalid preview request accepted: %#v", invalid)
+		}
+	}
+}
+
+// Break caught: msgpack silently ignores a caller-controlled path field,
+// defeating the file-ID-only boundary even though the Go DTO has no Path.
+func TestLocalImagePreviewRequestStrictDecodeRejectsUnknownPath(t *testing.T) {
+	payload, err := msgpack.Marshal(map[string]any{
+		"file_id": int64(41), "max_width": int32(640), "max_height": int32(480),
+		"format": "jpeg", "quality": int32(80), "path": `D:\private\source.jpg`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var request LocalImagePreviewRequest
+	if err := DecodeLocalPayload(payload, &request); err == nil {
+		t.Fatal("preview request accepted unknown path field")
+	}
+}
+
+// Break caught: exactly 4 MiB of image bytes becomes an oversized msgpack
+// response after field overhead and is rejected only after expensive work.
+func TestLocalImagePreviewResponseEncodingStaysWithinPayloadLimit(t *testing.T) {
+	response := LocalImagePreviewResponse{
+		MIME: "image/webp", Width: 640, Height: 480,
+		Bytes: make([]byte, MaxLocalPreviewEncodedBytes),
+	}
+	payload, err := EncodeLocalPayload(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(payload) > LocalPayloadMaxBytes {
+		t.Fatalf("preview payload bytes=%d", len(payload))
+	}
+	response.Bytes = make([]byte, MaxLocalPreviewEncodedBytes+1)
+	if _, err := EncodeLocalPayload(response); err == nil {
+		t.Fatal("preview response above safe encoded-byte cap was accepted")
+	}
+}
+
+// Break caught: group query and review submissions accept unstable paging or
+// ambiguous decisions before reaching the Agent's SQLite boundary.
+func TestLocalReviewDTOsValidatePagingFiltersAndExplicitDecisions(t *testing.T) {
+	query := LocalGroupListRequest{Scope: "current", Category: "image", ReviewStatus: "undecided", Limit: 200}
+	if err := query.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	query.Limit = 201
+	if err := query.Validate(); err == nil {
+		t.Fatal("group query limit above 200 was accepted")
+	}
+	query = LocalGroupListRequest{Scope: "history", Limit: 20}
+	if err := query.Validate(); err == nil {
+		t.Fatal("history query without run_id was accepted")
+	}
+
+	review := LocalReviewSaveRequest{
+		RunID: "run-1", GroupID: "group-1", Reviewer: "local-user",
+		Decisions: []LocalReviewDecision{{FileID: 1, Decision: "keep"}, {FileID: 2, Decision: "delete"}},
+	}
+	if err := review.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	review.Decisions[1].Decision = "erase"
+	if err := review.Validate(); err == nil {
+		t.Fatal("invalid review decision was accepted")
+	}
+}

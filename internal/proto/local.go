@@ -1,6 +1,7 @@
 package proto
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 )
 
 const LocalPayloadMaxBytes = 4 * 1024 * 1024
+const MaxLocalPreviewEncodedBytes = LocalPayloadMaxBytes - 1024
 
 const (
 	UnsupportedOperationErrorCode = "unsupported_operation"
@@ -211,7 +213,163 @@ type LocalTaskRetryResponse struct {
 	Task LocalTask `msgpack:"task"`
 }
 
+type LocalGroupListRequest struct {
+	Scope            string `msgpack:"scope,omitempty"`
+	RunID            string `msgpack:"run_id,omitempty"`
+	Category         string `msgpack:"category,omitempty"`
+	PathContains     string `msgpack:"path_contains,omitempty"`
+	FileNameContains string `msgpack:"file_name_contains,omitempty"`
+	MinSize          *int64 `msgpack:"min_size,omitempty"`
+	MaxSize          *int64 `msgpack:"max_size,omitempty"`
+	ReviewStatus     string `msgpack:"review_status,omitempty"`
+	Offset           int    `msgpack:"offset"`
+	Limit            int    `msgpack:"limit"`
+}
+
+func (request LocalGroupListRequest) Validate() error {
+	if request.Scope == "" {
+		request.Scope = "current"
+	}
+	if request.Scope != "current" && request.Scope != "history" {
+		return fmt.Errorf("invalid_group_scope")
+	}
+	if request.Scope == "history" && request.RunID == "" {
+		return fmt.Errorf("invalid_run_id")
+	}
+	if request.RunID != "" && strings.TrimSpace(request.RunID) != request.RunID {
+		return fmt.Errorf("invalid_run_id")
+	}
+	switch request.Category {
+	case "", "exact", "image", "video", "inconclusive":
+	default:
+		return fmt.Errorf("invalid_group_category")
+	}
+	switch request.ReviewStatus {
+	case "", "undecided", "reviewed", "keep", "delete":
+	default:
+		return fmt.Errorf("invalid_review_status")
+	}
+	if request.Offset < 0 || request.Limit < 0 || request.Limit > 200 {
+		return fmt.Errorf("invalid_group_page")
+	}
+	if request.MinSize != nil && *request.MinSize < 0 ||
+		request.MaxSize != nil && *request.MaxSize < 0 ||
+		request.MinSize != nil && request.MaxSize != nil && *request.MinSize > *request.MaxSize {
+		return fmt.Errorf("invalid_size_filter")
+	}
+	return nil
+}
+
+type LocalGroupMember struct {
+	FileID           int64  `msgpack:"file_id"`
+	Path             string `msgpack:"path"`
+	FileName         string `msgpack:"file_name"`
+	Size             int64  `msgpack:"size"`
+	Status           string `msgpack:"status"`
+	Decision         string `msgpack:"decision"`
+	VideoPreviewPath string `msgpack:"video_preview_path,omitempty"`
+}
+
+type LocalGroup struct {
+	RunID        string             `msgpack:"run_id"`
+	Generation   int64              `msgpack:"generation"`
+	GroupID      string             `msgpack:"group_id"`
+	Category     string             `msgpack:"category"`
+	Verdict      string             `msgpack:"verdict"`
+	ReviewStatus string             `msgpack:"review_status"`
+	Members      []LocalGroupMember `msgpack:"members"`
+}
+
+type LocalGroupListResponse struct {
+	Groups     []LocalGroup `msgpack:"groups"`
+	Offset     int          `msgpack:"offset"`
+	NextOffset int          `msgpack:"next_offset"`
+}
+
+type LocalGroupDetailRequest struct {
+	RunID   string `msgpack:"run_id,omitempty"`
+	GroupID string `msgpack:"group_id"`
+}
+
+func (request LocalGroupDetailRequest) Validate() error {
+	if request.GroupID == "" || strings.TrimSpace(request.GroupID) != request.GroupID ||
+		(request.RunID != "" && strings.TrimSpace(request.RunID) != request.RunID) {
+		return fmt.Errorf("invalid_group_id")
+	}
+	return nil
+}
+
+type LocalGroupDetailResponse struct {
+	Group LocalGroup `msgpack:"group"`
+}
+
+type LocalReviewDecision struct {
+	FileID   int64  `msgpack:"file_id"`
+	Decision string `msgpack:"decision"`
+}
+
+type LocalReviewSaveRequest struct {
+	RunID     string                `msgpack:"run_id"`
+	GroupID   string                `msgpack:"group_id"`
+	Reviewer  string                `msgpack:"reviewer"`
+	Note      string                `msgpack:"note,omitempty"`
+	Decisions []LocalReviewDecision `msgpack:"decisions"`
+}
+
+func (request LocalReviewSaveRequest) Validate() error {
+	if request.RunID == "" || request.GroupID == "" || request.Reviewer == "" ||
+		strings.TrimSpace(request.RunID) != request.RunID ||
+		strings.TrimSpace(request.GroupID) != request.GroupID ||
+		strings.TrimSpace(request.Reviewer) != request.Reviewer || len(request.Decisions) == 0 {
+		return fmt.Errorf("invalid_review")
+	}
+	seen := make(map[int64]struct{}, len(request.Decisions))
+	for _, decision := range request.Decisions {
+		if decision.FileID <= 0 ||
+			(decision.Decision != "keep" && decision.Decision != "delete" && decision.Decision != "undecided") {
+			return fmt.Errorf("invalid_review")
+		}
+		if _, exists := seen[decision.FileID]; exists {
+			return fmt.Errorf("invalid_review")
+		}
+		seen[decision.FileID] = struct{}{}
+	}
+	return nil
+}
+
+type LocalReviewSaveResponse struct {
+	Saved bool `msgpack:"saved"`
+}
+
+type LocalImagePreviewRequest struct {
+	FileID    int64  `msgpack:"file_id"`
+	MaxWidth  int32  `msgpack:"max_width"`
+	MaxHeight int32  `msgpack:"max_height"`
+	Format    string `msgpack:"format"`
+	Quality   int32  `msgpack:"quality"`
+}
+
+func (request LocalImagePreviewRequest) Validate() error {
+	if request.FileID <= 0 || request.MaxWidth <= 0 || request.MaxWidth > 8192 ||
+		request.MaxHeight <= 0 || request.MaxHeight > 8192 ||
+		(request.Format != "jpeg" && request.Format != "webp") ||
+		request.Quality < 1 || request.Quality > 100 {
+		return fmt.Errorf("invalid_preview")
+	}
+	return nil
+}
+
+type LocalImagePreviewResponse struct {
+	MIME   string `msgpack:"mime"`
+	Width  int32  `msgpack:"width"`
+	Height int32  `msgpack:"height"`
+	Bytes  []byte `msgpack:"bytes"`
+}
+
 func EncodeLocalPayload(value any) ([]byte, error) {
+	if response, ok := value.(LocalImagePreviewResponse); ok && len(response.Bytes) > MaxLocalPreviewEncodedBytes {
+		return nil, errors.New(LocalPayloadTooLargeErrorCode)
+	}
 	payload, err := msgpack.Marshal(value)
 	if err != nil {
 		return nil, err
@@ -226,7 +384,9 @@ func DecodeLocalPayload(payload []byte, destination any) error {
 	if len(payload) > LocalPayloadMaxBytes {
 		return errors.New(LocalPayloadTooLargeErrorCode)
 	}
-	return msgpack.Unmarshal(payload, destination)
+	decoder := msgpack.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields(true)
+	return decoder.Decode(destination)
 }
 
 func (event LocalEvent) Validate() error {

@@ -4,8 +4,12 @@ import (
 	"crypto/sha512"
 	"encoding/binary"
 	"errors"
+	"image"
+	"image/color"
+	"image/jpeg"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +17,75 @@ import (
 	"dedup/internal/worker"
 	"dedup/internal/wproc/videocore"
 )
+
+// Break caught: worker.exe recognizes the preview phase on the wire but the
+// real wproc dispatcher still sends it to the unsupported-phase branch.
+func TestServeDispatchesImagePreviewToMemoryEncoder(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "source.jpg")
+	img := image.NewNRGBA(image.Rect(0, 0, 20, 10))
+	for y := range 10 {
+		for x := range 20 {
+			img.SetNRGBA(x, y, color.NRGBA{R: uint8(x), G: uint8(y), B: 100, A: 255})
+		}
+	}
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jpeg.Encode(file, img, &jpeg.Options{Quality: 90}); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha512.Sum512(data)
+	job := worker.JobMsg{
+		JobID: 1801, ScanTaskID: "preview-1801", Path: path,
+		Kind: worker.MediaImage, Phase: worker.PhasePreview,
+		ScreenStage: worker.ScreenStagePreview, Source: worker.JobSourceLocal,
+		Size: info.Size(), MTimeUnix: info.ModTime().Unix(),
+		KnownSHA: append([]byte(nil), sum[:]...), PreviewFormat: worker.PreviewFormatJPEG,
+		PreviewMaxWidth: 10, PreviewMaxHeight: 10, PreviewQuality: 80,
+	}
+
+	server, parent := net.Pipe()
+	done := make(chan int, 1)
+	go func() { done <- serve(server, 18, testConfig(), pipelineDeps{runtime: testReadyRuntimeInfo}) }()
+	conn := worker.NewIPCConn(parent)
+	if _, err := conn.Read(); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Write(worker.MsgJob, job); err != nil {
+		t.Fatal(err)
+	}
+	envelope, err := conn.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := worker.DecodeBody[worker.JobResultMsg](envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Type != worker.MsgResult || result.PreviewErrorCode != "" ||
+		result.PreviewWidth != 10 || result.PreviewHeight != 5 || len(result.PreviewBytes) == 0 {
+		t.Fatalf("preview dispatch result = type:%q %#v", envelope.Type, result)
+	}
+	if err := conn.Write(worker.MsgShutdown, struct{}{}); err != nil {
+		t.Fatal(err)
+	}
+	if code := <-done; code != 0 {
+		t.Fatalf("serve exit=%d", code)
+	}
+}
 
 func testReadyRuntimeInfo() (videocore.RuntimeInfo, error) {
 	return videocore.RuntimeInfo{ABI: videocore.ABIVersion, Version: "1.0.0", Components: [4]videocore.RuntimeComponent{

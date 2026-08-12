@@ -216,6 +216,7 @@ func cloneWorkerResult(result *worker.JobResultMsg) *worker.JobResultMsg {
 	copy.ThumbQuality = cloneInt32(result.ThumbQuality)
 	copy.PHashParts = append([]byte(nil), result.PHashParts...)
 	copy.SobelHist = append([]byte(nil), result.SobelHist...)
+	copy.PreviewBytes = append([]byte(nil), result.PreviewBytes...)
 	copy.Errors = append([]worker.FieldError(nil), result.Errors...)
 	copy.Frames = make([]worker.FrameFeature, len(result.Frames))
 	for index, frame := range result.Frames {

@@ -33,6 +33,8 @@ import (
 	"dedup/internal/firstscreen"
 	"dedup/internal/localanalysis"
 	"dedup/internal/localcontrol"
+	"dedup/internal/localpreview"
+	"dedup/internal/localreview"
 	"dedup/internal/localtask"
 	"dedup/internal/machineid"
 	"dedup/internal/nodectl"
@@ -293,6 +295,8 @@ func runWithDependencies(
 	stageWorker := agent.NewLocalStageWorker(fairPool, router)
 	analysisEngine := localanalysis.NewEngine(cfg.MachineID, stageOne, local, stageWorker, config.DefaultGUI().Phase2)
 	tasks := localtask.NewService(cfg.MachineID, local, &agentLocalTaskRunner{scans: scans, analysis: analysisEngine})
+	reviews := localreview.NewService(cfg.MachineID, local)
+	previews := localpreview.NewService(cfg.MachineID, local, stageWorker)
 	resumeLocalTasks, err := prepareLocalTaskLifecycle(ctx, tasks, logger)
 	if err != nil {
 		return fmt.Errorf("prepare local task recovery: %w", err)
@@ -320,6 +324,7 @@ func runWithDependencies(
 		ConfigPath: configPath, ExecutablePath: executablePath, CPUCount: runtime.NumCPU(),
 		EffectiveConfigSHA256: configSHA256,
 		Tasks:                 agent.NewLocalTaskHandler(tasks),
+		Results:               agent.NewLocalResultHandler(reviews, previews),
 	})
 	return runService(
 		workerPool,
@@ -636,6 +641,7 @@ type agentLocalHandlerInputs struct {
 	CPUCount              int
 	EffectiveConfigSHA256 string
 	Tasks                 agent.LocalHandler
+	Results               agent.LocalHandler
 }
 
 type agentLocalHandler struct {
@@ -706,6 +712,11 @@ func (h *agentLocalHandler) HandleLocal(ctx context.Context, request proto.Local
 	default:
 		if h.inputs.Tasks != nil && (strings.HasPrefix(request.Operation, "local.task.") || strings.HasPrefix(request.Operation, "local.analysis.")) {
 			return h.inputs.Tasks.HandleLocal(ctx, request)
+		}
+		if h.inputs.Results != nil && (strings.HasPrefix(request.Operation, "local.groups.") ||
+			request.Operation == proto.LocalOperationReviewSave ||
+			request.Operation == proto.LocalOperationPreviewImage) {
+			return h.inputs.Results.HandleLocal(ctx, request)
 		}
 		return localAgentFailure(request.RequestID, proto.UnsupportedOperationErrorCode)
 	}

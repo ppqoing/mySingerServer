@@ -76,6 +76,99 @@ func NewLocalTaskHandler(service LocalTaskService) *LocalTaskHandler {
 	return &LocalTaskHandler{service: service}
 }
 
+type LocalReviewService interface {
+	List(context.Context, proto.LocalGroupListRequest) (proto.LocalGroupListResponse, error)
+	Detail(context.Context, proto.LocalGroupDetailRequest) (proto.LocalGroupDetailResponse, error)
+	Save(context.Context, proto.LocalReviewSaveRequest) (proto.LocalReviewSaveResponse, error)
+}
+
+type LocalPreviewService interface {
+	Preview(context.Context, proto.LocalImagePreviewRequest) (proto.LocalImagePreviewResponse, error)
+}
+
+type LocalResultHandler struct {
+	reviews  LocalReviewService
+	previews LocalPreviewService
+}
+
+func NewLocalResultHandler(reviews LocalReviewService, previews LocalPreviewService) *LocalResultHandler {
+	return &LocalResultHandler{reviews: reviews, previews: previews}
+}
+
+func (handler *LocalResultHandler) HandleLocal(ctx context.Context, request proto.LocalRequest) proto.LocalResponse {
+	if handler == nil || ctx == nil || ctx.Err() != nil {
+		return localTaskFailure(request.RequestID, "local_results_unavailable")
+	}
+	switch request.Operation {
+	case proto.LocalOperationGroupsList:
+		if handler.reviews == nil {
+			return localTaskFailure(request.RequestID, "local_results_unavailable")
+		}
+		var input proto.LocalGroupListRequest
+		if err := proto.DecodeLocalPayload(request.Payload, &input); err != nil || input.Validate() != nil {
+			return localTaskFailure(request.RequestID, "invalid_group_query")
+		}
+		page, err := handler.reviews.List(ctx, input)
+		if err != nil {
+			return localTaskFailure(request.RequestID, "local_results_failed")
+		}
+		return localTaskSuccess(request.RequestID, page)
+	case proto.LocalOperationGroupsDetail:
+		if handler.reviews == nil {
+			return localTaskFailure(request.RequestID, "local_results_unavailable")
+		}
+		var input proto.LocalGroupDetailRequest
+		if err := proto.DecodeLocalPayload(request.Payload, &input); err != nil || input.Validate() != nil {
+			return localTaskFailure(request.RequestID, "invalid_group_id")
+		}
+		detail, err := handler.reviews.Detail(ctx, input)
+		if err != nil {
+			return localTaskFailure(request.RequestID, "local_results_failed")
+		}
+		return localTaskSuccess(request.RequestID, detail)
+	case proto.LocalOperationReviewSave:
+		if handler.reviews == nil {
+			return localTaskFailure(request.RequestID, "local_results_unavailable")
+		}
+		var input proto.LocalReviewSaveRequest
+		if err := proto.DecodeLocalPayload(request.Payload, &input); err != nil || input.Validate() != nil {
+			return localTaskFailure(request.RequestID, "invalid_review")
+		}
+		saved, err := handler.reviews.Save(ctx, input)
+		if err != nil {
+			return localTaskFailure(request.RequestID, "review_failed")
+		}
+		return localTaskSuccess(request.RequestID, saved)
+	case proto.LocalOperationPreviewImage:
+		if handler.previews == nil {
+			return localTaskFailure(request.RequestID, "local_preview_unavailable")
+		}
+		var input proto.LocalImagePreviewRequest
+		if err := proto.DecodeLocalPayload(request.Payload, &input); err != nil || input.Validate() != nil {
+			return localTaskFailure(request.RequestID, "invalid_preview")
+		}
+		preview, err := handler.previews.Preview(ctx, input)
+		if err != nil {
+			return localTaskFailure(request.RequestID, safePreviewError(err))
+		}
+		return localTaskSuccess(request.RequestID, preview)
+	default:
+		return localTaskFailure(request.RequestID, proto.UnsupportedOperationErrorCode)
+	}
+}
+
+func safePreviewError(err error) string {
+	if err == nil {
+		return ""
+	}
+	switch err.Error() {
+	case "stale_preview", "preview_not_available", "preview_too_large":
+		return err.Error()
+	default:
+		return "preview_failed"
+	}
+}
+
 func (h *LocalTaskHandler) HandleLocal(ctx context.Context, request proto.LocalRequest) proto.LocalResponse {
 	if h == nil || h.service == nil {
 		return localTaskFailure(request.RequestID, "local_task_unavailable")

@@ -12,6 +12,34 @@ import (
 	"dedup/internal/worker"
 )
 
+// Break caught: PoolRouter aliases the Worker's preview byte buffer, allowing
+// reuse after routing to mutate the authenticated local response.
+func TestImagePreviewPoolRouterDeepCopiesPreviewBytes(t *testing.T) {
+	pool := newPhase2FakePool()
+	router := NewPoolRouter(pool, nil)
+	job := &worker.JobMsg{
+		JobID: router.NextJobID(), ScanTaskID: "preview", Path: `D:\media\source.jpg`,
+		Kind: worker.MediaImage, Phase: worker.PhasePreview,
+		ScreenStage: worker.ScreenStagePreview, Source: worker.JobSourceLocal,
+	}
+	terminal, cancel, err := router.Register(job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+	previewBytes := []byte{1, 2, 3}
+	pool.results <- &worker.JobResultMsg{
+		JobID: job.JobID, ScanTaskID: job.ScanTaskID, Path: job.Path,
+		Kind: job.Kind, Phase: job.Phase, ScreenStage: job.ScreenStage,
+		Source: job.Source, PreviewBytes: previewBytes,
+	}
+	outcome := <-terminal
+	previewBytes[0] = 9
+	if outcome.result == nil || outcome.result.PreviewBytes[0] != 1 {
+		t.Fatalf("routed preview aliased worker bytes: %#v", outcome.result)
+	}
+}
+
 func TestPoolRouterIsSoleConsumerAndRoutesInterleavedPhasesByFullOwner(t *testing.T) {
 	pool := newPhase2FakePool()
 	router := NewPoolRouter(

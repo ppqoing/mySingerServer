@@ -42,6 +42,49 @@ func TestRedactKnownPathHandlesMixedSeparatorsAndUnicode(t *testing.T) {
 	}
 }
 
+// Break caught: an image preview is accidentally routed as a phase-2 feature
+// job, or its encoded bytes/options are omitted from the worker wire payload.
+func TestImagePreviewMessagesRoundTripMemoryPayload(t *testing.T) {
+	job := JobMsg{
+		JobID: 601, ScanTaskID: "preview-601", Path: `C:\media\preview.jpg`,
+		Kind: MediaImage, Phase: PhasePreview, ScreenStage: ScreenStagePreview,
+		Source: JobSourceLocal, Size: 1234, MTimeUnix: 1720000000,
+		KnownSHA: bytes64(0x61), PreviewFormat: PreviewFormatJPEG,
+		PreviewMaxWidth: 640, PreviewMaxHeight: 480, PreviewQuality: 82,
+	}
+	jobBody, err := msgpack.Marshal(job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobEnvelope := &Envelope{Type: MsgJob, Body: jobBody}
+	decodedJob, err := DecodeBody[JobMsg](jobEnvelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(decodedJob, job) {
+		t.Fatalf("preview job round trip = %#v, want %#v", decodedJob, job)
+	}
+
+	result := JobResultMsg{
+		JobID: 601, Path: job.Path, Kind: MediaImage,
+		SHA512: bytes64(0x61), PreviewFormat: PreviewFormatJPEG,
+		PreviewWidth: 320, PreviewHeight: 240,
+		PreviewBytes: []byte{0xff, 0xd8, 0xff, 0xd9},
+	}
+	resultBody, err := msgpack.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resultEnvelope := &Envelope{Type: MsgResult, Body: resultBody}
+	decodedResult, err := DecodeBody[JobResultMsg](resultEnvelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(decodedResult, result) {
+		t.Fatalf("preview result round trip = %#v, want %#v", decodedResult, result)
+	}
+}
+
 func TestMessageRoundTrip(t *testing.T) {
 	duration := int64(6543)
 	thumbQuality := int32(91)

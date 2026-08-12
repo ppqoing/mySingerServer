@@ -3,13 +3,112 @@ package agent
 import (
 	"context"
 	"errors"
+	"net"
 	"testing"
 	"time"
 
 	"dedup/internal/localtask"
 	"dedup/internal/proto"
 	"dedup/internal/worker"
+	"github.com/vmihailenco/msgpack/v5"
 )
+
+// Break caught: groups/review/preview operations are decoded inconsistently or
+// a strict-preview decode failure still reaches the service with a secret path.
+func TestLocalResultHandlerDispatchesGroupsReviewAndFileIDOnlyPreview(t *testing.T) {
+	reviews := &fakeLocalReviewService{}
+	previews := &fakeLocalPreviewService{}
+	handler := NewLocalResultHandler(reviews, previews)
+
+	listPayload, _ := proto.EncodeLocalPayload(proto.LocalGroupListRequest{Scope: "current", Limit: 20})
+	if response := handler.HandleLocal(context.Background(), proto.LocalRequest{RequestID: "list", Operation: proto.LocalOperationGroupsList, Payload: listPayload}); !response.OK || reviews.listCalls != 1 {
+		t.Fatalf("groups list response=%#v calls=%d", response, reviews.listCalls)
+	}
+	reviewPayload, _ := proto.EncodeLocalPayload(proto.LocalReviewSaveRequest{
+		RunID: "run", GroupID: "group", Reviewer: "user",
+		Decisions: []proto.LocalReviewDecision{{FileID: 1, Decision: "keep"}},
+	})
+	if response := handler.HandleLocal(context.Background(), proto.LocalRequest{RequestID: "review", Operation: proto.LocalOperationReviewSave, Payload: reviewPayload}); !response.OK || reviews.saveCalls != 1 {
+		t.Fatalf("review response=%#v calls=%d", response, reviews.saveCalls)
+	}
+	previewPayload, _ := proto.EncodeLocalPayload(proto.LocalImagePreviewRequest{FileID: 1, MaxWidth: 10, MaxHeight: 10, Format: "jpeg", Quality: 80})
+	if response := handler.HandleLocal(context.Background(), proto.LocalRequest{RequestID: "preview", Operation: proto.LocalOperationPreviewImage, Payload: previewPayload}); !response.OK || previews.calls != 1 {
+		t.Fatalf("preview response=%#v calls=%d", response, previews.calls)
+	}
+
+	maliciousPayload, _ := msgpack.Marshal(map[string]any{
+		"file_id": int64(1), "max_width": 10, "max_height": 10,
+		"format": "jpeg", "quality": 80, "path": `D:\private\source.jpg`,
+	})
+	response := handler.HandleLocal(context.Background(), proto.LocalRequest{RequestID: "malicious", Operation: proto.LocalOperationPreviewImage, Payload: maliciousPayload})
+	if response.OK || response.ErrorCode != "invalid_preview" || previews.calls != 1 {
+		t.Fatalf("malicious response=%#v preview calls=%d", response, previews.calls)
+	}
+}
+
+// Break caught: NodeTray-only result APIs accidentally inherit Manager/non-
+// loopback privileges from the regular Agent protocol.
+func TestLocalResultSocketRequiresLoopbackNodeTrayAuth(t *testing.T) {
+	const token = "result-token"
+	server, _ := newLocalControlTestServer(t)
+	handler := NewLocalResultHandler(&fakeLocalReviewService{}, &fakeLocalPreviewService{})
+	server.SetLocalControl(token, handler)
+	payload, _ := proto.EncodeLocalPayload(proto.LocalGroupListRequest{Scope: "current", Limit: 20})
+	request := proto.LocalRequest{RequestID: "groups", Operation: proto.LocalOperationGroupsList, Payload: payload}
+
+	manager, closeManager := startLocalControlTestConnection(t, server, net.ParseIP("127.0.0.1"))
+	defer closeManager()
+	writeLocalControlTestAuth(t, manager, proto.ClientAuth{Role: "manager", Token: token, Version: proto.ProtocolVersion})
+	if result := readDeleteTestMessage(t, manager).(*proto.ClientAuthResult); result.Accepted {
+		t.Fatalf("manager auth = %#v", result)
+	}
+
+	remote, closeRemote := startLocalControlTestConnection(t, server, net.ParseIP("10.2.3.4"))
+	defer closeRemote()
+	writeLocalControlTestAuth(t, remote, proto.ClientAuth{Role: "nodetray", Token: token, Version: proto.ProtocolVersion})
+	if result := readDeleteTestMessage(t, remote).(*proto.ClientAuthResult); result.Accepted {
+		t.Fatalf("non-loopback auth = %#v", result)
+	}
+
+	client, closeClient := startLocalControlTestConnection(t, server, net.ParseIP("127.0.0.1"))
+	defer closeClient()
+	writeLocalControlTestAuth(t, client, proto.ClientAuth{Role: "nodetray", Token: token, Version: proto.ProtocolVersion})
+	if result := readDeleteTestMessage(t, client).(*proto.ClientAuthResult); !result.Accepted {
+		t.Fatalf("NodeTray auth = %#v", result)
+	}
+	if err := client.WriteFrame(proto.MsgLocalRequest, &request); err != nil {
+		t.Fatal(err)
+	}
+	if response := readDeleteTestMessage(t, client).(*proto.LocalResponse); !response.OK {
+		t.Fatalf("groups response = %#v", response)
+	}
+}
+
+type fakeLocalReviewService struct {
+	listCalls   int
+	detailCalls int
+	saveCalls   int
+}
+
+func (fake *fakeLocalReviewService) List(context.Context, proto.LocalGroupListRequest) (proto.LocalGroupListResponse, error) {
+	fake.listCalls++
+	return proto.LocalGroupListResponse{}, nil
+}
+func (fake *fakeLocalReviewService) Detail(context.Context, proto.LocalGroupDetailRequest) (proto.LocalGroupDetailResponse, error) {
+	fake.detailCalls++
+	return proto.LocalGroupDetailResponse{}, nil
+}
+func (fake *fakeLocalReviewService) Save(context.Context, proto.LocalReviewSaveRequest) (proto.LocalReviewSaveResponse, error) {
+	fake.saveCalls++
+	return proto.LocalReviewSaveResponse{Saved: true}, nil
+}
+
+type fakeLocalPreviewService struct{ calls int }
+
+func (fake *fakeLocalPreviewService) Preview(context.Context, proto.LocalImagePreviewRequest) (proto.LocalImagePreviewResponse, error) {
+	fake.calls++
+	return proto.LocalImagePreviewResponse{MIME: "image/jpeg", Width: 1, Height: 1, Bytes: []byte{1}}, nil
+}
 
 // Break caught: a local StageWorker consumes the process-wide Results channel
 // itself or submits before registration, losing a fast terminal result.

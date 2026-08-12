@@ -28,6 +28,29 @@ import (
 	"dedup/internal/worker"
 )
 
+// Break caught: production's aggregate local handler forwards only task and
+// analysis prefixes, leaving groups/review/preview permanently unsupported.
+func TestAgentLocalHandlerForwardsResultOperations(t *testing.T) {
+	results := &recordingLocalHandler{}
+	handler := newAgentLocalHandler(agentLocalHandlerInputs{Results: results})
+	for _, operation := range []string{
+		proto.LocalOperationGroupsList, proto.LocalOperationGroupsDetail,
+		proto.LocalOperationReviewSave, proto.LocalOperationPreviewImage,
+	} {
+		response := handler.HandleLocal(context.Background(), proto.LocalRequest{RequestID: operation, Operation: operation})
+		if !response.OK || results.operations[len(results.operations)-1] != operation {
+			t.Fatalf("operation %q response=%#v forwarded=%v", operation, response, results.operations)
+		}
+	}
+}
+
+type recordingLocalHandler struct{ operations []string }
+
+func (handler *recordingLocalHandler) HandleLocal(_ context.Context, request proto.LocalRequest) proto.LocalResponse {
+	handler.operations = append(handler.operations, request.Operation)
+	return proto.LocalResponse{RequestID: request.RequestID, OK: true}
+}
+
 func TestNewAgentEnumeratorDisabledUsesWalker(t *testing.T) {
 	primary := &agentAvailabilityProbe{
 		called: make(chan struct{}),

@@ -80,16 +80,26 @@ const (
 type Phase int8
 
 const (
-	Phase1 Phase = 1
-	Phase2 Phase = 2
+	Phase1       Phase = 1
+	Phase2       Phase = 2
+	PhasePreview Phase = 3
 )
 
 type ScreenStage uint8
 
 const (
-	ScreenStageLegacy ScreenStage = 0
-	ScreenStageTwo    ScreenStage = 2
-	ScreenStageThree  ScreenStage = 3
+	ScreenStageLegacy  ScreenStage = 0
+	ScreenStageTwo     ScreenStage = 2
+	ScreenStageThree   ScreenStage = 3
+	ScreenStagePreview ScreenStage = 4
+)
+
+const (
+	PreviewFormatJPEG = "jpeg"
+	PreviewFormatWebP = "webp"
+	// Reserve room for the authenticated local response envelope while keeping
+	// the encoded image itself below the 4 MiB product boundary.
+	MaxPreviewBytes = (4 << 20) - 1024
 )
 
 type JobSource string
@@ -146,20 +156,24 @@ type ReadyMsg struct {
 }
 
 type JobMsg struct {
-	JobID       int64       `msgpack:"job_id"`
-	ScanTaskID  string      `msgpack:"scan_task_id"`
-	Path        string      `msgpack:"path"`
-	Kind        MediaKind   `msgpack:"kind"`
-	Phase       Phase       `msgpack:"phase"`
-	ScreenStage ScreenStage `msgpack:"screen_stage,omitempty"`
-	Source      JobSource   `msgpack:"source,omitempty"`
-	FieldsMask  uint32      `msgpack:"fields_mask"`
-	Size        int64       `msgpack:"size"`
-	MTimeUnix   int64       `msgpack:"mtime_unix"`
-	KnownSHA    []byte      `msgpack:"known_sha,omitempty"`
-	MTimeMS     int64       `msgpack:"mtime_ms,omitempty"`
-	FrameMask   uint8       `msgpack:"frame_mask,omitempty"`
-	DurationMS  int64       `msgpack:"duration_ms,omitempty"`
+	JobID            int64       `msgpack:"job_id"`
+	ScanTaskID       string      `msgpack:"scan_task_id"`
+	Path             string      `msgpack:"path"`
+	Kind             MediaKind   `msgpack:"kind"`
+	Phase            Phase       `msgpack:"phase"`
+	ScreenStage      ScreenStage `msgpack:"screen_stage,omitempty"`
+	Source           JobSource   `msgpack:"source,omitempty"`
+	FieldsMask       uint32      `msgpack:"fields_mask"`
+	Size             int64       `msgpack:"size"`
+	MTimeUnix        int64       `msgpack:"mtime_unix"`
+	KnownSHA         []byte      `msgpack:"known_sha,omitempty"`
+	MTimeMS          int64       `msgpack:"mtime_ms,omitempty"`
+	FrameMask        uint8       `msgpack:"frame_mask,omitempty"`
+	DurationMS       int64       `msgpack:"duration_ms,omitempty"`
+	PreviewFormat    string      `msgpack:"preview_format,omitempty"`
+	PreviewMaxWidth  int32       `msgpack:"preview_max_width,omitempty"`
+	PreviewMaxHeight int32       `msgpack:"preview_max_height,omitempty"`
+	PreviewQuality   int32       `msgpack:"preview_quality,omitempty"`
 }
 
 type SHAQueryMsg struct {
@@ -287,6 +301,11 @@ type JobResultMsg struct {
 	Decoded            bool           `msgpack:"decoded,omitempty"`
 	ThumbGenerated     bool           `msgpack:"thumb_generated,omitempty"`
 	ThumbCacheHit      bool           `msgpack:"thumb_cache_hit,omitempty"`
+	PreviewFormat      string         `msgpack:"preview_format,omitempty"`
+	PreviewWidth       int32          `msgpack:"preview_width,omitempty"`
+	PreviewHeight      int32          `msgpack:"preview_height,omitempty"`
+	PreviewBytes       []byte         `msgpack:"preview_bytes,omitempty"`
+	PreviewErrorCode   string         `msgpack:"preview_error_code,omitempty"`
 }
 
 func (msg JobResultMsg) ValidateVideoCoreMasks() error {
