@@ -353,7 +353,7 @@ func normalizeSHAQuery(query SHAQueryMsg) (SHAQueryMsg, error) {
 		if query.RequestedFields == 0 {
 			query.RequestedFields = store.RequiredStageOneMask(store.MediaVideo)
 		}
-		if query.RequestedFields&MaskVideo6F != 0 && query.RequestedFrames == 0 {
+		if query.RequestedFields&videoSixFrameWorkerFields() != 0 && query.RequestedFrames == 0 {
 			query.RequestedFrames = FrameMaskFull
 		}
 	default:
@@ -404,6 +404,17 @@ func replyFromContentState(query SHAQueryMsg, state store.ContentState) SHAReply
 		reply.ThumbPath = state.Video.ThumbPath
 		reply.ThumbPDQ = cloneBytes(state.Video.ThumbPDQ)
 		reply.ThumbQuality = cloneInt32(state.Video.ThumbQuality)
+	}
+	for _, frame := range state.Frames {
+		if frame.FrameIdx < 0 || frame.FrameIdx >= len(reply.FrameResults) {
+			continue
+		}
+		reply.FrameResults[frame.FrameIdx] = FrameResult{
+			FrameIdx: frame.FrameIdx, Status: 0,
+			PDQ256:     cloneBytes(frame.PDQ256),
+			PHashParts: cloneBytes(frame.PHashParts),
+			SobelHist:  cloneBytes(frame.SobelHist),
+		}
 	}
 	reply.Found = reply.MissingFields == 0 && reply.MissingFrames == 0
 	return reply
@@ -460,6 +471,35 @@ func replyFromCommittedResult(result JobResultMsg, key dedupeKey) (SHAReplyMsg, 
 		reply.FramesPresent == key.frames {
 		reply.FieldsPresent |= MaskVideo6F
 	}
+	if key.fields&MaskVideo6FPHash != 0 && result.FieldsDone&MaskVideo6FPHash != 0 &&
+		reply.FramesPresent == key.frames {
+		reply.FieldsPresent |= MaskVideo6FPHash
+	}
+	if key.fields&MaskVideo6FSobel != 0 && result.FieldsDone&MaskVideo6FSobel != 0 &&
+		reply.FramesPresent == key.frames {
+		reply.FieldsPresent |= MaskVideo6FSobel
+	}
+	for index, frame := range result.FrameResults {
+		bit := uint8(1 << uint(index))
+		if key.frames&bit == 0 || result.FramesDone&bit == 0 {
+			continue
+		}
+		reply.FrameResults[index] = FrameResult{
+			FrameIdx: frame.FrameIdx, Status: 0, TimeMS: frame.TimeMS,
+			PDQ256: cloneBytes(frame.PDQ256), Quality: frame.Quality,
+			PHashParts: cloneBytes(frame.PHashParts), SobelHist: cloneBytes(frame.SobelHist),
+		}
+	}
+	for _, frame := range result.Frames {
+		if frame.FrameIdx < 0 || frame.FrameIdx >= len(reply.FrameResults) {
+			continue
+		}
+		reply.FrameResults[frame.FrameIdx] = FrameResult{
+			FrameIdx: frame.FrameIdx, Status: 0, TimeMS: frame.TimeMS,
+			PDQ256: cloneBytes(frame.PDQ256), Quality: frame.Quality,
+			PHashParts: cloneBytes(frame.PHashParts), SobelHist: cloneBytes(frame.SobelHist),
+		}
+	}
 	reply.MissingFields &^= reply.FieldsPresent
 	reply.MissingFrames &^= reply.FramesPresent
 	reply.Found = reply.MissingFields == 0 && reply.MissingFrames == 0
@@ -471,6 +511,11 @@ func cloneReply(reply SHAReplyMsg) SHAReplyMsg {
 	reply.DurationMS = cloneInt64(reply.DurationMS)
 	reply.ThumbPDQ = cloneBytes(reply.ThumbPDQ)
 	reply.ThumbQuality = cloneInt32(reply.ThumbQuality)
+	for index := range reply.FrameResults {
+		reply.FrameResults[index].PDQ256 = cloneBytes(reply.FrameResults[index].PDQ256)
+		reply.FrameResults[index].PHashParts = cloneBytes(reply.FrameResults[index].PHashParts)
+		reply.FrameResults[index].SobelHist = cloneBytes(reply.FrameResults[index].SobelHist)
+	}
 	return reply
 }
 

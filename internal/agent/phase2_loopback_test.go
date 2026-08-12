@@ -38,6 +38,7 @@ func TestPhase2RealTCPLoopbackReconnectReplaysWithoutResubmission(t *testing.T) 
 		pool.results <- &worker.JobResultMsg{
 			JobID: job.JobID, ScanTaskID: job.ScanTaskID,
 			Path: job.Path, Kind: job.Kind, Phase: worker.Phase2,
+			ScreenStage: job.ScreenStage, Source: job.Source,
 			SHA512:     append([]byte(nil), job.KnownSHA...),
 			FieldsDone: job.FieldsMask, PHashParts: []byte{1, 2, 3},
 		}

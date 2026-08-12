@@ -1,6 +1,7 @@
 package wproc
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -66,7 +67,7 @@ func processMediaWithDeps(ctx context.Context, cfg Config, job *worker.JobMsg, d
 	if err != nil {
 		return sessionPipelineFileError(result, job.FieldsMask, "stale", err), nil
 	}
-	if !matchesDispatchedFile(before, job) {
+	if !matchesSessionDispatchedFile(before, job) {
 		return sessionPipelineStale(result, job, ContactSheetPaths{}), nil
 	}
 	if err := ctx.Err(); err != nil {
@@ -84,6 +85,9 @@ func processMediaWithDeps(ctx context.Context, cfg Config, job *worker.JobMsg, d
 		return sessionPipelineFileError(result, worker.MaskSHA512, "native_hash", err), nil
 	}
 	result.SHA512 = append([]byte(nil), sha[:]...)
+	if job.Phase == worker.Phase2 && !bytes.Equal(job.KnownSHA, sha[:]) {
+		return sessionPipelineStale(result, job, ContactSheetPaths{}), nil
+	}
 	if job.FieldsMask&worker.MaskSHA512 != 0 {
 		result.FieldsDone |= worker.MaskSHA512
 	}
@@ -101,7 +105,7 @@ func processMediaWithDeps(ctx context.Context, cfg Config, job *worker.JobMsg, d
 	}
 	missingFields, missingFrames := reply.MissingFields, reply.MissingFrames
 	cachedPresent := reply.FieldsPresent
-	if err := validateSessionPipelineCachedPayload(reply, cachedPresent); err != nil {
+	if err := validateSessionPipelineCachedPayload(job, reply, cachedPresent); err != nil {
 		return nil, err
 	}
 	var cachedContact *ContactSheetMeta
@@ -149,7 +153,7 @@ func processMediaWithDeps(ctx context.Context, cfg Config, job *worker.JobMsg, d
 		return sessionPipelineCancelled(result, paths), err
 	}
 	after, err := deps.stat(path)
-	if err != nil || !deps.sameFile(before, after) || !sameFileState(before, after) || !matchesDispatchedFile(after, job) {
+	if err != nil || !deps.sameFile(before, after) || !sameFileState(before, after) || !matchesSessionDispatchedFile(after, job) {
 		return sessionPipelineStale(result, job, paths), nil
 	}
 	sessionPipelineMergeAnalysis(result, job, missingFields, analysisFields, missingFrames, analysis)
@@ -177,7 +181,7 @@ func processMediaWithDeps(ctx context.Context, cfg Config, job *worker.JobMsg, d
 		}
 		if err := deps.publishContactSheet(paths, meta, func() error {
 			info, err := deps.stat(path)
-			if err != nil || !deps.sameFile(before, info) || !sameFileState(before, info) || !matchesDispatchedFile(info, job) {
+			if err != nil || !deps.sameFile(before, info) || !sameFileState(before, info) || !matchesSessionDispatchedFile(info, job) {
 				return fmt.Errorf("source drift before contact sheet publish")
 			}
 			return nil
@@ -205,7 +209,7 @@ func newSessionPipelineResult(job *worker.JobMsg) *worker.JobResultMsg {
 	if job == nil {
 		return &worker.JobResultMsg{}
 	}
-	return &worker.JobResultMsg{JobID: job.JobID, ScanTaskID: job.ScanTaskID, Path: job.Path, Kind: job.Kind, Phase: job.Phase}
+	return &worker.JobResultMsg{JobID: job.JobID, ScanTaskID: job.ScanTaskID, Path: job.Path, Kind: job.Kind, Phase: job.Phase, ScreenStage: job.ScreenStage, Source: job.Source}
 }
 
 func validateSessionPipelineJob(job *worker.JobMsg) error {
@@ -218,10 +222,54 @@ func validateSessionPipelineJob(job *worker.JobMsg) error {
 	if job.Phase != worker.Phase1 && job.Phase != worker.Phase2 {
 		return fmt.Errorf("unsupported media phase")
 	}
-	if job.FieldsMask == 0 || job.FieldsMask&^(worker.MaskSHA512|worker.MaskImagePDQ|worker.MaskVideoThumb|worker.MaskPHashParts|worker.MaskSobelHist|worker.MaskVideo6F|worker.MaskVideoDuration|worker.MaskVideoContactSheet) != 0 || job.FrameMask&^worker.FrameMaskFull != 0 {
+	if job.Phase == worker.Phase2 && len(job.KnownSHA) != 64 {
+		return fmt.Errorf("phase-two job known SHA-512 length %d", len(job.KnownSHA))
+	}
+	if job.FieldsMask == 0 || job.FieldsMask&^(worker.MaskSHA512|worker.MaskImagePDQ|worker.MaskVideoThumb|worker.MaskPHashParts|worker.MaskSobelHist|worker.MaskVideo6F|worker.MaskVideoDuration|worker.MaskVideoContactSheet|worker.MaskVideo6FPHash|worker.MaskVideo6FSobel) != 0 || job.FrameMask&^worker.FrameMaskFull != 0 {
 		return fmt.Errorf("invalid media job masks")
 	}
+	if err := validateSessionPipelineStage(job); err != nil {
+		return err
+	}
 	return nil
+}
+
+func validateSessionPipelineStage(job *worker.JobMsg) error {
+	if job.Phase != worker.Phase2 {
+		return nil
+	}
+	switch job.ScreenStage {
+	case worker.ScreenStageLegacy:
+	case worker.ScreenStageTwo:
+		want := uint32(worker.MaskPHashParts)
+		if job.Kind == worker.MediaVideo {
+			want = worker.MaskVideo6FPHash
+		}
+		if job.FieldsMask != want {
+			return fmt.Errorf("stage two field mask %#x, want %#x", job.FieldsMask, want)
+		}
+	case worker.ScreenStageThree:
+		want := uint32(worker.MaskSobelHist)
+		if job.Kind == worker.MediaVideo {
+			want = worker.MaskVideo6FSobel
+		}
+		if job.FieldsMask != want {
+			return fmt.Errorf("stage three field mask %#x, want %#x", job.FieldsMask, want)
+		}
+	default:
+		return fmt.Errorf("invalid screen stage %d", job.ScreenStage)
+	}
+	return nil
+}
+
+func matchesSessionDispatchedFile(info os.FileInfo, job *worker.JobMsg) bool {
+	if info.Size() != job.Size {
+		return false
+	}
+	if job.Phase == worker.Phase2 {
+		return info.ModTime().UnixMilli() == job.MTimeMS
+	}
+	return info.ModTime().Unix() == job.MTimeUnix
 }
 
 func validateSessionPipelineDeps(deps sessionPipelineDeps) error {
@@ -234,14 +282,17 @@ func validateSessionPipelineDeps(deps sessionPipelineDeps) error {
 func sessionPipelineRequested(job *worker.JobMsg) (uint32, uint8) {
 	fields := job.FieldsMask &^ worker.MaskSHA512
 	frames := job.FrameMask
-	if job.Kind == worker.MediaVideo && fields&worker.MaskVideo6F != 0 && frames == 0 {
+	if job.Kind == worker.MediaVideo && fields&(worker.MaskVideo6F|worker.MaskVideo6FPHash|worker.MaskVideo6FSobel) != 0 && frames == 0 {
 		frames = worker.FrameMaskFull
 	}
 	return fields, frames
 }
 
 func sessionPipelineAnalysisFields(missing uint32) uint32 {
-	fields := missing &^ worker.MaskVideoThumb
+	fields := missing &^ (worker.MaskVideoThumb | worker.MaskVideo6FPHash | worker.MaskVideo6FSobel)
+	if missing&(worker.MaskVideo6FPHash|worker.MaskVideo6FSobel) != 0 {
+		fields |= worker.MaskVideo6F
+	}
 	if missing&worker.MaskVideoThumb != 0 {
 		fields |= worker.MaskVideoDuration | worker.MaskVideoContactSheet
 	}
@@ -258,7 +309,7 @@ func validateSessionPipelineReply(job *worker.JobMsg, fields uint32, frames uint
 	return nil
 }
 
-func validateSessionPipelineCachedPayload(reply *worker.SHAReplyMsg, present uint32) error {
+func validateSessionPipelineCachedPayload(job *worker.JobMsg, reply *worker.SHAReplyMsg, present uint32) error {
 	if present&worker.MaskImagePDQ != 0 && (len(reply.PDQ) != videocore.PDQBytes || reply.Quality < 0 || reply.Quality > 100 || reply.Width <= 0 || reply.Height <= 0) {
 		return fmt.Errorf("session pipeline incompatible cached image PDQ")
 	}
@@ -267,6 +318,32 @@ func validateSessionPipelineCachedPayload(reply *worker.SHAReplyMsg, present uin
 	}
 	if present&(worker.MaskVideoThumb|worker.MaskVideoContactSheet) != 0 && (reply.ThumbPath == "" || len(reply.ThumbPDQ) != videocore.PDQBytes || reply.ThumbQuality == nil || *reply.ThumbQuality < 0 || *reply.ThumbQuality > 100) {
 		return fmt.Errorf("session pipeline incompatible cached contact sheet")
+	}
+	for index, frame := range reply.FrameResults {
+		bit := uint8(1 << uint(index))
+		if reply.FramesPresent&bit == 0 {
+			if frame.FrameIdx != 0 || frame.Status != 0 || frame.TimeMS != 0 || len(frame.PDQ256) != 0 || frame.Quality != 0 || len(frame.PHashParts) != 0 || len(frame.SobelHist) != 0 {
+				return fmt.Errorf("session pipeline unclaimed cached frame %d", index)
+			}
+			continue
+		}
+		if frame.FrameIdx != index || frame.Status != 0 {
+			return fmt.Errorf("session pipeline incompatible cached frame %d", index)
+		}
+		switch job.ScreenStage {
+		case worker.ScreenStageTwo:
+			if len(frame.PHashParts) == 0 || len(frame.PDQ256) != 0 || frame.Quality != 0 || len(frame.SobelHist) != 0 {
+				return fmt.Errorf("session pipeline incompatible stage-two cached frame %d", index)
+			}
+		case worker.ScreenStageThree:
+			if len(frame.SobelHist) == 0 || len(frame.PDQ256) != 0 || frame.Quality != 0 || len(frame.PHashParts) != 0 {
+				return fmt.Errorf("session pipeline incompatible stage-three cached frame %d", index)
+			}
+		case worker.ScreenStageLegacy:
+			if len(frame.PDQ256) != 32 || len(frame.PHashParts) == 0 || len(frame.SobelHist) == 0 {
+				return fmt.Errorf("session pipeline incompatible legacy cached frame %d", index)
+			}
+		}
 	}
 	return nil
 }
@@ -290,6 +367,21 @@ func sessionPipelineMergeCached(result *worker.JobResultMsg, reply *worker.SHARe
 		result.ContactSheetHeight = int32(contact.CanvasHeight)
 		result.FieldsDone |= present & (worker.MaskVideoThumb | worker.MaskVideoContactSheet)
 	}
+	for index, frame := range reply.FrameResults {
+		if reply.FramesPresent&(1<<uint(index)) == 0 {
+			continue
+		}
+		result.FrameResults[index] = cloneSessionFrameResult(frame)
+		result.FramesDone |= 1 << uint(index)
+	}
+	result.FieldsDone |= present & (worker.MaskVideo6F | worker.MaskVideo6FPHash | worker.MaskVideo6FSobel)
+}
+
+func cloneSessionFrameResult(frame worker.FrameResult) worker.FrameResult {
+	frame.PDQ256 = append([]byte(nil), frame.PDQ256...)
+	frame.PHashParts = append([]byte(nil), frame.PHashParts...)
+	frame.SobelHist = append([]byte(nil), frame.SobelHist...)
+	return frame
 }
 
 func sessionPipelineAnalyzeStage(job *worker.JobMsg, fields uint32, frames uint8) string {
@@ -299,7 +391,7 @@ func sessionPipelineAnalyzeStage(job *worker.JobMsg, fields uint32, frames uint8
 	if fields&worker.MaskVideoContactSheet != 0 {
 		return "video_contact_sheet"
 	}
-	if frames != 0 || fields&worker.MaskVideo6F != 0 {
+	if frames != 0 || fields&(worker.MaskVideo6F|worker.MaskVideo6FPHash|worker.MaskVideo6FSobel) != 0 {
 		return "video_frame"
 	}
 	if fields&worker.MaskVideoDuration != 0 {
@@ -341,16 +433,22 @@ func sessionPipelineMergeAnalysis(result *worker.JobResultMsg, job *worker.JobMs
 		native := analysis.Frames[index]
 		frame := worker.FrameResult{FrameIdx: index, Status: native.Status, TimeMS: native.SampleTimeMS}
 		if native.Status == videocore.StatusOK && analysis.CompletedFrameMask&(1<<uint(index)) != 0 {
-			frame.PDQ256 = append([]byte(nil), native.Features.PDQ[:]...)
-			frame.Quality = int32(native.Features.PDQQuality)
-			frame.PHashParts = features.EncodePHashParts(native.Features.PHash)
-			frame.SobelHist, _ = features.EncodeSobelHist(native.Features.SobelHistogram)
+			if missingFields&worker.MaskVideo6F != 0 {
+				frame.PDQ256 = append([]byte(nil), native.Features.PDQ[:]...)
+				frame.Quality = int32(native.Features.PDQQuality)
+			}
+			if missingFields&(worker.MaskVideo6F|worker.MaskVideo6FPHash) != 0 {
+				frame.PHashParts = features.EncodePHashParts(native.Features.PHash)
+			}
+			if missingFields&(worker.MaskVideo6F|worker.MaskVideo6FSobel) != 0 {
+				frame.SobelHist, _ = features.EncodeSobelHist(native.Features.SobelHistogram)
+			}
 			result.FramesDone |= 1 << uint(index)
 		}
 		result.FrameResults[index] = frame
 	}
-	if result.FramesDone == worker.FrameMaskFull {
-		result.FieldsDone |= worker.MaskVideo6F
+	if result.FramesDone&frames == frames {
+		result.FieldsDone |= missingFields & (worker.MaskVideo6F | worker.MaskVideo6FPHash | worker.MaskVideo6FSobel)
 	}
 	if analysisFields&worker.MaskVideoContactSheet != 0 && analysis.ContactSheetStatus == videocore.StatusOK {
 		result.ContactSheetStatus = analysis.ContactSheetStatus
@@ -419,6 +517,9 @@ func sessionPipelineCancelled(result *worker.JobResultMsg, paths ContactSheetPat
 func sessionPipelineStale(result *worker.JobResultMsg, job *worker.JobMsg, paths ContactSheetPaths) *worker.JobResultMsg {
 	removeContactSheetTemps(paths)
 	clearSessionPipelineResult(result)
+	if job.Phase == worker.Phase2 && len(job.KnownSHA) == 64 {
+		result.SHA512 = append([]byte(nil), job.KnownSHA...)
+	}
 	result.Errors = append(result.Errors, worker.FieldError{Field: job.FieldsMask, Stage: "stale", Msg: "media file changed"})
 	return result
 }

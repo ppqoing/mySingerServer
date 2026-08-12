@@ -41,6 +41,22 @@ const (
 	Phase2 Phase = 2
 )
 
+type ScreenStage uint8
+
+const (
+	ScreenStageLegacy ScreenStage = 0
+	ScreenStageTwo    ScreenStage = 2
+	ScreenStageThree  ScreenStage = 3
+)
+
+type JobSource string
+
+const (
+	JobSourceManager JobSource = "manager"
+	JobSourceLocal   JobSource = "local"
+	JobSourceScan    JobSource = "scan"
+)
+
 const (
 	MaskSHA512   uint32 = 1 << 0
 	MaskImagePDQ uint32 = 1 << 1
@@ -51,6 +67,8 @@ const (
 	MaskVideo6F           uint32 = 1 << 5
 	MaskVideoDuration     uint32 = 1 << 6
 	MaskVideoContactSheet uint32 = 1 << 7
+	MaskVideo6FPHash      uint32 = 1 << 8
+	MaskVideo6FSobel      uint32 = 1 << 9
 )
 
 var (
@@ -62,7 +80,8 @@ const (
 	FrameMaskFull uint8  = 0x3f
 	fieldMaskFull uint32 = MaskSHA512 | MaskImagePDQ | MaskVideoThumb |
 		MaskPHashParts | MaskSobelHist | MaskVideo6F |
-		MaskVideoDuration | MaskVideoContactSheet
+		MaskVideoDuration | MaskVideoContactSheet |
+		MaskVideo6FPHash | MaskVideo6FSobel
 )
 
 type RuntimeComponent struct {
@@ -84,18 +103,20 @@ type ReadyMsg struct {
 }
 
 type JobMsg struct {
-	JobID      int64     `msgpack:"job_id"`
-	ScanTaskID string    `msgpack:"scan_task_id"`
-	Path       string    `msgpack:"path"`
-	Kind       MediaKind `msgpack:"kind"`
-	Phase      Phase     `msgpack:"phase"`
-	FieldsMask uint32    `msgpack:"fields_mask"`
-	Size       int64     `msgpack:"size"`
-	MTimeUnix  int64     `msgpack:"mtime_unix"`
-	KnownSHA   []byte    `msgpack:"known_sha,omitempty"`
-	MTimeMS    int64     `msgpack:"mtime_ms,omitempty"`
-	FrameMask  uint8     `msgpack:"frame_mask,omitempty"`
-	DurationMS int64     `msgpack:"duration_ms,omitempty"`
+	JobID       int64       `msgpack:"job_id"`
+	ScanTaskID  string      `msgpack:"scan_task_id"`
+	Path        string      `msgpack:"path"`
+	Kind        MediaKind   `msgpack:"kind"`
+	Phase       Phase       `msgpack:"phase"`
+	ScreenStage ScreenStage `msgpack:"screen_stage,omitempty"`
+	Source      JobSource   `msgpack:"source,omitempty"`
+	FieldsMask  uint32      `msgpack:"fields_mask"`
+	Size        int64       `msgpack:"size"`
+	MTimeUnix   int64       `msgpack:"mtime_unix"`
+	KnownSHA    []byte      `msgpack:"known_sha,omitempty"`
+	MTimeMS     int64       `msgpack:"mtime_ms,omitempty"`
+	FrameMask   uint8       `msgpack:"frame_mask,omitempty"`
+	DurationMS  int64       `msgpack:"duration_ms,omitempty"`
 }
 
 type SHAQueryMsg struct {
@@ -108,23 +129,24 @@ type SHAQueryMsg struct {
 }
 
 type SHAReplyMsg struct {
-	JobID           int64  `msgpack:"job_id"`
-	Found           bool   `msgpack:"found"`
-	RequestedFields uint32 `msgpack:"requested_fields"`
-	FieldsPresent   uint32 `msgpack:"present_fields"`
-	MissingFields   uint32 `msgpack:"missing_fields"`
-	RequestedFrames uint8  `msgpack:"requested_frames"`
-	FramesPresent   uint8  `msgpack:"present_frames"`
-	MissingFrames   uint8  `msgpack:"missing_frames"`
-	PDQ             []byte `msgpack:"pdq,omitempty"`
-	Quality         int32  `msgpack:"quality,omitempty"`
-	Width           int32  `msgpack:"width,omitempty"`
-	Height          int32  `msgpack:"height,omitempty"`
-	DurationMS      *int64 `msgpack:"duration_ms,omitempty"`
-	ThumbPath       string `msgpack:"thumb_path,omitempty"`
-	ThumbPDQ        []byte `msgpack:"thumb_pdq,omitempty"`
-	ThumbQuality    *int32 `msgpack:"thumb_quality,omitempty"`
-	ReusedFlight    bool   `msgpack:"reused_flight,omitempty"`
+	JobID           int64          `msgpack:"job_id"`
+	Found           bool           `msgpack:"found"`
+	RequestedFields uint32         `msgpack:"requested_fields"`
+	FieldsPresent   uint32         `msgpack:"present_fields"`
+	MissingFields   uint32         `msgpack:"missing_fields"`
+	RequestedFrames uint8          `msgpack:"requested_frames"`
+	FramesPresent   uint8          `msgpack:"present_frames"`
+	MissingFrames   uint8          `msgpack:"missing_frames"`
+	PDQ             []byte         `msgpack:"pdq,omitempty"`
+	Quality         int32          `msgpack:"quality,omitempty"`
+	Width           int32          `msgpack:"width,omitempty"`
+	Height          int32          `msgpack:"height,omitempty"`
+	DurationMS      *int64         `msgpack:"duration_ms,omitempty"`
+	ThumbPath       string         `msgpack:"thumb_path,omitempty"`
+	ThumbPDQ        []byte         `msgpack:"thumb_pdq,omitempty"`
+	ThumbQuality    *int32         `msgpack:"thumb_quality,omitempty"`
+	FrameResults    [6]FrameResult `msgpack:"frame_results,omitempty"`
+	ReusedFlight    bool           `msgpack:"reused_flight,omitempty"`
 }
 
 func (msg SHAQueryMsg) ValidateMasks() error {
@@ -190,6 +212,8 @@ type JobResultMsg struct {
 	ScanTaskID         string         `msgpack:"scan_task_id,omitempty"`
 	WorkerPID          int            `msgpack:"-"`
 	Phase              Phase          `msgpack:"-"`
+	ScreenStage        ScreenStage    `msgpack:"screen_stage,omitempty"`
+	Source             JobSource      `msgpack:"source,omitempty"`
 	Path               string         `msgpack:"path"`
 	Kind               MediaKind      `msgpack:"kind"`
 	SHA512             []byte         `msgpack:"sha512,omitempty"`
@@ -230,7 +254,7 @@ func (msg JobResultMsg) ValidateVideoCoreMasks() error {
 		return fmt.Errorf("worker: job result frames_done contains bits outside six frames")
 	}
 
-	hasFrameResults := msg.FieldsDone&MaskVideo6F != 0 || msg.FramesDone != 0
+	hasFrameResults := msg.FieldsDone&videoSixFrameWorkerFields() != 0 || msg.FramesDone != 0
 	for _, frame := range msg.FrameResults {
 		if frame.FrameIdx != 0 || frame.Status != 0 || frame.TimeMS != 0 || frameHasFeaturePayload(frame) {
 			hasFrameResults = true

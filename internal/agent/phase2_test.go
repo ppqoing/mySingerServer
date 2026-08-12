@@ -121,6 +121,113 @@ func TestPhase2PrepareRejectsInvalidEnvelopeAtomically(t *testing.T) {
 	}
 }
 
+func TestPhase2EnvelopeUsesStageAwareValidationAndStageIsPartOfIdentity(t *testing.T) {
+	manager := NewPhase2Manager("machine-a")
+	stageTwoItem := validPhase2Image(`D:\media\stage-envelope.jpg`)
+	stageTwoItem.FieldsMask = proto.FieldPHashParts
+	stageTwo := proto.Phase2Task{
+		TaskID: "stage-envelope",
+		Stage:  proto.ScreenStageTwo,
+		Items:  []proto.Phase2Item{stageTwoItem},
+	}
+
+	ack, _ := manager.Prepare(stageTwo, nil)
+	if !ack.Accepted {
+		t.Fatalf("stage-two ack=%#v, want accepted", ack)
+	}
+	ack, _ = manager.Prepare(clonePhase2TaskForTest(stageTwo), nil)
+	if !ack.Accepted || ack.Reason != "resumed" {
+		t.Fatalf("same stage envelope ack=%#v, want resumed", ack)
+	}
+
+	stageThree := clonePhase2TaskForTest(stageTwo)
+	stageThree.Stage = proto.ScreenStageThree
+	stageThree.Items[0].FieldsMask = proto.FieldSobelHist
+	ack, _ = manager.Prepare(stageThree, nil)
+	if ack.Accepted || !strings.Contains(ack.Reason, "task_id envelope mismatch") {
+		t.Fatalf("different stage envelope ack=%#v, want mismatch", ack)
+	}
+
+	invalidStageTwo := clonePhase2TaskForTest(stageTwo)
+	invalidStageTwo.TaskID = "stage-envelope-invalid"
+	invalidStageTwo.Items[0].FieldsMask = proto.FieldSobelHist
+	ack, _ = manager.Prepare(invalidStageTwo, nil)
+	if ack.Accepted || !strings.Contains(ack.Reason, "stage-two") {
+		t.Fatalf("invalid stage-two ack=%#v, want stage-aware rejection", ack)
+	}
+}
+
+func TestPhase2StageTwoCreatesOnlyManagerStageTwoJob(t *testing.T) {
+	pool := newPhase2FakePool()
+	router := NewPoolRouter(pool, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	defer close(pool.results)
+	path := `D:\media\stage-two-only.jpg`
+	item := validPhase2Image(path)
+	item.FieldsMask = proto.FieldPHashParts
+	manager := NewPhase2ManagerWithRuntime(
+		"machine-a",
+		&phase2CommittedFake{states: map[string]store.Phase2Committed{
+			path: {MissingFields: proto.FieldPHashParts},
+		}},
+		pool,
+		router,
+		func(string) (int64, bool, error) { return 1, false, nil },
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	submitted := make(chan worker.JobMsg, 2)
+	pool.onSubmit = func(job worker.JobMsg) {
+		submitted <- job
+		pool.results <- &worker.JobResultMsg{
+			JobID: job.JobID, ScanTaskID: job.ScanTaskID, Path: job.Path,
+			Kind: job.Kind, Phase: job.Phase, ScreenStage: job.ScreenStage,
+			Source: job.Source, FieldsDone: worker.MaskPHashParts,
+			SHA512:     append([]byte(nil), job.KnownSHA...),
+			PHashParts: []byte{7},
+		}
+	}
+	task := proto.Phase2Task{TaskID: "stage-two-only", Stage: proto.ScreenStageTwo, Items: []proto.Phase2Item{item}}
+	ack, start := manager.Prepare(task, nil)
+	if !ack.Accepted || start == nil {
+		t.Fatalf("ack=%#v start_nil=%t", ack, start == nil)
+	}
+	start()
+
+	select {
+	case job := <-submitted:
+		if job.ScreenStage != worker.ScreenStageTwo || job.Source != worker.JobSourceManager ||
+			job.FieldsMask != worker.MaskPHashParts {
+			t.Fatalf("stage-two job=%#v", job)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stage-two job was not submitted")
+	}
+
+	deadline := time.After(time.Second)
+	for {
+		manager.mu.Lock()
+		state := manager.tasks[task.TaskID]
+		manager.mu.Unlock()
+		state.mu.Lock()
+		done := state.status == proto.StatusDone
+		state.mu.Unlock()
+		if done {
+			break
+		}
+		select {
+		case extra := <-submitted:
+			t.Fatalf("stage two implicitly submitted another job: %#v", extra)
+		case <-deadline:
+			t.Fatal("stage-two task did not complete")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	select {
+	case extra := <-submitted:
+		t.Fatalf("stage two implicitly submitted stage three: %#v", extra)
+	case <-time.After(20 * time.Millisecond):
+	}
+}
+
 func TestPhase2PrepareConcurrentDuplicateCreatesOneLogicalExecution(t *testing.T) {
 	manager := NewPhase2Manager("machine-a")
 	var executions atomic.Int64
@@ -281,6 +388,7 @@ func TestPhase2SchedulesPerPhysicalDiskPrunesAndDeepCopiesPartialResults(t *test
 			firstResult = &worker.JobResultMsg{
 				JobID: job.JobID, ScanTaskID: job.ScanTaskID,
 				Path: job.Path, Kind: job.Kind, Phase: worker.Phase2,
+				ScreenStage: job.ScreenStage, Source: job.Source,
 				SHA512:     append([]byte(nil), job.KnownSHA...),
 				FieldsDone: worker.MaskPHashParts,
 				PHashParts: []byte{1, 2, 3},
@@ -296,6 +404,7 @@ func TestPhase2SchedulesPerPhysicalDiskPrunesAndDeepCopiesPartialResults(t *test
 			pool.results <- &worker.JobResultMsg{
 				JobID: job.JobID, ScanTaskID: job.ScanTaskID,
 				Path: job.Path, Kind: job.Kind, Phase: worker.Phase2,
+				ScreenStage: job.ScreenStage, Source: job.Source,
 				SHA512:     append([]byte(nil), job.KnownSHA...),
 				FieldsDone: worker.MaskSobelHist,
 				SobelHist:  []byte{4, 5, 6},
@@ -305,6 +414,7 @@ func TestPhase2SchedulesPerPhysicalDiskPrunesAndDeepCopiesPartialResults(t *test
 			videoResult = &worker.JobResultMsg{
 				JobID: job.JobID, ScanTaskID: job.ScanTaskID,
 				Path: job.Path, Kind: job.Kind, Phase: worker.Phase2,
+				ScreenStage: job.ScreenStage, Source: job.Source,
 				SHA512: append([]byte(nil), job.KnownSHA...),
 				Frames: []worker.FrameFeature{{
 					FrameIdx:   1,
@@ -492,6 +602,37 @@ func TestPhase2FeatureFromWorkerFiltersFramesOutsideEffectiveMask(t *testing.T) 
 	full := phase2FeatureFromWorker(accepted, job, result)
 	if len(full.Frames) != 2 {
 		t.Fatalf("zero FrameMask Frames=%#v, want full-mask normalization", full.Frames)
+	}
+}
+
+func TestPhase2FeatureFromWorkerMapsFixedVideoFramesWithoutCrossStagePayload(t *testing.T) {
+	accepted := validPhase2Video(`D:\media\fixed-stage.mp4`, proto.FrameMaskFull)
+	accepted.FieldsMask = proto.FieldVideo6FPHash
+	job := &worker.JobMsg{
+		Path: accepted.Path, Kind: worker.MediaVideo, Phase: worker.Phase2,
+		ScreenStage: worker.ScreenStageTwo, Source: worker.JobSourceManager,
+		FieldsMask: worker.MaskVideo6FPHash, FrameMask: worker.FrameMaskFull,
+	}
+	result := &worker.JobResultMsg{
+		Path: accepted.Path, Kind: worker.MediaVideo, Phase: worker.Phase2,
+		ScreenStage: worker.ScreenStageTwo, Source: worker.JobSourceManager,
+		FieldsDone: worker.MaskVideo6FPHash, FramesDone: worker.FrameMaskFull,
+	}
+	for index := range result.FrameResults {
+		result.FrameResults[index] = worker.FrameResult{
+			FrameIdx: index, TimeMS: int64(index+1) * 1000,
+			PHashParts: []byte{byte(index + 1)},
+		}
+	}
+
+	feature := phase2FeatureFromWorker(accepted, job, result)
+	if feature.Status != proto.StatusDone || feature.FieldsDone != proto.FieldVideo6FPHash || len(feature.Frames) != 6 {
+		t.Fatalf("fixed-frame feature=%#v", feature)
+	}
+	for index, frame := range feature.Frames {
+		if len(frame.PHashParts) == 0 || len(frame.SobelHist) != 0 || len(frame.PDQ256) != 0 {
+			t.Fatalf("feature frame[%d] leaked payload: %#v", index, frame)
+		}
 	}
 }
 
@@ -835,6 +976,7 @@ func TestScanAndPhase2UseSharedRouterJobIDAllocator(t *testing.T) {
 		pool.results <- &worker.JobResultMsg{
 			JobID: job.JobID, ScanTaskID: job.ScanTaskID,
 			Path: job.Path, Kind: job.Kind, Phase: worker.Phase2,
+			ScreenStage: job.ScreenStage, Source: job.Source,
 			SHA512:     append([]byte(nil), job.KnownSHA...),
 			FieldsDone: job.FieldsMask,
 			PHashParts: []byte{1},
@@ -882,6 +1024,7 @@ func TestPhase2SenderFailureKeepsWorkAndReconnectReplaysOrderedImmutableTerminal
 		result := &worker.JobResultMsg{
 			JobID: job.JobID, ScanTaskID: job.ScanTaskID,
 			Path: job.Path, Kind: job.Kind, Phase: worker.Phase2,
+			ScreenStage: job.ScreenStage, Source: job.Source,
 			SHA512:     append([]byte(nil), job.KnownSHA...),
 			FieldsDone: job.FieldsMask,
 			PHashParts: []byte{byte(len(sources) + 1)},
@@ -1000,6 +1143,7 @@ func TestPhase2OldConnectionDetachCannotClearNewBinding(t *testing.T) {
 		pool.results <- &worker.JobResultMsg{
 			JobID: job.JobID, ScanTaskID: job.ScanTaskID,
 			Path: job.Path, Kind: job.Kind, Phase: worker.Phase2,
+			ScreenStage: job.ScreenStage, Source: job.Source,
 			SHA512:     append([]byte(nil), job.KnownSHA...),
 			FieldsDone: job.FieldsMask, PHashParts: []byte{1},
 		}
@@ -1178,6 +1322,7 @@ func TestPhase2ShutdownRejectsAdmissionWaitsForDrainAndRemovesTaskState(t *testi
 		pool.results <- &worker.JobResultMsg{
 			JobID: job.JobID, ScanTaskID: job.ScanTaskID,
 			Path: job.Path, Kind: job.Kind, Phase: worker.Phase2,
+			ScreenStage: job.ScreenStage, Source: job.Source,
 			SHA512:     append([]byte(nil), job.KnownSHA...),
 			FieldsDone: job.FieldsMask, PHashParts: []byte{1},
 		}
@@ -1785,11 +1930,12 @@ func (p *blockingSubmitPool) Metrics() worker.MetricsSnapshot {
 	return worker.MetricsSnapshot{}
 }
 
-func (s *cancellablePhase2CommittedStore) Phase2CommittedState(
+func (s *cancellablePhase2CommittedStore) Phase2CommittedStateForFields(
 	ctx context.Context,
 	_ string,
 	_ string,
 	_ store.MediaKind,
+	_ uint32,
 ) (store.Phase2Committed, error) {
 	s.enterOnce.Do(func() { close(s.entered) })
 	select {
@@ -1897,11 +2043,12 @@ func replaySeqBytes(values []uint64) []byte {
 	return out
 }
 
-func (s *phase2CommittedFake) Phase2CommittedState(
+func (s *phase2CommittedFake) Phase2CommittedStateForFields(
 	_ context.Context,
 	_ string,
 	path string,
 	_ store.MediaKind,
+	_ uint32,
 ) (store.Phase2Committed, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

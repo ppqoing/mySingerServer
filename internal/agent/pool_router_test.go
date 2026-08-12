@@ -147,6 +147,47 @@ func TestPoolRouterPoolCloseTerminatesEveryRegisteredOwner(t *testing.T) {
 	}
 }
 
+func TestPoolRouterRejectsForeignStageAndSourceResult(t *testing.T) {
+	pool := newPhase2FakePool()
+	router := NewPoolRouter(pool, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	job := worker.JobMsg{
+		JobID: router.NextJobID(), ScanTaskID: "stage-source", Path: `D:\media\owner.jpg`,
+		Kind: worker.MediaImage, Phase: worker.Phase2,
+		ScreenStage: worker.ScreenStageTwo, Source: worker.JobSourceManager,
+	}
+	terminal, cancel, err := router.Register(&job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+
+	for _, foreign := range []worker.JobResultMsg{
+		{JobID: job.JobID, ScanTaskID: job.ScanTaskID, Path: job.Path, Kind: job.Kind, Phase: job.Phase, ScreenStage: worker.ScreenStageThree, Source: job.Source},
+		{JobID: job.JobID, ScanTaskID: job.ScanTaskID, Path: job.Path, Kind: job.Kind, Phase: job.Phase, ScreenStage: job.ScreenStage, Source: worker.JobSourceLocal},
+	} {
+		copy := foreign
+		pool.results <- &copy
+	}
+	select {
+	case got := <-terminal:
+		t.Fatalf("foreign result reached owner: %#v", got)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	pool.results <- &worker.JobResultMsg{
+		JobID: job.JobID, ScanTaskID: job.ScanTaskID, Path: job.Path, Kind: job.Kind,
+		Phase: job.Phase, ScreenStage: job.ScreenStage, Source: job.Source,
+	}
+	select {
+	case got := <-terminal:
+		if got.result == nil || got.result.ScreenStage != job.ScreenStage || got.result.Source != job.Source {
+			t.Fatalf("owner result=%#v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("matching stage/source result was not routed")
+	}
+}
+
 type phase2FakePool struct {
 	mu           sync.Mutex
 	submitted    []worker.JobMsg

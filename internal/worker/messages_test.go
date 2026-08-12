@@ -22,7 +22,7 @@ func TestMessageRoundTrip(t *testing.T) {
 	}{
 		{"envelope", Envelope{Type: MsgJob, Body: []byte{1, 2, 3}}, func() any { return new(Envelope) }},
 		{"ready", ReadyMsg{PID: 41, WorkerIndex: 3, IPCVersion: IPCCompatibilityVersion, DLLVersion: MediaCoreDLLVersion}, func() any { return new(ReadyMsg) }},
-		{"job", JobMsg{JobID: 92, ScanTaskID: "550e8400-e29b-41d4-a716-446655440000", Path: `C:\media\sample.jpg`, Kind: MediaImage, Phase: Phase2, FieldsMask: MaskPHashParts, Size: 123456, MTimeUnix: 1720000000, KnownSHA: bytes64(7), MTimeMS: 1720000000123, FrameMask: 0x15, DurationMS: 6543}, func() any { return new(JobMsg) }},
+		{"job", JobMsg{JobID: 92, ScanTaskID: "550e8400-e29b-41d4-a716-446655440000", Path: `C:\media\sample.jpg`, Kind: MediaImage, Phase: Phase2, ScreenStage: ScreenStageTwo, Source: JobSourceManager, FieldsMask: MaskPHashParts, Size: 123456, MTimeUnix: 1720000000, KnownSHA: bytes64(7), MTimeMS: 1720000000123, FrameMask: 0x15, DurationMS: 6543}, func() any { return new(JobMsg) }},
 		{"sha query", SHAQueryMsg{JobID: 93, SHA512: bytes64(8), Kind: MediaVideo}, func() any { return new(SHAQueryMsg) }},
 		{"sha reply", SHAReplyMsg{JobID: 94, Found: true, PDQ: []byte{4, 5}, Quality: 86, Width: 1920, Height: 1080, DurationMS: &duration, ThumbPath: `C:\thumbs\sample.jpg`, ThumbPDQ: []byte{6, 7}, ThumbQuality: &thumbQuality}, func() any { return new(SHAReplyMsg) }},
 		{"field error", FieldError{Field: MaskPHashParts, Stage: "decode", Msg: "invalid image"}, func() any { return new(FieldError) }},
@@ -385,6 +385,12 @@ func TestMergedResultMapCompatibilityUsesExplicitFrameStatus(t *testing.T) {
 	}
 	if err := declaredFramesWithImplicitSuccess.ValidateVideoCoreMasks(); err == nil {
 		t.Fatal("result declared MaskVideo6F with no done frames and six implicit success statuses")
+	}
+	for _, field := range []uint32{MaskVideo6FPHash, MaskVideo6FSobel} {
+		declaredFramesWithImplicitSuccess.FieldsDone = field
+		if err := declaredFramesWithImplicitSuccess.ValidateVideoCoreMasks(); err == nil {
+			t.Fatalf("result declared split frame field %#x with no done frames and six implicit success statuses", field)
+		}
 	}
 
 	legacy, err := msgpack.Marshal(map[string]any{

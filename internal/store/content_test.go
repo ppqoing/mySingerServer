@@ -200,6 +200,60 @@ func TestLookupContentVideoFiveOfSixFramesPreservesExactPartialState(t *testing.
 	}
 }
 
+func TestLookupContentVideoStageTwoAndThreeAreIndependentAndTrimPayload(t *testing.T) {
+	db := openContentTestDB(t)
+	sha := bytes.Repeat([]byte{0x4a}, 64)
+	shaText := hex.EncodeToString(sha)
+	pHash := features.EncodePHashParts([9]uint64{9})
+	sobel, err := features.EncodeSobelHist([128]float32{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for frameIdx := 0; frameIdx < 6; frameIdx++ {
+		if _, err := db.db.Exec(`
+			INSERT INTO video_frames (sha512, frame_idx, pdq256, phash_parts, sobel_hist)
+			VALUES (?1, ?2, NULL, ?3, ?4)`, shaText, frameIdx, pHash, sobel); err != nil {
+			t.Fatalf("insert frame %d: %v", frameIdx, err)
+		}
+	}
+
+	tests := []struct {
+		name      string
+		field     uint32
+		wantPHash bool
+		wantSobel bool
+	}{
+		{name: "stage two", field: proto.FieldVideo6FPHash, wantPHash: true},
+		{name: "stage three", field: proto.FieldVideo6FSobel, wantSobel: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			state, err := db.LookupContent(context.Background(), sha, MediaVideo, test.field, proto.FrameMaskFull)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if state.FieldsPresent != test.field || state.MissingFields != 0 ||
+				state.FramesPresent != proto.FrameMaskFull || state.MissingFrames != 0 || len(state.Frames) != 6 {
+				t.Fatalf("stage content state=%#v", state)
+			}
+			for index, frame := range state.Frames {
+				if len(frame.PDQ256) != 0 || (len(frame.PHashParts) != 0) != test.wantPHash ||
+					(len(frame.SobelHist) != 0) != test.wantSobel {
+					t.Fatalf("frame[%d] leaked unrequested payload: %#v", index, frame)
+				}
+			}
+		})
+	}
+
+	legacy, err := db.LookupContent(context.Background(), sha, MediaVideo, proto.FieldVideo6F, proto.FrameMaskFull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacy.FieldsPresent != 0 || legacy.MissingFields != proto.FieldVideo6F || legacy.FramesPresent != 0 {
+		t.Fatalf("legacy content accepted frames without PDQ: %#v", legacy)
+	}
+}
+
 func TestLookupContentCorruptBlobsAreMissingAndNotReturned(t *testing.T) {
 	db := openContentTestDB(t)
 	sha := bytes.Repeat([]byte{0x55}, 64)

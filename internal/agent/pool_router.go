@@ -59,6 +59,13 @@ func (r *PoolRouter) Register(
 	if job.JobID <= 0 {
 		return nil, nil, fmt.Errorf("agent: register invalid worker job ID %d", job.JobID)
 	}
+	if job.Source == "" {
+		if job.Phase == worker.Phase1 {
+			job.Source = worker.JobSourceScan
+		} else {
+			job.Source = worker.JobSourceManager
+		}
+	}
 	route := poolRoute{
 		job:      cloneWorkerJob(*job),
 		terminal: make(chan poolTerminal, 1),
@@ -114,11 +121,15 @@ func (r *PoolRouter) run() {
 func (r *PoolRouter) routeResult(result *worker.JobResultMsg) {
 	r.mu.Lock()
 	route, exists := r.routes[result.JobID]
+	implicitPhaseOneSource := exists && route.job.Phase == worker.Phase1 &&
+		result.ScreenStage == worker.ScreenStageLegacy && result.Source == ""
 	if !exists ||
 		result.ScanTaskID != route.job.ScanTaskID ||
 		result.Path != route.job.Path ||
 		result.Phase != route.job.Phase ||
-		result.Kind != route.job.Kind {
+		result.Kind != route.job.Kind ||
+		(!implicitPhaseOneSource && result.ScreenStage != route.job.ScreenStage) ||
+		(!implicitPhaseOneSource && result.Source != route.job.Source) {
 		r.mu.Unlock()
 		if r.log != nil {
 			r.log.Warn(
@@ -129,6 +140,10 @@ func (r *PoolRouter) routeResult(result *worker.JobResultMsg) {
 			)
 		}
 		return
+	}
+	if implicitPhaseOneSource {
+		result.ScreenStage = route.job.ScreenStage
+		result.Source = route.job.Source
 	}
 	delete(r.routes, result.JobID)
 	r.mu.Unlock()

@@ -290,6 +290,38 @@ func TestDeduperMarksOnlyActiveFlightWaitersAsSingleFlightReuse(t *testing.T) {
 	}
 }
 
+func TestDeduperComputedVideoStageReplyKeepsFixedFramePayload(t *testing.T) {
+	sha := bytes64(34)
+	d := NewDeduper(missLookup())
+	query := SHAQueryMsg{
+		JobID: 341, ScanTaskID: "stage-two", SHA512: sha, Kind: MediaVideo,
+		RequestedFields: MaskVideo6FPHash, RequestedFrames: FrameMaskFull,
+	}
+	owner, err := d.Ask(context.Background(), query)
+	if err != nil || owner.Found {
+		t.Fatalf("owner = (%#v, %v)", owner, err)
+	}
+	frames := [6]FrameResult{}
+	for index := range frames {
+		frames[index] = FrameResult{FrameIdx: index, PHashParts: []byte{byte(index + 1)}}
+	}
+	d.Resolve(JobResultMsg{
+		JobID: query.JobID, ScanTaskID: query.ScanTaskID, Kind: MediaVideo, SHA512: sha,
+		FieldsDone: MaskVideo6FPHash, FramesDone: FrameMaskFull, FrameResults: frames,
+	})
+
+	query.JobID++
+	reused, err := d.Ask(context.Background(), query)
+	if err != nil || !reused.Found || !reused.ReusedFlight {
+		t.Fatalf("reused = (%#v, %v)", reused, err)
+	}
+	for index, frame := range reused.FrameResults {
+		if frame.FrameIdx != index || !bytes.Equal(frame.PHashParts, []byte{byte(index + 1)}) {
+			t.Fatalf("frame %d = %#v, want fixed pHash payload", index, frame)
+		}
+	}
+}
+
 func TestDeduperConcurrentWaiterOnBlockedPersistentStoreHitIsNotSingleFlightReuse(t *testing.T) {
 	sha := bytes64(33)
 	lookupEntered := make(chan struct{})

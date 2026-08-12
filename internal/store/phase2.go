@@ -210,6 +210,16 @@ func (d *DB) Phase2CommittedState(
 	path string,
 	kind MediaKind,
 ) (Phase2Committed, error) {
+	return d.Phase2CommittedStateForFields(ctx, machineID, path, kind, phase2Mask(kind))
+}
+
+func (d *DB) Phase2CommittedStateForFields(
+	ctx context.Context,
+	machineID string,
+	path string,
+	kind MediaKind,
+	requestedFields uint32,
+) (Phase2Committed, error) {
 	var state Phase2Committed
 	var sha sql.NullString
 	if err := d.db.QueryRowContext(ctx, `
@@ -238,15 +248,19 @@ func (d *DB) Phase2CommittedState(
 			)
 		}
 		if err == sql.ErrNoRows {
-			state.MissingFields =
-				proto.FieldPHashParts | proto.FieldSobelHist
+			state.MissingFields = requestedFields &
+				(proto.FieldPHashParts | proto.FieldSobelHist)
 			return state, nil
 		}
-		if _, decodeErr := features.DecodePHashParts(pHash); decodeErr != nil {
-			state.MissingFields |= proto.FieldPHashParts
+		if requestedFields&proto.FieldPHashParts != 0 {
+			if _, decodeErr := features.DecodePHashParts(pHash); decodeErr != nil {
+				state.MissingFields |= proto.FieldPHashParts
+			}
 		}
-		if _, decodeErr := features.DecodeSobelHist(sobel); decodeErr != nil {
-			state.MissingFields |= proto.FieldSobelHist
+		if requestedFields&proto.FieldSobelHist != 0 {
+			if _, decodeErr := features.DecodeSobelHist(sobel); decodeErr != nil {
+				state.MissingFields |= proto.FieldSobelHist
+			}
 		}
 		return state, nil
 	case MediaVideo:
@@ -273,13 +287,7 @@ func (d *DB) Phase2CommittedState(
 					err,
 				)
 			}
-			if len(pdq) != 32 {
-				continue
-			}
-			if _, err := features.DecodePHashParts(pHash); err != nil {
-				continue
-			}
-			if _, err := features.DecodeSobelHist(sobel); err != nil {
+			if !videoFramePayloadValid(requestedFields, pdq, pHash, sobel) {
 				continue
 			}
 			state.MissingFrames &^= 1 << uint(frameIdx)
@@ -291,7 +299,7 @@ func (d *DB) Phase2CommittedState(
 			)
 		}
 		if state.MissingFrames != 0 {
-			state.MissingFields = proto.FieldVideo6F
+			state.MissingFields = requestedFields & videoSixFrameFields()
 		}
 		return state, nil
 	default:

@@ -360,7 +360,7 @@ func runtimeTaskSummary(job *JobMsg) string {
 	if job == nil {
 		return ""
 	}
-	return fmt.Sprintf("phase=%d job_id=%d", job.Phase, job.JobID)
+	return fmt.Sprintf("phase=%d screen_stage=%d source=%s job_id=%d", job.Phase, job.ScreenStage, job.Source, job.JobID)
 }
 
 func (p *Pool) publishCrash(record CrashRecord) bool {
@@ -481,7 +481,9 @@ func (p *Pool) saveResult(job JobMsg, result JobResultMsg) {
 		p.deps.errorLogger.Error("file error",
 			"path", result.Path,
 			"stage", "frame",
-			"field_mask", MaskVideo6F,
+			"field_mask", job.FieldsMask&videoSixFrameWorkerFields(),
+			"screen_stage", job.ScreenStage,
+			"source", job.Source,
 			"frame_idx", frame.FrameIdx,
 			"err", frame.Error,
 			"worker_pid", result.WorkerPID,
@@ -573,7 +575,7 @@ func analysisStoreResult(machineID string, job JobMsg, result JobResultMsg) stor
 
 func normalizedRequestedFrames(job JobMsg) uint8 {
 	frames := job.FrameMask
-	if job.Kind == MediaVideo && job.FieldsMask&MaskVideo6F != 0 && frames == 0 {
+	if job.Kind == MediaVideo && job.FieldsMask&videoSixFrameWorkerFields() != 0 && frames == 0 {
 		return FrameMaskFull
 	}
 	return frames
@@ -645,7 +647,7 @@ func pruneUncommittedPayload(result *JobResultMsg) {
 			result.FrameResults[index] = FrameResult{}
 		}
 	}
-	if result.FieldsDone&MaskVideo6F == 0 {
+	if result.FieldsDone&videoSixFrameWorkerFields() == 0 {
 		result.Frames = nil
 	}
 }
@@ -669,7 +671,7 @@ func clearPhase2FeaturePayload(result *JobResultMsg) {
 }
 
 func attemptedPhase2Fields(result JobResultMsg) uint32 {
-	attempted := result.FieldsDone & (MaskPHashParts | MaskSobelHist | MaskVideo6F)
+	attempted := result.FieldsDone & (MaskPHashParts | MaskSobelHist | videoSixFrameWorkerFields())
 	if len(result.PHashParts) != 0 {
 		attempted |= MaskPHashParts
 	}
@@ -677,12 +679,23 @@ func attemptedPhase2Fields(result JobResultMsg) uint32 {
 		attempted |= MaskSobelHist
 	}
 	if len(result.Frames) != 0 {
-		attempted |= MaskVideo6F
+		switch result.ScreenStage {
+		case ScreenStageTwo:
+			attempted |= MaskVideo6FPHash
+		case ScreenStageThree:
+			attempted |= MaskVideo6FSobel
+		default:
+			attempted |= MaskVideo6F
+		}
 	}
 	for _, fieldError := range result.Errors {
-		attempted |= fieldError.Field & (MaskPHashParts | MaskSobelHist | MaskVideo6F)
+		attempted |= fieldError.Field & (MaskPHashParts | MaskSobelHist | videoSixFrameWorkerFields())
 	}
 	return attempted
+}
+
+func videoSixFrameWorkerFields() uint32 {
+	return MaskVideo6F | MaskVideo6FPHash | MaskVideo6FSobel
 }
 
 func erroredFrames(frames []FrameFeature) []FrameFeature {

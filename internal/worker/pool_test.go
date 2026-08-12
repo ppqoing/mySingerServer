@@ -623,6 +623,85 @@ func TestValidateWorkerResultAcceptsPartialAndCompletePhase2VideoFrames(t *testi
 	}
 }
 
+func TestValidateWorkerResultRejectsForeignScreenStageOrSource(t *testing.T) {
+	pHash, _ := validPhase2Blobs(t)
+	job := &JobMsg{
+		JobID: 839, ScanTaskID: "stage-owner", Path: `D:\media\stage-owner.jpg`,
+		Kind: MediaImage, Phase: Phase2, ScreenStage: ScreenStageTwo, Source: JobSourceManager,
+		FieldsMask: MaskPHashParts, KnownSHA: bytes64(0x78),
+	}
+	base := JobResultMsg{
+		JobID: job.JobID, Path: job.Path, Kind: job.Kind,
+		ScreenStage: job.ScreenStage, Source: job.Source,
+		SHA512: append([]byte(nil), job.KnownSHA...), FieldsDone: MaskPHashParts,
+		PHashParts: pHash,
+	}
+	if err := validateWorkerResult(job, &base); err != nil {
+		t.Fatalf("matching stage/source rejected: %v", err)
+	}
+	foreignStage := base
+	foreignStage.ScreenStage = ScreenStageThree
+	if err := validateWorkerResult(job, &foreignStage); err == nil {
+		t.Fatal("foreign screen stage accepted")
+	}
+	foreignSource := base
+	foreignSource.Source = JobSourceLocal
+	if err := validateWorkerResult(job, &foreignSource); err == nil {
+		t.Fatal("foreign source accepted")
+	}
+}
+
+func TestValidateWorkerResultVideoSixFrameStagePayloadIsolation(t *testing.T) {
+	pHash, sobel := validPhase2Blobs(t)
+	tests := []struct {
+		name      string
+		stage     ScreenStage
+		field     uint32
+		wantPHash bool
+		wantSobel bool
+	}{
+		{name: "stage two", stage: ScreenStageTwo, field: MaskVideo6FPHash, wantPHash: true},
+		{name: "stage three", stage: ScreenStageThree, field: MaskVideo6FSobel, wantSobel: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			job := &JobMsg{
+				JobID: 840, ScanTaskID: "video-stage", Path: `D:\media\video-stage.mp4`,
+				Kind: MediaVideo, Phase: Phase2, ScreenStage: test.stage, Source: JobSourceManager,
+				FieldsMask: test.field, FrameMask: FrameMaskFull, KnownSHA: bytes64(0x79),
+			}
+			result := &JobResultMsg{
+				JobID: job.JobID, Path: job.Path, Kind: job.Kind,
+				ScreenStage: job.ScreenStage, Source: job.Source,
+				SHA512: append([]byte(nil), job.KnownSHA...), FieldsDone: test.field,
+			}
+			for index := 0; index < 6; index++ {
+				frame := FrameFeature{FrameIdx: index, TimeMS: int64(index+1) * 1000}
+				if test.wantPHash {
+					frame.PHashParts = append([]byte(nil), pHash...)
+				}
+				if test.wantSobel {
+					frame.SobelHist = append([]byte(nil), sobel...)
+				}
+				result.Frames = append(result.Frames, frame)
+			}
+			if err := validateWorkerResult(job, result); err != nil {
+				t.Fatalf("valid split-stage result rejected: %v", err)
+			}
+			leaked := *result
+			leaked.Frames = append([]FrameFeature(nil), result.Frames...)
+			if test.wantPHash {
+				leaked.Frames[0].SobelHist = append([]byte(nil), sobel...)
+			} else {
+				leaked.Frames[0].PHashParts = append([]byte(nil), pHash...)
+			}
+			if err := validateWorkerResult(job, &leaked); err == nil {
+				t.Fatal("split-stage result carrying foreign feature accepted")
+			}
+		})
+	}
+}
+
 func TestPoolStampsTrustedPhaseOnlyAfterClaimingValidatedResult(t *testing.T) {
 	knownSHA := bytes64(0x79)
 	result := JobResultMsg{
