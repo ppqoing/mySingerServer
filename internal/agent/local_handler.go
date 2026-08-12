@@ -34,8 +34,16 @@ func (w *LocalStageWorker) Execute(ctx context.Context, job *worker.JobMsg) (*wo
 		return nil, err
 	}
 	defer cancelRoute()
-	if err := w.pool.Submit(job); err != nil {
-		return nil, err
+	var submitErr error
+	if submitter, ok := w.pool.(interface {
+		SubmitContext(context.Context, *worker.JobMsg) error
+	}); ok {
+		submitErr = submitter.SubmitContext(ctx, job)
+	} else {
+		submitErr = w.pool.Submit(job)
+	}
+	if submitErr != nil {
+		return nil, submitErr
 	}
 	select {
 	case <-ctx.Done():

@@ -55,6 +55,10 @@ func NewEngine(machineID string, stageOne StageOneRunner, analysisStore EngineSt
 }
 
 func (e *Engine) Run(ctx context.Context, taskID string) error {
+	return e.RunWithProgress(ctx, taskID, nil)
+}
+
+func (e *Engine) RunWithProgress(ctx context.Context, taskID string, checkpoint func(int) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -137,6 +141,11 @@ func (e *Engine) Run(ctx context.Context, taskID string) error {
 	}
 	if err = e.event(ctx, run, "stage2", map[string]int{"pairs": len(result.CandidatePairs)}); err != nil {
 		return err
+	}
+	if checkpoint != nil {
+		if err := checkpoint(2); err != nil {
+			return err
+		}
 	}
 
 	decisions := make([]PairDecision, 0, len(stage2Passed))

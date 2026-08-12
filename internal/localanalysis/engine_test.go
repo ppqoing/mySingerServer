@@ -158,6 +158,38 @@ func TestEngineStage2FailureHasNoStageCompletionOrStage3(t *testing.T) {
 	}
 }
 
+func TestEngineRunWithProgressCheckpointsAfterDurableStage2BeforeStage3(t *testing.T) {
+	w := &engineWorker{makeResult: validEngineStageResult}
+	s := &engineStore{run: store.LocalAnalysisRun{RunID: "run-progress", MachineID: "machine-a", Generation: 1, TaskID: "task-progress", Status: "building"}, fail: map[string]error{}}
+	engine := NewEngine("machine-a", engineStageOne{result: engineTwoCandidateResult()}, s, w, testPhase2Config())
+	engine.fileMetadata = func(string) (int64, int64, error) { return 10, 20, nil }
+	callbackErr := errors.New("checkpoint failed")
+	calls := 0
+	err := engine.RunWithProgress(context.Background(), "task-progress", func(stage int) error {
+		calls++
+		if stage != 2 {
+			t.Fatalf("stage=%d want2", stage)
+		}
+		if !hasEngineStageEvent(s.events, "stage2") {
+			t.Fatal("callback ran before durable stage2 outbox")
+		}
+		for _, job := range w.jobs {
+			if job.ScreenStage == worker.ScreenStageThree {
+				t.Fatal("stage3 ran before callback")
+			}
+		}
+		return callbackErr
+	})
+	if !errors.Is(err, callbackErr) || calls != 1 {
+		t.Fatalf("err=%v calls=%d", err, calls)
+	}
+	for _, job := range w.jobs {
+		if job.ScreenStage == worker.ScreenStageThree {
+			t.Fatal("stage3 ran after failed callback")
+		}
+	}
+}
+
 func TestEngineComputeRejectsForeignIdentityAndStagePayload(t *testing.T) {
 	path := `D:\secret\media.jpg`
 	file := firstscreen.File{FileRef: firstscreen.FileRef{ID: 9, MachineID: "machine-a", Path: path}, SHA512: [64]byte{7}}

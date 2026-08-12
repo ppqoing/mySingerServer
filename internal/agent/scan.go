@@ -164,14 +164,13 @@ func resolveDisk(root string) (int64, bool, error) {
 		return -1, false, err
 	}
 	if !info.MediaTypeKnown {
-		slog.Warn(
-			"disk media type unavailable, using HDD scheduling",
-			"root", root,
-			"mount_point", mountPoint,
-			"device_number", info.DeviceNumber,
-		)
+		logUnknownDiskMedia(slog.Default(), root, mountPoint, info.DeviceNumber)
 	}
 	return int64(info.DeviceNumber), info.IsSSD, nil
+}
+
+func logUnknownDiskMedia(logger *slog.Logger, root, _ string, deviceNumber uint32) {
+	logger.Warn("disk media type unavailable, using HDD scheduling", "path_id", worker.PathID(root), "error_code", "disk_media_type_unknown", "device_number", deviceNumber)
 }
 
 func (m *ScanManager) Handle(task proto.ScanTask, sender Sender) proto.TaskAck {

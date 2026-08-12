@@ -60,7 +60,7 @@ func (d *DB) CreateOrLoadLocalTask(ctx context.Context, in LocalTaskCreate) (Loc
 		return LocalTask{}, err
 	}
 	if task.MachineID != in.MachineID || task.Source != in.Source ||
-		task.Type != in.Type || task.Stage != in.Stage ||
+		task.Type != in.Type ||
 		task.EnvelopeDigest != in.EnvelopeDigest || !bytes.Equal(task.Envelope, in.Envelope) {
 		return LocalTask{}, fmt.Errorf("%w: task %s", ErrLocalTaskConflict, in.TaskID)
 	}
@@ -119,12 +119,12 @@ func (d *DB) RecoverLocalTasks(ctx context.Context, machineID string) ([]LocalTa
 	now := time.Now().UnixMilli()
 	if _, err := d.db.ExecContext(ctx, `
 		UPDATE local_tasks SET status='waiting_recovery',updated_at=?2
-		WHERE machine_id=?1 AND status='running'`, machineID, now); err != nil {
+		WHERE machine_id=?1 AND status IN ('pending','running')`, machineID, now); err != nil {
 		return nil, fmt.Errorf("store: recover local tasks: %w", err)
 	}
 	rows, err := d.db.QueryContext(ctx, `
 		SELECT task_id FROM local_tasks
-		WHERE machine_id=?1 AND status='waiting_recovery'
+		WHERE machine_id=?1 AND status IN ('pending','waiting_recovery')
 		ORDER BY created_at,task_id`, machineID)
 	if err != nil {
 		return nil, fmt.Errorf("store: list recovered local tasks: %w", err)

@@ -332,6 +332,46 @@ func TestLocalTaskPersistsOpaqueEnvelopeAndConflictsOnDifferentBytes(t *testing.
 	}
 }
 
+func TestLocalTaskIdempotencyIgnoresMutableStage(t *testing.T) {
+	db := openLocalTestDB(t)
+	ctx := context.Background()
+	in := LocalTaskCreate{TaskID: "stage-idempotent", MachineID: "machine-a", Source: "local", Type: "analysis", EnvelopeDigest: "digest", Envelope: []byte("same"), Stage: 0}
+	if _, err := db.CreateOrLoadLocalTask(ctx, in); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.TransitionLocalTask(ctx, "machine-a", in.TaskID, LocalTaskUpdate{Status: "running", Stage: 2}); err != nil {
+		t.Fatal(err)
+	}
+	in.Stage = 0
+	got, err := db.CreateOrLoadLocalTask(ctx, in)
+	if err != nil {
+		t.Fatalf("idempotent create after stage advance: %v", err)
+	}
+	if got.Stage != 2 {
+		t.Fatalf("stage=%d want persisted 2", got.Stage)
+	}
+}
+
+func TestRecoverLocalTasksIncludesDurablePending(t *testing.T) {
+	db := openLocalTestDB(t)
+	ctx := context.Background()
+	for _, in := range []LocalTaskCreate{{TaskID: "pending-good", MachineID: "m", Source: "local", Type: "scan", EnvelopeDigest: "g", Envelope: []byte("good")}, {TaskID: "pending-legacy", MachineID: "m", Source: "local", Type: "scan", EnvelopeDigest: "l", Envelope: []byte("legacy")}} {
+		if _, err := db.CreateOrLoadLocalTask(ctx, in); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.db.Exec(`UPDATE local_tasks SET envelope=X'' WHERE task_id='pending-legacy'`); err != nil {
+		t.Fatal(err)
+	}
+	got, err := db.RecoverLocalTasks(ctx, "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].TaskID != "pending-good" || got[0].Status != "waiting_recovery" || got[1].TaskID != "pending-legacy" {
+		t.Fatalf("recovered=%#v", got)
+	}
+}
+
 // Break caught: unrestricted UPDATEs permit progress rollback and invalid
 // terminal-to-running transitions, which makes retries and recovery ambiguous.
 func TestLocalTaskLifecycleUsesExplicitTransitionsAndStablePagination(t *testing.T) {

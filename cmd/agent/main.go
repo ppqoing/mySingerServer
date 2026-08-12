@@ -114,15 +114,15 @@ func newAgentEnumerator(
 			options.Logger.Info("everything enumerator ready")
 		},
 		OnRootFallback: func(root string, cause error) {
-			options.Logger.Warn(
-				"everything root unavailable, fallback to walker",
-				"root", root,
-				"err", cause,
-			)
+			logEverythingRootFallback(options.Logger, root, cause)
 		},
 	})
 	enumerator.Start()
 	return enumerator
+}
+
+func logEverythingRootFallback(logger *slog.Logger, root string, _ error) {
+	logger.Warn("everything root unavailable, fallback to walker", "path_id", worker.PathID(root), "error_code", "everything_root_fallback")
 }
 
 func runWithDeleteLogger(
@@ -267,7 +267,6 @@ func runWithDependencies(
 	}
 
 	fairPool := localtask.NewFairScheduler(workerPool)
-	defer fairPool.Close()
 	router := agent.NewPoolRouter(fairPool, logger)
 	scans := agent.NewScanManagerWithPoolRouter(
 		cfg,
@@ -345,6 +344,11 @@ func runWithDependencies(
 			return nil
 		},
 		func() error { return drainPhase2(phase2, phase2DrainTimeout(cfg)) },
+		func() error {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), phase2DrainTimeout(cfg))
+			defer cancel()
+			return fairPool.Shutdown(shutdownCtx)
+		},
 	)
 }
 
@@ -398,9 +402,9 @@ func drainPhase2(manager phase2Shutdowner, timeout time.Duration) error {
 func initializePostgres(ctx context.Context, dsn string, health *syncHealthState, logger *slog.Logger) *pgxpool.Pool {
 	pg, err := pgxpool.New(ctx, dsn)
 	if err != nil {
-		health.set(false, safeAgentSummary(err.Error()))
+		health.set(false, "postgres_config_invalid")
 		if logger != nil {
-			logger.Warn("postgres initialization degraded", "err", safeAgentSummary(err.Error()))
+			logger.Warn("postgres initialization degraded", "error_code", "postgres_config_invalid")
 		}
 		return nil
 	}
@@ -709,6 +713,7 @@ func (h *agentLocalHandler) HandleLocal(ctx context.Context, request proto.Local
 
 type localAnalysisRunner interface {
 	Run(context.Context, string) error
+	RunWithProgress(context.Context, string, func(int) error) error
 }
 
 type localScanRunner interface {
@@ -755,7 +760,7 @@ func (r *agentLocalTaskRunner) Run(ctx context.Context, request localtask.Create
 		stage = 1
 	}
 	if request.Mode == proto.LocalTaskModeScanThenAnalysis && stage < 3 {
-		if err := r.analysis.Run(ctx, request.TaskID); err != nil {
+		if err := r.analysis.RunWithProgress(ctx, request.TaskID, advance); err != nil {
 			return err
 		}
 		return advance(3)

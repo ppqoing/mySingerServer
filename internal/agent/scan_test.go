@@ -411,6 +411,23 @@ func TestScanCountsDiskResolutionFailure(t *testing.T) {
 	}
 }
 
+func TestUnknownDiskMediaLogDoesNotExposeRootOrMount(t *testing.T) {
+	var output bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&output, nil))
+	root := `D:\Private\Media`
+	mount := `D:\Private`
+	logUnknownDiskMedia(logger, root, mount, 7)
+	got := output.String()
+	for _, value := range []string{"Private", "Media", root, mount} {
+		if strings.Contains(got, value) {
+			t.Fatalf("log leaked %q: %q", value, got)
+		}
+	}
+	if !strings.Contains(got, "path_id") || !strings.Contains(got, "device_number=7") {
+		t.Fatalf("safe fields missing: %q", got)
+	}
+}
+
 func TestScanCountsEnumerationFailure(t *testing.T) {
 	enumr := &fakeEnumerator{
 		records: map[string][]fileenum.FileRecord{

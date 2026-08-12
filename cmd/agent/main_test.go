@@ -227,7 +227,7 @@ func TestRunServiceClosesStartedPoolWhenServerReturnsError(t *testing.T) {
 	}
 }
 
-func TestRunServiceDrainsPhase2BeforeClosingPool(t *testing.T) {
+func TestRunServiceDrainsPhase2ThenSchedulerBeforeClosingPool(t *testing.T) {
 	var events []string
 	pool := &orderedLifecyclePool{events: &events}
 	err := runService(
@@ -237,9 +237,16 @@ func TestRunServiceDrainsPhase2BeforeClosingPool(t *testing.T) {
 			return nil
 		},
 		func() error {
-			events = append(events, "drain")
+			events = append(events, "phase2-drain")
 			if pool.closed {
 				t.Fatal("pool closed before Phase2 drain")
+			}
+			return nil
+		},
+		func() error {
+			events = append(events, "scheduler-shutdown")
+			if pool.closed {
+				t.Fatal("pool closed before scheduler shutdown")
 			}
 			return nil
 		},
@@ -247,7 +254,7 @@ func TestRunServiceDrainsPhase2BeforeClosingPool(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"start", "serve", "drain", "close"}
+	want := []string{"start", "serve", "phase2-drain", "scheduler-shutdown", "close"}
 	if !reflect.DeepEqual(events, want) {
 		t.Fatalf("lifecycle events=%v, want %v", events, want)
 	}
@@ -262,14 +269,14 @@ func TestLocalTaskRunnerRecoverySkipsScanAndCompletesStageThree(t *testing.T) {
 	if err := runner.Run(context.Background(), request, 1, func(stage int) error { stages = append(stages, stage); return nil }); err != nil {
 		t.Fatal(err)
 	}
-	if scans.calls != 0 || analysis.calls != 1 || !reflect.DeepEqual(stages, []int{3}) {
+	if scans.calls != 0 || analysis.calls != 1 || !reflect.DeepEqual(stages, []int{2, 3}) {
 		t.Fatalf("scan=%d analysis=%d stages=%v", scans.calls, analysis.calls, stages)
 	}
 	stages = nil
 	if err := runner.Run(context.Background(), request, 2, func(stage int) error { stages = append(stages, stage); return nil }); err != nil {
 		t.Fatal(err)
 	}
-	if scans.calls != 0 || analysis.calls != 2 || !reflect.DeepEqual(stages, []int{3}) {
+	if scans.calls != 0 || analysis.calls != 2 || !reflect.DeepEqual(stages, []int{2, 3}) {
 		t.Fatalf("stage2 recovery scan=%d analysis=%d stages=%v", scans.calls, analysis.calls, stages)
 	}
 }
@@ -287,6 +294,20 @@ func TestLocalTaskRunnerScanOnlyEndsAtStageOne(t *testing.T) {
 	}
 }
 
+func TestLocalTaskRunnerAutoAnalysisPersistsEveryDurableCheckpoint(t *testing.T) {
+	scans := &recordingLocalScanRunner{}
+	analysis := &recordingLocalAnalysisRunner{}
+	runner := &agentLocalTaskRunner{scans: scans, analysis: analysis}
+	var stages []int
+	request := proto.LocalTaskCreateRequest{TaskID: "auto", Roots: []string{`D:\media`}, Mode: proto.LocalTaskModeScanThenAnalysis}
+	if err := runner.Run(context.Background(), request, 0, func(stage int) error { stages = append(stages, stage); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if scans.calls != 1 || analysis.calls != 1 || !reflect.DeepEqual(stages, []int{1, 2, 3}) {
+		t.Fatalf("scan=%d analysis=%d stages=%v", scans.calls, analysis.calls, stages)
+	}
+}
+
 func TestPostgresParseFailureIsImmediateDegradedState(t *testing.T) {
 	health := newSyncHealthState()
 	started := time.Now()
@@ -296,6 +317,42 @@ func TestPostgresParseFailureIsImmediateDegradedState(t *testing.T) {
 	}
 	if time.Since(started) > 100*time.Millisecond || health.snapshot().Healthy {
 		t.Fatalf("parse failure blocked or reported healthy: elapsed=%v health=%#v", time.Since(started), health.snapshot())
+	}
+}
+
+func TestPostgresConfigFailureDoesNotExposeDSN(t *testing.T) {
+	secret := `postgres://private-user:private-password@secret-%zz-host/private-db?token=private-query`
+	health := newSyncHealthState()
+	var output bytes.Buffer
+	pool := initializePostgres(context.Background(), secret, health, slog.New(slog.NewTextHandler(&output, nil)))
+	if pool != nil {
+		pool.Close()
+		t.Fatal("invalid DSN returned pool")
+	}
+	combined := output.String() + health.snapshot().ErrorSummary
+	for _, value := range []string{"private-user", "private-password", "secret-host", "private-db", "private-query", "token="} {
+		if strings.Contains(combined, value) {
+			t.Fatalf("diagnostics leaked %q: %q", value, combined)
+		}
+	}
+	if health.snapshot().ErrorSummary != "postgres_config_invalid" {
+		t.Fatalf("health=%#v", health.snapshot())
+	}
+}
+
+func TestEverythingRootFallbackLogUsesOnlyPathIdentity(t *testing.T) {
+	root := `D:\Private\Media`
+	cause := errors.New(`Everything failed under D:/Private\Media token=secret`)
+	var output bytes.Buffer
+	logEverythingRootFallback(slog.New(slog.NewTextHandler(&output, nil)), root, cause)
+	got := output.String()
+	for _, value := range []string{"Private", "Media", "token=secret", "Everything failed"} {
+		if strings.Contains(got, value) {
+			t.Fatalf("log leaked %q: %q", value, got)
+		}
+	}
+	if !strings.Contains(got, "path_id") || !strings.Contains(got, "everything_root_fallback") {
+		t.Fatalf("safe fields missing: %q", got)
 	}
 }
 
@@ -1020,6 +1077,10 @@ type recordingLocalAnalysisRunner struct{ calls int }
 func (r *recordingLocalAnalysisRunner) Run(context.Context, string) error {
 	r.calls++
 	return nil
+}
+func (r *recordingLocalAnalysisRunner) RunWithProgress(ctx context.Context, task string, checkpoint func(int) error) error {
+	r.calls++
+	return checkpoint(2)
 }
 
 type recordingLocalTaskLifecycle struct {

@@ -53,6 +53,44 @@ func TestLocalStageWorkerCancellationCleansRegisteredRoute(t *testing.T) {
 	}
 }
 
+func TestLocalStageWorkerUsesCancelableSchedulerSubmission(t *testing.T) {
+	pool := &contextSubmitPool{phase2FakePool: newPhase2FakePool(), entered: make(chan struct{})}
+	router := NewPoolRouter(pool, nil)
+	adapter := NewLocalStageWorker(pool, router)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := adapter.Execute(ctx, &worker.JobMsg{ScanTaskID: "queued", Path: `D:\media\queued.jpg`, Kind: worker.MediaImage, Phase: worker.Phase2, ScreenStage: worker.ScreenStageTwo, Source: worker.JobSourceLocal})
+		done <- err
+	}()
+	<-pool.entered
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Execute=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Execute did not cancel queued submit")
+	}
+	if !pool.usedContext {
+		t.Fatal("Execute bypassed SubmitContext")
+	}
+}
+
+type contextSubmitPool struct {
+	*phase2FakePool
+	entered     chan struct{}
+	usedContext bool
+}
+
+func (p *contextSubmitPool) SubmitContext(ctx context.Context, _ *worker.JobMsg) error {
+	p.usedContext = true
+	close(p.entered)
+	<-ctx.Done()
+	return ctx.Err()
+}
+
 // Break caught: task operations are decoded inconsistently or run inline,
 // blocking the Socket loop and delaying ping/status responses under load.
 func TestLocalTaskHandlerDispatchesTaskCommandsWithoutBlockingHeartbeat(t *testing.T) {
