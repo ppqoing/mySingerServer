@@ -39,6 +39,7 @@ type RecoverableService interface {
 
 type TaskStore interface {
 	CreateOrLoadLocalTask(context.Context, store.LocalTaskCreate) (store.LocalTask, error)
+	LoadLocalTask(context.Context, string, string) (store.LocalTask, error)
 	ListLocalTasks(context.Context, string, int, int) ([]store.LocalTask, error)
 	CancelLocalTask(context.Context, string, string) error
 	RetryLocalTask(context.Context, string, string) (store.LocalTask, error)
@@ -59,7 +60,7 @@ type taskService struct {
 
 	mu       sync.Mutex
 	active   map[string]*taskAttempt
-	retrying map[string]struct{}
+	gates    map[string]*taskGate
 	recovery []store.LocalTask
 	prepared bool
 }
@@ -68,12 +69,13 @@ type taskAttempt struct {
 	cancel     context.CancelFunc
 	done       chan struct{}
 	superseded bool
-	terminalMu sync.Mutex
 }
+
+type taskGate struct{ token chan struct{} }
 
 func NewService(machineID string, taskStore TaskStore, runner TaskRunner) RecoverableService {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &taskService{machineID: machineID, store: taskStore, runner: runner, ctx: ctx, cancel: cancel, active: make(map[string]*taskAttempt), retrying: make(map[string]struct{})}
+	return &taskService{machineID: machineID, store: taskStore, runner: runner, ctx: ctx, cancel: cancel, active: make(map[string]*taskAttempt), gates: make(map[string]*taskGate)}
 }
 
 func EncodeCreateEnvelope(request CreateRequest) ([]byte, string, error) {
@@ -152,16 +154,13 @@ func (s *taskService) Cancel(ctx context.Context, taskID string) error {
 	if err := (proto.LocalTaskIDRequest{TaskID: taskID}).Validate(); err != nil {
 		return err
 	}
-	s.mu.Lock()
-	attempt := s.active[taskID]
-	s.mu.Unlock()
-	if attempt != nil {
-		attempt.terminalMu.Lock()
+	gate, err := s.acquireTaskGate(ctx, taskID)
+	if err != nil {
+		return err
 	}
+	attempt := s.currentAttempt(taskID)
 	if err := s.store.CancelLocalTask(ctx, s.machineID, taskID); err != nil {
-		if attempt != nil {
-			attempt.terminalMu.Unlock()
-		}
+		gate.release()
 		return err
 	}
 	s.mu.Lock()
@@ -171,12 +170,10 @@ func (s *taskService) Cancel(ctx context.Context, taskID string) error {
 	s.mu.Unlock()
 	if attempt != nil {
 		attempt.cancel()
-		attempt.terminalMu.Unlock()
-		select {
-		case <-attempt.done:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
+	}
+	gate.release()
+	if attempt != nil {
+		return waitAttempt(ctx, attempt)
 	}
 	return nil
 }
@@ -188,58 +185,61 @@ func (s *taskService) Retry(ctx context.Context, taskID string) (Task, error) {
 	if err := ctx.Err(); err != nil {
 		return Task{}, err
 	}
-	s.mu.Lock()
-	if _, claimed := s.retrying[taskID]; claimed {
-		s.mu.Unlock()
-		return Task{}, fmt.Errorf("localtask: retry already in progress")
-	}
-	s.retrying[taskID] = struct{}{}
-	attempt := s.active[taskID]
-	s.mu.Unlock()
-	defer func() {
-		s.mu.Lock()
-		delete(s.retrying, taskID)
-		s.mu.Unlock()
-	}()
-	if attempt != nil {
-		attempt.terminalMu.Lock()
-	}
-	persisted, err := s.store.RetryLocalTask(ctx, s.machineID, taskID)
+	loaded, err := s.store.LoadLocalTask(ctx, s.machineID, taskID)
 	if err != nil {
-		if attempt != nil {
-			attempt.terminalMu.Unlock()
-		}
 		return Task{}, err
 	}
-	if attempt != nil {
+	if _, err := decodeCreateEnvelope(loaded.Envelope); err != nil {
+		return Task{}, err
+	}
+	gate, err := s.acquireTaskGate(ctx, taskID)
+	if err != nil {
+		return Task{}, err
+	}
+	loaded, err = s.store.LoadLocalTask(ctx, s.machineID, taskID)
+	if err != nil {
+		gate.release()
+		return Task{}, err
+	}
+	request, err := decodeCreateEnvelope(loaded.Envelope)
+	if err != nil {
+		gate.release()
+		return Task{}, err
+	}
+	attempt := s.currentAttempt(taskID)
+	if attempt != nil && (loaded.Status == "failed" || loaded.Status == "cancelled") {
 		s.mu.Lock()
 		if s.active[taskID] == attempt {
 			attempt.superseded = true
 		}
 		s.mu.Unlock()
 		attempt.cancel()
-		attempt.terminalMu.Unlock()
-		request, decodeErr := decodeCreateEnvelope(persisted.Envelope)
-		if decodeErr != nil {
-			return Task{}, decodeErr
+		gate.release()
+		if err := waitAttempt(ctx, attempt); err != nil {
+			return Task{}, err
 		}
-		select {
-		case <-attempt.done:
-		case <-ctx.Done():
-			go func() {
-				<-attempt.done
-				s.launch(persisted, request)
-			}()
-			return Task{}, ctx.Err()
+		gate, err = s.acquireTaskGate(ctx, taskID)
+		if err != nil {
+			return Task{}, err
 		}
-		s.launch(persisted, request)
-		return taskFromStore(persisted, request), nil
+		loaded, err = s.store.LoadLocalTask(ctx, s.machineID, taskID)
+		if err != nil {
+			gate.release()
+			return Task{}, err
+		}
+		request, err = decodeCreateEnvelope(loaded.Envelope)
+		if err != nil {
+			gate.release()
+			return Task{}, err
+		}
 	}
-	request, err := decodeCreateEnvelope(persisted.Envelope)
+	persisted, err := s.store.RetryLocalTask(ctx, s.machineID, taskID)
 	if err != nil {
+		gate.release()
 		return Task{}, err
 	}
-	s.launch(persisted, request)
+	s.launchHeld(persisted, request)
+	gate.release()
 	return taskFromStore(persisted, request), nil
 }
 
@@ -290,6 +290,15 @@ func (s *taskService) Resume(ctx context.Context) error {
 }
 
 func (s *taskService) launch(persisted store.LocalTask, request CreateRequest) {
+	gate, err := s.acquireTaskGate(context.Background(), persisted.TaskID)
+	if err != nil {
+		return
+	}
+	s.launchHeld(persisted, request)
+	gate.release()
+}
+
+func (s *taskService) launchHeld(persisted store.LocalTask, request CreateRequest) {
 	s.mu.Lock()
 	if _, exists := s.active[persisted.TaskID]; exists {
 		s.mu.Unlock()
@@ -304,14 +313,29 @@ func (s *taskService) launch(persisted store.LocalTask, request CreateRequest) {
 
 func (s *taskService) run(ctx context.Context, persisted store.LocalTask, request CreateRequest, attempt *taskAttempt) {
 	defer func() {
+		gate, err := s.acquireTaskGate(context.Background(), persisted.TaskID)
+		if err != nil {
+			close(attempt.done)
+			return
+		}
 		s.mu.Lock()
 		if s.active[persisted.TaskID] == attempt {
 			delete(s.active, persisted.TaskID)
 		}
 		s.mu.Unlock()
 		close(attempt.done)
+		gate.release()
 	}()
+	gate, err := s.acquireTaskGate(ctx, persisted.TaskID)
+	if err != nil {
+		return
+	}
+	if s.currentAttempt(persisted.TaskID) != attempt || attempt.superseded {
+		gate.release()
+		return
+	}
 	current, err := s.store.TransitionLocalTask(ctx, s.machineID, persisted.TaskID, store.LocalTaskUpdate{Status: "running", Stage: persisted.Stage, ProgressComplete: persisted.ProgressComplete, ProgressTotal: persisted.ProgressTotal, StatsJSON: persisted.StatsJSON})
+	gate.release()
 	if err != nil {
 		return
 	}
@@ -333,13 +357,48 @@ func (s *taskService) run(ctx context.Context, persisted store.LocalTask, reques
 		}
 		code = &value
 	}
-	attempt.terminalMu.Lock()
-	defer attempt.terminalMu.Unlock()
-	s.mu.Lock()
-	isCurrent := s.active[persisted.TaskID] == attempt && !attempt.superseded
-	s.mu.Unlock()
+	gate, gateErr := s.acquireTaskGate(context.Background(), persisted.TaskID)
+	if gateErr != nil {
+		return
+	}
+	isCurrent := s.currentAttempt(persisted.TaskID) == attempt && !attempt.superseded
 	if isCurrent {
 		_, _ = s.store.TransitionLocalTask(context.Background(), s.machineID, persisted.TaskID, store.LocalTaskUpdate{Status: status, Stage: current.Stage, ProgressComplete: current.ProgressComplete, ProgressTotal: current.ProgressTotal, StatsJSON: current.StatsJSON, SafeErrorCode: code})
+	}
+	gate.release()
+}
+
+func (s *taskService) acquireTaskGate(ctx context.Context, taskID string) (*taskGate, error) {
+	s.mu.Lock()
+	gate := s.gates[taskID]
+	if gate == nil {
+		gate = &taskGate{token: make(chan struct{}, 1)}
+		gate.token <- struct{}{}
+		s.gates[taskID] = gate
+	}
+	s.mu.Unlock()
+	select {
+	case <-gate.token:
+		return gate, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (g *taskGate) release() { g.token <- struct{}{} }
+
+func (s *taskService) currentAttempt(taskID string) *taskAttempt {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.active[taskID]
+}
+
+func waitAttempt(ctx context.Context, attempt *taskAttempt) error {
+	select {
+	case <-attempt.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 

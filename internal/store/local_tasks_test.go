@@ -310,6 +310,29 @@ func TestLocalTaskConcurrentCreateIsIdempotentAndConflictsOnEnvelope(t *testing.
 	}
 }
 
+func TestLoadLocalTaskIsMachineScopedAndReturnsOwnedEnvelope(t *testing.T) {
+	db := openLocalTestDB(t)
+	created, err := db.CreateOrLoadLocalTask(context.Background(), LocalTaskCreate{TaskID: "load-task", MachineID: "machine-a", Source: "local", Type: "scan", EnvelopeDigest: "digest", Envelope: []byte("envelope")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := db.LoadLocalTask(context.Background(), "machine-a", created.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded.Envelope[0] = 'X'
+	again, err := db.LoadLocalTask(context.Background(), "machine-a", created.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(again.Envelope) != "envelope" {
+		t.Fatalf("stored envelope aliased caller: %q", again.Envelope)
+	}
+	if _, err := db.LoadLocalTask(context.Background(), "machine-b", created.TaskID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("cross-machine LoadLocalTask=%v, want sql.ErrNoRows", err)
+	}
+}
+
 // Break caught: recovery used to retain only a digest, making the accepted
 // scan roots and mode impossible to reconstruct after an Agent restart.
 func TestLocalTaskPersistsOpaqueEnvelopeAndConflictsOnDifferentBytes(t *testing.T) {

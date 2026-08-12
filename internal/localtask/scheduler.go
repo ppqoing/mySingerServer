@@ -48,12 +48,15 @@ type FairScheduler struct {
 	haveLast bool
 	closed   bool
 
-	results     chan *worker.JobResultMsg
-	crashes     chan worker.CrashRecord
-	stop        chan struct{}
-	done        chan struct{}
-	forwardDone chan struct{}
-	once        sync.Once
+	results       chan *worker.JobResultMsg
+	crashes       chan worker.CrashRecord
+	admission     chan struct{}
+	admissionStop chan struct{}
+	stop          chan struct{}
+	done          chan struct{}
+	forwardDone   chan struct{}
+	stopOnce      sync.Once
+	admissionOnce sync.Once
 }
 
 func NewFairScheduler(pool schedulerPool) *FairScheduler {
@@ -64,7 +67,7 @@ func newFairScheduler(pool schedulerPool, capacity int) *FairScheduler {
 	if capacity < 1 {
 		capacity = 1
 	}
-	s := &FairScheduler{pool: pool, capacity: capacity, queues: make(map[schedulerQueueKey][]*scheduledSubmit), inflight: make(map[int64]struct{}), results: make(chan *worker.JobResultMsg, capacity), crashes: make(chan worker.CrashRecord, capacity), stop: make(chan struct{}), done: make(chan struct{}), forwardDone: make(chan struct{})}
+	s := &FairScheduler{pool: pool, capacity: capacity, queues: make(map[schedulerQueueKey][]*scheduledSubmit), inflight: make(map[int64]struct{}), results: make(chan *worker.JobResultMsg, capacity), crashes: make(chan worker.CrashRecord, capacity), admission: make(chan struct{}, capacity), admissionStop: make(chan struct{}), stop: make(chan struct{}), done: make(chan struct{}), forwardDone: make(chan struct{})}
 	s.cond = sync.NewCond(&s.mu)
 	go s.dispatch()
 	go s.forwardTerminals()
@@ -90,16 +93,22 @@ func (s *FairScheduler) SubmitContext(ctx context.Context, job *worker.JobMsg) e
 	}
 	request := &scheduledSubmit{job: cloneScheduledJob(*job), done: make(chan error, 1)}
 	key := schedulerKey(request.job)
-	s.mu.Lock()
-	for s.pending >= s.capacity && !s.closed && ctx.Err() == nil {
-		s.cond.Wait()
+	select {
+	case s.admission <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.admissionStop:
+		return ErrFairSchedulerClosed
 	}
+	s.mu.Lock()
 	if err := ctx.Err(); err != nil {
 		s.mu.Unlock()
+		s.releaseAdmission()
 		return err
 	}
 	if s.closed {
 		s.mu.Unlock()
+		s.releaseAdmission()
 		return ErrFairSchedulerClosed
 	}
 	s.queues[key] = append(s.queues[key], request)
@@ -135,6 +144,7 @@ func (s *FairScheduler) removePending(target *scheduledSubmit) bool {
 				delete(s.queues, key)
 			}
 			s.pending--
+			s.releaseAdmission()
 			s.cond.Broadcast()
 			return true
 		}
@@ -160,6 +170,7 @@ func (s *FairScheduler) dispatch() {
 		key, request := s.nextLocked()
 		s.last, s.haveLast = key, true
 		s.pending--
+		s.releaseAdmission()
 		s.inflight[request.job.JobID] = struct{}{}
 		s.cond.Broadcast()
 		s.mu.Unlock()
@@ -253,6 +264,9 @@ func (s *FairScheduler) takeAllLocked() []*scheduledSubmit {
 		result = append(result, queue...)
 	}
 	s.queues = make(map[schedulerQueueKey][]*scheduledSubmit)
+	for range s.pending {
+		s.releaseAdmission()
+	}
 	s.pending = 0
 	s.cond.Broadcast()
 	return result
@@ -268,6 +282,7 @@ func (s *FairScheduler) StopAccepting() {
 	s.cond.Broadcast()
 	s.mu.Unlock()
 	if !already {
+		s.admissionOnce.Do(func() { close(s.admissionStop) })
 		if pool, ok := s.pool.(interface{ StopAccepting() }); ok {
 			pool.StopAccepting()
 		}
@@ -311,7 +326,7 @@ func (s *FairScheduler) Shutdown(ctx context.Context) error {
 		case <-ticker.C:
 		}
 	}
-	s.once.Do(func() { close(s.stop) })
+	s.stopOnce.Do(func() { close(s.stop) })
 	select {
 	case <-s.forwardDone:
 		return nil
@@ -344,6 +359,13 @@ func cloneScheduledJob(job worker.JobMsg) worker.JobMsg {
 func completeScheduledSubmit(request *scheduledSubmit, err error) {
 	select {
 	case request.done <- err:
+	default:
+	}
+}
+
+func (s *FairScheduler) releaseAdmission() {
+	select {
+	case <-s.admission:
 	default:
 	}
 }

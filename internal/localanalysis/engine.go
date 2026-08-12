@@ -28,6 +28,7 @@ type StageWorker interface {
 
 type EngineStore interface {
 	BeginLocalAnalysis(context.Context, string, string) (store.LocalAnalysisRun, error)
+	CurrentLocalAnalysis(context.Context, string) (store.LocalAnalysisRun, error)
 	SaveLocalPairScore(context.Context, store.LocalPairScore) error
 	ReplaceLocalAnalysisGroups(context.Context, string, []store.LocalAnalysisGroup) error
 	CompleteLocalAnalysis(context.Context, string) error
@@ -69,8 +70,27 @@ func (e *Engine) RunWithProgress(ctx context.Context, taskID string, checkpoint 
 	if err != nil {
 		return fmt.Errorf("localanalysis: begin run: %w", err)
 	}
-	if run.MachineID != e.machineID || run.TaskID != taskID || run.Status != "building" {
-		return fmt.Errorf("localanalysis: building run identity mismatch")
+	if run.MachineID != e.machineID || run.TaskID != taskID {
+		return fmt.Errorf("localanalysis: run identity mismatch")
+	}
+	switch run.Status {
+	case "complete":
+		if err := e.store.PublishLocalAnalysis(ctx, run.RunID); err != nil {
+			return fmt.Errorf("localanalysis: publish completed run: %w", err)
+		}
+		return nil
+	case "published":
+		current, err := e.store.CurrentLocalAnalysis(ctx, e.machineID)
+		if err != nil {
+			return fmt.Errorf("localanalysis: verify published run: %w", err)
+		}
+		if current.RunID != run.RunID || current.MachineID != e.machineID {
+			return fmt.Errorf("localanalysis: published run is not current")
+		}
+		return nil
+	case "building":
+	default:
+		return fmt.Errorf("localanalysis: unsupported run status %q", run.Status)
 	}
 	result, err := e.stageOne.Run(ctx, e.machineID, run.RunID)
 	if err != nil {

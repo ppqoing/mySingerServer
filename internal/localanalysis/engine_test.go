@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -24,17 +25,22 @@ func (s engineStageOne) Run(context.Context, string, string) (firstscreen.Result
 }
 
 type engineStore struct {
-	run    store.LocalAnalysisRun
-	calls  []string
-	pairs  []store.LocalPairScore
-	groups []store.LocalAnalysisGroup
-	events []store.LocalOutboxEvent
-	fail   map[string]error
+	run     store.LocalAnalysisRun
+	current store.LocalAnalysisRun
+	calls   []string
+	pairs   []store.LocalPairScore
+	groups  []store.LocalAnalysisGroup
+	events  []store.LocalOutboxEvent
+	fail    map[string]error
 }
 
 func (s *engineStore) BeginLocalAnalysis(context.Context, string, string) (store.LocalAnalysisRun, error) {
 	s.calls = append(s.calls, "begin")
 	return s.run, s.fail["begin"]
+}
+func (s *engineStore) CurrentLocalAnalysis(context.Context, string) (store.LocalAnalysisRun, error) {
+	s.calls = append(s.calls, "current")
+	return s.current, s.fail["current"]
 }
 func (s *engineStore) SaveLocalPairScore(_ context.Context, p store.LocalPairScore) error {
 	s.calls = append(s.calls, "pair")
@@ -81,6 +87,49 @@ func (w *engineWorker) Execute(_ context.Context, job *worker.JobMsg) (*worker.J
 		}
 	}
 	return w.makeResult(job), nil
+}
+
+func TestEngineRecoveryConvergesCompleteAndPublishedRunsWithoutRecomputing(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "agent.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	createRun := func(taskID string) store.LocalAnalysisRun {
+		t.Helper()
+		if _, err := db.CreateOrLoadLocalTask(context.Background(), store.LocalTaskCreate{TaskID: taskID, MachineID: "machine-a", Source: "local", Type: "analysis", Stage: 2, EnvelopeDigest: "digest-" + taskID, Envelope: []byte("envelope-" + taskID)}); err != nil {
+			t.Fatal(err)
+		}
+		run, err := db.BeginLocalAnalysis(context.Background(), "machine-a", taskID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := db.CompleteLocalAnalysis(context.Background(), run.RunID); err != nil {
+			t.Fatal(err)
+		}
+		return run
+	}
+	engine := NewEngine("machine-a", engineStageOne{err: errors.New("stage one must not rerun")}, db, &engineWorker{makeResult: validEngineStageResult}, config.Phase2Config{})
+
+	first := createRun("task-complete")
+	if err := engine.RunWithProgress(context.Background(), first.TaskID, nil); err != nil {
+		t.Fatalf("recover complete: %v", err)
+	}
+	current, err := db.CurrentLocalAnalysis(context.Background(), "machine-a")
+	if err != nil || current.RunID != first.RunID {
+		t.Fatalf("current after complete recovery=%#v err=%v", current, err)
+	}
+	if err := engine.RunWithProgress(context.Background(), first.TaskID, nil); err != nil {
+		t.Fatalf("recover published current: %v", err)
+	}
+
+	second := createRun("task-newer")
+	if err := db.PublishLocalAnalysis(context.Background(), second.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.RunWithProgress(context.Background(), first.TaskID, nil); err == nil {
+		t.Fatal("superseded published run was accepted as current")
+	}
 }
 
 func TestEngineCompletesAndPersistsAllStage2BeforeAnyStage3(t *testing.T) {

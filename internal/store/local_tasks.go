@@ -112,6 +112,21 @@ func (d *DB) loadLocalTask(ctx context.Context, taskID string) (LocalTask, error
 	return task, nil
 }
 
+func (d *DB) LoadLocalTask(ctx context.Context, machineID, taskID string) (LocalTask, error) {
+	if machineID == "" || taskID == "" {
+		return LocalTask{}, fmt.Errorf("store: load local task: machine and task are required")
+	}
+	task, err := d.loadLocalTask(ctx, taskID)
+	if err != nil {
+		return LocalTask{}, err
+	}
+	if task.MachineID != machineID {
+		return LocalTask{}, sql.ErrNoRows
+	}
+	task.Envelope = append([]byte(nil), task.Envelope...)
+	return task, nil
+}
+
 func (d *DB) RecoverLocalTasks(ctx context.Context, machineID string) ([]LocalTask, error) {
 	if machineID == "" {
 		return nil, fmt.Errorf("store: recover local tasks: empty machine ID")

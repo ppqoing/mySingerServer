@@ -140,3 +140,52 @@ ok  dedup/cmd/agent                1.277s
 - `ReadyWorkers` 是当前可用容量快照；为避免 backend FIFO 隐藏竞争，低值时仍保守限制为 1，容量增长会在 terminal/新提交唤醒后继续调度。
 - Stage 2 恢复继续安全重跑完整幂等 Engine（不重扫），没有实现 pair 粒度的 Stage 3 续点。
 - 未做真实媒体/native DLL 与真实 PostgreSQL 服务运行验收；本轮覆盖单测、race、生产组合顺序和敏感日志边界。
+
+---
+
+# Task 9 修复轮次 2/5（2026-08-13）
+
+基线：`14ba57d19f3b316abc0308c97adbc594ede0fe7a`。本轮继续保持 `?? .codex-temp/` 完全未读取、未修改、未删除、未暂存。
+
+## 四项 RED → GREEN
+
+1. admission cancellation：RED 在 capacity=1、inflight=1、pending=1 时，job3 卡在 admission，取消后 50ms 仍不返回，只有取消 job2 的无关 `Broadcast` 才唤醒。GREEN 改为 context-aware 有界 admission channel；pending 在 dispatch、取消移除、关闭清队列时精确归还 slot。取消 job 永不进入 queue/backend，无 timer/goroutine callback 泄漏。
+2. per-task 串行 gate：RED 用 terminal commit 精确屏障证明 Retry 等待不可取消 mutex 时忽略 20ms context，超过 100ms 不返回。GREEN 使用每 task 的引用稳定 channel gate；Cancel、Retry、attempt 启动/替换、terminal commit、active 注销均在同 gate 下线性化且 gate 获取可响应 context。等待 runner `done` 始终位于 gate 外，避免自等待死锁；重入 gate 后重新读取 Store/active。双 Retry 中第二个不会取消首个刚启动的新 attempt，最多一次 launch；Cancel 成功返回前 runner 已退出。
+3. Engine recovery convergence：RED 中 Begin 返回 complete/published 均被 `building run identity mismatch` 拒绝。GREEN 由真实 SQLite 测试锁定三个崩溃窗口：complete 会幂等 Publish 并成为 current；published 且仍为 machine current 直接成功；发布更新 generation 后旧 published 非 current，稳定 fail-closed。恢复不重新执行 Stage1/Stage2/Stage3，外层 runner 随后可持久 advance(3)。
+4. invalid envelope Retry：RED 首先以缺失窄读取 API 的编译失败锁定边界；旧顺序会在解码前把 failed 改 pending。GREEN 新增 machine-scoped `LoadLocalTask`，返回 owned envelope；Retry 在任何状态转换前 load/decode，并在取得 task gate 后重新 load/decode。空/畸形 envelope 保持 failed，不 launch、不产生 pending 窗口。
+
+## 最终门禁原始摘要
+
+关键并发/取消/恢复测试 `-count=30`：
+
+```text
+ok  dedup/internal/localtask  6.157s
+```
+
+六包 full：
+
+```text
+ok  dedup/internal/proto          0.155s
+ok  dedup/internal/store          1.751s
+ok  dedup/internal/localtask      0.378s
+ok  dedup/internal/localanalysis  0.062s
+ok  dedup/internal/agent          0.722s
+ok  dedup/cmd/agent               0.099s
+```
+
+五包 race：
+
+```text
+ok  dedup/internal/store          10.817s
+ok  dedup/internal/localtask       1.879s
+ok  dedup/internal/localanalysis   1.158s
+ok  dedup/internal/agent           2.631s
+ok  dedup/cmd/agent                1.274s
+```
+
+## 本轮文件、提交与 concerns
+
+- 文件：`internal/localtask/scheduler.go`, `scheduler_test.go`, `service.go`, `service_test.go`; `internal/localanalysis/engine.go`, `engine_test.go`; `internal/store/local_tasks.go`, `local_tasks_test.go`; 本报告。
+- 固定提交消息：`fix: close local task recovery races`；哈希见任务回执。
+- task gate 按持久 task ID 保留到 Service 生命周期结束，以避免 waiter 引用期间删除/重建造成双 gate；其规模与 Agent 已接受任务数同阶。
+- 本轮仍未执行真实媒体/native DLL 与真实 PostgreSQL 服务验收；恢复收敛以真实 SQLite、单测与 race 为证据。

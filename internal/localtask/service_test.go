@@ -146,7 +146,76 @@ func TestLocalTaskRetrySupersedesFailedAttemptInActiveDeferWindow(t *testing.T) 
 	close(runner.release)
 }
 
-func TestLocalTaskRetryContextExpiryStillLaunchesCommittedPendingAttempt(t *testing.T) {
+// Break caught: per-task serialization used sync.Mutex.Lock, so a Retry whose
+// context expired could remain blocked behind terminal commit indefinitely.
+func TestLocalTaskRetryGateWaitHonorsContextWithoutChangingFailedState(t *testing.T) {
+	db := openServiceDB(t)
+	blocking := &blockingFailedStore{TaskStore: db, failedWritten: make(chan struct{}), releaseFailed: make(chan struct{}), failedResult: make(chan error, 1)}
+	runner := &failFirstAttemptRunner{starts: make(chan int, 2), release: make(chan struct{})}
+	service := NewService("m", blocking, runner)
+	_, err := service.Create(context.Background(), CreateRequest{TaskID: "gate-timeout", Roots: []string{`D:\media`}, Mode: proto.LocalTaskModeScanOnly})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-runner.starts
+	select {
+	case <-blocking.failedWritten:
+	case err := <-blocking.failedResult:
+		t.Fatal(err)
+	case <-time.After(time.Second):
+		t.Fatal("terminal commit did not reach barrier")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { _, err := service.Retry(ctx, "gate-timeout"); done <- err }()
+	var retryErr error
+	select {
+	case retryErr = <-done:
+	case <-time.After(100 * time.Millisecond):
+		close(blocking.releaseFailed)
+		t.Fatal("Retry ignored context while waiting per-task gate")
+	}
+	if !errors.Is(retryErr, context.DeadlineExceeded) {
+		t.Fatalf("Retry=%v, want deadline", retryErr)
+	}
+	close(blocking.releaseFailed)
+	waitTaskStatus(t, service, "gate-timeout", "failed")
+	select {
+	case <-runner.starts:
+		t.Fatal("gate timeout launched a replacement attempt")
+	default:
+	}
+}
+
+func TestLocalTaskCancelGateWaitHonorsContextWithoutCancellingCompletedRunner(t *testing.T) {
+	db := openServiceDB(t)
+	blocking := &blockingFailedStore{TaskStore: db, failedWritten: make(chan struct{}), releaseFailed: make(chan struct{}), failedResult: make(chan error, 1)}
+	runner := &failFirstAttemptRunner{starts: make(chan int, 2), release: make(chan struct{})}
+	service := NewService("m", blocking, runner)
+	_, err := service.Create(context.Background(), CreateRequest{TaskID: "cancel-gate-timeout", Roots: []string{`D:\media`}, Mode: proto.LocalTaskModeScanOnly})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-runner.starts
+	select {
+	case <-blocking.failedWritten:
+	case err := <-blocking.failedResult:
+		t.Fatal(err)
+	case <-time.After(time.Second):
+		t.Fatal("terminal commit did not reach barrier")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := service.Cancel(ctx, "cancel-gate-timeout"); !errors.Is(err, context.DeadlineExceeded) {
+		close(blocking.releaseFailed)
+		t.Fatalf("Cancel=%v, want deadline", err)
+	}
+	close(blocking.releaseFailed)
+	waitTaskStatus(t, service, "cancel-gate-timeout", "failed")
+}
+
+func TestLocalTaskRetryContextExpiryBeforeTransitionLeavesCancelledAttempt(t *testing.T) {
 	db := openServiceDB(t)
 	runner := &stubbornAttemptRunner{starts: make(chan int, 2), releaseFirst: make(chan struct{}), releaseSecond: make(chan struct{})}
 	service := NewService("m", db, runner)
@@ -170,13 +239,49 @@ func TestLocalTaskRetryContextExpiryStillLaunchesCommittedPendingAttempt(t *test
 	close(runner.releaseFirst)
 	select {
 	case got := <-runner.starts:
-		if got != 2 {
-			t.Fatalf("attempt=%d want2", got)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("committed pending retry was not launched after old attempt exited")
+		t.Fatalf("context-expired Retry launched attempt %d", got)
+	case <-time.After(50 * time.Millisecond):
 	}
-	close(runner.releaseSecond)
+	waitTaskStatus(t, service, "retry-timeout", "cancelled")
+}
+
+func TestLocalTaskRetryRejectsInvalidPersistedEnvelopeBeforePendingTransition(t *testing.T) {
+	db := openServiceDB(t)
+	request := CreateRequest{TaskID: "invalid-retry", Roots: []string{`D:\media`}, Mode: proto.LocalTaskModeScanOnly}
+	envelope, digest, err := EncodeCreateEnvelope(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.CreateOrLoadLocalTask(context.Background(), store.LocalTaskCreate{TaskID: request.TaskID, MachineID: "m", Source: "local", Type: "scan", EnvelopeDigest: digest, Envelope: envelope}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.TransitionLocalTask(context.Background(), "m", request.TaskID, store.LocalTaskUpdate{Status: "running"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.TransitionLocalTask(context.Background(), "m", request.TaskID, store.LocalTaskUpdate{Status: "failed"}); err != nil {
+		t.Fatal(err)
+	}
+	service := NewService("m", &malformedLoadStore{TaskStore: db}, &recordingTaskRunner{started: make(chan runRecord, 1), release: make(chan struct{})})
+	if _, err := service.Retry(context.Background(), request.TaskID); err == nil {
+		t.Fatal("Retry accepted malformed persisted envelope")
+	}
+	loaded, err := db.LoadLocalTask(context.Background(), "m", request.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Status != "failed" {
+		t.Fatalf("invalid envelope status=%q, want failed", loaded.Status)
+	}
+}
+
+type malformedLoadStore struct{ TaskStore }
+
+func (s *malformedLoadStore) LoadLocalTask(ctx context.Context, machineID, taskID string) (store.LocalTask, error) {
+	task, err := s.TaskStore.LoadLocalTask(ctx, machineID, taskID)
+	if err == nil {
+		task.Envelope = []byte{0x80}
+	}
+	return task, err
 }
 
 type stubbornAttemptRunner struct {

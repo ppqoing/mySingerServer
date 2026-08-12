@@ -128,6 +128,59 @@ func TestFairSchedulerSubmitContextRemovesCancelledQueuedJob(t *testing.T) {
 	}
 }
 
+// Break caught: admission waited on a condition variable that cancellation
+// never signalled, so a caller blocked behind a full scheduler backlog could
+// not observe its own context until unrelated work completed.
+func TestFairSchedulerAdmissionCancellationDoesNotWaitForTerminalOrEnterQueue(t *testing.T) {
+	backend := newBufferedSchedulerPool(1024, 1)
+	scheduler := newFairScheduler(backend, 1)
+	if err := scheduler.Submit(&worker.JobMsg{JobID: 1, Source: worker.JobSourceScan}); err != nil {
+		t.Fatal(err)
+	}
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	done2 := make(chan error, 1)
+	go func() { done2 <- scheduler.SubmitContext(ctx2, &worker.JobMsg{JobID: 2, Source: worker.JobSourceScan}) }()
+	waitForSchedulerPending(t, scheduler, 1)
+
+	ctx3, cancel3 := context.WithCancel(context.Background())
+	done3 := make(chan error, 1)
+	go func() {
+		done3 <- scheduler.SubmitContext(ctx3, &worker.JobMsg{JobID: 3, Source: worker.JobSourceLocal})
+	}()
+	cancel3()
+	returnedWithoutWake := false
+	select {
+	case err := <-done3:
+		returnedWithoutWake = errors.Is(err, context.Canceled)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	cancel2()
+	if err := <-done2; !errors.Is(err, context.Canceled) {
+		t.Fatalf("pending SubmitContext=%v", err)
+	}
+	if !returnedWithoutWake {
+		select {
+		case <-done3:
+		case <-time.After(time.Second):
+			t.Fatal("admission caller remained blocked after cleanup wake")
+		}
+	}
+	backend.results <- &worker.JobResultMsg{JobID: 1}
+	<-scheduler.Results()
+	shutdownCtx, stop := context.WithTimeout(context.Background(), time.Second)
+	defer stop()
+	if err := scheduler.Shutdown(shutdownCtx); err != nil {
+		t.Fatal(err)
+	}
+	if !returnedWithoutWake {
+		t.Fatal("admission cancellation waited for an unrelated backlog wake")
+	}
+	if ids := backend.jobIDs(); len(ids) != 1 || ids[0] != 1 {
+		t.Fatalf("cancelled admission reached backend: %v", ids)
+	}
+}
+
 func TestFairSchedulerStopAcceptingReachesBackendAndCloseStopsLoops(t *testing.T) {
 	backend := newBufferedSchedulerPool(1024, 1)
 	scheduler := newFairScheduler(backend, 8)
