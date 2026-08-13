@@ -1,7 +1,9 @@
 package wproc
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha512"
 	"errors"
 	"io/fs"
 	"os"
@@ -27,8 +29,8 @@ func TestSessionPipelineOneOpenOneHashOneAnalyze(t *testing.T) {
 	if _, err := processMediaWithDeps(context.Background(), sessionPipelineTestConfig(), job, deps); err != nil {
 		t.Fatal(err)
 	}
-	if fake.opens != 1 || fake.hashes != 1 || fake.analyzes != 1 || fake.closes != 1 {
-		t.Fatalf("calls open/hash/analyze/close = %d/%d/%d/%d, want 1/1/1/1", fake.opens, fake.hashes, fake.analyzes, fake.closes)
+	if fake.opens != 1 || fake.hashes != 1 || fake.rehashes != 1 || fake.analyzes != 1 || fake.closes != 1 {
+		t.Fatalf("calls open/hash/rehash/analyze/close = %d/%d/%d/%d/%d, want 1/1/1/1/1", fake.opens, fake.hashes, fake.rehashes, fake.analyzes, fake.closes)
 	}
 }
 
@@ -50,8 +52,132 @@ func TestSessionPipelineCompleteHitSkipsAnalyze(t *testing.T) {
 	if _, err := processMediaWithDeps(context.Background(), sessionPipelineTestConfig(), job, deps); err != nil {
 		t.Fatal(err)
 	}
-	if fake.opens != 1 || fake.hashes != 1 || fake.analyzes != 0 || fake.closes != 1 {
-		t.Fatalf("calls open/hash/analyze/close = %d/%d/%d/%d, want 1/1/0/1", fake.opens, fake.hashes, fake.analyzes, fake.closes)
+	if fake.opens != 1 || fake.hashes != 1 || fake.rehashes != 1 || fake.analyzes != 0 || fake.closes != 1 {
+		t.Fatalf("calls open/hash/rehash/analyze/close = %d/%d/%d/%d/%d, want 1/1/1/0/1", fake.opens, fake.hashes, fake.rehashes, fake.analyzes, fake.closes)
+	}
+}
+
+func TestSessionPipelineFinalIdentityRejectsDriftAfterCacheQuery(t *testing.T) {
+	job, deps, fake := newSessionPipelineTest(t, worker.MediaImage,
+		worker.MaskImagePDQ, 0)
+	before := sessionPipelineTestInfo{size: job.Size, mtime: time.UnixMilli(job.MTimeMS)}
+	after := sessionPipelineTestInfo{size: job.Size + 1, mtime: time.UnixMilli(job.MTimeMS + 1)}
+	current := fs.FileInfo(before)
+	deps.stat = func(string) (fs.FileInfo, error) { return current, nil }
+	deps.query = func(*worker.SHAQueryMsg) (*worker.SHAReplyMsg, error) {
+		current = after
+		return &worker.SHAReplyMsg{
+			JobID: job.JobID, Found: true,
+			RequestedFields: worker.MaskImagePDQ,
+			FieldsPresent:   worker.MaskImagePDQ,
+			PDQ:             bytes.Repeat([]byte{7}, 32),
+			Quality:         80,
+			Width:           640,
+			Height:          360,
+		}, nil
+	}
+
+	result, err := processMediaWithDeps(context.Background(), sessionPipelineTestConfig(), job, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSessionPipelineStalePayload(t, result)
+	if fake.analyzes != 0 || fake.hashes != 1 || fake.rehashes != 0 {
+		t.Fatalf("analyze/hash/rehash = %d/%d/%d, want metadata drift before rehash", fake.analyzes, fake.hashes, fake.rehashes)
+	}
+}
+
+func TestSessionPipelineFinalIdentityRejectsSameMetadataContentReplacementAfterAnalyze(t *testing.T) {
+	job, deps, fake := newSessionPipelineTest(t, worker.MediaImage,
+		worker.MaskPHashParts, 0)
+	deps.query = sessionPipelineMissingReply(job, worker.MaskPHashParts, 0)
+	fake.result = videocore.AnalysisResult{
+		MediaType: 1, ImageStatus: videocore.StatusOK,
+		ImageFeatures: videocore.FeatureSet{PHash: [9]uint64{1}},
+	}
+	changed := fake.sha
+	changed[0] ^= 0xff
+	fake.rehashSHA = &changed
+
+	result, err := processMediaWithDeps(context.Background(), sessionPipelineTestConfig(), job, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSessionPipelineStalePayload(t, result)
+	if fake.analyzes != 1 || fake.hashes != 1 || fake.rehashes != 1 {
+		t.Fatalf("analyze/hash/rehash = %d/%d/%d, want 1/1/1", fake.analyzes, fake.hashes, fake.rehashes)
+	}
+}
+
+func TestDefaultSessionPipelineRehashReadsFreshBytesAndHonorsCancellation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "media.bin")
+	first := bytes.Repeat([]byte{1}, 8192)
+	second := bytes.Repeat([]byte{2}, len(first))
+	if err := os.WriteFile(path, first, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := &worker.JobMsg{Size: before.Size(), MTimeUnix: before.ModTime().Unix(), MTimeMS: before.ModTime().UnixMilli()}
+	deps := defaultSessionPipelineDeps(nil)
+	firstDigest, err := deps.rehash(context.Background(), path, before, job)
+	if err != nil || firstDigest != sha512.Sum512(first) {
+		t.Fatalf("first rehash=%x err=%v", firstDigest, err)
+	}
+	if err := os.WriteFile(path, second, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, before.ModTime(), before.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	secondDigest, err := deps.rehash(context.Background(), path, before, job)
+	if err != nil || secondDigest != sha512.Sum512(second) || secondDigest == firstDigest {
+		t.Fatalf("fresh rehash=%x first=%x err=%v", secondDigest, firstDigest, err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := deps.rehash(ctx, path, before, job); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled rehash error=%v, want context.Canceled", err)
+	}
+}
+
+func TestSessionPipelineContactGuardRejectsDriftBeforeAtomicPublish(t *testing.T) {
+	job, deps, fake := newSessionPipelineTest(t, worker.MediaVideo,
+		worker.MaskSHA512|worker.MaskVideoDuration|worker.MaskVideoContactSheet, 0)
+	root := t.TempDir()
+	paths, err := contactSheetPaths(root, fake.sha, 99, job.JobID, "guard")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deps.contactSheetPaths = func(string, [64]byte, int, int64, string) (ContactSheetPaths, error) { return paths, nil }
+	deps.publishContactSheet = publishContactSheet
+	deps.query = sessionPipelineMissingReply(job, worker.MaskVideoDuration|worker.MaskVideoContactSheet, 0)
+	changed := fake.sha
+	changed[0] ^= 0xff
+	fake.rehashSHA = &changed
+	fake.result = videocore.AnalysisResult{
+		MediaType: 2, DurationStatus: videocore.StatusOK, DurationMS: 4321,
+		ContactSheetStatus: videocore.StatusOK, ContactSheetWidth: 960, ContactSheetHeight: 540,
+		ContactSheetFeatures: videocore.FeatureSet{PDQ: [32]byte{7}, PDQQuality: 88},
+		CompletedFrameMask:   1,
+		Frames:               [6]videocore.FrameResult{{StandardIndex: 0, Status: videocore.StatusOK}},
+	}
+	fake.onAnalyze = func(request videocore.AnalysisRequest) {
+		if err := os.WriteFile(request.TempJPEGPath, []byte("jpeg"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	result, err := processMediaWithDeps(context.Background(), sessionPipelineTestConfig(), job, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSessionPipelineStalePayload(t, result)
+	for _, path := range []string{paths.JPEG, paths.Sidecar} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("stale contact published final %q: %v", path, err)
+		}
 	}
 }
 
@@ -79,8 +205,8 @@ func TestSessionPipelinePartialMask(t *testing.T) {
 	if fake.analyzes != 1 || fake.request.Fields != worker.MaskVideo6F|worker.MaskVideoContactSheet || fake.request.FrameMask != worker.FrameMaskFull {
 		t.Fatalf("analyze = %d request=%#v, want exactly missing fields and six frames", fake.analyzes, fake.request)
 	}
-	if fake.opens != 1 || fake.hashes != 1 || fake.closes != 1 {
-		t.Fatalf("calls open/hash/close = %d/%d/%d, want 1/1/1", fake.opens, fake.hashes, fake.closes)
+	if fake.opens != 1 || fake.hashes != 1 || fake.rehashes != 1 || fake.closes != 1 {
+		t.Fatalf("calls open/hash/rehash/close = %d/%d/%d/%d, want 1/1/1/1", fake.opens, fake.hashes, fake.rehashes, fake.closes)
 	}
 }
 
@@ -110,7 +236,7 @@ func TestSessionPipelineCancellation(t *testing.T) {
 	if err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
 	}
-	assertSessionPipelineCleared(t, result, fake, paths)
+	assertSessionPipelineCleared(t, result, fake, paths, false)
 }
 
 func TestSessionPipelineStale(t *testing.T) {
@@ -133,7 +259,7 @@ func TestSessionPipelineStale(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertSessionPipelineCleared(t, result, fake, paths)
+	assertSessionPipelineCleared(t, result, fake, paths, true)
 	if len(result.Errors) != 1 || result.Errors[0].Stage != "stale" {
 		t.Fatalf("stale errors = %#v, want one stale file error", result.Errors)
 	}
@@ -207,7 +333,25 @@ func TestSessionPipelineAnalyzeCancellationClears(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("analyze cancellation error = %v, want context.Canceled", err)
 	}
-	assertSessionPipelineCleared(t, result, fake, ContactSheetPaths{})
+	assertSessionPipelineCleared(t, result, fake, ContactSheetPaths{}, false)
+}
+
+func TestSessionPipelineStaleIdentityHashMismatchReturnsStableStaleWithoutPayload(t *testing.T) {
+	job, deps, fake := newSessionPipelineTest(t, worker.MediaImage, worker.MaskPHashParts, 0)
+	job.ScreenStage = worker.ScreenStageTwo
+	job.Source = worker.JobSourceManager
+	job.KnownSHA = bytesRepeat64(0xee)
+	deps.query = sessionPipelineMissingReply(job, worker.MaskPHashParts, 0)
+
+	result, err := processMediaWithDeps(context.Background(), sessionPipelineTestConfig(), job, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Errors) != 1 || result.Errors[0].Stage != "stale" ||
+		string(result.SHA512) != string(job.KnownSHA) || result.FieldsDone != 0 ||
+		len(result.PHashParts) != 0 || fake.analyzes != 0 {
+		t.Fatalf("hash-mismatch stale result=%#v analyze=%d", result, fake.analyzes)
+	}
 }
 
 func TestSessionPipelineLegacyThumbValidatesAndPublishes(t *testing.T) {
@@ -258,6 +402,131 @@ func TestSessionPipelineLegacyThumbValidatesAndPublishes(t *testing.T) {
 	})
 }
 
+func TestVideoBaseFeaturesSessionPublishesCompleteContactPayload(t *testing.T) {
+	job, deps, fake := newSessionPipelineTest(
+		t, worker.MediaVideo, worker.MaskAllVideo, 0,
+	)
+	root := t.TempDir()
+	paths := ContactSheetPaths{
+		JPEG: filepath.Join(root, "grid.jpg"), Sidecar: filepath.Join(root, "grid.jpg.json"),
+		TempJPEG: filepath.Join(root, "grid.tmp.jpg"), TempSidecar: filepath.Join(root, "grid.tmp.json"),
+	}
+	deps.contactSheetPaths = func(string, [64]byte, int, int64, string) (ContactSheetPaths, error) {
+		return paths, nil
+	}
+	deps.query = sessionPipelineMissingReply(
+		job, worker.MaskVideoDuration|worker.MaskVideoContactSheet, 0,
+	)
+	published := 0
+	deps.publishContactSheet = func(got ContactSheetPaths, _ ContactSheetMeta, validate func() error) error {
+		published++
+		if got != paths {
+			t.Fatalf("publish paths = %#v, want %#v", got, paths)
+		}
+		return validate()
+	}
+	fake.result = videocore.AnalysisResult{
+		MediaType: 2, DurationStatus: videocore.StatusOK, DurationMS: 4321,
+		ContactSheetStatus: videocore.StatusOK, ContactSheetWidth: 960, ContactSheetHeight: 540,
+		ContactSheetFeatures: videocore.FeatureSet{PDQ: [32]byte{7}, PDQQuality: 88},
+		CompletedFrameMask:   1,
+		Frames:               [6]videocore.FrameResult{{StandardIndex: 0, Status: videocore.StatusOK, SampleTimeMS: 1000}},
+	}
+	fake.onAnalyze = func(request videocore.AnalysisRequest) {
+		if err := os.WriteFile(request.TempJPEGPath, []byte("jpeg"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	result, err := processMediaWithDeps(context.Background(), sessionPipelineTestConfig(), job, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if published != 1 || result.FieldsDone != worker.MaskAllVideo ||
+		result.DurationMS == nil || *result.DurationMS != 4321 ||
+		result.ThumbPath != paths.JPEG || len(result.ThumbPDQ) != 32 || result.ThumbPDQ[0] != 7 ||
+		result.ThumbQuality == nil || *result.ThumbQuality != 88 ||
+		result.ContactSheetWidth != 960 || result.ContactSheetHeight != 540 || !result.ThumbGenerated {
+		t.Fatalf("video base result = published:%d %#v", published, result)
+	}
+}
+
+func TestVideoBaseFeaturesUnpublishedContactPreservesDurationPartial(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*sessionPipelineDeps, *videocore.AnalysisResult)
+	}{
+		{
+			name: "runtime lookup failure",
+			configure: func(deps *sessionPipelineDeps, _ *videocore.AnalysisResult) {
+				deps.runtime = func() (videocore.RuntimeInfo, error) {
+					return videocore.RuntimeInfo{}, errors.New("runtime unavailable")
+				}
+			},
+		},
+		{
+			name: "invalid metadata",
+			configure: func(_ *sessionPipelineDeps, analysis *videocore.AnalysisResult) {
+				analysis.ContactSheetWidth = 2
+				analysis.ContactSheetHeight = 1
+			},
+		},
+		{
+			name: "publish failure",
+			configure: func(deps *sessionPipelineDeps, _ *videocore.AnalysisResult) {
+				deps.publishContactSheet = func(ContactSheetPaths, ContactSheetMeta, func() error) error {
+					return errors.New("publish failed")
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			job, deps, fake := newSessionPipelineTest(
+				t, worker.MediaVideo, worker.MaskAllVideo, 0,
+			)
+			root := t.TempDir()
+			paths := ContactSheetPaths{
+				JPEG: filepath.Join(root, "grid.jpg"), Sidecar: filepath.Join(root, "grid.jpg.json"),
+				TempJPEG: filepath.Join(root, "grid.tmp.jpg"), TempSidecar: filepath.Join(root, "grid.tmp.json"),
+			}
+			deps.contactSheetPaths = func(string, [64]byte, int, int64, string) (ContactSheetPaths, error) {
+				return paths, nil
+			}
+			deps.query = sessionPipelineMissingReply(
+				job, worker.MaskVideoDuration|worker.MaskVideoContactSheet, 0,
+			)
+			fake.result = videocore.AnalysisResult{
+				MediaType: 2, DurationStatus: videocore.StatusOK, DurationMS: 4321,
+				ContactSheetStatus: videocore.StatusOK, ContactSheetWidth: 960, ContactSheetHeight: 540,
+				ContactSheetFeatures: videocore.FeatureSet{PDQ: [32]byte{7}, PDQQuality: 88},
+				CompletedFrameMask:   1,
+				Frames:               [6]videocore.FrameResult{{StandardIndex: 0, Status: videocore.StatusOK, SampleTimeMS: 1000}},
+			}
+			fake.onAnalyze = func(request videocore.AnalysisRequest) {
+				if err := os.WriteFile(request.TempJPEGPath, []byte("jpeg"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			tt.configure(&deps, &fake.result)
+
+			result, err := processMediaWithDeps(
+				context.Background(), sessionPipelineTestConfig(), job, deps,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantDone := uint32(worker.MaskSHA512 | worker.MaskVideoDuration)
+			if result.FieldsDone != wantDone || result.DurationMS == nil || *result.DurationMS != 4321 ||
+				result.ContactSheetStatus != 0 || result.ContactSheetWidth != 0 || result.ContactSheetHeight != 0 ||
+				result.ThumbPath != "" || len(result.ThumbPDQ) != 0 || result.ThumbQuality != nil ||
+				result.ThumbGenerated || len(result.Errors) != 1 ||
+				result.Errors[0].Field != worker.MaskVideoContactSheet {
+				t.Fatalf("unpublished contact result = %#v", result)
+			}
+		})
+	}
+}
+
 func TestSessionPipelineImagePhase2Features(t *testing.T) {
 	job, deps, fake := newSessionPipelineTest(t, worker.MediaImage, worker.MaskSHA512|worker.MaskImagePDQ|worker.MaskPHashParts|worker.MaskSobelHist, 0)
 	deps.query = sessionPipelineMissingReply(job, worker.MaskImagePDQ|worker.MaskPHashParts|worker.MaskSobelHist, 0)
@@ -273,18 +542,143 @@ func TestSessionPipelineImagePhase2Features(t *testing.T) {
 	}
 }
 
-func TestSessionPipelineCachedFramesAreNotFabricated(t *testing.T) {
+func TestSessionPipelineImageStageTwoAndThreeReturnOnlyRequestedFeature(t *testing.T) {
+	tests := []struct {
+		name      string
+		stage     worker.ScreenStage
+		field     uint32
+		wantPHash bool
+		wantSobel bool
+	}{
+		{name: "stage two", stage: worker.ScreenStageTwo, field: worker.MaskPHashParts, wantPHash: true},
+		{name: "stage three", stage: worker.ScreenStageThree, field: worker.MaskSobelHist, wantSobel: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			job, deps, fake := newSessionPipelineTest(t, worker.MediaImage, test.field, 0)
+			job.ScreenStage = test.stage
+			job.Source = worker.JobSourceManager
+			deps.query = sessionPipelineMissingReply(job, test.field, 0)
+			fake.result = videocore.AnalysisResult{MediaType: 1, ImageStatus: videocore.StatusOK,
+				ImageFeatures: videocore.FeatureSet{PHash: [9]uint64{2}, SobelHistogram: [128]float32{3}}}
+
+			result, err := processMediaWithDeps(context.Background(), sessionPipelineTestConfig(), job, deps)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.ScreenStage != test.stage || result.Source != worker.JobSourceManager ||
+				result.FieldsDone != test.field || (len(result.PHashParts) != 0) != test.wantPHash ||
+				(len(result.SobelHist) != 0) != test.wantSobel {
+				t.Fatalf("stage-isolated image result=%#v", result)
+			}
+			if fake.request.Fields != test.field {
+				t.Fatalf("native image fields=%#x, want %#x", fake.request.Fields, test.field)
+			}
+		})
+	}
+}
+
+func TestSessionPipelineVideoSixFrameStagesMapToLegacyNativeAndTrimPayload(t *testing.T) {
+	tests := []struct {
+		name      string
+		stage     worker.ScreenStage
+		field     uint32
+		wantPHash bool
+		wantSobel bool
+	}{
+		{name: "stage two", stage: worker.ScreenStageTwo, field: worker.MaskVideo6FPHash, wantPHash: true},
+		{name: "stage three", stage: worker.ScreenStageThree, field: worker.MaskVideo6FSobel, wantSobel: true},
+		{name: "legacy combined", stage: worker.ScreenStageLegacy, field: worker.MaskVideo6F, wantPHash: true, wantSobel: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			job, deps, fake := newSessionPipelineTest(t, worker.MediaVideo, test.field, worker.FrameMaskFull)
+			job.ScreenStage = test.stage
+			job.Source = worker.JobSourceManager
+			deps.query = sessionPipelineMissingReply(job, test.field, worker.FrameMaskFull)
+			fake.result = sessionStageVideoResult()
+
+			result, err := processMediaWithDeps(context.Background(), sessionPipelineTestConfig(), job, deps)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if fake.request.Fields != worker.MaskVideo6F {
+				t.Fatalf("native fields=%#x, want legacy %#x", fake.request.Fields, worker.MaskVideo6F)
+			}
+			if result.FieldsDone != test.field || result.FramesDone != worker.FrameMaskFull {
+				t.Fatalf("done fields/frames=%#x/%#x, want %#x/%#x", result.FieldsDone, result.FramesDone, test.field, worker.FrameMaskFull)
+			}
+			for index, frame := range result.FrameResults {
+				if (len(frame.PHashParts) != 0) != test.wantPHash || (len(frame.SobelHist) != 0) != test.wantSobel {
+					t.Fatalf("frame[%d] leaked stage payload: pHash=%d Sobel=%d", index, len(frame.PHashParts), len(frame.SobelHist))
+				}
+				if test.stage != worker.ScreenStageLegacy && (len(frame.PDQ256) != 0 || frame.Quality != 0) {
+					t.Fatalf("frame[%d] stage %d leaked legacy PDQ", index, test.stage)
+				}
+				if test.stage == worker.ScreenStageLegacy && (len(frame.PDQ256) != 32 || frame.Quality == 0) {
+					t.Fatalf("legacy frame[%d] lost PDQ/quality", index)
+				}
+			}
+		})
+	}
+}
+
+func TestSessionPipelineVideoStageCacheReturnsOnlyRequestedPayload(t *testing.T) {
+	job, deps, fake := newSessionPipelineTest(t, worker.MediaVideo, worker.MaskVideo6FPHash, worker.FrameMaskFull)
+	job.ScreenStage = worker.ScreenStageTwo
+	job.Source = worker.JobSourceManager
+	cached := sessionStageVideoResult()
+	frames := [6]worker.FrameResult{}
+	for index, native := range cached.Frames {
+		frames[index] = worker.FrameResult{
+			FrameIdx: index, Status: native.Status, TimeMS: native.SampleTimeMS,
+			PHashParts: make([]byte, 76),
+		}
+	}
+	deps.query = func(query *worker.SHAQueryMsg) (*worker.SHAReplyMsg, error) {
+		return &worker.SHAReplyMsg{
+			JobID: query.JobID, Found: true,
+			RequestedFields: worker.MaskVideo6FPHash, FieldsPresent: worker.MaskVideo6FPHash,
+			RequestedFrames: worker.FrameMaskFull, FramesPresent: worker.FrameMaskFull,
+			FrameResults: frames,
+		}, nil
+	}
+
+	result, err := processMediaWithDeps(context.Background(), sessionPipelineTestConfig(), job, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fake.analyzes != 0 || result.FieldsDone != worker.MaskVideo6FPHash || result.FramesDone != worker.FrameMaskFull {
+		t.Fatalf("stage cache result=%#v analyzes=%d", result, fake.analyzes)
+	}
+	for index, frame := range result.FrameResults {
+		if len(frame.PHashParts) == 0 || len(frame.SobelHist) != 0 || len(frame.PDQ256) != 0 {
+			t.Fatalf("cached frame[%d] leaked payload: %#v", index, frame)
+		}
+	}
+}
+
+func sessionStageVideoResult() videocore.AnalysisResult {
+	result := videocore.AnalysisResult{MediaType: 2, CompletedFrameMask: worker.FrameMaskFull}
+	for index := range result.Frames {
+		result.Frames[index] = videocore.FrameResult{
+			StandardIndex: uint32(index), Status: videocore.StatusOK, SampleTimeMS: int64(index+1) * 1000,
+			Features: videocore.FeatureSet{PDQ: [32]byte{byte(index + 1)}, PDQQuality: 80,
+				PHash: [9]uint64{uint64(index + 1)}, SobelHistogram: [128]float32{float32(index + 1)}},
+		}
+	}
+	return result
+}
+
+func TestSessionPipelineCachedFrameMasksWithoutPayloadAreRejected(t *testing.T) {
 	job, deps, fake := newSessionPipelineTest(t, worker.MediaVideo, worker.MaskSHA512|worker.MaskVideo6F, worker.FrameMaskFull)
 	deps.query = func(*worker.SHAQueryMsg) (*worker.SHAReplyMsg, error) {
 		return &worker.SHAReplyMsg{JobID: job.JobID, Found: true, RequestedFields: worker.MaskVideo6F, FieldsPresent: worker.MaskVideo6F,
 			RequestedFrames: worker.FrameMaskFull, FramesPresent: worker.FrameMaskFull}, nil
 	}
 	result, err := processMediaWithDeps(context.Background(), sessionPipelineTestConfig(), job, deps)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if fake.analyzes != 0 || result.FramesDone != 0 || result.FieldsDone&worker.MaskVideo6F != 0 {
-		t.Fatalf("cached frames were fabricated: %#v analyze=%d", result, fake.analyzes)
+	if err == nil || result != nil || fake.analyzes != 0 {
+		t.Fatalf("mask-only cached frames result=%#v err=%v analyze=%d, want rejection", result, err, fake.analyzes)
 	}
 }
 
@@ -310,6 +704,9 @@ type sessionPipelineFake struct {
 	request    videocore.AnalysisRequest
 	onAnalyze  func(videocore.AnalysisRequest)
 	analyzeErr error
+	rehashes   int
+	rehashSHA  *[64]byte
+	rehashErr  error
 }
 
 func (fake *sessionPipelineFake) Hash() ([64]byte, error) {
@@ -336,18 +733,34 @@ func sessionPipelineMissingReply(job *worker.JobMsg, fields uint32, frames uint8
 	}
 }
 
-func assertSessionPipelineCleared(t *testing.T, result *worker.JobResultMsg, fake *sessionPipelineFake, paths ContactSheetPaths) {
+func assertSessionPipelineCleared(t *testing.T, result *worker.JobResultMsg, fake *sessionPipelineFake, paths ContactSheetPaths, wantKnownSHA bool) {
 	t.Helper()
 	if result == nil {
 		t.Fatal("cancellation/stale returned nil result")
 	}
-	if fake.closes != 1 || len(result.SHA512) != 0 || result.FieldsDone != 0 || result.FramesDone != 0 || len(result.PDQ) != 0 || result.DurationMS != nil || result.ContactSheetWidth != 0 || result.ContactSheetHeight != 0 {
+	wantSHALen := 0
+	if wantKnownSHA {
+		wantSHALen = 64
+	}
+	if fake.closes != 1 || len(result.SHA512) != wantSHALen || result.FieldsDone != 0 || result.FramesDone != 0 || len(result.PDQ) != 0 || result.DurationMS != nil || result.ContactSheetWidth != 0 || result.ContactSheetHeight != 0 {
 		t.Fatalf("cancellation/stale retained result or did not close once: close=%d result=%#v", fake.closes, result)
 	}
 	for _, path := range []string{paths.TempJPEG, paths.TempSidecar} {
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Fatalf("cancellation/stale left temp %q: %v", path, err)
 		}
+	}
+}
+
+func assertSessionPipelineStalePayload(t *testing.T, result *worker.JobResultMsg) {
+	t.Helper()
+	if result == nil || result.FieldsDone != 0 || result.FramesDone != 0 || len(result.PDQ) != 0 ||
+		len(result.PHashParts) != 0 || len(result.SobelHist) != 0 || result.DurationMS != nil ||
+		len(result.ThumbPDQ) != 0 || result.ThumbQuality != nil {
+		t.Fatalf("stale result retained payload: %#v", result)
+	}
+	if len(result.Errors) != 1 || result.Errors[0].Stage != "stale" {
+		t.Fatalf("stale errors = %#v, want stable stale", result.Errors)
 	}
 }
 
@@ -366,8 +779,9 @@ func newSessionPipelineTest(t *testing.T, kind worker.MediaKind, fields uint32, 
 	job := &worker.JobMsg{
 		JobID: 77, ScanTaskID: "scan", Path: `C:\synthetic\input.bin`, Kind: kind,
 		Phase: worker.Phase2, FieldsMask: fields, FrameMask: frames,
-		Size: info.size, MTimeUnix: info.mtime.Unix(),
+		Size: info.size, MTimeUnix: info.mtime.Unix(), MTimeMS: info.mtime.UnixMilli(),
 	}
+	job.KnownSHA = append([]byte(nil), fake.sha[:]...)
 	deps := sessionPipelineDeps{
 		stat:     func(string) (fs.FileInfo, error) { return info, nil },
 		sameFile: func(left, right fs.FileInfo) bool { return left == right },
@@ -383,6 +797,16 @@ func newSessionPipelineTest(t *testing.T, kind worker.MediaKind, fields uint32, 
 			fake.opens++
 			return fake, nil
 		},
+		rehash: func(context.Context, string, fs.FileInfo, *worker.JobMsg) ([64]byte, error) {
+			fake.rehashes++
+			if fake.rehashErr != nil {
+				return [64]byte{}, fake.rehashErr
+			}
+			if fake.rehashSHA != nil {
+				return *fake.rehashSHA, nil
+			}
+			return fake.sha, nil
+		},
 		query:              func(*worker.SHAQueryMsg) (*worker.SHAReplyMsg, error) { return nil, nil },
 		contactSheetLookup: contactSheetLookupNoop,
 		contactSheetPaths:  contactSheetPathsNoop,
@@ -394,6 +818,14 @@ func newSessionPipelineTest(t *testing.T, kind worker.MediaKind, fields uint32, 
 		now:   func() time.Time { return time.Unix(1_700_000_000, 0) },
 	}
 	return job, deps, fake
+}
+
+func bytesRepeat64(value byte) []byte {
+	out := make([]byte, 64)
+	for index := range out {
+		out[index] = value
+	}
+	return out
 }
 
 func contactSheetLookupNoop(string, [64]byte) (ContactSheetMeta, bool, error) {

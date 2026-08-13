@@ -87,6 +87,307 @@ func TestServerHandshakePingAndUnsupportedMessageKeepConnectionAlive(t *testing.
 	}
 }
 
+// This fails if the server drops browse requests, changes their request ID, or
+// rewrites entries produced by the injected filesystem browser.
+func TestServerRoutesFilesystemBrowserResponse(t *testing.T) {
+	server := newDeleteTestServer(t)
+	server.SetFilesystemBrowser(filesystemBrowserFunc(func(_ context.Context, request proto.FilesystemBrowseRequest) proto.FilesystemBrowseResponse {
+		return proto.FilesystemBrowseResponse{
+			RequestID: "wrong-id",
+			Entries: []proto.FilesystemEntry{{
+				Name: "Photos", Path: `D:\Media\Photos`, Kind: proto.FilesystemEntryDirectory, Selectable: true,
+			}},
+		}
+	}))
+	client, cleanup := startDeleteTestConnection(t, server, context.Background())
+	defer cleanup()
+	if err := client.WriteFrame(proto.MsgFilesystemBrowse, &proto.FilesystemBrowseRequest{
+		RequestID: "browse-1", Path: `D:\Media`, Limit: 200,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	message := readDeleteTestMessage(t, client)
+	response, ok := message.(*proto.FilesystemBrowseResponse)
+	if !ok {
+		t.Fatalf("response = %T", message)
+	}
+	if response.RequestID != "browse-1" || len(response.Entries) != 1 || response.Entries[0].Path != `D:\Media\Photos` || !response.Entries[0].Selectable {
+		t.Fatalf("browse response = %#v", response)
+	}
+}
+
+// This fails if a slow browse blocks the connection reader, allowing a second
+// browse to queue instead of returning browse_busy or delaying Ping/Pong.
+func TestServerFilesystemBrowserRejectsConcurrentRequestWithoutBlockingPing(t *testing.T) {
+	server := newDeleteTestServer(t)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	server.SetFilesystemBrowser(filesystemBrowserFunc(func(ctx context.Context, request proto.FilesystemBrowseRequest) proto.FilesystemBrowseResponse {
+		close(entered)
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+		return proto.FilesystemBrowseResponse{RequestID: request.RequestID}
+	}))
+	client, cleanup := startDeleteTestConnection(t, server, context.Background())
+	defer cleanup()
+	if err := client.WriteFrame(proto.MsgFilesystemBrowse, &proto.FilesystemBrowseRequest{RequestID: "browse-slow", Path: `D:\Media`, Limit: 200}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("browser did not receive first request")
+	}
+	if err := client.WriteFrame(proto.MsgFilesystemBrowse, &proto.FilesystemBrowseRequest{RequestID: "browse-busy", Path: `D:\Media`, Limit: 200}); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.WriteFrame(proto.MsgPing, &proto.Ping{TS: 813}); err != nil {
+		t.Fatal(err)
+	}
+	var sawBusy, sawPong bool
+	for deadline := time.Now().Add(time.Second); !(sawBusy && sawPong); {
+		_ = client.SetReadDeadline(deadline)
+		msgType, body, err := client.ReadFrame()
+		if err != nil {
+			t.Fatalf("read busy/pong: %v", err)
+		}
+		message, err := proto.Decode(msgType, body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch value := message.(type) {
+		case *proto.FilesystemBrowseResponse:
+			if value.RequestID == "browse-busy" && value.ErrorCode == "browse_busy" {
+				sawBusy = true
+			}
+		case *proto.Pong:
+			if value.TS == 813 {
+				sawPong = true
+			}
+		}
+	}
+	close(release)
+	response, ok := readDeleteTestMessage(t, client).(*proto.FilesystemBrowseResponse)
+	if !ok || response.RequestID != "browse-slow" || response.ErrorCode != "" {
+		t.Fatalf("slow browse response = %#v", response)
+	}
+}
+
+func TestServerClientAuthAcceptsOnlyLoopbackNodeTrayWithCorrectToken(t *testing.T) {
+	const token = "correct-local-control-token"
+	server, logs := newLocalControlTestServer(t)
+	server.SetLocalControl(token, localHandlerFunc(func(
+		_ context.Context,
+		request proto.LocalRequest,
+	) proto.LocalResponse {
+		return proto.LocalResponse{RequestID: request.RequestID, OK: true, Payload: []byte("ready")}
+	}))
+
+	wrongTokenClient, cleanupWrong := startLocalControlTestConnection(t, server, net.ParseIP("127.0.0.1"))
+	defer cleanupWrong()
+	writeLocalControlTestAuth(t, wrongTokenClient, proto.ClientAuth{Role: "nodetray", Token: "wrong-secret", Version: proto.ProtocolVersion})
+	wrongResult := readDeleteTestMessage(t, wrongTokenClient).(*proto.ClientAuthResult)
+	if wrongResult.Accepted || wrongResult.ErrorCode != "unauthorized" {
+		t.Fatalf("wrong token auth = %#v", wrongResult)
+	}
+
+	nonLocalClient, cleanupNonLocal := startLocalControlTestConnection(t, server, net.ParseIP("203.0.113.20"))
+	defer cleanupNonLocal()
+	writeLocalControlTestAuth(t, nonLocalClient, proto.ClientAuth{Role: "nodetray", Token: token, Version: proto.ProtocolVersion})
+	nonLocalResult := readDeleteTestMessage(t, nonLocalClient).(*proto.ClientAuthResult)
+	if nonLocalResult.Accepted || nonLocalResult.ErrorCode != "local_only" {
+		t.Fatalf("non-local auth = %#v", nonLocalResult)
+	}
+
+	client, cleanup := startLocalControlTestConnection(t, server, net.ParseIP("::1"))
+	defer cleanup()
+	writeLocalControlTestAuth(t, client, proto.ClientAuth{Role: "nodetray", Token: token, Version: proto.ProtocolVersion})
+	result := readDeleteTestMessage(t, client).(*proto.ClientAuthResult)
+	if !result.Accepted || result.ErrorCode != "" {
+		t.Fatalf("loopback auth = %#v", result)
+	}
+	request := proto.LocalRequest{RequestID: "status-1", Operation: proto.LocalOperationStatusGet}
+	if err := client.WriteFrame(proto.MsgLocalRequest, &request); err != nil {
+		t.Fatal(err)
+	}
+	response := readDeleteTestMessage(t, client).(*proto.LocalResponse)
+	if !response.OK || response.RequestID != "status-1" || string(response.Payload) != "ready" {
+		t.Fatalf("local response = %#v", response)
+	}
+	if strings.Contains(logs.String(), token) || strings.Contains(logs.String(), "wrong-secret") {
+		t.Fatal("authentication token leaked into server logs")
+	}
+}
+
+func TestServerClientAuthRejectsWrongRoleAndProtocolVersion(t *testing.T) {
+	server, _ := newLocalControlTestServer(t)
+	server.SetLocalControl("token", localHandlerFunc(func(context.Context, proto.LocalRequest) proto.LocalResponse {
+		return proto.LocalResponse{OK: true}
+	}))
+	for _, auth := range []proto.ClientAuth{
+		{Role: "manager", Token: "token", Version: proto.ProtocolVersion},
+		{Role: "nodetray", Token: "token", Version: proto.ProtocolVersion + 1},
+	} {
+		client, cleanup := startLocalControlTestConnection(t, server, net.ParseIP("127.0.0.1"))
+		writeLocalControlTestAuth(t, client, auth)
+		result := readDeleteTestMessage(t, client).(*proto.ClientAuthResult)
+		if result.Accepted || result.ErrorCode != "unauthorized" {
+			t.Fatalf("auth %#v result = %#v", auth, result)
+		}
+		cleanup()
+	}
+}
+
+func TestServerLocalRequestWithoutHandlerReturnsLocalUnavailable(t *testing.T) {
+	server, _ := newLocalControlTestServer(t)
+	server.SetLocalControl("token", nil)
+	client, cleanup := startLocalControlTestConnection(t, server, net.ParseIP("127.0.0.1"))
+	defer cleanup()
+	writeLocalControlTestAuth(t, client, proto.ClientAuth{Role: "nodetray", Token: "token", Version: proto.ProtocolVersion})
+	if result := readDeleteTestMessage(t, client).(*proto.ClientAuthResult); !result.Accepted {
+		t.Fatalf("auth result = %#v", result)
+	}
+	if err := client.WriteFrame(proto.MsgLocalRequest, &proto.LocalRequest{RequestID: "status-2", Operation: proto.LocalOperationStatusGet}); err != nil {
+		t.Fatal(err)
+	}
+	response := readDeleteTestMessage(t, client).(*proto.LocalResponse)
+	if response.OK || response.ErrorCode != "local_unavailable" || response.RequestID != "status-2" {
+		t.Fatalf("local unavailable response = %#v", response)
+	}
+	if err := client.WriteFrame(proto.MsgPing, &proto.Ping{TS: 44}); err != nil {
+		t.Fatal(err)
+	}
+	if pong := readDeleteTestMessage(t, client).(*proto.Pong); pong.TS != 44 {
+		t.Fatalf("pong = %#v", pong)
+	}
+}
+
+func TestServerManagerCompatibilityAndShutdownAuthorization(t *testing.T) {
+	server, _ := newLocalControlTestServer(t)
+	server.SetLocalControl("token", nil)
+	server.phase2 = phase2HandlerFunc(func(task proto.Phase2Task, _ Sender) (proto.TaskAck, func()) {
+		return proto.TaskAck{TaskID: task.TaskID, Accepted: true, Reason: "accepted"}, nil
+	})
+	client, cleanup := startLocalControlTestConnection(t, server, net.ParseIP("127.0.0.1"))
+	defer cleanup()
+
+	sendManagerScanAndReadAck(t, client, "manager-before-auth")
+	if err := client.WriteFrame(proto.MsgPhase2Task, &proto.Phase2Task{TaskID: "manager-phase2"}); err != nil {
+		t.Fatal(err)
+	}
+	phase2Ack := readDeleteTestMessage(t, client).(*proto.TaskAck)
+	if !phase2Ack.Accepted || phase2Ack.TaskID != "manager-phase2" {
+		t.Fatalf("manager Phase2 ack = %#v", phase2Ack)
+	}
+	if err := client.WriteFrame(proto.MsgLocalRequest, &proto.LocalRequest{RequestID: "manager-local", Operation: proto.LocalOperationStatusGet}); err != nil {
+		t.Fatal(err)
+	}
+	response := readDeleteTestMessage(t, client).(*proto.LocalResponse)
+	if response.OK || response.ErrorCode != "unauthorized" {
+		t.Fatalf("unauthenticated local response = %#v", response)
+	}
+	if err := client.WriteFrame(proto.MsgShutdown, &proto.Shutdown{}); err != nil {
+		t.Fatal(err)
+	}
+	protocolError := readDeleteTestMessage(t, client).(*proto.Error)
+	if protocolError.Stage != "local" || protocolError.Msg != "unauthorized" {
+		t.Fatalf("unauthenticated shutdown response = %#v", protocolError)
+	}
+	sendManagerScanAndReadAck(t, client, "manager-after-denial")
+}
+
+func TestServerAuthenticatedRawShutdownIsUnsupported(t *testing.T) {
+	server, _ := newLocalControlTestServer(t)
+	server.SetLocalControl("token", nil)
+	client, cleanup := startLocalControlTestConnection(t, server, net.ParseIP("127.0.0.1"))
+	defer cleanup()
+	writeLocalControlTestAuth(t, client, proto.ClientAuth{Role: "nodetray", Token: "token", Version: proto.ProtocolVersion})
+	_ = readDeleteTestMessage(t, client).(*proto.ClientAuthResult)
+	if err := client.WriteFrame(proto.MsgShutdown, &proto.Shutdown{}); err != nil {
+		t.Fatal(err)
+	}
+	protocolError := readDeleteTestMessage(t, client).(*proto.Error)
+	if protocolError.Stage != "local" || protocolError.Msg != "unsupported_operation" {
+		t.Fatalf("authenticated shutdown response = %#v", protocolError)
+	}
+}
+
+func TestServerLocalResponseDoesNotLeakControlToken(t *testing.T) {
+	const token = "response-must-not-contain-this-token"
+	server, _ := newLocalControlTestServer(t)
+	server.SetLocalControl(token, localHandlerFunc(func(context.Context, proto.LocalRequest) proto.LocalResponse {
+		return proto.LocalResponse{RequestID: token, OK: true, ErrorCode: token, Payload: []byte(token)}
+	}))
+	client, cleanup := startLocalControlTestConnection(t, server, net.ParseIP("127.0.0.1"))
+	defer cleanup()
+	writeLocalControlTestAuth(t, client, proto.ClientAuth{Role: "nodetray", Token: token, Version: proto.ProtocolVersion})
+	_ = readDeleteTestMessage(t, client).(*proto.ClientAuthResult)
+	if err := client.WriteFrame(proto.MsgLocalRequest, &proto.LocalRequest{RequestID: "safe-id", Operation: proto.LocalOperationStatusGet}); err != nil {
+		t.Fatal(err)
+	}
+	response := readDeleteTestMessage(t, client).(*proto.LocalResponse)
+	encoded := response.RequestID + response.ErrorCode + string(response.Payload)
+	if strings.Contains(encoded, token) {
+		t.Fatalf("local response leaked control token: %#v", response)
+	}
+}
+
+func TestServerAllLocalResponseBranchesCleanControlTokenFromRequestID(t *testing.T) {
+	const token = "request-id-must-not-leak-this-token"
+	tests := []struct {
+		name         string
+		authenticate bool
+		operation    string
+		wantError    string
+	}{
+		{
+			name:      "unauthenticated",
+			operation: proto.LocalOperationStatusGet,
+			wantError: "unauthorized",
+		},
+		{
+			name:         "invalid request",
+			authenticate: true,
+			operation:    "local.invalid",
+			wantError:    proto.UnsupportedOperationErrorCode,
+		},
+		{
+			name:         "local unavailable",
+			authenticate: true,
+			operation:    proto.LocalOperationStatusGet,
+			wantError:    "local_unavailable",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server, _ := newLocalControlTestServer(t)
+			server.SetLocalControl(token, nil)
+			client, cleanup := startLocalControlTestConnection(t, server, net.ParseIP("127.0.0.1"))
+			defer cleanup()
+			if test.authenticate {
+				writeLocalControlTestAuth(t, client, proto.ClientAuth{
+					Role: "nodetray", Token: token, Version: proto.ProtocolVersion,
+				})
+				if result := readDeleteTestMessage(t, client).(*proto.ClientAuthResult); !result.Accepted {
+					t.Fatalf("auth result = %#v", result)
+				}
+			}
+			if err := client.WriteFrame(proto.MsgLocalRequest, &proto.LocalRequest{
+				RequestID: token, Operation: test.operation,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			response := readDeleteTestMessage(t, client).(*proto.LocalResponse)
+			if strings.Contains(response.RequestID, token) || response.ErrorCode != test.wantError {
+				t.Fatalf("local response = %#v, want cleaned request ID and error %q", response, test.wantError)
+			}
+		})
+	}
+}
+
 type recordingStatsProvider struct {
 	window int
 	report proto.StatsReport
@@ -932,6 +1233,87 @@ func (*typedNilDeleteHandler) Handle(
 	panic("typed-nil delete handler must not be called")
 }
 
+type localHandlerFunc func(context.Context, proto.LocalRequest) proto.LocalResponse
+
+func (fn localHandlerFunc) HandleLocal(
+	ctx context.Context,
+	request proto.LocalRequest,
+) proto.LocalResponse {
+	return fn(ctx, request)
+}
+
+type localControlTestConn struct {
+	net.Conn
+	remote net.Addr
+}
+
+func (connection localControlTestConn) RemoteAddr() net.Addr {
+	return connection.remote
+}
+
+func newLocalControlTestServer(t *testing.T) (*Server, *bytes.Buffer) {
+	t.Helper()
+	cfg := config.DefaultAgent()
+	cfg.MachineID = "machine-local-control"
+	cfg.Proto.HeartbeatS = 60
+	logs := &bytes.Buffer{}
+	server := NewServer(
+		cfg,
+		scanHandlerFunc(func(task proto.ScanTask, _ Sender) (proto.TaskAck, func()) {
+			return proto.TaskAck{TaskID: task.TaskID, Accepted: true, Reason: "accepted"}, nil
+		}),
+		slog.New(slog.NewJSONHandler(logs, nil)),
+	)
+	return server, logs
+}
+
+func startLocalControlTestConnection(
+	t *testing.T,
+	server *Server,
+	remoteIP net.IP,
+) (*proto.Conn, func()) {
+	t.Helper()
+	serverSide, clientSide := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		server.handleConn(context.Background(), localControlTestConn{
+			Conn:   serverSide,
+			remote: &net.TCPAddr{IP: remoteIP, Port: 43210},
+		})
+		close(done)
+	}()
+	client := proto.NewConn(clientSide)
+	if _, _, err := client.ReadFrame(); err != nil {
+		t.Fatalf("read Hello: %v", err)
+	}
+	return client, func() {
+		_ = client.Close()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Error("local control server goroutine did not exit")
+		}
+	}
+}
+
+func writeLocalControlTestAuth(t *testing.T, client *proto.Conn, auth proto.ClientAuth) {
+	t.Helper()
+	if err := client.WriteFrame(proto.MsgClientAuth, &auth); err != nil {
+		t.Fatalf("write ClientAuth: %v", err)
+	}
+}
+
+func sendManagerScanAndReadAck(t *testing.T, client *proto.Conn, taskID string) {
+	t.Helper()
+	if err := client.WriteFrame(proto.MsgScanTask, &proto.ScanTask{TaskID: taskID, Roots: []string{`D:\media`}, Phase: 1}); err != nil {
+		t.Fatal(err)
+	}
+	ack := readDeleteTestMessage(t, client).(*proto.TaskAck)
+	if !ack.Accepted || ack.TaskID != taskID {
+		t.Fatalf("manager scan ack = %#v", ack)
+	}
+}
+
 func newDeleteTestServer(t *testing.T) *Server {
 	t.Helper()
 	cfg := config.DefaultAgent()
@@ -992,6 +1374,12 @@ func readDeleteTestMessage(t *testing.T, client *proto.Conn) any {
 		t.Fatalf("decode message type=%d: %v", msgType, err)
 	}
 	return message
+}
+
+type filesystemBrowserFunc func(context.Context, proto.FilesystemBrowseRequest) proto.FilesystemBrowseResponse
+
+func (fn filesystemBrowserFunc) Browse(ctx context.Context, request proto.FilesystemBrowseRequest) proto.FilesystemBrowseResponse {
+	return fn(ctx, request)
 }
 
 func assertDeleteTestConnectionClosed(t *testing.T, client *proto.Conn) {

@@ -975,6 +975,71 @@ func TestForwarderAcceptsEmptyPartialReportAsUncertainSubset(t *testing.T) {
 	}
 }
 
+// Break caught: an ambiguous Helper response with OK=true and Uncertain=true
+// is persisted as deleted even though physical outcome is not certain.
+func TestForwarderUncertainSuccessDoesNotMarkDeleted(t *testing.T) {
+	path := `C:\inert\ambiguous.jpg`
+	dialer := newScriptedDialer(func(conn net.Conn) {
+		framed := proto.NewConn(conn)
+		if writeValidHello(framed) != nil {
+			return
+		}
+		chunk, err := readDeleteTask(framed)
+		if err != nil {
+			return
+		}
+		_ = framed.WriteFrame(proto.MsgDeleteReport, &proto.DeleteReport{
+			TaskID: chunk.TaskID, Seq: chunk.Seq, LastSeq: chunk.LastSeq,
+			Entries: []proto.DeleteResult{{Path: path, OK: true, Uncertain: true, ErrCode: proto.DeleteErrHelperLost}},
+		})
+	})
+	state := &recordingState{}
+	sender := &recordingSender{}
+	forwarder := newTestForwarder(dialer, state, sender, nil)
+	if err := forwarder.Handle(context.Background(), proto.DeleteTask{
+		TaskID: "task-uncertain-success", Entries: []string{path},
+	}, sender.Send); err != nil {
+		t.Fatal(err)
+	}
+	dialer.wait(t)
+	if state.callCount() != 0 {
+		t.Fatalf("uncertain result changed state: %#v", state.pathsByCall())
+	}
+}
+
+func TestForwarderExecuteReturnsPhysicalReportWithoutStateMutation(t *testing.T) {
+	path := `C:\inert\physical-only.jpg`
+	dialer := newScriptedDialer(func(conn net.Conn) {
+		framed := proto.NewConn(conn)
+		if writeValidHello(framed) != nil {
+			return
+		}
+		chunk, err := readDeleteTask(framed)
+		if err != nil {
+			return
+		}
+		_ = framed.WriteFrame(proto.MsgDeleteReport, &proto.DeleteReport{
+			TaskID: chunk.TaskID, Seq: chunk.Seq, LastSeq: chunk.LastSeq,
+			Entries: []proto.DeleteResult{{Path: path, OK: true}},
+		})
+	})
+	state := &recordingState{}
+	forwarder := newTestForwarder(dialer, state, &recordingSender{}, nil)
+	reports, err := forwarder.Execute(context.Background(), proto.DeleteTask{
+		TaskID: "physical-only", Entries: []string{path}, Confirmed: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dialer.wait(t)
+	if len(reports) != 1 || len(reports[0].Entries) != 1 || !reports[0].Entries[0].OK {
+		t.Fatalf("reports=%#v", reports)
+	}
+	if state.callCount() != 0 {
+		t.Fatalf("physical-only execution changed state: %#v", state.pathsByCall())
+	}
+}
+
 func TestForwarderOwnsStateSyncAnnotationsAtAgentBoundary(t *testing.T) {
 	localStateErr := errors.New("sqlite busy")
 	tests := []struct {
@@ -1019,7 +1084,7 @@ func TestForwarderOwnsStateSyncAnnotationsAtAgentBoundary(t *testing.T) {
 							{
 								Path:         chunk.Entries[0],
 								OK:           true,
-								Uncertain:    true,
+								Uncertain:    false,
 								StateSyncErr: "forged successful-item SQLite status",
 							},
 						},
@@ -1060,7 +1125,7 @@ func TestForwarderOwnsStateSyncAnnotationsAtAgentBoundary(t *testing.T) {
 				Total:     2,
 				OK:        1,
 				Failed:    1,
-				Uncertain: 1,
+				Uncertain: 0,
 			}); got != want {
 				t.Fatalf("stats = %+v, want %+v", got, want)
 			}
@@ -1071,7 +1136,7 @@ func TestForwarderOwnsStateSyncAnnotationsAtAgentBoundary(t *testing.T) {
 			failed := report.Entries[1]
 			if success.Path != paths[0] ||
 				!success.OK ||
-				!success.Uncertain {
+				success.Uncertain {
 				t.Fatalf("successful physical result changed: %+v", success)
 			}
 			if failed.Path != paths[1] ||

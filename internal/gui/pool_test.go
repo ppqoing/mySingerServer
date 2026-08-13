@@ -185,6 +185,49 @@ func TestPoolSetOnConnectReceivesAgentNotification(t *testing.T) {
 	}
 }
 
+func TestPoolSetOnDisconnectReceivesClaimedConnectionNotification(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		connection, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer connection.Close()
+		_ = proto.NewConn(connection).WriteFrame(proto.MsgHello, &proto.Hello{
+			Version: proto.ProtocolVersion, MachineID: machineA,
+		})
+	}()
+
+	disconnected := make(chan string, 1)
+	pool := NewPool([]config.AgentEndpoint{{Addr: listener.Addr().String()}}, testLogger(), nil)
+	pool.SetOnDisconnect(func(machineID string) {
+		disconnected <- machineID
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pool.Start(ctx, time.Minute)
+	select {
+	case machineID := <-disconnected:
+		if machineID != machineA {
+			t.Fatalf("disconnected machine=%q", machineID)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("claimed connection did not notify disconnect")
+	}
+	pool.StopReconnects()
+	select {
+	case <-serverDone:
+	case <-time.After(time.Second):
+		t.Fatal("server did not finish")
+	}
+}
+
 func TestPoolIdentityClaimConflictReleaseAndLateRelease(t *testing.T) {
 	pool := NewPool([]config.AgentEndpoint{
 		{Addr: "127.0.0.1:9101"},

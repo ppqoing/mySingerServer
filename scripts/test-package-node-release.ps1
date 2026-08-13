@@ -25,6 +25,29 @@ function Write-Utf8NoBom {
         [Text.UTF8Encoding]::new($false))
 }
 
+function Test-ContainsSensitiveConfigKey {
+    param([object]$Value)
+    if ($null -eq $Value -or $Value -is [string]) { return $false }
+    if ($Value -is [Collections.IDictionary]) {
+        foreach ($key in $Value.Keys) {
+            if ([string]$key -match '(?i)(machine[_-]?id|token|secret|credential|password|passwd|pwd)') { return $true }
+            if (Test-ContainsSensitiveConfigKey -Value $Value[$key]) { return $true }
+        }
+        return $false
+    }
+    if ($Value -is [Collections.IEnumerable]) {
+        foreach ($item in $Value) {
+            if (Test-ContainsSensitiveConfigKey -Value $item) { return $true }
+        }
+        return $false
+    }
+    foreach ($property in $Value.PSObject.Properties) {
+        if ($property.Name -match '(?i)(machine[_-]?id|token|secret|credential|password|passwd|pwd)') { return $true }
+        if (Test-ContainsSensitiveConfigKey -Value $property.Value) { return $true }
+    }
+    return $false
+}
+
 $testRoot = Join-Path $repo (
     '.tmp\test-package-node-release-{0}' -f [Guid]::NewGuid().ToString('N'))
 $stage = Join-Path $testRoot 'full-stage'
@@ -38,16 +61,23 @@ try {
             'agent.exe',
             'worker.exe',
             'helper.exe',
+            'Everything.exe',
             'Everything64.dll',
             'MicrosoftEdgeWebview2Setup.exe',
             'videocore.dll',
             'avcodec-fixture.dll')) {
         Write-Utf8NoBom -Path (Join-Path $stage $name) -Value "fixture:$name"
     }
-    Copy-Item -LiteralPath (Join-Path $repo 'deploy\agent.example.json') `
-        -Destination (Join-Path $stage 'agent.example.json')
-    Copy-Item -LiteralPath (Join-Path $repo 'deploy\helper.example.json') `
-        -Destination (Join-Path $stage 'helper.example.json')
+    $licenses = Join-Path $stage 'licenses'
+    New-Item -ItemType Directory -Path $licenses | Out-Null
+    Write-Utf8NoBom -Path (Join-Path $licenses 'everything-LICENSE.txt') `
+        -Value 'fixture:everything-license'
+    Write-Utf8NoBom -Path (Join-Path $licenses 'everything-NOTICE.md') `
+        -Value 'fixture:everything-notice'
+    foreach ($name in @('agent.default.json', 'nodetray.default.json', 'helper.default.json')) {
+        Copy-Item -LiteralPath (Join-Path $repo (Join-Path 'deploy' $name)) `
+            -Destination (Join-Path $stage $name)
+    }
 
     # A full build contains center/config files. The node package must ignore them.
     foreach ($name in @('gui.exe', 'agent.json', 'helper.json', 'gui.json')) {
@@ -82,15 +112,15 @@ try {
         -BuildDate '2026-08-03' `
         -SourceRevision 'N/A_NO_GIT_METADATA'
 
-    $zipName = 'MySingerServer-node-win-x64-contract-test.zip'
+    $zipName = 'MySingerServer-compute-win-x64-contract-test.zip'
     $zipPath = Join-Path $output $zipName
     $sidecarPath = "$zipPath.sha256"
     Assert-True (Test-Path -LiteralPath $zipPath -PathType Leaf) 'ZIP was not created'
     Assert-True (Test-Path -LiteralPath $sidecarPath -PathType Leaf) 'ZIP SHA-256 sidecar was not created'
 
     Expand-Archive -LiteralPath $zipPath -DestinationPath $extract
-    $payloadRoot = Join-Path $extract 'MySingerServer'
-    Assert-True (Test-Path -LiteralPath $payloadRoot -PathType Container) 'ZIP lacks MySingerServer top-level directory'
+    $payloadRoot = Join-Path $extract 'MySingerServer-Compute'
+    Assert-True (Test-Path -LiteralPath $payloadRoot -PathType Container) 'ZIP lacks MySingerServer-Compute top-level directory'
     $topLevel = @(Get-ChildItem -LiteralPath $extract -Force)
     Assert-True ($topLevel.Count -eq 1 -and $topLevel[0].PSIsContainer) 'ZIP must contain exactly one top-level directory'
 
@@ -102,16 +132,21 @@ try {
             Sort-Object
     )
     $expectedFiles = @(
+        'Everything.exe',
         'Everything64.dll',
         'MicrosoftEdgeWebview2Setup.exe',
         'README-节点部署.md',
-        'agent.example.json',
+        'Start-Compute.ps1',
+        'data/agent/agent.json',
         'agent.exe',
         'avcodec-fixture.dll',
-        'helper.example.json',
+        'data/nodetray/tray.json',
+        'data/helper/helper.json',
         'helper.exe',
         'licenses/ffmpeg-LICENSE.txt',
         'licenses/ffmpeg-NOTICE.md',
+        'licenses/everything-LICENSE.txt',
+        'licenses/everything-NOTICE.md',
         'licenses/webview2-NOTICE.md',
         'native-dependencies.json',
         'nodetray.exe',
@@ -122,15 +157,38 @@ try {
     $difference = @(Compare-Object -ReferenceObject $expectedFiles -DifferenceObject $actualFiles)
     Assert-True ($difference.Count -eq 0) (
         'ZIP file list differs: ' + (($difference | Out-String).Trim()))
+    $agent = Get-Content -Raw -LiteralPath (Join-Path $payloadRoot 'data\agent\agent.json') | ConvertFrom-Json
+    Assert-True ([string]$agent.data_dir -ceq './data/agent') 'unsafe Agent data root'
+    Assert-True ($null -ne $agent.worker -and [int]$agent.worker.image_memory_mb -eq 256) 'Worker defaults missing'
+    Assert-True ([string]$agent.worker.exe_path -ceq '') 'Worker path must resolve beside agent.exe'
+    Assert-True (-not (Test-ContainsSensitiveConfigKey -Value $agent)) `
+        'Agent default must not contain machine_id, token, secret, credential, or password keys'
+    $tray = Get-Content -Raw -LiteralPath (Join-Path $payloadRoot 'data\nodetray\tray.json') | ConvertFrom-Json
+    Assert-True (-not [bool]$tray.helperEnabled -and [string]$tray.agentStartMode -ceq 'automatic') `
+        'Compute package must auto-start Agent so NodeTray can reach the packaged Agent configuration'
+    $helper = Get-Content -Raw -LiteralPath (Join-Path $payloadRoot 'data\helper\helper.json') | ConvertFrom-Json
+    Assert-True (@($helper.allowed_roots).Count -eq 0) 'Helper default must not authorize a root'
+    Assert-True (-not [bool]$helper.allow_hard_delete -and [string]$helper.log_dir -ceq '') `
+        'Helper default must not enable hard deletion or logging'
 
-    foreach ($forbidden in @('gui.exe', 'agent.json', 'helper.json', 'gui.json')) {
+    foreach ($forbidden in @(
+            'gui.exe',
+            'agent.json',
+            'helper.json',
+            'gui.json',
+            'gui.example.json',
+            'Start-Manager.ps1')) {
         Assert-True (-not ($actualFiles -contains $forbidden)) "forbidden file shipped: $forbidden"
+    }
+    foreach ($forbidden in @('data/agent/agent.db', 'data/agent/local-control.token')) {
+        Assert-True (-not ($actualFiles -contains $forbidden)) "runtime secret/state shipped: $forbidden"
     }
 
     $releaseManifest = Get-Content -Raw -LiteralPath (
         Join-Path $payloadRoot 'release-manifest.json') | ConvertFrom-Json
-    Assert-True ($releaseManifest.release_kind -ceq 'media-node-minimal') 'wrong release kind'
-    Assert-True ($releaseManifest.install_root -ceq 'C:\Program Files\MySingerServer\') 'wrong fixed install root'
+    Assert-True ($releaseManifest.release_kind -ceq 'compute-node-portable') 'wrong release kind'
+    Assert-True ($releaseManifest.portable_root -ceq '.') 'wrong portable root'
+    Assert-True ($null -eq $releaseManifest.PSObject.Properties['install_root']) 'fixed install root must not be present'
     Assert-True ($releaseManifest.helper.default_enabled -eq $false) 'Helper must be disabled by default'
     Assert-True ($releaseManifest.helper.requires_administrator -eq $true) 'Helper must record its administrator requirement'
     Assert-True ($releaseManifest.source_revision -ceq 'N/A_NO_GIT_METADATA') 'wrong source revision marker'
@@ -166,9 +224,9 @@ try {
     $credentialStage = Join-Path $testRoot 'credential-stage'
     Copy-Item -LiteralPath $stage -Destination $credentialStage -Recurse
     $credentialAgent = Get-Content -Raw -LiteralPath (
-        Join-Path $credentialStage 'agent.example.json') | ConvertFrom-Json
+        Join-Path $credentialStage 'agent.default.json') | ConvertFrom-Json
     $credentialAgent.pg_dsn = 'postgres://dedup:real-secret@127.0.0.1:5432/dedup'
-    Write-Utf8NoBom -Path (Join-Path $credentialStage 'agent.example.json') `
+    Write-Utf8NoBom -Path (Join-Path $credentialStage 'agent.default.json') `
         -Value (($credentialAgent | ConvertTo-Json -Depth 8) + [Environment]::NewLine)
     $credentialRejected = $false
     try {
@@ -188,14 +246,40 @@ try {
         $WarningPreference = $oldWarningPreference
     }
     Assert-True $credentialRejected `
-        'password-bearing PostgreSQL example DSN was accepted'
+        'password-bearing PostgreSQL default DSN was accepted'
+
+    foreach ($sensitiveCase in @(
+            [ordered]@{ name = 'machine-id'; mutate = { param($config) $config | Add-Member -NotePropertyName 'machine_id' -NotePropertyValue 'node-sensitive' } },
+            [ordered]@{ name = 'nested-token'; mutate = { param($config) $config.worker | Add-Member -NotePropertyName 'Access_Token' -NotePropertyValue 'sensitive-token' } },
+            [ordered]@{ name = 'array-secret'; mutate = { param($config) $config.scan.image_exts = @([pscustomobject]@{ SeCrEt = 'sensitive-secret' }) } })) {
+        $sensitiveStage = Join-Path $testRoot ("sensitive-{0}-stage" -f $sensitiveCase.name)
+        Copy-Item -LiteralPath $stage -Destination $sensitiveStage -Recurse
+        $sensitiveAgent = Get-Content -Raw -LiteralPath (Join-Path $sensitiveStage 'agent.default.json') | ConvertFrom-Json
+        & $sensitiveCase.mutate $sensitiveAgent
+        Write-Utf8NoBom -Path (Join-Path $sensitiveStage 'agent.default.json') `
+            -Value (($sensitiveAgent | ConvertTo-Json -Depth 8) + [Environment]::NewLine)
+        $sensitiveRejected = $false
+        try {
+            $oldWarningPreference = $WarningPreference
+            $WarningPreference = 'SilentlyContinue'
+            & $packageScript -StageDir $sensitiveStage `
+                -OutputDir (Join-Path $testRoot ("sensitive-{0}-release" -f $sensitiveCase.name)) `
+                -ReleaseId ("sensitive-{0}" -f $sensitiveCase.name) `
+                -BuildDate '2026-08-03'
+        } catch {
+            $sensitiveRejected = $_.Exception.Message -match 'NODE_RELEASE_SENSITIVE_CONFIG'
+        } finally {
+            $WarningPreference = $oldWarningPreference
+        }
+        Assert-True $sensitiveRejected ("sensitive agent default was accepted: {0}" -f $sensitiveCase.name)
+    }
 
     $helperRootStage = Join-Path $testRoot 'helper-root-stage'
     Copy-Item -LiteralPath $stage -Destination $helperRootStage -Recurse
     $helperRootConfig = Get-Content -Raw -LiteralPath (
-        Join-Path $helperRootStage 'helper.example.json') | ConvertFrom-Json
+        Join-Path $helperRootStage 'helper.default.json') | ConvertFrom-Json
     $helperRootConfig.allowed_roots = @('I:\tmp')
-    Write-Utf8NoBom -Path (Join-Path $helperRootStage 'helper.example.json') `
+    Write-Utf8NoBom -Path (Join-Path $helperRootStage 'helper.default.json') `
         -Value (($helperRootConfig | ConvertTo-Json -Depth 8) + [Environment]::NewLine)
     $helperRootRejected = $false
     try {
@@ -215,7 +299,7 @@ try {
         $WarningPreference = $oldWarningPreference
     }
     Assert-True $helperRootRejected `
-        'Helper example with a live allowed_roots path was accepted'
+        'Helper default with a live allowed_roots path was accepted'
 
     Write-Host "NODE RELEASE PACKAGE CONTRACT PASS files=$($actualFiles.Count)"
 }

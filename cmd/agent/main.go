@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -8,24 +9,38 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
+	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"dedup/internal/agent"
 	agentdelete "dedup/internal/agent/delete"
-	"dedup/internal/agentcontrol"
+	"dedup/internal/agentinstance"
 	"dedup/internal/config"
 	fileenum "dedup/internal/enum"
+	"dedup/internal/firstscreen"
+	"dedup/internal/localanalysis"
+	"dedup/internal/localcontrol"
+	"dedup/internal/localdelete"
+	"dedup/internal/localpreview"
+	"dedup/internal/localreview"
+	"dedup/internal/localtask"
 	"dedup/internal/machineid"
 	"dedup/internal/nodectl"
+	"dedup/internal/proto"
+	"dedup/internal/securefile"
 	"dedup/internal/stats"
 	"dedup/internal/store"
 	"dedup/internal/syncer"
@@ -50,6 +65,78 @@ type deleteLoggerFactory func(
 ) (*slog.Logger, func() error, error)
 
 type machineIdentityProvider func() (machineid.Result, error)
+
+type filesystemBrowserSetter interface {
+	SetFilesystemBrowser(agent.FilesystemBrowser)
+}
+
+type filesystemBrowserFactory func() agent.FilesystemBrowser
+
+func setAgentFilesystemBrowser(server filesystemBrowserSetter, newBrowser filesystemBrowserFactory) {
+	server.SetFilesystemBrowser(newBrowser())
+}
+
+type agentEnumeratorOptions struct {
+	Enabled     bool
+	Primary     fileenum.Enumerator
+	Fallback    fileenum.Enumerator
+	StartClient func() error
+	Poll        func(context.Context) error
+	Logger      *slog.Logger
+}
+
+func newAgentEnumerator(
+	ctx context.Context,
+	options agentEnumeratorOptions,
+) fileenum.Enumerator {
+	if !options.Enabled {
+		return fileenum.WalkerEnumerator{}
+	}
+	if options.Fallback == nil {
+		options.Fallback = fileenum.WalkerEnumerator{}
+	}
+	if options.Logger == nil {
+		options.Logger = slog.Default()
+	}
+
+	var waitingMu sync.Mutex
+	var lastWaitingLog time.Time
+	enumerator := fileenum.NewAutoStartEnumerator(fileenum.AutoStartOptions{
+		Context:     ctx,
+		Primary:     options.Primary,
+		Fallback:    options.Fallback,
+		StartClient: options.StartClient,
+		Poll:        options.Poll,
+		OnWaiting: func(err error) {
+			waitingMu.Lock()
+			defer waitingMu.Unlock()
+			now := time.Now()
+			if !lastWaitingLog.IsZero() && now.Sub(lastWaitingLog) < 30*time.Second {
+				return
+			}
+			lastWaitingLog = now
+			options.Logger.Info("waiting for everything index", "err", err)
+		},
+		OnFallback: func(err error) {
+			options.Logger.Warn(
+				"everything unavailable, fallback to walker",
+				"err", err,
+			)
+		},
+		OnReady: func() {
+			options.Logger.Info("everything enumerator ready")
+		},
+		OnRootFallback: func(root string, cause error) {
+			logEverythingRootFallback(options.Logger, root, cause)
+		},
+	})
+	enumerator.Start()
+	return enumerator
+}
+
+func logEverythingRootFallback(logger *slog.Logger, root string, _ error) {
+	logger.Warn("everything root unavailable, fallback to walker", "path_id", worker.PathID(root), "error_code", "everything_root_fallback")
+}
 
 func runWithDeleteLogger(
 	configPath string,
@@ -86,7 +173,7 @@ func runWithDependencies(
 	if err := validateAgentControlIdentity(cfg, executablePath); err != nil {
 		return err
 	}
-	instance, err := agentcontrol.AcquireSingleInstance(cfg.MachineID)
+	instance, err := agentinstance.AcquireSingleInstance(cfg.MachineID)
 	if err != nil {
 		return fmt.Errorf("acquire Agent single-instance lock: %w", err)
 	}
@@ -96,6 +183,11 @@ func runWithDependencies(
 		return fmt.Errorf("fingerprint effective config: %w", err)
 	}
 	startedAt := time.Now()
+	portableRoot := filepath.Dir(executablePath)
+	controlToken, err := (localcontrol.FileTokenStore{}).LoadOrCreate(localcontrol.TokenPath(portableRoot))
+	if err != nil {
+		return fmt.Errorf("load local control token: %w", err)
+	}
 	logger, errorLogger, closeLogs, err := agent.NewLoggers(cfg.DataDir, os.Stdout)
 	if err != nil {
 		return fmt.Errorf("open logs: %w", err)
@@ -129,48 +221,30 @@ func runWithDependencies(
 		crashLogger,
 	)
 
-	var enumerator fileenum.Enumerator = fileenum.WalkerEnumerator{}
-	if cfg.UseEverything {
-		everything := fileenum.NewEverythingEnumerator()
-		if err := everything.Available(); err != nil {
-			logger.Warn("everything unavailable, fallback to walker", "err", err)
-		} else {
-			enumerator = fileenum.NewResilientEnumerator(
-				everything,
-				fileenum.WalkerEnumerator{},
-				func(root string, cause error) {
-					logger.Warn(
-						"everything root unavailable, fallback to walker",
-						"root", root,
-						"err", cause,
-					)
-				},
-			)
-		}
-	}
-	logger.Info("enumerator ready", "name", enumerator.Name())
-
-	pg, err := pgxpool.New(context.Background(), cfg.PGDSN)
-	if err != nil {
-		return fmt.Errorf("parse postgres DSN: %w", err)
-	}
-	defer pg.Close()
-	syncHealth := newSyncHealthState()
-	pingContext, cancelPing := context.WithTimeout(context.Background(), 5*time.Second)
-	if err := pg.Ping(pingContext); err != nil {
-		logger.Warn("postgres unreachable at startup, syncer will retry", "err", err)
-		syncHealth.set(false, err.Error())
-	} else {
-		syncHealth.set(true, "")
-	}
-	cancelPing()
-
 	ctx, stop := signal.NotifyContext(
 		context.Background(),
 		os.Interrupt,
 		syscall.SIGTERM,
 	)
 	defer stop()
+	everythingPath := filepath.Join(filepath.Dir(executablePath), "Everything.exe")
+	enumerator := newAgentEnumerator(ctx, agentEnumeratorOptions{
+		Enabled:  cfg.UseEverything,
+		Primary:  fileenum.NewEverythingEnumerator(),
+		Fallback: fileenum.WalkerEnumerator{},
+		StartClient: func() error {
+			return fileenum.StartEverythingClientAt(everythingPath)
+		},
+		Logger: logger,
+	})
+	logger.Info("enumerator configured", "name", enumerator.Name())
+
+	syncHealth := newSyncHealthState()
+	pg := initializePostgres(context.Background(), cfg.PGDSN, syncHealth, logger)
+	if pg != nil {
+		defer pg.Close()
+	}
+
 	var statistics *stats.Collector
 	var statsSink *stats.JSONLSink
 	if cfg.Tuning.StatsEnabled {
@@ -193,23 +267,26 @@ func runWithDependencies(
 			logger.Warn("start pprof failed", "err", err)
 		}
 	}
-	uploader := syncer.New(local, pg, syncer.Config{
-		Interval:    cfg.SyncInterval(),
-		TriggerRows: int64(cfg.Sync.TriggerRows),
-		UpsertBatch: cfg.Sync.UpsertBatch,
-		OnHealth: func(update syncer.HealthUpdate) {
-			syncHealth.set(update.Healthy, update.ErrorSummary)
-		},
-	}, logger)
-	go uploader.Run(ctx)
+	if pg != nil {
+		uploader := syncer.New(local, pg, syncer.Config{
+			Interval:    cfg.SyncInterval(),
+			TriggerRows: int64(cfg.Sync.TriggerRows),
+			UpsertBatch: cfg.Sync.UpsertBatch,
+			OnHealth: func(update syncer.HealthUpdate) {
+				syncHealth.set(update.Healthy, update.ErrorSummary)
+			},
+		}, logger)
+		go uploader.Run(ctx)
+	}
 
-	router := agent.NewPoolRouter(workerPool, logger)
+	fairPool := localtask.NewFairScheduler(workerPool)
+	router := agent.NewPoolRouter(fairPool, logger)
 	scans := agent.NewScanManagerWithPoolRouter(
 		cfg,
 		local,
 		enumerator,
 		agent.GoHasher{},
-		workerPool,
+		fairPool,
 		router,
 		logger,
 		errorLogger,
@@ -220,11 +297,21 @@ func runWithDependencies(
 	phase2 := agent.NewPhase2ManagerWithRuntime(
 		cfg.MachineID,
 		local,
-		workerPool,
+		fairPool,
 		router,
 		nil,
 		logger,
 	)
+	stageOne := localanalysis.NewStageOne(local, local, firstscreen.DefaultConfig(), logger)
+	stageWorker := agent.NewLocalStageWorker(fairPool, router)
+	analysisEngine := localanalysis.NewEngine(cfg.MachineID, stageOne, local, stageWorker, config.DefaultGUI().Phase2)
+	tasks := localtask.NewService(cfg.MachineID, local, &agentLocalTaskRunner{scans: scans, analysis: analysisEngine})
+	reviews := localreview.NewService(cfg.MachineID, local)
+	previews := localpreview.NewService(cfg.MachineID, local, stageWorker)
+	resumeLocalTasks, err := prepareLocalTaskLifecycle(ctx, tasks, logger)
+	if err != nil {
+		return fmt.Errorf("prepare local task recovery: %w", err)
+	}
 	dialer := agentdelete.NewPipeDialer(cfg.Delete.PipeName)
 	forwarder := buildDeleteForwarder(
 		cfg,
@@ -233,8 +320,9 @@ func runWithDependencies(
 		deleteLogger,
 		logger,
 	)
+	deletes := localdelete.NewService(cfg.MachineID, local, forwarder)
 	var listenerReady atomic.Bool
-	provider := agentcontrol.NewProvider(agentcontrol.Inputs{
+	provider := newAgentStatusProvider(agentStatusInputs{
 		MachineID:      cfg.MachineID,
 		ExecutablePath: executablePath,
 		ConfigSHA256:   configSHA256,
@@ -243,20 +331,27 @@ func runWithDependencies(
 		Workers:        workerPool,
 		SyncHealth:     syncHealth.snapshot,
 	})
-	controlService := agentcontrol.New(provider, nodectl.ShutdownFunc(stop))
-	return runControlledService(
-		ctx,
-		stop,
+	localHandler := newAgentLocalHandler(agentLocalHandlerInputs{
+		Status: provider.ControlStatus, Shutdown: stop,
+		ConfigPath: configPath, ExecutablePath: executablePath, CPUCount: runtime.NumCPU(),
+		EffectiveConfigSHA256: configSHA256,
+		Tasks:                 agent.NewLocalTaskHandler(tasks),
+		Results:               agent.NewLocalResultHandler(reviews, previews),
+		Deletes:               agent.NewLocalDeleteHandler(deletes),
+	})
+	return runService(
 		workerPool,
-		func(ctx context.Context, ready func()) error {
+		func() error {
 			businessLogger := slog.New(&listenerReadyHandler{
 				next: logger.Handler(),
 				ready: func() {
 					listenerReady.Store(true)
-					ready()
+					resumeLocalTasks()
 				},
 			})
 			server := agent.NewServer(cfg, scans, businessLogger, phase2)
+			setAgentFilesystemBrowser(server, agent.NewFilesystemBrowser)
+			server.SetLocalControl(controlToken, localHandler)
 			if statistics != nil {
 				server.SetStatsProvider(statistics)
 			}
@@ -267,8 +362,12 @@ func runWithDependencies(
 			}
 			return nil
 		},
-		controlService.Run,
 		func() error { return drainPhase2(phase2, phase2DrainTimeout(cfg)) },
+		func() error {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), phase2DrainTimeout(cfg))
+			defer cancel()
+			return fairPool.Shutdown(shutdownCtx)
+		},
 	)
 }
 
@@ -288,7 +387,7 @@ func buildDeleteForwarder(
 	state agentdelete.StateStore,
 	deleteLogger *slog.Logger,
 	logger *slog.Logger,
-) agent.DeleteHandler {
+) *agentdelete.Forwarder {
 	return agentdelete.NewForwarder(
 		cfg.MachineID,
 		cfg.Delete,
@@ -319,88 +418,50 @@ func drainPhase2(manager phase2Shutdowner, timeout time.Duration) error {
 	return manager.Shutdown(ctx)
 }
 
+func initializePostgres(ctx context.Context, dsn string, health *syncHealthState, logger *slog.Logger) *pgxpool.Pool {
+	if strings.TrimSpace(dsn) == "" {
+		health.set(false, "sync_not_configured")
+		return nil
+	}
+	pg, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		health.set(false, "postgres_config_invalid")
+		if logger != nil {
+			logger.Warn("postgres initialization degraded", "error_code", "postgres_config_invalid")
+		}
+		return nil
+	}
+	health.set(false, "sync_pending")
+	return pg
+}
+
+type localTaskLifecycle interface {
+	PrepareRecovery(context.Context) error
+	Resume(context.Context) error
+}
+
+func prepareLocalTaskLifecycle(ctx context.Context, tasks localTaskLifecycle, logger *slog.Logger) (func(), error) {
+	if tasks == nil {
+		return nil, errors.New("local task lifecycle is required")
+	}
+	if err := tasks.PrepareRecovery(ctx); err != nil {
+		return nil, err
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			go func() {
+				if err := tasks.Resume(ctx); err != nil && logger != nil {
+					logger.Error("resume local tasks failed", "err", safeAgentSummary(err.Error()))
+				}
+			}()
+		})
+	}, nil
+}
+
 type managedPool interface {
 	Start()
 	Close()
-}
-
-type contextualService func(context.Context, func()) error
-
-func runControlledService(
-	ctx context.Context,
-	cancel context.CancelFunc,
-	pool managedPool,
-	business contextualService,
-	control func(context.Context) error,
-	drain ...func() error,
-) error {
-	pool.Start()
-	defer pool.Close()
-
-	ready := make(chan struct{})
-	var readyOnce sync.Once
-	businessResult := make(chan error, 1)
-	go func() {
-		businessResult <- business(ctx, func() { readyOnce.Do(func() { close(ready) }) })
-	}()
-
-	var primary error
-	businessDone := false
-	controlDone := false
-	controlStarted := false
-	controlResult := make(chan error, 1)
-	select {
-	case <-ctx.Done():
-	case err := <-businessResult:
-		businessDone = true
-		primary = unexpectedServiceExit("business", err, ctx)
-	case <-ready:
-		controlStarted = true
-		go func() { controlResult <- control(ctx) }()
-	}
-
-	if controlStarted && primary == nil && ctx.Err() == nil {
-		select {
-		case <-ctx.Done():
-		case err := <-businessResult:
-			businessDone = true
-			primary = unexpectedServiceExit("business", err, ctx)
-		case err := <-controlResult:
-			controlDone = true
-			primary = unexpectedServiceExit("control", err, ctx)
-		}
-	}
-	cancel()
-	if !businessDone {
-		<-businessResult
-	}
-	if controlStarted && !controlDone {
-		<-controlResult
-	}
-
-	var drainErr error
-	for _, wait := range drain {
-		if wait == nil {
-			continue
-		}
-		if err := wait(); err != nil && drainErr == nil {
-			drainErr = err
-		}
-	}
-	if primary != nil {
-		return primary
-	}
-	return drainErr
-}
-
-func unexpectedServiceExit(name string, err error, root context.Context) error {
-	if root.Err() != nil && (err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
-		return nil
-	}
-	if err == nil {
-		return fmt.Errorf("%s service exited unexpectedly", name)
-	}
-	return fmt.Errorf("%s service exited: %w", name, err)
 }
 
 func runService(
@@ -479,10 +540,337 @@ func (s *syncHealthState) set(healthy bool, summary string) {
 	s.mu.Unlock()
 }
 
-func (s *syncHealthState) snapshot() agentcontrol.SyncHealth {
+func (s *syncHealthState) snapshot() agentSyncHealth {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return agentcontrol.SyncHealth{Healthy: s.healthy, ErrorSummary: s.error}
+	return agentSyncHealth{Healthy: s.healthy, ErrorSummary: s.error}
+}
+
+const maxReportedWorkers = 1024
+
+var (
+	mediaPathSummary = regexp.MustCompile(`(?i)(?:[a-z]:\\|/)[^\r\n]*?\.(?:mp4|mkv|avi|mov|wmv|flv|webm|mp3|wav|flac|m4a|aac|jpg|jpeg|png|gif|webp|bmp|tif|tiff)(?:\b|$)`)
+	envSummary       = regexp.MustCompile(`(?i)\benv(?:ironment)?\s*[:=]\s*[^[:space:],;}\]]+`)
+)
+
+type agentStatusInputs struct {
+	MachineID      string
+	ExecutablePath string
+	ConfigSHA256   string
+	StartedAt      time.Time
+	ListenerReady  func() bool
+	Workers        interface{ RuntimeSnapshot() worker.RuntimeSnapshot }
+	SyncHealth     func() agentSyncHealth
+}
+
+type agentSyncHealth struct {
+	Healthy      bool
+	ErrorSummary string
+}
+
+type agentStatusProvider struct{ inputs agentStatusInputs }
+
+func newAgentStatusProvider(inputs agentStatusInputs) *agentStatusProvider {
+	return &agentStatusProvider{inputs: inputs}
+}
+
+func (p *agentStatusProvider) ControlStatus() nodectl.Status {
+	serviceReady := p != nil && p.inputs.ListenerReady != nil && p.inputs.ListenerReady()
+	var runtimeSnapshot worker.RuntimeSnapshot
+	if p != nil && p.inputs.Workers != nil {
+		runtimeSnapshot = p.inputs.Workers.RuntimeSnapshot()
+	}
+	expected := runtimeSnapshot.Expected
+	if expected < 0 {
+		expected = 0
+	}
+	if expected > maxReportedWorkers {
+		expected = maxReportedWorkers
+	}
+	mapped := make([]nodectl.WorkerStatus, expected)
+	for index := range mapped {
+		mapped[index].Index = index
+	}
+	for _, source := range runtimeSnapshot.Workers {
+		if source.Index < 0 || source.Index >= expected {
+			continue
+		}
+		pid := source.PID
+		if pid < 0 {
+			pid = 0
+		}
+		mapped[source.Index] = nodectl.WorkerStatus{
+			Index: source.Index, PID: pid, Ready: source.Ready,
+			CurrentTaskSummary: boundedAgentSummary(source.CurrentTaskSummary, 96),
+			LastErrorSummary:   boundedAgentSummary(source.LastErrorSummary, 192),
+		}
+	}
+	ready := 0
+	for _, status := range mapped {
+		if status.Ready {
+			ready++
+		}
+	}
+	syncHealth := agentSyncHealth{}
+	if p != nil && p.inputs.SyncHealth != nil {
+		syncHealth = p.inputs.SyncHealth()
+	}
+	fullyReady := serviceReady && ready == expected
+	lifecycle := "starting"
+	if fullyReady {
+		lifecycle = "running"
+	}
+	return nodectl.Status{
+		Component: nodectl.ComponentAgent, MachineID: p.inputs.MachineID, PID: os.Getpid(),
+		StartedAtUnixMS: p.inputs.StartedAt.UnixMilli(), ExecutablePath: p.inputs.ExecutablePath,
+		ConfigSHA256: strings.ToLower(p.inputs.ConfigSHA256), Lifecycle: lifecycle,
+		ServiceReady: serviceReady, Ready: fullyReady,
+		WorkerExpected: expected, WorkerReady: ready, Workers: mapped,
+		SyncHealthy: syncHealth.Healthy, SyncErrorSummary: safeAgentSummary(syncHealth.ErrorSummary),
+		LastErrorSummary: safeAgentSummary(runtimeSnapshot.LastErrorSummary),
+	}
+}
+
+func safeAgentSummary(value string) string {
+	value = nodectl.SanitizeSummary(value)
+	value = mediaPathSummary.ReplaceAllString(value, "[REDACTED_PATH]")
+	value = envSummary.ReplaceAllString(value, "env=[REDACTED]")
+	return nodectl.SanitizeSummary(value)
+}
+
+func boundedAgentSummary(value string, maxBytes int) string {
+	value = safeAgentSummary(value)
+	if len(value) <= maxBytes {
+		return value
+	}
+	value = value[:maxBytes]
+	for !utf8.ValidString(value) {
+		value = value[:len(value)-1]
+	}
+	return value
+}
+
+type agentLocalHandlerInputs struct {
+	Status                func() nodectl.Status
+	Shutdown              context.CancelFunc
+	ShutdownDelay         time.Duration
+	ConfigPath            string
+	ExecutablePath        string
+	CPUCount              int
+	EffectiveConfigSHA256 string
+	Tasks                 agent.LocalHandler
+	Results               agent.LocalHandler
+	Deletes               agent.LocalHandler
+}
+
+type agentLocalHandler struct {
+	inputs agentLocalHandlerInputs
+	mu     sync.Mutex
+	once   sync.Once
+}
+
+func newAgentLocalHandler(inputs agentLocalHandlerInputs) *agentLocalHandler {
+	if inputs.ShutdownDelay <= 0 {
+		inputs.ShutdownDelay = 25 * time.Millisecond
+	}
+	return &agentLocalHandler{inputs: inputs}
+}
+
+func (h *agentLocalHandler) HandleLocal(ctx context.Context, request proto.LocalRequest) proto.LocalResponse {
+	if h == nil || ctx == nil || ctx.Err() != nil {
+		return localAgentFailure(request.RequestID, "local_unavailable")
+	}
+	switch request.Operation {
+	case proto.LocalOperationStatusGet:
+		if h.inputs.Status == nil {
+			return localAgentFailure(request.RequestID, "status_unavailable")
+		}
+		status := h.inputs.Status()
+		if err := status.Validate(); err != nil {
+			return localAgentFailure(request.RequestID, "status_unavailable")
+		}
+		return localAgentSuccess(request.RequestID, proto.LocalStatusGetResponse{Status: status})
+	case proto.LocalOperationConfigGet:
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		_, canonical, digest, err := h.loadConfig()
+		if err != nil {
+			return localAgentFailure(request.RequestID, "config_unavailable")
+		}
+		return localAgentSuccess(request.RequestID, proto.LocalConfigGetResponse{CanonicalJSON: canonical, SHA256: digest})
+	case proto.LocalOperationConfigValidate:
+		_, _, digest, err := h.decodeConfigRequest(request.Payload)
+		if err != nil {
+			return localAgentFailure(request.RequestID, "invalid_config")
+		}
+		return localAgentSuccess(request.RequestID, proto.LocalConfigValidateResponse{
+			Valid: true, SHA256: digest, RestartRequired: digest != h.inputs.EffectiveConfigSHA256,
+		})
+	case proto.LocalOperationConfigSave:
+		_, canonical, digest, err := h.decodeConfigRequest(request.Payload)
+		if err != nil {
+			return localAgentFailure(request.RequestID, "invalid_config")
+		}
+		h.mu.Lock()
+		err = writeAgentConfigAtomic(h.inputs.ConfigPath, canonical)
+		h.mu.Unlock()
+		if err != nil {
+			return localAgentFailure(request.RequestID, "config_save_failed")
+		}
+		return localAgentSuccess(request.RequestID, proto.LocalConfigSaveResponse{
+			SHA256: digest, RestartRequired: digest != h.inputs.EffectiveConfigSHA256,
+		})
+	case proto.LocalOperationShutdown:
+		if h.inputs.Shutdown == nil {
+			return localAgentFailure(request.RequestID, "shutdown_unavailable")
+		}
+		h.once.Do(func() {
+			time.AfterFunc(h.inputs.ShutdownDelay, h.inputs.Shutdown)
+		})
+		return localAgentSuccess(request.RequestID, proto.LocalShutdownResponse{Accepted: true})
+	default:
+		if h.inputs.Tasks != nil && (strings.HasPrefix(request.Operation, "local.task.") || strings.HasPrefix(request.Operation, "local.analysis.")) {
+			return h.inputs.Tasks.HandleLocal(ctx, request)
+		}
+		if h.inputs.Results != nil && (strings.HasPrefix(request.Operation, "local.groups.") ||
+			request.Operation == proto.LocalOperationReviewSave ||
+			request.Operation == proto.LocalOperationPreviewImage) {
+			return h.inputs.Results.HandleLocal(ctx, request)
+		}
+		if h.inputs.Deletes != nil && strings.HasPrefix(request.Operation, "local.delete.") {
+			return h.inputs.Deletes.HandleLocal(ctx, request)
+		}
+		return localAgentFailure(request.RequestID, proto.UnsupportedOperationErrorCode)
+	}
+}
+
+type localAnalysisRunner interface {
+	Run(context.Context, string) error
+	RunWithProgress(context.Context, string, func(int) error) error
+}
+
+type localScanRunner interface {
+	Prepare(proto.ScanTask, agent.Sender) (proto.TaskAck, func())
+}
+
+type agentLocalTaskRunner struct {
+	scans    localScanRunner
+	analysis localAnalysisRunner
+}
+
+func (r *agentLocalTaskRunner) Run(ctx context.Context, request localtask.CreateRequest, stage int, advance func(int) error) error {
+	if r == nil || r.scans == nil || r.analysis == nil {
+		return errors.New("local task runner unavailable")
+	}
+	if stage < 1 {
+		terminal := make(chan error, 1)
+		ack, start := r.scans.Prepare(proto.ScanTask{TaskID: request.TaskID, Roots: append([]string(nil), request.Roots...), Phase: 1, Options: proto.ScanOptions{Rescan: request.Rescan, Extensions: append([]string(nil), request.Extensions...)}}, func(messageType uint8, value any) error {
+			if messageType == proto.MsgTaskDone {
+				select {
+				case terminal <- nil:
+				default:
+				}
+			}
+			return nil
+		})
+		if !ack.Accepted {
+			return errors.New("local scan rejected")
+		}
+		if start != nil {
+			start()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case err := <-terminal:
+				if err != nil {
+					return err
+				}
+			}
+		}
+		if err := advance(1); err != nil {
+			return err
+		}
+		stage = 1
+	}
+	if request.Mode == proto.LocalTaskModeScanThenAnalysis && stage < 3 {
+		if err := r.analysis.RunWithProgress(ctx, request.TaskID, advance); err != nil {
+			return err
+		}
+		return advance(3)
+	}
+	return nil
+}
+
+func (h *agentLocalHandler) loadConfig() (*config.AgentConfig, []byte, string, error) {
+	data, err := os.ReadFile(h.inputs.ConfigPath)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	return h.validateCanonicalConfig(data, false)
+}
+
+func (h *agentLocalHandler) decodeConfigRequest(payload []byte) (*config.AgentConfig, []byte, string, error) {
+	var request proto.LocalConfigRequest
+	if err := proto.DecodeLocalPayload(payload, &request); err != nil {
+		return nil, nil, "", err
+	}
+	return h.validateCanonicalConfig(request.CanonicalJSON, true)
+}
+
+func (h *agentLocalHandler) validateCanonicalConfig(data []byte, requireCanonical bool) (*config.AgentConfig, []byte, string, error) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	cfg := config.DefaultAgent()
+	if err := decoder.Decode(cfg); err != nil {
+		return nil, nil, "", err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			err = errors.New("trailing Agent configuration")
+		}
+		return nil, nil, "", err
+	}
+	if requireCanonical {
+		inputCanonical, err := canonicalAgentConfig(cfg)
+		if err != nil || !bytes.Equal(inputCanonical, data) {
+			return nil, nil, "", errors.New("Agent configuration is not canonical")
+		}
+	}
+	validated, err := config.ValidateAgent(cfg, h.inputs.ExecutablePath, h.inputs.CPUCount)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	canonical, err := canonicalAgentConfig(validated)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	digest := sha256.Sum256(canonical)
+	return validated, canonical, hex.EncodeToString(digest[:]), nil
+}
+
+func canonicalAgentConfig(cfg *config.AgentConfig) ([]byte, error) {
+	canonical, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(canonical, '\n'), nil
+}
+
+func writeAgentConfigAtomic(path string, canonical []byte) (err error) {
+	return securefile.WriteAtomic(path, canonical, os.ReadFile)
+}
+
+func localAgentSuccess(requestID string, payload any) proto.LocalResponse {
+	encoded, err := proto.EncodeLocalPayload(payload)
+	if err != nil {
+		return localAgentFailure(requestID, "internal_error")
+	}
+	return proto.LocalResponse{RequestID: requestID, OK: true, Payload: encoded}
+}
+
+func localAgentFailure(requestID, code string) proto.LocalResponse {
+	return proto.LocalResponse{RequestID: requestID, ErrorCode: code}
 }
 
 func workerPoolConfig(cfg *config.AgentConfig) worker.Config {

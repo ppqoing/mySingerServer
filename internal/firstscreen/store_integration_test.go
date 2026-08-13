@@ -265,6 +265,55 @@ func TestPGKeysetContextCancellationQueryAndCallbackErrors(t *testing.T) {
 	}
 }
 
+func TestDeletedExcludedFromFirstScreenFileStreamsAndSHASet(t *testing.T) {
+	fixture := newTask4PGFixture(t, false)
+	ctx := context.Background()
+	sha := fixture.sha("deleted-excluded", 0)
+	var activeID int64
+	if err := fixture.conn.QueryRow(ctx, `
+		INSERT INTO files(machine_id,disk_no,path,size,sha512,status)
+		VALUES($1,0,$2,1,$3,'done') RETURNING id`,
+		"active-"+fixture.token, "/active/"+fixture.token, sha).Scan(&activeID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.conn.Exec(ctx, `
+		INSERT INTO files(machine_id,disk_no,path,size,sha512,status)
+		VALUES($1,0,$2,1,$3,'deleted')`,
+		"deleted-"+fixture.token, "/deleted/"+fixture.token, sha); err != nil {
+		t.Fatal(err)
+	}
+	store := NewStore(fixture.conn, DefaultConfig())
+	var ids []int64
+	if err := store.StreamFilesBySHA(ctx, func(_ [64]byte, file FileRef) error {
+		if file.MachineID == "active-"+fixture.token || file.MachineID == "deleted-"+fixture.token {
+			ids = append(ids, file.ID)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(ids, []int64{activeID}) {
+		t.Fatalf("first-screen file IDs=%v want [%d]", ids, activeID)
+	}
+	rows, err := fixture.conn.Query(ctx, qFilesBySHASet, []string{sha})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	ids = nil
+	for rows.Next() {
+		var file FileRef
+		var gotSHA string
+		if err := rows.Scan(&file.ID, &gotSHA, &file.MachineID, &file.DiskNo, &file.Path, &file.Size); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, file.ID)
+	}
+	if !reflect.DeepEqual(ids, []int64{activeID}) {
+		t.Fatalf("SHA set file IDs=%v want [%d]", ids, activeID)
+	}
+}
+
 func TestPGKeysetSchemaTwiceIndexesAndExplainEligibility(t *testing.T) {
 	fixture := newTask4PGFixture(t, true)
 	ctx := context.Background()

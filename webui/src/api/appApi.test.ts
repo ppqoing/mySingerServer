@@ -1,5 +1,5 @@
 import { ApiError } from "./client";
-import { createAppApi, GUIConfigValidationError } from "./appApi";
+import { createAppApi, GUIConfigValidationError, waitForManager } from "./appApi";
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -56,6 +56,68 @@ test("encodes complete group filters and converts snake_case fields", async () =
     totalBytes: 3000,
     wastedBytes: 2000
   });
+});
+
+test("browses an encoded Agent filesystem path exclusively through the JSON body", async () => {
+  const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+    current_path: "D:\\Media",
+    parent_path: "D:\\",
+    entries: [{
+      name: "Photos",
+      path: "D:\\Media\\Photos",
+      kind: "directory",
+      hidden: false,
+      system: false,
+      selectable: true
+    }],
+    next_cursor: "next-page"
+  }));
+  vi.stubGlobal("fetch", fetchMock);
+
+  await expect(createAppApi().browseAgentFilesystem("agent/a", {
+    path: "D:\\Media",
+    showHidden: false,
+    cursor: "",
+    limit: 100
+  })).resolves.toEqual({
+    currentPath: "D:\\Media",
+    parentPath: "D:\\",
+    entries: [{
+      name: "Photos",
+      path: "D:\\Media\\Photos",
+      kind: "directory",
+      hidden: false,
+      system: false,
+      selectable: true
+    }],
+    nextCursor: "next-page"
+  });
+
+  expect(fetchMock).toHaveBeenCalledWith(
+    "/api/agents/agent%2Fa/filesystem/browse",
+    expect.objectContaining({
+      method: "POST",
+      body: JSON.stringify({ path: "D:\\Media", show_hidden: false, cursor: "", limit: 100 })
+    })
+  );
+});
+
+test("rejects malformed filesystem entries instead of accepting unknown kinds or omitted selection", async () => {
+  const valid = {
+    current_path: "D:\\",
+    parent_path: "",
+    entries: [{ name: "D:", path: "D:\\", kind: "drive", hidden: false, system: false, selectable: true }],
+    next_cursor: ""
+  };
+  vi.stubGlobal("fetch", vi.fn()
+    .mockResolvedValueOnce(jsonResponse({ ...valid, entries: [{ ...valid.entries[0], kind: "symlink" }] }))
+    .mockResolvedValueOnce(jsonResponse({ ...valid, entries: [{ name: "D:", path: "D:\\", kind: "drive", hidden: false, system: false }] })));
+  const api = createAppApi();
+
+  await expect(api.browseAgentFilesystem("agent-a", { path: "", showHidden: false, cursor: "", limit: 100 }))
+    .rejects.toBeInstanceOf(ApiError);
+  await expect(api.browseAgentFilesystem("agent-a", { path: "", showHidden: false, cursor: "", limit: 100 }))
+    .rejects.toBeInstanceOf(ApiError);
 });
 
 test("turns handled error responses and malformed success payloads into ApiError", async () => {
@@ -312,7 +374,9 @@ test("loads and decodes the complete GUI configuration", async () => {
 });
 
 test("encodes the complete GUI configuration with snake_case fields", async () => {
-  const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ saved: true, restart_required: true }));
+  const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+    saved: true, restart_required: true, restarting: false, recovery_url: ""
+  }));
   vi.stubGlobal("fetch", fetchMock);
   const guiConfig = {
     listenAddr: "127.0.0.1:18080",
@@ -349,13 +413,141 @@ test("encodes the complete GUI configuration with snake_case fields", async () =
 
   await expect(createAppApi().saveGUIConfig(guiConfig)).resolves.toEqual({
     saved: true,
-    restartRequired: true
+    restartRequired: true,
+    restarting: false,
+    recoveryURL: ""
   });
   expect(fetchMock).toHaveBeenCalledWith("/api/config", expect.objectContaining({
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(guiConfigResponse.config)
   }));
+});
+
+test("decodes automatic restart recovery details from a saved GUI configuration", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse({
+    saved: true,
+    restart_required: true,
+    restarting: true,
+    recovery_url: "http://127.0.0.1:28081/api/restart/health"
+  })));
+
+  await expect(createAppApi().saveGUIConfig({
+    listenAddr: "127.0.0.1:18080",
+    pgDsn: "postgres://user:pass@127.0.0.1:5432/dedup",
+    agents: [{ addr: "192.168.1.10:9101" }],
+    heartbeatS: 15,
+    firstScreen: {
+      hammingMax: 31, aspectTolerance: 0.1, videoDurationWindowMs: 2000,
+      imageQualityMin: 50, readPageSize: 50000, groupInsertBatch: 1000, shaResolveChunk: 10000
+    },
+    phase2: {
+      phashPassT2: 0.8, phashPartThreshold: 10, sobelT3: 0.85, videoFrames: 6,
+      videoAvgT4: 0.8, videoMinPassed: 4, videoMinValid: 4, videoFileTimeoutS: 120,
+      videoFrameCommandTimeoutS: 20, imageFileTimeoutS: 30, taskShardSize: 5000, autoDispatch: true
+    }
+  })).resolves.toMatchObject({
+    saved: true,
+    restartRequired: true,
+    restarting: true,
+    recoveryURL: "http://127.0.0.1:28081/api/restart/health"
+  });
+});
+
+test.each([
+  ["connecting", "", [{ machine_id: "", addr: "10.0.0.1:9101", online: false, identity_state: "pending" }]],
+  ["connected", "", [{ machine_id: "node-a", addr: "10.0.0.1:9101", online: true, identity_state: "claimed" }]],
+  ["error", "database_unavailable", [{ machine_id: "", addr: "10.0.0.1:9101", online: false, identity_state: "pending" }]]
+])("decodes runtime status %s", async (databaseState, databaseErrorCode, agents) => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse({
+    database_state: databaseState,
+    database_error_code: databaseErrorCode,
+    agents,
+    restarting: false,
+    recovery_url: ""
+  })));
+
+  await expect(createAppApi().getRuntimeStatus()).resolves.toMatchObject({
+    databaseState,
+    databaseErrorCode,
+    restarting: false,
+    recoveryURL: ""
+  });
+});
+
+test("waits past an unrelated Manager until the replacement restart token matches", async () => {
+  vi.useFakeTimers();
+  const fetchMock = vi.fn()
+    .mockResolvedValueOnce(jsonResponse({ ok: true, restart_token: "unrelated-instance", restarting: false }))
+    .mockResolvedValueOnce(jsonResponse({ ok: true, restart_token: "replacement-instance", restarting: false }));
+  vi.stubGlobal("fetch", fetchMock);
+  const recoveryURL = "http://127.0.0.1:28081/api/restart/health?restart_token=replacement-instance";
+  const waiting = waitForManager(recoveryURL);
+
+  await vi.advanceTimersByTimeAsync(250);
+  await expect(waiting).resolves.toBeUndefined();
+  expect(fetchMock).toHaveBeenCalledTimes(2);
+  expect(fetchMock).toHaveBeenCalledWith(recoveryURL, expect.objectContaining({ credentials: "omit" }));
+  vi.useRealTimers();
+});
+
+test("aborts a hung recovery health fetch at the global deadline", async () => {
+  vi.useFakeTimers();
+  let healthSignal: AbortSignal | undefined;
+  vi.stubGlobal("fetch", vi.fn().mockImplementation((_url, options: RequestInit) => new Promise((_resolve, reject) => {
+    healthSignal = options.signal ?? undefined;
+    healthSignal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+  })));
+  const waiting = waitForManager("http://127.0.0.1:28081/api/restart/health");
+  const rejected = expect(waiting).rejects.toThrow("Manager restart timed out");
+
+  await Promise.resolve();
+  await vi.advanceTimersByTimeAsync(30_000);
+  expect(healthSignal?.aborted).toBe(true);
+  await rejected;
+  vi.useRealTimers();
+});
+
+test("rejects a GUI save response missing recovery fields", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse({ saved: true, restart_required: true })));
+
+  await expect(createAppApi().saveGUIConfig({
+    listenAddr: "127.0.0.1:18080", pgDsn: "postgres://user:pass@127.0.0.1:5432/dedup",
+    agents: [{ addr: "192.168.1.10:9101" }], heartbeatS: 15,
+    firstScreen: { hammingMax: 31, aspectTolerance: 0.1, videoDurationWindowMs: 2000, imageQualityMin: 50, readPageSize: 50000, groupInsertBatch: 1000, shaResolveChunk: 10000 },
+    phase2: { phashPassT2: 0.8, phashPartThreshold: 10, sobelT3: 0.85, videoFrames: 6, videoAvgT4: 0.8, videoMinPassed: 4, videoMinValid: 4, videoFileTimeoutS: 120, videoFrameCommandTimeoutS: 20, imageFileTimeoutS: 30, taskShardSize: 5000, autoDispatch: true }
+  })).rejects.toBeInstanceOf(ApiError);
+});
+
+test("preserves a saved configuration when automatic restart launch fails", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse({
+    error: "restart_launch_failed", saved: true, restart_required: true, restarting: false, recovery_url: ""
+  }, 500)));
+
+  await expect(createAppApi().saveGUIConfig({
+    listenAddr: "127.0.0.1:18080", pgDsn: "postgres://user:pass@127.0.0.1:5432/dedup", agents: [{ addr: "192.168.1.10:9101" }], heartbeatS: 15,
+    firstScreen: { hammingMax: 31, aspectTolerance: 0.1, videoDurationWindowMs: 2000, imageQualityMin: 50, readPageSize: 50000, groupInsertBatch: 1000, shaResolveChunk: 10000 },
+    phase2: { phashPassT2: 0.8, phashPartThreshold: 10, sobelT3: 0.85, videoFrames: 6, videoAvgT4: 0.8, videoMinPassed: 4, videoMinValid: 4, videoFileTimeoutS: 120, videoFrameCommandTimeoutS: 20, imageFileTimeoutS: 30, taskShardSize: 5000, autoDispatch: true }
+  })).rejects.toMatchObject({ name: "GUIConfigRestartError", saved: true, restartRequired: true });
+});
+
+test("preserves the retryable HTTP 500 semantics for a generic GUI save failure", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse({ error: "config_save_failed" }, 500)));
+
+  await expect(createAppApi().saveGUIConfig({
+    listenAddr: "127.0.0.1:18080", pgDsn: "postgres://user:pass@127.0.0.1:5432/dedup", agents: [{ addr: "192.168.1.10:9101" }], heartbeatS: 15,
+    firstScreen: { hammingMax: 31, aspectTolerance: 0.1, videoDurationWindowMs: 2000, imageQualityMin: 50, readPageSize: 50000, groupInsertBatch: 1000, shaResolveChunk: 10000 },
+    phase2: { phashPassT2: 0.8, phashPartThreshold: 10, sobelT3: 0.85, videoFrames: 6, videoAvgT4: 0.8, videoMinPassed: 4, videoMinValid: 4, videoFileTimeoutS: 120, videoFrameCommandTimeoutS: 20, imageFileTimeoutS: 30, taskShardSize: 5000, autoDispatch: true }
+  })).rejects.toMatchObject({ name: "ApiError", status: 500, message: "config_save_failed", retryable: true });
+});
+
+test.each(["invalid_request", "config_invalid"])("keeps %s as a 400 GUI save failure", async error => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse({ error }, 400)));
+  await expect(createAppApi().saveGUIConfig({
+    listenAddr: "127.0.0.1:18080", pgDsn: "postgres://user:pass@127.0.0.1:5432/dedup", agents: [{ addr: "192.168.1.10:9101" }], heartbeatS: 15,
+    firstScreen: { hammingMax: 31, aspectTolerance: 0.1, videoDurationWindowMs: 2000, imageQualityMin: 50, readPageSize: 50000, groupInsertBatch: 1000, shaResolveChunk: 10000 },
+    phase2: { phashPassT2: 0.8, phashPartThreshold: 10, sobelT3: 0.85, videoFrames: 6, videoAvgT4: 0.8, videoMinPassed: 4, videoMinValid: 4, videoFileTimeoutS: 120, videoFrameCommandTimeoutS: 20, imageFileTimeoutS: 30, taskShardSize: 5000, autoDispatch: true }
+  })).rejects.toMatchObject({ status: 400, retryable: false });
 });
 
 test("preserves structured GUI configuration field errors", async () => {

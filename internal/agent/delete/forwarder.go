@@ -223,6 +223,37 @@ func (f *Forwarder) Handle(
 	return accumulated
 }
 
+// Execute exposes the physical Helper reports without applying StateStore
+// changes. Local review-bound deletion uses this path and commits the complete
+// audit/state transition itself in one SQLite transaction.
+func (f *Forwarder) Execute(ctx context.Context, task proto.DeleteTask) ([]proto.DeleteReport, error) {
+	collector := &reportCollector{}
+	clone := *f
+	clone.state = noOpState{}
+	err := clone.Handle(ctx, task, collector.Send)
+	return collector.reports, err
+}
+
+type noOpState struct{}
+
+func (noOpState) MarkDeleted(context.Context, string, []string) error { return nil }
+
+type reportCollector struct{ reports []proto.DeleteReport }
+
+func (collector *reportCollector) Send(messageType uint8, value any) error {
+	if messageType != proto.MsgDeleteReport {
+		return fmt.Errorf("delete forwarder: unexpected collected message %d", messageType)
+	}
+	report, ok := value.(*proto.DeleteReport)
+	if !ok || report == nil {
+		return errors.New("delete forwarder: invalid collected report")
+	}
+	copyReport := *report
+	copyReport.Entries = append([]proto.DeleteResult(nil), report.Entries...)
+	collector.reports = append(collector.reports, copyReport)
+	return nil
+}
+
 func (f *Forwarder) validate(
 	ctx context.Context,
 	task proto.DeleteTask,
@@ -504,14 +535,14 @@ func (f *Forwarder) deliverReport(
 
 	successful := make([]string, 0, len(report.Entries))
 	for _, result := range report.Entries {
-		if result.OK {
+		if result.OK && !result.Uncertain {
 			successful = append(successful, result.Path)
 		}
 	}
 	if len(successful) != 0 {
 		if err := f.state.MarkDeleted(ctx, f.machineID, successful); err != nil {
 			for index := range report.Entries {
-				if report.Entries[index].OK {
+				if report.Entries[index].OK && !report.Entries[index].Uncertain {
 					report.Entries[index].StateSyncErr = err.Error()
 				}
 			}

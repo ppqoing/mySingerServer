@@ -1,0 +1,15 @@
+{
+  "listen_addr": "0.0.0.0:9101",
+  "data_dir": "./data/agent",
+  "pg_dsn": "",
+  "use_everything": true,
+  "scan": {"hdd_read_block_mb": 4, "hdd_streams_per_disk": 2, "ssd_streams_per_disk": 6, "image_mem_resident_mb": 256, "image_timeout_s": 30, "video_timeout_s": 120, "image_exts": [], "video_exts": []},
+  "sync": {"interval_s": 300, "trigger_rows": 50000, "upsert_batch": 5000},
+  "proto": {"heartbeat_s": 15},
+  "worker": {"count": 0, "exe_path": "", "image_timeout_s": 30, "video_timeout_s": 120, "image_memory_mb": 256, "respawn_delay_ms": 500, "crash_injection": false},
+  "pipeline": {"read_chunk_kb": 4096},
+  "thumb": {"cache_dir": "thumbcache", "tile_max_side": 256, "probe_timeout_s": 15, "native_timeout_s": 60, "frame_timeout_s": 20},
+  "ipc": {"max_frame_mb": 16},
+  "delete": {"pipe_name": "\\\\.\\pipe\\dedup-delete", "max_entries_per_frame": 2000, "dial_timeout_ms": 500, "hello_timeout_s": 5, "report_timeout_s": 600},
+  "tuning": {"stats_enabled": true, "stats_interval_s": 1, "stats_history_s": 300, "pending_bytes_mb": 1024, "stats_log_mb": 32, "pprof_addr": ""}
+}

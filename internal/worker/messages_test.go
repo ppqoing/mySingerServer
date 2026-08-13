@@ -2,10 +2,88 @@ package worker
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/vmihailenco/msgpack/v5"
 )
+
+func TestRedactKnownPathHandlesMixedSeparatorsAndUnicode(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		text string
+	}{
+		{
+			name: "mixed separators",
+			path: `D:\Private\Album\Secret.JPG`,
+			text: `open D:/Private\Album/Secret.JPG failed`,
+		},
+		{
+			name: "unicode case mapping",
+			path: `D:\İstanbul\Album\Secret.JPG`,
+			text: `open D:\İstanbul\Album\Secret.JPG failed`,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			redacted := RedactKnownPath(test.text, test.path)
+			lower := strings.ToLower(redacted)
+			for _, secret := range []string{"private", "stanbul", "album", "secret.jpg"} {
+				if strings.Contains(lower, secret) {
+					t.Fatalf("redacted text leaked %q: %q", secret, redacted)
+				}
+			}
+			if !strings.Contains(redacted, "<path>") {
+				t.Fatalf("redacted text = %q, want path marker", redacted)
+			}
+		})
+	}
+}
+
+// Break caught: an image preview is accidentally routed as a phase-2 feature
+// job, or its encoded bytes/options are omitted from the worker wire payload.
+func TestImagePreviewMessagesRoundTripMemoryPayload(t *testing.T) {
+	job := JobMsg{
+		JobID: 601, ScanTaskID: "preview-601", Path: `C:\media\preview.jpg`,
+		Kind: MediaImage, Phase: PhasePreview, ScreenStage: ScreenStagePreview,
+		Source: JobSourceLocal, Size: 1234, MTimeUnix: 1720000000,
+		KnownSHA: bytes64(0x61), PreviewFormat: PreviewFormatJPEG,
+		PreviewMaxWidth: 640, PreviewMaxHeight: 480, PreviewQuality: 82,
+	}
+	jobBody, err := msgpack.Marshal(job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobEnvelope := &Envelope{Type: MsgJob, Body: jobBody}
+	decodedJob, err := DecodeBody[JobMsg](jobEnvelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(decodedJob, job) {
+		t.Fatalf("preview job round trip = %#v, want %#v", decodedJob, job)
+	}
+
+	result := JobResultMsg{
+		JobID: 601, Path: job.Path, Kind: MediaImage,
+		SHA512: bytes64(0x61), PreviewFormat: PreviewFormatJPEG,
+		PreviewWidth: 320, PreviewHeight: 240,
+		PreviewBytes: []byte{0xff, 0xd8, 0xff, 0xd9},
+	}
+	resultBody, err := msgpack.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resultEnvelope := &Envelope{Type: MsgResult, Body: resultBody}
+	decodedResult, err := DecodeBody[JobResultMsg](resultEnvelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(decodedResult, result) {
+		t.Fatalf("preview result round trip = %#v, want %#v", decodedResult, result)
+	}
+}
 
 func TestMessageRoundTrip(t *testing.T) {
 	duration := int64(6543)
@@ -22,7 +100,7 @@ func TestMessageRoundTrip(t *testing.T) {
 	}{
 		{"envelope", Envelope{Type: MsgJob, Body: []byte{1, 2, 3}}, func() any { return new(Envelope) }},
 		{"ready", ReadyMsg{PID: 41, WorkerIndex: 3, IPCVersion: IPCCompatibilityVersion, DLLVersion: MediaCoreDLLVersion}, func() any { return new(ReadyMsg) }},
-		{"job", JobMsg{JobID: 92, ScanTaskID: "550e8400-e29b-41d4-a716-446655440000", Path: `C:\media\sample.jpg`, Kind: MediaImage, Phase: Phase2, FieldsMask: MaskPHashParts, Size: 123456, MTimeUnix: 1720000000, KnownSHA: bytes64(7), MTimeMS: 1720000000123, FrameMask: 0x15, DurationMS: 6543}, func() any { return new(JobMsg) }},
+		{"job", JobMsg{JobID: 92, ScanTaskID: "550e8400-e29b-41d4-a716-446655440000", Path: `C:\media\sample.jpg`, Kind: MediaImage, Phase: Phase2, ScreenStage: ScreenStageTwo, Source: JobSourceManager, FieldsMask: MaskPHashParts, Size: 123456, MTimeUnix: 1720000000, KnownSHA: bytes64(7), MTimeMS: 1720000000123, FrameMask: 0x15, DurationMS: 6543}, func() any { return new(JobMsg) }},
 		{"sha query", SHAQueryMsg{JobID: 93, SHA512: bytes64(8), Kind: MediaVideo}, func() any { return new(SHAQueryMsg) }},
 		{"sha reply", SHAReplyMsg{JobID: 94, Found: true, PDQ: []byte{4, 5}, Quality: 86, Width: 1920, Height: 1080, DurationMS: &duration, ThumbPath: `C:\thumbs\sample.jpg`, ThumbPDQ: []byte{6, 7}, ThumbQuality: &thumbQuality}, func() any { return new(SHAReplyMsg) }},
 		{"field error", FieldError{Field: MaskPHashParts, Stage: "decode", Msg: "invalid image"}, func() any { return new(FieldError) }},
@@ -44,6 +122,19 @@ func TestMessageRoundTrip(t *testing.T) {
 				t.Fatalf("round trip mismatch\nwant: %#v\n got: %#v", tc.value, got)
 			}
 		})
+	}
+}
+
+func TestDefaultStageOneWorkerMasksUseExplicitVideoFields(t *testing.T) {
+	if MaskAllImage != MaskSHA512|MaskImagePDQ {
+		t.Fatalf("image stage-one mask = %#x", uint32(MaskAllImage))
+	}
+	wantVideo := uint32(MaskSHA512 | MaskVideoDuration | MaskVideoContactSheet)
+	if MaskAllVideo != wantVideo {
+		t.Fatalf("video stage-one mask = %#x, want %#x", uint32(MaskAllVideo), wantVideo)
+	}
+	if MaskAllVideo&MaskVideoThumb != 0 {
+		t.Fatalf("video stage-one mask retained legacy thumbnail bit %#x", uint32(MaskAllVideo))
 	}
 }
 
@@ -372,6 +463,12 @@ func TestMergedResultMapCompatibilityUsesExplicitFrameStatus(t *testing.T) {
 	}
 	if err := declaredFramesWithImplicitSuccess.ValidateVideoCoreMasks(); err == nil {
 		t.Fatal("result declared MaskVideo6F with no done frames and six implicit success statuses")
+	}
+	for _, field := range []uint32{MaskVideo6FPHash, MaskVideo6FSobel} {
+		declaredFramesWithImplicitSuccess.FieldsDone = field
+		if err := declaredFramesWithImplicitSuccess.ValidateVideoCoreMasks(); err == nil {
+			t.Fatalf("result declared split frame field %#x with no done frames and six implicit success statuses", field)
+		}
 	}
 
 	legacy, err := msgpack.Marshal(map[string]any{

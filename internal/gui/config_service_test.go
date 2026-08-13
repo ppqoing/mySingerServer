@@ -186,6 +186,38 @@ func TestGUIConfigServiceReplaceFailurePreservesOriginal(t *testing.T) {
 	}
 }
 
+func TestGUIConfigServicePermissionFailureDoesNotPublishReplacement(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "gui.json")
+	runtime := testGUIConfig()
+	original := writeTestGUIConfig(t, path, runtime)
+	service, err := NewGUIConfigService(path, runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.restrict = func(*os.File) error { return errors.New("synthetic ACL failure") }
+	changed := testGUIConfig()
+	changed.HeartbeatS = 31
+
+	if _, err := service.Save(context.Background(), changed); err == nil {
+		t.Fatal("Save succeeded after config permission failure")
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, original) {
+		t.Fatal("config permission failure published a replacement")
+	}
+	temps, err := filepath.Glob(filepath.Join(dir, ".gui.json.*.tmp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(temps) != 0 {
+		t.Fatalf("temporary files remain after config permission failure: %v", temps)
+	}
+}
+
 func TestGUIConfigServiceConcurrentSavesRemainCompleteJSON(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "gui.json")
 	runtime := testGUIConfig()

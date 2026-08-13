@@ -6,6 +6,7 @@ param(
     [string]$OutDir = "bin",
     [string]$CMake = "",
     [string]$VcpkgRoot = "C:\vcpkg",
+    [string]$Vcpkg = "",
     [switch]$MediacoreOnly,
     [switch]$VideoCoreOnly,
     [string]$StageDir = "",
@@ -15,6 +16,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'standard-dependency-paths.ps1')
 
 function Resolve-Application {
     param(
@@ -77,6 +79,12 @@ if ($MyInvocation.InvocationName -eq '.') {
     return
 }
 
+$dependencyPaths = Resolve-StandardDependencyPaths `
+    -RepositoryRoot $repo -GoExecutable $Go -VcpkgRoot $VcpkgRoot
+Write-Host "Go module cache: $($dependencyPaths.GoModCache)"
+Write-Host "Go build cache: $($dependencyPaths.GoBuildCache)"
+Write-Host "vcpkg installed: $($dependencyPaths.VcpkgInstalled)"
+
 if ($VideoCoreOnly -and $MediacoreOnly) {
     throw "VIDEOCORE_BUILD_MODE_CONFLICT"
 }
@@ -119,6 +127,9 @@ $toolchain = Join-Path $VcpkgRoot "scripts\buildsystems\vcpkg.cmake"
 if (-not (Test-Path -LiteralPath $toolchain -PathType Leaf)) {
     throw "vcpkg toolchain not found: $toolchain"
 }
+$provisionVcpkg = Join-Path $PSScriptRoot "provision-standard-vcpkg.ps1"
+& $provisionVcpkg -VcpkgRoot $VcpkgRoot -VcpkgExecutable $Vcpkg
+if ($LASTEXITCODE -ne 0) { throw "STANDARD_VCPKG_PROVISION_FAILED" }
 
 $ccExe = $null
 if ($useVideoCore) {
@@ -133,8 +144,14 @@ if ($useVideoCore) {
         -B $videoCoreBuild `
         -G "Visual Studio 17 2022" `
         -A x64 `
+        "-DCMAKE_EXE_LINKER_FLAGS=" `
+        "-DCMAKE_SHARED_LINKER_FLAGS=" `
+        "-DCMAKE_MODULE_LINKER_FLAGS=" `
+        "-DCMAKE_STATIC_LINKER_FLAGS=" `
         "-DCMAKE_TOOLCHAIN_FILE=$toolchainCMake" `
         -DVCPKG_TARGET_TRIPLET=x64-windows-static `
+        "-DVCPKG_INSTALLED_DIR=$($dependencyPaths.VcpkgInstalled)" `
+        -DVCPKG_MANIFEST_MODE=OFF `
         "-DVC_FFMPEG_ROOT=$ffmpegRootCMake"
     if ($LASTEXITCODE -ne 0) { throw "VIDEOCORE_CONFIGURE_FAILED" }
 
@@ -253,7 +270,9 @@ if ($MediacoreOnly) {
         -G "Visual Studio 17 2022" `
         -A x64 `
         "-DCMAKE_TOOLCHAIN_FILE=$($toolchain -replace '\\', '/')" `
-        -DVCPKG_TARGET_TRIPLET=x64-windows-static
+        -DVCPKG_TARGET_TRIPLET=x64-windows-static `
+        "-DVCPKG_INSTALLED_DIR=$($dependencyPaths.VcpkgInstalled)" `
+        -DVCPKG_MANIFEST_MODE=OFF
     if ($LASTEXITCODE -ne 0) { throw "mediacore configure failed" }
     & $cmakeExe --build $mediacoreBuild --config Release
     if ($LASTEXITCODE -ne 0) { throw "mediacore Release build failed" }
@@ -314,13 +333,13 @@ try {
     Remove-Item Env:CC -ErrorAction SilentlyContinue
     $controlPackages = @(
         "./internal/nodectl",
-        "./internal/agentcontrol",
+        "./internal/nodetray/agentclient",
         "./internal/helpercontrol"
     )
     & $Go -C $repo test @controlPackages -count=1
     if ($LASTEXITCODE -ne 0) { throw "node control package tests failed" }
 
-    & $Go -C $repo build -trimpath -o (Join-Path $out "agent.exe") ./cmd/agent
+    & $Go -C $repo build -trimpath -tags nodynamic -o (Join-Path $out "agent.exe") ./cmd/agent
     if ($LASTEXITCODE -ne 0) { throw "agent build failed" }
 
     & $Go -C $repo build -trimpath -o (Join-Path $out "gui.exe") ./cmd/gui
@@ -361,7 +380,8 @@ try {
 
     $env:CGO_ENABLED = "1"
     $env:CC = $ccExe
-    & $Go -C $repo build -trimpath -o (Join-Path $out "worker.exe") ./cmd/worker
+    & $Go -C $repo build -trimpath -tags nodynamic `
+        -o (Join-Path $out "worker.exe") ./cmd/worker
     if ($LASTEXITCODE -ne 0) { throw "worker build failed" }
 }
 finally {
@@ -413,28 +433,57 @@ if ($SkipNodeTrayBuild) {
     }
 }
 
-Copy-Item -Force `
-    (Join-Path $repo "third_party\everything_sdk\Everything64.dll") `
-    (Join-Path $out "Everything64.dll")
-
-foreach ($name in @("agent", "gui")) {
-    $example = Join-Path $repo "deploy\$name.example.json"
-    $target = Join-Path $out "$name.json"
-    if (-not (Test-Path -LiteralPath $target)) {
-        Copy-Item -LiteralPath $example -Destination $target
+$everythingRoot = Join-Path $repo "third_party\everything"
+$everythingManifestPath = Join-Path $everythingRoot "manifest.json"
+if (-not (Test-Path -LiteralPath $everythingManifestPath -PathType Leaf)) {
+    throw "EVERYTHING_MANIFEST_NOT_FOUND path=$everythingManifestPath"
+}
+$everythingManifest = Get-Content -Raw -LiteralPath $everythingManifestPath |
+    ConvertFrom-Json
+if ($everythingManifest.schema_version -ne 1 -or
+    [string]$everythingManifest.version -cne "1.4.1.1032" -or
+    [string]$everythingManifest.architecture -cne "x64") {
+    throw "EVERYTHING_MANIFEST_INVALID"
+}
+foreach ($name in @("Everything.exe", "LICENSE.txt")) {
+    $entry = @($everythingManifest.files | Where-Object path -CEQ $name)
+    if ($entry.Count -ne 1) {
+        throw "EVERYTHING_MANIFEST_FILE_INVALID name=$name"
+    }
+    $source = Join-Path $everythingRoot $name
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+        throw "EVERYTHING_SOURCE_NOT_FOUND path=$source"
+    }
+    $item = Get-Item -LiteralPath $source
+    $hash = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($item.Length -ne [long]$entry[0].size -or
+        $hash -cne [string]$entry[0].sha256) {
+        throw "EVERYTHING_SOURCE_HASH_MISMATCH name=$name"
     }
 }
-
-$helperExample = Join-Path $repo "deploy\helper.example.json"
-$helperConfig = Join-Path $out "helper.json"
-if (-not (Test-Path -LiteralPath $helperConfig)) {
-    Copy-Item -LiteralPath $helperExample -Destination $helperConfig
+$everythingNotice = Join-Path $everythingRoot "NOTICE.md"
+if (-not (Test-Path -LiteralPath $everythingNotice -PathType Leaf)) {
+    throw "EVERYTHING_NOTICE_NOT_FOUND path=$everythingNotice"
 }
+$everythingSDK = Join-Path $repo "third_party\everything_sdk\Everything64.dll"
+if (-not (Test-Path -LiteralPath $everythingSDK -PathType Leaf)) {
+    throw "EVERYTHING_SDK_NOT_FOUND path=$everythingSDK"
+}
+$everythingLicenses = Join-Path $out "licenses"
+New-Item -ItemType Directory -Path $everythingLicenses -Force | Out-Null
+Copy-Item -LiteralPath (Join-Path $everythingRoot "Everything.exe") `
+    -Destination (Join-Path $out "Everything.exe")
+Copy-Item -LiteralPath $everythingSDK `
+    -Destination (Join-Path $out "Everything64.dll")
+Copy-Item -LiteralPath (Join-Path $everythingRoot "LICENSE.txt") `
+    -Destination (Join-Path $everythingLicenses "everything-LICENSE.txt")
+Copy-Item -LiteralPath $everythingNotice `
+    -Destination (Join-Path $everythingLicenses "everything-NOTICE.md")
 
-Copy-Item -LiteralPath (Join-Path $repo "deploy\agent.example.json") `
-    -Destination (Join-Path $out "agent.example.json")
-Copy-Item -LiteralPath $helperExample `
-    -Destination (Join-Path $out "helper.example.json")
+foreach ($name in @("agent.default.json", "gui.default.json", "helper.default.json", "nodetray.default.json")) {
+    Copy-Item -LiteralPath (Join-Path $repo "deploy\$name") `
+        -Destination (Join-Path $out $name)
+}
 
 $requiredStageFiles = @(
     "agent.exe",
@@ -442,8 +491,14 @@ $requiredStageFiles = @(
     "helper.exe",
     "worker.exe",
     "videocore.dll",
-    "agent.example.json",
-    "helper.example.json"
+    "Everything.exe",
+    "Everything64.dll",
+    "licenses\everything-LICENSE.txt",
+    "licenses\everything-NOTICE.md",
+    "agent.default.json",
+    "gui.default.json",
+    "helper.default.json",
+    "nodetray.default.json"
 )
 if (-not $SkipNodeTrayBuild) {
     $requiredStageFiles += @("nodetray.exe", "MicrosoftEdgeWebview2Setup.exe")

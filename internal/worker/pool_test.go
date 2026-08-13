@@ -412,6 +412,26 @@ func TestWorkerResultAndSHAQueryValidationRejectForeignOrMalformedPayloads(t *te
 	}
 }
 
+func TestVideoBaseFeaturesValidatorAcceptsContactFailurePartial(t *testing.T) {
+	job := &JobMsg{
+		JobID: 811, ScanTaskID: "task-contact-partial", Path: `D:\media\partial.mp4`,
+		Kind: MediaVideo, Phase: Phase1,
+		FieldsMask: store.RequiredStageOneMask(store.MediaVideo),
+	}
+	duration := int64(4321)
+	result := &JobResultMsg{
+		JobID: job.JobID, ScanTaskID: job.ScanTaskID, Path: job.Path, Kind: job.Kind,
+		SHA512: bytes64(0x51), FieldsDone: MaskSHA512 | MaskVideoDuration,
+		DurationMS: &duration,
+		Errors: []FieldError{{
+			Field: MaskVideoContactSheet, Stage: "thumb_cache", Msg: "publish failed",
+		}},
+	}
+	if err := validateWorkerResult(job, result); err != nil {
+		t.Fatalf("valid contact failure partial rejected: %v", err)
+	}
+}
+
 func TestValidateWorkerResultAcceptsOnlyRequestedPhase2ImagePayload(t *testing.T) {
 	knownSHA := bytes64(0x62)
 	validPHash, validSobel := validPhase2Blobs(t)
@@ -598,6 +618,85 @@ func TestValidateWorkerResultAcceptsPartialAndCompletePhase2VideoFrames(t *testi
 			tc.edit(job, result)
 			if err := validateWorkerResult(job, result); err == nil {
 				t.Fatalf("validateWorkerResult accepted job=%#v result=%#v", job, result)
+			}
+		})
+	}
+}
+
+func TestValidateWorkerResultRejectsForeignScreenStageOrSource(t *testing.T) {
+	pHash, _ := validPhase2Blobs(t)
+	job := &JobMsg{
+		JobID: 839, ScanTaskID: "stage-owner", Path: `D:\media\stage-owner.jpg`,
+		Kind: MediaImage, Phase: Phase2, ScreenStage: ScreenStageTwo, Source: JobSourceManager,
+		FieldsMask: MaskPHashParts, KnownSHA: bytes64(0x78),
+	}
+	base := JobResultMsg{
+		JobID: job.JobID, Path: job.Path, Kind: job.Kind,
+		ScreenStage: job.ScreenStage, Source: job.Source,
+		SHA512: append([]byte(nil), job.KnownSHA...), FieldsDone: MaskPHashParts,
+		PHashParts: pHash,
+	}
+	if err := validateWorkerResult(job, &base); err != nil {
+		t.Fatalf("matching stage/source rejected: %v", err)
+	}
+	foreignStage := base
+	foreignStage.ScreenStage = ScreenStageThree
+	if err := validateWorkerResult(job, &foreignStage); err == nil {
+		t.Fatal("foreign screen stage accepted")
+	}
+	foreignSource := base
+	foreignSource.Source = JobSourceLocal
+	if err := validateWorkerResult(job, &foreignSource); err == nil {
+		t.Fatal("foreign source accepted")
+	}
+}
+
+func TestValidateWorkerResultVideoSixFrameStagePayloadIsolation(t *testing.T) {
+	pHash, sobel := validPhase2Blobs(t)
+	tests := []struct {
+		name      string
+		stage     ScreenStage
+		field     uint32
+		wantPHash bool
+		wantSobel bool
+	}{
+		{name: "stage two", stage: ScreenStageTwo, field: MaskVideo6FPHash, wantPHash: true},
+		{name: "stage three", stage: ScreenStageThree, field: MaskVideo6FSobel, wantSobel: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			job := &JobMsg{
+				JobID: 840, ScanTaskID: "video-stage", Path: `D:\media\video-stage.mp4`,
+				Kind: MediaVideo, Phase: Phase2, ScreenStage: test.stage, Source: JobSourceManager,
+				FieldsMask: test.field, FrameMask: FrameMaskFull, KnownSHA: bytes64(0x79),
+			}
+			result := &JobResultMsg{
+				JobID: job.JobID, Path: job.Path, Kind: job.Kind,
+				ScreenStage: job.ScreenStage, Source: job.Source,
+				SHA512: append([]byte(nil), job.KnownSHA...), FieldsDone: test.field,
+			}
+			for index := 0; index < 6; index++ {
+				frame := FrameFeature{FrameIdx: index, TimeMS: int64(index+1) * 1000}
+				if test.wantPHash {
+					frame.PHashParts = append([]byte(nil), pHash...)
+				}
+				if test.wantSobel {
+					frame.SobelHist = append([]byte(nil), sobel...)
+				}
+				result.Frames = append(result.Frames, frame)
+			}
+			if err := validateWorkerResult(job, result); err != nil {
+				t.Fatalf("valid split-stage result rejected: %v", err)
+			}
+			leaked := *result
+			leaked.Frames = append([]FrameFeature(nil), result.Frames...)
+			if test.wantPHash {
+				leaked.Frames[0].SobelHist = append([]byte(nil), sobel...)
+			} else {
+				leaked.Frames[0].PHashParts = append([]byte(nil), pHash...)
+			}
+			if err := validateWorkerResult(job, &leaked); err == nil {
+				t.Fatal("split-stage result carrying foreign feature accepted")
 			}
 		})
 	}
@@ -921,6 +1020,39 @@ func TestPoolWatchdogUsesStableReasonForMediaKind(t *testing.T) {
 				t.Fatalf("active crash files_failed = %d, want 1", got)
 			}
 		})
+	}
+}
+
+// Break caught: an ephemeral preview timeout is persisted as a scan crash,
+// changing files.status/sync state even though preview is not analysis work.
+func TestPoolPreviewCrashPublishesTerminalWithoutPersistingOrFileMetrics(t *testing.T) {
+	h := newLifecycleHarness(t, workerScript{ready: true, hangJob: true})
+	p := h.newPool(Config{
+		MachineID: "machine-a", WorkerCount: 1,
+		ImageTimeout: 30 * time.Second, RespawnDelay: 500 * time.Millisecond,
+	})
+	p.Start()
+	t.Cleanup(p.Close)
+	h.ready(t)
+	job := JobMsg{
+		JobID: 72, ScanTaskID: "preview-timeout", Path: `D:\media\preview.jpg`,
+		Kind: MediaImage, Phase: PhasePreview, ScreenStage: ScreenStagePreview,
+		Source: JobSourceLocal,
+	}
+	if err := p.Submit(&job); err != nil {
+		t.Fatal(err)
+	}
+	h.dispatched(t)
+	h.clock.next(t, 30*time.Second).fire()
+	crash := h.crash(t)
+	if crash.JobID != job.JobID || crash.ScanTaskID != job.ScanTaskID || crash.Reason != "watchdog_image" {
+		t.Fatalf("preview terminal = %#v", crash)
+	}
+	if got := h.store.crashCount(); got != 0 {
+		t.Fatalf("preview crash persisted through MarkCrash %d times", got)
+	}
+	if got := p.Metrics(); got.FilesDone != 0 || got.FilesFailed != 0 {
+		t.Fatalf("preview crash changed scan file metrics: %#v", got)
 	}
 }
 
@@ -1333,7 +1465,7 @@ func TestPoolMarkCrashFailureIsLoggedWithoutDuplicateClassificationOrRedispatch(
 	for key, want := range map[string]any{
 		"worker_index": float64(0),
 		"pid":          float64(1000),
-		"path":         job.Path,
+		"path_id":      PathID(job.Path),
 		"reason":       "watchdog_image",
 		"err":          sentinel.Error(),
 	} {
@@ -1421,7 +1553,7 @@ func TestPoolMetricsReflectResultAndSingleFlight(t *testing.T) {
 		t.Fatalf("errors.log record is not JSON: %v", err)
 	}
 	for key, want := range map[string]any{
-		"path": result.Path, "stage": "decode", "field_mask": float64(MaskImagePDQ), "err": "partial",
+		"path_id": PathID(result.Path), "stage": "decode", "field_mask": float64(MaskImagePDQ), "err": "partial",
 	} {
 		if value := errorRecord[key]; value != want {
 			t.Fatalf("errors.log %s = %#v, want %#v", key, value, want)
@@ -1917,6 +2049,74 @@ func TestPoolPhase2LogsEachTopLevelAndErroredFrameOnce(t *testing.T) {
 	}
 	if got := p.Metrics(); got.FilesFailed != 1 || got.FilesDone != 0 {
 		t.Fatalf("phase2 errored frame metrics=%#v", got)
+	}
+}
+
+func TestPoolPhase2ErrorLogsUsePathIDAndStageContext(t *testing.T) {
+	h := newLifecycleHarness(t)
+	h.store.phase2MissingMask = MaskVideo6FPHash
+	p := h.newPool(Config{MachineID: "machine-private-log"})
+	t.Cleanup(p.Close)
+	path := `D:\private\customer-album\secret-name.mp4`
+	p.saveResult(JobMsg{
+		JobID: 922, Path: path, Kind: MediaVideo, Phase: Phase2,
+		FieldsMask: MaskVideo6FPHash, FrameMask: 1,
+		ScreenStage: ScreenStageTwo, Source: JobSourceManager, KnownSHA: bytes64(0xa2),
+	}, JobResultMsg{
+		JobID: 922, Path: path, Kind: MediaVideo, Phase: Phase2,
+		ScreenStage: ScreenStageTwo, Source: JobSourceManager, SHA512: bytes64(0xa2),
+		Errors: []FieldError{{Field: MaskVideo6FPHash, Stage: "video_frame", Msg: "decode failed for " + path}},
+		Frames: []FrameFeature{{FrameIdx: 0, Error: "native failed for " + path}},
+	})
+	<-p.Results()
+	if strings.Contains(h.errorLog.String(), "customer-album") || strings.Contains(h.errorLog.String(), "secret-name.mp4") {
+		t.Fatalf("error log leaked sensitive path: %s", h.errorLog.String())
+	}
+	for _, record := range jsonLogRecords(t, h.errorLog.String()) {
+		if record["path_id"] != PathID(path) || record["screen_stage"] != float64(ScreenStageTwo) || record["source"] != string(JobSourceManager) {
+			t.Fatalf("safe log context = %#v", record)
+		}
+	}
+}
+
+func TestPoolAllFrameFailuresPersistPublishAndLogStableErrors(t *testing.T) {
+	h := newLifecycleHarness(t)
+	h.store.phase2MissingMask = MaskVideo6FPHash
+	h.store.missingFrames = FrameMaskFull
+	p := h.newPool(Config{MachineID: "machine-all-frame-errors"})
+	t.Cleanup(p.Close)
+	path := `D:\private\all-failed.mp4`
+	frames := [6]FrameResult{}
+	for index := range frames {
+		frames[index] = FrameResult{FrameIdx: index, Status: -20 - int32(index), TimeMS: int64(index) * 1000}
+	}
+	p.saveResult(JobMsg{
+		JobID: 923, Path: path, Kind: MediaVideo, Phase: Phase2,
+		FieldsMask: MaskVideo6FPHash, FrameMask: FrameMaskFull,
+		ScreenStage: ScreenStageTwo, Source: JobSourceManager, KnownSHA: bytes64(0xa3),
+	}, JobResultMsg{
+		JobID: 923, Path: path, Kind: MediaVideo, Phase: Phase2,
+		ScreenStage: ScreenStageTwo, Source: JobSourceManager, SHA512: bytes64(0xa3),
+		FrameResults: frames,
+	})
+	published := <-p.Results()
+	if len(published.Frames) != 6 || published.FieldsDone != 0 {
+		t.Fatalf("all-failed result=%#v, want six error-only frames", published)
+	}
+	for index, frame := range published.Frames {
+		if frame.FrameIdx != index || frame.Error != fmt.Sprintf("native_status_%d", -20-int32(index)) ||
+			len(frame.PDQ256) != 0 || len(frame.PHashParts) != 0 || len(frame.SobelHist) != 0 {
+			t.Fatalf("failed frame[%d]=%#v", index, frame)
+		}
+	}
+	records := jsonLogRecords(t, h.errorLog.String())
+	if len(records) != 6 {
+		t.Fatalf("all-failed logs=%d %#v, want six", len(records), records)
+	}
+	for _, record := range records {
+		if record["path_id"] != PathID(path) || record["screen_stage"] != float64(ScreenStageTwo) || record["source"] != string(JobSourceManager) {
+			t.Fatalf("all-failed log context=%#v", record)
+		}
 	}
 }
 
@@ -2647,12 +2847,56 @@ type poolTestStore struct {
 	blockSave          bool
 	missingMask        uint32
 	phase2MissingMask  uint32
+	missingFrames      uint8
 	saveStarted        chan struct{}
 	saveOnce           sync.Once
 	saveCount          int
 	phase2SaveCount    int
 	phase2MissingCalls int
 	phase2Results      []store.Phase2Result
+}
+
+// Break caught: a preview result is sent through SaveAnalysis and persists
+// thumbnail-like data instead of remaining an in-memory response.
+func TestImagePreviewPoolBypassesFeatureStore(t *testing.T) {
+	backend := &poolTestStore{}
+	pool := &Pool{
+		ctx: context.Background(), store: backend, dedup: NewDeduper(backend),
+		results: make(chan *JobResultMsg, 1), quit: make(chan struct{}),
+	}
+	job := JobMsg{
+		JobID: 702, Path: `D:\media\source.jpg`, Kind: MediaImage,
+		Phase: PhasePreview, ScreenStage: ScreenStagePreview, Source: JobSourceLocal,
+		KnownSHA: bytes64(0x72), PreviewFormat: PreviewFormatJPEG,
+		PreviewMaxWidth: 100, PreviewMaxHeight: 100, PreviewQuality: 80,
+	}
+	pool.saveResult(job, JobResultMsg{
+		JobID: job.JobID, Path: job.Path, Kind: job.Kind,
+		SHA512: bytes64(0x72), PreviewFormat: PreviewFormatJPEG,
+		PreviewWidth: 50, PreviewHeight: 40, PreviewBytes: []byte{1, 2, 3},
+	})
+	if got := backend.saveCountValue() + backend.phase2SaveCountValue(); got != 0 {
+		t.Fatalf("preview persisted through feature store %d times", got)
+	}
+	select {
+	case result := <-pool.results:
+		if len(result.PreviewBytes) != 3 {
+			t.Fatalf("published preview bytes = %d", len(result.PreviewBytes))
+		}
+	default:
+		t.Fatal("preview result was not published")
+	}
+	if got := pool.Metrics(); got.FilesDone != 0 || got.FilesFailed != 0 {
+		t.Fatalf("successful preview changed scan file metrics: %#v", got)
+	}
+	pool.saveResult(job, JobResultMsg{
+		JobID: job.JobID, Path: job.Path, Kind: job.Kind,
+		SHA512: bytes64(0x72), PreviewErrorCode: "preview_too_large",
+	})
+	<-pool.results
+	if got := pool.Metrics(); got.FilesDone != 0 || got.FilesFailed != 0 {
+		t.Fatalf("failed preview changed scan file metrics: %#v", got)
+	}
 }
 
 func (s *poolTestStore) LookupContent(_ context.Context, _ []byte, kind store.MediaKind, requestedFields uint32, requestedFrames uint8) (store.ContentState, error) {
@@ -2673,7 +2917,7 @@ func (s *poolTestStore) LookupContent(_ context.Context, _ []byte, kind store.Me
 }
 
 func (s *poolTestStore) SaveAnalysis(ctx context.Context, result store.AnalysisResult) (store.CommittedState, error) {
-	isPhase2 := result.RequestedFields&(MaskPHashParts|MaskSobelHist|MaskVideo6F) != 0 && result.RequestedFields&(MaskSHA512|MaskImagePDQ|MaskVideoThumb|MaskVideoDuration|MaskVideoContactSheet) == 0
+	isPhase2 := result.RequestedFields&(MaskPHashParts|MaskSobelHist|videoSixFrameWorkerFields()) != 0 && result.RequestedFields&(MaskSHA512|MaskImagePDQ|MaskVideoThumb|MaskVideoDuration|MaskVideoContactSheet) == 0
 	s.mu.Lock()
 	if isPhase2 {
 		s.phase2SaveCount++
@@ -2700,7 +2944,7 @@ func (s *poolTestStore) SaveAnalysis(ctx context.Context, result store.AnalysisR
 	if isPhase2 {
 		missing = s.phase2MissingMask
 	}
-	return store.CommittedState{FieldsPresent: result.RequestedFields &^ missing, MissingFields: missing, FramesPresent: result.RequestedFrames, MissingFrames: 0}, nil
+	return store.CommittedState{FieldsPresent: result.RequestedFields &^ missing, MissingFields: missing, FramesPresent: result.RequestedFrames &^ s.missingFrames, MissingFrames: s.missingFrames}, nil
 }
 
 func (s *poolTestStore) Phase1MissingMask(context.Context, string, string) (uint32, error) {

@@ -1,7 +1,7 @@
 {
   "listen_addr": "0.0.0.0:9101",
   "data_dir": "./data",
-  "pg_dsn": "postgres://dedup@127.0.0.1:5432/dedup",
+  "pg_dsn": "",
   "use_everything": true,
   "scan": {
     "hdd_read_block_mb": 4,

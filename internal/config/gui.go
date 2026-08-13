@@ -69,8 +69,15 @@ type AgentEndpoint struct {
 }
 
 func DefaultGUI() *GUIConfig {
+	cfg := defaultGUIOptionalFields()
+	cfg.PGDSN = ""
+	cfg.Agents = []AgentEndpoint{{Addr: "127.0.0.1:9101"}}
+	return cfg
+}
+
+func defaultGUIOptionalFields() *GUIConfig {
 	return &GUIConfig{
-		ListenAddr:  "127.0.0.1:8080",
+		ListenAddr:  "127.0.0.1:18081",
 		HeartbeatS:  15,
 		FirstScreen: defaultFirstScreen(),
 		Phase2:      defaultPhase2(),
@@ -78,13 +85,13 @@ func DefaultGUI() *GUIConfig {
 }
 
 func LoadGUI(path string) (*GUIConfig, error) {
-	cfg := DefaultGUI()
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
+	cfg := defaultGUIOptionalFields()
 	if err := json.Unmarshal(data, cfg); err != nil {
-		return nil, fmt.Errorf("config: parse %s: %w", path, err)
+		return nil, fmt.Errorf("config: parse: %w", err)
 	}
 	if err := ValidateGUI(cfg); err != nil {
 		return nil, err
@@ -104,10 +111,10 @@ func ValidateGUI(cfg *GUIConfig) error {
 	} else if !validGUIHostPort(cfg.ListenAddr) {
 		validation.add("listen_addr", "invalid_address", "地址必须是 host:port")
 	}
-	if cfg.PGDSN == "" {
-		validation.add("pg_dsn", "required", "PostgreSQL DSN 不能为空")
-	} else if _, err := pgxpool.ParseConfig(cfg.PGDSN); err != nil {
-		validation.add("pg_dsn", "invalid_dsn", "必须是可解析的 PostgreSQL DSN")
+	if cfg.PGDSN != "" {
+		if _, err := pgxpool.ParseConfig(cfg.PGDSN); err != nil {
+			validation.add("pg_dsn", "invalid_dsn", "必须是可解析的 PostgreSQL DSN")
+		}
 	}
 	if cfg.HeartbeatS < 1 {
 		validation.add("heartbeat_s", "positive", "心跳间隔必须为正数")

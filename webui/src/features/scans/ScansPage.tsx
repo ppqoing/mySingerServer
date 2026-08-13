@@ -4,6 +4,8 @@ import type { AgentStatus, ScanTask } from "../../api/contracts";
 import { AsyncState } from "../../components/AsyncState";
 import { usePolling } from "../../hooks/usePolling";
 import "../operational-pages.css";
+import { RemotePathBrowser } from "./RemotePathBrowser";
+import { addTaskRoot } from "./taskRoots";
 
 export interface ScansPageProps {
   readonly api?: AppApi;
@@ -31,7 +33,9 @@ function dispatchableAgents(values: readonly AgentStatus[]): AgentStatus[] {
 
 export function ScansPage({ api = appApi }: ScansPageProps) {
   const [selectedMachine, setSelectedMachine] = useState("");
-  const [rootsText, setRootsText] = useState("");
+  const [roots, setRoots] = useState<string[]>([]);
+  const [manualRoot, setManualRoot] = useState("");
+  const [browserOpen, setBrowserOpen] = useState(false);
   const [rescan, setRescan] = useState(false);
   const [formError, setFormError] = useState<string>();
   const [createdTaskId, setCreatedTaskId] = useState<string>();
@@ -46,11 +50,12 @@ export function ScansPage({ api = appApi }: ScansPageProps) {
     dependencies: [api, taskRefreshVersion],
     isTerminal: tasks => tasks.length > 0 && tasks.every(isTerminal)
   });
+  const agents = dispatchableAgents(agentsState.data ?? []);
+  const selectedAgent = agents.find(agent => agent.machineId === selectedMachine);
 
   useEffect(() => () => submitController.current?.abort(), []);
 
   const submit = async () => {
-    const roots = rootsText.split("|").map(value => value.trim()).filter(Boolean);
     if (!selectedMachine) {
       setFormError("请选择在线 Agent。");
       return;
@@ -59,7 +64,6 @@ export function ScansPage({ api = appApi }: ScansPageProps) {
       setFormError("至少输入一个扫描根目录。");
       return;
     }
-    const selectedAgent = agentsState.data?.find(agent => agent.machineId === selectedMachine);
     if (!selectedAgent?.online) {
       setFormError("所选 Agent 当前离线，请重新选择。");
       return;
@@ -85,16 +89,48 @@ export function ScansPage({ api = appApi }: ScansPageProps) {
   };
 
   const tasks = tasksState.data ?? [];
-  const agents = dispatchableAgents(agentsState.data ?? []);
+  const canBrowse = Boolean(selectedAgent?.online && selectedAgent.identityState === "claimed");
+
+  const addRoot = (candidate: string) => {
+    const change = addTaskRoot(roots, candidate);
+    if (change.kind === "add") {
+      setRoots(change.roots);
+      setManualRoot("");
+      setFormError(undefined);
+      return true;
+    }
+    if (change.kind === "replace") {
+      if (!window.confirm(`添加 ${candidate} 会覆盖已选子目录：${change.covered.join("、")}。是否继续？`)) return false;
+      setRoots(change.roots);
+      setManualRoot("");
+      setFormError(undefined);
+      return true;
+    }
+    setFormError(change.kind === "invalid" ? "请输入绝对 Windows 或 UNC 路径。" : change.kind === "duplicate"
+      ? "该扫描根目录已添加。"
+      : "该目录已被现有扫描根目录覆盖。");
+    return false;
+  };
+
+  const changeMachine = (machineID: string) => {
+    if (selectedMachine && machineID !== selectedMachine && (roots.length > 0 || manualRoot)) {
+      setRoots([]);
+      setManualRoot("");
+      setFormError("切换 Agent 后已清空待选根目录。");
+    }
+    setBrowserOpen(false);
+    setSelectedMachine(machineID);
+  };
+
   return (
     <section aria-labelledby="scans-heading" className="operational-page">
       <header className="operational-page__header operational-surface">
         <h1 id="scans-heading">扫描任务</h1>
-        <p>仅可向在线 Agent 提交一阶段扫描；根目录使用竖线分隔。</p>
+        <p>仅可向在线 Agent 提交一阶段扫描；可从远程目录选择或逐个手工输入根目录。</p>
       </header>
       <section aria-label="创建扫描任务" className="operational-form operational-surface">
         <label htmlFor="scan-agent">扫描 Agent</label>
-        <select id="scan-agent" onChange={event => setSelectedMachine(event.target.value)} value={selectedMachine}>
+        <select id="scan-agent" onChange={event => changeMachine(event.target.value)} value={selectedMachine}>
           <option value="">请选择在线 Agent</option>
           {agents.map(agent => (
             <option disabled={!agent.online || agent.identityState !== "claimed"} key={agent.machineId} value={agent.machineId}>
@@ -102,8 +138,15 @@ export function ScansPage({ api = appApi }: ScansPageProps) {
             </option>
           ))}
         </select>
-        <label htmlFor="scan-roots">扫描根目录</label>
-        <textarea id="scan-roots" onChange={event => setRootsText(event.target.value)} placeholder="D:\\Music | E:\\Video" value={rootsText} />
+        <label htmlFor="scan-manual-root">手工根目录</label>
+        <div className="scan-roots-input">
+          <input id="scan-manual-root" onChange={event => setManualRoot(event.target.value)} placeholder="D:\\Music 或 \\server\\share" value={manualRoot} />
+          <button onClick={() => addRoot(manualRoot)} type="button">添加根目录</button>
+          <button disabled={!canBrowse} onClick={() => setBrowserOpen(true)} type="button">选择目录…</button>
+        </div>
+        {roots.length > 0 ? <ul aria-label="已选扫描根目录" className="scan-roots-list">{roots.map(root => <li key={root}>
+          <span>{root}</span><button aria-label={`移除 ${root}`} onClick={() => setRoots(values => values.filter(value => value !== root))} type="button">移除</button>
+        </li>)}</ul> : null}
         <label><input checked={rescan} onChange={event => setRescan(event.target.checked)} type="checkbox" />重新扫描</label>
         <button disabled={submitting} onClick={() => void submit()} type="button">
           {submitting ? "正在创建…" : "创建扫描任务"}
@@ -111,6 +154,15 @@ export function ScansPage({ api = appApi }: ScansPageProps) {
         {formError ? <p role="alert">{formError}</p> : null}
         {createdTaskId ? <p>已创建任务：{createdTaskId}</p> : null}
       </section>
+      <RemotePathBrowser
+        api={api}
+        machineID={selectedMachine}
+        onAdd={path => {
+          if (addRoot(path)) setBrowserOpen(false);
+        }}
+        onClose={() => setBrowserOpen(false)}
+        open={browserOpen && canBrowse}
+      />
       {agentsState.error ? <AsyncState error={agentsState.error.message} state="error" /> : null}
       {!agentsState.data && agentsState.loading ? <AsyncState message="正在加载 Agent…" state="loading" /> : null}
       <section aria-label="扫描任务列表" className="operational-surface">

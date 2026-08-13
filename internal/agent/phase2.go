@@ -38,11 +38,12 @@ type Phase2Manager struct {
 }
 
 type Phase2Store interface {
-	Phase2CommittedState(
+	Phase2CommittedStateForFields(
 		context.Context,
 		string,
 		string,
 		store.MediaKind,
+		uint32,
 	) (store.Phase2Committed, error)
 }
 
@@ -449,7 +450,7 @@ func (m *Phase2Manager) runTask(state *phase2State) {
 	outcomes := make(chan phase2Outcome, total)
 	disks := make(map[int64][]phase2Work)
 	for index, item := range state.task.Items {
-		work, outcome, ok := m.prepareWork(m.workCtx, index, item)
+		work, outcome, ok := m.prepareWork(m.workCtx, index, state.task.Stage, item)
 		if !ok {
 			outcomes <- outcome
 			continue
@@ -513,6 +514,7 @@ func (m *Phase2Manager) runTask(state *phase2State) {
 func (m *Phase2Manager) prepareWork(
 	ctx context.Context,
 	index int,
+	stage uint8,
 	item proto.Phase2Item,
 ) (phase2Work, phase2Outcome, bool) {
 	work := phase2Work{index: index, item: item}
@@ -545,11 +547,12 @@ func (m *Phase2Manager) prepareWork(
 		kind = store.MediaVideo
 		workerKind = worker.MediaVideo
 	}
-	committed, err := m.store.Phase2CommittedState(
+	committed, err := m.store.Phase2CommittedStateForFields(
 		ctx,
 		m.machineID,
 		item.Path,
 		kind,
+		item.FieldsMask,
 	)
 	if err != nil {
 		return work, failedPhase2Outcome(index, item, 0, "store", err), false
@@ -567,23 +570,12 @@ func (m *Phase2Manager) prepareWork(
 			),
 		), false
 	}
-	fieldsMask := item.FieldsMask & committed.MissingFields
+	fieldsMask := item.FieldsMask
 	frameMask := item.FrameMask
 	if item.Kind == proto.KindVideo {
 		if frameMask == 0 {
 			frameMask = proto.FrameMaskFull
 		}
-		frameMask &= committed.MissingFrames
-		if frameMask == 0 {
-			fieldsMask = 0
-		}
-	}
-	if fieldsMask == 0 {
-		return work, phase2Outcome{
-			index:   index,
-			item:    basePhase2Feature(item, proto.StatusDone),
-			skipped: true,
-		}, false
 	}
 	knownSHA, err := hex.DecodeString(item.SHA512)
 	if err != nil || len(knownSHA) != 64 {
@@ -605,17 +597,19 @@ func (m *Phase2Manager) prepareWork(
 		), false
 	}
 	job := &worker.JobMsg{
-		JobID:      m.router.NextJobID(),
-		ScanTaskID: stateTaskIDPlaceholder,
-		Path:       item.Path,
-		Kind:       workerKind,
-		Phase:      worker.Phase2,
-		FieldsMask: fieldsMask,
-		Size:       item.Size,
-		MTimeMS:    item.MTimeMS,
-		KnownSHA:   knownSHA,
-		FrameMask:  frameMask,
-		DurationMS: item.DurationMS,
+		JobID:       m.router.NextJobID(),
+		ScanTaskID:  stateTaskIDPlaceholder,
+		Path:        item.Path,
+		Kind:        workerKind,
+		Phase:       worker.Phase2,
+		ScreenStage: worker.ScreenStage(stage),
+		Source:      worker.JobSourceManager,
+		FieldsMask:  fieldsMask,
+		Size:        item.Size,
+		MTimeMS:     item.MTimeMS,
+		KnownSHA:    knownSHA,
+		FrameMask:   frameMask,
+		DurationMS:  item.DurationMS,
 	}
 	work.job = job
 	return work, phase2Outcome{}, true
@@ -772,14 +766,35 @@ func phase2FeatureFromWorker(
 	if effectiveFrameMask == 0 {
 		effectiveFrameMask = proto.FrameMaskFull
 	}
-	item.Frames = make([]proto.FrameFeature, 0, len(result.Frames))
+	workerFrames := result.Frames
+	if len(workerFrames) == 0 && job.Kind == worker.MediaVideo &&
+		job.FieldsMask&(worker.MaskVideo6F|worker.MaskVideo6FPHash|worker.MaskVideo6FSobel) != 0 {
+		workerFrames = make([]worker.FrameFeature, 0, 6)
+		for index, frame := range result.FrameResults {
+			bit := uint8(1 << uint(index))
+			if effectiveFrameMask&bit == 0 {
+				continue
+			}
+			converted := worker.FrameFeature{
+				FrameIdx: index, TimeMS: frame.TimeMS,
+				PDQ256: append([]byte(nil), frame.PDQ256...), Quality: frame.Quality,
+				PHashParts: append([]byte(nil), frame.PHashParts...),
+				SobelHist:  append([]byte(nil), frame.SobelHist...),
+			}
+			if result.FramesDone&bit == 0 {
+				converted.Error = fmt.Sprintf("native_status_%d", frame.Status)
+			}
+			workerFrames = append(workerFrames, converted)
+		}
+	}
+	item.Frames = make([]proto.FrameFeature, 0, len(workerFrames))
 	validFrames := 0
-	for _, frame := range result.Frames {
+	for _, frame := range workerFrames {
 		if frame.FrameIdx < 0 || frame.FrameIdx >= 6 ||
 			effectiveFrameMask&(1<<uint(frame.FrameIdx)) == 0 {
 			continue
 		}
-		item.Frames = append(item.Frames, proto.FrameFeature{
+		mapped := proto.FrameFeature{
 			FrameIdx: frame.FrameIdx,
 			TimeMS:   frame.TimeMS,
 			PDQ256:   append([]byte(nil), frame.PDQ256...),
@@ -790,11 +805,25 @@ func phase2FeatureFromWorker(
 			),
 			SobelHist: append([]byte(nil), frame.SobelHist...),
 			Error:     frame.Error,
-		})
-		if frame.Error == "" &&
-			len(frame.PDQ256) != 0 &&
-			len(frame.PHashParts) != 0 &&
-			len(frame.SobelHist) != 0 {
+		}
+		switch job.ScreenStage {
+		case worker.ScreenStageTwo:
+			mapped.PDQ256, mapped.Quality, mapped.SobelHist = nil, 0, nil
+		case worker.ScreenStageThree:
+			mapped.PDQ256, mapped.Quality, mapped.PHashParts = nil, 0, nil
+		}
+		item.Frames = append(item.Frames, mapped)
+		valid := mapped.Error == ""
+		switch job.ScreenStage {
+		case worker.ScreenStageTwo:
+			valid = valid && len(mapped.PHashParts) != 0
+		case worker.ScreenStageThree:
+			valid = valid && len(mapped.SobelHist) != 0
+		default:
+			valid = valid && len(mapped.PDQ256) != 0 &&
+				len(mapped.PHashParts) != 0 && len(mapped.SobelHist) != 0
+		}
+		if valid {
 			validFrames++
 		}
 	}
@@ -944,6 +973,9 @@ func validatePhase2Envelope(task proto.Phase2Task, machineID string) error {
 	if len(task.Items) == 0 {
 		return fmt.Errorf("empty items")
 	}
+	if err := task.Validate(); err != nil {
+		return err
+	}
 	if len(task.Items) > maxPhase2TaskItems {
 		return fmt.Errorf(
 			"item count %d exceeds shard limit %d",
@@ -955,9 +987,6 @@ func validatePhase2Envelope(task proto.Phase2Task, machineID string) error {
 	pathToSHA := make(map[string]string, len(task.Items))
 	shaToPath := make(map[string]string, len(task.Items))
 	for index, item := range task.Items {
-		if err := item.Validate(); err != nil {
-			return fmt.Errorf("item[%d]: %w", index, err)
-		}
 		if item.MachineID != machineID {
 			return fmt.Errorf(
 				"item[%d] machine_id %q does not match local machine %q",
@@ -992,7 +1021,7 @@ func clonePhase2Task(task proto.Phase2Task) proto.Phase2Task {
 }
 
 func samePhase2Envelope(left, right proto.Phase2Task) bool {
-	if left.TaskID != right.TaskID || len(left.Items) != len(right.Items) {
+	if left.TaskID != right.TaskID || left.Stage != right.Stage || len(left.Items) != len(right.Items) {
 		return false
 	}
 	for index := range left.Items {

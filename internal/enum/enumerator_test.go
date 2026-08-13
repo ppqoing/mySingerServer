@@ -240,26 +240,27 @@ func TestEverythingMatchesWalkerWhenIntegrationEnabled(t *testing.T) {
 	}
 	enumr := NewEverythingEnumeratorAt(dll)
 	availableErr := enumr.Available()
-	if availableErr != nil && !errors.Is(availableErr, ErrEmptyIndex) {
+	if availableErr != nil && !errors.Is(availableErr, ErrIndexNotReady) {
 		t.Fatalf("Everything Available: %v", availableErr)
 	}
-	var selected Enumerator = enumr
-	if errors.Is(availableErr, ErrEmptyIndex) {
-		selected = WalkerEnumerator{}
-		t.Log("Everything index is empty; verifying documented Walker fallback")
+	deadline := time.Now().Add(30 * time.Second)
+	for errors.Is(availableErr, ErrIndexNotReady) && time.Now().Before(deadline) {
+		time.Sleep(250 * time.Millisecond)
+		availableErr = enumr.Available()
+	}
+	if availableErr != nil {
+		t.Fatalf("Everything database did not become ready: %v", availableErr)
 	}
 	var everythingRecords []FileRecord
-	deadline := time.Now().Add(30 * time.Second)
 	for {
 		everythingRecords = everythingRecords[:0]
-		if err := selected.Enum(root, func(record FileRecord) error {
+		if err := enumr.Enum(root, func(record FileRecord) error {
 			everythingRecords = append(everythingRecords, record)
 			return nil
 		}); err != nil {
-			t.Fatalf("%s Enum: %v", selected.Name(), err)
+			t.Fatalf("%s Enum: %v", enumr.Name(), err)
 		}
-		if len(everythingRecords) == 2 || selected.Name() == "walker" ||
-			time.Now().After(deadline) {
+		if len(everythingRecords) == 2 || time.Now().After(deadline) {
 			break
 		}
 		time.Sleep(250 * time.Millisecond)

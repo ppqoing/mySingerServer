@@ -4,7 +4,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"dedup/internal/proto"
+	"dedup/internal/store"
 )
 
 var (
@@ -59,10 +59,10 @@ func MissingBaseWithExtensions(path string, imageExts, videoExts []string) uint3
 func missingBaseForKind(kind string) uint32 {
 	switch kind {
 	case "image":
-		return proto.FieldSHA512 | proto.FieldPDQ256
+		return store.RequiredStageOneMask(store.MediaImage)
 	case "video":
-		return proto.FieldSHA512 | proto.FieldThumb
+		return store.RequiredStageOneMask(store.MediaVideo)
 	default:
-		return proto.FieldSHA512
+		return store.RequiredStageOneMask(store.MediaKind(kind))
 	}
 }

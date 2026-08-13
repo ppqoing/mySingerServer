@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -23,23 +24,47 @@ func (compositionStore) LoadTraySettings() (traymodel.TraySettings, error) {
 	return production.DefaultTraySettings(), nil
 }
 func (compositionStore) SaveTraySettings(traymodel.TraySettings) error { return nil }
-func (compositionStore) LoadAgentForm() (trayconfig.AgentForm, error) {
-	return trayconfig.AgentForm{}, nil
-}
-func (compositionStore) SaveAgentForm(trayconfig.AgentForm) (string, error) {
-	return "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", nil
-}
 func (compositionStore) LoadHelperForm() (trayconfig.HelperForm, error) {
 	return trayconfig.HelperForm{}, nil
+}
+func (compositionStore) ValidateHelperForm(trayconfig.HelperForm) []trayconfig.FieldError { return nil }
+func (compositionStore) SaveHelperForm(trayconfig.HelperForm) (string, error) {
+	return strings.Repeat("b", 64), nil
 }
 func (compositionStore) PrepareHelperWrite(trayconfig.HelperForm) (trayconfig.PreparedWrite, error) {
 	return trayconfig.PreparedWrite{}, nil
 }
+func (compositionStore) PrepareDefaultHelperWrite() (trayconfig.PreparedWrite, error) {
+	return trayconfig.PreparedWrite{}, trayconfig.ErrHelperConfigExists
+}
+func (compositionStore) HelperFingerprint() (string, error) { return strings.Repeat("b", 64), nil }
 
 type compositionValidator struct{}
 
-func (compositionValidator) ValidateAgent(trayconfig.AgentForm) []trayconfig.FieldError   { return nil }
 func (compositionValidator) ValidateHelper(trayconfig.HelperForm) []trayconfig.FieldError { return nil }
+
+type compositionAgentConfig struct {
+	loaded trayconfig.AgentForm
+	calls  *[]string
+}
+
+func (g compositionAgentConfig) LoadAgentForm(context.Context) (trayconfig.AgentForm, error) {
+	*g.calls = append(*g.calls, "socket-load-agent")
+	return g.loaded, nil
+}
+func (g compositionAgentConfig) ValidateAgentForm(context.Context, trayconfig.AgentForm) []trayconfig.FieldError {
+	*g.calls = append(*g.calls, "socket-validate-agent")
+	return nil
+}
+func (g compositionAgentConfig) SaveAgentForm(context.Context, trayconfig.AgentForm) (trayapp.AgentConfigSaveResult, error) {
+	*g.calls = append(*g.calls, "socket-save-agent")
+	return trayapp.AgentConfigSaveResult{SHA256: strings.Repeat("c", 64), RestartRequired: true}, nil
+}
+func (g compositionAgentConfig) PromotePendingEndpoint() {
+	*g.calls = append(*g.calls, "socket-promote-agent-endpoint")
+}
+
+func (g compositionAgentConfig) CallLocal(context.Context, string, any, any) error { return nil }
 
 type compositionComponent struct{}
 
@@ -141,14 +166,17 @@ func (compositionUI) Ready(context.Context) error { return nil }
 
 func validCompositionInputs() productionCompositionInputs {
 	component := &compositionComponent{}
+	agentConfigCalls := []string{}
 	paths := bootstrap.Paths{
-		TraySettings: `C:\Users\u\AppData\Local\MySingerServer\NodeTray\tray.json`,
-		AgentConfig:  `C:\ProgramData\MySingerServer\Node\agent.json`,
-		HelperConfig: `C:\ProgramData\MySingerServer\Helper\helper.json`,
+		TraySettings: `C:\Portable\Compute\data\nodetray\tray.json`,
+		AgentConfig:  `C:\Portable\Compute\data\agent\agent.json`,
+		HelperConfig: `C:\Portable\Compute\data\helper\helper.json`,
 	}
 	return productionCompositionInputs{
 		Store:             compositionStore{},
 		Validator:         compositionValidator{},
+		AgentConfig:       compositionAgentConfig{loaded: trayconfig.AgentForm{DataDir: "socket-agent"}, calls: &agentConfigCalls},
+		LocalAgent:        compositionAgentConfig{calls: &agentConfigCalls},
 		MachineID:         "node-" + strings.Repeat("1", 64),
 		Agent:             component,
 		Helper:            component,
@@ -157,37 +185,61 @@ func validCompositionInputs() productionCompositionInputs {
 		Task:              compositionTask{},
 		Elevation:         compositionElevation{},
 		LoginStart:        compositionLoginStart{},
-		TrayExecutable:    `C:\Program Files\MySingerServer\nodetray.exe`,
+		PortableRoot:      `C:\Portable\Compute`,
+		WebViewDataPath:   `C:\Portable\Compute\data\nodetray\webview2`,
+		TrayExecutable:    `C:\Portable\Compute\nodetray.exe`,
 		TaskDefinition: task.Definition{
-			HelperExecutable: `C:\Program Files\MySingerServer\helper.exe`,
+			HelperExecutable: `C:\Portable\Compute\helper.exe`,
 			HelperConfig:     paths.HelperConfig,
 			UserSID:          "S-1-5-21-101-202-303-1001",
 		},
 		Locations: map[traymodel.LocationKind]trayapp.Location{
-			traymodel.AgentLogs:    {Path: `C:\ProgramData\MySingerServer\Node\logs`, Root: `C:\ProgramData\MySingerServer\Node`},
-			traymodel.HelperLogs:   {Path: `C:\ProgramData\MySingerServer\Helper\logs`, Root: `C:\ProgramData\MySingerServer\Helper`},
-			traymodel.AgentBackup:  {Path: paths.AgentConfig + ".last-good", Root: `C:\ProgramData\MySingerServer\Node`},
-			traymodel.HelperBackup: {Path: paths.HelperConfig + ".last-good", Root: `C:\ProgramData\MySingerServer\Helper`},
+			traymodel.AgentLogs:    {Path: `C:\Portable\Compute\data\agent\logs`, Root: `C:\Portable\Compute\data\agent`},
+			traymodel.HelperLogs:   {Path: `C:\Portable\Compute\data\helper\logs`, Root: `C:\Portable\Compute\data\helper`},
+			traymodel.AgentBackup:  {Path: paths.AgentConfig + ".last-good", Root: `C:\Portable\Compute\data\agent`},
+			traymodel.HelperBackup: {Path: paths.HelperConfig + ".last-good", Root: `C:\Portable\Compute\data\helper`},
 		},
-		FinalPaths:    compositionFinalPaths{},
-		Opener:        compositionOpener{},
-		Workers:       compositionWorkers{},
-		ProcessWaiter: compositionProcessWaiter{},
-		Paths:         compositionPaths{paths: paths},
-		Instance:      compositionInstance{},
-		Factory:       compositionFactory{component: component},
-		Scheduler:     compositionScheduler{},
-		UI:            compositionUI{},
-		Emitter:       func(context.Context, string, any) {},
-		Prepare:       func() error { return nil },
-		Show:          func(context.Context) {},
-		Quit:          func(context.Context) {},
+		FinalPaths:        compositionFinalPaths{},
+		Opener:            compositionOpener{},
+		Workers:           compositionWorkers{},
+		ProcessWaiter:     compositionProcessWaiter{},
+		Paths:             compositionPaths{paths: paths},
+		Instance:          compositionInstance{},
+		Factory:           compositionFactory{component: component},
+		Scheduler:         compositionScheduler{},
+		UI:                compositionUI{},
+		Emitter:           func(context.Context, string, any) {},
+		Prepare:           func() error { return nil },
+		Show:              func(context.Context) {},
+		Quit:              func(context.Context) {},
+		CloseAgentControl: func() error { return nil },
+	}
+}
+
+func TestProductionCompositionRoutesAgentConfigThroughInjectedSocketGateway(t *testing.T) {
+	inputs := validCompositionInputs()
+	calls := []string{}
+	inputs.AgentConfig = compositionAgentConfig{loaded: trayconfig.AgentForm{DataDir: "socket-only"}, calls: &calls}
+	backend, err := composeProductionBackendWith(inputs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	form, err := backend.service.GetAgentForm(context.Background())
+	if err != nil || form.DataDir != "socket-only" {
+		t.Fatalf("GetAgentForm = %#v, %v", form, err)
+	}
+	result := backend.service.SaveAgent(context.Background(), form)
+	if !result.OK || result.SHA256 != strings.Repeat("c", 64) || result.NeedsRestart {
+		t.Fatalf("SaveAgent = %#v", result)
+	}
+	if want := []string{"socket-load-agent", "socket-validate-agent", "socket-save-agent"}; !reflect.DeepEqual(calls, want) {
+		t.Fatalf("calls = %v, want %v", calls, want)
 	}
 }
 
 func TestProductionCompositionDefersPreparationAndWiresActivationAndExit(t *testing.T) {
 	inputs := validCompositionInputs()
-	var prepareCalls, bootstrapCalls, showCalls, quitCalls atomic.Int32
+	var prepareCalls, bootstrapCalls, showCalls, quitCalls, closeAgentCalls atomic.Int32
 	inputs.Prepare = func() error { prepareCalls.Add(1); return nil }
 	inputs.Show = func(ctx context.Context) {
 		if ctx == nil || ctx.Err() != nil {
@@ -201,6 +253,7 @@ func TestProductionCompositionDefersPreparationAndWiresActivationAndExit(t *test
 		}
 		quitCalls.Add(1)
 	}
+	inputs.CloseAgentControl = func() error { closeAgentCalls.Add(1); return nil }
 	inputs.StartBootstrap = func(ctx context.Context, dependencies bootstrap.Dependencies) (*bootstrap.Runtime, error) {
 		bootstrapCalls.Add(1)
 		if dependencies.Factory == nil || dependencies.Settings == nil || dependencies.Instance == nil || dependencies.Show == nil {
@@ -230,6 +283,9 @@ func TestProductionCompositionDefersPreparationAndWiresActivationAndExit(t *test
 	}
 	if err := backend.Shutdown(context.Background()); err != nil {
 		t.Fatalf("Shutdown: %v", err)
+	}
+	if closeAgentCalls.Load() != 1 {
+		t.Fatalf("shared Agent controller close calls = %d, want 1", closeAgentCalls.Load())
 	}
 }
 

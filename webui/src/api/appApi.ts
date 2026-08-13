@@ -1,9 +1,10 @@
-import { ApiError, requestJson, requestVoid } from "./client";
+import { ApiError, isAbortError, requestJson, requestVoid } from "./client";
 import type {
   AgentStatus,
   AnalysisStats,
   AnalysisStatus,
   AppApi,
+  BrowseAgentFilesystemInput,
   DeleteMachineStatus,
   DeleteMode,
   DeletePreparation,
@@ -11,6 +12,8 @@ import type {
   DeleteSequenceStatus,
   DeleteSummary,
   DeleteTaskStatus,
+  FilesystemEntry,
+  FilesystemPage,
   ConfigFieldError,
   GUIConfig,
   GUIConfigSaveResult,
@@ -21,6 +24,7 @@ import type {
   GroupPage,
   GroupQuery,
   GroupSummary,
+  RuntimeStatus,
   ScanTask,
   StartScanInput
 } from "./contracts";
@@ -42,6 +46,11 @@ export function createAppApi(): AppApi {
     listAgents: signal => requestJson("/api/agents", get(signal), agents),
     listTasks: signal => requestJson("/api/tasks", get(signal), tasks),
     startScan: (input, signal) => requestJson("/api/scan", jsonPost(scanInput(input), signal), taskId),
+    browseAgentFilesystem: (machineID, input, signal) => requestJson(
+      `/api/agents/${encodeURIComponent(requiredText(machineID, "machine id"))}/filesystem/browse`,
+      jsonPost(filesystemBrowseInput(input), signal),
+      filesystemPage
+    ),
     getAnalysisStatus: signal => requestJson(
       "/api/analysis/firstscreen/status",
       { ...get(signal), decodeStatuses: [503] },
@@ -78,13 +87,85 @@ export function createAppApi(): AppApi {
     loadGUIConfig: signal => requestJson("/api/config", get(signal), guiConfigSnapshot),
     saveGUIConfig: (configValue, signal) => requestJson(
       "/api/config",
-      { ...jsonPut(guiConfigInput(configValue), signal), decodeStatuses: [400] },
+      { ...jsonPut(guiConfigInput(configValue), signal), decodeStatuses: [400, 500] },
       guiConfigSaveResponse
-    )
+    ),
+    getRuntimeStatus: signal => requestJson("/api/runtime/status", get(signal), runtimeStatus)
   };
 }
 
+export class GUIConfigRestartError extends ApiError {
+  readonly saved: boolean;
+  readonly restartRequired: boolean;
+
+  constructor(saved: boolean, restartRequired: boolean) {
+    super(500, "restart_launch_failed", false);
+    this.name = "GUIConfigRestartError";
+    this.saved = saved;
+    this.restartRequired = restartRequired;
+  }
+}
+
 export const appApi: AppApi = createAppApi();
+
+const managerRecoveryPollIntervalMs = 250;
+const managerRecoveryTimeoutMs = 30_000;
+
+export async function waitForManager(recoveryURL: string, signal?: AbortSignal): Promise<void> {
+  const expectedRestartToken = new URL(recoveryURL).searchParams.get("restart_token");
+  const healthURL = recoveryURL;
+  const controller = new AbortController();
+  let timedOut = false;
+  const timeout = setTimeout(() => { timedOut = true; controller.abort(); }, managerRecoveryTimeoutMs);
+  const abort = () => controller.abort();
+  signal?.addEventListener("abort", abort, { once: true });
+  if (signal?.aborted) controller.abort();
+  try {
+    while (true) {
+      try {
+        const response = await fetch(healthURL, { credentials: "omit", signal: controller.signal });
+        if (response.ok && await recoveryHealthReady(response, expectedRestartToken)) return;
+      } catch (error) {
+        if (timedOut) throw new Error("Manager restart timed out", { cause: error });
+        if (isAbortError(error) || signal?.aborted) throw error;
+      }
+      await waitFor(managerRecoveryPollIntervalMs, controller.signal);
+    }
+  } catch (error) {
+    if (timedOut) throw new Error("Manager restart timed out", { cause: error });
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+    signal?.removeEventListener("abort", abort);
+  }
+}
+
+async function recoveryHealthReady(response: Response, expectedRestartToken: string | null): Promise<boolean> {
+  try {
+    const value: unknown = await response.json();
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+    const health = value as { ok?: unknown; restart_token?: unknown; restarting?: unknown };
+    return expectedRestartToken !== null && expectedRestartToken !== "" &&
+      health.ok === true && health.restart_token === expectedRestartToken && health.restarting === false;
+  } catch {
+    return false;
+  }
+}
+
+function waitFor(milliseconds: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(complete, milliseconds);
+    const abort = () => {
+      clearTimeout(timer);
+      reject(new DOMException("The operation was aborted", "AbortError"));
+    };
+    function complete() {
+      signal?.removeEventListener("abort", abort);
+      resolve();
+    }
+    if (signal) signal.addEventListener("abort", abort, { once: true });
+  });
+}
 
 function get(signal?: AbortSignal): RequestInit {
   return { method: "GET", body: undefined, signal };
@@ -125,6 +206,15 @@ function scanInput(input: StartScanInput): Record<string, unknown> {
     body.phase = positiveInteger(input.phase, "phase");
   }
   return body;
+}
+
+function filesystemBrowseInput(input: BrowseAgentFilesystemInput): Record<string, unknown> {
+  return {
+    path: requiredTextOrEmpty(input.path, "filesystem path"),
+    show_hidden: boolean(input.showHidden, "show hidden"),
+    cursor: requiredTextOrEmpty(input.cursor, "filesystem cursor"),
+    limit: positiveInteger(input.limit, "filesystem limit")
+  };
 }
 
 function groupListUrl(query: GroupQuery): string {
@@ -196,6 +286,28 @@ function tasks(value: unknown): ScanTask[] {
 
 function taskId(value: unknown): { taskId: string } {
   return { taskId: text(record(value, "task response").task_id, "task_id") };
+}
+
+function filesystemPage(value: unknown): FilesystemPage {
+  const raw = record(value, "filesystem page");
+  return {
+    currentPath: text(raw.current_path, "filesystem.current_path"),
+    parentPath: text(raw.parent_path, "filesystem.parent_path"),
+    entries: array(raw.entries, "filesystem.entries").map(filesystemEntry),
+    nextCursor: text(raw.next_cursor, "filesystem.next_cursor")
+  };
+}
+
+function filesystemEntry(value: unknown): FilesystemEntry {
+  const raw = record(value, "filesystem entry");
+  return {
+    name: text(raw.name, "filesystem entry.name"),
+    path: text(raw.path, "filesystem entry.path"),
+    kind: filesystemEntryKind(raw.kind),
+    hidden: boolean(raw.hidden, "filesystem entry.hidden"),
+    system: boolean(raw.system, "filesystem entry.system"),
+    selectable: boolean(raw.selectable, "filesystem entry.selectable")
+  };
 }
 
 function analysisStatus(value: unknown): AnalysisStatus {
@@ -402,17 +514,38 @@ function guiConfigInput(value: GUIConfig): Record<string, unknown> {
   };
 }
 
-function guiConfigSaveResponse(value: unknown): GUIConfigSaveResult {
+function guiConfigSaveResponse(value: unknown, status = httpStatusOK): GUIConfigSaveResult {
   const raw = record(value, "GUI config save response");
   if (raw.error === "config_invalid") {
     throw new GUIConfigValidationError(configFieldErrors(raw.fields));
   }
+  if (raw.error === "restart_launch_failed") {
+    throw new GUIConfigRestartError(
+      boolean(raw.saved, "GUI config saved"),
+      boolean(raw.restart_required, "GUI config restart_required")
+    );
+  }
   if (typeof raw.error === "string") {
-    throw new ApiError(400, raw.error, false);
+    throw new ApiError(status, raw.error, status >= 500);
   }
   return {
     saved: boolean(raw.saved, "GUI config saved"),
-    restartRequired: boolean(raw.restart_required, "GUI config restart_required")
+    restartRequired: boolean(raw.restart_required, "GUI config restart_required"),
+    restarting: boolean(raw.restarting, "GUI config restarting"),
+    recoveryURL: text(raw.recovery_url, "GUI config recovery_url")
+  };
+}
+
+const httpStatusOK = 200;
+
+function runtimeStatus(value: unknown): RuntimeStatus {
+  const raw = record(value, "runtime status");
+  return {
+    databaseState: runtimeDatabaseState(raw.database_state),
+    databaseErrorCode: text(raw.database_error_code, "runtime database_error_code"),
+    agents: agents(raw.agents),
+    restarting: boolean(raw.restarting, "runtime restarting"),
+    recoveryURL: text(raw.recovery_url, "runtime recovery_url")
   };
 }
 
@@ -545,6 +678,13 @@ function agentIdentityState(value: unknown): AgentStatus["identityState"] {
   throw new TypeError("agent.identity_state is invalid");
 }
 
+function runtimeDatabaseState(value: unknown): RuntimeStatus["databaseState"] {
+  if (value === "connecting" || value === "connected" || value === "error") {
+    return value;
+  }
+  throw new TypeError("runtime database_state is invalid");
+}
+
 function deleteMode(value: unknown): DeleteMode {
   if (value === "soft" || value === "hard") {
     return value;
@@ -552,9 +692,23 @@ function deleteMode(value: unknown): DeleteMode {
   throw new TypeError("delete mode is invalid");
 }
 
+function filesystemEntryKind(value: unknown): FilesystemEntry["kind"] {
+  if (value === "drive" || value === "directory" || value === "file") {
+    return value;
+  }
+  throw new TypeError("filesystem entry.kind is invalid");
+}
+
 function requiredText(value: string, field: string): string {
   if (value.trim() === "") {
     throw new Error(`${field} is required`);
+  }
+  return value;
+}
+
+function requiredTextOrEmpty(value: string, field: string): string {
+  if (typeof value !== "string") {
+    throw new Error(`${field} must be a string`);
   }
   return value;
 }

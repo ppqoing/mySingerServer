@@ -48,11 +48,19 @@ type executorAuthority struct {
 
 type elevatedTestHooks struct {
 	beforeLock        func()
+	stat              func(string) (os.FileInfo, error)
 	beforeBackup      func()
 	afterSync         func(tempPath, destination string) error
 	beforeReplace     func(tempPath, destination string) error
 	replace           func(tempPath, destination string) error
 	beforeTaskService func()
+}
+
+func (executor *Executor) stat(path string) (os.FileInfo, error) {
+	if executor.testHooks.stat != nil {
+		return executor.testHooks.stat(path)
+	}
+	return os.Stat(path)
 }
 
 type elevatedPlatform interface {
@@ -129,6 +137,9 @@ func (executor *Executor) Execute(ctx context.Context, request elevation.Request
 			}
 			if errors.Is(err, trayconfig.ErrSaveVerify) {
 				return failResponse(response, elevation.ErrorCodeSaveVerifyFailed, "configuration verification failed")
+			}
+			if errors.Is(err, trayconfig.ErrHelperConfigExists) {
+				return failResponse(response, elevation.ErrorCodeHelperConfigExists, "helper configuration already exists")
 			}
 			return failResponse(response, elevation.ErrorCodeWriteFailed, "configuration write failed")
 		}
@@ -311,16 +322,25 @@ func (executor *Executor) savePreparedHelper(ctx context.Context, prepared trayc
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return executor.saveLocked(ctx, prepared.CanonicalJSON)
+	return executor.saveLocked(ctx, prepared.CanonicalJSON, prepared.CreateOnly)
 }
 
-func (executor *Executor) saveLocked(ctx context.Context, data []byte) error {
+func (executor *Executor) saveLocked(ctx context.Context, data []byte, createOnly bool) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	target := executor.frozen.helperConfigPath
 	backup := target + ".last-good"
-	_, targetStatErr := os.Stat(target)
+	if createOnly {
+		for _, path := range []string{target, backup} {
+			if _, err := executor.stat(path); err == nil {
+				return trayconfig.ErrHelperConfigExists
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		}
+	}
+	_, targetStatErr := executor.stat(target)
 	switch {
 	case targetStatErr == nil:
 		oldData, err := executor.loadCanonicalHelperFile(target)
@@ -338,7 +358,7 @@ func (executor *Executor) saveLocked(ctx context.Context, data []byte) error {
 			return err
 		}
 	case errors.Is(targetStatErr, os.ErrNotExist):
-		_, backupStatErr := os.Stat(backup)
+		_, backupStatErr := executor.stat(backup)
 		switch {
 		case backupStatErr == nil:
 			if _, err := executor.loadCanonicalHelperFile(backup); err != nil {

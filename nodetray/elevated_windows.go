@@ -14,11 +14,9 @@ import (
 	"dedup/internal/nodetray/production"
 	"dedup/internal/nodetray/windows/elevation"
 	"dedup/internal/nodetray/windows/task"
-	"golang.org/x/sys/windows"
 )
 
 type elevatedOnceFactories struct {
-	Layout      production.Layout
 	Inspector   process.Inspector
 	FinalPath   func(string) (string, error)
 	UserSID     func(process.Identity) (string, error)
@@ -32,14 +30,10 @@ func init() {
 }
 
 func runWindowsElevatedOnce(pipeName, nonce string) error {
-	layout, err := resolveWindowsLayout(windowsKnownFolderPath)
-	if err != nil {
-		return err
-	}
 	inspector := process.NewInspector()
 	return runElevatedOnceWith(pipeName, nonce, elevatedOnceFactories{
-		Layout: layout, Inspector: inspector,
-		FinalPath: func(path string) (string, error) { return (bootstrapFinalPathResolver{}).Final(path) },
+		Inspector: inspector,
+		FinalPath: func(path string) (string, error) { return (bootstrap.OSFinalPathResolver{}).Final(path) },
 		UserSID:   process.UserSIDForProcess,
 		NewTask:   task.New,
 		NewExecutor: func(helperConfig string, service task.Service, definition task.Definition, capability task.Capability) (elevation.Handler, error) {
@@ -61,14 +55,18 @@ func runElevatedOnceWith(pipeName, nonce string, factories elevatedOnceFactories
 	if err != nil || self.PID != os.Getpid() || self.StartedAtUnixMS <= 0 || self.ExecutablePath == "" {
 		return errors.New("elevated composition: current process identity unavailable")
 	}
-	finalTray, err := factories.FinalPath(factories.Layout.TrayExecutable)
+	layout, err := production.ResolvePortableLayout(self.ExecutablePath)
+	if err != nil {
+		return errors.New("elevated composition: portable layout unavailable")
+	}
+	finalTray, err := factories.FinalPath(layout.TrayExecutable)
 	if err != nil || finalTray == "" {
-		return errors.New("elevated composition: fixed tray executable unavailable")
+		return errors.New("elevated composition: portable tray executable unavailable")
 	}
 	expected := self
 	expected.ExecutablePath = finalTray
 	if !process.SameProcess(expected, self) {
-		return errors.New("elevated composition: current executable is outside fixed deployment")
+		return errors.New("elevated composition: current executable is outside portable deployment")
 	}
 	return factories.Serve(context.Background(), pipeName, nonce, factories.Inspector, func(parent process.Identity) (elevation.Handler, error) {
 		userSID, err := factories.UserSID(parent)
@@ -80,25 +78,14 @@ func runElevatedOnceWith(pipeName, nonce string, factories elevatedOnceFactories
 			return nil, errors.New("elevated composition: elevated task service unavailable")
 		}
 		definition := task.Definition{
-			HelperExecutable: factories.Layout.HelperExecutable,
-			HelperConfig:     factories.Layout.HelperConfig,
+			HelperExecutable: layout.HelperExecutable,
+			HelperConfig:     layout.HelperConfig,
 			UserSID:          userSID,
 		}
-		handler, err := factories.NewExecutor(factories.Layout.HelperConfig, service, definition, task.CapabilityElevated)
+		handler, err := factories.NewExecutor(layout.HelperConfig, service, definition, task.CapabilityElevated)
 		if err != nil || handler == nil {
 			return nil, errors.New("elevated composition: fixed action executor unavailable")
 		}
 		return handler, nil
 	})
-}
-
-// These indirections keep package initialization free of known-folder and
-// filesystem work while allowing the elevated entry to share fixed layout
-// resolution with the ordinary composition.
-var windowsKnownFolderPath windowsKnownFolderLookup = windows.KnownFolderPath
-
-type bootstrapFinalPathResolver struct{}
-
-func (bootstrapFinalPathResolver) Final(path string) (string, error) {
-	return (bootstrap.OSFinalPathResolver{}).Final(path)
 }

@@ -14,6 +14,7 @@ $script:WailsCommand = "github.com/wailsapp/wails/v2/cmd/wails@$script:WailsVers
 $script:ExpectedWailsModuleSum = "h1:BHO/kLNWFHYjCzucxbzAYZWUjub1Tvb4cSguQozHn5c="
 $script:OfficialWebView2URL = "https://go.microsoft.com/fwlink/p/?LinkId=2124703"
 $repo = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'standard-dependency-paths.ps1')
 
 function Resolve-NodeTrayApplication {
     param(
@@ -302,6 +303,12 @@ if ($MyInvocation.InvocationName -eq '.') {
 
 $goExe = Resolve-NodeTrayApplication -Requested $Go -Label 'Go'
 $npmExe = Resolve-NodeTrayApplication -Requested $Npm -Label 'npm'
+$dependencyPaths = Resolve-StandardDependencyPaths `
+    -RepositoryRoot $repo -GoExecutable $goExe -NpmExecutable $npmExe
+$goModuleCache = $dependencyPaths.GoModCache
+Write-Host "Go module cache: $goModuleCache"
+Write-Host "Go build cache: $($dependencyPaths.GoBuildCache)"
+Write-Host "npm cache: $($dependencyPaths.NpmCache)"
 $out = Resolve-NodeTrayPath -Path $OutDir -RepositoryRoot $repo
 $repoRoot = [IO.Path]::GetFullPath($repo).TrimEnd('\')
 $driveRoot = [IO.Path]::GetPathRoot($out).TrimEnd('\')
@@ -331,10 +338,6 @@ if ($LASTEXITCODE -ne 0 -or $npmVersion -notmatch '^\d+\.\d+\.\d+') {
     throw "NODETRAY_NPM_VERSION_FAILED"
 }
 
-$goModuleCache = (& $goExe env GOMODCACHE 2>&1 | Out-String).Trim()
-if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($goModuleCache)) {
-    throw "NODETRAY_GOMODCACHE_RESOLVE_FAILED"
-}
 $localGoProxy = Get-LocalGoModuleProxy -GoModuleCache $goModuleCache
 $wailsBootstrapper = Join-Path $goModuleCache `
     'github.com\wailsapp\wails\v2@v2.12.0\internal\webview2runtime\MicrosoftEdgeWebview2Setup.exe'

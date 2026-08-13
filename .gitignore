@@ -3,7 +3,9 @@
 /artifacts/
 /.tmp/
 /.tmp-*/
+/.codex-temp/
 /.superpowers/
+/.worktrees/
 /node_modules/
 /.pnpm-store/
 /webui/node_modules/

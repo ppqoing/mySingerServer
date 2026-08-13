@@ -43,6 +43,7 @@ type RemoteTx interface {
 	UpsertImages(ctx context.Context, rows []store.ImageFeatureSyncRow) error
 	UpsertVideos(ctx context.Context, rows []store.VideoFeatureSyncRow) error
 	UpsertFrames(ctx context.Context, rows []store.VideoFrameSyncRow) error
+	UpsertLocal(ctx context.Context, batch store.LocalSyncBatch) error
 	CloseBatch(ctx context.Context) error
 	Commit(ctx context.Context) error
 	Rollback(ctx context.Context) error
@@ -58,6 +59,9 @@ type syncStore interface {
 	MarkSyncBatch(ctx context.Context, rows []store.SyncQueueRow) error
 	PruneMissingSyncRows(ctx context.Context, rows []store.SyncQueueRow) error
 	QuarantineSyncRows(ctx context.Context, rows []store.SyncQueueRow) error
+	PendingLocalSyncEvents(ctx context.Context, limit int) ([]store.LocalOutboxSyncRow, error)
+	LoadLocalSyncBatch(ctx context.Context, events []store.LocalOutboxSyncRow) (store.LocalSyncBatch, error)
+	AcknowledgeLocalSyncEvents(ctx context.Context, events []store.LocalOutboxSyncRow) error
 }
 
 type Syncer struct {
@@ -115,7 +119,13 @@ func (s *Syncer) Run(ctx context.Context) {
 				s.reportFailure(ctx, err)
 				continue
 			}
-			if count >= s.cfg.TriggerRows {
+			localEvents, localErr := s.local.PendingLocalSyncEvents(ctx, 1)
+			if localErr != nil {
+				s.log.Error("sync: count local outbox", "err", localErr)
+				s.reportFailure(ctx, localErr)
+				continue
+			}
+			if count >= s.cfg.TriggerRows || len(localEvents) != 0 {
 				s.log.Info("sync: backlog trigger", "pending", count)
 				s.syncOnce(ctx)
 			} else if count == 0 {
@@ -131,6 +141,7 @@ type loadedBatch struct {
 	images []store.ImageFeatureSyncRow
 	videos []store.VideoFeatureSyncRow
 	frames []store.VideoFrameSyncRow
+	local  store.LocalSyncBatch
 }
 
 func (s *Syncer) syncOnce(ctx context.Context) {
@@ -145,7 +156,13 @@ func (s *Syncer) syncOnce(ctx context.Context) {
 			s.reportFailure(ctx, err)
 			return
 		}
-		if len(queueRows) == 0 {
+		localEvents, err := s.local.PendingLocalSyncEvents(ctx, limit)
+		if err != nil {
+			s.log.Error("sync: read local outbox", "err", err)
+			s.reportFailure(ctx, err)
+			return
+		}
+		if len(queueRows) == 0 && len(localEvents) == 0 {
 			s.reportHealthy()
 			return
 		}
@@ -171,7 +188,7 @@ func (s *Syncer) syncOnce(ctx context.Context) {
 				return
 			}
 		}
-		if len(validRows) == 0 {
+		if len(validRows) == 0 && len(localEvents) == 0 {
 			continue
 		}
 		batch, missing, err := s.loadBatch(ctx, validRows)
@@ -188,7 +205,13 @@ func (s *Syncer) syncOnce(ctx context.Context) {
 			}
 			s.log.Warn("sync: pruned orphan queue rows", "rows", len(missing))
 		}
-		if len(batch.queue) == 0 {
+		batch.local, err = s.local.LoadLocalSyncBatch(ctx, localEvents)
+		if err != nil {
+			s.log.Error("sync: load local outbox", "err", err)
+			s.reportFailure(ctx, err)
+			return
+		}
+		if len(batch.queue) == 0 && len(batch.local.Events) == 0 {
 			continue
 		}
 		if err := s.commitRemoteBatch(ctx, batch); err != nil {
@@ -204,6 +227,11 @@ func (s *Syncer) syncOnce(ctx context.Context) {
 			// Remote UPSERTs are idempotent. A commit followed by a local
 			// acknowledgement failure is deliberately retried.
 			s.log.Error("sync: mark local rows", "err", err)
+			s.reportFailure(ctx, err)
+			return
+		}
+		if err := s.local.AcknowledgeLocalSyncEvents(ctx, batch.local.Events); err != nil {
+			s.log.Error("sync: acknowledge local outbox", "err", err)
 			s.reportFailure(ctx, err)
 			return
 		}
@@ -384,6 +412,11 @@ func (s *Syncer) commitRemoteBatch(ctx context.Context, batch loadedBatch) error
 			return err
 		}
 	}
+	if len(batch.local.Events) != 0 {
+		if err := tx.UpsertLocal(ctx, batch.local); err != nil {
+			return err
+		}
+	}
 	if err := tx.CloseBatch(ctx); err != nil {
 		return fmt.Errorf("close remote batch: %w", err)
 	}
@@ -446,7 +479,7 @@ ON CONFLICT (machine_id, path) DO UPDATE SET
     disk_no = EXCLUDED.disk_no,
     size = EXCLUDED.size,
     mtime = EXCLUDED.mtime,
-    sha512 = EXCLUDED.sha512,
+    sha512 = COALESCE(EXCLUDED.sha512, files.sha512),
     phase1_done = EXCLUDED.phase1_done,
     phase2_done = EXCLUDED.phase2_done,
     status = EXCLUDED.status,
@@ -494,6 +527,31 @@ ON CONFLICT (sha512, frame_idx) DO UPDATE SET
     pdq256 = EXCLUDED.pdq256,
     phash_parts = EXCLUDED.phash_parts,
     sobel_hist = EXCLUDED.sobel_hist;`
+
+const upsertLocalRunPG = `INSERT INTO local_analysis_runs(machine_id,run_id,generation,task_id,status,created_at,completed_at,published_at)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+ON CONFLICT(machine_id,run_id,generation) DO UPDATE SET task_id=EXCLUDED.task_id,status=EXCLUDED.status,
+ completed_at=COALESCE(EXCLUDED.completed_at,local_analysis_runs.completed_at),
+ published_at=COALESCE(EXCLUDED.published_at,local_analysis_runs.published_at);`
+const upsertLocalPairPG = `INSERT INTO local_pair_scores(machine_id,run_id,generation,pair_key,left_file_id,right_file_id,left_sha512,right_sha512,stage1_json,stage2_json,stage3_json,final_verdict)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb,$11::jsonb,$12)
+ON CONFLICT(machine_id,run_id,generation,pair_key) DO UPDATE SET stage1_json=EXCLUDED.stage1_json,
+ stage2_json=COALESCE(EXCLUDED.stage2_json,local_pair_scores.stage2_json),
+ stage3_json=COALESCE(EXCLUDED.stage3_json,local_pair_scores.stage3_json),final_verdict=EXCLUDED.final_verdict;`
+const upsertLocalGroupPG = `INSERT INTO local_dup_groups(machine_id,run_id,generation,group_id,category,verdict)
+VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(machine_id,run_id,generation,group_id) DO UPDATE SET category=EXCLUDED.category,verdict=EXCLUDED.verdict;`
+const upsertLocalMemberPG = `INSERT INTO local_dup_members(machine_id,run_id,generation,group_id,file_id,sha512)
+VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(machine_id,run_id,generation,group_id,file_id) DO UPDATE SET sha512=EXCLUDED.sha512;`
+const upsertLocalEventPG = `INSERT INTO local_task_events(machine_id,sequence,topic,entity_key,generation,payload_json)
+VALUES($1,$2,$3,$4,$5,$6::jsonb) ON CONFLICT(machine_id,sequence) DO UPDATE SET payload_json=EXCLUDED.payload_json;`
+const upsertLocalReviewPG = `INSERT INTO local_review_decisions(machine_id,run_id,generation,group_id,file_id,decision,reviewer,note,reviewed_at)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(machine_id,run_id,generation,group_id,file_id) DO UPDATE SET
+ decision=EXCLUDED.decision,reviewer=EXCLUDED.reviewer,note=EXCLUDED.note,reviewed_at=EXCLUDED.reviewed_at;`
+const upsertLocalDeletePG = `INSERT INTO local_delete_results(machine_id,batch_id,file_id,run_id,generation,path,sha512,result,error_code,uncertain,completed_at)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,NULLIF($9,''),$10,$11) ON CONFLICT(machine_id,batch_id,file_id) DO UPDATE SET
+ result=EXCLUDED.result,error_code=EXCLUDED.error_code,uncertain=EXCLUDED.uncertain,completed_at=EXCLUDED.completed_at;`
+const applyLocalDeletedFilePG = `UPDATE files SET status='deleted',error=NULL,updated_at=GREATEST(updated_at,$4),synced_at=now()
+WHERE machine_id=$1 AND path=$2 AND sha512=$3;`
 
 func (tx *pgRemoteTx) UpsertFiles(_ context.Context, rows []store.FileRow) error {
 	for _, row := range rows {
@@ -571,6 +629,47 @@ func (tx *pgRemoteTx) UpsertFrames(
 			row.SobelHist,
 		)
 		tx.commands++
+	}
+	return nil
+}
+
+func (tx *pgRemoteTx) UpsertLocal(_ context.Context, batch store.LocalSyncBatch) error {
+	for _, row := range batch.Runs {
+		tx.batch.Queue(upsertLocalRunPG, row.MachineID, row.RunID, row.Generation, row.TaskID,
+			row.Status, row.CreatedAt, nullableInt64(row.CompletedAt), nullableInt64(row.PublishedAt))
+		tx.commands++
+	}
+	for _, row := range batch.Pairs {
+		tx.batch.Queue(upsertLocalPairPG, row.MachineID, row.RunID, row.Generation, row.PairKey,
+			row.LeftFileID, row.RightFileID, row.LeftSHA512, row.RightSHA512, row.Stage1JSON,
+			nullableString(row.Stage2JSON), nullableString(row.Stage3JSON), row.Verdict)
+		tx.commands++
+	}
+	for _, row := range batch.Groups {
+		tx.batch.Queue(upsertLocalGroupPG, row.MachineID, row.RunID, row.Generation, row.GroupID, row.Category, row.Verdict)
+		tx.commands++
+	}
+	for _, row := range batch.Members {
+		tx.batch.Queue(upsertLocalMemberPG, row.MachineID, row.RunID, row.Generation, row.GroupID, row.FileID, row.SHA512)
+		tx.commands++
+	}
+	for _, row := range batch.Events {
+		tx.batch.Queue(upsertLocalEventPG, row.MachineID, row.Sequence, row.Topic, row.EntityKey, row.Generation, row.PayloadJSON)
+		tx.commands++
+	}
+	for _, row := range batch.Reviews {
+		tx.batch.Queue(upsertLocalReviewPG, row.MachineID, row.RunID, row.Generation, row.GroupID,
+			row.FileID, row.Decision, row.Reviewer, row.Note, row.ReviewedAt)
+		tx.commands++
+	}
+	for _, row := range batch.Deletes {
+		tx.batch.Queue(upsertLocalDeletePG, row.MachineID, row.BatchID, row.FileID, row.RunID,
+			row.Generation, row.Path, row.SHA512, row.Result, row.ErrorCode, row.Uncertain, row.CompletedAt)
+		tx.commands++
+		if row.Result == "deleted" && row.Status == "deleted" && !row.Uncertain {
+			tx.batch.Queue(applyLocalDeletedFilePG, row.MachineID, row.Path, row.SHA512, row.CompletedAt)
+			tx.commands++
+		}
 	}
 	return nil
 }

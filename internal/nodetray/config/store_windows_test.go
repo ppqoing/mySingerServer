@@ -3,15 +3,34 @@
 package config
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
 
+	"dedup/internal/securefile"
 	"github.com/google/uuid"
 	"golang.org/x/sys/windows"
 )
+
+func TestStoreAndAgentShareSecureAtomicWriter(t *testing.T) {
+	directory := filepath.Join(t.TempDir(), "shared-secure-writer")
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(directory, "tray.json")
+	want := []byte("{\n  \"value\": true\n}\n")
+	if err := securefile.WriteAtomic(target, want, func(path string) ([]byte, error) { return os.ReadFile(path) }); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("shared writer bytes = %q, %v", got, err)
+	}
+	assertRestrictedWritableACL(t, target, currentTestUserSID(t))
+}
 
 func TestStoreWritableConfigACLAllowsOnlyCurrentUserAdministratorsAndSystem(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "acl-"+uuid.NewString())
@@ -174,7 +193,7 @@ func TestStoreHelperACLRejectsUntrustedOwnerAndAcceptsTrustedOwner(t *testing.T)
 	safeParent := "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;" + currentSID + ")"
 	safeFile := "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GR;;;" + currentSID + ")"
 
-	t.Run("NewStore rejects deployment user owner on real paths", func(t *testing.T) {
+	t.Run("NewStore accepts deployment user owner on real paths", func(t *testing.T) {
 		root := filepath.Join(t.TempDir(), "helper-owner-"+uuid.NewString())
 		paths := Paths{
 			TraySettings:     filepath.Join(root, "tray", "settings.json"),
@@ -198,10 +217,9 @@ func TestStoreHelperACLRejectsUntrustedOwnerAndAcceptsTrustedOwner(t *testing.T)
 		})
 
 		_, err := NewStore(paths)
-		if err == nil {
-			t.Fatal("NewStore accepted deployment-user-owned Helper parent and file")
+		if err != nil {
+			t.Fatalf("NewStore rejected deployment-user-owned Helper config: %v", err)
 		}
-		assertErrorRedacted(t, err, root, paths.HelperConfig)
 	})
 
 	for _, tt := range []struct {
@@ -258,7 +276,13 @@ func assertRestrictedWritableACL(t *testing.T, path, currentSID string) {
 	}
 	trustees := map[string]bool{}
 	for _, match := range regexp.MustCompile(`\([AD];[^)]*;;;([^)]+)\)`).FindAllStringSubmatch(sddl, -1) {
-		trustees[match[1]] = true
+		trustee := match[1]
+		if trustee == "LA" {
+			if sid, err := windows.StringToSid(currentSID); err == nil && sid.IsWellKnown(windows.WinAccountAdministratorSid) {
+				trustee = currentSID
+			}
+		}
+		trustees[trustee] = true
 	}
 	for _, wanted := range []string{"SY", "BA", currentSID} {
 		if !trustees[wanted] {

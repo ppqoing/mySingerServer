@@ -1,9 +1,11 @@
 package gui
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -16,13 +18,20 @@ import (
 )
 
 type API struct {
-	pool     *Pool
-	tasks    *TaskRegistry
-	pg       *pgxpool.Pool
-	analysis *AnalysisHandlers
-	groups   *GroupHandlers
-	delete   deleteHTTPService
-	config   guiConfigStore
+	pool       *Pool
+	tasks      *TaskRegistry
+	pg         *pgxpool.Pool
+	analysis   *AnalysisHandlers
+	groups     *GroupHandlers
+	delete     deleteHTTPService
+	config     guiConfigStore
+	filesystem filesystemBrowseService
+}
+
+const filesystemBrowseTimeout = 10 * time.Second
+
+type filesystemBrowseService interface {
+	Browse(context.Context, string, proto.FilesystemBrowseRequest) (proto.FilesystemBrowseResponse, error)
 }
 
 func NewAPI(
@@ -56,6 +65,10 @@ func (api *API) SetDeleteService(service *DeleteService) {
 	api.delete = service
 }
 
+func (api *API) SetFilesystemBrowser(service filesystemBrowseService) {
+	api.filesystem = service
+}
+
 func (api *API) BeginAnalysisShutdown() {
 	api.analysis.BeginShutdown()
 }
@@ -71,8 +84,9 @@ func (api *API) SetAnalysisSuccessHook(hook func() error) {
 func (api *API) Routes() *http.ServeMux {
 	legacy := http.NewServeMux()
 	legacy.HandleFunc("GET /api/agents", api.handleAgents)
-	legacy.HandleFunc("GET /api/config", api.handleConfigGet)
-	legacy.HandleFunc("PUT /api/config", api.handleConfigPut)
+	legacy.HandleFunc("POST /api/agents/{machine_id}/filesystem/browse", api.handleFilesystemBrowse)
+	legacy.Handle("GET /api/config", newConfigHTTP(api.config))
+	legacy.Handle("PUT /api/config", newConfigHTTP(api.config))
 	legacy.HandleFunc("POST /api/scan", api.handleScan)
 	legacy.HandleFunc("GET /api/tasks", api.handleTasks)
 	legacy.HandleFunc("GET /api/dup_groups", api.handleDupGroups)
@@ -95,6 +109,121 @@ func (api *API) Routes() *http.ServeMux {
 	mux.Handle("/api/delete/", http.StripPrefix("/api/delete", deleteRoutes))
 	mux.Handle("/", legacy)
 	return mux
+}
+
+type filesystemBrowseHTTPRequest struct {
+	Path       string `json:"path"`
+	ShowHidden bool   `json:"show_hidden"`
+	Cursor     string `json:"cursor"`
+	Limit      int    `json:"limit"`
+}
+
+type filesystemBrowseHTTPEntry struct {
+	Name       string `json:"name"`
+	Path       string `json:"path"`
+	Kind       string `json:"kind"`
+	Hidden     bool   `json:"hidden"`
+	System     bool   `json:"system"`
+	Selectable bool   `json:"selectable"`
+}
+
+type filesystemBrowseHTTPResponse struct {
+	CurrentPath string                      `json:"current_path"`
+	ParentPath  string                      `json:"parent_path"`
+	Entries     []filesystemBrowseHTTPEntry `json:"entries"`
+	NextCursor  string                      `json:"next_cursor"`
+}
+
+func (api *API) handleFilesystemBrowse(response http.ResponseWriter, request *http.Request) {
+	if api.filesystem == nil {
+		writeJSON(response, http.StatusServiceUnavailable, map[string]string{"error": "files_disabled"})
+		return
+	}
+	var input filesystemBrowseHTTPRequest
+	decoder := json.NewDecoder(request.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&input); err != nil {
+		writeFilesystemBrowseRequestError(response)
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeFilesystemBrowseRequestError(response)
+		return
+	}
+	browseRequest := proto.FilesystemBrowseRequest{
+		Path:       input.Path,
+		ShowHidden: input.ShowHidden,
+		Cursor:     input.Cursor,
+		Limit:      input.Limit,
+	}
+	validateRequest := browseRequest
+	validateRequest.RequestID = "http-validation"
+	if err := validateRequest.Validate(); err != nil {
+		writeFilesystemBrowseRequestError(response)
+		return
+	}
+	browseContext, cancel := context.WithTimeout(request.Context(), filesystemBrowseTimeout)
+	defer cancel()
+	browseResponse, err := api.filesystem.Browse(
+		browseContext,
+		request.PathValue("machine_id"),
+		browseRequest,
+	)
+	if err != nil {
+		status, code := filesystemBrowseErrorStatus(err)
+		writeJSON(response, status, map[string]string{"error": code})
+		return
+	}
+	if browseResponse.ErrorCode != "" {
+		status, code := filesystemBrowseResponseStatus(browseResponse.ErrorCode)
+		writeJSON(response, status, map[string]string{"error": code})
+		return
+	}
+	entries := make([]filesystemBrowseHTTPEntry, len(browseResponse.Entries))
+	for index, entry := range browseResponse.Entries {
+		entries[index] = filesystemBrowseHTTPEntry{
+			Name: entry.Name, Path: entry.Path, Kind: entry.Kind,
+			Hidden: entry.Hidden, System: entry.System, Selectable: entry.Selectable,
+		}
+	}
+	writeJSON(response, http.StatusOK, filesystemBrowseHTTPResponse{
+		CurrentPath: browseResponse.CurrentPath,
+		ParentPath:  browseResponse.ParentPath,
+		Entries:     entries,
+		NextCursor:  browseResponse.NextCursor,
+	})
+}
+
+func writeFilesystemBrowseRequestError(response http.ResponseWriter) {
+	writeJSON(response, http.StatusBadRequest, map[string]string{
+		"error": "invalid_filesystem_browse_request",
+	})
+}
+
+func filesystemBrowseErrorStatus(err error) (int, string) {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return http.StatusGatewayTimeout, "browse_timeout"
+	case errors.Is(err, ErrFilesystemAgentOffline):
+		return http.StatusServiceUnavailable, "agent_offline"
+	default:
+		return http.StatusBadGateway, "browse_failed"
+	}
+}
+
+func filesystemBrowseResponseStatus(errorCode string) (int, string) {
+	switch errorCode {
+	case "access_denied":
+		return http.StatusForbidden, errorCode
+	case "path_not_found":
+		return http.StatusNotFound, errorCode
+	case "browse_cancelled":
+		return http.StatusGatewayTimeout, errorCode
+	case "files_disabled", "browse_unsupported", "agent_disconnected", "browse_busy":
+		return http.StatusServiceUnavailable, errorCode
+	default:
+		return http.StatusBadGateway, "browse_failed"
+	}
 }
 
 func writeJSON(response http.ResponseWriter, status int, value any) {

@@ -146,9 +146,9 @@ func NewPool(cfg Config, store FeatureStore, logger, errorLogger, crashLogger *s
 			crashLogger.Error("worker crash",
 				"pid", record.PID,
 				"worker_index", record.WorkerIndex,
-				"file", record.File,
+				"path_id", PathID(record.File),
 				"exit_code", record.ExitCode,
-				"reason", record.Reason,
+				"reason", RedactKnownPath(record.Reason, record.File),
 			)
 		}
 	}
@@ -360,7 +360,7 @@ func runtimeTaskSummary(job *JobMsg) string {
 	if job == nil {
 		return ""
 	}
-	return fmt.Sprintf("phase=%d job_id=%d", job.Phase, job.JobID)
+	return fmt.Sprintf("phase=%d screen_stage=%d source=%s job_id=%d", job.Phase, job.ScreenStage, job.Source, job.JobID)
 }
 
 func (p *Pool) publishCrash(record CrashRecord) bool {
@@ -466,24 +466,37 @@ func (p *Pool) watchdogDuration(kind MediaKind) time.Duration {
 }
 
 func (p *Pool) saveResult(job JobMsg, result JobResultMsg) {
+	if job.Phase == PhasePreview {
+		result.PreviewBytes = cloneBytes(result.PreviewBytes)
+		select {
+		case p.results <- &result:
+		case <-p.quit:
+		}
+		return
+	}
+	materializeFixedFrameResults(job, &result)
 	frameErrors := erroredFrames(result.Frames)
 	p.saveAnalysisResult(job, &result)
 	for _, fieldError := range result.Errors {
 		p.deps.errorLogger.Error("file error",
-			"path", result.Path,
+			"path_id", PathID(result.Path),
 			"stage", fieldError.Stage,
+			"screen_stage", job.ScreenStage,
+			"source", job.Source,
 			"field_mask", fieldError.Field,
-			"err", fieldError.Msg,
+			"err", RedactKnownPath(fieldError.Msg, result.Path),
 			"worker_pid", result.WorkerPID,
 		)
 	}
 	for _, frame := range frameErrors {
 		p.deps.errorLogger.Error("file error",
-			"path", result.Path,
+			"path_id", PathID(result.Path),
 			"stage", "frame",
-			"field_mask", MaskVideo6F,
+			"field_mask", job.FieldsMask&videoSixFrameWorkerFields(),
+			"screen_stage", job.ScreenStage,
+			"source", job.Source,
 			"frame_idx", frame.FrameIdx,
-			"err", frame.Error,
+			"err", RedactKnownPath(frame.Error, result.Path),
 			"worker_pid", result.WorkerPID,
 		)
 	}
@@ -511,6 +524,31 @@ func (p *Pool) saveResult(job JobMsg, result JobResultMsg) {
 	}
 }
 
+func materializeFixedFrameResults(job JobMsg, result *JobResultMsg) {
+	if result == nil || len(result.Frames) != 0 || job.Kind != MediaVideo ||
+		job.FieldsMask&videoSixFrameWorkerFields() == 0 {
+		return
+	}
+	requested := normalizedRequestedFrames(job)
+	result.Frames = make([]FrameFeature, 0, 6)
+	for index, frame := range result.FrameResults {
+		bit := uint8(1 << uint(index))
+		if requested&bit == 0 {
+			continue
+		}
+		converted := FrameFeature{FrameIdx: index, TimeMS: frame.TimeMS}
+		if result.FramesDone&bit != 0 {
+			converted.PDQ256 = cloneBytes(frame.PDQ256)
+			converted.Quality = frame.Quality
+			converted.PHashParts = cloneBytes(frame.PHashParts)
+			converted.SobelHist = cloneBytes(frame.SobelHist)
+		} else {
+			converted.Error = fmt.Sprintf("native_status_%d", frame.Status)
+		}
+		result.Frames = append(result.Frames, converted)
+	}
+}
+
 func (p *Pool) saveAnalysisResult(job JobMsg, result *JobResultMsg) {
 	if p.store == nil {
 		p.dedup.Resolve(*result)
@@ -525,7 +563,12 @@ func (p *Pool) saveAnalysisResult(job JobMsg, result *JobResultMsg) {
 			return
 		}
 		if !errors.Is(err, context.Canceled) {
-			p.deps.logger.Error("save analysis failed", "path", result.Path, "err", err)
+			p.deps.logger.Error("save analysis failed",
+				"path_id", PathID(result.Path),
+				"screen_stage", job.ScreenStage,
+				"source", job.Source,
+				"err", RedactKnownPath(err.Error(), result.Path),
+			)
 		}
 		result.Errors = append(result.Errors, FieldError{Field: 0, Stage: "store", Msg: err.Error()})
 		return
@@ -573,7 +616,7 @@ func analysisStoreResult(machineID string, job JobMsg, result JobResultMsg) stor
 
 func normalizedRequestedFrames(job JobMsg) uint8 {
 	frames := job.FrameMask
-	if job.Kind == MediaVideo && job.FieldsMask&MaskVideo6F != 0 && frames == 0 {
+	if job.Kind == MediaVideo && job.FieldsMask&videoSixFrameWorkerFields() != 0 && frames == 0 {
 		return FrameMaskFull
 	}
 	return frames
@@ -645,9 +688,21 @@ func pruneUncommittedPayload(result *JobResultMsg) {
 			result.FrameResults[index] = FrameResult{}
 		}
 	}
-	if result.FieldsDone&MaskVideo6F == 0 {
-		result.Frames = nil
+	keptFrames := result.Frames[:0]
+	for _, frame := range result.Frames {
+		bit := uint8(1 << uint(frame.FrameIdx))
+		if frame.FrameIdx < 0 || frame.FrameIdx >= 6 {
+			continue
+		}
+		if result.FramesDone&bit == 0 {
+			frame.PDQ256, frame.Quality, frame.PHashParts, frame.SobelHist = nil, 0, nil, nil
+			if frame.Error == "" {
+				continue
+			}
+		}
+		keptFrames = append(keptFrames, frame)
 	}
+	result.Frames = keptFrames
 }
 
 func clearFeaturePayload(result *JobResultMsg) {
@@ -669,7 +724,7 @@ func clearPhase2FeaturePayload(result *JobResultMsg) {
 }
 
 func attemptedPhase2Fields(result JobResultMsg) uint32 {
-	attempted := result.FieldsDone & (MaskPHashParts | MaskSobelHist | MaskVideo6F)
+	attempted := result.FieldsDone & (MaskPHashParts | MaskSobelHist | videoSixFrameWorkerFields())
 	if len(result.PHashParts) != 0 {
 		attempted |= MaskPHashParts
 	}
@@ -677,12 +732,23 @@ func attemptedPhase2Fields(result JobResultMsg) uint32 {
 		attempted |= MaskSobelHist
 	}
 	if len(result.Frames) != 0 {
-		attempted |= MaskVideo6F
+		switch result.ScreenStage {
+		case ScreenStageTwo:
+			attempted |= MaskVideo6FPHash
+		case ScreenStageThree:
+			attempted |= MaskVideo6FSobel
+		default:
+			attempted |= MaskVideo6F
+		}
 	}
 	for _, fieldError := range result.Errors {
-		attempted |= fieldError.Field & (MaskPHashParts | MaskSobelHist | MaskVideo6F)
+		attempted |= fieldError.Field & (MaskPHashParts | MaskSobelHist | videoSixFrameWorkerFields())
 	}
 	return attempted
+}
+
+func videoSixFrameWorkerFields() uint32 {
+	return MaskVideo6F | MaskVideo6FPHash | MaskVideo6FSobel
 }
 
 func erroredFrames(frames []FrameFeature) []FrameFeature {

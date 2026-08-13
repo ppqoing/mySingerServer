@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -21,11 +22,108 @@ import (
 	traynative "dedup/internal/nodetray/windows/tray"
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/windows"
+	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 type backendTestRecorder struct {
 	mu    sync.Mutex
 	calls []string
+}
+
+// Break caught: a valid current task directory is not forwarded to the native
+// picker, so users must navigate back to it every time they add a root.
+func TestChooseLocalTaskRootUsesWindowsDirectoryDialog(t *testing.T) {
+	currentPath := t.TempDir()
+	selectedPath := filepath.Join(currentPath, "Photos")
+	if err := os.Mkdir(selectedPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	original := openDirectoryDialogAdapter
+	t.Cleanup(func() { openDirectoryDialogAdapter = original })
+	openDirectoryDialogAdapter = func(_ context.Context, options runtime.OpenDialogOptions) (string, error) {
+		if options.Title != "选择本地任务扫描目录" || options.DefaultDirectory != currentPath {
+			t.Fatalf("options=%#v", options)
+		}
+		return selectedPath, nil
+	}
+
+	backend := NewBackend(nil)
+	backend.Startup(context.Background())
+	result := backend.ChooseLocalTaskRoot(currentPath)
+	if !result.OK || result.Cancelled || result.Path != selectedPath {
+		t.Fatalf("result=%#v", result)
+	}
+}
+
+// Break caught: an unexpected non-directory result from the native boundary
+// reaches the frontend and can be submitted as a scan root.
+func TestChooseLocalTaskRootRejectsNonDirectorySelection(t *testing.T) {
+	selected, err := os.CreateTemp(t.TempDir(), "selected-file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := selected.Close(); err != nil {
+		t.Fatal(err)
+	}
+	original := openDirectoryDialogAdapter
+	t.Cleanup(func() { openDirectoryDialogAdapter = original })
+	openDirectoryDialogAdapter = func(context.Context, runtime.OpenDialogOptions) (string, error) { return selected.Name(), nil }
+
+	backend := NewBackend(nil)
+	backend.Startup(context.Background())
+	result := backend.ChooseLocalTaskRoot("")
+	if result.OK || result.Cancelled || result.Path != "" || result.ErrorCode != "directory_dialog_failed" {
+		t.Fatalf("result=%#v", result)
+	}
+}
+
+// Break caught: closing the native picker changes the pending roots or is
+// reported as a failure instead of an explicit successful cancellation.
+func TestChooseLocalTaskRootReturnsCancelledForEmptyNativeSelection(t *testing.T) {
+	original := openDirectoryDialogAdapter
+	t.Cleanup(func() { openDirectoryDialogAdapter = original })
+	openDirectoryDialogAdapter = func(context.Context, runtime.OpenDialogOptions) (string, error) { return "", nil }
+
+	backend := NewBackend(nil)
+	backend.Startup(context.Background())
+	result := backend.ChooseLocalTaskRoot("")
+	if !result.OK || !result.Cancelled || result.Path != "" || result.ErrorCode != "" {
+		t.Fatalf("result=%#v", result)
+	}
+}
+
+// Break caught: an operating-system picker error exposes a private filesystem
+// path or raw error to the WebView instead of a stable display-safe failure.
+func TestChooseLocalTaskRootRedactsDirectoryDialogFailure(t *testing.T) {
+	original := openDirectoryDialogAdapter
+	t.Cleanup(func() { openDirectoryDialogAdapter = original })
+	openDirectoryDialogAdapter = func(_ context.Context, options runtime.OpenDialogOptions) (string, error) {
+		if options.DefaultDirectory != "" {
+			t.Fatalf("non-directory current path became default directory: %#v", options)
+		}
+		return "", errors.New(`open C:\private\media: access denied`)
+	}
+
+	file, err := os.CreateTemp(t.TempDir(), "not-a-directory")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	backend := NewBackend(nil)
+	backend.Startup(context.Background())
+	result := backend.ChooseLocalTaskRoot(file.Name())
+	if result.OK || result.Cancelled || result.ErrorCode != "directory_dialog_failed" || result.ErrorSummary == "" {
+		t.Fatalf("result=%#v", result)
+	}
+	serialized, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(strings.ToLower(string(serialized)), "private") || strings.Contains(strings.ToLower(string(serialized)), "access denied") {
+		t.Fatalf("result leaked directory dialog error: %s", serialized)
+	}
 }
 
 func (r *backendTestRecorder) add(value string) {
@@ -44,7 +142,6 @@ type backendTestStore struct {
 	recorder    *backendTestRecorder
 	settings    traymodel.TraySettings
 	settingsErr error
-	agent       trayconfig.AgentForm
 	helper      trayconfig.HelperForm
 }
 
@@ -58,20 +155,37 @@ func (s *backendTestStore) SaveTraySettings(traymodel.TraySettings) error {
 	return nil
 }
 
-func (s *backendTestStore) LoadAgentForm() (trayconfig.AgentForm, error) {
-	s.recorder.add("load-agent")
-	return s.agent, nil
-}
-
-func (s *backendTestStore) SaveAgentForm(trayconfig.AgentForm) (string, error) {
-	s.recorder.add("save-agent")
-	return strings.Repeat("a", 64), nil
-}
-
 func (s *backendTestStore) LoadHelperForm() (trayconfig.HelperForm, error) {
 	s.recorder.add("load-helper")
 	return s.helper, nil
 }
+func (s *backendTestStore) ValidateHelperForm(trayconfig.HelperForm) []trayconfig.FieldError {
+	s.recorder.add("validate-helper")
+	return nil
+}
+func (s *backendTestStore) SaveHelperForm(trayconfig.HelperForm) (string, error) {
+	s.recorder.add("save-helper")
+	return strings.Repeat("b", 64), nil
+}
+
+type backendTestAgentConfig struct {
+	recorder *backendTestRecorder
+	form     trayconfig.AgentForm
+}
+
+func (g *backendTestAgentConfig) LoadAgentForm(context.Context) (trayconfig.AgentForm, error) {
+	g.recorder.add("load-agent")
+	return g.form, nil
+}
+func (g *backendTestAgentConfig) ValidateAgentForm(context.Context, trayconfig.AgentForm) []trayconfig.FieldError {
+	g.recorder.add("validate-agent")
+	return nil
+}
+func (g *backendTestAgentConfig) SaveAgentForm(context.Context, trayconfig.AgentForm) (trayapp.AgentConfigSaveResult, error) {
+	g.recorder.add("save-agent")
+	return trayapp.AgentConfigSaveResult{SHA256: strings.Repeat("a", 64)}, nil
+}
+func (g *backendTestAgentConfig) PromotePendingEndpoint() { g.recorder.add("promote-agent-endpoint") }
 
 func (s *backendTestStore) PrepareHelperWrite(trayconfig.HelperForm) (trayconfig.PreparedWrite, error) {
 	s.recorder.add("prepare-helper")
@@ -82,12 +196,12 @@ func (s *backendTestStore) PrepareHelperWrite(trayconfig.HelperForm) (trayconfig
 	}, nil
 }
 
-type backendTestValidator struct{ recorder *backendTestRecorder }
-
-func (v backendTestValidator) ValidateAgent(trayconfig.AgentForm) []trayconfig.FieldError {
-	v.recorder.add("validate-agent")
-	return nil
+func (*backendTestStore) PrepareDefaultHelperWrite() (trayconfig.PreparedWrite, error) {
+	return trayconfig.PreparedWrite{}, trayconfig.ErrHelperConfigExists
 }
+func (*backendTestStore) HelperFingerprint() (string, error) { return strings.Repeat("b", 64), nil }
+
+type backendTestValidator struct{ recorder *backendTestRecorder }
 
 func (v backendTestValidator) ValidateHelper(trayconfig.HelperForm) []trayconfig.FieldError {
 	v.recorder.add("validate-helper")
@@ -263,15 +377,16 @@ func newBackendTestService(t *testing.T) (*trayapp.Service, *backendTestRecorder
 	store := &backendTestStore{
 		recorder: recorder,
 		settings: backendTestSettings(),
-		agent:    trayconfig.AgentForm{},
 		helper:   trayconfig.HelperForm{PipeName: "helper-pipe"},
 	}
+	agentConfig := &backendTestAgentConfig{recorder: recorder}
 	agent := &backendTestComponent{name: "agent", recorder: recorder}
 	helper := &backendTestComponent{name: "helper", recorder: recorder}
 	root := t.TempDir()
 	return trayapp.NewService(trayapp.Dependencies{
 		Store:             store,
 		Validator:         backendTestValidator{recorder: recorder},
+		AgentConfig:       agentConfig,
 		MachineID:         "node-" + strings.Repeat("1", 64),
 		Agent:             agent,
 		Helper:            helper,
@@ -375,14 +490,14 @@ func TestBackendForwardsEveryPublicOperationExactlyOnce(t *testing.T) {
 	requirePureSuccess(t, backend.OpenLocation(traymodel.AgentLogs))
 
 	wantCounts := map[string]int{
-		"load-settings": 7, "load-agent": 1, "load-helper": 1,
+		"load-settings": 7, "load-agent": 1, "load-helper": 3,
 		"agent-refresh": 3, "helper-refresh": 2, "workers-snapshot": 1,
-		"task-inspect": 1, "login-enabled": 2,
+		"login-enabled":  2,
 		"validate-agent": 3, "save-agent": 2,
-		"agent-start": 2, "agent-stop": 2, "agent-restart": 1, "agent-force": 1,
-		"validate-helper": 2, "prepare-helper": 1,
-		"elevate-write_helper_config": 1,
-		"helper-start":                1, "helper-stop": 1, "helper-restart": 1, "helper-force": 1,
+		"promote-agent-endpoint": 2,
+		"agent-start":            2, "agent-stop": 2, "agent-restart": 1, "agent-force": 1,
+		"validate-helper": 4, "save-helper": 1,
+		"helper-start": 1, "helper-stop": 1, "helper-restart": 1, "helper-force": 1,
 		"save-settings": 1,
 		"open-location": 1,
 	}
@@ -590,12 +705,13 @@ func backendTestSettingsWithClose(closeToTray bool) traymodel.TraySettings {
 func newBackendTestServiceWithSettings(t *testing.T, settings traymodel.TraySettings, settingsErr error) (*trayapp.Service, *backendTestRecorder, *backendTestComponent) {
 	t.Helper()
 	recorder := &backendTestRecorder{}
-	store := &backendTestStore{recorder: recorder, settings: settings, settingsErr: settingsErr, agent: trayconfig.AgentForm{}, helper: trayconfig.HelperForm{PipeName: "helper-pipe"}}
+	store := &backendTestStore{recorder: recorder, settings: settings, settingsErr: settingsErr, helper: trayconfig.HelperForm{PipeName: "helper-pipe"}}
+	agentConfig := &backendTestAgentConfig{recorder: recorder}
 	agent := &backendTestComponent{name: "agent", recorder: recorder}
 	helper := &backendTestComponent{name: "helper", recorder: recorder}
 	root := t.TempDir()
 	return trayapp.NewService(trayapp.Dependencies{
-		Store: store, Validator: backendTestValidator{recorder: recorder}, Agent: agent, Helper: helper,
+		Store: store, Validator: backendTestValidator{recorder: recorder}, AgentConfig: agentConfig, Agent: agent, Helper: helper,
 		MachineID: "node-" + strings.Repeat("1", 64), AgentFingerprint: backendTestUpdater{}, HelperFingerprint: backendTestUpdater{},
 		Task: backendTestTask{recorder: recorder}, Elevation: backendTestElevation{recorder: recorder}, LoginStart: backendTestLoginStart{recorder: recorder},
 		TrayExecutable: filepath.Join(root, "nodetray.exe"), TaskDefinition: nodetask.Definition{HelperExecutable: filepath.Join(root, "helper.exe"), HelperConfig: filepath.Join(root, "helper.json"), UserSID: "S-1-5-21-1"},
@@ -745,18 +861,19 @@ func TestMainReportsWailsInitializationFailureWithOnlyStableCode(t *testing.T) {
 
 	originalCompose := composeBackend
 	originalWailsRun := wailsRunAdapter
-	originalUserConfig := userConfigDirAdapter
 	originalNormalTray := runNormalTray
 	originalFailureLog := startupFailureLogAdapter
 	t.Cleanup(func() {
 		composeBackend = originalCompose
 		wailsRunAdapter = originalWailsRun
-		userConfigDirAdapter = originalUserConfig
 		runNormalTray = originalNormalTray
 		startupFailureLogAdapter = originalFailureLog
 	})
-	composeBackend = func() (*Backend, error) { return NewBackend(service), nil }
-	userConfigDirAdapter = func() (string, error) { return t.TempDir(), nil }
+	composeBackend = func() (*Backend, error) {
+		backend := NewBackend(service)
+		backend.webViewDataPath = `D:\便携 工具\Compute\data\nodetray\webview2`
+		return backend, nil
+	}
 	wailsRunAdapter = func(*options.App) error { return rawFailure }
 	runNormalTray = runNormalWails
 	var logs []string
@@ -776,6 +893,28 @@ func TestMainReportsWailsInitializationFailureWithOnlyStableCode(t *testing.T) {
 	}
 	if calls := recorder.snapshot(); len(calls) != 0 {
 		t.Fatalf("Wails pre-start failure reached component services: %v", calls)
+	}
+}
+
+func TestRunNormalWailsUsesBackendPortableWebViewData(t *testing.T) {
+	service, _, _ := newBackendTestService(t)
+	originalCompose, originalWailsRun, originalNormalTray := composeBackend, wailsRunAdapter, runNormalTray
+	t.Cleanup(func() {
+		composeBackend, wailsRunAdapter, runNormalTray = originalCompose, originalWailsRun, originalNormalTray
+	})
+	composeBackend = func() (*Backend, error) {
+		backend := NewBackend(service)
+		backend.webViewDataPath = `D:\便携 工具\Compute\data\nodetray\webview2`
+		return backend, nil
+	}
+	var gotPath string
+	wailsRunAdapter = func(app *options.App) error { gotPath = app.Windows.WebviewUserDataPath; return nil }
+	runNormalTray = runNormalWails
+	if err := runNormalWails(false); err != nil {
+		t.Fatalf("runNormalWails: %v", err)
+	}
+	if gotPath != `D:\便携 工具\Compute\data\nodetray\webview2` {
+		t.Fatalf("WebView2 data path = %q", gotPath)
 	}
 }
 

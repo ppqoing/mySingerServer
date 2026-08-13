@@ -121,6 +121,242 @@ func TestPhase2PrepareRejectsInvalidEnvelopeAtomically(t *testing.T) {
 	}
 }
 
+func TestPhase2EnvelopeUsesStageAwareValidationAndStageIsPartOfIdentity(t *testing.T) {
+	manager := NewPhase2Manager("machine-a")
+	stageTwoItem := validPhase2Image(`D:\media\stage-envelope.jpg`)
+	stageTwoItem.FieldsMask = proto.FieldPHashParts
+	stageTwo := proto.Phase2Task{
+		TaskID: "stage-envelope",
+		Stage:  proto.ScreenStageTwo,
+		Items:  []proto.Phase2Item{stageTwoItem},
+	}
+
+	ack, _ := manager.Prepare(stageTwo, nil)
+	if !ack.Accepted {
+		t.Fatalf("stage-two ack=%#v, want accepted", ack)
+	}
+	ack, _ = manager.Prepare(clonePhase2TaskForTest(stageTwo), nil)
+	if !ack.Accepted || ack.Reason != "resumed" {
+		t.Fatalf("same stage envelope ack=%#v, want resumed", ack)
+	}
+
+	stageThree := clonePhase2TaskForTest(stageTwo)
+	stageThree.Stage = proto.ScreenStageThree
+	stageThree.Items[0].FieldsMask = proto.FieldSobelHist
+	ack, _ = manager.Prepare(stageThree, nil)
+	if ack.Accepted || !strings.Contains(ack.Reason, "task_id envelope mismatch") {
+		t.Fatalf("different stage envelope ack=%#v, want mismatch", ack)
+	}
+
+	invalidStageTwo := clonePhase2TaskForTest(stageTwo)
+	invalidStageTwo.TaskID = "stage-envelope-invalid"
+	invalidStageTwo.Items[0].FieldsMask = proto.FieldSobelHist
+	ack, _ = manager.Prepare(invalidStageTwo, nil)
+	if ack.Accepted || !strings.Contains(ack.Reason, "stage-two") {
+		t.Fatalf("invalid stage-two ack=%#v, want stage-aware rejection", ack)
+	}
+}
+
+func TestPhase2StageTwoCreatesOnlyManagerStageTwoJob(t *testing.T) {
+	pool := newPhase2FakePool()
+	router := NewPoolRouter(pool, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	defer close(pool.results)
+	path := `D:\media\stage-two-only.jpg`
+	item := validPhase2Image(path)
+	item.FieldsMask = proto.FieldPHashParts
+	manager := NewPhase2ManagerWithRuntime(
+		"machine-a",
+		&phase2CommittedFake{states: map[string]store.Phase2Committed{
+			path: {MissingFields: proto.FieldPHashParts},
+		}},
+		pool,
+		router,
+		func(string) (int64, bool, error) { return 1, false, nil },
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	submitted := make(chan worker.JobMsg, 2)
+	pool.onSubmit = func(job worker.JobMsg) {
+		submitted <- job
+		pool.results <- &worker.JobResultMsg{
+			JobID: job.JobID, ScanTaskID: job.ScanTaskID, Path: job.Path,
+			Kind: job.Kind, Phase: job.Phase, ScreenStage: job.ScreenStage,
+			Source: job.Source, FieldsDone: worker.MaskPHashParts,
+			SHA512:     append([]byte(nil), job.KnownSHA...),
+			PHashParts: []byte{7},
+		}
+	}
+	task := proto.Phase2Task{TaskID: "stage-two-only", Stage: proto.ScreenStageTwo, Items: []proto.Phase2Item{item}}
+	ack, start := manager.Prepare(task, nil)
+	if !ack.Accepted || start == nil {
+		t.Fatalf("ack=%#v start_nil=%t", ack, start == nil)
+	}
+	start()
+
+	select {
+	case job := <-submitted:
+		if job.ScreenStage != worker.ScreenStageTwo || job.Source != worker.JobSourceManager ||
+			job.FieldsMask != worker.MaskPHashParts {
+			t.Fatalf("stage-two job=%#v", job)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stage-two job was not submitted")
+	}
+
+	deadline := time.After(time.Second)
+	for {
+		manager.mu.Lock()
+		state := manager.tasks[task.TaskID]
+		manager.mu.Unlock()
+		state.mu.Lock()
+		done := state.status == proto.StatusDone
+		state.mu.Unlock()
+		if done {
+			break
+		}
+		select {
+		case extra := <-submitted:
+			t.Fatalf("stage two implicitly submitted another job: %#v", extra)
+		case <-deadline:
+			t.Fatal("stage-two task did not complete")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	select {
+	case extra := <-submitted:
+		t.Fatalf("stage two implicitly submitted stage three: %#v", extra)
+	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+func TestPhase2CachedStageStillSubmitsOriginalRequestAndReturnsPayload(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		stage   uint8
+		field   uint32
+		payload []byte
+	}{
+		{name: "stage two pHash", stage: proto.ScreenStageTwo, field: proto.FieldPHashParts, payload: []byte{2, 2}},
+		{name: "stage three Sobel", stage: proto.ScreenStageThree, field: proto.FieldSobelHist, payload: []byte{3, 3}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			pool := newPhase2FakePool()
+			router := NewPoolRouter(pool, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			defer close(pool.results)
+			path := `D:\cache\` + test.name + `.jpg`
+			item := validPhase2Image(path)
+			item.FieldsMask = test.field
+			manager := NewPhase2ManagerWithRuntime(
+				"machine-a",
+				&phase2CommittedFake{states: map[string]store.Phase2Committed{path: {MissingFields: 0}}},
+				pool, router,
+				func(string) (int64, bool, error) { return 1, false, nil },
+				slog.New(slog.NewTextHandler(io.Discard, nil)),
+			)
+			pool.onSubmit = func(job worker.JobMsg) {
+				result := &worker.JobResultMsg{
+					JobID: job.JobID, ScanTaskID: job.ScanTaskID, Path: job.Path, Kind: job.Kind,
+					Phase: job.Phase, ScreenStage: job.ScreenStage, Source: job.Source,
+					SHA512: append([]byte(nil), job.KnownSHA...), FieldsDone: job.FieldsMask,
+				}
+				if test.field == proto.FieldPHashParts {
+					result.PHashParts = append([]byte(nil), test.payload...)
+				} else {
+					result.SobelHist = append([]byte(nil), test.payload...)
+				}
+				pool.results <- result
+			}
+			features := make(chan proto.FeatureItem, 1)
+			task := proto.Phase2Task{TaskID: "cached-" + test.name, Stage: test.stage, Items: []proto.Phase2Item{item}}
+			ack, start := manager.Prepare(task, func(msgType uint8, value any) error {
+				if msgType == proto.MsgFeatureResult {
+					features <- value.(*proto.FeatureResult).Items[0]
+				}
+				return nil
+			})
+			if !ack.Accepted || start == nil {
+				t.Fatalf("ack=%#v", ack)
+			}
+			start()
+			select {
+			case feature := <-features:
+				if feature.FieldsDone != test.field ||
+					(test.field == proto.FieldPHashParts && !bytes.Equal(feature.PHashParts, test.payload)) ||
+					(test.field == proto.FieldSobelHist && !bytes.Equal(feature.SobelHist, test.payload)) {
+					t.Fatalf("cached feature=%#v", feature)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("cached feature result was not emitted")
+			}
+			submitted := pool.submittedSnapshot()
+			if len(submitted) != 1 || submitted[0].FieldsMask != test.field || submitted[0].ScreenStage != worker.ScreenStage(test.stage) {
+				t.Fatalf("cached jobs=%#v, want one original stage request", submitted)
+			}
+		})
+	}
+}
+
+func TestPhase2PartialVideoCacheStillRequestsOriginalFrameMask(t *testing.T) {
+	pool := newPhase2FakePool()
+	router := NewPoolRouter(pool, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	defer close(pool.results)
+	path := `D:\cache\partial-video.mp4`
+	item := validPhase2Video(path, proto.FrameMaskFull)
+	item.FieldsMask = proto.FieldVideo6FPHash
+	manager := NewPhase2ManagerWithRuntime(
+		"machine-a",
+		&phase2CommittedFake{states: map[string]store.Phase2Committed{path: {
+			MissingFields: proto.FieldVideo6FPHash, MissingFrames: 0x04,
+		}}},
+		pool, router,
+		func(string) (int64, bool, error) { return 1, false, nil },
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	pool.onSubmit = func(job worker.JobMsg) {
+		pool.results <- &worker.JobResultMsg{
+			JobID: job.JobID, ScanTaskID: job.ScanTaskID, Path: job.Path, Kind: job.Kind,
+			Phase: job.Phase, ScreenStage: job.ScreenStage, Source: job.Source,
+			SHA512: append([]byte(nil), job.KnownSHA...), FieldsDone: job.FieldsMask,
+		}
+	}
+	task := proto.Phase2Task{TaskID: "partial-video-cache", Stage: proto.ScreenStageTwo, Items: []proto.Phase2Item{item}}
+	ack, start := manager.Prepare(task, nil)
+	if !ack.Accepted || start == nil {
+		t.Fatalf("ack=%#v", ack)
+	}
+	start()
+	deadline := time.Now().Add(time.Second)
+	for len(pool.submittedSnapshot()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	submitted := pool.submittedSnapshot()
+	if len(submitted) != 1 || submitted[0].FieldsMask != proto.FieldVideo6FPHash || submitted[0].FrameMask != proto.FrameMaskFull {
+		t.Fatalf("partial-cache job=%#v, want original field/frame masks", submitted)
+	}
+}
+
+func TestPhase2FeatureMapsAllFixedFrameFailuresWithoutPayload(t *testing.T) {
+	accepted := validPhase2Video(`D:\private\all-failed.mp4`, proto.FrameMaskFull)
+	accepted.FieldsMask = proto.FieldVideo6FPHash
+	job := &worker.JobMsg{
+		Kind: worker.MediaVideo, FieldsMask: worker.MaskVideo6FPHash, FrameMask: worker.FrameMaskFull,
+		ScreenStage: worker.ScreenStageTwo, Source: worker.JobSourceManager,
+	}
+	result := &worker.JobResultMsg{ScreenStage: job.ScreenStage, Source: job.Source}
+	for index := range result.FrameResults {
+		result.FrameResults[index] = worker.FrameResult{FrameIdx: index, Status: -30 - int32(index)}
+	}
+	feature := phase2FeatureFromWorker(accepted, job, result)
+	if feature.Status != proto.StatusFailed || len(feature.Frames) != 6 {
+		t.Fatalf("all-failed feature=%#v", feature)
+	}
+	for index, frame := range feature.Frames {
+		if frame.FrameIdx != index || frame.Error != fmt.Sprintf("native_status_%d", -30-int32(index)) ||
+			len(frame.PHashParts) != 0 || len(frame.SobelHist) != 0 || len(frame.PDQ256) != 0 {
+			t.Fatalf("feature frame[%d]=%#v", index, frame)
+		}
+	}
+}
+
 func TestPhase2PrepareConcurrentDuplicateCreatesOneLogicalExecution(t *testing.T) {
 	manager := NewPhase2Manager("machine-a")
 	var executions atomic.Int64
@@ -229,7 +465,7 @@ func TestPhase2PrepareRetainsImmutableEnvelopeAndRejectsAnyConflict(t *testing.T
 	}
 }
 
-func TestPhase2SchedulesPerPhysicalDiskPrunesAndDeepCopiesPartialResults(t *testing.T) {
+func TestPhase2SchedulesPerPhysicalDiskAndDeepCopiesPartialResults(t *testing.T) {
 	pool := newPhase2FakePool()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	router := NewPoolRouter(pool, log)
@@ -281,6 +517,7 @@ func TestPhase2SchedulesPerPhysicalDiskPrunesAndDeepCopiesPartialResults(t *test
 			firstResult = &worker.JobResultMsg{
 				JobID: job.JobID, ScanTaskID: job.ScanTaskID,
 				Path: job.Path, Kind: job.Kind, Phase: worker.Phase2,
+				ScreenStage: job.ScreenStage, Source: job.Source,
 				SHA512:     append([]byte(nil), job.KnownSHA...),
 				FieldsDone: worker.MaskPHashParts,
 				PHashParts: []byte{1, 2, 3},
@@ -296,6 +533,7 @@ func TestPhase2SchedulesPerPhysicalDiskPrunesAndDeepCopiesPartialResults(t *test
 			pool.results <- &worker.JobResultMsg{
 				JobID: job.JobID, ScanTaskID: job.ScanTaskID,
 				Path: job.Path, Kind: job.Kind, Phase: worker.Phase2,
+				ScreenStage: job.ScreenStage, Source: job.Source,
 				SHA512:     append([]byte(nil), job.KnownSHA...),
 				FieldsDone: worker.MaskSobelHist,
 				SobelHist:  []byte{4, 5, 6},
@@ -305,6 +543,7 @@ func TestPhase2SchedulesPerPhysicalDiskPrunesAndDeepCopiesPartialResults(t *test
 			videoResult = &worker.JobResultMsg{
 				JobID: job.JobID, ScanTaskID: job.ScanTaskID,
 				Path: job.Path, Kind: job.Kind, Phase: worker.Phase2,
+				ScreenStage: job.ScreenStage, Source: job.Source,
 				SHA512: append([]byte(nil), job.KnownSHA...),
 				Frames: []worker.FrameFeature{{
 					FrameIdx:   1,
@@ -316,6 +555,14 @@ func TestPhase2SchedulesPerPhysicalDiskPrunesAndDeepCopiesPartialResults(t *test
 				}},
 			}
 			pool.results <- videoResult
+		case `F:\disk-c\already.jpg`:
+			pool.results <- &worker.JobResultMsg{
+				JobID: job.JobID, ScanTaskID: job.ScanTaskID,
+				Path: job.Path, Kind: job.Kind, Phase: worker.Phase2,
+				ScreenStage: job.ScreenStage, Source: job.Source,
+				SHA512: append([]byte(nil), job.KnownSHA...), FieldsDone: job.FieldsMask,
+				PHashParts: []byte{12}, SobelHist: []byte{13},
+			}
 		default:
 			t.Errorf("unexpected pool submission: %#v", job)
 		}
@@ -379,13 +626,13 @@ func TestPhase2SchedulesPerPhysicalDiskPrunesAndDeepCopiesPartialResults(t *test
 		t.Fatal("Phase2 task did not finish")
 	}
 	if final.Stats.Total != 4 || final.Stats.Done != 4 ||
-		final.Stats.Skipped != 1 {
+		final.Stats.Skipped != 0 {
 		t.Fatalf("TaskDone stats=%#v", final.Stats)
 	}
 
 	submitted := pool.submittedSnapshot()
-	if len(submitted) != 3 {
-		t.Fatalf("submissions=%#v, want 3 after one pruned no-op", submitted)
+	if len(submitted) != 4 {
+		t.Fatalf("submissions=%#v, want one original job per request", submitted)
 	}
 	jobs := make(map[string]worker.JobMsg, len(submitted))
 	for _, job := range submitted {
@@ -399,12 +646,12 @@ func TestPhase2SchedulesPerPhysicalDiskPrunesAndDeepCopiesPartialResults(t *test
 		worker.MaskPHashParts|worker.MaskSobelHist {
 		t.Fatalf("first mask=%#x", jobs[`D:\disk-a\first.jpg`].FieldsMask)
 	}
-	if jobs[`D:\disk-a\second.jpg`].FieldsMask != worker.MaskSobelHist {
+	if jobs[`D:\disk-a\second.jpg`].FieldsMask != worker.MaskPHashParts|worker.MaskSobelHist {
 		t.Fatalf("second mask=%#x", jobs[`D:\disk-a\second.jpg`].FieldsMask)
 	}
 	videoJob := jobs[`E:\disk-b\clip.mp4`]
 	if videoJob.FieldsMask != worker.MaskVideo6F ||
-		videoJob.FrameMask != 1<<1|1<<4 ||
+		videoJob.FrameMask != worker.FrameMaskFull ||
 		videoJob.DurationMS != 12000 {
 		t.Fatalf("video job=%#v", videoJob)
 	}
@@ -437,8 +684,8 @@ func TestPhase2SchedulesPerPhysicalDiskPrunesAndDeepCopiesPartialResults(t *test
 		t.Fatalf("partial video item=%#v", video)
 	}
 	noop := items[`F:\disk-c\already.jpg`]
-	if noop.Status != proto.StatusDone || noop.FieldsDone != 0 {
-		t.Fatalf("pruned no-op item=%#v", noop)
+	if noop.Status != proto.StatusDone || noop.FieldsDone != proto.FieldPHashParts|proto.FieldSobelHist {
+		t.Fatalf("cached item=%#v", noop)
 	}
 
 	firstResult.PHashParts[0] = 99
@@ -492,6 +739,37 @@ func TestPhase2FeatureFromWorkerFiltersFramesOutsideEffectiveMask(t *testing.T) 
 	full := phase2FeatureFromWorker(accepted, job, result)
 	if len(full.Frames) != 2 {
 		t.Fatalf("zero FrameMask Frames=%#v, want full-mask normalization", full.Frames)
+	}
+}
+
+func TestPhase2FeatureFromWorkerMapsFixedVideoFramesWithoutCrossStagePayload(t *testing.T) {
+	accepted := validPhase2Video(`D:\media\fixed-stage.mp4`, proto.FrameMaskFull)
+	accepted.FieldsMask = proto.FieldVideo6FPHash
+	job := &worker.JobMsg{
+		Path: accepted.Path, Kind: worker.MediaVideo, Phase: worker.Phase2,
+		ScreenStage: worker.ScreenStageTwo, Source: worker.JobSourceManager,
+		FieldsMask: worker.MaskVideo6FPHash, FrameMask: worker.FrameMaskFull,
+	}
+	result := &worker.JobResultMsg{
+		Path: accepted.Path, Kind: worker.MediaVideo, Phase: worker.Phase2,
+		ScreenStage: worker.ScreenStageTwo, Source: worker.JobSourceManager,
+		FieldsDone: worker.MaskVideo6FPHash, FramesDone: worker.FrameMaskFull,
+	}
+	for index := range result.FrameResults {
+		result.FrameResults[index] = worker.FrameResult{
+			FrameIdx: index, TimeMS: int64(index+1) * 1000,
+			PHashParts: []byte{byte(index + 1)},
+		}
+	}
+
+	feature := phase2FeatureFromWorker(accepted, job, result)
+	if feature.Status != proto.StatusDone || feature.FieldsDone != proto.FieldVideo6FPHash || len(feature.Frames) != 6 {
+		t.Fatalf("fixed-frame feature=%#v", feature)
+	}
+	for index, frame := range feature.Frames {
+		if len(frame.PHashParts) == 0 || len(frame.SobelHist) != 0 || len(frame.PDQ256) != 0 {
+			t.Fatalf("feature frame[%d] leaked payload: %#v", index, frame)
+		}
 	}
 }
 
@@ -675,7 +953,7 @@ func TestPhase2CommittedSHAOwnershipMismatchIsStaleWithoutSkipOrSubmit(t *testin
 	}
 }
 
-func TestPhase2FailuresAfterPruningUseEffectiveFieldMask(t *testing.T) {
+func TestPhase2FailuresAfterCommittedLookupUseOriginalFieldMask(t *testing.T) {
 	for _, test := range []struct {
 		name  string
 		setup func(*phase2FakePool, *PoolRouter)
@@ -730,7 +1008,7 @@ func TestPhase2FailuresAfterPruningUseEffectiveFieldMask(t *testing.T) {
 			)
 			if terminal.Status != proto.StatusFailed ||
 				len(terminal.FieldErrors) != 1 ||
-				terminal.FieldErrors[0].Field != proto.FieldSobelHist ||
+				terminal.FieldErrors[0].Field != proto.FieldPHashParts|proto.FieldSobelHist ||
 				terminal.FieldErrors[0].Stage != "worker" {
 				t.Fatalf("pruned failure terminal=%#v", terminal)
 			}
@@ -835,6 +1113,7 @@ func TestScanAndPhase2UseSharedRouterJobIDAllocator(t *testing.T) {
 		pool.results <- &worker.JobResultMsg{
 			JobID: job.JobID, ScanTaskID: job.ScanTaskID,
 			Path: job.Path, Kind: job.Kind, Phase: worker.Phase2,
+			ScreenStage: job.ScreenStage, Source: job.Source,
 			SHA512:     append([]byte(nil), job.KnownSHA...),
 			FieldsDone: job.FieldsMask,
 			PHashParts: []byte{1},
@@ -882,6 +1161,7 @@ func TestPhase2SenderFailureKeepsWorkAndReconnectReplaysOrderedImmutableTerminal
 		result := &worker.JobResultMsg{
 			JobID: job.JobID, ScanTaskID: job.ScanTaskID,
 			Path: job.Path, Kind: job.Kind, Phase: worker.Phase2,
+			ScreenStage: job.ScreenStage, Source: job.Source,
 			SHA512:     append([]byte(nil), job.KnownSHA...),
 			FieldsDone: job.FieldsMask,
 			PHashParts: []byte{byte(len(sources) + 1)},
@@ -1000,6 +1280,7 @@ func TestPhase2OldConnectionDetachCannotClearNewBinding(t *testing.T) {
 		pool.results <- &worker.JobResultMsg{
 			JobID: job.JobID, ScanTaskID: job.ScanTaskID,
 			Path: job.Path, Kind: job.Kind, Phase: worker.Phase2,
+			ScreenStage: job.ScreenStage, Source: job.Source,
 			SHA512:     append([]byte(nil), job.KnownSHA...),
 			FieldsDone: job.FieldsMask, PHashParts: []byte{1},
 		}
@@ -1178,6 +1459,7 @@ func TestPhase2ShutdownRejectsAdmissionWaitsForDrainAndRemovesTaskState(t *testi
 		pool.results <- &worker.JobResultMsg{
 			JobID: job.JobID, ScanTaskID: job.ScanTaskID,
 			Path: job.Path, Kind: job.Kind, Phase: worker.Phase2,
+			ScreenStage: job.ScreenStage, Source: job.Source,
 			SHA512:     append([]byte(nil), job.KnownSHA...),
 			FieldsDone: job.FieldsMask, PHashParts: []byte{1},
 		}
@@ -1785,11 +2067,12 @@ func (p *blockingSubmitPool) Metrics() worker.MetricsSnapshot {
 	return worker.MetricsSnapshot{}
 }
 
-func (s *cancellablePhase2CommittedStore) Phase2CommittedState(
+func (s *cancellablePhase2CommittedStore) Phase2CommittedStateForFields(
 	ctx context.Context,
 	_ string,
 	_ string,
 	_ store.MediaKind,
+	_ uint32,
 ) (store.Phase2Committed, error) {
 	s.enterOnce.Do(func() { close(s.entered) })
 	select {
@@ -1897,11 +2180,12 @@ func replaySeqBytes(values []uint64) []byte {
 	return out
 }
 
-func (s *phase2CommittedFake) Phase2CommittedState(
+func (s *phase2CommittedFake) Phase2CommittedStateForFields(
 	_ context.Context,
 	_ string,
 	path string,
 	_ store.MediaKind,
+	_ uint32,
 ) (store.Phase2Committed, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

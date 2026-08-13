@@ -1,0 +1,29 @@
+{
+  "listen_addr": "127.0.0.1:18081",
+  "pg_dsn": "",
+  "agents": [{"addr": "127.0.0.1:9101"}],
+  "heartbeat_s": 15,
+  "firstscreen": {
+    "hamming_max": 31,
+    "aspect_tolerance": 0.10,
+    "video_duration_window_ms": 2000,
+    "image_quality_min": 50,
+    "read_page_size": 50000,
+    "group_insert_batch": 1000,
+    "sha_resolve_chunk": 10000
+  },
+  "phase2": {
+    "phash_pass_t2": 0.80,
+    "phash_part_threshold": 10,
+    "sobel_t3": 0.85,
+    "video_frames": 6,
+    "video_avg_t4": 0.80,
+    "video_min_passed": 4,
+    "video_min_valid": 4,
+    "video_file_timeout_s": 120,
+    "video_frame_command_timeout_s": 20,
+    "image_file_timeout_s": 30,
+    "task_shard_size": 5000,
+    "auto_dispatch": true
+  }
+}

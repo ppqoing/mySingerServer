@@ -4,7 +4,12 @@ import (
 	"crypto/sha512"
 	"encoding/binary"
 	"errors"
+	"image"
+	"image/color"
+	"image/jpeg"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +17,75 @@ import (
 	"dedup/internal/worker"
 	"dedup/internal/wproc/videocore"
 )
+
+// Break caught: worker.exe recognizes the preview phase on the wire but the
+// real wproc dispatcher still sends it to the unsupported-phase branch.
+func TestServeDispatchesImagePreviewToMemoryEncoder(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "source.jpg")
+	img := image.NewNRGBA(image.Rect(0, 0, 20, 10))
+	for y := range 10 {
+		for x := range 20 {
+			img.SetNRGBA(x, y, color.NRGBA{R: uint8(x), G: uint8(y), B: 100, A: 255})
+		}
+	}
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jpeg.Encode(file, img, &jpeg.Options{Quality: 90}); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha512.Sum512(data)
+	job := worker.JobMsg{
+		JobID: 1801, ScanTaskID: "preview-1801", Path: path,
+		Kind: worker.MediaImage, Phase: worker.PhasePreview,
+		ScreenStage: worker.ScreenStagePreview, Source: worker.JobSourceLocal,
+		Size: info.Size(), MTimeUnix: info.ModTime().Unix(),
+		KnownSHA: append([]byte(nil), sum[:]...), PreviewFormat: worker.PreviewFormatJPEG,
+		PreviewMaxWidth: 10, PreviewMaxHeight: 10, PreviewQuality: 80,
+	}
+
+	server, parent := net.Pipe()
+	done := make(chan int, 1)
+	go func() { done <- serve(server, 18, testConfig(), pipelineDeps{runtime: testReadyRuntimeInfo}) }()
+	conn := worker.NewIPCConn(parent)
+	if _, err := conn.Read(); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Write(worker.MsgJob, job); err != nil {
+		t.Fatal(err)
+	}
+	envelope, err := conn.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := worker.DecodeBody[worker.JobResultMsg](envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Type != worker.MsgResult || result.PreviewErrorCode != "" ||
+		result.PreviewWidth != 10 || result.PreviewHeight != 5 || len(result.PreviewBytes) == 0 {
+		t.Fatalf("preview dispatch result = type:%q %#v", envelope.Type, result)
+	}
+	if err := conn.Write(worker.MsgShutdown, struct{}{}); err != nil {
+		t.Fatal(err)
+	}
+	if code := <-done; code != 0 {
+		t.Fatalf("serve exit=%d", code)
+	}
+}
 
 func testReadyRuntimeInfo() (videocore.RuntimeInfo, error) {
 	return videocore.RuntimeInfo{ABI: videocore.ABIVersion, Version: "1.0.0", Components: [4]videocore.RuntimeComponent{
@@ -109,7 +183,9 @@ func TestServeDispatchesPhase2ThroughSessionPipeline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.JobID != job.JobID || result.Kind != worker.MediaImage || len(result.SHA512) != sha512.Size || fake.opens != 1 || fake.hashes != 1 || fake.analyzes != 0 || fake.closes != 1 {
+	// The final identity guard uses the independent rehash dependency rather
+	// than the native session's cached Hash result.
+	if result.JobID != job.JobID || result.Kind != worker.MediaImage || len(result.SHA512) != sha512.Size || fake.opens != 1 || fake.hashes != 1 || fake.rehashes != 1 || fake.analyzes != 0 || fake.closes != 1 {
 		t.Fatalf("phase-2 result/session = %#v; %d/%d/%d/%d", result, fake.opens, fake.hashes, fake.analyzes, fake.closes)
 	}
 	if err := conn.Write(worker.MsgShutdown, struct{}{}); err != nil {
@@ -117,6 +193,79 @@ func TestServeDispatchesPhase2ThroughSessionPipeline(t *testing.T) {
 	}
 	if code := <-done; code != 0 {
 		t.Fatalf("serve shutdown exit = %d, want 0", code)
+	}
+}
+
+func TestImageNoThumbnailServeUsesImagePipelineEvenWithSessionConfigured(t *testing.T) {
+	file := newFakeFile([]byte("pixels"), 6, 123)
+	imageDeps, imageState := testPipelineDeps(file)
+	imageDeps.runtime = testReadyRuntimeInfo
+	imageDeps.query = nil
+	cacheDir := t.TempDir()
+	cfg := testConfig()
+	cfg.ThumbCacheDir = cacheDir
+	_, sessionDeps, sessionFake := newSessionPipelineTest(
+		t, worker.MediaImage, worker.MaskAllImage, 0,
+	)
+	sessionDeps.query = nil
+	imageDeps.session = &sessionDeps
+
+	server, parent := net.Pipe()
+	done := make(chan int, 1)
+	go func() { done <- serve(server, 14, cfg, imageDeps) }()
+	conn := worker.NewIPCConn(parent)
+	if _, err := conn.Read(); err != nil {
+		t.Fatal(err)
+	}
+	job := worker.JobMsg{
+		JobID: 1401, Path: `C:\media\no-thumb.jpg`, Kind: worker.MediaImage,
+		Phase: worker.Phase1, FieldsMask: worker.MaskAllImage,
+		Size: 6, MTimeUnix: 123,
+	}
+	if err := conn.Write(worker.MsgJob, job); err != nil {
+		t.Fatal(err)
+	}
+	envelope, err := conn.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	query, err := worker.DecodeBody[worker.SHAQueryMsg](envelope)
+	if err != nil || envelope.Type != worker.MsgSHAQuery {
+		t.Fatalf("image query = type %q %#v err=%v", envelope.Type, query, err)
+	}
+	if err := conn.Write(worker.MsgSHAReply, worker.SHAReplyMsg{JobID: query.JobID}); err != nil {
+		t.Fatal(err)
+	}
+	envelope, err = conn.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := worker.DecodeBody[worker.JobResultMsg](envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Type != worker.MsgResult || result.FieldsDone != worker.MaskAllImage ||
+		len(result.PDQ) != 32 || result.Width <= 0 || result.Height <= 0 ||
+		result.ThumbPath != "" || result.ThumbGenerated || result.ThumbCacheHit {
+		t.Fatalf("image result = type %q %#v", envelope.Type, result)
+	}
+	if imageState.decodeCalls != 1 || sessionFake.opens != 0 || sessionFake.analyzes != 0 ||
+		sessionFake.closes != 0 {
+		t.Fatalf("image/session calls = decode:%d open/analyze/close:%d/%d/%d",
+			imageState.decodeCalls, sessionFake.opens, sessionFake.analyzes, sessionFake.closes)
+	}
+	entries, err := os.ReadDir(cacheDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("image pipeline created thumbnail cache entries: %#v", entries)
+	}
+	if err := conn.Write(worker.MsgShutdown, struct{}{}); err != nil {
+		t.Fatal(err)
+	}
+	if code := <-done; code != 0 {
+		t.Fatalf("serve exit = %d", code)
 	}
 }
 
@@ -264,6 +413,7 @@ func TestServeRoutesVideoJobsThroughVideoPipeline(t *testing.T) {
 		t.Fatal(err)
 	}
 	job := *testVideoJob(711)
+	job.FieldsMask = legacyPhase1VideoMask
 	if err := conn.Write(worker.MsgJob, job); err != nil {
 		t.Fatal(err)
 	}
@@ -289,7 +439,7 @@ func TestServeRoutesVideoJobsThroughVideoPipeline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if envelope.Type != worker.MsgResult || result.Kind != worker.MediaVideo || result.FieldsDone != worker.MaskAllVideo {
+	if envelope.Type != worker.MsgResult || result.Kind != worker.MediaVideo || result.FieldsDone != legacyPhase1VideoMask {
 		t.Fatalf("video result = type %q body %#v", envelope.Type, result)
 	}
 	if got := strings.Join(state.events, ","); got != "probe,cache,ffmpeg,thumb-read,thumb-pdq" {

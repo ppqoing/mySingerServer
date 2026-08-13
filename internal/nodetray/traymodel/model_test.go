@@ -82,6 +82,34 @@ func TestLifecycleRepairModelsExposeStableJSONContract(t *testing.T) {
 	assertJSONKeys(t, state, "runtimeConfigSha256", "savedConfigSha256", "needsRestart")
 }
 
+func TestLocalConsoleModelsKeepSecretsOutOfWailsJSON(t *testing.T) {
+	preview := LocalDeletePreview{OK: true, BatchID: "batch-1", SelectionDigest: "digest", Count: 2}
+	raw, err := json.Marshal(preview)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(strings.ToLower(string(raw)), "token") {
+		t.Fatalf("delete preview exposed a one-time token: %s", raw)
+	}
+	assertJSONKeys(t, preview, "ok", "batchId", "selectionDigest", "count", "totalSize", "expiresAt", "files", "errorCode", "errorSummary")
+
+	image := ImagePreview{OK: true, MIME: "image/jpeg", Width: 40, Height: 20, DataBase64: "AA=="}
+	assertJSONKeys(t, image, "ok", "mime", "width", "height", "dataBase64", "errorCode", "errorSummary")
+}
+
+// Break caught: the Wails directory picker result drops cancellation or a
+// stable, display-safe error field before it reaches the local-task UI.
+func TestPathSelectionResultExposesWailsSafeJSONContract(t *testing.T) {
+	result := PathSelectionResult{
+		OK:           true,
+		Path:         `D:\Media`,
+		Cancelled:    false,
+		ErrorCode:    "",
+		ErrorSummary: "",
+	}
+	assertJSONKeys(t, result, "ok", "path", "cancelled", "errorCode", "errorSummary")
+}
+
 func assertJSONKeys(t *testing.T, value any, keys ...string) {
 	t.Helper()
 	raw, err := json.Marshal(value)

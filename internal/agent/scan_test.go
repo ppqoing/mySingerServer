@@ -34,6 +34,44 @@ func TestScanManagerRejectsInvalidTasks(t *testing.T) {
 	}
 }
 
+func TestScanReportErrLogsSafePathIdentityAcrossWindowsVariants(t *testing.T) {
+	var output bytes.Buffer
+	manager := &ScanManager{errLog: slog.New(slog.NewJSONHandler(&output, nil))}
+	path := `D:\İstanbul\Private\Album\Secret.JPG`
+	message := `open d:/İstanbul\PRIVATE/ALBUM\SECRET.jpg failed; retry SECRET.JPG`
+	state := &ScanState{Task: proto.ScanTask{TaskID: "scan-private-log"}}
+	responses := make(chan proto.Error, 1)
+	state.bindSender(func(msgType uint8, value any) error {
+		if msgType == proto.MsgError {
+			responses <- *value.(*proto.Error)
+		}
+		return nil
+	})
+
+	manager.reportErr(state, path, "hash", errors.New(message))
+	logged := output.String()
+	for _, secret := range []string{"stanbul", "private", "album", "secret.jpg"} {
+		if strings.Contains(strings.ToLower(logged), secret) {
+			t.Fatalf("scan error log leaked %q from Windows path variant: %s", secret, logged)
+		}
+	}
+	var record map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(output.Bytes()), &record); err != nil {
+		t.Fatal(err)
+	}
+	if record["path_id"] != worker.PathID(path) || record["screen_stage"] != float64(worker.ScreenStageLegacy) || record["source"] != string(worker.JobSourceScan) {
+		t.Fatalf("scan safe log context=%#v", record)
+	}
+	select {
+	case response := <-responses:
+		if response.Path != path || response.Msg != message || response.Stage != "hash" {
+			t.Fatalf("authorized protocol response=%#v", response)
+		}
+	default:
+		t.Fatal("scan reportErr emitted no authorized protocol response")
+	}
+}
+
 func TestScanTaskResumesAndCompletesWithoutRestarting(t *testing.T) {
 	hashStarted := make(chan struct{})
 	releaseHash := make(chan struct{})
@@ -373,6 +411,23 @@ func TestScanCountsDiskResolutionFailure(t *testing.T) {
 	}
 }
 
+func TestUnknownDiskMediaLogDoesNotExposeRootOrMount(t *testing.T) {
+	var output bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&output, nil))
+	root := `D:\Private\Media`
+	mount := `D:\Private`
+	logUnknownDiskMedia(logger, root, mount, 7)
+	got := output.String()
+	for _, value := range []string{"Private", "Media", root, mount} {
+		if strings.Contains(got, value) {
+			t.Fatalf("log leaked %q: %q", value, got)
+		}
+	}
+	if !strings.Contains(got, "path_id") || !strings.Contains(got, "device_number=7") {
+		t.Fatalf("safe fields missing: %q", got)
+	}
+}
+
 func TestScanCountsEnumerationFailure(t *testing.T) {
 	enumr := &fakeEnumerator{
 		records: map[string][]fileenum.FileRecord{
@@ -639,6 +694,85 @@ func TestPreparePendingSkipsMediaRowsWhosePhase1MaskIsZero(t *testing.T) {
 	})
 	if len(work) != 0 || len(routes) != 0 || len(pool.submittedSnapshot()) != 0 {
 		t.Fatalf("mask-zero prepare = work %#v routes %#v submits %#v", work, routes, pool.submittedSnapshot())
+	}
+}
+
+func TestDefaultStageOnePreparePendingDoesNotDependOnMutableWorkerAliases(t *testing.T) {
+	originalImage, originalVideo := worker.MaskAllImage, worker.MaskAllVideo
+	worker.MaskAllImage, worker.MaskAllVideo = 0, worker.MaskVideoThumb
+	t.Cleanup(func() {
+		worker.MaskAllImage, worker.MaskAllVideo = originalImage, originalVideo
+	})
+	m, cleanup := newTestScanManager(t, nil, nil)
+	defer cleanup()
+	m.pool = newFakeScanPool()
+	state := &ScanState{Task: proto.ScanTask{TaskID: "task-required-mask"}}
+	pending := map[int64][]store.PendingFile{1: {
+		{Path: `D:\image.jpg`, MissingMask: store.RequiredStageOneMask(store.MediaImage)},
+		{Path: `D:\video.mp4`, MissingMask: store.RequiredStageOneMask(store.MediaVideo)},
+	}}
+	work, _ := m.preparePending(state, pending)
+	if len(work[1]) != 2 || work[1][0].media == nil || work[1][1].media == nil ||
+		work[1][0].media.FieldsMask != store.RequiredStageOneMask(store.MediaImage) ||
+		work[1][1].media.FieldsMask != store.RequiredStageOneMask(store.MediaVideo) {
+		t.Fatalf("prepared required masks = %#v", work[1])
+	}
+}
+
+func TestImageNoThumbnailFeatureItemKeepsImageDimensionsOnly(t *testing.T) {
+	job := &worker.JobMsg{
+		Path: `D:\media\photo.jpg`, Kind: worker.MediaImage,
+		FieldsMask: worker.MaskAllImage, Size: 10, MTimeUnix: 20,
+	}
+	result := &worker.JobResultMsg{
+		Kind: worker.MediaImage, FieldsDone: worker.MaskAllImage,
+		SHA512: bytes.Repeat([]byte{1}, 64), PDQ: bytes.Repeat([]byte{2}, 32),
+		Quality: 87, Width: 640, Height: 480,
+	}
+	item := featureItemFromWorker(job, result)
+	if item.Status != proto.StatusDone || item.Width != 640 || item.Height != 480 ||
+		item.ThumbPath != "" || item.ThumbPDQ256 != "" || item.ThumbQuality != nil {
+		t.Fatalf("image feature item = %#v", item)
+	}
+}
+
+func TestVideoBaseFeaturesFeatureItemUsesContactSheetDimensions(t *testing.T) {
+	duration, quality := int64(4321), int32(91)
+	job := &worker.JobMsg{
+		Path: `D:\media\clip.mp4`, Kind: worker.MediaVideo,
+		FieldsMask: worker.MaskAllVideo, Size: 30, MTimeUnix: 40,
+	}
+	result := &worker.JobResultMsg{
+		Kind: worker.MediaVideo, FieldsDone: worker.MaskAllVideo,
+		SHA512: bytes.Repeat([]byte{3}, 64), DurationMS: &duration,
+		ThumbPath: `D:\cache\clip.jpg`, ThumbPDQ: bytes.Repeat([]byte{4}, 32),
+		ThumbQuality: &quality, ContactSheetWidth: 960, ContactSheetHeight: 540,
+	}
+	item := featureItemFromWorker(job, result)
+	if item.Status != proto.StatusDone || item.Width != 960 || item.Height != 540 ||
+		item.ThumbPath != result.ThumbPath {
+		t.Fatalf("video feature item = %#v", item)
+	}
+}
+
+func TestVideoBaseFeaturesMissingContactSheetIsPartial(t *testing.T) {
+	duration := int64(4321)
+	job := &worker.JobMsg{
+		Path: `D:\media\partial.mp4`, Kind: worker.MediaVideo,
+		FieldsMask: worker.MaskAllVideo,
+	}
+	result := &worker.JobResultMsg{
+		Kind:       worker.MediaVideo,
+		FieldsDone: worker.MaskSHA512 | worker.MaskVideoDuration,
+		SHA512:     bytes.Repeat([]byte{5}, 64), DurationMS: &duration,
+		Errors: []worker.FieldError{{
+			Field: worker.MaskVideoContactSheet, Stage: "contact_sheet", Msg: "decode failed",
+		}},
+	}
+	item := featureItemFromWorker(job, result)
+	if item.Status != proto.StatusPartial ||
+		item.FieldsDone != worker.MaskSHA512|worker.MaskVideoDuration {
+		t.Fatalf("partial video feature item = %#v", item)
 	}
 }
 

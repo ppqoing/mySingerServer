@@ -105,6 +105,80 @@ func TestStoreReturnsSafeInteractiveDefaultsOnlyForCompletelyAbsentComponentConf
 	}
 }
 
+func TestStoreLoadsStrictPackageHelperDefaultForEditableFirstRun(t *testing.T) {
+	store, paths := newTestStore(t)
+	defaultPath := filepath.Join(filepath.Dir(paths.HelperExecutable), "helper.default.json")
+	defaultConfig := validHelperConfig(t)
+	defaultConfig.AllowedRoots = []string{}
+	defaultConfig.DeniedRoots = []string{`D:\nodetray-test-media\private`}
+	defaultConfig.LogDir = ""
+	writeJSONFixture(t, defaultPath, defaultConfig)
+
+	form, err := store.LoadHelperForm()
+	if err != nil {
+		t.Fatalf("LoadHelperForm: %v", err)
+	}
+	if len(form.AllowedRoots) != 0 || !reflect.DeepEqual(form.DeniedRoots, defaultConfig.DeniedRoots) {
+		t.Fatalf("form did not preserve editable package default: %#v", form)
+	}
+	if form.LogDir != filepath.Join(filepath.Dir(paths.HelperConfig), "logs") {
+		t.Fatalf("LogDir = %q", form.LogDir)
+	}
+	if _, err := store.PrepareDefaultHelperWrite(); err == nil {
+		t.Fatal("empty allowed_roots default was prepared")
+	}
+	for _, data := range [][]byte{[]byte(`{"unknown":true}`), append(mustCanonicalJSON(t, validHelperConfig(t)), []byte(`{}`)...)} {
+		writeBytesFixture(t, defaultPath, data)
+		if _, err := store.LoadHelperForm(); err == nil {
+			t.Fatal("non-strict package default was accepted")
+		}
+	}
+}
+
+func TestStoreLoadsEditableActualHelperConfigWithEmptyRoots(t *testing.T) {
+	store, paths := newTestStore(t)
+	value := validHelperConfig(t)
+	value.AllowedRoots = []string{}
+	value.DeniedRoots = []string{`D:\nodetray-test-media\private`}
+	value.LogDir = ""
+	writeJSONFixture(t, paths.HelperConfig, value)
+
+	form, err := store.LoadHelperForm()
+	if err != nil {
+		t.Fatalf("LoadHelperForm: %v", err)
+	}
+	if len(form.AllowedRoots) != 0 || !reflect.DeepEqual(form.DeniedRoots, value.DeniedRoots) {
+		t.Fatalf("editable Helper form = %#v", form)
+	}
+	if form.LogDir != filepath.Join(filepath.Dir(paths.HelperConfig), "logs") {
+		t.Fatalf("LogDir = %q", form.LogDir)
+	}
+	if digest, err := store.HelperFingerprint(); err != nil || len(digest) != 64 {
+		t.Fatalf("HelperFingerprint = %q, %v", digest, err)
+	}
+}
+
+func TestStoreSaveHelperFormWritesLocalConfigAndLastGood(t *testing.T) {
+	store, paths := newTestStore(t)
+	first := HelperToForm(validHelperConfig(t))
+	firstSHA, err := store.SaveHelperForm(first)
+	if err != nil || len(firstSHA) != 64 {
+		t.Fatalf("first SaveHelperForm = %q, %v", firstSHA, err)
+	}
+	second := first
+	second.FrameReadTimeoutSec++
+	secondSHA, err := store.SaveHelperForm(second)
+	if err != nil || secondSHA == firstSHA {
+		t.Fatalf("second SaveHelperForm = %q, %v", secondSHA, err)
+	}
+	if _, _, err := loadHelperConfig(paths.HelperConfig, paths.HelperExecutable); err != nil {
+		t.Fatalf("formal Helper config: %v", err)
+	}
+	if _, _, err := loadHelperConfig(paths.HelperConfig+".last-good", paths.HelperExecutable); err != nil {
+		t.Fatalf("last-good Helper config: %v", err)
+	}
+}
+
 func TestStoreDoesNotHideMissingOfficialConfigWhenBackupExists(t *testing.T) {
 	store, paths := newTestStore(t)
 	writeBytesFixture(t, paths.AgentConfig+".last-good", mustCanonicalJSON(t, fullyPopulatedAgentConfig()))
@@ -124,7 +198,6 @@ func TestStoreFingerprintsStrictCanonicalConfigurationsWithoutReturningTheirCont
 	agent.Worker.ExePath = ""
 	writeBytesFixture(t, paths.AgentConfig, mustCanonicalJSON(t, agent))
 	helper := validHelperConfig(t)
-	helper.LogDir = ""
 	writeBytesFixture(t, paths.HelperConfig, mustCanonicalJSON(t, helper))
 
 	agentDigest, err := store.AgentFingerprint()
@@ -197,7 +270,7 @@ func TestStoreStrictlyRejectsUnknownFieldsAndTrailingValuesWithoutLeakingInput(t
 	}
 }
 
-func TestStoreRejectsProtectedHelperInsideWritableConfigurationDirectory(t *testing.T) {
+func TestStoreAcceptsHelperInsideUserWritableConfigurationDirectory(t *testing.T) {
 	root := t.TempDir()
 	for _, helperPath := range []string{
 		filepath.Join(root, "writable", "helper.json"),
@@ -210,10 +283,9 @@ func TestStoreRejectsProtectedHelperInsideWritableConfigurationDirectory(t *test
 			AgentExecutable:  filepath.Join(root, "bin", "agent.exe"),
 			HelperExecutable: filepath.Join(root, "bin", "helper.exe"),
 		})
-		if err == nil {
-			t.Fatalf("NewStore accepted protected Helper path %q inside writable Agent directory", helperPath)
+		if err != nil {
+			t.Fatalf("NewStore rejected writable Helper path: %v", err)
 		}
-		assertErrorRedacted(t, err, root, helperPath)
 	}
 }
 
@@ -384,6 +456,44 @@ func TestStorePrepareHelperWriteValidatesCanonicalizesCopiesAndNeverWritesProtec
 	}
 	if again.CanonicalJSON[0] != '{' {
 		t.Fatal("PreparedWrite.CanonicalJSON shares mutable state across calls")
+	}
+}
+
+func TestStorePrepareDefaultHelperWriteIsCreateOnlyAndNeverOverwrites(t *testing.T) {
+	store, paths := newTestStore(t)
+	defaultPath := filepath.Join(filepath.Dir(paths.HelperExecutable), "helper.default.json")
+	writeJSONFixture(t, defaultPath, validHelperConfig(t))
+	prepared, err := store.PrepareDefaultHelperWrite()
+	if err != nil {
+		t.Fatalf("PrepareDefaultHelperWrite: %v", err)
+	}
+	if !prepared.CreateOnly {
+		t.Fatal("default prepared write must be create-only")
+	}
+	if prepared.TargetPath != paths.HelperConfig {
+		t.Fatalf("target = %q", prepared.TargetPath)
+	}
+	if err := os.MkdirAll(filepath.Dir(paths.HelperConfig), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeBytesFixture(t, paths.HelperConfig, []byte("existing"))
+	if _, err := store.PrepareDefaultHelperWrite(); !errors.Is(err, ErrHelperConfigExists) {
+		t.Fatalf("existing target error = %v", err)
+	}
+	if got := readFixture(t, paths.HelperConfig); string(got) != "existing" {
+		t.Fatal("existing helper was changed")
+	}
+}
+
+func TestStorePrepareDefaultHelperWriteRejectsInvalidDefault(t *testing.T) {
+	store, paths := newTestStore(t)
+	defaultPath := filepath.Join(filepath.Dir(paths.HelperExecutable), "helper.default.json")
+	writeBytesFixture(t, defaultPath, []byte(`{"allowed_roots":[]} trailing`))
+	if _, err := store.PrepareDefaultHelperWrite(); err == nil {
+		t.Fatal("invalid default was accepted")
+	}
+	if _, err := os.Stat(paths.HelperConfig); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("target was written: %v", err)
 	}
 }
 
@@ -740,12 +850,17 @@ func newTestStore(t *testing.T) (*Store, Paths) {
 		AgentConfig:      filepath.Join(root, "agent", "agent.json"),
 		HelperConfig:     filepath.Join(root, "helper", "helper.json"),
 		AgentExecutable:  `D:\nodetray-test-binaries\agent.exe`,
-		HelperExecutable: `D:\nodetray-test-binaries\helper.exe`,
+		HelperExecutable: filepath.Join(root, "bin", "helper.exe"),
 	}
 	store, err := NewStore(paths)
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
+	defaultConfig, err := HelperFromForm(firstRunHelperForm(paths))
+	if err != nil {
+		t.Fatalf("HelperFromForm: %v", err)
+	}
+	writeJSONFixture(t, filepath.Join(filepath.Dir(paths.HelperExecutable), "helper.default.json"), defaultConfig)
 	return store, paths
 }
 

@@ -19,8 +19,10 @@ type GUIConfigSnapshot struct {
 }
 
 type GUIConfigSaveResult struct {
-	Saved           bool `json:"saved"`
-	RestartRequired bool `json:"restart_required"`
+	Saved           bool   `json:"saved"`
+	RestartRequired bool   `json:"restart_required"`
+	Restarting      bool   `json:"restarting"`
+	RecoveryURL     string `json:"recovery_url"`
 }
 
 type GUIConfigService struct {
@@ -28,6 +30,20 @@ type GUIConfigService struct {
 	path             string
 	runtimeCanonical []byte
 	replace          func(source, destination string) error
+	restrict         func(file *os.File) error
+	restart          guiRestartCoordinator
+}
+
+func (s *GUIConfigService) SetRestartCoordinator(restart guiRestartCoordinator) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.restart = restart
+}
+
+func (s *GUIConfigService) RestartCoordinator() guiRestartCoordinator {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.restart
 }
 
 func NewGUIConfigService(path string, runtime *config.GUIConfig) (*GUIConfigService, error) {
@@ -43,6 +59,7 @@ func NewGUIConfigService(path string, runtime *config.GUIConfig) (*GUIConfigServ
 		path:             absolute,
 		runtimeCanonical: runtimeCanonical,
 		replace:          replaceFileAtomically,
+		restrict:         restrictGUIConfigPermissions,
 	}, nil
 }
 
@@ -93,47 +110,56 @@ func (s *GUIConfigService) Save(ctx context.Context, cfg *config.GUIConfig) (GUI
 	if err := ctx.Err(); err != nil {
 		return GUIConfigSaveResult{}, err
 	}
-	temp, err := os.CreateTemp(filepath.Dir(s.path), "."+filepath.Base(s.path)+".*.tmp")
+	if err := writeCanonicalGUIConfig(s.path, canonical, s.replace, s.restrict, ctx.Err); err != nil {
+		return GUIConfigSaveResult{}, err
+	}
+	return GUIConfigSaveResult{Saved: true, RestartRequired: restartRequired}, nil
+}
+
+func writeCanonicalGUIConfig(path string, canonical []byte, replace func(source, destination string) error, restrict func(file *os.File) error, beforeReplace func() error) error {
+	temp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*.tmp")
 	if err != nil {
-		return GUIConfigSaveResult{}, fmt.Errorf("create temporary config for %s: %w", filepath.Base(s.path), err)
+		return fmt.Errorf("create temporary config for %s: %w", filepath.Base(path), err)
 	}
 	tempPath := temp.Name()
 	defer os.Remove(tempPath)
 
-	if err := temp.Chmod(0o600); err != nil {
+	if err := restrict(temp); err != nil {
 		_ = temp.Close()
-		return GUIConfigSaveResult{}, fmt.Errorf("set temporary config permissions for %s: %w", filepath.Base(s.path), err)
+		return fmt.Errorf("set temporary config permissions for %s: %w", filepath.Base(path), err)
 	}
 	if _, err := temp.Write(canonical); err != nil {
 		_ = temp.Close()
-		return GUIConfigSaveResult{}, fmt.Errorf("write temporary config for %s: %w", filepath.Base(s.path), err)
+		return fmt.Errorf("write temporary config for %s: %w", filepath.Base(path), err)
 	}
 	if err := temp.Sync(); err != nil {
 		_ = temp.Close()
-		return GUIConfigSaveResult{}, fmt.Errorf("sync temporary config for %s: %w", filepath.Base(s.path), err)
+		return fmt.Errorf("sync temporary config for %s: %w", filepath.Base(path), err)
 	}
 	if err := temp.Close(); err != nil {
-		return GUIConfigSaveResult{}, fmt.Errorf("close temporary config for %s: %w", filepath.Base(s.path), err)
+		return fmt.Errorf("close temporary config for %s: %w", filepath.Base(path), err)
 	}
 
 	verified, err := config.LoadGUI(tempPath)
 	if err != nil {
-		return GUIConfigSaveResult{}, fmt.Errorf("verify temporary config for %s: %w", filepath.Base(s.path), err)
+		return fmt.Errorf("verify temporary config for %s: %w", filepath.Base(path), err)
 	}
 	verifiedCanonical, err := canonicalGUIConfig(verified)
 	if err != nil || !bytes.Equal(verifiedCanonical, canonical) {
 		if err != nil {
-			return GUIConfigSaveResult{}, fmt.Errorf("verify temporary config for %s: %w", filepath.Base(s.path), err)
+			return fmt.Errorf("verify temporary config for %s: %w", filepath.Base(path), err)
 		}
-		return GUIConfigSaveResult{}, fmt.Errorf("verify temporary config for %s: canonical mismatch", filepath.Base(s.path))
+		return fmt.Errorf("verify temporary config for %s: canonical mismatch", filepath.Base(path))
 	}
-	if err := ctx.Err(); err != nil {
-		return GUIConfigSaveResult{}, err
+	if beforeReplace != nil {
+		if err := beforeReplace(); err != nil {
+			return err
+		}
 	}
-	if err := s.replace(tempPath, s.path); err != nil {
-		return GUIConfigSaveResult{}, fmt.Errorf("replace %s: %w", filepath.Base(s.path), err)
+	if err := replace(tempPath, path); err != nil {
+		return fmt.Errorf("replace %s: %w", filepath.Base(path), err)
 	}
-	return GUIConfigSaveResult{Saved: true, RestartRequired: restartRequired}, nil
+	return nil
 }
 
 func canonicalGUIConfig(cfg *config.GUIConfig) ([]byte, error) {

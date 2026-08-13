@@ -1,16 +1,16 @@
 export namespace config {
-	
+
 	export class AgentDeleteForm {
 	    pipeName: string;
 	    maxEntriesPerFrame: number;
 	    dialTimeoutMs: number;
 	    helloTimeoutS: number;
 	    reportTimeoutS: number;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new AgentDeleteForm(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.pipeName = source["pipeName"];
@@ -27,11 +27,11 @@ export namespace config {
 	    pendingBytesMb: number;
 	    statsLogMb: number;
 	    pprofAddr: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new TuningForm(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.statsEnabled = source["statsEnabled"];
@@ -44,11 +44,11 @@ export namespace config {
 	}
 	export class IPCForm {
 	    maxFrameMb: number;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new IPCForm(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.maxFrameMb = source["maxFrameMb"];
@@ -60,11 +60,11 @@ export namespace config {
 	    probeTimeoutS: number;
 	    nativeTimeoutS: number;
 	    frameTimeoutS: number;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new ThumbForm(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.cacheDir = source["cacheDir"];
@@ -76,11 +76,11 @@ export namespace config {
 	}
 	export class PipelineForm {
 	    readChunkKb: number;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new PipelineForm(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.readChunkKb = source["readChunkKb"];
@@ -93,11 +93,11 @@ export namespace config {
 	    videoTimeoutS: number;
 	    imageMemoryMb: number;
 	    respawnDelayMs: number;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new WorkerForm(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.count = source["count"];
@@ -110,11 +110,11 @@ export namespace config {
 	}
 	export class ProtoForm {
 	    heartbeatS: number;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new ProtoForm(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.heartbeatS = source["heartbeatS"];
@@ -124,11 +124,11 @@ export namespace config {
 	    intervalS: number;
 	    triggerRows: number;
 	    upsertBatch: number;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new SyncForm(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.intervalS = source["intervalS"];
@@ -145,11 +145,11 @@ export namespace config {
 	    videoTimeoutS: number;
 	    imageExts: string[];
 	    videoExts: string[];
-	
+
 	    static createFrom(source: any = {}) {
 	        return new ScanForm(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.hddReadBlockMb = source["hddReadBlockMb"];
@@ -171,11 +171,11 @@ export namespace config {
 	    passwordStored: boolean;
 	    replacePassword: boolean;
 	    sslMode: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new DatabaseForm(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.host = source["host"];
@@ -203,11 +203,11 @@ export namespace config {
 	    ipc: IPCForm;
 	    delete: AgentDeleteForm;
 	    tuning: TuningForm;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new AgentForm(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.listenHost = source["listenHost"];
@@ -225,7 +225,7 @@ export namespace config {
 	        this.delete = this.convertValues(source["delete"], AgentDeleteForm);
 	        this.tuning = this.convertValues(source["tuning"], TuningForm);
 	    }
-	
+
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -244,16 +244,16 @@ export namespace config {
 		    return a;
 		}
 	}
-	
+
 	export class FieldError {
 	    field: string;
 	    code: string;
 	    message: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new FieldError(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.field = source["field"];
@@ -272,11 +272,11 @@ export namespace config {
 	    frameReadTimeoutSec: number;
 	    frameWriteTimeoutSec: number;
 	    logDir: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new HelperForm(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.pipeName = source["pipeName"];
@@ -291,27 +291,27 @@ export namespace config {
 	        this.logDir = source["logDir"];
 	    }
 	}
-	
-	
-	
-	
-	
-	
-	
+
+
+
+
+
+
+
 
 }
 
 export namespace main {
-	
+
 	export class BackendStartup {
 	    Ready: boolean;
 	    Duplicate: boolean;
 	    ErrorCode: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new BackendStartup(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.Ready = source["Ready"];
@@ -323,7 +323,7 @@ export namespace main {
 }
 
 export namespace traymodel {
-	
+
 	export class ComponentState {
 	    lifecycle: string;
 	    healthy: boolean;
@@ -340,11 +340,11 @@ export namespace traymodel {
 	    runtimeConfigSha256: string;
 	    savedConfigSha256: string;
 	    needsRestart: boolean;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new ComponentState(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.lifecycle = source["lifecycle"];
@@ -372,11 +372,11 @@ export namespace traymodel {
 	    needsRestart: boolean;
 	    errorCode: string;
 	    errorSummary: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new ConfigApplyResult(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.ok = source["ok"];
@@ -393,11 +393,11 @@ export namespace traymodel {
 	    failedComponents: string[];
 	    errorCode: string;
 	    errorSummary: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new ForceExitResult(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.ok = source["ok"];
@@ -406,16 +406,520 @@ export namespace traymodel {
 	        this.errorSummary = source["errorSummary"];
 	    }
 	}
+	export class ImagePreview {
+	    ok: boolean;
+	    mime: string;
+	    width: number;
+	    height: number;
+	    dataBase64: string;
+	    errorCode: string;
+	    errorSummary: string;
+
+	    static createFrom(source: any = {}) {
+	        return new ImagePreview(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.ok = source["ok"];
+	        this.mime = source["mime"];
+	        this.width = source["width"];
+	        this.height = source["height"];
+	        this.dataBase64 = source["dataBase64"];
+	        this.errorCode = source["errorCode"];
+	        this.errorSummary = source["errorSummary"];
+	    }
+	}
+	export class LocalDeleteItem {
+	    fileId: number;
+	    result: string;
+	    errorCode: string;
+	    uncertain: boolean;
+
+	    static createFrom(source: any = {}) {
+	        return new LocalDeleteItem(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.fileId = source["fileId"];
+	        this.result = source["result"];
+	        this.errorCode = source["errorCode"];
+	        this.uncertain = source["uncertain"];
+	    }
+	}
+	export class LocalDeleteBatch {
+	    ok: boolean;
+	    batchId: string;
+	    status: string;
+	    requested: number;
+	    succeeded: number;
+	    failed: number;
+	    uncertain: number;
+	    items: LocalDeleteItem[];
+	    errorCode: string;
+	    errorSummary: string;
+
+	    static createFrom(source: any = {}) {
+	        return new LocalDeleteBatch(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.ok = source["ok"];
+	        this.batchId = source["batchId"];
+	        this.status = source["status"];
+	        this.requested = source["requested"];
+	        this.succeeded = source["succeeded"];
+	        this.failed = source["failed"];
+	        this.uncertain = source["uncertain"];
+	        this.items = this.convertValues(source["items"], LocalDeleteItem);
+	        this.errorCode = source["errorCode"];
+	        this.errorSummary = source["errorSummary"];
+	    }
+
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	export class LocalDeleteExecute {
+	    batchId: string;
+	    selectionDigest: string;
+
+	    static createFrom(source: any = {}) {
+	        return new LocalDeleteExecute(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.batchId = source["batchId"];
+	        this.selectionDigest = source["selectionDigest"];
+	    }
+	}
+	export class LocalDeleteFile {
+	    fileId: number;
+	    path: string;
+	    size: number;
+
+	    static createFrom(source: any = {}) {
+	        return new LocalDeleteFile(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.fileId = source["fileId"];
+	        this.path = source["path"];
+	        this.size = source["size"];
+	    }
+	}
+
+	export class LocalDeletePrepare {
+	    runId: string;
+	    groupId: string;
+
+	    static createFrom(source: any = {}) {
+	        return new LocalDeletePrepare(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.runId = source["runId"];
+	        this.groupId = source["groupId"];
+	    }
+	}
+	export class LocalDeletePreview {
+	    ok: boolean;
+	    batchId: string;
+	    selectionDigest: string;
+	    count: number;
+	    totalSize: number;
+	    expiresAt: number;
+	    files: LocalDeleteFile[];
+	    errorCode: string;
+	    errorSummary: string;
+
+	    static createFrom(source: any = {}) {
+	        return new LocalDeletePreview(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.ok = source["ok"];
+	        this.batchId = source["batchId"];
+	        this.selectionDigest = source["selectionDigest"];
+	        this.count = source["count"];
+	        this.totalSize = source["totalSize"];
+	        this.expiresAt = source["expiresAt"];
+	        this.files = this.convertValues(source["files"], LocalDeleteFile);
+	        this.errorCode = source["errorCode"];
+	        this.errorSummary = source["errorSummary"];
+	    }
+
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	export class LocalGroupMember {
+	    fileId: number;
+	    path: string;
+	    fileName: string;
+	    size: number;
+	    status: string;
+	    decision: string;
+
+	    static createFrom(source: any = {}) {
+	        return new LocalGroupMember(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.fileId = source["fileId"];
+	        this.path = source["path"];
+	        this.fileName = source["fileName"];
+	        this.size = source["size"];
+	        this.status = source["status"];
+	        this.decision = source["decision"];
+	    }
+	}
+	export class LocalGroup {
+	    runId: string;
+	    generation: number;
+	    groupId: string;
+	    category: string;
+	    verdict: string;
+	    reviewStatus: string;
+	    stageOne: string;
+	    stageTwo: string;
+	    stageThree: string;
+	    members: LocalGroupMember[];
+
+	    static createFrom(source: any = {}) {
+	        return new LocalGroup(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.runId = source["runId"];
+	        this.generation = source["generation"];
+	        this.groupId = source["groupId"];
+	        this.category = source["category"];
+	        this.verdict = source["verdict"];
+	        this.reviewStatus = source["reviewStatus"];
+	        this.stageOne = source["stageOne"];
+	        this.stageTwo = source["stageTwo"];
+	        this.stageThree = source["stageThree"];
+	        this.members = this.convertValues(source["members"], LocalGroupMember);
+	    }
+
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+
+	export class LocalGroupPage {
+	    ok: boolean;
+	    groups: LocalGroup[];
+	    offset: number;
+	    nextOffset: number;
+	    errorCode: string;
+	    errorSummary: string;
+
+	    static createFrom(source: any = {}) {
+	        return new LocalGroupPage(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.ok = source["ok"];
+	        this.groups = this.convertValues(source["groups"], LocalGroup);
+	        this.offset = source["offset"];
+	        this.nextOffset = source["nextOffset"];
+	        this.errorCode = source["errorCode"];
+	        this.errorSummary = source["errorSummary"];
+	    }
+
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	export class LocalGroupQuery {
+	    scope: string;
+	    runId: string;
+	    category: string;
+	    pathContains: string;
+	    fileNameContains: string;
+	    reviewStatus: string;
+	    offset: number;
+	    limit: number;
+
+	    static createFrom(source: any = {}) {
+	        return new LocalGroupQuery(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.scope = source["scope"];
+	        this.runId = source["runId"];
+	        this.category = source["category"];
+	        this.pathContains = source["pathContains"];
+	        this.fileNameContains = source["fileNameContains"];
+	        this.reviewStatus = source["reviewStatus"];
+	        this.offset = source["offset"];
+	        this.limit = source["limit"];
+	    }
+	}
+	export class LocalReviewDecision {
+	    fileId: number;
+	    decision: string;
+
+	    static createFrom(source: any = {}) {
+	        return new LocalReviewDecision(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.fileId = source["fileId"];
+	        this.decision = source["decision"];
+	    }
+	}
+	export class LocalReviewSave {
+	    runId: string;
+	    groupId: string;
+	    reviewer: string;
+	    note: string;
+	    decisions: LocalReviewDecision[];
+
+	    static createFrom(source: any = {}) {
+	        return new LocalReviewSave(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.runId = source["runId"];
+	        this.groupId = source["groupId"];
+	        this.reviewer = source["reviewer"];
+	        this.note = source["note"];
+	        this.decisions = this.convertValues(source["decisions"], LocalReviewDecision);
+	    }
+
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	export class LocalTask {
+	    taskId: string;
+	    source: string;
+	    mode: string;
+	    stage: number;
+	    status: string;
+	    roots: string[];
+	    progressComplete: number;
+	    progressTotal: number;
+	    speed: string;
+	    failures: number;
+	    duration: string;
+	    syncStatus: string;
+	    errorCode: string;
+	    errorSummary: string;
+
+	    static createFrom(source: any = {}) {
+	        return new LocalTask(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.taskId = source["taskId"];
+	        this.source = source["source"];
+	        this.mode = source["mode"];
+	        this.stage = source["stage"];
+	        this.status = source["status"];
+	        this.roots = source["roots"];
+	        this.progressComplete = source["progressComplete"];
+	        this.progressTotal = source["progressTotal"];
+	        this.speed = source["speed"];
+	        this.failures = source["failures"];
+	        this.duration = source["duration"];
+	        this.syncStatus = source["syncStatus"];
+	        this.errorCode = source["errorCode"];
+	        this.errorSummary = source["errorSummary"];
+	    }
+	}
+	export class LocalTaskCreate {
+	    taskId: string;
+	    roots: string[];
+	    mode: string;
+	    rescan: boolean;
+	    extensions: string[];
+
+	    static createFrom(source: any = {}) {
+	        return new LocalTaskCreate(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.taskId = source["taskId"];
+	        this.roots = source["roots"];
+	        this.mode = source["mode"];
+	        this.rescan = source["rescan"];
+	        this.extensions = source["extensions"];
+	    }
+	}
+	export class LocalTaskPage {
+	    ok: boolean;
+	    tasks: LocalTask[];
+	    offset: number;
+	    nextOffset: number;
+	    errorCode: string;
+	    errorSummary: string;
+
+	    static createFrom(source: any = {}) {
+	        return new LocalTaskPage(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.ok = source["ok"];
+	        this.tasks = this.convertValues(source["tasks"], LocalTask);
+	        this.offset = source["offset"];
+	        this.nextOffset = source["nextOffset"];
+	        this.errorCode = source["errorCode"];
+	        this.errorSummary = source["errorSummary"];
+	    }
+
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	export class LocalTaskResult {
+	    ok: boolean;
+	    task: LocalTask;
+	    errorCode: string;
+	    errorSummary: string;
+
+	    static createFrom(source: any = {}) {
+	        return new LocalTaskResult(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.ok = source["ok"];
+	        this.task = this.convertValues(source["task"], LocalTask);
+	        this.errorCode = source["errorCode"];
+	        this.errorSummary = source["errorSummary"];
+	    }
+
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
 	export class OperationResult {
 	    ok: boolean;
 	    errorCode: string;
 	    errorSummary: string;
 	    uacCancelled: boolean;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new OperationResult(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.ok = source["ok"];
@@ -430,11 +934,11 @@ export namespace traymodel {
 	    ready: boolean;
 	    currentTaskSummary: string;
 	    lastErrorSummary: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new WorkerState(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.index = source["index"];
@@ -454,11 +958,11 @@ export namespace traymodel {
 	    helperEnabled: boolean;
 	    helperTaskDrift: boolean;
 	    loginStartDrift: boolean;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new Overview(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.machineId = source["machineId"];
@@ -471,7 +975,7 @@ export namespace traymodel {
 	        this.helperTaskDrift = source["helperTaskDrift"];
 	        this.loginStartDrift = source["loginStartDrift"];
 	    }
-	
+
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -490,6 +994,20 @@ export namespace traymodel {
 		    return a;
 		}
 	}
+	export class PageRequest {
+	    offset: number;
+	    limit: number;
+
+	    static createFrom(source: any = {}) {
+	        return new PageRequest(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.offset = source["offset"];
+	        this.limit = source["limit"];
+	    }
+	}
 	export class TraySettings {
 	    loginStartTray: boolean;
 	    agentStartMode: string;
@@ -498,11 +1016,11 @@ export namespace traymodel {
 	    closeToTray: boolean;
 	    refreshIntervalSeconds: number;
 	    notificationLevel: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new TraySettings(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.loginStartTray = source["loginStartTray"];

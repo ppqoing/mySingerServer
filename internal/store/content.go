@@ -48,7 +48,7 @@ func (d *DB) LookupContent(
 	if kind == MediaImage && requestedFrames != 0 {
 		return ContentState{}, fmt.Errorf("store: image content cannot request video frames")
 	}
-	if kind == MediaVideo && requestedFields&proto.FieldVideo6F != 0 && requestedFrames == 0 {
+	if kind == MediaVideo && requestedFields&videoSixFrameFields() != 0 && requestedFrames == 0 {
 		requestedFrames = proto.FrameMaskFull
 	}
 
@@ -82,7 +82,8 @@ func contentFieldMask(kind MediaKind) uint32 {
 			proto.FieldPHashParts | proto.FieldSobelHist
 	case MediaVideo:
 		return proto.FieldSHA512 | proto.FieldThumb | proto.FieldVideo6F |
-			proto.FieldVideoDuration | proto.FieldVideoContactSheet
+			proto.FieldVideoDuration | proto.FieldVideoContactSheet |
+			proto.FieldVideo6FPHash | proto.FieldVideo6FSobel
 	default:
 		return 0
 	}
@@ -159,11 +160,15 @@ func (d *DB) lookupVideoContent(
 		var duration sql.NullInt64
 		var thumbPath sql.NullString
 		var thumbPDQ []byte
-		var thumbQuality sql.NullInt64
+		var thumbQuality, thumbWidth, thumbHeight sql.NullInt64
 		err := d.db.QueryRowContext(ctx, `
-			SELECT sha512, duration_ms, thumb_path, thumb_pdq256, thumb_quality
+			SELECT sha512, duration_ms, thumb_path, thumb_pdq256, thumb_quality,
+			       thumb_width, thumb_height
 			FROM video_features WHERE sha512=?1`, shaText,
-		).Scan(&storedSHA, &duration, &thumbPath, &thumbPDQ, &thumbQuality)
+		).Scan(
+			&storedSHA, &duration, &thumbPath, &thumbPDQ, &thumbQuality,
+			&thumbWidth, &thumbHeight,
+		)
 		if err != nil && err != sql.ErrNoRows {
 			return fmt.Errorf("store: lookup video content: %w", err)
 		}
@@ -172,18 +177,29 @@ func (d *DB) lookupVideoContent(
 			if decodeErr == nil && len(decodedSHA) == 64 {
 				feature := &VideoFeature{SHA512: decodedSHA}
 				durationOK := duration.Valid && duration.Int64 >= 0
-				contactOK := thumbPath.Valid && thumbPath.String != "" &&
+				legacyContactOK := durationOK && thumbPath.Valid && thumbPath.String != "" &&
 					len(thumbPDQ) == 32 && thumbQuality.Valid &&
 					thumbQuality.Int64 >= 0 && thumbQuality.Int64 <= 100
+				contactOK := legacyContactOK &&
+					thumbWidth.Valid && thumbWidth.Int64 > 0 &&
+					thumbHeight.Valid && thumbHeight.Int64 > 0
 				if durationOK && (requestedFields&(proto.FieldVideoDuration|proto.FieldThumb) != 0) {
 					value := duration.Int64
 					feature.DurationMS = &value
 				}
-				if contactOK && (requestedFields&(proto.FieldVideoContactSheet|proto.FieldThumb) != 0) {
+				wantsLegacyContact := requestedFields&proto.FieldThumb != 0 && legacyContactOK
+				wantsContact := requestedFields&proto.FieldVideoContactSheet != 0 && contactOK
+				if wantsLegacyContact || wantsContact {
 					value := int32(thumbQuality.Int64)
 					feature.ThumbPath = thumbPath.String
 					feature.ThumbPDQ = append([]byte(nil), thumbPDQ...)
 					feature.ThumbQuality = &value
+					if contactOK {
+						width := int32(thumbWidth.Int64)
+						height := int32(thumbHeight.Int64)
+						feature.ThumbWidth = &width
+						feature.ThumbHeight = &height
+					}
 				}
 				if requestedFields&proto.FieldVideoDuration != 0 && durationOK {
 					state.FieldsPresent |= proto.FieldVideoDuration
@@ -193,7 +209,7 @@ func (d *DB) lookupVideoContent(
 					state.FieldsPresent |= proto.FieldVideoContactSheet
 					state.MissingFields &^= proto.FieldVideoContactSheet
 				}
-				if requestedFields&proto.FieldThumb != 0 && durationOK && contactOK {
+				if requestedFields&proto.FieldThumb != 0 && legacyContactOK {
 					state.FieldsPresent |= proto.FieldThumb
 					state.MissingFields &^= proto.FieldThumb
 				}
@@ -223,18 +239,24 @@ func (d *DB) lookupVideoContent(
 				return fmt.Errorf("store: scan video content frame: %w", err)
 			}
 			bit := uint8(1 << uint(frame.FrameIdx))
-			if requestedFrames&bit == 0 || len(frame.PDQ256) != 32 {
+			if requestedFrames&bit == 0 || !videoFramePayloadValid(requestedFields, frame.PDQ256, frame.PHashParts, frame.SobelHist) {
 				continue
 			}
-			if _, err := features.DecodePHashParts(frame.PHashParts); err != nil {
-				continue
+			if requestedFields&proto.FieldVideo6F != 0 {
+				frame.PDQ256 = append([]byte(nil), frame.PDQ256...)
+			} else {
+				frame.PDQ256 = nil
 			}
-			if _, err := features.DecodeSobelHist(frame.SobelHist); err != nil {
-				continue
+			if requestedFields&(proto.FieldVideo6F|proto.FieldVideo6FPHash) != 0 {
+				frame.PHashParts = append([]byte(nil), frame.PHashParts...)
+			} else {
+				frame.PHashParts = nil
 			}
-			frame.PDQ256 = append([]byte(nil), frame.PDQ256...)
-			frame.PHashParts = append([]byte(nil), frame.PHashParts...)
-			frame.SobelHist = append([]byte(nil), frame.SobelHist...)
+			if requestedFields&(proto.FieldVideo6F|proto.FieldVideo6FSobel) != 0 {
+				frame.SobelHist = append([]byte(nil), frame.SobelHist...)
+			} else {
+				frame.SobelHist = nil
+			}
 			state.Frames = append(state.Frames, frame)
 			state.FramesPresent |= bit
 			state.MissingFrames &^= bit
@@ -243,9 +265,31 @@ func (d *DB) lookupVideoContent(
 			return fmt.Errorf("store: iterate video content frames: %w", err)
 		}
 	}
-	if requestedFields&proto.FieldVideo6F != 0 && state.MissingFrames == 0 {
-		state.FieldsPresent |= proto.FieldVideo6F
-		state.MissingFields &^= proto.FieldVideo6F
+	if state.MissingFrames == 0 {
+		completed := requestedFields & videoSixFrameFields()
+		state.FieldsPresent |= completed
+		state.MissingFields &^= completed
 	}
 	return nil
+}
+
+func videoSixFrameFields() uint32 {
+	return proto.FieldVideo6F | proto.FieldVideo6FPHash | proto.FieldVideo6FSobel
+}
+
+func videoFramePayloadValid(fields uint32, pdq, pHash, sobel []byte) bool {
+	if fields&proto.FieldVideo6F != 0 && len(pdq) != 32 {
+		return false
+	}
+	if fields&(proto.FieldVideo6F|proto.FieldVideo6FPHash) != 0 {
+		if _, err := features.DecodePHashParts(pHash); err != nil {
+			return false
+		}
+	}
+	if fields&(proto.FieldVideo6F|proto.FieldVideo6FSobel) != 0 {
+		if _, err := features.DecodeSobelHist(sobel); err != nil {
+			return false
+		}
+	}
+	return true
 }

@@ -118,9 +118,9 @@ func (d *DB) SavePhase2(ctx context.Context, result Phase2Result) error {
 				INSERT INTO video_frames (sha512, frame_idx, pdq256, phash_parts, sobel_hist)
 				VALUES (?1, ?2, ?3, ?4, ?5)
 				ON CONFLICT (sha512, frame_idx) DO UPDATE SET
-					pdq256=excluded.pdq256,
-					phash_parts=excluded.phash_parts,
-					sobel_hist=excluded.sobel_hist;`,
+					pdq256=COALESCE(excluded.pdq256, video_frames.pdq256),
+					phash_parts=COALESCE(excluded.phash_parts, video_frames.phash_parts),
+					sobel_hist=COALESCE(excluded.sobel_hist, video_frames.sobel_hist);`,
 				sha,
 				frame.FrameIdx,
 				frame.PDQ256,
@@ -137,20 +137,33 @@ func (d *DB) SavePhase2(ctx context.Context, result Phase2Result) error {
 		}
 	}
 
-	phase2Mask := phase2Mask(result.Kind)
+	saveMask := phase2SaveMask(result.Kind)
 	derivedMissing, err := phase2MissingFromRows(ctx, tx, result.Kind, sha)
 	if err != nil {
 		return err
 	}
-	updatedMissing := missing&^phase2Mask | derivedMissing
-	phase2Done := derivedMissing == 0
+	fieldsToDerive := result.FieldsDone
+	if result.Kind == MediaImage {
+		fieldsToDerive |= phase2Mask(result.Kind)
+	}
+	if result.Kind == MediaVideo &&
+		missing&proto.FieldVideo6F != 0 &&
+		derivedMissing&(proto.FieldVideo6FPHash|proto.FieldVideo6FSobel) == 0 {
+		fieldsToDerive |= proto.FieldVideo6F
+		derivedMissing &^= proto.FieldVideo6F
+	}
+	updatedMissing := missing&^fieldsToDerive | derivedMissing&fieldsToDerive
+	phase2Done := updatedMissing&saveMask == 0
 	status := proto.StatusPartial
 	var errorValue any
+	splitVideoComplete := result.Kind == MediaVideo &&
+		result.FieldsDone&(proto.FieldVideo6FPHash|proto.FieldVideo6FSobel) != 0 &&
+		updatedMissing&(proto.FieldVideo6FPHash|proto.FieldVideo6FSobel) == 0
 	if updatedMissing == 0 {
 		status = proto.StatusDone
 	} else if summary := phase2ErrorText(result); summary != "" {
 		errorValue = summary
-	} else if priorError.Valid {
+	} else if priorError.Valid && !splitVideoComplete {
 		errorValue = priorError.String
 	}
 	if _, err := tx.ExecContext(ctx, `
@@ -210,6 +223,16 @@ func (d *DB) Phase2CommittedState(
 	path string,
 	kind MediaKind,
 ) (Phase2Committed, error) {
+	return d.Phase2CommittedStateForFields(ctx, machineID, path, kind, phase2Mask(kind))
+}
+
+func (d *DB) Phase2CommittedStateForFields(
+	ctx context.Context,
+	machineID string,
+	path string,
+	kind MediaKind,
+	requestedFields uint32,
+) (Phase2Committed, error) {
 	var state Phase2Committed
 	var sha sql.NullString
 	if err := d.db.QueryRowContext(ctx, `
@@ -238,15 +261,19 @@ func (d *DB) Phase2CommittedState(
 			)
 		}
 		if err == sql.ErrNoRows {
-			state.MissingFields =
-				proto.FieldPHashParts | proto.FieldSobelHist
+			state.MissingFields = requestedFields &
+				(proto.FieldPHashParts | proto.FieldSobelHist)
 			return state, nil
 		}
-		if _, decodeErr := features.DecodePHashParts(pHash); decodeErr != nil {
-			state.MissingFields |= proto.FieldPHashParts
+		if requestedFields&proto.FieldPHashParts != 0 {
+			if _, decodeErr := features.DecodePHashParts(pHash); decodeErr != nil {
+				state.MissingFields |= proto.FieldPHashParts
+			}
 		}
-		if _, decodeErr := features.DecodeSobelHist(sobel); decodeErr != nil {
-			state.MissingFields |= proto.FieldSobelHist
+		if requestedFields&proto.FieldSobelHist != 0 {
+			if _, decodeErr := features.DecodeSobelHist(sobel); decodeErr != nil {
+				state.MissingFields |= proto.FieldSobelHist
+			}
 		}
 		return state, nil
 	case MediaVideo:
@@ -273,13 +300,7 @@ func (d *DB) Phase2CommittedState(
 					err,
 				)
 			}
-			if len(pdq) != 32 {
-				continue
-			}
-			if _, err := features.DecodePHashParts(pHash); err != nil {
-				continue
-			}
-			if _, err := features.DecodeSobelHist(sobel); err != nil {
+			if !videoFramePayloadValid(requestedFields, pdq, pHash, sobel) {
 				continue
 			}
 			state.MissingFrames &^= 1 << uint(frameIdx)
@@ -291,7 +312,7 @@ func (d *DB) Phase2CommittedState(
 			)
 		}
 		if state.MissingFrames != 0 {
-			state.MissingFields = proto.FieldVideo6F
+			state.MissingFields = requestedFields & videoSixFrameFields()
 		}
 		return state, nil
 	default:
@@ -303,7 +324,7 @@ func (d *DB) Phase2CommittedState(
 }
 
 func validatePhase2Result(result Phase2Result) error {
-	mask := phase2Mask(result.Kind)
+	mask := phase2SaveMask(result.Kind)
 	if mask == 0 {
 		return fmt.Errorf("store: invalid phase2 media kind %q", result.Kind)
 	}
@@ -405,7 +426,15 @@ func validatePhase2Frames(result Phase2Result) error {
 			}
 			continue
 		}
-		if len(frame.PDQ256) != 32 {
+		splitPHash := result.FieldsDone&proto.FieldVideo6FPHash != 0
+		splitSobel := result.FieldsDone&proto.FieldVideo6FSobel != 0
+		if splitPHash && (len(frame.PDQ256) != 0 || frame.Quality != 0 || len(frame.SobelHist) != 0) {
+			return fmt.Errorf("store: phase2 stage-two frame %d contains cross-stage payload", frame.FrameIdx)
+		}
+		if splitSobel && (len(frame.PDQ256) != 0 || frame.Quality != 0 || len(frame.PHashParts) != 0) {
+			return fmt.Errorf("store: phase2 stage-three frame %d contains cross-stage payload", frame.FrameIdx)
+		}
+		if !splitPHash && !splitSobel && len(frame.PDQ256) != 32 {
 			return fmt.Errorf(
 				"store: phase2 frame %d PDQ length %d",
 				frame.FrameIdx,
@@ -419,23 +448,27 @@ func validatePhase2Frames(result Phase2Result) error {
 				frame.Quality,
 			)
 		}
-		if _, err := features.DecodePHashParts(frame.PHashParts); err != nil {
-			return fmt.Errorf(
-				"store: phase2 frame %d phash_parts: %w",
-				frame.FrameIdx,
-				err,
-			)
+		if !splitSobel {
+			if _, err := features.DecodePHashParts(frame.PHashParts); err != nil {
+				return fmt.Errorf(
+					"store: phase2 frame %d phash_parts: %w",
+					frame.FrameIdx,
+					err,
+				)
+			}
 		}
-		if _, err := features.DecodeSobelHist(frame.SobelHist); err != nil {
-			return fmt.Errorf(
-				"store: phase2 frame %d sobel_hist: %w",
-				frame.FrameIdx,
-				err,
-			)
+		if !splitPHash {
+			if _, err := features.DecodeSobelHist(frame.SobelHist); err != nil {
+				return fmt.Errorf(
+					"store: phase2 frame %d sobel_hist: %w",
+					frame.FrameIdx,
+					err,
+				)
+			}
 		}
 		complete++
 	}
-	if result.FieldsDone&proto.FieldVideo6F != 0 && complete != len(seen) {
+	if result.FieldsDone&(proto.FieldVideo6F|proto.FieldVideo6FPHash|proto.FieldVideo6FSobel) != 0 && complete != len(seen) {
 		return fmt.Errorf(
 			"store: completed phase2 video has %d complete frames, want %d",
 			complete,
@@ -454,6 +487,13 @@ func phase2Mask(kind MediaKind) uint32 {
 	default:
 		return 0
 	}
+}
+
+func phase2SaveMask(kind MediaKind) uint32 {
+	if kind == MediaVideo {
+		return proto.FieldVideo6F | proto.FieldVideo6FPHash | proto.FieldVideo6FSobel
+	}
+	return phase2Mask(kind)
 }
 
 func phase2MissingFromRows(
@@ -484,21 +524,29 @@ func phase2MissingFromRows(
 		}
 		return missing, nil
 	case MediaVideo:
-		var complete int
+		var completeLegacy, completePHash, completeSobel int
 		if err := tx.QueryRowContext(ctx, `
-			SELECT count(*) FROM video_frames
-			WHERE sha512=?1 AND frame_idx BETWEEN 0 AND 5
-				AND pdq256 IS NOT NULL
-				AND phash_parts IS NOT NULL
-				AND sobel_hist IS NOT NULL`,
+			SELECT
+				count(*) FILTER (WHERE pdq256 IS NOT NULL AND phash_parts IS NOT NULL AND sobel_hist IS NOT NULL),
+				count(*) FILTER (WHERE phash_parts IS NOT NULL),
+				count(*) FILTER (WHERE sobel_hist IS NOT NULL)
+			FROM video_frames
+			WHERE sha512=?1 AND frame_idx BETWEEN 0 AND 5`,
 			sha,
-		).Scan(&complete); err != nil {
+		).Scan(&completeLegacy, &completePHash, &completeSobel); err != nil {
 			return 0, fmt.Errorf("store: load phase2 video presence: %w", err)
 		}
-		if complete == 6 {
-			return 0, nil
+		var missing uint32
+		if completeLegacy != 6 {
+			missing |= proto.FieldVideo6F
 		}
-		return proto.FieldVideo6F, nil
+		if completePHash != 6 {
+			missing |= proto.FieldVideo6FPHash
+		}
+		if completeSobel != 6 {
+			missing |= proto.FieldVideo6FSobel
+		}
+		return missing, nil
 	default:
 		return 0, fmt.Errorf("store: invalid phase2 media kind %q", kind)
 	}

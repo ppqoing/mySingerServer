@@ -31,30 +31,28 @@ type startupStageError struct {
 func (e *startupStageError) Error() string { return e.code }
 
 var compositionFailureCodes = map[string]string{
-	"production composition: required dependency unavailable":                "required_dependency_unavailable",
-	"production composition: fixed authority invalid":                        "fixed_authority_invalid",
-	"production composition: fixed locations invalid":                        "fixed_locations_invalid",
-	"production composition: runtime unavailable":                            "runtime_unavailable",
-	"production composition: tray settings unavailable":                      "tray_settings_unavailable",
-	"production composition: current process identity unavailable":           "process_identity_unavailable",
-	"production composition: fixed tray executable unavailable":              "fixed_tray_executable_unavailable",
-	"production composition: current executable is outside fixed deployment": "outside_fixed_deployment",
-	"production composition: current user identity unavailable":              "user_identity_unavailable",
-	"production composition: configuration store unavailable":                "configuration_store_unavailable",
-	"production composition: task service unavailable":                       "task_service_unavailable",
-	"production composition: login-start service unavailable":                "login_start_service_unavailable",
-	"production composition: elevation client unavailable":                   "elevation_client_unavailable",
-	"production composition: process handle inspector unavailable":           "process_handle_inspector_unavailable",
-	"production composition: known-folder resolver unavailable":              "known_folder_resolver_unavailable",
-	"production composition: Program Files unavailable":                      "program_files_unavailable",
-	"production composition: ProgramData unavailable":                        "program_data_unavailable",
-	"production composition: LocalAppData unavailable":                       "local_app_data_unavailable",
-	"production composition: machine identity unavailable":                   "machine_identity_unavailable",
-	"production composition: Windows dependencies unavailable":               "windows_dependencies_unavailable",
-	"production composition: shared component factory unavailable":           "component_factory_unavailable",
-	"production composition: Wails context unavailable":                      "wails_context_unavailable",
-	"production composition: instance context unavailable":                   "instance_context_unavailable",
-	"production composition: activation dependencies unavailable":            "activation_dependencies_unavailable",
+	"production composition: required dependency unavailable":                   "required_dependency_unavailable",
+	"production composition: fixed authority invalid":                           "fixed_authority_invalid",
+	"production composition: fixed locations invalid":                           "fixed_locations_invalid",
+	"production composition: runtime unavailable":                               "runtime_unavailable",
+	"production composition: tray settings unavailable":                         "tray_settings_unavailable",
+	"production composition: current process identity unavailable":              "process_identity_unavailable",
+	"production composition: portable layout unavailable":                       "portable_layout_unavailable",
+	"production composition: portable tray executable unavailable":              "portable_tray_executable_unavailable",
+	"production composition: current executable is outside portable deployment": "outside_portable_deployment",
+	"production composition: current user identity unavailable":                 "user_identity_unavailable",
+	"production composition: configuration store unavailable":                   "configuration_store_unavailable",
+	"production composition: task service unavailable":                          "task_service_unavailable",
+	"production composition: login-start service unavailable":                   "login_start_service_unavailable",
+	"production composition: elevation client unavailable":                      "elevation_client_unavailable",
+	"production composition: process handle inspector unavailable":              "process_handle_inspector_unavailable",
+	"production composition: portable data invalid":                             "portable_data_unavailable",
+	"production composition: machine identity unavailable":                      "machine_identity_unavailable",
+	"production composition: Windows dependencies unavailable":                  "windows_dependencies_unavailable",
+	"production composition: shared component factory unavailable":              "component_factory_unavailable",
+	"production composition: Wails context unavailable":                         "wails_context_unavailable",
+	"production composition: instance context unavailable":                      "instance_context_unavailable",
+	"production composition: activation dependencies unavailable":               "activation_dependencies_unavailable",
 }
 
 //go:embed all:frontend/dist
@@ -76,7 +74,6 @@ var (
 	composeBackend           = func() (*Backend, error) { return nil, errCompositionUnavailable }
 	runNormalTray            = runNormalWails
 	wailsRunAdapter          = wails.Run
-	userConfigDirAdapter     = os.UserConfigDir
 	startupFailureLogAdapter = func(code string) { log.Print(code) }
 	trayStartAdapter         = traynative.Start
 	trayMonitorTickerAdapter = func(duration time.Duration) trayMonitorTicker {
@@ -165,12 +162,10 @@ func runNormalWails(background bool) error {
 	if backend == nil || backend.service == nil {
 		return &startupStageError{code: "composition_unavailable"}
 	}
-	configDir, err := userConfigDirAdapter()
-	if err != nil || configDir == "" || !filepath.IsAbs(configDir) {
-		return &startupStageError{code: "user_config_unavailable"}
+	if backend.webViewDataPath == "" || !filepath.IsAbs(backend.webViewDataPath) {
+		return &startupStageError{code: "portable_data_unavailable"}
 	}
-	userDataPath := filepath.Join(configDir, "MySingerServer", "NodeTray", "WebView2")
-	if err := wailsRunAdapter(newWailsOptions(frontendAssets, backend, userDataPath, background)); err != nil {
+	if err := wailsRunAdapter(newWailsOptions(frontendAssets, backend, backend.webViewDataPath, background)); err != nil {
 		return &startupStageError{code: "wails_run_failed"}
 	}
 	return nil

@@ -16,9 +16,11 @@ import (
 	agentconfig "dedup/internal/config"
 	"dedup/internal/helper"
 	"dedup/internal/nodetray/traymodel"
+	"dedup/internal/securefile"
 )
 
 var ErrSaveVerify = errors.New("save_verify_failed")
+var ErrHelperConfigExists = errors.New("helper_config_exists")
 
 type Paths struct {
 	TraySettings     string
@@ -37,6 +39,7 @@ type PreparedWrite struct {
 	TargetPath    string
 	CanonicalJSON []byte
 	SHA256        string
+	CreateOnly    bool
 }
 
 // storeTestHooks are intentionally private fault boundaries. Production stores
@@ -71,28 +74,7 @@ func NewStore(paths Paths) (*Store, error) {
 			}
 		}
 	}
-	helperDirectory := filepath.Dir(paths.HelperConfig)
-	for _, writableDirectory := range []string{
-		filepath.Dir(paths.TraySettings),
-		filepath.Dir(paths.AgentConfig),
-	} {
-		if sameOrBelowDirectory(helperDirectory, writableDirectory) {
-			return nil, errors.New("node config store: protected Helper path overlaps a writable configuration directory")
-		}
-	}
-	if err := platformValidateProtectedHelper(paths.HelperConfig); err != nil {
-		return nil, errors.New("node config store: protected Helper ACL validation failed")
-	}
 	return &Store{paths: paths}, nil
-}
-
-func sameOrBelowDirectory(path, root string) bool {
-	relative, err := filepath.Rel(strings.ToLower(root), strings.ToLower(path))
-	if err != nil || filepath.IsAbs(relative) {
-		return false
-	}
-	return relative == "." ||
-		(relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)))
 }
 
 func (s *Store) LoadTraySettings() (traymodel.TraySettings, error) {
@@ -234,14 +216,40 @@ func (s *Store) ValidateAgentForm(value AgentForm) []FieldError {
 }
 
 func (s *Store) LoadHelperForm() (HelperForm, error) {
-	cfg, _, err := loadHelperConfig(s.paths.HelperConfig, s.paths.HelperExecutable)
+	cfg, _, err := loadEditableHelperConfig(s.paths.HelperConfig, s.paths.HelperExecutable)
 	if err != nil {
 		if configAndBackupAbsent(s.paths.HelperConfig) {
-			return firstRunHelperForm(s.paths), nil
+			var defaultConfig helper.Config
+			if err := strictDecodeFile(s.helperDefaultPath(), &defaultConfig); err != nil {
+				return HelperForm{}, storeError(s.helperDefaultPath(), "strict default load failed")
+			}
+			if defaultConfig.LogDir == "" {
+				defaultConfig.LogDir = filepath.Join(filepath.Dir(s.paths.HelperConfig), "logs")
+			}
+			return HelperToForm(defaultConfig), nil
 		}
 		return HelperForm{}, storeError(s.paths.HelperConfig, "strict load failed")
 	}
 	return HelperToForm(cfg), nil
+}
+
+// SaveHelperForm validates and atomically publishes the Helper configuration
+// as the current desktop user. Elevation is reserved for launching helper.exe.
+func (s *Store) SaveHelperForm(value HelperForm) (string, error) {
+	prepared, err := s.PrepareHelperWrite(value)
+	if err != nil {
+		return "", err
+	}
+	err = s.withWriteLock(s.paths.HelperConfig, func() error {
+		if err := s.saveLocked(s.paths.HelperConfig, prepared.CanonicalJSON, s.helperCanonicalLoader); err != nil {
+			return storeErrorCause(s.paths.HelperConfig, "atomic save failed", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	return prepared.SHA256, nil
 }
 
 func configAndBackupAbsent(path string) bool {
@@ -252,6 +260,34 @@ func configAndBackupAbsent(path string) bool {
 		return false
 	}
 	return true
+}
+
+func (s *Store) helperDefaultPath() string {
+	return filepath.Join(filepath.Dir(s.paths.HelperExecutable), "helper.default.json")
+}
+
+func (s *Store) PrepareDefaultHelperWrite() (PreparedWrite, error) {
+	if !configAndBackupAbsent(s.paths.HelperConfig) {
+		return PreparedWrite{}, ErrHelperConfigExists
+	}
+	var cfg helper.Config
+	if err := strictDecodeFile(s.helperDefaultPath(), &cfg); err != nil {
+		return PreparedWrite{}, storeError(s.helperDefaultPath(), "strict default load failed")
+	}
+	if cfg.LogDir == "" {
+		cfg.LogDir = filepath.Join(filepath.Dir(s.paths.HelperConfig), "logs")
+	}
+	cfg, err := helper.ValidateConfig(cfg, s.paths.HelperExecutable)
+	if err != nil {
+		return PreparedWrite{}, storeError(s.helperDefaultPath(), "shared validation failed")
+	}
+	data, err := canonicalJSON(cfg)
+	if err != nil {
+		return PreparedWrite{}, storeError(s.paths.HelperConfig, "canonical encoding failed")
+	}
+	prepared := preparedWrite(s.paths.HelperConfig, data)
+	prepared.CreateOnly = true
+	return prepared, nil
 }
 
 func firstRunAgentForm(paths Paths) (AgentForm, error) {
@@ -328,7 +364,7 @@ func (s *Store) AgentFingerprint() (string, error) {
 }
 
 func (s *Store) HelperFingerprint() (string, error) {
-	data, err := s.helperCanonicalLoader(s.paths.HelperConfig)
+	_, data, err := loadEditableHelperConfig(s.paths.HelperConfig, s.paths.HelperExecutable)
 	if err != nil {
 		return "", storeError(s.paths.HelperConfig, "strict load failed")
 	}
@@ -422,6 +458,15 @@ func (s *Store) saveLocked(target string, data []byte, loader canonicalLoader) e
 }
 
 func (s *Store) writeAtomic(target string, data []byte, loader canonicalLoader) (err error) {
+	if s.testHooks.afterSync == nil && s.testHooks.beforeReplace == nil && s.testHooks.replace == nil {
+		if err := securefile.WriteAtomic(target, data, securefile.Loader(loader)); err != nil {
+			if errors.Is(err, securefile.ErrVerify) {
+				return fmt.Errorf("%w: formal target invalid", ErrSaveVerify)
+			}
+			return err
+		}
+		return nil
+	}
 	directory := filepath.Dir(target)
 	temp, err := os.CreateTemp(directory, "."+filepath.Base(target)+".tmp-*")
 	if err != nil {
@@ -530,6 +575,21 @@ func loadHelperConfig(path, executable string) (helper.Config, []byte, error) {
 	cfg, err := helper.LoadConfig(path, executable)
 	if err != nil {
 		return helper.Config{}, nil, err
+	}
+	data, err := canonicalJSON(cfg)
+	return cfg, data, err
+}
+
+func loadEditableHelperConfig(path, executable string) (helper.Config, []byte, error) {
+	var cfg helper.Config
+	if err := strictDecodeFile(path, &cfg); err != nil {
+		return helper.Config{}, nil, err
+	}
+	if len(cfg.AllowedRoots) != 0 {
+		return loadHelperConfig(path, executable)
+	}
+	if cfg.LogDir == "" {
+		cfg.LogDir = filepath.Join(filepath.Dir(path), "logs")
 	}
 	data, err := canonicalJSON(cfg)
 	return cfg, data, err

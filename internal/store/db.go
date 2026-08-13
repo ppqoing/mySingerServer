@@ -16,7 +16,7 @@ type DB struct {
 
 func Open(path string) (*DB, error) {
 	dsn := fmt.Sprintf(
-		"file:%s?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)",
+		"file:%s?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)",
 		filepath.ToSlash(path),
 	)
 	sqlDB, err := sql.Open("sqlite", dsn)
@@ -36,7 +36,24 @@ func Open(path string) (*DB, error) {
 		_ = sqlDB.Close()
 		return nil, fmt.Errorf("store: migrate sync queue: %w", err)
 	}
+	if err := migrateLocalTaskEnvelope(sqlDB); err != nil {
+		_ = sqlDB.Close()
+		return nil, fmt.Errorf("store: migrate local task envelope: %w", err)
+	}
 	return &DB{db: sqlDB}, nil
+}
+
+func migrateLocalTaskEnvelope(db *sql.DB) error {
+	var exists int
+	err := db.QueryRow(`SELECT 1 FROM pragma_table_info('local_tasks') WHERE name='envelope'`).Scan(&exists)
+	if err == nil {
+		return nil
+	}
+	if err != sql.ErrNoRows {
+		return err
+	}
+	_, err = db.Exec(`ALTER TABLE local_tasks ADD COLUMN envelope BLOB NOT NULL DEFAULT X''`)
+	return err
 }
 
 func migrateVideoFeaturePresence(db *sql.DB) error {

@@ -2,6 +2,8 @@ package app
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -13,22 +15,42 @@ import (
 	"dedup/internal/nodetray/traymodel"
 	"dedup/internal/nodetray/windows/elevation"
 	nodetask "dedup/internal/nodetray/windows/task"
+	"dedup/internal/proto"
 	"github.com/vmihailenco/msgpack/v5"
 )
 
 type Store interface {
 	LoadTraySettings() (traymodel.TraySettings, error)
 	SaveTraySettings(traymodel.TraySettings) error
-	LoadAgentForm() (config.AgentForm, error)
-	SaveAgentForm(config.AgentForm) (string, error)
 	LoadHelperForm() (config.HelperForm, error)
+	ValidateHelperForm(config.HelperForm) []config.FieldError
+	SaveHelperForm(config.HelperForm) (string, error)
 	PrepareHelperWrite(config.HelperForm) (config.PreparedWrite, error)
+	PrepareDefaultHelperWrite() (config.PreparedWrite, error)
+	HelperFingerprint() (string, error)
 }
 
-// Validator is the injected pure Task 1 form-validation boundary. It must not
-// persist configuration or start components.
+type AgentConfigSaveResult struct {
+	SHA256          string
+	RestartRequired bool
+}
+
+// AgentConfigGateway owns local Agent configuration I/O and stages a changed
+// listen endpoint for the separate runtime control connection.
+type AgentConfigGateway interface {
+	LoadAgentForm(context.Context) (config.AgentForm, error)
+	ValidateAgentForm(context.Context, config.AgentForm) []config.FieldError
+	SaveAgentForm(context.Context, config.AgentForm) (AgentConfigSaveResult, error)
+	PromotePendingEndpoint()
+}
+
+type LocalAgentGateway interface {
+	CallLocal(context.Context, string, any, any) error
+}
+
+// Validator is the local pure Helper form-validation boundary. Agent
+// validation belongs to AgentConfigGateway.
 type Validator interface {
-	ValidateAgent(config.AgentForm) []config.FieldError
 	ValidateHelper(config.HelperForm) []config.FieldError
 }
 
@@ -79,6 +101,8 @@ type Location struct {
 type Dependencies struct {
 	Store             Store
 	Validator         Validator
+	AgentConfig       AgentConfigGateway
+	LocalAgent        LocalAgentGateway
 	MachineID         string
 	Agent             Component
 	Helper            Component
@@ -100,6 +124,10 @@ type Service struct {
 	agentConfigMu     sync.Mutex
 	store             Store
 	validator         Validator
+	agentConfig       AgentConfigGateway
+	localAgent        LocalAgentGateway
+	deleteMu          sync.Mutex
+	deleteTokens      map[string]localDeleteToken
 	machineID         string
 	agent             Component
 	helper            Component
@@ -123,7 +151,8 @@ func NewService(dependencies Dependencies) *Service {
 		locations[kind] = location
 	}
 	return &Service{
-		store: dependencies.Store, validator: dependencies.Validator,
+		store: dependencies.Store, validator: dependencies.Validator, agentConfig: dependencies.AgentConfig,
+		localAgent: dependencies.LocalAgent, deleteTokens: make(map[string]localDeleteToken),
 		machineID: dependencies.MachineID,
 		agent:     dependencies.Agent, helper: dependencies.Helper, task: dependencies.Task,
 		agentFingerprint: dependencies.AgentFingerprint, helperFingerprint: dependencies.HelperFingerprint,
@@ -132,6 +161,176 @@ func NewService(dependencies Dependencies) *Service {
 		locations: locations, pathResolver: dependencies.PathResolver,
 		opener: dependencies.Opener, workers: dependencies.Workers, processWaiter: dependencies.ProcessWaiter,
 	}
+}
+
+type localDeleteToken struct {
+	digest    string
+	token     string
+	expiresAt int64
+}
+
+func (s *Service) localCall(ctx context.Context, operation string, request, response any) error {
+	if s == nil || s.localAgent == nil || ctx == nil {
+		return errors.New("agent_disconnected")
+	}
+	return s.localAgent.CallLocal(ctx, operation, request, response)
+}
+
+func localError(err error) (string, string) {
+	if err == nil {
+		return "", ""
+	}
+	code := "local_operation_failed"
+	var remote interface{ Error() string }
+	if errors.As(err, &remote) {
+		candidate := remote.Error()
+		if candidate != "" && !strings.ContainsAny(candidate, `:/\\ `) {
+			code = candidate
+		}
+	}
+	return code, "本机 Agent 暂不可用，请稍后重试"
+}
+
+func mapLocalTask(value proto.LocalTask) traymodel.LocalTask {
+	result := traymodel.LocalTask{TaskID: value.TaskID, Source: value.Source, Mode: value.Mode, Stage: value.Stage, Status: value.Status,
+		Roots: append([]string(nil), value.Roots...), ProgressComplete: value.ProgressComplete, ProgressTotal: value.ProgressTotal,
+		ErrorCode: value.SafeErrorCode, ErrorSummary: sanitizeText(value.SafeErrorMessage), SyncStatus: "本机已保存"}
+	var stats struct {
+		Speed      string `json:"speed"`
+		Failures   int64  `json:"failures"`
+		Duration   string `json:"duration"`
+		SyncStatus string `json:"sync_status"`
+	}
+	if json.Unmarshal([]byte(value.StatsJSON), &stats) == nil {
+		result.Speed, result.Failures, result.Duration = sanitizeText(stats.Speed), stats.Failures, sanitizeText(stats.Duration)
+		if stats.SyncStatus != "" {
+			result.SyncStatus = sanitizeText(stats.SyncStatus)
+		}
+	}
+	return result
+}
+
+func (s *Service) CreateLocalTask(ctx context.Context, request traymodel.LocalTaskCreate) traymodel.LocalTaskResult {
+	var response proto.LocalTaskCreateResponse
+	err := s.localCall(ctx, proto.LocalOperationTaskCreate, proto.LocalTaskCreateRequest{TaskID: request.TaskID, Roots: request.Roots, Mode: request.Mode, Rescan: request.Rescan, Extensions: request.Extensions}, &response)
+	if err != nil {
+		code, summary := localError(err)
+		return traymodel.LocalTaskResult{ErrorCode: code, ErrorSummary: summary}
+	}
+	return traymodel.LocalTaskResult{OK: true, Task: mapLocalTask(response.Task)}
+}
+
+func (s *Service) StartLocalAnalysis(ctx context.Context, request traymodel.LocalAnalysisStart) traymodel.OperationResult {
+	var response proto.LocalTaskCreateResponse
+	err := s.localCall(ctx, proto.LocalOperationAnalysisStart, proto.LocalTaskCreateRequest{TaskID: request.TaskID, Roots: request.Roots, Mode: proto.LocalTaskModeScanThenAnalysis, Rescan: request.Rescan, Extensions: request.Extensions}, &response)
+	if err != nil {
+		code, summary := localError(err)
+		return traymodel.OperationResult{ErrorCode: code, ErrorSummary: summary}
+	}
+	return traymodel.OperationResult{OK: true}
+}
+
+func (s *Service) ListLocalTasks(ctx context.Context, request traymodel.PageRequest) traymodel.LocalTaskPage {
+	var response proto.LocalTaskListResponse
+	err := s.localCall(ctx, proto.LocalOperationTaskList, proto.LocalTaskListRequest{Offset: request.Offset, Limit: request.Limit}, &response)
+	if err != nil {
+		code, summary := localError(err)
+		return traymodel.LocalTaskPage{Tasks: []traymodel.LocalTask{}, ErrorCode: code, ErrorSummary: summary}
+	}
+	tasks := make([]traymodel.LocalTask, len(response.Tasks))
+	for i := range response.Tasks {
+		tasks[i] = mapLocalTask(response.Tasks[i])
+	}
+	return traymodel.LocalTaskPage{OK: true, Tasks: tasks, Offset: response.Offset, NextOffset: response.NextOffset}
+}
+
+func mapLocalGroup(value proto.LocalGroup) traymodel.LocalGroup {
+	members := make([]traymodel.LocalGroupMember, len(value.Members))
+	for i, member := range value.Members {
+		members[i] = traymodel.LocalGroupMember{FileID: member.FileID, Path: member.Path, FileName: member.FileName, Size: member.Size, Status: member.Status, Decision: member.Decision}
+	}
+	return traymodel.LocalGroup{RunID: value.RunID, Generation: value.Generation, GroupID: value.GroupID, Category: value.Category, Verdict: value.Verdict, ReviewStatus: value.ReviewStatus, Members: members}
+}
+
+func (s *Service) ListLocalGroups(ctx context.Context, request traymodel.LocalGroupQuery) traymodel.LocalGroupPage {
+	var response proto.LocalGroupListResponse
+	err := s.localCall(ctx, proto.LocalOperationGroupsList, proto.LocalGroupListRequest{Scope: request.Scope, RunID: request.RunID, Category: request.Category, PathContains: request.PathContains, FileNameContains: request.FileNameContains, ReviewStatus: request.ReviewStatus, Offset: request.Offset, Limit: request.Limit}, &response)
+	if err != nil {
+		code, summary := localError(err)
+		return traymodel.LocalGroupPage{Groups: []traymodel.LocalGroup{}, ErrorCode: code, ErrorSummary: summary}
+	}
+	groups := make([]traymodel.LocalGroup, len(response.Groups))
+	for i := range response.Groups {
+		groups[i] = mapLocalGroup(response.Groups[i])
+	}
+	return traymodel.LocalGroupPage{OK: true, Groups: groups, Offset: response.Offset, NextOffset: response.NextOffset}
+}
+
+func (s *Service) SaveLocalReview(ctx context.Context, request traymodel.LocalReviewSave) traymodel.OperationResult {
+	decisions := make([]proto.LocalReviewDecision, len(request.Decisions))
+	for i, decision := range request.Decisions {
+		decisions[i] = proto.LocalReviewDecision{FileID: decision.FileID, Decision: decision.Decision}
+	}
+	var response proto.LocalReviewSaveResponse
+	err := s.localCall(ctx, proto.LocalOperationReviewSave, proto.LocalReviewSaveRequest{RunID: request.RunID, GroupID: request.GroupID, Reviewer: request.Reviewer, Note: request.Note, Decisions: decisions}, &response)
+	if err != nil || !response.Saved {
+		code, summary := localError(err)
+		if err == nil {
+			code, summary = "review_not_saved", "审核结果未保存"
+		}
+		return traymodel.OperationResult{ErrorCode: code, ErrorSummary: summary}
+	}
+	return traymodel.OperationResult{OK: true}
+}
+
+func (s *Service) PrepareLocalDelete(ctx context.Context, request traymodel.LocalDeletePrepare) traymodel.LocalDeletePreview {
+	var response proto.LocalDeletePreview
+	err := s.localCall(ctx, proto.LocalOperationDeletePrepare, proto.LocalDeletePrepareRequest{RunID: request.RunID, GroupID: request.GroupID}, &response)
+	if err != nil {
+		code, summary := localError(err)
+		return traymodel.LocalDeletePreview{Files: []traymodel.LocalDeleteFile{}, ErrorCode: code, ErrorSummary: summary}
+	}
+	files := make([]traymodel.LocalDeleteFile, len(response.Files))
+	for i, file := range response.Files {
+		files[i] = traymodel.LocalDeleteFile{FileID: file.FileID, Path: file.Path, Size: file.Size}
+	}
+	s.deleteMu.Lock()
+	s.deleteTokens[response.BatchID] = localDeleteToken{digest: response.SelectionDigest, token: response.Token, expiresAt: response.ExpiresAt}
+	s.deleteMu.Unlock()
+	return traymodel.LocalDeletePreview{OK: true, BatchID: response.BatchID, SelectionDigest: response.SelectionDigest, Count: response.Count, TotalSize: response.TotalSize, ExpiresAt: response.ExpiresAt, Files: files}
+}
+
+func (s *Service) ExecuteLocalDelete(ctx context.Context, request traymodel.LocalDeleteExecute) traymodel.LocalDeleteBatch {
+	s.deleteMu.Lock()
+	authorization, ok := s.deleteTokens[request.BatchID]
+	if ok {
+		delete(s.deleteTokens, request.BatchID)
+	}
+	s.deleteMu.Unlock()
+	if !ok || authorization.digest != request.SelectionDigest || authorization.token == "" {
+		return traymodel.LocalDeleteBatch{Items: []traymodel.LocalDeleteItem{}, ErrorCode: "delete_authorization_expired", ErrorSummary: "删除确认已失效，请重新预览"}
+	}
+	var response proto.LocalDeleteBatch
+	err := s.localCall(ctx, proto.LocalOperationDeleteExecute, proto.LocalDeleteExecuteRequest{BatchID: request.BatchID, SelectionDigest: request.SelectionDigest, Token: authorization.token}, &response)
+	if err != nil {
+		code, summary := localError(err)
+		return traymodel.LocalDeleteBatch{Items: []traymodel.LocalDeleteItem{}, ErrorCode: code, ErrorSummary: summary}
+	}
+	items := make([]traymodel.LocalDeleteItem, len(response.Items))
+	for i, item := range response.Items {
+		items[i] = traymodel.LocalDeleteItem{FileID: item.FileID, Result: item.Result, ErrorCode: item.ErrorCode, Uncertain: item.Uncertain}
+	}
+	return traymodel.LocalDeleteBatch{OK: true, BatchID: response.BatchID, Status: response.Status, Requested: response.Requested, Succeeded: response.Succeeded, Failed: response.Failed, Uncertain: response.Uncertain, Items: items}
+}
+
+func (s *Service) GetLocalImagePreview(ctx context.Context, fileID int64) traymodel.ImagePreview {
+	var response proto.LocalImagePreviewResponse
+	err := s.localCall(ctx, proto.LocalOperationPreviewImage, proto.LocalImagePreviewRequest{FileID: fileID, MaxWidth: 1600, MaxHeight: 1200, Format: "jpeg", Quality: 85}, &response)
+	if err != nil {
+		code, summary := localError(err)
+		return traymodel.ImagePreview{ErrorCode: code, ErrorSummary: summary}
+	}
+	return traymodel.ImagePreview{OK: true, MIME: response.MIME, Width: response.Width, Height: response.Height, DataBase64: base64.StdEncoding.EncodeToString(response.Bytes)}
 }
 
 const forceExitWaitTimeout = 15 * time.Second
@@ -172,18 +371,7 @@ func (s *Service) GetOverview(ctx context.Context) (traymodel.Overview, error) {
 			overview.Workers = sanitizeWorkers(workers)
 		}
 	}
-	if s.task != nil {
-		status, inspectErr := s.task.Inspect(ctx)
-		if inspectErr != nil {
-			overview.Helper.NeedsAttention = true
-			overview.HelperTaskDrift = true
-		} else {
-			overview.HelperTaskDrift = status.Installed != (settings.HelperEnabled && settings.HelperStartMode == traymodel.StartAutomatic)
-		}
-	} else {
-		overview.HelperTaskDrift = true
-		overview.Helper.NeedsAttention = true
-	}
+	overview.HelperTaskDrift = false
 	if s.loginStart != nil {
 		enabled, current, loginErr := s.loginStart.Enabled()
 		if loginErr != nil {
@@ -199,19 +387,19 @@ func (s *Service) GetOverview(ctx context.Context) (traymodel.Overview, error) {
 	return overview, nil
 }
 
-func (s *Service) GetAgentForm(context.Context) (config.AgentForm, error) {
-	if s == nil || s.store == nil {
+func (s *Service) GetAgentForm(ctx context.Context) (config.AgentForm, error) {
+	if s == nil || s.agentConfig == nil {
 		return config.AgentForm{}, errors.New("app unavailable")
 	}
-	value, err := s.store.LoadAgentForm()
+	value, err := s.agentConfig.LoadAgentForm(ctx)
 	return value, safeUIError(err)
 }
 
-func (s *Service) ValidateAgent(_ context.Context, value config.AgentForm) []config.FieldError {
-	if s == nil || s.validator == nil {
+func (s *Service) ValidateAgent(ctx context.Context, value config.AgentForm) []config.FieldError {
+	if s == nil || s.agentConfig == nil {
 		return []config.FieldError{{Field: "agent", Code: "unavailable", Message: "验证服务不可用"}}
 	}
-	return sanitizeFieldErrors(s.validator.ValidateAgent(value))
+	return sanitizeFieldErrors(s.agentConfig.ValidateAgentForm(ctx, value))
 }
 
 func (s *Service) SaveAgent(ctx context.Context, value config.AgentForm) traymodel.ConfigApplyResult {
@@ -227,10 +415,10 @@ func (s *Service) saveAgentLocked(ctx context.Context, value config.AgentForm) t
 	if fields := s.ValidateAgent(ctx, value); len(fields) != 0 {
 		return configApplyFailure("invalid_config", fields[0].Message)
 	}
-	if s == nil || s.store == nil {
+	if s == nil || s.agentConfig == nil {
 		return configApplyFailure("unavailable", "配置服务不可用")
 	}
-	digest, err := s.store.SaveAgentForm(value)
+	saved, err := s.agentConfig.SaveAgentForm(ctx, value)
 	if err != nil {
 		if errors.Is(err, config.ErrSaveVerify) {
 			return configApplyFailure("save_verify_failed", err.Error())
@@ -238,16 +426,16 @@ func (s *Service) saveAgentLocked(ctx context.Context, value config.AgentForm) t
 		return configApplyFailure("save_failed", err.Error())
 	}
 	if s.agentFingerprint == nil {
-		return savedConfigApplyFailure("unavailable", "Agent 摘要更新服务不可用", digest, true)
+		return savedConfigApplyFailure("unavailable", "Agent 摘要更新服务不可用", saved.SHA256, true)
 	}
-	if updated := sanitizeOperation(s.agentFingerprint.UpdateExpectedSHA256(digest)); !updated.OK {
-		return savedConfigApplyFailure(updated.ErrorCode, updated.ErrorSummary, digest, true)
+	if updated := sanitizeOperation(s.agentFingerprint.UpdateExpectedSHA256(saved.SHA256)); !updated.OK {
+		return savedConfigApplyFailure(updated.ErrorCode, updated.ErrorSummary, saved.SHA256, true)
 	}
-	needsRestart := false
+	needsRestart := saved.RestartRequired
 	if s.agent != nil {
 		needsRestart = s.agent.Refresh(ctx).NeedsRestart
 	}
-	return traymodel.ConfigApplyResult{OK: true, Saved: true, SHA256: digest, NeedsRestart: needsRestart}
+	return traymodel.ConfigApplyResult{OK: true, Saved: true, SHA256: saved.SHA256, NeedsRestart: needsRestart}
 }
 
 func (s *Service) SaveAndRestartAgent(ctx context.Context, value config.AgentForm) traymodel.ConfigApplyResult {
@@ -274,6 +462,9 @@ func (s *Service) SaveAndRestartAgent(ctx context.Context, value config.AgentFor
 func (s *Service) StartAgent(ctx context.Context) traymodel.OperationResult {
 	if s == nil {
 		return operationFailure("unavailable", "组件服务不可用")
+	}
+	if s.agentConfig != nil {
+		s.agentConfig.PromotePendingEndpoint()
 	}
 	return callComponent(s, s.agent, ctx, "start")
 }
@@ -363,48 +554,37 @@ func (s *Service) GetHelperForm(context.Context) (config.HelperForm, error) {
 }
 
 func (s *Service) ValidateHelper(_ context.Context, value config.HelperForm) []config.FieldError {
-	if s == nil || s.validator == nil {
+	if s == nil || s.store == nil {
 		return []config.FieldError{{Field: "helper", Code: "unavailable", Message: "验证服务不可用"}}
 	}
-	return sanitizeFieldErrors(s.validator.ValidateHelper(value))
+	return sanitizeFieldErrors(s.store.ValidateHelperForm(value))
 }
 
 func (s *Service) SaveHelper(ctx context.Context, value config.HelperForm) traymodel.ConfigApplyResult {
 	if fields := s.ValidateHelper(ctx, value); len(fields) != 0 {
 		return configApplyFailure("invalid_config", fields[0].Message)
 	}
-	if s == nil || s.store == nil || s.elevation == nil {
+	if s == nil || s.store == nil {
 		return configApplyFailure("unavailable", "Helper 配置服务不可用")
 	}
-	prepared, err := s.store.PrepareHelperWrite(value)
+	digest, err := s.store.SaveHelperForm(value)
 	if err != nil {
+		if errors.Is(err, config.ErrSaveVerify) {
+			return configApplyFailure("save_verify_failed", err.Error())
+		}
 		return configApplyFailure("save_failed", err.Error())
-	}
-	payload, err := msgpack.Marshal(prepared)
-	if err != nil {
-		return configApplyFailure("save_failed", "配置请求编码失败")
-	}
-	invoked, err := s.elevation.Invoke(ctx, elevation.ActionWriteHelperConfig, payload)
-	if err != nil {
-		return configApplyFailure("save_failed", err.Error())
-	}
-	if invoked.UACCancelled {
-		return configApplyFailure(elevation.ErrorCodeUACCancelled, invoked.Response.ErrorSummary)
-	}
-	if !invoked.Response.OK {
-		return configApplyFailure(stableCode(invoked.Response.ErrorCode, "save_failed"), invoked.Response.ErrorSummary)
 	}
 	if s.helperFingerprint == nil {
-		return savedConfigApplyFailure("unavailable", "Helper 摘要更新服务不可用", prepared.SHA256, true)
+		return savedConfigApplyFailure("unavailable", "Helper 摘要更新服务不可用", digest, true)
 	}
-	if updated := sanitizeOperation(s.helperFingerprint.UpdateExpectedSHA256(prepared.SHA256)); !updated.OK {
-		return savedConfigApplyFailure(updated.ErrorCode, updated.ErrorSummary, prepared.SHA256, true)
+	if updated := sanitizeOperation(s.helperFingerprint.UpdateExpectedSHA256(digest)); !updated.OK {
+		return savedConfigApplyFailure(updated.ErrorCode, updated.ErrorSummary, digest, true)
 	}
 	needsRestart := false
 	if s.helper != nil {
 		needsRestart = s.helper.Refresh(ctx).NeedsRestart
 	}
-	return traymodel.ConfigApplyResult{OK: true, Saved: true, SHA256: prepared.SHA256, NeedsRestart: needsRestart}
+	return traymodel.ConfigApplyResult{OK: true, Saved: true, SHA256: digest, NeedsRestart: needsRestart}
 }
 
 func (s *Service) StartHelper(ctx context.Context) traymodel.OperationResult {
@@ -415,8 +595,8 @@ func (s *Service) StartHelper(ctx context.Context) traymodel.OperationResult {
 	if !settings.HelperEnabled {
 		return operationFailure("helper_disabled", "Helper 未启用")
 	}
-	if settings.HelperStartMode == traymodel.StartAutomatic {
-		return taskOperation(ctx, s.task)
+	if result := s.validateHelperStart(); !result.OK {
+		return result
 	}
 	return callComponent(s, s.helper, ctx, "start")
 }
@@ -433,18 +613,28 @@ func (s *Service) StopHelper(ctx context.Context) traymodel.OperationResult {
 }
 
 func (s *Service) RestartHelper(ctx context.Context) traymodel.OperationResult {
-	settings, result := s.helperSettings()
+	_, result := s.helperSettings()
 	if !result.OK {
 		return result
 	}
-	if settings.HelperStartMode == traymodel.StartAutomatic {
-		stopped := callComponent(s, s.helper, ctx, "stop")
-		if !stopped.OK {
-			return stopped
-		}
-		return taskOperation(ctx, s.task)
+	if result := s.validateHelperStart(); !result.OK {
+		return result
 	}
 	return callComponent(s, s.helper, ctx, "restart")
+}
+
+func (s *Service) validateHelperStart() traymodel.OperationResult {
+	if s == nil || s.store == nil {
+		return operationFailure("helper_config_invalid", "Helper 配置不可用")
+	}
+	value, err := s.store.LoadHelperForm()
+	if err != nil {
+		return operationFailure("helper_config_invalid", "Helper 配置读取失败")
+	}
+	if fields := s.store.ValidateHelperForm(value); len(fields) != 0 {
+		return operationFailure("helper_config_invalid", fields[0].Message)
+	}
+	return traymodel.OperationResult{OK: true}
 }
 
 func (s *Service) ForceStopHelper(ctx context.Context) traymodel.OperationResult {
@@ -466,7 +656,7 @@ func (s *Service) SaveTraySettings(ctx context.Context, value traymodel.TraySett
 	if err := value.Validate(); err != nil {
 		return operationFailure("invalid_config", err.Error())
 	}
-	if s == nil || s.store == nil || s.loginStart == nil || s.elevation == nil {
+	if s == nil || s.store == nil || s.loginStart == nil {
 		return operationFailure("unavailable", "设置服务不可用")
 	}
 	current, err := s.store.LoadTraySettings()
@@ -474,13 +664,6 @@ func (s *Service) SaveTraySettings(ctx context.Context, value traymodel.TraySett
 		return operationFailure("load_failed", err.Error())
 	}
 	loginChanged := current.LoginStartTray != value.LoginStartTray
-	helperPolicyChanged := current.HelperEnabled != value.HelperEnabled || current.HelperStartMode != value.HelperStartMode
-
-	if helperPolicyChanged {
-		if result := s.reconcileHelperTaskPolicy(ctx, value); !result.OK {
-			return result
-		}
-	}
 
 	if loginChanged {
 		if value.LoginStartTray {
@@ -489,22 +672,54 @@ func (s *Service) SaveTraySettings(ctx context.Context, value traymodel.TraySett
 			err = s.loginStart.Disable()
 		}
 		if err != nil {
-			s.reloadSettingsActualState(ctx, helperPolicyChanged)
+			s.reloadSettingsActualState(ctx, false)
 			return operationFailure("settings_partially_applied", err.Error())
 		}
 	}
 
 	if err := s.store.SaveTraySettings(value); err != nil {
-		s.reloadSettingsActualState(ctx, helperPolicyChanged)
-		if helperPolicyChanged || loginChanged {
+		s.reloadSettingsActualState(ctx, false)
+		if loginChanged {
 			return operationFailure("settings_partially_applied", err.Error())
 		}
 		return operationFailure("save_failed", err.Error())
 	}
-	if err := s.reloadSettingsActualState(ctx, helperPolicyChanged); err != nil {
+	if err := s.reloadSettingsActualState(ctx, false); err != nil {
 		return operationFailure("settings_partially_applied", err.Error())
 	}
 	return traymodel.OperationResult{OK: true}
+}
+
+func (s *Service) ensureDefaultHelperConfig(ctx context.Context) traymodel.OperationResult {
+	prepared, err := s.store.PrepareDefaultHelperWrite()
+	if errors.Is(err, config.ErrHelperConfigExists) {
+		return traymodel.OperationResult{OK: true}
+	}
+	if err != nil {
+		return operationFailure("helper_config_invalid", "Helper 默认配置无效")
+	}
+	payload, err := msgpack.Marshal(prepared)
+	if err != nil {
+		return operationFailure("helper_config_invalid", "配置请求编码失败")
+	}
+	invoked, err := s.elevation.Invoke(ctx, elevation.ActionWriteHelperConfig, payload)
+	if err != nil {
+		return operationFailure("helper_config_invalid", err.Error())
+	}
+	if invoked.UACCancelled {
+		return operationFailure(elevation.ErrorCodeUACCancelled, invoked.Response.ErrorSummary)
+	}
+	if !invoked.Response.OK && invoked.Response.ErrorCode != elevation.ErrorCodeHelperConfigExists {
+		return operationFailure(stableCode(invoked.Response.ErrorCode, "helper_config_invalid"), invoked.Response.ErrorSummary)
+	}
+	if s.helperFingerprint == nil {
+		return operationFailure("unavailable", "Helper 摘要更新服务不可用")
+	}
+	actualSHA, err := s.store.HelperFingerprint()
+	if err != nil {
+		return operationFailure("helper_config_invalid", "Helper 配置读取失败")
+	}
+	return sanitizeOperation(s.helperFingerprint.UpdateExpectedSHA256(actualSHA))
 }
 
 func (s *Service) reconcileHelperTaskPolicy(ctx context.Context, value traymodel.TraySettings) traymodel.OperationResult {

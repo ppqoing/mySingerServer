@@ -93,29 +93,58 @@ function Write-Utf8NoBom {
         [Text.UTF8Encoding]::new($false))
 }
 
-function Assert-SanitizedAgentExample {
+function Test-ContainsSensitiveConfigKey {
+    param([object]$Value)
+    if ($null -eq $Value -or $Value -is [string]) { return $false }
+    if ($Value -is [Collections.IDictionary]) {
+        foreach ($key in $Value.Keys) {
+            if ([string]$key -match '(?i)(machine[_-]?id|token|secret|credential|password|passwd|pwd)') { return $true }
+            if (Test-ContainsSensitiveConfigKey -Value $Value[$key]) { return $true }
+        }
+        return $false
+    }
+    if ($Value -is [Collections.IEnumerable]) {
+        foreach ($item in $Value) {
+            if (Test-ContainsSensitiveConfigKey -Value $item) { return $true }
+        }
+        return $false
+    }
+    foreach ($property in $Value.PSObject.Properties) {
+        if ($property.Name -match '(?i)(machine[_-]?id|token|secret|credential|password|passwd|pwd)') { return $true }
+        if (Test-ContainsSensitiveConfigKey -Value $property.Value) { return $true }
+    }
+    return $false
+}
+
+function Assert-SanitizedAgentDefault {
     param([string]$Path)
     try {
         $config = Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json
+        if (Test-ContainsSensitiveConfigKey -Value $config) {
+            throw 'sensitive_config_key'
+        }
         $dsn = [string]$config.pg_dsn
-        $uri = [Uri]::new($dsn)
+        $uri = $null
+        if (-not [string]::IsNullOrWhiteSpace($dsn)) {
+            $uri = [Uri]::new($dsn)
+        }
     }
     catch {
-        throw "NODE_RELEASE_SENSITIVE_CONFIG invalid_agent_example path=$Path"
+        throw "NODE_RELEASE_SENSITIVE_CONFIG invalid_agent_default path=$Path"
     }
-    if ($uri.UserInfo -match ':' -or
-        $uri.Query -match '(?i)(password|passwd|pwd|token|secret)=') {
+    if ($null -ne $uri -and ($uri.UserInfo -match ':' -or
+        $uri.Query -match '(?i)(password|passwd|pwd|token|secret)=')) {
         throw "NODE_RELEASE_SENSITIVE_CONFIG password_in_pg_dsn path=$Path"
     }
 }
 
-function Assert-SanitizedHelperExample {
+function Assert-SanitizedHelperDefault {
     param([string]$Path)
     try {
         $config = Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json
     }
     catch {
-        throw "NODE_RELEASE_SENSITIVE_CONFIG invalid_helper_example path=$Path"
+        throw "NODE_RELEASE_SENSITIVE_CONFIG invalid_helper_default path=$Path"
     }
     if (@($config.allowed_roots).Count -ne 0) {
         throw "NODE_RELEASE_SENSITIVE_CONFIG helper_allowed_roots_not_empty path=$Path"
@@ -124,7 +153,7 @@ function Assert-SanitizedHelperExample {
 
 $stage = Resolve-InputDirectory -Path $StageDir -Label 'NODE_RELEASE_STAGE'
 $output = Resolve-OutputDirectory -Path $OutputDir
-$baseName = "MySingerServer-node-win-x64-$ReleaseId"
+$baseName = "MySingerServer-compute-win-x64-$ReleaseId"
 $zipPath = Join-Path $output "$baseName.zip"
 $sidecarPath = "$zipPath.sha256"
 foreach ($finalPath in @($zipPath, $sidecarPath)) {
@@ -135,7 +164,7 @@ foreach ($finalPath in @($zipPath, $sidecarPath)) {
 
 $work = Join-Path $output (
     '.node-release-work-{0}' -f [Guid]::NewGuid().ToString('N'))
-$payload = Join-Path $work 'MySingerServer'
+$payload = Join-Path $work 'MySingerServer-Compute'
 $verifyRoot = Join-Path $work 'verify'
 $temporaryZip = Join-Path $work "$baseName.zip"
 $temporarySidecar = "$temporaryZip.sha256"
@@ -143,6 +172,11 @@ $complete = $false
 
 try {
     New-Item -ItemType Directory -Path $payload | Out-Null
+    Write-Utf8NoBom -Path (Join-Path $payload 'Start-Compute.ps1') -Value @'
+$ErrorActionPreference = 'Stop'
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
+Start-Process -FilePath (Join-Path $root 'nodetray.exe') -WorkingDirectory $root
+'@
 
     $nativeManifestPath = Join-Path $stage 'native-dependencies.json'
     if (-not (Test-Path -LiteralPath $nativeManifestPath -PathType Leaf)) {
@@ -182,23 +216,30 @@ try {
         throw 'NODE_RELEASE_VIDEOCORE_NOT_IN_NATIVE_MANIFEST'
     }
 
-    Assert-SanitizedAgentExample -Path (
-        Join-Path $stage 'agent.example.json')
-    Assert-SanitizedHelperExample -Path (
-        Join-Path $stage 'helper.example.json')
+    Assert-SanitizedAgentDefault -Path (
+        Join-Path $stage 'agent.default.json')
+    Assert-SanitizedHelperDefault -Path (
+        Join-Path $stage 'helper.default.json')
 
     foreach ($name in @(
             'nodetray.exe',
             'agent.exe',
             'worker.exe',
             'helper.exe',
+            'Everything.exe',
             'Everything64.dll',
-            'MicrosoftEdgeWebview2Setup.exe',
-            'agent.example.json',
-            'helper.example.json')) {
+            'licenses\everything-LICENSE.txt',
+            'licenses\everything-NOTICE.md',
+            'MicrosoftEdgeWebview2Setup.exe')) {
         Copy-RequiredFile -SourceRoot $stage -RelativeSource $name `
             -DestinationRoot $payload
     }
+    Copy-RequiredFile -SourceRoot $stage -RelativeSource 'agent.default.json' `
+        -DestinationRoot $payload -RelativeDestination 'data\\agent\\agent.json'
+    Copy-RequiredFile -SourceRoot $stage -RelativeSource 'nodetray.default.json' `
+        -DestinationRoot $payload -RelativeDestination 'data\\nodetray\\tray.json'
+    Copy-RequiredFile -SourceRoot $stage -RelativeSource 'helper.default.json' `
+        -DestinationRoot $payload -RelativeDestination 'data\\helper\\helper.json'
     Copy-RequiredFile -SourceRoot $stage `
         -RelativeSource 'native-dependencies.json' `
         -DestinationRoot $payload
@@ -221,11 +262,11 @@ try {
     $manifest = [ordered]@{
         schema_version = 1
         product = 'mySingerServer'
-        release_kind = 'media-node-minimal'
+        release_kind = 'compute-node-portable'
         target = 'windows/amd64'
         build_date = $BuildDate
         source_revision = $SourceRevision
-        install_root = 'C:\Program Files\MySingerServer\'
+        portable_root = '.'
         helper = [ordered]@{
             included = $true
             default_enabled = $false
@@ -240,10 +281,10 @@ try {
     Compress-Archive -LiteralPath $payload -DestinationPath $temporaryZip `
         -CompressionLevel Optimal
     Expand-Archive -LiteralPath $temporaryZip -DestinationPath $verifyRoot
-    $verifiedPayload = Join-Path $verifyRoot 'MySingerServer'
+    $verifiedPayload = Join-Path $verifyRoot 'MySingerServer-Compute'
     $topLevel = @(Get-ChildItem -LiteralPath $verifyRoot -Force)
     if ($topLevel.Count -ne 1 -or -not $topLevel[0].PSIsContainer -or
-        $topLevel[0].Name -cne 'MySingerServer') {
+        $topLevel[0].Name -cne 'MySingerServer-Compute') {
         throw 'NODE_RELEASE_ZIP_TOP_LEVEL_INVALID'
     }
 

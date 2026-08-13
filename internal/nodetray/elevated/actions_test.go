@@ -61,6 +61,64 @@ func TestExecutorWritesStrictPreparedHelperConfigWithOneLastGood(t *testing.T) {
 	}
 }
 
+func TestExecutorCreateOnlyRejectsExistingHelperConfig(t *testing.T) {
+	executor, _, target := newTestExecutor(t)
+	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, validPreparedWrite(t, target, 120).CanonicalJSON, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prepared := validPreparedWrite(t, target, 121)
+	prepared.CreateOnly = true
+	response := executor.Execute(context.Background(), executorRequest(t, elevation.ActionWriteHelperConfig, prepared))
+	assertExecutorFailure(t, response, elevation.ErrorCodeHelperConfigExists)
+}
+
+func TestExecutorCreateOnlyRejectsBackupAndLockRace(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		arrange func(*Executor, string)
+	}{
+		{"backup", func(_ *Executor, target string) {
+			if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(target+".last-good", validPreparedWrite(t, target, 120).CanonicalJSON, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"before lock", func(executor *Executor, target string) {
+			executor.testHooks.beforeLock = func() {
+				if err := os.WriteFile(target, validPreparedWrite(t, target, 120).CanonicalJSON, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			executor, _, target := newTestExecutor(t)
+			test.arrange(executor, target)
+			prepared := validPreparedWrite(t, target, 121)
+			prepared.CreateOnly = true
+			response := executor.Execute(context.Background(), executorRequest(t, elevation.ActionWriteHelperConfig, prepared))
+			assertExecutorFailure(t, response, elevation.ErrorCodeHelperConfigExists)
+		})
+	}
+}
+
+func TestExecutorCreateOnlyFailsClosedOnStatFailure(t *testing.T) {
+	executor, _, target := newTestExecutor(t)
+	executor.testHooks.stat = func(string) (os.FileInfo, error) { return nil, errors.New("stat failed") }
+	prepared := validPreparedWrite(t, target, 121)
+	prepared.CreateOnly = true
+	response := executor.Execute(context.Background(), executorRequest(t, elevation.ActionWriteHelperConfig, prepared))
+	assertExecutorFailure(t, response, elevation.ErrorCodeWriteFailed)
+	if _, err := os.Stat(target); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("target was written: %v", err)
+	}
+}
+
 func TestExecutorRejectsFormalHelperTargetChangedImmediatelyAfterReplace(t *testing.T) {
 	executor, platform, target := newTestExecutor(t)
 	executor.testHooks.replace = func(source, destination string) error {

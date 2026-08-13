@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/hex"
@@ -24,7 +25,7 @@ func TestSavePhase1Idempotent(t *testing.T) {
 	}
 	result := Phase1Result{
 		MachineID: "m", Path: `D:\image.jpg`, Kind: MediaImage, SHA512: phase1TestSHA(),
-		FieldsDone: 3, PDQ: []byte{1, 2}, Quality: 91, Width: 640, Height: 480,
+		FieldsDone: 3, PDQ: make([]byte, 32), Quality: 91, Width: 640, Height: 480,
 	}
 	if err := db.SavePhase1(ctx, result); err != nil {
 		t.Fatalf("first SavePhase1: %v", err)
@@ -348,7 +349,7 @@ func TestSavePhase1PreservesPartialVideoFields(t *testing.T) {
 	quality := int32(88)
 	if err := db.SavePhase1(ctx, Phase1Result{
 		MachineID: "m", Path: `D:\video.mp4`, Kind: MediaVideo, SHA512: phase1TestSHA(),
-		FieldsDone: 4, ThumbPath: `D:\thumb.jpg`, ThumbPDQ: []byte{9}, ThumbQuality: &quality,
+		FieldsDone: 4, ThumbPath: `D:\thumb.jpg`, ThumbPDQ: bytes.Repeat([]byte{9}, 32), ThumbQuality: &quality,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -361,7 +362,7 @@ func TestSavePhase1PreservesPartialVideoFields(t *testing.T) {
 	).Scan(&savedDuration, &savedPath, &savedPDQ, &savedQuality); err != nil {
 		t.Fatal(err)
 	}
-	if savedDuration != 1234 || savedPath != `D:\thumb.jpg` || len(savedPDQ) != 1 || savedPDQ[0] != 9 || savedQuality != 88 {
+	if savedDuration != 1234 || savedPath != `D:\thumb.jpg` || len(savedPDQ) != 32 || savedPDQ[0] != 9 || savedQuality != 88 {
 		t.Fatalf("saved video feature = duration:%d path:%q pdq:%v quality:%d", savedDuration, savedPath, savedPDQ, savedQuality)
 	}
 	if err := db.db.QueryRowContext(ctx, `SELECT missing_mask FROM files WHERE path=?`, `D:\video.mp4`).Scan(&missing); err != nil {
@@ -381,7 +382,7 @@ func TestSavePhase1PreservesPartialVideoFields(t *testing.T) {
 	).Scan(&savedDuration, &savedPath, &savedPDQ, &savedQuality); err != nil {
 		t.Fatal(err)
 	}
-	if savedDuration != 1234 || savedPath != `D:\thumb.jpg` || len(savedPDQ) != 1 || savedPDQ[0] != 9 || savedQuality != 88 {
+	if savedDuration != 1234 || savedPath != `D:\thumb.jpg` || len(savedPDQ) != 32 || savedPDQ[0] != 9 || savedQuality != 88 {
 		t.Fatalf("failed update erased video feature = duration:%d path:%q pdq:%v quality:%d", savedDuration, savedPath, savedPDQ, savedQuality)
 	}
 }
@@ -586,5 +587,116 @@ func TestSaveAnalysisVideoDimensionsFlowThroughLookupAndSyncLoader(t *testing.T)
 	if len(rows) != 1 || rows[0].ThumbWidth == nil || *rows[0].ThumbWidth != width ||
 		rows[0].ThumbHeight == nil || *rows[0].ThumbHeight != height {
 		t.Fatalf("sync dimensions = %#v", rows)
+	}
+}
+
+func TestImageNoThumbnailPhase1RejectsIncompletePDQPayload(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(filepath.Join(t.TempDir(), "agent.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	path := `D:\image-no-thumb.jpg`
+	if err := db.UpsertEnumerated(ctx, []EnumUpsert{{
+		MachineID: "m", Path: path, Size: 10, MTime: 20,
+		MissingBase: proto.FieldSHA512 | proto.FieldPDQ256,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	err = db.SavePhase1(ctx, Phase1Result{
+		MachineID: "m", Path: path, Kind: MediaImage,
+		SHA512: phase1TestSHA(), FieldsDone: proto.FieldSHA512 | proto.FieldPDQ256,
+		PDQ: []byte{1}, Quality: 80,
+	})
+	if err == nil {
+		t.Fatal("SavePhase1 accepted an incomplete successful image PDQ payload")
+	}
+}
+
+func TestVideoBaseFeaturesSavePhase1PersistsContactDimensions(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(filepath.Join(t.TempDir(), "agent.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	path := `D:\video-base.mp4`
+	required := RequiredStageOneMask(MediaVideo)
+	if err := db.UpsertEnumerated(ctx, []EnumUpsert{{
+		MachineID: "m", Path: path, Size: 10, MTime: 20, MissingBase: required,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	duration, quality := int64(1234), int32(88)
+	if err := db.SavePhase1(ctx, Phase1Result{
+		MachineID: "m", Path: path, Kind: MediaVideo,
+		SHA512: phase1TestSHA(), FieldsDone: required,
+		DurationMS: &duration, ThumbPath: `D:\cache\contact.jpg`,
+		ThumbPDQ: make([]byte, 32), ThumbQuality: &quality,
+		Width: 960, Height: 540,
+	}); err != nil {
+		t.Fatalf("SavePhase1: %v", err)
+	}
+	var width, height int32
+	var status string
+	var phase1 int
+	if err := db.db.QueryRowContext(ctx, `
+		SELECT video_features.thumb_width, video_features.thumb_height,
+		       files.status, files.phase1_done
+		FROM files JOIN video_features ON video_features.sha512=files.sha512
+		WHERE files.path=?1`, path,
+	).Scan(&width, &height, &status, &phase1); err != nil {
+		t.Fatal(err)
+	}
+	if width != 960 || height != 540 || status != proto.StatusDone || phase1 != 1 {
+		t.Fatalf("stored video width/height/status/phase1 = %d/%d/%q/%d", width, height, status, phase1)
+	}
+}
+
+func TestVideoBaseFeaturesShortCachedPDQStaysMissingAfterFailedRetry(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(filepath.Join(t.TempDir(), "agent.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	path := `D:\short-contact.mp4`
+	required := RequiredStageOneMask(MediaVideo)
+	if err := db.UpsertEnumerated(ctx, []EnumUpsert{{
+		MachineID: "m", Path: path, Size: 10, MTime: 20, MissingBase: required,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	sha := phase1TestSHA()
+	shaText := hex.EncodeToString(sha)
+	if _, err := db.db.ExecContext(ctx, `
+		UPDATE files SET sha512=?1, missing_mask=?2, status='partial' WHERE path=?3;
+		INSERT INTO video_features
+			(sha512, duration_ms, thumb_path, thumb_pdq256, thumb_quality, thumb_width, thumb_height)
+		VALUES (?1, 1234, 'short.jpg', X'01', 80, 960, 540)`,
+		shaText, proto.FieldVideoContactSheet, path,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SavePhase1(ctx, Phase1Result{
+		MachineID: "m", Path: path, Kind: MediaVideo, SHA512: sha,
+		Errors: []FieldError{{
+			Field: proto.FieldVideoContactSheet, Stage: "contact_sheet", Msg: "retry failed",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var status string
+	var missing uint32
+	var phase1 int
+	if err := db.db.QueryRowContext(ctx, `
+		SELECT status, missing_mask, phase1_done FROM files WHERE path=?1`, path,
+	).Scan(&status, &missing, &phase1); err != nil {
+		t.Fatal(err)
+	}
+	if status != proto.StatusPartial || missing != proto.FieldVideoContactSheet || phase1 != 0 {
+		t.Fatalf("short cached PDQ state = %q/%#x/%d, want partial/%#x/0",
+			status, missing, phase1, proto.FieldVideoContactSheet)
 	}
 }

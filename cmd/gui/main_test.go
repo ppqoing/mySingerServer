@@ -5,7 +5,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -24,6 +26,446 @@ import (
 	"dedup/internal/phase2"
 	"dedup/internal/proto"
 )
+
+type noopAnalysisLifecycle struct{}
+
+func (noopAnalysisLifecycle) BeginAnalysisShutdown() {}
+func (noopAnalysisLifecycle) WaitForAnalysis()       {}
+
+func TestGUIOpensBrowserOnlyAfterListenerIsBound(t *testing.T) {
+	originalBrowser := guiOpenBrowser
+	defer func() { guiOpenBrowser = originalBrowser }()
+	events := []string{"listen"}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	guiOpenBrowser = func(string) error { events = append(events, "browser"); return nil }
+	server := newFakeGUIServer(http.ErrServerClosed, false)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := serveBoundGUI(ctx, cancel, server, listener, &noopAnalysisLifecycle{}, time.Second, "127.0.0.1:8080", false, slog.Default(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(events, []string{"listen", "browser"}) {
+		t.Fatalf("events = %v", events)
+	}
+}
+
+func TestGUINoBrowserFlagSuppressesBrowserLaunch(t *testing.T) {
+	originalBrowser := guiOpenBrowser
+	defer func() { guiOpenBrowser = originalBrowser }()
+	events := []string{"listen"}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	guiOpenBrowser = func(string) error { events = append(events, "browser"); return nil }
+	server := newFakeGUIServer(http.ErrServerClosed, false)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := serveBoundGUI(ctx, cancel, server, listener, &noopAnalysisLifecycle{}, time.Second, "127.0.0.1:8080", true, slog.Default(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(events, []string{"listen"}) {
+		t.Fatalf("events = %v", events)
+	}
+}
+
+func TestGUIMissingConfigurationIsCreatedBeforeServing(t *testing.T) {
+	originalExecutable := guiExecutablePath
+	originalListen := guiListen
+	originalServer := guiNewHTTPServer
+	originalBuilder := guiBuildOperationalRuntime
+	defer func() {
+		guiExecutablePath = originalExecutable
+		guiListen = originalListen
+		guiNewHTTPServer = originalServer
+		guiBuildOperationalRuntime = originalBuilder
+	}()
+	root := t.TempDir()
+	guiExecutablePath = func() (string, error) { return filepath.Join(root, "gui.exe"), nil }
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	guiListen = func(string, string) (net.Listener, error) { return listener, nil }
+	built := make(chan struct{})
+	guiBuildOperationalRuntime = func(
+		context.Context,
+		*config.GUIConfig,
+		*slog.Logger,
+	) (*operationalRuntime, error) {
+		close(built)
+		return nil, errors.New("postgres unavailable")
+	}
+	server := newFakeGUIServer(http.ErrServerClosed, true)
+	defer server.Shutdown(context.Background())
+	guiNewHTTPServer = func(string, http.Handler) guiHTTPServer { return server }
+	result := make(chan error, 1)
+	go func() { result <- run([]string{"-no-browser"}) }()
+	select {
+	case <-server.serveStarted:
+	case <-time.After(time.Second):
+		t.Fatal("GUI did not serve after creating the default configuration")
+	}
+	select {
+	case <-built:
+	case <-time.After(time.Second):
+		t.Fatal("operational runtime initialization did not start")
+	}
+	if _, err := config.LoadGUI(filepath.Join(root, "gui.json")); err != nil {
+		t.Fatalf("created GUI configuration: %v", err)
+	}
+	server.shutdownOnce.Do(func() { close(server.shutdown) })
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("run: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("GUI did not stop")
+	}
+}
+
+func TestGUIRestartTokenFlagIsExposedByReplacementHealth(t *testing.T) {
+	originalExecutable := guiExecutablePath
+	originalListen := guiListen
+	originalServer := guiNewHTTPServer
+	originalBuilder := guiBuildOperationalRuntime
+	defer func() {
+		guiExecutablePath = originalExecutable
+		guiListen = originalListen
+		guiNewHTTPServer = originalServer
+		guiBuildOperationalRuntime = originalBuilder
+	}()
+
+	root := t.TempDir()
+	guiExecutablePath = func() (string, error) { return filepath.Join(root, "gui.exe"), nil }
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	guiListen = func(string, string) (net.Listener, error) { return listener, nil }
+	guiBuildOperationalRuntime = func(context.Context, *config.GUIConfig, *slog.Logger) (*operationalRuntime, error) {
+		return nil, errors.New("postgres unavailable")
+	}
+	server := newFakeGUIServer(http.ErrServerClosed, true)
+	defer server.Shutdown(context.Background())
+	handlers := make(chan http.Handler, 1)
+	guiNewHTTPServer = func(_ string, handler http.Handler) guiHTTPServer {
+		handlers <- handler
+		return server
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		result <- run([]string{"-no-browser", "-restart-token", "replacement-instance-token"})
+	}()
+	var handler http.Handler
+	select {
+	case handler = <-handlers:
+	case err := <-result:
+		t.Fatalf("run returned before exposing restart health: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("GUI did not create its runtime host")
+	}
+
+	health := httptest.NewRecorder()
+	handler.ServeHTTP(health, httptest.NewRequest(http.MethodGet, "/api/restart/health", nil))
+	if got := health.Body.String(); got != "{\"ok\":true,\"restart_token\":\"replacement-instance-token\",\"restarting\":false}\n" {
+		t.Fatalf("restart health=%s", got)
+	}
+	if err := server.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("run: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("GUI did not stop")
+	}
+}
+
+func TestGUIPingFailureIsLoggedBeforeInteractiveNotification(t *testing.T) {
+	originalExecutable := guiExecutablePath
+	originalNotify := guiShowStartupError
+	originalListen := guiListen
+	originalServer := guiNewHTTPServer
+	originalLogger := guiNewRuntimeLogger
+	defer func() {
+		guiExecutablePath = originalExecutable
+		guiShowStartupError = originalNotify
+		guiListen = originalListen
+		guiNewHTTPServer = originalServer
+		guiNewRuntimeLogger = originalLogger
+	}()
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "gui.json"), []byte(`{
+		"listen_addr":"127.0.0.1:18080",
+        "pg_dsn":"postgres://user:secret@127.0.0.1:1/dedup?connect_timeout=1",
+        "agents":[{"addr":"127.0.0.1:9101"}]
+    }`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	guiExecutablePath = func() (string, error) { return filepath.Join(root, "gui.exe"), nil }
+	events := &orderedEvents{}
+	failureLogged := make(chan struct{})
+	logHandler := &startupEventLogHandler{
+		events:        events,
+		failureLogged: failureLogged,
+	}
+	guiNewRuntimeLogger = func(string, io.Writer) (*slog.Logger, func() error, error) {
+		return slog.New(logHandler), func() error { return nil }, nil
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	guiListen = func(string, string) (net.Listener, error) {
+		events.add("listen")
+		return listener, nil
+	}
+	server := &runtimeFailureGUIServer{
+		failureLogged: failureLogged,
+		shutdown:      make(chan struct{}),
+		started:       make(chan struct{}),
+	}
+	defer server.Shutdown(context.Background())
+	guiNewHTTPServer = func(string, http.Handler) guiHTTPServer { return server }
+	var notification string
+	guiShowStartupError = func(message string) { notification = message }
+	result := make(chan error, 1)
+	go func() { result <- executeGUI([]string{"-no-browser"}) }()
+	select {
+	case <-server.started:
+	case <-time.After(time.Second):
+		t.Fatal("GUI did not begin serving before PostgreSQL initialization")
+	}
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("executeGUI: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("GUI did not stop after server cancellation")
+	}
+	if notification != "" {
+		t.Fatalf("database failure triggered startup notification %q", notification)
+	}
+	content := logHandler.snapshot()
+	if strings.Contains(content, "secret") || strings.Contains(content, "postgres://") {
+		t.Fatalf("runtime failure log leaked DSN: %s", content)
+	}
+	want := []string{"listen", "serve", "postgres-error"}
+	if got := events.snapshot(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("events = %v, want %v", got, want)
+	}
+}
+
+func TestGUIBindsAndServesBeforeOperationalRuntimeRestore(t *testing.T) {
+	originalExecutable := guiExecutablePath
+	originalListen := guiListen
+	originalServer := guiNewHTTPServer
+	originalBuilder := guiBuildOperationalRuntime
+	defer func() {
+		guiExecutablePath = originalExecutable
+		guiListen = originalListen
+		guiNewHTTPServer = originalServer
+		guiBuildOperationalRuntime = originalBuilder
+	}()
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "gui.json"), []byte(`{
+		"listen_addr":"127.0.0.1:18080",
+		"pg_dsn":"postgres://dedup@127.0.0.1:5432/dedup",
+		"agents":[{"addr":"127.0.0.1:9101"}]
+	}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	guiExecutablePath = func() (string, error) { return filepath.Join(root, "gui.exe"), nil }
+	events := &orderedEvents{}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	guiListen = func(string, string) (net.Listener, error) {
+		events.add("listen")
+		return listener, nil
+	}
+	server := &recordingCancelableGUIServer{
+		events:  events,
+		release: make(chan struct{}),
+		started: make(chan struct{}),
+	}
+	defer server.Shutdown(context.Background())
+	guiNewHTTPServer = func(string, http.Handler) guiHTTPServer { return server }
+	restoreStarted := make(chan struct{})
+	continueRestore := make(chan struct{})
+	defer func() {
+		select {
+		case <-continueRestore:
+		default:
+			close(continueRestore)
+		}
+	}()
+	restoreFinished := make(chan struct{})
+	guiBuildOperationalRuntime = func(
+		context.Context,
+		*config.GUIConfig,
+		*slog.Logger,
+	) (*operationalRuntime, error) {
+		close(restoreStarted)
+		<-continueRestore
+		events.add("restore")
+		close(restoreFinished)
+		return nil, errors.New("restore failed")
+	}
+	result := make(chan error, 1)
+	go func() { result <- run([]string{"-no-browser"}) }()
+	select {
+	case <-restoreStarted:
+	case <-time.After(time.Second):
+		t.Fatal("operational runtime restore did not start")
+	}
+	select {
+	case <-server.started:
+	case <-time.After(time.Second):
+		t.Fatal("GUI did not serve while operational runtime restore was blocked")
+	}
+	if got := events.snapshot(); !reflect.DeepEqual(got, []string{"listen", "serve"}) {
+		t.Fatalf("events before restore continuation = %v", got)
+	}
+	close(continueRestore)
+	select {
+	case <-restoreFinished:
+	case <-time.After(time.Second):
+		t.Fatal("operational runtime restore did not continue")
+	}
+	if err := server.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("run: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("GUI did not stop")
+	}
+	if got := events.snapshot(); !reflect.DeepEqual(got, []string{"listen", "serve", "restore"}) {
+		t.Fatalf("events = %v", got)
+	}
+}
+
+type recordingCancelableGUIServer struct {
+	events       *orderedEvents
+	release      chan struct{}
+	started      chan struct{}
+	shutdownOnce sync.Once
+}
+
+func (s *recordingCancelableGUIServer) Serve(net.Listener) error {
+	s.events.add("serve")
+	close(s.started)
+	<-s.release
+	return http.ErrServerClosed
+}
+
+func (s *recordingCancelableGUIServer) Shutdown(context.Context) error {
+	s.shutdownOnce.Do(func() {
+		select {
+		case <-s.release:
+		default:
+			close(s.release)
+		}
+	})
+	return nil
+}
+
+func (s *recordingCancelableGUIServer) Close() error {
+	return s.Shutdown(context.Background())
+}
+
+type runtimeFailureGUIServer struct {
+	failureLogged <-chan struct{}
+	shutdown      chan struct{}
+	started       chan struct{}
+	shutdownOnce  sync.Once
+}
+
+func (s *runtimeFailureGUIServer) Serve(net.Listener) error {
+	close(s.started)
+	select {
+	case <-s.failureLogged:
+	case <-s.shutdown:
+	}
+	return http.ErrServerClosed
+}
+
+func (s *runtimeFailureGUIServer) Shutdown(context.Context) error {
+	s.shutdownOnce.Do(func() { close(s.shutdown) })
+	return nil
+}
+
+func (s *runtimeFailureGUIServer) Close() error {
+	return s.Shutdown(context.Background())
+}
+
+type startupEventLogHandler struct {
+	events        *orderedEvents
+	failureLogged chan struct{}
+	failureOnce   sync.Once
+
+	mu      sync.Mutex
+	records []string
+}
+
+func (*startupEventLogHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (handler *startupEventLogHandler) Handle(_ context.Context, record slog.Record) error {
+	var fields strings.Builder
+	fields.WriteString(record.Message)
+	record.Attrs(func(attr slog.Attr) bool {
+		fields.WriteByte(' ')
+		fields.WriteString(attr.Key)
+		fields.WriteByte('=')
+		fields.WriteString(attr.Value.String())
+		return true
+	})
+	handler.mu.Lock()
+	handler.records = append(handler.records, fields.String())
+	handler.mu.Unlock()
+	switch record.Message {
+	case "gui serving":
+		handler.events.add("serve")
+	case "operational runtime unavailable":
+		handler.events.add("postgres-error")
+		handler.failureOnce.Do(func() { close(handler.failureLogged) })
+	}
+	return nil
+}
+
+func (handler *startupEventLogHandler) WithAttrs([]slog.Attr) slog.Handler {
+	return handler
+}
+
+func (handler *startupEventLogHandler) WithGroup(string) slog.Handler {
+	return handler
+}
+
+func (handler *startupEventLogHandler) snapshot() string {
+	handler.mu.Lock()
+	defer handler.mu.Unlock()
+	return strings.Join(handler.records, "\n")
+}
 
 func TestLoadGUIRuntimeReturnsAbsoluteNonDefaultPath(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "custom-gui.json")
@@ -309,7 +751,7 @@ func newFakeGUIServer(serveErr error, waitShutdown bool) *fakeGUIServer {
 	}
 }
 
-func (s *fakeGUIServer) ListenAndServe() error {
+func (s *fakeGUIServer) Serve(net.Listener) error {
 	close(s.serveStarted)
 	if s.waitShutdown {
 		<-s.shutdown
@@ -322,6 +764,10 @@ func (s *fakeGUIServer) Shutdown(context.Context) error {
 		close(s.shutdown)
 	})
 	return nil
+}
+
+func (s *fakeGUIServer) Close() error {
+	return s.Shutdown(context.Background())
 }
 
 func TestFirstScreenServeErrorDrainsAcceptedRunBeforeReturning(t *testing.T) {
@@ -375,6 +821,7 @@ func TestFirstScreenServeErrorDrainsAcceptedRunBeforeReturning(t *testing.T) {
 		processContext,
 		cancelAndRecord,
 		server,
+		nil,
 		lifecycle,
 		time.Second,
 	)
@@ -440,6 +887,7 @@ func TestServeErrorCancelsAdmittedSuccessHookBeforeWaiting(t *testing.T) {
 			processContext,
 			cancelProcess,
 			newFakeGUIServer(serveErr, false),
+			nil,
 			api,
 			time.Second,
 		)
@@ -488,6 +936,7 @@ func TestFirstScreenSignalServerCloseIsNotReportedAsError(t *testing.T) {
 			processContext,
 			cancelProcess,
 			server,
+			nil,
 			lifecycle,
 			time.Second,
 		)
@@ -518,6 +967,7 @@ func TestFirstScreenNilServeReturnStillRunsCommonDrain(t *testing.T) {
 		processContext,
 		cancelProcess,
 		server,
+		nil,
 		lifecycle,
 		time.Second,
 	); err != nil {
@@ -529,6 +979,94 @@ func TestFirstScreenNilServeReturnStillRunsCommonDrain(t *testing.T) {
 	beginCalls, waitCalls := lifecycle.counts()
 	if beginCalls == 0 || waitCalls != 1 {
 		t.Fatalf("lifecycle calls = begin:%d wait:%d", beginCalls, waitCalls)
+	}
+}
+
+type shutdownTimeoutGUIServer struct {
+	serveStarted chan struct{}
+	forceClosed  chan struct{}
+	closeOnce    sync.Once
+}
+
+func newShutdownTimeoutGUIServer() *shutdownTimeoutGUIServer {
+	return &shutdownTimeoutGUIServer{
+		serveStarted: make(chan struct{}),
+		forceClosed:  make(chan struct{}),
+	}
+}
+
+func (s *shutdownTimeoutGUIServer) Serve(net.Listener) error {
+	close(s.serveStarted)
+	<-s.forceClosed
+	return http.ErrServerClosed
+}
+
+func (*shutdownTimeoutGUIServer) Shutdown(context.Context) error {
+	return context.DeadlineExceeded
+}
+
+func (s *shutdownTimeoutGUIServer) Close() error {
+	s.closeOnce.Do(func() { close(s.forceClosed) })
+	return nil
+}
+
+type recordingHTTPDrainLifecycle struct {
+	events *orderedEvents
+}
+
+func (l *recordingHTTPDrainLifecycle) BeginAnalysisShutdown() {
+	l.events.add("analysis begin")
+}
+
+func (l *recordingHTTPDrainLifecycle) WaitForAnalysis() {
+	l.events.add("analysis wait")
+}
+
+func (l *recordingHTTPDrainLifecycle) BeginHTTPShutdown() {
+	l.events.add("http begin")
+}
+
+func (l *recordingHTTPDrainLifecycle) WaitForHTTP() {
+	l.events.add("http wait")
+}
+
+func TestShutdownTimeoutForceClosesServerAndWaitsForHTTPHandlers(t *testing.T) {
+	processContext, cancelProcess := context.WithCancel(context.Background())
+	server := newShutdownTimeoutGUIServer()
+	events := &orderedEvents{}
+	lifecycle := &recordingHTTPDrainLifecycle{events: events}
+	result := make(chan error, 1)
+	go func() {
+		result <- serveAndDrain(
+			processContext,
+			cancelProcess,
+			server,
+			nil,
+			lifecycle,
+			50*time.Millisecond,
+		)
+	}()
+	select {
+	case <-server.serveStarted:
+	case <-time.After(time.Second):
+		t.Fatal("server did not start")
+	}
+	cancelProcess()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("serveAndDrain error=%v, want shutdown deadline", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("shutdown timeout did not force-close the server")
+	}
+	if got := events.snapshot(); !equalEventOrder(got, []string{
+		"http begin",
+		"analysis begin",
+		"http wait",
+		"analysis wait",
+	}) {
+		t.Fatalf("shutdown events=%v", got)
 	}
 }
 

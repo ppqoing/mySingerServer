@@ -16,6 +16,8 @@ import (
 	"dedup/internal/wproc/mediacore"
 )
 
+const legacyPhase1VideoMask = worker.MaskSHA512 | worker.MaskVideoThumb
+
 func TestVideoQueriesSHABeforeProbeAndThumbnailWork(t *testing.T) {
 	file := newFakeFile([]byte("video"), 5, 123)
 	deps, state := testVideoPipelineDeps(file)
@@ -28,7 +30,7 @@ func TestVideoQueriesSHABeforeProbeAndThumbnailWork(t *testing.T) {
 	if got := strings.Join(state.events, ","); got != "query,probe,cache,ffmpeg,thumb-read,thumb-pdq" {
 		t.Fatalf("event order = %q, want SHA query before probe/thumbnail work", got)
 	}
-	if result.FieldsDone != worker.MaskAllVideo || result.DurationMS == nil || *result.DurationMS != 5000 {
+	if result.FieldsDone != legacyPhase1VideoMask || result.DurationMS == nil || *result.DurationMS != 5000 {
 		t.Fatalf("owner result = %#v", result)
 	}
 	if !result.ThumbGenerated || result.ThumbCacheHit || !result.Decoded {
@@ -56,7 +58,7 @@ func TestVideoCompleteHitSkipsProbeFFmpegAndThumbPDQ(t *testing.T) {
 	if got := strings.Join(state.events, ","); got != "query" {
 		t.Fatalf("complete hit events = %q, want query only", got)
 	}
-	if result.FieldsDone != worker.MaskAllVideo || result.Decoded || result.ThumbGenerated || result.ThumbCacheHit {
+	if result.FieldsDone != legacyPhase1VideoMask || result.Decoded || result.ThumbGenerated || result.ThumbCacheHit {
 		t.Fatalf("complete hit result = %#v", result)
 	}
 }
@@ -229,7 +231,7 @@ func TestVideoPublishConflictNeverEmitsThumbnailFromDifferentCacheFile(t *testin
 	if result.DurationMS == nil || *result.DurationMS != 5000 {
 		t.Fatalf("safe duration partial was lost: %#v", result.DurationMS)
 	}
-	if result.FieldsDone != worker.MaskAllVideo {
+	if result.FieldsDone != legacyPhase1VideoMask {
 		t.Fatalf("duration partial fields = %#x, want frozen bundle bit plus SHA", result.FieldsDone)
 	}
 	if result.ThumbPath != "" || len(result.ThumbPDQ) != 0 || result.ThumbQuality != nil ||
@@ -279,7 +281,7 @@ func TestVideoRealFiveSecondTwoPassCacheAndMTimeInvalidation(t *testing.T) {
 		}
 		job := &worker.JobMsg{
 			JobID: id, Path: video, Kind: worker.MediaVideo, Phase: worker.Phase1,
-			FieldsMask: worker.MaskAllVideo, Size: info.Size(), MTimeUnix: info.ModTime().Unix(),
+			FieldsMask: legacyPhase1VideoMask, Size: info.Size(), MTimeUnix: info.ModTime().Unix(),
 		}
 		result, err := processVideoWithDeps(ctx, cfg, job, deps)
 		if err != nil {
@@ -380,7 +382,7 @@ func TestPackagedWorkerProcessesVideoWithCleanPATH(t *testing.T) {
 	defer pool.Close()
 	job := &worker.JobMsg{
 		JobID: 901, Path: video, Kind: worker.MediaVideo, Phase: worker.Phase1,
-		FieldsMask: worker.MaskAllVideo, Size: info.Size(), MTimeUnix: info.ModTime().Unix(),
+		FieldsMask: legacyPhase1VideoMask, Size: info.Size(), MTimeUnix: info.ModTime().Unix(),
 	}
 	if err := pool.Submit(job); err != nil {
 		t.Fatal(err)
@@ -390,7 +392,7 @@ func TestPackagedWorkerProcessesVideoWithCleanPATH(t *testing.T) {
 		if result == nil {
 			t.Fatal("packaged worker result channel closed")
 		}
-		if len(result.Errors) != 0 || result.FieldsDone != worker.MaskAllVideo ||
+		if len(result.Errors) != 0 || result.FieldsDone != legacyPhase1VideoMask ||
 			result.DurationMS == nil || *result.DurationMS < 4900 || *result.DurationMS > 5100 ||
 			len(result.ThumbPDQ) != 32 || !result.ThumbGenerated {
 			t.Fatalf("packaged clean-PATH video result = %#v", result)
@@ -509,6 +511,6 @@ func testVideoPipelineDeps(file *fakeFile) (videoPipelineDeps, *videoTestState) 
 func testVideoJob(id int64) *worker.JobMsg {
 	return &worker.JobMsg{
 		JobID: id, Path: `C:\media\video.mp4`, Kind: worker.MediaVideo,
-		Phase: worker.Phase1, FieldsMask: worker.MaskAllVideo, Size: 5, MTimeUnix: 123,
+		Phase: worker.Phase1, FieldsMask: legacyPhase1VideoMask, Size: 5, MTimeUnix: 123,
 	}
 }

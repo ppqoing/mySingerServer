@@ -1,0 +1,9 @@
+{
+  "loginStartTray": false,
+  "agentStartMode": "automatic",
+  "helperEnabled": false,
+  "helperStartMode": "manual",
+  "closeToTray": true,
+  "refreshIntervalSeconds": 2,
+  "notificationLevel": "important"
+}

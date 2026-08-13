@@ -3,7 +3,6 @@
 package enum
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -20,12 +19,6 @@ const (
 	everythingRequestFullPath     = 0x00000004
 	everythingRequestSize         = 0x00000010
 	everythingRequestDateModified = 0x00000040
-)
-
-var (
-	ErrIPC        = errors.New("everything: IPC unavailable (Everything not running?)")
-	ErrEmptyIndex = errors.New("everything: index is empty or not ready")
-	errProbeDone  = errors.New("everything: availability probe complete")
 )
 
 // EverythingEnumerator loads Everything64.dll only when first used. This
@@ -51,6 +44,7 @@ type everythingProcs struct {
 	getResultDateModified *windows.Proc
 	isFolderResult        *windows.Proc
 	getMajorVersion       *windows.Proc
+	isDBLoaded            *windows.Proc
 }
 
 func NewEverythingEnumerator() *EverythingEnumerator {
@@ -73,16 +67,22 @@ func (e *EverythingEnumerator) Available() error {
 	if err := e.loadLocked(); err != nil {
 		return err
 	}
-	err := e.queryLocked("", func(FileRecord) error {
-		return errProbeDone
-	})
-	if errors.Is(err, errProbeDone) {
-		return nil
+	majorVersion, _, _ := e.procs.getMajorVersion.Call()
+	if majorVersion == 0 {
+		code, _, _ := e.procs.getLastError.Call()
+		if code == 0 || code == everythingErrorIPC {
+			return ErrIPC
+		}
+		return fmt.Errorf(
+			"everything: GetMajorVersion failed, lastError=%d",
+			code,
+		)
 	}
-	if err != nil {
-		return err
+	loaded, _, _ := e.procs.isDBLoaded.Call()
+	if loaded == 0 {
+		return ErrIndexNotReady
 	}
-	return ErrEmptyIndex
+	return nil
 }
 
 func (e *EverythingEnumerator) Enum(root string, visit func(FileRecord) error) error {
@@ -161,6 +161,10 @@ func (e *EverythingEnumerator) loadLocked() error {
 		return err
 	}
 	if procs.getMajorVersion, err = find("Everything_GetMajorVersion"); err != nil {
+		_ = dll.Release()
+		return err
+	}
+	if procs.isDBLoaded, err = find("Everything_IsDBLoaded"); err != nil {
 		_ = dll.Release()
 		return err
 	}

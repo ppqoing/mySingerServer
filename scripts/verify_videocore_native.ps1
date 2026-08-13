@@ -1,6 +1,7 @@
 param(
     [string]$CMake = "",
     [string]$VcpkgRoot = "C:\vcpkg",
+    [string]$Vcpkg = "",
     [string]$EvidenceDir = ""
 )
 
@@ -86,10 +87,17 @@ $pwsh = Resolve-VerificationApplication -Name "pwsh"
 $videoCoreSource = Join-Path $repo "videocore"
 $videoCoreBuild = Join-Path $videoCoreSource "build"
 $toolchain = Join-Path $VcpkgRoot "scripts\buildsystems\vcpkg.cmake"
+$vcpkgInstalled = Join-Path $VcpkgRoot "installed"
 $ffmpegRoot = Join-Path $repo "third_party\ffmpeg"
 if (-not (Test-Path -LiteralPath $toolchain -PathType Leaf)) {
     throw "VIDEOCORE_VERIFY_TOOLCHAIN_NOT_FOUND path=$toolchain"
 }
+if (-not (Test-Path -LiteralPath $vcpkgInstalled -PathType Container)) {
+    throw "VIDEOCORE_VERIFY_VCPKG_INSTALLED_NOT_FOUND path=$vcpkgInstalled"
+}
+$provisionVcpkg = Join-Path $PSScriptRoot "provision-standard-vcpkg.ps1"
+& $provisionVcpkg -VcpkgRoot $VcpkgRoot -VcpkgExecutable $Vcpkg
+if ($LASTEXITCODE -ne 0) { throw "VIDEOCORE_VERIFY_VCPKG_PROVISION_FAILED" }
 if (-not $EvidenceDir) {
     $EvidenceDir = Join-Path $repo (
         "artifacts\verification\videocore-native-{0}-{1}" -f `
@@ -114,6 +122,8 @@ try {
         -A x64 `
         "-DCMAKE_TOOLCHAIN_FILE=$($toolchain -replace '\\', '/')" `
         -DVCPKG_TARGET_TRIPLET=x64-windows-static `
+        "-DVCPKG_INSTALLED_DIR=$vcpkgInstalled" `
+        -DVCPKG_MANIFEST_MODE=OFF `
         "-DVC_FFMPEG_ROOT=$($ffmpegRoot -replace '\\', '/')"
     if ($LASTEXITCODE -ne 0) { throw "VIDEOCORE_VERIFY_CONFIGURE_FAILED" }
 

@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	trayconfig "dedup/internal/nodetray/config"
 	"dedup/internal/nodetray/traymodel"
 	"dedup/internal/nodetray/windows/singleinstance"
 )
@@ -37,6 +38,10 @@ func (OSFinalPathResolver) Final(path string) (string, error) {
 
 type SettingsLoader interface {
 	LoadTraySettings() (traymodel.TraySettings, error)
+}
+type HelperConfigValidator interface {
+	LoadHelperForm() (trayconfig.HelperForm, error)
+	ValidateHelperForm(trayconfig.HelperForm) []trayconfig.FieldError
 }
 type Lease interface{ Close() error }
 type InstanceService interface {
@@ -67,16 +72,17 @@ type AttentionSink interface {
 }
 
 type Dependencies struct {
-	Paths      PathResolver
-	FinalPaths FinalPathResolver
-	Settings   SettingsLoader
-	Instance   InstanceService
-	Factory    Factory
-	Task       TaskRunner
-	Scheduler  RefreshScheduler
-	UI         UI
-	Attention  AttentionSink
-	Show       func()
+	Paths        PathResolver
+	FinalPaths   FinalPathResolver
+	Settings     SettingsLoader
+	HelperConfig HelperConfigValidator
+	Instance     InstanceService
+	Factory      Factory
+	Task         TaskRunner
+	Scheduler    RefreshScheduler
+	UI           UI
+	Attention    AttentionSink
+	Show         func()
 }
 
 type Runtime struct {
@@ -167,10 +173,12 @@ func Start(ctx context.Context, dependencies Dependencies) (*Runtime, error) {
 		reportOperation(dependencies.Attention, "agent", agent.Start(ctx), "Agent 自动启动失败")
 	}
 	if settings.HelperEnabled && settings.HelperStartMode == traymodel.StartAutomatic {
-		if dependencies.Task == nil {
-			dependencies.Attention.Required("helper", "task_unavailable", "Helper 固定任务不可用")
-		} else if err := dependencies.Task.Run(ctx); err != nil {
-			dependencies.Attention.Required("helper", "task_failed", "Helper 固定任务启动失败")
+		if helper == nil {
+			dependencies.Attention.Required("helper", "unavailable", "Helper 初始化失败")
+		} else if !helperConfigReady(dependencies.HelperConfig) {
+			dependencies.Attention.Required("helper", "helper_config_invalid", "Helper 配置无效")
+		} else {
+			reportOperation(dependencies.Attention, "helper", helper.Start(ctx), "Helper 自动启动失败")
 		}
 	}
 	refresh := func(refreshCtx context.Context) {
@@ -197,6 +205,14 @@ func Start(ctx context.Context, dependencies Dependencies) (*Runtime, error) {
 		return fail(errors.New("bootstrap: tray UI startup failed"))
 	}
 	return runtime, nil
+}
+
+func helperConfigReady(config HelperConfigValidator) bool {
+	if config == nil {
+		return false
+	}
+	form, err := config.LoadHelperForm()
+	return err == nil && len(config.ValidateHelperForm(form)) == 0
 }
 
 func (runtime *Runtime) Close() error {
