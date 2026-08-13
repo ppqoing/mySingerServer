@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"testing"
 
 	"dedup/internal/worker"
@@ -59,6 +60,20 @@ func TestImagePreviewWorkerEncodesJPEGAndWebPWithoutCreatingFiles(t *testing.T) 
 	}
 	if got := directoryNames(t, taskTemp); !reflect.DeepEqual(got, beforeTemp) {
 		t.Fatalf("TEMP changed: before=%v after=%v", beforeTemp, got)
+	}
+}
+
+// Break caught: the pre-read budget check treats the caller's maximum output
+// dimensions as the actual image size and rejects a small, valid preview.
+func TestImagePreviewWorkerBudgetsActualDimensionsAfterReadingConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "small.webp")
+	writePreviewWebP(t, path, 16, 8, false)
+	job := previewJobForFile(t, path, worker.PreviewFormatWebP)
+	job.PreviewMaxWidth, job.PreviewMaxHeight = 8192, 8192
+	result := generateImagePreview(context.Background(), &job, 256<<20)
+	if result.PreviewErrorCode != "" || result.PreviewWidth != 16 || result.PreviewHeight != 8 {
+		t.Fatalf("small preview = code:%q dimensions:%dx%d", result.PreviewErrorCode,
+			result.PreviewWidth, result.PreviewHeight)
 	}
 }
 
@@ -126,6 +141,78 @@ func TestImagePreviewWorkerRejectsSourceAndDecodedPixelsOutsideMemoryBudget(t *t
 	})
 }
 
+// Break caught: DecodeConfig reports only canvas dimensions, then Decode on an
+// animated WebP materializes every frame in the WASM module before returning.
+func TestImagePreviewWorkerRejectsAnimatedWebPBeforeCodec(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "animated.bin")
+	writeAnimatedPreviewWebP(t, path)
+	job := previewJobForFile(t, path, worker.PreviewFormatJPEG)
+	result := generateImagePreview(context.Background(), &job, 256<<20)
+	if result.PreviewErrorCode != "preview_memory_limit" || len(result.PreviewBytes) != 0 {
+		t.Fatalf("animated preview = code:%q bytes:%d", result.PreviewErrorCode, len(result.PreviewBytes))
+	}
+}
+
+func TestInspectPreviewWebPUsesConstantMemory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "static.webp")
+	writePreviewWebP(t, path, 20, 10, false)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	allocations := testing.AllocsPerRun(1000, func() {
+		isWebP, animated, inspectErr := inspectPreviewWebP(data)
+		if inspectErr != nil || !isWebP || animated {
+			panic("static WebP inspection failed")
+		}
+	})
+	if allocations != 0 {
+		t.Fatalf("RIFF inspection allocations = %v, want 0", allocations)
+	}
+}
+
+// Break caught: static WebP metadata/source duplication and fallback codec
+// copies are omitted, admitting a request whose simultaneous live set exceeds
+// the configured budget before decode or encode returns.
+func TestStaticWebPMemoryBudgetIncludesMetadataBackendCopiesAndEncodedResultCopies(t *testing.T) {
+	t.Run("large metadata source", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "metadata.bin")
+		writePreviewWebP(t, path, 2, 2, false)
+		appendWebPChunk(t, path, "JUNK", make([]byte, 7<<20))
+		job := previewJobForFile(t, path, worker.PreviewFormatJPEG)
+		job.PreviewMaxWidth, job.PreviewMaxHeight = 2, 2
+		runtime.GC()
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		result := generateImagePreview(context.Background(), &job, 24<<20)
+		runtime.ReadMemStats(&after)
+		if result.PreviewErrorCode != "preview_memory_limit" || len(result.PreviewBytes) != 0 {
+			t.Fatalf("metadata preview = code:%q bytes:%d", result.PreviewErrorCode, len(result.PreviewBytes))
+		}
+		if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 1<<20 {
+			t.Fatalf("metadata rejection allocated %d bytes before codec", allocated)
+		}
+	})
+	t.Run("webp encode live set", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "noisy.webp")
+		writePreviewWebP(t, path, 1800, 1800, true)
+		job := previewJobForFile(t, path, worker.PreviewFormatWebP)
+		job.PreviewMaxWidth, job.PreviewMaxHeight = 1800, 1800
+		job.PreviewQuality = 100
+		runtime.GC()
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		result := generateImagePreview(context.Background(), &job, 64<<20)
+		runtime.ReadMemStats(&after)
+		if result.PreviewErrorCode != "preview_memory_limit" || len(result.PreviewBytes) != 0 {
+			t.Fatalf("encode live-set preview = code:%q bytes:%d", result.PreviewErrorCode, len(result.PreviewBytes))
+		}
+		if allocated := after.TotalAlloc - before.TotalAlloc; allocated > uint64(job.Size)+(2<<20) {
+			t.Fatalf("encode live-set rejection allocated %d bytes before codec", allocated)
+		}
+	})
+}
+
 func previewJobForFile(t *testing.T, path, format string) worker.JobMsg {
 	t.Helper()
 	data, err := os.ReadFile(path)
@@ -188,6 +275,80 @@ func writeHugePreviewPNGHeader(t *testing.T, path string, width, height uint32) 
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func writePreviewWebP(t *testing.T, path string, width, height int, noisy bool) {
+	t.Helper()
+	img := previewTestImage(width, height, noisy)
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := webpcodec.Encode(file, img, webpcodec.Options{Quality: 90, Method: 4}); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeAnimatedPreviewWebP(t *testing.T, path string) {
+	t.Helper()
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	animation := &webpcodec.WEBP{
+		Image: []image.Image{previewTestImage(2, 2, false), previewTestImage(2, 2, true)},
+		Delay: []int{20, 20}, LoopCount: 0,
+	}
+	if err := webpcodec.EncodeAll(file, animation, webpcodec.Options{Quality: 80, Method: 4}); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func appendWebPChunk(t *testing.T, path, fourCC string, payload []byte) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fourCC) != 4 || len(data) < 12 {
+		t.Fatal("invalid test WebP")
+	}
+	data = append(data, fourCC...)
+	var size [4]byte
+	binary.LittleEndian.PutUint32(size[:], uint32(len(payload)))
+	data = append(data, size[:]...)
+	data = append(data, payload...)
+	if len(payload)%2 != 0 {
+		data = append(data, 0)
+	}
+	binary.LittleEndian.PutUint32(data[4:8], uint32(len(data)-8))
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func previewTestImage(width, height int, noisy bool) *image.NRGBA {
+	img := image.NewNRGBA(image.Rect(0, 0, width, height))
+	state := uint32(1)
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			if noisy {
+				state = state*1664525 + 1013904223
+				img.SetNRGBA(x, y, color.NRGBA{R: uint8(state), G: uint8(state >> 8), B: uint8(state >> 16), A: 255})
+			} else {
+				img.SetNRGBA(x, y, color.NRGBA{R: uint8(x), G: uint8(y), B: 120, A: 255})
+			}
+		}
+	}
+	return img
 }
 
 func directoryNames(t *testing.T, path string) []string {

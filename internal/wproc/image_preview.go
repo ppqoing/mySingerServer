@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha512"
+	"encoding/binary"
 	"errors"
 	"image"
 	"image/jpeg"
@@ -20,6 +21,8 @@ import (
 )
 
 var errPreviewTooLarge = errors.New("preview exceeds response limit")
+
+const previewWASMBaseBytes int64 = 128 << 10
 
 // generateImagePreview runs only in the Worker process. It independently binds
 // the source path to Agent's immutable identity and returns encoded bytes only.
@@ -58,6 +61,13 @@ func generateImagePreview(ctx context.Context, job *worker.JobMsg, memoryBudget 
 	if !os.SameFile(pathInfo, handleBefore) || !samePreviewState(pathInfo, handleBefore) {
 		return previewFailure(result, "stale_preview")
 	}
+	sourceWebP, err := previewSourceIsWebP(file, job.Size)
+	if err != nil {
+		return previewFailure(result, "preview_io_failed")
+	}
+	if !previewFitsInitialMemoryBudget(job.Size, memoryBudget, sourceWebP) {
+		return previewFailure(result, "preview_memory_limit")
+	}
 
 	data, sum, err := readPreviewSource(ctx, file, job.Size)
 	if err != nil {
@@ -75,12 +85,23 @@ func generateImagePreview(ctx context.Context, job *worker.JobMsg, memoryBudget 
 		return previewFailure(result, "stale_preview")
 	}
 
+	isWebP, animated, err := inspectPreviewWebP(data)
+	if err != nil {
+		return previewFailure(result, "preview_decode_failed")
+	}
+	if animated {
+		return previewFailure(result, "preview_memory_limit")
+	}
+	if isWebP != sourceWebP {
+		return previewFailure(result, "stale_preview")
+	}
 	config, err := decodePreviewConfig(data)
 	if err != nil {
 		return previewFailure(result, "preview_decode_failed")
 	}
 	if !previewFitsMemoryBudget(job.Size, config.Width, config.Height,
-		int(job.PreviewMaxWidth), int(job.PreviewMaxHeight), memoryBudget) {
+		int(job.PreviewMaxWidth), int(job.PreviewMaxHeight), memoryBudget,
+		isWebP, job.PreviewFormat) {
 		return previewFailure(result, "preview_memory_limit")
 	}
 	decoded, err := decodePreview(data)
@@ -103,6 +124,59 @@ func generateImagePreview(ctx context.Context, job *worker.JobMsg, memoryBudget 
 	return result
 }
 
+func previewSourceIsWebP(file *os.File, size int64) (bool, error) {
+	if size < 12 {
+		return false, nil
+	}
+	var header [12]byte
+	if _, err := file.ReadAt(header[:], 0); err != nil {
+		return false, err
+	}
+	return header[0] == 'R' && header[1] == 'I' && header[2] == 'F' && header[3] == 'F' &&
+		header[8] == 'W' && header[9] == 'E' && header[10] == 'B' && header[11] == 'P', nil
+}
+
+// inspectPreviewWebP walks the RIFF chunk table without allocating. Animated
+// WebP is outside the product contract and must not reach either codec backend.
+func inspectPreviewWebP(data []byte) (isWebP, animated bool, err error) {
+	if len(data) < 12 || string(data[:4]) != "RIFF" || string(data[8:12]) != "WEBP" {
+		return false, false, nil
+	}
+	declared := uint64(binary.LittleEndian.Uint32(data[4:8])) + 8
+	if declared != uint64(len(data)) {
+		return true, false, errors.New("invalid WebP RIFF size")
+	}
+	for offset := uint64(12); offset < declared; {
+		if declared-offset < 8 {
+			return true, false, errors.New("truncated WebP chunk")
+		}
+		start := int(offset)
+		fourCC := string(data[start : start+4])
+		size := uint64(binary.LittleEndian.Uint32(data[start+4 : start+8]))
+		payload := offset + 8
+		end := payload + size
+		if end < payload || end > declared {
+			return true, false, errors.New("invalid WebP chunk size")
+		}
+		if fourCC == "ANIM" || fourCC == "ANMF" {
+			return true, true, nil
+		}
+		if fourCC == "VP8X" {
+			if size < 10 {
+				return true, false, errors.New("invalid WebP VP8X chunk")
+			}
+			if data[int(payload)]&0x02 != 0 {
+				return true, true, nil
+			}
+		}
+		offset = end + size%2
+		if offset < end || offset > declared {
+			return true, false, errors.New("invalid WebP padding")
+		}
+	}
+	return true, false, nil
+}
+
 func decodePreviewConfig(data []byte) (image.Config, error) {
 	if len(data) >= 12 && string(data[:4]) == "RIFF" && string(data[8:12]) == "WEBP" {
 		return webpcodec.DecodeConfig(bytes.NewReader(data))
@@ -111,7 +185,9 @@ func decodePreviewConfig(data []byte) (image.Config, error) {
 	return config, err
 }
 
-func previewFitsMemoryBudget(sourceBytes int64, width, height, maxWidth, maxHeight int, budget int64) bool {
+func previewFitsMemoryBudget(sourceBytes int64, width, height, maxWidth, maxHeight int,
+	budget int64, sourceWebP bool, outputFormat string,
+) bool {
 	if sourceBytes < 0 || width <= 0 || height <= 0 || maxWidth <= 0 || maxHeight <= 0 || budget <= 0 {
 		return false
 	}
@@ -119,7 +195,20 @@ func previewFitsMemoryBudget(sourceBytes int64, width, height, maxWidth, maxHeig
 	if !ok {
 		return false
 	}
-	decodedBytes, ok := safePreviewProduct(decodedPixels, 8)
+	decodedFactor := int64(8)
+	sourceFactor := int64(1)
+	if sourceWebP {
+		// The nodynamic backend keeps the caller buffer while io.ReadAll copies
+		// it and copies it again into a growing WASM linear memory. Conservative
+		// factors include transient slice growth and decoder scratch.
+		sourceFactor = 6
+		decodedFactor = 16
+	}
+	sourceLive, ok := safePreviewProduct(sourceBytes, sourceFactor)
+	if !ok {
+		return false
+	}
+	decodedBytes, ok := safePreviewProduct(decodedPixels, decodedFactor)
 	if !ok {
 		return false
 	}
@@ -132,14 +221,65 @@ func previewFitsMemoryBudget(sourceBytes int64, width, height, maxWidth, maxHeig
 	if !ok {
 		return false
 	}
-	total := int64(0)
-	for _, amount := range []int64{sourceBytes, decodedBytes, resizedBytes, int64(worker.MaxPreviewBytes)} {
-		if amount > budget-total {
+	encodePixels, encodedBytes, ok := previewEncodeMemory(resizedPixels, outputFormat)
+	if !ok {
+		return false
+	}
+	fixedBytes := int64(0)
+	if sourceWebP {
+		fixedBytes = previewWASMBaseBytes
+	}
+	if outputFormat == worker.PreviewFormatWebP {
+		var added bool
+		fixedBytes, added = safePreviewAdd(fixedBytes, previewWASMBaseBytes)
+		if !added {
 			return false
 		}
-		total += amount
+	}
+	total := int64(0)
+	for _, amount := range []int64{sourceLive, decodedBytes, resizedBytes, encodePixels, encodedBytes, fixedBytes} {
+		var added bool
+		total, added = safePreviewAdd(total, amount)
+		if !added || total > budget {
+			return false
+		}
 	}
 	return true
+}
+
+func previewFitsInitialMemoryBudget(sourceBytes, budget int64, sourceWebP bool) bool {
+	if sourceBytes < 0 || budget <= 0 {
+		return false
+	}
+	sourceFactor := int64(1)
+	if sourceWebP {
+		sourceFactor = 6
+	}
+	sourceLive, ok := safePreviewProduct(sourceBytes, sourceFactor)
+	if !ok {
+		return false
+	}
+	if sourceWebP {
+		sourceLive, ok = safePreviewAdd(sourceLive, previewWASMBaseBytes)
+	}
+	return ok && sourceLive <= budget
+}
+
+func previewEncodeMemory(targetPixels int64, outputFormat string) (pixels, encoded int64, ok bool) {
+	encodePixelsFactor := int64(4)
+	encodedCopies := int64(2)
+	if outputFormat == worker.PreviewFormatWebP {
+		// NRGBA conversion/input, WASM linear-memory growth and libwebp scratch
+		// coexist with WASM output, bytes.Buffer storage, and the returned copy.
+		encodePixelsFactor = 24
+		encodedCopies = 5
+	}
+	pixels, ok = safePreviewProduct(targetPixels, encodePixelsFactor)
+	if !ok {
+		return 0, 0, false
+	}
+	encoded, ok = safePreviewProduct(int64(worker.MaxPreviewBytes), encodedCopies)
+	return pixels, encoded, ok
 }
 
 func safePreviewProduct(left, right int64) (int64, bool) {
@@ -147,6 +287,13 @@ func safePreviewProduct(left, right int64) (int64, bool) {
 		return 0, false
 	}
 	return left * right, true
+}
+
+func safePreviewAdd(left, right int64) (int64, bool) {
+	if left < 0 || right < 0 || right > int64(^uint64(0)>>1)-left {
+		return 0, false
+	}
+	return left + right, true
 }
 
 func resizeDimensions(width, height, maxWidth, maxHeight int) (int, int) {

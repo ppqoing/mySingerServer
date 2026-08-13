@@ -38,6 +38,13 @@
 - 通用 `DecodeLocalPayload` 曾全局 strict，破坏追加字段兼容；现恢复宽松解码，仅 `DecodeLocalImagePreviewPayload` 严格拒绝未知字段，恶意 `path` 仍在服务调用前拒绝。
 - 官方 Worker build 曾缺少 `nodynamic`；供应链 AST 门禁先以 `WORKER_BUILD_NODYNAMIC_TAG_MISSING` RED，随后 `scripts/build.ps1` 的唯一 Worker 命令强制 `-tags nodynamic`，Agent 等其他 build 命令不受影响，门禁 GREEN。
 
+独立 review fix round 2/5 的 RED → GREEN：
+
+- 真实两帧动画 WebP 在旧实现中会进入 codec 并成功产出 599 字节 JPEG；现于解码前零分配遍历 RIFF chunk，`VP8X` animation flag、`ANIM` 或 `ANMF` 均稳定返回 `preview_memory_limit`。测试文件使用 `.bin`，证明判断基于内容而非扩展名；静态 WebP 检查 `AllocsPerRun=0`。
+- 追加 7 MiB `JUNK` metadata 的静态 WebP 在旧实现的 24 MiB 预算下成功；现读源前用溢出安全乘加保守核算 caller source、fallback `io.ReadAll`、WASM 输入复制/线性内存和固定基线，在 codec 前拒绝，实测本次调用总分配小于 1 MiB。
+- 1800×1800 高熵 WebP 在旧实现的 64 MiB 预算下成功产生 3,467,662 字节 WebP；现按 nodynamic 同时存活峰值计入 decoded/Go image、resize、NRGBA 转换、WASM scratch/input/output、`bytes.Buffer` 和返回副本，在 codec 大分配前拒绝，实测分配不超过源大小加 2 MiB。
+- 初始保守模型一度把 8192×8192 请求上限当作真实尺寸，错误拒绝 16×8 小图；新增 RED 后将预算拆为两阶段：读源前只核源常驻峰值，`DecodeConfig` 后才按真实尺寸核完整峰值。普通 JPEG/WebP 及大请求上限小图均恢复 GREEN。
+
 ## 验证摘要
 
 - 默认标签完整相关包：`go test -count=1 ./internal/localreview ./internal/localpreview ./internal/store ./internal/proto ./internal/agent ./internal/worker ./internal/wproc ./cmd/worker ./cmd/agent`：PASS。
@@ -46,6 +53,7 @@
 - Windows 构建：`go build -tags nodynamic ./cmd/agent ./cmd/worker`：PASS；`go list -tags nodynamic -deps ./cmd/agent` 不含 WebP codec。
 - 官方供应链：`scripts/test-node-tray-supply-chain.ps1`：PASS；Worker build 恰有一个且含 `-tags nodynamic`，Agent build 不含该 tag。
 - 静态门禁：`git diff --check` PASS；生产 preview 代码无 `Create/CreateTemp/WriteFile/Mkdir/Rename`；相关生产代码无 path 日志。
+- Fix round 2 focused：动画拒绝、零分配 RIFF 检查、metadata/编码峰值、小图大请求上限、普通 JPEG/WebP、4 MiB 与像素炸弹，在 default 与 `-tags nodynamic` 下均 PASS。
 - Linux/CGO=0：`localreview` 与 `proto` 可编译；包含 `localpreview` 的组合被既有 `internal/worker` Windows-only `supervisorDeps/workerProc` 边界阻断，属于非目标平台 PARTIAL，未扩范围修改。
 
 ## 依赖与发布边界
@@ -70,6 +78,8 @@
 - 本报告及 `progress.md` ledger。
 
 提交信息固定为 `feat: review local results with memory previews`，本报告随该提交一并落库。
+
+Fix round 2 仅修改 `internal/wproc/image_preview.go`、`internal/wproc/image_preview_test.go`、本报告和 `progress.md`；提交信息固定为 `fix: bound webp preview memory`。
 
 ## Concerns
 
