@@ -45,6 +45,15 @@ it('手工添加和逐项移除目录', async () => {
   expect(screen.queryByText('D:\\Media')).not.toBeInTheDocument()
 })
 
+it('拒绝相对手工目录且保持目录列表不变', async () => {
+  render(<LocalTasksPage api={api()} />)
+  const user = userEvent.setup()
+  await user.type(screen.getByLabelText('手工目录'), '.\\media')
+  await user.click(screen.getByRole('button', { name: '添加目录' }))
+  expect(screen.getByRole('status')).toHaveTextContent('请输入有效的绝对 Windows 或 UNC 目录')
+  expect(screen.getByRole('list', { name: '扫描目录列表' })).toBeEmptyDOMElement()
+})
+
 it('父目录替换子目录前使用可注入确认函数', async () => {
   const confirmReplace = vi.fn(async () => false)
   const choose = vi.fn().mockResolvedValueOnce(path('D:\\Media\\Photos')).mockResolvedValueOnce(path('D:\\Media'))

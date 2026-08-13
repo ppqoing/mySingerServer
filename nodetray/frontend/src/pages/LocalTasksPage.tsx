@@ -26,7 +26,7 @@ export function LocalTasksPage({
 
   const addRoot = async (value: string): Promise<void> => {
     const plan = planTaskRootAddition(roots, value)
-    if (plan.kind === 'invalid') { setMessage('请输入扫描目录'); return }
+    if (plan.kind === 'invalid') { setMessage('请输入有效的绝对 Windows 或 UNC 目录'); return }
     if (plan.kind === 'duplicate') { setMessage('该目录已在列表中'); return }
     if (plan.kind === 'covered') { setMessage('该目录已被父目录覆盖'); return }
     if (plan.kind === 'replace-children' && !(await confirmReplace(plan.coveredRoots, plan.roots.at(-1) ?? value))) return

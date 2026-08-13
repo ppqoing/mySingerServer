@@ -1,6 +1,22 @@
 import { planTaskRootAddition } from './taskRoots'
 
 describe('planTaskRootAddition', () => {
+
+  // Break caught: relative or drive-relative manual text reaches task creation
+  // and is interpreted against a different working directory by the backend.
+  it('accepts only absolute Windows drive or UNC share paths for manual roots', () => {
+    const cases = [
+      { value: 'foo', kind: 'invalid' },
+      { value: '.\\media', kind: 'invalid' },
+      { value: '\\relative', kind: 'invalid' },
+      { value: 'C:\\Media', kind: 'added' },
+      { value: '\\\\server\\share\\Media', kind: 'added' },
+    ] as const
+
+    for (const testCase of cases) {
+      expect(planTaskRootAddition([], testCase.value)).toMatchObject({ kind: testCase.kind, roots: testCase.kind === 'added' ? [testCase.value] : [] })
+    }
+  })
   it('deduplicates Windows paths regardless of case, separators, or trailing slashes', () => {
     expect(planTaskRootAddition(['D:\\Media'], 'd:/media/')).toEqual({
       kind: 'duplicate', roots: ['D:\\Media'], coveredRoots: [],

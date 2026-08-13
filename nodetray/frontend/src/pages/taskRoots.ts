@@ -13,6 +13,10 @@ function normalizeTaskRoot(value: string): string {
 
 function key(value: string): string { return normalizeTaskRoot(value).toLocaleLowerCase() }
 
+function isAbsoluteWindowsTaskRoot(value: string): boolean {
+  return /^[a-zA-Z]:\\/.test(value) || /^\\\\[^\\]+\\[^\\]+(?:\\|$)/.test(value)
+}
+
 function isParent(parent: string, child: string): boolean {
   const parentKey = key(parent)
   const childKey = key(child)
@@ -21,7 +25,7 @@ function isParent(parent: string, child: string): boolean {
 
 export function planTaskRootAddition(roots: string[], value: string): TaskRootPlan {
   const candidate = normalizeTaskRoot(value)
-  if (!candidate) return { kind: 'invalid', roots, coveredRoots: [] }
+  if (!candidate || !isAbsoluteWindowsTaskRoot(candidate)) return { kind: 'invalid', roots, coveredRoots: [] }
   if (roots.some((root) => key(root) === key(candidate))) return { kind: 'duplicate', roots, coveredRoots: [] }
 
   const parent = roots.find((root) => isParent(root, candidate))
