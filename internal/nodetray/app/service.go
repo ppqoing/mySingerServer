@@ -2,6 +2,8 @@ package app
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -13,6 +15,7 @@ import (
 	"dedup/internal/nodetray/traymodel"
 	"dedup/internal/nodetray/windows/elevation"
 	nodetask "dedup/internal/nodetray/windows/task"
+	"dedup/internal/proto"
 	"github.com/vmihailenco/msgpack/v5"
 )
 
@@ -35,6 +38,10 @@ type AgentConfigGateway interface {
 	ValidateAgentForm(context.Context, config.AgentForm) []config.FieldError
 	SaveAgentForm(context.Context, config.AgentForm) (AgentConfigSaveResult, error)
 	PromotePendingEndpoint()
+}
+
+type LocalAgentGateway interface {
+	CallLocal(context.Context, string, any, any) error
 }
 
 // Validator is the local pure Helper form-validation boundary. Agent
@@ -91,6 +98,7 @@ type Dependencies struct {
 	Store             Store
 	Validator         Validator
 	AgentConfig       AgentConfigGateway
+	LocalAgent        LocalAgentGateway
 	MachineID         string
 	Agent             Component
 	Helper            Component
@@ -113,6 +121,9 @@ type Service struct {
 	store             Store
 	validator         Validator
 	agentConfig       AgentConfigGateway
+	localAgent        LocalAgentGateway
+	deleteMu          sync.Mutex
+	deleteTokens      map[string]localDeleteToken
 	machineID         string
 	agent             Component
 	helper            Component
@@ -137,6 +148,7 @@ func NewService(dependencies Dependencies) *Service {
 	}
 	return &Service{
 		store: dependencies.Store, validator: dependencies.Validator, agentConfig: dependencies.AgentConfig,
+		localAgent: dependencies.LocalAgent, deleteTokens: make(map[string]localDeleteToken),
 		machineID: dependencies.MachineID,
 		agent:     dependencies.Agent, helper: dependencies.Helper, task: dependencies.Task,
 		agentFingerprint: dependencies.AgentFingerprint, helperFingerprint: dependencies.HelperFingerprint,
@@ -145,6 +157,176 @@ func NewService(dependencies Dependencies) *Service {
 		locations: locations, pathResolver: dependencies.PathResolver,
 		opener: dependencies.Opener, workers: dependencies.Workers, processWaiter: dependencies.ProcessWaiter,
 	}
+}
+
+type localDeleteToken struct {
+	digest    string
+	token     string
+	expiresAt int64
+}
+
+func (s *Service) localCall(ctx context.Context, operation string, request, response any) error {
+	if s == nil || s.localAgent == nil || ctx == nil {
+		return errors.New("agent_disconnected")
+	}
+	return s.localAgent.CallLocal(ctx, operation, request, response)
+}
+
+func localError(err error) (string, string) {
+	if err == nil {
+		return "", ""
+	}
+	code := "local_operation_failed"
+	var remote interface{ Error() string }
+	if errors.As(err, &remote) {
+		candidate := remote.Error()
+		if candidate != "" && !strings.ContainsAny(candidate, `:/\\ `) {
+			code = candidate
+		}
+	}
+	return code, "本机 Agent 暂不可用，请稍后重试"
+}
+
+func mapLocalTask(value proto.LocalTask) traymodel.LocalTask {
+	result := traymodel.LocalTask{TaskID: value.TaskID, Source: value.Source, Mode: value.Mode, Stage: value.Stage, Status: value.Status,
+		Roots: append([]string(nil), value.Roots...), ProgressComplete: value.ProgressComplete, ProgressTotal: value.ProgressTotal,
+		ErrorCode: value.SafeErrorCode, ErrorSummary: sanitizeText(value.SafeErrorMessage), SyncStatus: "本机已保存"}
+	var stats struct {
+		Speed      string `json:"speed"`
+		Failures   int64  `json:"failures"`
+		Duration   string `json:"duration"`
+		SyncStatus string `json:"sync_status"`
+	}
+	if json.Unmarshal([]byte(value.StatsJSON), &stats) == nil {
+		result.Speed, result.Failures, result.Duration = sanitizeText(stats.Speed), stats.Failures, sanitizeText(stats.Duration)
+		if stats.SyncStatus != "" {
+			result.SyncStatus = sanitizeText(stats.SyncStatus)
+		}
+	}
+	return result
+}
+
+func (s *Service) CreateLocalTask(ctx context.Context, request traymodel.LocalTaskCreate) traymodel.LocalTaskResult {
+	var response proto.LocalTaskCreateResponse
+	err := s.localCall(ctx, proto.LocalOperationTaskCreate, proto.LocalTaskCreateRequest{TaskID: request.TaskID, Roots: request.Roots, Mode: request.Mode, Rescan: request.Rescan, Extensions: request.Extensions}, &response)
+	if err != nil {
+		code, summary := localError(err)
+		return traymodel.LocalTaskResult{ErrorCode: code, ErrorSummary: summary}
+	}
+	return traymodel.LocalTaskResult{OK: true, Task: mapLocalTask(response.Task)}
+}
+
+func (s *Service) StartLocalAnalysis(ctx context.Context, request traymodel.LocalAnalysisStart) traymodel.OperationResult {
+	var response proto.LocalTaskCreateResponse
+	err := s.localCall(ctx, proto.LocalOperationAnalysisStart, proto.LocalTaskCreateRequest{TaskID: request.TaskID, Roots: request.Roots, Mode: proto.LocalTaskModeScanThenAnalysis, Rescan: request.Rescan, Extensions: request.Extensions}, &response)
+	if err != nil {
+		code, summary := localError(err)
+		return traymodel.OperationResult{ErrorCode: code, ErrorSummary: summary}
+	}
+	return traymodel.OperationResult{OK: true}
+}
+
+func (s *Service) ListLocalTasks(ctx context.Context, request traymodel.PageRequest) traymodel.LocalTaskPage {
+	var response proto.LocalTaskListResponse
+	err := s.localCall(ctx, proto.LocalOperationTaskList, proto.LocalTaskListRequest{Offset: request.Offset, Limit: request.Limit}, &response)
+	if err != nil {
+		code, summary := localError(err)
+		return traymodel.LocalTaskPage{Tasks: []traymodel.LocalTask{}, ErrorCode: code, ErrorSummary: summary}
+	}
+	tasks := make([]traymodel.LocalTask, len(response.Tasks))
+	for i := range response.Tasks {
+		tasks[i] = mapLocalTask(response.Tasks[i])
+	}
+	return traymodel.LocalTaskPage{OK: true, Tasks: tasks, Offset: response.Offset, NextOffset: response.NextOffset}
+}
+
+func mapLocalGroup(value proto.LocalGroup) traymodel.LocalGroup {
+	members := make([]traymodel.LocalGroupMember, len(value.Members))
+	for i, member := range value.Members {
+		members[i] = traymodel.LocalGroupMember{FileID: member.FileID, Path: member.Path, FileName: member.FileName, Size: member.Size, Status: member.Status, Decision: member.Decision}
+	}
+	return traymodel.LocalGroup{RunID: value.RunID, Generation: value.Generation, GroupID: value.GroupID, Category: value.Category, Verdict: value.Verdict, ReviewStatus: value.ReviewStatus, Members: members}
+}
+
+func (s *Service) ListLocalGroups(ctx context.Context, request traymodel.LocalGroupQuery) traymodel.LocalGroupPage {
+	var response proto.LocalGroupListResponse
+	err := s.localCall(ctx, proto.LocalOperationGroupsList, proto.LocalGroupListRequest{Scope: request.Scope, RunID: request.RunID, Category: request.Category, PathContains: request.PathContains, FileNameContains: request.FileNameContains, ReviewStatus: request.ReviewStatus, Offset: request.Offset, Limit: request.Limit}, &response)
+	if err != nil {
+		code, summary := localError(err)
+		return traymodel.LocalGroupPage{Groups: []traymodel.LocalGroup{}, ErrorCode: code, ErrorSummary: summary}
+	}
+	groups := make([]traymodel.LocalGroup, len(response.Groups))
+	for i := range response.Groups {
+		groups[i] = mapLocalGroup(response.Groups[i])
+	}
+	return traymodel.LocalGroupPage{OK: true, Groups: groups, Offset: response.Offset, NextOffset: response.NextOffset}
+}
+
+func (s *Service) SaveLocalReview(ctx context.Context, request traymodel.LocalReviewSave) traymodel.OperationResult {
+	decisions := make([]proto.LocalReviewDecision, len(request.Decisions))
+	for i, decision := range request.Decisions {
+		decisions[i] = proto.LocalReviewDecision{FileID: decision.FileID, Decision: decision.Decision}
+	}
+	var response proto.LocalReviewSaveResponse
+	err := s.localCall(ctx, proto.LocalOperationReviewSave, proto.LocalReviewSaveRequest{RunID: request.RunID, GroupID: request.GroupID, Reviewer: request.Reviewer, Note: request.Note, Decisions: decisions}, &response)
+	if err != nil || !response.Saved {
+		code, summary := localError(err)
+		if err == nil {
+			code, summary = "review_not_saved", "审核结果未保存"
+		}
+		return traymodel.OperationResult{ErrorCode: code, ErrorSummary: summary}
+	}
+	return traymodel.OperationResult{OK: true}
+}
+
+func (s *Service) PrepareLocalDelete(ctx context.Context, request traymodel.LocalDeletePrepare) traymodel.LocalDeletePreview {
+	var response proto.LocalDeletePreview
+	err := s.localCall(ctx, proto.LocalOperationDeletePrepare, proto.LocalDeletePrepareRequest{RunID: request.RunID, GroupID: request.GroupID}, &response)
+	if err != nil {
+		code, summary := localError(err)
+		return traymodel.LocalDeletePreview{Files: []traymodel.LocalDeleteFile{}, ErrorCode: code, ErrorSummary: summary}
+	}
+	files := make([]traymodel.LocalDeleteFile, len(response.Files))
+	for i, file := range response.Files {
+		files[i] = traymodel.LocalDeleteFile{FileID: file.FileID, Path: file.Path, Size: file.Size}
+	}
+	s.deleteMu.Lock()
+	s.deleteTokens[response.BatchID] = localDeleteToken{digest: response.SelectionDigest, token: response.Token, expiresAt: response.ExpiresAt}
+	s.deleteMu.Unlock()
+	return traymodel.LocalDeletePreview{OK: true, BatchID: response.BatchID, SelectionDigest: response.SelectionDigest, Count: response.Count, TotalSize: response.TotalSize, ExpiresAt: response.ExpiresAt, Files: files}
+}
+
+func (s *Service) ExecuteLocalDelete(ctx context.Context, request traymodel.LocalDeleteExecute) traymodel.LocalDeleteBatch {
+	s.deleteMu.Lock()
+	authorization, ok := s.deleteTokens[request.BatchID]
+	if ok {
+		delete(s.deleteTokens, request.BatchID)
+	}
+	s.deleteMu.Unlock()
+	if !ok || authorization.digest != request.SelectionDigest || authorization.token == "" {
+		return traymodel.LocalDeleteBatch{Items: []traymodel.LocalDeleteItem{}, ErrorCode: "delete_authorization_expired", ErrorSummary: "删除确认已失效，请重新预览"}
+	}
+	var response proto.LocalDeleteBatch
+	err := s.localCall(ctx, proto.LocalOperationDeleteExecute, proto.LocalDeleteExecuteRequest{BatchID: request.BatchID, SelectionDigest: request.SelectionDigest, Token: authorization.token}, &response)
+	if err != nil {
+		code, summary := localError(err)
+		return traymodel.LocalDeleteBatch{Items: []traymodel.LocalDeleteItem{}, ErrorCode: code, ErrorSummary: summary}
+	}
+	items := make([]traymodel.LocalDeleteItem, len(response.Items))
+	for i, item := range response.Items {
+		items[i] = traymodel.LocalDeleteItem{FileID: item.FileID, Result: item.Result, ErrorCode: item.ErrorCode, Uncertain: item.Uncertain}
+	}
+	return traymodel.LocalDeleteBatch{OK: true, BatchID: response.BatchID, Status: response.Status, Requested: response.Requested, Succeeded: response.Succeeded, Failed: response.Failed, Uncertain: response.Uncertain, Items: items}
+}
+
+func (s *Service) GetLocalImagePreview(ctx context.Context, fileID int64) traymodel.ImagePreview {
+	var response proto.LocalImagePreviewResponse
+	err := s.localCall(ctx, proto.LocalOperationPreviewImage, proto.LocalImagePreviewRequest{FileID: fileID, MaxWidth: 1600, MaxHeight: 1200, Format: "jpeg", Quality: 85}, &response)
+	if err != nil {
+		code, summary := localError(err)
+		return traymodel.ImagePreview{ErrorCode: code, ErrorSummary: summary}
+	}
+	return traymodel.ImagePreview{OK: true, MIME: response.MIME, Width: response.Width, Height: response.Height, DataBase64: base64.StdEncoding.EncodeToString(response.Bytes)}
 }
 
 const forceExitWaitTimeout = 15 * time.Second

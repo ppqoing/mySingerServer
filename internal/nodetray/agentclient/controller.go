@@ -76,6 +76,13 @@ func (c *Controller) Shutdown(ctx context.Context) error {
 	return nil
 }
 
+// CallLocal exposes the authenticated local-operation channel to the NodeTray
+// application service. The controller retains connection ownership and
+// reconnect semantics; callers never receive the token or raw transport.
+func (c *Controller) CallLocal(ctx context.Context, operation string, request, response any) error {
+	return c.call(ctx, operation, request, response)
+}
+
 func (c *Controller) LoadAgentForm(ctx context.Context) (trayconfig.AgentForm, error) {
 	var payload proto.LocalConfigGetResponse
 	if err := c.call(ctx, proto.LocalOperationConfigGet, nil, &payload); err != nil {

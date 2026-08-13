@@ -61,7 +61,7 @@ describe('App shell', () => {
     ])
   })
 
-  it('renders the fixed four tabs with overview selected and associated panels', () => {
+  it('renders lifecycle and local console tabs with overview selected', () => {
     render(<App />)
 
     expect(screen.getAllByRole('tab').map((tab) => tab.textContent)).toEqual([
@@ -69,11 +69,15 @@ describe('App shell', () => {
       'Agent',
       '删除 Helper',
       '程序设置',
+	  '本地任务',
+	  '去重分析',
+	  '结果审核',
+	  '删除记录',
     ])
     expect(selectedTabName()).toBe('总览')
 
     const panels = screen.getAllByRole('tabpanel', { hidden: true })
-    expect(panels).toHaveLength(4)
+    expect(panels).toHaveLength(8)
     for (const tab of screen.getAllByRole('tab')) {
       const panel = panels.find((candidate) => candidate.id === tab.getAttribute('aria-controls'))
       expect(panel).toHaveAttribute('aria-labelledby', tab.id)
@@ -94,12 +98,12 @@ describe('App shell', () => {
     expect(tabs[2]).toHaveFocus()
 
     await user.keyboard('{End}')
-    expect(selectedTabName()).toBe('程序设置')
+    expect(selectedTabName()).toBe('删除记录')
     await user.keyboard('{ArrowRight}')
     expect(selectedTabName()).toBe('总览')
 
     await user.keyboard('{ArrowLeft}')
-    expect(selectedTabName()).toBe('程序设置')
+    expect(selectedTabName()).toBe('删除记录')
     await user.keyboard('{Home}')
     expect(selectedTabName()).toBe('总览')
   })
@@ -118,8 +122,8 @@ describe('App shell', () => {
     const first = screen.getByRole('tab', { name: '总览' })
     first.focus()
     fireEvent.keyDown(first, { key: 'ArrowLeft' })
-    expect(screen.getByRole('tab', { name: '程序设置' })).toHaveFocus()
-    expect(selectedTabName()).toBe('程序设置')
+    expect(screen.getByRole('tab', { name: '删除记录' })).toHaveFocus()
+    expect(selectedTabName()).toBe('删除记录')
   })
 
   it('只订阅一次原生关闭事件，卸载时取消，并打开与设置页共用的退出对话框', async () => {

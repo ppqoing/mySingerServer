@@ -15,6 +15,8 @@ import (
 	"dedup/internal/nodetray/traymodel"
 	"dedup/internal/nodetray/windows/elevation"
 	nodetask "dedup/internal/nodetray/windows/task"
+	"dedup/internal/proto"
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 type fakeStore struct {
@@ -64,6 +66,69 @@ type fakeAgentConfigGateway struct {
 	loadCtx     context.Context
 	validateCtx context.Context
 	saveCtx     context.Context
+}
+
+type fakeLocalAgentGateway struct {
+	requests  []string
+	responses map[string]any
+}
+
+func (f *fakeLocalAgentGateway) CallLocal(_ context.Context, operation string, _, response any) error {
+	f.requests = append(f.requests, operation)
+	value, ok := f.responses[operation]
+	if !ok {
+		return errors.New("agent_disconnected")
+	}
+	raw, _ := msgpack.Marshal(value)
+	return msgpack.Unmarshal(raw, response)
+}
+
+func TestLocalConsoleUsesSocketAndKeepsDeleteTokenServerSide(t *testing.T) {
+	s, _, _, _, _, _ := serviceFixture(t)
+	gateway := &fakeLocalAgentGateway{responses: map[string]any{
+		proto.LocalOperationTaskCreate:    proto.LocalTaskCreateResponse{Task: proto.LocalTask{TaskID: "task-1", Source: "nodetray", Mode: proto.LocalTaskModeScanThenAnalysis, Stage: 1, Status: "running"}},
+		proto.LocalOperationTaskList:      proto.LocalTaskListResponse{Tasks: []proto.LocalTask{{TaskID: "task-1", Source: "nodetray", Stage: 1, Status: "running"}}},
+		proto.LocalOperationGroupsList:    proto.LocalGroupListResponse{Groups: []proto.LocalGroup{{RunID: "run-1", GroupID: "group-1", Category: "image", Verdict: "duplicate"}}},
+		proto.LocalOperationReviewSave:    proto.LocalReviewSaveResponse{Saved: true},
+		proto.LocalOperationDeletePrepare: proto.LocalDeletePreview{BatchID: "batch-1", RunID: "run-1", GroupID: "group-1", Count: 1, SelectionDigest: "digest", Token: "one-time-secret", Files: []proto.LocalDeleteFile{{FileID: 7, Path: `D:\media\a.jpg`, Size: 12}}},
+		proto.LocalOperationDeleteExecute: proto.LocalDeleteBatch{BatchID: "batch-1", Status: "complete", Requested: 1, Succeeded: 1},
+		proto.LocalOperationPreviewImage:  proto.LocalImagePreviewResponse{MIME: "image/jpeg", Width: 40, Height: 20, Bytes: []byte{1, 2, 3}},
+	}}
+	s.localAgent = gateway
+
+	created := s.CreateLocalTask(context.Background(), traymodel.LocalTaskCreate{TaskID: "task-1", Roots: []string{`D:\media`}, Mode: proto.LocalTaskModeScanThenAnalysis})
+	if !created.OK || created.Task.TaskID != "task-1" {
+		t.Fatalf("CreateLocalTask = %#v", created)
+	}
+	if page := s.ListLocalTasks(context.Background(), traymodel.PageRequest{Limit: 50}); !page.OK || len(page.Tasks) != 1 {
+		t.Fatalf("ListLocalTasks = %#v", page)
+	}
+	if page := s.ListLocalGroups(context.Background(), traymodel.LocalGroupQuery{Limit: 50}); !page.OK || len(page.Groups) != 1 {
+		t.Fatalf("ListLocalGroups = %#v", page)
+	}
+	if result := s.SaveLocalReview(context.Background(), traymodel.LocalReviewSave{RunID: "run-1", GroupID: "group-1", Reviewer: "local", Decisions: []traymodel.LocalReviewDecision{{FileID: 7, Decision: "keep"}}}); !result.OK {
+		t.Fatalf("SaveLocalReview = %#v", result)
+	}
+	preview := s.PrepareLocalDelete(context.Background(), traymodel.LocalDeletePrepare{RunID: "run-1", GroupID: "group-1"})
+	if !preview.OK || strings.Contains(fmt.Sprintf("%#v", preview), "one-time-secret") {
+		t.Fatalf("PrepareLocalDelete leaked token: %#v", preview)
+	}
+	batch := s.ExecuteLocalDelete(context.Background(), traymodel.LocalDeleteExecute{BatchID: preview.BatchID, SelectionDigest: preview.SelectionDigest})
+	if !batch.OK || batch.Succeeded != 1 {
+		t.Fatalf("ExecuteLocalDelete = %#v", batch)
+	}
+	if second := s.ExecuteLocalDelete(context.Background(), traymodel.LocalDeleteExecute{BatchID: preview.BatchID, SelectionDigest: preview.SelectionDigest}); second.OK {
+		t.Fatalf("one-time token was reusable: %#v", second)
+	}
+	image := s.GetLocalImagePreview(context.Background(), 7)
+	if !image.OK || image.DataBase64 != "AQID" || strings.Contains(image.DataBase64, "file://") {
+		t.Fatalf("GetLocalImagePreview = %#v", image)
+	}
+
+	want := []string{proto.LocalOperationTaskCreate, proto.LocalOperationTaskList, proto.LocalOperationGroupsList, proto.LocalOperationReviewSave, proto.LocalOperationDeletePrepare, proto.LocalOperationDeleteExecute, proto.LocalOperationPreviewImage}
+	if !reflect.DeepEqual(gateway.requests, want) {
+		t.Fatalf("socket operations = %v, want %v", gateway.requests, want)
+	}
 }
 
 func (f *fakeAgentConfigGateway) record(operation string) {

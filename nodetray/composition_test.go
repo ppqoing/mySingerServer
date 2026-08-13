@@ -56,6 +56,8 @@ func (g compositionAgentConfig) PromotePendingEndpoint() {
 	*g.calls = append(*g.calls, "socket-promote-agent-endpoint")
 }
 
+func (g compositionAgentConfig) CallLocal(context.Context, string, any, any) error { return nil }
+
 type compositionComponent struct{}
 
 func (*compositionComponent) Start(context.Context) traymodel.OperationResult {
@@ -166,6 +168,7 @@ func validCompositionInputs() productionCompositionInputs {
 		Store:             compositionStore{},
 		Validator:         compositionValidator{},
 		AgentConfig:       compositionAgentConfig{loaded: trayconfig.AgentForm{DataDir: "socket-agent"}, calls: &agentConfigCalls},
+		LocalAgent:        compositionAgentConfig{calls: &agentConfigCalls},
 		MachineID:         "node-" + strings.Repeat("1", 64),
 		Agent:             component,
 		Helper:            component,

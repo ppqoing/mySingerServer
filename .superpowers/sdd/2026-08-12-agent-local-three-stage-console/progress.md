@@ -58,3 +58,6 @@ Task 11: complete pending commit — committed-review prepare, process-local one
 Task 11: complete (commit 8e280159; focused/full/race/static retention gates PASS; original `.codex-temp/` untouched).
 
 Task 12: complete pending commit — central local-scope tables, SQLite outbox snapshot/ack, atomic published event, mixed remote transaction, idempotent replay and remote deleted retention implemented; Store/Syncer/cmd full and race gates PASS. Real PostgreSQL integration SKIP because `TEST_POSTGRES_DSN` is unset and remains a Task 14 runtime gate.
+Task 12: complete (commit 9ce4736b; focused/full/race gates PASS; PostgreSQL runtime integration remains explicitly deferred to Task 14 because TEST_POSTGRES_DSN is unset).
+
+Task 13: complete pending commit — NodeTray typed Socket-backed local task/analysis/review/delete/preview methods, Go-only delete token custody, Wails bindings and four local-console pages implemented. Go NodeTray full packages PASS; frontend 24 files/115 tests, lint and production build PASS; Windows Wails nodynamic build generated bindings/embed successfully.

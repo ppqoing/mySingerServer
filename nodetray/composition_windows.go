@@ -237,7 +237,7 @@ func buildWindowsProductionInputs(layout production.Layout, userSID string, nati
 	}
 	finalPaths := bootstrap.OSFinalPathResolver{}
 	return productionCompositionInputs{
-		Store: native.Store, Validator: production.NewValidator(native.Store), AgentConfig: production.NewAgentConfigGateway(sharedAgentController),
+		Store: native.Store, Validator: production.NewValidator(native.Store), AgentConfig: production.NewAgentConfigGateway(sharedAgentController), LocalAgent: sharedAgentController,
 		MachineID: native.MachineID,
 		Agent:     factory.Agent(), Helper: factory.Helper(),
 		AgentFingerprint: factory.Agent(), HelperFingerprint: factory.Helper(),

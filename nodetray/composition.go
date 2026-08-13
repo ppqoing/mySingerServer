@@ -19,6 +19,7 @@ type productionCompositionInputs struct {
 	Store             trayapp.Store
 	Validator         trayapp.Validator
 	AgentConfig       trayapp.AgentConfigGateway
+	LocalAgent        trayapp.LocalAgentGateway
 	MachineID         string
 	Agent             trayapp.Component
 	Helper            trayapp.Component
@@ -78,8 +79,9 @@ func composeProductionBackendWith(inputs productionCompositionInputs) (*Backend,
 	lifecycle := &preparedRuntimeLifecycle{prepare: inputs.Prepare, runtime: runtimeLifecycle, events: events, closeAgentControl: inputs.CloseAgentControl}
 	service := trayapp.NewService(trayapp.Dependencies{
 		Store: inputs.Store, Validator: inputs.Validator, AgentConfig: inputs.AgentConfig,
-		MachineID: inputs.MachineID,
-		Agent:     inputs.Agent, Helper: inputs.Helper,
+		LocalAgent: inputs.LocalAgent,
+		MachineID:  inputs.MachineID,
+		Agent:      inputs.Agent, Helper: inputs.Helper,
 		AgentFingerprint:  inputs.AgentFingerprint,
 		HelperFingerprint: inputs.HelperFingerprint,
 		Task:              inputs.Task, Elevation: inputs.Elevation, LoginStart: inputs.LoginStart,
@@ -91,7 +93,7 @@ func composeProductionBackendWith(inputs productionCompositionInputs) (*Backend,
 }
 
 func validateProductionComposition(inputs productionCompositionInputs) error {
-	if inputs.Store == nil || inputs.Validator == nil || inputs.AgentConfig == nil || inputs.Agent == nil || inputs.Helper == nil ||
+	if inputs.Store == nil || inputs.Validator == nil || inputs.AgentConfig == nil || inputs.LocalAgent == nil || inputs.Agent == nil || inputs.Helper == nil ||
 		!machineid.Valid(inputs.MachineID) || inputs.AgentFingerprint == nil || inputs.HelperFingerprint == nil ||
 		inputs.Task == nil || inputs.Elevation == nil || inputs.LoginStart == nil || inputs.FinalPaths == nil ||
 		inputs.Opener == nil || inputs.Workers == nil || inputs.ProcessWaiter == nil || inputs.Paths == nil || inputs.Instance == nil ||
