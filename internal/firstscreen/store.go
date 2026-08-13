@@ -21,6 +21,7 @@ const (
 		SELECT id,sha512,machine_id,disk_no,path,size
 		FROM files
 		WHERE sha512 = ANY($1::text[])
+		  AND status <> 'deleted'
 		ORDER BY sha512,id`
 	qDeleteMembersM3 = `
 		DELETE FROM dup_members
@@ -188,6 +189,7 @@ func (s *Store) StreamFilesBySHA(
 			SELECT sha512,id,machine_id,disk_no,path,size
 			FROM files
 			WHERE sha512 IS NOT NULL
+			  AND status <> 'deleted'
 			  AND ($1::text IS NULL OR (sha512,id) > ($1::text,$2))
 			ORDER BY sha512,id
 			LIMIT $3`,

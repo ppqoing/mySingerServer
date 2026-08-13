@@ -234,3 +234,59 @@ func TestLocalReviewDTOsValidatePagingFiltersAndExplicitDecisions(t *testing.T) 
 		t.Fatal("invalid review decision was accepted")
 	}
 }
+
+// Break caught: a local delete request can carry caller-controlled paths or
+// omit the committed review identity, bypassing the review-bound preview.
+func TestLocalDeleteDTOsBindExecutionToPreparedReviewWithoutRequestPaths(t *testing.T) {
+	prepare := LocalDeletePrepareRequest{RunID: "run-1", GroupID: "group-1"}
+	if err := prepare.Validate(); err != nil {
+		t.Fatalf("valid prepare: %v", err)
+	}
+	payload, err := EncodeLocalPayload(prepare)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]msgpack.RawMessage
+	if err := msgpack.Unmarshal(payload, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := raw["path"]; exists {
+		t.Fatal("delete prepare exposed a request path")
+	}
+
+	execute := LocalDeleteExecuteRequest{BatchID: "batch-1", SelectionDigest: "digest", Token: "one-time"}
+	if err := execute.Validate(); err != nil {
+		t.Fatalf("valid execute: %v", err)
+	}
+	status := LocalDeleteStatusRequest{BatchID: "batch-1"}
+	if err := status.Validate(); err != nil {
+		t.Fatalf("valid status: %v", err)
+	}
+
+	for name, invalid := range map[string]any{
+		"prepare run":    LocalDeletePrepareRequest{GroupID: "group-1"},
+		"prepare group":  LocalDeletePrepareRequest{RunID: "run-1"},
+		"execute batch":  LocalDeleteExecuteRequest{SelectionDigest: "digest", Token: "one-time"},
+		"execute digest": LocalDeleteExecuteRequest{BatchID: "batch-1", Token: "one-time"},
+		"execute token":  LocalDeleteExecuteRequest{BatchID: "batch-1", SelectionDigest: "digest"},
+		"status batch":   LocalDeleteStatusRequest{},
+	} {
+		t.Run(name, func(t *testing.T) {
+			validator := invalid.(interface{ Validate() error })
+			if err := validator.Validate(); err == nil {
+				t.Fatalf("invalid DTO accepted: %#v", invalid)
+			}
+		})
+	}
+
+	malicious, err := msgpack.Marshal(map[string]any{
+		"run_id": "run-1", "group_id": "group-1", "path": `D:\\private\\source.jpg`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded LocalDeletePrepareRequest
+	if err := DecodeLocalDeletePayload(malicious, &decoded); err == nil {
+		t.Fatal("delete prepare accepted an unknown path")
+	}
+}

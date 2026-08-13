@@ -7,11 +7,112 @@ import (
 	"testing"
 	"time"
 
+	"dedup/internal/localdelete"
 	"dedup/internal/localtask"
 	"dedup/internal/proto"
 	"dedup/internal/worker"
 	"github.com/vmihailenco/msgpack/v5"
 )
+
+// Break caught: Socket deletion accepts an arbitrary path or dispatches
+// prepare/execute/status without the strict review-bound DTOs.
+func TestLocalDeleteHandlerDispatchesStrictReviewBoundCommands(t *testing.T) {
+	service := &fakeLocalDeleteService{}
+	handler := NewLocalDeleteHandler(service)
+	preparePayload, _ := proto.EncodeLocalPayload(proto.LocalDeletePrepareRequest{RunID: "run", GroupID: "group"})
+	response := handler.HandleLocal(context.Background(), proto.LocalRequest{
+		RequestID: "prepare", Operation: proto.LocalOperationDeletePrepare, Payload: preparePayload,
+	})
+	if !response.OK || service.prepareCalls != 1 {
+		t.Fatalf("prepare=%#v calls=%d", response, service.prepareCalls)
+	}
+	var preview proto.LocalDeletePreview
+	if err := proto.DecodeLocalPayload(response.Payload, &preview); err != nil || preview.Token != "token" {
+		t.Fatalf("preview=%#v err=%v", preview, err)
+	}
+
+	executePayload, _ := proto.EncodeLocalPayload(proto.LocalDeleteExecuteRequest{
+		BatchID: "batch", SelectionDigest: "digest", Token: "token",
+	})
+	response = handler.HandleLocal(context.Background(), proto.LocalRequest{
+		RequestID: "execute", Operation: proto.LocalOperationDeleteExecute, Payload: executePayload,
+	})
+	if !response.OK || service.executeCalls != 1 {
+		t.Fatalf("execute=%#v calls=%d", response, service.executeCalls)
+	}
+	statusPayload, _ := proto.EncodeLocalPayload(proto.LocalDeleteStatusRequest{BatchID: "batch"})
+	response = handler.HandleLocal(context.Background(), proto.LocalRequest{
+		RequestID: "status", Operation: proto.LocalOperationDeleteStatus, Payload: statusPayload,
+	})
+	if !response.OK || service.statusCalls != 1 {
+		t.Fatalf("status=%#v calls=%d", response, service.statusCalls)
+	}
+
+	malicious, _ := msgpack.Marshal(map[string]any{
+		"run_id": "run", "group_id": "group", "path": `D:\private\source.jpg`,
+	})
+	response = handler.HandleLocal(context.Background(), proto.LocalRequest{
+		RequestID: "malicious", Operation: proto.LocalOperationDeletePrepare, Payload: malicious,
+	})
+	if response.OK || response.ErrorCode != "invalid_delete_selection" || service.prepareCalls != 1 {
+		t.Fatalf("malicious=%#v calls=%d", response, service.prepareCalls)
+	}
+}
+
+func TestLocalDeleteSocketRequiresLoopbackNodeTrayAuth(t *testing.T) {
+	const token = "delete-token"
+	server, _ := newLocalControlTestServer(t)
+	service := &fakeLocalDeleteService{}
+	server.SetLocalControl(token, NewLocalDeleteHandler(service))
+	payload, _ := proto.EncodeLocalPayload(proto.LocalDeletePrepareRequest{RunID: "run", GroupID: "group"})
+	request := proto.LocalRequest{RequestID: "delete", Operation: proto.LocalOperationDeletePrepare, Payload: payload}
+
+	manager, closeManager := startLocalControlTestConnection(t, server, net.ParseIP("127.0.0.1"))
+	defer closeManager()
+	writeLocalControlTestAuth(t, manager, proto.ClientAuth{Role: "manager", Token: token, Version: proto.ProtocolVersion})
+	if result := readDeleteTestMessage(t, manager).(*proto.ClientAuthResult); result.Accepted {
+		t.Fatalf("manager auth=%#v", result)
+	}
+
+	remote, closeRemote := startLocalControlTestConnection(t, server, net.ParseIP("10.2.3.4"))
+	defer closeRemote()
+	writeLocalControlTestAuth(t, remote, proto.ClientAuth{Role: "nodetray", Token: token, Version: proto.ProtocolVersion})
+	if result := readDeleteTestMessage(t, remote).(*proto.ClientAuthResult); result.Accepted {
+		t.Fatalf("remote NodeTray auth=%#v", result)
+	}
+
+	client, closeClient := startLocalControlTestConnection(t, server, net.ParseIP("127.0.0.1"))
+	defer closeClient()
+	writeLocalControlTestAuth(t, client, proto.ClientAuth{Role: "nodetray", Token: token, Version: proto.ProtocolVersion})
+	if result := readDeleteTestMessage(t, client).(*proto.ClientAuthResult); !result.Accepted {
+		t.Fatalf("loopback NodeTray auth=%#v", result)
+	}
+	if err := client.WriteFrame(proto.MsgLocalRequest, &request); err != nil {
+		t.Fatal(err)
+	}
+	if response := readDeleteTestMessage(t, client).(*proto.LocalResponse); !response.OK || service.prepareCalls != 1 {
+		t.Fatalf("delete response=%#v calls=%d", response, service.prepareCalls)
+	}
+}
+
+type fakeLocalDeleteService struct {
+	prepareCalls int
+	executeCalls int
+	statusCalls  int
+}
+
+func (fake *fakeLocalDeleteService) Prepare(context.Context, localdelete.DeleteSelection) (localdelete.DeletePreview, error) {
+	fake.prepareCalls++
+	return proto.LocalDeletePreview{BatchID: "batch", SelectionDigest: "digest", Token: "token"}, nil
+}
+func (fake *fakeLocalDeleteService) Execute(context.Context, localdelete.DeleteExecution) (localdelete.DeleteBatch, error) {
+	fake.executeCalls++
+	return proto.LocalDeleteBatch{BatchID: "batch", Status: "succeeded"}, nil
+}
+func (fake *fakeLocalDeleteService) Status(context.Context, string) (localdelete.DeleteBatch, error) {
+	fake.statusCalls++
+	return proto.LocalDeleteBatch{BatchID: "batch", Status: "succeeded"}, nil
+}
 
 // Break caught: groups/review/preview operations are decoded inconsistently or
 // a strict-preview decode failure still reaches the service with a secret path.

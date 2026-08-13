@@ -44,6 +44,19 @@ func TestAgentLocalHandlerForwardsResultOperations(t *testing.T) {
 	}
 }
 
+func TestAgentLocalHandlerForwardsDeleteOperations(t *testing.T) {
+	deletes := &recordingLocalHandler{}
+	handler := newAgentLocalHandler(agentLocalHandlerInputs{Deletes: deletes})
+	for _, operation := range []string{
+		proto.LocalOperationDeletePrepare, proto.LocalOperationDeleteExecute, proto.LocalOperationDeleteStatus,
+	} {
+		response := handler.HandleLocal(context.Background(), proto.LocalRequest{RequestID: operation, Operation: operation})
+		if !response.OK || deletes.operations[len(deletes.operations)-1] != operation {
+			t.Fatalf("operation %q response=%#v forwarded=%v", operation, response, deletes.operations)
+		}
+	}
+}
+
 type recordingLocalHandler struct{ operations []string }
 
 func (handler *recordingLocalHandler) HandleLocal(_ context.Context, request proto.LocalRequest) proto.LocalResponse {

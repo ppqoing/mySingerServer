@@ -2,8 +2,10 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
+	"dedup/internal/localdelete"
 	"dedup/internal/localtask"
 	"dedup/internal/proto"
 	"dedup/internal/worker"
@@ -84,6 +86,67 @@ type LocalReviewService interface {
 
 type LocalPreviewService interface {
 	Preview(context.Context, proto.LocalImagePreviewRequest) (proto.LocalImagePreviewResponse, error)
+}
+
+type LocalDeleteHandler struct{ service localdelete.Service }
+
+func NewLocalDeleteHandler(service localdelete.Service) *LocalDeleteHandler {
+	return &LocalDeleteHandler{service: service}
+}
+
+func (handler *LocalDeleteHandler) HandleLocal(ctx context.Context, request proto.LocalRequest) proto.LocalResponse {
+	if handler == nil || handler.service == nil || ctx == nil || ctx.Err() != nil {
+		return localTaskFailure(request.RequestID, "local_delete_unavailable")
+	}
+	switch request.Operation {
+	case proto.LocalOperationDeletePrepare:
+		var input proto.LocalDeletePrepareRequest
+		if err := proto.DecodeLocalDeletePayload(request.Payload, &input); err != nil || input.Validate() != nil {
+			return localTaskFailure(request.RequestID, "invalid_delete_selection")
+		}
+		preview, err := handler.service.Prepare(ctx, localdelete.DeleteSelection{RunID: input.RunID, GroupID: input.GroupID})
+		if err != nil {
+			return localTaskFailure(request.RequestID, safeLocalDeleteError(err))
+		}
+		return localTaskSuccess(request.RequestID, preview)
+	case proto.LocalOperationDeleteExecute:
+		var input proto.LocalDeleteExecuteRequest
+		if err := proto.DecodeLocalDeletePayload(request.Payload, &input); err != nil || input.Validate() != nil {
+			return localTaskFailure(request.RequestID, "invalid_delete_execution")
+		}
+		batch, err := handler.service.Execute(ctx, localdelete.DeleteExecution{
+			BatchID: input.BatchID, SelectionDigest: input.SelectionDigest, Token: input.Token,
+		})
+		if err != nil {
+			return localTaskFailure(request.RequestID, safeLocalDeleteError(err))
+		}
+		return localTaskSuccess(request.RequestID, batch)
+	case proto.LocalOperationDeleteStatus:
+		var input proto.LocalDeleteStatusRequest
+		if err := proto.DecodeLocalDeletePayload(request.Payload, &input); err != nil || input.Validate() != nil {
+			return localTaskFailure(request.RequestID, "invalid_delete_batch")
+		}
+		batch, err := handler.service.Status(ctx, input.BatchID)
+		if err != nil {
+			return localTaskFailure(request.RequestID, safeLocalDeleteError(err))
+		}
+		return localTaskSuccess(request.RequestID, batch)
+	default:
+		return localTaskFailure(request.RequestID, proto.UnsupportedOperationErrorCode)
+	}
+}
+
+func safeLocalDeleteError(err error) string {
+	if err == nil {
+		return ""
+	}
+	if errors.Is(err, localdelete.ErrInvalidToken) {
+		return "invalid_delete_token"
+	}
+	if errors.Is(err, localdelete.ErrSelectionChanged) {
+		return "delete_selection_changed"
+	}
+	return "local_delete_failed"
 }
 
 type LocalResultHandler struct {

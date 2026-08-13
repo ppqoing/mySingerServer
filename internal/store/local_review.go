@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"time"
 )
@@ -15,6 +16,94 @@ type LocalReview struct {
 	Decision  string
 	Reviewer  string
 	Note      string
+}
+
+type DeletionFile struct {
+	FileID    int64
+	MachineID string
+	Path      string
+	SHA512    string
+	Size      int64
+	MTime     int64
+}
+
+type CommittedDeletion struct {
+	MachineID  string
+	RunID      string
+	GroupID    string
+	Generation int64
+	Category   string
+	Verdict    string
+	Files      []DeletionFile
+}
+
+// LoadCommittedDeletion loads only delete choices from a fully committed
+// review belonging to the machine's current published analysis.
+func (d *DB) LoadCommittedDeletion(
+	ctx context.Context,
+	machineID, runID, groupID string,
+) (CommittedDeletion, error) {
+	if d == nil || d.db == nil || machineID == "" || runID == "" || groupID == "" {
+		return CommittedDeletion{}, fmt.Errorf("store: invalid deletion selection")
+	}
+	selection := CommittedDeletion{MachineID: machineID, RunID: runID, GroupID: groupID}
+	err := d.db.QueryRowContext(ctx, `
+		SELECT g.generation,g.category,g.verdict
+		FROM local_dup_groups g
+		JOIN local_current_analysis c
+		  ON c.machine_id=g.machine_id AND c.run_id=g.run_id AND c.generation=g.generation
+		WHERE g.machine_id=?1 AND g.run_id=?2 AND g.group_id=?3`,
+		machineID, runID, groupID,
+	).Scan(&selection.Generation, &selection.Category, &selection.Verdict)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return CommittedDeletion{}, ErrLocalResultNotFound
+		}
+		return CommittedDeletion{}, err
+	}
+	if selection.Category != "exact" && selection.Verdict != "duplicate" {
+		return CommittedDeletion{}, fmt.Errorf("store: deletion selection is not eligible")
+	}
+	var memberCount, reviewCount, keepCount int
+	if err := d.db.QueryRowContext(ctx, `
+		SELECT COUNT(*),COUNT(r.file_id),COALESCE(SUM(CASE WHEN r.decision='keep' THEN 1 ELSE 0 END),0)
+		FROM local_dup_members m
+		LEFT JOIN local_reviews r
+		  ON r.machine_id=m.machine_id AND r.run_id=m.run_id AND r.generation=m.generation
+		 AND r.group_id=m.group_id AND r.file_id=m.file_id
+		WHERE m.machine_id=?1 AND m.run_id=?2 AND m.generation=?3 AND m.group_id=?4`,
+		machineID, runID, selection.Generation, groupID,
+	).Scan(&memberCount, &reviewCount, &keepCount); err != nil {
+		return CommittedDeletion{}, err
+	}
+	if memberCount == 0 || reviewCount != memberCount || keepCount == 0 {
+		return CommittedDeletion{}, fmt.Errorf("store: deletion review is incomplete")
+	}
+	rows, err := d.db.QueryContext(ctx, `
+		SELECT f.id,f.machine_id,f.path,f.sha512,f.size,f.mtime
+		FROM local_reviews r
+		JOIN files f ON f.machine_id=r.machine_id AND f.id=r.file_id
+		WHERE r.machine_id=?1 AND r.run_id=?2 AND r.generation=?3 AND r.group_id=?4
+		  AND r.decision='delete' AND f.status<>'deleted' AND f.sha512 IS NOT NULL
+		ORDER BY f.id`, machineID, runID, selection.Generation, groupID)
+	if err != nil {
+		return CommittedDeletion{}, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var file DeletionFile
+		if err := rows.Scan(&file.FileID, &file.MachineID, &file.Path, &file.SHA512, &file.Size, &file.MTime); err != nil {
+			return CommittedDeletion{}, err
+		}
+		selection.Files = append(selection.Files, file)
+	}
+	if err := rows.Err(); err != nil {
+		return CommittedDeletion{}, err
+	}
+	if len(selection.Files) == 0 {
+		return CommittedDeletion{}, fmt.Errorf("store: deletion review has no active delete members")
+	}
+	return selection, nil
 }
 
 func (d *DB) SaveLocalReview(ctx context.Context, review LocalReview) error {

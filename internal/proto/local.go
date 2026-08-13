@@ -341,6 +341,84 @@ type LocalReviewSaveResponse struct {
 	Saved bool `msgpack:"saved"`
 }
 
+type LocalDeletePrepareRequest struct {
+	RunID   string `msgpack:"run_id"`
+	GroupID string `msgpack:"group_id"`
+}
+
+func (request LocalDeletePrepareRequest) Validate() error {
+	if request.RunID == "" || request.GroupID == "" ||
+		strings.TrimSpace(request.RunID) != request.RunID ||
+		strings.TrimSpace(request.GroupID) != request.GroupID {
+		return errors.New("invalid_delete_selection")
+	}
+	return nil
+}
+
+type LocalDeleteFile struct {
+	FileID int64  `msgpack:"file_id"`
+	Path   string `msgpack:"path"`
+	Size   int64  `msgpack:"size"`
+	SHA512 string `msgpack:"sha512"`
+}
+
+type LocalDeletePreview struct {
+	BatchID         string            `msgpack:"batch_id"`
+	RunID           string            `msgpack:"run_id"`
+	GroupID         string            `msgpack:"group_id"`
+	Generation      int64             `msgpack:"generation"`
+	Count           int               `msgpack:"count"`
+	TotalSize       int64             `msgpack:"total_size"`
+	SelectionDigest string            `msgpack:"selection_digest"`
+	Token           string            `msgpack:"token"`
+	ExpiresAt       int64             `msgpack:"expires_at"`
+	Files           []LocalDeleteFile `msgpack:"files"`
+}
+
+type LocalDeleteExecuteRequest struct {
+	BatchID         string `msgpack:"batch_id"`
+	SelectionDigest string `msgpack:"selection_digest"`
+	Token           string `msgpack:"token"`
+}
+
+func (request LocalDeleteExecuteRequest) Validate() error {
+	if request.BatchID == "" || request.SelectionDigest == "" || request.Token == "" ||
+		strings.TrimSpace(request.BatchID) != request.BatchID ||
+		strings.TrimSpace(request.SelectionDigest) != request.SelectionDigest ||
+		strings.TrimSpace(request.Token) != request.Token {
+		return errors.New("invalid_delete_execution")
+	}
+	return nil
+}
+
+type LocalDeleteStatusRequest struct {
+	BatchID string `msgpack:"batch_id"`
+}
+
+func (request LocalDeleteStatusRequest) Validate() error {
+	if request.BatchID == "" || strings.TrimSpace(request.BatchID) != request.BatchID {
+		return errors.New("invalid_delete_batch")
+	}
+	return nil
+}
+
+type LocalDeleteItem struct {
+	FileID    int64  `msgpack:"file_id"`
+	Result    string `msgpack:"result"`
+	ErrorCode string `msgpack:"error_code,omitempty"`
+	Uncertain bool   `msgpack:"uncertain,omitempty"`
+}
+
+type LocalDeleteBatch struct {
+	BatchID   string            `msgpack:"batch_id"`
+	Status    string            `msgpack:"status"`
+	Requested int               `msgpack:"requested"`
+	Succeeded int               `msgpack:"succeeded"`
+	Failed    int               `msgpack:"failed"`
+	Uncertain int               `msgpack:"uncertain"`
+	Items     []LocalDeleteItem `msgpack:"items"`
+}
+
 type LocalImagePreviewRequest struct {
 	FileID    int64  `msgpack:"file_id"`
 	MaxWidth  int32  `msgpack:"max_width"`
@@ -393,6 +471,15 @@ func DecodeLocalImagePreviewPayload(payload []byte, destination *LocalImagePrevi
 	}
 	if destination == nil {
 		return errors.New("invalid_preview")
+	}
+	decoder := msgpack.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields(true)
+	return decoder.Decode(destination)
+}
+
+func DecodeLocalDeletePayload(payload []byte, destination any) error {
+	if len(payload) > LocalPayloadMaxBytes || destination == nil {
+		return errors.New("invalid_delete")
 	}
 	decoder := msgpack.NewDecoder(bytes.NewReader(payload))
 	decoder.DisallowUnknownFields(true)

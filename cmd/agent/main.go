@@ -33,6 +33,7 @@ import (
 	"dedup/internal/firstscreen"
 	"dedup/internal/localanalysis"
 	"dedup/internal/localcontrol"
+	"dedup/internal/localdelete"
 	"dedup/internal/localpreview"
 	"dedup/internal/localreview"
 	"dedup/internal/localtask"
@@ -309,6 +310,7 @@ func runWithDependencies(
 		deleteLogger,
 		logger,
 	)
+	deletes := localdelete.NewService(cfg.MachineID, local, forwarder)
 	var listenerReady atomic.Bool
 	provider := newAgentStatusProvider(agentStatusInputs{
 		MachineID:      cfg.MachineID,
@@ -325,6 +327,7 @@ func runWithDependencies(
 		EffectiveConfigSHA256: configSHA256,
 		Tasks:                 agent.NewLocalTaskHandler(tasks),
 		Results:               agent.NewLocalResultHandler(reviews, previews),
+		Deletes:               agent.NewLocalDeleteHandler(deletes),
 	})
 	return runService(
 		workerPool,
@@ -373,7 +376,7 @@ func buildDeleteForwarder(
 	state agentdelete.StateStore,
 	deleteLogger *slog.Logger,
 	logger *slog.Logger,
-) agent.DeleteHandler {
+) *agentdelete.Forwarder {
 	return agentdelete.NewForwarder(
 		cfg.MachineID,
 		cfg.Delete,
@@ -642,6 +645,7 @@ type agentLocalHandlerInputs struct {
 	EffectiveConfigSHA256 string
 	Tasks                 agent.LocalHandler
 	Results               agent.LocalHandler
+	Deletes               agent.LocalHandler
 }
 
 type agentLocalHandler struct {
@@ -717,6 +721,9 @@ func (h *agentLocalHandler) HandleLocal(ctx context.Context, request proto.Local
 			request.Operation == proto.LocalOperationReviewSave ||
 			request.Operation == proto.LocalOperationPreviewImage) {
 			return h.inputs.Results.HandleLocal(ctx, request)
+		}
+		if h.inputs.Deletes != nil && strings.HasPrefix(request.Operation, "local.delete.") {
+			return h.inputs.Deletes.HandleLocal(ctx, request)
 		}
 		return localAgentFailure(request.RequestID, proto.UnsupportedOperationErrorCode)
 	}
