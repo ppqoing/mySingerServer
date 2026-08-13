@@ -5,7 +5,10 @@ export type TaskRootPlan = {
 }
 
 function normalizeTaskRoot(value: string): string {
-  const normalized = value.trim().replaceAll('/', '\\')
+  const path = value.trim().replaceAll('/', '\\')
+  const unc = /^\\{2,}/.test(path)
+  const remainder = unc ? path.replace(/^\\+/, '') : path
+  const normalized = `${unc ? '\\\\' : ''}${remainder.replace(/\\+/g, '\\')}`
   if (!normalized) return ''
   if (/^[a-zA-Z]:\\+$/.test(normalized)) return `${normalized.slice(0, 1).toUpperCase()}:\\`
   return normalized.replace(/\\+$/, '')

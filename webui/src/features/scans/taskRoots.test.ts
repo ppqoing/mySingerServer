@@ -23,4 +23,11 @@ describe("addTaskRoot", () => {
   test("keeps a drive root stable when duplicate trailing separators are supplied", () => {
     expect(addTaskRoot([], "D:\\\\")).toEqual({ kind: "add", roots: ["D:\\"] });
   });
+
+  test("collapses repeated middle separators before duplicate and parent coverage checks", () => {
+    expect(addTaskRoot(["D:\\Media"], "d:\\\\media").kind).toBe("duplicate");
+    expect(addTaskRoot(["\\\\server\\share\\Photos"], "\\\\server\\\\share")).toEqual({
+      kind: "replace", roots: ["\\\\server\\share"], covered: ["\\\\server\\share\\Photos"]
+    });
+  });
 });

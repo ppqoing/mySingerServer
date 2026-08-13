@@ -37,10 +37,12 @@ export function RemotePathBrowser({ machineID, api, open, onAdd, onClose }: Remo
       const result = await api.browseAgentFilesystem(machineID, {
         path, showHidden: hidden, cursor, limit: pageSize
       }, request.signal);
-      if (request.signal.aborted) return;
+      if (request.signal.aborted) return false;
       applyPage(result, append);
+      return true;
     } catch (cause) {
       if (!request.signal.aborted) setError(cause instanceof Error ? cause.message : "无法浏览远程目录。");
+      return false;
     } finally {
       if (controller.current === request) setLoading(false);
     }
@@ -59,9 +61,8 @@ export function RemotePathBrowser({ machineID, api, open, onAdd, onClose }: Remo
   const breadcrumbPaths = useMemo(() => windowsBreadcrumbs(currentPath), [currentPath]);
   if (!open) return null;
 
-  const navigate = (path: string) => {
-    setSelectedPath(path);
-    void browse(path, "", false, showHidden);
+  const navigate = async (path: string) => {
+    if (await browse(path, "", false, showHidden)) setSelectedPath(path);
   };
   const addCurrent = () => {
     const path = selectedPath || currentPath;

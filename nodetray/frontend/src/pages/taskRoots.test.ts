@@ -43,4 +43,11 @@ describe('planTaskRootAddition', () => {
       kind: 'added', roots: ['\\\\server\\share', '\\\\server\\share2'], coveredRoots: [],
     })
   })
+
+  it('collapses repeated middle separators before duplicate and parent coverage checks', () => {
+    expect(planTaskRootAddition(['D:\\Media'], 'd:\\\\media')).toMatchObject({ kind: 'duplicate' })
+    expect(planTaskRootAddition(['\\\\server\\share\\Photos'], '\\\\server\\\\share')).toEqual({
+      kind: 'replace-children', roots: ['\\\\server\\share'], coveredRoots: ['\\\\server\\share\\Photos'],
+    })
+  })
 })

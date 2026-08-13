@@ -72,6 +72,26 @@ func TestFilesystemBrowseHTTPUsesBodyPathAndReturnsFilesDisabled(t *testing.T) {
 	}
 }
 
+func TestFilesystemBrowseHTTPIncludesEmptyNavigationFields(t *testing.T) {
+	api := NewAPI(nil, nil, nil)
+	api.SetFilesystemBrowser(&fakeFilesystemBrowseService{})
+	request := httptest.NewRequest(http.MethodPost, "/api/agents/machine-a/filesystem/browse", strings.NewReader(`{"path":""}`))
+	response := httptest.NewRecorder()
+	api.Routes().ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"current_path", "parent_path", "next_cursor"} {
+		if got, exists := body[field]; !exists || string(got) != `""` {
+			t.Fatalf("%s=%s exists=%t body=%s", field, got, exists, response.Body.String())
+		}
+	}
+}
+
 func TestFilesystemBrowseHTTPRejectsUnknownJSONField(t *testing.T) {
 	api := NewAPI(nil, nil, nil)
 	api.SetFilesystemBrowser(&fakeFilesystemBrowseService{})

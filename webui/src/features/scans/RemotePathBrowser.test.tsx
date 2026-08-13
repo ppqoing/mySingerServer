@@ -66,16 +66,19 @@ test("reloads hidden entries and appends the next page", async () => {
   expect(await screen.findByRole("button", { name: "More" })).toBeVisible();
 });
 
-test("keeps the selected directory after a browse error", async () => {
+test("keeps the last successful directory addable after a navigation error", async () => {
   const browse = vi.fn()
     .mockResolvedValueOnce(page("D:\\Media", [{ name: "Photos", path: "D:\\Media\\Photos", kind: "directory", hidden: false, system: false, selectable: true }]))
     .mockRejectedValueOnce(new Error("网络断开"));
-  render(<RemotePathBrowser api={apiFor(browse)} machineID="agent-a" onAdd={vi.fn()} onClose={vi.fn()} open />);
+  const onAdd = vi.fn();
+  render(<RemotePathBrowser api={apiFor(browse)} machineID="agent-a" onAdd={onAdd} onClose={vi.fn()} open />);
   const user = userEvent.setup();
 
   await user.click(await screen.findByRole("button", { name: "Photos" }));
   expect(await screen.findByRole("alert")).toHaveTextContent("网络断开");
-  expect(screen.getByText("D:\\Media\\Photos")).toBeVisible();
+  expect(screen.getByText("D:\\Media")).toBeVisible();
+  await user.click(screen.getByRole("button", { name: "添加当前目录" }));
+  expect(onAdd).toHaveBeenCalledWith("D:\\Media");
 });
 
 test("aborts the active browse request when the dialog closes", async () => {

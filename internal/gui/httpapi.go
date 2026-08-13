@@ -128,10 +128,10 @@ type filesystemBrowseHTTPEntry struct {
 }
 
 type filesystemBrowseHTTPResponse struct {
-	CurrentPath string                      `json:"current_path,omitempty"`
-	ParentPath  string                      `json:"parent_path,omitempty"`
+	CurrentPath string                      `json:"current_path"`
+	ParentPath  string                      `json:"parent_path"`
 	Entries     []filesystemBrowseHTTPEntry `json:"entries"`
-	NextCursor  string                      `json:"next_cursor,omitempty"`
+	NextCursor  string                      `json:"next_cursor"`
 }
 
 func (api *API) handleFilesystemBrowse(response http.ResponseWriter, request *http.Request) {

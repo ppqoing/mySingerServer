@@ -24,10 +24,16 @@ export function addTaskRoot(current: readonly string[], candidate: string): Root
 }
 
 export function normalizeTaskRoot(value: string): string | undefined {
-  const path = value.trim().replaceAll("/", "\\");
+  const path = collapseWindowsSeparators(value.trim().replaceAll("/", "\\"));
   if (!isAbsoluteWindowsPath(path)) return undefined;
   if (/^[a-zA-Z]:\\+$/.test(path)) return `${path.slice(0, 2)}\\`;
   return path.replace(/\\+$/, "");
+}
+
+function collapseWindowsSeparators(path: string): string {
+  const unc = /^\\{2,}/.test(path);
+  const remainder = unc ? path.replace(/^\\+/, "") : path;
+  return `${unc ? "\\\\" : ""}${remainder.replace(/\\+/g, "\\")}`;
 }
 
 function isAbsoluteWindowsPath(path: string): boolean {
