@@ -87,14 +87,31 @@ func TestNewAgentEnumeratorDisabledUsesWalker(t *testing.T) {
 // inject the constructed browser into the Agent server.
 func TestSetAgentFilesystemBrowserConstructsAndInjectsOnce(t *testing.T) {
 	setter := &recordingFilesystemBrowserSetter{}
-	want := agent.NewFilesystemBrowser()
-	calls := 0
+	browser := &recordingInjectedFilesystemBrowser{}
+	constructCalls := 0
 	setAgentFilesystemBrowser(setter, func() agent.FilesystemBrowser {
-		calls++
-		return want
+		constructCalls++
+		return browser
 	})
-	if calls != 1 || setter.calls != 1 || setter.browser != want {
-		t.Fatalf("browser construction/injection calls=%d/%d browser=%#v", calls, setter.calls, setter.browser)
+	if constructCalls != 1 || setter.calls != 1 {
+		t.Fatalf("browser construction/injection calls=%d/%d", constructCalls, setter.calls)
+	}
+	response := setter.browser.Browse(context.Background(), proto.FilesystemBrowseRequest{RequestID: "browse-wiring"})
+	if browser.calls != 1 || response.RequestID != "browse-wiring" || response.ErrorCode != "injected_browser" {
+		t.Fatalf("injected browser calls=%d response=%#v", browser.calls, response)
+	}
+}
+
+type recordingInjectedFilesystemBrowser struct{ calls int }
+
+func (browser *recordingInjectedFilesystemBrowser) Browse(
+	_ context.Context,
+	request proto.FilesystemBrowseRequest,
+) proto.FilesystemBrowseResponse {
+	browser.calls++
+	return proto.FilesystemBrowseResponse{
+		RequestID: request.RequestID,
+		ErrorCode: "injected_browser",
 	}
 }
 
