@@ -51,7 +51,7 @@ func TestFilesystemBrokerPairsResponseByMachineAndRequestID(t *testing.T) {
 	}
 }
 
-func TestFilesystemBrokerDoesNotPairWrongMachine(t *testing.T) {
+func TestFilesystemBrokerConsumesWrongMachineResponseWithoutPairing(t *testing.T) {
 	transport := &fakeFilesystemTransport{online: true, sent: make(chan proto.FilesystemBrowseRequest, 1)}
 	broker := NewFilesystemBroker(transport)
 	result := make(chan proto.FilesystemBrowseResponse, 1)
@@ -60,8 +60,13 @@ func TestFilesystemBrokerDoesNotPairWrongMachine(t *testing.T) {
 		result <- response
 	}()
 	sent := <-transport.sent
-	if broker.Dispatch("machine-b", &proto.FilesystemBrowseResponse{RequestID: sent.RequestID}) {
-		t.Fatal("wrong machine response claimed")
+	if !broker.Dispatch("machine-b", &proto.FilesystemBrowseResponse{RequestID: sent.RequestID}) {
+		t.Fatal("wrong machine browse response was not consumed")
+	}
+	select {
+	case response := <-result:
+		t.Fatalf("wrong machine paired response=%#v", response)
+	case <-time.After(50 * time.Millisecond):
 	}
 	if !broker.Dispatch("machine-a", &proto.FilesystemBrowseResponse{RequestID: sent.RequestID, CurrentPath: `D:\Media`}) {
 		t.Fatal("correct response not claimed")
@@ -83,8 +88,8 @@ func TestFilesystemBrokerCancellationClearsPendingAndIgnoresLateResponse(t *test
 	if err := <-result; !errors.Is(err, context.Canceled) {
 		t.Fatalf("Browse error=%v, want context cancellation", err)
 	}
-	if broker.Dispatch("machine-a", &proto.FilesystemBrowseResponse{RequestID: sent.RequestID}) {
-		t.Fatal("late response claimed after cancellation")
+	if !broker.Dispatch("machine-a", &proto.FilesystemBrowseResponse{RequestID: sent.RequestID}) {
+		t.Fatal("late browse response was not consumed after cancellation")
 	}
 }
 

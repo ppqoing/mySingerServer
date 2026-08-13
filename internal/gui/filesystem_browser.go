@@ -74,8 +74,11 @@ func (broker *FilesystemBroker) Browse(
 
 func (broker *FilesystemBroker) Dispatch(machineID string, message any) bool {
 	response, ok := message.(*proto.FilesystemBrowseResponse)
-	if !ok || response == nil || response.RequestID == "" {
+	if !ok || response == nil {
 		return false
+	}
+	if response.RequestID == "" {
+		return true
 	}
 	key := filesystemBrowseKey(machineID, response.RequestID)
 	broker.mu.Lock()
@@ -85,7 +88,7 @@ func (broker *FilesystemBroker) Dispatch(machineID string, message any) bool {
 	}
 	broker.mu.Unlock()
 	if !ok {
-		return false
+		return true
 	}
 	pending.result <- *response
 	return true

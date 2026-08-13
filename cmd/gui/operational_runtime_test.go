@@ -58,6 +58,17 @@ func TestOperationalRuntimeRoutesFilesystemBrowseResponseBeforeOtherMessages(t *
 	}
 }
 
+func TestOperationalRuntimeConsumesUnmatchedFilesystemBrowseResponse(t *testing.T) {
+	resources := &postgresOperationalRuntimeResources{
+		filesystemBrowser: gui.NewFilesystemBroker(&operationalFilesystemTransport{
+			sent: make(chan *proto.FilesystemBrowseRequest, 1),
+		}),
+	}
+	resources.dispatchAgentMessage(context.Background(), "machine-a", nil, &proto.FilesystemBrowseResponse{
+		RequestID: "late-response",
+	})
+}
+
 func TestBuildOperationalRuntimeClosesResourcesAfterIntermediateFailure(t *testing.T) {
 	originalFactory := guiNewOperationalRuntimeResources
 	defer func() { guiNewOperationalRuntimeResources = originalFactory }()
