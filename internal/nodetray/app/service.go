@@ -24,6 +24,7 @@ type Store interface {
 	SaveTraySettings(traymodel.TraySettings) error
 	LoadHelperForm() (config.HelperForm, error)
 	PrepareHelperWrite(config.HelperForm) (config.PreparedWrite, error)
+	PrepareDefaultHelperWrite() (config.PreparedWrite, error)
 }
 
 type AgentConfigSaveResult struct {
@@ -607,6 +608,9 @@ func (s *Service) StartHelper(ctx context.Context) traymodel.OperationResult {
 	if !settings.HelperEnabled {
 		return operationFailure("helper_disabled", "Helper 未启用")
 	}
+	if result := s.ensureDefaultHelperConfig(ctx); !result.OK {
+		return result
+	}
 	if settings.HelperStartMode == traymodel.StartAutomatic {
 		return taskOperation(ctx, s.task)
 	}
@@ -669,6 +673,11 @@ func (s *Service) SaveTraySettings(ctx context.Context, value traymodel.TraySett
 	helperPolicyChanged := current.HelperEnabled != value.HelperEnabled || current.HelperStartMode != value.HelperStartMode
 
 	if helperPolicyChanged {
+		if value.HelperEnabled {
+			if result := s.ensureDefaultHelperConfig(ctx); !result.OK {
+				return result
+			}
+		}
 		if result := s.reconcileHelperTaskPolicy(ctx, value); !result.OK {
 			return result
 		}
@@ -697,6 +706,34 @@ func (s *Service) SaveTraySettings(ctx context.Context, value traymodel.TraySett
 		return operationFailure("settings_partially_applied", err.Error())
 	}
 	return traymodel.OperationResult{OK: true}
+}
+
+func (s *Service) ensureDefaultHelperConfig(ctx context.Context) traymodel.OperationResult {
+	prepared, err := s.store.PrepareDefaultHelperWrite()
+	if errors.Is(err, config.ErrHelperConfigExists) {
+		return traymodel.OperationResult{OK: true}
+	}
+	if err != nil {
+		return operationFailure("helper_config_invalid", "Helper 默认配置无效")
+	}
+	payload, err := msgpack.Marshal(prepared)
+	if err != nil {
+		return operationFailure("helper_config_invalid", "配置请求编码失败")
+	}
+	invoked, err := s.elevation.Invoke(ctx, elevation.ActionWriteHelperConfig, payload)
+	if err != nil {
+		return operationFailure("helper_config_invalid", err.Error())
+	}
+	if invoked.UACCancelled {
+		return operationFailure(elevation.ErrorCodeUACCancelled, invoked.Response.ErrorSummary)
+	}
+	if !invoked.Response.OK && invoked.Response.ErrorCode != elevation.ErrorCodeHelperConfigExists {
+		return operationFailure(stableCode(invoked.Response.ErrorCode, "helper_config_invalid"), invoked.Response.ErrorSummary)
+	}
+	if s.helperFingerprint == nil {
+		return operationFailure("unavailable", "Helper 摘要更新服务不可用")
+	}
+	return sanitizeOperation(s.helperFingerprint.UpdateExpectedSHA256(prepared.SHA256))
 }
 
 func (s *Service) reconcileHelperTaskPolicy(ctx context.Context, value traymodel.TraySettings) traymodel.OperationResult {

@@ -61,6 +61,20 @@ func TestExecutorWritesStrictPreparedHelperConfigWithOneLastGood(t *testing.T) {
 	}
 }
 
+func TestExecutorCreateOnlyRejectsExistingHelperConfig(t *testing.T) {
+	executor, _, target := newTestExecutor(t)
+	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, validPreparedWrite(t, target, 120).CanonicalJSON, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prepared := validPreparedWrite(t, target, 121)
+	prepared.CreateOnly = true
+	response := executor.Execute(context.Background(), executorRequest(t, elevation.ActionWriteHelperConfig, prepared))
+	assertExecutorFailure(t, response, elevation.ErrorCodeHelperConfigExists)
+}
+
 func TestExecutorRejectsFormalHelperTargetChangedImmediatelyAfterReplace(t *testing.T) {
 	executor, platform, target := newTestExecutor(t)
 	executor.testHooks.replace = func(source, destination string) error {

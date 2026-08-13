@@ -90,6 +90,10 @@ func (s *backendTestStore) PrepareHelperWrite(trayconfig.HelperForm) (trayconfig
 	}, nil
 }
 
+func (*backendTestStore) PrepareDefaultHelperWrite() (trayconfig.PreparedWrite, error) {
+	return trayconfig.PreparedWrite{}, trayconfig.ErrHelperConfigExists
+}
+
 type backendTestValidator struct{ recorder *backendTestRecorder }
 
 func (v backendTestValidator) ValidateHelper(trayconfig.HelperForm) []trayconfig.FieldError {

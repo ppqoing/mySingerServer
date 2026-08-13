@@ -31,15 +31,16 @@ const (
 )
 
 const (
-	ErrorCodeInvalidRequest   = "invalid_request"
-	ErrorCodeUnauthorizedPeer = "unauthorized_peer"
-	ErrorCodeTimeout          = "timeout"
-	ErrorCodeUACCancelled     = "uac_cancelled"
-	ErrorCodeWriteFailed      = "write_failed"
-	ErrorCodeSaveVerifyFailed = "save_verify_failed"
-	ErrorCodeTaskFailed       = "task_failed"
-	ErrorCodeUnavailable      = "unavailable"
-	ErrorCodeInternal         = "internal_error"
+	ErrorCodeInvalidRequest     = "invalid_request"
+	ErrorCodeUnauthorizedPeer   = "unauthorized_peer"
+	ErrorCodeTimeout            = "timeout"
+	ErrorCodeUACCancelled       = "uac_cancelled"
+	ErrorCodeWriteFailed        = "write_failed"
+	ErrorCodeSaveVerifyFailed   = "save_verify_failed"
+	ErrorCodeTaskFailed         = "task_failed"
+	ErrorCodeUnavailable        = "unavailable"
+	ErrorCodeInternal           = "internal_error"
+	ErrorCodeHelperConfigExists = "helper_config_exists"
 )
 
 type Request struct {
@@ -159,7 +160,8 @@ func allowedErrorCode(value string) bool {
 		ErrorCodeSaveVerifyFailed,
 		ErrorCodeTaskFailed,
 		ErrorCodeUnavailable,
-		ErrorCodeInternal:
+		ErrorCodeInternal,
+		ErrorCodeHelperConfigExists:
 		return true
 	default:
 		return false

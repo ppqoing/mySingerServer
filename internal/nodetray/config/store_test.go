@@ -387,6 +387,44 @@ func TestStorePrepareHelperWriteValidatesCanonicalizesCopiesAndNeverWritesProtec
 	}
 }
 
+func TestStorePrepareDefaultHelperWriteIsCreateOnlyAndNeverOverwrites(t *testing.T) {
+	store, paths := newTestStore(t)
+	defaultPath := filepath.Join(filepath.Dir(paths.HelperExecutable), "helper.default.json")
+	writeJSONFixture(t, defaultPath, validHelperConfig(t))
+	prepared, err := store.PrepareDefaultHelperWrite()
+	if err != nil {
+		t.Fatalf("PrepareDefaultHelperWrite: %v", err)
+	}
+	if !prepared.CreateOnly {
+		t.Fatal("default prepared write must be create-only")
+	}
+	if prepared.TargetPath != paths.HelperConfig {
+		t.Fatalf("target = %q", prepared.TargetPath)
+	}
+	if err := os.MkdirAll(filepath.Dir(paths.HelperConfig), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeBytesFixture(t, paths.HelperConfig, []byte("existing"))
+	if _, err := store.PrepareDefaultHelperWrite(); !errors.Is(err, ErrHelperConfigExists) {
+		t.Fatalf("existing target error = %v", err)
+	}
+	if got := readFixture(t, paths.HelperConfig); string(got) != "existing" {
+		t.Fatal("existing helper was changed")
+	}
+}
+
+func TestStorePrepareDefaultHelperWriteRejectsInvalidDefault(t *testing.T) {
+	store, paths := newTestStore(t)
+	defaultPath := filepath.Join(filepath.Dir(paths.HelperExecutable), "helper.default.json")
+	writeBytesFixture(t, defaultPath, []byte(`{"allowed_roots":[]} trailing`))
+	if _, err := store.PrepareDefaultHelperWrite(); err == nil {
+		t.Fatal("invalid default was accepted")
+	}
+	if _, err := os.Stat(paths.HelperConfig); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("target was written: %v", err)
+	}
+}
+
 func TestStoreFormValidationUsesEditBaseAndSharedValidatorsWithoutWriting(t *testing.T) {
 	store, paths := newTestStore(t)
 	base := agentconfig.DefaultAgent()
@@ -740,12 +778,13 @@ func newTestStore(t *testing.T) (*Store, Paths) {
 		AgentConfig:      filepath.Join(root, "agent", "agent.json"),
 		HelperConfig:     filepath.Join(root, "helper", "helper.json"),
 		AgentExecutable:  `D:\nodetray-test-binaries\agent.exe`,
-		HelperExecutable: `D:\nodetray-test-binaries\helper.exe`,
+		HelperExecutable: filepath.Join(root, "bin", "helper.exe"),
 	}
 	store, err := NewStore(paths)
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
+	writeJSONFixture(t, filepath.Join(filepath.Dir(paths.HelperExecutable), "helper.default.json"), validHelperConfig(t))
 	return store, paths
 }
 

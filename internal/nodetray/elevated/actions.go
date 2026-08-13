@@ -130,6 +130,9 @@ func (executor *Executor) Execute(ctx context.Context, request elevation.Request
 			if errors.Is(err, trayconfig.ErrSaveVerify) {
 				return failResponse(response, elevation.ErrorCodeSaveVerifyFailed, "configuration verification failed")
 			}
+			if errors.Is(err, trayconfig.ErrHelperConfigExists) {
+				return failResponse(response, elevation.ErrorCodeHelperConfigExists, "helper configuration already exists")
+			}
 			return failResponse(response, elevation.ErrorCodeWriteFailed, "configuration write failed")
 		}
 	case elevation.ActionInstallHelperTask:
@@ -311,15 +314,24 @@ func (executor *Executor) savePreparedHelper(ctx context.Context, prepared trayc
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return executor.saveLocked(ctx, prepared.CanonicalJSON)
+	return executor.saveLocked(ctx, prepared.CanonicalJSON, prepared.CreateOnly)
 }
 
-func (executor *Executor) saveLocked(ctx context.Context, data []byte) error {
+func (executor *Executor) saveLocked(ctx context.Context, data []byte, createOnly bool) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	target := executor.frozen.helperConfigPath
 	backup := target + ".last-good"
+	if createOnly {
+		for _, path := range []string{target, backup} {
+			if _, err := os.Stat(path); err == nil {
+				return trayconfig.ErrHelperConfigExists
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		}
+	}
 	_, targetStatErr := os.Stat(target)
 	switch {
 	case targetStatErr == nil:

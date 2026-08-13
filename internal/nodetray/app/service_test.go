@@ -20,13 +20,14 @@ import (
 )
 
 type fakeStore struct {
-	settings  traymodel.TraySettings
-	helper    config.HelperForm
-	prepared  config.PreparedWrite
-	calls     *[]string
-	saveErr   error
-	loadErr   error
-	loadCalls int
+	settings   traymodel.TraySettings
+	helper     config.HelperForm
+	prepared   config.PreparedWrite
+	calls      *[]string
+	saveErr    error
+	defaultErr error
+	loadErr    error
+	loadCalls  int
 }
 
 func (f *fakeStore) LoadTraySettings() (traymodel.TraySettings, error) {
@@ -47,6 +48,15 @@ func (f *fakeStore) PrepareHelperWrite(config.HelperForm) (config.PreparedWrite,
 		return config.PreparedWrite{}, f.saveErr
 	}
 	return f.prepared, nil
+}
+func (f *fakeStore) PrepareDefaultHelperWrite() (config.PreparedWrite, error) {
+	if f.defaultErr != nil {
+		return config.PreparedWrite{}, f.defaultErr
+	}
+	*f.calls = append(*f.calls, "prepare-default-helper")
+	prepared := f.prepared
+	prepared.CreateOnly = true
+	return prepared, nil
 }
 
 type fakeValidator struct{ helper []config.FieldError }
@@ -310,7 +320,7 @@ func validSettings() traymodel.TraySettings {
 func serviceFixture(t *testing.T) (*Service, *[]string, *fakeStore, *fakeComponent, *fakeComponent, *fakeElevation) {
 	t.Helper()
 	calls := []string{}
-	store := &fakeStore{settings: validSettings(), calls: &calls, prepared: config.PreparedWrite{TargetPath: `C:\ProgramData\MySingerServer\helper.json`, CanonicalJSON: []byte("{}"), SHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}
+	store := &fakeStore{settings: validSettings(), calls: &calls, defaultErr: config.ErrHelperConfigExists, prepared: config.PreparedWrite{TargetPath: `C:\ProgramData\MySingerServer\helper.json`, CanonicalJSON: []byte("{}"), SHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}
 	agentConfig := &fakeAgentConfigGateway{source: store, calls: &calls}
 	agent := &fakeComponent{name: "agent", calls: &calls, results: map[string]traymodel.OperationResult{}}
 	helper := &fakeComponent{name: "helper", calls: &calls, results: map[string]traymodel.OperationResult{}}
@@ -888,6 +898,17 @@ func TestHelperManualAndAutomaticOperationsUseExclusiveRoutes(t *testing.T) {
 	_ = s.RestartHelper(context.Background())
 	if !reflect.DeepEqual(*calls, []string{"task-run", "helper-stop", "helper-stop", "task-run"}) {
 		t.Fatalf("automatic calls = %v", *calls)
+	}
+}
+
+func TestStartHelperImportsDefaultBeforeStarting(t *testing.T) {
+	s, calls, store, _, _, _ := serviceFixture(t)
+	store.defaultErr = nil
+	if result := s.StartHelper(context.Background()); !result.OK {
+		t.Fatalf("StartHelper: %#v", result)
+	}
+	if !reflect.DeepEqual(*calls, []string{"prepare-default-helper", "elevate-write_helper_config", "helper-sha", "helper-start"}) {
+		t.Fatalf("calls = %v", *calls)
 	}
 }
 

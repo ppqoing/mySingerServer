@@ -20,6 +20,7 @@ import (
 )
 
 var ErrSaveVerify = errors.New("save_verify_failed")
+var ErrHelperConfigExists = errors.New("helper_config_exists")
 
 type Paths struct {
 	TraySettings     string
@@ -38,6 +39,7 @@ type PreparedWrite struct {
 	TargetPath    string
 	CanonicalJSON []byte
 	SHA256        string
+	CreateOnly    bool
 }
 
 // storeTestHooks are intentionally private fault boundaries. Production stores
@@ -253,6 +255,34 @@ func configAndBackupAbsent(path string) bool {
 		return false
 	}
 	return true
+}
+
+func (s *Store) helperDefaultPath() string {
+	return filepath.Join(filepath.Dir(s.paths.HelperExecutable), "helper.default.json")
+}
+
+func (s *Store) PrepareDefaultHelperWrite() (PreparedWrite, error) {
+	if !configAndBackupAbsent(s.paths.HelperConfig) {
+		return PreparedWrite{}, ErrHelperConfigExists
+	}
+	var cfg helper.Config
+	if err := strictDecodeFile(s.helperDefaultPath(), &cfg); err != nil {
+		return PreparedWrite{}, storeError(s.helperDefaultPath(), "strict default load failed")
+	}
+	if cfg.LogDir == "" {
+		cfg.LogDir = filepath.Join(filepath.Dir(s.paths.HelperConfig), "logs")
+	}
+	cfg, err := helper.ValidateConfig(cfg, s.paths.HelperExecutable)
+	if err != nil {
+		return PreparedWrite{}, storeError(s.helperDefaultPath(), "shared validation failed")
+	}
+	data, err := canonicalJSON(cfg)
+	if err != nil {
+		return PreparedWrite{}, storeError(s.paths.HelperConfig, "canonical encoding failed")
+	}
+	prepared := preparedWrite(s.paths.HelperConfig, data)
+	prepared.CreateOnly = true
+	return prepared, nil
 }
 
 func firstRunAgentForm(paths Paths) (AgentForm, error) {

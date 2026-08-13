@@ -30,6 +30,9 @@ func (compositionStore) LoadHelperForm() (trayconfig.HelperForm, error) {
 func (compositionStore) PrepareHelperWrite(trayconfig.HelperForm) (trayconfig.PreparedWrite, error) {
 	return trayconfig.PreparedWrite{}, nil
 }
+func (compositionStore) PrepareDefaultHelperWrite() (trayconfig.PreparedWrite, error) {
+	return trayconfig.PreparedWrite{}, trayconfig.ErrHelperConfigExists
+}
 
 type compositionValidator struct{}
 
