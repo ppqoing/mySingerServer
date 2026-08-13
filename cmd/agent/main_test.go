@@ -83,6 +83,31 @@ func TestNewAgentEnumeratorDisabledUsesWalker(t *testing.T) {
 	}
 }
 
+// This fails if production can construct more than one browser or forgets to
+// inject the constructed browser into the Agent server.
+func TestSetAgentFilesystemBrowserConstructsAndInjectsOnce(t *testing.T) {
+	setter := &recordingFilesystemBrowserSetter{}
+	want := agent.NewFilesystemBrowser()
+	calls := 0
+	setAgentFilesystemBrowser(setter, func() agent.FilesystemBrowser {
+		calls++
+		return want
+	})
+	if calls != 1 || setter.calls != 1 || setter.browser != want {
+		t.Fatalf("browser construction/injection calls=%d/%d browser=%#v", calls, setter.calls, setter.browser)
+	}
+}
+
+type recordingFilesystemBrowserSetter struct {
+	calls   int
+	browser agent.FilesystemBrowser
+}
+
+func (setter *recordingFilesystemBrowserSetter) SetFilesystemBrowser(browser agent.FilesystemBrowser) {
+	setter.calls++
+	setter.browser = browser
+}
+
 func TestNewAgentEnumeratorEnabledDoesNotBlockStartup(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

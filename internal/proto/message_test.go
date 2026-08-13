@@ -59,6 +59,61 @@ func TestDecodeClientAuthAndLocalEnvelope(t *testing.T) {
 	}
 }
 
+// These cases fail if the filesystem browse envelope is assigned a conflicting
+// message type or Decode stops producing the concrete request/response DTOs.
+func TestFilesystemBrowseMessagesRoundTrip(t *testing.T) {
+	request := FilesystemBrowseRequest{
+		RequestID: "browse-1", Path: `D:\Media`, ShowHidden: true, Limit: 200,
+	}
+	response := FilesystemBrowseResponse{
+		RequestID: "browse-1", CurrentPath: `D:\Media`,
+		Entries: []FilesystemEntry{{
+			Name: "Photos", Path: `D:\Media\Photos`,
+			Kind: FilesystemEntryDirectory, Selectable: true,
+		}},
+	}
+	for _, item := range []struct {
+		typ    uint8
+		value  any
+		target any
+	}{
+		{MsgFilesystemBrowse, request, &FilesystemBrowseRequest{}},
+		{MsgFilesystemBrowseResult, response, &FilesystemBrowseResponse{}},
+	} {
+		body, err := msgpack.Marshal(item.value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := Decode(item.typ, body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if reflect.TypeOf(got) != reflect.TypeOf(item.target) {
+			t.Fatalf("decoded %T", got)
+		}
+	}
+}
+
+// These cases fail if malformed browse requests reach filesystem enumeration,
+// or if a future implementation narrows accepted Windows absolute paths.
+func TestFilesystemBrowseRequestValidate(t *testing.T) {
+	valid := FilesystemBrowseRequest{RequestID: "browse-1", Path: `D:\Media`, Limit: 200}
+	if err := valid.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	for _, mutate := range []func(*FilesystemBrowseRequest){
+		func(v *FilesystemBrowseRequest) { v.RequestID = "" },
+		func(v *FilesystemBrowseRequest) { v.Path = `Media\relative` },
+		func(v *FilesystemBrowseRequest) { v.Limit = 501 },
+	} {
+		candidate := valid
+		mutate(&candidate)
+		if err := candidate.Validate(); err == nil {
+			t.Fatal("invalid request accepted")
+		}
+	}
+}
+
 // These cases fail if stage two accidentally permits Sobel work, or assigns
 // the new video pHash bit to an image/video request incorrectly.
 func TestPhase2TaskStageTwoAcceptsOnlyPHashFields(t *testing.T) {

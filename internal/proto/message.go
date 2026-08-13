@@ -2,6 +2,7 @@ package proto
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/vmihailenco/msgpack/v5"
 )
@@ -17,20 +18,22 @@ const (
 	MsgClientAuth       uint8 = 5
 	MsgClientAuthResult uint8 = 6
 
-	MsgScanTask   uint8 = 10
-	MsgTaskAck    uint8 = 11
-	MsgPhase2Task uint8 = 12
-	MsgDeleteTask uint8 = 13
-	MsgConfigPush uint8 = 14
-	MsgStatsQuery uint8 = 15
+	MsgScanTask         uint8 = 10
+	MsgTaskAck          uint8 = 11
+	MsgPhase2Task       uint8 = 12
+	MsgDeleteTask       uint8 = 13
+	MsgConfigPush       uint8 = 14
+	MsgStatsQuery       uint8 = 15
+	MsgFilesystemBrowse uint8 = 16
 
-	MsgTaskProgress  uint8 = 20
-	MsgFeatureResult uint8 = 21
-	MsgTaskDone      uint8 = 22
-	MsgError         uint8 = 23
-	MsgCrashNotice   uint8 = 24
-	MsgDeleteReport  uint8 = 25
-	MsgStatsReport   uint8 = 26
+	MsgTaskProgress           uint8 = 20
+	MsgFeatureResult          uint8 = 21
+	MsgTaskDone               uint8 = 22
+	MsgError                  uint8 = 23
+	MsgCrashNotice            uint8 = 24
+	MsgDeleteReport           uint8 = 25
+	MsgStatsReport            uint8 = 26
+	MsgFilesystemBrowseResult uint8 = 27
 
 	MsgLocalRequest  uint8 = 30
 	MsgLocalResponse uint8 = 31
@@ -38,6 +41,12 @@ const (
 )
 
 const ProtocolVersion = 1
+
+const (
+	FilesystemEntryDrive     = "drive"
+	FilesystemEntryDirectory = "directory"
+	FilesystemEntryFile      = "file"
+)
 
 const (
 	FieldSHA512 uint32 = 1 << 0
@@ -101,6 +110,72 @@ type Ping struct {
 
 type Pong struct {
 	TS int64 `msgpack:"ts"`
+}
+
+type FilesystemBrowseRequest struct {
+	RequestID  string `msgpack:"request_id"`
+	Path       string `msgpack:"path,omitempty"`
+	ShowHidden bool   `msgpack:"show_hidden"`
+	Cursor     string `msgpack:"cursor,omitempty"`
+	Limit      int    `msgpack:"limit"`
+}
+
+func (request FilesystemBrowseRequest) Validate() error {
+	if request.RequestID == "" {
+		return fmt.Errorf("proto: filesystem browse request_id required")
+	}
+	if request.Path != "" && !isWindowsAbsoluteBrowsePath(request.Path) {
+		return fmt.Errorf("proto: filesystem browse path must be drive-absolute or UNC")
+	}
+	if request.Limit < 0 || request.Limit > 500 {
+		return fmt.Errorf("proto: filesystem browse limit must be between 1 and 500")
+	}
+	if request.Cursor != "" && len(request.Cursor) > 1024 {
+		return fmt.Errorf("proto: filesystem browse cursor exceeds 1024 bytes")
+	}
+	return nil
+}
+
+func isWindowsAbsoluteBrowsePath(path string) bool {
+	if len(path) >= 3 && isASCIIAlpha(path[0]) && path[1] == ':' && isPathSeparator(path[2]) {
+		return true
+	}
+	if !strings.HasPrefix(path, `\\`) {
+		return false
+	}
+	rest := path[2:]
+	serverEnd := strings.IndexAny(rest, `\\/`)
+	if serverEnd <= 0 {
+		return false
+	}
+	share := strings.TrimLeft(rest[serverEnd:], `\\/`)
+	return share != "" && strings.IndexAny(share, `\\/`) != 0
+}
+
+func isASCIIAlpha(value byte) bool {
+	return value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z'
+}
+
+func isPathSeparator(value byte) bool {
+	return value == '\\' || value == '/'
+}
+
+type FilesystemEntry struct {
+	Name       string `msgpack:"name"`
+	Path       string `msgpack:"path"`
+	Kind       string `msgpack:"kind"`
+	Hidden     bool   `msgpack:"hidden"`
+	System     bool   `msgpack:"system"`
+	Selectable bool   `msgpack:"selectable"`
+}
+
+type FilesystemBrowseResponse struct {
+	RequestID   string            `msgpack:"request_id"`
+	CurrentPath string            `msgpack:"current_path,omitempty"`
+	ParentPath  string            `msgpack:"parent_path,omitempty"`
+	Entries     []FilesystemEntry `msgpack:"entries"`
+	NextCursor  string            `msgpack:"next_cursor,omitempty"`
+	ErrorCode   string            `msgpack:"error_code,omitempty"`
 }
 
 type Hello struct {
@@ -431,6 +506,8 @@ func Decode(msgType uint8, body []byte) (any, error) {
 		value = &ConfigPush{}
 	case MsgStatsQuery:
 		value = &StatsQuery{}
+	case MsgFilesystemBrowse:
+		value = &FilesystemBrowseRequest{}
 	case MsgTaskProgress:
 		value = &TaskProgress{}
 	case MsgFeatureResult:
@@ -445,6 +522,8 @@ func Decode(msgType uint8, body []byte) (any, error) {
 		value = &DeleteReport{}
 	case MsgStatsReport:
 		value = &StatsReport{}
+	case MsgFilesystemBrowseResult:
+		value = &FilesystemBrowseResponse{}
 	case MsgLocalRequest:
 		value = &LocalRequest{}
 	case MsgLocalResponse:

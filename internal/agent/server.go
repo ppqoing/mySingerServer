@@ -68,6 +68,8 @@ type Server struct {
 	localMu           sync.RWMutex
 	localToken        string
 	localHandler      LocalHandler
+	filesystemMu      sync.RWMutex
+	filesystemBrowser FilesystemBrowser
 }
 
 func (s *Server) SetLocalControl(token string, handler LocalHandler) {
@@ -75,6 +77,12 @@ func (s *Server) SetLocalControl(token string, handler LocalHandler) {
 	s.localToken = token
 	s.localHandler = handler
 	s.localMu.Unlock()
+}
+
+func (s *Server) SetFilesystemBrowser(browser FilesystemBrowser) {
+	s.filesystemMu.Lock()
+	s.filesystemBrowser = browser
+	s.filesystemMu.Unlock()
 }
 
 func NewServer(
@@ -197,6 +205,7 @@ func (s *Server) handleConn(parent context.Context, connection net.Conn) {
 		response = protectLocalResponse(response, token)
 		return sender(proto.MsgLocalResponse, &response)
 	}
+	browseGate := make(chan struct{}, 1)
 	var detachPhase2 []func()
 	authenticatedNodeTray := false
 	defer func() {
@@ -222,6 +231,35 @@ func (s *Server) handleConn(parent context.Context, connection net.Conn) {
 			continue
 		}
 		switch value := message.(type) {
+		case *proto.FilesystemBrowseRequest:
+			browser := s.currentFilesystemBrowser()
+			if browser == nil {
+				if err := sender(proto.MsgFilesystemBrowseResult, &proto.FilesystemBrowseResponse{
+					RequestID: value.RequestID,
+					ErrorCode: "browse_failed",
+				}); err != nil {
+					return
+				}
+				continue
+			}
+			select {
+			case browseGate <- struct{}{}:
+				request := *value
+				go func() {
+					defer func() { <-browseGate }()
+					response := browser.Browse(connectionContext, request)
+					response.RequestID = request.RequestID
+					_ = sender(proto.MsgFilesystemBrowseResult, &response)
+				}()
+			default:
+				requestID := value.RequestID
+				go func() {
+					_ = sender(proto.MsgFilesystemBrowseResult, &proto.FilesystemBrowseResponse{
+						RequestID: requestID,
+						ErrorCode: "browse_busy",
+					})
+				}()
+			}
 		case *proto.ClientAuth:
 			authenticatedNodeTray = false
 			result := proto.ClientAuthResult{}
@@ -423,6 +461,12 @@ func (s *Server) currentStatsProvider() StatsProvider {
 	s.statsMu.RLock()
 	defer s.statsMu.RUnlock()
 	return s.statsProvider
+}
+
+func (s *Server) currentFilesystemBrowser() FilesystemBrowser {
+	s.filesystemMu.RLock()
+	defer s.filesystemMu.RUnlock()
+	return s.filesystemBrowser
 }
 
 const maxDeleteLogTaskIDBytes = 128

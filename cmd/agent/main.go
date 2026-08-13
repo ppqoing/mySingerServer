@@ -66,6 +66,16 @@ type deleteLoggerFactory func(
 
 type machineIdentityProvider func() (machineid.Result, error)
 
+type filesystemBrowserSetter interface {
+	SetFilesystemBrowser(agent.FilesystemBrowser)
+}
+
+type filesystemBrowserFactory func() agent.FilesystemBrowser
+
+func setAgentFilesystemBrowser(server filesystemBrowserSetter, newBrowser filesystemBrowserFactory) {
+	server.SetFilesystemBrowser(newBrowser())
+}
+
 type agentEnumeratorOptions struct {
 	Enabled     bool
 	Primary     fileenum.Enumerator
@@ -340,6 +350,7 @@ func runWithDependencies(
 				},
 			})
 			server := agent.NewServer(cfg, scans, businessLogger, phase2)
+			setAgentFilesystemBrowser(server, agent.NewFilesystemBrowser)
 			server.SetLocalControl(controlToken, localHandler)
 			if statistics != nil {
 				server.SetStatsProvider(statistics)
