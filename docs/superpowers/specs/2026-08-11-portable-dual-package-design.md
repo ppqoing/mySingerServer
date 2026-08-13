@@ -75,19 +75,19 @@ MySingerServer-Compute\
 ├─ 原生 DLL 和工具
 ├─ licenses\
 ├─ release-manifest.json
-└─ data\
+└─ data\                    # 发布包不预建 data\helper
    ├─ nodetray\
    │  ├─ tray.json
    │  └─ webview2\
-   ├─ agent\
+   └─ agent\
    │  ├─ agent.json
    │  ├─ agent.db
    │  ├─ logs\
    │  └─ stats.log
-   └─ helper\
-      ├─ helper.json
-      └─ logs\
 ```
+
+`data\helper` 不作为空目录、`.gitkeep` 或 ZIP 目录项发布。只有用户通过 NodeTray UI
+保存 Helper 配置时，提权写入器才首次创建受保护的 `data\helper`、`helper.json` 和日志目录。
 
 ### 管理端
 
@@ -127,7 +127,7 @@ NodeTray 从自身便携根解析 Agent、Worker、Helper、配置、日志和 W
 
 ### 管理端路径
 
-`gui.exe` 无 `-config` 参数时默认读取自身目录下的 `gui.json`。显式 `-config` 仍可覆盖默认路径。GUI 自身日志固定写入 `data\logs\gui.log`，并保留控制台日志输出。
+Windows 上先打开当前 GUI 映像并取得最终路径，再以最终 `gui.exe` 的父目录为便携根；最终路径为 UNC 时拒绝启动。`gui.exe` 无 `-config` 参数时默认读取该目录下的 `gui.json`。显式 `-config` 仍按既有语义解析并覆盖默认路径。GUI 自身日志固定写入 `<exe-root>\data\logs\gui.log`，并保留控制台日志输出。
 
 `Start-Manager.ps1` 使用 `$PSScriptRoot` 定位 `gui.exe` 和 `gui.json`，不得依赖调用者的工作目录。
 
@@ -161,7 +161,7 @@ NodeTray 从自身便携根解析 Agent、Worker、Helper、配置、日志和 W
 
 部署文档必须明确警告：在多人使用或不可信账户可写的机器上，应由管理员把计算目录 ACL 限制为仅 Administrators 和 SYSTEM 可修改。程序仍须保留进程身份、最终路径、父子进程和请求协议验证，但这些检查不能消除可执行文件本身被替换的风险。
 
-发布模板不得包含 PostgreSQL 密码、访问令牌、真实主机名或真实 Agent 地址。发布脚本继续 fail closed 地检查模板。
+发布模板不得包含 PostgreSQL 密码、访问令牌、真实主机名或真实 Agent 地址。Manager 模板的 DSN scheme 只能是 `postgres` 或 `postgresql`，host 只能是 `127.0.0.1` 或 `localhost` 安全占位；发布脚本继续 fail closed 地检查模板。
 
 ## 构建与发布
 
@@ -184,7 +184,7 @@ MySingerServer-manager-win-x64-<版本>.zip.sha256
 - `portable_root` 为 `.`；
 - 文件相对路径、大小和 SHA-256。
 
-新增总发布入口，在任务专用临时目录中生成和验证两个候选包。只有两个包的文件集合、manifest、解压校验和 sidecar 全部通过，才把四个最终文件发布到输出目录。任一候选失败时清理候选文件，不留下半套最终发布物。目标文件已存在时拒绝覆盖。
+新增总发布入口，在任务专用临时目录中生成和验证两个候选包。只有两个包的文件集合、manifest、解压校验和 sidecar 全部通过，才把四个最终文件发布到输出目录。任一候选失败时清理候选文件，不留下半套最终发布物。目标文件已存在时拒绝覆盖。发布阶段失败后的回滚必须打开并持续锁定每个已发布文件，在同一文件句柄上完成 SHA-256 校验和删除；若路径在校验后被替换，只删除原先锁定的发布对象，保留替换后的用户文件。句柄打开、校验、删除或关闭失败时保留对象、记录 cleanup warning，并继续处理其余回滚项。
 
 ## 测试策略
 
@@ -203,7 +203,7 @@ MySingerServer-manager-win-x64-<版本>.zip.sha256
 
 ### 发布契约测试
 
-- 计算包包含全部计算运行文件，不包含 `gui.exe` 和 GUI 配置。
+- 计算包包含全部计算运行文件，不包含 `gui.exe`、GUI 配置或预建的 `data\helper` 目录项。
 - 管理包只包含 GUI、模板、启动脚本、部署说明和发布 manifest，不包含计算依赖；`data\logs` 由首次运行创建。
 - 两个配置模板不包含密码、令牌或真实地址。
 - 两个 manifest 与解压文件集合、大小和 SHA-256 完全一致。

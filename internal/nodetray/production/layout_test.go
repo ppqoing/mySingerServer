@@ -7,40 +7,56 @@ import (
 	"dedup/internal/nodetray/traymodel"
 )
 
-func TestResolveLayoutReturnsTheFixedProductionLocations(t *testing.T) {
-	layout, err := ResolveLayout(`C:\Program Files`, `C:\ProgramData`, `C:\Users\node\AppData\Local`)
-	if err != nil {
-		t.Fatalf("ResolveLayout: %v", err)
-	}
-	want := Layout{
-		TrayExecutable:   `C:\Program Files\MySingerServer\nodetray.exe`,
-		AgentExecutable:  `C:\Program Files\MySingerServer\agent.exe`,
-		HelperExecutable: `C:\Program Files\MySingerServer\helper.exe`,
-		TraySettings:     `C:\Users\node\AppData\Local\MySingerServer\NodeTray\tray.json`,
-		AgentConfig:      `C:\ProgramData\MySingerServer\Node\agent.json`,
-		HelperConfig:     `C:\ProgramData\MySingerServer\Helper\helper.json`,
-		AgentLogs:        `C:\ProgramData\MySingerServer\Node\logs`,
-		HelperLogs:       `C:\ProgramData\MySingerServer\Helper\logs`,
-	}
-	if !reflect.DeepEqual(layout, want) {
-		t.Fatalf("layout = %#v, want %#v", layout, want)
-	}
-}
-
-func TestResolveLayoutRejectsNonAbsoluteOverlappingAndEscapingRoots(t *testing.T) {
+func TestResolvePortableLayoutUsesExecutableDirectoryForProgramsAndData(t *testing.T) {
 	tests := []struct {
-		name                             string
-		programFiles, programData, local string
+		name       string
+		executable string
+		want       Layout
 	}{
-		{name: "relative Program Files", programFiles: `Program Files`, programData: `C:\ProgramData`, local: `C:\Users\node\AppData\Local`},
-		{name: "ProgramData below Program Files", programFiles: `C:\Company`, programData: `C:\Company\ProgramData`, local: `C:\Users\node\AppData\Local`},
-		{name: "LocalAppData is ProgramData", programFiles: `C:\Program Files`, programData: `C:\ProgramData`, local: `C:\ProgramData`},
-		{name: "root traversal cleans into overlap", programFiles: `C:\Company\Programs\..`, programData: `C:\Company`, local: `C:\Users\node\AppData\Local`},
+		{
+			name:       "portable executable",
+			executable: `D:\便携 工具\MySingerServer-Compute\nodetray.exe`,
+			want: Layout{
+				Root:             `D:\便携 工具\MySingerServer-Compute`,
+				TrayExecutable:   `D:\便携 工具\MySingerServer-Compute\nodetray.exe`,
+				AgentExecutable:  `D:\便携 工具\MySingerServer-Compute\agent.exe`,
+				HelperExecutable: `D:\便携 工具\MySingerServer-Compute\helper.exe`,
+				TraySettings:     `D:\便携 工具\MySingerServer-Compute\data\nodetray\tray.json`,
+				AgentConfig:      `D:\便携 工具\MySingerServer-Compute\data\agent\agent.json`,
+				HelperConfig:     `D:\便携 工具\MySingerServer-Compute\data\helper\helper.json`,
+				AgentLogs:        `D:\便携 工具\MySingerServer-Compute\data\agent\logs`,
+				HelperLogs:       `D:\便携 工具\MySingerServer-Compute\data\helper\logs`,
+				WebViewData:      `D:\便携 工具\MySingerServer-Compute\data\nodetray\webview2`,
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if _, err := ResolveLayout(tt.programFiles, tt.programData, tt.local); err == nil {
-				t.Fatal("ResolveLayout accepted unsafe roots")
+			got, err := ResolvePortableLayout(tt.executable)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("layout=%#v want=%#v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResolvePortableLayoutRejectsRelativeUNCAndWrongExecutableName(t *testing.T) {
+	tests := []struct {
+		name       string
+		executable string
+	}{
+		{name: "relative path", executable: `MySingerServer-Compute\nodetray.exe`},
+		{name: "UNC path", executable: `\\server\share\nodetray.exe`},
+		{name: "root directory", executable: `D:\nodetray.exe`},
+		{name: "wrong executable name", executable: `D:\MySingerServer-Compute\agent.exe`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := ResolvePortableLayout(tt.executable); err == nil {
+				t.Fatal("ResolvePortableLayout accepted unsafe executable path")
 			}
 		})
 	}

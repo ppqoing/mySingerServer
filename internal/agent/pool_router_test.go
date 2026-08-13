@@ -1,14 +1,44 @@
 package agent
 
 import (
+	"bytes"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"dedup/internal/worker"
 )
+
+// Break caught: PoolRouter aliases the Worker's preview byte buffer, allowing
+// reuse after routing to mutate the authenticated local response.
+func TestImagePreviewPoolRouterDeepCopiesPreviewBytes(t *testing.T) {
+	pool := newPhase2FakePool()
+	router := NewPoolRouter(pool, nil)
+	job := &worker.JobMsg{
+		JobID: router.NextJobID(), ScanTaskID: "preview", Path: `D:\media\source.jpg`,
+		Kind: worker.MediaImage, Phase: worker.PhasePreview,
+		ScreenStage: worker.ScreenStagePreview, Source: worker.JobSourceLocal,
+	}
+	terminal, cancel, err := router.Register(job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+	previewBytes := []byte{1, 2, 3}
+	pool.results <- &worker.JobResultMsg{
+		JobID: job.JobID, ScanTaskID: job.ScanTaskID, Path: job.Path,
+		Kind: job.Kind, Phase: job.Phase, ScreenStage: job.ScreenStage,
+		Source: job.Source, PreviewBytes: previewBytes,
+	}
+	outcome := <-terminal
+	previewBytes[0] = 9
+	if outcome.result == nil || outcome.result.PreviewBytes[0] != 1 {
+		t.Fatalf("routed preview aliased worker bytes: %#v", outcome.result)
+	}
+}
 
 func TestPoolRouterIsSoleConsumerAndRoutesInterleavedPhasesByFullOwner(t *testing.T) {
 	pool := newPhase2FakePool()
@@ -145,6 +175,101 @@ func TestPoolRouterPoolCloseTerminatesEveryRegisteredOwner(t *testing.T) {
 	}); err == nil {
 		t.Fatal("Register after pool close unexpectedly succeeded")
 	}
+}
+
+func TestPoolRouterRejectsForeignStageAndSourceResult(t *testing.T) {
+	pool := newPhase2FakePool()
+	router := NewPoolRouter(pool, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	job := worker.JobMsg{
+		JobID: router.NextJobID(), ScanTaskID: "stage-source", Path: `D:\media\owner.jpg`,
+		Kind: worker.MediaImage, Phase: worker.Phase2,
+		ScreenStage: worker.ScreenStageTwo, Source: worker.JobSourceManager,
+	}
+	terminal, cancel, err := router.Register(&job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+
+	for _, foreign := range []worker.JobResultMsg{
+		{JobID: job.JobID, ScanTaskID: job.ScanTaskID, Path: job.Path, Kind: job.Kind, Phase: job.Phase, ScreenStage: worker.ScreenStageThree, Source: job.Source},
+		{JobID: job.JobID, ScanTaskID: job.ScanTaskID, Path: job.Path, Kind: job.Kind, Phase: job.Phase, ScreenStage: job.ScreenStage, Source: worker.JobSourceLocal},
+	} {
+		copy := foreign
+		pool.results <- &copy
+	}
+	select {
+	case got := <-terminal:
+		t.Fatalf("foreign result reached owner: %#v", got)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	pool.results <- &worker.JobResultMsg{
+		JobID: job.JobID, ScanTaskID: job.ScanTaskID, Path: job.Path, Kind: job.Kind,
+		Phase: job.Phase, ScreenStage: job.ScreenStage, Source: job.Source,
+	}
+	select {
+	case got := <-terminal:
+		if got.result == nil || got.result.ScreenStage != job.ScreenStage || got.result.Source != job.Source {
+			t.Fatalf("owner result=%#v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("matching stage/source result was not routed")
+	}
+}
+
+func TestPoolRouterForeignLogsDoNotExposePaths(t *testing.T) {
+	pool := newPhase2FakePool()
+	var output synchronizedBuffer
+	router := NewPoolRouter(pool, slog.New(slog.NewJSONHandler(&output, nil)))
+	path := `D:\private\customer-album\secret-name.jpg`
+	job := worker.JobMsg{
+		JobID: router.NextJobID(), ScanTaskID: "private-log", Path: path,
+		Kind: worker.MediaImage, Phase: worker.Phase2,
+		ScreenStage: worker.ScreenStageThree, Source: worker.JobSourceManager,
+	}
+	_, cancel, err := router.Register(&job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+	pool.results <- &worker.JobResultMsg{
+		JobID: job.JobID, ScanTaskID: job.ScanTaskID, Path: path + ".foreign", Kind: job.Kind,
+		Phase: job.Phase, ScreenStage: job.ScreenStage, Source: job.Source,
+	}
+	pool.crashes <- worker.CrashRecord{JobID: job.JobID, ScanTaskID: job.ScanTaskID, File: path + ".foreign"}
+	var logged string
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		logged = output.String()
+		if strings.Count(logged, worker.PathID(path+".foreign")) == 2 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if strings.Contains(logged, "customer-album") || strings.Contains(logged, "secret-name.jpg") {
+		t.Fatalf("router log leaked sensitive path: %s", logged)
+	}
+	if !strings.Contains(logged, worker.PathID(path+".foreign")) || !strings.Contains(logged, `"screen_stage":3`) || !strings.Contains(logged, `"source":"manager"`) {
+		t.Fatalf("router log missing safe identity context: %s", logged)
+	}
+}
+
+type synchronizedBuffer struct {
+	mu sync.Mutex
+	bytes.Buffer
+}
+
+func (b *synchronizedBuffer) Write(data []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.Buffer.Write(data)
+}
+
+func (b *synchronizedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.Buffer.String()
 }
 
 type phase2FakePool struct {

@@ -3,15 +3,34 @@
 package config
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
 
+	"dedup/internal/securefile"
 	"github.com/google/uuid"
 	"golang.org/x/sys/windows"
 )
+
+func TestStoreAndAgentShareSecureAtomicWriter(t *testing.T) {
+	directory := filepath.Join(t.TempDir(), "shared-secure-writer")
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(directory, "tray.json")
+	want := []byte("{\n  \"value\": true\n}\n")
+	if err := securefile.WriteAtomic(target, want, func(path string) ([]byte, error) { return os.ReadFile(path) }); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("shared writer bytes = %q, %v", got, err)
+	}
+	assertRestrictedWritableACL(t, target, currentTestUserSID(t))
+}
 
 func TestStoreWritableConfigACLAllowsOnlyCurrentUserAdministratorsAndSystem(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "acl-"+uuid.NewString())
@@ -258,7 +277,13 @@ func assertRestrictedWritableACL(t *testing.T, path, currentSID string) {
 	}
 	trustees := map[string]bool{}
 	for _, match := range regexp.MustCompile(`\([AD];[^)]*;;;([^)]+)\)`).FindAllStringSubmatch(sddl, -1) {
-		trustees[match[1]] = true
+		trustee := match[1]
+		if trustee == "LA" {
+			if sid, err := windows.StringToSid(currentSID); err == nil && sid.IsWellKnown(windows.WinAccountAdministratorSid) {
+				trustee = currentSID
+			}
+		}
+		trustees[trustee] = true
 	}
 	for _, wanted := range []string{"SY", "BA", currentSID} {
 		if !trustees[wanted] {

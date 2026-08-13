@@ -145,3 +145,102 @@ CREATE TABLE IF NOT EXISTS scan_tasks (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Agent-local scope is isolated from Manager's global duplicate tables. All
+-- identities below include machine_id and generation so replay is idempotent.
+CREATE TABLE IF NOT EXISTS local_analysis_runs (
+    machine_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    generation BIGINT NOT NULL,
+    task_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at BIGINT NOT NULL,
+    completed_at BIGINT,
+    published_at BIGINT,
+    PRIMARY KEY (machine_id, run_id, generation)
+);
+
+CREATE TABLE IF NOT EXISTS local_pair_scores (
+    machine_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    generation BIGINT NOT NULL,
+    pair_key TEXT NOT NULL,
+    left_file_id BIGINT NOT NULL,
+    right_file_id BIGINT NOT NULL,
+    left_sha512 TEXT NOT NULL,
+    right_sha512 TEXT NOT NULL,
+    stage1_json JSONB NOT NULL,
+    stage2_json JSONB,
+    stage3_json JSONB,
+    final_verdict TEXT NOT NULL,
+    PRIMARY KEY (machine_id, run_id, generation, pair_key),
+    FOREIGN KEY (machine_id, run_id, generation)
+        REFERENCES local_analysis_runs(machine_id, run_id, generation) ON DELETE RESTRICT
+);
+
+CREATE TABLE IF NOT EXISTS local_dup_groups (
+    machine_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    generation BIGINT NOT NULL,
+    group_id TEXT NOT NULL,
+    category TEXT NOT NULL,
+    verdict TEXT NOT NULL,
+    PRIMARY KEY (machine_id, run_id, generation, group_id),
+    FOREIGN KEY (machine_id, run_id, generation)
+        REFERENCES local_analysis_runs(machine_id, run_id, generation) ON DELETE RESTRICT
+);
+
+CREATE TABLE IF NOT EXISTS local_dup_members (
+    machine_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    generation BIGINT NOT NULL,
+    group_id TEXT NOT NULL,
+    file_id BIGINT NOT NULL,
+    sha512 TEXT NOT NULL,
+    PRIMARY KEY (machine_id, run_id, generation, group_id, file_id),
+    FOREIGN KEY (machine_id, run_id, generation, group_id)
+        REFERENCES local_dup_groups(machine_id, run_id, generation, group_id) ON DELETE RESTRICT
+);
+
+CREATE TABLE IF NOT EXISTS local_task_events (
+    machine_id TEXT NOT NULL,
+    sequence BIGINT NOT NULL,
+    topic TEXT NOT NULL,
+    entity_key TEXT NOT NULL,
+    generation BIGINT NOT NULL,
+    payload_json JSONB NOT NULL,
+    PRIMARY KEY (machine_id, sequence),
+    UNIQUE (machine_id, topic, entity_key, generation)
+);
+
+CREATE TABLE IF NOT EXISTS local_review_decisions (
+    machine_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    generation BIGINT NOT NULL,
+    group_id TEXT NOT NULL,
+    file_id BIGINT NOT NULL,
+    decision TEXT NOT NULL,
+    reviewer TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    reviewed_at BIGINT NOT NULL,
+    PRIMARY KEY (machine_id, run_id, generation, group_id, file_id),
+    FOREIGN KEY (machine_id, run_id, generation, group_id)
+        REFERENCES local_dup_groups(machine_id, run_id, generation, group_id) ON DELETE RESTRICT
+);
+
+CREATE TABLE IF NOT EXISTS local_delete_results (
+    machine_id TEXT NOT NULL,
+    batch_id TEXT NOT NULL,
+    file_id BIGINT NOT NULL,
+    run_id TEXT NOT NULL,
+    generation BIGINT NOT NULL,
+    path TEXT NOT NULL,
+    sha512 TEXT NOT NULL,
+    result TEXT NOT NULL,
+    error_code TEXT,
+    uncertain BOOLEAN NOT NULL DEFAULT false,
+    completed_at BIGINT NOT NULL,
+    PRIMARY KEY (machine_id, batch_id, file_id),
+    FOREIGN KEY (machine_id, run_id, generation)
+        REFERENCES local_analysis_runs(machine_id, run_id, generation) ON DELETE RESTRICT
+);

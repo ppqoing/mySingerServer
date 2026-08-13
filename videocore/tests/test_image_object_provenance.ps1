@@ -206,7 +206,7 @@ function Validate-CompileRecord(
     $pathmaps = [Collections.Generic.List[object]]::new()
     $foValue = $null
     $fdValue = $null
-    $requiredSingles = @('/c','/nologo','/W1','/WX-','/diagnostics:column','/EHsc','/MT',
+    $requiredSingles = @('/c','/nologo','/W1','/WX-','/diagnostics:column','/EHsc','/MT','/O2','/Ob2',
         '/fp:precise','/std:c++17','/external:W0','/TP','/utf-8','/Brepro',
         '/experimental:deterministic')
     for ($i = 0; $i -lt $args.Count; $i++) {
@@ -273,7 +273,7 @@ function Validate-CompileRecord(
             throw "$role is missing source or deterministic Task 6 flags"
         }
     }
-    $expectedDefinitions = @('_MBCS','NOMINMAX','WIN32_LEAN_AND_MEAN','CMAKE_INTDIR="Release"')
+    $expectedDefinitions = @('_MBCS','WIN32','_WINDOWS','NDEBUG','NOMINMAX','WIN32_LEAN_AND_MEAN','CMAKE_INTDIR="Release"')
     if (-not (Compare-TextMultiset @($definitions) $expectedDefinitions)) {
         throw "$role compile definition set mismatch"
     }

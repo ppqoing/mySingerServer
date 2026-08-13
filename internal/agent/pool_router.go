@@ -59,6 +59,13 @@ func (r *PoolRouter) Register(
 	if job.JobID <= 0 {
 		return nil, nil, fmt.Errorf("agent: register invalid worker job ID %d", job.JobID)
 	}
+	if job.Source == "" {
+		if job.Phase == worker.Phase1 {
+			job.Source = worker.JobSourceScan
+		} else {
+			job.Source = worker.JobSourceManager
+		}
+	}
 	route := poolRoute{
 		job:      cloneWorkerJob(*job),
 		terminal: make(chan poolTerminal, 1),
@@ -114,21 +121,31 @@ func (r *PoolRouter) run() {
 func (r *PoolRouter) routeResult(result *worker.JobResultMsg) {
 	r.mu.Lock()
 	route, exists := r.routes[result.JobID]
+	implicitPhaseOneSource := exists && route.job.Phase == worker.Phase1 &&
+		result.ScreenStage == worker.ScreenStageLegacy && result.Source == ""
 	if !exists ||
 		result.ScanTaskID != route.job.ScanTaskID ||
 		result.Path != route.job.Path ||
 		result.Phase != route.job.Phase ||
-		result.Kind != route.job.Kind {
+		result.Kind != route.job.Kind ||
+		(!implicitPhaseOneSource && result.ScreenStage != route.job.ScreenStage) ||
+		(!implicitPhaseOneSource && result.Source != route.job.Source) {
 		r.mu.Unlock()
 		if r.log != nil {
 			r.log.Warn(
 				"ignored foreign worker result",
 				"job_id", result.JobID,
 				"task_id", result.ScanTaskID,
-				"path", result.Path,
+				"path_id", worker.PathID(result.Path),
+				"screen_stage", result.ScreenStage,
+				"source", result.Source,
 			)
 		}
 		return
+	}
+	if implicitPhaseOneSource {
+		result.ScreenStage = route.job.ScreenStage
+		result.Source = route.job.Source
 	}
 	delete(r.routes, result.JobID)
 	r.mu.Unlock()
@@ -143,11 +160,17 @@ func (r *PoolRouter) routeCrash(crash worker.CrashRecord) {
 		crash.File != route.job.Path {
 		r.mu.Unlock()
 		if r.log != nil {
+			stage, source := worker.ScreenStageLegacy, worker.JobSource("")
+			if exists {
+				stage, source = route.job.ScreenStage, route.job.Source
+			}
 			r.log.Warn(
 				"ignored foreign worker crash",
 				"job_id", crash.JobID,
 				"task_id", crash.ScanTaskID,
-				"path", crash.File,
+				"path_id", worker.PathID(crash.File),
+				"screen_stage", stage,
+				"source", source,
 			)
 		}
 		return
@@ -193,6 +216,7 @@ func cloneWorkerResult(result *worker.JobResultMsg) *worker.JobResultMsg {
 	copy.ThumbQuality = cloneInt32(result.ThumbQuality)
 	copy.PHashParts = append([]byte(nil), result.PHashParts...)
 	copy.SobelHist = append([]byte(nil), result.SobelHist...)
+	copy.PreviewBytes = append([]byte(nil), result.PreviewBytes...)
 	copy.Errors = append([]worker.FieldError(nil), result.Errors...)
 	copy.Frames = make([]worker.FrameFeature, len(result.Frames))
 	for index, frame := range result.Frames {

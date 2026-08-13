@@ -249,17 +249,29 @@ func (d *Deduper) lookupFeature(ctx context.Context, query SHAQueryMsg) (SHARepl
 		if err != nil {
 			return SHAReplyMsg{}, false, fmt.Errorf("worker deduper: lookup video: %w", err)
 		}
-		if feature == nil || !completeVideoFeature(feature) {
-			reply := missingReply(query)
-			if query.RequestedFields&MaskSHA512 != 0 {
-				reply.FieldsPresent |= MaskSHA512
-				reply.MissingFields &^= MaskSHA512
-			}
+		reply := missingReply(query)
+		if feature == nil {
 			return reply, false, nil
 		}
-		reply := missingReply(query)
-		present := query.RequestedFields & (MaskSHA512 | MaskVideoThumb)
-		reply.FieldsPresent |= present
+		durationOK := feature.DurationMS != nil && *feature.DurationMS >= 0
+		legacyContactOK := durationOK && feature.ThumbPath != "" && len(feature.ThumbPDQ) == 32 &&
+			feature.ThumbQuality != nil && *feature.ThumbQuality >= 0 && *feature.ThumbQuality <= 100
+		contactOK := legacyContactOK && feature.ThumbWidth != nil && *feature.ThumbWidth > 0 &&
+			feature.ThumbHeight != nil && *feature.ThumbHeight > 0
+		present := uint32(0)
+		if query.RequestedFields&MaskSHA512 != 0 && len(feature.SHA512) == 64 {
+			present |= MaskSHA512
+		}
+		if query.RequestedFields&MaskVideoDuration != 0 && durationOK {
+			present |= MaskVideoDuration
+		}
+		if query.RequestedFields&MaskVideoThumb != 0 && legacyContactOK {
+			present |= MaskVideoThumb
+		}
+		if query.RequestedFields&MaskVideoContactSheet != 0 && contactOK {
+			present |= MaskVideoContactSheet
+		}
+		reply.FieldsPresent = present
 		reply.MissingFields &^= present
 		reply.DurationMS = cloneInt64(feature.DurationMS)
 		reply.ThumbPath = feature.ThumbPath
@@ -306,9 +318,9 @@ func dedupeKeyForTask(taskID string, kind MediaKind, sha []byte) (dedupeKey, err
 	if len(sha) != 64 {
 		return dedupeKey{}, fmt.Errorf("worker deduper: SHA-512 must be exactly 64 bytes, got %d", len(sha))
 	}
-	fields := uint32(MaskAllImage)
+	fields := store.RequiredStageOneMask(store.MediaImage)
 	if kind == MediaVideo {
-		fields = MaskAllVideo
+		fields = store.RequiredStageOneMask(store.MediaVideo)
 	}
 	return dedupeKey{
 		task: taskID, kind: kind, sha: shaKey(sha), fields: fields,
@@ -332,16 +344,16 @@ func normalizeSHAQuery(query SHAQueryMsg) (SHAQueryMsg, error) {
 	switch query.Kind {
 	case MediaImage:
 		if query.RequestedFields == 0 {
-			query.RequestedFields = MaskAllImage
+			query.RequestedFields = store.RequiredStageOneMask(store.MediaImage)
 		}
 		if query.RequestedFrames != 0 {
 			return query, fmt.Errorf("worker deduper: image query cannot request video frames")
 		}
 	case MediaVideo:
 		if query.RequestedFields == 0 {
-			query.RequestedFields = MaskAllVideo
+			query.RequestedFields = store.RequiredStageOneMask(store.MediaVideo)
 		}
-		if query.RequestedFields&MaskVideo6F != 0 && query.RequestedFrames == 0 {
+		if query.RequestedFields&videoSixFrameWorkerFields() != 0 && query.RequestedFrames == 0 {
 			query.RequestedFrames = FrameMaskFull
 		}
 	default:
@@ -393,6 +405,17 @@ func replyFromContentState(query SHAQueryMsg, state store.ContentState) SHAReply
 		reply.ThumbPDQ = cloneBytes(state.Video.ThumbPDQ)
 		reply.ThumbQuality = cloneInt32(state.Video.ThumbQuality)
 	}
+	for _, frame := range state.Frames {
+		if frame.FrameIdx < 0 || frame.FrameIdx >= len(reply.FrameResults) {
+			continue
+		}
+		reply.FrameResults[frame.FrameIdx] = FrameResult{
+			FrameIdx: frame.FrameIdx, Status: 0,
+			PDQ256:     cloneBytes(frame.PDQ256),
+			PHashParts: cloneBytes(frame.PHashParts),
+			SobelHist:  cloneBytes(frame.SobelHist),
+		}
+	}
 	reply.Found = reply.MissingFields == 0 && reply.MissingFrames == 0
 	return reply
 }
@@ -401,10 +424,6 @@ func shaKey(sha []byte) [64]byte {
 	var result [64]byte
 	copy(result[:], sha)
 	return result
-}
-
-func completeVideoFeature(feature *store.VideoFeature) bool {
-	return feature.DurationMS != nil && feature.ThumbPath != "" && len(feature.ThumbPDQ) != 0 && feature.ThumbQuality != nil
 }
 
 func replyFromCommittedResult(result JobResultMsg, key dedupeKey) (SHAReplyMsg, bool) {
@@ -452,6 +471,35 @@ func replyFromCommittedResult(result JobResultMsg, key dedupeKey) (SHAReplyMsg, 
 		reply.FramesPresent == key.frames {
 		reply.FieldsPresent |= MaskVideo6F
 	}
+	if key.fields&MaskVideo6FPHash != 0 && result.FieldsDone&MaskVideo6FPHash != 0 &&
+		reply.FramesPresent == key.frames {
+		reply.FieldsPresent |= MaskVideo6FPHash
+	}
+	if key.fields&MaskVideo6FSobel != 0 && result.FieldsDone&MaskVideo6FSobel != 0 &&
+		reply.FramesPresent == key.frames {
+		reply.FieldsPresent |= MaskVideo6FSobel
+	}
+	for index, frame := range result.FrameResults {
+		bit := uint8(1 << uint(index))
+		if key.frames&bit == 0 || result.FramesDone&bit == 0 {
+			continue
+		}
+		reply.FrameResults[index] = FrameResult{
+			FrameIdx: frame.FrameIdx, Status: 0, TimeMS: frame.TimeMS,
+			PDQ256: cloneBytes(frame.PDQ256), Quality: frame.Quality,
+			PHashParts: cloneBytes(frame.PHashParts), SobelHist: cloneBytes(frame.SobelHist),
+		}
+	}
+	for _, frame := range result.Frames {
+		if frame.FrameIdx < 0 || frame.FrameIdx >= len(reply.FrameResults) {
+			continue
+		}
+		reply.FrameResults[frame.FrameIdx] = FrameResult{
+			FrameIdx: frame.FrameIdx, Status: 0, TimeMS: frame.TimeMS,
+			PDQ256: cloneBytes(frame.PDQ256), Quality: frame.Quality,
+			PHashParts: cloneBytes(frame.PHashParts), SobelHist: cloneBytes(frame.SobelHist),
+		}
+	}
 	reply.MissingFields &^= reply.FieldsPresent
 	reply.MissingFrames &^= reply.FramesPresent
 	reply.Found = reply.MissingFields == 0 && reply.MissingFrames == 0
@@ -463,6 +511,11 @@ func cloneReply(reply SHAReplyMsg) SHAReplyMsg {
 	reply.DurationMS = cloneInt64(reply.DurationMS)
 	reply.ThumbPDQ = cloneBytes(reply.ThumbPDQ)
 	reply.ThumbQuality = cloneInt32(reply.ThumbQuality)
+	for index := range reply.FrameResults {
+		reply.FrameResults[index].PDQ256 = cloneBytes(reply.FrameResults[index].PDQ256)
+		reply.FrameResults[index].PHashParts = cloneBytes(reply.FrameResults[index].PHashParts)
+		reply.FrameResults[index].SobelHist = cloneBytes(reply.FrameResults[index].SobelHist)
+	}
 	return reply
 }
 

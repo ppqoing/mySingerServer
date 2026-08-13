@@ -137,6 +137,96 @@ func TestPostgresSyncIsIdempotentWhenIntegrationEnabled(t *testing.T) {
 	}
 }
 
+func TestLocalScopeAndDeletedRemoteRetentionWhenIntegrationEnabled(t *testing.T) {
+	t.Parallel()
+	dsn := os.Getenv("TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("set TEST_POSTGRES_DSN to run local-scope PostgreSQL integration")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	if err := pool.Ping(ctx); err != nil {
+		t.Fatal(err)
+	}
+	schema, err := os.ReadFile(filepath.Join("..", "..", "deploy", "central.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, string(schema)); err != nil {
+		t.Fatal(err)
+	}
+	machineID := uniquePGMachineID(t, "local-scope")
+	sha := derivePGSHA(uniquePGToken(t), "deleted-retention")
+	runID := "run-" + machineID
+	t.Cleanup(func() {
+		cleanupPGRows(t, pool, `DELETE FROM local_task_events WHERE machine_id=$1`, machineID)
+		cleanupPGRows(t, pool, `DELETE FROM local_delete_results WHERE machine_id=$1`, machineID)
+		cleanupPGRows(t, pool, `DELETE FROM local_review_decisions WHERE machine_id=$1`, machineID)
+		cleanupPGRows(t, pool, `DELETE FROM local_dup_members WHERE machine_id=$1`, machineID)
+		cleanupPGRows(t, pool, `DELETE FROM local_dup_groups WHERE machine_id=$1`, machineID)
+		cleanupPGRows(t, pool, `DELETE FROM local_pair_scores WHERE machine_id=$1`, machineID)
+		cleanupPGRows(t, pool, `DELETE FROM local_analysis_runs WHERE machine_id=$1`, machineID)
+		cleanupPGRows(t, pool, `DELETE FROM files WHERE machine_id=$1`, machineID)
+		cleanupPGRows(t, pool, `DELETE FROM image_features WHERE sha512=$1`, sha)
+	})
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO files(machine_id,path,sha512,status) VALUES($1,$2,$3,'done')`,
+		machineID, `D:\local\deleted.jpg`, sha); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO image_features(sha512,width,height,pdq256,pdq_quality) VALUES($1,10,10,$2,80)`,
+		sha, make([]byte, 32)); err != nil {
+		t.Fatal(err)
+	}
+	remote := &PGRemote{pool: pool}
+	batch := store.LocalSyncBatch{
+		Runs:    []store.LocalAnalysisRunSyncRow{{MachineID: machineID, RunID: runID, Generation: 1, TaskID: "task", Status: "published"}},
+		Events:  []store.LocalOutboxSyncRow{{Sequence: 1, MachineID: machineID, Topic: "local.delete", EntityKey: "batch:1", Generation: 1, PayloadJSON: `{"status":"deleted"}`}},
+		Deletes: []store.LocalDeleteSyncRow{{MachineID: machineID, RunID: runID, Generation: 1, BatchID: "batch", FileID: 1, Path: `D:\local\deleted.jpg`, SHA512: sha, Result: "deleted", Status: "deleted", CompletedAt: 1}},
+	}
+	for range 2 {
+		tx, err := remote.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.UpsertLocal(ctx, batch); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.CloseBatch(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var status, storedSHA string
+	if err := pool.QueryRow(ctx, `SELECT status,sha512 FROM files WHERE machine_id=$1 AND path=$2`, machineID, `D:\local\deleted.jpg`).Scan(&status, &storedSHA); err != nil {
+		t.Fatal(err)
+	}
+	if status != "deleted" || storedSHA != sha {
+		t.Fatalf("remote file=%s/%s", status, storedSHA)
+	}
+	var features, history, events int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM image_features WHERE sha512=$1`, sha).Scan(&features); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM local_delete_results WHERE machine_id=$1`, machineID).Scan(&history); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM local_task_events WHERE machine_id=$1`, machineID).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if features != 1 || history != 1 || events != 1 {
+		t.Fatalf("retained rows features/history/events=%d/%d/%d", features, history, events)
+	}
+}
+
 func TestPGRemoteFeatureUpsertsAndCentralMigrationWhenIntegrationEnabled(t *testing.T) {
 	t.Parallel()
 	dsn := os.Getenv("FS_PG_DSN")

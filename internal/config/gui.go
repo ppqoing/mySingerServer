@@ -69,8 +69,15 @@ type AgentEndpoint struct {
 }
 
 func DefaultGUI() *GUIConfig {
+	cfg := defaultGUIOptionalFields()
+	cfg.PGDSN = "postgres://dedup@127.0.0.1:5432/dedup"
+	cfg.Agents = []AgentEndpoint{{Addr: "127.0.0.1:9101"}}
+	return cfg
+}
+
+func defaultGUIOptionalFields() *GUIConfig {
 	return &GUIConfig{
-		ListenAddr:  "127.0.0.1:8080",
+		ListenAddr:  "127.0.0.1:18081",
 		HeartbeatS:  15,
 		FirstScreen: defaultFirstScreen(),
 		Phase2:      defaultPhase2(),
@@ -78,13 +85,13 @@ func DefaultGUI() *GUIConfig {
 }
 
 func LoadGUI(path string) (*GUIConfig, error) {
-	cfg := DefaultGUI()
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
+	cfg := defaultGUIOptionalFields()
 	if err := json.Unmarshal(data, cfg); err != nil {
-		return nil, fmt.Errorf("config: parse %s: %w", path, err)
+		return nil, fmt.Errorf("config: parse: %w", err)
 	}
 	if err := ValidateGUI(cfg); err != nil {
 		return nil, err

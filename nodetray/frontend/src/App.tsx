@@ -6,6 +6,10 @@ import { AgentPage } from './pages/AgentPage'
 import { HelperPage } from './pages/HelperPage'
 import { OverviewPage } from './pages/OverviewPage'
 import { SettingsPage } from './pages/SettingsPage'
+import { LocalTasksPage } from './pages/LocalTasksPage'
+import { AnalysisPage } from './pages/AnalysisPage'
+import { ReviewPage } from './pages/ReviewPage'
+import { DeleteHistoryPage } from './pages/DeleteHistoryPage'
 import { NodeStateProvider } from './state/NodeStateContext'
 
 export type SubscribeWindowClose = (handler: () => void) => () => void
@@ -38,6 +42,10 @@ export function App({ subscribeWindowClose = defaultSubscribeWindowClose }: { su
         agent: <AgentPage onDirtyChange={agentDirty} />,
         helper: <HelperPage onDirtyChange={helperDirty} onRequestExit={() => setExitOpen(true)} />,
         settings: <SettingsPage onDirtyChange={settingsDirty} onRequestExit={() => setExitOpen(true)} />,
+        'local-tasks': <LocalTasksPage />,
+        analysis: <AnalysisPage />,
+        review: <ReviewPage />,
+        deletions: <DeleteHistoryPage />,
       }} />
       <ExitDialog open={exitOpen} dirty={dirty.agent || dirty.helper || dirty.settings} onReturn={() => setExitOpen(false)} />
     </NodeStateProvider>

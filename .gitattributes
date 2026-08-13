@@ -1,0 +1,10 @@
+mediacore/testdata/level_b/level_b.tsv text eol=lf
+third_party/ffmpeg/SOURCE.md text eol=lf
+third_party/ffmpeg/LICENSE.txt text eol=lf
+third_party/ffmpeg/NOTICE.md text eol=lf
+third_party/ffmpeg/manifest.json text eol=lf
+third_party/ffmpeg/manifest.schema.json text eol=lf
+third_party/ffmpeg/include/**/*.h text eol=lf
+videocore/testdata/level_b/level_b.tsv text eol=lf
+videocore/testdata/legacy_level_b/legacy-golden.tsv text eol=lf
+videocore/testdata/legacy_level_b/manifest.json text eol=crlf

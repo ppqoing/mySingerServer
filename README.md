@@ -56,6 +56,47 @@ flowchart LR
 > GUI HTTP、Agent TCP 和 PostgreSQL 示例部署没有应用层鉴权或 TLS。
 > 不要把这些端口直接暴露到互联网。
 
+## 双便携包发布与部署
+
+一次发布包含两个独立 ZIP，二者都连接到部署方已有的外部 PostgreSQL；发布包
+不携带数据库、真实连接凭据或自动数据库初始化逻辑。
+
+- **Compute（计算节点包）**：部署到每台媒体 Windows 机器，包含 `nodetray.exe`、
+  Agent、Worker、可选的管理员 Helper、媒体依赖和节点配置示例。Worker 始终由
+  Agent 管理，不应手工启动。
+- **Manager（管理端包）**：部署到中央管理机器，包含 `gui.exe`、受限的
+  `gui.example.json` 和启动脚本；配置完成后可直接双击 `gui.exe`，或在
+  PowerShell 中运行 `./Start-Manager.ps1`，监听成功后会自动打开浏览器。
+
+从完整 stage 目录生成两个包时使用同一个 ReleaseId；入口会先在专用候选目录
+生成并复核全部 ZIP 与 SHA-256 sidecar，确认四个最终目标都不存在后才一起发布：
+
+```powershell
+pwsh -NoProfile -File .\scripts\package-portable-release.ps1 `
+  -StageDir .\artifacts\stage `
+  -ReleaseId 20260811 `
+  -BuildDate 2026-08-11 `
+  -SourceRevision N/A_NO_GIT_METADATA
+```
+
+未指定 `-OutputDir` 时，双 ZIP 与 `.sha256` 默认发布到
+`D:\code\mySingerServer\publish`；仍可显式传入 `-OutputDir` 覆盖该目录。
+
+输出目录会得到以下四个文件：
+
+- `MySingerServer-compute-win-x64-<ReleaseId>.zip`
+- `MySingerServer-compute-win-x64-<ReleaseId>.zip.sha256`
+- `MySingerServer-manager-win-x64-<ReleaseId>.zip`
+- `MySingerServer-manager-win-x64-<ReleaseId>.zip.sha256`
+
+分别解压到任意可写目录，不需要安装。计算节点完整解压后可双击 `Start-Compute.ps1`
+或直接启动 `nodetray.exe`，再由
+NodeTray UI 生成 Agent 与可选 Helper 的生产配置；不要手工预建 `data\helper` 或写入
+`helper.json`。管理端不要直接修改模板：先复制 `gui.example.json` 为 `gui.json`，
+填写实际外部 PostgreSQL DSN 与可信 Agent 地址，然后直接双击 `gui.exe`，或在
+PowerShell 中运行 `./Start-Manager.ps1`。升级时保留已有运行配置，仅替换程序文件并
+按需迁移配置。
+
 ## 节点托盘快速开始
 
 节点日常配置应使用 `nodetray.exe` 的交互式表单，不需要直接编辑 Agent 或
@@ -63,7 +104,8 @@ flowchart LR
 准备固定程序目录和运行文件，操作员随后按以下顺序完成单机配置：
 
 1. 启动 `nodetray.exe`。程序进入 Windows 通知区域并打开节点控制台；主窗口
-   固定包含“总览”“Agent”“删除 Helper”“程序设置”四个页签。
+   包含“总览”“Agent”“删除 Helper”“程序设置”“本地任务”“去重分析”
+   “结果审核”“删除记录”八个页签。
 2. 打开“Agent”页签，通过输入框、选择器和开关填写节点身份、监听地址、
    数据目录、数据库连接、扫描、同步、Worker 数量及其他必要参数。数据库密码
    在界面中以密码控件处理，不要复制到截图、通知或公开日志。
@@ -86,6 +128,25 @@ flowchart LR
 
 完整的四页签说明、配置备份、WebView2 排障和安全边界见
 [节点托盘部署说明](docs/deployment/node-tray.md)。
+
+### 无 PostgreSQL 的本机闭环
+
+PostgreSQL 对计算节点是可选同步目标。`pg_dsn` 留空时 Agent 仍会启动，NodeTray
+可以在本机创建扫描任务，默认计算一筛基础特征，并继续执行二筛、三筛、结果审核
+和经 Helper 确认的删除。只有同步状态显示“同步暂不可用/未配置”，本地 SQLite、
+扫描、计算和审核不会被阻断。之后在 Agent 页面填写 PostgreSQL 主机、端口、库名、
+用户和密码并保存，连接恢复后 outbox 会幂等补传，立即生效。
+
+DSN 手工示例为 `postgres://dedup:密码@127.0.0.1:5432/dedup?sslmode=prefer`；
+特殊字符必须进行 URL 转义，不要把真实 DSN 写入模板、截图或日志。图片一筛只保存
+SHA-512、PDQ、质量和尺寸等特征，不计算或落盘图片缩略图；审核页的图片预览由
+Worker 按需在内存中生成。视频仍可复用接触表缓存。
+
+删除只对 Helper 明确返回成功的文件生效。物理文件删除后，本地 SQLite 和可选
+PostgreSQL 中的 `files.status` 标记为 `deleted`；SHA-512、特征、哈希索引关联、
+分数、分组历史、审核和删除审计均保留。失败或 uncertain 项保持原状态。Manager
+仍可向 Agent 分别下发二筛和三筛计算任务；关闭 Manager 或 PostgreSQL 不影响新的
+本机任务。
 
 ## 中央端与兼容 CLI 部署
 
@@ -423,7 +484,7 @@ Agent 的 `data_dir` 中包含：
 
 ### 构建环境
 
-- Go 1.22+；
+- Go 1.23+；
 - Node.js 22.15+ 与 npm 10.9+（用于测试并生成内嵌 React 页面）；
 - Visual Studio 2022，包含 C++ x64 工具链；
 - CMake 3.20+ 和相邻的 CTest；

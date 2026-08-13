@@ -68,9 +68,17 @@ func TestManualHelperLauncherUsesOnlyFixedRunasContract(t *testing.T) {
 	if backend.request.Verb != "runas" {
 		t.Fatalf("verb = %q, want runas", backend.request.Verb)
 	}
-	wantHelper, _ := filepath.Abs(helper)
-	if !strings.EqualFold(backend.request.File, filepath.Clean(wantHelper)) {
-		t.Fatalf("file = %q, want canonical helper %q", backend.request.File, wantHelper)
+	launchedInfo, err := os.Stat(backend.request.File)
+	if err != nil {
+		t.Fatalf("stat launched helper %q: %v", backend.request.File, err)
+	}
+	helperInfo, err := os.Stat(helper)
+	if err != nil {
+		t.Fatalf("stat fixture helper %q: %v", helper, err)
+	}
+	if !filepath.IsAbs(backend.request.File) || filepath.Clean(backend.request.File) != backend.request.File ||
+		!strings.EqualFold(filepath.Base(backend.request.File), "helper.exe") || !os.SameFile(launchedInfo, helperInfo) {
+		t.Fatalf("file = %q, want canonical path for helper fixture %q", backend.request.File, helper)
 	}
 	wantConfig, _ := filepath.Abs(config)
 	wantParameters := `--config "` + filepath.Clean(wantConfig) + `"`

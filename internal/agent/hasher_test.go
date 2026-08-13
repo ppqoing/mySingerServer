@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"dedup/internal/proto"
 )
 
 func TestGoHasherMatchesSHA512ReferenceAcrossBlocks(t *testing.T) {
@@ -46,14 +48,17 @@ func TestLongPathPrefixUsesUNCDeviceSyntax(t *testing.T) {
 	}
 }
 
-func TestMediaKindAndMissingBaseAreCaseInsensitive(t *testing.T) {
+func TestDefaultStageOneMediaKindAndMissingBaseAreCaseInsensitive(t *testing.T) {
 	tests := []struct {
 		path string
 		kind string
 		mask uint32
 	}{
 		{path: `D:\照片\A.JPG`, kind: "image", mask: 3},
-		{path: `D:\video\a.mkv`, kind: "video", mask: 5},
+		{
+			path: `D:\video\a.mkv`, kind: "video",
+			mask: proto.FieldSHA512 | proto.FieldVideoDuration | proto.FieldVideoContactSheet,
+		},
 		{path: `D:\other\a.txt`, kind: "other", mask: 1},
 	}
 	for _, tt := range tests {

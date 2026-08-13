@@ -22,16 +22,17 @@ var (
 )
 
 type Backend struct {
-	ctx            context.Context
-	service        *trayapp.Service
-	lifecycle      BackendLifecycle
-	lifeMu         sync.Mutex
-	started        bool
-	closed         bool
-	startup        BackendStartup
-	closeErr       error
-	quit           func(context.Context)
-	exitAuthorized atomic.Bool
+	ctx             context.Context
+	service         *trayapp.Service
+	lifecycle       BackendLifecycle
+	lifeMu          sync.Mutex
+	started         bool
+	closed          bool
+	startup         BackendStartup
+	closeErr        error
+	quit            func(context.Context)
+	webViewDataPath string
+	exitAuthorized  atomic.Bool
 }
 
 type BackendLifecycle interface {
@@ -129,6 +130,70 @@ func (b *Backend) GetOverview() (traymodel.Overview, error) {
 		return traymodel.Overview{}, err
 	}
 	return service.GetOverview(ctx)
+}
+
+func (b *Backend) CreateLocalTask(value traymodel.LocalTaskCreate) traymodel.LocalTaskResult {
+	ctx, service, err := b.ready()
+	if err != nil {
+		return traymodel.LocalTaskResult{ErrorCode: "backend_not_started", ErrorSummary: "本机控制台尚未启动"}
+	}
+	return service.CreateLocalTask(ctx, value)
+}
+
+func (b *Backend) ListLocalTasks(value traymodel.PageRequest) traymodel.LocalTaskPage {
+	ctx, service, err := b.ready()
+	if err != nil {
+		return traymodel.LocalTaskPage{Tasks: []traymodel.LocalTask{}, ErrorCode: "backend_not_started", ErrorSummary: "本机控制台尚未启动"}
+	}
+	return service.ListLocalTasks(ctx, value)
+}
+
+func (b *Backend) StartLocalAnalysis(value traymodel.LocalAnalysisStart) traymodel.OperationResult {
+	ctx, service, err := b.ready()
+	if err != nil {
+		return backendOperationError(err)
+	}
+	return service.StartLocalAnalysis(ctx, value)
+}
+
+func (b *Backend) ListLocalGroups(value traymodel.LocalGroupQuery) traymodel.LocalGroupPage {
+	ctx, service, err := b.ready()
+	if err != nil {
+		return traymodel.LocalGroupPage{Groups: []traymodel.LocalGroup{}, ErrorCode: "backend_not_started", ErrorSummary: "本机控制台尚未启动"}
+	}
+	return service.ListLocalGroups(ctx, value)
+}
+
+func (b *Backend) SaveLocalReview(value traymodel.LocalReviewSave) traymodel.OperationResult {
+	ctx, service, err := b.ready()
+	if err != nil {
+		return backendOperationError(err)
+	}
+	return service.SaveLocalReview(ctx, value)
+}
+
+func (b *Backend) PrepareLocalDelete(value traymodel.LocalDeletePrepare) traymodel.LocalDeletePreview {
+	ctx, service, err := b.ready()
+	if err != nil {
+		return traymodel.LocalDeletePreview{Files: []traymodel.LocalDeleteFile{}, ErrorCode: "backend_not_started", ErrorSummary: "本机控制台尚未启动"}
+	}
+	return service.PrepareLocalDelete(ctx, value)
+}
+
+func (b *Backend) ExecuteLocalDelete(value traymodel.LocalDeleteExecute) traymodel.LocalDeleteBatch {
+	ctx, service, err := b.ready()
+	if err != nil {
+		return traymodel.LocalDeleteBatch{Items: []traymodel.LocalDeleteItem{}, ErrorCode: "backend_not_started", ErrorSummary: "本机控制台尚未启动"}
+	}
+	return service.ExecuteLocalDelete(ctx, value)
+}
+
+func (b *Backend) GetLocalImagePreview(fileID int64) traymodel.ImagePreview {
+	ctx, service, err := b.ready()
+	if err != nil {
+		return traymodel.ImagePreview{ErrorCode: "backend_not_started", ErrorSummary: "本机控制台尚未启动"}
+	}
+	return service.GetLocalImagePreview(ctx, fileID)
 }
 
 func (b *Backend) getOverviewWithContext(ctx context.Context) (traymodel.Overview, error) {

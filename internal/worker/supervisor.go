@@ -543,6 +543,8 @@ func (worker *workerProc) readLoop(out chan<- workerOutcome) {
 				continue
 			}
 			result.Phase = job.Phase
+			result.ScreenStage = job.ScreenStage
+			result.Source = job.Source
 			result.ScanTaskID = job.ScanTaskID
 			result.WorkerPID = worker.proc.PID()
 			worker.pool.saveResult(*job, result)
@@ -683,10 +685,10 @@ func (worker *workerProc) claim(reason string, exitCode int32, cause error, owne
 		record.ScanTaskID = job.ScanTaskID
 	}
 	worker.pool.metrics.crashes.Add(1)
-	if job != nil {
+	if job != nil && job.Phase != PhasePreview {
 		worker.pool.metrics.filesFailed.Add(1)
 	}
-	if job != nil && worker.pool.store != nil {
+	if job != nil && job.Phase != PhasePreview && worker.pool.store != nil {
 		message := reason
 		if cause != nil {
 			message += ": " + cause.Error()
@@ -695,13 +697,15 @@ func (worker *workerProc) claim(reason string, exitCode int32, cause error, owne
 			worker.pool.deps.logger.Error("mark crash failed",
 				"worker_index", worker.index,
 				"pid", worker.proc.PID(),
-				"path", job.Path,
+				"path_id", PathID(job.Path),
+				"screen_stage", job.ScreenStage,
+				"source", job.Source,
 				"reason", reason,
-				"err", err,
+				"err", RedactKnownPath(err.Error(), job.Path),
 			)
 		}
 	}
-	if job != nil {
+	if job != nil && job.Phase != PhasePreview {
 		worker.pool.dedup.FailByJob(job.JobID)
 	}
 	if worker.pool.deps.crash != nil {
@@ -785,17 +789,24 @@ func validateWorkerResult(job *JobMsg, result *JobResultMsg) error {
 		result.Path != job.Path ||
 		result.Kind != job.Kind {
 		return fmt.Errorf(
-			"worker protocol: result identity mismatch job=%d/%d path=%q/%q kind=%d/%d",
+			"worker protocol: result identity mismatch job=%d/%d result_path_id=%s job_path_id=%s kind=%d/%d",
 			result.JobID,
 			job.JobID,
-			result.Path,
-			job.Path,
+			PathID(result.Path),
+			PathID(job.Path),
 			result.Kind,
 			job.Kind,
 		)
 	}
 	if result.ScanTaskID != "" && result.ScanTaskID != job.ScanTaskID {
 		return fmt.Errorf("worker protocol: result scan_task_id mismatch")
+	}
+	implicitPhaseOneSource := job.Phase == Phase1 && result.ScreenStage == ScreenStageLegacy && result.Source == ""
+	if !implicitPhaseOneSource && result.ScreenStage != job.ScreenStage {
+		return fmt.Errorf("worker protocol: result screen_stage mismatch")
+	}
+	if !implicitPhaseOneSource && result.Source != job.Source {
+		return fmt.Errorf("worker protocol: result source mismatch")
 	}
 	if result.FieldsDone&^job.FieldsMask != 0 {
 		return fmt.Errorf(
@@ -804,10 +815,61 @@ func validateWorkerResult(job *JobMsg, result *JobResultMsg) error {
 			job.FieldsMask,
 		)
 	}
-	if job.Phase != Phase1 && job.Phase != Phase2 {
+	if job.Phase != Phase1 && job.Phase != Phase2 && job.Phase != PhasePreview {
 		return fmt.Errorf("worker protocol: invalid job phase %d", job.Phase)
 	}
+	if job.Phase == PhasePreview {
+		return validateImagePreviewResult(job, result)
+	}
 	return validateMergedWorkerResult(job, result)
+}
+
+func validateImagePreviewResult(job *JobMsg, result *JobResultMsg) error {
+	if job.Kind != MediaImage || job.Source != JobSourceLocal ||
+		job.ScreenStage != ScreenStagePreview || job.FieldsMask != 0 ||
+		job.FrameMask != 0 || job.Size < 0 || job.MTimeUnix <= 0 ||
+		len(job.KnownSHA) != 64 || job.PreviewMaxWidth <= 0 ||
+		job.PreviewMaxHeight <= 0 || job.PreviewQuality < 1 ||
+		job.PreviewQuality > 100 || !validPreviewFormat(job.PreviewFormat) {
+		return fmt.Errorf("worker protocol: invalid image preview request")
+	}
+	if len(result.SHA512) != 64 || !bytes.Equal(job.KnownSHA, result.SHA512) {
+		return fmt.Errorf("worker protocol: image preview SHA-512 mismatch")
+	}
+	if result.FieldsDone != 0 || result.FramesDone != 0 || len(result.Errors) != 0 ||
+		len(result.PDQ) != 0 || len(result.PHashParts) != 0 ||
+		len(result.SobelHist) != 0 || len(result.Frames) != 0 {
+		return fmt.Errorf("worker protocol: image preview carried feature payload")
+	}
+	if result.PreviewErrorCode != "" {
+		if !validPreviewErrorCode(result.PreviewErrorCode) ||
+			result.PreviewFormat != "" || result.PreviewWidth != 0 ||
+			result.PreviewHeight != 0 || len(result.PreviewBytes) != 0 {
+			return fmt.Errorf("worker protocol: invalid image preview failure")
+		}
+		return nil
+	}
+	if result.PreviewFormat != job.PreviewFormat || result.PreviewWidth <= 0 ||
+		result.PreviewHeight <= 0 || result.PreviewWidth > job.PreviewMaxWidth ||
+		result.PreviewHeight > job.PreviewMaxHeight || len(result.PreviewBytes) == 0 ||
+		len(result.PreviewBytes) > MaxPreviewBytes {
+		return fmt.Errorf("worker protocol: invalid image preview response")
+	}
+	return nil
+}
+
+func validPreviewFormat(format string) bool {
+	return format == PreviewFormatJPEG || format == PreviewFormatWebP
+}
+
+func validPreviewErrorCode(code string) bool {
+	switch code {
+	case "stale_preview", "preview_io_failed", "preview_decode_failed",
+		"preview_encode_failed", "preview_too_large", "preview_memory_limit":
+		return true
+	default:
+		return false
+	}
 }
 
 func validateMergedWorkerResult(job *JobMsg, result *JobResultMsg) error {
@@ -816,7 +878,8 @@ func validateMergedWorkerResult(job *JobMsg, result *JobResultMsg) error {
 	case MediaImage:
 		allowed = MaskSHA512 | MaskImagePDQ | MaskPHashParts | MaskSobelHist
 	case MediaVideo:
-		allowed = MaskSHA512 | MaskVideoThumb | MaskVideo6F | MaskVideoDuration | MaskVideoContactSheet
+		allowed = MaskSHA512 | MaskVideoThumb | MaskVideo6F | MaskVideoDuration |
+			MaskVideoContactSheet | MaskVideo6FPHash | MaskVideo6FSobel
 	default:
 		return fmt.Errorf("worker protocol: invalid media kind %d", job.Kind)
 	}
@@ -900,9 +963,7 @@ func validateMergedVideoResult(job *JobMsg, result *JobResultMsg, requestedFrame
 		return fmt.Errorf("worker protocol: unclaimed video contact-sheet payload")
 	}
 	if len(result.Frames) != 0 {
-		legacyJob := *job
-		legacyJob.FieldsMask = MaskVideo6F
-		return validatePhase2VideoResult(&legacyJob, result)
+		return validatePhase2VideoResult(job, result)
 	}
 	for index, frame := range result.FrameResults {
 		bit := uint8(1 << uint(index))
@@ -917,20 +978,20 @@ func validateMergedVideoResult(job *JobMsg, result *JobResultMsg, requestedFrame
 		}
 		done := result.FramesDone&bit != 0
 		if done {
-			if frame.Status != 0 || len(frame.PDQ256) != 32 || frame.Quality < 0 || frame.Quality > 100 {
+			if frame.Status != 0 {
 				return fmt.Errorf("worker protocol: invalid successful frame %d", index)
 			}
-			if _, err := features.DecodePHashParts(frame.PHashParts); err != nil {
-				return fmt.Errorf("worker protocol: frame %d phash: %w", index, err)
-			}
-			if _, err := features.DecodeSobelHist(frame.SobelHist); err != nil {
-				return fmt.Errorf("worker protocol: frame %d sobel: %w", index, err)
+			if err := validatePhase2FramePayload(job.ScreenStage, FrameFeature{
+				FrameIdx: frame.FrameIdx, TimeMS: frame.TimeMS, PDQ256: frame.PDQ256,
+				Quality: frame.Quality, PHashParts: frame.PHashParts, SobelHist: frame.SobelHist,
+			}); err != nil {
+				return fmt.Errorf("worker protocol: frame %d: %w", index, err)
 			}
 		} else if frame.Status == 0 || frameHasFeaturePayload(frame) {
 			return fmt.Errorf("worker protocol: invalid failed frame %d", index)
 		}
 	}
-	if result.FieldsDone&MaskVideo6F != 0 && result.FramesDone != requestedFrames {
+	if result.FieldsDone&job.FieldsMask != 0 && result.FramesDone != requestedFrames {
 		return fmt.Errorf("worker protocol: video6f completed with frames %#x, want %#x", result.FramesDone, requestedFrames)
 	}
 	return nil
@@ -1058,11 +1119,20 @@ func validatePhase2WorkerResult(job *JobMsg, result *JobResultMsg) error {
 }
 
 func validatePhase2ImageResult(job *JobMsg, result *JobResultMsg) error {
-	const allowed = MaskPHashParts | MaskSobelHist
-	if job.FieldsMask&^allowed != 0 {
+	wanted := uint32(MaskPHashParts | MaskSobelHist)
+	switch job.ScreenStage {
+	case ScreenStageLegacy:
+	case ScreenStageTwo:
+		wanted = MaskPHashParts
+	case ScreenStageThree:
+		wanted = MaskSobelHist
+	default:
+		return fmt.Errorf("worker protocol: invalid phase-2 image screen stage %d", job.ScreenStage)
+	}
+	if job.FieldsMask != wanted {
 		return fmt.Errorf(
-			"worker protocol: phase-2 image job contains invalid fields %#x",
-			job.FieldsMask&^allowed,
+			"worker protocol: phase-2 image job fields %#x, want %#x for stage %d",
+			job.FieldsMask, wanted, job.ScreenStage,
 		)
 	}
 	if len(result.Frames) != 0 {
@@ -1113,10 +1183,20 @@ func validatePhase2ImageBlob(
 }
 
 func validatePhase2VideoResult(job *JobMsg, result *JobResultMsg) error {
-	if job.FieldsMask&^MaskVideo6F != 0 {
+	wanted := uint32(MaskVideo6F)
+	switch job.ScreenStage {
+	case ScreenStageLegacy:
+	case ScreenStageTwo:
+		wanted = MaskVideo6FPHash
+	case ScreenStageThree:
+		wanted = MaskVideo6FSobel
+	default:
+		return fmt.Errorf("worker protocol: invalid phase-2 screen stage %d", job.ScreenStage)
+	}
+	if job.FieldsMask != wanted {
 		return fmt.Errorf(
-			"worker protocol: phase-2 video job contains invalid fields %#x",
-			job.FieldsMask&^MaskVideo6F,
+			"worker protocol: phase-2 video job fields %#x, want %#x for stage %d",
+			job.FieldsMask, wanted, job.ScreenStage,
 		)
 	}
 	const fullFrameMask uint8 = 1<<6 - 1
@@ -1165,42 +1245,47 @@ func validatePhase2VideoResult(job *JobMsg, result *JobResultMsg) error {
 			}
 			continue
 		}
-		if len(frame.PDQ256) != 32 {
-			return fmt.Errorf(
-				"worker protocol: phase-2 frame %d PDQ length %d",
-				frame.FrameIdx,
-				len(frame.PDQ256),
-			)
-		}
-		if frame.Quality < 0 || frame.Quality > 100 {
-			return fmt.Errorf(
-				"worker protocol: phase-2 frame %d quality %d is invalid",
-				frame.FrameIdx,
-				frame.Quality,
-			)
-		}
-		if _, err := features.DecodePHashParts(frame.PHashParts); err != nil {
-			return fmt.Errorf(
-				"worker protocol: phase-2 frame %d phash_parts: %w",
-				frame.FrameIdx,
-				err,
-			)
-		}
-		if _, err := features.DecodeSobelHist(frame.SobelHist); err != nil {
-			return fmt.Errorf(
-				"worker protocol: phase-2 frame %d sobel_hist: %w",
-				frame.FrameIdx,
-				err,
-			)
+		if err := validatePhase2FramePayload(job.ScreenStage, frame); err != nil {
+			return fmt.Errorf("worker protocol: phase-2 frame %d: %w", frame.FrameIdx, err)
 		}
 		complete++
 	}
-	if result.FieldsDone&MaskVideo6F != 0 && complete != len(seen) {
+	if result.FieldsDone&wanted != 0 && complete != len(seen) {
 		return fmt.Errorf(
 			"worker protocol: completed phase-2 video has %d complete frames, want %d",
 			complete,
 			len(seen),
 		)
+	}
+	return nil
+}
+
+func validatePhase2FramePayload(stage ScreenStage, frame FrameFeature) error {
+	switch stage {
+	case ScreenStageLegacy:
+		if len(frame.PDQ256) != 32 || frame.Quality < 0 || frame.Quality > 100 {
+			return fmt.Errorf("invalid legacy PDQ payload")
+		}
+		if _, err := features.DecodePHashParts(frame.PHashParts); err != nil {
+			return fmt.Errorf("phash_parts: %w", err)
+		}
+		if _, err := features.DecodeSobelHist(frame.SobelHist); err != nil {
+			return fmt.Errorf("sobel_hist: %w", err)
+		}
+	case ScreenStageTwo:
+		if len(frame.PDQ256) != 0 || frame.Quality != 0 || len(frame.SobelHist) != 0 {
+			return fmt.Errorf("stage-two frame contains foreign payload")
+		}
+		if _, err := features.DecodePHashParts(frame.PHashParts); err != nil {
+			return fmt.Errorf("phash_parts: %w", err)
+		}
+	case ScreenStageThree:
+		if len(frame.PDQ256) != 0 || frame.Quality != 0 || len(frame.PHashParts) != 0 {
+			return fmt.Errorf("stage-three frame contains foreign payload")
+		}
+		if _, err := features.DecodeSobelHist(frame.SobelHist); err != nil {
+			return fmt.Errorf("sobel_hist: %w", err)
+		}
 	}
 	return nil
 }

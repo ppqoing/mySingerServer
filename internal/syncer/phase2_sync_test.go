@@ -303,6 +303,8 @@ func (tx *phase2RecordingTx) UpsertFrames(_ context.Context, rows []store.VideoF
 	return nil
 }
 
+func (*phase2RecordingTx) UpsertLocal(context.Context, store.LocalSyncBatch) error { return nil }
+
 func (*phase2RecordingTx) CloseBatch(context.Context) error { return nil }
 
 func (tx *phase2RecordingTx) Commit(context.Context) error {
@@ -386,6 +388,16 @@ func (local *phase2ScriptedLocal) QuarantineSyncRows(
 ) error {
 	local.quarantined = append(local.quarantined, rows...)
 	local.remove(rows)
+	return nil
+}
+
+func (*phase2ScriptedLocal) PendingLocalSyncEvents(context.Context, int) ([]store.LocalOutboxSyncRow, error) {
+	return nil, nil
+}
+func (*phase2ScriptedLocal) LoadLocalSyncBatch(context.Context, []store.LocalOutboxSyncRow) (store.LocalSyncBatch, error) {
+	return store.LocalSyncBatch{}, nil
+}
+func (*phase2ScriptedLocal) AcknowledgeLocalSyncEvents(context.Context, []store.LocalOutboxSyncRow) error {
 	return nil
 }
 

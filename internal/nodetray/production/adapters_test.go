@@ -2,6 +2,7 @@ package production
 
 import (
 	"context"
+	"errors"
 	"net"
 	"reflect"
 	"strings"
@@ -9,29 +10,71 @@ import (
 	"testing"
 
 	"dedup/internal/nodectl"
+	"dedup/internal/nodetray/agentclient"
+	trayapp "dedup/internal/nodetray/app"
 	trayconfig "dedup/internal/nodetray/config"
 	"dedup/internal/nodetray/traymodel"
+	"dedup/internal/proto"
 )
 
 type fakeValidationStore struct {
-	agent  []trayconfig.FieldError
 	helper []trayconfig.FieldError
 }
 
-func (f fakeValidationStore) ValidateAgentForm(trayconfig.AgentForm) []trayconfig.FieldError {
-	return append([]trayconfig.FieldError(nil), f.agent...)
+type fakeAgentConfigurationController struct {
+	ctx      context.Context
+	form     trayconfig.AgentForm
+	result   agentclient.ConfigSaveResult
+	promoted bool
 }
+
+func (f *fakeAgentConfigurationController) LoadAgentForm(ctx context.Context) (trayconfig.AgentForm, error) {
+	f.ctx = ctx
+	return f.form, nil
+}
+func (f *fakeAgentConfigurationController) ValidateAgentForm(ctx context.Context, _ trayconfig.AgentForm) []trayconfig.FieldError {
+	f.ctx = ctx
+	return nil
+}
+func (f *fakeAgentConfigurationController) SaveAgentForm(ctx context.Context, _ trayconfig.AgentForm) (agentclient.ConfigSaveResult, error) {
+	f.ctx = ctx
+	return f.result, nil
+}
+func (f *fakeAgentConfigurationController) PromotePendingEndpoint() { f.promoted = true }
+
+func TestAgentConfigGatewayAdaptsSocketControllerWithoutLocalStore(t *testing.T) {
+	wantForm := trayconfig.AgentForm{DataDir: "socket-agent"}
+	wantSHA := strings.Repeat("c", 64)
+	controller := &fakeAgentConfigurationController{
+		form:   wantForm,
+		result: agentclient.ConfigSaveResult{SHA256: wantSHA, RestartRequired: true},
+	}
+	gateway := NewAgentConfigGateway(controller)
+	var _ trayapp.AgentConfigGateway = gateway
+	ctx := context.WithValue(context.Background(), struct{ key string }{"gateway"}, "marker")
+	if got, err := gateway.LoadAgentForm(ctx); err != nil || !reflect.DeepEqual(got, wantForm) {
+		t.Fatalf("LoadAgentForm = %#v, %v", got, err)
+	}
+	if fields := gateway.ValidateAgentForm(ctx, wantForm); len(fields) != 0 {
+		t.Fatalf("ValidateAgentForm = %#v", fields)
+	}
+	result, err := gateway.SaveAgentForm(ctx, wantForm)
+	if err != nil || result != (trayapp.AgentConfigSaveResult{SHA256: wantSHA, RestartRequired: true}) {
+		t.Fatalf("SaveAgentForm = %#v, %v", result, err)
+	}
+	gateway.PromotePendingEndpoint()
+	if controller.ctx != ctx || !controller.promoted {
+		t.Fatal("gateway lost request context or endpoint promotion")
+	}
+}
+
 func (f fakeValidationStore) ValidateHelperForm(trayconfig.HelperForm) []trayconfig.FieldError {
 	return append([]trayconfig.FieldError(nil), f.helper...)
 }
 
 func TestValidatorDelegatesToStoreSharedPureValidation(t *testing.T) {
-	wantAgent := []trayconfig.FieldError{{Field: "agent", Code: "invalid", Message: "Agent 配置无效"}}
 	wantHelper := []trayconfig.FieldError{{Field: "helper", Code: "invalid", Message: "Helper 配置无效"}}
-	validator := NewValidator(fakeValidationStore{agent: wantAgent, helper: wantHelper})
-	if got := validator.ValidateAgent(trayconfig.AgentForm{}); !reflect.DeepEqual(got, wantAgent) {
-		t.Fatalf("ValidateAgent = %#v", got)
-	}
+	validator := NewValidator(fakeValidationStore{helper: wantHelper})
 	if got := validator.ValidateHelper(trayconfig.HelperForm{}); !reflect.DeepEqual(got, wantHelper) {
 		t.Fatalf("ValidateHelper = %#v", got)
 	}
@@ -82,73 +125,104 @@ func validAgentControlStatus() nodectl.Status {
 	}
 }
 
-func TestControllerFreezesAgentPipeAndValidatesStatusIdentity(t *testing.T) {
-	dialer := &scriptedDialer{statuses: []nodectl.Status{validAgentControlStatus()}}
-	controller, err := NewAgentController(dialer, controllerMachineID("1"))
+func TestAgentControllerUsesLoopbackSocketAndNeverUsesHelperPipeDialer(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	_, port, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := "production-agent-token"
+	machineID := controllerMachineID("1")
+	serverErr := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer conn.Close()
+		framed := proto.NewConn(conn)
+		if err := framed.WriteFrame(proto.MsgHello, &proto.Hello{Version: proto.ProtocolVersion, MachineID: machineID, PID: 1001}); err != nil {
+			serverErr <- err
+			return
+		}
+		messageType, body, err := framed.ReadFrame()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		decoded, err := proto.Decode(messageType, body)
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		auth, ok := decoded.(*proto.ClientAuth)
+		if !ok || auth.Token != token || auth.Role != "nodetray" {
+			serverErr <- errors.New("invalid Agent controller authentication")
+			return
+		}
+		if err := framed.WriteFrame(proto.MsgClientAuthResult, &proto.ClientAuthResult{Accepted: true}); err != nil {
+			serverErr <- err
+			return
+		}
+		for _, operation := range []string{proto.LocalOperationStatusGet, proto.LocalOperationShutdown} {
+			messageType, body, err = framed.ReadFrame()
+			if err != nil {
+				serverErr <- err
+				return
+			}
+			decoded, err = proto.Decode(messageType, body)
+			if err != nil {
+				serverErr <- err
+				return
+			}
+			request, ok := decoded.(*proto.LocalRequest)
+			if !ok || request.Operation != operation {
+				serverErr <- errors.New("Agent controller did not use local operation")
+				return
+			}
+			var payload any = proto.LocalShutdownResponse{Accepted: true}
+			if operation == proto.LocalOperationStatusGet {
+				payload = proto.LocalStatusGetResponse{Status: validAgentControlStatus()}
+			}
+			encoded, err := proto.EncodeLocalPayload(payload)
+			if err != nil {
+				serverErr <- err
+				return
+			}
+			if err := framed.WriteFrame(proto.MsgLocalResponse, &proto.LocalResponse{RequestID: request.RequestID, OK: true, Payload: encoded}); err != nil {
+				serverErr <- err
+				return
+			}
+		}
+		serverErr <- nil
+	}()
+
+	pipeDialer := &scriptedDialer{}
+	controller, err := NewAgentController(pipeDialer, machineID, func(context.Context) (string, string, error) {
+		return net.JoinHostPort("0.0.0.0", port), token, nil
+	})
 	if err != nil {
 		t.Fatalf("NewAgentController: %v", err)
 	}
 	status, err := controller.Status(context.Background())
-	if err != nil || status.MachineID != controllerMachineID("1") {
+	if err != nil || status.MachineID != machineID {
 		t.Fatalf("Status = %#v, %v", status, err)
 	}
 	if err := controller.Shutdown(context.Background()); err != nil {
 		t.Fatalf("Shutdown: %v", err)
 	}
-	dialer.mu.Lock()
-	defer dialer.mu.Unlock()
-	if !reflect.DeepEqual(dialer.names, []string{nodectl.AgentPipeName(), nodectl.AgentPipeName()}) {
-		t.Fatalf("dialed pipes = %v", dialer.names)
+	pipeDialer.mu.Lock()
+	defer pipeDialer.mu.Unlock()
+	if len(pipeDialer.names) != 0 {
+		t.Fatalf("Agent controller dialed Helper pipe transport: %v", pipeDialer.names)
 	}
-	if !reflect.DeepEqual(dialer.commands, []nodectl.Command{nodectl.CommandStatus, nodectl.CommandShutdown}) {
-		t.Fatalf("commands = %v", dialer.commands)
-	}
-}
-
-func TestAgentControllerRejectsEveryDifferentReportedMachineID(t *testing.T) {
-	status := validAgentControlStatus()
-	status.MachineID = controllerMachineID("2")
-	controller, err := NewAgentController(
-		&scriptedDialer{statuses: []nodectl.Status{status}},
-		controllerMachineID("1"),
-	)
-	if err != nil {
+	if err := <-serverErr; err != nil {
 		t.Fatal(err)
-	}
-	if _, err := controller.Status(context.Background()); err == nil {
-		t.Fatal("controller accepted a different generated machine ID")
-	}
-}
-
-func TestControllerRejectsInvalidOrMismatchedStatusWithoutLeakingResponse(t *testing.T) {
-	tests := []struct {
-		name   string
-		mutate func(*nodectl.Status)
-	}{
-		{name: "protocol invalid", mutate: func(s *nodectl.Status) { s.PID = -1; s.LastErrorSummary = "password=fixture-secret" }},
-		{name: "wrong component", mutate: func(s *nodectl.Status) { s.Component = nodectl.ComponentHelper }},
-		{name: "wrong machine", mutate: func(s *nodectl.Status) { s.MachineID = "private-machine-name" }},
-		{name: "empty current sha", mutate: func(s *nodectl.Status) { s.ConfigSHA256 = "" }},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			status := validAgentControlStatus()
-			tt.mutate(&status)
-			dialer := &scriptedDialer{statuses: []nodectl.Status{status}}
-			controller, err := NewAgentController(dialer, controllerMachineID("1"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			_, err = controller.Status(context.Background())
-			if err == nil {
-				t.Fatal("Status accepted invalid identity")
-			}
-			for _, forbidden := range []string{"fixture-secret", "private-machine-name", `C:\Program Files`} {
-				if strings.Contains(err.Error(), forbidden) {
-					t.Fatalf("Status error leaked %q: %v", forbidden, err)
-				}
-			}
-		})
 	}
 }
 
@@ -232,8 +306,8 @@ func TestLocationOpenerUsesFixedExplorerWithOneValidatedArgument(t *testing.T) {
 }
 
 func TestAdaptersFailClosedWhenDependenciesAreUnavailable(t *testing.T) {
-	if _, err := NewAgentController(nil, controllerMachineID("1")); err == nil {
-		t.Fatal("nil dialer accepted")
+	if _, err := NewAgentController(nil, ""); err == nil {
+		t.Fatal("empty Agent identity accepted")
 	}
 	if _, err := NewHelperController(&scriptedDialer{}, ""); err == nil {
 		t.Fatal("empty generated identity accepted")

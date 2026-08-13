@@ -18,6 +18,8 @@ import (
 type productionCompositionInputs struct {
 	Store             trayapp.Store
 	Validator         trayapp.Validator
+	AgentConfig       trayapp.AgentConfigGateway
+	LocalAgent        trayapp.LocalAgentGateway
 	MachineID         string
 	Agent             trayapp.Component
 	Helper            trayapp.Component
@@ -27,28 +29,31 @@ type productionCompositionInputs struct {
 		trayapp.TaskController
 		bootstrap.TaskRunner
 	}
-	Elevation      trayapp.ElevationClient
-	LoginStart     trayapp.LoginStart
-	TrayExecutable string
-	TaskDefinition task.Definition
-	Locations      map[traymodel.LocationKind]trayapp.Location
-	FinalPaths     interface {
+	Elevation       trayapp.ElevationClient
+	LoginStart      trayapp.LoginStart
+	PortableRoot    string
+	WebViewDataPath string
+	TrayExecutable  string
+	TaskDefinition  task.Definition
+	Locations       map[traymodel.LocationKind]trayapp.Location
+	FinalPaths      interface {
 		trayapp.PathResolver
 		bootstrap.FinalPathResolver
 	}
-	Opener         trayapp.LocationOpener
-	Workers        trayapp.WorkerProvider
-	ProcessWaiter  trayapp.ProcessWaiter
-	Paths          bootstrap.PathResolver
-	Instance       bootstrap.InstanceService
-	Factory        bootstrap.Factory
-	Scheduler      bootstrap.RefreshScheduler
-	UI             bootstrap.UI
-	Emitter        production.EventEmitter
-	Prepare        func() error
-	Show           func(context.Context)
-	Quit           func(context.Context)
-	StartBootstrap production.BootstrapStarter
+	Opener            trayapp.LocationOpener
+	Workers           trayapp.WorkerProvider
+	ProcessWaiter     trayapp.ProcessWaiter
+	Paths             bootstrap.PathResolver
+	Instance          bootstrap.InstanceService
+	Factory           bootstrap.Factory
+	Scheduler         bootstrap.RefreshScheduler
+	UI                bootstrap.UI
+	Emitter           production.EventEmitter
+	Prepare           func() error
+	Show              func(context.Context)
+	Quit              func(context.Context)
+	StartBootstrap    production.BootstrapStarter
+	CloseAgentControl func() error
 }
 
 func composeProductionBackendWith(inputs productionCompositionInputs) (*Backend, error) {
@@ -71,11 +76,12 @@ func composeProductionBackendWith(inputs productionCompositionInputs) (*Backend,
 		Events: events, Emitter: inputs.Emitter, EventBuffer: 16,
 		StartBootstrap: inputs.StartBootstrap,
 	})
-	lifecycle := &preparedRuntimeLifecycle{prepare: inputs.Prepare, runtime: runtimeLifecycle, events: events}
+	lifecycle := &preparedRuntimeLifecycle{prepare: inputs.Prepare, runtime: runtimeLifecycle, events: events, closeAgentControl: inputs.CloseAgentControl}
 	service := trayapp.NewService(trayapp.Dependencies{
-		Store: inputs.Store, Validator: inputs.Validator,
-		MachineID: inputs.MachineID,
-		Agent:     inputs.Agent, Helper: inputs.Helper,
+		Store: inputs.Store, Validator: inputs.Validator, AgentConfig: inputs.AgentConfig,
+		LocalAgent: inputs.LocalAgent,
+		MachineID:  inputs.MachineID,
+		Agent:      inputs.Agent, Helper: inputs.Helper,
 		AgentFingerprint:  inputs.AgentFingerprint,
 		HelperFingerprint: inputs.HelperFingerprint,
 		Task:              inputs.Task, Elevation: inputs.Elevation, LoginStart: inputs.LoginStart,
@@ -83,16 +89,16 @@ func composeProductionBackendWith(inputs productionCompositionInputs) (*Backend,
 		Locations: inputs.Locations, PathResolver: inputs.FinalPaths,
 		Opener: inputs.Opener, Workers: inputs.Workers, ProcessWaiter: inputs.ProcessWaiter,
 	})
-	return &Backend{ctx: state, service: service, lifecycle: lifecycle, quit: inputs.Quit}, nil
+	return &Backend{ctx: state, service: service, lifecycle: lifecycle, quit: inputs.Quit, webViewDataPath: inputs.WebViewDataPath}, nil
 }
 
 func validateProductionComposition(inputs productionCompositionInputs) error {
-	if inputs.Store == nil || inputs.Validator == nil || inputs.Agent == nil || inputs.Helper == nil ||
+	if inputs.Store == nil || inputs.Validator == nil || inputs.AgentConfig == nil || inputs.LocalAgent == nil || inputs.Agent == nil || inputs.Helper == nil ||
 		!machineid.Valid(inputs.MachineID) || inputs.AgentFingerprint == nil || inputs.HelperFingerprint == nil ||
 		inputs.Task == nil || inputs.Elevation == nil || inputs.LoginStart == nil || inputs.FinalPaths == nil ||
 		inputs.Opener == nil || inputs.Workers == nil || inputs.ProcessWaiter == nil || inputs.Paths == nil || inputs.Instance == nil ||
 		inputs.Factory == nil || inputs.Scheduler == nil || inputs.UI == nil || inputs.Emitter == nil ||
-		inputs.Prepare == nil || inputs.Show == nil || inputs.Quit == nil {
+		inputs.Prepare == nil || inputs.Show == nil || inputs.Quit == nil || inputs.CloseAgentControl == nil {
 		return errors.New("production composition: required dependency unavailable")
 	}
 	if !validCompositionExecutable(inputs.TrayExecutable, "nodetray.exe") ||
@@ -101,6 +107,9 @@ func validateProductionComposition(inputs productionCompositionInputs) error {
 		inputs.TaskDefinition.UserSID == "" || strings.TrimSpace(inputs.TaskDefinition.UserSID) != inputs.TaskDefinition.UserSID ||
 		!strings.HasPrefix(inputs.TaskDefinition.UserSID, "S-1-") {
 		return errors.New("production composition: fixed authority invalid")
+	}
+	if !validCompositionDirectory(inputs.PortableRoot) || !strictlyWithinCompositionRoot(inputs.WebViewDataPath, inputs.PortableRoot) {
+		return errors.New("production composition: portable data invalid")
 	}
 	for _, kind := range []traymodel.LocationKind{
 		traymodel.AgentLogs, traymodel.HelperLogs, traymodel.AgentBackup, traymodel.HelperBackup,
@@ -121,14 +130,25 @@ func validCompositionFile(value string) bool {
 	return value != "" && filepath.IsAbs(value) && filepath.Clean(value) == value && filepath.Base(value) != "."
 }
 
+func validCompositionDirectory(value string) bool { return validCompositionFile(value) }
+
+func strictlyWithinCompositionRoot(path, root string) bool {
+	if !validCompositionFile(path) || !validCompositionDirectory(root) {
+		return false
+	}
+	relative, err := filepath.Rel(strings.ToLower(filepath.Clean(root)), strings.ToLower(filepath.Clean(path)))
+	return err == nil && relative != "." && relative != ".." && !filepath.IsAbs(relative) && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
+}
+
 type preparedRuntimeLifecycle struct {
-	prepare     func() error
-	runtime     *production.Runtime
-	events      *trayapp.EventBus
-	prepareOnce sync.Once
-	prepareErr  error
-	closeOnce   sync.Once
-	closeErr    error
+	prepare           func() error
+	runtime           *production.Runtime
+	events            *trayapp.EventBus
+	closeAgentControl func() error
+	prepareOnce       sync.Once
+	prepareErr        error
+	closeOnce         sync.Once
+	closeErr          error
 }
 
 func (l *preparedRuntimeLifecycle) Start(ctx context.Context) (*bootstrap.Runtime, error) {
@@ -152,6 +172,11 @@ func (l *preparedRuntimeLifecycle) Close() error {
 		}
 		if l.events != nil {
 			l.events.Close()
+		}
+		if l.closeAgentControl != nil {
+			if err := l.closeAgentControl(); l.closeErr == nil {
+				l.closeErr = err
+			}
 		}
 	})
 	return l.closeErr

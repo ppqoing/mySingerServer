@@ -3,9 +3,12 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
+
+	"dedup/internal/proto"
 )
 
 type FileRow struct {
@@ -22,6 +25,41 @@ type FileRow struct {
 	MissingMask uint32
 	Error       *string
 	UpdatedAt   int64
+}
+
+type DeletionResult struct {
+	FileID             int64
+	MachineID          string
+	Path               string
+	SHA512             string
+	Size               int64
+	MTime              int64
+	BatchID            string
+	RunID              string
+	GroupID            string
+	Generation         int64
+	ConfirmationDigest string
+	OK                 bool
+	Uncertain          bool
+	ErrorCode          string
+	ErrorMessage       string
+}
+
+type DeletionItem struct {
+	FileID    int64
+	Result    string
+	ErrorCode string
+	Uncertain bool
+}
+
+type DeletionBatch struct {
+	BatchID   string
+	Status    string
+	Requested int
+	Succeeded int
+	Failed    int
+	Uncertain int
+	Items     []DeletionItem
 }
 
 type EnumUpsert struct {
@@ -97,8 +135,58 @@ func (d *DB) UpsertEnumerated(ctx context.Context, records []EnumUpsert) error {
 		); err != nil {
 			return fmt.Errorf("store: upsert %s: %w", record.Path, err)
 		}
+		if err := revalidateEnumeratedPhase1(ctx, tx, record); err != nil {
+			return fmt.Errorf("store: revalidate %s: %w", record.Path, err)
+		}
 	}
 	return tx.Commit()
+}
+
+func revalidateEnumeratedPhase1(ctx context.Context, tx *sql.Tx, record EnumUpsert) error {
+	var sha sql.NullString
+	var currentMissing uint32
+	if err := tx.QueryRowContext(ctx, `
+		SELECT sha512, missing_mask FROM files WHERE machine_id=?1 AND path=?2`,
+		record.MachineID, record.Path,
+	).Scan(&sha, &currentMissing); err != nil {
+		return err
+	}
+	if !sha.Valid || sha.String == "" {
+		return nil
+	}
+
+	kind := MediaKind("")
+	switch {
+	case record.MissingBase&proto.FieldPDQ256 != 0:
+		kind = MediaImage
+	case record.MissingBase&(proto.FieldThumb|proto.FieldVideoDuration|proto.FieldVideoContactSheet) != 0:
+		kind = MediaVideo
+	}
+	row := FileRow{
+		MachineID: record.MachineID,
+		Path:      record.Path,
+		Size:      record.Size,
+		MTime:     record.MTime,
+		SHA512:    &sha.String,
+	}
+	missing, err := missingPhase1(ctx, tx, row, kind, record.MissingBase)
+	if err != nil {
+		return err
+	}
+	updatedMissing := currentMissing&^phaseOneFieldsMask | missing
+	status, phase1Done := stageOneState(kind, updatedMissing, false)
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE files SET
+			missing_mask=?3,
+			phase1_done=?4,
+			status=CASE WHEN ?4=0 THEN ?5 WHEN ?3=0 THEN 'done' ELSE status END,
+			error=CASE WHEN ?3=0 THEN NULL ELSE error END
+		WHERE machine_id=?1 AND path=?2`,
+		record.MachineID, record.Path, updatedMissing, boolToInt(phase1Done), status,
+	); err != nil {
+		return err
+	}
+	return nil
 }
 
 type PendingFile struct {
@@ -119,8 +207,8 @@ func (d *DB) PendingSnapshot(
 		FROM files
 		WHERE machine_id = ?1
 		  AND status != 'deleted'
-		  AND (missing_mask & 7) != 0
-		ORDER BY disk_no, path;`, machineID)
+		  AND (missing_mask & ?2) != 0
+		ORDER BY disk_no, path;`, machineID, phaseOneFieldsMask)
 	if err != nil {
 		return nil, err
 	}
@@ -160,7 +248,7 @@ type HashResult struct {
 const markHashOKSQL = `
 UPDATE files SET sha512 = ?3, status = 'done', error = NULL,
     missing_mask = missing_mask & ~1,
-    phase1_done = CASE WHEN ((missing_mask & ~1) & 7) = 0 THEN 1 ELSE 0 END,
+	phase1_done = CASE WHEN ((missing_mask & ~1) & ?5) = 0 THEN 1 ELSE 0 END,
     updated_at = ?4
 WHERE machine_id = ?1 AND path = ?2;`
 
@@ -240,6 +328,171 @@ func (d *DB) MarkDeleted(
 	return tx.Commit()
 }
 
+// CommitDeletionResults atomically records the complete Helper outcome and
+// marks only explicit, certain successes deleted. It intentionally leaves all
+// hashes, features, scores, groups, members, and reviews untouched.
+func (d *DB) CommitDeletionResults(ctx context.Context, batchID string, results []DeletionResult) error {
+	if d == nil || d.db == nil || batchID == "" || len(results) == 0 {
+		return fmt.Errorf("store: invalid deletion results")
+	}
+	first := results[0]
+	if first.BatchID != batchID || first.MachineID == "" || first.RunID == "" ||
+		first.GroupID == "" || first.Generation <= 0 || first.ConfirmationDigest == "" {
+		return fmt.Errorf("store: invalid deletion batch identity")
+	}
+	seen := make(map[int64]struct{}, len(results))
+	for _, result := range results {
+		if result.BatchID != batchID || result.MachineID != first.MachineID ||
+			result.RunID != first.RunID || result.GroupID != first.GroupID ||
+			result.Generation != first.Generation || result.ConfirmationDigest != first.ConfirmationDigest ||
+			result.FileID <= 0 || result.Path == "" || result.SHA512 == "" {
+			return fmt.Errorf("store: inconsistent deletion result identity")
+		}
+		if _, duplicate := seen[result.FileID]; duplicate {
+			return fmt.Errorf("store: duplicate deletion file %d", result.FileID)
+		}
+		seen[result.FileID] = struct{}{}
+	}
+
+	tx, err := d.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var currentRun string
+	var currentGeneration int64
+	if err := tx.QueryRowContext(ctx, `SELECT run_id,generation FROM local_current_analysis WHERE machine_id=?1`, first.MachineID).Scan(&currentRun, &currentGeneration); err != nil {
+		return fmt.Errorf("store: verify current deletion review: %w", err)
+	}
+	if currentRun != first.RunID || currentGeneration != first.Generation {
+		return fmt.Errorf("store: deletion review generation changed")
+	}
+	now := time.Now().UnixMilli()
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO local_delete_batches(
+		 batch_id,machine_id,run_id,confirmation_digest,status,requested_count,created_at,updated_at)
+		VALUES (?1,?2,?3,?4,'running',?5,?6,?6)`,
+		batchID, first.MachineID, first.RunID, first.ConfirmationDigest, len(results), now); err != nil {
+		return fmt.Errorf("store: begin deletion batch: %w", err)
+	}
+
+	succeeded, failed, uncertainCount := 0, 0, 0
+	for _, result := range results {
+		var status, sha string
+		var size, mtime int64
+		if err := tx.QueryRowContext(ctx, `
+			SELECT status,sha512,size,mtime FROM files
+			WHERE machine_id=?1 AND id=?2 AND path=?3`, result.MachineID, result.FileID, result.Path,
+		).Scan(&status, &sha, &size, &mtime); err != nil {
+			return fmt.Errorf("store: verify deletion file %d: %w", result.FileID, err)
+		}
+		if status == "deleted" || sha != result.SHA512 || size != result.Size || mtime != result.MTime {
+			return fmt.Errorf("store: deletion file identity changed")
+		}
+		var reviewCount int
+		if err := tx.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM local_reviews
+			WHERE machine_id=?1 AND run_id=?2 AND generation=?3 AND group_id=?4
+			  AND file_id=?5 AND decision='delete'`,
+			result.MachineID, result.RunID, result.Generation, result.GroupID, result.FileID,
+		).Scan(&reviewCount); err != nil || reviewCount != 1 {
+			return fmt.Errorf("store: deletion review changed")
+		}
+
+		itemResult := "failed"
+		itemUncertain := 0
+		if result.OK && !result.Uncertain {
+			itemResult = "deleted"
+			succeeded++
+		} else if result.Uncertain {
+			itemResult = "uncertain"
+			itemUncertain = 1
+			uncertainCount++
+		} else {
+			failed++
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO local_delete_items(
+			 batch_id,machine_id,file_id,path_snapshot,sha512,result,error_code,error_message,
+			 uncertain,created_at,updated_at,completed_at)
+			VALUES (?1,?2,?3,?4,?5,?6,NULLIF(?7,''),NULLIF(?8,''),?9,?10,?10,?10)`,
+			batchID, result.MachineID, result.FileID, result.Path, result.SHA512,
+			itemResult, result.ErrorCode, result.ErrorMessage, itemUncertain, now); err != nil {
+			return fmt.Errorf("store: record deletion item: %w", err)
+		}
+		if itemResult != "deleted" {
+			continue
+		}
+		changed, err := tx.ExecContext(ctx, markDeletedSQL, result.MachineID, result.Path, now)
+		if err != nil {
+			return fmt.Errorf("store: mark deletion result: %w", err)
+		}
+		if rows, err := changed.RowsAffected(); err != nil || rows != 1 {
+			return fmt.Errorf("store: mark deletion result rows: %d %v", rows, err)
+		}
+		if _, err := tx.ExecContext(ctx, enqueueFilesSyncSQL, result.MachineID, result.Path, now); err != nil {
+			return fmt.Errorf("store: enqueue deletion result: %w", err)
+		}
+		payload, err := json.Marshal(struct {
+			FileID    int64  `json:"file_id"`
+			MachineID string `json:"machine_id"`
+			Status    string `json:"status"`
+			SHA512    string `json:"sha512"`
+			BatchID   string `json:"batch_id"`
+		}{result.FileID, result.MachineID, "deleted", result.SHA512, batchID})
+		if err != nil {
+			return err
+		}
+		entityKey := fmt.Sprintf("%s:%d", batchID, result.FileID)
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO local_outbox(topic,entity_key,generation,payload_json,created_at,updated_at)
+			VALUES ('local.delete',?1,?2,?3,?4,?4)`, entityKey, result.Generation, string(payload), now); err != nil {
+			return fmt.Errorf("store: enqueue local delete event: %w", err)
+		}
+	}
+	batchStatus := "failed"
+	if succeeded == len(results) {
+		batchStatus = "succeeded"
+	} else if uncertainCount > 0 {
+		batchStatus = "uncertain"
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE local_delete_batches SET status=?2,succeeded_count=?3,failed_count=?4,
+		 uncertain_count=?5,updated_at=?6,completed_at=?6 WHERE batch_id=?1`,
+		batchID, batchStatus, succeeded, failed, uncertainCount, now); err != nil {
+		return fmt.Errorf("store: finish deletion batch: %w", err)
+	}
+	return tx.Commit()
+}
+
+func (d *DB) LoadDeletionBatch(ctx context.Context, machineID, batchID string) (DeletionBatch, error) {
+	if d == nil || d.db == nil || machineID == "" || batchID == "" {
+		return DeletionBatch{}, fmt.Errorf("store: invalid deletion batch")
+	}
+	batch := DeletionBatch{BatchID: batchID}
+	if err := d.db.QueryRowContext(ctx, `
+		SELECT status,requested_count,succeeded_count,failed_count,uncertain_count
+		FROM local_delete_batches WHERE machine_id=?1 AND batch_id=?2`, machineID, batchID,
+	).Scan(&batch.Status, &batch.Requested, &batch.Succeeded, &batch.Failed, &batch.Uncertain); err != nil {
+		return DeletionBatch{}, err
+	}
+	rows, err := d.db.QueryContext(ctx, `
+		SELECT file_id,result,COALESCE(error_code,''),uncertain
+		FROM local_delete_items WHERE machine_id=?1 AND batch_id=?2 ORDER BY item_id`, machineID, batchID)
+	if err != nil {
+		return DeletionBatch{}, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var item DeletionItem
+		if err := rows.Scan(&item.FileID, &item.Result, &item.ErrorCode, &item.Uncertain); err != nil {
+			return DeletionBatch{}, err
+		}
+		batch.Items = append(batch.Items, item)
+	}
+	return batch, rows.Err()
+}
+
 func (d *DB) ApplyHashResults(
 	ctx context.Context,
 	machineID string,
@@ -258,7 +511,7 @@ func (d *DB) ApplyHashResults(
 	for _, result := range results {
 		if result.Err == "" {
 			_, err = tx.ExecContext(
-				ctx, markHashOKSQL, machineID, result.Path, result.SHA512, now,
+				ctx, markHashOKSQL, machineID, result.Path, result.SHA512, now, phaseOneFieldsMask,
 			)
 		} else {
 			_, err = tx.ExecContext(

@@ -4,7 +4,7 @@
 
 **Goal:** 让计算端和远端管理端都能从任意本地可写目录运行，并从一次构建中生成职责隔离的 Compute 与 Manager 两个 Windows x64 ZIP。
 
-**Architecture:** 计算端以 `nodetray.exe` 最终真实路径的父目录作为唯一便携根，所有程序和运行数据都从该根解析。管理端以 `gui.exe` 所在目录解析默认配置和日志，在 HTTP 监听成功后打开浏览器。发布阶段分别构造 Compute 与 Manager 候选包，全部验证通过后才发布两个 ZIP 和 sidecar。
+**Architecture:** 计算端以 `nodetray.exe` 最终真实路径的父目录作为唯一便携根，所有程序和运行数据都从该根解析。管理端以 Windows 最终 `gui.exe` 路径所在目录解析默认配置和日志，在 HTTP 监听成功后打开浏览器。发布阶段分别构造 Compute 与 Manager 候选包，全部验证通过后才发布两个 ZIP 和 sidecar。
 
 **Tech Stack:** Go 1.26.5、Windows API、Wails v2、PowerShell 7、PostgreSQL/pgx、现有 NodeTray/Agent/Worker/Helper/Everything 发布链路。
 
@@ -224,6 +224,8 @@ git commit -m "feat: run compute node from portable directory"
 ```go
 func TestResolveGUIRuntimePathsUsesExecutableDirectoryInsteadOfWorkingDirectory(t *testing.T)
 func TestResolveGUIRuntimePathsKeepsExplicitConfigOverride(t *testing.T)
+func TestResolveGUIExecutablePathUsesFinalImageInsteadOfLaunchAlias(t *testing.T)
+func TestResolveGUIExecutablePathRejectsFinalUNCImage(t *testing.T)
 func TestGUIRuntimeLoggerWritesPortableLogAndConsole(t *testing.T)
 func TestLocalBrowserURLMapsWildcardListenersToLoopback(t *testing.T)
 ```
@@ -264,7 +266,7 @@ type guiRuntimePaths struct {
 }
 ```
 
-无显式配置时使用 `<exe-root>\gui.json`；显式配置按现有语义转为绝对路径。拒绝 UNC EXE 根。`newGUIRuntimeLogger` 创建 `data\logs`，用现有 lumberjack 依赖写 `gui.log`，并用 `io.MultiWriter` 同时输出控制台。
+Windows 上以打开映像句柄取得 `gui.exe` 最终路径，再把最终绝对路径传给运行时路径解析器；无显式配置时使用 `<final-exe-root>\gui.json`，显式配置按现有语义转为绝对路径。拒绝最终 UNC EXE 根。`newGUIRuntimeLogger` 创建 `data\logs`，用现有 lumberjack 依赖写 `gui.log`，并用 `io.MultiWriter` 同时输出控制台。
 
 把 `-config` flag 默认值从字符串 `gui.json` 改为空字符串，使解析器能够区分“采用 EXE 同目录默认值”和“用户显式覆盖”；帮助文本仍说明默认文件为 EXE 同目录 `gui.json`。
 
@@ -330,7 +332,7 @@ MySingerServer-Manager/release-manifest.json
 
 断言不存在 `agent.exe`、`worker.exe`、`helper.exe`、`nodetray.exe`、Everything、FFmpeg、VideoCore、WebView2 和 `gui.json`。断言 manifest `release_kind=remote-manager-portable`、`portable_root=.`，并验证文件哈希与 sidecar。
 
-另用含密码 DSN、token query 或第二个真实 LAN Agent 地址的临时模板证明脚本 fail closed。
+另用含密码 DSN、token query、第二个真实 LAN Agent 地址、LAN PostgreSQL IP、内部 DNS 名或错误 DSN scheme 的临时模板证明脚本 fail closed。
 
 - [ ] **Step 2: 运行测试并确认 RED**
 
@@ -363,7 +365,7 @@ exit $LASTEXITCODE
 
 - [ ] **Step 4: 实现 Manager 打包器**
 
-沿用节点打包器的路径规范化、目标冲突、UTF-8、候选目录、解压复核、逐文件 SHA-256 和 sidecar 模式。配置检查必须解析 JSON/URI，拒绝 DSN UserInfo 中的密码以及 query 中的 `password|passwd|pwd|token|secret`。
+沿用节点打包器的路径规范化、目标冲突、UTF-8、候选目录、解压复核、逐文件 SHA-256 和 sidecar 模式。配置检查必须解析 JSON/URI，拒绝 DSN UserInfo 中的密码以及 query 中的 `password|passwd|pwd|token|secret`，只允许 `postgres`/`postgresql` scheme 和 `127.0.0.1`/`localhost` host 占位。
 
 发布 manifest 不写安装目录，写：
 
@@ -412,6 +414,7 @@ git commit -m "build: add portable manager release"
 - manifest `release_kind=compute-node-portable`、`portable_root=.`；
 - 不再存在 `install_root=C:\Program Files\MySingerServer\`；
 - 不包含 `gui.exe`、`gui.json`、`gui.example.json`、`Start-Manager.ps1`；
+- 不包含 `data/helper` 目录、`.gitkeep` 或空 ZIP 目录项；
 - 保持 Everything 四文件、NodeTray、Agent、Worker、Helper、WebView2、原生依赖和许可证完整。
 
 Run:
@@ -495,7 +498,7 @@ param(
 )
 ```
 
-先计算四个最终路径并拒绝任何冲突。两个子打包器只写入任务专用候选目录；总入口再次验证 ZIP、sidecar 和 manifest product/release_kind。发布时记录已移动文件，若后续移动失败，只删除本次已移动且哈希仍等于候选哈希的文件，然后抛出 `PORTABLE_RELEASE_PUBLISH_FAILED`。
+先计算四个最终路径并拒绝任何冲突。两个子打包器只写入任务专用候选目录；总入口再次验证 ZIP、sidecar 和 manifest product/release_kind。发布时记录已移动文件；若后续移动失败，回滚为每个文件打开持续锁定的 Windows 句柄，在同一对象上校验候选哈希并请求删除。哈希后路径被替换时必须保留替换后的用户文件；句柄打开、校验、删除、关闭或测试 hook 失败时追加 cleanup warning 并继续，最后抛出保留原发布错误的 `PORTABLE_RELEASE_PUBLISH_FAILED`。
 
 - [ ] **Step 4: 更新根 README 发布说明**
 

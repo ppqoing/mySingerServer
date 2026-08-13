@@ -164,14 +164,13 @@ func resolveDisk(root string) (int64, bool, error) {
 		return -1, false, err
 	}
 	if !info.MediaTypeKnown {
-		slog.Warn(
-			"disk media type unavailable, using HDD scheduling",
-			"root", root,
-			"mount_point", mountPoint,
-			"device_number", info.DeviceNumber,
-		)
+		logUnknownDiskMedia(slog.Default(), root, mountPoint, info.DeviceNumber)
 	}
 	return int64(info.DeviceNumber), info.IsSSD, nil
+}
+
+func logUnknownDiskMedia(logger *slog.Logger, root, _ string, deviceNumber uint32) {
+	logger.Warn("disk media type unavailable, using HDD scheduling", "path_id", worker.PathID(root), "error_code", "disk_media_type_unknown", "device_number", deviceNumber)
 }
 
 func (m *ScanManager) Handle(task proto.ScanTask, sender Sender) proto.TaskAck {
@@ -478,10 +477,10 @@ func (m *ScanManager) preparePending(
 			mask := file.MissingMask
 			mediaKind := worker.MediaImage
 			if kind == "image" {
-				mask &= worker.MaskAllImage
+				mask &= store.RequiredStageOneMask(store.MediaImage)
 			} else {
 				mediaKind = worker.MediaVideo
-				mask &= worker.MaskAllVideo
+				mask &= store.RequiredStageOneMask(store.MediaVideo)
 			}
 			if mask == 0 {
 				continue
@@ -747,6 +746,10 @@ func featureItemFromWorker(
 	item.Quality = result.Quality
 	item.Width = result.Width
 	item.Height = result.Height
+	if job.Kind == worker.MediaVideo {
+		item.Width = result.ContactSheetWidth
+		item.Height = result.ContactSheetHeight
+	}
 	item.DurationMS = cloneInt64(result.DurationMS)
 	item.ThumbPath = result.ThumbPath
 	if len(result.ThumbPDQ) != 0 {
@@ -790,7 +793,9 @@ func videoPartialPayload(job *worker.JobMsg, result *worker.JobResultMsg) bool {
 	return result.DurationMS != nil ||
 		result.ThumbPath != "" ||
 		len(result.ThumbPDQ) != 0 ||
-		result.ThumbQuality != nil
+		result.ThumbQuality != nil ||
+		result.ContactSheetWidth != 0 ||
+		result.ContactSheetHeight != 0
 }
 
 func cloneInt64(value *int64) *int64 {
@@ -1042,9 +1047,11 @@ func (m *ScanManager) reportErr(
 ) {
 	m.errLog.Error(
 		"file error",
-		"path", path,
+		"path_id", worker.PathID(path),
 		"stage", stage,
-		"err", err.Error(),
+		"screen_stage", worker.ScreenStageLegacy,
+		"source", worker.JobSourceScan,
+		"err", worker.RedactKnownPath(err.Error(), path),
 	)
 	state.send(proto.MsgError, &proto.Error{
 		TaskID: state.Task.TaskID,

@@ -159,13 +159,14 @@ func TestLoadAgentValidatesTuningBoundariesAndLoopbackPprof(t *testing.T) {
 	}
 }
 
-func TestLoadAgentRejectsMissingDSN(t *testing.T) {
+func TestLoadAgentAcceptsMissingDSNForLocalOnlyMode(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "agent.json")
-	if err := os.WriteFile(path, []byte(`{"machine_id":"machine-a"}`), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(`{"listen_addr":"127.0.0.1:9101","data_dir":"data"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := LoadAgent(path); err == nil {
-		t.Fatal("LoadAgent accepted missing pg_dsn")
+	cfg, err := loadAgent(path, `C:\portable\agent.exe`, 4)
+	if err != nil || cfg.PGDSN != "" {
+		t.Fatalf("local-only config = %#v, err=%v", cfg, err)
 	}
 }
 
@@ -423,6 +424,18 @@ func TestValidateGUIAcceptsDefaultedLoadableConfig(t *testing.T) {
 	}
 }
 
+func TestDefaultGUIIsACompletePortableFirstRunConfiguration(t *testing.T) {
+	cfg := DefaultGUI()
+	if err := ValidateGUI(cfg); err != nil {
+		t.Fatalf("DefaultGUI: %v", err)
+	}
+	if cfg.ListenAddr != "127.0.0.1:18081" ||
+		cfg.PGDSN != "postgres://dedup@127.0.0.1:5432/dedup" ||
+		len(cfg.Agents) != 1 || cfg.Agents[0].Addr != "127.0.0.1:9101" {
+		t.Fatalf("incomplete portable defaults: %#v", cfg)
+	}
+}
+
 func TestValidateGUIRejectsNetworkAndDSNFieldsWithStablePaths(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -542,7 +555,7 @@ func TestLoadGUIAppliesDefaultsAndValidatesEndpoints(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadGUI: %v", err)
 	}
-	if cfg.ListenAddr != "127.0.0.1:8080" || cfg.HeartbeatS != 15 {
+	if cfg.ListenAddr != "127.0.0.1:18081" || cfg.HeartbeatS != 15 {
 		t.Fatalf("unexpected GUI defaults: %#v", cfg)
 	}
 	if cfg.FirstScreen != (FirstScreenConfig{
@@ -555,6 +568,37 @@ func TestLoadGUIAppliesDefaultsAndValidatesEndpoints(t *testing.T) {
 		SHAResolveChunk:       10000,
 	}) {
 		t.Fatalf("unexpected first-screen defaults: %#v", cfg.FirstScreen)
+	}
+}
+
+func TestLoadGUIRejectsExistingFilesMissingRequiredConnectionFields(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "empty", body: `{}`},
+		{name: "missing DSN", body: `{"listen_addr":"127.0.0.1:18081","agents":[{"addr":"127.0.0.1:9101"}]}`},
+		{name: "missing Agent", body: `{"listen_addr":"127.0.0.1:18081","pg_dsn":"postgres://dedup@127.0.0.1:5432/dedup"}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "gui.json")
+			original := []byte(test.body)
+			if err := os.WriteFile(path, original, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := LoadGUI(path); err == nil {
+				t.Fatal("LoadGUI accepted an existing configuration missing required fields")
+			}
+			current, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(current, original) {
+				t.Fatalf("LoadGUI rewrote invalid existing configuration:\n got %q\nwant %q", current, original)
+			}
+		})
 	}
 }
 

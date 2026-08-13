@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -131,6 +132,171 @@ func TestEnumerationChangesAndForcedRescanBecomePending(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertPendingSHA(t, db, rec.Path)
+}
+
+func TestDefaultStageOneUnchangedVideoReusesOnlyCompleteContactCache(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(filepath.Join(t.TempDir(), "agent.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	required := RequiredStageOneMask(MediaVideo)
+	record := EnumUpsert{
+		MachineID: "machine-a", DiskNo: 1, Path: `D:\complete.mp4`,
+		Size: 10, MTime: 20, MissingBase: required,
+	}
+	if err := db.UpsertEnumerated(ctx, []EnumUpsert{record}); err != nil {
+		t.Fatal(err)
+	}
+	duration, quality := int64(1234), int32(88)
+	width, height := int32(960), int32(540)
+	sha := phase1TestSHA()
+	if _, err := db.SaveAnalysis(ctx, AnalysisResult{
+		MachineID: record.MachineID, Path: record.Path, Kind: MediaVideo,
+		Size: record.Size, MTime: record.MTime, SHA512: sha,
+		RequestedFields: required, FieldsDone: required,
+		DurationMS: &duration, ThumbPath: `D:\cache\contact.jpg`,
+		ThumbPDQ: make([]byte, 32), ThumbQuality: &quality,
+		ThumbWidth: &width, ThumbHeight: &height,
+	}); err != nil {
+		t.Fatalf("SaveAnalysis: %v", err)
+	}
+	if err := db.UpsertEnumerated(ctx, []EnumUpsert{record}); err != nil {
+		t.Fatal(err)
+	}
+	assertStageOneFileState(t, db, record.Path, proto.StatusDone, 0, true, true)
+
+	if _, err := db.db.ExecContext(ctx, `
+		UPDATE video_features SET thumb_width=NULL, thumb_height=NULL
+		WHERE sha512=?1`, hex.EncodeToString(sha)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertEnumerated(ctx, []EnumUpsert{record}); err != nil {
+		t.Fatal(err)
+	}
+	assertStageOneFileState(
+		t, db, record.Path, proto.StatusPartial,
+		proto.FieldVideoContactSheet, false, true,
+	)
+	pending, err := db.PendingSnapshot(ctx, record.MachineID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending[record.DiskNo]) != 1 ||
+		pending[record.DiskNo][0].MissingMask != proto.FieldVideoContactSheet {
+		t.Fatalf("pending explicit video fields = %#v", pending)
+	}
+}
+
+func TestDefaultStageOneRevalidateCompleteSharedCacheRestoresDone(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(filepath.Join(t.TempDir(), "agent.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	required := RequiredStageOneMask(MediaVideo)
+	record := EnumUpsert{
+		MachineID: "machine-a", DiskNo: 1, Path: `D:\shared.mp4`,
+		Size: 10, MTime: 20, MissingBase: required,
+	}
+	if err := db.UpsertEnumerated(ctx, []EnumUpsert{record}); err != nil {
+		t.Fatal(err)
+	}
+	sha := phase1TestSHA()
+	if _, err := db.db.ExecContext(ctx, `
+		UPDATE files SET sha512=?1, status='failed', error='retry failed',
+			missing_mask=?2, phase1_done=0 WHERE path=?3;
+		INSERT INTO video_features
+			(sha512, duration_ms, thumb_path, thumb_pdq256, thumb_quality, thumb_width, thumb_height)
+		VALUES (?1, 1234, 'shared.jpg', zeroblob(32), 80, 960, 540)`,
+		hex.EncodeToString(sha), proto.FieldVideoContactSheet, record.Path,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertEnumerated(ctx, []EnumUpsert{record}); err != nil {
+		t.Fatal(err)
+	}
+	var status string
+	var errorText sql.NullString
+	var missing uint32
+	var phase1 int
+	if err := db.db.QueryRowContext(ctx, `
+		SELECT status, error, missing_mask, phase1_done FROM files WHERE path=?1`, record.Path,
+	).Scan(&status, &errorText, &missing, &phase1); err != nil {
+		t.Fatal(err)
+	}
+	if status != proto.StatusDone || errorText.Valid || missing != 0 || phase1 != 1 {
+		t.Fatalf("revalidated complete cache = %q/%#v/%#x/%d, want done/null/0/1",
+			status, errorText, missing, phase1)
+	}
+}
+
+func TestDefaultStageOneRevalidateDoesNotCompletePendingPhaseTwo(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(filepath.Join(t.TempDir(), "agent.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	required := RequiredStageOneMask(MediaImage)
+	record := EnumUpsert{
+		MachineID: "machine-a", DiskNo: 1, Path: `D:\phase-two.jpg`,
+		Size: 10, MTime: 20, MissingBase: required,
+	}
+	if err := db.UpsertEnumerated(ctx, []EnumUpsert{record}); err != nil {
+		t.Fatal(err)
+	}
+	sha := phase1TestSHA()
+	if _, err := db.db.ExecContext(ctx, `
+		UPDATE files SET sha512=?1, status='partial', missing_mask=?2,
+			phase1_done=1, phase2_done=0 WHERE path=?3;
+		INSERT INTO image_features (sha512, width, height, pdq256, pdq_quality)
+		VALUES (?1, 640, 480, zeroblob(32), 80)`,
+		hex.EncodeToString(sha), proto.FieldPHashParts, record.Path,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertEnumerated(ctx, []EnumUpsert{record}); err != nil {
+		t.Fatal(err)
+	}
+	var status string
+	var missing uint32
+	var phase1, phase2 int
+	if err := db.db.QueryRowContext(ctx, `
+		SELECT status, missing_mask, phase1_done, phase2_done FROM files WHERE path=?1`, record.Path,
+	).Scan(&status, &missing, &phase1, &phase2); err != nil {
+		t.Fatal(err)
+	}
+	if status != proto.StatusPartial || missing != proto.FieldPHashParts || phase1 != 1 || phase2 != 0 {
+		t.Fatalf("phase-two state = %q/%#x/%d/%d, want partial/%#x/1/0",
+			status, missing, phase1, phase2, proto.FieldPHashParts)
+	}
+}
+
+func assertStageOneFileState(
+	t *testing.T,
+	db *DB,
+	path string,
+	wantStatus string,
+	wantMissing uint32,
+	wantDone bool,
+	wantSHA bool,
+) {
+	t.Helper()
+	var status string
+	var missing uint32
+	var done int
+	var sha sql.NullString
+	if err := db.db.QueryRow(`
+		SELECT status, missing_mask, phase1_done, sha512 FROM files WHERE path=?1`, path,
+	).Scan(&status, &missing, &done, &sha); err != nil {
+		t.Fatal(err)
+	}
+	if status != wantStatus || missing != wantMissing || done != boolToInt(wantDone) || sha.Valid != wantSHA {
+		t.Fatalf("file state = status:%q missing:%#x done:%d sha:%#v", status, missing, done, sha)
+	}
 }
 
 func TestApplyHashResultsPreservesRetryAndDeduplicatesSyncQueue(t *testing.T) {

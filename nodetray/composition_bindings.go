@@ -2,7 +2,12 @@
 
 package main
 
-import trayapp "dedup/internal/nodetray/app"
+import (
+	"os"
+	"path/filepath"
+
+	trayapp "dedup/internal/nodetray/app"
+)
 
 // Wails executes the application under its private bindings build tag to
 // reflect exported methods. This metadata-only service is excluded from every
@@ -10,6 +15,8 @@ import trayapp "dedup/internal/nodetray/app"
 // performs operating-system actions.
 func init() {
 	composeBackend = func() (*Backend, error) {
-		return NewBackend(trayapp.NewService(trayapp.Dependencies{})), nil
+		backend := NewBackend(trayapp.NewService(trayapp.Dependencies{}))
+		backend.webViewDataPath = filepath.Join(os.TempDir(), "mysingerserver-wails-bindings")
+		return backend, nil
 	}
 }

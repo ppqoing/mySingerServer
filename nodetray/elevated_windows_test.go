@@ -37,7 +37,7 @@ func (elevatedCompositionHandler) Execute(context.Context, elevation.Request) el
 }
 
 func TestElevatedOnceFreezesAuthorityFromValidatedOrdinaryParent(t *testing.T) {
-	layout, err := production.ResolveLayout(`C:\Program Files`, `C:\ProgramData`, `C:\Users\admin\AppData\Local`)
+	layout, err := production.ResolvePortableLayout(`D:\便携 工具\Compute\nodetray.exe`)
 	if err != nil {
 		t.Fatalf("ResolveLayout: %v", err)
 	}
@@ -54,7 +54,7 @@ func TestElevatedOnceFreezesAuthorityFromValidatedOrdinaryParent(t *testing.T) {
 	executorConstructed := false
 	served := false
 	factories := elevatedOnceFactories{
-		Layout: layout, Inspector: inspector,
+		Inspector: inspector,
 		FinalPath: func(path string) (string, error) { return path, nil },
 		UserSID: func(identity process.Identity) (string, error) {
 			sidIdentity = identity
@@ -103,15 +103,39 @@ func TestElevatedOnceFreezesAuthorityFromValidatedOrdinaryParent(t *testing.T) {
 	}
 }
 
-func TestElevatedOnceRejectsExecutableOutsideFixedLayoutBeforeServing(t *testing.T) {
-	layout, err := production.ResolveLayout(`C:\Program Files`, `C:\ProgramData`, `C:\Users\admin\AppData\Local`)
-	if err != nil {
-		t.Fatalf("ResolveLayout: %v", err)
+func TestElevatedEntryDerivesHelperPathsFromItsPortableTrayExecutable(t *testing.T) {
+	self := process.Identity{PID: os.Getpid(), StartedAtUnixMS: 100, ExecutablePath: `D:\便携 工具\Compute\nodetray.exe`}
+	parent := process.Identity{PID: 3131, StartedAtUnixMS: 200, ExecutablePath: self.ExecutablePath}
+	inspector := elevatedCompositionInspector{identities: map[int]process.Identity{self.PID: self, parent.PID: parent}}
+	var helperConfig string
+	var definition task.Definition
+	factories := elevatedOnceFactories{
+		Inspector: inspector, FinalPath: func(path string) (string, error) { return path, nil },
+		UserSID: func(process.Identity) (string, error) { return "S-1-5-21-101-202-303-1001", nil },
+		NewTask: func(task.Capability) (task.Service, error) { return &windowsCompositionTask{}, nil },
+		NewExecutor: func(config string, _ task.Service, got task.Definition, _ task.Capability) (elevation.Handler, error) {
+			helperConfig, definition = config, got
+			return elevatedCompositionHandler{}, nil
+		},
+		Serve: func(_ context.Context, _ string, _ string, _ process.Inspector, factory elevation.HandlerFactory) error {
+			_, err := factory(parent)
+			return err
+		},
 	}
-	self := process.Identity{PID: os.Getpid(), StartedAtUnixMS: 100, ExecutablePath: `C:\Temp\nodetray.exe`}
+	if err := runElevatedOnceWith(`\\.\pipe\mysingerserver-elevate-`+elevatedCompositionNonce, elevatedCompositionNonce, factories); err != nil {
+		t.Fatalf("runElevatedOnceWith: %v", err)
+	}
+	wantConfig := `D:\便携 工具\Compute\data\helper\helper.json`
+	wantDefinition := task.Definition{HelperExecutable: `D:\便携 工具\Compute\helper.exe`, HelperConfig: wantConfig, UserSID: "S-1-5-21-101-202-303-1001"}
+	if helperConfig != wantConfig || definition != wantDefinition {
+		t.Fatalf("portable helper authority config=%q definition=%#v", helperConfig, definition)
+	}
+}
+
+func TestElevatedOnceRejectsInvalidPortableExecutableBeforeServing(t *testing.T) {
+	self := process.Identity{PID: os.Getpid(), StartedAtUnixMS: 100, ExecutablePath: `C:\Temp\other.exe`}
 	serveCalls := 0
 	factories := elevatedOnceFactories{
-		Layout:    layout,
 		Inspector: elevatedCompositionInspector{identities: map[int]process.Identity{self.PID: self}},
 		FinalPath: func(path string) (string, error) { return path, nil },
 		UserSID:   func(process.Identity) (string, error) { return "", errors.New("not called") },

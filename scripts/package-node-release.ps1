@@ -98,6 +98,7 @@ function Assert-SanitizedAgentExample {
     try {
         $config = Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json
         $dsn = [string]$config.pg_dsn
+		if ([string]::IsNullOrWhiteSpace($dsn)) { return }
         $uri = [Uri]::new($dsn)
     }
     catch {
@@ -124,7 +125,7 @@ function Assert-SanitizedHelperExample {
 
 $stage = Resolve-InputDirectory -Path $StageDir -Label 'NODE_RELEASE_STAGE'
 $output = Resolve-OutputDirectory -Path $OutputDir
-$baseName = "MySingerServer-node-win-x64-$ReleaseId"
+$baseName = "MySingerServer-compute-win-x64-$ReleaseId"
 $zipPath = Join-Path $output "$baseName.zip"
 $sidecarPath = "$zipPath.sha256"
 foreach ($finalPath in @($zipPath, $sidecarPath)) {
@@ -135,7 +136,7 @@ foreach ($finalPath in @($zipPath, $sidecarPath)) {
 
 $work = Join-Path $output (
     '.node-release-work-{0}' -f [Guid]::NewGuid().ToString('N'))
-$payload = Join-Path $work 'MySingerServer'
+$payload = Join-Path $work 'MySingerServer-Compute'
 $verifyRoot = Join-Path $work 'verify'
 $temporaryZip = Join-Path $work "$baseName.zip"
 $temporarySidecar = "$temporaryZip.sha256"
@@ -143,6 +144,16 @@ $complete = $false
 
 try {
     New-Item -ItemType Directory -Path $payload | Out-Null
+    foreach ($relativeDirectory in @('data\\agent', 'data\\nodetray')) {
+        $directory = Join-Path $payload $relativeDirectory
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+        Write-Utf8NoBom -Path (Join-Path $directory '.gitkeep') -Value ''
+    }
+    Write-Utf8NoBom -Path (Join-Path $payload 'Start-Compute.ps1') -Value @'
+$ErrorActionPreference = 'Stop'
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
+Start-Process -FilePath (Join-Path $root 'nodetray.exe') -WorkingDirectory $root
+'@
 
     $nativeManifestPath = Join-Path $stage 'native-dependencies.json'
     if (-not (Test-Path -LiteralPath $nativeManifestPath -PathType Leaf)) {
@@ -224,11 +235,11 @@ try {
     $manifest = [ordered]@{
         schema_version = 1
         product = 'mySingerServer'
-        release_kind = 'media-node-minimal'
+        release_kind = 'compute-node-portable'
         target = 'windows/amd64'
         build_date = $BuildDate
         source_revision = $SourceRevision
-        install_root = 'C:\Program Files\MySingerServer\'
+        portable_root = '.'
         helper = [ordered]@{
             included = $true
             default_enabled = $false
@@ -243,10 +254,10 @@ try {
     Compress-Archive -LiteralPath $payload -DestinationPath $temporaryZip `
         -CompressionLevel Optimal
     Expand-Archive -LiteralPath $temporaryZip -DestinationPath $verifyRoot
-    $verifiedPayload = Join-Path $verifyRoot 'MySingerServer'
+    $verifiedPayload = Join-Path $verifyRoot 'MySingerServer-Compute'
     $topLevel = @(Get-ChildItem -LiteralPath $verifyRoot -Force)
     if ($topLevel.Count -ne 1 -or -not $topLevel[0].PSIsContainer -or
-        $topLevel[0].Name -cne 'MySingerServer') {
+        $topLevel[0].Name -cne 'MySingerServer-Compute') {
         throw 'NODE_RELEASE_ZIP_TOP_LEVEL_INVALID'
     }
 

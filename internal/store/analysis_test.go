@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"path/filepath"
@@ -122,6 +123,115 @@ func TestSaveAnalysisPartialFrames(t *testing.T) {
 	}
 	if !bytes.Equal(gotOld, old.PDQ256) || !bytes.Equal(gotSecond, second.PDQ256) {
 		t.Fatalf("frame persistence old=%x second=%x", gotOld, gotSecond)
+	}
+}
+
+func TestSaveAnalysisVideoStageTwoAndThreeMergeInEitherOrder(t *testing.T) {
+	orders := []struct {
+		name   string
+		fields []uint32
+	}{
+		{name: "two then three", fields: []uint32{proto.FieldVideo6FPHash, proto.FieldVideo6FSobel}},
+		{name: "three then two", fields: []uint32{proto.FieldVideo6FSobel, proto.FieldVideo6FPHash}},
+	}
+	for _, order := range orders {
+		t.Run(order.name, func(t *testing.T) {
+			db := openAnalysisTestStore(t)
+			ctx := context.Background()
+			sha := analysisTestSHA(0x35)
+			shaText := hex.EncodeToString(sha)
+			path := `D:\analysis\staged.mp4`
+			seedAnalysisFile(t, db, path, sha, proto.FieldVideo6F)
+			pHash, sobel := phase2TestBlobs(t, 35)
+
+			for step, field := range order.fields {
+				frames := make([]Phase2Frame, 6)
+				for index := range frames {
+					frames[index].FrameIdx = index
+					if field == proto.FieldVideo6FPHash {
+						frames[index].PHashParts = append([]byte(nil), pHash...)
+					} else {
+						frames[index].SobelHist = append([]byte(nil), sobel...)
+					}
+				}
+				state, err := db.SaveAnalysis(ctx, AnalysisResult{
+					MachineID: "m", Path: path, Kind: MediaVideo, Size: 10, MTime: 20, SHA512: sha,
+					RequestedFields: field, FieldsDone: field, RequestedFrames: proto.FrameMaskFull,
+					Frames: frames,
+				})
+				if err != nil {
+					t.Fatalf("step %d field %#x SaveAnalysis: %v", step, field, err)
+				}
+				if state.FieldsPresent != field || state.MissingFields != 0 ||
+					state.FramesPresent != proto.FrameMaskFull || state.MissingFrames != 0 {
+					t.Fatalf("step %d state=%#v", step, state)
+				}
+			}
+
+			rows, err := db.db.QueryContext(ctx, `
+				SELECT phash_parts, sobel_hist FROM video_frames
+				WHERE sha512=?1 ORDER BY frame_idx`, shaText)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer rows.Close()
+			count := 0
+			for rows.Next() {
+				var gotPHash, gotSobel []byte
+				if err := rows.Scan(&gotPHash, &gotSobel); err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(gotPHash, pHash) || !bytes.Equal(gotSobel, sobel) {
+					t.Fatalf("frame %d columns were cleared: pHash=%d Sobel=%d", count, len(gotPHash), len(gotSobel))
+				}
+				count++
+			}
+			if err := rows.Err(); err != nil {
+				t.Fatal(err)
+			}
+			if count != 6 {
+				t.Fatalf("stored frames=%d, want 6", count)
+			}
+			assertAnalysisFile(t, db, path, 0, true, true)
+		})
+	}
+}
+
+func TestSaveAnalysisContactRetryFailureKeepsExistingStageOnePartial(t *testing.T) {
+	db := openAnalysisTestStore(t)
+	ctx := context.Background()
+	sha := analysisTestSHA(0x37)
+	path := `D:\analysis\contact-retry.mp4`
+	required := RequiredStageOneMask(MediaVideo)
+	seedAnalysisFile(t, db, path, sha, proto.FieldVideoContactSheet)
+	if _, err := db.db.ExecContext(ctx, `
+		INSERT INTO video_features (sha512, duration_ms) VALUES (?1, 1234)`,
+		hex.EncodeToString(sha),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SaveAnalysis(ctx, AnalysisResult{
+		MachineID: "m", Path: path, Kind: MediaVideo, Size: 10, MTime: 20, SHA512: sha,
+		RequestedFields: proto.FieldVideoContactSheet,
+		Errors: []FieldError{{
+			Field: proto.FieldVideoContactSheet, Stage: "contact_sheet", Msg: "retry failed",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var status string
+	var errorText sql.NullString
+	var missing uint32
+	var phase1 int
+	if err := db.db.QueryRowContext(ctx, `
+		SELECT status, error, missing_mask, phase1_done FROM files WHERE path=?1`, path,
+	).Scan(&status, &errorText, &missing, &phase1); err != nil {
+		t.Fatal(err)
+	}
+	if status != proto.StatusPartial || !errorText.Valid ||
+		missing != proto.FieldVideoContactSheet || phase1 != 0 {
+		t.Fatalf("retry failure = %q/%#v/%#x/%d, want partial/error/%#x/0 (required %#x)",
+			status, errorText, missing, phase1, proto.FieldVideoContactSheet, required)
 	}
 }
 

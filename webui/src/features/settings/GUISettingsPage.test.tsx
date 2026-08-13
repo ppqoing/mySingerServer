@@ -1,7 +1,7 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { AppApi, GUIConfig } from "../../api/contracts";
-import { GUIConfigValidationError } from "../../api/appApi";
+import { GUIConfigRestartError, GUIConfigValidationError } from "../../api/appApi";
 import { GUISettingsPage } from "./GUISettingsPage";
 
 const baseConfig: GUIConfig = {
@@ -44,7 +44,7 @@ function copyConfig(config: GUIConfig = baseConfig): GUIConfig {
 function apiFor(overrides: Partial<AppApi> = {}): AppApi {
   return {
     loadGUIConfig: vi.fn().mockResolvedValue({ config: copyConfig(), restartRequired: false }),
-    saveGUIConfig: vi.fn().mockResolvedValue({ saved: true, restartRequired: true }),
+    saveGUIConfig: vi.fn().mockResolvedValue({ saved: true, restartRequired: true, restarting: false, recoveryURL: "" }),
     ...overrides
   } as unknown as AppApi;
 }
@@ -131,8 +131,8 @@ test("reloads disk configuration and clears dirty state", async () => {
   expect(loadGUIConfig).toHaveBeenCalledTimes(2);
 });
 
-test("shows the manual restart message after a changed save", async () => {
-  const saveGUIConfig = vi.fn().mockResolvedValue({ saved: true, restartRequired: true });
+test("shows a manual restart notice when an applied configuration could not restart automatically", async () => {
+  const saveGUIConfig = vi.fn().mockResolvedValue({ saved: true, restartRequired: true, restarting: false, recoveryURL: "" });
   const user = userEvent.setup();
   render(<GUISettingsPage api={apiFor({ saveGUIConfig })} />);
   const listen = await screen.findByLabelText("监听地址");
@@ -148,12 +148,82 @@ test("shows the manual restart message after a changed save", async () => {
   expect(screen.queryByText("有未保存更改")).not.toBeInTheDocument();
 });
 
-test("shows no-restart message when saved configuration matches runtime", async () => {
-  const saveGUIConfig = vi.fn().mockResolvedValue({ saved: false, restartRequired: false });
+test("shows unchanged message when saved configuration matches runtime", async () => {
+  const saveGUIConfig = vi.fn().mockResolvedValue({ saved: false, restartRequired: false, restarting: false, recoveryURL: "" });
   const user = userEvent.setup();
   render(<GUISettingsPage api={apiFor({ saveGUIConfig })} />);
   await screen.findByLabelText("监听地址");
   await user.click(screen.getByRole("button", { name: "保存配置" }));
 
-  expect(await screen.findByText("配置已保存，当前无需重启")).toBeInTheDocument();
+  expect(await screen.findByText("配置未变化")).toBeInTheDocument();
+});
+
+test("keeps the saved fact visible when automatic restart launch fails", async () => {
+  const user = userEvent.setup();
+  render(<GUISettingsPage api={apiFor({ saveGUIConfig: vi.fn().mockRejectedValue(new GUIConfigRestartError(true, true)) })} />);
+  await screen.findByLabelText("监听地址");
+  await user.click(screen.getByRole("button", { name: "保存配置" }));
+
+  expect(await screen.findByText("配置已保存，但自动重启失败，请检查 data\\logs\\gui.log")).toBeInTheDocument();
+});
+
+test("aborts the latest manual configuration reload when the settings page unmounts", async () => {
+  let reloadSignal: AbortSignal | undefined;
+  const loadGUIConfig = vi.fn()
+    .mockResolvedValueOnce({ config: copyConfig(), restartRequired: false })
+    .mockImplementationOnce((signal?: AbortSignal) => new Promise(() => { reloadSignal = signal; }));
+  const user = userEvent.setup();
+  const view = render(<GUISettingsPage api={apiFor({ loadGUIConfig })} />);
+  await screen.findByLabelText("监听地址");
+  await user.click(screen.getByRole("button", { name: "重新加载" }));
+
+  view.unmount();
+  expect(reloadSignal?.aborted).toBe(true);
+});
+
+test("waits for the replacement Manager then navigates to its settings page", async () => {
+  const navigate = vi.fn();
+  const recoveryURL = "http://127.0.0.1:28081/api/restart/health?restart_token=replacement-instance";
+  const saveGUIConfig = vi.fn().mockResolvedValue({
+    saved: true,
+    restartRequired: true,
+    restarting: true,
+    recoveryURL
+  });
+  const fetchMock = vi.fn()
+    .mockResolvedValueOnce(new Response("{\"ok\":true,\"restart_token\":\"unrelated-instance\",\"restarting\":false}", { status: 200 }))
+    .mockResolvedValueOnce(new Response("{\"ok\":true,\"restart_token\":\"replacement-instance\",\"restarting\":false}", { status: 200 }));
+  vi.stubGlobal("fetch", fetchMock);
+  const user = userEvent.setup();
+  render(<GUISettingsPage api={apiFor({ saveGUIConfig })} navigate={navigate} />);
+
+  await screen.findByLabelText("监听地址");
+  await user.click(screen.getByRole("button", { name: "保存配置" }));
+
+  expect(await screen.findByText("配置已保存，Manager 正在自动重启")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "正在保存…" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "重新加载" })).toBeDisabled();
+  await waitFor(() => expect(navigate).toHaveBeenCalledWith("http://127.0.0.1:28081/#/settings"));
+  expect(fetchMock).toHaveBeenCalledTimes(2);
+  expect(fetchMock).toHaveBeenCalledWith(recoveryURL, expect.objectContaining({ credentials: "omit" }));
+});
+
+test("shows a recovery error when the replacement Manager does not listen in time", async () => {
+  const saveGUIConfig = vi.fn().mockResolvedValue({
+    saved: true,
+    restartRequired: true,
+    restarting: true,
+    recoveryURL: "http://127.0.0.1:28081/api/restart/health"
+  });
+  vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("offline")));
+  render(<GUISettingsPage api={apiFor({ saveGUIConfig })} />);
+
+  await screen.findByLabelText("监听地址");
+  vi.useFakeTimers();
+  fireEvent.submit(screen.getByRole("button", { name: "保存配置" }).closest("form")!);
+  await act(async () => {});
+  await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+
+  expect(screen.getByText("重启后监听失败，请检查 data\\logs\\gui.log")).toBeInTheDocument();
+  vi.useRealTimers();
 });

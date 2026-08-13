@@ -21,6 +21,20 @@ function Assert-True {
     if (-not $Condition) { Add-GateFailure $Code }
 }
 
+function Test-ManagerStartAllowsMissingConfig {
+    param([string]$Text)
+    $tokens = $null
+    $errors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseInput(
+        $Text, [ref]$tokens, [ref]$errors)
+    if (@($errors).Count -gt 0) { return $false }
+    $throws = @($ast.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.ThrowStatementAst]
+    }, $true))
+    return $throws.Count -eq 0
+}
+
 function Get-ParsedScript {
     param([string]$Path)
     $tokens = $null
@@ -45,6 +59,7 @@ function Get-CommandTexts {
 
 $required = @(
     "scripts\build-nodetray.ps1",
+    "scripts\package-manager-release.ps1",
     "third_party\webview2\manifest.schema.json",
     "third_party\webview2\manifest.json",
     "third_party\webview2\NOTICE.md",
@@ -54,11 +69,48 @@ $required = @(
     "third_party\everything\NOTICE.md",
     "third_party\everything\manifest.json",
     "nodetray\frontend\package-lock.json",
-    "nodetray\build\windows\nodetray.manifest"
+    "nodetray\build\windows\nodetray.manifest",
+    "deploy\gui.example.json",
+    "deploy\Start-Manager.ps1",
+    "deploy\README-管理端部署.md"
 )
 foreach ($relative in $required) {
     Assert-True (Test-Path -LiteralPath (Join-Path $repo $relative) -PathType Leaf) `
         ("REQUIRED_FILE_MISSING path={0}" -f $relative)
+}
+
+$guiExamplePath = Join-Path $repo 'deploy\gui.example.json'
+if (Test-Path -LiteralPath $guiExamplePath -PathType Leaf) {
+    try {
+        $guiExample = Get-Content -Raw -LiteralPath $guiExamplePath | ConvertFrom-Json
+        $guiDsn = [Uri]::new([string]$guiExample.pg_dsn)
+        Assert-True ($guiDsn.UserInfo -notmatch ':') 'GUI_EXAMPLE_DSN_CONTAINS_PASSWORD'
+        Assert-True ($guiDsn.Query -notmatch '(?i)(^|[?&])(password|passwd|pwd|token|secret)=') `
+            'GUI_EXAMPLE_DSN_CONTAINS_SECRET_QUERY'
+        Assert-True ([string]$guiExample.listen_addr -ceq '127.0.0.1:18081') `
+            'GUI_EXAMPLE_LISTEN_ADDR_NOT_DEDICATED_LOOPBACK'
+        $guiAgents = @($guiExample.agents)
+        Assert-True ($guiAgents.Count -eq 1 -and [string]$guiAgents[0].addr -ceq '127.0.0.1:9101') `
+            'GUI_EXAMPLE_AGENT_NOT_LOOPBACK_ONLY'
+    } catch {
+        Add-GateFailure 'GUI_EXAMPLE_INVALID'
+    }
+}
+
+$managerStartPath = Join-Path $repo 'deploy\Start-Manager.ps1'
+if (Test-Path -LiteralPath $managerStartPath -PathType Leaf) {
+    $managerStartText = Get-Content -Raw -LiteralPath $managerStartPath
+    Assert-True ($managerStartText -match 'Join-Path \$root ''gui.exe''') 'MANAGER_START_GUI_EXE_MISSING'
+    Assert-True ($managerStartText -match 'Join-Path \$root ''gui.json''') 'MANAGER_START_GUI_CONFIG_MISSING'
+    Assert-True ($managerStartText -match `
+        '& \(Join-Path \$root ''gui\.exe''\) -config \(Join-Path \$root ''gui\.json''\) @args') `
+        'MANAGER_START_CONFIG_ARGUMENT_MISSING'
+    Assert-True (Test-ManagerStartAllowsMissingConfig -Text $managerStartText) `
+        'MANAGER_START_REJECTS_MISSING_CONFIG'
+    $inlineThrowMutation = $managerStartText + `
+        "`nif (-not (Test-Path -LiteralPath 'gui.json')) { throw 'missing config' }"
+    Assert-True (-not (Test-ManagerStartAllowsMissingConfig -Text $inlineThrowMutation)) `
+        'MANAGER_START_INLINE_THROW_MUTATION_ACCEPTED'
 }
 
 $buildNodeTray = Join-Path $repo "scripts\build-nodetray.ps1"
@@ -184,6 +236,26 @@ if (Test-Path -LiteralPath $coreBuild -PathType Leaf) {
             ("FULL_BUILD_RELEASE_FILE_MISSING name={0}" -f $name)
     }
     Assert-True ($coreText -match 'build-nodetray\.ps1') "FULL_BUILD_NODETRAY_INTEGRATION_MISSING"
+
+    $coreCommands = Get-CommandTexts $coreAst
+    $workerBuildCommands = @($coreCommands | Where-Object {
+        $_ -match '(?i)\bbuild\b' -and $_ -match '(?i)\./cmd/worker\b'
+    })
+    Assert-True ($workerBuildCommands.Count -eq 1) `
+        "WORKER_BUILD_COMMAND_NOT_EXACTLY_ONE"
+    if ($workerBuildCommands.Count -eq 1) {
+        Assert-True ($workerBuildCommands[0] -match '(?i)(^|\s)-tags\s+nodynamic(\s|$)') `
+            "WORKER_BUILD_NODYNAMIC_TAG_MISSING"
+    }
+    $agentBuildCommands = @($coreCommands | Where-Object {
+        $_ -match '(?i)\bbuild\b' -and $_ -match '(?i)\./cmd/agent\b'
+    })
+    Assert-True ($agentBuildCommands.Count -eq 1) `
+        "AGENT_BUILD_COMMAND_NOT_EXACTLY_ONE"
+    if ($agentBuildCommands.Count -eq 1) {
+        Assert-True ($agentBuildCommands[0] -match '(?i)(^|\s)-tags\s+nodynamic(\s|$)') `
+            "AGENT_BUILD_NODYNAMIC_TAG_MISSING"
+    }
 }
 
 if ((Get-Command Publish-FreshNodeTrayStage -ErrorAction SilentlyContinue)) {

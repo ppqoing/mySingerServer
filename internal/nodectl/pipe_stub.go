@@ -9,15 +9,10 @@ import (
 )
 
 const (
-	agentPipeName  = `\\.\pipe\mysingerserver-agent-control-v1`
 	helperPipeName = `\\.\pipe\mysingerserver-helper-control-v1`
 )
 
 var errNamedPipesRequireWindows = errors.New("nodectl named pipes require windows")
-
-func AgentPipeName() string {
-	return agentPipeName
-}
 
 func HelperPipeName() string {
 	return helperPipeName

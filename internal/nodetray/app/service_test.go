@@ -15,11 +15,12 @@ import (
 	"dedup/internal/nodetray/traymodel"
 	"dedup/internal/nodetray/windows/elevation"
 	nodetask "dedup/internal/nodetray/windows/task"
+	"dedup/internal/proto"
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 type fakeStore struct {
 	settings  traymodel.TraySettings
-	agent     config.AgentForm
 	helper    config.HelperForm
 	prepared  config.PreparedWrite
 	calls     *[]string
@@ -39,14 +40,6 @@ func (f *fakeStore) SaveTraySettings(v traymodel.TraySettings) error {
 	}
 	return f.saveErr
 }
-func (f *fakeStore) LoadAgentForm() (config.AgentForm, error) { return f.agent, f.loadErr }
-func (f *fakeStore) SaveAgentForm(config.AgentForm) (string, error) {
-	*f.calls = append(*f.calls, "save-agent")
-	if f.saveErr != nil {
-		return "", f.saveErr
-	}
-	return "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", nil
-}
 func (f *fakeStore) LoadHelperForm() (config.HelperForm, error) { return f.helper, f.loadErr }
 func (f *fakeStore) PrepareHelperWrite(config.HelperForm) (config.PreparedWrite, error) {
 	*f.calls = append(*f.calls, "prepare-helper")
@@ -56,13 +49,125 @@ func (f *fakeStore) PrepareHelperWrite(config.HelperForm) (config.PreparedWrite,
 	return f.prepared, nil
 }
 
-type fakeValidator struct{ agent, helper []config.FieldError }
+type fakeValidator struct{ helper []config.FieldError }
 
-func (f fakeValidator) ValidateAgent(config.AgentForm) []config.FieldError {
-	return append([]config.FieldError(nil), f.agent...)
-}
 func (f fakeValidator) ValidateHelper(config.HelperForm) []config.FieldError {
 	return append([]config.FieldError(nil), f.helper...)
+}
+
+type fakeAgentConfigGateway struct {
+	form        config.AgentForm
+	fields      []config.FieldError
+	result      AgentConfigSaveResult
+	err         error
+	source      *fakeStore
+	calls       *[]string
+	callPrefix  string
+	loadCtx     context.Context
+	validateCtx context.Context
+	saveCtx     context.Context
+}
+
+type fakeLocalAgentGateway struct {
+	requests  []string
+	responses map[string]any
+}
+
+func (f *fakeLocalAgentGateway) CallLocal(_ context.Context, operation string, _, response any) error {
+	f.requests = append(f.requests, operation)
+	value, ok := f.responses[operation]
+	if !ok {
+		return errors.New("agent_disconnected")
+	}
+	raw, _ := msgpack.Marshal(value)
+	return msgpack.Unmarshal(raw, response)
+}
+
+func TestLocalConsoleUsesSocketAndKeepsDeleteTokenServerSide(t *testing.T) {
+	s, _, _, _, _, _ := serviceFixture(t)
+	gateway := &fakeLocalAgentGateway{responses: map[string]any{
+		proto.LocalOperationTaskCreate:    proto.LocalTaskCreateResponse{Task: proto.LocalTask{TaskID: "task-1", Source: "nodetray", Mode: proto.LocalTaskModeScanThenAnalysis, Stage: 1, Status: "running"}},
+		proto.LocalOperationTaskList:      proto.LocalTaskListResponse{Tasks: []proto.LocalTask{{TaskID: "task-1", Source: "nodetray", Stage: 1, Status: "running"}}},
+		proto.LocalOperationGroupsList:    proto.LocalGroupListResponse{Groups: []proto.LocalGroup{{RunID: "run-1", GroupID: "group-1", Category: "image", Verdict: "duplicate"}}},
+		proto.LocalOperationReviewSave:    proto.LocalReviewSaveResponse{Saved: true},
+		proto.LocalOperationDeletePrepare: proto.LocalDeletePreview{BatchID: "batch-1", RunID: "run-1", GroupID: "group-1", Count: 1, SelectionDigest: "digest", Token: "one-time-secret", Files: []proto.LocalDeleteFile{{FileID: 7, Path: `D:\media\a.jpg`, Size: 12}}},
+		proto.LocalOperationDeleteExecute: proto.LocalDeleteBatch{BatchID: "batch-1", Status: "complete", Requested: 1, Succeeded: 1},
+		proto.LocalOperationPreviewImage:  proto.LocalImagePreviewResponse{MIME: "image/jpeg", Width: 40, Height: 20, Bytes: []byte{1, 2, 3}},
+	}}
+	s.localAgent = gateway
+
+	created := s.CreateLocalTask(context.Background(), traymodel.LocalTaskCreate{TaskID: "task-1", Roots: []string{`D:\media`}, Mode: proto.LocalTaskModeScanThenAnalysis})
+	if !created.OK || created.Task.TaskID != "task-1" {
+		t.Fatalf("CreateLocalTask = %#v", created)
+	}
+	if page := s.ListLocalTasks(context.Background(), traymodel.PageRequest{Limit: 50}); !page.OK || len(page.Tasks) != 1 {
+		t.Fatalf("ListLocalTasks = %#v", page)
+	}
+	if page := s.ListLocalGroups(context.Background(), traymodel.LocalGroupQuery{Limit: 50}); !page.OK || len(page.Groups) != 1 {
+		t.Fatalf("ListLocalGroups = %#v", page)
+	}
+	if result := s.SaveLocalReview(context.Background(), traymodel.LocalReviewSave{RunID: "run-1", GroupID: "group-1", Reviewer: "local", Decisions: []traymodel.LocalReviewDecision{{FileID: 7, Decision: "keep"}}}); !result.OK {
+		t.Fatalf("SaveLocalReview = %#v", result)
+	}
+	preview := s.PrepareLocalDelete(context.Background(), traymodel.LocalDeletePrepare{RunID: "run-1", GroupID: "group-1"})
+	if !preview.OK || strings.Contains(fmt.Sprintf("%#v", preview), "one-time-secret") {
+		t.Fatalf("PrepareLocalDelete leaked token: %#v", preview)
+	}
+	batch := s.ExecuteLocalDelete(context.Background(), traymodel.LocalDeleteExecute{BatchID: preview.BatchID, SelectionDigest: preview.SelectionDigest})
+	if !batch.OK || batch.Succeeded != 1 {
+		t.Fatalf("ExecuteLocalDelete = %#v", batch)
+	}
+	if second := s.ExecuteLocalDelete(context.Background(), traymodel.LocalDeleteExecute{BatchID: preview.BatchID, SelectionDigest: preview.SelectionDigest}); second.OK {
+		t.Fatalf("one-time token was reusable: %#v", second)
+	}
+	image := s.GetLocalImagePreview(context.Background(), 7)
+	if !image.OK || image.DataBase64 != "AQID" || strings.Contains(image.DataBase64, "file://") {
+		t.Fatalf("GetLocalImagePreview = %#v", image)
+	}
+
+	want := []string{proto.LocalOperationTaskCreate, proto.LocalOperationTaskList, proto.LocalOperationGroupsList, proto.LocalOperationReviewSave, proto.LocalOperationDeletePrepare, proto.LocalOperationDeleteExecute, proto.LocalOperationPreviewImage}
+	if !reflect.DeepEqual(gateway.requests, want) {
+		t.Fatalf("socket operations = %v, want %v", gateway.requests, want)
+	}
+}
+
+func (f *fakeAgentConfigGateway) record(operation string) {
+	*f.calls = append(*f.calls, f.callPrefix+operation)
+}
+
+func (f *fakeAgentConfigGateway) LoadAgentForm(ctx context.Context) (config.AgentForm, error) {
+	f.loadCtx = ctx
+	if f.callPrefix != "" {
+		f.record("load-agent")
+	}
+	if f.source != nil {
+		return f.form, f.source.loadErr
+	}
+	return f.form, f.err
+}
+
+func (f *fakeAgentConfigGateway) ValidateAgentForm(ctx context.Context, _ config.AgentForm) []config.FieldError {
+	f.validateCtx = ctx
+	if f.callPrefix != "" {
+		f.record("validate-agent")
+	}
+	return append([]config.FieldError(nil), f.fields...)
+}
+
+func (f *fakeAgentConfigGateway) SaveAgentForm(ctx context.Context, _ config.AgentForm) (AgentConfigSaveResult, error) {
+	f.saveCtx = ctx
+	f.record("save-agent")
+	if f.source != nil && f.source.saveErr != nil {
+		return AgentConfigSaveResult{}, f.source.saveErr
+	}
+	if f.result == (AgentConfigSaveResult{}) {
+		return AgentConfigSaveResult{SHA256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}, f.err
+	}
+	return f.result, f.err
+}
+
+func (f *fakeAgentConfigGateway) PromotePendingEndpoint() {
+	f.record("promote-agent-endpoint")
 }
 
 type fakeComponent struct {
@@ -206,6 +311,7 @@ func serviceFixture(t *testing.T) (*Service, *[]string, *fakeStore, *fakeCompone
 	t.Helper()
 	calls := []string{}
 	store := &fakeStore{settings: validSettings(), calls: &calls, prepared: config.PreparedWrite{TargetPath: `C:\ProgramData\MySingerServer\helper.json`, CanonicalJSON: []byte("{}"), SHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}
+	agentConfig := &fakeAgentConfigGateway{source: store, calls: &calls}
 	agent := &fakeComponent{name: "agent", calls: &calls, results: map[string]traymodel.OperationResult{}}
 	helper := &fakeComponent{name: "helper", calls: &calls, results: map[string]traymodel.OperationResult{}}
 	elevated := &fakeElevation{calls: &calls, result: elevation.InvocationResult{Response: elevation.Response{OK: true}}}
@@ -216,7 +322,7 @@ func serviceFixture(t *testing.T) (*Service, *[]string, *fakeStore, *fakeCompone
 		traymodel.HelperBackup: {Path: `C:\node\helper\backup`, Root: `C:\node\helper`},
 	}
 	s := NewService(Dependencies{
-		Store: store, Validator: fakeValidator{}, Agent: agent, Helper: helper,
+		Store: store, Validator: fakeValidator{}, AgentConfig: agentConfig, Agent: agent, Helper: helper,
 		Task: &fakeTask{calls: &calls}, Elevation: elevated,
 		LoginStart: &fakeLogin{calls: &calls}, TrayExecutable: `C:\node\nodetray.exe`,
 		TaskDefinition:    nodetask.Definition{HelperExecutable: `C:\node\helper.exe`, HelperConfig: store.prepared.TargetPath, UserSID: "S-1-5-21-1"},
@@ -360,9 +466,43 @@ func TestGetterErrorsAreSanitizedBeforeTheyReachUI(t *testing.T) {
 	}
 }
 
+func TestAgentConfigOperationsUseContextAwareSocketGatewayAndReturnedRestartState(t *testing.T) {
+	s, calls, store, agent, _, _ := serviceFixture(t)
+	store.saveErr = errors.New("local-store-write-must-not-be-used")
+	agent.state = traymodel.ComponentState{NeedsRestart: false}
+	wantForm := config.AgentForm{DataDir: "socket-form"}
+	wantSHA := strings.Repeat("c", 64)
+	gateway := &fakeAgentConfigGateway{
+		form:   wantForm,
+		result: AgentConfigSaveResult{SHA256: wantSHA, RestartRequired: true},
+		calls:  calls, callPrefix: "socket-",
+	}
+	s.agentConfig = gateway
+	ctx := context.WithValue(context.Background(), struct{ name string }{"gateway"}, "context-marker")
+
+	gotForm, err := s.GetAgentForm(ctx)
+	if err != nil || !reflect.DeepEqual(gotForm, wantForm) {
+		t.Fatalf("GetAgentForm = %#v, %v", gotForm, err)
+	}
+	if fields := s.ValidateAgent(ctx, wantForm); len(fields) != 0 {
+		t.Fatalf("ValidateAgent = %#v", fields)
+	}
+	result := s.SaveAgent(ctx, wantForm)
+	if !result.OK || !result.Saved || result.SHA256 != wantSHA || !result.NeedsRestart {
+		t.Fatalf("SaveAgent = %#v", result)
+	}
+	if gateway.loadCtx != ctx || gateway.validateCtx != ctx || gateway.saveCtx != ctx {
+		t.Fatal("Agent Socket gateway did not receive the Wails request context")
+	}
+	wantCalls := []string{"socket-load-agent", "socket-validate-agent", "socket-validate-agent", "socket-save-agent", "agent-sha"}
+	if !reflect.DeepEqual(*calls, wantCalls) {
+		t.Fatalf("calls = %v, want %v", *calls, wantCalls)
+	}
+}
+
 func TestSaveAgentRejectsInvalidFormBeforeStoreAndKeepsSuccessResultEmpty(t *testing.T) {
 	s, calls, store, _, _, _ := serviceFixture(t)
-	s.validator = fakeValidator{agent: []config.FieldError{{Field: "listenPort", Code: "out_of_range", Message: "bad"}}}
+	s.agentConfig.(*fakeAgentConfigGateway).fields = []config.FieldError{{Field: "listenPort", Code: "out_of_range", Message: "bad"}}
 	if result := s.SaveAgent(context.Background(), config.AgentForm{}); result.OK || result.ErrorCode != "invalid_config" {
 		t.Fatalf("invalid SaveAgent = %#v", result)
 	}
@@ -370,7 +510,7 @@ func TestSaveAgentRejectsInvalidFormBeforeStoreAndKeepsSuccessResultEmpty(t *tes
 		t.Fatalf("invalid form wrote config: %v", *calls)
 	}
 
-	s.validator = fakeValidator{}
+	s.agentConfig.(*fakeAgentConfigGateway).fields = nil
 	result := s.SaveAgent(context.Background(), config.AgentForm{})
 	if !result.OK || result.ErrorCode != "" || result.ErrorSummary != "" {
 		t.Fatalf("valid SaveAgent = %#v", result)
@@ -415,6 +555,7 @@ func TestSaveAgentReturnsFormalDigestAndRuntimeDrift(t *testing.T) {
 		SavedConfigSHA256:   wantSHA,
 		NeedsRestart:        true,
 	}
+	s.agentConfig.(*fakeAgentConfigGateway).result = AgentConfigSaveResult{SHA256: wantSHA, RestartRequired: true}
 
 	result := s.SaveAgent(context.Background(), config.AgentForm{DataDir: "node-2"})
 
@@ -446,7 +587,7 @@ func TestSaveAndRestartAgentUsesSaveStopStartOrderAndShortCircuits(t *testing.T)
 		stop    traymodel.OperationResult
 		want    []string
 	}{
-		{name: "success", stop: traymodel.OperationResult{OK: true}, want: []string{"save-agent", "agent-sha", "agent-stop", "agent-start"}},
+		{name: "success", stop: traymodel.OperationResult{OK: true}, want: []string{"save-agent", "agent-sha", "agent-stop", "promote-agent-endpoint", "agent-start"}},
 		{name: "save fails", saveErr: errors.New("postgres://user:secret@db/media\r\n"), stop: traymodel.OperationResult{OK: true}, want: []string{"save-agent"}},
 		{name: "stop fails", stop: traymodel.OperationResult{ErrorCode: "stop_timeout", ErrorSummary: "token=secret"}, want: []string{"save-agent", "agent-sha", "agent-stop"}},
 	}
@@ -482,7 +623,7 @@ func TestSaveAndRestartAgentReportsSavedWhenRestartFails(t *testing.T) {
 			stop:      traymodel.OperationResult{OK: true},
 			start:     traymodel.OperationResult{ErrorCode: "start_failed", ErrorSummary: "token=secret"},
 			wantCode:  "start_failed",
-			wantCalls: []string{"save-agent", "agent-sha", "agent-stop", "agent-start"},
+			wantCalls: []string{"save-agent", "agent-sha", "agent-stop", "promote-agent-endpoint", "agent-start"},
 		},
 	}
 	for _, tt := range tests {
@@ -520,7 +661,7 @@ func (r *workflowRecorder) snapshot() []string {
 	return append([]string(nil), r.events...)
 }
 
-type workflowStore struct {
+type workflowAgentConfig struct {
 	recorder     *workflowRecorder
 	entered      chan string
 	blockMachine string
@@ -529,12 +670,13 @@ type workflowStore struct {
 	persisted    string
 }
 
-func (s *workflowStore) LoadTraySettings() (traymodel.TraySettings, error) {
-	return validSettings(), nil
+func (s *workflowAgentConfig) LoadAgentForm(context.Context) (config.AgentForm, error) {
+	return config.AgentForm{}, nil
 }
-func (s *workflowStore) SaveTraySettings(traymodel.TraySettings) error { return nil }
-func (s *workflowStore) LoadAgentForm() (config.AgentForm, error)      { return config.AgentForm{}, nil }
-func (s *workflowStore) SaveAgentForm(value config.AgentForm) (string, error) {
+func (s *workflowAgentConfig) ValidateAgentForm(context.Context, config.AgentForm) []config.FieldError {
+	return nil
+}
+func (s *workflowAgentConfig) SaveAgentForm(_ context.Context, value config.AgentForm) (AgentConfigSaveResult, error) {
 	s.recorder.add("save:" + value.DataDir)
 	s.mu.Lock()
 	s.persisted = value.DataDir
@@ -546,17 +688,14 @@ func (s *workflowStore) SaveAgentForm(value config.AgentForm) (string, error) {
 		<-s.release
 	}
 	if value.DataDir == "node-a" {
-		return strings.Repeat("a", 64), nil
+		return AgentConfigSaveResult{SHA256: strings.Repeat("a", 64), RestartRequired: true}, nil
 	}
-	return strings.Repeat("b", 64), nil
+	return AgentConfigSaveResult{SHA256: strings.Repeat("b", 64), RestartRequired: true}, nil
 }
-func (s *workflowStore) LoadHelperForm() (config.HelperForm, error) {
-	return config.HelperForm{}, nil
+func (s *workflowAgentConfig) PromotePendingEndpoint() {
+	s.recorder.add("promote")
 }
-func (s *workflowStore) PrepareHelperWrite(config.HelperForm) (config.PreparedWrite, error) {
-	return config.PreparedWrite{}, nil
-}
-func (s *workflowStore) persistedMachine() string {
+func (s *workflowAgentConfig) persistedMachine() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.persisted
@@ -612,10 +751,10 @@ func (c *workflowComponent) Refresh(context.Context) traymodel.ComponentState {
 	return traymodel.ComponentState{}
 }
 
-func workflowService(store Store, recorder *workflowRecorder, component Component) (*Service, *workflowFingerprintUpdater) {
+func workflowService(agentConfig *workflowAgentConfig, recorder *workflowRecorder, component Component) (*Service, *workflowFingerprintUpdater) {
 	fingerprint := &workflowFingerprintUpdater{recorder: recorder}
 	return NewService(Dependencies{
-		Store: store, Validator: fakeValidator{}, Agent: component,
+		Validator: fakeValidator{}, AgentConfig: agentConfig, Agent: component,
 		MachineID: "node-" + strings.Repeat("1", 64), AgentFingerprint: fingerprint,
 	}), fingerprint
 }
@@ -623,7 +762,7 @@ func workflowService(store Store, recorder *workflowRecorder, component Componen
 func TestConcurrentAgentSavesPublishTheSameLastVersionAsTheStore(t *testing.T) {
 	recorder := &workflowRecorder{}
 	releaseA := make(chan struct{})
-	store := &workflowStore{recorder: recorder, entered: make(chan string, 4), blockMachine: "node-a", release: releaseA}
+	store := &workflowAgentConfig{recorder: recorder, entered: make(chan string, 4), blockMachine: "node-a", release: releaseA}
 	service, fingerprint := workflowService(store, recorder, &workflowComponent{recorder: recorder})
 	results := make(chan traymodel.ConfigApplyResult, 2)
 	go func() { results <- service.SaveAgent(context.Background(), config.AgentForm{DataDir: "node-a"}) }()
@@ -653,7 +792,7 @@ func TestConcurrentAgentSavesPublishTheSameLastVersionAsTheStore(t *testing.T) {
 
 func TestSecondSaveCannotEnterSaveAndRestartBetweenOldStopAndNewStart(t *testing.T) {
 	recorder := &workflowRecorder{}
-	store := &workflowStore{recorder: recorder, entered: make(chan string, 4)}
+	store := &workflowAgentConfig{recorder: recorder, entered: make(chan string, 4)}
 	stopEntered := make(chan struct{})
 	releaseStop := make(chan struct{})
 	component := &workflowComponent{recorder: recorder, stopEntered: stopEntered, releaseStop: releaseStop}
@@ -687,7 +826,7 @@ func TestSecondSaveCannotEnterSaveAndRestartBetweenOldStopAndNewStart(t *testing
 		t.Fatal("second SaveAgent entered during save-stop-start workflow")
 	}
 	want := []string{
-		"save:node-a", "sha:a", "stop", "start",
+		"save:node-a", "sha:a", "stop", "promote", "start",
 		"save:node-b", "sha:b",
 	}
 	if got := recorder.snapshot(); !reflect.DeepEqual(got, want) {

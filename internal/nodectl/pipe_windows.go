@@ -14,18 +14,12 @@ import (
 )
 
 const (
-	agentPipeName  = `\\.\pipe\mysingerserver-agent-control-v1`
 	helperPipeName = `\\.\pipe\mysingerserver-helper-control-v1`
 )
 
 const (
-	agentPipeMutexName  = `Local\mysingerserver-agent-control-v1-listener`
 	helperPipeMutexName = `Local\mysingerserver-helper-control-v1-listener`
 )
-
-func AgentPipeName() string {
-	return agentPipeName
-}
 
 func HelperPipeName() string {
 	return helperPipeName
@@ -67,8 +61,6 @@ func Dial(ctx context.Context, name string) (net.Conn, error) {
 
 func pipeMutexName(name string) (string, error) {
 	switch name {
-	case agentPipeName:
-		return agentPipeMutexName, nil
 	case helperPipeName:
 		return helperPipeMutexName, nil
 	default:

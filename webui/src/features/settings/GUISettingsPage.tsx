@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
-import { appApi, GUIConfigValidationError, type AppApi } from "../../api/appApi";
+import { appApi, GUIConfigRestartError, GUIConfigValidationError, waitForManager, type AppApi } from "../../api/appApi";
 import { isAbortError } from "../../api/client";
 import type {
   GUIConfig,
@@ -11,6 +11,7 @@ import "./GUISettingsPage.css";
 
 export interface GUISettingsPageProps {
   readonly api?: AppApi;
+  readonly navigate?: (target: string) => void;
 }
 
 type LoadState = "loading" | "ready" | "error";
@@ -82,7 +83,7 @@ function NumberField({ error, label, note, onChange, path, step = 1, value }: Nu
   );
 }
 
-export function GUISettingsPage({ api = appApi }: GUISettingsPageProps) {
+export function GUISettingsPage({ api = appApi, navigate = target => window.location.assign(target) }: GUISettingsPageProps) {
   const [config, setConfig] = useState<GUIConfig>();
   const [baseline, setBaseline] = useState<GUIConfig>();
   const [loadState, setLoadState] = useState<LoadState>("loading");
@@ -132,7 +133,7 @@ export function GUISettingsPage({ api = appApi }: GUISettingsPageProps) {
       setLoadState("error");
     });
     return () => {
-      controller.abort();
+      loadController.current?.abort();
       saveController.current?.abort();
     };
   }, [api]);
@@ -230,15 +231,29 @@ export function GUISettingsPage({ api = appApi }: GUISettingsPageProps) {
       if (controller.signal.aborted) return;
       setBaseline(config);
       setDiskRestartRequired(result.restartRequired);
-      setNotice(result.restartRequired
-        ? "配置已保存，请手动重启 GUI 后生效"
-        : "配置已保存，当前无需重启");
+      if (result.restarting) {
+        setNotice("配置已保存，Manager 正在自动重启");
+        await waitForManager(result.recoveryURL, controller.signal);
+        if (!controller.signal.aborted) navigate(`${new URL(result.recoveryURL).origin}/#/settings`);
+      } else {
+        setNotice(!result.saved ? "配置未变化" : result.restartRequired
+          ? "配置已保存，请手动重启 GUI 后生效"
+          : "配置已保存，当前无需重启");
+      }
     } catch (error) {
       if (isAbortError(error) || controller.signal.aborted) return;
-      if (error instanceof GUIConfigValidationError) {
+      if (error instanceof GUIConfigRestartError) {
+        setBaseline(config);
+        setDiskRestartRequired(error.restartRequired);
+        setNotice(error.saved
+          ? "配置已保存，但自动重启失败，请检查 data\\logs\\gui.log"
+          : "自动重启失败，请检查 data\\logs\\gui.log");
+      } else if (error instanceof GUIConfigValidationError) {
         setFieldErrors(Object.fromEntries(error.fields.map(field => [field.field, field.message])));
       } else {
-        setPageError(error instanceof Error ? error.message : "保存配置失败");
+        setPageError(error instanceof Error && error.message === "Manager restart timed out"
+          ? "重启后监听失败，请检查 data\\logs\\gui.log"
+          : error instanceof Error ? error.message : "保存配置失败");
       }
     } finally {
       if (!controller.signal.aborted) setSaving(false);
@@ -249,7 +264,7 @@ export function GUISettingsPage({ api = appApi }: GUISettingsPageProps) {
     <section aria-labelledby="gui-settings-heading" className="operational-page gui-settings">
       <header className="operational-page__header operational-surface">
         <h1 id="gui-settings-heading">GUI 设置</h1>
-        <p>编辑完整 GUI 配置。保存只写入磁盘，需要手动重启 GUI 才会应用。</p>
+        <p>编辑完整 GUI 配置；变更监听地址或连接参数时，Manager 会自动重启并恢复到此页面。</p>
         {dirty ? <strong className="gui-settings__dirty">有未保存更改</strong> : null}
         {!dirty && diskRestartRequired ? <strong className="gui-settings__restart">磁盘配置等待重启生效</strong> : null}
       </header>

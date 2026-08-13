@@ -1,6 +1,6 @@
 import { useState, type KeyboardEvent, type ReactNode } from 'react'
 
-export type TabKey = 'overview' | 'agent' | 'helper' | 'settings'
+export type TabKey = 'overview' | 'agent' | 'helper' | 'settings' | 'local-tasks' | 'analysis' | 'review' | 'deletions'
 
 export type AppShellPanels = Partial<Record<TabKey, ReactNode>>
 
@@ -15,6 +15,10 @@ const tabs: readonly TabDefinition[] = [
   { key: 'agent', label: 'Agent', summary: 'Agent 交互式配置将在这里显示。' },
   { key: 'helper', label: '删除 Helper', summary: '删除 Helper 配置将在这里显示。' },
   { key: 'settings', label: '程序设置', summary: '托盘程序设置将在这里显示。' },
+  { key: 'local-tasks', label: '本地任务', summary: '创建与跟踪本机扫描任务。' },
+  { key: 'analysis', label: '去重分析', summary: '查看一筛、二筛、三筛计算进度。' },
+  { key: 'review', label: '结果审核', summary: '审核本机去重结果。' },
+  { key: 'deletions', label: '删除记录', summary: '预览删除并查看执行结果。' },
 ]
 
 function tabFromHash(hash: string): TabKey {

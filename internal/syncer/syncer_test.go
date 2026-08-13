@@ -166,6 +166,45 @@ func TestSyncOnceCanBeRepeatedWithoutResendingSyncedRows(t *testing.T) {
 	}
 }
 
+func TestLocalOutboxOfflineRecoveryCommitsWithFileStateAndAcksAfterRemoteCommit(t *testing.T) {
+	ctx := context.Background()
+	local, err := store.Open(filepath.Join(t.TempDir(), "agent.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer local.Close()
+	seedSyncedFiles(t, local, 1)
+	if err := local.EnqueueLocalEvent(ctx, store.LocalOutboxEvent{
+		Topic: "local.task", EntityKey: "task-1", Generation: 1,
+		PayloadJSON: `{"machine_id":"machine-a","task_id":"task-1","state":"done"}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	remote := &transactionalRemote{failStage: "commit"}
+	uploader := NewWithRemote(local, remote, Config{UpsertBatch: 10}, discardLogger())
+	uploader.syncOnce(ctx)
+	if pending, _ := local.PendingLocalSyncEvents(ctx, 10); len(pending) != 1 {
+		t.Fatalf("offline pending events=%#v", pending)
+	}
+	if count, _ := local.PendingSyncCount(ctx); count != 1 {
+		t.Fatalf("offline pending files=%d", count)
+	}
+
+	remote.failStage = ""
+	uploader.syncOnce(ctx)
+	if pending, _ := local.PendingLocalSyncEvents(ctx, 10); len(pending) != 0 {
+		t.Fatalf("recovered pending events=%#v", pending)
+	}
+	if len(remote.committed) != 1 || len(remote.committed[0].files) != 1 ||
+		len(remote.committed[0].local.Events) != 1 {
+		t.Fatalf("committed batches=%#v", remote.committed)
+	}
+	uploader.syncOnce(ctx)
+	if len(remote.committed) != 1 {
+		t.Fatalf("idempotent replay created commits=%d", len(remote.committed))
+	}
+}
+
 func TestSyncOnceDoesNotClearUpdateEnqueuedDuringRemoteUpsert(t *testing.T) {
 	ctx := context.Background()
 	local, err := store.Open(filepath.Join(t.TempDir(), "agent.db"))

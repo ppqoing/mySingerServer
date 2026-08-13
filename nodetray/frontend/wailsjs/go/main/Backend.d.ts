@@ -5,6 +5,10 @@ import {config} from '../models';
 import {context} from '../models';
 import {main} from '../models';
 
+export function CreateLocalTask(arg1:traymodel.LocalTaskCreate):Promise<traymodel.LocalTaskResult>;
+
+export function ExecuteLocalDelete(arg1:traymodel.LocalDeleteExecute):Promise<traymodel.LocalDeleteBatch>;
+
 export function ForceExitAll():Promise<traymodel.ForceExitResult>;
 
 export function ForceStopAgent():Promise<traymodel.OperationResult>;
@@ -15,11 +19,19 @@ export function GetAgentForm():Promise<config.AgentForm>;
 
 export function GetHelperForm():Promise<config.HelperForm>;
 
+export function GetLocalImagePreview(arg1:number):Promise<traymodel.ImagePreview>;
+
 export function GetOverview():Promise<traymodel.Overview>;
 
 export function GetTraySettings():Promise<traymodel.TraySettings>;
 
+export function ListLocalGroups(arg1:traymodel.LocalGroupQuery):Promise<traymodel.LocalGroupPage>;
+
+export function ListLocalTasks(arg1:traymodel.PageRequest):Promise<traymodel.LocalTaskPage>;
+
 export function OpenLocation(arg1:traymodel.LocationKind):Promise<traymodel.OperationResult>;
+
+export function PrepareLocalDelete(arg1:traymodel.LocalDeletePrepare):Promise<traymodel.LocalDeletePreview>;
 
 export function RestartAgent():Promise<traymodel.OperationResult>;
 
@@ -31,6 +43,8 @@ export function SaveAndRestartAgent(arg1:config.AgentForm):Promise<traymodel.Con
 
 export function SaveHelper(arg1:config.HelperForm):Promise<traymodel.ConfigApplyResult>;
 
+export function SaveLocalReview(arg1:traymodel.LocalReviewSave):Promise<traymodel.OperationResult>;
+
 export function SaveTraySettings(arg1:traymodel.TraySettings):Promise<traymodel.OperationResult>;
 
 export function Shutdown(arg1:context.Context):Promise<void>;
@@ -38,6 +52,8 @@ export function Shutdown(arg1:context.Context):Promise<void>;
 export function StartAgent():Promise<traymodel.OperationResult>;
 
 export function StartHelper():Promise<traymodel.OperationResult>;
+
+export function StartLocalAnalysis(arg1:traymodel.LocalTaskCreate):Promise<traymodel.OperationResult>;
 
 export function Startup(arg1:context.Context):Promise<main.BackendStartup>;
 

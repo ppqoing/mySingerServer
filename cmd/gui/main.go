@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -123,13 +124,49 @@ func firstScreenConfig(cfg config.FirstScreenConfig) firstscreen.Config {
 }
 
 type guiHTTPServer interface {
-	ListenAndServe() error
+	Serve(net.Listener) error
 	Shutdown(context.Context) error
+	Close() error
+}
+
+type serveEntryHTTPServer struct {
+	guiHTTPServer
+	onServe func()
+}
+
+func (server *serveEntryHTTPServer) Serve(listener net.Listener) error {
+	if server.onServe != nil {
+		server.onServe()
+	}
+	return server.guiHTTPServer.Serve(listener)
+}
+
+var (
+	guiExecutablePath   = finalGUIExecutablePath
+	guiListen           = net.Listen
+	guiNewHTTPServer    = newGUIHTTPServer
+	guiNewRuntimeLogger = newGUIRuntimeLogger
+	guiOpenBrowser      = openGUIBrowser
+	guiShowStartupError = showGUIStartupError
+	guiWaitParent       = guiWaitForParent
+)
+
+func newGUIHTTPServer(addr string, handler http.Handler) guiHTTPServer {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
 }
 
 type analysisLifecycle interface {
 	BeginAnalysisShutdown()
 	WaitForAnalysis()
+}
+
+type httpLifecycle interface {
+	BeginHTTPShutdown()
+	WaitForHTTP()
 }
 
 type phase2MessageDispatcher interface {
@@ -500,22 +537,36 @@ func serveAndDrain(
 	processContext context.Context,
 	cancelProcess context.CancelFunc,
 	server guiHTTPServer,
+	listener net.Listener,
 	analysis analysisLifecycle,
 	shutdownTimeout time.Duration,
 ) error {
 	shutdownResult := make(chan error, 1)
 	go func() {
 		<-processContext.Done()
+		httpRequests, tracksHTTP := analysis.(httpLifecycle)
+		if tracksHTTP {
+			httpRequests.BeginHTTPShutdown()
+		}
 		analysis.BeginAnalysisShutdown()
 		shutdownContext, cancelShutdown := context.WithTimeout(
 			context.Background(),
 			shutdownTimeout,
 		)
 		defer cancelShutdown()
-		shutdownResult <- server.Shutdown(shutdownContext)
+		shutdownErr := server.Shutdown(shutdownContext)
+		if shutdownErr != nil {
+			if closeErr := server.Close(); closeErr != nil {
+				shutdownErr = errors.Join(shutdownErr, closeErr)
+			}
+		}
+		if tracksHTTP {
+			httpRequests.WaitForHTTP()
+		}
+		shutdownResult <- shutdownErr
 	}()
 
-	serveErr := server.ListenAndServe()
+	serveErr := server.Serve(listener)
 	analysis.BeginAnalysisShutdown()
 	cancelProcess()
 	analysis.WaitForAnalysis()
@@ -530,11 +581,56 @@ func serveAndDrain(
 	return nil
 }
 
+func serveBoundGUI(
+	processContext context.Context,
+	cancelProcess context.CancelFunc,
+	server guiHTTPServer,
+	listener net.Listener,
+	analysis analysisLifecycle,
+	shutdownTimeout time.Duration,
+	listenAddr string,
+	noBrowser bool,
+	logger *slog.Logger,
+	onServe func(),
+) error {
+	defer listener.Close()
+	logger.Info("gui listening", "addr", listener.Addr().String())
+	if !noBrowser {
+		browserURL, urlErr := localBrowserURL(listenAddr)
+		if urlErr != nil {
+			logger.Warn("GUI browser URL unavailable", "err", urlErr)
+		} else if openErr := guiOpenBrowser(browserURL); openErr != nil {
+			logger.Warn("open GUI browser", "err", openErr)
+		}
+	}
+	return serveAndDrain(
+		processContext,
+		cancelProcess,
+		&serveEntryHTTPServer{guiHTTPServer: server, onServe: onServe},
+		listener,
+		analysis,
+		shutdownTimeout,
+	)
+}
+
 func main() {
-	if err := run(os.Args[1:]); err != nil {
+	if err := executeGUI(os.Args[1:]); err != nil {
 		slog.Error("gui exited", "err", err)
 		os.Exit(1)
 	}
+}
+
+func executeGUI(args []string) error {
+	err := run(args)
+	if err != nil {
+		guiShowStartupError("GUI 启动失败，请检查便携目录中的 gui.json 和 data\\logs\\gui.log。")
+	}
+	return err
+}
+
+func guiStartupFailure(logger *slog.Logger, stage string, err error) error {
+	logger.Error("gui startup failed", "stage", stage, "err", err)
+	return fmt.Errorf("%s: %w", stage, err)
 }
 
 func loadGUIRuntime(path string) (string, *config.GUIConfig, error) {
@@ -551,147 +647,82 @@ func loadGUIRuntime(path string) (string, *config.GUIConfig, error) {
 
 func run(args []string) error {
 	flags := flag.NewFlagSet("gui", flag.ContinueOnError)
-	configPath := flags.String("config", "gui.json", "配置文件路径")
+	configPath := flags.String("config", "", "配置文件路径（默认：EXE 同目录 gui.json）")
+	noBrowser := flags.Bool("no-browser", false, "不自动打开浏览器")
+	waitParentPID := flags.Int("wait-parent-pid", 0, "等待父 GUI 进程退出后再启动")
+	restartToken := flags.String("restart-token", "", "内部 Manager 重启实例令牌")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 
-	absoluteConfigPath, cfg, err := loadGUIRuntime(*configPath)
+	executable, err := guiExecutablePath()
 	if err != nil {
-		return fmt.Errorf("load config: %w", err)
+		return fmt.Errorf("resolve GUI executable path: %w", err)
 	}
-	configService, err := gui.NewGUIConfigService(absoluteConfigPath, cfg)
+	runtimePaths, err := resolveGUIRuntimePaths(executable, *configPath)
 	if err != nil {
-		return fmt.Errorf("initialize GUI config service: %w", err)
+		return err
 	}
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	pg, err := pgxpool.New(context.Background(), cfg.PGDSN)
+	if *waitParentPID > 0 {
+		if err := guiWaitParent(*waitParentPID); err != nil {
+			return fmt.Errorf("wait for parent GUI: %w", err)
+		}
+	}
+	logger, closeLogger, err := guiNewRuntimeLogger(runtimePaths.LogPath, os.Stdout)
 	if err != nil {
-		return fmt.Errorf("parse postgres DSN: %w", err)
+		return err
 	}
-	defer pg.Close()
-	pingContext, cancelPing := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancelPing()
-	if err := pg.Ping(pingContext); err != nil {
-		return fmt.Errorf("postgres unreachable: %w", err)
+	defer closeLogger()
+	cfg, err := gui.LoadOrCreateGUIConfig(runtimePaths.ConfigPath)
+	if err != nil {
+		return guiStartupFailure(logger, "load config", err)
 	}
-	cancelPing()
-
+	configService, err := gui.NewGUIConfigService(runtimePaths.ConfigPath, cfg)
+	if err != nil {
+		return guiStartupFailure(logger, "initialize GUI config service", err)
+	}
 	processContext, cancelProcess := signal.NotifyContext(
 		context.Background(),
 		os.Interrupt,
 		syscall.SIGTERM,
 	)
 	defer cancelProcess()
-	tasks := gui.NewTaskRegistry(pg, logger)
-	if err := tasks.Restore(processContext); err != nil {
-		return fmt.Errorf("restore scan tasks: %w", err)
+	configService.SetRestartCoordinator(newGUIRestartCoordinator(
+		executable,
+		runtimePaths.ConfigPath,
+		os.Getpid(),
+		cancelProcess,
+	))
+	host := gui.NewRuntimeHost(configService, cfg.Agents, *restartToken)
+	listener, err := guiListen("tcp", cfg.ListenAddr)
+	if err != nil {
+		return guiStartupFailure(logger, "bind GUI listener", err)
 	}
-	var phase2Dispatcher *phase2.Dispatcher
-	var phase2Rescreener *phase2.Rescreener
-	var phase2Router *phase2Orchestration
-	var deleteService *gui.DeleteService
-	pool := gui.NewPool(
-		cfg.Agents,
-		logger,
-		func(machineID string, _ *gui.AgentConn, message any) {
-			if phase2Dispatcher != nil && phase2Router != nil {
-				routeAgentMessage(
-					processContext,
-					machineID,
-					message,
-					phase2Dispatcher,
-					phase2Router,
-					tasks,
-					logger,
-					deleteService,
-				)
-				return
-			}
-			tasks.Dispatch(machineID, message)
-		},
-	)
-	deleteService, _ = newDeleteRuntime(
-		pg,
-		pool,
-		time.Minute,
-		time.Now,
-		logger,
-	)
-	phase2Dispatcher = phase2.NewDispatcher(
-		pg,
-		pool,
-		cfg.Phase2,
-		logger,
-	)
-	if err := phase2Dispatcher.RestorePending(processContext); err != nil {
-		return fmt.Errorf("restore phase2 tasks: %w", err)
-	}
-	phase2Rescreener = phase2.NewRescreener(pg, cfg.Phase2, logger)
-	restoreContext, cancelRestore := context.WithTimeout(
-		processContext,
-		5*time.Minute,
-	)
-	if err := phase2Rescreener.Restore(restoreContext); err != nil {
-		cancelRestore()
-		return fmt.Errorf("restore phase2 rescreener: %w", err)
-	}
-	phase2Router = newPhase2Orchestration(
-		phase2Rescreener,
-		phase2Dispatcher,
-		phase2.NewGroupRebuilder(pg),
-	)
-	phase2Router.Start(processContext, logger, phase2FinalizeWorkerConfig{})
-	phase2Router.SignalFinalize()
-	cancelRestore()
-	defer phase2Dispatcher.Shutdown()
-	defer pool.StopReconnects()
-	pool.SetOnConnectContext(func(ctx context.Context, machineID string) {
-		resumeAgentWork(
-			ctx,
-			machineID,
-			tasks,
-			pool,
-			phase2Dispatcher,
-			logger,
-		)
-	})
-	pool.Start(processContext, time.Duration(cfg.HeartbeatS)*time.Second)
-	analysisRunner := newPooledAnalysisRunner(
-		processContext,
-		pgxAnalysisPool{pool: pg},
-		firstScreenConfig(cfg.FirstScreen),
-		logger,
-	)
-	api := gui.NewAPI(pool, tasks, pg, analysisRunner)
-	api.SetConfigService(configService)
-	api.SetDeleteService(deleteService)
-	api.SetAnalysisSuccessHook(func() error {
-		hookContext, cancelHook := context.WithTimeout(
-			processContext,
-			5*time.Minute,
-		)
-		defer cancelHook()
-		return reloadDispatchAndFinalize(
-			hookContext,
-			phase2Router,
-			cfg.Phase2.AutoDispatch,
-		)
-	})
-
-	server := &http.Server{
-		Addr:              cfg.ListenAddr,
-		Handler:           api.Routes(),
-		ReadHeaderTimeout: 10 * time.Second,
-	}
-	logger.Info("gui listening", "addr", cfg.ListenAddr)
-	serveErr := serveAndDrain(
+	server := guiNewHTTPServer(cfg.ListenAddr, host)
+	serveEntered := make(chan struct{})
+	httpDrained := make(chan struct{})
+	initializationDone := make(chan struct{})
+	go func() {
+		defer close(initializationDone)
+		<-serveEntered
+		initializeOperationalRuntime(processContext, cfg, host, logger, httpDrained)
+	}()
+	serveErr := serveBoundGUI(
 		processContext,
 		cancelProcess,
 		server,
-		api,
+		listener,
+		host,
 		5*time.Second,
+		cfg.ListenAddr,
+		*noBrowser,
+		logger,
+		func() {
+			logger.Info("gui serving", "addr", listener.Addr().String())
+			close(serveEntered)
+		},
 	)
-	phase2Router.Wait()
+	close(httpDrained)
+	<-initializationDone
 	return serveErr
 }

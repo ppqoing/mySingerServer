@@ -4,17 +4,21 @@ import (
 	"context"
 	"errors"
 	"net"
+	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 
+	"dedup/internal/localcontrol"
 	"dedup/internal/machineid"
 	"dedup/internal/nodectl"
+	"dedup/internal/nodetray/agentclient"
+	trayapp "dedup/internal/nodetray/app"
 	trayconfig "dedup/internal/nodetray/config"
 	"dedup/internal/nodetray/traymodel"
 )
 
 type FormValidationStore interface {
-	ValidateAgentForm(trayconfig.AgentForm) []trayconfig.FieldError
 	ValidateHelperForm(trayconfig.HelperForm) []trayconfig.FieldError
 }
 
@@ -22,18 +26,52 @@ type Validator struct{ store FormValidationStore }
 
 func NewValidator(store FormValidationStore) *Validator { return &Validator{store: store} }
 
-func (v *Validator) ValidateAgent(value trayconfig.AgentForm) []trayconfig.FieldError {
-	if v == nil || v.store == nil {
-		return []trayconfig.FieldError{{Field: "agent", Code: "unavailable", Message: "Agent 配置验证不可用"}}
-	}
-	return append([]trayconfig.FieldError(nil), v.store.ValidateAgentForm(value)...)
-}
-
 func (v *Validator) ValidateHelper(value trayconfig.HelperForm) []trayconfig.FieldError {
 	if v == nil || v.store == nil {
 		return []trayconfig.FieldError{{Field: "helper", Code: "unavailable", Message: "Helper 配置验证不可用"}}
 	}
 	return append([]trayconfig.FieldError(nil), v.store.ValidateHelperForm(value)...)
+}
+
+type agentConfigurationController interface {
+	LoadAgentForm(context.Context) (trayconfig.AgentForm, error)
+	ValidateAgentForm(context.Context, trayconfig.AgentForm) []trayconfig.FieldError
+	SaveAgentForm(context.Context, trayconfig.AgentForm) (agentclient.ConfigSaveResult, error)
+	PromotePendingEndpoint()
+}
+
+type AgentConfigGateway struct{ controller agentConfigurationController }
+
+func NewAgentConfigGateway(controller agentConfigurationController) *AgentConfigGateway {
+	return &AgentConfigGateway{controller: controller}
+}
+
+func (g *AgentConfigGateway) LoadAgentForm(ctx context.Context) (trayconfig.AgentForm, error) {
+	if g == nil || g.controller == nil {
+		return trayconfig.AgentForm{}, errors.New("production Agent config unavailable")
+	}
+	return g.controller.LoadAgentForm(ctx)
+}
+
+func (g *AgentConfigGateway) ValidateAgentForm(ctx context.Context, value trayconfig.AgentForm) []trayconfig.FieldError {
+	if g == nil || g.controller == nil {
+		return []trayconfig.FieldError{{Field: "agent", Code: "unavailable", Message: "Agent 配置验证不可用"}}
+	}
+	return g.controller.ValidateAgentForm(ctx, value)
+}
+
+func (g *AgentConfigGateway) SaveAgentForm(ctx context.Context, value trayconfig.AgentForm) (trayapp.AgentConfigSaveResult, error) {
+	if g == nil || g.controller == nil {
+		return trayapp.AgentConfigSaveResult{}, errors.New("production Agent config unavailable")
+	}
+	result, err := g.controller.SaveAgentForm(ctx, value)
+	return trayapp.AgentConfigSaveResult{SHA256: result.SHA256, RestartRequired: result.RestartRequired}, err
+}
+
+func (g *AgentConfigGateway) PromotePendingEndpoint() {
+	if g != nil && g.controller != nil {
+		g.controller.PromotePendingEndpoint()
+	}
 }
 
 type Dialer interface {
@@ -47,12 +85,63 @@ type FixedController struct {
 	machineID string
 }
 
-func NewAgentController(dialer Dialer, machineID string) (*FixedController, error) {
-	return newFixedController(dialer, nodectl.AgentPipeName(), nodectl.ComponentAgent, machineID)
+type AgentConnectionSource func(context.Context) (configuredEndpoint, token string, err error)
+
+func NewAgentController(_ Dialer, machineID string, sources ...AgentConnectionSource) (*agentclient.Controller, error) {
+	if !validMachineID(machineID) || len(sources) > 1 {
+		return nil, errors.New("production controller: fixed identity unavailable")
+	}
+	source := defaultAgentConnectionSource
+	if len(sources) == 1 {
+		source = sources[0]
+	}
+	if source == nil {
+		return nil, errors.New("production controller: Agent connection unavailable")
+	}
+	endpoint, token, err := source(context.Background())
+	if err != nil {
+		return nil, errors.New("production controller: Agent connection unavailable")
+	}
+	controller, err := agentclient.NewController(endpoint, token, machineID)
+	if err != nil {
+		return nil, errors.New("production controller: Agent connection unavailable")
+	}
+	return controller, nil
 }
 
 func NewHelperController(dialer Dialer, machineID string) (*FixedController, error) {
 	return newFixedController(dialer, nodectl.HelperPipeName(), nodectl.ComponentHelper, machineID)
+}
+
+func defaultAgentConnectionSource(context.Context) (string, string, error) {
+	executable, err := os.Executable()
+	if err != nil {
+		return "", "", err
+	}
+	executable, err = filepath.Abs(executable)
+	if err != nil {
+		return "", "", err
+	}
+	layout, err := ResolvePortableLayout(executable)
+	if err != nil {
+		return "", "", err
+	}
+	store, err := trayconfig.NewStore(trayconfig.Paths{
+		TraySettings: layout.TraySettings, AgentConfig: layout.AgentConfig, HelperConfig: layout.HelperConfig,
+		AgentExecutable: layout.AgentExecutable, HelperExecutable: layout.HelperExecutable,
+	})
+	if err != nil {
+		return "", "", err
+	}
+	form, err := store.LoadAgentForm()
+	if err != nil {
+		return "", "", err
+	}
+	token, err := (localcontrol.FileTokenStore{}).LoadOrCreate(localcontrol.TokenPath(layout.Root))
+	if err != nil {
+		return "", "", err
+	}
+	return net.JoinHostPort(form.ListenHost, strconv.Itoa(form.ListenPort)), token, nil
 }
 
 func newFixedController(dialer Dialer, pipeName string, component nodectl.Component, machineID string) (*FixedController, error) {

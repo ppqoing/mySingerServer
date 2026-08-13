@@ -144,6 +144,10 @@ if ($useVideoCore) {
         -B $videoCoreBuild `
         -G "Visual Studio 17 2022" `
         -A x64 `
+        "-DCMAKE_EXE_LINKER_FLAGS=" `
+        "-DCMAKE_SHARED_LINKER_FLAGS=" `
+        "-DCMAKE_MODULE_LINKER_FLAGS=" `
+        "-DCMAKE_STATIC_LINKER_FLAGS=" `
         "-DCMAKE_TOOLCHAIN_FILE=$toolchainCMake" `
         -DVCPKG_TARGET_TRIPLET=x64-windows-static `
         "-DVCPKG_INSTALLED_DIR=$($dependencyPaths.VcpkgInstalled)" `
@@ -329,13 +333,13 @@ try {
     Remove-Item Env:CC -ErrorAction SilentlyContinue
     $controlPackages = @(
         "./internal/nodectl",
-        "./internal/agentcontrol",
+        "./internal/nodetray/agentclient",
         "./internal/helpercontrol"
     )
     & $Go -C $repo test @controlPackages -count=1
     if ($LASTEXITCODE -ne 0) { throw "node control package tests failed" }
 
-    & $Go -C $repo build -trimpath -o (Join-Path $out "agent.exe") ./cmd/agent
+    & $Go -C $repo build -trimpath -tags nodynamic -o (Join-Path $out "agent.exe") ./cmd/agent
     if ($LASTEXITCODE -ne 0) { throw "agent build failed" }
 
     & $Go -C $repo build -trimpath -o (Join-Path $out "gui.exe") ./cmd/gui
@@ -376,7 +380,8 @@ try {
 
     $env:CGO_ENABLED = "1"
     $env:CC = $ccExe
-    & $Go -C $repo build -trimpath -o (Join-Path $out "worker.exe") ./cmd/worker
+    & $Go -C $repo build -trimpath -tags nodynamic `
+        -o (Join-Path $out "worker.exe") ./cmd/worker
     if ($LASTEXITCODE -ne 0) { throw "worker build failed" }
 }
 finally {

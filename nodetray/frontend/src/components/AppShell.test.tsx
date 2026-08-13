@@ -8,7 +8,7 @@ describe('AppShell', () => {
     window.location.hash = ''
   })
 
-  it('固定四页签顺序，并同时用文字和 ARIA 标明当前页面', () => {
+  it('包含本机闭环页签且不提供其他机器连接入口', () => {
     render(<AppShell />)
 
     expect(screen.getAllByRole('tab').map((tab) => tab.textContent)).toEqual([
@@ -16,12 +16,17 @@ describe('AppShell', () => {
       'Agent',
       '删除 Helper',
       '程序设置',
+	  '本地任务',
+	  '去重分析',
+	  '结果审核',
+	  '删除记录',
     ])
+	expect(screen.queryByRole('tab', { name: /其他机器|远程 Agent/ })).not.toBeInTheDocument()
     expect(screen.getByRole('tab', { name: '总览' })).toHaveAttribute('aria-selected', 'true')
     expect(screen.getByRole('status')).toHaveTextContent('当前页面：总览')
 
     const panels = screen.getAllByRole('tabpanel', { hidden: true })
-    expect(panels).toHaveLength(4)
+    expect(panels).toHaveLength(8)
     for (const tab of screen.getAllByRole('tab')) {
       const panel = panels.find((candidate) => candidate.id === tab.getAttribute('aria-controls'))
       expect(panel).toHaveAttribute('aria-labelledby', tab.id)
@@ -35,13 +40,13 @@ describe('AppShell', () => {
     const overview = screen.getByRole('tab', { name: '总览' })
     overview.focus()
     await user.keyboard('{ArrowLeft}')
-    expect(screen.getByRole('tab', { name: '程序设置' })).toHaveFocus()
-    expect(screen.getByRole('status')).toHaveTextContent('当前页面：程序设置')
+    expect(screen.getByRole('tab', { name: '删除记录' })).toHaveFocus()
+    expect(screen.getByRole('status')).toHaveTextContent('当前页面：删除记录')
 
     await user.keyboard('{Home}')
     expect(overview).toHaveFocus()
     await user.keyboard('{End}')
-    expect(screen.getByRole('tab', { name: '程序设置' })).toHaveFocus()
+    expect(screen.getByRole('tab', { name: '删除记录' })).toHaveFocus()
     await user.keyboard('{ArrowRight}')
     expect(overview).toHaveFocus()
   })
@@ -65,6 +70,6 @@ describe('AppShell', () => {
     expect(screen.getByText('真实总览')).toBeVisible()
     await user.click(screen.getByRole('tab', { name: 'Agent' }))
     expect(screen.getByText('真实 Agent')).toBeVisible()
-    expect(screen.getAllByRole('tab')).toHaveLength(4)
+    expect(screen.getAllByRole('tab')).toHaveLength(8)
   })
 })

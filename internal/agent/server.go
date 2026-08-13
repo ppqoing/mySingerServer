@@ -1,7 +1,10 @@
 package agent
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"errors"
 	"io"
 	"log/slog"
@@ -32,6 +35,10 @@ type StatsProvider interface {
 	Stats(windowSeconds int) proto.StatsReport
 }
 
+type LocalHandler interface {
+	HandleLocal(context.Context, proto.LocalRequest) proto.LocalResponse
+}
+
 type phase2ConnectionHandler interface {
 	PrepareConnection(
 		task proto.Phase2Task,
@@ -58,6 +65,16 @@ type Server struct {
 	statsMu           sync.RWMutex
 	statsProvider     StatsProvider
 	heartbeatInterval time.Duration
+	localMu           sync.RWMutex
+	localToken        string
+	localHandler      LocalHandler
+}
+
+func (s *Server) SetLocalControl(token string, handler LocalHandler) {
+	s.localMu.Lock()
+	s.localToken = token
+	s.localHandler = handler
+	s.localMu.Unlock()
 }
 
 func NewServer(
@@ -175,7 +192,13 @@ func (s *Server) handleConn(parent context.Context, connection net.Conn) {
 	sender := func(msgType uint8, value any) error {
 		return conn.WriteFrame(msgType, value)
 	}
+	sendLocalResponse := func(response proto.LocalResponse) error {
+		token, _ := s.localControl()
+		response = protectLocalResponse(response, token)
+		return sender(proto.MsgLocalResponse, &response)
+	}
 	var detachPhase2 []func()
+	authenticatedNodeTray := false
 	defer func() {
 		for _, detach := range detachPhase2 {
 			detach()
@@ -199,6 +222,66 @@ func (s *Server) handleConn(parent context.Context, connection net.Conn) {
 			continue
 		}
 		switch value := message.(type) {
+		case *proto.ClientAuth:
+			authenticatedNodeTray = false
+			result := proto.ClientAuthResult{}
+			if !isLoopbackRemote(connection.RemoteAddr()) {
+				result.ErrorCode = "local_only"
+			} else {
+				token, _ := s.localControl()
+				if value.Role == "nodetray" &&
+					value.Version == proto.ProtocolVersion &&
+					token != "" &&
+					constantTimeTokenEqual(value.Token, token) {
+					authenticatedNodeTray = true
+					result.Accepted = true
+				} else {
+					result.ErrorCode = "unauthorized"
+				}
+			}
+			if err := sender(proto.MsgClientAuthResult, &result); err != nil {
+				return
+			}
+		case *proto.LocalRequest:
+			if !authenticatedNodeTray {
+				_ = sendLocalResponse(proto.LocalResponse{
+					RequestID: value.RequestID,
+					ErrorCode: "unauthorized",
+				})
+				continue
+			}
+			if err := value.Validate(); err != nil {
+				_ = sendLocalResponse(proto.LocalResponse{
+					RequestID: value.RequestID,
+					ErrorCode: err.Error(),
+				})
+				continue
+			}
+			_, handler := s.localControl()
+			if handler == nil {
+				_ = sendLocalResponse(proto.LocalResponse{
+					RequestID: value.RequestID,
+					ErrorCode: "local_unavailable",
+				})
+				continue
+			}
+			response := handler.HandleLocal(connectionContext, *value)
+			response.RequestID = value.RequestID
+			if err := response.Validate(); err != nil {
+				response = proto.LocalResponse{
+					RequestID: value.RequestID,
+					ErrorCode: err.Error(),
+				}
+			}
+			if err := sendLocalResponse(response); err != nil {
+				return
+			}
+		case *proto.Shutdown:
+			message := "unauthorized"
+			if authenticatedNodeTray {
+				message = proto.UnsupportedOperationErrorCode
+			}
+			_ = sender(proto.MsgError, &proto.Error{Stage: "local", Msg: message})
 		case *proto.Ping:
 			_ = sender(proto.MsgPong, &proto.Pong{TS: value.TS})
 		case *proto.Pong:
@@ -292,6 +375,48 @@ func (s *Server) handleConn(parent context.Context, connection net.Conn) {
 			})
 		}
 	}
+}
+
+func constantTimeTokenEqual(provided, expected string) bool {
+	providedHash := sha256.Sum256([]byte(provided))
+	expectedHash := sha256.Sum256([]byte(expected))
+	return subtle.ConstantTimeCompare(providedHash[:], expectedHash[:]) == 1
+}
+
+func (s *Server) localControl() (string, LocalHandler) {
+	s.localMu.RLock()
+	defer s.localMu.RUnlock()
+	return s.localToken, s.localHandler
+}
+
+func isLoopbackRemote(address net.Addr) bool {
+	if address == nil {
+		return false
+	}
+	if tcpAddress, ok := address.(*net.TCPAddr); ok {
+		return tcpAddress.IP.IsLoopback()
+	}
+	host, _, err := net.SplitHostPort(address.String())
+	if err != nil {
+		return false
+	}
+	return net.ParseIP(host).IsLoopback()
+}
+
+func protectLocalResponse(response proto.LocalResponse, token string) proto.LocalResponse {
+	if token == "" {
+		return response
+	}
+	if bytes.Contains([]byte(response.RequestID), []byte(token)) {
+		response.RequestID = ""
+	}
+	if bytes.Contains([]byte(response.ErrorCode), []byte(token)) ||
+		bytes.Contains(response.Payload, []byte(token)) {
+		response.OK = false
+		response.ErrorCode = "internal_error"
+		response.Payload = nil
+	}
+	return response
 }
 
 func (s *Server) currentStatsProvider() StatsProvider {

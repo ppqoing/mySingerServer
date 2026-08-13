@@ -173,10 +173,10 @@ func (d *DB) SaveAnalysis(ctx context.Context, result AnalysisResult) (Committed
 				INSERT INTO video_frames (sha512, frame_idx, pdq256, phash_parts, sobel_hist)
 				VALUES (?1, ?2, ?3, ?4, ?5)
 				ON CONFLICT (sha512, frame_idx) DO UPDATE SET
-					pdq256=excluded.pdq256,
-					phash_parts=excluded.phash_parts,
-					sobel_hist=excluded.sobel_hist;`,
-				sha, frame.FrameIdx, frame.PDQ256, frame.PHashParts, frame.SobelHist,
+					pdq256=COALESCE(excluded.pdq256, video_frames.pdq256),
+					phash_parts=COALESCE(excluded.phash_parts, video_frames.phash_parts),
+					sobel_hist=COALESCE(excluded.sobel_hist, video_frames.sobel_hist);`,
+				sha, frame.FrameIdx, nullableBytes(frame.PDQ256), nullableBytes(frame.PHashParts), nullableBytes(frame.SobelHist),
 			); err != nil {
 				return CommittedState{}, fmt.Errorf(
 					"store: save analysis video frame %d: %w", frame.FrameIdx, err,
@@ -193,14 +193,24 @@ func (d *DB) SaveAnalysis(ctx context.Context, result AnalysisResult) (Committed
 		return CommittedState{}, err
 	}
 	updatedMissing := priorMissing&^result.RequestedFields | state.MissingFields
-	phase1Done := analysisPhase1Done(result.Kind, updatedMissing)
+	if result.Kind == MediaVideo && result.RequestedFields&(proto.FieldVideo6FPHash|proto.FieldVideo6FSobel) != 0 {
+		complete, completeErr := committedFrameMaskForFields(
+			ctx, tx, sha, proto.FieldVideo6FPHash|proto.FieldVideo6FSobel,
+		)
+		if completeErr != nil {
+			return CommittedState{}, completeErr
+		}
+		if complete == proto.FrameMaskFull {
+			updatedMissing &^= proto.FieldVideo6F
+		}
+	}
+	stageOneStatus, phase1Done := stageOneState(
+		result.Kind, updatedMissing, len(result.Errors) != 0 || hasAnalysisFrameErrors(result.Frames),
+	)
 	phase2Done := updatedMissing&phase2Mask(result.Kind) == 0
-	status := proto.StatusPartial
-	if updatedMissing == 0 {
-		status = proto.StatusDone
-	} else if state.FieldsPresent == 0 && state.FramesPresent == 0 &&
-		(len(result.Errors) != 0 || hasAnalysisFrameErrors(result.Frames)) {
-		status = proto.StatusFailed
+	status := stageOneStatus
+	if updatedMissing&RequiredStageOneMask(result.Kind) == 0 && updatedMissing != 0 {
+		status = proto.StatusPartial
 	}
 	var errorValue any
 	if status != proto.StatusDone {
@@ -266,7 +276,7 @@ func validateAnalysisResult(result AnalysisResult) (uint8, error) {
 		return 0, fmt.Errorf("store: requested analysis frames exceed six slots")
 	}
 	requestedFrames := result.RequestedFrames
-	if result.Kind == MediaVideo && result.RequestedFields&proto.FieldVideo6F != 0 && requestedFrames == 0 {
+	if result.Kind == MediaVideo && result.RequestedFields&videoSixFrameFields() != 0 && requestedFrames == 0 {
 		requestedFrames = proto.FrameMaskFull
 	}
 	for _, fieldError := range result.Errors {
@@ -335,7 +345,7 @@ func validateAnalysisResult(result AnalysisResult) (uint8, error) {
 			result.ThumbQuality != nil || result.ThumbWidth != nil || result.ThumbHeight != nil {
 			return 0, fmt.Errorf("store: unclaimed analysis contact sheet payload")
 		}
-		if err := validateAnalysisFrames(result.Frames, requestedFrames); err != nil {
+		if err := validateAnalysisFrames(result.Frames, requestedFrames, result.RequestedFields); err != nil {
 			return 0, err
 		}
 	}
@@ -375,7 +385,7 @@ func validateAnalysisBlob(
 	return nil
 }
 
-func validateAnalysisFrames(frames []Phase2Frame, requested uint8) error {
+func validateAnalysisFrames(frames []Phase2Frame, requested uint8, requestedFields uint32) error {
 	var seen uint8
 	for _, frame := range frames {
 		if frame.FrameIdx < 0 || frame.FrameIdx > 5 {
@@ -396,14 +406,17 @@ func validateAnalysisFrames(frames []Phase2Frame, requested uint8) error {
 			}
 			continue
 		}
-		if len(frame.PDQ256) != 32 || frame.Quality < 0 || frame.Quality > 100 {
-			return fmt.Errorf("store: invalid analysis frame %d PDQ payload", frame.FrameIdx)
+		if !videoFramePayloadValid(requestedFields, frame.PDQ256, frame.PHashParts, frame.SobelHist) {
+			return fmt.Errorf("store: invalid analysis frame %d stage payload", frame.FrameIdx)
 		}
-		if _, err := features.DecodePHashParts(frame.PHashParts); err != nil {
-			return fmt.Errorf("store: invalid analysis frame %d phash_parts: %w", frame.FrameIdx, err)
+		if requestedFields&proto.FieldVideo6F == 0 && (len(frame.PDQ256) != 0 || frame.Quality != 0) {
+			return fmt.Errorf("store: split analysis frame %d contains legacy PDQ payload", frame.FrameIdx)
 		}
-		if _, err := features.DecodeSobelHist(frame.SobelHist); err != nil {
-			return fmt.Errorf("store: invalid analysis frame %d sobel_hist: %w", frame.FrameIdx, err)
+		if requestedFields&(proto.FieldVideo6F|proto.FieldVideo6FPHash) == 0 && len(frame.PHashParts) != 0 {
+			return fmt.Errorf("store: analysis frame %d contains unrequested pHash", frame.FrameIdx)
+		}
+		if requestedFields&(proto.FieldVideo6F|proto.FieldVideo6FSobel) == 0 && len(frame.SobelHist) != 0 {
+			return fmt.Errorf("store: analysis frame %d contains unrequested Sobel", frame.FrameIdx)
 		}
 	}
 	return nil
@@ -486,21 +499,26 @@ func committedAnalysisState(
 				state.MissingFields &^= proto.FieldThumb
 			}
 		}
-		frameMask, err := committedFrameMask(ctx, tx, sha)
+		frameMask, err := committedFrameMaskForFields(ctx, tx, sha, requestedFields)
 		if err != nil {
 			return CommittedState{}, err
 		}
 		state.FramesPresent = requestedFrames & frameMask
 		state.MissingFrames = requestedFrames &^ frameMask
-		if requestedFields&proto.FieldVideo6F != 0 && frameMask == proto.FrameMaskFull {
-			state.FieldsPresent |= proto.FieldVideo6F
-			state.MissingFields &^= proto.FieldVideo6F
+		if frameMask == proto.FrameMaskFull {
+			completed := requestedFields & videoSixFrameFields()
+			state.FieldsPresent |= completed
+			state.MissingFields &^= completed
 		}
 	}
 	return state, nil
 }
 
 func committedFrameMask(ctx context.Context, tx *sql.Tx, sha string) (uint8, error) {
+	return committedFrameMaskForFields(ctx, tx, sha, proto.FieldVideo6F)
+}
+
+func committedFrameMaskForFields(ctx context.Context, tx *sql.Tx, sha string, fields uint32) (uint8, error) {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT frame_idx, pdq256, phash_parts, sobel_hist
 		FROM video_frames WHERE sha512=?1 AND frame_idx BETWEEN 0 AND 5`, sha,
@@ -516,13 +534,7 @@ func committedFrameMask(ctx context.Context, tx *sql.Tx, sha string) (uint8, err
 		if err := rows.Scan(&frameIdx, &pdq, &pHash, &sobel); err != nil {
 			return 0, fmt.Errorf("store: scan committed analysis frame: %w", err)
 		}
-		if len(pdq) != 32 {
-			continue
-		}
-		if _, err := features.DecodePHashParts(pHash); err != nil {
-			continue
-		}
-		if _, err := features.DecodeSobelHist(sobel); err != nil {
+		if !videoFramePayloadValid(fields, pdq, pHash, sobel) {
 			continue
 		}
 		mask |= 1 << uint(frameIdx)
@@ -534,15 +546,7 @@ func committedFrameMask(ctx context.Context, tx *sql.Tx, sha string) (uint8, err
 }
 
 func analysisPhase1Done(kind MediaKind, missing uint32) bool {
-	switch kind {
-	case MediaImage:
-		return missing&(proto.FieldSHA512|proto.FieldPDQ256) == 0
-	case MediaVideo:
-		return missing&(proto.FieldSHA512|proto.FieldThumb|
-			proto.FieldVideoDuration|proto.FieldVideoContactSheet) == 0
-	default:
-		return false
-	}
+	return missing&RequiredStageOneMask(kind) == 0
 }
 
 func hasAnalysisFrameErrors(frames []Phase2Frame) bool {
