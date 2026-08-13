@@ -198,7 +198,6 @@ func TestStoreFingerprintsStrictCanonicalConfigurationsWithoutReturningTheirCont
 	agent.Worker.ExePath = ""
 	writeBytesFixture(t, paths.AgentConfig, mustCanonicalJSON(t, agent))
 	helper := validHelperConfig(t)
-	helper.LogDir = ""
 	writeBytesFixture(t, paths.HelperConfig, mustCanonicalJSON(t, helper))
 
 	agentDigest, err := store.AgentFingerprint()
