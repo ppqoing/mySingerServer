@@ -60,6 +60,18 @@ func TestBuildOperationalRuntimeClosesResourcesAfterIntermediateFailure(t *testi
 	}
 }
 
+func TestNewOperationalRuntimeResourcesRejectsEmptyPostgresBeforePoolCreation(t *testing.T) {
+	cfg := config.DefaultGUI()
+	cfg.PGDSN = "  "
+	resources, err := newOperationalRuntimeResources(context.Background(), cfg, testOperationalLogger())
+	if resources != nil {
+		t.Fatalf("resources = %#v, want nil", resources)
+	}
+	if !errors.Is(err, gui.ErrPostgresNotConfigured) {
+		t.Fatalf("error = %v, want ErrPostgresNotConfigured", err)
+	}
+}
+
 func TestBuildOperationalRuntimeClosesSuccessfulResourcesInOrder(t *testing.T) {
 	originalFactory := guiNewOperationalRuntimeResources
 	defer func() { guiNewOperationalRuntimeResources = originalFactory }()

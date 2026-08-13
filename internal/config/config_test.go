@@ -430,9 +430,17 @@ func TestDefaultGUIIsACompletePortableFirstRunConfiguration(t *testing.T) {
 		t.Fatalf("DefaultGUI: %v", err)
 	}
 	if cfg.ListenAddr != "127.0.0.1:18081" ||
-		cfg.PGDSN != "postgres://dedup@127.0.0.1:5432/dedup" ||
+		cfg.PGDSN != "" ||
 		len(cfg.Agents) != 1 || cfg.Agents[0].Addr != "127.0.0.1:9101" {
 		t.Fatalf("incomplete portable defaults: %#v", cfg)
+	}
+}
+
+func TestValidateGUIAcceptsEmptyPostgresDSNAsUnconfigured(t *testing.T) {
+	cfg := validGUIConfigForValidation()
+	cfg.PGDSN = ""
+	if err := ValidateGUI(cfg); err != nil {
+		t.Fatalf("ValidateGUI empty pg_dsn: %v", err)
 	}
 }
 
@@ -577,7 +585,6 @@ func TestLoadGUIRejectsExistingFilesMissingRequiredConnectionFields(t *testing.T
 		body string
 	}{
 		{name: "empty", body: `{}`},
-		{name: "missing DSN", body: `{"listen_addr":"127.0.0.1:18081","agents":[{"addr":"127.0.0.1:9101"}]}`},
 		{name: "missing Agent", body: `{"listen_addr":"127.0.0.1:18081","pg_dsn":"postgres://dedup@127.0.0.1:5432/dedup"}`},
 	}
 	for _, test := range tests {
@@ -599,6 +606,20 @@ func TestLoadGUIRejectsExistingFilesMissingRequiredConnectionFields(t *testing.T
 				t.Fatalf("LoadGUI rewrote invalid existing configuration:\n got %q\nwant %q", current, original)
 			}
 		})
+	}
+}
+
+func TestLoadGUIAcceptsExistingFileWithMissingPostgresDSN(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gui.json")
+	if err := os.WriteFile(path, []byte(`{"listen_addr":"127.0.0.1:18081","agents":[{"addr":"127.0.0.1:9101"}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadGUI(path)
+	if err != nil {
+		t.Fatalf("LoadGUI: %v", err)
+	}
+	if cfg.PGDSN != "" {
+		t.Fatalf("PGDSN = %q, want empty", cfg.PGDSN)
 	}
 }
 

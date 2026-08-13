@@ -30,10 +30,12 @@ function Test-ManagerStartAllowsMissingConfig {
 
 function Test-ManagerReadmeContract {
     param([string]$Text)
-    return ($Text -match '首次双击.*自动生成.*gui\.json') -and
+    return ($Text -match '包内.*gui\.json') -and
         ($Text -match 'PostgreSQL.*Agent.*不可用.*设置页') -and
         ($Text -match '保存.*自动重启') -and
-        ($Text -notmatch '(?is)(必须|需要|请|先).{0,12}(手工|手动)?复制.{0,24}gui\.example\.json') -and
+        ($Text -notmatch '首次双击.*自动生成.*gui\.json') -and
+        ($Text -notmatch 'gui\.example\.json') -and
+        ($Text -notmatch '(?is)(必须|需要|请|先).{0,12}(手工|手动)?复制.{0,24}gui\.json') -and
         ($Text -notmatch '(?is)(缺少|缺失|没有).{0,12}gui\.json.{0,12}(不能|无法|不可).{0,8}(启动|运行)') -and
         ($Text -notmatch '(?is)(请先|必须|需要).{0,40}(PostgreSQL.{0,20}Agent|Agent.{0,20}PostgreSQL).{0,30}(解压|启动)')
 }
@@ -44,7 +46,7 @@ function Invoke-RejectedPackage {
     try {
         & $packageScript -StageDir $stage -OutputDir (Join-Path $testRoot $ReleaseId) `
             -ReleaseId $ReleaseId -BuildDate '2026-08-11' `
-            -SourceRevision 'N/A_NO_GIT_METADATA' -GuiExamplePath $TemplatePath
+            -SourceRevision 'N/A_NO_GIT_METADATA' -GuiConfigPath $TemplatePath
     } catch {
         $rejected = $_.Exception.Message -match 'MANAGER_RELEASE_SENSITIVE_CONFIG'
     }
@@ -60,7 +62,7 @@ try {
     New-Item -ItemType Directory -Path $stage -Force | Out-Null
     Write-Utf8NoBom -Path (Join-Path $stage 'gui.exe') -Value 'fixture:gui.exe'
     foreach ($name in @('agent.exe', 'worker.exe', 'helper.exe', 'nodetray.exe',
-            'Everything.exe', 'ffmpeg.exe', 'videocore.dll', 'WebView2Loader.dll', 'gui.json')) {
+            'Everything.exe', 'ffmpeg.exe', 'videocore.dll', 'WebView2Loader.dll', 'gui.example.json')) {
         Write-Utf8NoBom -Path (Join-Path $stage $name) -Value "must-not-ship:$name"
     }
 
@@ -86,18 +88,21 @@ try {
     $actualFiles = @(Get-ChildItem -LiteralPath $payloadRoot -Recurse -File | ForEach-Object {
         [IO.Path]::GetRelativePath($payloadRoot, $_.FullName).Replace('\', '/')
     } | Sort-Object)
-    $expectedFiles = @('gui.exe', 'gui.example.json', 'Start-Manager.ps1',
+    $expectedFiles = @('gui.exe', 'gui.json', 'Start-Manager.ps1',
         'README-管理端部署.md', 'release-manifest.json') | Sort-Object
     Assert-True (@(Compare-Object -ReferenceObject $expectedFiles -DifferenceObject $actualFiles).Count -eq 0) `
         'ZIP file list differs from the portable manager contract'
     foreach ($forbidden in @('agent.exe', 'worker.exe', 'helper.exe', 'nodetray.exe',
-            'Everything.exe', 'ffmpeg.exe', 'videocore.dll', 'WebView2Loader.dll', 'gui.json')) {
+            'Everything.exe', 'ffmpeg.exe', 'videocore.dll', 'WebView2Loader.dll', 'gui.example.json')) {
         Assert-True (-not ($actualFiles -contains $forbidden)) "forbidden file shipped: $forbidden"
     }
-    $guiExample = Get-Content -Raw -LiteralPath (Join-Path $payloadRoot 'gui.example.json') |
+    $guiConfig = Get-Content -Raw -LiteralPath (Join-Path $payloadRoot 'gui.json') |
         ConvertFrom-Json
-    Assert-True ([string]$guiExample.listen_addr -ceq '127.0.0.1:18081') `
-        'manager template must use the dedicated loopback port 18081'
+    Assert-True ([string]$guiConfig.listen_addr -ceq '127.0.0.1:18081') `
+        'manager config must use the dedicated loopback port 18081'
+    Assert-True ([string]$guiConfig.pg_dsn -ceq '') 'manager config must leave PostgreSQL unconfigured'
+    Assert-True (@($guiConfig.agents).Count -eq 1 -and [string]$guiConfig.agents[0].addr -ceq '127.0.0.1:9101') `
+        'manager config must contain only the loopback Agent'
 
     $startScript = Get-Content -Raw -LiteralPath (Join-Path $payloadRoot 'Start-Manager.ps1')
     Assert-True ($startScript -match `
@@ -117,7 +122,7 @@ try {
         $acceptedMutations.Add('inline-throw')
     }
     foreach ($readmeMutation in @(
-            [ordered]@{ name = 'manual-copy'; text = '必须手工复制 gui.example.json 为 gui.json 才能启动。' },
+            [ordered]@{ name = 'manual-copy'; text = '必须手工复制 gui.json 才能启动。' },
             [ordered]@{ name = 'missing-config-blocks-start'; text = '缺少 gui.json 时不能启动。' },
             [ordered]@{ name = 'dependencies-required-before-extract'; text = '请先在可访问 PostgreSQL 与 Agent 的 Windows 电脑上解压。' })) {
         if (Test-ManagerReadmeContract -Text ($readme + "`n" + $readmeMutation.text)) {
@@ -179,7 +184,7 @@ try {
     & $packageScript -StageDir $stage -OutputDir $safePlaceholderOutput `
         -ReleaseId 'safe-placeholder' -BuildDate '2026-08-11' `
         -SourceRevision 'N/A_NO_GIT_METADATA' `
-        -GuiExamplePath $safePlaceholderTemplate
+        -GuiConfigPath $safePlaceholderTemplate
     Assert-True (Test-Path -LiteralPath (Join-Path $safePlaceholderOutput `
             'MySingerServer-manager-win-x64-safe-placeholder.zip') -PathType Leaf) `
         'postgresql localhost placeholder was rejected'

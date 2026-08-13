@@ -70,7 +70,7 @@ type AgentEndpoint struct {
 
 func DefaultGUI() *GUIConfig {
 	cfg := defaultGUIOptionalFields()
-	cfg.PGDSN = "postgres://dedup@127.0.0.1:5432/dedup"
+	cfg.PGDSN = ""
 	cfg.Agents = []AgentEndpoint{{Addr: "127.0.0.1:9101"}}
 	return cfg
 }
@@ -111,10 +111,10 @@ func ValidateGUI(cfg *GUIConfig) error {
 	} else if !validGUIHostPort(cfg.ListenAddr) {
 		validation.add("listen_addr", "invalid_address", "地址必须是 host:port")
 	}
-	if cfg.PGDSN == "" {
-		validation.add("pg_dsn", "required", "PostgreSQL DSN 不能为空")
-	} else if _, err := pgxpool.ParseConfig(cfg.PGDSN); err != nil {
-		validation.add("pg_dsn", "invalid_dsn", "必须是可解析的 PostgreSQL DSN")
+	if cfg.PGDSN != "" {
+		if _, err := pgxpool.ParseConfig(cfg.PGDSN); err != nil {
+			validation.add("pg_dsn", "invalid_dsn", "必须是可解析的 PostgreSQL DSN")
+		}
 	}
 	if cfg.HeartbeatS < 1 {
 		validation.add("heartbeat_s", "positive", "心跳间隔必须为正数")

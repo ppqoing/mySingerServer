@@ -1,6 +1,7 @@
 package gui
 
 import (
+	"errors"
 	"net"
 	"strings"
 	"syscall"
@@ -22,5 +23,15 @@ func TestClassifyRuntimeFailureReturnsOnlyStableCodesAndChineseSummaries(t *test
 		if status.Code != test.want || strings.Contains(status.Summary, "password") || status.Summary == "" {
 			t.Fatalf("unsafe status: %#v", status)
 		}
+	}
+}
+
+func TestClassifyRuntimeFailureMapsPostgresNotConfigured(t *testing.T) {
+	status := ClassifyRuntimeFailure(ErrPostgresNotConfigured)
+	if status.Code != "postgres_not_configured" || status.Summary != "PostgreSQL 尚未配置" {
+		t.Fatalf("status = %#v", status)
+	}
+	if !errors.Is(ErrPostgresNotConfigured, ErrPostgresNotConfigured) {
+		t.Fatal("unconfigured error must remain comparable")
 	}
 }

@@ -70,7 +70,7 @@ $required = @(
     "third_party\everything\manifest.json",
     "nodetray\frontend\package-lock.json",
     "nodetray\build\windows\nodetray.manifest",
-    "deploy\gui.example.json",
+    "deploy\gui.default.json",
     "deploy\Start-Manager.ps1",
     "deploy\README-管理端部署.md"
 )
@@ -79,21 +79,18 @@ foreach ($relative in $required) {
         ("REQUIRED_FILE_MISSING path={0}" -f $relative)
 }
 
-$guiExamplePath = Join-Path $repo 'deploy\gui.example.json'
-if (Test-Path -LiteralPath $guiExamplePath -PathType Leaf) {
+$guiDefaultPath = Join-Path $repo 'deploy\gui.default.json'
+if (Test-Path -LiteralPath $guiDefaultPath -PathType Leaf) {
     try {
-        $guiExample = Get-Content -Raw -LiteralPath $guiExamplePath | ConvertFrom-Json
-        $guiDsn = [Uri]::new([string]$guiExample.pg_dsn)
-        Assert-True ($guiDsn.UserInfo -notmatch ':') 'GUI_EXAMPLE_DSN_CONTAINS_PASSWORD'
-        Assert-True ($guiDsn.Query -notmatch '(?i)(^|[?&])(password|passwd|pwd|token|secret)=') `
-            'GUI_EXAMPLE_DSN_CONTAINS_SECRET_QUERY'
-        Assert-True ([string]$guiExample.listen_addr -ceq '127.0.0.1:18081') `
-            'GUI_EXAMPLE_LISTEN_ADDR_NOT_DEDICATED_LOOPBACK'
-        $guiAgents = @($guiExample.agents)
+        $guiDefault = Get-Content -Raw -LiteralPath $guiDefaultPath | ConvertFrom-Json
+        Assert-True ([string]$guiDefault.pg_dsn -ceq '') 'GUI_DEFAULT_DSN_MUST_BE_EMPTY'
+        Assert-True ([string]$guiDefault.listen_addr -ceq '127.0.0.1:18081') `
+            'GUI_DEFAULT_LISTEN_ADDR_NOT_DEDICATED_LOOPBACK'
+        $guiAgents = @($guiDefault.agents)
         Assert-True ($guiAgents.Count -eq 1 -and [string]$guiAgents[0].addr -ceq '127.0.0.1:9101') `
-            'GUI_EXAMPLE_AGENT_NOT_LOOPBACK_ONLY'
+            'GUI_DEFAULT_AGENT_NOT_LOOPBACK_ONLY'
     } catch {
-        Add-GateFailure 'GUI_EXAMPLE_INVALID'
+        Add-GateFailure 'GUI_DEFAULT_INVALID'
     }
 }
 

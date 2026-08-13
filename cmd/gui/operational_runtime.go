@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -52,6 +53,9 @@ func newOperationalRuntimeResources(
 	cfg *config.GUIConfig,
 	logger *slog.Logger,
 ) (operationalRuntimeResources, error) {
+	if strings.TrimSpace(cfg.PGDSN) == "" {
+		return nil, gui.ErrPostgresNotConfigured
+	}
 	pg, err := pgxpool.New(ctx, cfg.PGDSN)
 	if err != nil {
 		return nil, err

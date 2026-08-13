@@ -4,8 +4,8 @@
 
 ## 配置与启动
 
-1. 可直接双击 `gui.exe`，或在 PowerShell 中执行 `./Start-Manager.ps1`。首次双击时，程序会在同目录自动生成 `gui.json`。
-2. `gui.example.json` 仅供参考，无需手工复制。请在设置页填写外部 PostgreSQL 的连接地址和可访问的 Agent 地址。即使 PostgreSQL 或 Agent 暂时不可用，程序仍可启动并进入设置页。
+1. 包内已包含 `gui.json`，可直接双击 `gui.exe`，或在 PowerShell 中执行 `./Start-Manager.ps1`。
+2. 请在设置页填写外部 PostgreSQL 的连接地址和可访问的 Agent 地址。即使 PostgreSQL 或 Agent 暂时不可用，程序仍可启动并进入设置页。
 3. 保存设置后，程序会自动重启以应用新配置。配置中如需密码，请仅写入本机的 `gui.json`，不要提交或分发它。
 
 如果不希望自动打开浏览器，可执行：

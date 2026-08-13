@@ -8,6 +8,8 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
+var ErrPostgresNotConfigured = errors.New("postgres_not_configured")
+
 type RuntimeFailure struct {
 	Code    string
 	Summary string
@@ -22,6 +24,9 @@ type RuntimeStatus struct {
 }
 
 func ClassifyRuntimeFailure(err error) RuntimeFailure {
+	if errors.Is(err, ErrPostgresNotConfigured) {
+		return RuntimeFailure{Code: "postgres_not_configured", Summary: "PostgreSQL 尚未配置"}
+	}
 	var pgError *pgconn.PgError
 	if errors.As(err, &pgError) && pgError.Code == "28P01" {
 		return RuntimeFailure{Code: "postgres_auth_failed", Summary: "PostgreSQL 认证失败"}

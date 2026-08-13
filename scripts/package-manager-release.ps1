@@ -13,7 +13,7 @@ param(
 
     [string]$SourceRevision = 'N/A_NO_GIT_METADATA',
 
-    [string]$GuiExamplePath = ''
+    [string]$GuiConfigPath = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -74,19 +74,19 @@ function Get-ManifestFiles {
         })
 }
 
-function Assert-SanitizedGuiExample {
+function Assert-SanitizedGuiConfig {
     param([string]$Path)
     try {
         $config = Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json
-        $uri = [Uri]::new([string]$config.pg_dsn)
+        $uri = if ([string]::IsNullOrWhiteSpace([string]$config.pg_dsn)) { $null } else { [Uri]::new([string]$config.pg_dsn) }
     } catch {
-        throw "MANAGER_RELEASE_SENSITIVE_CONFIG invalid_gui_example path=$Path"
+        throw "MANAGER_RELEASE_SENSITIVE_CONFIG invalid_gui_config path=$Path"
     }
-    if (($uri.Scheme -cne 'postgres' -and $uri.Scheme -cne 'postgresql') -or
-        ($uri.Host -cne '127.0.0.1' -and $uri.Host -cne 'localhost')) {
+    if ($null -ne $uri -and (($uri.Scheme -cne 'postgres' -and $uri.Scheme -cne 'postgresql') -or
+        ($uri.Host -cne '127.0.0.1' -and $uri.Host -cne 'localhost'))) {
         throw "MANAGER_RELEASE_SENSITIVE_CONFIG unsafe_pg_dsn_endpoint path=$Path"
     }
-    if ($uri.UserInfo -match ':') {
+    if ($null -ne $uri -and $uri.UserInfo -match ':') {
         throw "MANAGER_RELEASE_SENSITIVE_CONFIG credential_in_pg_dsn path=$Path"
     }
     $sensitiveQueryKeys = [Collections.Generic.HashSet[string]]::new(
@@ -95,7 +95,7 @@ function Assert-SanitizedGuiExample {
         [void]$sensitiveQueryKeys.Add($key)
     }
     try {
-        $encodedQuery = $uri.GetComponents([UriComponents]::Query, [UriFormat]::UriEscaped)
+        $encodedQuery = if ($null -eq $uri) { '' } else { $uri.GetComponents([UriComponents]::Query, [UriFormat]::UriEscaped) }
         foreach ($segment in $encodedQuery -split '&') {
             if ([string]::IsNullOrEmpty($segment)) { continue }
             $encodedName = ($segment -split '=', 2)[0]
@@ -115,10 +115,10 @@ function Assert-SanitizedGuiExample {
 
 $stage = Resolve-InputDirectory -Path $StageDir -Label 'MANAGER_RELEASE_STAGE'
 $output = Resolve-OutputDirectory -Path $OutputDir
-$guiExample = Resolve-InputFile -Path $(if ([string]::IsNullOrWhiteSpace($GuiExamplePath)) { Join-Path $repo 'deploy\gui.example.json' } else { $GuiExamplePath }) -Label 'MANAGER_RELEASE_GUI_EXAMPLE'
+$guiConfig = Resolve-InputFile -Path $(if ([string]::IsNullOrWhiteSpace($GuiConfigPath)) { Join-Path $repo 'deploy\gui.default.json' } else { $GuiConfigPath }) -Label 'MANAGER_RELEASE_GUI_CONFIG'
 $startScript = Resolve-InputFile -Path (Join-Path $repo 'deploy\Start-Manager.ps1') -Label 'MANAGER_RELEASE_START_SCRIPT'
 $readme = Resolve-InputFile -Path (Join-Path $repo 'deploy\README-管理端部署.md') -Label 'MANAGER_RELEASE_README'
-Assert-SanitizedGuiExample -Path $guiExample
+Assert-SanitizedGuiConfig -Path $guiConfig
 
 $baseName = "MySingerServer-manager-win-x64-$ReleaseId"
 $zipPath = Join-Path $output "$baseName.zip"
@@ -136,7 +136,7 @@ $complete = $false
 try {
     New-Item -ItemType Directory -Path $payload | Out-Null
     Copy-RequiredFile -Source (Join-Path $stage 'gui.exe') -DestinationRoot $payload -DestinationName 'gui.exe'
-    Copy-RequiredFile -Source $guiExample -DestinationRoot $payload -DestinationName 'gui.example.json'
+    Copy-RequiredFile -Source $guiConfig -DestinationRoot $payload -DestinationName 'gui.json'
     Copy-RequiredFile -Source $startScript -DestinationRoot $payload -DestinationName 'Start-Manager.ps1'
     Copy-RequiredFile -Source $readme -DestinationRoot $payload -DestinationName 'README-管理端部署.md'
 
