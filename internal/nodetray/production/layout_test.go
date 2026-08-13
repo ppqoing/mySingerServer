@@ -65,7 +65,7 @@ func TestResolvePortableLayoutRejectsRelativeUNCAndWrongExecutableName(t *testin
 func TestDefaultTraySettingsUsesTheSafeFirstRunValues(t *testing.T) {
 	want := traymodel.TraySettings{
 		LoginStartTray:         false,
-		AgentStartMode:         traymodel.StartManual,
+		AgentStartMode:         traymodel.StartAutomatic,
 		HelperEnabled:          false,
 		HelperStartMode:        traymodel.StartManual,
 		CloseToTray:            true,

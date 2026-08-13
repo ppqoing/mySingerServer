@@ -168,7 +168,8 @@ try {
     Assert-True (-not (Test-ContainsSensitiveConfigKey -Value $agent)) `
         'Agent default must not contain machine_id, token, secret, credential, or password keys'
     $tray = Get-Content -Raw -LiteralPath (Join-Path $payloadRoot 'data\nodetray\tray.json') | ConvertFrom-Json
-    Assert-True (-not [bool]$tray.helperEnabled -and [string]$tray.agentStartMode -ceq 'manual') 'unsafe tray defaults'
+    Assert-True (-not [bool]$tray.helperEnabled -and [string]$tray.agentStartMode -ceq 'automatic') `
+        'Compute package must auto-start Agent so NodeTray can reach the packaged Agent configuration'
     $helper = Get-Content -Raw -LiteralPath (Join-Path $payloadRoot 'helper.default.json') | ConvertFrom-Json
     Assert-True (@($helper.allowed_roots).Count -eq 0) 'Helper default must not authorize a root'
     Assert-True (-not [bool]$helper.allow_hard_delete -and [string]$helper.log_dir -ceq '') `

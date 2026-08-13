@@ -82,7 +82,7 @@ func ResolvePortableLayout(trayExecutable string) (Layout, error) {
 func DefaultTraySettings() traymodel.TraySettings {
 	return traymodel.TraySettings{
 		LoginStartTray:         false,
-		AgentStartMode:         traymodel.StartManual,
+		AgentStartMode:         traymodel.StartAutomatic,
 		HelperEnabled:          false,
 		HelperStartMode:        traymodel.StartManual,
 		CloseToTray:            true,

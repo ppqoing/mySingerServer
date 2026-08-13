@@ -1,6 +1,6 @@
 {
   "loginStartTray": false,
-  "agentStartMode": "manual",
+  "agentStartMode": "automatic",
   "helperEnabled": false,
   "helperStartMode": "manual",
   "closeToTray": true,
