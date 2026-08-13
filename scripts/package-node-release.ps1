@@ -93,19 +93,47 @@ function Write-Utf8NoBom {
         [Text.UTF8Encoding]::new($false))
 }
 
+function Test-ContainsSensitiveConfigKey {
+    param([object]$Value)
+    if ($null -eq $Value -or $Value -is [string]) { return $false }
+    if ($Value -is [Collections.IDictionary]) {
+        foreach ($key in $Value.Keys) {
+            if ([string]$key -match '(?i)(machine[_-]?id|token|secret|credential|password|passwd|pwd)') { return $true }
+            if (Test-ContainsSensitiveConfigKey -Value $Value[$key]) { return $true }
+        }
+        return $false
+    }
+    if ($Value -is [Collections.IEnumerable]) {
+        foreach ($item in $Value) {
+            if (Test-ContainsSensitiveConfigKey -Value $item) { return $true }
+        }
+        return $false
+    }
+    foreach ($property in $Value.PSObject.Properties) {
+        if ($property.Name -match '(?i)(machine[_-]?id|token|secret|credential|password|passwd|pwd)') { return $true }
+        if (Test-ContainsSensitiveConfigKey -Value $property.Value) { return $true }
+    }
+    return $false
+}
+
 function Assert-SanitizedAgentDefault {
     param([string]$Path)
     try {
         $config = Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json
+        if (Test-ContainsSensitiveConfigKey -Value $config) {
+            throw 'sensitive_config_key'
+        }
         $dsn = [string]$config.pg_dsn
-		if ([string]::IsNullOrWhiteSpace($dsn)) { return }
-        $uri = [Uri]::new($dsn)
+        $uri = $null
+        if (-not [string]::IsNullOrWhiteSpace($dsn)) {
+            $uri = [Uri]::new($dsn)
+        }
     }
     catch {
         throw "NODE_RELEASE_SENSITIVE_CONFIG invalid_agent_default path=$Path"
     }
-    if ($uri.UserInfo -match ':' -or
-        $uri.Query -match '(?i)(password|passwd|pwd|token|secret)=') {
+    if ($null -ne $uri -and ($uri.UserInfo -match ':' -or
+        $uri.Query -match '(?i)(password|passwd|pwd|token|secret)=')) {
         throw "NODE_RELEASE_SENSITIVE_CONFIG password_in_pg_dsn path=$Path"
     }
 }

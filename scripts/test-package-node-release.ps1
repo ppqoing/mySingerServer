@@ -25,6 +25,29 @@ function Write-Utf8NoBom {
         [Text.UTF8Encoding]::new($false))
 }
 
+function Test-ContainsSensitiveConfigKey {
+    param([object]$Value)
+    if ($null -eq $Value -or $Value -is [string]) { return $false }
+    if ($Value -is [Collections.IDictionary]) {
+        foreach ($key in $Value.Keys) {
+            if ([string]$key -match '(?i)(machine[_-]?id|token|secret|credential|password|passwd|pwd)') { return $true }
+            if (Test-ContainsSensitiveConfigKey -Value $Value[$key]) { return $true }
+        }
+        return $false
+    }
+    if ($Value -is [Collections.IEnumerable]) {
+        foreach ($item in $Value) {
+            if (Test-ContainsSensitiveConfigKey -Value $item) { return $true }
+        }
+        return $false
+    }
+    foreach ($property in $Value.PSObject.Properties) {
+        if ($property.Name -match '(?i)(machine[_-]?id|token|secret|credential|password|passwd|pwd)') { return $true }
+        if (Test-ContainsSensitiveConfigKey -Value $property.Value) { return $true }
+    }
+    return $false
+}
+
 $testRoot = Join-Path $repo (
     '.tmp\test-package-node-release-{0}' -f [Guid]::NewGuid().ToString('N'))
 $stage = Join-Path $testRoot 'full-stage'
@@ -142,6 +165,8 @@ try {
     Assert-True ([string]$agent.data_dir -ceq './data/agent') 'unsafe Agent data root'
     Assert-True ($null -ne $agent.worker -and [int]$agent.worker.image_memory_mb -eq 256) 'Worker defaults missing'
     Assert-True ([string]$agent.worker.exe_path -ceq '') 'Worker path must resolve beside agent.exe'
+    Assert-True (-not (Test-ContainsSensitiveConfigKey -Value $agent)) `
+        'Agent default must not contain machine_id, token, secret, credential, or password keys'
     $tray = Get-Content -Raw -LiteralPath (Join-Path $payloadRoot 'data\nodetray\tray.json') | ConvertFrom-Json
     Assert-True (-not [bool]$tray.helperEnabled -and [string]$tray.agentStartMode -ceq 'manual') 'unsafe tray defaults'
     $helper = Get-Content -Raw -LiteralPath (Join-Path $payloadRoot 'helper.default.json') | ConvertFrom-Json
@@ -225,6 +250,32 @@ try {
     }
     Assert-True $credentialRejected `
         'password-bearing PostgreSQL default DSN was accepted'
+
+    foreach ($sensitiveCase in @(
+            [ordered]@{ name = 'machine-id'; mutate = { param($config) $config | Add-Member -NotePropertyName 'machine_id' -NotePropertyValue 'node-sensitive' } },
+            [ordered]@{ name = 'nested-token'; mutate = { param($config) $config.worker | Add-Member -NotePropertyName 'Access_Token' -NotePropertyValue 'sensitive-token' } },
+            [ordered]@{ name = 'array-secret'; mutate = { param($config) $config.scan.image_exts = @([pscustomobject]@{ SeCrEt = 'sensitive-secret' }) } })) {
+        $sensitiveStage = Join-Path $testRoot ("sensitive-{0}-stage" -f $sensitiveCase.name)
+        Copy-Item -LiteralPath $stage -Destination $sensitiveStage -Recurse
+        $sensitiveAgent = Get-Content -Raw -LiteralPath (Join-Path $sensitiveStage 'agent.default.json') | ConvertFrom-Json
+        & $sensitiveCase.mutate $sensitiveAgent
+        Write-Utf8NoBom -Path (Join-Path $sensitiveStage 'agent.default.json') `
+            -Value (($sensitiveAgent | ConvertTo-Json -Depth 8) + [Environment]::NewLine)
+        $sensitiveRejected = $false
+        try {
+            $oldWarningPreference = $WarningPreference
+            $WarningPreference = 'SilentlyContinue'
+            & $packageScript -StageDir $sensitiveStage `
+                -OutputDir (Join-Path $testRoot ("sensitive-{0}-release" -f $sensitiveCase.name)) `
+                -ReleaseId ("sensitive-{0}" -f $sensitiveCase.name) `
+                -BuildDate '2026-08-03'
+        } catch {
+            $sensitiveRejected = $_.Exception.Message -match 'NODE_RELEASE_SENSITIVE_CONFIG'
+        } finally {
+            $WarningPreference = $oldWarningPreference
+        }
+        Assert-True $sensitiveRejected ("sensitive agent default was accepted: {0}" -f $sensitiveCase.name)
+    }
 
     $helperRootStage = Join-Path $testRoot 'helper-root-stage'
     Copy-Item -LiteralPath $stage -Destination $helperRootStage -Recurse
