@@ -318,13 +318,13 @@ try {
     Remove-Item Env:CC -ErrorAction SilentlyContinue
     $controlPackages = @(
         "./internal/nodectl",
-        "./internal/agentcontrol",
+        "./internal/nodetray/agentclient",
         "./internal/helpercontrol"
     )
     & $Go -C $repo test @controlPackages -count=1
     if ($LASTEXITCODE -ne 0) { throw "node control package tests failed" }
 
-    & $Go -C $repo build -trimpath -o (Join-Path $out "agent.exe") ./cmd/agent
+    & $Go -C $repo build -trimpath -tags nodynamic -o (Join-Path $out "agent.exe") ./cmd/agent
     if ($LASTEXITCODE -ne 0) { throw "agent build failed" }
 
     & $Go -C $repo build -trimpath -o (Join-Path $out "gui.exe") ./cmd/gui

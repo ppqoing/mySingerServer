@@ -113,6 +113,7 @@ try {
         'Everything64.dll',
         'MicrosoftEdgeWebview2Setup.exe',
         'README-节点部署.md',
+        'Start-Compute.ps1',
         'agent.example.json',
         'agent.exe',
         'avcodec-fixture.dll',
@@ -146,6 +147,9 @@ try {
             'gui.example.json',
             'Start-Manager.ps1')) {
         Assert-True (-not ($actualFiles -contains $forbidden)) "forbidden file shipped: $forbidden"
+    }
+    foreach ($forbidden in @('data/agent/agent.db', 'data/agent/local-control.token')) {
+        Assert-True (-not ($actualFiles -contains $forbidden)) "runtime secret/state shipped: $forbidden"
     }
 
     $releaseManifest = Get-Content -Raw -LiteralPath (

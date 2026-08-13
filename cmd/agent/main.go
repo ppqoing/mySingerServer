@@ -408,6 +408,10 @@ func drainPhase2(manager phase2Shutdowner, timeout time.Duration) error {
 }
 
 func initializePostgres(ctx context.Context, dsn string, health *syncHealthState, logger *slog.Logger) *pgxpool.Pool {
+	if strings.TrimSpace(dsn) == "" {
+		health.set(false, "sync_not_configured")
+		return nil
+	}
 	pg, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		health.set(false, "postgres_config_invalid")

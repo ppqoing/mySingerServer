@@ -356,6 +356,16 @@ func TestPostgresParseFailureIsImmediateDegradedState(t *testing.T) {
 	}
 }
 
+func TestEmptyPostgresConfigurationIsLocalOnlyAndNonBlocking(t *testing.T) {
+	health := newSyncHealthState()
+	if pool := initializePostgres(context.Background(), "", health, nil); pool != nil {
+		t.Fatal("empty PostgreSQL configuration created a pool")
+	}
+	if snapshot := health.snapshot(); snapshot.Healthy || snapshot.ErrorSummary != "sync_not_configured" {
+		t.Fatalf("health = %#v", snapshot)
+	}
+}
+
 func TestPostgresConfigFailureDoesNotExposeDSN(t *testing.T) {
 	secret := `postgres://private-user:private-password@secret-%zz-host/private-db?token=private-query`
 	health := newSyncHealthState()

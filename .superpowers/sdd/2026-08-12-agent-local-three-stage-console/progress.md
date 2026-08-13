@@ -61,3 +61,9 @@ Task 12: complete pending commit — central local-scope tables, SQLite outbox s
 Task 12: complete (commit 9ce4736b; focused/full/race gates PASS; PostgreSQL runtime integration remains explicitly deferred to Task 14 because TEST_POSTGRES_DSN is unset).
 
 Task 13: complete pending commit — NodeTray typed Socket-backed local task/analysis/review/delete/preview methods, Go-only delete token custody, Wails bindings and four local-console pages implemented. Go NodeTray full packages PASS; frontend 24 files/115 tests, lint and production build PASS; Windows Wails nodynamic build generated bindings/embed successfully.
+Task 13: complete (commit 93176586; NodeTray Go packages, frontend 24 files/115 tests, lint, production build and actual Windows Wails build PASS; real media runtime deferred to Task 14).
+
+Task 14: implementation complete pending commit — PostgreSQL is optional for Agent local-only mode, empty database form round-trips, Compute ships Start-Compute.ps1 without runtime DB/token/config, Agent/Worker release builds use nodynamic, and Chinese deployment documentation covers the eight-tab local console and deletion retention.
+Task 14: fresh affected Go full/race and vet PASS; frontend 24 files/115 tests and lint PASS; NodeTray supply-chain, Compute package and dual portable package contracts PASS; local-console stage static contract PASS.
+Task 14: actual VS2022/C:\vcpkg Windows build PASS (native CTest 18/18, dependency closure, WebView2, Wails and release stage). Whole-source Go gate remains PARTIAL only at pre-existing helper VideoCore-stage/resource fixtures and restricted-token environment behavior.
+Task 14: runtime PARTIAL — existing user Agent PID 405300 owns the machine singleton, TEST_POSTGRES_DSN is unset, and no operator-provided disposable media fixture is available; no user process/file was stopped or deleted.

@@ -239,9 +239,6 @@ func ValidateAgent(cfg *AgentConfig, executable string, cpuCount int) (*AgentCon
 	validated.Scan.VideoExts = append([]string(nil), cfg.Scan.VideoExts...)
 	cfg = &validated
 
-	if cfg.PGDSN == "" {
-		return nil, fmt.Errorf("config: pg_dsn required")
-	}
 	if cfg.ListenAddr == "" || cfg.DataDir == "" {
 		return nil, fmt.Errorf("config: listen_addr and data_dir required")
 	}

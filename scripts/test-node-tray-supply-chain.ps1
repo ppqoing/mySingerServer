@@ -253,8 +253,8 @@ if (Test-Path -LiteralPath $coreBuild -PathType Leaf) {
     Assert-True ($agentBuildCommands.Count -eq 1) `
         "AGENT_BUILD_COMMAND_NOT_EXACTLY_ONE"
     if ($agentBuildCommands.Count -eq 1) {
-        Assert-True ($agentBuildCommands[0] -notmatch '(?i)(^|\s)-tags\s+nodynamic(\s|$)') `
-            "AGENT_BUILD_UNEXPECTED_NODYNAMIC_TAG"
+        Assert-True ($agentBuildCommands[0] -match '(?i)(^|\s)-tags\s+nodynamic(\s|$)') `
+            "AGENT_BUILD_NODYNAMIC_TAG_MISSING"
     }
 }
 

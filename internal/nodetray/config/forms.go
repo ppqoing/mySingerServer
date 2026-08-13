@@ -223,6 +223,9 @@ func HelperFromForm(form HelperForm) (helper.Config, error) {
 }
 
 func databaseToForm(dsn string) (DatabaseForm, error) {
+	if strings.TrimSpace(dsn) == "" {
+		return DatabaseForm{}, nil
+	}
 	u, err := parsePostgresURL(dsn)
 	if err != nil {
 		return DatabaseForm{}, err
@@ -260,6 +263,9 @@ func databaseToForm(dsn string) (DatabaseForm, error) {
 }
 
 func databaseFromForm(form DatabaseForm, base *agentconfig.AgentConfig) (string, error) {
+	if form == (DatabaseForm{}) {
+		return "", nil
+	}
 	if err := validateHost(form.Host, "database.host"); err != nil {
 		return "", err
 	}

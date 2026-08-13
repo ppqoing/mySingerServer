@@ -55,6 +55,17 @@ try {
         Assert-True (Test-Path -LiteralPath (Join-Path $output $name) -PathType Leaf) "missing published artifact: $name"
     }
 
+    $computeExtract = Join-Path $testRoot 'compute-extract'
+    Expand-Archive -LiteralPath (Join-Path $output $expected[0]) -DestinationPath $computeExtract
+    $computeRoot = Join-Path $computeExtract 'MySingerServer-Compute'
+    $computeFiles = @(Get-ChildItem -LiteralPath $computeRoot -Recurse -File | ForEach-Object {
+        [IO.Path]::GetRelativePath($computeRoot, $_.FullName).Replace('\', '/')
+    })
+    Assert-True ($computeFiles -contains 'Start-Compute.ps1') 'Compute start script missing'
+    foreach ($forbidden in @('gui.exe','agent.json','data/agent/agent.db','data/agent/local-control.token')) {
+        Assert-True (-not ($computeFiles -contains $forbidden)) "Compute package leaked runtime file: $forbidden"
+    }
+
     $missingGuiStage = Join-Path $testRoot 'missing-gui-stage'
     Copy-Item -LiteralPath $stage -Destination $missingGuiStage -Recurse
     Remove-Item -LiteralPath (Join-Path $missingGuiStage 'gui.exe')

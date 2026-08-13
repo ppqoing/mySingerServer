@@ -159,13 +159,14 @@ func TestLoadAgentValidatesTuningBoundariesAndLoopbackPprof(t *testing.T) {
 	}
 }
 
-func TestLoadAgentRejectsMissingDSN(t *testing.T) {
+func TestLoadAgentAcceptsMissingDSNForLocalOnlyMode(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "agent.json")
-	if err := os.WriteFile(path, []byte(`{"machine_id":"machine-a"}`), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(`{"listen_addr":"127.0.0.1:9101","data_dir":"data"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := LoadAgent(path); err == nil {
-		t.Fatal("LoadAgent accepted missing pg_dsn")
+	cfg, err := loadAgent(path, `C:\portable\agent.exe`, 4)
+	if err != nil || cfg.PGDSN != "" {
+		t.Fatalf("local-only config = %#v, err=%v", cfg, err)
 	}
 }
 

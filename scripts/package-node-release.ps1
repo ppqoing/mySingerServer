@@ -98,6 +98,7 @@ function Assert-SanitizedAgentExample {
     try {
         $config = Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json
         $dsn = [string]$config.pg_dsn
+		if ([string]::IsNullOrWhiteSpace($dsn)) { return }
         $uri = [Uri]::new($dsn)
     }
     catch {
@@ -148,6 +149,11 @@ try {
         New-Item -ItemType Directory -Path $directory -Force | Out-Null
         Write-Utf8NoBom -Path (Join-Path $directory '.gitkeep') -Value ''
     }
+    Write-Utf8NoBom -Path (Join-Path $payload 'Start-Compute.ps1') -Value @'
+$ErrorActionPreference = 'Stop'
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
+Start-Process -FilePath (Join-Path $root 'nodetray.exe') -WorkingDirectory $root
+'@
 
     $nativeManifestPath = Join-Path $stage 'native-dependencies.json'
     if (-not (Test-Path -LiteralPath $nativeManifestPath -PathType Leaf)) {

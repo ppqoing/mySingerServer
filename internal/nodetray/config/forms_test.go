@@ -250,6 +250,21 @@ func TestAgentFromFormValidatesListenAndDatabaseHostsWithoutRejectingDNSOrIP(t *
 	}
 }
 
+func TestAgentFormAllowsPostgresToRemainUnconfigured(t *testing.T) {
+	cfg := fullyPopulatedAgentConfig()
+	cfg.PGDSN = ""
+	form, err := AgentToForm(cfg)
+	if err != nil || form.Database != (DatabaseForm{}) {
+		t.Fatalf("AgentToForm local-only = %#v, err=%v", form.Database, err)
+	}
+	form.ListenHost = "127.0.0.1"
+	form.ListenPort = 9101
+	converted, err := AgentFromForm(form, cfg)
+	if err != nil || converted.PGDSN != "" {
+		t.Fatalf("AgentFromForm local-only = %#v, err=%v", converted, err)
+	}
+}
+
 func TestDatabaseFormAllowsOnlyStableLibpqSSLModeValues(t *testing.T) {
 	base := fullyPopulatedAgentConfig()
 	baseForm, err := AgentToForm(base)
