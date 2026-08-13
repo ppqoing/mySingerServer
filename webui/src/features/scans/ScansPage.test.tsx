@@ -38,6 +38,21 @@ describe("ScansPage", () => {
     expect(screen.getByRole("option", { name: /agent-a/ })).toBeEnabled();
   });
 
+  test("opens remote browsing when an earlier duplicate Agent record is offline", async () => {
+    const offlineDuplicate: AgentStatus = { ...online, addr: "10.0.0.9", online: false, identityState: "conflict" };
+    const api = apiFor({
+      listAgents: vi.fn().mockResolvedValue([offlineDuplicate, online]),
+      browseAgentFilesystem: vi.fn().mockResolvedValue({ currentPath: "", parentPath: "", entries: [], nextCursor: "" })
+    });
+    render(<ScansPage api={api} />);
+    const user = userEvent.setup();
+
+    await user.selectOptions(await screen.findByLabelText("扫描 Agent"), "agent-a");
+    await user.click(screen.getByRole("button", { name: "选择目录…" }));
+
+    expect(await screen.findByRole("dialog", { name: "选择远程目录" })).toBeVisible();
+  });
+
   test("rejects an absent machine or empty parsed roots before calling the API", async () => {
     const api = apiFor();
     const user = userEvent.setup();

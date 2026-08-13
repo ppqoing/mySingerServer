@@ -50,6 +50,8 @@ export function ScansPage({ api = appApi }: ScansPageProps) {
     dependencies: [api, taskRefreshVersion],
     isTerminal: tasks => tasks.length > 0 && tasks.every(isTerminal)
   });
+  const agents = dispatchableAgents(agentsState.data ?? []);
+  const selectedAgent = agents.find(agent => agent.machineId === selectedMachine);
 
   useEffect(() => () => submitController.current?.abort(), []);
 
@@ -62,7 +64,6 @@ export function ScansPage({ api = appApi }: ScansPageProps) {
       setFormError("至少输入一个扫描根目录。");
       return;
     }
-    const selectedAgent = agentsState.data?.find(agent => agent.machineId === selectedMachine);
     if (!selectedAgent?.online) {
       setFormError("所选 Agent 当前离线，请重新选择。");
       return;
@@ -88,8 +89,6 @@ export function ScansPage({ api = appApi }: ScansPageProps) {
   };
 
   const tasks = tasksState.data ?? [];
-  const agents = dispatchableAgents(agentsState.data ?? []);
-  const selectedAgent = agentsState.data?.find(agent => agent.machineId === selectedMachine);
   const canBrowse = Boolean(selectedAgent?.online && selectedAgent.identityState === "claimed");
 
   const addRoot = (candidate: string) => {

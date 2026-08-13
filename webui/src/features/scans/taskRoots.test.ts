@@ -19,4 +19,8 @@ describe("addTaskRoot", () => {
   test("rejects relative paths without consulting the filesystem", () => {
     expect(addTaskRoot([], "Media\\relative").kind).toBe("invalid");
   });
+
+  test("keeps a drive root stable when duplicate trailing separators are supplied", () => {
+    expect(addTaskRoot([], "D:\\\\")).toEqual({ kind: "add", roots: ["D:\\"] });
+  });
 });

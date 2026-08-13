@@ -26,7 +26,7 @@ export function addTaskRoot(current: readonly string[], candidate: string): Root
 export function normalizeTaskRoot(value: string): string | undefined {
   const path = value.trim().replaceAll("/", "\\");
   if (!isAbsoluteWindowsPath(path)) return undefined;
-  if (/^[a-zA-Z]:\\$/.test(path)) return path;
+  if (/^[a-zA-Z]:\\+$/.test(path)) return `${path.slice(0, 2)}\\`;
   return path.replace(/\\+$/, "");
 }
 
