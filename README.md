@@ -74,11 +74,13 @@ flowchart LR
 ```powershell
 pwsh -NoProfile -File .\scripts\package-portable-release.ps1 `
   -StageDir .\artifacts\stage `
-  -OutputDir .\artifacts\releases `
   -ReleaseId 20260811 `
   -BuildDate 2026-08-11 `
   -SourceRevision N/A_NO_GIT_METADATA
 ```
+
+未指定 `-OutputDir` 时，双 ZIP 与 `.sha256` 默认发布到
+`D:\code\mySingerServer\publish`；仍可显式传入 `-OutputDir` 覆盖该目录。
 
 输出目录会得到以下四个文件：
 

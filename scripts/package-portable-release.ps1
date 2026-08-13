@@ -3,7 +3,7 @@ param(
     [Parameter(Mandatory)]
     [string]$StageDir,
 
-    [string]$OutputDir = 'artifacts\releases',
+    [string]$OutputDir = 'D:\code\mySingerServer\publish',
 
     [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._-]*$')]
     [string]$ReleaseId = (Get-Date -Format 'yyyyMMdd'),

@@ -41,6 +41,9 @@ function New-CompleteStage {
 $testRoot = Join-Path $repo ('.tmp\test-package-portable-release-{0}' -f [Guid]::NewGuid().ToString('N'))
 try {
     Assert-True (Test-Path -LiteralPath $packageScript -PathType Leaf) 'portable release entrypoint is missing'
+    $packageSource = Get-Content -Raw -LiteralPath $packageScript
+    Assert-True ($packageSource -match "(?m)\[string\]\`$OutputDir\s*=\s*'D:\\code\\mySingerServer\\publish'") `
+        'portable release default output directory is not D:\code\mySingerServer\publish'
 
     $stage = Join-Path $testRoot 'stage'
     $output = Join-Path $testRoot 'release'
