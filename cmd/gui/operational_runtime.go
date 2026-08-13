@@ -40,12 +40,13 @@ type postgresOperationalRuntimeResources struct {
 	logger *slog.Logger
 	pg     *pgxpool.Pool
 
-	tasks            *gui.TaskRegistry
-	pool             *gui.Pool
-	deleteService    *gui.DeleteService
-	phase2Dispatcher *phase2.Dispatcher
-	phase2Router     *phase2Orchestration
-	api              *gui.API
+	tasks             *gui.TaskRegistry
+	pool              *gui.Pool
+	filesystemBrowser *gui.FilesystemBroker
+	deleteService     *gui.DeleteService
+	phase2Dispatcher  *phase2.Dispatcher
+	phase2Router      *phase2Orchestration
+	api               *gui.API
 }
 
 func newOperationalRuntimeResources(
@@ -146,22 +147,11 @@ func (resources *postgresOperationalRuntimeResources) RestorePhase2(ctx context.
 		resources.cfg.Agents,
 		resources.logger,
 		func(machineID string, _ *gui.AgentConn, message any) {
-			if resources.phase2Dispatcher != nil && resources.phase2Router != nil {
-				routeAgentMessage(
-					ctx,
-					machineID,
-					message,
-					resources.phase2Dispatcher,
-					resources.phase2Router,
-					resources.tasks,
-					resources.logger,
-					resources.deleteService,
-				)
-				return
-			}
-			resources.tasks.Dispatch(machineID, message)
+			resources.dispatchAgentMessage(ctx, machineID, nil, message)
 		},
 	)
+	resources.filesystemBrowser = gui.NewFilesystemBroker(resources.pool)
+	resources.pool.SetOnDisconnect(resources.filesystemBrowser.FailMachine)
 	resources.deleteService, _ = newDeleteRuntime(
 		resources.pg,
 		resources.pool,
@@ -224,6 +214,7 @@ func (resources *postgresOperationalRuntimeResources) Start(ctx context.Context)
 		analysisRunner,
 	)
 	resources.api.SetDeleteService(resources.deleteService)
+	resources.api.SetFilesystemBrowser(resources.filesystemBrowser)
 	resources.api.SetAnalysisSuccessHook(func() error {
 		hookContext, cancelHook := context.WithTimeout(ctx, 5*time.Minute)
 		defer cancelHook()
@@ -234,6 +225,31 @@ func (resources *postgresOperationalRuntimeResources) Start(ctx context.Context)
 		)
 	})
 	return nil
+}
+
+func (resources *postgresOperationalRuntimeResources) dispatchAgentMessage(
+	ctx context.Context,
+	machineID string,
+	_ *gui.AgentConn,
+	message any,
+) {
+	if resources.filesystemBrowser != nil && resources.filesystemBrowser.Dispatch(machineID, message) {
+		return
+	}
+	if resources.phase2Dispatcher != nil && resources.phase2Router != nil {
+		routeAgentMessage(
+			ctx,
+			machineID,
+			message,
+			resources.phase2Dispatcher,
+			resources.phase2Router,
+			resources.tasks,
+			resources.logger,
+			resources.deleteService,
+		)
+		return
+	}
+	resources.tasks.Dispatch(machineID, message)
 }
 
 func (resources *postgresOperationalRuntimeResources) API() *gui.API {

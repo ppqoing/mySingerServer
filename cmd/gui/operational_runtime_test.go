@@ -16,7 +16,47 @@ import (
 
 	"dedup/internal/config"
 	"dedup/internal/gui"
+	"dedup/internal/proto"
 )
+
+type operationalFilesystemTransport struct {
+	sent chan *proto.FilesystemBrowseRequest
+}
+
+func (*operationalFilesystemTransport) IsOnline(string) bool {
+	return true
+}
+
+func (transport *operationalFilesystemTransport) Send(_ string, msgType uint8, value any) error {
+	if msgType != proto.MsgFilesystemBrowse {
+		return errors.New("unexpected message type")
+	}
+	request, ok := value.(*proto.FilesystemBrowseRequest)
+	if !ok {
+		return errors.New("unexpected message value")
+	}
+	transport.sent <- request
+	return nil
+}
+
+func TestOperationalRuntimeRoutesFilesystemBrowseResponseBeforeOtherMessages(t *testing.T) {
+	transport := &operationalFilesystemTransport{sent: make(chan *proto.FilesystemBrowseRequest, 1)}
+	resources := &postgresOperationalRuntimeResources{
+		filesystemBrowser: gui.NewFilesystemBroker(transport),
+	}
+	result := make(chan proto.FilesystemBrowseResponse, 1)
+	go func() {
+		response, _ := resources.filesystemBrowser.Browse(context.Background(), "machine-a", proto.FilesystemBrowseRequest{Path: `D:\Media`, Limit: 200})
+		result <- response
+	}()
+	sent := <-transport.sent
+	resources.dispatchAgentMessage(context.Background(), "machine-a", nil, &proto.FilesystemBrowseResponse{
+		RequestID: sent.RequestID, CurrentPath: `D:\Media`,
+	})
+	if got := <-result; got.CurrentPath != `D:\Media` {
+		t.Fatalf("response=%#v", got)
+	}
+}
 
 func TestBuildOperationalRuntimeClosesResourcesAfterIntermediateFailure(t *testing.T) {
 	originalFactory := guiNewOperationalRuntimeResources

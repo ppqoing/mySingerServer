@@ -31,12 +31,13 @@ type AgentStatus struct {
 }
 
 type AgentConn struct {
-	ep          config.AgentEndpoint
-	log         *slog.Logger
-	on          func(machineID string, conn *AgentConn, message any)
-	onConnected func(machineID string)
-	claim       func(*AgentConn, string) error
-	release     func(*AgentConn, string)
+	ep             config.AgentEndpoint
+	log            *slog.Logger
+	on             func(machineID string, conn *AgentConn, message any)
+	onConnected    func(machineID string)
+	onDisconnected func(machineID string)
+	claim          func(*AgentConn, string) error
+	release        func(*AgentConn, string)
 
 	mu            sync.Mutex
 	conn          *proto.Conn
@@ -70,6 +71,7 @@ func (agent *AgentConn) Run(ctx context.Context, heartbeat time.Duration) {
 		err := agent.runOnce(ctx, heartbeat)
 		wasOnline := agent.setOffline(err)
 		if wasOnline {
+			agent.notifyDisconnected()
 			backoff = time.Second
 		}
 		timer := time.NewTimer(backoff)
@@ -85,6 +87,17 @@ func (agent *AgentConn) Run(ctx context.Context, heartbeat time.Duration) {
 				backoff = 30 * time.Second
 			}
 		}
+	}
+}
+
+func (agent *AgentConn) notifyDisconnected() {
+	agent.mu.Lock()
+	machineID := agent.machineID
+	claimed := agent.identityState == IdentityClaimed
+	callback := agent.onDisconnected
+	agent.mu.Unlock()
+	if claimed && callback != nil {
+		callback(machineID)
 	}
 }
 
@@ -256,6 +269,9 @@ type Pool struct {
 	connectCancel context.CancelFunc
 	connectClosed bool
 	connectWG     sync.WaitGroup
+
+	disconnectMu sync.Mutex
+	onDisconnect func(string)
 }
 
 func NewPool(
@@ -273,11 +289,27 @@ func NewPool(
 	for _, endpoint := range endpoints {
 		conn := newAgentConn(endpoint, logger, onMessage)
 		conn.onConnected = pool.notifyConnected
+		conn.onDisconnected = pool.notifyDisconnected
 		conn.claim = pool.claimIdentity
 		conn.release = pool.releaseIdentity
 		pool.byAddr[endpoint.Addr] = conn
 	}
 	return pool
+}
+
+func (pool *Pool) SetOnDisconnect(callback func(machineID string)) {
+	pool.disconnectMu.Lock()
+	pool.onDisconnect = callback
+	pool.disconnectMu.Unlock()
+}
+
+func (pool *Pool) notifyDisconnected(machineID string) {
+	pool.disconnectMu.Lock()
+	callback := pool.onDisconnect
+	pool.disconnectMu.Unlock()
+	if callback != nil {
+		callback(machineID)
+	}
 }
 
 func (pool *Pool) SetOnConnect(callback func(machineID string)) {

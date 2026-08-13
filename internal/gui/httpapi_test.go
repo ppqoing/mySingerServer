@@ -2,7 +2,9 @@ package gui
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"net"
@@ -18,6 +20,114 @@ import (
 	"dedup/internal/config"
 	"dedup/internal/proto"
 )
+
+type fakeFilesystemBrowseService struct {
+	response proto.FilesystemBrowseResponse
+	err      error
+	machine  string
+	request  proto.FilesystemBrowseRequest
+}
+
+func (service *fakeFilesystemBrowseService) Browse(
+	_ context.Context,
+	machineID string,
+	request proto.FilesystemBrowseRequest,
+) (proto.FilesystemBrowseResponse, error) {
+	service.machine = machineID
+	service.request = request
+	return service.response, service.err
+}
+
+func TestFilesystemBrowseHTTPUsesBodyPathAndReturnsFilesDisabled(t *testing.T) {
+	service := &fakeFilesystemBrowseService{response: proto.FilesystemBrowseResponse{
+		CurrentPath: `D:\Media`,
+		Entries: []proto.FilesystemEntry{{
+			Name: "cover.jpg", Path: `D:\Media\cover.jpg`,
+			Kind: proto.FilesystemEntryFile, Selectable: false,
+		}},
+	}}
+	api := NewAPI(nil, nil, nil)
+	api.SetFilesystemBrowser(service)
+	request := httptest.NewRequest(http.MethodPost, "/api/agents/machine-a/filesystem/browse?path=E%3A%5CIgnored", strings.NewReader(`{"path":"D:\\Media","show_hidden":false,"limit":200}`))
+	response := httptest.NewRecorder()
+	api.Routes().ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if service.machine != "machine-a" || service.request.Path != `D:\Media` {
+		t.Fatalf("browse=%q %#v", service.machine, service.request)
+	}
+	var body struct {
+		CurrentPath string `json:"current_path"`
+		Entries     []struct {
+			Name string `json:"name"`
+			Path string `json:"path"`
+		} `json:"entries"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.CurrentPath != `D:\Media` || len(body.Entries) != 1 || body.Entries[0].Path != `D:\Media\cover.jpg` {
+		t.Fatalf("response=%s", response.Body.String())
+	}
+}
+
+func TestFilesystemBrowseHTTPRejectsUnknownJSONField(t *testing.T) {
+	api := NewAPI(nil, nil, nil)
+	api.SetFilesystemBrowser(&fakeFilesystemBrowseService{})
+	response := httptest.NewRecorder()
+	api.Routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/agents/machine-a/filesystem/browse", strings.NewReader(`{"path":"D:\\Media","unexpected":true}`)))
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestFilesystemBrowseHTTPMapsServiceFailures(t *testing.T) {
+	tests := []struct {
+		name     string
+		service  *fakeFilesystemBrowseService
+		wantCode int
+	}{
+		{"offline", &fakeFilesystemBrowseService{err: ErrFilesystemAgentOffline}, http.StatusServiceUnavailable},
+		{"timeout", &fakeFilesystemBrowseService{err: context.DeadlineExceeded}, http.StatusGatewayTimeout},
+		{"access denied", &fakeFilesystemBrowseService{response: proto.FilesystemBrowseResponse{ErrorCode: "access_denied"}}, http.StatusForbidden},
+		{"path not found", &fakeFilesystemBrowseService{response: proto.FilesystemBrowseResponse{ErrorCode: "path_not_found"}}, http.StatusNotFound},
+		{"files disabled", &fakeFilesystemBrowseService{response: proto.FilesystemBrowseResponse{ErrorCode: "files_disabled"}}, http.StatusServiceUnavailable},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			api := NewAPI(nil, nil, nil)
+			api.SetFilesystemBrowser(test.service)
+			response := httptest.NewRecorder()
+			api.Routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/agents/machine-a/filesystem/browse", strings.NewReader(`{"path":"D:\\Media"}`)))
+			if response.Code != test.wantCode {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestFilesystemBrowseHTTPReturnsServiceUnavailableWhenNotConfigured(t *testing.T) {
+	api := NewAPI(nil, nil, nil)
+	response := httptest.NewRecorder()
+	api.Routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/agents/machine-a/filesystem/browse", strings.NewReader(`{"path":"D:\\Media"}`)))
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestFilesystemBrowseHTTPDoesNotExposePathInValidationErrors(t *testing.T) {
+	api := NewAPI(nil, nil, nil)
+	api.SetFilesystemBrowser(&fakeFilesystemBrowseService{err: errors.New("unused")})
+	response := httptest.NewRecorder()
+	api.Routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/agents/machine-a/filesystem/browse", strings.NewReader(`{"path":"relative-sensitive-path"}`)))
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), "relative-sensitive-path") {
+		t.Fatalf("validation error leaked path: %s", response.Body.String())
+	}
+}
 
 var embeddedStaticTag = regexp.MustCompile(
 	`(?is)<\s*(script|link)\b[^>]*>`,
