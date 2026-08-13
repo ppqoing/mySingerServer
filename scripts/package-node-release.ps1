@@ -93,7 +93,7 @@ function Write-Utf8NoBom {
         [Text.UTF8Encoding]::new($false))
 }
 
-function Assert-SanitizedAgentExample {
+function Assert-SanitizedAgentDefault {
     param([string]$Path)
     try {
         $config = Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json
@@ -102,7 +102,7 @@ function Assert-SanitizedAgentExample {
         $uri = [Uri]::new($dsn)
     }
     catch {
-        throw "NODE_RELEASE_SENSITIVE_CONFIG invalid_agent_example path=$Path"
+        throw "NODE_RELEASE_SENSITIVE_CONFIG invalid_agent_default path=$Path"
     }
     if ($uri.UserInfo -match ':' -or
         $uri.Query -match '(?i)(password|passwd|pwd|token|secret)=') {
@@ -110,13 +110,13 @@ function Assert-SanitizedAgentExample {
     }
 }
 
-function Assert-SanitizedHelperExample {
+function Assert-SanitizedHelperDefault {
     param([string]$Path)
     try {
         $config = Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json
     }
     catch {
-        throw "NODE_RELEASE_SENSITIVE_CONFIG invalid_helper_example path=$Path"
+        throw "NODE_RELEASE_SENSITIVE_CONFIG invalid_helper_default path=$Path"
     }
     if (@($config.allowed_roots).Count -ne 0) {
         throw "NODE_RELEASE_SENSITIVE_CONFIG helper_allowed_roots_not_empty path=$Path"
@@ -144,11 +144,6 @@ $complete = $false
 
 try {
     New-Item -ItemType Directory -Path $payload | Out-Null
-    foreach ($relativeDirectory in @('data\\agent', 'data\\nodetray')) {
-        $directory = Join-Path $payload $relativeDirectory
-        New-Item -ItemType Directory -Path $directory -Force | Out-Null
-        Write-Utf8NoBom -Path (Join-Path $directory '.gitkeep') -Value ''
-    }
     Write-Utf8NoBom -Path (Join-Path $payload 'Start-Compute.ps1') -Value @'
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -193,10 +188,10 @@ Start-Process -FilePath (Join-Path $root 'nodetray.exe') -WorkingDirectory $root
         throw 'NODE_RELEASE_VIDEOCORE_NOT_IN_NATIVE_MANIFEST'
     }
 
-    Assert-SanitizedAgentExample -Path (
-        Join-Path $stage 'agent.example.json')
-    Assert-SanitizedHelperExample -Path (
-        Join-Path $stage 'helper.example.json')
+    Assert-SanitizedAgentDefault -Path (
+        Join-Path $stage 'agent.default.json')
+    Assert-SanitizedHelperDefault -Path (
+        Join-Path $stage 'helper.default.json')
 
     foreach ($name in @(
             'nodetray.exe',
@@ -208,11 +203,14 @@ Start-Process -FilePath (Join-Path $root 'nodetray.exe') -WorkingDirectory $root
             'licenses\everything-LICENSE.txt',
             'licenses\everything-NOTICE.md',
             'MicrosoftEdgeWebview2Setup.exe',
-            'agent.example.json',
-            'helper.example.json')) {
+            'helper.default.json')) {
         Copy-RequiredFile -SourceRoot $stage -RelativeSource $name `
             -DestinationRoot $payload
     }
+    Copy-RequiredFile -SourceRoot $stage -RelativeSource 'agent.default.json' `
+        -DestinationRoot $payload -RelativeDestination 'data\\agent\\agent.json'
+    Copy-RequiredFile -SourceRoot $stage -RelativeSource 'nodetray.default.json' `
+        -DestinationRoot $payload -RelativeDestination 'data\\nodetray\\tray.json'
     Copy-RequiredFile -SourceRoot $stage `
         -RelativeSource 'native-dependencies.json' `
         -DestinationRoot $payload

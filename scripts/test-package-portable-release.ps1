@@ -27,8 +27,9 @@ function New-CompleteStage {
     New-Item -ItemType Directory -Path $licenses -Force | Out-Null
     Write-Utf8NoBom -Path (Join-Path $licenses 'everything-LICENSE.txt') -Value 'fixture:license'
     Write-Utf8NoBom -Path (Join-Path $licenses 'everything-NOTICE.md') -Value 'fixture:notice'
-    Copy-Item -LiteralPath (Join-Path $repo 'deploy\agent.example.json') -Destination (Join-Path $Path 'agent.example.json')
-    Copy-Item -LiteralPath (Join-Path $repo 'deploy\helper.example.json') -Destination (Join-Path $Path 'helper.example.json')
+    foreach ($name in @('agent.default.json', 'nodetray.default.json', 'helper.default.json')) {
+        Copy-Item -LiteralPath (Join-Path $repo (Join-Path 'deploy' $name)) -Destination (Join-Path $Path $name)
+    }
     $nativeFiles = @(
         foreach ($name in @('videocore.dll', 'avcodec-fixture.dll')) {
             $file = Join-Path $Path $name
@@ -65,6 +66,9 @@ try {
         [IO.Path]::GetRelativePath($computeRoot, $_.FullName).Replace('\', '/')
     })
     Assert-True ($computeFiles -contains 'Start-Compute.ps1') 'Compute start script missing'
+    foreach ($required in @('data/agent/agent.json', 'data/nodetray/tray.json', 'helper.default.json')) {
+        Assert-True ($computeFiles -contains $required) "Compute default configuration missing: $required"
+    }
     foreach ($forbidden in @('gui.exe','agent.json','data/agent/agent.db','data/agent/local-control.token')) {
         Assert-True (-not ($computeFiles -contains $forbidden)) "Compute package leaked runtime file: $forbidden"
     }

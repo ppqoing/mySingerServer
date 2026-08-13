@@ -71,6 +71,9 @@ $required = @(
     "nodetray\frontend\package-lock.json",
     "nodetray\build\windows\nodetray.manifest",
     "deploy\gui.default.json",
+    "deploy\agent.default.json",
+    "deploy\nodetray.default.json",
+    "deploy\helper.default.json",
     "deploy\Start-Manager.ps1",
     "deploy\README-管理端部署.md"
 )
@@ -226,8 +229,10 @@ if (Test-Path -LiteralPath $coreBuild -PathType Leaf) {
         'Everything.exe',
         'everything-LICENSE.txt',
         'everything-NOTICE.md',
-        'agent.example.json',
-        'helper.example.json'
+        'agent.default.json',
+        'gui.default.json',
+        'helper.default.json',
+        'nodetray.default.json'
     )) {
         Assert-True ($coreText -match [regex]::Escape($name)) `
             ("FULL_BUILD_RELEASE_FILE_MISSING name={0}" -f $name)

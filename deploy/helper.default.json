@@ -1,0 +1,12 @@
+{
+  "pipe_name": "\\\\.\\pipe\\dedup-delete",
+  "allowed_roots": [],
+  "denied_roots": ["C:\\System Volume Information", "C:\\$Recycle.Bin"],
+  "default_mode": "soft",
+  "allow_hard_delete": false,
+  "recycle_dir_name": "$DedupRecycle",
+  "max_entries_per_frame": 2000,
+  "frame_read_timeout_sec": 120,
+  "frame_write_timeout_sec": 60,
+  "log_dir": ""
+}

@@ -51,10 +51,10 @@ try {
         -Value 'fixture:everything-license'
     Write-Utf8NoBom -Path (Join-Path $licenses 'everything-NOTICE.md') `
         -Value 'fixture:everything-notice'
-    Copy-Item -LiteralPath (Join-Path $repo 'deploy\agent.example.json') `
-        -Destination (Join-Path $stage 'agent.example.json')
-    Copy-Item -LiteralPath (Join-Path $repo 'deploy\helper.example.json') `
-        -Destination (Join-Path $stage 'helper.example.json')
+    foreach ($name in @('agent.default.json', 'nodetray.default.json', 'helper.default.json')) {
+        Copy-Item -LiteralPath (Join-Path $repo (Join-Path 'deploy' $name)) `
+            -Destination (Join-Path $stage $name)
+    }
 
     # A full build contains center/config files. The node package must ignore them.
     foreach ($name in @('gui.exe', 'agent.json', 'helper.json', 'gui.json')) {
@@ -114,12 +114,11 @@ try {
         'MicrosoftEdgeWebview2Setup.exe',
         'README-节点部署.md',
         'Start-Compute.ps1',
-        'agent.example.json',
+        'data/agent/agent.json',
         'agent.exe',
         'avcodec-fixture.dll',
-        'data/agent/.gitkeep',
-        'data/nodetray/.gitkeep',
-        'helper.example.json',
+        'data/nodetray/tray.json',
+        'helper.default.json',
         'helper.exe',
         'licenses/ffmpeg-LICENSE.txt',
         'licenses/ffmpeg-NOTICE.md',
@@ -138,6 +137,17 @@ try {
     Assert-True (-not (Test-Path -LiteralPath (
             Join-Path $payloadRoot 'data\helper'))) `
         'fresh Compute package must not pre-create data\helper'
+
+    $agent = Get-Content -Raw -LiteralPath (Join-Path $payloadRoot 'data\agent\agent.json') | ConvertFrom-Json
+    Assert-True ([string]$agent.data_dir -ceq './data/agent') 'unsafe Agent data root'
+    Assert-True ($null -ne $agent.worker -and [int]$agent.worker.image_memory_mb -eq 256) 'Worker defaults missing'
+    Assert-True ([string]$agent.worker.exe_path -ceq '') 'Worker path must resolve beside agent.exe'
+    $tray = Get-Content -Raw -LiteralPath (Join-Path $payloadRoot 'data\nodetray\tray.json') | ConvertFrom-Json
+    Assert-True (-not [bool]$tray.helperEnabled -and [string]$tray.agentStartMode -ceq 'manual') 'unsafe tray defaults'
+    $helper = Get-Content -Raw -LiteralPath (Join-Path $payloadRoot 'helper.default.json') | ConvertFrom-Json
+    Assert-True (@($helper.allowed_roots).Count -eq 0) 'Helper default must not authorize a root'
+    Assert-True (-not [bool]$helper.allow_hard_delete -and [string]$helper.log_dir -ceq '') `
+        'Helper default must not enable hard deletion or logging'
 
     foreach ($forbidden in @(
             'gui.exe',
@@ -192,9 +202,9 @@ try {
     $credentialStage = Join-Path $testRoot 'credential-stage'
     Copy-Item -LiteralPath $stage -Destination $credentialStage -Recurse
     $credentialAgent = Get-Content -Raw -LiteralPath (
-        Join-Path $credentialStage 'agent.example.json') | ConvertFrom-Json
+        Join-Path $credentialStage 'agent.default.json') | ConvertFrom-Json
     $credentialAgent.pg_dsn = 'postgres://dedup:real-secret@127.0.0.1:5432/dedup'
-    Write-Utf8NoBom -Path (Join-Path $credentialStage 'agent.example.json') `
+    Write-Utf8NoBom -Path (Join-Path $credentialStage 'agent.default.json') `
         -Value (($credentialAgent | ConvertTo-Json -Depth 8) + [Environment]::NewLine)
     $credentialRejected = $false
     try {
@@ -214,14 +224,14 @@ try {
         $WarningPreference = $oldWarningPreference
     }
     Assert-True $credentialRejected `
-        'password-bearing PostgreSQL example DSN was accepted'
+        'password-bearing PostgreSQL default DSN was accepted'
 
     $helperRootStage = Join-Path $testRoot 'helper-root-stage'
     Copy-Item -LiteralPath $stage -Destination $helperRootStage -Recurse
     $helperRootConfig = Get-Content -Raw -LiteralPath (
-        Join-Path $helperRootStage 'helper.example.json') | ConvertFrom-Json
+        Join-Path $helperRootStage 'helper.default.json') | ConvertFrom-Json
     $helperRootConfig.allowed_roots = @('I:\tmp')
-    Write-Utf8NoBom -Path (Join-Path $helperRootStage 'helper.example.json') `
+    Write-Utf8NoBom -Path (Join-Path $helperRootStage 'helper.default.json') `
         -Value (($helperRootConfig | ConvertTo-Json -Depth 8) + [Environment]::NewLine)
     $helperRootRejected = $false
     try {
@@ -241,7 +251,7 @@ try {
         $WarningPreference = $oldWarningPreference
     }
     Assert-True $helperRootRejected `
-        'Helper example with a live allowed_roots path was accepted'
+        'Helper default with a live allowed_roots path was accepted'
 
     Write-Host "NODE RELEASE PACKAGE CONTRACT PASS files=$($actualFiles.Count)"
 }

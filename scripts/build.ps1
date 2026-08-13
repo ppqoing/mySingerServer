@@ -480,24 +480,10 @@ Copy-Item -LiteralPath (Join-Path $everythingRoot "LICENSE.txt") `
 Copy-Item -LiteralPath $everythingNotice `
     -Destination (Join-Path $everythingLicenses "everything-NOTICE.md")
 
-foreach ($name in @("agent", "gui")) {
-    $example = Join-Path $repo "deploy\$name.example.json"
-    $target = Join-Path $out "$name.json"
-    if (-not (Test-Path -LiteralPath $target)) {
-        Copy-Item -LiteralPath $example -Destination $target
-    }
+foreach ($name in @("agent.default.json", "gui.default.json", "helper.default.json", "nodetray.default.json")) {
+    Copy-Item -LiteralPath (Join-Path $repo "deploy\$name") `
+        -Destination (Join-Path $out $name)
 }
-
-$helperExample = Join-Path $repo "deploy\helper.example.json"
-$helperConfig = Join-Path $out "helper.json"
-if (-not (Test-Path -LiteralPath $helperConfig)) {
-    Copy-Item -LiteralPath $helperExample -Destination $helperConfig
-}
-
-Copy-Item -LiteralPath (Join-Path $repo "deploy\agent.example.json") `
-    -Destination (Join-Path $out "agent.example.json")
-Copy-Item -LiteralPath $helperExample `
-    -Destination (Join-Path $out "helper.example.json")
 
 $requiredStageFiles = @(
     "agent.exe",
@@ -509,8 +495,10 @@ $requiredStageFiles = @(
     "Everything64.dll",
     "licenses\everything-LICENSE.txt",
     "licenses\everything-NOTICE.md",
-    "agent.example.json",
-    "helper.example.json"
+    "agent.default.json",
+    "gui.default.json",
+    "helper.default.json",
+    "nodetray.default.json"
 )
 if (-not $SkipNodeTrayBuild) {
     $requiredStageFiles += @("nodetray.exe", "MicrosoftEdgeWebview2Setup.exe")
