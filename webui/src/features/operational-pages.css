@@ -77,8 +77,102 @@
 
 .operational-form > button,
 .operational-form > p,
-.operational-form > label:has(input[type="checkbox"]) {
+.operational-form > label:has(input[type="checkbox"]),
+.operational-form > .scan-roots-input,
+.operational-form > .scan-roots-list {
   grid-column: 2;
+}
+
+.scan-roots-input {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.scan-roots-input input {
+  flex: 1 1 16rem;
+  min-width: 0;
+  padding: var(--space-2) var(--space-3);
+  color: var(--color-ink);
+  background: var(--color-surface-raised);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-control);
+}
+
+.scan-roots-list {
+  display: grid;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.scan-roots-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  background: var(--color-primary-soft);
+  border-radius: var(--radius-control);
+}
+
+.remote-path-browser__backdrop {
+  position: fixed;
+  z-index: 10;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: var(--space-4);
+  background: color-mix(in srgb, black 45%, transparent);
+}
+
+.remote-path-browser {
+  display: grid;
+  width: min(42rem, 100%);
+  max-height: min(42rem, 100%);
+  gap: var(--space-3);
+  padding: var(--space-4);
+  overflow: auto;
+  color: var(--color-ink);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-panel);
+  box-shadow: var(--shadow-panel);
+}
+
+.remote-path-browser__header,
+.remote-path-browser__actions,
+.remote-path-browser__breadcrumbs,
+.remote-path-browser__toggle {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.remote-path-browser__header {
+  justify-content: space-between;
+}
+
+.remote-path-browser__header h2,
+.remote-path-browser__selection {
+  margin: 0;
+}
+
+.remote-path-browser__entries {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.remote-path-browser__entry {
+  color: var(--color-ink) !important;
+  text-align: left;
+  background: var(--color-surface-raised) !important;
+}
+
+.remote-path-browser__entry--selected {
+  outline: 2px solid var(--color-primary);
 }
 
 .operational-grid {
@@ -161,7 +255,9 @@
 
   .operational-form > button,
   .operational-form > p,
-  .operational-form > label:has(input[type="checkbox"]) {
+  .operational-form > label:has(input[type="checkbox"]),
+  .operational-form > .scan-roots-input,
+  .operational-form > .scan-roots-list {
     grid-column: 1;
   }
 }

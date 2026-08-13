@@ -40,6 +40,29 @@ export interface StartScanInput {
   rescan: boolean;
 }
 
+export interface FilesystemEntry {
+  name: string;
+  path: string;
+  kind: "drive" | "directory" | "file";
+  hidden: boolean;
+  system: boolean;
+  selectable: boolean;
+}
+
+export interface FilesystemPage {
+  currentPath: string;
+  parentPath: string;
+  entries: FilesystemEntry[];
+  nextCursor: string;
+}
+
+export interface BrowseAgentFilesystemInput {
+  path: string;
+  showHidden: boolean;
+  cursor: string;
+  limit: number;
+}
+
 export interface AnalysisStats {
   filesScanned: number;
   exactGroups: number;
@@ -241,6 +264,7 @@ export interface AppApi {
   listAgents(signal?: AbortSignal): Promise<AgentStatus[]>;
   listTasks(signal?: AbortSignal): Promise<ScanTask[]>;
   startScan(input: StartScanInput, signal?: AbortSignal): Promise<{ taskId: string }>;
+  browseAgentFilesystem(machineID: string, input: BrowseAgentFilesystemInput, signal?: AbortSignal): Promise<FilesystemPage>;
   getAnalysisStatus(signal?: AbortSignal): Promise<AnalysisStatus>;
   runAnalysis(signal?: AbortSignal): Promise<void>;
   listGroups(query: GroupQuery, signal?: AbortSignal): Promise<GroupPage>;

@@ -58,6 +58,68 @@ test("encodes complete group filters and converts snake_case fields", async () =
   });
 });
 
+test("browses an encoded Agent filesystem path exclusively through the JSON body", async () => {
+  const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+    current_path: "D:\\Media",
+    parent_path: "D:\\",
+    entries: [{
+      name: "Photos",
+      path: "D:\\Media\\Photos",
+      kind: "directory",
+      hidden: false,
+      system: false,
+      selectable: true
+    }],
+    next_cursor: "next-page"
+  }));
+  vi.stubGlobal("fetch", fetchMock);
+
+  await expect(createAppApi().browseAgentFilesystem("agent/a", {
+    path: "D:\\Media",
+    showHidden: false,
+    cursor: "",
+    limit: 100
+  })).resolves.toEqual({
+    currentPath: "D:\\Media",
+    parentPath: "D:\\",
+    entries: [{
+      name: "Photos",
+      path: "D:\\Media\\Photos",
+      kind: "directory",
+      hidden: false,
+      system: false,
+      selectable: true
+    }],
+    nextCursor: "next-page"
+  });
+
+  expect(fetchMock).toHaveBeenCalledWith(
+    "/api/agents/agent%2Fa/filesystem/browse",
+    expect.objectContaining({
+      method: "POST",
+      body: JSON.stringify({ path: "D:\\Media", show_hidden: false, cursor: "", limit: 100 })
+    })
+  );
+});
+
+test("rejects malformed filesystem entries instead of accepting unknown kinds or omitted selection", async () => {
+  const valid = {
+    current_path: "D:\\",
+    parent_path: "",
+    entries: [{ name: "D:", path: "D:\\", kind: "drive", hidden: false, system: false, selectable: true }],
+    next_cursor: ""
+  };
+  vi.stubGlobal("fetch", vi.fn()
+    .mockResolvedValueOnce(jsonResponse({ ...valid, entries: [{ ...valid.entries[0], kind: "symlink" }] }))
+    .mockResolvedValueOnce(jsonResponse({ ...valid, entries: [{ name: "D:", path: "D:\\", kind: "drive", hidden: false, system: false }] })));
+  const api = createAppApi();
+
+  await expect(api.browseAgentFilesystem("agent-a", { path: "", showHidden: false, cursor: "", limit: 100 }))
+    .rejects.toBeInstanceOf(ApiError);
+  await expect(api.browseAgentFilesystem("agent-a", { path: "", showHidden: false, cursor: "", limit: 100 }))
+    .rejects.toBeInstanceOf(ApiError);
+});
+
 test("turns handled error responses and malformed success payloads into ApiError", async () => {
   const fetchMock = vi.fn()
     .mockResolvedValueOnce(jsonResponse({ error: "central database unavailable" }, 503))

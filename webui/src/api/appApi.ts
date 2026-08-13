@@ -4,6 +4,7 @@ import type {
   AnalysisStats,
   AnalysisStatus,
   AppApi,
+  BrowseAgentFilesystemInput,
   DeleteMachineStatus,
   DeleteMode,
   DeletePreparation,
@@ -11,6 +12,8 @@ import type {
   DeleteSequenceStatus,
   DeleteSummary,
   DeleteTaskStatus,
+  FilesystemEntry,
+  FilesystemPage,
   ConfigFieldError,
   GUIConfig,
   GUIConfigSaveResult,
@@ -43,6 +46,11 @@ export function createAppApi(): AppApi {
     listAgents: signal => requestJson("/api/agents", get(signal), agents),
     listTasks: signal => requestJson("/api/tasks", get(signal), tasks),
     startScan: (input, signal) => requestJson("/api/scan", jsonPost(scanInput(input), signal), taskId),
+    browseAgentFilesystem: (machineID, input, signal) => requestJson(
+      `/api/agents/${encodeURIComponent(requiredText(machineID, "machine id"))}/filesystem/browse`,
+      jsonPost(filesystemBrowseInput(input), signal),
+      filesystemPage
+    ),
     getAnalysisStatus: signal => requestJson(
       "/api/analysis/firstscreen/status",
       { ...get(signal), decodeStatuses: [503] },
@@ -200,6 +208,15 @@ function scanInput(input: StartScanInput): Record<string, unknown> {
   return body;
 }
 
+function filesystemBrowseInput(input: BrowseAgentFilesystemInput): Record<string, unknown> {
+  return {
+    path: requiredTextOrEmpty(input.path, "filesystem path"),
+    show_hidden: boolean(input.showHidden, "show hidden"),
+    cursor: requiredTextOrEmpty(input.cursor, "filesystem cursor"),
+    limit: positiveInteger(input.limit, "filesystem limit")
+  };
+}
+
 function groupListUrl(query: GroupQuery): string {
   const params = new URLSearchParams({
     kind: groupKind(query.kind),
@@ -269,6 +286,28 @@ function tasks(value: unknown): ScanTask[] {
 
 function taskId(value: unknown): { taskId: string } {
   return { taskId: text(record(value, "task response").task_id, "task_id") };
+}
+
+function filesystemPage(value: unknown): FilesystemPage {
+  const raw = record(value, "filesystem page");
+  return {
+    currentPath: text(raw.current_path, "filesystem.current_path"),
+    parentPath: text(raw.parent_path, "filesystem.parent_path"),
+    entries: array(raw.entries, "filesystem.entries").map(filesystemEntry),
+    nextCursor: text(raw.next_cursor, "filesystem.next_cursor")
+  };
+}
+
+function filesystemEntry(value: unknown): FilesystemEntry {
+  const raw = record(value, "filesystem entry");
+  return {
+    name: text(raw.name, "filesystem entry.name"),
+    path: text(raw.path, "filesystem entry.path"),
+    kind: filesystemEntryKind(raw.kind),
+    hidden: boolean(raw.hidden, "filesystem entry.hidden"),
+    system: boolean(raw.system, "filesystem entry.system"),
+    selectable: boolean(raw.selectable, "filesystem entry.selectable")
+  };
 }
 
 function analysisStatus(value: unknown): AnalysisStatus {
@@ -653,9 +692,23 @@ function deleteMode(value: unknown): DeleteMode {
   throw new TypeError("delete mode is invalid");
 }
 
+function filesystemEntryKind(value: unknown): FilesystemEntry["kind"] {
+  if (value === "drive" || value === "directory" || value === "file") {
+    return value;
+  }
+  throw new TypeError("filesystem entry.kind is invalid");
+}
+
 function requiredText(value: string, field: string): string {
   if (value.trim() === "") {
     throw new Error(`${field} is required`);
+  }
+  return value;
+}
+
+function requiredTextOrEmpty(value: string, field: string): string {
+  if (typeof value !== "string") {
+    throw new Error(`${field} must be a string`);
   }
   return value;
 }
