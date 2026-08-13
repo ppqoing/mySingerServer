@@ -315,6 +315,24 @@ func (d *DB) PublishLocalAnalysis(ctx context.Context, runID string) error {
 	if changed != 1 {
 		return fmt.Errorf("%w: machine %s generation %d", ErrStaleLocalAnalysisGeneration, machineID, generation)
 	}
+	payload, err := json.Marshal(struct {
+		MachineID  string `json:"machine_id"`
+		RunID      string `json:"run_id"`
+		Generation int64  `json:"generation"`
+		Status     string `json:"status"`
+	}{machineID, runID, generation, "published"})
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO local_outbox(topic,entity_key,generation,payload_json,created_at,updated_at)
+		VALUES ('local.analysis.published',?1,?2,?3,?4,?4)
+		ON CONFLICT(topic,entity_key,generation) DO UPDATE SET
+		 payload_json=excluded.payload_json,ack_at=NULL,retry_count=0,
+		 next_retry_at=NULL,last_error=NULL,updated_at=excluded.updated_at`,
+		runID, generation, string(payload), now); err != nil {
+		return fmt.Errorf("store: enqueue local analysis publish event: %w", err)
+	}
 	return tx.Commit()
 }
 

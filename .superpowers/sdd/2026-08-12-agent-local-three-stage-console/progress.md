@@ -55,3 +55,6 @@ Task 10: fix round 2/5 (1 Important addressed, 0 open — animated WebP content 
 
 Task 11: production whitelist minimally expanded to `internal/proto/local.go`/test and `cmd/agent/main.go`/test because the plan had operation constants but no typed delete DTOs and no production composition route; strict DTOs reject caller paths.
 Task 11: complete pending commit — committed-review prepare, process-local one-time token, digest and live file SHA/size/mtime revalidation, physical-only Helper reports, atomic SQLite audit/deleted/sync/outbox commit, partial/uncertain fail-closed behavior, SHA/features/scores/groups/reviews retention, and default first-screen deleted exclusion implemented.
+Task 11: complete (commit 8e280159; focused/full/race/static retention gates PASS; original `.codex-temp/` untouched).
+
+Task 12: complete pending commit — central local-scope tables, SQLite outbox snapshot/ack, atomic published event, mixed remote transaction, idempotent replay and remote deleted retention implemented; Store/Syncer/cmd full and race gates PASS. Real PostgreSQL integration SKIP because `TEST_POSTGRES_DSN` is unset and remains a Task 14 runtime gate.

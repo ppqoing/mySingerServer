@@ -302,7 +302,7 @@ func seedPhase1Image(t *testing.T, local *store.DB, path string, fill byte) {
 	if err := local.SavePhase1(context.Background(), store.Phase1Result{
 		MachineID: "machine-a", Path: path, Kind: store.MediaImage,
 		SHA512: sha, FieldsDone: proto.FieldSHA512 | proto.FieldPDQ256,
-		PDQ: []byte{1, 2, 3}, Quality: 88, Width: 640, Height: 480,
+		PDQ: bytes.Repeat([]byte{1}, 32), Quality: 88, Width: 640, Height: 480,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -329,7 +329,9 @@ func seedPhase1Video(t *testing.T, local *store.DB, path string, fill byte, comp
 	}
 	if complete {
 		result.ThumbPath = `D:\cache\thumb.jpg`
-		result.ThumbPDQ = []byte{4, 5, 6}
+		result.ThumbPDQ = bytes.Repeat([]byte{4}, 32)
+		result.Width = 640
+		result.Height = 360
 		result.ThumbQuality = &quality
 	}
 	if err := local.SavePhase1(context.Background(), result); err != nil {
@@ -342,6 +344,7 @@ type recordedTx struct {
 	images []store.ImageFeatureSyncRow
 	videos []store.VideoFeatureSyncRow
 	frames []store.VideoFrameSyncRow
+	local  store.LocalSyncBatch
 }
 
 type transactionalRemote struct {
@@ -396,6 +399,8 @@ func (*cancelDuringUpsertTx) UpsertVideos(context.Context, []store.VideoFeatureS
 func (*cancelDuringUpsertTx) UpsertFrames(context.Context, []store.VideoFrameSyncRow) error {
 	return nil
 }
+
+func (*cancelDuringUpsertTx) UpsertLocal(context.Context, store.LocalSyncBatch) error { return nil }
 
 func (*cancelDuringUpsertTx) CloseBatch(context.Context) error { return nil }
 func (*cancelDuringUpsertTx) Commit(context.Context) error     { return nil }
@@ -461,6 +466,14 @@ func (tx *transactionalRemoteTx) UpsertFrames(_ context.Context, rows []store.Vi
 		return err
 	}
 	tx.rows.frames = append(tx.rows.frames, rows...)
+	return nil
+}
+
+func (tx *transactionalRemoteTx) UpsertLocal(_ context.Context, batch store.LocalSyncBatch) error {
+	if err := tx.owner.fail("local"); err != nil {
+		return err
+	}
+	tx.rows.local = batch
 	return nil
 }
 
@@ -570,6 +583,16 @@ func (l *scriptedLocal) PruneMissingSyncRows(_ context.Context, rows []store.Syn
 
 func (l *scriptedLocal) QuarantineSyncRows(_ context.Context, rows []store.SyncQueueRow) error {
 	l.quarantined = append(l.quarantined, rows...)
+	return nil
+}
+
+func (*scriptedLocal) PendingLocalSyncEvents(context.Context, int) ([]store.LocalOutboxSyncRow, error) {
+	return nil, nil
+}
+func (*scriptedLocal) LoadLocalSyncBatch(context.Context, []store.LocalOutboxSyncRow) (store.LocalSyncBatch, error) {
+	return store.LocalSyncBatch{}, nil
+}
+func (*scriptedLocal) AcknowledgeLocalSyncEvents(context.Context, []store.LocalOutboxSyncRow) error {
 	return nil
 }
 

@@ -39,6 +39,13 @@ func TestLocalAnalysisGenerationIsMonotonicAndPublishRollsBackCurrentOnFailure(t
 	if err := db.PublishLocalAnalysis(ctx, first.RunID); err != nil {
 		t.Fatalf("Publish first: %v", err)
 	}
+	var publishEvents int
+	if err := db.db.QueryRow(`SELECT count(*) FROM local_outbox WHERE topic='local.analysis.published' AND entity_key=? AND generation=?`, first.RunID, first.Generation).Scan(&publishEvents); err != nil {
+		t.Fatal(err)
+	}
+	if publishEvents != 1 {
+		t.Fatalf("published outbox events=%d want=1", publishEvents)
+	}
 
 	second, err := db.BeginLocalAnalysis(ctx, "machine-a", "task-2")
 	if err != nil {
@@ -73,6 +80,12 @@ func TestLocalAnalysisGenerationIsMonotonicAndPublishRollsBackCurrentOnFailure(t
 	}
 	if status != "complete" {
 		t.Fatalf("second status after rollback = %q, want complete", status)
+	}
+	if err := db.db.QueryRow(`SELECT count(*) FROM local_outbox WHERE topic='local.analysis.published' AND entity_key=?`, second.RunID).Scan(&publishEvents); err != nil {
+		t.Fatal(err)
+	}
+	if publishEvents != 0 {
+		t.Fatalf("failed publish left outbox event=%d", publishEvents)
 	}
 }
 
