@@ -120,6 +120,14 @@ type OperationResult struct {
 	UACCancelled bool   `json:"uacCancelled"`
 }
 
+type PathSelectionResult struct {
+	OK           bool   `json:"ok"`
+	Path         string `json:"path"`
+	Cancelled    bool   `json:"cancelled"`
+	ErrorCode    string `json:"errorCode"`
+	ErrorSummary string `json:"errorSummary"`
+}
+
 type ForceExitResult struct {
 	OK               bool     `json:"ok"`
 	FailedComponents []string `json:"failedComponents"`

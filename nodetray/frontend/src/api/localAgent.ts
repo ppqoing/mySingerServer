@@ -7,6 +7,7 @@ export type LocalGroupPage = { ok: boolean; groups: LocalGroup[]; errorCode?: st
 export type DeletePreview = { ok: boolean; batchId: string; selectionDigest: string; count: number; totalSize: number; files: unknown[]; errorSummary?: string }
 export type DeleteBatch = { ok: boolean; succeeded: number; failed: number; uncertain: number; items: Array<{ fileId: number; result: string; uncertain: boolean }>; errorSummary?: string }
 export type ImagePreview = { ok: boolean; mime: string; width: number; height: number; dataBase64: string; errorSummary?: string }
+export type PathSelectionResult = { ok: boolean; path: string; cancelled: boolean; errorCode?: string; errorSummary?: string }
 
 type Backend = Record<string, (...args: unknown[]) => Promise<unknown>>
 function backend(): Backend | undefined { return window.go?.main?.Backend as Backend | undefined }
@@ -17,6 +18,7 @@ async function call<T>(method: string, fallback: T, ...args: unknown[]): Promise
 }
 
 export const createLocalTask = (request: LocalTaskCreate) => call('CreateLocalTask', { ok: false, task: {} as LocalTask, errorSummary: 'Agent 暂不可用' }, request)
+export const chooseLocalTaskRoot = (currentPath: string) => call<PathSelectionResult>('ChooseLocalTaskRoot', { ok: false, path: '', cancelled: false, errorCode: 'backend_unavailable' }, currentPath)
 export const listLocalTasks = () => call<LocalTaskPage>('ListLocalTasks', { ok: false, tasks: [], errorSummary: 'Agent 暂不可用' }, { offset: 0, limit: 100 })
 export const startLocalAnalysis = (request: LocalTaskCreate) => call('StartLocalAnalysis', { ok: false, errorSummary: 'Agent 暂不可用' }, request)
 export const listLocalGroups = (category = '') => call<LocalGroupPage>('ListLocalGroups', { ok: false, groups: [], errorSummary: 'Agent 暂不可用' }, { scope: 'current', category, offset: 0, limit: 100 })

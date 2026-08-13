@@ -97,6 +97,19 @@ func TestLocalConsoleModelsKeepSecretsOutOfWailsJSON(t *testing.T) {
 	assertJSONKeys(t, image, "ok", "mime", "width", "height", "dataBase64", "errorCode", "errorSummary")
 }
 
+// Break caught: the Wails directory picker result drops cancellation or a
+// stable, display-safe error field before it reaches the local-task UI.
+func TestPathSelectionResultExposesWailsSafeJSONContract(t *testing.T) {
+	result := PathSelectionResult{
+		OK:           true,
+		Path:         `D:\Media`,
+		Cancelled:    false,
+		ErrorCode:    "",
+		ErrorSummary: "",
+	}
+	assertJSONKeys(t, result, "ok", "path", "cancelled", "errorCode", "errorSummary")
+}
+
 func assertJSONKeys(t *testing.T, value any, keys ...string) {
 	t.Helper()
 	raw, err := json.Marshal(value)

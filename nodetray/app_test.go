@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -21,11 +22,108 @@ import (
 	traynative "dedup/internal/nodetray/windows/tray"
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/windows"
+	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 type backendTestRecorder struct {
 	mu    sync.Mutex
 	calls []string
+}
+
+// Break caught: a valid current task directory is not forwarded to the native
+// picker, so users must navigate back to it every time they add a root.
+func TestChooseLocalTaskRootUsesWindowsDirectoryDialog(t *testing.T) {
+	currentPath := t.TempDir()
+	selectedPath := filepath.Join(currentPath, "Photos")
+	if err := os.Mkdir(selectedPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	original := openDirectoryDialogAdapter
+	t.Cleanup(func() { openDirectoryDialogAdapter = original })
+	openDirectoryDialogAdapter = func(_ context.Context, options runtime.OpenDialogOptions) (string, error) {
+		if options.Title != "选择本地任务扫描目录" || options.DefaultDirectory != currentPath {
+			t.Fatalf("options=%#v", options)
+		}
+		return selectedPath, nil
+	}
+
+	backend := NewBackend(nil)
+	backend.Startup(context.Background())
+	result := backend.ChooseLocalTaskRoot(currentPath)
+	if !result.OK || result.Cancelled || result.Path != selectedPath {
+		t.Fatalf("result=%#v", result)
+	}
+}
+
+// Break caught: an unexpected non-directory result from the native boundary
+// reaches the frontend and can be submitted as a scan root.
+func TestChooseLocalTaskRootRejectsNonDirectorySelection(t *testing.T) {
+	selected, err := os.CreateTemp(t.TempDir(), "selected-file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := selected.Close(); err != nil {
+		t.Fatal(err)
+	}
+	original := openDirectoryDialogAdapter
+	t.Cleanup(func() { openDirectoryDialogAdapter = original })
+	openDirectoryDialogAdapter = func(context.Context, runtime.OpenDialogOptions) (string, error) { return selected.Name(), nil }
+
+	backend := NewBackend(nil)
+	backend.Startup(context.Background())
+	result := backend.ChooseLocalTaskRoot("")
+	if result.OK || result.Cancelled || result.Path != "" || result.ErrorCode != "directory_dialog_failed" {
+		t.Fatalf("result=%#v", result)
+	}
+}
+
+// Break caught: closing the native picker changes the pending roots or is
+// reported as a failure instead of an explicit successful cancellation.
+func TestChooseLocalTaskRootReturnsCancelledForEmptyNativeSelection(t *testing.T) {
+	original := openDirectoryDialogAdapter
+	t.Cleanup(func() { openDirectoryDialogAdapter = original })
+	openDirectoryDialogAdapter = func(context.Context, runtime.OpenDialogOptions) (string, error) { return "", nil }
+
+	backend := NewBackend(nil)
+	backend.Startup(context.Background())
+	result := backend.ChooseLocalTaskRoot("")
+	if !result.OK || !result.Cancelled || result.Path != "" || result.ErrorCode != "" {
+		t.Fatalf("result=%#v", result)
+	}
+}
+
+// Break caught: an operating-system picker error exposes a private filesystem
+// path or raw error to the WebView instead of a stable display-safe failure.
+func TestChooseLocalTaskRootRedactsDirectoryDialogFailure(t *testing.T) {
+	original := openDirectoryDialogAdapter
+	t.Cleanup(func() { openDirectoryDialogAdapter = original })
+	openDirectoryDialogAdapter = func(_ context.Context, options runtime.OpenDialogOptions) (string, error) {
+		if options.DefaultDirectory != "" {
+			t.Fatalf("non-directory current path became default directory: %#v", options)
+		}
+		return "", errors.New(`open C:\private\media: access denied`)
+	}
+
+	file, err := os.CreateTemp(t.TempDir(), "not-a-directory")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	backend := NewBackend(nil)
+	backend.Startup(context.Background())
+	result := backend.ChooseLocalTaskRoot(file.Name())
+	if result.OK || result.Cancelled || result.ErrorCode != "directory_dialog_failed" || result.ErrorSummary == "" {
+		t.Fatalf("result=%#v", result)
+	}
+	serialized, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(strings.ToLower(string(serialized)), "private") || strings.Contains(strings.ToLower(string(serialized)), "access denied") {
+		t.Fatalf("result leaked directory dialog error: %s", serialized)
+	}
 }
 
 func (r *backendTestRecorder) add(value string) {

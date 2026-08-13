@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,10 +17,11 @@ import (
 )
 
 var (
-	errBackendNotStarted  = errors.New("backend_not_started")
-	errBackendUnavailable = errors.New("backend_unavailable")
-	windowHideAdapter     = runtime.WindowHide
-	eventsEmitAdapter     = runtime.EventsEmit
+	errBackendNotStarted       = errors.New("backend_not_started")
+	errBackendUnavailable      = errors.New("backend_unavailable")
+	windowHideAdapter          = runtime.WindowHide
+	eventsEmitAdapter          = runtime.EventsEmit
+	openDirectoryDialogAdapter = runtime.OpenDirectoryDialog
 )
 
 type Backend struct {
@@ -138,6 +141,38 @@ func (b *Backend) CreateLocalTask(value traymodel.LocalTaskCreate) traymodel.Loc
 		return traymodel.LocalTaskResult{ErrorCode: "backend_not_started", ErrorSummary: "本机控制台尚未启动"}
 	}
 	return service.CreateLocalTask(ctx, value)
+}
+
+func (b *Backend) ChooseLocalTaskRoot(currentPath string) traymodel.PathSelectionResult {
+	if b == nil {
+		return traymodel.PathSelectionResult{ErrorCode: "backend_not_started", ErrorSummary: "本机控制台尚未启动"}
+	}
+	state, ok := b.ctx.(*backendContext)
+	if !ok || state == nil {
+		return traymodel.PathSelectionResult{ErrorCode: "backend_not_started", ErrorSummary: "本机控制台尚未启动"}
+	}
+	ctx := state.snapshot()
+	if ctx == nil {
+		return traymodel.PathSelectionResult{ErrorCode: "backend_not_started", ErrorSummary: "本机控制台尚未启动"}
+	}
+
+	options := runtime.OpenDialogOptions{Title: "选择本地任务扫描目录"}
+	if filepath.IsAbs(currentPath) {
+		if info, err := os.Stat(currentPath); err == nil && info.IsDir() {
+			options.DefaultDirectory = currentPath
+		}
+	}
+	selected, err := openDirectoryDialogAdapter(ctx, options)
+	if err != nil {
+		return traymodel.PathSelectionResult{ErrorCode: "directory_dialog_failed", ErrorSummary: "无法打开目录选择窗口"}
+	}
+	if selected == "" {
+		return traymodel.PathSelectionResult{OK: true, Cancelled: true}
+	}
+	if info, statErr := os.Stat(selected); statErr != nil || !info.IsDir() {
+		return traymodel.PathSelectionResult{ErrorCode: "directory_dialog_failed", ErrorSummary: "无法选择目录"}
+	}
+	return traymodel.PathSelectionResult{OK: true, Path: selected}
 }
 
 func (b *Backend) ListLocalTasks(value traymodel.PageRequest) traymodel.LocalTaskPage {
