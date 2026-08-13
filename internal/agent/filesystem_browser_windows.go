@@ -18,13 +18,26 @@ import (
 
 const defaultFilesystemBrowseLimit = 200
 
-type filesystemBrowser struct{}
-
-func NewFilesystemBrowser() FilesystemBrowser {
-	return filesystemBrowser{}
+type filesystemBrowser struct {
+	readDir           func(string) ([]os.DirEntry, error)
+	getFileAttributes func(*uint16) (uint32, error)
 }
 
-func (filesystemBrowser) Browse(
+func NewFilesystemBrowser() FilesystemBrowser {
+	return newFilesystemBrowser(os.ReadDir, windows.GetFileAttributes)
+}
+
+func newFilesystemBrowser(
+	readDir func(string) ([]os.DirEntry, error),
+	getFileAttributes func(*uint16) (uint32, error),
+) filesystemBrowser {
+	return filesystemBrowser{
+		readDir:           readDir,
+		getFileAttributes: getFileAttributes,
+	}
+}
+
+func (browser filesystemBrowser) Browse(
 	ctx context.Context,
 	request proto.FilesystemBrowseRequest,
 ) proto.FilesystemBrowseResponse {
@@ -49,7 +62,7 @@ func (filesystemBrowser) Browse(
 	if request.Path == "" {
 		return browseWindowsDrives(ctx, response, cursor, limit)
 	}
-	return browseWindowsDirectory(ctx, request, response, cursor, limit)
+	return browser.browseWindowsDirectory(ctx, request, response, cursor, limit)
 }
 
 func browseWindowsDrives(
@@ -88,20 +101,18 @@ func browseWindowsDrives(
 	return paginateFilesystemBrowseEntries(response, entries, cursor, limit)
 }
 
-func browseWindowsDirectory(
+func (browser filesystemBrowser) browseWindowsDirectory(
 	ctx context.Context,
 	request proto.FilesystemBrowseRequest,
 	response proto.FilesystemBrowseResponse,
 	cursor filesystemBrowseCursor,
 	limit int,
 ) proto.FilesystemBrowseResponse {
-	directoryEntries, err := os.ReadDir(request.Path)
+	directoryEntries, err := browser.readDir(request.Path)
 	if err != nil {
 		response.ErrorCode = mapFilesystemBrowseError(err)
 		return response
 	}
-	response.CurrentPath = request.Path
-	response.ParentPath = filepath.Dir(request.Path)
 	entries := make([]filesystemBrowseEntry, 0, len(directoryEntries))
 	for _, directoryEntry := range directoryEntries {
 		if ctx.Err() != nil {
@@ -109,7 +120,7 @@ func browseWindowsDirectory(
 			return response
 		}
 		path := filepath.Join(request.Path, directoryEntry.Name())
-		attributes, err := windows.GetFileAttributes(windows.StringToUTF16Ptr(path))
+		attributes, err := browser.getFileAttributes(windows.StringToUTF16Ptr(path))
 		if err != nil {
 			response.ErrorCode = mapFilesystemBrowseError(err)
 			return response
@@ -135,6 +146,8 @@ func browseWindowsDirectory(
 			rank: rank,
 		})
 	}
+	response.CurrentPath = request.Path
+	response.ParentPath = filepath.Dir(request.Path)
 	return paginateFilesystemBrowseEntries(response, entries, cursor, limit)
 }
 

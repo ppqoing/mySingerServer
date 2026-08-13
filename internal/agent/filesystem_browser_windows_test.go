@@ -161,6 +161,56 @@ func TestFilesystemBrowserMapsCancelledContext(t *testing.T) {
 	}
 }
 
+// This fails if cancellation after a successful directory read returns the
+// requested local path in an otherwise error-only response.
+func TestFilesystemBrowserDoesNotReturnPathsAfterLateCancellation(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "entry.txt"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	browser := newFilesystemBrowser(
+		func(string) ([]os.DirEntry, error) {
+			cancel()
+			return entries, nil
+		},
+		windows.GetFileAttributes,
+	)
+	response := browser.Browse(ctx, proto.FilesystemBrowseRequest{
+		RequestID: "browse-late-cancel", Path: root, Limit: 200,
+	})
+	if response.ErrorCode != "browse_cancelled" || response.CurrentPath != "" || response.ParentPath != "" {
+		t.Fatalf("late cancellation response=%#v", response)
+	}
+}
+
+// This fails if an entry attribute error after a successful directory read
+// leaves CurrentPath or ParentPath in the error response.
+func TestFilesystemBrowserDoesNotReturnPathsAfterAttributeError(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "entry.txt"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	browser := newFilesystemBrowser(
+		func(string) ([]os.DirEntry, error) { return entries, nil },
+		func(*uint16) (uint32, error) { return 0, windows.ERROR_ACCESS_DENIED },
+	)
+	response := browser.Browse(context.Background(), proto.FilesystemBrowseRequest{
+		RequestID: "browse-attribute-error", Path: root, Limit: 200,
+	})
+	if response.ErrorCode != "access_denied" || response.CurrentPath != "" || response.ParentPath != "" {
+		t.Fatalf("attribute error response=%#v", response)
+	}
+}
+
 func setWindowsAttributes(t *testing.T, path string, attributes uint32) {
 	t.Helper()
 	pathUTF16 := windows.StringToUTF16Ptr(path)
