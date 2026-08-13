@@ -20,14 +20,16 @@ import (
 )
 
 type fakeStore struct {
-	settings   traymodel.TraySettings
-	helper     config.HelperForm
-	prepared   config.PreparedWrite
-	calls      *[]string
-	saveErr    error
-	defaultErr error
-	loadErr    error
-	loadCalls  int
+	settings       traymodel.TraySettings
+	helper         config.HelperForm
+	prepared       config.PreparedWrite
+	calls          *[]string
+	saveErr        error
+	defaultErr     error
+	fingerprint    string
+	fingerprintErr error
+	loadErr        error
+	loadCalls      int
 }
 
 func (f *fakeStore) LoadTraySettings() (traymodel.TraySettings, error) {
@@ -57,6 +59,10 @@ func (f *fakeStore) PrepareDefaultHelperWrite() (config.PreparedWrite, error) {
 	prepared := f.prepared
 	prepared.CreateOnly = true
 	return prepared, nil
+}
+func (f *fakeStore) HelperFingerprint() (string, error) {
+	*f.calls = append(*f.calls, "read-helper-fingerprint")
+	return f.fingerprint, f.fingerprintErr
 }
 
 type fakeValidator struct{ helper []config.FieldError }
@@ -907,8 +913,49 @@ func TestStartHelperImportsDefaultBeforeStarting(t *testing.T) {
 	if result := s.StartHelper(context.Background()); !result.OK {
 		t.Fatalf("StartHelper: %#v", result)
 	}
-	if !reflect.DeepEqual(*calls, []string{"prepare-default-helper", "elevate-write_helper_config", "helper-sha", "helper-start"}) {
+	if !reflect.DeepEqual(*calls, []string{"prepare-default-helper", "elevate-write_helper_config", "read-helper-fingerprint", "helper-sha", "helper-start"}) {
 		t.Fatalf("calls = %v", *calls)
+	}
+}
+
+func TestStartHelperUsesCompetitionWinnerFingerprint(t *testing.T) {
+	s, calls, store, _, _, elevated := serviceFixture(t)
+	store.defaultErr = nil
+	store.fingerprint = strings.Repeat("c", 64)
+	elevated.result.Response = elevation.Response{OK: false, ErrorCode: elevation.ErrorCodeHelperConfigExists, ErrorSummary: "helper configuration already exists"}
+	if result := s.StartHelper(context.Background()); !result.OK {
+		t.Fatalf("StartHelper: %#v", result)
+	}
+	if !reflect.DeepEqual(*calls, []string{"prepare-default-helper", "elevate-write_helper_config", "read-helper-fingerprint", "helper-sha", "helper-start"}) {
+		t.Fatalf("calls = %v", *calls)
+	}
+}
+
+func TestStartHelperDefaultImportFailuresDoNotStart(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		setup func(*fakeStore, *fakeElevation)
+	}{
+		{"invalid", func(store *fakeStore, _ *fakeElevation) { store.defaultErr = errors.New("invalid") }},
+		{"uac", func(store *fakeStore, elevated *fakeElevation) {
+			store.defaultErr = nil
+			elevated.result.UACCancelled = true
+		}},
+		{"write", func(store *fakeStore, elevated *fakeElevation) {
+			store.defaultErr = nil
+			elevated.result.Response = elevation.Response{OK: false, ErrorCode: elevation.ErrorCodeWriteFailed, ErrorSummary: "configuration write failed"}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s, calls, store, _, _, elevated := serviceFixture(t)
+			test.setup(store, elevated)
+			if result := s.StartHelper(context.Background()); result.OK {
+				t.Fatal("StartHelper succeeded")
+			}
+			if strings.Contains(strings.Join(*calls, ","), "helper-start") {
+				t.Fatalf("helper started: %v", *calls)
+			}
+		})
 	}
 }
 

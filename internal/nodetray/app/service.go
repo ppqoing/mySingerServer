@@ -25,6 +25,7 @@ type Store interface {
 	LoadHelperForm() (config.HelperForm, error)
 	PrepareHelperWrite(config.HelperForm) (config.PreparedWrite, error)
 	PrepareDefaultHelperWrite() (config.PreparedWrite, error)
+	HelperFingerprint() (string, error)
 }
 
 type AgentConfigSaveResult struct {
@@ -733,7 +734,11 @@ func (s *Service) ensureDefaultHelperConfig(ctx context.Context) traymodel.Opera
 	if s.helperFingerprint == nil {
 		return operationFailure("unavailable", "Helper 摘要更新服务不可用")
 	}
-	return sanitizeOperation(s.helperFingerprint.UpdateExpectedSHA256(prepared.SHA256))
+	actualSHA, err := s.store.HelperFingerprint()
+	if err != nil {
+		return operationFailure("helper_config_invalid", "Helper 配置读取失败")
+	}
+	return sanitizeOperation(s.helperFingerprint.UpdateExpectedSHA256(actualSHA))
 }
 
 func (s *Service) reconcileHelperTaskPolicy(ctx context.Context, value traymodel.TraySettings) traymodel.OperationResult {

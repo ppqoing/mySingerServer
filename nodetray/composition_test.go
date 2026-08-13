@@ -33,6 +33,7 @@ func (compositionStore) PrepareHelperWrite(trayconfig.HelperForm) (trayconfig.Pr
 func (compositionStore) PrepareDefaultHelperWrite() (trayconfig.PreparedWrite, error) {
 	return trayconfig.PreparedWrite{}, trayconfig.ErrHelperConfigExists
 }
+func (compositionStore) HelperFingerprint() (string, error) { return strings.Repeat("b", 64), nil }
 
 type compositionValidator struct{}
 

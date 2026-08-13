@@ -240,7 +240,14 @@ func (s *Store) LoadHelperForm() (HelperForm, error) {
 	cfg, _, err := loadHelperConfig(s.paths.HelperConfig, s.paths.HelperExecutable)
 	if err != nil {
 		if configAndBackupAbsent(s.paths.HelperConfig) {
-			return firstRunHelperForm(s.paths), nil
+			var defaultConfig helper.Config
+			if err := strictDecodeFile(s.helperDefaultPath(), &defaultConfig); err != nil {
+				return HelperForm{}, storeError(s.helperDefaultPath(), "strict default load failed")
+			}
+			if defaultConfig.LogDir == "" {
+				defaultConfig.LogDir = filepath.Join(filepath.Dir(s.paths.HelperConfig), "logs")
+			}
+			return HelperToForm(defaultConfig), nil
 		}
 		return HelperForm{}, storeError(s.paths.HelperConfig, "strict load failed")
 	}

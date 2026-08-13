@@ -105,6 +105,36 @@ func TestStoreReturnsSafeInteractiveDefaultsOnlyForCompletelyAbsentComponentConf
 	}
 }
 
+func TestStoreLoadsStrictPackageHelperDefaultForEditableFirstRun(t *testing.T) {
+	store, paths := newTestStore(t)
+	defaultPath := filepath.Join(filepath.Dir(paths.HelperExecutable), "helper.default.json")
+	defaultConfig := validHelperConfig(t)
+	defaultConfig.AllowedRoots = []string{}
+	defaultConfig.DeniedRoots = []string{`D:\nodetray-test-media\private`}
+	defaultConfig.LogDir = ""
+	writeJSONFixture(t, defaultPath, defaultConfig)
+
+	form, err := store.LoadHelperForm()
+	if err != nil {
+		t.Fatalf("LoadHelperForm: %v", err)
+	}
+	if len(form.AllowedRoots) != 0 || !reflect.DeepEqual(form.DeniedRoots, defaultConfig.DeniedRoots) {
+		t.Fatalf("form did not preserve editable package default: %#v", form)
+	}
+	if form.LogDir != filepath.Join(filepath.Dir(paths.HelperConfig), "logs") {
+		t.Fatalf("LogDir = %q", form.LogDir)
+	}
+	if _, err := store.PrepareDefaultHelperWrite(); err == nil {
+		t.Fatal("empty allowed_roots default was prepared")
+	}
+	for _, data := range [][]byte{[]byte(`{"unknown":true}`), append(mustCanonicalJSON(t, validHelperConfig(t)), []byte(`{}`)...)} {
+		writeBytesFixture(t, defaultPath, data)
+		if _, err := store.LoadHelperForm(); err == nil {
+			t.Fatal("non-strict package default was accepted")
+		}
+	}
+}
+
 func TestStoreDoesNotHideMissingOfficialConfigWhenBackupExists(t *testing.T) {
 	store, paths := newTestStore(t)
 	writeBytesFixture(t, paths.AgentConfig+".last-good", mustCanonicalJSON(t, fullyPopulatedAgentConfig()))
@@ -784,7 +814,11 @@ func newTestStore(t *testing.T) (*Store, Paths) {
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
-	writeJSONFixture(t, filepath.Join(filepath.Dir(paths.HelperExecutable), "helper.default.json"), validHelperConfig(t))
+	defaultConfig, err := HelperFromForm(firstRunHelperForm(paths))
+	if err != nil {
+		t.Fatalf("HelperFromForm: %v", err)
+	}
+	writeJSONFixture(t, filepath.Join(filepath.Dir(paths.HelperExecutable), "helper.default.json"), defaultConfig)
 	return store, paths
 }
 

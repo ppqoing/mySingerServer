@@ -48,11 +48,19 @@ type executorAuthority struct {
 
 type elevatedTestHooks struct {
 	beforeLock        func()
+	stat              func(string) (os.FileInfo, error)
 	beforeBackup      func()
 	afterSync         func(tempPath, destination string) error
 	beforeReplace     func(tempPath, destination string) error
 	replace           func(tempPath, destination string) error
 	beforeTaskService func()
+}
+
+func (executor *Executor) stat(path string) (os.FileInfo, error) {
+	if executor.testHooks.stat != nil {
+		return executor.testHooks.stat(path)
+	}
+	return os.Stat(path)
 }
 
 type elevatedPlatform interface {
@@ -325,14 +333,14 @@ func (executor *Executor) saveLocked(ctx context.Context, data []byte, createOnl
 	backup := target + ".last-good"
 	if createOnly {
 		for _, path := range []string{target, backup} {
-			if _, err := os.Stat(path); err == nil {
+			if _, err := executor.stat(path); err == nil {
 				return trayconfig.ErrHelperConfigExists
 			} else if !errors.Is(err, os.ErrNotExist) {
 				return err
 			}
 		}
 	}
-	_, targetStatErr := os.Stat(target)
+	_, targetStatErr := executor.stat(target)
 	switch {
 	case targetStatErr == nil:
 		oldData, err := executor.loadCanonicalHelperFile(target)
@@ -350,7 +358,7 @@ func (executor *Executor) saveLocked(ctx context.Context, data []byte, createOnl
 			return err
 		}
 	case errors.Is(targetStatErr, os.ErrNotExist):
-		_, backupStatErr := os.Stat(backup)
+		_, backupStatErr := executor.stat(backup)
 		switch {
 		case backupStatErr == nil:
 			if _, err := executor.loadCanonicalHelperFile(backup); err != nil {
