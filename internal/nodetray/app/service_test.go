@@ -929,6 +929,10 @@ func TestStartHelperUsesCompetitionWinnerFingerprint(t *testing.T) {
 	if !reflect.DeepEqual(*calls, []string{"prepare-default-helper", "elevate-write_helper_config", "read-helper-fingerprint", "helper-sha", "helper-start"}) {
 		t.Fatalf("calls = %v", *calls)
 	}
+	updater := s.helperFingerprint.(*fakeFingerprintUpdater)
+	if !reflect.DeepEqual(updater.values, []string{store.fingerprint}) || updater.values[0] == store.prepared.SHA256 {
+		t.Fatalf("updated SHA = %v, winner=%q prepared=%q", updater.values, store.fingerprint, store.prepared.SHA256)
+	}
 }
 
 func TestStartHelperDefaultImportFailuresDoNotStart(t *testing.T) {
@@ -1312,6 +1316,45 @@ func TestSaveTraySettingsUACCancelDoesNotPersistRequestedPolicy(t *testing.T) {
 	}
 	if store.loadCalls != 1 {
 		t.Fatalf("settings loads = %d, want initial load only", store.loadCalls)
+	}
+}
+
+func TestSaveTraySettingsDefaultImportFailuresDoNotEnableOrInstall(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		setup    func(*fakeStore, *fakeElevation)
+		wantCode string
+	}{
+		{"invalid", func(store *fakeStore, _ *fakeElevation) { store.defaultErr = errors.New("invalid") }, "helper_config_invalid"},
+		{"uac", func(store *fakeStore, elevated *fakeElevation) {
+			store.defaultErr = nil
+			elevated.result = elevation.InvocationResult{UACCancelled: true}
+		}, elevation.ErrorCodeUACCancelled},
+		{"write", func(store *fakeStore, elevated *fakeElevation) {
+			store.defaultErr = nil
+			elevated.result.Response = elevation.Response{OK: false, ErrorCode: elevation.ErrorCodeWriteFailed, ErrorSummary: "configuration write failed"}
+		}, elevation.ErrorCodeWriteFailed},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s, calls, store, _, _, elevated := serviceFixture(t)
+			store.settings.HelperEnabled = false
+			store.settings.HelperStartMode = traymodel.StartManual
+			test.setup(store, elevated)
+			value := store.settings
+			value.HelperEnabled = true
+			value.HelperStartMode = traymodel.StartAutomatic
+			result := s.SaveTraySettings(context.Background(), value)
+			if result.OK || result.ErrorCode != test.wantCode {
+				t.Fatalf("result = %#v", result)
+			}
+			if store.settings.HelperEnabled || store.settings.HelperStartMode != traymodel.StartManual {
+				t.Fatalf("settings saved: %#v", store.settings)
+			}
+			joined := strings.Join(*calls, ",")
+			if strings.Contains(joined, "save-settings") || strings.Contains(joined, "install_helper_task") || strings.Contains(joined, "task-run") || strings.Contains(joined, "helper-start") {
+				t.Fatalf("unsafe calls: %v", *calls)
+			}
+		})
 	}
 }
 
