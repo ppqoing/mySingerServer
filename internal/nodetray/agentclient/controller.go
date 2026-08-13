@@ -137,6 +137,23 @@ func (c *Controller) SaveAgentForm(ctx context.Context, value trayconfig.AgentFo
 	return ConfigSaveResult{SHA256: payload.SHA256, RestartRequired: payload.RestartRequired}, nil
 }
 
+// StageAgentEndpoint records the endpoint from a locally saved Agent config.
+// It does not contact the Agent; promotion happens immediately before a start
+// or after a controlled shutdown.
+func (c *Controller) StageAgentEndpoint(value trayconfig.AgentForm) error {
+	if c == nil {
+		return errors.New("agent_controller_unavailable")
+	}
+	pendingEndpoint, err := LoopbackEndpoint(net.JoinHostPort(value.ListenHost, strconv.Itoa(value.ListenPort)))
+	if err != nil {
+		return errors.New("agent_config_invalid")
+	}
+	c.mu.Lock()
+	c.pendingEndpoint = pendingEndpoint
+	c.mu.Unlock()
+	return nil
+}
+
 // PromotePendingEndpoint makes the endpoint from the most recent successful
 // save active for future dials. It also retires any connection to the old
 // Agent, so a successful shutdown can never be followed by a stale call.

@@ -193,7 +193,7 @@ func TestStoreHelperACLRejectsUntrustedOwnerAndAcceptsTrustedOwner(t *testing.T)
 	safeParent := "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;" + currentSID + ")"
 	safeFile := "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GR;;;" + currentSID + ")"
 
-	t.Run("NewStore rejects deployment user owner on real paths", func(t *testing.T) {
+	t.Run("NewStore accepts deployment user owner on real paths", func(t *testing.T) {
 		root := filepath.Join(t.TempDir(), "helper-owner-"+uuid.NewString())
 		paths := Paths{
 			TraySettings:     filepath.Join(root, "tray", "settings.json"),
@@ -217,10 +217,9 @@ func TestStoreHelperACLRejectsUntrustedOwnerAndAcceptsTrustedOwner(t *testing.T)
 		})
 
 		_, err := NewStore(paths)
-		if err == nil {
-			t.Fatal("NewStore accepted deployment-user-owned Helper parent and file")
+		if err != nil {
+			t.Fatalf("NewStore rejected deployment-user-owned Helper config: %v", err)
 		}
-		assertErrorRedacted(t, err, root, paths.HelperConfig)
 	})
 
 	for _, tt := range []struct {

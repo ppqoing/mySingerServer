@@ -61,6 +61,14 @@ func (s *backendTestStore) LoadHelperForm() (trayconfig.HelperForm, error) {
 	s.recorder.add("load-helper")
 	return s.helper, nil
 }
+func (s *backendTestStore) ValidateHelperForm(trayconfig.HelperForm) []trayconfig.FieldError {
+	s.recorder.add("validate-helper")
+	return nil
+}
+func (s *backendTestStore) SaveHelperForm(trayconfig.HelperForm) (string, error) {
+	s.recorder.add("save-helper")
+	return strings.Repeat("b", 64), nil
+}
 
 type backendTestAgentConfig struct {
 	recorder *backendTestRecorder
@@ -384,15 +392,14 @@ func TestBackendForwardsEveryPublicOperationExactlyOnce(t *testing.T) {
 	requirePureSuccess(t, backend.OpenLocation(traymodel.AgentLogs))
 
 	wantCounts := map[string]int{
-		"load-settings": 7, "load-agent": 1, "load-helper": 1,
-		"agent-refresh": 1, "helper-refresh": 2, "workers-snapshot": 1,
-		"task-inspect": 1, "login-enabled": 2,
+		"load-settings": 7, "load-agent": 1, "load-helper": 3,
+		"agent-refresh": 3, "helper-refresh": 2, "workers-snapshot": 1,
+		"login-enabled":  2,
 		"validate-agent": 3, "save-agent": 2,
-		"promote-agent-endpoint": 1,
+		"promote-agent-endpoint": 2,
 		"agent-start":            2, "agent-stop": 2, "agent-restart": 1, "agent-force": 1,
-		"validate-helper": 2, "prepare-helper": 1,
-		"elevate-write_helper_config": 1,
-		"helper-start":                1, "helper-stop": 1, "helper-restart": 1, "helper-force": 1,
+		"validate-helper": 4, "save-helper": 1,
+		"helper-start": 1, "helper-stop": 1, "helper-restart": 1, "helper-force": 1,
 		"save-settings": 1,
 		"open-location": 1,
 	}

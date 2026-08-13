@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	trayconfig "dedup/internal/nodetray/config"
 	"dedup/internal/nodetray/traymodel"
 	"dedup/internal/nodetray/windows/singleinstance"
 )
@@ -49,6 +50,17 @@ type fakeSettings struct {
 	calls *[]string
 	value traymodel.TraySettings
 	err   error
+}
+
+type fakeHelperConfig struct{ calls *[]string }
+
+func (f fakeHelperConfig) LoadHelperForm() (trayconfig.HelperForm, error) {
+	*f.calls = append(*f.calls, "load-helper-config")
+	return trayconfig.HelperForm{}, nil
+}
+func (f fakeHelperConfig) ValidateHelperForm(trayconfig.HelperForm) []trayconfig.FieldError {
+	*f.calls = append(*f.calls, "validate-helper-config")
+	return nil
 }
 
 func (f fakeSettings) LoadTraySettings() (traymodel.TraySettings, error) {
@@ -199,7 +211,7 @@ func bootstrapFixture(t *testing.T, settings traymodel.TraySettings) (Dependenci
 	timer := &fakeTimer{calls: &calls}
 	scheduler := &fakeScheduler{calls: &calls, timer: timer}
 	return Dependencies{
-		Paths: fakePaths{calls: &calls, value: bootstrapPaths(t)}, Settings: fakeSettings{calls: &calls, value: settings},
+		Paths: fakePaths{calls: &calls, value: bootstrapPaths(t)}, Settings: fakeSettings{calls: &calls, value: settings}, HelperConfig: fakeHelperConfig{calls: &calls},
 		FinalPaths: fakeFinalPaths{},
 		Instance:   &fakeInstance{calls: &calls, lease: &fakeLease{calls: &calls}, listener: &fakeActivationListener{calls: &calls}},
 		Factory:    &fakeFactory{calls: &calls, agent: agent, helper: helper}, Task: &fakeTask{calls: &calls},
@@ -224,7 +236,7 @@ func TestStartCoversEightLoginAgentHelperModeCombinationsWithExactOrder(t *testi
 						want = append(want, "agent-start")
 					}
 					if helperMode == traymodel.StartAutomatic {
-						want = append(want, "task-run")
+						want = append(want, "load-helper-config", "validate-helper-config", "helper-start")
 					}
 					want = append(want, "schedule:2s:10s", "ui")
 					if !reflect.DeepEqual(*calls, want) {
@@ -254,7 +266,8 @@ func TestDuplicateInstanceOnlySignalsExistingAndCreatesNoComponents(t *testing.T
 func TestComponentFailuresBecomeAttentionAndDoNotPreventUI(t *testing.T) {
 	deps, calls, agent, _, _ := bootstrapFixture(t, bootstrapSettings(traymodel.StartAutomatic, traymodel.StartAutomatic, false))
 	agent.start = traymodel.OperationResult{ErrorCode: "start_failed", ErrorSummary: "password=secret\r\n"}
-	deps.Task.(*fakeTask).err = errors.New("postgres://u:p@db/media")
+	helper := deps.Factory.(*fakeFactory).helper.(*fakeManaged)
+	helper.start = traymodel.OperationResult{ErrorCode: "start_failed", ErrorSummary: "postgres://u:p@db/media"}
 	runtime, err := Start(context.Background(), deps)
 	if err != nil {
 		t.Fatalf("Start: %v", err)

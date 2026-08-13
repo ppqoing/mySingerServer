@@ -135,6 +135,50 @@ func TestStoreLoadsStrictPackageHelperDefaultForEditableFirstRun(t *testing.T) {
 	}
 }
 
+func TestStoreLoadsEditableActualHelperConfigWithEmptyRoots(t *testing.T) {
+	store, paths := newTestStore(t)
+	value := validHelperConfig(t)
+	value.AllowedRoots = []string{}
+	value.DeniedRoots = []string{`D:\nodetray-test-media\private`}
+	value.LogDir = ""
+	writeJSONFixture(t, paths.HelperConfig, value)
+
+	form, err := store.LoadHelperForm()
+	if err != nil {
+		t.Fatalf("LoadHelperForm: %v", err)
+	}
+	if len(form.AllowedRoots) != 0 || !reflect.DeepEqual(form.DeniedRoots, value.DeniedRoots) {
+		t.Fatalf("editable Helper form = %#v", form)
+	}
+	if form.LogDir != filepath.Join(filepath.Dir(paths.HelperConfig), "logs") {
+		t.Fatalf("LogDir = %q", form.LogDir)
+	}
+	if digest, err := store.HelperFingerprint(); err != nil || len(digest) != 64 {
+		t.Fatalf("HelperFingerprint = %q, %v", digest, err)
+	}
+}
+
+func TestStoreSaveHelperFormWritesLocalConfigAndLastGood(t *testing.T) {
+	store, paths := newTestStore(t)
+	first := HelperToForm(validHelperConfig(t))
+	firstSHA, err := store.SaveHelperForm(first)
+	if err != nil || len(firstSHA) != 64 {
+		t.Fatalf("first SaveHelperForm = %q, %v", firstSHA, err)
+	}
+	second := first
+	second.FrameReadTimeoutSec++
+	secondSHA, err := store.SaveHelperForm(second)
+	if err != nil || secondSHA == firstSHA {
+		t.Fatalf("second SaveHelperForm = %q, %v", secondSHA, err)
+	}
+	if _, _, err := loadHelperConfig(paths.HelperConfig, paths.HelperExecutable); err != nil {
+		t.Fatalf("formal Helper config: %v", err)
+	}
+	if _, _, err := loadHelperConfig(paths.HelperConfig+".last-good", paths.HelperExecutable); err != nil {
+		t.Fatalf("last-good Helper config: %v", err)
+	}
+}
+
 func TestStoreDoesNotHideMissingOfficialConfigWhenBackupExists(t *testing.T) {
 	store, paths := newTestStore(t)
 	writeBytesFixture(t, paths.AgentConfig+".last-good", mustCanonicalJSON(t, fullyPopulatedAgentConfig()))
@@ -227,7 +271,7 @@ func TestStoreStrictlyRejectsUnknownFieldsAndTrailingValuesWithoutLeakingInput(t
 	}
 }
 
-func TestStoreRejectsProtectedHelperInsideWritableConfigurationDirectory(t *testing.T) {
+func TestStoreAcceptsHelperInsideUserWritableConfigurationDirectory(t *testing.T) {
 	root := t.TempDir()
 	for _, helperPath := range []string{
 		filepath.Join(root, "writable", "helper.json"),
@@ -240,10 +284,9 @@ func TestStoreRejectsProtectedHelperInsideWritableConfigurationDirectory(t *test
 			AgentExecutable:  filepath.Join(root, "bin", "agent.exe"),
 			HelperExecutable: filepath.Join(root, "bin", "helper.exe"),
 		})
-		if err == nil {
-			t.Fatalf("NewStore accepted protected Helper path %q inside writable Agent directory", helperPath)
+		if err != nil {
+			t.Fatalf("NewStore rejected writable Helper path: %v", err)
 		}
-		assertErrorRedacted(t, err, root, helperPath)
 	}
 }
 

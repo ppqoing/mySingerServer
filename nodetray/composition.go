@@ -64,7 +64,7 @@ func composeProductionBackendWith(inputs productionCompositionInputs) (*Backend,
 	events := trayapp.NewEventBus(16)
 	runtimeLifecycle := production.NewRuntime(production.RuntimeDependencies{
 		Bootstrap: bootstrap.Dependencies{
-			Paths: inputs.Paths, FinalPaths: inputs.FinalPaths, Settings: inputs.Store,
+			Paths: inputs.Paths, FinalPaths: inputs.FinalPaths, Settings: inputs.Store, HelperConfig: inputs.Store,
 			Instance: inputs.Instance, Factory: inputs.Factory, Task: inputs.Task,
 			Scheduler: inputs.Scheduler, UI: inputs.UI,
 			Show: func() {

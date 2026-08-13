@@ -66,7 +66,7 @@ try {
         [IO.Path]::GetRelativePath($computeRoot, $_.FullName).Replace('\', '/')
     })
     Assert-True ($computeFiles -contains 'Start-Compute.ps1') 'Compute start script missing'
-    foreach ($required in @('data/agent/agent.json', 'data/nodetray/tray.json', 'helper.default.json')) {
+    foreach ($required in @('data/agent/agent.json', 'data/helper/helper.json', 'data/nodetray/tray.json')) {
         Assert-True ($computeFiles -contains $required) "Compute default configuration missing: $required"
     }
     foreach ($forbidden in @('gui.exe','agent.json','data/agent/agent.db','data/agent/local-control.token')) {

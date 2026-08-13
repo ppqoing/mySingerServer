@@ -33,39 +33,52 @@ func (v *Validator) ValidateHelper(value trayconfig.HelperForm) []trayconfig.Fie
 	return append([]trayconfig.FieldError(nil), v.store.ValidateHelperForm(value)...)
 }
 
+type agentConfigurationStore interface {
+	LoadAgentForm() (trayconfig.AgentForm, error)
+	ValidateAgentForm(trayconfig.AgentForm) []trayconfig.FieldError
+	SaveAgentForm(trayconfig.AgentForm) (string, error)
+}
+
 type agentConfigurationController interface {
-	LoadAgentForm(context.Context) (trayconfig.AgentForm, error)
-	ValidateAgentForm(context.Context, trayconfig.AgentForm) []trayconfig.FieldError
-	SaveAgentForm(context.Context, trayconfig.AgentForm) (agentclient.ConfigSaveResult, error)
+	StageAgentEndpoint(trayconfig.AgentForm) error
 	PromotePendingEndpoint()
 }
 
-type AgentConfigGateway struct{ controller agentConfigurationController }
-
-func NewAgentConfigGateway(controller agentConfigurationController) *AgentConfigGateway {
-	return &AgentConfigGateway{controller: controller}
+type AgentConfigGateway struct {
+	store      agentConfigurationStore
+	controller agentConfigurationController
 }
 
-func (g *AgentConfigGateway) LoadAgentForm(ctx context.Context) (trayconfig.AgentForm, error) {
-	if g == nil || g.controller == nil {
+func NewAgentConfigGateway(store agentConfigurationStore, controller agentConfigurationController) *AgentConfigGateway {
+	return &AgentConfigGateway{store: store, controller: controller}
+}
+
+func (g *AgentConfigGateway) LoadAgentForm(context.Context) (trayconfig.AgentForm, error) {
+	if g == nil || g.store == nil {
 		return trayconfig.AgentForm{}, errors.New("production Agent config unavailable")
 	}
-	return g.controller.LoadAgentForm(ctx)
+	return g.store.LoadAgentForm()
 }
 
-func (g *AgentConfigGateway) ValidateAgentForm(ctx context.Context, value trayconfig.AgentForm) []trayconfig.FieldError {
-	if g == nil || g.controller == nil {
+func (g *AgentConfigGateway) ValidateAgentForm(_ context.Context, value trayconfig.AgentForm) []trayconfig.FieldError {
+	if g == nil || g.store == nil {
 		return []trayconfig.FieldError{{Field: "agent", Code: "unavailable", Message: "Agent 配置验证不可用"}}
 	}
-	return g.controller.ValidateAgentForm(ctx, value)
+	return g.store.ValidateAgentForm(value)
 }
 
-func (g *AgentConfigGateway) SaveAgentForm(ctx context.Context, value trayconfig.AgentForm) (trayapp.AgentConfigSaveResult, error) {
-	if g == nil || g.controller == nil {
+func (g *AgentConfigGateway) SaveAgentForm(_ context.Context, value trayconfig.AgentForm) (trayapp.AgentConfigSaveResult, error) {
+	if g == nil || g.store == nil || g.controller == nil {
 		return trayapp.AgentConfigSaveResult{}, errors.New("production Agent config unavailable")
 	}
-	result, err := g.controller.SaveAgentForm(ctx, value)
-	return trayapp.AgentConfigSaveResult{SHA256: result.SHA256, RestartRequired: result.RestartRequired}, err
+	digest, err := g.store.SaveAgentForm(value)
+	if err != nil {
+		return trayapp.AgentConfigSaveResult{}, err
+	}
+	if err := g.controller.StageAgentEndpoint(value); err != nil {
+		return trayapp.AgentConfigSaveResult{SHA256: digest, RestartRequired: true}, err
+	}
+	return trayapp.AgentConfigSaveResult{SHA256: digest, RestartRequired: true}, nil
 }
 
 func (g *AgentConfigGateway) PromotePendingEndpoint() {

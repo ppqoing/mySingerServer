@@ -23,6 +23,8 @@ type Store interface {
 	LoadTraySettings() (traymodel.TraySettings, error)
 	SaveTraySettings(traymodel.TraySettings) error
 	LoadHelperForm() (config.HelperForm, error)
+	ValidateHelperForm(config.HelperForm) []config.FieldError
+	SaveHelperForm(config.HelperForm) (string, error)
 	PrepareHelperWrite(config.HelperForm) (config.PreparedWrite, error)
 	PrepareDefaultHelperWrite() (config.PreparedWrite, error)
 	HelperFingerprint() (string, error)
@@ -33,8 +35,8 @@ type AgentConfigSaveResult struct {
 	RestartRequired bool
 }
 
-// AgentConfigGateway is the authenticated, context-aware Socket boundary for
-// every interactive Agent configuration operation.
+// AgentConfigGateway owns local Agent configuration I/O and stages a changed
+// listen endpoint for the separate runtime control connection.
 type AgentConfigGateway interface {
 	LoadAgentForm(context.Context) (config.AgentForm, error)
 	ValidateAgentForm(context.Context, config.AgentForm) []config.FieldError
@@ -369,18 +371,7 @@ func (s *Service) GetOverview(ctx context.Context) (traymodel.Overview, error) {
 			overview.Workers = sanitizeWorkers(workers)
 		}
 	}
-	if s.task != nil {
-		status, inspectErr := s.task.Inspect(ctx)
-		if inspectErr != nil {
-			overview.Helper.NeedsAttention = true
-			overview.HelperTaskDrift = true
-		} else {
-			overview.HelperTaskDrift = status.Installed != (settings.HelperEnabled && settings.HelperStartMode == traymodel.StartAutomatic)
-		}
-	} else {
-		overview.HelperTaskDrift = true
-		overview.Helper.NeedsAttention = true
-	}
+	overview.HelperTaskDrift = false
 	if s.loginStart != nil {
 		enabled, current, loginErr := s.loginStart.Enabled()
 		if loginErr != nil {
@@ -440,7 +431,11 @@ func (s *Service) saveAgentLocked(ctx context.Context, value config.AgentForm) t
 	if updated := sanitizeOperation(s.agentFingerprint.UpdateExpectedSHA256(saved.SHA256)); !updated.OK {
 		return savedConfigApplyFailure(updated.ErrorCode, updated.ErrorSummary, saved.SHA256, true)
 	}
-	return traymodel.ConfigApplyResult{OK: true, Saved: true, SHA256: saved.SHA256, NeedsRestart: saved.RestartRequired}
+	needsRestart := saved.RestartRequired
+	if s.agent != nil {
+		needsRestart = s.agent.Refresh(ctx).NeedsRestart
+	}
+	return traymodel.ConfigApplyResult{OK: true, Saved: true, SHA256: saved.SHA256, NeedsRestart: needsRestart}
 }
 
 func (s *Service) SaveAndRestartAgent(ctx context.Context, value config.AgentForm) traymodel.ConfigApplyResult {
@@ -457,7 +452,6 @@ func (s *Service) SaveAndRestartAgent(ctx context.Context, value config.AgentFor
 	if !stopped.OK {
 		return savedConfigApplyFailure(stopped.ErrorCode, stopped.ErrorSummary, saved.SHA256, true)
 	}
-	s.agentConfig.PromotePendingEndpoint()
 	started := s.StartAgent(ctx)
 	if !started.OK {
 		return savedConfigApplyFailure(started.ErrorCode, started.ErrorSummary, saved.SHA256, true)
@@ -468,6 +462,9 @@ func (s *Service) SaveAndRestartAgent(ctx context.Context, value config.AgentFor
 func (s *Service) StartAgent(ctx context.Context) traymodel.OperationResult {
 	if s == nil {
 		return operationFailure("unavailable", "组件服务不可用")
+	}
+	if s.agentConfig != nil {
+		s.agentConfig.PromotePendingEndpoint()
 	}
 	return callComponent(s, s.agent, ctx, "start")
 }
@@ -557,48 +554,37 @@ func (s *Service) GetHelperForm(context.Context) (config.HelperForm, error) {
 }
 
 func (s *Service) ValidateHelper(_ context.Context, value config.HelperForm) []config.FieldError {
-	if s == nil || s.validator == nil {
+	if s == nil || s.store == nil {
 		return []config.FieldError{{Field: "helper", Code: "unavailable", Message: "验证服务不可用"}}
 	}
-	return sanitizeFieldErrors(s.validator.ValidateHelper(value))
+	return sanitizeFieldErrors(s.store.ValidateHelperForm(value))
 }
 
 func (s *Service) SaveHelper(ctx context.Context, value config.HelperForm) traymodel.ConfigApplyResult {
 	if fields := s.ValidateHelper(ctx, value); len(fields) != 0 {
 		return configApplyFailure("invalid_config", fields[0].Message)
 	}
-	if s == nil || s.store == nil || s.elevation == nil {
+	if s == nil || s.store == nil {
 		return configApplyFailure("unavailable", "Helper 配置服务不可用")
 	}
-	prepared, err := s.store.PrepareHelperWrite(value)
+	digest, err := s.store.SaveHelperForm(value)
 	if err != nil {
+		if errors.Is(err, config.ErrSaveVerify) {
+			return configApplyFailure("save_verify_failed", err.Error())
+		}
 		return configApplyFailure("save_failed", err.Error())
-	}
-	payload, err := msgpack.Marshal(prepared)
-	if err != nil {
-		return configApplyFailure("save_failed", "配置请求编码失败")
-	}
-	invoked, err := s.elevation.Invoke(ctx, elevation.ActionWriteHelperConfig, payload)
-	if err != nil {
-		return configApplyFailure("save_failed", err.Error())
-	}
-	if invoked.UACCancelled {
-		return configApplyFailure(elevation.ErrorCodeUACCancelled, invoked.Response.ErrorSummary)
-	}
-	if !invoked.Response.OK {
-		return configApplyFailure(stableCode(invoked.Response.ErrorCode, "save_failed"), invoked.Response.ErrorSummary)
 	}
 	if s.helperFingerprint == nil {
-		return savedConfigApplyFailure("unavailable", "Helper 摘要更新服务不可用", prepared.SHA256, true)
+		return savedConfigApplyFailure("unavailable", "Helper 摘要更新服务不可用", digest, true)
 	}
-	if updated := sanitizeOperation(s.helperFingerprint.UpdateExpectedSHA256(prepared.SHA256)); !updated.OK {
-		return savedConfigApplyFailure(updated.ErrorCode, updated.ErrorSummary, prepared.SHA256, true)
+	if updated := sanitizeOperation(s.helperFingerprint.UpdateExpectedSHA256(digest)); !updated.OK {
+		return savedConfigApplyFailure(updated.ErrorCode, updated.ErrorSummary, digest, true)
 	}
 	needsRestart := false
 	if s.helper != nil {
 		needsRestart = s.helper.Refresh(ctx).NeedsRestart
 	}
-	return traymodel.ConfigApplyResult{OK: true, Saved: true, SHA256: prepared.SHA256, NeedsRestart: needsRestart}
+	return traymodel.ConfigApplyResult{OK: true, Saved: true, SHA256: digest, NeedsRestart: needsRestart}
 }
 
 func (s *Service) StartHelper(ctx context.Context) traymodel.OperationResult {
@@ -609,11 +595,8 @@ func (s *Service) StartHelper(ctx context.Context) traymodel.OperationResult {
 	if !settings.HelperEnabled {
 		return operationFailure("helper_disabled", "Helper 未启用")
 	}
-	if result := s.ensureDefaultHelperConfig(ctx); !result.OK {
+	if result := s.validateHelperStart(); !result.OK {
 		return result
-	}
-	if settings.HelperStartMode == traymodel.StartAutomatic {
-		return taskOperation(ctx, s.task)
 	}
 	return callComponent(s, s.helper, ctx, "start")
 }
@@ -630,18 +613,28 @@ func (s *Service) StopHelper(ctx context.Context) traymodel.OperationResult {
 }
 
 func (s *Service) RestartHelper(ctx context.Context) traymodel.OperationResult {
-	settings, result := s.helperSettings()
+	_, result := s.helperSettings()
 	if !result.OK {
 		return result
 	}
-	if settings.HelperStartMode == traymodel.StartAutomatic {
-		stopped := callComponent(s, s.helper, ctx, "stop")
-		if !stopped.OK {
-			return stopped
-		}
-		return taskOperation(ctx, s.task)
+	if result := s.validateHelperStart(); !result.OK {
+		return result
 	}
 	return callComponent(s, s.helper, ctx, "restart")
+}
+
+func (s *Service) validateHelperStart() traymodel.OperationResult {
+	if s == nil || s.store == nil {
+		return operationFailure("helper_config_invalid", "Helper 配置不可用")
+	}
+	value, err := s.store.LoadHelperForm()
+	if err != nil {
+		return operationFailure("helper_config_invalid", "Helper 配置读取失败")
+	}
+	if fields := s.store.ValidateHelperForm(value); len(fields) != 0 {
+		return operationFailure("helper_config_invalid", fields[0].Message)
+	}
+	return traymodel.OperationResult{OK: true}
 }
 
 func (s *Service) ForceStopHelper(ctx context.Context) traymodel.OperationResult {
@@ -663,7 +656,7 @@ func (s *Service) SaveTraySettings(ctx context.Context, value traymodel.TraySett
 	if err := value.Validate(); err != nil {
 		return operationFailure("invalid_config", err.Error())
 	}
-	if s == nil || s.store == nil || s.loginStart == nil || s.elevation == nil {
+	if s == nil || s.store == nil || s.loginStart == nil {
 		return operationFailure("unavailable", "设置服务不可用")
 	}
 	current, err := s.store.LoadTraySettings()
@@ -671,18 +664,6 @@ func (s *Service) SaveTraySettings(ctx context.Context, value traymodel.TraySett
 		return operationFailure("load_failed", err.Error())
 	}
 	loginChanged := current.LoginStartTray != value.LoginStartTray
-	helperPolicyChanged := current.HelperEnabled != value.HelperEnabled || current.HelperStartMode != value.HelperStartMode
-
-	if helperPolicyChanged {
-		if value.HelperEnabled {
-			if result := s.ensureDefaultHelperConfig(ctx); !result.OK {
-				return result
-			}
-		}
-		if result := s.reconcileHelperTaskPolicy(ctx, value); !result.OK {
-			return result
-		}
-	}
 
 	if loginChanged {
 		if value.LoginStartTray {
@@ -691,19 +672,19 @@ func (s *Service) SaveTraySettings(ctx context.Context, value traymodel.TraySett
 			err = s.loginStart.Disable()
 		}
 		if err != nil {
-			s.reloadSettingsActualState(ctx, helperPolicyChanged)
+			s.reloadSettingsActualState(ctx, false)
 			return operationFailure("settings_partially_applied", err.Error())
 		}
 	}
 
 	if err := s.store.SaveTraySettings(value); err != nil {
-		s.reloadSettingsActualState(ctx, helperPolicyChanged)
-		if helperPolicyChanged || loginChanged {
+		s.reloadSettingsActualState(ctx, false)
+		if loginChanged {
 			return operationFailure("settings_partially_applied", err.Error())
 		}
 		return operationFailure("save_failed", err.Error())
 	}
-	if err := s.reloadSettingsActualState(ctx, helperPolicyChanged); err != nil {
+	if err := s.reloadSettingsActualState(ctx, false); err != nil {
 		return operationFailure("settings_partially_applied", err.Error())
 	}
 	return traymodel.OperationResult{OK: true}

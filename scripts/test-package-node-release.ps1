@@ -141,7 +141,7 @@ try {
         'agent.exe',
         'avcodec-fixture.dll',
         'data/nodetray/tray.json',
-        'helper.default.json',
+        'data/helper/helper.json',
         'helper.exe',
         'licenses/ffmpeg-LICENSE.txt',
         'licenses/ffmpeg-NOTICE.md',
@@ -157,10 +157,6 @@ try {
     $difference = @(Compare-Object -ReferenceObject $expectedFiles -DifferenceObject $actualFiles)
     Assert-True ($difference.Count -eq 0) (
         'ZIP file list differs: ' + (($difference | Out-String).Trim()))
-    Assert-True (-not (Test-Path -LiteralPath (
-            Join-Path $payloadRoot 'data\helper'))) `
-        'fresh Compute package must not pre-create data\helper'
-
     $agent = Get-Content -Raw -LiteralPath (Join-Path $payloadRoot 'data\agent\agent.json') | ConvertFrom-Json
     Assert-True ([string]$agent.data_dir -ceq './data/agent') 'unsafe Agent data root'
     Assert-True ($null -ne $agent.worker -and [int]$agent.worker.image_memory_mb -eq 256) 'Worker defaults missing'
@@ -170,7 +166,7 @@ try {
     $tray = Get-Content -Raw -LiteralPath (Join-Path $payloadRoot 'data\nodetray\tray.json') | ConvertFrom-Json
     Assert-True (-not [bool]$tray.helperEnabled -and [string]$tray.agentStartMode -ceq 'automatic') `
         'Compute package must auto-start Agent so NodeTray can reach the packaged Agent configuration'
-    $helper = Get-Content -Raw -LiteralPath (Join-Path $payloadRoot 'helper.default.json') | ConvertFrom-Json
+    $helper = Get-Content -Raw -LiteralPath (Join-Path $payloadRoot 'data\helper\helper.json') | ConvertFrom-Json
     Assert-True (@($helper.allowed_roots).Count -eq 0) 'Helper default must not authorize a root'
     Assert-True (-not [bool]$helper.allow_hard_delete -and [string]$helper.log_dir -ceq '') `
         'Helper default must not enable hard deletion or logging'

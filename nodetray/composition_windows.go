@@ -29,6 +29,9 @@ import (
 
 type windowsProductionStore interface {
 	trayapp.Store
+	LoadAgentForm() (trayconfig.AgentForm, error)
+	ValidateAgentForm(trayconfig.AgentForm) []trayconfig.FieldError
+	SaveAgentForm(trayconfig.AgentForm) (string, error)
 	production.FormValidationStore
 	production.FingerprintSource
 	bootstrap.SettingsLoader
@@ -237,7 +240,7 @@ func buildWindowsProductionInputs(layout production.Layout, userSID string, nati
 	}
 	finalPaths := bootstrap.OSFinalPathResolver{}
 	return productionCompositionInputs{
-		Store: native.Store, Validator: production.NewValidator(native.Store), AgentConfig: production.NewAgentConfigGateway(sharedAgentController), LocalAgent: sharedAgentController,
+		Store: native.Store, Validator: production.NewValidator(native.Store), AgentConfig: production.NewAgentConfigGateway(native.Store, sharedAgentController), LocalAgent: sharedAgentController,
 		MachineID: native.MachineID,
 		Agent:     factory.Agent(), Helper: factory.Helper(),
 		AgentFingerprint: factory.Agent(), HelperFingerprint: factory.Helper(),

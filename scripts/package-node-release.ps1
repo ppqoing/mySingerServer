@@ -230,8 +230,7 @@ Start-Process -FilePath (Join-Path $root 'nodetray.exe') -WorkingDirectory $root
             'Everything64.dll',
             'licenses\everything-LICENSE.txt',
             'licenses\everything-NOTICE.md',
-            'MicrosoftEdgeWebview2Setup.exe',
-            'helper.default.json')) {
+            'MicrosoftEdgeWebview2Setup.exe')) {
         Copy-RequiredFile -SourceRoot $stage -RelativeSource $name `
             -DestinationRoot $payload
     }
@@ -239,6 +238,8 @@ Start-Process -FilePath (Join-Path $root 'nodetray.exe') -WorkingDirectory $root
         -DestinationRoot $payload -RelativeDestination 'data\\agent\\agent.json'
     Copy-RequiredFile -SourceRoot $stage -RelativeSource 'nodetray.default.json' `
         -DestinationRoot $payload -RelativeDestination 'data\\nodetray\\tray.json'
+    Copy-RequiredFile -SourceRoot $stage -RelativeSource 'helper.default.json' `
+        -DestinationRoot $payload -RelativeDestination 'data\\helper\\helper.json'
     Copy-RequiredFile -SourceRoot $stage `
         -RelativeSource 'native-dependencies.json' `
         -DestinationRoot $payload

@@ -10,7 +10,6 @@ import (
 	"testing"
 
 	"dedup/internal/nodectl"
-	"dedup/internal/nodetray/agentclient"
 	trayapp "dedup/internal/nodetray/app"
 	trayconfig "dedup/internal/nodetray/config"
 	"dedup/internal/nodetray/traymodel"
@@ -22,34 +21,42 @@ type fakeValidationStore struct {
 }
 
 type fakeAgentConfigurationController struct {
-	ctx      context.Context
-	form     trayconfig.AgentForm
-	result   agentclient.ConfigSaveResult
 	promoted bool
+	staged   trayconfig.AgentForm
 }
 
-func (f *fakeAgentConfigurationController) LoadAgentForm(ctx context.Context) (trayconfig.AgentForm, error) {
-	f.ctx = ctx
+type fakeLocalAgentConfigStore struct {
+	form   trayconfig.AgentForm
+	fields []trayconfig.FieldError
+	digest string
+	calls  []string
+}
+
+func (f *fakeLocalAgentConfigStore) LoadAgentForm() (trayconfig.AgentForm, error) {
+	f.calls = append(f.calls, "load")
 	return f.form, nil
 }
-func (f *fakeAgentConfigurationController) ValidateAgentForm(ctx context.Context, _ trayconfig.AgentForm) []trayconfig.FieldError {
-	f.ctx = ctx
-	return nil
+func (f *fakeLocalAgentConfigStore) ValidateAgentForm(trayconfig.AgentForm) []trayconfig.FieldError {
+	f.calls = append(f.calls, "validate")
+	return append([]trayconfig.FieldError(nil), f.fields...)
 }
-func (f *fakeAgentConfigurationController) SaveAgentForm(ctx context.Context, _ trayconfig.AgentForm) (agentclient.ConfigSaveResult, error) {
-	f.ctx = ctx
-	return f.result, nil
+func (f *fakeLocalAgentConfigStore) SaveAgentForm(trayconfig.AgentForm) (string, error) {
+	f.calls = append(f.calls, "save")
+	return f.digest, nil
+}
+
+func (f *fakeAgentConfigurationController) StageAgentEndpoint(value trayconfig.AgentForm) error {
+	f.staged = value
+	return nil
 }
 func (f *fakeAgentConfigurationController) PromotePendingEndpoint() { f.promoted = true }
 
-func TestAgentConfigGatewayAdaptsSocketControllerWithoutLocalStore(t *testing.T) {
-	wantForm := trayconfig.AgentForm{DataDir: "socket-agent"}
+func TestAgentConfigGatewayUsesLocalStoreAndOnlyStagesSocketEndpoint(t *testing.T) {
+	wantForm := trayconfig.AgentForm{DataDir: "local-agent", ListenHost: "0.0.0.0", ListenPort: 9201}
 	wantSHA := strings.Repeat("c", 64)
-	controller := &fakeAgentConfigurationController{
-		form:   wantForm,
-		result: agentclient.ConfigSaveResult{SHA256: wantSHA, RestartRequired: true},
-	}
-	gateway := NewAgentConfigGateway(controller)
+	store := &fakeLocalAgentConfigStore{form: wantForm, digest: wantSHA}
+	controller := &fakeAgentConfigurationController{}
+	gateway := NewAgentConfigGateway(store, controller)
 	var _ trayapp.AgentConfigGateway = gateway
 	ctx := context.WithValue(context.Background(), struct{ key string }{"gateway"}, "marker")
 	if got, err := gateway.LoadAgentForm(ctx); err != nil || !reflect.DeepEqual(got, wantForm) {
@@ -63,8 +70,8 @@ func TestAgentConfigGatewayAdaptsSocketControllerWithoutLocalStore(t *testing.T)
 		t.Fatalf("SaveAgentForm = %#v, %v", result, err)
 	}
 	gateway.PromotePendingEndpoint()
-	if controller.ctx != ctx || !controller.promoted {
-		t.Fatal("gateway lost request context or endpoint promotion")
+	if !reflect.DeepEqual(store.calls, []string{"load", "validate", "save"}) || !reflect.DeepEqual(controller.staged, wantForm) || !controller.promoted {
+		t.Fatalf("local calls=%v staged=%#v promoted=%t", store.calls, controller.staged, controller.promoted)
 	}
 }
 

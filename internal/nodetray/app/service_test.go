@@ -30,6 +30,7 @@ type fakeStore struct {
 	fingerprintErr error
 	loadErr        error
 	loadCalls      int
+	helperFields   []config.FieldError
 }
 
 func (f *fakeStore) LoadTraySettings() (traymodel.TraySettings, error) {
@@ -44,6 +45,16 @@ func (f *fakeStore) SaveTraySettings(v traymodel.TraySettings) error {
 	return f.saveErr
 }
 func (f *fakeStore) LoadHelperForm() (config.HelperForm, error) { return f.helper, f.loadErr }
+func (f *fakeStore) ValidateHelperForm(config.HelperForm) []config.FieldError {
+	return append([]config.FieldError(nil), f.helperFields...)
+}
+func (f *fakeStore) SaveHelperForm(config.HelperForm) (string, error) {
+	*f.calls = append(*f.calls, "save-helper")
+	if f.saveErr != nil {
+		return "", f.saveErr
+	}
+	return f.prepared.SHA256, nil
+}
 func (f *fakeStore) PrepareHelperWrite(config.HelperForm) (config.PreparedWrite, error) {
 	*f.calls = append(*f.calls, "prepare-helper")
 	if f.saveErr != nil {
@@ -410,8 +421,8 @@ func TestOverviewNormalizesDisabledUnavailableHelperAndKeepsTaskDrift(t *testing
 	if !reflect.DeepEqual(overview.Helper, wantHelper) {
 		t.Fatalf("disabled Helper = %#v, want %#v", overview.Helper, wantHelper)
 	}
-	if !overview.HelperTaskDrift {
-		t.Fatal("installed Helper task drift was hidden by disabled normalization")
+	if overview.HelperTaskDrift {
+		t.Fatal("obsolete Helper task affected current direct-start state")
 	}
 	if overview.Agent.Lifecycle != traymodel.Failed || overview.Agent.ErrorCode != "agent_failed" {
 		t.Fatalf("Agent state was changed by Helper normalization: %#v", overview.Agent)
@@ -482,7 +493,7 @@ func TestGetterErrorsAreSanitizedBeforeTheyReachUI(t *testing.T) {
 	}
 }
 
-func TestAgentConfigOperationsUseContextAwareSocketGatewayAndReturnedRestartState(t *testing.T) {
+func TestAgentConfigOperationsUseGatewayAndRuntimeRestartState(t *testing.T) {
 	s, calls, store, agent, _, _ := serviceFixture(t)
 	store.saveErr = errors.New("local-store-write-must-not-be-used")
 	agent.state = traymodel.ComponentState{NeedsRestart: false}
@@ -504,7 +515,7 @@ func TestAgentConfigOperationsUseContextAwareSocketGatewayAndReturnedRestartStat
 		t.Fatalf("ValidateAgent = %#v", fields)
 	}
 	result := s.SaveAgent(ctx, wantForm)
-	if !result.OK || !result.Saved || result.SHA256 != wantSHA || !result.NeedsRestart {
+	if !result.OK || !result.Saved || result.SHA256 != wantSHA || result.NeedsRestart {
 		t.Fatalf("SaveAgent = %#v", result)
 	}
 	if gateway.loadCtx != ctx || gateway.validateCtx != ctx || gateway.saveCtx != ctx {
@@ -850,23 +861,22 @@ func TestSecondSaveCannotEnterSaveAndRestartBetweenOldStopAndNewStart(t *testing
 	}
 }
 
-func TestSaveHelperInvokesOneShotExactlyOnceAndUACCancelDoesNotTouchSupervisor(t *testing.T) {
+func TestSaveHelperWritesLocallyWithoutElevation(t *testing.T) {
 	s, calls, _, _, _, elevated := serviceFixture(t)
-	elevated.result = elevation.InvocationResult{UACCancelled: true, Response: elevation.Response{ErrorCode: elevation.ErrorCodeUACCancelled, ErrorSummary: "password=secret\r\n"}}
 	result := s.SaveHelper(context.Background(), config.HelperForm{})
-	if result.OK || result.ErrorCode != elevation.ErrorCodeUACCancelled {
+	if !result.OK {
 		t.Fatalf("SaveHelper = %#v", result)
 	}
-	if !reflect.DeepEqual(*calls, []string{"prepare-helper", "elevate-write_helper_config"}) {
+	if !reflect.DeepEqual(*calls, []string{"save-helper", "helper-sha"}) {
 		t.Fatalf("calls = %v", *calls)
 	}
-	if len(elevated.actions) != 1 {
+	if len(elevated.actions) != 0 {
 		t.Fatalf("elevation calls = %d", len(elevated.actions))
 	}
 }
 
-func TestSaveHelperPublishesPreparedFingerprintOnlyAfterElevatedSuccess(t *testing.T) {
-	s, calls, _, _, _, elevated := serviceFixture(t)
+func TestSaveHelperPublishesFingerprintOnlyAfterLocalWrite(t *testing.T) {
+	s, calls, store, _, _, elevated := serviceFixture(t)
 	updater := &fakeFingerprintUpdater{name: "helper", calls: calls}
 	s.helperFingerprint = updater
 
@@ -874,21 +884,21 @@ func TestSaveHelperPublishesPreparedFingerprintOnlyAfterElevatedSuccess(t *testi
 		t.Fatalf("SaveHelper = %#v", result)
 	}
 	wantSHA := strings.Repeat("a", 64)
-	if !reflect.DeepEqual(*calls, []string{"prepare-helper", "elevate-write_helper_config", "helper-sha"}) || !reflect.DeepEqual(updater.values, []string{wantSHA}) {
+	if !reflect.DeepEqual(*calls, []string{"save-helper", "helper-sha"}) || !reflect.DeepEqual(updater.values, []string{wantSHA}) {
 		t.Fatalf("calls=%v values=%v", *calls, updater.values)
 	}
 
 	*calls = nil
-	elevated.result = elevation.InvocationResult{Response: elevation.Response{OK: false, ErrorCode: "write_failed"}}
+	store.saveErr = errors.New("write failed")
 	if result := s.SaveHelper(context.Background(), config.HelperForm{}); result.OK {
 		t.Fatalf("failed SaveHelper = %#v", result)
 	}
-	if !reflect.DeepEqual(*calls, []string{"prepare-helper", "elevate-write_helper_config"}) || len(updater.values) != 1 {
-		t.Fatalf("failed elevated write published fingerprint: calls=%v values=%v", *calls, updater.values)
+	if !reflect.DeepEqual(*calls, []string{"save-helper"}) || len(updater.values) != 1 || len(elevated.actions) != 0 {
+		t.Fatalf("failed local write published fingerprint or elevated: calls=%v values=%v elevation=%v", *calls, updater.values, elevated.actions)
 	}
 }
 
-func TestHelperManualAndAutomaticOperationsUseExclusiveRoutes(t *testing.T) {
+func TestHelperManualAndAutomaticModesBothUseElevatedComponentLauncher(t *testing.T) {
 	s, calls, store, _, _, _ := serviceFixture(t)
 	_ = s.StartHelper(context.Background())
 	_ = s.StopHelper(context.Background())
@@ -902,77 +912,19 @@ func TestHelperManualAndAutomaticOperationsUseExclusiveRoutes(t *testing.T) {
 	_ = s.StartHelper(context.Background())
 	_ = s.StopHelper(context.Background())
 	_ = s.RestartHelper(context.Background())
-	if !reflect.DeepEqual(*calls, []string{"task-run", "helper-stop", "helper-stop", "task-run"}) {
+	if !reflect.DeepEqual(*calls, []string{"helper-start", "helper-stop", "helper-restart"}) {
 		t.Fatalf("automatic calls = %v", *calls)
 	}
 }
 
-func TestStartHelperImportsDefaultBeforeStarting(t *testing.T) {
-	s, calls, store, _, _, _ := serviceFixture(t)
-	store.defaultErr = nil
-	if result := s.StartHelper(context.Background()); !result.OK {
-		t.Fatalf("StartHelper: %#v", result)
-	}
-	if !reflect.DeepEqual(*calls, []string{"prepare-default-helper", "elevate-write_helper_config", "read-helper-fingerprint", "helper-sha", "helper-start"}) {
-		t.Fatalf("calls = %v", *calls)
-	}
-}
-
-func TestStartHelperUsesCompetitionWinnerFingerprint(t *testing.T) {
+func TestInvalidHelperConfigDoesNotInvokeElevatedLauncher(t *testing.T) {
 	s, calls, store, _, _, elevated := serviceFixture(t)
-	store.defaultErr = nil
-	store.fingerprint = strings.Repeat("c", 64)
-	elevated.result.Response = elevation.Response{OK: false, ErrorCode: elevation.ErrorCodeHelperConfigExists, ErrorSummary: "helper configuration already exists"}
-	if result := s.StartHelper(context.Background()); !result.OK {
-		t.Fatalf("StartHelper: %#v", result)
+	store.helperFields = []config.FieldError{{Field: "allowedRoots", Code: "required", Message: "至少配置一个目录"}}
+	if result := s.StartHelper(context.Background()); result.OK || result.ErrorCode != "helper_config_invalid" {
+		t.Fatalf("StartHelper = %#v", result)
 	}
-	if !reflect.DeepEqual(*calls, []string{"prepare-default-helper", "elevate-write_helper_config", "read-helper-fingerprint", "helper-sha", "helper-start"}) {
-		t.Fatalf("calls = %v", *calls)
-	}
-	updater := s.helperFingerprint.(*fakeFingerprintUpdater)
-	if !reflect.DeepEqual(updater.values, []string{store.fingerprint}) || updater.values[0] == store.prepared.SHA256 {
-		t.Fatalf("updated SHA = %v, winner=%q prepared=%q", updater.values, store.fingerprint, store.prepared.SHA256)
-	}
-}
-
-func TestStartHelperDefaultImportFailuresDoNotStart(t *testing.T) {
-	for _, test := range []struct {
-		name  string
-		setup func(*fakeStore, *fakeElevation)
-	}{
-		{"invalid", func(store *fakeStore, _ *fakeElevation) { store.defaultErr = errors.New("invalid") }},
-		{"uac", func(store *fakeStore, elevated *fakeElevation) {
-			store.defaultErr = nil
-			elevated.result.UACCancelled = true
-		}},
-		{"write", func(store *fakeStore, elevated *fakeElevation) {
-			store.defaultErr = nil
-			elevated.result.Response = elevation.Response{OK: false, ErrorCode: elevation.ErrorCodeWriteFailed, ErrorSummary: "configuration write failed"}
-		}},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			s, calls, store, _, _, elevated := serviceFixture(t)
-			test.setup(store, elevated)
-			if result := s.StartHelper(context.Background()); result.OK {
-				t.Fatal("StartHelper succeeded")
-			}
-			if strings.Contains(strings.Join(*calls, ","), "helper-start") {
-				t.Fatalf("helper started: %v", *calls)
-			}
-		})
-	}
-}
-
-func TestAutomaticHelperRestartShortCircuitsBeforeTaskRunWhenControlledStopFails(t *testing.T) {
-	s, calls, store, _, helper, _ := serviceFixture(t)
-	store.settings.HelperStartMode = traymodel.StartAutomatic
-	helper.results["stop"] = traymodel.OperationResult{ErrorCode: "stop_timeout", ErrorSummary: "password=secret"}
-	result := s.RestartHelper(context.Background())
-	if result.OK || result.ErrorCode != "stop_timeout" {
-		t.Fatalf("RestartHelper = %#v", result)
-	}
-	if !reflect.DeepEqual(*calls, []string{"helper-stop"}) {
-		t.Fatalf("calls = %v", *calls)
+	if len(*calls) != 0 || len(elevated.actions) != 0 {
+		t.Fatalf("invalid config started or elevated: calls=%v elevation=%v", *calls, elevated.actions)
 	}
 }
 
@@ -1183,17 +1135,17 @@ func TestSaveTraySettingsAppliesOnlyChangedLoginSettingBeforeDiskCommit(t *testi
 	}
 }
 
-func TestSaveTraySettingsHelperPolicyChangeRunsElevationBeforeDiskCommit(t *testing.T) {
+func TestSaveTraySettingsHelperPolicyChangeOnlyPersistsSettings(t *testing.T) {
 	s, calls, _, _, _, elevated := serviceFixture(t)
 	value := validSettings()
 	value.HelperStartMode = traymodel.StartAutomatic
 
 	result := s.SaveTraySettings(context.Background(), value)
 
-	if !result.OK || !reflect.DeepEqual(*calls, []string{"elevate-install_helper_task", "save-settings"}) {
+	if !result.OK || !reflect.DeepEqual(*calls, []string{"save-settings"}) {
 		t.Fatalf("result=%#v calls=%v", result, *calls)
 	}
-	if !reflect.DeepEqual(elevated.actions, []elevation.Action{elevation.ActionInstallHelperTask}) {
+	if len(elevated.actions) != 0 {
 		t.Fatalf("elevation actions = %v", elevated.actions)
 	}
 }
@@ -1215,7 +1167,7 @@ func TestSaveTraySettingsManualHelperEnableSkipsTaskRemovalWhenTaskAbsent(t *tes
 	if !reflect.DeepEqual(*calls, []string{"save-settings"}) {
 		t.Fatalf("calls=%v", *calls)
 	}
-	if task.inspectCalls != 2 || len(elevated.actions) != 0 {
+	if task.inspectCalls != 0 || len(elevated.actions) != 0 {
 		t.Fatalf("inspect=%d elevation=%v", task.inspectCalls, elevated.actions)
 	}
 }
@@ -1237,7 +1189,7 @@ func TestSaveTraySettingsHelperTaskAlreadyMatchesTargetSkipsElevation(t *testing
 	}
 }
 
-func TestSaveTraySettingsHelperTaskInspectFailureDoesNotPersistPolicy(t *testing.T) {
+func TestSaveTraySettingsIgnoresObsoleteHelperTaskInspectFailure(t *testing.T) {
 	s, calls, store, _, _, elevated := serviceFixture(t)
 	store.settings.HelperEnabled = false
 	task := s.task.(*fakeTask)
@@ -1247,15 +1199,15 @@ func TestSaveTraySettingsHelperTaskInspectFailureDoesNotPersistPolicy(t *testing
 
 	result := s.SaveTraySettings(context.Background(), value)
 
-	if result.OK || result.ErrorCode != "task_failed" || store.settings.HelperEnabled {
+	if !result.OK || !store.settings.HelperEnabled {
 		t.Fatalf("result=%#v persisted=%#v", result, store.settings)
 	}
-	if len(*calls) != 0 || len(elevated.actions) != 0 {
+	if !reflect.DeepEqual(*calls, []string{"save-settings"}) || len(elevated.actions) != 0 {
 		t.Fatalf("calls=%v elevation=%v", *calls, elevated.actions)
 	}
 }
 
-func TestSaveTraySettingsRemovesInstalledHelperTaskBeforePersistingManualOrDisabledPolicy(t *testing.T) {
+func TestSaveTraySettingsDoesNotMutateObsoleteHelperTask(t *testing.T) {
 	tests := []struct {
 		name    string
 		current traymodel.TraySettings
@@ -1290,17 +1242,17 @@ func TestSaveTraySettingsRemovesInstalledHelperTaskBeforePersistingManualOrDisab
 			if !result.OK || !reflect.DeepEqual(store.settings, tt.value) {
 				t.Fatalf("result=%#v persisted=%#v, want %#v", result, store.settings, tt.value)
 			}
-			if !reflect.DeepEqual(*calls, []string{"elevate-remove_helper_task", "save-settings"}) {
+			if !reflect.DeepEqual(*calls, []string{"save-settings"}) {
 				t.Fatalf("calls=%v", *calls)
 			}
-			if !reflect.DeepEqual(elevated.actions, []elevation.Action{elevation.ActionRemoveHelperTask}) {
+			if len(elevated.actions) != 0 {
 				t.Fatalf("elevation actions=%v", elevated.actions)
 			}
 		})
 	}
 }
 
-func TestSaveTraySettingsUACCancelDoesNotPersistRequestedPolicy(t *testing.T) {
+func TestSaveTraySettingsDoesNotRequestUAC(t *testing.T) {
 	s, calls, store, _, _, elevated := serviceFixture(t)
 	elevated.result = elevation.InvocationResult{UACCancelled: true}
 	value := validSettings()
@@ -1308,32 +1260,31 @@ func TestSaveTraySettingsUACCancelDoesNotPersistRequestedPolicy(t *testing.T) {
 
 	result := s.SaveTraySettings(context.Background(), value)
 
-	if result.OK || !result.UACCancelled || result.ErrorCode != elevation.ErrorCodeUACCancelled {
+	if !result.OK || result.UACCancelled {
 		t.Fatalf("result = %#v", result)
 	}
-	if !reflect.DeepEqual(*calls, []string{"elevate-install_helper_task"}) || store.settings.HelperStartMode != traymodel.StartManual {
+	if !reflect.DeepEqual(*calls, []string{"save-settings"}) || store.settings.HelperStartMode != traymodel.StartAutomatic || len(elevated.actions) != 0 {
 		t.Fatalf("calls=%v persisted=%#v", *calls, store.settings)
 	}
-	if store.loadCalls != 1 {
-		t.Fatalf("settings loads = %d, want initial load only", store.loadCalls)
+	if store.loadCalls != 2 {
+		t.Fatalf("settings loads = %d, want initial and verification loads", store.loadCalls)
 	}
 }
 
-func TestSaveTraySettingsDefaultImportFailuresDoNotEnableOrInstall(t *testing.T) {
+func TestSaveTraySettingsDoesNotReadOrImportHelperDefaults(t *testing.T) {
 	for _, test := range []struct {
-		name     string
-		setup    func(*fakeStore, *fakeElevation)
-		wantCode string
+		name  string
+		setup func(*fakeStore, *fakeElevation)
 	}{
-		{"invalid", func(store *fakeStore, _ *fakeElevation) { store.defaultErr = errors.New("invalid") }, "helper_config_invalid"},
+		{"invalid", func(store *fakeStore, _ *fakeElevation) { store.defaultErr = errors.New("invalid") }},
 		{"uac", func(store *fakeStore, elevated *fakeElevation) {
 			store.defaultErr = nil
 			elevated.result = elevation.InvocationResult{UACCancelled: true}
-		}, elevation.ErrorCodeUACCancelled},
+		}},
 		{"write", func(store *fakeStore, elevated *fakeElevation) {
 			store.defaultErr = nil
 			elevated.result.Response = elevation.Response{OK: false, ErrorCode: elevation.ErrorCodeWriteFailed, ErrorSummary: "configuration write failed"}
-		}, elevation.ErrorCodeWriteFailed},
+		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			s, calls, store, _, _, elevated := serviceFixture(t)
@@ -1344,14 +1295,14 @@ func TestSaveTraySettingsDefaultImportFailuresDoNotEnableOrInstall(t *testing.T)
 			value.HelperEnabled = true
 			value.HelperStartMode = traymodel.StartAutomatic
 			result := s.SaveTraySettings(context.Background(), value)
-			if result.OK || result.ErrorCode != test.wantCode {
+			if !result.OK {
 				t.Fatalf("result = %#v", result)
 			}
-			if store.settings.HelperEnabled || store.settings.HelperStartMode != traymodel.StartManual {
+			if !store.settings.HelperEnabled || store.settings.HelperStartMode != traymodel.StartAutomatic {
 				t.Fatalf("settings saved: %#v", store.settings)
 			}
 			joined := strings.Join(*calls, ",")
-			if strings.Contains(joined, "save-settings") || strings.Contains(joined, "install_helper_task") || strings.Contains(joined, "task-run") || strings.Contains(joined, "helper-start") {
+			if joined != "save-settings" || len(elevated.actions) != 0 {
 				t.Fatalf("unsafe calls: %v", *calls)
 			}
 		})

@@ -26,7 +26,7 @@
 
 Helper 必须与 Agent 位于同一台机器，建议由同一账号运行，并需要管理员权限。只在确实需要删除辅助功能时启用，并在界面中把 `allowed_roots` 配置为明确、窄范围的媒体目录。默认采用 soft 删除；是否允许硬删除由用户在配置界面中明确决定。
 
-首次解压后不要手工创建 `data\helper` 或复制 `helper.json`。包根 `helper.default.json` 只是安全默认源，修改它不会直接启用 Helper；NodeTray 的普通用户进程不会创建或放宽该目录。只有用户在界面中保存 Helper 配置时，提权写入器才会首次安全创建受保护的 `data\helper` 并写入配置。
+首次解压后即可在 NodeTray 界面中查看和修改 `data\helper\helper.json`。保存 Agent、Helper 与 NodeTray 配置都不需要管理员权限；只有真正启动 `helper.exe` 时 Windows 才会显示 UAC 提示。
 
 当包根允许普通用户写入时，启用 Helper 会带来额外的提权风险：管理员任务会从该包根启动 `helper.exe`。只应在受信任的本地目录中启用它，并限制该目录的写入权限；移动、替换或允许不受信任用户写入包根后，应先禁用并重新检查 Helper 配置和任务。
 
@@ -39,7 +39,7 @@ Helper 必须与 Agent 位于同一台机器，建议由同一账号运行，并
 | Helper 配置与日志 | `data\helper\` 与 `data\helper\logs\` |
 | NodeTray 设置与 WebView2 数据 | `data\nodetray\` 与 `data\nodetray\webview2\` |
 
-包内预置 `data\agent\agent.json` 和 `data\nodetray\tray.json`；Agent 的 Worker 参数唯一位于 `data\agent\agent.json` 的 `worker` 段，不会生成 `worker.json`。包根 `helper.default.json` 仅为安全默认源，不包含 `data\helper` 目录或运行配置；实际 Helper 配置由提权写入器首次安全创建。所有默认运行路径都相对包根，不依赖系统安装目录或用户配置目录。
+包内预置 `data\agent\agent.json`、`data\helper\helper.json` 和 `data\nodetray\tray.json`；Agent 的 Worker 参数唯一位于 `data\agent\agent.json` 的 `worker` 段，不会生成 `worker.json`。所有默认运行路径都相对包根，不依赖系统安装目录或用户配置目录。
 
 如需移动整个计算包，请先通过 NodeTray 停止组件，再完整移动整个目录。移动后在 NodeTray 中检查并修复登录启动；若曾启用 Helper，也要检查并重新保存其任务配置，使其指向新目录。不要混用旧目录中的 `data`。
 

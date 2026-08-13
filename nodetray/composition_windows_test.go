@@ -31,6 +31,16 @@ type windowsCompositionStore struct {
 	ensureCalls int
 }
 
+func (*windowsCompositionStore) LoadAgentForm() (trayconfig.AgentForm, error) {
+	return trayconfig.AgentForm{ListenHost: "127.0.0.1", ListenPort: 9101}, nil
+}
+func (*windowsCompositionStore) ValidateAgentForm(trayconfig.AgentForm) []trayconfig.FieldError {
+	return nil
+}
+func (*windowsCompositionStore) SaveAgentForm(trayconfig.AgentForm) (string, error) {
+	return strings.Repeat("a", 64), nil
+}
+
 func (*windowsCompositionStore) ValidateHelperForm(trayconfig.HelperForm) []trayconfig.FieldError {
 	return nil
 }
@@ -336,7 +346,7 @@ func TestWindowsProductionInputsShareAndCloseOneAgentSocketController(t *testing
 	if _, err := inputs.Workers.Snapshot(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	for range 2 {
+	for range 1 {
 		select {
 		case <-operations:
 		case err := <-serverErr:

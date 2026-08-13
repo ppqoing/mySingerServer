@@ -27,6 +27,10 @@ func (compositionStore) SaveTraySettings(traymodel.TraySettings) error { return 
 func (compositionStore) LoadHelperForm() (trayconfig.HelperForm, error) {
 	return trayconfig.HelperForm{}, nil
 }
+func (compositionStore) ValidateHelperForm(trayconfig.HelperForm) []trayconfig.FieldError { return nil }
+func (compositionStore) SaveHelperForm(trayconfig.HelperForm) (string, error) {
+	return strings.Repeat("b", 64), nil
+}
 func (compositionStore) PrepareHelperWrite(trayconfig.HelperForm) (trayconfig.PreparedWrite, error) {
 	return trayconfig.PreparedWrite{}, nil
 }
@@ -225,7 +229,7 @@ func TestProductionCompositionRoutesAgentConfigThroughInjectedSocketGateway(t *t
 		t.Fatalf("GetAgentForm = %#v, %v", form, err)
 	}
 	result := backend.service.SaveAgent(context.Background(), form)
-	if !result.OK || result.SHA256 != strings.Repeat("c", 64) || !result.NeedsRestart {
+	if !result.OK || result.SHA256 != strings.Repeat("c", 64) || result.NeedsRestart {
 		t.Fatalf("SaveAgent = %#v", result)
 	}
 	if want := []string{"socket-load-agent", "socket-validate-agent", "socket-save-agent"}; !reflect.DeepEqual(calls, want) {
