@@ -416,14 +416,6 @@ func (d *DB) UpdateLocalTaskProgress(
 	if err := validateLocalTaskControl(machineID, control); err != nil {
 		return LocalTask{}, err
 	}
-	if _, ok := localTaskPhaseOrder[update.Phase]; !ok || update.Stage < 0 || update.Stage > 3 ||
-		update.ProgressComplete < 0 || update.ProgressTotal < 0 ||
-		((update.ProgressTotalKnown || update.ProgressTotal > 0) && update.ProgressComplete > update.ProgressTotal) {
-		return LocalTask{}, fmt.Errorf("%w: invalid progress update", ErrLocalTaskTransition)
-	}
-	if update.StatsJSON == "" {
-		update.StatsJSON = "{}"
-	}
 	tx, err := d.db.BeginTx(ctx, nil)
 	if err != nil {
 		return LocalTask{}, err
@@ -438,6 +430,14 @@ func (d *DB) UpdateLocalTaskProgress(
 	}
 	if task.Revision != control.ExpectedRevision {
 		return LocalTask{}, fmt.Errorf("%w: task %s", ErrLocalTaskStale, control.TaskID)
+	}
+	if _, ok := localTaskPhaseOrder[update.Phase]; !ok || update.Stage < 0 || update.Stage > 3 ||
+		update.ProgressComplete < 0 || update.ProgressTotal < 0 ||
+		((update.ProgressTotalKnown || update.ProgressTotal > 0) && update.ProgressComplete > update.ProgressTotal) {
+		return LocalTask{}, fmt.Errorf("%w: invalid progress update", ErrLocalTaskTransition)
+	}
+	if update.StatsJSON == "" {
+		update.StatsJSON = "{}"
 	}
 	oldPhase := localTaskPhaseOrder[task.Phase]
 	newPhase := localTaskPhaseOrder[update.Phase]
@@ -481,14 +481,16 @@ func (d *DB) CancelLocalTask(ctx context.Context, machineID, taskID string) erro
 	if err != nil {
 		return err
 	}
-	if task.Status == "cancelled" || task.Status == "stopping" {
+	if task.Status == "cancelled" {
 		return nil
 	}
-	toStatus := "stopping"
-	if task.Status == "paused" {
-		toStatus = "cancelled"
+	if task.Status != "paused" && task.Status != "stopping" {
+		task, err = d.TransitionLocalTaskLifecycle(ctx, machineID, controlForLocalTask(task), "stopping", nil, nil)
+		if err != nil {
+			return err
+		}
 	}
-	_, err = d.TransitionLocalTaskLifecycle(ctx, machineID, controlForLocalTask(task), toStatus, nil, nil)
+	_, err = d.TransitionLocalTaskLifecycle(ctx, machineID, controlForLocalTask(task), "cancelled", nil, nil)
 	return err
 }
 
@@ -496,9 +498,6 @@ func (d *DB) RetryLocalTask(ctx context.Context, machineID, taskID string) (Loca
 	task, err := d.LoadLocalTask(ctx, machineID, taskID)
 	if err != nil {
 		return LocalTask{}, err
-	}
-	if task.Status == "pending" {
-		return task, nil
 	}
 	return d.TransitionLocalTaskLifecycle(ctx, machineID, controlForLocalTask(task), "pending", nil, nil)
 }

@@ -821,21 +821,12 @@ func TestLocalTaskLifecycleUsesExplicitTransitionsAndStablePagination(t *testing
 	if err := db.CancelLocalTask(ctx, "machine-a", "task-a"); err != nil {
 		t.Fatalf("idempotent CancelLocalTask: %v", err)
 	}
-	stopping, err := db.LoadLocalTask(ctx, "machine-a", "task-a")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if stopping.Status != "stopping" {
-		t.Fatalf("cancel status=%q, want stopping", stopping.Status)
-	}
-	cancelled, err := db.TransitionLocalTaskLifecycle(ctx, "machine-a", LocalTaskControl{
-		TaskID: stopping.TaskID, InstanceID: stopping.InstanceID, ExpectedRevision: stopping.Revision,
-	}, "cancelled", nil, nil)
+	cancelled, err := db.LoadLocalTask(ctx, "machine-a", "task-a")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cancelled.Status != "cancelled" {
-		t.Fatalf("completed cancel status=%q, want cancelled", cancelled.Status)
+		t.Fatalf("cancel status=%q, want cancelled", cancelled.Status)
 	}
 	retried, err := db.RetryLocalTask(ctx, "machine-a", "task-a")
 	if err != nil {
@@ -844,6 +835,53 @@ func TestLocalTaskLifecycleUsesExplicitTransitionsAndStablePagination(t *testing
 	if retried.TaskID != "task-a" || retried.Status != "pending" || retried.Stage != 1 || string(retried.Envelope) != "task-a" {
 		t.Fatalf("retried = %#v", retried)
 	}
+}
+
+// Break caught: the legacy Service expects CancelLocalTask to return only after
+// the durable row reaches cancelled, so stopping must be an internal legal edge.
+func TestLocalTaskLifecycleLegacyCancelConvergesAlongLegalEdges(t *testing.T) {
+	db := openLocalTestDB(t)
+	ctx := context.Background()
+	for _, test := range []struct {
+		status       string
+		wantRevision int64
+	}{
+		{status: "pending", wantRevision: 3},
+		{status: "running", wantRevision: 3},
+		{status: "waiting_recovery", wantRevision: 3},
+		{status: "pausing", wantRevision: 3},
+		{status: "stopping", wantRevision: 2},
+		{status: "paused", wantRevision: 2},
+		{status: "cancelled", wantRevision: 1},
+	} {
+		t.Run(test.status, func(t *testing.T) {
+			task := createVersionedLocalTask(t, db, "legacy-cancel-"+test.status)
+			if _, err := db.db.Exec(`UPDATE local_tasks SET status=?1 WHERE task_id=?2`, test.status, task.TaskID); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.CancelLocalTask(ctx, "machine-1", task.TaskID); err != nil {
+				t.Fatal(err)
+			}
+			cancelled, err := db.LoadLocalTask(ctx, "machine-1", task.TaskID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cancelled.Status != "cancelled" || cancelled.Revision != test.wantRevision {
+				t.Fatalf("cancelled=(%q,%d), want=(cancelled,%d)", cancelled.Status, cancelled.Revision, test.wantRevision)
+			}
+		})
+	}
+}
+
+// Break caught: treating a legacy retry of pending as success makes two
+// serialized Service retries both report success even though only one launches.
+func TestLocalTaskLifecycleLegacyRetryRejectsAlreadyPending(t *testing.T) {
+	db := openLocalTestDB(t)
+	task := createVersionedLocalTask(t, db, "legacy-retry-pending")
+	if _, err := db.RetryLocalTask(context.Background(), "machine-1", task.TaskID); !errors.Is(err, ErrLocalTaskTransition) {
+		t.Fatalf("RetryLocalTask error=%v, want %v", err, ErrLocalTaskTransition)
+	}
+	assertLocalTaskSnapshot(t, db, task)
 }
 
 // Break caught: omitting any explicitly allowed edge makes a valid lifecycle
@@ -942,16 +980,16 @@ func TestLocalTaskStaleAndInstanceMismatchDoNotMutate(t *testing.T) {
 	assertLocalTaskSnapshot(t, db, task)
 
 	if _, err := db.UpdateLocalTaskProgress(ctx, "machine-1", stale, LocalTaskProgressUpdate{
-		Phase: "scan", Stage: 0, ProgressComplete: 1, ProgressTotal: 2, StatsJSON: "{}",
+		Phase: "not-a-phase", Stage: -1, ProgressComplete: -1, ProgressTotal: -1, StatsJSON: "{}",
 	}); !errors.Is(err, ErrLocalTaskStale) {
-		t.Fatalf("stale progress error=%v, want %v", err, ErrLocalTaskStale)
+		t.Fatalf("stale plus invalid progress error=%v, want %v", err, ErrLocalTaskStale)
 	}
 	assertLocalTaskSnapshot(t, db, task)
 
 	if _, err := db.UpdateLocalTaskProgress(ctx, "machine-1", wrongInstance, LocalTaskProgressUpdate{
-		Phase: "scan", Stage: 0, ProgressComplete: 1, ProgressTotal: 2, StatsJSON: "{}",
+		Phase: "not-a-phase", Stage: -1, ProgressComplete: -1, ProgressTotal: -1, StatsJSON: "{}",
 	}); !errors.Is(err, ErrLocalTaskInstanceMismatch) {
-		t.Fatalf("progress instance mismatch error=%v, want %v", err, ErrLocalTaskInstanceMismatch)
+		t.Fatalf("instance mismatch plus invalid progress error=%v, want %v", err, ErrLocalTaskInstanceMismatch)
 	}
 	assertLocalTaskSnapshot(t, db, task)
 }
