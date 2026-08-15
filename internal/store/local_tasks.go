@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 var ErrLocalTaskConflict = errors.New("task_conflict")
@@ -24,21 +26,27 @@ type LocalTaskCreate struct {
 }
 
 type LocalTask struct {
-	TaskID           string
-	MachineID        string
-	Source           string
-	Type             string
-	Stage            int
-	Status           string
-	EnvelopeDigest   string
-	Envelope         []byte
-	ProgressComplete int64
-	ProgressTotal    int64
-	StatsJSON        string
-	SafeErrorCode    *string
-	SafeErrorMessage *string
-	CreatedAt        int64
-	UpdatedAt        int64
+	TaskID             string
+	InstanceID         string
+	Revision           int64
+	MachineID          string
+	Source             string
+	Type               string
+	Stage              int
+	Status             string
+	Phase              string
+	EnvelopeDigest     string
+	Envelope           []byte
+	ProgressComplete   int64
+	ProgressTotal      int64
+	ProgressTotalKnown bool
+	StatsJSON          string
+	SafeErrorCode      *string
+	SafeErrorMessage   *string
+	CreatedAt          int64
+	UpdatedAt          int64
+	StartedAt          *int64
+	CompletedAt        *int64
 }
 
 func (d *DB) CreateOrLoadLocalTask(ctx context.Context, in LocalTaskCreate) (LocalTask, error) {
@@ -48,10 +56,10 @@ func (d *DB) CreateOrLoadLocalTask(ctx context.Context, in LocalTaskCreate) (Loc
 	now := time.Now().UnixMilli()
 	if _, err := d.db.ExecContext(ctx, `
 		INSERT INTO local_tasks
-			(task_id,machine_id,source,type,stage,status,envelope_digest,envelope,created_at,updated_at)
-		VALUES (?1,?2,?3,?4,?5,'pending',?6,?7,?8,?8)
+			(task_id,instance_id,revision,machine_id,source,type,stage,status,phase,envelope_digest,envelope,progress_total_known,created_at,updated_at)
+		VALUES (?1,?2,1,?3,?4,?5,?6,'pending',?7,?8,?9,0,?10,?10)
 		ON CONFLICT(task_id) DO NOTHING`,
-		in.TaskID, in.MachineID, in.Source, in.Type, in.Stage, in.EnvelopeDigest, in.Envelope, now,
+		in.TaskID, uuid.NewString(), in.MachineID, in.Source, in.Type, in.Stage, localTaskPhase("pending", in.Stage), in.EnvelopeDigest, in.Envelope, now,
 	); err != nil {
 		return LocalTask{}, fmt.Errorf("store: create local task: %w", err)
 	}
@@ -88,15 +96,17 @@ func validateLocalTaskCreate(in LocalTaskCreate) error {
 func (d *DB) loadLocalTask(ctx context.Context, taskID string) (LocalTask, error) {
 	var task LocalTask
 	var errorCode, errorMessage sql.NullString
+	var progressTotalKnown int
+	var startedAt, completedAt sql.NullInt64
 	err := d.db.QueryRowContext(ctx, `
-		SELECT task_id,machine_id,source,type,stage,status,envelope_digest,envelope,
-		       progress_completed,progress_total,stats_json,
-		       safe_error_code,safe_error_message,created_at,updated_at
+		SELECT task_id,instance_id,revision,machine_id,source,type,stage,status,phase,envelope_digest,envelope,
+		       progress_completed,progress_total,progress_total_known,stats_json,
+		       safe_error_code,safe_error_message,created_at,updated_at,started_at,completed_at
 		FROM local_tasks WHERE task_id=?1`, taskID).Scan(
-		&task.TaskID, &task.MachineID, &task.Source, &task.Type, &task.Stage,
-		&task.Status, &task.EnvelopeDigest, &task.Envelope, &task.ProgressComplete,
-		&task.ProgressTotal, &task.StatsJSON, &errorCode, &errorMessage,
-		&task.CreatedAt, &task.UpdatedAt,
+		&task.TaskID, &task.InstanceID, &task.Revision, &task.MachineID, &task.Source, &task.Type, &task.Stage,
+		&task.Status, &task.Phase, &task.EnvelopeDigest, &task.Envelope, &task.ProgressComplete,
+		&task.ProgressTotal, &progressTotalKnown, &task.StatsJSON, &errorCode, &errorMessage,
+		&task.CreatedAt, &task.UpdatedAt, &startedAt, &completedAt,
 	)
 	if err != nil {
 		return LocalTask{}, fmt.Errorf("store: load local task: %w", err)
@@ -109,7 +119,33 @@ func (d *DB) loadLocalTask(ctx context.Context, taskID string) (LocalTask, error
 		value := errorMessage.String
 		task.SafeErrorMessage = &value
 	}
+	task.ProgressTotalKnown = progressTotalKnown == 1
+	if startedAt.Valid {
+		value := startedAt.Int64
+		task.StartedAt = &value
+	}
+	if completedAt.Valid {
+		value := completedAt.Int64
+		task.CompletedAt = &value
+	}
 	return task, nil
+}
+
+func localTaskPhase(status string, stage int) string {
+	if stage == 0 {
+		if status == "pending" {
+			return "waiting"
+		}
+		return "scan"
+	}
+	switch stage {
+	case 1:
+		return "stage1"
+	case 2:
+		return "stage3"
+	default:
+		return "finalizing"
+	}
 }
 
 func (d *DB) LoadLocalTask(ctx context.Context, machineID, taskID string) (LocalTask, error) {

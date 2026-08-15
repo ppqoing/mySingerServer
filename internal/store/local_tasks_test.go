@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -20,6 +21,224 @@ func openLocalTestDB(t *testing.T) *DB {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	return db
+}
+
+// Break caught: opening a v3 Agent database used to retain only the mutable
+// task row, so a restart could not distinguish task incarnations or recover a
+// durable lifecycle phase.
+func TestLocalTaskV3MigrationAddsVersionedLifecycleWithoutLosingDependents(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "legacy-v3.db")
+	seedLocalTaskV3Database(t, dbPath, "running", 2)
+	db := openTestDBAt(t, dbPath)
+
+	var version int
+	if err := db.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 4 {
+		t.Fatalf("user_version=%d, want 4", version)
+	}
+	task, err := db.LoadLocalTask(context.Background(), "machine-1", "task-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.InstanceID == "" {
+		t.Fatal("missing migrated instance ID")
+	}
+	if task.Revision != 1 {
+		t.Fatalf("revision=%d, want 1", task.Revision)
+	}
+	if task.Phase != "stage3" {
+		t.Fatalf("phase=%q, want stage3", task.Phase)
+	}
+	if task.ProgressComplete != 5 || task.ProgressTotal != 10 || !task.ProgressTotalKnown ||
+		string(task.Envelope) != "legacy-envelope" || task.CreatedAt != 100 || task.UpdatedAt != 200 ||
+		task.StartedAt == nil || *task.StartedAt != 150 || task.CompletedAt != nil {
+		t.Fatalf("migrated task lost snapshot data: %#v", task)
+	}
+	var runID, taskID string
+	if err := db.db.QueryRow(`SELECT run_id,task_id FROM local_analysis_runs`).Scan(&runID, &taskID); err != nil {
+		t.Fatalf("load dependent local_analysis_run: %v", err)
+	}
+	if runID != "run-1" || taskID != "task-1" {
+		t.Fatalf("dependent row = (%q,%q)", runID, taskID)
+	}
+	requireForeignKeysValid(t, db)
+}
+
+// Break caught: a failed lifecycle rebuild previously stamped the database as
+// current, preventing a corrected subsequent Open from completing migration.
+func TestLocalTaskV3MigrationFailureDoesNotAdvanceVersion(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "legacy-v3-invalid.db")
+	seedLocalTaskV3Database(t, dbPath, "unknown", 2)
+	if _, err := Open(dbPath); err == nil {
+		t.Fatal("Open accepted invalid legacy lifecycle status")
+	}
+
+	legacy, err := sql.Open("sqlite", "file:"+filepath.ToSlash(dbPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var version int
+	if err := legacy.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		legacy.Close()
+		t.Fatal(err)
+	}
+	if version != 3 {
+		legacy.Close()
+		t.Fatalf("user_version after failed migration=%d, want 3", version)
+	}
+	if _, err := legacy.Exec(`UPDATE local_tasks SET status='pending' WHERE task_id='task-1'`); err != nil {
+		legacy.Close()
+		t.Fatal(err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if db := openTestDBAt(t, dbPath); db == nil {
+		t.Fatal("Open after correcting legacy data returned nil DB")
+	}
+}
+
+// Break caught: deriving the phase directly from the numeric v3 stage made
+// pending work look scanned and shifted the legacy stage-2 meaning.
+func TestLocalTaskV3MigrationMapsLegacyStatusAndStageToNearestPhase(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		status string
+		stage  int
+		phase  string
+	}{
+		{name: "pending stage zero", status: "pending", stage: 0, phase: "waiting"},
+		{name: "running stage zero", status: "running", stage: 0, phase: "scan"},
+		{name: "stage one", status: "running", stage: 1, phase: "stage1"},
+		{name: "stage two", status: "running", stage: 2, phase: "stage3"},
+		{name: "stage three", status: "running", stage: 3, phase: "finalizing"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "legacy-v3.db")
+			seedLocalTaskV3Database(t, path, test.status, test.stage)
+			db := openTestDBAt(t, path)
+			task, err := db.LoadLocalTask(context.Background(), "machine-1", "task-1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if task.Phase != test.phase {
+				t.Fatalf("phase=%q, want %q", task.Phase, test.phase)
+			}
+		})
+	}
+}
+
+// Break caught: expanding the lifecycle state machine without a database
+// constraint allowed typos to persist and omitted valid paused/delete states.
+func TestLocalTaskSchemaAcceptsOnlyVersionedLifecycleStates(t *testing.T) {
+	db := openLocalTestDB(t)
+	for index, status := range []string{
+		"pending", "running", "waiting_recovery", "pausing", "paused", "stopping",
+		"cancelled", "succeeded", "failed", "deleting", "delete_failed",
+	} {
+		if _, err := db.db.Exec(`
+			INSERT INTO local_tasks
+			(task_id,instance_id,revision,machine_id,source,type,stage,status,phase,envelope_digest,envelope,progress_total_known,stats_json,created_at,updated_at)
+			VALUES (?1,?2,1,'m','local','analysis',0,?3,'waiting','digest',X'01',0,'{}',1,1)`,
+			"allowed-"+status, fmt.Sprintf("instance-%d", index), status,
+		); err != nil {
+			t.Fatalf("status %q rejected: %v", status, err)
+		}
+	}
+	if _, err := db.db.Exec(`
+		INSERT INTO local_tasks
+		(task_id,instance_id,revision,machine_id,source,type,stage,status,phase,envelope_digest,envelope,progress_total_known,stats_json,created_at,updated_at)
+		VALUES ('bad','instance-bad',1,'m','local','analysis',0,'bogus','waiting','digest',X'01',0,'{}',1,1)`); err == nil {
+		t.Fatal("unknown task status was accepted")
+	}
+	if !pragmaHasUniqueIndex(t, db, "local_task_deletion_receipts", []string{"machine_id", "task_id", "instance_id"}) {
+		t.Fatal("local_task_deletion_receipts primary key is missing")
+	}
+}
+
+func openTestDBAt(t *testing.T, path string) *DB {
+	t.Helper()
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return db
+}
+
+func seedLocalTaskV3Database(t *testing.T, path, status string, stage int) {
+	t.Helper()
+	legacy, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = legacy.Close() })
+	if _, err := legacy.Exec(`
+		PRAGMA foreign_keys = ON;
+		CREATE TABLE local_tasks (
+			task_id TEXT PRIMARY KEY,
+			machine_id TEXT NOT NULL,
+			source TEXT NOT NULL,
+			type TEXT NOT NULL,
+			stage INTEGER NOT NULL,
+			status TEXT NOT NULL,
+			envelope_digest TEXT NOT NULL,
+			envelope BLOB NOT NULL DEFAULT X'',
+			progress_completed INTEGER NOT NULL DEFAULT 0,
+			progress_total INTEGER NOT NULL DEFAULT 0,
+			stats_json TEXT NOT NULL DEFAULT '{}',
+			safe_error_code TEXT,
+			safe_error_message TEXT,
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL,
+			started_at INTEGER,
+			completed_at INTEGER,
+			UNIQUE(machine_id, task_id)
+		);
+		CREATE TABLE local_analysis_runs (
+			run_id TEXT PRIMARY KEY,
+			machine_id TEXT NOT NULL,
+			generation INTEGER NOT NULL,
+			task_id TEXT NOT NULL UNIQUE,
+			status TEXT NOT NULL,
+			created_at INTEGER NOT NULL,
+			completed_at INTEGER,
+			published_at INTEGER,
+			UNIQUE(machine_id, generation),
+			UNIQUE(machine_id, run_id),
+			UNIQUE(run_id, generation),
+			UNIQUE(machine_id, run_id, generation),
+			FOREIGN KEY(machine_id, task_id) REFERENCES local_tasks(machine_id, task_id) ON DELETE RESTRICT
+		);
+		INSERT INTO local_tasks
+			(task_id,machine_id,source,type,stage,status,envelope_digest,envelope,progress_completed,progress_total,stats_json,safe_error_code,safe_error_message,created_at,updated_at,started_at,completed_at)
+		VALUES ('task-1','machine-1','local','analysis',?2,?1,'digest-1',X'6C65676163792D656E76656C6F7065',5,10,'{"legacy":true}','legacy-code','legacy-message',100,200,150,NULL);
+		INSERT INTO local_analysis_runs
+			(run_id,machine_id,generation,task_id,status,created_at)
+		VALUES ('run-1','machine-1',1,'task-1','building',100);
+		PRAGMA user_version = 3;`, status, stage); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func requireForeignKeysValid(t *testing.T, db *DB) {
+	t.Helper()
+	rows, err := db.db.Query(`PRAGMA foreign_key_check`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	if rows.Next() {
+		t.Fatal("PRAGMA foreign_key_check reported a violation")
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestLocalMigrationNewAndLegacyDatabasesHaveSameSchema(t *testing.T) {

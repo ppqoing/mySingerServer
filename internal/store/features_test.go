@@ -520,10 +520,10 @@ func TestPhase1MigrationIdempotent(t *testing.T) {
 			db.Close()
 			t.Fatal(err)
 		}
-		if durationNotNull != 0 || qualityNotNull != 0 || dimensionColumns != 2 || userVersion != 3 {
+		if durationNotNull != 0 || qualityNotNull != 0 || dimensionColumns != 2 || userVersion != localSchemaVersion {
 			db.Close()
-			t.Fatalf("video schema duration_notnull=%d quality_notnull=%d dimension_columns=%d user_version=%d, want 0/0/2/3",
-				durationNotNull, qualityNotNull, dimensionColumns, userVersion)
+			t.Fatalf("video schema duration_notnull=%d quality_notnull=%d dimension_columns=%d user_version=%d, want 0/0/2/%d",
+				durationNotNull, qualityNotNull, dimensionColumns, userVersion, localSchemaVersion)
 		}
 		var gotSHA, gotPath string
 		var gotDuration, gotQuality int64

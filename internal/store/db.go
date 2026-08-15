@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 
 	_ "modernc.org/sqlite"
@@ -40,6 +41,18 @@ func Open(path string) (*DB, error) {
 		_ = sqlDB.Close()
 		return nil, fmt.Errorf("store: migrate local task envelope: %w", err)
 	}
+	if err := migrateLocalTaskLifecycle(sqlDB); err != nil {
+		_ = sqlDB.Close()
+		return nil, fmt.Errorf("store: migrate local task lifecycle: %w", err)
+	}
+	if err := verifyLocalForeignKeys(sqlDB); err != nil {
+		_ = sqlDB.Close()
+		return nil, fmt.Errorf("store: verify local foreign keys: %w", err)
+	}
+	if _, err := sqlDB.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, localSchemaVersion)); err != nil {
+		_ = sqlDB.Close()
+		return nil, fmt.Errorf("store: set schema version: %w", err)
+	}
 	return &DB{db: sqlDB}, nil
 }
 
@@ -54,6 +67,127 @@ func migrateLocalTaskEnvelope(db *sql.DB) error {
 	}
 	_, err = db.Exec(`ALTER TABLE local_tasks ADD COLUMN envelope BLOB NOT NULL DEFAULT X''`)
 	return err
+}
+
+func migrateLocalTaskLifecycle(db *sql.DB) error {
+	complete, err := localTaskLifecycleSchemaComplete(db)
+	if err != nil {
+		return err
+	}
+	if complete {
+		return verifyLocalForeignKeys(db)
+	}
+	if _, err := db.Exec(`PRAGMA foreign_keys = OFF`); err != nil {
+		return err
+	}
+	foreignKeysDisabled := true
+	defer func() {
+		if foreignKeysDisabled {
+			_, _ = db.Exec(`PRAGMA foreign_keys = ON`)
+		}
+	}()
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`
+		CREATE TABLE local_tasks_v4 (
+			task_id TEXT PRIMARY KEY,
+			instance_id TEXT NOT NULL,
+			revision INTEGER NOT NULL DEFAULT 1 CHECK (revision > 0),
+			machine_id TEXT NOT NULL,
+			source TEXT NOT NULL CHECK (source IN ('local','manager')),
+			type TEXT NOT NULL CHECK (type IN ('scan','analysis','stage2','stage3','delete')),
+			stage INTEGER NOT NULL CHECK (stage IN (0,1,2,3)),
+			status TEXT NOT NULL CHECK (status IN ('pending','running','waiting_recovery','pausing','paused','stopping','cancelled','succeeded','failed','deleting','delete_failed')),
+			phase TEXT NOT NULL DEFAULT 'waiting' CHECK (phase IN ('waiting','scan','stage1','stage2','stage3','finalizing')),
+			envelope_digest TEXT NOT NULL,
+			envelope BLOB NOT NULL DEFAULT X'',
+			progress_completed INTEGER NOT NULL DEFAULT 0 CHECK (progress_completed >= 0),
+			progress_total INTEGER NOT NULL DEFAULT 0 CHECK (progress_total >= 0),
+			progress_total_known INTEGER NOT NULL DEFAULT 0 CHECK (progress_total_known IN (0,1)),
+			stats_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(stats_json)),
+			safe_error_code TEXT,
+			safe_error_message TEXT,
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL,
+			started_at INTEGER,
+			completed_at INTEGER,
+			UNIQUE (machine_id, task_id),
+			CHECK (progress_total = 0 OR progress_completed <= progress_total)
+		);
+		INSERT INTO local_tasks_v4
+			(task_id,instance_id,revision,machine_id,source,type,stage,status,phase,envelope_digest,envelope,progress_completed,progress_total,progress_total_known,stats_json,safe_error_code,safe_error_message,created_at,updated_at,started_at,completed_at)
+		SELECT task_id,lower(hex(randomblob(16))),1,machine_id,source,type,stage,status,
+			CASE
+				WHEN stage=0 AND status='pending' THEN 'waiting'
+				WHEN stage=0 THEN 'scan'
+				WHEN stage=1 THEN 'stage1'
+				WHEN stage=2 THEN 'stage3'
+				WHEN stage=3 THEN 'finalizing'
+				ELSE 'scan'
+			END,
+			envelope_digest,envelope,progress_completed,progress_total,
+			CASE WHEN progress_total > 0 THEN 1 ELSE 0 END,
+			stats_json,safe_error_code,safe_error_message,created_at,updated_at,started_at,completed_at
+		FROM local_tasks;
+		DROP TABLE local_tasks;
+		ALTER TABLE local_tasks_v4 RENAME TO local_tasks;
+		CREATE INDEX idx_local_tasks_machine_status
+			ON local_tasks (machine_id, status, created_at, task_id);`); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`PRAGMA foreign_keys = ON`); err != nil {
+		return err
+	}
+	foreignKeysDisabled = false
+	return verifyLocalForeignKeys(db)
+}
+
+func localTaskLifecycleSchemaComplete(db *sql.DB) (bool, error) {
+	var sqlText string
+	err := db.QueryRow(`SELECT sql FROM sqlite_schema WHERE type='table' AND name='local_tasks'`).Scan(&sqlText)
+	if err != nil {
+		return false, err
+	}
+	normalized := strings.ToLower(strings.Join(strings.Fields(sqlText), " "))
+	for _, requirement := range []string{
+		"instance_id text not null",
+		"revision integer not null default 1 check (revision > 0)",
+		"phase text not null default 'waiting'",
+		"progress_total_known integer not null default 0",
+		"'pausing'", "'paused'", "'stopping'", "'deleting'", "'delete_failed'",
+	} {
+		if !strings.Contains(normalized, requirement) {
+			return false, nil
+		}
+	}
+	var receipts int
+	if err := db.QueryRow(`SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='local_task_deletion_receipts'`).Scan(&receipts); err != nil {
+		return false, err
+	}
+	return receipts == 1, nil
+}
+
+func verifyLocalForeignKeys(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA foreign_key_check`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	if rows.Next() {
+		var table string
+		var rowID, parent, foreignKeyID any
+		if err := rows.Scan(&table, &rowID, &parent, &foreignKeyID); err != nil {
+			return err
+		}
+		return fmt.Errorf("foreign key violation in %s", table)
+	}
+	return rows.Err()
 }
 
 func migrateVideoFeaturePresence(db *sql.DB) error {
