@@ -70,14 +70,18 @@ func migrateLocalTaskEnvelope(db *sql.DB) error {
 }
 
 func migrateLocalTaskLifecycle(db *sql.DB) error {
-	complete, err := localTaskLifecycleSchemaComplete(db)
+	tasksComplete, err := localTaskLifecycleSchemaComplete(db)
 	if err != nil {
 		return err
 	}
-	if complete {
+	receiptsComplete, err := localTaskDeletionReceiptsSchemaComplete(db)
+	if err != nil {
+		return err
+	}
+	if tasksComplete && receiptsComplete {
 		return verifyLocalForeignKeys(db)
 	}
-	receiptsComplete, err := localTaskDeletionReceiptsSchemaComplete(db)
+	hasReceiptDeletedAt, err := localTaskDeletionReceiptHasColumn(db, "deleted_at")
 	if err != nil {
 		return err
 	}
@@ -95,7 +99,8 @@ func migrateLocalTaskLifecycle(db *sql.DB) error {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err := tx.Exec(`
+	if !tasksComplete {
+		if _, err := tx.Exec(`
 		CREATE TABLE local_tasks_v4 (
 			task_id TEXT PRIMARY KEY,
 			instance_id TEXT NOT NULL,
@@ -138,9 +143,10 @@ func migrateLocalTaskLifecycle(db *sql.DB) error {
 		FROM local_tasks;
 		DROP TABLE local_tasks;
 		ALTER TABLE local_tasks_v4 RENAME TO local_tasks;
-		CREATE INDEX idx_local_tasks_machine_status
-			ON local_tasks (machine_id, status, created_at, task_id);`); err != nil {
-		return err
+			CREATE INDEX idx_local_tasks_machine_status
+				ON local_tasks (machine_id, status, created_at, task_id);`); err != nil {
+			return err
+		}
 	}
 	if !receiptsComplete {
 		if _, err := tx.Exec(`
@@ -150,13 +156,20 @@ func migrateLocalTaskLifecycle(db *sql.DB) error {
 				instance_id TEXT NOT NULL,
 				deleted_at INTEGER NOT NULL,
 				PRIMARY KEY (machine_id, task_id, instance_id)
-			);
+			);`); err != nil {
+			return err
+		}
+		copyDeletedAt := "0"
+		if hasReceiptDeletedAt {
+			copyDeletedAt = "deleted_at"
+		}
+		if _, err := tx.Exec(fmt.Sprintf(`
 			INSERT INTO local_task_deletion_receipts_v4
 				(machine_id,task_id,instance_id,deleted_at)
-			SELECT machine_id,task_id,instance_id,deleted_at
+			SELECT machine_id,task_id,instance_id,%s
 			FROM local_task_deletion_receipts;
 			DROP TABLE local_task_deletion_receipts;
-			ALTER TABLE local_task_deletion_receipts_v4 RENAME TO local_task_deletion_receipts;`); err != nil {
+			ALTER TABLE local_task_deletion_receipts_v4 RENAME TO local_task_deletion_receipts;`, copyDeletedAt)); err != nil {
 			return err
 		}
 	}
@@ -188,7 +201,7 @@ func localTaskLifecycleSchemaComplete(db *sql.DB) (bool, error) {
 			return false, nil
 		}
 	}
-	return localTaskDeletionReceiptsSchemaComplete(db)
+	return true, nil
 }
 
 func localTaskDeletionReceiptsSchemaComplete(db *sql.DB) (bool, error) {
@@ -197,7 +210,12 @@ func localTaskDeletionReceiptsSchemaComplete(db *sql.DB) (bool, error) {
 		return false, err
 	}
 	defer rows.Close()
+	columns := make(map[string]struct {
+		columnType string
+		notNull    int
+	})
 	primaryKey := make([]string, 3)
+	primaryKeyCount := 0
 	for rows.Next() {
 		var cid, notNull, position int
 		var name, columnType string
@@ -205,14 +223,44 @@ func localTaskDeletionReceiptsSchemaComplete(db *sql.DB) (bool, error) {
 		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &position); err != nil {
 			return false, err
 		}
-		if position > 0 && position <= len(primaryKey) {
-			primaryKey[position-1] = name
+		columns[name] = struct {
+			columnType string
+			notNull    int
+		}{columnType: columnType, notNull: notNull}
+		if position > 0 {
+			primaryKeyCount++
+			if position <= len(primaryKey) {
+				primaryKey[position-1] = name
+			}
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return false, err
 	}
-	return primaryKey[0] == "machine_id" && primaryKey[1] == "task_id" && primaryKey[2] == "instance_id", nil
+	if len(columns) != 4 || primaryKeyCount != 3 || primaryKey[0] != "machine_id" || primaryKey[1] != "task_id" || primaryKey[2] != "instance_id" {
+		return false, nil
+	}
+	for name, wantType := range map[string]string{
+		"machine_id":  "TEXT",
+		"task_id":     "TEXT",
+		"instance_id": "TEXT",
+		"deleted_at":  "INTEGER",
+	} {
+		column, ok := columns[name]
+		if !ok || !strings.EqualFold(column.columnType, wantType) || column.notNull != 1 {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func localTaskDeletionReceiptHasColumn(db *sql.DB, want string) (bool, error) {
+	var count int
+	err := db.QueryRow(`SELECT count(*) FROM pragma_table_info('local_task_deletion_receipts') WHERE name=?`, want).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count == 1, nil
 }
 
 func verifyLocalForeignKeys(db *sql.DB) error {

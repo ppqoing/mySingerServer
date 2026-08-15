@@ -235,6 +235,101 @@ func TestLocalTaskMigrationRebuildsNearV4TablesWithWeakenedConstraints(t *testin
 	}
 }
 
+// Break caught: repairing an unrelated malformed receipt table used to rebuild
+// an already-valid v4 task row, changing its incarnation and snapshot fields.
+func TestLocalTaskMigrationRepairsOnlyMalformedReceiptsWithoutRebuildingV4Tasks(t *testing.T) {
+	for name, receiptColumns := range map[string]string{
+		"wrong primary key": `
+			machine_id TEXT NOT NULL,
+			task_id TEXT NOT NULL,
+			instance_id TEXT NOT NULL,
+			deleted_at INTEGER NOT NULL,
+			PRIMARY KEY (machine_id, task_id)`,
+		"missing deleted at": `
+			machine_id TEXT NOT NULL,
+			task_id TEXT NOT NULL,
+			instance_id TEXT NOT NULL,
+			PRIMARY KEY (machine_id, task_id, instance_id)`,
+		"wrong deleted at type": `
+			machine_id TEXT NOT NULL,
+			task_id TEXT NOT NULL,
+			instance_id TEXT NOT NULL,
+			deleted_at TEXT NOT NULL,
+			PRIMARY KEY (machine_id, task_id, instance_id)`,
+		"nullable deleted at": `
+			machine_id TEXT NOT NULL,
+			task_id TEXT NOT NULL,
+			instance_id TEXT NOT NULL,
+			deleted_at INTEGER,
+			PRIMARY KEY (machine_id, task_id, instance_id)`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "v4-with-bad-receipts.db")
+			seed, err := Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			created, err := seed.CreateOrLoadLocalTask(context.Background(), LocalTaskCreate{
+				TaskID: "stable-task", MachineID: "machine-1", Source: "local", Type: "analysis", Stage: 1,
+				EnvelopeDigest: "stable-digest", Envelope: []byte("stable-envelope"),
+			})
+			if err != nil {
+				seed.Close()
+				t.Fatal(err)
+			}
+			if _, err := seed.db.Exec(`
+				UPDATE local_tasks
+				SET revision=9,status='paused',phase='stage2',progress_total=0,progress_total_known=1,
+					stats_json='{"stable":true}',started_at=123,completed_at=456
+				WHERE task_id='stable-task'`); err != nil {
+				seed.Close()
+				t.Fatal(err)
+			}
+			if err := seed.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			raw, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := raw.Exec(fmt.Sprintf(`
+				PRAGMA foreign_keys = OFF;
+				DROP TABLE local_task_deletion_receipts;
+				CREATE TABLE local_task_deletion_receipts (%s);`, receiptColumns)); err != nil {
+				raw.Close()
+				t.Fatal(err)
+			}
+			if err := raw.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			db := openTestDBAt(t, path)
+			got, err := db.LoadLocalTask(context.Background(), "machine-1", "stable-task")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.InstanceID != created.InstanceID || got.Revision != 9 || got.Phase != "stage2" ||
+				!got.ProgressTotalKnown || got.Status != "paused" || got.StatsJSON != `{"stable":true}` ||
+				got.StartedAt == nil || *got.StartedAt != 123 || got.CompletedAt == nil || *got.CompletedAt != 456 ||
+				string(got.Envelope) != "stable-envelope" {
+				t.Fatalf("receipt repair changed v4 task snapshot: %#v", got)
+			}
+			if !pragmaHasUniqueIndex(t, db, "local_task_deletion_receipts", []string{"machine_id", "task_id", "instance_id"}) {
+				t.Fatal("receipt primary key was not repaired")
+			}
+			var columnType string
+			var notNull int
+			if err := db.db.QueryRow(`SELECT type,"notnull" FROM pragma_table_info('local_task_deletion_receipts') WHERE name='deleted_at'`).Scan(&columnType, &notNull); err != nil {
+				t.Fatalf("load repaired deleted_at column: %v", err)
+			}
+			if columnType != "INTEGER" || notNull != 1 {
+				t.Fatalf("deleted_at = (%q, notnull=%d), want INTEGER NOT NULL", columnType, notNull)
+			}
+		})
+	}
+}
+
 func openTestDBAt(t *testing.T, path string) *DB {
 	t.Helper()
 	db, err := Open(path)
