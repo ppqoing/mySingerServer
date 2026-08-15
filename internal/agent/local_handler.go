@@ -2,13 +2,16 @@ package agent
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 
 	"dedup/internal/localdelete"
 	"dedup/internal/localtask"
 	"dedup/internal/proto"
+	"dedup/internal/store"
 	"dedup/internal/worker"
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 type LocalStageWorker struct {
@@ -67,9 +70,13 @@ func (w *LocalStageWorker) Execute(ctx context.Context, job *worker.JobMsg) (*wo
 type LocalTaskService interface {
 	Create(context.Context, localtask.CreateRequest) (localtask.Task, error)
 	List(context.Context, localtask.ListRequest) (localtask.Page[localtask.Task], error)
-	Cancel(context.Context, string) error
-	Retry(context.Context, string) (localtask.Task, error)
-	Resume(context.Context) error
+	Pause(context.Context, localtask.ControlRequest) (localtask.Task, error)
+	ResumeTask(context.Context, localtask.ControlRequest) (localtask.Task, error)
+	Cancel(context.Context, localtask.ControlRequest) (localtask.Task, error)
+	Delete(context.Context, localtask.ControlRequest) (localtask.ControlResult, error)
+	Retry(context.Context, localtask.ControlRequest) (localtask.Task, error)
+	LegacyCancel(context.Context, string) (localtask.Task, error)
+	LegacyRetry(context.Context, string) (localtask.Task, error)
 }
 
 type LocalTaskHandler struct{ service LocalTaskService }
@@ -233,7 +240,7 @@ func safePreviewError(err error) string {
 }
 
 func (h *LocalTaskHandler) HandleLocal(ctx context.Context, request proto.LocalRequest) proto.LocalResponse {
-	if h == nil || h.service == nil {
+	if h == nil || h.service == nil || ctx == nil || ctx.Err() != nil {
 		return localTaskFailure(request.RequestID, "local_task_unavailable")
 	}
 	switch request.Operation {
@@ -260,27 +267,104 @@ func (h *LocalTaskHandler) HandleLocal(ctx context.Context, request proto.LocalR
 			return localTaskFailure(request.RequestID, "local_task_failed")
 		}
 		return localTaskSuccess(request.RequestID, proto.LocalTaskListResponse{Tasks: page.Items, Offset: page.Offset, NextOffset: page.NextOffset})
+	case proto.LocalOperationTaskPause:
+		input, _, legacy, err := decodeLocalTaskControl(request.Payload, false)
+		if err != nil || legacy {
+			return localTaskFailure(request.RequestID, proto.InvalidTaskControlErrorCode)
+		}
+		task, err := h.service.Pause(ctx, input)
+		return localTaskControlResponse(request.RequestID, task, err, false)
+	case proto.LocalOperationTaskResume:
+		input, _, legacy, err := decodeLocalTaskControl(request.Payload, false)
+		if err != nil || legacy {
+			return localTaskFailure(request.RequestID, proto.InvalidTaskControlErrorCode)
+		}
+		task, err := h.service.ResumeTask(ctx, input)
+		return localTaskControlResponse(request.RequestID, task, err, false)
 	case proto.LocalOperationTaskCancel:
-		var input proto.LocalTaskIDRequest
-		if err := proto.DecodeLocalPayload(request.Payload, &input); err != nil || input.Validate() != nil {
-			return localTaskFailure(request.RequestID, "invalid_task_id")
-		}
-		if err := h.service.Cancel(ctx, input.TaskID); err != nil {
-			return localTaskFailure(request.RequestID, safeLocalTaskError(err))
-		}
-		return localTaskSuccess(request.RequestID, struct{}{})
-	case proto.LocalOperationTaskRetry:
-		var input proto.LocalTaskIDRequest
-		if err := proto.DecodeLocalPayload(request.Payload, &input); err != nil || input.Validate() != nil {
-			return localTaskFailure(request.RequestID, "invalid_task_id")
-		}
-		task, err := h.service.Retry(ctx, input.TaskID)
+		input, legacyTaskID, legacy, err := decodeLocalTaskControl(request.Payload, true)
 		if err != nil {
-			return localTaskFailure(request.RequestID, safeLocalTaskError(err))
+			return localTaskFailure(request.RequestID, proto.InvalidTaskControlErrorCode)
 		}
-		return localTaskSuccess(request.RequestID, proto.LocalTaskRetryResponse{Task: task})
+		if legacy {
+			task, err := h.service.LegacyCancel(ctx, legacyTaskID)
+			return localTaskControlResponse(request.RequestID, task, err, false)
+		}
+		task, err := h.service.Cancel(ctx, input)
+		return localTaskControlResponse(request.RequestID, task, err, false)
+	case proto.LocalOperationTaskRetry:
+		input, legacyTaskID, legacy, err := decodeLocalTaskControl(request.Payload, true)
+		if err != nil {
+			return localTaskFailure(request.RequestID, proto.InvalidTaskControlErrorCode)
+		}
+		if legacy {
+			task, err := h.service.LegacyRetry(ctx, legacyTaskID)
+			return localTaskControlResponse(request.RequestID, task, err, false)
+		}
+		task, err := h.service.Retry(ctx, input)
+		return localTaskControlResponse(request.RequestID, task, err, false)
+	case proto.LocalOperationTaskDelete:
+		input, _, legacy, err := decodeLocalTaskControl(request.Payload, false)
+		if err != nil || legacy {
+			return localTaskFailure(request.RequestID, proto.InvalidTaskControlErrorCode)
+		}
+		result, err := h.service.Delete(ctx, input)
+		if err != nil {
+			return localTaskFailure(request.RequestID, safeLocalTaskControlError(err, true))
+		}
+		return localTaskSuccess(request.RequestID, result)
 	default:
 		return localTaskFailure(request.RequestID, proto.UnsupportedOperationErrorCode)
+	}
+}
+
+func decodeLocalTaskControl(payload []byte, legacyAllowed bool) (localtask.ControlRequest, string, bool, error) {
+	var fields map[string]msgpack.RawMessage
+	if err := proto.DecodeLocalPayload(payload, &fields); err != nil || len(fields) == 0 {
+		return localtask.ControlRequest{}, "", false, proto.LocalTaskControlRequest{}.Validate()
+	}
+	_, hasInstance := fields["instance_id"]
+	_, hasRevision := fields["expected_revision"]
+	if hasInstance || hasRevision {
+		var request localtask.ControlRequest
+		if err := proto.DecodeLocalPayload(payload, &request); err != nil || request.Validate() != nil {
+			return localtask.ControlRequest{}, "", false, proto.LocalTaskControlRequest{}.Validate()
+		}
+		return request, "", false, nil
+	}
+	if !legacyAllowed || len(fields) != 1 || fields["task_id"] == nil {
+		return localtask.ControlRequest{}, "", false, proto.LocalTaskControlRequest{}.Validate()
+	}
+	var request proto.LocalTaskIDRequest
+	if err := proto.DecodeLocalPayload(payload, &request); err != nil || request.Validate() != nil {
+		return localtask.ControlRequest{}, "", false, proto.LocalTaskControlRequest{}.Validate()
+	}
+	return localtask.ControlRequest{}, request.TaskID, true, nil
+}
+
+func localTaskControlResponse(requestID string, task localtask.Task, err error, deleting bool) proto.LocalResponse {
+	if err != nil {
+		return localTaskFailure(requestID, safeLocalTaskControlError(err, deleting))
+	}
+	return localTaskSuccess(requestID, localtask.ControlResult{Task: &task})
+}
+
+func safeLocalTaskControlError(err error, deleting bool) string {
+	switch {
+	case errors.Is(err, store.ErrLocalTaskStale):
+		return "stale_task"
+	case errors.Is(err, store.ErrLocalTaskInstanceMismatch):
+		return "task_instance_mismatch"
+	case errors.Is(err, store.ErrLocalTaskTransition):
+		return "invalid_task_state"
+	case errors.Is(err, sql.ErrNoRows):
+		return "task_not_found"
+	case err != nil && err.Error() == "task_instance_required":
+		return "task_instance_required"
+	case deleting:
+		return "task_delete_failed"
+	default:
+		return "task_control_failed"
 	}
 }
 

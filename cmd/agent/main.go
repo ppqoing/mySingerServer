@@ -335,7 +335,7 @@ func runWithDependencies(
 		Status: provider.ControlStatus, Shutdown: stop,
 		ConfigPath: configPath, ExecutablePath: executablePath, CPUCount: runtime.NumCPU(),
 		EffectiveConfigSHA256: configSHA256,
-		Tasks:                 agent.NewLocalTaskHandler(legacyLocalTaskHandlerService{RecoverableService: tasks}),
+		Tasks:                 agent.NewLocalTaskHandler(tasks),
 		Results:               agent.NewLocalResultHandler(reviews, previews),
 		Deletes:               agent.NewLocalDeleteHandler(deletes),
 	})
@@ -948,21 +948,6 @@ func runnerStatsJSON(value any) string {
 		return "{}"
 	}
 	return string(encoded)
-}
-
-type legacyLocalTaskHandlerService struct{ localtask.RecoverableService }
-
-func (s legacyLocalTaskHandlerService) Cancel(ctx context.Context, taskID string) error {
-	_, err := s.LegacyCancel(ctx, taskID)
-	return err
-}
-
-func (s legacyLocalTaskHandlerService) Retry(ctx context.Context, taskID string) (localtask.Task, error) {
-	return s.LegacyRetry(ctx, taskID)
-}
-
-func (s legacyLocalTaskHandlerService) Resume(ctx context.Context) error {
-	return s.ResumeRecoveredTasks(ctx)
 }
 
 func (h *agentLocalHandler) loadConfig() (*config.AgentConfig, []byte, string, error) {
