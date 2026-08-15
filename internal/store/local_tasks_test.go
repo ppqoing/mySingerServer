@@ -799,6 +799,9 @@ func TestLocalTaskLifecycleUsesExplicitTransitionsAndStablePagination(t *testing
 	if _, err := db.CreateOrLoadLocalTask(ctx, LocalTaskCreate{TaskID: "foreign", MachineID: "machine-b", Source: "local", Type: "scan", EnvelopeDigest: "foreign", Envelope: []byte("foreign")}); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := db.db.Exec(`UPDATE local_tasks SET created_at=100 WHERE task_id IN ('task-a','task-b','task-c')`); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := db.TransitionLocalTask(ctx, "machine-a", "task-a", LocalTaskUpdate{Status: "running", Stage: 1, ProgressComplete: 4, ProgressTotal: 10}); err != nil {
 		t.Fatal(err)
 	}
@@ -809,7 +812,7 @@ func TestLocalTaskLifecycleUsesExplicitTransitionsAndStablePagination(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(page) != 2 || page[0].TaskID != "task-a" || page[1].TaskID != "task-b" {
+	if len(page) != 2 || page[0].TaskID != "task-c" || page[1].TaskID != "task-b" {
 		t.Fatalf("first page = %#v", page)
 	}
 	if err := db.CancelLocalTask(ctx, "machine-a", "task-a"); err != nil {
@@ -818,12 +821,305 @@ func TestLocalTaskLifecycleUsesExplicitTransitionsAndStablePagination(t *testing
 	if err := db.CancelLocalTask(ctx, "machine-a", "task-a"); err != nil {
 		t.Fatalf("idempotent CancelLocalTask: %v", err)
 	}
+	stopping, err := db.LoadLocalTask(ctx, "machine-a", "task-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stopping.Status != "stopping" {
+		t.Fatalf("cancel status=%q, want stopping", stopping.Status)
+	}
+	cancelled, err := db.TransitionLocalTaskLifecycle(ctx, "machine-a", LocalTaskControl{
+		TaskID: stopping.TaskID, InstanceID: stopping.InstanceID, ExpectedRevision: stopping.Revision,
+	}, "cancelled", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cancelled.Status != "cancelled" {
+		t.Fatalf("completed cancel status=%q, want cancelled", cancelled.Status)
+	}
 	retried, err := db.RetryLocalTask(ctx, "machine-a", "task-a")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if retried.TaskID != "task-a" || retried.Status != "pending" || retried.Stage != 1 || string(retried.Envelope) != "task-a" {
 		t.Fatalf("retried = %#v", retried)
+	}
+}
+
+// Break caught: omitting any explicitly allowed edge makes a valid lifecycle
+// request fail, while accepting an unlisted edge reopens stable terminal work.
+func TestLocalTaskLifecycleAllowsOnlyDeclaredEdgesAndBumpsRevisionOnce(t *testing.T) {
+	db := openLocalTestDB(t)
+	ctx := context.Background()
+	edges := map[string][]string{
+		"pending":          {"running", "pausing", "stopping", "deleting", "waiting_recovery"},
+		"running":          {"pausing", "stopping", "deleting", "succeeded", "failed", "waiting_recovery"},
+		"waiting_recovery": {"running", "pausing", "stopping", "deleting", "failed"},
+		"pausing":          {"paused", "stopping", "deleting", "failed", "waiting_recovery"},
+		"paused":           {"pending", "cancelled", "deleting"},
+		"stopping":         {"cancelled", "deleting", "failed", "waiting_recovery"},
+		"failed":           {"pending", "deleting"},
+		"cancelled":        {"pending", "deleting"},
+		"succeeded":        {"deleting"},
+		"delete_failed":    {"deleting"},
+	}
+	index := 0
+	for from, targets := range edges {
+		for _, to := range targets {
+			index++
+			t.Run(from+"_to_"+to, func(t *testing.T) {
+				id := fmt.Sprintf("edge-%03d", index)
+				task := createVersionedLocalTask(t, db, id)
+				if _, err := db.db.Exec(`UPDATE local_tasks SET status=?1,revision=10 WHERE task_id=?2`, from, id); err != nil {
+					t.Fatal(err)
+				}
+				task, err := db.LoadLocalTask(ctx, "machine-1", task.TaskID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				updated, err := db.TransitionLocalTaskLifecycle(ctx, "machine-1", controlFor(task), to, nil, nil)
+				if err != nil {
+					t.Fatalf("%s -> %s: %v", from, to, err)
+				}
+				if updated.Status != to || updated.Revision != 11 {
+					t.Fatalf("updated=(status=%q revision=%d), want (%q,11)", updated.Status, updated.Revision, to)
+				}
+			})
+		}
+	}
+
+	for _, test := range []struct{ from, to string }{
+		{from: "succeeded", to: "running"},
+		{from: "cancelled", to: "succeeded"},
+		{from: "failed", to: "running"},
+		{from: "delete_failed", to: "pending"},
+		{from: "deleting", to: "pending"},
+	} {
+		t.Run("reject_"+test.from+"_to_"+test.to, func(t *testing.T) {
+			id := "reject-" + test.from
+			task := createVersionedLocalTask(t, db, id)
+			if _, err := db.db.Exec(`UPDATE local_tasks SET status=?1,revision=20 WHERE task_id=?2`, test.from, id); err != nil {
+				t.Fatal(err)
+			}
+			task, err := db.LoadLocalTask(ctx, "machine-1", task.TaskID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.TransitionLocalTaskLifecycle(ctx, "machine-1", controlFor(task), test.to, nil, nil); !errors.Is(err, ErrLocalTaskTransition) {
+				t.Fatalf("error=%v, want %v", err, ErrLocalTaskTransition)
+			}
+			unchanged, err := db.LoadLocalTask(ctx, "machine-1", task.TaskID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if unchanged.Status != test.from || unchanged.Revision != 20 {
+				t.Fatalf("rejected transition mutated task: %#v", unchanged)
+			}
+		})
+	}
+}
+
+// Break caught: checking only task_id lets a late request mutate a replacement
+// incarnation, and checking only instance_id lets stale lifecycle commands win.
+func TestLocalTaskStaleAndInstanceMismatchDoNotMutate(t *testing.T) {
+	db := openLocalTestDB(t)
+	ctx := context.Background()
+	task := createVersionedLocalTask(t, db, "cas-task")
+
+	wrongInstance := controlFor(task)
+	wrongInstance.InstanceID = "replacement-instance"
+	wrongInstance.ExpectedRevision++
+	if _, err := db.TransitionLocalTaskLifecycle(ctx, "machine-1", wrongInstance, "not-a-state", nil, nil); !errors.Is(err, ErrLocalTaskInstanceMismatch) {
+		t.Fatalf("instance mismatch error=%v, want %v", err, ErrLocalTaskInstanceMismatch)
+	}
+	assertLocalTaskSnapshot(t, db, task)
+
+	stale := controlFor(task)
+	stale.ExpectedRevision++
+	if _, err := db.TransitionLocalTaskLifecycle(ctx, "machine-1", stale, "not-a-state", nil, nil); !errors.Is(err, ErrLocalTaskStale) {
+		t.Fatalf("stale lifecycle error=%v, want %v", err, ErrLocalTaskStale)
+	}
+	assertLocalTaskSnapshot(t, db, task)
+
+	if _, err := db.UpdateLocalTaskProgress(ctx, "machine-1", stale, LocalTaskProgressUpdate{
+		Phase: "scan", Stage: 0, ProgressComplete: 1, ProgressTotal: 2, StatsJSON: "{}",
+	}); !errors.Is(err, ErrLocalTaskStale) {
+		t.Fatalf("stale progress error=%v, want %v", err, ErrLocalTaskStale)
+	}
+	assertLocalTaskSnapshot(t, db, task)
+
+	if _, err := db.UpdateLocalTaskProgress(ctx, "machine-1", wrongInstance, LocalTaskProgressUpdate{
+		Phase: "scan", Stage: 0, ProgressComplete: 1, ProgressTotal: 2, StatsJSON: "{}",
+	}); !errors.Is(err, ErrLocalTaskInstanceMismatch) {
+		t.Fatalf("progress instance mismatch error=%v, want %v", err, ErrLocalTaskInstanceMismatch)
+	}
+	assertLocalTaskSnapshot(t, db, task)
+}
+
+// Break caught: progress persistence used to share lifecycle writes, causing
+// polling updates to invalidate the worker's otherwise-current revision.
+func TestLocalTaskProgressAdvancesPhaseWithoutBumpingRevision(t *testing.T) {
+	db := openLocalTestDB(t)
+	ctx := context.Background()
+	task := createVersionedLocalTask(t, db, "phase-advance")
+	updated, err := db.UpdateLocalTaskProgress(ctx, "machine-1", controlFor(task), LocalTaskProgressUpdate{
+		Phase: "stage2", Stage: 2, ProgressComplete: 0,
+		ProgressTotal: 12, ProgressTotalKnown: true, StatsJSON: "{}",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Revision != task.Revision {
+		t.Fatalf("revision=%d, want %d", updated.Revision, task.Revision)
+	}
+	if updated.Phase != "stage2" || updated.Stage != 2 || updated.ProgressTotal != 12 || !updated.ProgressTotalKnown {
+		t.Fatalf("updated progress=%#v", updated)
+	}
+}
+
+// Break caught: allowing counters, totals, or total-known state to roll back in
+// one phase makes progress regress; forbidding resets across phases blocks work.
+func TestLocalTaskProgressEnforcesMonotonicPhaseRules(t *testing.T) {
+	db := openLocalTestDB(t)
+	ctx := context.Background()
+	task := createVersionedLocalTask(t, db, "progress-rules")
+
+	updates := []LocalTaskProgressUpdate{
+		{Phase: "waiting", Stage: 0, ProgressComplete: 1, ProgressTotal: 2, ProgressTotalKnown: false, StatsJSON: `{"step":1}`},
+		{Phase: "waiting", Stage: 0, ProgressComplete: 2, ProgressTotal: 4, ProgressTotalKnown: false, StatsJSON: `{"step":2}`},
+		{Phase: "waiting", Stage: 0, ProgressComplete: 3, ProgressTotal: 5, ProgressTotalKnown: true, StatsJSON: `{"step":3}`},
+	}
+	for _, update := range updates {
+		var err error
+		task, err = db.UpdateLocalTaskProgress(ctx, "machine-1", controlFor(task), update)
+		if err != nil {
+			t.Fatalf("update %#v: %v", update, err)
+		}
+	}
+	if task.Revision != 1 || !task.ProgressTotalKnown || task.ProgressTotal != 5 {
+		t.Fatalf("progress snapshot=%#v", task)
+	}
+	task, err := db.UpdateLocalTaskProgress(ctx, "machine-1", controlFor(task), LocalTaskProgressUpdate{
+		Phase: "waiting", Stage: 0, ProgressComplete: 4, ProgressTotal: 6,
+		ProgressTotalKnown: true, StatsJSON: `{"step":4}`,
+	})
+	if err != nil {
+		t.Fatalf("known total increase: %v", err)
+	}
+
+	for name, update := range map[string]LocalTaskProgressUpdate{
+		"completed rollback": {Phase: "waiting", Stage: 0, ProgressComplete: 3, ProgressTotal: 6, ProgressTotalKnown: true, StatsJSON: "{}"},
+		"total rollback":     {Phase: "waiting", Stage: 0, ProgressComplete: 4, ProgressTotal: 5, ProgressTotalKnown: true, StatsJSON: "{}"},
+		"known rollback":     {Phase: "waiting", Stage: 0, ProgressComplete: 4, ProgressTotal: 6, ProgressTotalKnown: false, StatsJSON: "{}"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := db.UpdateLocalTaskProgress(ctx, "machine-1", controlFor(task), update); !errors.Is(err, ErrLocalTaskProgressRollback) {
+				t.Fatalf("error=%v, want %v", err, ErrLocalTaskProgressRollback)
+			}
+		})
+	}
+
+	advanced, err := db.UpdateLocalTaskProgress(ctx, "machine-1", controlFor(task), LocalTaskProgressUpdate{
+		Phase: "scan", Stage: 0, ProgressComplete: 0, ProgressTotal: 0,
+		ProgressTotalKnown: false, StatsJSON: `{"phase":"scan"}`,
+	})
+	if err != nil {
+		t.Fatalf("phase advance reset: %v", err)
+	}
+	if advanced.ProgressTotalKnown || advanced.ProgressTotal != 0 || advanced.ProgressComplete != 0 {
+		t.Fatalf("phase reset=%#v", advanced)
+	}
+	if _, err := db.UpdateLocalTaskProgress(ctx, "machine-1", controlFor(advanced), LocalTaskProgressUpdate{
+		Phase: "waiting", Stage: 0, ProgressComplete: 0, ProgressTotal: 0,
+		ProgressTotalKnown: false, StatsJSON: "{}",
+	}); !errors.Is(err, ErrLocalTaskProgressRollback) {
+		t.Fatalf("phase rollback error=%v, want %v", err, ErrLocalTaskProgressRollback)
+	}
+}
+
+// Break caught: ordering only by task_id ignores creation time and makes the
+// newest-task page unstable when timestamps tie.
+func TestLocalTaskListOrdersNewestThenTaskIDDescending(t *testing.T) {
+	db := openLocalTestDB(t)
+	ctx := context.Background()
+	for _, id := range []string{"old-z", "new-a", "new-b"} {
+		createVersionedLocalTask(t, db, id)
+	}
+	if _, err := db.db.Exec(`UPDATE local_tasks SET created_at=CASE WHEN task_id='old-z' THEN 100 ELSE 200 END`); err != nil {
+		t.Fatal(err)
+	}
+	tasks, err := db.ListLocalTasks(ctx, "machine-1", 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]string, len(tasks))
+	for i := range tasks {
+		got[i] = tasks[i].TaskID
+	}
+	want := []string{"new-b", "new-a", "old-z"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("task order=%v, want %v", got, want)
+	}
+}
+
+// Break caught: restart recovery changed statuses without versioning them, so
+// in-flight pre-restart commands remained current and could overwrite recovery.
+func TestLocalTaskLifecycleRecoveryVersionsEveryChangedRowOnce(t *testing.T) {
+	db := openLocalTestDB(t)
+	ctx := context.Background()
+	statuses := []string{"pending", "running", "pausing", "stopping", "paused", "deleting", "succeeded"}
+	for _, status := range statuses {
+		task := createVersionedLocalTask(t, db, "recover-"+status)
+		if _, err := db.db.Exec(`UPDATE local_tasks SET status=?1,revision=7 WHERE task_id=?2`, status, task.TaskID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.RecoverLocalTasks(ctx, "machine-1"); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]struct {
+		status   string
+		revision int64
+	}{
+		"pending": {"waiting_recovery", 8}, "running": {"waiting_recovery", 8},
+		"pausing": {"paused", 8}, "stopping": {"cancelled", 8},
+		"paused": {"paused", 7}, "deleting": {"deleting", 7}, "succeeded": {"succeeded", 7},
+	}
+	for from, expected := range want {
+		task, err := db.LoadLocalTask(ctx, "machine-1", "recover-"+from)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if task.Status != expected.status || task.Revision != expected.revision {
+			t.Fatalf("%s recovered=(%q,%d), want=(%q,%d)", from, task.Status, task.Revision, expected.status, expected.revision)
+		}
+	}
+}
+
+func createVersionedLocalTask(t *testing.T, db *DB, taskID string) LocalTask {
+	t.Helper()
+	task, err := db.CreateOrLoadLocalTask(context.Background(), LocalTaskCreate{
+		TaskID: taskID, MachineID: "machine-1", Source: "local", Type: "analysis",
+		EnvelopeDigest: "digest-" + taskID, Envelope: []byte("envelope-" + taskID),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return task
+}
+
+func controlFor(task LocalTask) LocalTaskControl {
+	return LocalTaskControl{TaskID: task.TaskID, InstanceID: task.InstanceID, ExpectedRevision: task.Revision}
+}
+
+func assertLocalTaskSnapshot(t *testing.T, db *DB, want LocalTask) {
+	t.Helper()
+	got, err := db.LoadLocalTask(context.Background(), want.MachineID, want.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("task mutated\ngot:  %#v\nwant: %#v", got, want)
 	}
 }
 
