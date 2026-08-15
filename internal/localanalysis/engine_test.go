@@ -26,9 +26,16 @@ func (s engineStageOne) Run(context.Context, string, string) (firstscreen.Result
 	return s.result, s.err
 }
 
+type engineStageOneFunc func(context.Context, string, string) (firstscreen.Result, error)
+
+func (run engineStageOneFunc) Run(ctx context.Context, machineID, runID string) (firstscreen.Result, error) {
+	return run(ctx, machineID, runID)
+}
+
 type engineStore struct {
 	run      store.LocalAnalysisRun
 	current  store.LocalAnalysisRun
+	durable  firstscreen.Result
 	calls    []string
 	pairs    []store.LocalPairScore
 	existing []store.LocalPairScore
@@ -50,6 +57,10 @@ func (s *engineStore) ListLocalPairScoresForRun(context.Context, string) ([]stor
 	result := append([]store.LocalPairScore(nil), s.existing...)
 	result = append(result, s.pairs...)
 	return result, s.fail["list-pairs"]
+}
+func (s *engineStore) LoadLocalStageOneForRun(context.Context, string) (firstscreen.Result, error) {
+	s.calls = append(s.calls, "load-stage1")
+	return s.durable, s.fail["load-stage1"]
 }
 func (s *engineStore) SaveLocalPairScore(_ context.Context, p store.LocalPairScore) error {
 	s.calls = append(s.calls, "pair")
@@ -279,9 +290,10 @@ func TestLocalAnalysisReportsDurableBusinessProgress(t *testing.T) {
 }
 
 func TestLocalAnalysisResumeSkipsDurablePairWork(t *testing.T) {
-	s := &engineStore{run: store.LocalAnalysisRun{RunID: "run-resume-progress", MachineID: "machine-a", Generation: 2, TaskID: "task-resume-progress", Status: "building"}, fail: map[string]error{}}
+	result := engineTwoCandidateResult()
+	s := &engineStore{run: store.LocalAnalysisRun{RunID: "run-resume-progress", MachineID: "machine-a", Generation: 2, TaskID: "task-resume-progress", Status: "building"}, durable: result, fail: map[string]error{}}
 	w := &engineWorker{makeResult: validEngineStageResult}
-	engine := NewEngine("machine-a", engineStageOne{result: engineTwoCandidateResult()}, s, w, testPhase2Config())
+	engine := NewEngine("machine-a", engineStageOne{result: result}, s, w, testPhase2Config())
 	engine.fileMetadata = func(string) (int64, int64, error) { return 10, 20, nil }
 	drain := make(chan struct{})
 	err := engine.RunWithProgress(context.Background(), "task-resume-progress", drain, func(progress AnalysisProgress) error {
@@ -319,7 +331,8 @@ func TestLocalAnalysisResumeUsesStage2JSONWhenFinalVerdictChangedAtStage3(t *tes
 	stage3 := `{"verdict":"no"}`
 	pair := result.CandidatePairs[0]
 	s := &engineStore{
-		run: store.LocalAnalysisRun{RunID: "run-resume-stage-verdict", MachineID: "machine-a", Generation: 5, TaskID: "task-resume-stage-verdict", Status: "building"},
+		run:     store.LocalAnalysisRun{RunID: "run-resume-stage-verdict", MachineID: "machine-a", Generation: 5, TaskID: "task-resume-stage-verdict", Status: "building"},
+		durable: result,
 		existing: []store.LocalPairScore{{
 			RunID: "run-resume-stage-verdict", PairKey: pairKey(pair),
 			LeftFileID: 3, RightFileID: 4,
@@ -342,6 +355,83 @@ func TestLocalAnalysisResumeUsesStage2JSONWhenFinalVerdictChangedAtStage3(t *tes
 	}
 	if len(w.jobs) != 0 || stage3Total != 1 {
 		t.Fatalf("jobs=%d stage3Total=%d, want durable stage2 yes-pair reused", len(w.jobs), stage3Total)
+	}
+}
+
+func TestLocalAnalysisSQLiteResumeDoesNotDeleteDurableStage2AndStage3(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(filepath.Join(t.TempDir(), "agent.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	result := engineCandidateResult()
+	records := make([]store.EnumUpsert, 0, len(result.Files))
+	hashes := make([]store.HashResult, 0, len(result.Files))
+	for _, file := range result.Files {
+		records = append(records, store.EnumUpsert{
+			MachineID: "machine-a", DiskNo: int64(file.DiskNo), Path: file.Path,
+			Size: file.Size, MTime: 1, MissingBase: 1,
+		})
+		hashes = append(hashes, store.HashResult{
+			Path: file.Path, SHA512: hex.EncodeToString(file.SHA512[:]),
+			Size: file.Size, MTime: 1,
+		})
+	}
+	if err := db.UpsertEnumerated(ctx, records); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ApplyHashResults(ctx, "machine-a", hashes); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.CreateOrLoadLocalTask(ctx, store.LocalTaskCreate{
+		TaskID: "task-sqlite-resume", MachineID: "machine-a", Source: "local",
+		Type: "analysis", Stage: 2, EnvelopeDigest: "digest", Envelope: []byte("envelope"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	run, err := db.BeginLocalAnalysis(ctx, "machine-a", "task-sqlite-resume")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ReplaceStageOne(ctx, run.RunID, result); err != nil {
+		t.Fatal(err)
+	}
+	pairs, err := db.ListLocalPairScoresForRun(ctx, run.RunID)
+	if err != nil || len(pairs) != 1 {
+		t.Fatalf("stage1 pairs=%#v err=%v", pairs, err)
+	}
+	stage2, stage3 := `{"verdict":"yes"}`, `{"verdict":"yes"}`
+	pairs[0].Stage2JSON = &stage2
+	pairs[0].Stage3JSON = &stage3
+	pairs[0].Verdict = "duplicate"
+	if err := db.SaveLocalPairScore(ctx, pairs[0]); err != nil {
+		t.Fatal(err)
+	}
+
+	stageOneCalls := 0
+	stageOne := engineStageOneFunc(func(ctx context.Context, _ string, runID string) (firstscreen.Result, error) {
+		stageOneCalls++
+		if err := db.ReplaceStageOne(ctx, runID, result); err != nil {
+			return firstscreen.Result{}, err
+		}
+		return result, nil
+	})
+	w := &engineWorker{makeResult: validEngineStageResult}
+	engine := NewEngine("machine-a", stageOne, db, w, testPhase2Config())
+	if err := engine.RunWithProgress(ctx, "task-sqlite-resume", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if stageOneCalls != 0 || len(w.jobs) != 0 {
+		t.Fatalf("resume reran stage1/work: stage1=%d jobs=%d", stageOneCalls, len(w.jobs))
+	}
+	got, err := db.ListLocalPairScoresForRun(ctx, run.RunID)
+	if err != nil || len(got) != 1 || got[0].Stage2JSON == nil || got[0].Stage3JSON == nil {
+		t.Fatalf("durable pair after resume=%#v err=%v", got, err)
+	}
+	current, err := db.CurrentLocalAnalysis(ctx, "machine-a")
+	if err != nil || current.RunID != run.RunID || current.Status != "published" {
+		t.Fatalf("current=%#v err=%v", current, err)
 	}
 }
 

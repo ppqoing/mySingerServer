@@ -31,6 +31,7 @@ type EngineStore interface {
 	BeginLocalAnalysis(context.Context, string, string) (store.LocalAnalysisRun, error)
 	CurrentLocalAnalysis(context.Context, string) (store.LocalAnalysisRun, error)
 	ListLocalPairScoresForRun(context.Context, string) ([]store.LocalPairScore, error)
+	LoadLocalStageOneForRun(context.Context, string) (firstscreen.Result, error)
 	SaveLocalPairScore(context.Context, store.LocalPairScore) error
 	ReplaceLocalAnalysisGroups(context.Context, string, []store.LocalAnalysisGroup) error
 	CompleteLocalAnalysis(context.Context, string) error
@@ -126,7 +127,15 @@ func (e *Engine) RunWithProgress(ctx context.Context, taskID string, drain <-cha
 	if drainRequested(drain) {
 		return ErrDrainRequested
 	}
-	result, err := e.stageOne.Run(ctx, e.machineID, run.RunID)
+	var result firstscreen.Result
+	if hasDurablePairCheckpoint(existingRows) {
+		result, err = e.store.LoadLocalStageOneForRun(ctx, run.RunID)
+		if err != nil {
+			return fmt.Errorf("localanalysis: load durable stage one: %w", err)
+		}
+	} else {
+		result, err = e.stageOne.Run(ctx, e.machineID, run.RunID)
+	}
 	if err != nil {
 		return fmt.Errorf("localanalysis: stage one: %w", err)
 	}
@@ -322,6 +331,15 @@ func (e *Engine) RunWithProgress(ctx context.Context, taskID string, drain <-cha
 		return fmt.Errorf("localanalysis: publish run: %w", err)
 	}
 	return reportAnalysisProgress(report, AnalysisProgress{Phase: "finalizing", Complete: 1, Total: 1, TotalKnown: true, CheckpointStage: 3})
+}
+
+func hasDurablePairCheckpoint(rows []store.LocalPairScore) bool {
+	for _, row := range rows {
+		if row.Stage2JSON != nil || row.Stage3JSON != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func reportAnalysisProgress(report func(AnalysisProgress) error, progress AnalysisProgress) error {

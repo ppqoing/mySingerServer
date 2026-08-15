@@ -32,17 +32,19 @@ type WorkerPool interface {
 }
 
 type ScanManager struct {
-	cfg      *config.AgentConfig
-	st       *store.DB
-	enumr    fileenum.Enumerator
-	hasher   Hasher
-	log      *slog.Logger
-	errLog   *slog.Logger
-	resolver DiskResolver
-	pool     WorkerPool
-	router   *PoolRouter
-	limiter  *byteLimiter
-	observer ScanObserver
+	cfg             *config.AgentConfig
+	st              *store.DB
+	enumr           fileenum.Enumerator
+	hasher          Hasher
+	log             *slog.Logger
+	errLog          *slog.Logger
+	resolver        DiskResolver
+	pool            WorkerPool
+	router          *PoolRouter
+	limiter         *byteLimiter
+	observer        ScanObserver
+	pendingSnapshot func(context.Context, string) (map[int64][]store.PendingFile, error)
+	progressTicks   func() (<-chan time.Time, func())
 
 	mu    sync.Mutex
 	tasks map[string]*ScanState
@@ -142,7 +144,7 @@ func NewScanManagerWithResolver(
 	errLog *slog.Logger,
 	resolver DiskResolver,
 ) *ScanManager {
-	return &ScanManager{
+	manager := &ScanManager{
 		cfg:      cfg,
 		st:       st,
 		enumr:    enumr,
@@ -154,6 +156,12 @@ func NewScanManagerWithResolver(
 		disks:    make(map[int64]bool),
 		limiter:  newByteLimiter(int64(cfg.Tuning.PendingBytesMB) << 20),
 	}
+	manager.pendingSnapshot = st.PendingSnapshot
+	manager.progressTicks = func() (<-chan time.Time, func()) {
+		ticker := time.NewTicker(time.Second)
+		return ticker.C, ticker.Stop
+	}
+	return manager
 }
 
 func (m *ScanManager) SetObserver(observer ScanObserver) {
@@ -219,7 +227,18 @@ func (m *ScanManager) Prepare(
 		state.mu.Lock()
 		status := state.Status
 		stats := state.Stats
+		drainReason := state.drainReason
 		state.mu.Unlock()
+		if status == "done" && drainReason != "" {
+			resumed := newScanState(task)
+			resumed.bindSender(sender)
+			m.tasks[task.TaskID] = resumed
+			m.mu.Unlock()
+			return proto.TaskAck{
+				TaskID: task.TaskID, Accepted: true,
+				Reason: "resumed", Total: -1,
+			}, m.startScan(resumed)
+		}
 		m.mu.Unlock()
 		if status == "done" {
 			return proto.TaskAck{
@@ -233,17 +252,19 @@ func (m *ScanManager) Prepare(
 		}, m.startScan(state)
 	}
 
-	state := &ScanState{
-		Task:     task,
-		Status:   "running",
-		speedWin: newSpeedWindow(10 * time.Second),
-	}
+	state := newScanState(task)
 	state.bindSender(sender)
 	m.tasks[task.TaskID] = state
 	m.mu.Unlock()
 	return proto.TaskAck{
 		TaskID: task.TaskID, Accepted: true, Reason: "accepted", Total: -1,
 	}, m.startScan(state)
+}
+
+func newScanState(task proto.ScanTask) *ScanState {
+	return &ScanState{
+		Task: task, Status: "running", speedWin: newSpeedWindow(10 * time.Second),
+	}
 }
 
 func (m *ScanManager) startScan(state *ScanState) func() {
@@ -426,9 +447,14 @@ func (m *ScanManager) run(state *ScanState) {
 		state.poolStart = m.pool.Metrics()
 	}
 	progressDone := make(chan struct{})
-	go m.progressLoop(state, progressDone)
+	progressExited := make(chan struct{})
+	go func() {
+		defer close(progressExited)
+		m.progressLoop(state, progressDone)
+	}()
 	finishRun := func(enumerated int64) {
 		close(progressDone)
+		<-progressExited
 		m.finish(state, started, enumerated)
 	}
 	var enumerated int64
@@ -519,7 +545,7 @@ func (m *ScanManager) run(state *ScanState) {
 	}
 	state.enumerationComplete.Store(true)
 
-	pending, err := m.st.PendingSnapshot(ctx, m.cfg.MachineID)
+	pending, err := m.pendingSnapshot(ctx, m.cfg.MachineID)
 	if err != nil {
 		state.failed.Add(1)
 		state.scanErrors.Add(1)
@@ -528,11 +554,8 @@ func (m *ScanManager) run(state *ScanState) {
 		return
 	}
 	pending = filterPendingSeen(pending, seen)
+	pendingWork := m.pendingWorkCount(pending)
 	work, _ := m.preparePending(state, pending)
-	var pendingWork int64
-	for _, files := range work {
-		pendingWork += int64(len(files))
-	}
 	cached := enumerated - pendingWork
 	if cached < 0 {
 		cached = 0
@@ -572,8 +595,7 @@ func (m *ScanManager) run(state *ScanState) {
 	close(mediaResults)
 	<-hashWriterDone
 	<-mediaWriterDone
-	close(progressDone)
-	m.finish(state, started, enumerated)
+	finishRun(enumerated)
 }
 
 type scanWork struct {
@@ -587,6 +609,43 @@ type scanWork struct {
 type mediaRoute struct {
 	job    *worker.JobMsg
 	cancel func()
+}
+
+type pendingWorkSpec struct {
+	media bool
+	kind  worker.MediaKind
+	mask  uint32
+}
+
+func (m *ScanManager) pendingSpec(file store.PendingFile) (pendingWorkSpec, bool) {
+	kind := MediaKindWithExtensions(
+		file.Path,
+		m.cfg.Scan.ImageExts,
+		m.cfg.Scan.VideoExts,
+	)
+	if kind == "other" {
+		return pendingWorkSpec{}, file.MissingMask&proto.FieldSHA512 != 0
+	}
+	spec := pendingWorkSpec{media: true, kind: worker.MediaImage}
+	if kind == "image" {
+		spec.mask = file.MissingMask & store.RequiredStageOneMask(store.MediaImage)
+	} else {
+		spec.kind = worker.MediaVideo
+		spec.mask = file.MissingMask & store.RequiredStageOneMask(store.MediaVideo)
+	}
+	return spec, spec.mask != 0
+}
+
+func (m *ScanManager) pendingWorkCount(pending map[int64][]store.PendingFile) int64 {
+	var count int64
+	for _, files := range pending {
+		for _, file := range files {
+			if _, ok := m.pendingSpec(file); ok {
+				count++
+			}
+		}
+	}
+	return count
 }
 
 func (m *ScanManager) preparePending(
@@ -604,26 +663,12 @@ func (m *ScanManager) preparePending(
 	router := m.ensurePoolRouter()
 	for diskNo, files := range pending {
 		for _, file := range files {
-			kind := MediaKindWithExtensions(
-				file.Path,
-				m.cfg.Scan.ImageExts,
-				m.cfg.Scan.VideoExts,
-			)
-			if kind == "other" {
-				if file.MissingMask&proto.FieldSHA512 != 0 {
-					work[diskNo] = append(work[diskNo], scanWork{file: file})
-				}
+			spec, needed := m.pendingSpec(file)
+			if !needed {
 				continue
 			}
-			mask := file.MissingMask
-			mediaKind := worker.MediaImage
-			if kind == "image" {
-				mask &= store.RequiredStageOneMask(store.MediaImage)
-			} else {
-				mediaKind = worker.MediaVideo
-				mask &= store.RequiredStageOneMask(store.MediaVideo)
-			}
-			if mask == 0 {
+			if !spec.media {
+				work[diskNo] = append(work[diskNo], scanWork{file: file})
 				continue
 			}
 			current := scanWork{file: file}
@@ -655,8 +700,8 @@ func (m *ScanManager) preparePending(
 			jobID := router.NextJobID()
 			current.media = &worker.JobMsg{
 				JobID: jobID, ScanTaskID: state.Task.TaskID,
-				Path: file.Path, Kind: mediaKind, Phase: worker.Phase1,
-				FieldsMask: mask, Size: file.Size, MTimeUnix: file.MTime,
+				Path: file.Path, Kind: spec.kind, Phase: worker.Phase1,
+				FieldsMask: spec.mask, Size: file.Size, MTimeUnix: file.MTime,
 				KnownSHA: knownSHA,
 			}
 			terminal, cancelRoute, err := router.Register(current.media)
@@ -1097,13 +1142,13 @@ func (m *ScanManager) mediaResultWriter(
 }
 
 func (m *ScanManager) progressLoop(state *ScanState, done <-chan struct{}) {
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
+	ticks, stop := m.progressTicks()
+	defer stop()
 	for {
 		select {
 		case <-done:
 			return
-		case <-ticker.C:
+		case <-ticks:
 			state.send(proto.MsgTaskProgress, m.scanProgress(state))
 		}
 	}
@@ -1201,7 +1246,9 @@ func (m *ScanManager) finish(
 	}
 	time.AfterFunc(10*time.Minute, func() {
 		m.mu.Lock()
-		delete(m.tasks, state.Task.TaskID)
+		if m.tasks[state.Task.TaskID] == state {
+			delete(m.tasks, state.Task.TaskID)
+		}
 		m.mu.Unlock()
 	})
 }

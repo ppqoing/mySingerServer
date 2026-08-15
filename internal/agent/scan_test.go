@@ -167,7 +167,7 @@ func TestScanDrainStopsDispatchAndWaitsForInFlightResult(t *testing.T) {
 	done := make(chan proto.TaskDone, 1)
 	items := make(chan proto.FeatureItem, 2)
 	task := proto.ScanTask{TaskID: "task-drain", Roots: []string{`D:\media`}, Phase: 1}
-	if ack := manager.Handle(task, func(messageType uint8, value any) error {
+	sender := func(messageType uint8, value any) error {
 		switch messageType {
 		case proto.MsgFeatureResult:
 			for _, item := range value.(*proto.FeatureResult).Items {
@@ -177,7 +177,8 @@ func TestScanDrainStopsDispatchAndWaitsForInFlightResult(t *testing.T) {
 			done <- *value.(*proto.TaskDone)
 		}
 		return nil
-	}); !ack.Accepted {
+	}
+	if ack := manager.Handle(task, sender); !ack.Accepted {
 		t.Fatalf("ack=%#v", ack)
 	}
 	job := <-submitted
@@ -223,6 +224,37 @@ func TestScanDrainStopsDispatchAndWaitsForInFlightResult(t *testing.T) {
 	if routes != 0 {
 		t.Fatalf("registered routes after drain=%d", routes)
 	}
+	resume, start := manager.Prepare(task, sender)
+	if !resume.Accepted || resume.Reason != "resumed" || start == nil {
+		t.Fatalf("drained task resume=%#v start=%v", resume, start != nil)
+	}
+	start()
+	sawRemaining := false
+	for range 2 {
+		var resumedJob worker.JobMsg
+		select {
+		case resumedJob = <-submitted:
+		case <-time.After(5 * time.Second):
+			t.Fatal("resumed scan did not dispatch remaining work")
+		}
+		sawRemaining = sawRemaining || resumedJob.Path != job.Path
+		pool.results <- &worker.JobResultMsg{
+			JobID: resumedJob.JobID, ScanTaskID: resumedJob.ScanTaskID, Path: resumedJob.Path,
+			Kind: resumedJob.Kind, Phase: resumedJob.Phase, Source: resumedJob.Source,
+			FieldsDone: resumedJob.FieldsMask, SHA512: bytes.Repeat([]byte{0x55}, 64),
+		}
+	}
+	if !sawRemaining {
+		t.Fatal("resumed scan did not start the previously undispatched file")
+	}
+	select {
+	case final := <-done:
+		if final.Reason != "" || final.Stats.Done != 2 {
+			t.Fatalf("resumed TaskDone=%#v", final)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("resumed scan did not finish")
+	}
 }
 
 func TestScanDrainFlushesEnumeratedTailWithWorkContext(t *testing.T) {
@@ -261,6 +293,109 @@ func TestScanDrainFlushesEnumeratedTailWithWorkContext(t *testing.T) {
 	}
 	if !reflect.DeepEqual(paths, []string{`D:\media\tail.bin`}) {
 		t.Fatalf("durable enumerated tail=%v", paths)
+	}
+}
+
+func TestScanDrainAfterPendingSnapshotDoesNotCountPendingAsCached(t *testing.T) {
+	enumr := &fakeEnumerator{records: map[string][]fileenum.FileRecord{
+		`D:\media`: {{Path: `D:\media\pending.bin`, Size: 10, MTime: 20}},
+	}}
+	manager, cleanup := newTestScanManager(t, enumr, nil)
+	defer cleanup()
+	pendingReady := make(chan struct{})
+	releasePending := make(chan struct{})
+	manager.pendingSnapshot = func(ctx context.Context, machineID string) (map[int64][]store.PendingFile, error) {
+		pending, err := manager.st.PendingSnapshot(ctx, machineID)
+		close(pendingReady)
+		<-releasePending
+		return pending, err
+	}
+	done := make(chan proto.TaskDone, 1)
+	task := proto.ScanTask{TaskID: "task-pending-window", Roots: []string{`D:\media`}, Phase: 1}
+	manager.Handle(task, captureTaskDone(done))
+	<-pendingReady
+	if accepted, _ := manager.Drain(task.TaskID, proto.TaskDrainPause); !accepted {
+		t.Fatal("drain was not accepted")
+	}
+	close(releasePending)
+	select {
+	case final := <-done:
+		if final.Reason != proto.TaskDrainPause || final.Stats.Total != 1 ||
+			final.Stats.Done != 0 || final.Stats.Skipped != 0 {
+			t.Fatalf("drain-window TaskDone=%#v", final)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("drain-window scan did not finish")
+	}
+}
+
+func TestScanJoinsProgressLoopBeforeFinalProgressAndTaskDone(t *testing.T) {
+	hashStarted := make(chan struct{})
+	releaseHash := make(chan struct{})
+	hasher := hasherFunc(func(string) (string, error) {
+		close(hashStarted)
+		<-releaseHash
+		return "hash", nil
+	})
+	enumr := &fakeEnumerator{records: map[string][]fileenum.FileRecord{
+		`D:\media`: {{Path: `D:\media\progress.bin`, Size: 10, MTime: 20}},
+	}}
+	manager, cleanup := newTestScanManager(t, enumr, hasher)
+	defer cleanup()
+	ticks := make(chan time.Time, 1)
+	manager.progressTicks = func() (<-chan time.Time, func()) {
+		return ticks, func() {}
+	}
+	loopEntered := make(chan struct{})
+	releaseLoop := make(chan struct{})
+	featureSent := make(chan struct{})
+	done := make(chan proto.TaskDone, 1)
+	var mu sync.Mutex
+	progressCalls := 0
+	messageOrder := make([]uint8, 0, 5)
+	sender := func(msgType uint8, value any) error {
+		if msgType == proto.MsgTaskProgress {
+			mu.Lock()
+			progressCalls++
+			call := progressCalls
+			mu.Unlock()
+			if call == 2 {
+				close(loopEntered)
+				<-releaseLoop
+			}
+		}
+		mu.Lock()
+		messageOrder = append(messageOrder, msgType)
+		mu.Unlock()
+		switch msgType {
+		case proto.MsgFeatureResult:
+			close(featureSent)
+		case proto.MsgTaskDone:
+			done <- *value.(*proto.TaskDone)
+		}
+		return nil
+	}
+	manager.Handle(proto.ScanTask{TaskID: "task-progress-join", Roots: []string{`D:\media`}, Phase: 1}, sender)
+	<-hashStarted
+	ticks <- time.Now()
+	<-loopEntered
+	close(releaseHash)
+	<-featureSent
+	select {
+	case final := <-done:
+		t.Fatalf("TaskDone overtook blocked progress send: %#v", final)
+	case <-time.After(250 * time.Millisecond):
+	}
+	close(releaseLoop)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("scan did not finish after progress send was released")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(messageOrder) == 0 || messageOrder[len(messageOrder)-1] != proto.MsgTaskDone {
+		t.Fatalf("message order=%v, want TaskDone last", messageOrder)
 	}
 }
 
