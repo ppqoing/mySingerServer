@@ -63,6 +63,10 @@ type RecoverableService interface {
 
 var errServiceClosing = errors.New("localtask: service is closing")
 
+// ErrTaskInstanceRequired rejects legacy task-ID-only controls after a
+// deletion receipt makes the task ID ambiguous.
+var ErrTaskInstanceRequired = errors.New("task_instance_required")
+
 type taskService struct {
 	machineID string
 	store     TaskStore
@@ -399,7 +403,7 @@ func (s *taskService) LegacyCancel(ctx context.Context, taskID string) (Task, er
 		return Task{}, err
 	}
 	if deleted {
-		return Task{}, fmt.Errorf("%w: task %s has deletion receipt", store.ErrLocalTaskTransition, taskID)
+		return Task{}, fmt.Errorf("%w: task %s has deletion receipt", ErrTaskInstanceRequired, taskID)
 	}
 	current, err := s.store.LoadLocalTask(ctx, s.machineID, taskID)
 	if err != nil {
@@ -425,7 +429,7 @@ func (s *taskService) LegacyRetry(ctx context.Context, taskID string) (Task, err
 		return Task{}, err
 	}
 	if deleted {
-		return Task{}, fmt.Errorf("%w: task %s has deletion receipt", store.ErrLocalTaskTransition, taskID)
+		return Task{}, fmt.Errorf("%w: task %s has deletion receipt", ErrTaskInstanceRequired, taskID)
 	}
 	current, err := s.store.LoadLocalTask(ctx, s.machineID, taskID)
 	if err != nil {

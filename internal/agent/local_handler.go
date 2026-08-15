@@ -355,12 +355,12 @@ func safeLocalTaskControlError(err error, deleting bool) string {
 		return "stale_task"
 	case errors.Is(err, store.ErrLocalTaskInstanceMismatch):
 		return "task_instance_mismatch"
+	case errors.Is(err, localtask.ErrTaskInstanceRequired):
+		return "task_instance_required"
 	case errors.Is(err, store.ErrLocalTaskTransition):
 		return "invalid_task_state"
 	case errors.Is(err, sql.ErrNoRows):
 		return "task_not_found"
-	case err != nil && err.Error() == "task_instance_required":
-		return "task_instance_required"
 	case deleting:
 		return "task_delete_failed"
 	default:

@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -561,7 +563,7 @@ func TestLocalTaskHandlerMapsControlErrorsWithoutLeakingBackendText(t *testing.T
 		{name: "instance mismatch", operation: proto.LocalOperationTaskResume, configure: func(s *fakeLocalTaskService, err error) { s.resumeErr = err }, err: fmt.Errorf("wrapped: %w", store.ErrLocalTaskInstanceMismatch), want: "task_instance_mismatch"},
 		{name: "invalid state", operation: proto.LocalOperationTaskCancel, configure: func(s *fakeLocalTaskService, err error) { s.cancelErr = err }, err: fmt.Errorf("wrapped: %w", store.ErrLocalTaskTransition), want: "invalid_task_state"},
 		{name: "not found", operation: proto.LocalOperationTaskRetry, configure: func(s *fakeLocalTaskService, err error) { s.retryErr = err }, err: sql.ErrNoRows, want: "task_not_found"},
-		{name: "reused legacy task", operation: proto.LocalOperationTaskCancel, configure: func(s *fakeLocalTaskService, err error) { s.legacyCancelErr = err }, err: errors.New("task_instance_required"), want: "task_instance_required"},
+		{name: "reused legacy task", operation: proto.LocalOperationTaskCancel, configure: func(s *fakeLocalTaskService, err error) { s.legacyCancelErr = err }, err: fmt.Errorf("wrapped: %w", localtask.ErrTaskInstanceRequired), want: "task_instance_required"},
 		{name: "delete failure", operation: proto.LocalOperationTaskDelete, configure: func(s *fakeLocalTaskService, err error) { s.deleteErr = err }, err: secret, want: "task_delete_failed"},
 		{name: "other control failure", operation: proto.LocalOperationTaskPause, configure: func(s *fakeLocalTaskService, err error) { s.pauseErr = err }, err: secret, want: "task_control_failed"},
 	} {
@@ -585,6 +587,25 @@ func TestLocalTaskHandlerMapsControlErrorsWithoutLeakingBackendText(t *testing.T
 	}
 }
 
+// Break caught: legacy cancel/retry can target a new task that reused a
+// deleted task ID, instead of requiring an instance-aware control request.
+func TestLocalTaskHandlerRequiresInstanceForReusedLegacyTaskID(t *testing.T) {
+	service := newReceiptBlockedLocalTaskService(t)
+	handler := NewLocalTaskHandler(service)
+	for _, operation := range []string{proto.LocalOperationTaskCancel, proto.LocalOperationTaskRetry} {
+		t.Run(operation, func(t *testing.T) {
+			payload, err := proto.EncodeLocalPayload(proto.LocalTaskIDRequest{TaskID: "reused-task"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			response := handler.HandleLocal(context.Background(), proto.LocalRequest{RequestID: operation, Operation: operation, Payload: payload})
+			if response.OK || response.ErrorCode != "task_instance_required" {
+				t.Fatalf("response=%#v", response)
+			}
+		})
+	}
+}
+
 func handleLocalTaskRequest(t *testing.T, service LocalTaskService, operation string, input any) proto.LocalResponse {
 	t.Helper()
 	payload, err := proto.EncodeLocalPayload(input)
@@ -596,4 +617,92 @@ func handleLocalTaskRequest(t *testing.T, service LocalTaskService, operation st
 
 func taskSnapshot(status string, revision int64) localtask.Task {
 	return localtask.Task{TaskID: "task-1", InstanceID: "instance-1", Revision: revision, Mode: proto.LocalTaskModeScanOnly, Status: status}
+}
+
+func newReceiptBlockedLocalTaskService(t *testing.T) localtask.Service {
+	t.Helper()
+	db, err := store.Open(filepath.Join(t.TempDir(), "agent.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	runner := &receiptTaskRunner{started: make(chan struct{}), release: make(chan struct{})}
+	t.Cleanup(func() { close(runner.release) })
+	service := localtask.NewService("machine-a", db, runner)
+	request := localtask.CreateRequest{TaskID: "reused-task", Roots: []string{`D:\\media`}, Mode: proto.LocalTaskModeScanOnly}
+	original, err := service.Create(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-runner.started:
+	case <-time.After(time.Second):
+		t.Fatal("task did not start")
+	}
+	current := waitTaskForHandler(t, service, original.TaskID, "running")
+	if _, err := service.Delete(context.Background(), localtask.ControlRequest{
+		TaskID: current.TaskID, InstanceID: current.InstanceID, ExpectedRevision: current.Revision,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitReceiptForHandler(t, db, original)
+	replacement, err := service.Create(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replacement.InstanceID == original.InstanceID {
+		t.Fatalf("replacement instance=%q original=%q", replacement.InstanceID, original.InstanceID)
+	}
+	return service
+}
+
+type receiptTaskRunner struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (runner *receiptTaskRunner) Run(control localtask.RunControl, _ localtask.CreateRequest, _ localtask.Task, _ func(localtask.ProgressUpdate) error) error {
+	runner.once.Do(func() { close(runner.started) })
+	select {
+	case <-control.Drain:
+		return localtask.ErrDrainRequested
+	case <-control.Context.Done():
+		return control.Context.Err()
+	case <-runner.release:
+		return nil
+	}
+}
+
+func waitReceiptForHandler(t *testing.T, db *store.DB, task localtask.Task) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := db.LoadLocalTaskDeletionReceipt(context.Background(), "machine-a", task.TaskID, task.InstanceID); err == nil {
+			return
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			t.Fatal(err)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("deletion receipt for task %q was not persisted", task.TaskID)
+}
+
+func waitTaskForHandler(t *testing.T, service localtask.Service, taskID, status string) localtask.Task {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		page, err := service.List(context.Background(), localtask.ListRequest{Limit: 200})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, task := range page.Items {
+			if task.TaskID == taskID && task.Status == status {
+				return task
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("task %q did not reach %s", taskID, status)
+	return localtask.Task{}
 }

@@ -60,6 +60,49 @@ func TestLocalTaskCreateUsesPersistedEnvelopeCopy(t *testing.T) {
 	close(runner.release)
 }
 
+// Break caught: an old task-ID-only control can operate on a replacement task
+// after the original attempt was deleted and its ID was reused.
+func TestLocalTaskLegacyControlsRequireInstanceAfterTaskIDReuse(t *testing.T) {
+	db := openServiceDB(t)
+	runner := &recordingTaskRunner{started: make(chan runRecord, 2), release: make(chan struct{})}
+	defer close(runner.release)
+	service := NewService("machine-a", db, runner)
+	request := CreateRequest{TaskID: "reused-task", Roots: []string{`D:\\media`}, Mode: proto.LocalTaskModeScanOnly}
+	original, err := service.Create(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = waitRun(t, runner.started)
+	current := waitLocalTaskSnapshot(t, service, original.TaskID, "running")
+	if _, err := service.Delete(context.Background(), ControlRequest{
+		TaskID: current.TaskID, InstanceID: current.InstanceID, ExpectedRevision: current.Revision,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitLocalTaskDeletionReceipt(t, db, "machine-a", original)
+	replacement, err := service.Create(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replacement.InstanceID == original.InstanceID {
+		t.Fatalf("replacement instance=%q original=%q", replacement.InstanceID, original.InstanceID)
+	}
+
+	for _, control := range []struct {
+		name string
+		call func(context.Context, string) (Task, error)
+	}{
+		{name: "cancel", call: service.LegacyCancel},
+		{name: "retry", call: service.LegacyRetry},
+	} {
+		t.Run(control.name, func(t *testing.T) {
+			if _, err := control.call(context.Background(), original.TaskID); !errors.Is(err, ErrTaskInstanceRequired) {
+				t.Fatalf("legacy %s error=%v, want task instance required", control.name, err)
+			}
+		})
+	}
+}
+
 // Break caught: recovery restarts completed scan work from stage zero or
 // guesses an old row's missing roots instead of failing closed.
 func TestLocalTaskRecoveryContinuesFromPersistedStageAndRejectsLegacyEnvelope(t *testing.T) {
@@ -186,4 +229,37 @@ func waitTaskStatus(t *testing.T, service Service, taskID, status string) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatalf("task %s did not reach %s", taskID, status)
+}
+
+func waitLocalTaskDeletionReceipt(t *testing.T, db *store.DB, machineID string, task Task) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := db.LoadLocalTaskDeletionReceipt(context.Background(), machineID, task.TaskID, task.InstanceID); err == nil {
+			return
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			t.Fatal(err)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("deletion receipt for task %q was not persisted", task.TaskID)
+}
+
+func waitLocalTaskSnapshot(t *testing.T, service Service, taskID, status string) Task {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		page, err := service.List(context.Background(), ListRequest{Limit: 200})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, task := range page.Items {
+			if task.TaskID == taskID && task.Status == status {
+				return task
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("task %q did not reach %s", taskID, status)
+	return Task{}
 }
