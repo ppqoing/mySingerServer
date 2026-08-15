@@ -12,6 +12,7 @@ import (
 )
 
 var ErrLocalTaskConflict = errors.New("task_conflict")
+var ErrLocalTaskDeleteRetryable = errors.New("task_delete_retryable")
 var ErrLocalTaskInstanceMismatch = errors.New("task_instance_mismatch")
 var ErrLocalTaskProgressRollback = errors.New("task_progress_rollback")
 var ErrLocalTaskStale = errors.New("stale_task")
