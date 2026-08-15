@@ -43,6 +43,113 @@ func TestLocalEnvelopeRejectsOversizedPayloadAndUnknownOperation(t *testing.T) {
 	}
 }
 
+func TestLocalTaskControlPayloadRoundTrip(t *testing.T) {
+	want := LocalTaskControlRequest{
+		TaskID: "task-1", InstanceID: "instance-1", ExpectedRevision: 7,
+	}
+	payload, err := EncodeLocalPayload(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got LocalTaskControlRequest
+	if err := DecodeLocalPayload(payload, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("got %#v, want %#v", got, want)
+	}
+	if err := got.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLocalTaskControlValidationRejectsUnstableIdentityOrRevision(t *testing.T) {
+	valid := LocalTaskControlRequest{TaskID: "task-1", InstanceID: "instance-1", ExpectedRevision: 1}
+	for name, mutate := range map[string]func(*LocalTaskControlRequest){
+		"empty task id":       func(v *LocalTaskControlRequest) { v.TaskID = "" },
+		"task id whitespace":  func(v *LocalTaskControlRequest) { v.TaskID = " task-1" },
+		"task id trailing":    func(v *LocalTaskControlRequest) { v.TaskID = "task-1 " },
+		"empty instance id":   func(v *LocalTaskControlRequest) { v.InstanceID = "" },
+		"instance whitespace": func(v *LocalTaskControlRequest) { v.InstanceID = " instance-1" },
+		"instance trailing":   func(v *LocalTaskControlRequest) { v.InstanceID = "instance-1 " },
+		"zero revision":       func(v *LocalTaskControlRequest) { v.ExpectedRevision = 0 },
+		"negative revision":   func(v *LocalTaskControlRequest) { v.ExpectedRevision = -1 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := valid
+			mutate(&candidate)
+			if err := candidate.Validate(); err == nil || err.Error() != InvalidTaskControlErrorCode {
+				t.Fatalf("Validate() error = %v, want %q", err, InvalidTaskControlErrorCode)
+			}
+		})
+	}
+}
+
+func TestLocalTaskControlOperationsAreAllowed(t *testing.T) {
+	for _, operation := range []string{
+		LocalOperationTaskPause, LocalOperationTaskResume, LocalOperationTaskDelete,
+	} {
+		if !IsLocalOperation(operation) {
+			t.Fatalf("IsLocalOperation(%q) = false", operation)
+		}
+	}
+}
+
+func TestLocalTaskControlResponseRoundTripPreservesCompleteSnapshot(t *testing.T) {
+	want := LocalTaskControlResponse{
+		Task: &LocalTask{
+			TaskID: "task-1", InstanceID: "instance-1", Revision: 9,
+			Source: "local", Mode: LocalTaskModeScanThenAnalysis, Stage: 2,
+			Phase: "analysis", Status: "paused", Roots: []string{`D:\\media`},
+			Rescan: true, Extensions: []string{".jpg"}, ProgressComplete: 4,
+			ProgressTotal: 10, ProgressTotalKnown: true, StatsJSON: `{"stable":true}`,
+			SafeErrorCode: "safe_error", SafeErrorMessage: "safe message",
+			CreatedAt: 100, UpdatedAt: 200, StartedAt: 110, CompletedAt: 0,
+		},
+	}
+	payload, err := EncodeLocalPayload(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got LocalTaskControlResponse
+	if err := DecodeLocalPayload(payload, &got); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %#v, want %#v", got, want)
+	}
+
+	want = LocalTaskControlResponse{Deleted: true}
+	payload, err = EncodeLocalPayload(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var deleted LocalTaskControlResponse
+	if err := DecodeLocalPayload(payload, &deleted); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(deleted, want) {
+		t.Fatalf("deleted response = %#v, want %#v", deleted, want)
+	}
+}
+
+func TestLegacyLocalTaskIDRequestStillDecodesForCancelAndRetry(t *testing.T) {
+	payload, err := msgpack.Marshal(LocalTaskIDRequest{TaskID: "legacy-task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got LocalTaskIDRequest
+	if err := DecodeLocalPayload(payload, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.TaskID != "legacy-task" {
+		t.Fatalf("legacy task id = %q", got.TaskID)
+	}
+	if err := got.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestLocalLifecyclePayloadsRoundTripWithoutNewMessageTypes(t *testing.T) {
 	status := nodectl.Status{
 		Component: nodectl.ComponentAgent, MachineID: "node-" + strings.Repeat("1", 64), PID: 17,

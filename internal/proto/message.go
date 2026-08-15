@@ -363,10 +363,13 @@ type StatsReport struct {
 }
 
 type TaskProgress struct {
-	TaskID string  `msgpack:"task_id"`
-	Done   int64   `msgpack:"done"`
-	Total  int64   `msgpack:"total"`
-	Speed  float64 `msgpack:"speed"`
+	TaskID     string  `msgpack:"task_id"`
+	Done       int64   `msgpack:"done"`
+	Total      int64   `msgpack:"total"`
+	TotalKnown bool    `msgpack:"total_known"`
+	Failed     int64   `msgpack:"failed"`
+	ElapsedMS  int64   `msgpack:"elapsed_ms"`
+	Speed      float64 `msgpack:"speed"`
 }
 
 type FeatureItem struct {
@@ -434,8 +437,18 @@ type TaskStats struct {
 }
 
 type TaskDone struct {
-	TaskID string    `msgpack:"task_id"`
-	Stats  TaskStats `msgpack:"stats"`
+	TaskID string          `msgpack:"task_id"`
+	Stats  TaskStats       `msgpack:"stats"`
+	Reason TaskDrainReason `msgpack:"reason,omitempty"`
+}
+
+func (done TaskDone) Validate() error {
+	switch done.Reason {
+	case "", TaskDrainPause, TaskDrainStop, TaskDrainDelete, TaskDrainProcessShutdown:
+		return nil
+	default:
+		return fmt.Errorf("%s", InvalidTaskDrainReasonErrorCode)
+	}
 }
 
 type Error struct {

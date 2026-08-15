@@ -59,6 +59,46 @@ func TestDecodeClientAuthAndLocalEnvelope(t *testing.T) {
 	}
 }
 
+func TestTaskProgressAndDoneLifecycleFieldsRoundTrip(t *testing.T) {
+	progress := TaskProgress{TaskID: "task-1", Done: 4, Total: 10, TotalKnown: true, Failed: 1, ElapsedMS: 2500, Speed: 2.5}
+	body, err := msgpack.Marshal(progress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotProgress TaskProgress
+	if err := msgpack.Unmarshal(body, &gotProgress); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(gotProgress, progress) {
+		t.Fatalf("progress = %#v, want %#v", gotProgress, progress)
+	}
+
+	for _, reason := range []TaskDrainReason{"", TaskDrainPause, TaskDrainStop, TaskDrainDelete, TaskDrainProcessShutdown} {
+		done := TaskDone{TaskID: "task-1", Reason: reason, Stats: TaskStats{Total: 10, Done: 9, Failed: 1, ElapsedMS: 2500}}
+		body, err := msgpack.Marshal(done)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got TaskDone
+		if err := msgpack.Unmarshal(body, &got); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got, done) {
+			t.Fatalf("done = %#v, want %#v", got, done)
+		}
+		if err := got.Validate(); err != nil {
+			t.Fatalf("reason %q rejected: %v", reason, err)
+		}
+	}
+}
+
+func TestTaskDoneRejectsUnknownDrainReason(t *testing.T) {
+	done := TaskDone{TaskID: "task-1", Reason: "internal_worker_error"}
+	if err := done.Validate(); err == nil || err.Error() != InvalidTaskDrainReasonErrorCode {
+		t.Fatalf("Validate() error = %v, want %q", err, InvalidTaskDrainReasonErrorCode)
+	}
+}
+
 // These cases fail if the filesystem browse envelope is assigned a conflicting
 // message type or Decode stops producing the concrete request/response DTOs.
 func TestFilesystemBrowseMessagesRoundTrip(t *testing.T) {
