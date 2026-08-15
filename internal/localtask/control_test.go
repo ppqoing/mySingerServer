@@ -44,15 +44,19 @@ func (r *blockingControlRunner) Run(control RunControl, _ CreateRequest, task Ta
 
 type watchedTaskStore struct {
 	TaskStore
-	transitions   chan store.LocalTask
-	progress      chan store.LocalTask
-	deleteEntered chan store.LocalTaskControl
-	deleteDone    chan error
-	deleteRelease <-chan struct{}
+	transitions         chan store.LocalTask
+	progress            chan store.LocalTask
+	deleteEntered       chan store.LocalTaskControl
+	deleteDone          chan error
+	deleteRelease       <-chan struct{}
+	deleteCommitted     chan<- struct{}
+	deleteReturnRelease <-chan struct{}
 
-	mu             sync.Mutex
-	deleteFailures int
-	deleteCalls    int
+	mu               sync.Mutex
+	deleteFailures   int
+	deleteCalls      int
+	progressFailures int
+	progressFailed   chan<- struct{}
 }
 
 func watchTaskStore(taskStore TaskStore) *watchedTaskStore {
@@ -74,6 +78,17 @@ func (s *watchedTaskStore) TransitionLocalTaskLifecycle(ctx context.Context, mac
 }
 
 func (s *watchedTaskStore) UpdateLocalTaskProgress(ctx context.Context, machineID string, control store.LocalTaskControl, update store.LocalTaskProgressUpdate) (store.LocalTask, error) {
+	s.mu.Lock()
+	if s.progressFailures > 0 {
+		s.progressFailures--
+		failed := s.progressFailed
+		s.mu.Unlock()
+		if failed != nil {
+			failed <- struct{}{}
+		}
+		return store.LocalTask{}, errors.New("transient progress write")
+	}
+	s.mu.Unlock()
 	task, err := s.TaskStore.UpdateLocalTaskProgress(ctx, machineID, control, update)
 	if err == nil {
 		s.progress <- task
@@ -103,6 +118,17 @@ func (s *watchedTaskStore) DeleteLocalTaskData(ctx context.Context, machineID st
 		}
 	}
 	result, err := s.TaskStore.DeleteLocalTaskData(ctx, machineID, control)
+	if err == nil && s.deleteCommitted != nil {
+		s.deleteCommitted <- struct{}{}
+	}
+	if err == nil && s.deleteReturnRelease != nil {
+		select {
+		case <-s.deleteReturnRelease:
+		case <-ctx.Done():
+			s.deleteDone <- ctx.Err()
+			return store.LocalTaskDeleteResult{}, ctx.Err()
+		}
+	}
 	s.deleteDone <- err
 	return result, err
 }
@@ -360,6 +386,81 @@ func TestLocalTaskDeleteStableTaskSkipsRunnerDrain(t *testing.T) {
 	}
 }
 
+// Break caught: the durable delete commit released the task gate before the
+// old active entry was removed, so a same-ID replacement stayed pending
+// forever after launchHeld observed the old deletion attempt.
+func TestLocalTaskDeleteCommitAndOldActiveCleanupAreAtomicForInstanceReuse(t *testing.T) {
+	fixture := newControlFixture(t)
+	committed := make(chan struct{})
+	releaseDeleteReturn := make(chan struct{})
+	fixture.Store.deleteCommitted = committed
+	fixture.Store.deleteReturnRelease = releaseDeleteReturn
+
+	oldRun := fixture.createAndWaitStarted("delete-reuse")
+	oldInstance := oldRun.Task.InstanceID
+	if _, err := fixture.Service.Delete(context.Background(), controlRequest(oldRun.Task)); err != nil {
+		t.Fatal(err)
+	}
+	oldRun.Release <- ErrDrainRequested
+	select {
+	case <-committed:
+	case <-time.After(time.Second):
+		t.Fatal("durable delete did not reach commit barrier")
+	}
+	if !taskGateIsHeld(fixture.Service.(*taskService), oldRun.Task.TaskID) {
+		close(releaseDeleteReturn)
+		<-fixture.Store.deleteDone
+		t.Fatal("task gate released between durable delete commit and old active cleanup")
+	}
+
+	created := make(chan Task, 1)
+	createErrors := make(chan error, 1)
+	createStarted := make(chan struct{})
+	go func() {
+		close(createStarted)
+		task, err := fixture.Service.Create(context.Background(), CreateRequest{
+			TaskID: oldRun.Task.TaskID, Roots: []string{`D:\replacement`}, Mode: proto.LocalTaskModeScanOnly,
+		})
+		created <- task
+		createErrors <- err
+	}()
+	<-createStarted
+	close(releaseDeleteReturn)
+	if err := <-fixture.Store.deleteDone; err != nil {
+		t.Fatal(err)
+	}
+	newTask := <-created
+	if err := <-createErrors; err != nil {
+		t.Fatal(err)
+	}
+	if newTask.InstanceID == "" || newTask.InstanceID == oldInstance {
+		t.Fatalf("replacement instance=%q old=%q", newTask.InstanceID, oldInstance)
+	}
+	newRun := receiveRun(t, fixture.Runner.Runs)
+	if newRun.Task.InstanceID != newTask.InstanceID || newRun.Task.Status != "running" {
+		t.Fatalf("replacement run=%#v created=%#v", newRun.Task, newTask)
+	}
+	requireNoRun(t, fixture.Runner.Runs)
+	newRun.Release <- nil
+	receiveTransition(t, fixture.Store.transitions, "succeeded")
+}
+
+func taskGateIsHeld(service *taskService, taskID string) bool {
+	service.mu.Lock()
+	gate := service.gates[taskID]
+	service.mu.Unlock()
+	if gate == nil {
+		return false
+	}
+	select {
+	case <-gate.token:
+		gate.release()
+		return false
+	default:
+		return true
+	}
+}
+
 // Break caught: a weaker intent overwrote a stronger intent, or repeated
 // controls incremented the revision more than once.
 func TestLocalTaskControlPriorityAndIdempotentSnapshots(t *testing.T) {
@@ -535,6 +636,115 @@ func TestLocalTaskOldReporterIsStaleAfterRetry(t *testing.T) {
 	}
 	second.Release <- nil
 	receiveTransition(t, fixture.Store.transitions, "succeeded")
+}
+
+// Break caught: a transient final progress write stopped the only retry ticker
+// and allowed natural completion to discard the retained pending snapshot.
+func TestLocalTaskNaturalTerminalWaitsForFinalProgressRetryEdge(t *testing.T) {
+	ticks := make(chan time.Time)
+	tickerStopped := make(chan struct{})
+	fixture := newControlFixture(t, manualProgressTicker(ticks, tickerStopped))
+	run := fixture.createAndWaitStarted("final-progress-natural")
+	if err := run.Report(ProgressUpdate{Phase: "scan", ProgressComplete: 1, ProgressTotal: 3, ProgressTotalKnown: true, StatsJSON: `{"step":1}`}); err != nil {
+		t.Fatal(err)
+	}
+	progressFailed := make(chan struct{})
+	fixture.Store.mu.Lock()
+	fixture.Store.progressFailures = 1
+	fixture.Store.progressFailed = progressFailed
+	fixture.Store.mu.Unlock()
+	if err := run.Report(ProgressUpdate{Phase: "scan", ProgressComplete: 2, ProgressTotal: 3, ProgressTotalKnown: true, StatsJSON: `{"step":2}`}); err != nil {
+		t.Fatal(err)
+	}
+	run.Release <- nil
+	select {
+	case <-progressFailed:
+	case <-time.After(time.Second):
+		t.Fatal("final progress did not reach transient failure")
+	}
+	select {
+	case <-tickerStopped:
+		t.Fatal("retry ticker stopped while final progress remained pending")
+	default:
+	}
+	current, err := fixture.DB.LoadLocalTask(context.Background(), "machine-a", run.Task.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Status != "running" {
+		t.Fatalf("status before retry=%q, want running", current.Status)
+	}
+	ticks <- time.Time{}
+	succeeded := receiveTransition(t, fixture.Store.transitions, "succeeded")
+	if succeeded.ProgressComplete != 2 || succeeded.StatsJSON != `{"step":2}` {
+		t.Fatalf("succeeded progress=%#v", succeeded)
+	}
+	select {
+	case <-tickerStopped:
+	case <-time.After(time.Second):
+		t.Fatal("retry ticker did not stop after final progress persisted")
+	}
+}
+
+// Break caught: a transient final progress write during pause drain allowed
+// paused to persist with the prior checkpoint before a retry edge.
+func TestLocalTaskDrainTerminalWaitsForFinalProgressRetryEdge(t *testing.T) {
+	ticks := make(chan time.Time)
+	tickerStopped := make(chan struct{})
+	fixture := newControlFixture(t, manualProgressTicker(ticks, tickerStopped))
+	run := fixture.createAndWaitStarted("final-progress-drain")
+	if err := run.Report(ProgressUpdate{Phase: "scan", ProgressComplete: 1, ProgressTotal: 3, ProgressTotalKnown: true, StatsJSON: `{"step":1}`}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.Service.Pause(context.Background(), controlRequest(run.Task)); err != nil {
+		t.Fatal(err)
+	}
+	progressFailed := make(chan struct{})
+	fixture.Store.mu.Lock()
+	fixture.Store.progressFailures = 1
+	fixture.Store.progressFailed = progressFailed
+	fixture.Store.mu.Unlock()
+	if err := run.Report(ProgressUpdate{Phase: "scan", ProgressComplete: 2, ProgressTotal: 3, ProgressTotalKnown: true, StatsJSON: `{"step":2}`}); err != nil {
+		t.Fatal(err)
+	}
+	run.Release <- ErrDrainRequested
+	select {
+	case <-progressFailed:
+	case <-time.After(time.Second):
+		t.Fatal("drain progress did not reach transient failure")
+	}
+	select {
+	case <-tickerStopped:
+		t.Fatal("retry ticker stopped while drain progress remained pending")
+	default:
+	}
+	current, err := fixture.DB.LoadLocalTask(context.Background(), "machine-a", run.Task.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Status != "pausing" {
+		t.Fatalf("status before retry=%q, want pausing", current.Status)
+	}
+	ticks <- time.Time{}
+	paused := receiveTransition(t, fixture.Store.transitions, "paused")
+	if paused.ProgressComplete != 2 || paused.StatsJSON != `{"step":2}` {
+		t.Fatalf("paused progress=%#v", paused)
+	}
+	select {
+	case <-tickerStopped:
+	case <-time.After(time.Second):
+		t.Fatal("retry ticker did not stop after drain progress persisted")
+	}
+}
+
+func manualProgressTicker(ticks <-chan time.Time, stopped chan<- struct{}) ServiceOption {
+	var once sync.Once
+	return withProgressTicker(func(time.Duration) progressTicker {
+		return progressTicker{
+			channel: ticks,
+			stop:    func() { once.Do(func() { close(stopped) }) },
+		}
+	})
 }
 
 // Break caught: delayed cleanup from an old attempt used an unconditional map

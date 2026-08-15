@@ -222,7 +222,6 @@ func newProgressReporter(service *taskService, attempt *taskAttempt, task Task) 
 
 func (r *progressReporter) run() {
 	defer close(r.done)
-	defer r.ticker.stop()
 	for {
 		select {
 		case <-r.ticker.channel:
@@ -256,7 +255,26 @@ func (r *progressReporter) stopAndFlush() error {
 	r.mu.Unlock()
 	r.stopOnce.Do(func() { close(r.stop) })
 	<-r.done
-	return r.flush()
+	defer r.ticker.stop()
+	for {
+		if err := r.flush(); err != nil {
+			return err
+		}
+		if !r.hasPending() {
+			return nil
+		}
+		select {
+		case <-r.ticker.channel:
+		case <-r.attempt.hardContext.Done():
+			return r.attempt.hardContext.Err()
+		}
+	}
+}
+
+func (r *progressReporter) hasPending() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.pending != nil && !r.stale
 }
 
 func (r *progressReporter) flush() error {

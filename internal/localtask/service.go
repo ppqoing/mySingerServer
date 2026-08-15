@@ -703,9 +703,8 @@ func (s *taskService) reconcileDelete(attempt *taskAttempt) {
 	delays := [...]time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second, 30 * time.Second}
 	var deleteErr error
 	for call := 0; call <= len(delays); call++ {
-		_, deleteErr = s.store.DeleteLocalTaskData(attempt.hardContext, s.machineID, attempt.version())
+		deleteErr = s.deleteAttempt(attempt)
 		if deleteErr == nil {
-			s.finishDeleteAttempt(attempt, "")
 			return
 		}
 		if !errors.Is(deleteErr, store.ErrLocalTaskDeleteRetryable) || call == len(delays) {
@@ -723,6 +722,22 @@ func (s *taskService) reconcileDelete(attempt *taskAttempt) {
 		code = "delete_retry_exhausted"
 	}
 	s.finishDeleteAttempt(attempt, code)
+}
+
+func (s *taskService) deleteAttempt(attempt *taskAttempt) error {
+	gate, err := s.acquireTaskGate(attempt.hardContext, attempt.version().TaskID)
+	if err != nil {
+		return err
+	}
+	defer gate.release()
+	if s.currentAttempt(attempt.version().TaskID) != attempt {
+		return store.ErrLocalTaskStale
+	}
+	_, err = s.store.DeleteLocalTaskData(attempt.hardContext, s.machineID, attempt.version())
+	if err == nil {
+		s.cleanupAttemptHeld(attempt)
+	}
+	return err
 }
 
 func (s *taskService) finishDeleteAttempt(attempt *taskAttempt, failureCode string) {
