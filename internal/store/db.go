@@ -77,6 +77,10 @@ func migrateLocalTaskLifecycle(db *sql.DB) error {
 	if complete {
 		return verifyLocalForeignKeys(db)
 	}
+	receiptsComplete, err := localTaskDeletionReceiptsSchemaComplete(db)
+	if err != nil {
+		return err
+	}
 	if _, err := db.Exec(`PRAGMA foreign_keys = OFF`); err != nil {
 		return err
 	}
@@ -138,6 +142,24 @@ func migrateLocalTaskLifecycle(db *sql.DB) error {
 			ON local_tasks (machine_id, status, created_at, task_id);`); err != nil {
 		return err
 	}
+	if !receiptsComplete {
+		if _, err := tx.Exec(`
+			CREATE TABLE local_task_deletion_receipts_v4 (
+				machine_id TEXT NOT NULL,
+				task_id TEXT NOT NULL,
+				instance_id TEXT NOT NULL,
+				deleted_at INTEGER NOT NULL,
+				PRIMARY KEY (machine_id, task_id, instance_id)
+			);
+			INSERT INTO local_task_deletion_receipts_v4
+				(machine_id,task_id,instance_id,deleted_at)
+			SELECT machine_id,task_id,instance_id,deleted_at
+			FROM local_task_deletion_receipts;
+			DROP TABLE local_task_deletion_receipts;
+			ALTER TABLE local_task_deletion_receipts_v4 RENAME TO local_task_deletion_receipts;`); err != nil {
+			return err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
@@ -158,19 +180,39 @@ func localTaskLifecycleSchemaComplete(db *sql.DB) (bool, error) {
 	for _, requirement := range []string{
 		"instance_id text not null",
 		"revision integer not null default 1 check (revision > 0)",
-		"phase text not null default 'waiting'",
-		"progress_total_known integer not null default 0",
-		"'pausing'", "'paused'", "'stopping'", "'deleting'", "'delete_failed'",
+		"status text not null check (status in ('pending','running','waiting_recovery','pausing','paused','stopping','cancelled','succeeded','failed','deleting','delete_failed'))",
+		"phase text not null default 'waiting' check (phase in ('waiting','scan','stage1','stage2','stage3','finalizing'))",
+		"progress_total_known integer not null default 0 check (progress_total_known in (0,1))",
 	} {
 		if !strings.Contains(normalized, requirement) {
 			return false, nil
 		}
 	}
-	var receipts int
-	if err := db.QueryRow(`SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='local_task_deletion_receipts'`).Scan(&receipts); err != nil {
+	return localTaskDeletionReceiptsSchemaComplete(db)
+}
+
+func localTaskDeletionReceiptsSchemaComplete(db *sql.DB) (bool, error) {
+	rows, err := db.Query(`PRAGMA table_info('local_task_deletion_receipts')`)
+	if err != nil {
 		return false, err
 	}
-	return receipts == 1, nil
+	defer rows.Close()
+	primaryKey := make([]string, 3)
+	for rows.Next() {
+		var cid, notNull, position int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &position); err != nil {
+			return false, err
+		}
+		if position > 0 && position <= len(primaryKey) {
+			primaryKey[position-1] = name
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	return primaryKey[0] == "machine_id" && primaryKey[1] == "task_id" && primaryKey[2] == "instance_id", nil
 }
 
 func verifyLocalForeignKeys(db *sql.DB) error {

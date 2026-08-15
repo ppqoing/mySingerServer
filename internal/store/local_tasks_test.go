@@ -158,6 +158,83 @@ func TestLocalTaskSchemaAcceptsOnlyVersionedLifecycleStates(t *testing.T) {
 	}
 }
 
+// Break caught: a table that merely named the v4 columns and states, while
+// accepting invalid values, was treated as migrated and stamped version 4.
+func TestLocalTaskMigrationRebuildsNearV4TablesWithWeakenedConstraints(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "near-v4.db")
+	legacy, err := sql.Open("sqlite", "file:"+filepath.ToSlash(dbPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := legacy.Exec(`
+		CREATE TABLE local_tasks (
+			task_id TEXT PRIMARY KEY,
+			instance_id TEXT NOT NULL,
+			revision INTEGER NOT NULL DEFAULT 1 CHECK (revision > 0),
+			machine_id TEXT NOT NULL,
+			source TEXT NOT NULL CHECK (source IN ('local','manager')),
+			type TEXT NOT NULL CHECK (type IN ('scan','analysis','stage2','stage3','delete')),
+			stage INTEGER NOT NULL CHECK (stage IN (0,1,2,3)),
+			status TEXT NOT NULL CHECK (status IN ('pending','running','waiting_recovery','pausing','paused','stopping','cancelled','succeeded','failed','deleting','delete_failed','bogus')),
+			phase TEXT NOT NULL DEFAULT 'waiting',
+			envelope_digest TEXT NOT NULL,
+			envelope BLOB NOT NULL DEFAULT X'',
+			progress_completed INTEGER NOT NULL DEFAULT 0 CHECK (progress_completed >= 0),
+			progress_total INTEGER NOT NULL DEFAULT 0 CHECK (progress_total >= 0),
+			progress_total_known INTEGER NOT NULL DEFAULT 0,
+			stats_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(stats_json)),
+			safe_error_code TEXT,
+			safe_error_message TEXT,
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL,
+			started_at INTEGER,
+			completed_at INTEGER,
+			UNIQUE (machine_id, task_id),
+			CHECK (progress_total = 0 OR progress_completed <= progress_total)
+		);
+		CREATE TABLE local_task_deletion_receipts (
+			machine_id TEXT NOT NULL,
+			task_id TEXT NOT NULL,
+			instance_id TEXT NOT NULL,
+			deleted_at INTEGER NOT NULL,
+			PRIMARY KEY (machine_id, task_id)
+		);
+		INSERT INTO local_tasks
+			(task_id,instance_id,revision,machine_id,source,type,stage,status,phase,envelope_digest,envelope,progress_total_known,stats_json,created_at,updated_at)
+		VALUES ('near-v4','instance-1',1,'m','local','analysis',0,'running','scan','digest',X'01',0,'{}',1,1);
+		PRAGMA user_version = 3;`); err != nil {
+		legacy.Close()
+		t.Fatal(err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db := openTestDBAt(t, dbPath)
+	for name, statement := range map[string]string{
+		"revision": `UPDATE local_tasks SET revision=0 WHERE task_id='near-v4'`,
+		"status":   `UPDATE local_tasks SET status='bogus' WHERE task_id='near-v4'`,
+		"phase":    `UPDATE local_tasks SET phase='bogus' WHERE task_id='near-v4'`,
+		"total":    `UPDATE local_tasks SET progress_total_known=2 WHERE task_id='near-v4'`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := db.db.Exec(statement); err == nil {
+				t.Fatalf("weakened %s constraint was retained", name)
+			}
+		})
+	}
+	if !pragmaHasUniqueIndex(t, db, "local_task_deletion_receipts", []string{"machine_id", "task_id", "instance_id"}) {
+		t.Fatal("deletion receipt v4 primary key was not rebuilt")
+	}
+	var version int
+	if err := db.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 4 {
+		t.Fatalf("user_version=%d, want 4 after rebuilt constraints", version)
+	}
+}
+
 func openTestDBAt(t *testing.T, path string) *DB {
 	t.Helper()
 	db, err := Open(path)
