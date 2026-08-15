@@ -519,6 +519,8 @@ func allowedLocalTaskTransition(from, to string) bool {
 		return to == "cancelled" || to == "deleting" || to == "failed" || to == "waiting_recovery"
 	case "failed", "cancelled":
 		return to == "pending" || to == "deleting"
+	case "deleting":
+		return to == "delete_failed"
 	case "succeeded", "delete_failed":
 		return to == "deleting"
 	default:

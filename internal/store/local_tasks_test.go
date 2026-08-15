@@ -899,6 +899,7 @@ func TestLocalTaskLifecycleAllowsOnlyDeclaredEdgesAndBumpsRevisionOnce(t *testin
 		"failed":           {"pending", "deleting"},
 		"cancelled":        {"pending", "deleting"},
 		"succeeded":        {"deleting"},
+		"deleting":         {"delete_failed"},
 		"delete_failed":    {"deleting"},
 	}
 	index := 0
