@@ -192,9 +192,11 @@ func localError(err error) (string, string) {
 }
 
 func mapLocalTask(value proto.LocalTask) traymodel.LocalTask {
-	result := traymodel.LocalTask{TaskID: value.TaskID, Source: value.Source, Mode: value.Mode, Stage: value.Stage, Status: value.Status,
-		Roots: append([]string(nil), value.Roots...), ProgressComplete: value.ProgressComplete, ProgressTotal: value.ProgressTotal,
-		ErrorCode: value.SafeErrorCode, ErrorSummary: sanitizeText(value.SafeErrorMessage), SyncStatus: "本机已保存"}
+	result := traymodel.LocalTask{TaskID: value.TaskID, InstanceID: value.InstanceID, Revision: value.Revision, Source: value.Source, Mode: value.Mode,
+		Stage: value.Stage, Status: value.Status, Phase: value.Phase, Roots: append([]string(nil), value.Roots...),
+		ProgressComplete: value.ProgressComplete, ProgressTotal: value.ProgressTotal, ProgressTotalKnown: value.ProgressTotalKnown,
+		ErrorCode: value.SafeErrorCode, ErrorSummary: sanitizeText(value.SafeErrorMessage), CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt,
+		StartedAt: value.StartedAt, CompletedAt: value.CompletedAt, SyncStatus: "本机已保存"}
 	var stats struct {
 		Speed      string `json:"speed"`
 		Failures   int64  `json:"failures"`
@@ -218,6 +220,44 @@ func (s *Service) CreateLocalTask(ctx context.Context, request traymodel.LocalTa
 		return traymodel.LocalTaskResult{ErrorCode: code, ErrorSummary: summary}
 	}
 	return traymodel.LocalTaskResult{OK: true, Task: mapLocalTask(response.Task)}
+}
+
+func (s *Service) PauseLocalTask(ctx context.Context, request traymodel.LocalTaskControl) traymodel.LocalTaskResult {
+	return s.controlLocalTask(ctx, proto.LocalOperationTaskPause, request)
+}
+
+func (s *Service) ResumeLocalTask(ctx context.Context, request traymodel.LocalTaskControl) traymodel.LocalTaskResult {
+	return s.controlLocalTask(ctx, proto.LocalOperationTaskResume, request)
+}
+
+func (s *Service) CancelLocalTask(ctx context.Context, request traymodel.LocalTaskControl) traymodel.LocalTaskResult {
+	return s.controlLocalTask(ctx, proto.LocalOperationTaskCancel, request)
+}
+
+func (s *Service) DeleteLocalTask(ctx context.Context, request traymodel.LocalTaskControl) traymodel.LocalTaskResult {
+	return s.controlLocalTask(ctx, proto.LocalOperationTaskDelete, request)
+}
+
+func (s *Service) RetryLocalTask(ctx context.Context, request traymodel.LocalTaskControl) traymodel.LocalTaskResult {
+	return s.controlLocalTask(ctx, proto.LocalOperationTaskRetry, request)
+}
+
+func (s *Service) controlLocalTask(ctx context.Context, operation string, request traymodel.LocalTaskControl) traymodel.LocalTaskResult {
+	control := proto.LocalTaskControlRequest{
+		TaskID: request.TaskID, InstanceID: request.InstanceID, ExpectedRevision: request.ExpectedRevision,
+	}
+	if err := control.Validate(); err != nil {
+		return traymodel.LocalTaskResult{ErrorCode: proto.InvalidTaskControlErrorCode, ErrorSummary: "任务控制请求无效"}
+	}
+	var response proto.LocalTaskControlResponse
+	if err := s.localCall(ctx, operation, control, &response); err != nil {
+		return traymodel.LocalTaskResult{ErrorCode: "local_operation_failed", ErrorSummary: "本机 Agent 暂不可用，请稍后重试"}
+	}
+	result := traymodel.LocalTaskResult{OK: true, Deleted: response.Deleted}
+	if response.Task != nil {
+		result.Task = mapLocalTask(*response.Task)
+	}
+	return result
 }
 
 func (s *Service) StartLocalAnalysis(ctx context.Context, request traymodel.LocalAnalysisStart) traymodel.OperationResult {

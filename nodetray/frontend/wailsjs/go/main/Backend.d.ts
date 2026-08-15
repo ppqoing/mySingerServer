@@ -5,7 +5,13 @@ import {config} from '../models';
 import {context} from '../models';
 import {main} from '../models';
 
+export function CancelLocalTask(arg1:traymodel.LocalTaskControl):Promise<traymodel.LocalTaskResult>;
+
+export function ChooseLocalTaskRoot(arg1:string):Promise<traymodel.PathSelectionResult>;
+
 export function CreateLocalTask(arg1:traymodel.LocalTaskCreate):Promise<traymodel.LocalTaskResult>;
+
+export function DeleteLocalTask(arg1:traymodel.LocalTaskControl):Promise<traymodel.LocalTaskResult>;
 
 export function ExecuteLocalDelete(arg1:traymodel.LocalDeleteExecute):Promise<traymodel.LocalDeleteBatch>;
 
@@ -31,11 +37,17 @@ export function ListLocalTasks(arg1:traymodel.PageRequest):Promise<traymodel.Loc
 
 export function OpenLocation(arg1:traymodel.LocationKind):Promise<traymodel.OperationResult>;
 
+export function PauseLocalTask(arg1:traymodel.LocalTaskControl):Promise<traymodel.LocalTaskResult>;
+
 export function PrepareLocalDelete(arg1:traymodel.LocalDeletePrepare):Promise<traymodel.LocalDeletePreview>;
 
 export function RestartAgent():Promise<traymodel.OperationResult>;
 
 export function RestartHelper():Promise<traymodel.OperationResult>;
+
+export function ResumeLocalTask(arg1:traymodel.LocalTaskControl):Promise<traymodel.LocalTaskResult>;
+
+export function RetryLocalTask(arg1:traymodel.LocalTaskControl):Promise<traymodel.LocalTaskResult>;
 
 export function SaveAgent(arg1:config.AgentForm):Promise<traymodel.ConfigApplyResult>;
 
