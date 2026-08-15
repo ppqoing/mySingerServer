@@ -23,6 +23,8 @@ import (
 	"dedup/internal/agentinstance"
 	"dedup/internal/config"
 	fileenum "dedup/internal/enum"
+	"dedup/internal/localanalysis"
+	"dedup/internal/localtask"
 	"dedup/internal/machineid"
 	"dedup/internal/proto"
 	"dedup/internal/worker"
@@ -305,13 +307,17 @@ func TestRunServiceClosesStartedPoolWhenServerReturnsError(t *testing.T) {
 	}
 }
 
-func TestRunServiceDrainsPhase2ThenSchedulerBeforeClosingPool(t *testing.T) {
+func TestRunServiceDrainsTasksThenPhase2ThenSchedulerBeforeClosingPool(t *testing.T) {
 	var events []string
 	pool := &orderedLifecyclePool{events: &events}
 	err := runService(
 		pool,
 		func() error {
 			events = append(events, "serve")
+			return nil
+		},
+		func() error {
+			events = append(events, "task-drain")
 			return nil
 		},
 		func() error {
@@ -332,7 +338,7 @@ func TestRunServiceDrainsPhase2ThenSchedulerBeforeClosingPool(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"start", "serve", "phase2-drain", "scheduler-shutdown", "close"}
+	want := []string{"start", "serve", "task-drain", "phase2-drain", "scheduler-shutdown", "close"}
 	if !reflect.DeepEqual(events, want) {
 		t.Fatalf("lifecycle events=%v, want %v", events, want)
 	}
@@ -342,33 +348,34 @@ func TestLocalTaskRunnerRecoverySkipsScanAndCompletesStageThree(t *testing.T) {
 	scans := &recordingLocalScanRunner{}
 	analysis := &recordingLocalAnalysisRunner{}
 	runner := &agentLocalTaskRunner{scans: scans, analysis: analysis}
-	var stages []int
+	var updates []localtask.ProgressUpdate
 	request := proto.LocalTaskCreateRequest{TaskID: "recover", Roots: []string{`D:\media`}, Mode: proto.LocalTaskModeScanThenAnalysis}
-	if err := runner.Run(context.Background(), request, 1, func(stage int) error { stages = append(stages, stage); return nil }); err != nil {
+	if err := runner.Run(localtask.RunControl{Context: context.Background()}, request, localtask.Task{TaskID: request.TaskID, Stage: 1, Phase: "stage1"}, func(update localtask.ProgressUpdate) error { updates = append(updates, update); return nil }); err != nil {
 		t.Fatal(err)
 	}
-	if scans.calls != 0 || analysis.calls != 1 || !reflect.DeepEqual(stages, []int{2, 3}) {
-		t.Fatalf("scan=%d analysis=%d stages=%v", scans.calls, analysis.calls, stages)
+	if scans.calls != 0 || analysis.calls != 1 || updates[len(updates)-1].Phase != "finalizing" {
+		t.Fatalf("scan=%d analysis=%d updates=%v", scans.calls, analysis.calls, updates)
 	}
-	stages = nil
-	if err := runner.Run(context.Background(), request, 2, func(stage int) error { stages = append(stages, stage); return nil }); err != nil {
+	updates = nil
+	if err := runner.Run(localtask.RunControl{Context: context.Background()}, request, localtask.Task{TaskID: request.TaskID, Stage: 2, Phase: "stage2", ProgressComplete: 1, ProgressTotal: 2, ProgressTotalKnown: true}, func(update localtask.ProgressUpdate) error { updates = append(updates, update); return nil }); err != nil {
 		t.Fatal(err)
 	}
-	if scans.calls != 0 || analysis.calls != 2 || !reflect.DeepEqual(stages, []int{2, 3}) {
-		t.Fatalf("stage2 recovery scan=%d analysis=%d stages=%v", scans.calls, analysis.calls, stages)
+	if scans.calls != 0 || analysis.calls != 2 || updates[0].Phase != "stage2" || updates[0].ProgressComplete != 1 {
+		t.Fatalf("stage2 recovery scan=%d analysis=%d updates=%v", scans.calls, analysis.calls, updates)
 	}
 }
 
 func TestLocalTaskRunnerScanOnlyEndsAtStageOne(t *testing.T) {
 	scans := &recordingLocalScanRunner{}
 	runner := &agentLocalTaskRunner{scans: scans, analysis: &recordingLocalAnalysisRunner{}}
-	var stages []int
+	var updates []localtask.ProgressUpdate
 	request := proto.LocalTaskCreateRequest{TaskID: "scan", Roots: []string{`D:\media`}, Mode: proto.LocalTaskModeScanOnly}
-	if err := runner.Run(context.Background(), request, 0, func(stage int) error { stages = append(stages, stage); return nil }); err != nil {
+	if err := runner.Run(localtask.RunControl{Context: context.Background()}, request, localtask.Task{TaskID: request.TaskID, Phase: "waiting"}, func(update localtask.ProgressUpdate) error { updates = append(updates, update); return nil }); err != nil {
 		t.Fatal(err)
 	}
-	if scans.calls != 1 || !reflect.DeepEqual(stages, []int{1}) {
-		t.Fatalf("scan=%d stages=%v", scans.calls, stages)
+	last := updates[len(updates)-1]
+	if scans.calls != 1 || last.Phase != "finalizing" || last.Stage != 1 || last.ProgressComplete != 1 || last.ProgressTotal != 1 || !last.ProgressTotalKnown {
+		t.Fatalf("scan=%d updates=%v", scans.calls, updates)
 	}
 }
 
@@ -376,13 +383,37 @@ func TestLocalTaskRunnerAutoAnalysisPersistsEveryDurableCheckpoint(t *testing.T)
 	scans := &recordingLocalScanRunner{}
 	analysis := &recordingLocalAnalysisRunner{}
 	runner := &agentLocalTaskRunner{scans: scans, analysis: analysis}
-	var stages []int
+	var updates []localtask.ProgressUpdate
 	request := proto.LocalTaskCreateRequest{TaskID: "auto", Roots: []string{`D:\media`}, Mode: proto.LocalTaskModeScanThenAnalysis}
-	if err := runner.Run(context.Background(), request, 0, func(stage int) error { stages = append(stages, stage); return nil }); err != nil {
+	if err := runner.Run(localtask.RunControl{Context: context.Background()}, request, localtask.Task{TaskID: request.TaskID, Phase: "waiting"}, func(update localtask.ProgressUpdate) error { updates = append(updates, update); return nil }); err != nil {
 		t.Fatal(err)
 	}
-	if scans.calls != 1 || analysis.calls != 1 || !reflect.DeepEqual(stages, []int{1, 2, 3}) {
-		t.Fatalf("scan=%d analysis=%d stages=%v", scans.calls, analysis.calls, stages)
+	if scans.calls != 1 || analysis.calls != 1 || updates[len(updates)-1].Phase != "finalizing" {
+		t.Fatalf("scan=%d analysis=%d updates=%v", scans.calls, analysis.calls, updates)
+	}
+}
+
+func TestAgentLocalTaskRunnerWaitsForScanDrainBeforeReturning(t *testing.T) {
+	scan := newBlockedLocalScanRunner()
+	runner := &agentLocalTaskRunner{scans: scan, analysis: &recordingLocalAnalysisRunner{}}
+	drain := make(chan struct{})
+	control := localtask.RunControl{Context: context.Background(), Drain: drain, Reason: func() localtask.DrainReason { return localtask.DrainPause }}
+	request := proto.LocalTaskCreateRequest{TaskID: "drain-scan", Roots: []string{`D:\media`}, Mode: proto.LocalTaskModeScanOnly}
+	done := make(chan error, 1)
+	go func() {
+		done <- runner.Run(control, request, localtask.Task{TaskID: request.TaskID, Phase: "waiting"}, func(localtask.ProgressUpdate) error { return nil })
+	}()
+	<-scan.started
+	close(drain)
+	<-scan.drainCalled
+	select {
+	case err := <-done:
+		t.Fatalf("runner returned before scan terminal: %v", err)
+	default:
+	}
+	scan.finish(proto.TaskDrainPause)
+	if err := <-done; !errors.Is(err, localtask.ErrDrainRequested) {
+		t.Fatalf("error=%v", err)
 	}
 }
 
@@ -1159,6 +1190,10 @@ func (r *recordingLocalScanRunner) Prepare(task proto.ScanTask, sender agent.Sen
 		_ = sender(proto.MsgTaskDone, &proto.TaskDone{TaskID: task.TaskID})
 	}
 }
+func (*recordingLocalScanRunner) Drain(string, proto.TaskDrainReason) (bool, *proto.TaskStats) {
+	return true, &proto.TaskStats{}
+}
+func (*recordingLocalScanRunner) Abort(string) bool { return true }
 
 type recordingLocalAnalysisRunner struct{ calls int }
 
@@ -1166,9 +1201,53 @@ func (r *recordingLocalAnalysisRunner) Run(context.Context, string) error {
 	r.calls++
 	return nil
 }
-func (r *recordingLocalAnalysisRunner) RunWithProgress(ctx context.Context, task string, checkpoint func(int) error) error {
+func (r *recordingLocalAnalysisRunner) RunWithProgress(_ context.Context, _ string, _ <-chan struct{}, report func(localanalysis.AnalysisProgress) error) error {
 	r.calls++
-	return checkpoint(2)
+	for _, progress := range []localanalysis.AnalysisProgress{
+		{Phase: "stage2", Complete: 1, Total: 2, TotalKnown: true, CheckpointStage: 2},
+		{Phase: "stage3", Complete: 1, Total: 1, TotalKnown: true, CheckpointStage: 3},
+		{Phase: "finalizing", Complete: 1, Total: 1, TotalKnown: true, CheckpointStage: 3},
+	} {
+		if report != nil {
+			if err := report(progress); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+type blockedLocalScanRunner struct {
+	started     chan struct{}
+	drainCalled chan struct{}
+	mu          sync.Mutex
+	sender      agent.Sender
+}
+
+func newBlockedLocalScanRunner() *blockedLocalScanRunner {
+	return &blockedLocalScanRunner{started: make(chan struct{}), drainCalled: make(chan struct{})}
+}
+
+func (r *blockedLocalScanRunner) Prepare(task proto.ScanTask, sender agent.Sender) (proto.TaskAck, func()) {
+	r.mu.Lock()
+	r.sender = sender
+	r.mu.Unlock()
+	return proto.TaskAck{TaskID: task.TaskID, Accepted: true}, func() { close(r.started) }
+}
+func (r *blockedLocalScanRunner) Drain(string, proto.TaskDrainReason) (bool, *proto.TaskStats) {
+	select {
+	case <-r.drainCalled:
+	default:
+		close(r.drainCalled)
+	}
+	return true, &proto.TaskStats{}
+}
+func (*blockedLocalScanRunner) Abort(string) bool { return true }
+func (r *blockedLocalScanRunner) finish(reason proto.TaskDrainReason) {
+	r.mu.Lock()
+	sender := r.sender
+	r.mu.Unlock()
+	_ = sender(proto.MsgTaskDone, &proto.TaskDone{TaskID: "drain-scan", Reason: reason})
 }
 
 type recordingLocalTaskLifecycle struct {
@@ -1180,10 +1259,11 @@ func (r *recordingLocalTaskLifecycle) PrepareRecovery(context.Context) error {
 	close(r.prepared)
 	return nil
 }
-func (r *recordingLocalTaskLifecycle) Resume(context.Context) error {
+func (r *recordingLocalTaskLifecycle) ResumeRecoveredTasks(context.Context) error {
 	close(r.resumed)
 	return nil
 }
+func (*recordingLocalTaskLifecycle) Shutdown(context.Context) error { return nil }
 
 type disabledInfoHandler struct{}
 

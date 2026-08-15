@@ -409,6 +409,49 @@ func (d *DB) SaveLocalPairScore(ctx context.Context, pair LocalPairScore) error 
 	return nil
 }
 
+func (d *DB) ListLocalPairScoresForRun(ctx context.Context, runID string) ([]LocalPairScore, error) {
+	if runID == "" {
+		return nil, fmt.Errorf("store: list local pair scores for run: empty run ID")
+	}
+	rows, err := d.db.QueryContext(ctx, `
+		SELECT pair_id,machine_id,run_id,generation,pair_key,
+		       left_file_id,right_file_id,left_sha512,right_sha512,
+		       stage1_json,stage2_json,stage3_json,final_verdict
+		FROM local_pair_scores
+		WHERE run_id=?1
+		ORDER BY pair_key,pair_id`, runID)
+	if err != nil {
+		return nil, fmt.Errorf("store: list local pair scores for run: %w", err)
+	}
+	defer rows.Close()
+	result := make([]LocalPairScore, 0)
+	for rows.Next() {
+		var pair LocalPairScore
+		var stage2, stage3 sql.NullString
+		if err := rows.Scan(
+			&pair.PairID, &pair.MachineID, &pair.RunID, &pair.Generation,
+			&pair.PairKey, &pair.LeftFileID, &pair.RightFileID,
+			&pair.LeftSHA512, &pair.RightSHA512, &pair.Stage1JSON,
+			&stage2, &stage3, &pair.Verdict,
+		); err != nil {
+			return nil, err
+		}
+		if stage2.Valid {
+			value := stage2.String
+			pair.Stage2JSON = &value
+		}
+		if stage3.Valid {
+			value := stage3.String
+			pair.Stage3JSON = &value
+		}
+		result = append(result, pair)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: list local pair scores for run: %w", err)
+	}
+	return result, nil
+}
+
 func (d *DB) ListCurrentLocalPairScores(ctx context.Context, machineID string, offset, limit int) ([]LocalPairScore, error) {
 	if machineID == "" {
 		return nil, fmt.Errorf("store: list local pair scores: empty machine ID")

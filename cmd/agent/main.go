@@ -335,7 +335,7 @@ func runWithDependencies(
 		Status: provider.ControlStatus, Shutdown: stop,
 		ConfigPath: configPath, ExecutablePath: executablePath, CPUCount: runtime.NumCPU(),
 		EffectiveConfigSHA256: configSHA256,
-		Tasks:                 agent.NewLocalTaskHandler(tasks),
+		Tasks:                 agent.NewLocalTaskHandler(legacyLocalTaskHandlerService{RecoverableService: tasks}),
 		Results:               agent.NewLocalResultHandler(reviews, previews),
 		Deletes:               agent.NewLocalDeleteHandler(deletes),
 	})
@@ -361,6 +361,11 @@ func runWithDependencies(
 				return fmt.Errorf("server exited: %w", err)
 			}
 			return nil
+		},
+		func() error {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), phase2DrainTimeout(cfg))
+			defer cancel()
+			return tasks.Shutdown(shutdownCtx)
 		},
 		func() error { return drainPhase2(phase2, phase2DrainTimeout(cfg)) },
 		func() error {
@@ -437,7 +442,8 @@ func initializePostgres(ctx context.Context, dsn string, health *syncHealthState
 
 type localTaskLifecycle interface {
 	PrepareRecovery(context.Context) error
-	Resume(context.Context) error
+	ResumeRecoveredTasks(context.Context) error
+	Shutdown(context.Context) error
 }
 
 func prepareLocalTaskLifecycle(ctx context.Context, tasks localTaskLifecycle, logger *slog.Logger) (func(), error) {
@@ -451,7 +457,7 @@ func prepareLocalTaskLifecycle(ctx context.Context, tasks localTaskLifecycle, lo
 	return func() {
 		once.Do(func() {
 			go func() {
-				if err := tasks.Resume(ctx); err != nil && logger != nil {
+				if err := tasks.ResumeRecoveredTasks(ctx); err != nil && logger != nil {
 					logger.Error("resume local tasks failed", "err", safeAgentSummary(err.Error()))
 				}
 			}()
@@ -746,11 +752,13 @@ func (h *agentLocalHandler) HandleLocal(ctx context.Context, request proto.Local
 
 type localAnalysisRunner interface {
 	Run(context.Context, string) error
-	RunWithProgress(context.Context, string, func(int) error) error
+	RunWithProgress(context.Context, string, <-chan struct{}, func(localanalysis.AnalysisProgress) error) error
 }
 
 type localScanRunner interface {
 	Prepare(proto.ScanTask, agent.Sender) (proto.TaskAck, func())
+	Drain(string, proto.TaskDrainReason) (bool, *proto.TaskStats)
+	Abort(string) bool
 }
 
 type agentLocalTaskRunner struct {
@@ -758,16 +766,52 @@ type agentLocalTaskRunner struct {
 	analysis localAnalysisRunner
 }
 
-func (r *agentLocalTaskRunner) Run(ctx context.Context, request localtask.CreateRequest, stage int, advance func(int) error) error {
+func (r *agentLocalTaskRunner) Run(control localtask.RunControl, request localtask.CreateRequest, snapshot localtask.Task, report func(localtask.ProgressUpdate) error) error {
 	if r == nil || r.scans == nil || r.analysis == nil {
 		return errors.New("local task runner unavailable")
 	}
-	if stage < 1 {
-		terminal := make(chan error, 1)
+	if control.Context == nil {
+		control.Context = context.Background()
+	}
+	emit := func(update localtask.ProgressUpdate) error {
+		if report == nil {
+			return nil
+		}
+		return report(update)
+	}
+	if snapshot.Stage < 1 {
+		terminal := make(chan proto.TaskDone, 1)
+		var progressMu sync.Mutex
+		latest := proto.TaskProgress{TaskID: request.TaskID}
+		if snapshot.Phase == "scan" {
+			latest.Done = snapshot.ProgressComplete
+			latest.Total = snapshot.ProgressTotal
+			latest.TotalKnown = snapshot.ProgressTotalKnown
+		}
+		var callbackErr error
+		reportScan := func(message proto.TaskProgress, checkpoint int, statsJSON string) {
+			progressMu.Lock()
+			message.Done = max(message.Done, latest.Done)
+			message.Total = max(message.Total, latest.Total)
+			message.TotalKnown = message.TotalKnown || latest.TotalKnown
+			latest = message
+			progressMu.Unlock()
+			if err := emit(localtask.ProgressUpdate{Phase: "scan", Stage: checkpoint, ProgressComplete: message.Done, ProgressTotal: message.Total, ProgressTotalKnown: message.TotalKnown, StatsJSON: statsJSON}); err != nil {
+				progressMu.Lock()
+				if callbackErr == nil {
+					callbackErr = err
+				}
+				progressMu.Unlock()
+			}
+		}
+		reportScan(latest, 0, runnerStatsJSON(latest))
 		ack, start := r.scans.Prepare(proto.ScanTask{TaskID: request.TaskID, Roots: append([]string(nil), request.Roots...), Phase: 1, Options: proto.ScanOptions{Rescan: request.Rescan, Extensions: append([]string(nil), request.Extensions...)}}, func(messageType uint8, value any) error {
-			if messageType == proto.MsgTaskDone {
+			switch messageType {
+			case proto.MsgTaskProgress:
+				reportScan(*value.(*proto.TaskProgress), 0, runnerStatsJSON(value))
+			case proto.MsgTaskDone:
 				select {
-				case terminal <- nil:
+				case terminal <- *value.(*proto.TaskDone):
 				default:
 				}
 			}
@@ -778,27 +822,147 @@ func (r *agentLocalTaskRunner) Run(ctx context.Context, request localtask.Create
 		}
 		if start != nil {
 			start()
+		} else if ack.Stats != nil {
+			terminal <- proto.TaskDone{TaskID: request.TaskID, Stats: *ack.Stats}
+		}
+		drain := control.Drain
+		drainIssued := false
+		var final proto.TaskDone
+		for {
 			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case err := <-terminal:
-				if err != nil {
-					return err
-				}
+			case <-control.Context.Done():
+				r.scans.Abort(request.TaskID)
+				return control.Context.Err()
+			case <-drain:
+				reason := localDrainReason(control)
+				r.scans.Drain(request.TaskID, reason)
+				drainIssued = true
+				drain = nil
+			case final = <-terminal:
+				goto scanFinished
 			}
 		}
-		if err := advance(1); err != nil {
-			return err
+	scanFinished:
+		progressMu.Lock()
+		message := latest
+		progressMu.Unlock()
+		message.Total = max(message.Total, final.Stats.Total)
+		message.Done = max(message.Done, final.Stats.Done)
+		checkpoint := 0
+		if !drainIssued && final.Reason == "" {
+			if missing := message.Total - final.Stats.Total; missing > 0 {
+				final.Stats.Skipped += missing
+			}
+			message.Done = message.Total
+			message.TotalKnown = true
+			checkpoint = 1
 		}
-		stage = 1
+		final.Stats.Total = message.Total
+		final.Stats.Done = message.Done
+		reportScan(message, checkpoint, runnerStatsJSON(final.Stats))
+		progressMu.Lock()
+		reportError := callbackErr
+		progressMu.Unlock()
+		if reportError != nil {
+			return reportError
+		}
+		if drainIssued || final.Reason != "" {
+			return localtask.ErrDrainRequested
+		}
+		snapshot.Stage = 1
+		snapshot.Phase = "scan"
+		snapshot.ProgressComplete = message.Done
+		snapshot.ProgressTotal = message.Total
+		snapshot.ProgressTotalKnown = true
+		snapshot.StatsJSON = runnerStatsJSON(final.Stats)
 	}
-	if request.Mode == proto.LocalTaskModeScanThenAnalysis && stage < 3 {
-		if err := r.analysis.RunWithProgress(ctx, request.TaskID, advance); err != nil {
+	if request.Mode == proto.LocalTaskModeScanOnly {
+		if snapshot.Phase != "finalizing" || !snapshot.ProgressTotalKnown || snapshot.ProgressComplete < snapshot.ProgressTotal {
+			if err := emit(localtask.ProgressUpdate{Phase: "finalizing", Stage: 1, ProgressTotalKnown: false, StatsJSON: snapshot.StatsJSON}); err != nil {
+				return err
+			}
+			if err := emit(localtask.ProgressUpdate{Phase: "finalizing", Stage: 1, ProgressComplete: 1, ProgressTotal: 1, ProgressTotalKnown: true, StatsJSON: snapshot.StatsJSON}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if request.Mode == proto.LocalTaskModeScanThenAnalysis {
+		if err := r.analysis.RunWithProgress(control.Context, request.TaskID, control.Drain, func(progress localanalysis.AnalysisProgress) error {
+			if phaseRank(progress.Phase) < phaseRank(snapshot.Phase) {
+				return nil
+			}
+			complete, total, known := progress.Complete, progress.Total, progress.TotalKnown
+			if progress.Phase == snapshot.Phase {
+				complete = max(complete, snapshot.ProgressComplete)
+				total = max(total, snapshot.ProgressTotal)
+				known = known || snapshot.ProgressTotalKnown
+			}
+			return emit(localtask.ProgressUpdate{Phase: progress.Phase, Stage: progress.CheckpointStage, ProgressComplete: complete, ProgressTotal: total, ProgressTotalKnown: known, StatsJSON: runnerStatsJSON(progress)})
+		}); err != nil {
+			if errors.Is(err, localanalysis.ErrDrainRequested) {
+				return localtask.ErrDrainRequested
+			}
 			return err
 		}
-		return advance(3)
 	}
 	return nil
+}
+
+func localDrainReason(control localtask.RunControl) proto.TaskDrainReason {
+	if control.Reason == nil {
+		return proto.TaskDrainProcessShutdown
+	}
+	switch control.Reason() {
+	case localtask.DrainPause:
+		return proto.TaskDrainPause
+	case localtask.DrainStop:
+		return proto.TaskDrainStop
+	case localtask.DrainDelete:
+		return proto.TaskDrainDelete
+	default:
+		return proto.TaskDrainProcessShutdown
+	}
+}
+
+func phaseRank(phase string) int {
+	switch phase {
+	case "scan":
+		return 1
+	case "stage1":
+		return 2
+	case "stage2":
+		return 3
+	case "stage3":
+		return 4
+	case "finalizing":
+		return 5
+	default:
+		return 0
+	}
+}
+
+func runnerStatsJSON(value any) string {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return "{}"
+	}
+	return string(encoded)
+}
+
+type legacyLocalTaskHandlerService struct{ localtask.RecoverableService }
+
+func (s legacyLocalTaskHandlerService) Cancel(ctx context.Context, taskID string) error {
+	_, err := s.LegacyCancel(ctx, taskID)
+	return err
+}
+
+func (s legacyLocalTaskHandlerService) Retry(ctx context.Context, taskID string) (localtask.Task, error) {
+	return s.LegacyRetry(ctx, taskID)
+}
+
+func (s legacyLocalTaskHandlerService) Resume(ctx context.Context) error {
+	return s.ResumeRecoveredTasks(ctx)
 }
 
 func (h *agentLocalHandler) loadConfig() (*config.AgentConfig, []byte, string, error) {

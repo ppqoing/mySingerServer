@@ -325,6 +325,39 @@ func TestLocalAnalysisCurrentPairsAreMachineScopedStableAndCapped(t *testing.T) 
 	}
 }
 
+func TestListLocalPairScoresForRunReturnsOnlyDurableRowsInStableOrder(t *testing.T) {
+	db := openLocalTestDB(t)
+	ctx := context.Background()
+	run := createLocalRunFixture(t, db, "resume-pairs")
+	left := insertLocalFileFixture(t, db, "machine-a", "resume-left", "resume-sha-left")
+	right := insertLocalFileFixture(t, db, "machine-a", "resume-right", "resume-sha-right")
+	stage2 := `{"verdict":"yes"}`
+	stage3 := `{"verdict":"no"}`
+	for _, pair := range []LocalPairScore{
+		{RunID: run.RunID, PairKey: "pair-b", LeftFileID: left, RightFileID: right, LeftSHA512: "resume-sha-left", RightSHA512: "resume-sha-right", Stage1JSON: `{}`, Stage2JSON: &stage2, Verdict: "duplicate"},
+		{RunID: run.RunID, PairKey: "pair-a", LeftFileID: left, RightFileID: right, LeftSHA512: "resume-sha-left", RightSHA512: "resume-sha-right", Stage1JSON: `{}`, Stage2JSON: &stage2, Stage3JSON: &stage3, Verdict: "not_duplicate"},
+	} {
+		if err := db.SaveLocalPairScore(ctx, pair); err != nil {
+			t.Fatal(err)
+		}
+	}
+	other := createLocalRunFixture(t, db, "resume-pairs-other")
+	if err := db.SaveLocalPairScore(ctx, LocalPairScore{RunID: other.RunID, PairKey: "pair-foreign", LeftFileID: left, RightFileID: right, LeftSHA512: "resume-sha-left", RightSHA512: "resume-sha-right", Stage1JSON: `{}`, Verdict: "undecided"}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := db.ListLocalPairScoresForRun(ctx, run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].PairKey != "pair-a" || got[1].PairKey != "pair-b" {
+		t.Fatalf("pairs=%#v", got)
+	}
+	if got[0].Stage2JSON == nil || got[0].Stage3JSON == nil || got[1].Stage2JSON == nil || got[1].Stage3JSON != nil {
+		t.Fatalf("durable stage JSON was not preserved: %#v", got)
+	}
+}
+
 func TestLocalSchemaRejectsCrossMachineOwnership(t *testing.T) {
 	t.Run("task to run", func(t *testing.T) {
 		db := openLocalTestDB(t)

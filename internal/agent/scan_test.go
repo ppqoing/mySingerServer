@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log/slog"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -137,11 +138,156 @@ func TestCompletedScanAckCarriesFinalStats(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("scan did not finish")
 	}
+	if final.Reason != "" {
+		t.Fatalf("natural completion reason=%q", final.Reason)
+	}
 
 	ack := manager.Handle(task, nil)
 	if ack.Reason != "already_done" || ack.Stats == nil ||
 		*ack.Stats != final.Stats {
 		t.Fatalf("completed ack = %#v, final = %#v", ack, final.Stats)
+	}
+}
+
+func TestScanDrainStopsDispatchAndWaitsForInFlightResult(t *testing.T) {
+	enumr := &fakeEnumerator{records: map[string][]fileenum.FileRecord{
+		`D:\media`: {
+			{Path: `D:\media\a.jpg`, Size: 10, MTime: 20},
+			{Path: `D:\media\b.jpg`, Size: 11, MTime: 21},
+		},
+	}}
+	manager, cleanup := newTestScanManager(t, enumr, nil)
+	defer cleanup()
+	manager.cfg.Scan.HDDStreams = 1
+	pool := newFakeScanPool()
+	submitted := make(chan worker.JobMsg, 1)
+	pool.onSubmit = func(job worker.JobMsg) { submitted <- job }
+	manager.pool = pool
+	manager.router = NewPoolRouter(pool, nil)
+	done := make(chan proto.TaskDone, 1)
+	items := make(chan proto.FeatureItem, 2)
+	task := proto.ScanTask{TaskID: "task-drain", Roots: []string{`D:\media`}, Phase: 1}
+	if ack := manager.Handle(task, func(messageType uint8, value any) error {
+		switch messageType {
+		case proto.MsgFeatureResult:
+			for _, item := range value.(*proto.FeatureResult).Items {
+				items <- item
+			}
+		case proto.MsgTaskDone:
+			done <- *value.(*proto.TaskDone)
+		}
+		return nil
+	}); !ack.Accepted {
+		t.Fatalf("ack=%#v", ack)
+	}
+	job := <-submitted
+	accepted, _ := manager.Drain(task.TaskID, proto.TaskDrainPause)
+	if !accepted {
+		t.Fatal("drain was not accepted")
+	}
+	if acceptedAgain, _ := manager.Drain(task.TaskID, proto.TaskDrainPause); !acceptedAgain {
+		t.Fatal("second drain was not idempotently accepted")
+	}
+	if got := len(pool.submittedSnapshot()); got != 1 {
+		t.Fatalf("submissions after drain=%d want1", got)
+	}
+	select {
+	case terminal := <-done:
+		t.Fatalf("TaskDone arrived before in-flight result: %#v", terminal)
+	default:
+	}
+	pool.results <- &worker.JobResultMsg{
+		JobID: job.JobID, ScanTaskID: job.ScanTaskID, Path: job.Path,
+		Kind: job.Kind, Phase: job.Phase, Source: job.Source,
+		FieldsDone: job.FieldsMask, SHA512: bytes.Repeat([]byte{0x44}, 64),
+	}
+	select {
+	case final := <-done:
+		if final.Reason != proto.TaskDrainPause || final.Stats.Done != 1 {
+			t.Fatalf("TaskDone=%#v", final)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("drained scan did not finish")
+	}
+	select {
+	case item := <-items:
+		if item.Path != job.Path || item.Status != proto.StatusDone {
+			t.Fatalf("in-flight item=%#v", item)
+		}
+	default:
+		t.Fatal("in-flight result was not published before TaskDone")
+	}
+	manager.router.mu.Lock()
+	routes := len(manager.router.routes)
+	manager.router.mu.Unlock()
+	if routes != 0 {
+		t.Fatalf("registered routes after drain=%d", routes)
+	}
+}
+
+func TestScanDrainFlushesEnumeratedTailWithWorkContext(t *testing.T) {
+	enumr := &barrierEnumerator{
+		first:   fileenum.FileRecord{Path: `D:\media\tail.bin`, Size: 10, MTime: 20},
+		second:  fileenum.FileRecord{Path: `D:\media\after.bin`, Size: 11, MTime: 21},
+		visited: make(chan struct{}), release: make(chan struct{}),
+	}
+	manager, cleanup := newTestScanManager(t, enumr, nil)
+	defer cleanup()
+	done := make(chan proto.TaskDone, 1)
+	task := proto.ScanTask{TaskID: "task-tail-drain", Roots: []string{`D:\media`}, Phase: 1}
+	manager.Handle(task, captureTaskDone(done))
+	<-enumr.visited
+	if accepted, _ := manager.Drain(task.TaskID, proto.TaskDrainStop); !accepted {
+		t.Fatal("drain was not accepted")
+	}
+	close(enumr.release)
+	select {
+	case final := <-done:
+		if final.Reason != proto.TaskDrainStop {
+			t.Fatalf("reason=%q", final.Reason)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("drained enumeration did not finish")
+	}
+	pending, err := manager.st.PendingSnapshot(context.Background(), manager.cfg.MachineID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var paths []string
+	for _, files := range pending {
+		for _, file := range files {
+			paths = append(paths, file.Path)
+		}
+	}
+	if !reflect.DeepEqual(paths, []string{`D:\media\tail.bin`}) {
+		t.Fatalf("durable enumerated tail=%v", paths)
+	}
+}
+
+func TestScanDrainPreservesTerminalReason(t *testing.T) {
+	for _, reason := range []proto.TaskDrainReason{proto.TaskDrainPause, proto.TaskDrainStop, proto.TaskDrainDelete, proto.TaskDrainProcessShutdown} {
+		t.Run(string(reason), func(t *testing.T) {
+			manager, cleanup := newTestScanManager(t, nil, nil)
+			defer cleanup()
+			done := make(chan proto.TaskDone, 1)
+			task := proto.ScanTask{TaskID: "task-reason-" + string(reason), Roots: []string{`D:\media`}, Phase: 1}
+			ack, start := manager.Prepare(task, captureTaskDone(done))
+			if !ack.Accepted {
+				t.Fatalf("ack=%#v", ack)
+			}
+			if accepted, _ := manager.Drain(task.TaskID, reason); !accepted {
+				t.Fatal("drain was not accepted before start")
+			}
+			start()
+			select {
+			case final := <-done:
+				if final.Reason != reason {
+					t.Fatalf("reason=%q want=%q", final.Reason, reason)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("scan did not finish")
+			}
+		})
 	}
 }
 
@@ -1214,6 +1360,24 @@ type fakeEnumerator struct {
 	calls   int
 	records map[string][]fileenum.FileRecord
 	errors  map[string]error
+}
+
+type barrierEnumerator struct {
+	first   fileenum.FileRecord
+	second  fileenum.FileRecord
+	visited chan struct{}
+	release chan struct{}
+}
+
+func (*barrierEnumerator) Name() string     { return "barrier" }
+func (*barrierEnumerator) Available() error { return nil }
+func (e *barrierEnumerator) Enum(_ string, visit func(fileenum.FileRecord) error) error {
+	if err := visit(e.first); err != nil {
+		return err
+	}
+	close(e.visited)
+	<-e.release
+	return visit(e.second)
 }
 
 func (f *fakeEnumerator) Name() string     { return "fake" }
