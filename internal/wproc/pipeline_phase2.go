@@ -80,8 +80,7 @@ func processPhase2Image(
 		return nil, fmt.Errorf("worker phase-2 image pipeline: dependency is unavailable")
 	}
 	if err := ctx.Err(); err != nil {
-		phase2FileError(result, "read", err)
-		return result, nil
+		return result, err
 	}
 
 	path := fixPath(job.Path)
@@ -130,8 +129,7 @@ func processPhase2Image(
 	for {
 		if err := ctx.Err(); err != nil {
 			result.ReadNS = time.Since(readStarted).Nanoseconds()
-			phase2FileError(result, "read", err)
-			return result, nil
+			return result, err
 		}
 		n, readErr := file.Read(chunk)
 		if n > 0 {

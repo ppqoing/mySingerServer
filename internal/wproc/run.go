@@ -110,7 +110,7 @@ func serve(conn net.Conn, index int, cfg Config, deps pipelineDeps) int {
 				return rpc.querySHA(query)
 			}
 			governedOpen := func(string) (readStatCloser, error) {
-				return openSource(ctx, &job, lease)
+				return openSource(ctx, &job, lease, deps.sourceOpen)
 			}
 
 			jobImageDeps := deps
@@ -169,8 +169,8 @@ func serve(conn net.Conn, index int, cfg Config, deps pipelineDeps) int {
 
 			var result *worker.JobResultMsg
 			if job.Phase == worker.PhasePreview {
-				result = generateImagePreviewWithOpen(ctx, &job, cfg.ImageMemBytes, func() (previewSourceFile, error) {
-					return openSource(ctx, &job, lease)
+				result, err = generateImagePreviewWithOpen(ctx, &job, cfg.ImageMemBytes, func() (previewSourceFile, error) {
+					return openSource(ctx, &job, lease, deps.sourceOpen)
 				})
 			} else if useSessionPipeline {
 				if job.Phase != worker.Phase1 && job.Phase != worker.Phase2 {
@@ -195,7 +195,7 @@ func serve(conn net.Conn, index int, cfg Config, deps pipelineDeps) int {
 					if job.Kind != worker.MediaImage && job.Kind != worker.MediaVideo {
 						result = invalidDispatchResult(&job, "kind", "unsupported media kind")
 					} else {
-						result, err = processPhase2WithDeps(context.Background(), cfg, &job, phase2Deps)
+						result, err = processPhase2WithDeps(ctx, cfg, &job, phase2Deps)
 					}
 				default:
 					result = invalidDispatchResult(&job, "phase", "unsupported worker phase")

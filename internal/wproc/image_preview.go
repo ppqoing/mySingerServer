@@ -27,9 +27,10 @@ const previewWASMBaseBytes int64 = 128 << 10
 // generateImagePreview runs only in the Worker process. It independently binds
 // the source path to Agent's immutable identity and returns encoded bytes only.
 func generateImagePreview(ctx context.Context, job *worker.JobMsg, memoryBudget int64) *worker.JobResultMsg {
-	return generateImagePreviewWithOpen(ctx, job, memoryBudget, func() (previewSourceFile, error) {
+	result, _ := generateImagePreviewWithOpen(ctx, job, memoryBudget, func() (previewSourceFile, error) {
 		return os.Open(job.Path)
 	})
+	return result
 }
 
 type previewSourceFile interface {
@@ -43,105 +44,114 @@ func generateImagePreviewWithOpen(
 	job *worker.JobMsg,
 	memoryBudget int64,
 	open func() (previewSourceFile, error),
-) *worker.JobResultMsg {
+) (*worker.JobResultMsg, error) {
 	result := previewResult(job)
 	if ctx == nil || job == nil || job.Kind != worker.MediaImage ||
 		job.Phase != worker.PhasePreview || job.Size < 0 || job.MTimeUnix <= 0 ||
 		len(job.KnownSHA) != sha512.Size || job.PreviewMaxWidth <= 0 ||
 		job.PreviewMaxHeight <= 0 || job.PreviewQuality < 1 || job.PreviewQuality > 100 ||
 		(job.PreviewFormat != worker.PreviewFormatJPEG && job.PreviewFormat != worker.PreviewFormatWebP) {
-		return previewFailure(result, "preview_encode_failed")
+		return previewFailure(result, "preview_encode_failed"), nil
 	}
 	if memoryBudget <= 0 || job.Size > memoryBudget {
-		return previewFailure(result, "preview_memory_limit")
+		return previewFailure(result, "preview_memory_limit"), nil
 	}
 	if err := ctx.Err(); err != nil {
-		return previewFailure(result, "preview_io_failed")
+		return result, err
 	}
 
 	pathInfo, err := os.Stat(job.Path)
 	if err != nil {
-		return previewFailure(result, "preview_io_failed")
+		return previewFailure(result, "preview_io_failed"), nil
 	}
 	if !matchesPreviewIdentity(pathInfo, job) {
-		return previewFailure(result, "stale_preview")
+		return previewFailure(result, "stale_preview"), nil
 	}
 	if open == nil {
-		return previewFailure(result, "preview_io_failed")
+		return previewFailure(result, "preview_io_failed"), nil
 	}
 	file, err := open()
 	if err != nil {
-		return previewFailure(result, "preview_io_failed")
+		if isContextError(err) {
+			return result, err
+		}
+		return previewFailure(result, "preview_io_failed"), nil
 	}
 	defer file.Close()
 	handleBefore, err := file.Stat()
 	if err != nil {
-		return previewFailure(result, "preview_io_failed")
+		return previewFailure(result, "preview_io_failed"), nil
 	}
 	if !os.SameFile(pathInfo, handleBefore) || !samePreviewState(pathInfo, handleBefore) {
-		return previewFailure(result, "stale_preview")
+		return previewFailure(result, "stale_preview"), nil
 	}
 	sourceWebP, err := previewSourceIsWebP(file, job.Size)
 	if err != nil {
-		return previewFailure(result, "preview_io_failed")
+		if isContextError(err) {
+			return result, err
+		}
+		return previewFailure(result, "preview_io_failed"), nil
 	}
 	if !previewFitsInitialMemoryBudget(job.Size, memoryBudget, sourceWebP) {
-		return previewFailure(result, "preview_memory_limit")
+		return previewFailure(result, "preview_memory_limit"), nil
 	}
 
 	data, sum, err := readPreviewSource(ctx, file, job.Size)
 	if err != nil {
-		return previewFailure(result, "preview_io_failed")
+		if isContextError(err) {
+			return result, err
+		}
+		return previewFailure(result, "preview_io_failed"), nil
 	}
 	handleAfter, handleErr := file.Stat()
 	pathAfter, pathErr := os.Stat(job.Path)
 	if handleErr != nil || pathErr != nil {
-		return previewFailure(result, "preview_io_failed")
+		return previewFailure(result, "preview_io_failed"), nil
 	}
 	if !os.SameFile(pathInfo, pathAfter) || !os.SameFile(handleBefore, handleAfter) ||
 		!os.SameFile(handleAfter, pathAfter) || !samePreviewState(handleBefore, handleAfter) ||
 		!samePreviewState(pathInfo, pathAfter) || !matchesPreviewIdentity(pathAfter, job) ||
 		!bytes.Equal(sum[:], job.KnownSHA) {
-		return previewFailure(result, "stale_preview")
+		return previewFailure(result, "stale_preview"), nil
 	}
 
 	isWebP, animated, err := inspectPreviewWebP(data)
 	if err != nil {
-		return previewFailure(result, "preview_decode_failed")
+		return previewFailure(result, "preview_decode_failed"), nil
 	}
 	if animated {
-		return previewFailure(result, "preview_memory_limit")
+		return previewFailure(result, "preview_memory_limit"), nil
 	}
 	if isWebP != sourceWebP {
-		return previewFailure(result, "stale_preview")
+		return previewFailure(result, "stale_preview"), nil
 	}
 	config, err := decodePreviewConfig(data)
 	if err != nil {
-		return previewFailure(result, "preview_decode_failed")
+		return previewFailure(result, "preview_decode_failed"), nil
 	}
 	if !previewFitsMemoryBudget(job.Size, config.Width, config.Height,
 		int(job.PreviewMaxWidth), int(job.PreviewMaxHeight), memoryBudget,
 		isWebP, job.PreviewFormat) {
-		return previewFailure(result, "preview_memory_limit")
+		return previewFailure(result, "preview_memory_limit"), nil
 	}
 	decoded, err := decodePreview(data)
 	if err != nil {
-		return previewFailure(result, "preview_decode_failed")
+		return previewFailure(result, "preview_decode_failed"), nil
 	}
 	resized := resizeWithin(decoded, int(job.PreviewMaxWidth), int(job.PreviewMaxHeight))
 	encoded, tooLarge, err := encodePreview(resized, job.PreviewFormat, int(job.PreviewQuality))
 	if tooLarge {
-		return previewFailure(result, "preview_too_large")
+		return previewFailure(result, "preview_too_large"), nil
 	}
 	if err != nil {
-		return previewFailure(result, "preview_encode_failed")
+		return previewFailure(result, "preview_encode_failed"), nil
 	}
 	bounds := resized.Bounds()
 	result.PreviewFormat = job.PreviewFormat
 	result.PreviewWidth = int32(bounds.Dx())
 	result.PreviewHeight = int32(bounds.Dy())
 	result.PreviewBytes = encoded
-	return result
+	return result, nil
 }
 
 func previewSourceIsWebP(file io.ReadSeeker, size int64) (bool, error) {

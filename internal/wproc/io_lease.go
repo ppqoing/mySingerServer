@@ -29,28 +29,49 @@ type IOLeaseClient interface {
 	AfterSeek(leaseID uint64, elapsed time.Duration, err error)
 }
 
-type governedFile struct {
-	file  *os.File
-	lease IOLeaseClient
-	ctx   context.Context
+type sourceFileHandle interface {
+	io.ReadSeeker
+	Stat() (os.FileInfo, error)
+	Close() error
 }
 
-func openSource(ctx context.Context, job *worker.JobMsg, lease IOLeaseClient) (*governedFile, error) {
+type governedFile struct {
+	file   *os.File
+	source sourceFileHandle
+	lease  IOLeaseClient
+	ctx    context.Context
+}
+
+func openSource(
+	ctx context.Context,
+	job *worker.JobMsg,
+	lease IOLeaseClient,
+	openers ...func(string) (sourceFileHandle, error),
+) (*governedFile, error) {
 	if job == nil || job.Path == "" || lease == nil {
 		return nil, fmt.Errorf("%w: source opener is not configured", errIOLeaseInfrastructure)
 	}
-	file, err := os.Open(fixPath(job.Path))
+	path := fixPath(job.Path)
+	var source sourceFileHandle
+	var file *os.File
+	var err error
+	if len(openers) != 0 && openers[0] != nil {
+		source, err = openers[0](path)
+	} else {
+		file, err = os.Open(path)
+	}
 	if err != nil {
 		return nil, err
 	}
-	return &governedFile{file: file, lease: lease, ctx: ctx}, nil
+	return &governedFile{file: file, source: source, lease: lease, ctx: ctx}, nil
 }
 
 func (file *governedFile) Read(buffer []byte) (int, error) {
 	if len(buffer) == 0 {
 		return 0, nil
 	}
-	if file == nil || file.file == nil || file.lease == nil {
+	handle := file.handle()
+	if handle == nil || file.lease == nil {
 		return 0, fmt.Errorf("%w: source read has no lease client", errIOLeaseInfrastructure)
 	}
 	ctx := file.context()
@@ -62,7 +83,7 @@ func (file *governedFile) Read(buffer []byte) (int, error) {
 		return 0, fmt.Errorf("%w: invalid read grant %d for %d bytes", errIOLeaseInfrastructure, granted, len(buffer))
 	}
 	started := time.Now()
-	read, readErr := file.file.Read(buffer[:granted])
+	read, readErr := handle.Read(buffer[:granted])
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		readErr = ctxErr
 	}
@@ -71,7 +92,8 @@ func (file *governedFile) Read(buffer []byte) (int, error) {
 }
 
 func (file *governedFile) Seek(offset int64, whence int) (int64, error) {
-	if file == nil || file.file == nil || file.lease == nil {
+	handle := file.handle()
+	if handle == nil || file.lease == nil {
 		return 0, fmt.Errorf("%w: source seek has no lease client", errIOLeaseInfrastructure)
 	}
 	ctx := file.context()
@@ -80,7 +102,7 @@ func (file *governedFile) Seek(offset int64, whence int) (int64, error) {
 		return 0, err
 	}
 	started := time.Now()
-	position, seekErr := file.file.Seek(offset, whence)
+	position, seekErr := handle.Seek(offset, whence)
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		seekErr = ctxErr
 	}
@@ -89,17 +111,29 @@ func (file *governedFile) Seek(offset int64, whence int) (int64, error) {
 }
 
 func (file *governedFile) Stat() (os.FileInfo, error) {
-	if file == nil || file.file == nil {
+	handle := file.handle()
+	if handle == nil {
 		return nil, os.ErrInvalid
 	}
-	return file.file.Stat()
+	return handle.Stat()
 }
 
 func (file *governedFile) Close() error {
-	if file == nil || file.file == nil {
+	handle := file.handle()
+	if handle == nil {
 		return nil
 	}
-	return file.file.Close()
+	return handle.Close()
+}
+
+func (file *governedFile) handle() sourceFileHandle {
+	if file == nil {
+		return nil
+	}
+	if file.source != nil {
+		return file.source
+	}
+	return file.file
 }
 
 func (file *governedFile) context() context.Context {
@@ -202,7 +236,11 @@ func (client *localIOLeaseClient) AfterRead(leaseID uint64, bytes int, elapsed t
 	client.clearPendingLocked()
 	if operationErr != nil {
 		cancelled := isContextError(operationErr) || client.contextErrLocked(nil) != nil
-		client.rememberLocked(client.flushLocked(cancelled))
+		flushErr := client.flushLocked(cancelled)
+		if isContextError(operationErr) {
+			client.rememberLocked(operationErr)
+		}
+		client.rememberLocked(flushErr)
 	}
 }
 
@@ -220,6 +258,15 @@ func (client *localIOLeaseClient) BeforeSeek(ctx context.Context) (uint64, error
 	}
 	if err := client.acquireLocked(ctx, 2, minIOLeaseWindowBytes, true); err != nil {
 		return 0, err
+	}
+	if client.grant.Seeks != 1 {
+		capacityErr := fmt.Errorf("%w: seek grant has %d tokens", errIOLeaseInfrastructure, client.grant.Seeks)
+		if err := client.flushLocked(true); err != nil {
+			client.rememberLocked(err)
+			return 0, err
+		}
+		client.rememberLocked(capacityErr)
+		return 0, capacityErr
 	}
 	client.pendingKind = 2
 	client.pendingLeaseID = client.grant.LeaseID
@@ -239,7 +286,11 @@ func (client *localIOLeaseClient) AfterSeek(leaseID uint64, elapsed time.Duratio
 	}
 	client.clearPendingLocked()
 	cancelled := isContextError(operationErr) || client.contextErrLocked(nil) != nil
-	client.rememberLocked(client.flushLocked(cancelled))
+	flushErr := client.flushLocked(cancelled)
+	if isContextError(operationErr) {
+		client.rememberLocked(operationErr)
+	}
+	client.rememberLocked(flushErr)
 }
 
 func (client *localIOLeaseClient) finish(operationErr error) error {
@@ -249,7 +300,11 @@ func (client *localIOLeaseClient) finish(operationErr error) error {
 		client.rememberLocked(fmt.Errorf("%w: source operation did not report completion", errIOLeaseInfrastructure))
 	}
 	cancelled := isContextError(operationErr) || client.contextErrLocked(nil) != nil
-	client.rememberLocked(client.flushLocked(cancelled))
+	flushErr := client.flushLocked(cancelled)
+	if isContextError(operationErr) {
+		client.rememberLocked(operationErr)
+	}
+	client.rememberLocked(flushErr)
 	return client.terminalErr
 }
 

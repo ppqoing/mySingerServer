@@ -32,16 +32,17 @@ type imagePhase1 struct {
 }
 
 type pipelineDeps struct {
-	runtime  func() (videocore.RuntimeInfo, error)
-	open     func(string) (readStatCloser, error)
-	stat     func(string) (os.FileInfo, error)
-	sameFile func(os.FileInfo, os.FileInfo) bool
-	newSHA   func() (sha512Stream, error)
-	query    func(*worker.SHAQueryMsg) (*worker.SHAReplyMsg, error)
-	decode   func([]byte) (imagePhase1, error)
-	video    *videoPipelineDeps
-	phase2   *phase2PipelineDeps
-	session  *sessionPipelineDeps
+	runtime    func() (videocore.RuntimeInfo, error)
+	sourceOpen func(string) (sourceFileHandle, error)
+	open       func(string) (readStatCloser, error)
+	stat       func(string) (os.FileInfo, error)
+	sameFile   func(os.FileInfo, os.FileInfo) bool
+	newSHA     func() (sha512Stream, error)
+	query      func(*worker.SHAQueryMsg) (*worker.SHAReplyMsg, error)
+	decode     func([]byte) (imagePhase1, error)
+	video      *videoPipelineDeps
+	phase2     *phase2PipelineDeps
+	session    *sessionPipelineDeps
 }
 
 func defaultPipelineDeps(query func(*worker.SHAQueryMsg) (*worker.SHAReplyMsg, error)) pipelineDeps {

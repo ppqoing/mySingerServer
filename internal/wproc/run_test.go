@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -59,8 +60,14 @@ func TestServeIOLeaseGovernsImagePreviewSource(t *testing.T) {
 	}
 
 	server, parent := net.Pipe()
+	audit := newSourceAccessAudit(t, path)
 	done := make(chan int, 1)
-	go func() { done <- serve(server, 18, testConfig(), pipelineDeps{runtime: testReadyRuntimeInfo}) }()
+	go func() {
+		done <- serve(server, 18, testConfig(), pipelineDeps{
+			runtime:    testReadyRuntimeInfo,
+			sourceOpen: audit.open,
+		})
+	}()
 	conn := worker.NewIPCConn(parent)
 	if _, err := conn.Read(); err != nil {
 		t.Fatal(err)
@@ -94,6 +101,7 @@ func TestServeIOLeaseGovernsImagePreviewSource(t *testing.T) {
 			if request.WantSeek {
 				grant.Seeks = 1
 			}
+			audit.grant(grant, request.WantSeek)
 			if err := conn.Write(worker.MsgIOLeaseGrant, grant); err != nil {
 				t.Fatal(err)
 			}
@@ -103,6 +111,7 @@ func TestServeIOLeaseGovernsImagePreviewSource(t *testing.T) {
 				t.Fatal(err)
 			}
 			leaseReports++
+			audit.report()
 			if report.JobID != job.JobID || !report.Completed || report.Cancelled {
 				t.Fatalf("preview lease report = %#v", report)
 			}
@@ -118,6 +127,7 @@ func TestServeIOLeaseGovernsImagePreviewSource(t *testing.T) {
 	}
 
 resultReceived:
+	audit.assertGoverned(t, true)
 	if leaseAcquires == 0 || leaseReports == 0 {
 		t.Fatalf("preview source lease traffic acquires=%d reports=%d, want both nonzero", leaseAcquires, leaseReports)
 	}
@@ -196,10 +206,12 @@ func serveLegacySourceWithLease(t *testing.T, job worker.JobMsg) (worker.JobResu
 	phase2.decode = func([]byte) (phase2GrayImage, error) { return gray, nil }
 	// The partial overrides avoid native algorithm dependencies while leaving
 	// source opening to serve, which must bind it to the job's lease client.
+	audit := newSourceAccessAudit(t, job.Path)
 	deps := pipelineDeps{
-		runtime: testReadyRuntimeInfo,
-		newSHA:  func() (sha512Stream, error) { return &fakeSHA{}, nil },
-		phase2:  &phase2,
+		runtime:    testReadyRuntimeInfo,
+		newSHA:     func() (sha512Stream, error) { return &fakeSHA{}, nil },
+		phase2:     &phase2,
+		sourceOpen: audit.open,
 	}
 	go func() { done <- serve(server, 19, testConfig(), deps) }()
 	conn := worker.NewIPCConn(parent)
@@ -229,6 +241,7 @@ func serveLegacySourceWithLease(t *testing.T, job worker.JobMsg) (worker.JobResu
 			if request.WantSeek {
 				grant.Seeks = 1
 			}
+			audit.grant(grant, request.WantSeek)
 			if err := conn.Write(worker.MsgIOLeaseGrant, grant); err != nil {
 				t.Fatal(err)
 			}
@@ -238,6 +251,7 @@ func serveLegacySourceWithLease(t *testing.T, job worker.JobMsg) (worker.JobResu
 				t.Fatal(err)
 			}
 			reports++
+			audit.report()
 			if !report.Completed || report.Cancelled {
 				t.Fatalf("legacy source report=%#v", report)
 			}
@@ -252,6 +266,7 @@ func serveLegacySourceWithLease(t *testing.T, job worker.JobMsg) (worker.JobResu
 			if code := <-done; code != 0 {
 				t.Fatalf("serve exit=%d", code)
 			}
+			audit.assertGoverned(t, false)
 			return result, acquires, reports
 		default:
 			t.Fatalf("legacy source message type=%q", envelope.Type)
@@ -453,9 +468,13 @@ func serveProductionSessionFixture(t *testing.T, job worker.JobMsg) worker.JobRe
 		t.Fatal(err)
 	}
 	done := make(chan int, 1)
+	audit := newSourceAccessAudit(t, job.Path)
 	go func() {
 		defer server.Close()
-		done <- serve(server, 3, cfg, pipelineDeps{runtime: testReadyRuntimeInfo})
+		done <- serve(server, 3, cfg, pipelineDeps{
+			runtime:    testReadyRuntimeInfo,
+			sourceOpen: audit.open,
+		})
 	}()
 	t.Cleanup(func() { _ = parent.Close() })
 	conn := worker.NewIPCConn(parent)
@@ -511,11 +530,13 @@ func serveProductionSessionFixture(t *testing.T, job worker.JobMsg) worker.JobRe
 				request.InstanceID != job.ScanInstanceID || request.DiskKey != job.DiskKey {
 				t.Fatalf("production source lease request = %#v", request)
 			}
-			if err := conn.Write(worker.MsgIOLeaseGrant, worker.IOLeaseGrantMsg{
+			grant := worker.IOLeaseGrantMsg{
 				JobID: request.JobID, RequestID: request.RequestID,
 				LeaseID: uint64(800 + leaseAcquires), Generation: 12,
 				Bytes: request.WantBytes,
-			}); err != nil {
+			}
+			audit.grant(grant, request.WantSeek)
+			if err := conn.Write(worker.MsgIOLeaseGrant, grant); err != nil {
 				t.Fatal(err)
 			}
 		case worker.MsgIOLeaseReport:
@@ -524,6 +545,7 @@ func serveProductionSessionFixture(t *testing.T, job worker.JobMsg) worker.JobRe
 				t.Fatal(err)
 			}
 			leaseReports++
+			audit.report()
 			if !report.Completed || report.Cancelled || report.Bytes != job.Size {
 				t.Fatalf("production source lease report = %#v", report)
 			}
@@ -539,6 +561,7 @@ func serveProductionSessionFixture(t *testing.T, job worker.JobMsg) worker.JobRe
 	}
 
 productionResultReceived:
+	audit.assertGoverned(t, false)
 	if leaseAcquires == 0 || leaseReports == 0 {
 		t.Fatalf("production final rehash lease traffic acquires=%d reports=%d", leaseAcquires, leaseReports)
 	}
@@ -551,6 +574,130 @@ productionResultReceived:
 	t.Logf("IPC chain: %s -> %s -> %s -> %s -> %s -> %s (serve=0)",
 		worker.MsgReady, worker.MsgJob, worker.MsgSHAQuery, worker.MsgSHAReply, worker.MsgResult, worker.MsgShutdown)
 	return result
+}
+
+// sourceAccessAudit is the production-opener seam: a grant is recorded before
+// it is sent to Worker, and every real source handle operation verifies that an
+// outstanding byte/seek authorization already exists. Only the immutable job
+// path may pass this seam; cache, temp contact sheets, sidecars and logs must not.
+type sourceAccessAudit struct {
+	mu         sync.Mutex
+	wantPath   string
+	readTokens int64
+	seekTokens int64
+	reads      int
+	seeks      int
+	opens      []string
+	violations []string
+}
+
+func newSourceAccessAudit(t *testing.T, path string) *sourceAccessAudit {
+	t.Helper()
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &sourceAccessAudit{wantPath: filepath.Clean(absolute)}
+}
+
+func (audit *sourceAccessAudit) grant(grant worker.IOLeaseGrantMsg, seek bool) {
+	audit.mu.Lock()
+	defer audit.mu.Unlock()
+	if seek {
+		audit.seekTokens += int64(grant.Seeks)
+	} else {
+		audit.readTokens += grant.Bytes
+	}
+}
+
+func (audit *sourceAccessAudit) report() {
+	audit.mu.Lock()
+	defer audit.mu.Unlock()
+	audit.readTokens = 0
+	audit.seekTokens = 0
+}
+
+func (audit *sourceAccessAudit) open(path string) (sourceFileHandle, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	absolute = filepath.Clean(absolute)
+	audit.mu.Lock()
+	audit.opens = append(audit.opens, absolute)
+	if !strings.EqualFold(absolute, audit.wantPath) {
+		audit.violations = append(audit.violations, "non-source path entered governed opener: "+absolute)
+	}
+	audit.mu.Unlock()
+	file, err := os.Open(absolute)
+	if err != nil {
+		return nil, err
+	}
+	return &auditedSourceFile{sourceFileHandle: file, path: absolute, audit: audit}, nil
+}
+
+func (audit *sourceAccessAudit) beforeRead(path string) {
+	audit.mu.Lock()
+	defer audit.mu.Unlock()
+	if audit.readTokens <= 0 {
+		audit.violations = append(audit.violations, "Read before grant: "+path)
+	}
+	audit.reads++
+}
+
+func (audit *sourceAccessAudit) afterRead(read int) {
+	audit.mu.Lock()
+	defer audit.mu.Unlock()
+	audit.readTokens -= int64(read)
+}
+
+func (audit *sourceAccessAudit) beforeSeek(path string) {
+	audit.mu.Lock()
+	defer audit.mu.Unlock()
+	if audit.seekTokens <= 0 {
+		audit.violations = append(audit.violations, "Seek before grant: "+path)
+	} else {
+		audit.seekTokens--
+	}
+	audit.seeks++
+}
+
+func (audit *sourceAccessAudit) assertGoverned(t *testing.T, wantSeek bool) {
+	t.Helper()
+	audit.mu.Lock()
+	defer audit.mu.Unlock()
+	if len(audit.violations) != 0 {
+		t.Fatalf("source operation audit violations: %v", audit.violations)
+	}
+	if audit.reads == 0 || len(audit.opens) == 0 {
+		t.Fatalf("source audit opens=%v reads=%d, want both nonzero", audit.opens, audit.reads)
+	}
+	if wantSeek && audit.seeks == 0 {
+		t.Fatal("source audit recorded no governed Seek")
+	}
+	for _, opened := range audit.opens {
+		if !strings.EqualFold(opened, audit.wantPath) {
+			t.Fatalf("cache/temp/sidecar/log path entered source governor: %s", opened)
+		}
+	}
+}
+
+type auditedSourceFile struct {
+	sourceFileHandle
+	path  string
+	audit *sourceAccessAudit
+}
+
+func (file *auditedSourceFile) Read(buffer []byte) (int, error) {
+	file.audit.beforeRead(file.path)
+	read, err := file.sourceFileHandle.Read(buffer)
+	file.audit.afterRead(read)
+	return read, err
+}
+
+func (file *auditedSourceFile) Seek(offset int64, whence int) (int64, error) {
+	file.audit.beforeSeek(file.path)
+	return file.sourceFileHandle.Seek(offset, whence)
 }
 
 func TestServeReadyReportsVideoCoreRuntime(t *testing.T) {
