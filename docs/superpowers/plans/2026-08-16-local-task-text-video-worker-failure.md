@@ -565,6 +565,42 @@ git commit -m "fix: align VideoCore provenance with standard dependencies"
 
 ---
 
+### Task 5B: 修复远程目录浏览会话状态与 Web lint 门禁
+
+**阻断证据（Task 5 第二轮）：**
+- Task 5A 后正式构建已通过 VideoCore CTest 18/18、exports 10/10、native closure 6/6、Web 测试 205/205；`build-web.ps1` 在 `RemotePathBrowser.tsx:56` 的 `react-hooks/set-state-in-effect` fail closed。
+- 当前 effect 只同步清空 `selectedPath`，不会立即清空 `currentPath/entries/cursor/error`；关闭重开或切换机器后，新根请求完成前仍会显示并允许添加旧会话路径。
+- 不能简单把 `showHidden` 加到 effect 依赖：toggle handler 的当前目录请求会被 cleanup 取消，继而多发一次根目录请求并丢失当前导航。
+
+**Files:**
+- Modify: `webui/src/features/scans/RemotePathBrowser.tsx`
+- Modify: `webui/src/features/scans/RemotePathBrowser.test.tsx`
+
+**Interfaces:**
+- `showHidden` 是跨开关对话框保留的用户偏好。
+- 路径、选择、条目、游标、错误、loading 和请求控制器属于一次 `(open session, machineID)` 会话；关闭或机器变化必须通过卸载旧会话同步清除，旧值不得在新请求等待期间可见/可提交。
+- 初始根请求每个新会话只发一次，并使用当时的隐藏项偏好；会话内切换隐藏项只刷新当前目录一次。
+- 保留现有 AbortSignal、aborted 检查和 controller identity，迟到旧请求不得覆盖新结果或错误地清除新 loading。
+
+- [ ] **Step 1: 建立行为与 lint RED**
+
+新增确定性测试：进入子目录后关闭再打开并延迟根响应时，旧路径/条目不可见且添加禁用；隐藏项切换只发一次当前目录请求；旧 A 被取消后迟到不得覆盖已完成 B；隐藏偏好为 true 时重开只发一次 true 根请求。运行聚焦测试并保留当前 stale-session 失败；运行 lint 保留现有 effect 错误。
+
+- [ ] **Step 2: 分离持久偏好和浏览会话**
+
+外层组件仅持有 `showHidden` 偏好；`open=false` 不挂载会话，`open=true` 按 `machineID` 挂载新的内部 session。内部所有浏览状态从空值初始化，effect 只发初始根请求和 cleanup，不同步 setState。不得加 eslint disable。
+
+- [ ] **Step 3: GREEN 与提交**
+
+运行 RemotePathBrowser 聚焦测试、Web 全量测试、lint 和 build；预期测试全绿、lint 0 error（现有无关 warning 可保留）、build PASS。只提交两个白名单文件：
+
+```powershell
+git add -- webui/src/features/scans/RemotePathBrowser.tsx webui/src/features/scans/RemotePathBrowser.test.tsx
+git commit -m "fix: isolate remote browser sessions"
+```
+
+---
+
 ### Task 5: 全量验证、构建和发布 Compute/Manager 包
 
 **Files:**
