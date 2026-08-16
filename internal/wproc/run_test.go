@@ -198,15 +198,55 @@ func productionSessionFixturePath(t *testing.T, kind, fixture string) string {
 	return path
 }
 
-func serveProductionSessionFixture(t *testing.T, job worker.JobMsg) worker.JobResultMsg {
+// Break caught: a clean checkout does not contain the ignored .tmp parent, so
+// the production session fixture helper failed before starting Worker IPC.
+func TestProductionSessionCacheRootCreatesMissingParent(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	cacheParent := filepath.Join(workspaceRoot, ".tmp", "task-3-real-codec-ipc")
+	if _, err := os.Stat(cacheParent); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("initial cache parent stat error = %v, want not exist", err)
+	}
+
+	var cacheRoot, sibling string
+	if !t.Run("isolated leaf", func(t *testing.T) {
+		cacheRoot = productionSessionCacheRoot(t, workspaceRoot)
+		info, err := os.Stat(cacheRoot)
+		if err != nil || !info.IsDir() {
+			t.Fatalf("cache root info = %v, err=%v", info, err)
+		}
+		sibling = filepath.Join(cacheParent, "keep.txt")
+		if err := os.WriteFile(sibling, []byte("keep"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}) {
+		return
+	}
+
+	if _, err := os.Stat(cacheRoot); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("cache leaf stat after cleanup error = %v, want not exist", err)
+	}
+	if info, err := os.Stat(cacheParent); err != nil || !info.IsDir() {
+		t.Fatalf("cache parent after cleanup = %v, err=%v", info, err)
+	}
+	if data, err := os.ReadFile(sibling); err != nil || string(data) != "keep" {
+		t.Fatalf("shared sibling after cleanup = %q, err=%v", data, err)
+	}
+}
+
+func productionSessionCacheRoot(t *testing.T, workspaceRoot string) string {
 	t.Helper()
-	cfg, err := configFromLookup(func(string) string { return "" })
+	cacheParent := filepath.Join(workspaceRoot, ".tmp", "task-3-real-codec-ipc")
+	if err := os.MkdirAll(cacheParent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	parentInfo, err := os.Lstat(cacheParent)
 	if err != nil {
 		t.Fatal(err)
 	}
-	videoRoot := os.Getenv("VC_TESTDATA_ROOT")
-	workspaceRoot := filepath.Clean(filepath.Join(videoRoot, "..", "..", "..", ".."))
-	cacheRoot, err := os.MkdirTemp(filepath.Join(workspaceRoot, ".tmp"), "task-3-real-codec-ipc-")
+	if !parentInfo.IsDir() || parentInfo.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("production session cache parent is not a normal directory: %s", cacheParent)
+	}
+	cacheRoot, err := os.MkdirTemp(cacheParent, "case-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -215,7 +255,18 @@ func serveProductionSessionFixture(t *testing.T, job worker.JobMsg) worker.JobRe
 			t.Errorf("remove production session cache root: %v", err)
 		}
 	})
-	cfg.ThumbCacheDir = cacheRoot
+	return cacheRoot
+}
+
+func serveProductionSessionFixture(t *testing.T, job worker.JobMsg) worker.JobResultMsg {
+	t.Helper()
+	cfg, err := configFromLookup(func(string) string { return "" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	videoRoot := os.Getenv("VC_TESTDATA_ROOT")
+	workspaceRoot := filepath.Clean(filepath.Join(videoRoot, "..", "..", "..", ".."))
+	cfg.ThumbCacheDir = productionSessionCacheRoot(t, workspaceRoot)
 
 	server, parent := net.Pipe()
 	deadline := time.Now().Add(2 * time.Minute)
