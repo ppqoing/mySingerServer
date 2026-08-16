@@ -5,6 +5,21 @@ import (
 	"testing"
 )
 
+// Break caught: parent validation rejects one precise, requested field error
+// for each media field after a decoder failure.
+func TestVideoFileErrorsAcceptOneRequestedBitEach(t *testing.T) {
+	job := &JobMsg{JobID: 801, Path: `D:\media\broken.mp4`, Kind: MediaVideo,
+		Phase: Phase1, FieldsMask: MaskVideoDuration | MaskVideoContactSheet}
+	result := &JobResultMsg{JobID: job.JobID, Path: job.Path, Kind: job.Kind,
+		Errors: []FieldError{
+			{Field: MaskVideoDuration, Stage: "video_probe", Msg: "decoder rejected stream"},
+			{Field: MaskVideoContactSheet, Stage: "video_probe", Msg: "decoder rejected stream"},
+		}}
+	if err := validateWorkerResult(job, result); err != nil {
+		t.Fatalf("file-level media errors rejected: %v", err)
+	}
+}
+
 // Break caught: the parent accepts a forged, oversized, or dimensionless
 // preview result instead of binding it to the dispatched immutable identity.
 func TestImagePreviewProtocolValidatesIdentityDimensionsAndFourMiBLimit(t *testing.T) {

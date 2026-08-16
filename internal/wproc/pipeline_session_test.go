@@ -34,6 +34,31 @@ func TestSessionPipelineOneOpenOneHashOneAnalyze(t *testing.T) {
 	}
 }
 
+// Break caught: file-level decoder failures combine independent requested
+// fields into one protocol-invalid error instead of preserving each field.
+func TestSessionPipelineFileErrorSplitsRequestedFieldBits(t *testing.T) {
+	job := &worker.JobMsg{
+		JobID: 801, Path: `D:\media\broken.mp4`, Kind: worker.MediaVideo,
+		Phase:      worker.Phase1,
+		FieldsMask: worker.MaskSHA512 | worker.MaskVideoDuration | worker.MaskVideoContactSheet,
+	}
+	result := newSessionPipelineResult(job)
+	sessionPipelineFileError(result,
+		worker.MaskVideoDuration|worker.MaskVideoContactSheet,
+		"video_probe", errors.New("decoder rejected stream"))
+	if len(result.Errors) != 2 ||
+		result.Errors[0].Field != worker.MaskVideoDuration ||
+		result.Errors[1].Field != worker.MaskVideoContactSheet {
+		t.Fatalf("field errors = %#v", result.Errors)
+	}
+	for _, fieldError := range result.Errors {
+		if fieldError.Stage != "video_probe" || fieldError.Msg != "decoder rejected stream" ||
+			fieldError.Field&(fieldError.Field-1) != 0 {
+			t.Fatalf("invalid field error = %#v", fieldError)
+		}
+	}
+}
+
 func TestSessionPipelineCompleteHitSkipsAnalyze(t *testing.T) {
 	job, deps, fake := newSessionPipelineTest(t, worker.MediaImage,
 		worker.MaskSHA512|worker.MaskImagePDQ, 0)

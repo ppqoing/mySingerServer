@@ -591,9 +591,16 @@ func contactSheetMetaFromAnalysis(sha [64]byte, size int64, runtime videocore.Ru
 
 func sessionPipelineFileError(result *worker.JobResultMsg, fields uint32, stage string, err error) *worker.JobResultMsg {
 	if fields == 0 {
-		fields = 1
+		result.Errors = append(result.Errors, worker.FieldError{Field: 0, Stage: stage, Msg: err.Error()})
+		return result
 	}
-	result.Errors = append(result.Errors, worker.FieldError{Field: fields, Stage: stage, Msg: err.Error()})
+	for bit := uint32(1); fields != 0; bit <<= 1 {
+		if fields&bit == 0 {
+			continue
+		}
+		result.Errors = append(result.Errors, worker.FieldError{Field: bit, Stage: stage, Msg: err.Error()})
+		fields &^= bit
+	}
 	return result
 }
 
