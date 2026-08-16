@@ -96,6 +96,198 @@ func testReadyRuntimeInfo() (videocore.RuntimeInfo, error) {
 	}}, nil
 }
 
+func missingReplyForQuery(query worker.SHAQueryMsg) worker.SHAReplyMsg {
+	return worker.SHAReplyMsg{
+		JobID:           query.JobID,
+		RequestedFields: query.RequestedFields,
+		MissingFields:   query.RequestedFields,
+		RequestedFrames: query.RequestedFrames,
+		MissingFrames:   query.RequestedFrames,
+	}
+}
+
+// Break caught: the production default session path can appear healthy with
+// synthetic dependencies while failing to open a concrete FFmpeg video codec.
+func TestServeProductionSessionDecodesVideoTrackCodec(t *testing.T) {
+	tests := []struct{ name, fixture, codec string }{
+		{"h264 mp4", `h264-standard.mp4`, "h264"},
+		{"hevc mkv", `hevc-standard.mkv`, "hevc"},
+		{"vp9 webm", `vp9-portrait.webm`, "vp9"},
+	}
+	for index, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			path := productionSessionFixturePath(t, "videos", tc.fixture)
+			info, err := os.Stat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			job := worker.JobMsg{
+				JobID:      int64(3100 + index),
+				ScanTaskID: "task-3-real-video-" + tc.codec,
+				Path:       path,
+				Kind:       worker.MediaVideo,
+				Phase:      worker.Phase1,
+				Source:     worker.JobSourceLocal,
+				FieldsMask: worker.MaskAllVideo,
+				Size:       info.Size(),
+				MTimeUnix:  info.ModTime().Unix(),
+			}
+			result := serveProductionSessionFixture(t, job)
+			if result.FieldsDone != worker.MaskAllVideo || result.DurationMS == nil ||
+				*result.DurationMS <= 0 || result.ThumbPath == "" || len(result.ThumbPDQ) != 32 ||
+				result.ContactSheetWidth <= 0 || result.ContactSheetHeight <= 0 ||
+				len(result.Errors) != 0 {
+				t.Fatalf("%s production video result = %#v", tc.codec, result)
+			}
+			if info, err := os.Stat(result.ThumbPath); err != nil || !info.Mode().IsRegular() {
+				t.Fatalf("%s contact sheet %q: info=%v err=%v", tc.codec, result.ThumbPath, info, err)
+			}
+		})
+	}
+}
+
+// Break caught: extension-agnostic production image analysis can regress to a
+// single decoder branch and silently fail JPEG, PNG, or WebP content.
+func TestServeProductionSessionDecodesImageContentFormat(t *testing.T) {
+	tests := []struct{ name, fixture string }{
+		{"jpeg", `synthetic-pattern.jpg`},
+		{"png", `synthetic-bars.png`},
+		{"webp", `synthetic-portrait.webp`},
+	}
+	for index, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			path := productionSessionFixturePath(t, "images", tc.fixture)
+			info, err := os.Stat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			job := worker.JobMsg{
+				JobID:      int64(3200 + index),
+				ScanTaskID: "task-3-real-image-" + tc.name,
+				Path:       path,
+				Kind:       worker.MediaImage,
+				Phase:      worker.Phase1,
+				Source:     worker.JobSourceLocal,
+				FieldsMask: worker.MaskAllImage,
+				Size:       info.Size(),
+				MTimeUnix:  info.ModTime().Unix(),
+			}
+			result := serveProductionSessionFixture(t, job)
+			if result.FieldsDone != worker.MaskAllImage || len(result.PDQ) != 32 ||
+				result.Width <= 0 || result.Height <= 0 || len(result.Errors) != 0 {
+				t.Fatalf("%s production image result = %#v", tc.name, result)
+			}
+		})
+	}
+}
+
+func productionSessionFixturePath(t *testing.T, kind, fixture string) string {
+	t.Helper()
+	videoRoot := os.Getenv("VC_TESTDATA_ROOT")
+	if videoRoot == "" {
+		t.Fatal("VC_TESTDATA_ROOT is required for production session fixture tests")
+	}
+	root := videoRoot
+	if kind == "images" {
+		root = filepath.Join(filepath.Dir(videoRoot), "images")
+	}
+	path, err := filepath.Abs(filepath.Join(root, fixture))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func serveProductionSessionFixture(t *testing.T, job worker.JobMsg) worker.JobResultMsg {
+	t.Helper()
+	cfg, err := configFromLookup(func(string) string { return "" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	videoRoot := os.Getenv("VC_TESTDATA_ROOT")
+	workspaceRoot := filepath.Clean(filepath.Join(videoRoot, "..", "..", "..", ".."))
+	cacheRoot, err := os.MkdirTemp(filepath.Join(workspaceRoot, ".tmp"), "task-3-real-codec-ipc-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(cacheRoot); err != nil {
+			t.Errorf("remove production session cache root: %v", err)
+		}
+	})
+	cfg.ThumbCacheDir = cacheRoot
+
+	server, parent := net.Pipe()
+	deadline := time.Now().Add(2 * time.Minute)
+	if err := server.SetDeadline(deadline); err != nil {
+		t.Fatal(err)
+	}
+	if err := parent.SetDeadline(deadline); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan int, 1)
+	go func() {
+		defer server.Close()
+		done <- serve(server, 3, cfg, pipelineDeps{runtime: testReadyRuntimeInfo})
+	}()
+	t.Cleanup(func() { _ = parent.Close() })
+	conn := worker.NewIPCConn(parent)
+
+	ready, err := conn.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ready.Type != worker.MsgReady {
+		t.Fatalf("production session first message = %q, want %q", ready.Type, worker.MsgReady)
+	}
+	if err := conn.Write(worker.MsgJob, job); err != nil {
+		t.Fatal(err)
+	}
+	queryEnvelope, err := conn.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queryEnvelope.Type != worker.MsgSHAQuery {
+		t.Fatalf("production session post-job message = %q, want %q", queryEnvelope.Type, worker.MsgSHAQuery)
+	}
+	query, err := worker.DecodeBody[worker.SHAQueryMsg](queryEnvelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if query.JobID != job.JobID || query.Kind != job.Kind || len(query.SHA512) != sha512.Size ||
+		query.RequestedFields != job.FieldsMask&^worker.MaskSHA512 {
+		t.Fatalf("production session SHA query = %#v", query)
+	}
+	if err := conn.Write(worker.MsgSHAReply, missingReplyForQuery(query)); err != nil {
+		t.Fatal(err)
+	}
+	resultEnvelope, err := conn.Read()
+	if err != nil {
+		select {
+		case code := <-done:
+			t.Fatalf("production session result read: %v; serve exit=%d", err, code)
+		default:
+			t.Fatal(err)
+		}
+	}
+	if resultEnvelope.Type != worker.MsgResult {
+		t.Fatalf("production session post-reply message = %q, want %q", resultEnvelope.Type, worker.MsgResult)
+	}
+	result, err := worker.DecodeBody[worker.JobResultMsg](resultEnvelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Write(worker.MsgShutdown, struct{}{}); err != nil {
+		t.Fatal(err)
+	}
+	if code := <-done; code != 0 {
+		t.Fatalf("production session shutdown exit = %d, want 0", code)
+	}
+	t.Logf("IPC chain: %s -> %s -> %s -> %s -> %s -> %s (serve=0)",
+		worker.MsgReady, worker.MsgJob, worker.MsgSHAQuery, worker.MsgSHAReply, worker.MsgResult, worker.MsgShutdown)
+	return result
+}
+
 func TestServeReadyReportsVideoCoreRuntime(t *testing.T) {
 	server, parent := net.Pipe()
 	done := make(chan int, 1)

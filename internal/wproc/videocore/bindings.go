@@ -6,8 +6,25 @@ package videocore
 #cgo CFLAGS: -I${SRCDIR}/../../../videocore/include
 #cgo LDFLAGS: -L${SRCDIR} -lvideocore
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <videocore/videocore.h>
+
+static uint16_t* go_vc_copy_utf16(const uint16_t* source, uint32_t units) {
+	if (source == NULL || units == 0u ||
+		(size_t)units > SIZE_MAX / sizeof(uint16_t)) {
+		return NULL;
+	}
+	size_t bytes = (size_t)units * sizeof(uint16_t);
+	uint16_t* copy = (uint16_t*)malloc(bytes);
+	if (copy == NULL) return NULL;
+	memcpy(copy, source, bytes);
+	return copy;
+}
+
+static void go_vc_free(void* value) {
+	free(value);
+}
 
 static void go_vc_init_error(vc_error* value) {
 	memset(value, 0, sizeof(*value));
@@ -227,8 +244,20 @@ func (cgoBridge) analyze(session nativeSession, request AnalysisRequest) (Analys
 	nativeRequest.probe_timeout_ms = C.uint32_t(probeTimeout)
 	nativeRequest.frame_timeout_ms = C.uint32_t(frameTimeout)
 	nativeRequest.contact_sheet_tile_max_side = C.uint32_t(request.TileMaxSide)
+	var nativeTemporaryPath *C.uint16_t
 	if len(temporaryPath) != 0 {
-		nativeRequest.temporary_jpeg_path = (*C.uint16_t)(unsafe.Pointer(unsafe.SliceData(temporaryPath)))
+		nativeTemporaryPath = C.go_vc_copy_utf16(
+			(*C.uint16_t)(unsafe.Pointer(unsafe.SliceData(temporaryPath))),
+			C.uint32_t(len(temporaryPath)),
+		)
+		runtime.KeepAlive(temporaryPath)
+		if nativeTemporaryPath == nil {
+			return AnalysisResult{}, &NativeError{
+				Code: StatusOOM, Message: "temporary JPEG path allocation failed",
+			}
+		}
+		defer C.go_vc_free(unsafe.Pointer(nativeTemporaryPath))
+		nativeRequest.temporary_jpeg_path = nativeTemporaryPath
 		nativeRequest.temporary_jpeg_path_units = C.uint32_t(len(temporaryPath))
 	}
 	rc := int32(C.vc_media_analyze(
@@ -237,7 +266,6 @@ func (cgoBridge) analyze(session nativeSession, request AnalysisRequest) (Analys
 		&nativeResult,
 		&nativeErr,
 	))
-	runtime.KeepAlive(temporaryPath)
 	if rc != StatusOK {
 		return AnalysisResult{}, cgoCallError("media analyze", rc, &nativeErr)
 	}
