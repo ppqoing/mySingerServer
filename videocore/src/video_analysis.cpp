@@ -715,6 +715,10 @@ int32_t ReceiveUntilTarget(AVCodecContext* codec,
                            AVFrame* frame,
                            AvioOpaque& opaque,
                            int64_t target_timestamp,
+                           bool reject_initial_overshoot,
+                           bool* decoded_before_target,
+                           bool* seek_overshot,
+                           int64_t* first_decoded_timestamp,
                            AVFormatContext* format,
                            AVStream* stream,
                            int rotation,
@@ -736,9 +740,27 @@ int32_t ReceiveUntilTarget(AVCodecContext* codec,
         if (status < 0) return VC_ERR_DECODE;
         if (decode_ordinal != nullptr) ++(*decode_ordinal);
         const int64_t timestamp = frame->best_effort_timestamp;
-        if (timestamp == AV_NOPTS_VALUE || timestamp < target_timestamp) {
+        if (timestamp != AV_NOPTS_VALUE &&
+            first_decoded_timestamp != nullptr &&
+            *first_decoded_timestamp == AV_NOPTS_VALUE) {
+            *first_decoded_timestamp = timestamp;
+        }
+        if (timestamp == AV_NOPTS_VALUE) {
             av_frame_unref(frame);
             continue;
+        }
+        if (timestamp < target_timestamp) {
+            if (decoded_before_target != nullptr) {
+                *decoded_before_target = true;
+            }
+            av_frame_unref(frame);
+            continue;
+        }
+        if (reject_initial_overshoot && timestamp > target_timestamp &&
+            decoded_before_target != nullptr && !*decoded_before_target) {
+            if (seek_overshot != nullptr) *seek_overshot = true;
+            av_frame_unref(frame);
+            return VC_ERR_NO_FRAME;
         }
 #if defined(VC_VIDEO_ANALYSIS_TESTING)
         const int64_t stream_start = stream->start_time == AV_NOPTS_VALUE
@@ -749,8 +771,29 @@ int32_t ReceiveUntilTarget(AVCodecContext* codec,
         const int64_t selected_pts_time_micros =
             av_rescale_q(selected_pts, stream->time_base,
                          AVRational{1, 1000000});
-        const int32_t selected_decode_ordinal =
+        int32_t selected_decode_ordinal =
             decode_ordinal == nullptr ? -1 : *decode_ordinal;
+        const AVRational frame_rate = stream->avg_frame_rate.num > 0 &&
+                                              stream->avg_frame_rate.den > 0
+                                          ? stream->avg_frame_rate
+                                          : stream->r_frame_rate;
+        const bool decoded_from_stream_start =
+            first_decoded_timestamp != nullptr &&
+            *first_decoded_timestamp != AV_NOPTS_VALUE &&
+            *first_decoded_timestamp <= stream_start;
+        if (reject_initial_overshoot && !decoded_from_stream_start &&
+            frame->pts != AV_NOPTS_VALUE && frame_rate.num > 0 &&
+            frame_rate.den > 0) {
+            const int64_t absolute_ordinal = av_rescale_q(
+                selected_pts, stream->time_base, av_inv_q(frame_rate));
+            if (absolute_ordinal >=
+                    (std::numeric_limits<int32_t>::min)() &&
+                absolute_ordinal <=
+                    (std::numeric_limits<int32_t>::max)()) {
+                selected_decode_ordinal =
+                    static_cast<int32_t>(absolute_ordinal);
+            }
+        }
         const uint8_t selected_key_frame =
             static_cast<uint8_t>((frame->flags & AV_FRAME_FLAG_KEY) != 0);
         const char selected_picture_type =
@@ -899,6 +942,9 @@ int32_t DecodeSample(AVFormatContext* format,
     FrameOwner frame;
     if (packet.value == nullptr || frame.value == nullptr) return VC_ERR_OOM;
     int32_t decode_ordinal = -1;
+    bool decoded_before_target = false;
+    bool seek_overshot = false;
+    int64_t first_decoded_timestamp = AV_NOPTS_VALUE;
     uint32_t transient_read_retries = 0u;
     uint32_t invalid_read_skips = 0u;
 
@@ -986,6 +1032,10 @@ int32_t DecodeSample(AVFormatContext* format,
                                       frame.value,
                                       opaque,
                                       target,
+                                      !seek_from_stream_start,
+                                      &decoded_before_target,
+                                      &seek_overshot,
+                                      &first_decoded_timestamp,
                                       format,
                                       stream,
                                       rotation,
@@ -1050,6 +1100,10 @@ int32_t DecodeSample(AVFormatContext* format,
                                                              frame.value,
                                                              opaque,
                                                              target,
+                                                             !seek_from_stream_start,
+                                                             &decoded_before_target,
+                                                             &seek_overshot,
+                                                             &first_decoded_timestamp,
                                                              format,
                                                              stream,
                                                              rotation,
@@ -1066,6 +1120,10 @@ int32_t DecodeSample(AVFormatContext* format,
                 av_packet_unref(packet.value);
                 return drain_status;
             }
+            if (seek_overshot) {
+                av_packet_unref(packet.value);
+                return VC_ERR_NO_FRAME;
+            }
             continue;
         }
         if (send_status < 0) {
@@ -1079,6 +1137,10 @@ int32_t DecodeSample(AVFormatContext* format,
                                                            frame.value,
                                                            opaque,
                                                            target,
+                                                           !seek_from_stream_start,
+                                                           &decoded_before_target,
+                                                           &seek_overshot,
+                                                           &first_decoded_timestamp,
                                                            format,
                                                            stream,
                                                            rotation,
@@ -1091,6 +1153,7 @@ int32_t DecodeSample(AVFormatContext* format,
                                                            &decode_ordinal);
         if (receive_status == VC_OK) return VC_OK;
         if (receive_status != VC_ERR_NO_FRAME) return receive_status;
+        if (seek_overshot) return VC_ERR_NO_FRAME;
         break;
         }
     }
@@ -1362,7 +1425,7 @@ int32_t AnalyzeVideo(AvioBridge* avio,
                                             &selected_gray,
                                             &format_failed,
                                             index,
-                                            true);
+                                            false);
         int32_t recovered_status = status;
         if (!format_failed && status != VC_OK &&
             status != VC_ERR_CANCELLED && status != VC_ERR_TIMEOUT) {
@@ -1384,7 +1447,7 @@ int32_t AnalyzeVideo(AvioBridge* avio,
                                             &selected_gray,
                                             &format_failed,
                                             index,
-                                            false);
+                                            true);
         }
         if (publicly_requested) {
             out->frames[index].status = recovered_status;

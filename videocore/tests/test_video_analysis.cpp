@@ -355,6 +355,81 @@ void TestFrameMaskZeroAndSparseMask() {
     vc_media_close(session);
 }
 
+void TestNormalSampleUsesDirectSeekBeforeDecoderPrerollRecovery() {
+    const std::wstring path = FixturePath(L"h264-standard.mp4");
+    vc_media_open_options options{};
+    options.struct_size = sizeof(options);
+    options.abi_version = VC_ABI_VERSION;
+    options.expected_media_type = VC_MEDIA_TYPE_VIDEO;
+    vc_media_session* session = nullptr;
+    vc_error error = FreshError();
+    Check(vc_media_open_w(reinterpret_cast<const uint16_t*>(path.data()),
+                          static_cast<uint32_t>(path.size()), &options,
+                          nullptr, &session, &error) == VC_OK,
+          "direct-seek fixture opens");
+    if (session == nullptr) return;
+    std::array<uint8_t, VC_SHA512_SIZE> digest{};
+    Check(vc_media_hash(session, digest.data(), &error) == VC_OK,
+          "direct-seek fixture hashes");
+
+    vc::detail::VideoAnalysisTestReset();
+    vc_analysis_request request = FreshRequest(0x20u);
+    vc_analysis_result result = FreshResult();
+    error = FreshError();
+    Check(vc_media_analyze(session, &request, &result, &error) == VC_OK &&
+              result.completed_frame_mask == 0x20u,
+          "normal late sample publishes requested slot");
+    const auto stats = vc::detail::VideoAnalysisTestGetStats();
+    Check(stats.seek_call_count == 1u &&
+              stats.recovery_seek_call_count == 0u,
+          "normal sample uses direct target seek before decoder-preroll recovery");
+    Check(stats.selected_pts[5] == 27648 &&
+              stats.selected_decode_ordinals[5] == 27,
+          "direct target seek preserves the frozen absolute source frame identity");
+    vc_media_close(session);
+}
+
+void TestDirectSeekOvershootUsesDecoderPrerollRecovery() {
+    const std::wstring path = FixturePath(L"corrupt-packet.ts");
+    vc_media_open_options options{};
+    options.struct_size = sizeof(options);
+    options.abi_version = VC_ABI_VERSION;
+    options.expected_media_type = VC_MEDIA_TYPE_VIDEO;
+    vc_media_session* session = nullptr;
+    vc_error error = FreshError();
+    Check(vc_media_open_w(reinterpret_cast<const uint16_t*>(path.data()),
+                          static_cast<uint32_t>(path.size()), &options,
+                          nullptr, &session, &error) == VC_OK,
+          "direct-seek overshoot fixture opens");
+    if (session == nullptr) return;
+    std::array<uint8_t, VC_SHA512_SIZE> digest{};
+    Check(vc_media_hash(session, digest.data(), &error) == VC_OK,
+          "direct-seek overshoot fixture hashes");
+
+    vc::detail::VideoAnalysisTestReset();
+    vc_analysis_request request = FreshRequest(0x01u);
+    vc_analysis_result result = FreshResult();
+    error = FreshError();
+    Check(vc_media_analyze(session, &request, &result, &error) == VC_OK &&
+              result.completed_frame_mask == 0x01u,
+          "decoder-preroll recovery publishes an overshot sample");
+    const auto stats = vc::detail::VideoAnalysisTestGetStats();
+    Check(stats.seek_call_count == 2u &&
+              stats.recovery_seek_call_count == 1u,
+          "direct seek overshoot triggers exactly one decoder-preroll recovery");
+    Check(stats.recovery_seek_stream_index == 0 &&
+              stats.recovery_seek_min == 51000 &&
+              stats.recovery_seek_target == 51000 &&
+              stats.recovery_seek_max == 141000 &&
+              stats.recovery_seek_flags == AVSEEK_FLAG_BACKWARD,
+          "decoder-preroll recovery uses the bounded stream-start window");
+    Check(stats.selected_pts[0] == 15000 &&
+              stats.selected_pts_time_micros[0] == 166667 &&
+              stats.selected_decode_ordinals[0] == 2,
+          "decoder-preroll recovery preserves the frozen target frame identity");
+    vc_media_close(session);
+}
+
 vc_feature_set ReferenceRotatedRgbFeatures(const AVFrame& frame,
                                            int32_t* out_width,
                                            int32_t* out_height) {
@@ -683,7 +758,7 @@ void TestTimestampSaturationAndNormalization() {
           "negative-start selected identity normalizes deterministically");
 }
 
-void TestNegativeStartUsesDecoderPrerollWindowAndSelectedIdentity() {
+void TestNegativeStartDirectSeekPreservesSelectedIdentity() {
     const std::wstring path = FixturePath(L"h264-standard.mp4");
     vc_media_open_options options{};
     options.struct_size = sizeof(options);
@@ -706,17 +781,11 @@ void TestNegativeStartUsesDecoderPrerollWindowAndSelectedIdentity() {
     error = FreshError();
     Check(vc_media_analyze(session, &request, &result, &error) == VC_OK &&
               result.completed_frame_mask == 0x01u,
-          "negative-start decoder-preroll analysis publishes slot zero");
+          "negative-start direct-seek analysis publishes slot zero");
     const auto stats = vc::detail::VideoAnalysisTestGetStats();
-    Check(stats.recovery_seek_call_count == 1u &&
-              stats.seek_call_count == 1u,
-          "negative-start analysis executes one decoder-preroll seek");
-    Check(stats.recovery_seek_stream_index == 0 &&
-              stats.recovery_seek_min == -12289 &&
-              stats.recovery_seek_target == -12289 &&
-              stats.recovery_seek_max == -1 &&
-              stats.recovery_seek_flags == AVSEEK_FLAG_BACKWARD,
-          "negative-start decoder-preroll uses derived target and real-start upper bound");
+    Check(stats.seek_call_count == 1u &&
+              stats.recovery_seek_call_count == 0u,
+          "negative-start analysis uses direct target seek without recovery");
     Check(stats.selected_decode_ordinals[0] == 3 &&
               stats.selected_pts[0] == 3073 &&
               stats.selected_key_frames[0] == 0u &&
@@ -766,15 +835,15 @@ void TestRecoverableReadErrorsContinueWithoutReseek() {
     }
     vc::detail::VideoAnalysisTestReset();
     vc::detail::VideoAnalysisTestInjectReadPlan(
-        5u,
+        4u,
         nonconsecutive_eagain.data(),
         static_cast<uint32_t>(nonconsecutive_eagain.size()));
-    vc_analysis_request separated_request = FreshRequest(0x20u);
+    vc_analysis_request separated_request = FreshRequest(0x10u);
     vc_analysis_result separated_result = FreshResult();
     error = FreshError();
     Check(vc_media_analyze(session, &separated_request, &separated_result,
                            &error) == VC_OK &&
-              separated_result.completed_frame_mask == 0x20u,
+              separated_result.completed_frame_mask == 0x10u,
           "successful packets reset the consecutive read EAGAIN budget");
     const auto separated_stats = vc::detail::VideoAnalysisTestGetStats();
     Check(separated_stats.injected_read_error_count == 9u &&
@@ -1070,10 +1139,12 @@ void TestProbeDeadlineAndOverflowSafeSampling() {
 int main() {
     for (const auto& fixture : fixtures) TestFixture(fixture);
     TestFrameMaskZeroAndSparseMask();
+    TestNormalSampleUsesDirectSeekBeforeDecoderPrerollRecovery();
+    TestDirectSeekOvershootUsesDecoderPrerollRecovery();
     TestRotatedRgbNegativeStrideUsesPixelFormatConversion();
     TestUnrotatedFramesUseExplicitColorspaceAndRangeConversion();
     TestTimestampSaturationAndNormalization();
-    TestNegativeStartUsesDecoderPrerollWindowAndSelectedIdentity();
+    TestNegativeStartDirectSeekPreservesSelectedIdentity();
     TestRecoverableReadErrorsContinueWithoutReseek();
     TestHardFailureStopsRemainingWork(false);
     TestHardFailureStopsRemainingWork(true);
