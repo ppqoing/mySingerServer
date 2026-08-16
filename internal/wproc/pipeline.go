@@ -1,6 +1,7 @@
 package wproc
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -96,6 +97,10 @@ func retentionCapacity(size, limit int64, readChunkBytes int) (int, bool) {
 }
 
 func processImageWithDeps(cfg Config, job *worker.JobMsg, deps pipelineDeps) (*worker.JobResultMsg, error) {
+	return processImageWithContext(context.Background(), cfg, job, deps)
+}
+
+func processImageWithContext(ctx context.Context, cfg Config, job *worker.JobMsg, deps pipelineDeps) (*worker.JobResultMsg, error) {
 	result := &worker.JobResultMsg{
 		JobID: job.JobID,
 		Path:  job.Path,
@@ -165,6 +170,9 @@ func processImageWithDeps(cfg Config, job *worker.JobMsg, deps pipelineDeps) (*w
 	}
 	chunk := make([]byte, cfg.ReadChunkBytes)
 	for {
+		if err := ctx.Err(); err != nil {
+			return result, err
+		}
 		n, readErr := file.Read(chunk)
 		if n > 0 {
 			block := chunk[:n]
@@ -186,6 +194,9 @@ func processImageWithDeps(cfg Config, job *worker.JobMsg, deps pipelineDeps) (*w
 			break
 		}
 		if readErr != nil {
+			if isContextError(readErr) {
+				return result, readErr
+			}
 			appendFieldError(result, job.FieldsMask, "read", readErr)
 			return result, nil
 		}

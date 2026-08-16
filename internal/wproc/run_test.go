@@ -18,9 +18,9 @@ import (
 	"dedup/internal/wproc/videocore"
 )
 
-// Break caught: worker.exe recognizes the preview phase on the wire but the
-// real wproc dispatcher still sends it to the unsupported-phase branch.
-func TestServeDispatchesImagePreviewToMemoryEncoder(t *testing.T) {
+// Break caught: the preview dispatcher reads the real source without first
+// obtaining and later reporting a parent-issued I/O lease.
+func TestServeIOLeaseGovernsImagePreviewSource(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "source.jpg")
 	img := image.NewNRGBA(image.Rect(0, 0, 20, 10))
 	for y := range 10 {
@@ -49,7 +49,8 @@ func TestServeDispatchesImagePreviewToMemoryEncoder(t *testing.T) {
 	}
 	sum := sha512.Sum512(data)
 	job := worker.JobMsg{
-		JobID: 1801, ScanTaskID: "preview-1801", Path: path,
+		JobID: 1801, ScanTaskID: "preview-1801", ScanInstanceID: "preview-instance-1801",
+		DiskKey: "preview-disk-1801", Path: path,
 		Kind: worker.MediaImage, Phase: worker.PhasePreview,
 		ScreenStage: worker.ScreenStagePreview, Source: worker.JobSourceLocal,
 		Size: info.Size(), MTimeUnix: info.ModTime().Unix(),
@@ -67,23 +68,194 @@ func TestServeDispatchesImagePreviewToMemoryEncoder(t *testing.T) {
 	if err := conn.Write(worker.MsgJob, job); err != nil {
 		t.Fatal(err)
 	}
-	envelope, err := conn.Read()
-	if err != nil {
-		t.Fatal(err)
+	var result worker.JobResultMsg
+	leaseAcquires, leaseReports := 0, 0
+	for {
+		envelope, err := conn.Read()
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch envelope.Type {
+		case worker.MsgIOLeaseAcquire:
+			request, err := worker.DecodeBody[worker.IOLeaseAcquireMsg](envelope)
+			if err != nil {
+				t.Fatal(err)
+			}
+			leaseAcquires++
+			if request.JobID != job.JobID || request.TaskID != job.ScanTaskID ||
+				request.InstanceID != job.ScanInstanceID || request.DiskKey != job.DiskKey {
+				t.Fatalf("preview lease request used wrong identity: %#v", request)
+			}
+			grant := worker.IOLeaseGrantMsg{
+				JobID: request.JobID, RequestID: request.RequestID,
+				LeaseID: uint64(700 + leaseAcquires), Generation: 11,
+				Bytes: request.WantBytes,
+			}
+			if request.WantSeek {
+				grant.Seeks = 1
+			}
+			if err := conn.Write(worker.MsgIOLeaseGrant, grant); err != nil {
+				t.Fatal(err)
+			}
+		case worker.MsgIOLeaseReport:
+			report, err := worker.DecodeBody[worker.IOLeaseReportMsg](envelope)
+			if err != nil {
+				t.Fatal(err)
+			}
+			leaseReports++
+			if report.JobID != job.JobID || !report.Completed || report.Cancelled {
+				t.Fatalf("preview lease report = %#v", report)
+			}
+		case worker.MsgResult:
+			result, err = worker.DecodeBody[worker.JobResultMsg](envelope)
+			if err != nil {
+				t.Fatal(err)
+			}
+			goto resultReceived
+		default:
+			t.Fatalf("preview message type=%q", envelope.Type)
+		}
 	}
-	result, err := worker.DecodeBody[worker.JobResultMsg](envelope)
-	if err != nil {
-		t.Fatal(err)
+
+resultReceived:
+	if leaseAcquires == 0 || leaseReports == 0 {
+		t.Fatalf("preview source lease traffic acquires=%d reports=%d, want both nonzero", leaseAcquires, leaseReports)
 	}
-	if envelope.Type != worker.MsgResult || result.PreviewErrorCode != "" ||
+	if result.PreviewErrorCode != "" ||
 		result.PreviewWidth != 10 || result.PreviewHeight != 5 || len(result.PreviewBytes) == 0 {
-		t.Fatalf("preview dispatch result = type:%q %#v", envelope.Type, result)
+		t.Fatalf("preview dispatch result = %#v", result)
 	}
 	if err := conn.Write(worker.MsgShutdown, struct{}{}); err != nil {
 		t.Fatal(err)
 	}
 	if code := <-done; code != 0 {
 		t.Fatalf("serve exit=%d", code)
+	}
+}
+
+// Break caught: the legacy Go phase-one SHA loop or phase-two image loop is
+// restored to its default os.Open dependency and bypasses the Worker governor.
+func TestServeIOLeaseGovernsLegacyPhaseOneAndPhaseTwoSourceReads(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "source.jpg")
+	writePreviewJPEG(t, path, 80, 40, false)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha512.Sum512(data)
+
+	tests := []struct {
+		name string
+		job  worker.JobMsg
+	}{
+		{
+			name: "phase one SHA",
+			job: worker.JobMsg{
+				JobID: 1811, ScanTaskID: "phase-one-task", ScanInstanceID: "phase-one-instance",
+				DiskKey: "phase-one-disk", Path: path, Kind: worker.MediaImage, Phase: worker.Phase1,
+				FieldsMask: worker.MaskSHA512, Size: info.Size(), MTimeUnix: info.ModTime().Unix(),
+			},
+		},
+		{
+			name: "phase two image",
+			job: worker.JobMsg{
+				JobID: 1812, ScanTaskID: "phase-two-task", ScanInstanceID: "phase-two-instance",
+				DiskKey: "phase-two-disk", Path: path, Kind: worker.MediaImage, Phase: worker.Phase2,
+				FieldsMask: worker.MaskPHashParts | worker.MaskSobelHist,
+				Size:       info.Size(), MTimeUnix: info.ModTime().Unix(), MTimeMS: info.ModTime().UnixMilli(),
+				KnownSHA: append([]byte(nil), sum[:]...),
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result, acquires, reports := serveLegacySourceWithLease(t, test.job)
+			if acquires == 0 || reports == 0 {
+				t.Fatalf("source lease traffic acquires=%d reports=%d result=%#v", acquires, reports, result)
+			}
+			if len(result.Errors) != 0 {
+				t.Fatalf("legacy result errors=%#v", result.Errors)
+			}
+		})
+	}
+}
+
+func serveLegacySourceWithLease(t *testing.T, job worker.JobMsg) (worker.JobResultMsg, int, int) {
+	t.Helper()
+	server, parent := net.Pipe()
+	done := make(chan int, 1)
+	gray := &fakePhase2Gray{}
+	gray.output.PHashParts[0] = 1
+	gray.output.SobelHist[0] = 1
+	phase2 := defaultPhase2PipelineDeps()
+	phase2.open = nil
+	phase2.decode = func([]byte) (phase2GrayImage, error) { return gray, nil }
+	// The partial overrides avoid native algorithm dependencies while leaving
+	// source opening to serve, which must bind it to the job's lease client.
+	deps := pipelineDeps{
+		runtime: testReadyRuntimeInfo,
+		newSHA:  func() (sha512Stream, error) { return &fakeSHA{}, nil },
+		phase2:  &phase2,
+	}
+	go func() { done <- serve(server, 19, testConfig(), deps) }()
+	conn := worker.NewIPCConn(parent)
+	if _, err := conn.Read(); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Write(worker.MsgJob, job); err != nil {
+		t.Fatal(err)
+	}
+	acquires, reports := 0, 0
+	for {
+		envelope, err := conn.Read()
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch envelope.Type {
+		case worker.MsgIOLeaseAcquire:
+			request, err := worker.DecodeBody[worker.IOLeaseAcquireMsg](envelope)
+			if err != nil {
+				t.Fatal(err)
+			}
+			acquires++
+			grant := worker.IOLeaseGrantMsg{
+				JobID: request.JobID, RequestID: request.RequestID,
+				LeaseID: uint64(900 + acquires), Generation: 13, Bytes: request.WantBytes,
+			}
+			if request.WantSeek {
+				grant.Seeks = 1
+			}
+			if err := conn.Write(worker.MsgIOLeaseGrant, grant); err != nil {
+				t.Fatal(err)
+			}
+		case worker.MsgIOLeaseReport:
+			report, err := worker.DecodeBody[worker.IOLeaseReportMsg](envelope)
+			if err != nil {
+				t.Fatal(err)
+			}
+			reports++
+			if !report.Completed || report.Cancelled {
+				t.Fatalf("legacy source report=%#v", report)
+			}
+		case worker.MsgResult:
+			result, err := worker.DecodeBody[worker.JobResultMsg](envelope)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := conn.Write(worker.MsgShutdown, struct{}{}); err != nil {
+				t.Fatal(err)
+			}
+			if code := <-done; code != 0 {
+				t.Fatalf("serve exit=%d", code)
+			}
+			return result, acquires, reports
+		default:
+			t.Fatalf("legacy source message type=%q", envelope.Type)
+		}
 	}
 }
 
@@ -122,15 +294,17 @@ func TestServeProductionSessionDecodesVideoTrackCodec(t *testing.T) {
 				t.Fatal(err)
 			}
 			job := worker.JobMsg{
-				JobID:      int64(3100 + index),
-				ScanTaskID: "task-3-real-video-" + tc.codec,
-				Path:       path,
-				Kind:       worker.MediaVideo,
-				Phase:      worker.Phase1,
-				Source:     worker.JobSourceLocal,
-				FieldsMask: worker.MaskAllVideo,
-				Size:       info.Size(),
-				MTimeUnix:  info.ModTime().Unix(),
+				JobID:          int64(3100 + index),
+				ScanTaskID:     "task-3-real-video-" + tc.codec,
+				ScanInstanceID: "instance-task-3-real-video-" + tc.codec,
+				DiskKey:        "disk-task-3-real-video",
+				Path:           path,
+				Kind:           worker.MediaVideo,
+				Phase:          worker.Phase1,
+				Source:         worker.JobSourceLocal,
+				FieldsMask:     worker.MaskAllVideo,
+				Size:           info.Size(),
+				MTimeUnix:      info.ModTime().Unix(),
 			}
 			result := serveProductionSessionFixture(t, job)
 			if result.FieldsDone != worker.MaskAllVideo || result.DurationMS == nil ||
@@ -162,15 +336,17 @@ func TestServeProductionSessionDecodesImageContentFormat(t *testing.T) {
 				t.Fatal(err)
 			}
 			job := worker.JobMsg{
-				JobID:      int64(3200 + index),
-				ScanTaskID: "task-3-real-image-" + tc.name,
-				Path:       path,
-				Kind:       worker.MediaImage,
-				Phase:      worker.Phase1,
-				Source:     worker.JobSourceLocal,
-				FieldsMask: worker.MaskAllImage,
-				Size:       info.Size(),
-				MTimeUnix:  info.ModTime().Unix(),
+				JobID:          int64(3200 + index),
+				ScanTaskID:     "task-3-real-image-" + tc.name,
+				ScanInstanceID: "instance-task-3-real-image-" + tc.name,
+				DiskKey:        "disk-task-3-real-image",
+				Path:           path,
+				Kind:           worker.MediaImage,
+				Phase:          worker.Phase1,
+				Source:         worker.JobSourceLocal,
+				FieldsMask:     worker.MaskAllImage,
+				Size:           info.Size(),
+				MTimeUnix:      info.ModTime().Unix(),
 			}
 			result := serveProductionSessionFixture(t, job)
 			if result.FieldsDone != worker.MaskAllImage || len(result.PDQ) != 32 ||
@@ -312,21 +488,59 @@ func serveProductionSessionFixture(t *testing.T, job worker.JobMsg) worker.JobRe
 	if err := conn.Write(worker.MsgSHAReply, missingReplyForQuery(query)); err != nil {
 		t.Fatal(err)
 	}
-	resultEnvelope, err := conn.Read()
-	if err != nil {
-		select {
-		case code := <-done:
-			t.Fatalf("production session result read: %v; serve exit=%d", err, code)
+	var result worker.JobResultMsg
+	leaseAcquires, leaseReports := 0, 0
+	for {
+		resultEnvelope, err := conn.Read()
+		if err != nil {
+			select {
+			case code := <-done:
+				t.Fatalf("production session result read: %v; serve exit=%d", err, code)
+			default:
+				t.Fatal(err)
+			}
+		}
+		switch resultEnvelope.Type {
+		case worker.MsgIOLeaseAcquire:
+			request, err := worker.DecodeBody[worker.IOLeaseAcquireMsg](resultEnvelope)
+			if err != nil {
+				t.Fatal(err)
+			}
+			leaseAcquires++
+			if request.JobID != job.JobID || request.TaskID != job.ScanTaskID ||
+				request.InstanceID != job.ScanInstanceID || request.DiskKey != job.DiskKey {
+				t.Fatalf("production source lease request = %#v", request)
+			}
+			if err := conn.Write(worker.MsgIOLeaseGrant, worker.IOLeaseGrantMsg{
+				JobID: request.JobID, RequestID: request.RequestID,
+				LeaseID: uint64(800 + leaseAcquires), Generation: 12,
+				Bytes: request.WantBytes,
+			}); err != nil {
+				t.Fatal(err)
+			}
+		case worker.MsgIOLeaseReport:
+			report, err := worker.DecodeBody[worker.IOLeaseReportMsg](resultEnvelope)
+			if err != nil {
+				t.Fatal(err)
+			}
+			leaseReports++
+			if !report.Completed || report.Cancelled || report.Bytes != job.Size {
+				t.Fatalf("production source lease report = %#v", report)
+			}
+		case worker.MsgResult:
+			result, err = worker.DecodeBody[worker.JobResultMsg](resultEnvelope)
+			if err != nil {
+				t.Fatal(err)
+			}
+			goto productionResultReceived
 		default:
-			t.Fatal(err)
+			t.Fatalf("production session post-reply message = %q", resultEnvelope.Type)
 		}
 	}
-	if resultEnvelope.Type != worker.MsgResult {
-		t.Fatalf("production session post-reply message = %q, want %q", resultEnvelope.Type, worker.MsgResult)
-	}
-	result, err := worker.DecodeBody[worker.JobResultMsg](resultEnvelope)
-	if err != nil {
-		t.Fatal(err)
+
+productionResultReceived:
+	if leaseAcquires == 0 || leaseReports == 0 {
+		t.Fatalf("production final rehash lease traffic acquires=%d reports=%d", leaseAcquires, leaseReports)
 	}
 	if err := conn.Write(worker.MsgShutdown, struct{}{}); err != nil {
 		t.Fatal(err)

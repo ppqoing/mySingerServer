@@ -258,6 +258,18 @@ func sessionPipelineFinalIdentityError(
 }
 
 func rehashMediaFile(ctx context.Context, path string, before fs.FileInfo, job *worker.JobMsg) ([64]byte, error) {
+	return rehashMediaFileWithOpen(ctx, path, before, job, func(path string) (readStatCloser, error) {
+		return os.Open(path)
+	})
+}
+
+func rehashMediaFileWithOpen(
+	ctx context.Context,
+	path string,
+	before fs.FileInfo,
+	job *worker.JobMsg,
+	open func(string) (readStatCloser, error),
+) ([64]byte, error) {
 	var digest [64]byte
 	if err := ctx.Err(); err != nil {
 		return digest, err
@@ -266,7 +278,10 @@ func rehashMediaFile(ctx context.Context, path string, before fs.FileInfo, job *
 	if err != nil || !sameRehashIdentity(before, pathBefore, job) {
 		return digest, errSessionPipelineStale
 	}
-	file, err := os.Open(path)
+	if open == nil {
+		return digest, fmt.Errorf("source opener is unavailable")
+	}
+	file, err := open(path)
 	if err != nil {
 		return digest, err
 	}

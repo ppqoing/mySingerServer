@@ -78,49 +78,6 @@ func serve(conn net.Conn, index int, cfg Config, deps pipelineDeps) int {
 	phase2Override := deps.phase2
 	sessionOverride := deps.session
 	useSessionPipeline := sessionOverride != nil || (deps.open == nil && videoOverride == nil && phase2Override == nil)
-	var sessionDeps sessionPipelineDeps
-	if sessionOverride != nil {
-		sessionDeps = *sessionOverride
-		if sessionDeps.query == nil {
-			sessionDeps.query = func(query *worker.SHAQueryMsg) (*worker.SHAReplyMsg, error) {
-				return pumpSHAReply(ipc, query)
-			}
-		}
-	} else if useSessionPipeline {
-		sessionDeps = defaultSessionPipelineDeps(func(query *worker.SHAQueryMsg) (*worker.SHAReplyMsg, error) {
-			return pumpSHAReply(ipc, query)
-		})
-	}
-	if deps.open == nil {
-		imageDeps := defaultPipelineDeps(func(query *worker.SHAQueryMsg) (*worker.SHAReplyMsg, error) {
-			return pumpSHAReply(ipc, query)
-		})
-		imageDeps.runtime = deps.runtime
-		deps = imageDeps
-	} else if deps.query == nil {
-		deps.query = func(query *worker.SHAQueryMsg) (*worker.SHAReplyMsg, error) {
-			return pumpSHAReply(ipc, query)
-		}
-	}
-	var videoDeps videoPipelineDeps
-	if videoOverride == nil && !useSessionPipeline {
-		videoDeps = defaultVideoPipelineDeps(func(query *worker.SHAQueryMsg) (*worker.SHAReplyMsg, error) {
-			return pumpSHAReply(ipc, query)
-		})
-	} else if !useSessionPipeline {
-		videoDeps = *videoOverride
-		if videoDeps.query == nil {
-			videoDeps.query = func(query *worker.SHAQueryMsg) (*worker.SHAReplyMsg, error) {
-				return pumpSHAReply(ipc, query)
-			}
-		}
-	}
-	var phase2Deps phase2PipelineDeps
-	if phase2Override == nil && !useSessionPipeline {
-		phase2Deps = defaultPhase2PipelineDeps()
-	} else if !useSessionPipeline {
-		phase2Deps = *phase2Override
-	}
 
 	for {
 		envelope, err := ipc.Read()
@@ -146,25 +103,91 @@ func serve(conn net.Conn, index int, cfg Config, deps pipelineDeps) int {
 					mediacoreDebugSleep(10 * time.Minute)
 				}
 			}
+			ctx := context.Background()
+			rpc := newWorkerRPC(ipc, &job)
+			lease := newLocalIOLeaseClient(ctx, rpc, &job, defaultIOLeaseWindowBytes)
+			query := func(query *worker.SHAQueryMsg) (*worker.SHAReplyMsg, error) {
+				return rpc.querySHA(query)
+			}
+			governedOpen := func(string) (readStatCloser, error) {
+				return openSource(ctx, &job, lease)
+			}
+
+			jobImageDeps := deps
+			if jobImageDeps.open == nil {
+				defaults := defaultPipelineDeps(query)
+				defaults.runtime = deps.runtime
+				if deps.stat != nil {
+					defaults.stat = deps.stat
+				}
+				if deps.sameFile != nil {
+					defaults.sameFile = deps.sameFile
+				}
+				if deps.newSHA != nil {
+					defaults.newSHA = deps.newSHA
+				}
+				if deps.decode != nil {
+					defaults.decode = deps.decode
+				}
+				jobImageDeps = defaults
+				jobImageDeps.open = governedOpen
+			} else if jobImageDeps.query == nil {
+				jobImageDeps.query = query
+			}
+			var sessionDeps sessionPipelineDeps
+			if sessionOverride != nil {
+				sessionDeps = *sessionOverride
+				if sessionDeps.query == nil {
+					sessionDeps.query = query
+				}
+			} else if useSessionPipeline {
+				sessionDeps = defaultSessionPipelineDeps(query)
+				sessionDeps.rehash = func(ctx context.Context, path string, before os.FileInfo, job *worker.JobMsg) ([64]byte, error) {
+					return rehashMediaFileWithOpen(ctx, path, before, job, governedOpen)
+				}
+			}
+			var videoDeps videoPipelineDeps
+			if videoOverride == nil && !useSessionPipeline {
+				videoDeps = defaultVideoPipelineDeps(query)
+				videoDeps.open = governedOpen
+			} else if !useSessionPipeline {
+				videoDeps = *videoOverride
+				if videoDeps.query == nil {
+					videoDeps.query = query
+				}
+			}
+			var phase2Deps phase2PipelineDeps
+			if phase2Override == nil && !useSessionPipeline {
+				phase2Deps = defaultPhase2PipelineDeps()
+				phase2Deps.open = governedOpen
+			} else if !useSessionPipeline {
+				phase2Deps = *phase2Override
+				if phase2Deps.open == nil {
+					phase2Deps.open = governedOpen
+				}
+			}
+
 			var result *worker.JobResultMsg
 			if job.Phase == worker.PhasePreview {
-				result = generateImagePreview(context.Background(), &job, cfg.ImageMemBytes)
+				result = generateImagePreviewWithOpen(ctx, &job, cfg.ImageMemBytes, func() (previewSourceFile, error) {
+					return openSource(ctx, &job, lease)
+				})
 			} else if useSessionPipeline {
 				if job.Phase != worker.Phase1 && job.Phase != worker.Phase2 {
 					result = invalidDispatchResult(&job, "phase", "unsupported worker phase")
 				} else if job.Kind != worker.MediaImage && job.Kind != worker.MediaVideo {
 					result = invalidDispatchResult(&job, "kind", "unsupported media kind")
 				} else {
-					result, err = processMediaWithDeps(context.Background(), cfg, &job, sessionDeps)
+					result, err = processMediaWithDeps(ctx, cfg, &job, sessionDeps)
 				}
 			} else {
 				switch job.Phase {
 				case worker.Phase1:
 					switch job.Kind {
 					case worker.MediaImage:
-						result, err = processImageWithDeps(cfg, &job, deps)
+						result, err = processImageWithContext(ctx, cfg, &job, jobImageDeps)
 					case worker.MediaVideo:
-						result, err = processVideoWithDeps(context.Background(), cfg, &job, videoDeps)
+						result, err = processVideoWithDeps(ctx, cfg, &job, videoDeps)
 					default:
 						result = invalidDispatchResult(&job, "kind", "unsupported media kind")
 					}
@@ -177,6 +200,9 @@ func serve(conn net.Conn, index int, cfg Config, deps pipelineDeps) int {
 				default:
 					result = invalidDispatchResult(&job, "phase", "unsupported worker phase")
 				}
+			}
+			if leaseErr := lease.finish(err); leaseErr != nil && err == nil {
+				err = leaseErr
 			}
 			if err != nil {
 				return 2

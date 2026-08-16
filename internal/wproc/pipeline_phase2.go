@@ -152,6 +152,9 @@ func processPhase2Image(
 		}
 		if readErr != nil {
 			result.ReadNS = time.Since(readStarted).Nanoseconds()
+			if isContextError(readErr) {
+				return result, readErr
+			}
 			phase2FileError(result, "read", readErr)
 			return result, nil
 		}

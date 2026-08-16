@@ -27,6 +27,23 @@ const previewWASMBaseBytes int64 = 128 << 10
 // generateImagePreview runs only in the Worker process. It independently binds
 // the source path to Agent's immutable identity and returns encoded bytes only.
 func generateImagePreview(ctx context.Context, job *worker.JobMsg, memoryBudget int64) *worker.JobResultMsg {
+	return generateImagePreviewWithOpen(ctx, job, memoryBudget, func() (previewSourceFile, error) {
+		return os.Open(job.Path)
+	})
+}
+
+type previewSourceFile interface {
+	io.ReadSeeker
+	Stat() (os.FileInfo, error)
+	Close() error
+}
+
+func generateImagePreviewWithOpen(
+	ctx context.Context,
+	job *worker.JobMsg,
+	memoryBudget int64,
+	open func() (previewSourceFile, error),
+) *worker.JobResultMsg {
 	result := previewResult(job)
 	if ctx == nil || job == nil || job.Kind != worker.MediaImage ||
 		job.Phase != worker.PhasePreview || job.Size < 0 || job.MTimeUnix <= 0 ||
@@ -49,7 +66,10 @@ func generateImagePreview(ctx context.Context, job *worker.JobMsg, memoryBudget 
 	if !matchesPreviewIdentity(pathInfo, job) {
 		return previewFailure(result, "stale_preview")
 	}
-	file, err := os.Open(job.Path)
+	if open == nil {
+		return previewFailure(result, "preview_io_failed")
+	}
+	file, err := open()
 	if err != nil {
 		return previewFailure(result, "preview_io_failed")
 	}
@@ -124,12 +144,15 @@ func generateImagePreview(ctx context.Context, job *worker.JobMsg, memoryBudget 
 	return result
 }
 
-func previewSourceIsWebP(file *os.File, size int64) (bool, error) {
+func previewSourceIsWebP(file io.ReadSeeker, size int64) (bool, error) {
 	if size < 12 {
 		return false, nil
 	}
 	var header [12]byte
-	if _, err := file.ReadAt(header[:], 0); err != nil {
+	if _, err := io.ReadFull(file, header[:]); err != nil {
+		return false, err
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return false, err
 	}
 	return header[0] == 'R' && header[1] == 'I' && header[2] == 'F' && header[3] == 'F' &&
