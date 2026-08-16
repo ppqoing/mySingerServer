@@ -204,13 +204,13 @@ private:
 
     int32_t HashOnce(uint8_t out[VC_SHA512_SIZE],
                      vc_error* error) {
-        const Deadline deadline = OperationDeadline();
+        Deadline deadline = OperationDeadline();
         int64_t position = -1;
         int32_t status = file_->Seek(0,
                                      FILE_BEGIN,
                                      &position,
                                      cancel_,
-                                     deadline,
+                                     &deadline,
                                      error);
         if (status != VC_OK) {
             RememberHashFailure(status, error);
@@ -242,7 +242,7 @@ private:
                                  static_cast<int>(chunk.size()),
                                  &bytes_read,
                                  cancel_,
-                                 deadline,
+                                 &deadline,
                                  error);
             if (status != VC_OK) {
                 RememberHashFailure(status, error);
@@ -604,7 +604,8 @@ int32_t CreateMediaSession(const uint16_t* path,
     const Deadline deadline =
         OpenDeadline(options.operation_timeout_ms);
     int32_t status = WinFile::Open(
-        wide_path, cancel_state, deadline, &file, error);
+        wide_path, cancel_state, deadline, &file, error,
+        options.io_governor);
     if (status != VC_OK) {
         return status;
     }

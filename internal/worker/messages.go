@@ -65,8 +65,8 @@ const (
 const (
 	IPCCompatibilityVersion = 2
 	MediaCoreDLLVersion     = "1.0.0"
-	VideoCoreABIVersion     = 1
-	VideoCoreVersion        = "1.0.0"
+	VideoCoreABIVersion     = 2
+	VideoCoreVersion        = "2.0.0"
 )
 
 type Envelope struct {

@@ -58,20 +58,37 @@ public:
                         const CancelState* cancel,
                         Deadline deadline,
                         std::unique_ptr<WinFile>* out,
-                        vc_error* error);
+                        vc_error* error,
+                        const vc_io_governor* governor = nullptr);
 
     int32_t Read(uint8_t* buffer,
                  int size,
                  int* bytes_read,
                  const CancelState* cancel,
-                 Deadline deadline,
+                 Deadline* deadline,
                  vc_error* error) noexcept;
     int32_t Seek(int64_t offset,
                  DWORD origin,
                  int64_t* position,
                  const CancelState* cancel,
-                 Deadline deadline,
+                 Deadline* deadline,
                  vc_error* error) noexcept;
+    int32_t Read(uint8_t* buffer,
+                 int size,
+                 int* bytes_read,
+                 const CancelState* cancel,
+                 Deadline deadline,
+                 vc_error* error) noexcept {
+        return Read(buffer, size, bytes_read, cancel, &deadline, error);
+    }
+    int32_t Seek(int64_t offset,
+                 DWORD origin,
+                 int64_t* position,
+                 const CancelState* cancel,
+                 Deadline deadline,
+                 vc_error* error) noexcept {
+        return Seek(offset, origin, position, cancel, &deadline, error);
+    }
     int64_t SnapshotSize() noexcept;
 
     HANDLE handle() const noexcept { return handle_; }
@@ -84,13 +101,25 @@ public:
 #endif
 
 private:
-    explicit WinFile(HANDLE handle) noexcept;
+    WinFile(HANDLE handle, const vc_io_governor* governor) noexcept;
+    int32_t AcquireIo(uint32_t operation,
+                      uint64_t requested_bytes,
+                      Deadline* deadline,
+                      uint64_t* lease_id,
+                      uint64_t* granted_bytes,
+                      vc_error* error) noexcept;
+    void ReportIo(uint64_t lease_id,
+                  uint64_t actual_bytes,
+                  uint64_t elapsed_ns,
+                  int32_t status) noexcept;
 #if defined(VC_WIN_FILE_TESTING)
     void RunHook(IoBoundary boundary) noexcept;
 #endif
 
     HANDLE handle_ = INVALID_HANDLE_VALUE;
     WinFileSnapshot snapshot_{};
+    vc_io_governor governor_{};
+    bool governor_enabled_ = false;
 #if defined(VC_WIN_FILE_TESTING)
     WinFileStats stats_{};
     IoBoundaryHook hook_ = nullptr;

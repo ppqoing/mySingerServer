@@ -40,7 +40,7 @@ int ReadPacket(void* opaque_value,
                                                size,
                                                &bytes_read,
                                                opaque->cancel,
-                                               opaque->deadline,
+                                               &opaque->deadline,
                                                nullptr);
     opaque->last_status = status;
     if (status != VC_OK) {
@@ -90,7 +90,7 @@ int64_t SeekPacket(void* opaque_value,
                                                move_method,
                                                &position,
                                                opaque->cancel,
-                                               opaque->deadline,
+                                               &opaque->deadline,
                                                nullptr);
     opaque->last_status = status;
     return status == VC_OK ? position : FfmpegFailure(status);

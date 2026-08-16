@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
+	"runtime/cgo"
 	"strconv"
 	"strings"
 	"sync"
@@ -14,7 +16,10 @@ import (
 	"dedup/internal/worker"
 )
 
-const ABIVersion uint32 = 1
+const (
+	ABIVersion uint32 = 2
+	Version           = "2.0.0"
+)
 
 var (
 	ErrUnavailable   = errors.New("videocore: cgo Windows binding unavailable")
@@ -67,9 +72,174 @@ type RuntimeInfo struct {
 }
 
 type OpenOptions struct {
-	Kind             worker.MediaKind
-	ImageMemoryBytes int64
-	NativeTimeout    time.Duration
+	Kind              worker.MediaKind
+	ImageMemoryBytes  int64
+	NativeTimeout     time.Duration
+	IOGovernor        IOGovernor
+	ioGovernorContext uintptr
+}
+
+type IOGovernor interface {
+	BeforeRead(context.Context, int) (leaseID uint64, granted int, err error)
+	AfterRead(leaseID uint64, bytes int, elapsed time.Duration, err error)
+	BeforeSeek(context.Context) (leaseID uint64, err error)
+	AfterSeek(leaseID uint64, elapsed time.Duration, err error)
+}
+
+const (
+	ioOperationRead uint32 = 1
+	ioOperationSeek uint32 = 2
+)
+
+type ioGovernorHandle struct {
+	handle           cgo.Handle
+	ctx              context.Context
+	governor         IOGovernor
+	once             sync.Once
+	mu               sync.Mutex
+	pendingLease     uint64
+	pendingOperation uint32
+}
+
+func newIOGovernorHandle(ctx context.Context, governor IOGovernor) *ioGovernorHandle {
+	if governor == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	owner := &ioGovernorHandle{ctx: ctx, governor: governor}
+	owner.handle = cgo.NewHandle(owner)
+	return owner
+}
+
+func (owner *ioGovernorHandle) Value() uintptr {
+	if owner == nil {
+		return 0
+	}
+	return uintptr(owner.handle)
+}
+
+func (owner *ioGovernorHandle) Delete() {
+	if owner != nil {
+		owner.once.Do(func() { owner.handle.Delete() })
+	}
+}
+
+func invokeIOAcquire(contextValue uintptr, operation uint32, requested uint64) (
+	leaseID uint64, granted uint64, status int32, message string,
+) {
+	status = StatusIO
+	message = "I/O governor unavailable"
+	defer func() {
+		if recover() != nil {
+			leaseID, granted = 0, 0
+			status = StatusIO
+			message = "I/O governor callback failed"
+		}
+	}()
+	owner, ok := cgo.Handle(contextValue).Value().(*ioGovernorHandle)
+	if !ok || owner == nil || owner.governor == nil {
+		return
+	}
+	switch operation {
+	case ioOperationRead:
+		if requested == 0 || requested > uint64(math.MaxInt) {
+			return 0, 0, StatusIO, "I/O governor read request is invalid"
+		}
+		id, allowed, err := owner.governor.BeforeRead(owner.ctx, int(requested))
+		if err != nil {
+			return 0, 0, governorErrorStatus(err), governorErrorMessage(err)
+		}
+		if id == 0 || allowed <= 0 || uint64(allowed) > requested {
+			return 0, 0, StatusIO, "I/O governor returned an invalid grant"
+		}
+		owner.rememberOperation(id, operation)
+		return id, uint64(allowed), StatusOK, ""
+	case ioOperationSeek:
+		id, err := owner.governor.BeforeSeek(owner.ctx)
+		if err != nil {
+			return 0, 0, governorErrorStatus(err), governorErrorMessage(err)
+		}
+		if id == 0 {
+			return 0, 0, StatusIO, "I/O governor returned an invalid grant"
+		}
+		owner.rememberOperation(id, operation)
+		return id, 0, StatusOK, ""
+	default:
+		return 0, 0, StatusIO, "I/O governor operation is invalid"
+	}
+}
+
+func invokeIOReport(contextValue uintptr, leaseID, actualBytes, elapsedNS uint64, status int32) {
+	defer func() { _ = recover() }()
+	owner, ok := cgo.Handle(contextValue).Value().(*ioGovernorHandle)
+	if !ok || owner == nil || owner.governor == nil {
+		return
+	}
+	operation := owner.takeOperation(leaseID)
+	elapsed := time.Duration(elapsedNS)
+	if elapsedNS > uint64(math.MaxInt64) {
+		elapsed = time.Duration(math.MaxInt64)
+	}
+	operationErr := governorOperationError(status)
+	switch operation {
+	case ioOperationRead:
+		bytes := int(actualBytes)
+		if actualBytes > uint64(math.MaxInt) {
+			bytes = 0
+			operationErr = &NativeError{Code: StatusIO, Message: "source I/O byte count is invalid"}
+		}
+		owner.governor.AfterRead(leaseID, bytes, elapsed, operationErr)
+	case ioOperationSeek:
+		owner.governor.AfterSeek(leaseID, elapsed, operationErr)
+	}
+}
+
+func (owner *ioGovernorHandle) rememberOperation(leaseID uint64, operation uint32) {
+	owner.mu.Lock()
+	owner.pendingLease = leaseID
+	owner.pendingOperation = operation
+	owner.mu.Unlock()
+}
+
+func (owner *ioGovernorHandle) takeOperation(leaseID uint64) uint32 {
+	owner.mu.Lock()
+	defer owner.mu.Unlock()
+	if owner.pendingLease != leaseID {
+		return 0
+	}
+	operation := owner.pendingOperation
+	owner.pendingLease = 0
+	owner.pendingOperation = 0
+	return operation
+}
+
+func governorErrorStatus(err error) int32 {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return StatusCancelled
+	}
+	return StatusIO
+}
+
+func governorErrorMessage(err error) string {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return "I/O governor cancelled"
+	}
+	return "I/O governor unavailable"
+}
+
+func governorOperationError(status int32) error {
+	switch status {
+	case StatusOK:
+		return nil
+	case StatusCancelled:
+		return context.Canceled
+	case StatusTimeout:
+		return context.DeadlineExceeded
+	default:
+		return &NativeError{Code: status, Message: "source I/O failed"}
+	}
 }
 
 type nativeSession struct{ value unsafe.Pointer }
@@ -101,7 +271,7 @@ func runtimeWith(bridge nativeBridge) (RuntimeInfo, error) {
 		return RuntimeInfo{}, fmt.Errorf("%w: runtime ABI=%d, binding ABI=%d", ErrABIMismatch, info.ABI, ABIVersion)
 	}
 	major, err := versionMajor(info.Version)
-	if err != nil || major != 1 {
+	if err != nil || major != 2 {
 		return RuntimeInfo{}, fmt.Errorf("%w: runtime version %q", ErrABIMismatch, info.Version)
 	}
 	for _, component := range info.Components {
@@ -132,6 +302,16 @@ func openWith(ctx context.Context, path string, options OpenOptions, bridge nati
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	governor := newIOGovernorHandle(ctx, options.IOGovernor)
+	if governor != nil {
+		options.ioGovernorContext = governor.Value()
+	}
+	keepGovernor := false
+	defer func() {
+		if !keepGovernor {
+			governor.Delete()
+		}
+	}()
 	cancel, err := bridge.cancelCreate()
 	if err != nil {
 		return nil, err
@@ -175,7 +355,8 @@ func openWith(ctx context.Context, path string, options OpenOptions, bridge nati
 		return nil, &NativeError{Code: StatusInternal, Message: "native open returned a nil session"}
 	}
 	keepCancel = true
-	return newSession(handle, cancel, bridge), nil
+	keepGovernor = true
+	return newSession(handle, cancel, bridge, governor), nil
 }
 
 func utf16Path(path string) ([]uint16, error) {
@@ -190,14 +371,19 @@ func utf16Path(path string) ([]uint16, error) {
 }
 
 type Session struct {
-	mu     sync.Mutex
-	handle nativeSession
-	cancel nativeCancel
-	bridge nativeBridge
+	mu       sync.Mutex
+	handle   nativeSession
+	cancel   nativeCancel
+	bridge   nativeBridge
+	governor *ioGovernorHandle
 }
 
-func newSession(handle nativeSession, cancel nativeCancel, bridge nativeBridge) *Session {
-	return &Session{handle: handle, cancel: cancel, bridge: bridge}
+func newSession(handle nativeSession, cancel nativeCancel, bridge nativeBridge, governors ...*ioGovernorHandle) *Session {
+	var governor *ioGovernorHandle
+	if len(governors) != 0 {
+		governor = governors[0]
+	}
+	return &Session{handle: handle, cancel: cancel, bridge: bridge, governor: governor}
 }
 
 func (s *Session) Hash() ([64]byte, error) {
@@ -262,9 +448,12 @@ func (s *Session) Close() error {
 	if s.handle.value == nil {
 		return nil
 	}
-	s.bridge.close(s.handle)
-	s.bridge.cancelFree(s.cancel)
+	handle, cancel, bridge, governor := s.handle, s.cancel, s.bridge, s.governor
 	s.handle = nativeSession{}
 	s.cancel = nativeCancel{}
+	s.governor = nil
+	defer governor.Delete()
+	defer bridge.cancelFree(cancel)
+	bridge.close(handle)
 	return nil
 }

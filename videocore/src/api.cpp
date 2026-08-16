@@ -168,6 +168,15 @@ VC_API int32_t VC_CALL vc_media_open_w(
                     options, err, "media open options ABI mismatch")) {
                 return options == nullptr ? VC_ERR_INVALID_ARG : VC_ERR_ABI;
             }
+            if (options->io_governor != nullptr &&
+                (options->io_governor->struct_size !=
+                     sizeof(vc_io_governor) ||
+                 options->io_governor->abi_version != VC_ABI_VERSION ||
+                 options->io_governor->acquire == nullptr ||
+                 options->io_governor->report == nullptr)) {
+                return Fail(err, VC_ERR_ABI,
+                            "I/O governor ABI mismatch");
+            }
             if (options->reserved_flags != 0u ||
                 options->reserved_0 != 0u) {
                 return Fail(err,

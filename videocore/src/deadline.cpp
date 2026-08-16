@@ -35,7 +35,27 @@ Deadline Deadline::After(std::chrono::milliseconds timeout) noexcept {
 }
 
 bool Deadline::Expired() const noexcept {
-    return active_ && now_(context_) >= expiry_;
+    return active_ && Now() >= expiry_;
+}
+
+Deadline::TimePoint Deadline::Now() const noexcept {
+    return now_(context_);
+}
+
+void Deadline::Extend(std::chrono::nanoseconds extension) noexcept {
+    if (!active_ || extension <= std::chrono::nanoseconds::zero()) {
+        return;
+    }
+    const auto converted =
+        std::chrono::duration_cast<Clock::duration>(extension);
+    if (converted <= Clock::duration::zero()) {
+        return;
+    }
+    if (expiry_ >= TimePoint::max() - converted) {
+        expiry_ = TimePoint::max();
+        return;
+    }
+    expiry_ += converted;
 }
 
 Deadline::TimePoint Deadline::SteadyNow(const void*) noexcept {

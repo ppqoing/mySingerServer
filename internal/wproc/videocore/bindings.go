@@ -10,6 +10,35 @@ package videocore
 #include <string.h>
 #include <videocore/videocore.h>
 
+extern int32_t go_vc_io_acquire(
+	uintptr_t, uint32_t, uint64_t, uint64_t*, uint64_t*, vc_error*);
+extern void go_vc_io_report(
+	uintptr_t, uint64_t, uint64_t, uint64_t, int32_t);
+
+static int32_t VC_CALL go_vc_io_acquire_bridge(
+	uintptr_t context, uint32_t operation, uint64_t requested_bytes,
+	uint64_t* lease_id, uint64_t* granted_bytes, vc_error* err) {
+	return go_vc_io_acquire(context, operation, requested_bytes,
+		lease_id, granted_bytes, err);
+}
+
+static void VC_CALL go_vc_io_report_bridge(
+	uintptr_t context, uint64_t lease_id, uint64_t actual_bytes,
+	uint64_t elapsed_ns, int32_t status) {
+	go_vc_io_report(context, lease_id, actual_bytes, elapsed_ns, status);
+}
+
+static vc_io_governor* go_vc_new_io_governor(uintptr_t context) {
+	vc_io_governor* value = (vc_io_governor*)calloc(1u, sizeof(*value));
+	if (value == NULL) return NULL;
+	value->struct_size = (uint32_t)sizeof(*value);
+	value->abi_version = VC_ABI_VERSION;
+	value->context = context;
+	value->acquire = &go_vc_io_acquire_bridge;
+	value->report = &go_vc_io_report_bridge;
+	return value;
+}
+
 static uint16_t* go_vc_copy_utf16(const uint16_t* source, uint32_t units) {
 	if (source == NULL || units == 0u ||
 		(size_t)units > SIZE_MAX / sizeof(uint16_t)) {
@@ -174,6 +203,15 @@ func (cgoBridge) open(path []uint16, options OpenOptions, cancel nativeCancel) (
 	nativeOptions.expected_media_type = C.uint32_t(mediaType)
 	nativeOptions.image_max_bytes = C.uint64_t(options.ImageMemoryBytes)
 	nativeOptions.operation_timeout_ms = C.uint32_t(timeout)
+	var nativeGovernor *C.vc_io_governor
+	if options.ioGovernorContext != 0 {
+		nativeGovernor = C.go_vc_new_io_governor(C.uintptr_t(options.ioGovernorContext))
+		if nativeGovernor == nil {
+			return nativeSession{}, &NativeError{Code: StatusOOM, Message: "I/O governor allocation failed"}
+		}
+		defer C.go_vc_free(unsafe.Pointer(nativeGovernor))
+		nativeOptions.io_governor = nativeGovernor
+	}
 	var session *C.vc_media_session
 	rc := int32(C.vc_media_open_w(
 		(*C.uint16_t)(unsafe.Pointer(unsafe.SliceData(path))),
@@ -184,6 +222,7 @@ func (cgoBridge) open(path []uint16, options OpenOptions, cancel nativeCancel) (
 		&nativeErr,
 	))
 	runtime.KeepAlive(path)
+	runtime.KeepAlive(options.IOGovernor)
 	if rc != StatusOK {
 		return nativeSession{}, cgoCallError("media open", rc, &nativeErr)
 	}

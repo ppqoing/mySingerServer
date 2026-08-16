@@ -275,7 +275,7 @@ func serveLegacySourceWithLease(t *testing.T, job worker.JobMsg) (worker.JobResu
 }
 
 func testReadyRuntimeInfo() (videocore.RuntimeInfo, error) {
-	return videocore.RuntimeInfo{ABI: videocore.ABIVersion, Version: "1.0.0", Components: [4]videocore.RuntimeComponent{
+	return videocore.RuntimeInfo{ABI: videocore.ABIVersion, Version: videocore.Version, Components: [4]videocore.RuntimeComponent{
 		{Name: "avformat", HeaderVersion: 63<<16 | 1<<8, RuntimeVersion: 63<<16 | 2<<8},
 		{Name: "avcodec", HeaderVersion: 63<<16 | 1<<8, RuntimeVersion: 63<<16 | 2<<8},
 		{Name: "avutil", HeaderVersion: 61<<16 | 1<<8, RuntimeVersion: 61<<16 | 2<<8},
@@ -714,7 +714,7 @@ func TestServeReadyReportsVideoCoreRuntime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ready.VideoCoreABI != 1 || ready.VideoCoreVersion != "1.0.0" || len(ready.FFmpegComponents) != 4 || ready.FFmpegComponents[0].BuildMajor != 63 || ready.FFmpegComponents[0].RuntimeMajor != 63 {
+	if ready.VideoCoreABI != videocore.ABIVersion || ready.VideoCoreVersion != videocore.Version || len(ready.FFmpegComponents) != 4 || ready.FFmpegComponents[0].BuildMajor != 63 || ready.FFmpegComponents[0].RuntimeMajor != 63 {
 		t.Fatalf("runtime Ready=%#v", ready)
 	}
 	if err := conn.Write(worker.MsgShutdown, struct{}{}); err != nil {
@@ -1171,7 +1171,7 @@ func TestServeSendsReadyAndHandlesShutdown(t *testing.T) {
 	}
 	if env.Type != worker.MsgReady || ready.WorkerIndex != 7 ||
 		ready.IPCVersion != worker.IPCCompatibilityVersion ||
-		ready.DLLVersion != "1.0.0" || ready.VideoCoreABI != videocore.ABIVersion {
+		ready.DLLVersion != videocore.Version || ready.VideoCoreABI != videocore.ABIVersion {
 		t.Fatalf("ready = type %q body %#v", env.Type, ready)
 	}
 	if err := conn.Write(worker.MsgShutdown, struct{}{}); err != nil {

@@ -408,8 +408,8 @@ func TestVideoCoreProtocolReadyIsAdditiveAndMapCompatible(t *testing.T) {
 	}}
 	ready := ReadyMsg{
 		PID: 41, WorkerIndex: 3, IPCVersion: IPCCompatibilityVersion,
-		DLLVersion: MediaCoreDLLVersion, VideoCoreABI: 1,
-		VideoCoreVersion: "1.0.0", FFmpegComponents: components,
+		DLLVersion: MediaCoreDLLVersion, VideoCoreABI: VideoCoreABIVersion,
+		VideoCoreVersion: VideoCoreVersion, FFmpegComponents: components,
 	}
 	body, err := msgpack.Marshal(ready)
 	if err != nil {

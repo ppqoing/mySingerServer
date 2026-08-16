@@ -19,8 +19,8 @@
 #endif
 #endif
 
-#define VC_ABI_VERSION 1u
-#define VC_VERSION_STRING "1.0.0"
+#define VC_ABI_VERSION 2u
+#define VC_VERSION_STRING "2.0.0"
 
 #define VC_SHA512_SIZE 64u
 #define VC_PDQ_SIZE 32u
@@ -49,6 +49,9 @@
 #define VC_MEDIA_TYPE_IMAGE 1u
 #define VC_MEDIA_TYPE_VIDEO 2u
 
+#define VC_IO_OPERATION_READ 1u
+#define VC_IO_OPERATION_SEEK 2u
+
 #define VC_FEATURE_PDQ 0x00000001ull
 #define VC_FEATURE_PHASH 0x00000002ull
 #define VC_FEATURE_SOBEL 0x00000004ull
@@ -67,6 +70,28 @@ typedef struct vc_error {
     uint32_t win32_code;
     char message_utf8[512];
 } vc_error;
+
+typedef int32_t (VC_CALL *vc_io_acquire_fn)(
+    uintptr_t context,
+    uint32_t operation,
+    uint64_t requested_bytes,
+    uint64_t* lease_id,
+    uint64_t* granted_bytes,
+    vc_error* err);
+typedef void (VC_CALL *vc_io_report_fn)(
+    uintptr_t context,
+    uint64_t lease_id,
+    uint64_t actual_bytes,
+    uint64_t elapsed_ns,
+    int32_t status);
+
+typedef struct vc_io_governor {
+    uint32_t struct_size;
+    uint32_t abi_version;
+    uintptr_t context;
+    vc_io_acquire_fn acquire;
+    vc_io_report_fn report;
+} vc_io_governor;
 
 struct vc_runtime_info {
     uint32_t struct_size;
@@ -91,6 +116,7 @@ typedef struct vc_media_open_options {
     uint64_t image_max_bytes;
     uint32_t operation_timeout_ms;
     uint32_t reserved_0;
+    const vc_io_governor* io_governor;
 } vc_media_open_options;
 
 typedef struct vc_feature_set {
