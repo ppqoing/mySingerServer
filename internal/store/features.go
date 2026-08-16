@@ -296,7 +296,7 @@ func validPreSHAFailure(result Phase1Result) bool {
 			return false
 		}
 		switch fieldError.Stage {
-		case "stat", "open", "read":
+		case "stat", "open", "read", "sha512", "native_open", "native_hash", "stale":
 		default:
 			return false
 		}

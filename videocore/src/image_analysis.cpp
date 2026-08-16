@@ -67,6 +67,8 @@ int32_t PublishImageFailure(vc_analysis_result* out,
     ClearImagePayload(&out->image_features);
     out->media_type = VC_MEDIA_TYPE_IMAGE;
     out->image_status = code;
+    out->contact_sheet_width = 0u;
+    out->contact_sheet_height = 0u;
     out->completed_frame_mask = 0u;
     SetError(error, code, 0, 0, message);
     return code;
@@ -142,6 +144,11 @@ int32_t AnalyzeImageBytes(const std::vector<uint8_t>& encoded,
     }
     out->media_type = VC_MEDIA_TYPE_IMAGE;
     out->image_status = VC_OK;
+    // ABI 1 has one media-dimension pair. For image results it carries the
+    // decoded image dimensions; for video results it carries contact-sheet
+    // dimensions. The Go boundary maps it according to media_type.
+    out->contact_sheet_width = static_cast<uint32_t>(gray.width);
+    out->contact_sheet_height = static_cast<uint32_t>(gray.height);
     out->completed_frame_mask = 0u;
     SetError(error, VC_OK, 0, 0, "");
     return VC_OK;

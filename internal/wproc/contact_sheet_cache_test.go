@@ -18,6 +18,32 @@ import (
 	"dedup/internal/wproc/videocore"
 )
 
+// Break caught: a fresh portable Agent passed a missing thumbcache root to
+// workers, so every contact-sheet lookup failed before it could create shards.
+func TestPrepareContactSheetRootCreatesMissingRoot(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "data", "thumbcache")
+	if err := PrepareContactSheetRoot(root); err != nil {
+		t.Fatal(err)
+	}
+	canonical, err := contactSheetRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !filepath.IsAbs(canonical) {
+		t.Fatalf("prepared canonical root = %q, want absolute path", canonical)
+	}
+}
+
+func TestPrepareContactSheetRootRejectsFile(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "thumbcache")
+	if err := os.WriteFile(root, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := PrepareContactSheetRoot(root); err == nil {
+		t.Fatal("PrepareContactSheetRoot accepted a regular file")
+	}
+}
+
 func TestContactSheetCachePath(t *testing.T) {
 	root := t.TempDir()
 	sha := testContactSheetSHA(0)

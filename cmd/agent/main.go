@@ -46,6 +46,7 @@ import (
 	"dedup/internal/store"
 	"dedup/internal/syncer"
 	"dedup/internal/worker"
+	"dedup/internal/wproc"
 )
 
 func main() {
@@ -188,6 +189,9 @@ func runWithDependencies(
 	controlToken, err := (localcontrol.FileTokenStore{}).LoadOrCreate(localcontrol.TokenPath(portableRoot))
 	if err != nil {
 		return fmt.Errorf("load local control token: %w", err)
+	}
+	if err := wproc.PrepareContactSheetRoot(cfg.Thumb.CacheDir); err != nil {
+		return fmt.Errorf("prepare thumb cache root: %w", err)
 	}
 	logger, errorLogger, closeLogs, err := agent.NewLoggers(cfg.DataDir, os.Stdout)
 	if err != nil {

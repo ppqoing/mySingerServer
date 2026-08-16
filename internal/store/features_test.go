@@ -165,6 +165,34 @@ func TestSavePhase1PreSHAFailureWhitelist(t *testing.T) {
 			allow: true,
 		},
 		{
+			name: "legacy SHA backend failure",
+			mutate: func(result *Phase1Result) {
+				result.Errors = []FieldError{{Field: proto.FieldSHA512 | proto.FieldPDQ256, Stage: "sha512", Msg: "backend unavailable"}}
+			},
+			allow: true,
+		},
+		{
+			name: "native open failure",
+			mutate: func(result *Phase1Result) {
+				result.Errors = []FieldError{{Field: proto.FieldSHA512 | proto.FieldPDQ256, Stage: "native_open", Msg: "sharing violation"}}
+			},
+			allow: true,
+		},
+		{
+			name: "native hash failure",
+			mutate: func(result *Phase1Result) {
+				result.Errors = []FieldError{{Field: proto.FieldSHA512, Stage: "native_hash", Msg: "read failed"}}
+			},
+			allow: true,
+		},
+		{
+			name: "stale before hash",
+			mutate: func(result *Phase1Result) {
+				result.Errors = []FieldError{{Field: proto.FieldSHA512 | proto.FieldPDQ256, Stage: "stale", Msg: "media file changed"}}
+			},
+			allow: true,
+		},
+		{
 			name: "decode stage",
 			mutate: func(result *Phase1Result) {
 				result.Errors = []FieldError{{Field: proto.FieldSHA512 | proto.FieldPDQ256, Stage: "decode", Msg: "bad image"}}

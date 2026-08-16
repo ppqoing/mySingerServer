@@ -508,6 +508,8 @@ func sessionPipelineMergeAnalysis(result *worker.JobResultMsg, job *worker.JobMs
 	if analysisFields&worker.MaskImagePDQ != 0 && analysis.ImageStatus == videocore.StatusOK {
 		result.PDQ = append([]byte(nil), analysis.ImageFeatures.PDQ[:]...)
 		result.Quality = int32(analysis.ImageFeatures.PDQQuality)
+		result.Width = int32(analysis.ContactSheetWidth)
+		result.Height = int32(analysis.ContactSheetHeight)
 		result.FieldsDone |= worker.MaskImagePDQ
 	}
 	if analysisFields&worker.MaskPHashParts != 0 && analysis.ImageStatus == videocore.StatusOK {

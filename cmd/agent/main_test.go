@@ -1162,6 +1162,46 @@ func TestSingleInstanceReleasedWhenAgentStartupFails(t *testing.T) {
 	}
 }
 
+// Break caught: a fresh Agent created its data directory but never created the
+// configured contact-sheet cache root before workers could receive jobs.
+func TestAgentStartupCreatesThumbCacheRootBeforeWorkerPoolStart(t *testing.T) {
+	root := t.TempDir()
+	blockedListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blockedListener.Close()
+	cfg := config.DefaultAgent()
+	cfg.PGDSN = ""
+	cfg.ListenAddr = blockedListener.Addr().String()
+	cfg.DataDir = filepath.Join(root, "data")
+	cfg.Thumb.CacheDir = filepath.Join(root, "cache", "thumbcache")
+	cfg.Worker.ExePath = filepath.Join(root, "missing-worker.exe")
+	cfg.UseEverything = false
+	cfg.Tuning.StatsEnabled = false
+	body, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(root, "agent.json")
+	if err := os.WriteFile(configPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	runErr := runWithDependencies(
+		configPath,
+		agent.NewDeleteLogger,
+		fixedMachineIdentity("t"),
+	)
+	if runErr == nil {
+		t.Fatal("run unexpectedly accepted occupied listen address")
+	}
+	info, statErr := os.Lstat(cfg.Thumb.CacheDir)
+	if statErr != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("thumb cache root was not prepared before Worker start: info=%v stat_err=%v run_err=%v", info, statErr, runErr)
+	}
+}
+
 func TestDrainPhase2UsesBoundedProductionContext(t *testing.T) {
 	cfg := config.DefaultAgent()
 	cfg.Worker.ImageTimeoutS = 31

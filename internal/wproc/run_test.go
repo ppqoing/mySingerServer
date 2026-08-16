@@ -196,33 +196,43 @@ func TestServeDispatchesPhase2ThroughSessionPipeline(t *testing.T) {
 	}
 }
 
-func TestImageNoThumbnailServeUsesImagePipelineEvenWithSessionConfigured(t *testing.T) {
-	file := newFakeFile([]byte("pixels"), 6, 123)
-	imageDeps, imageState := testPipelineDeps(file)
-	imageDeps.runtime = testReadyRuntimeInfo
-	imageDeps.query = nil
-	cacheDir := t.TempDir()
-	cfg := testConfig()
-	cfg.ThumbCacheDir = cacheDir
-	_, sessionDeps, sessionFake := newSessionPipelineTest(
+// Break caught: the default Windows Worker used the legacy MediaCore image
+// pipeline for phase one even though the production build only ships VideoCore.
+func TestImagePhaseOneServeUsesSessionPipeline(t *testing.T) {
+	job, sessionDeps, sessionFake := newSessionPipelineTest(
 		t, worker.MediaImage, worker.MaskAllImage, 0,
 	)
+	job.Phase = worker.Phase1
+	job.KnownSHA = nil
 	sessionDeps.query = nil
+	sessionFake.result = videocore.AnalysisResult{
+		MediaType:          1,
+		ImageStatus:        videocore.StatusOK,
+		ContactSheetWidth:  640,
+		ContactSheetHeight: 360,
+		ImageFeatures: videocore.FeatureSet{
+			PDQ: [32]byte{7}, PDQQuality: 88,
+		},
+	}
+	file := newFakeFile(make([]byte, int(job.Size)), job.Size, job.MTimeUnix)
+	imageDeps, imageState := testPipelineDeps(file)
+	legacyHashes := 0
+	imageDeps.newSHA = func() (sha512Stream, error) {
+		legacyHashes++
+		return &fakeSHA{}, nil
+	}
+	imageDeps.runtime = testReadyRuntimeInfo
+	imageDeps.query = nil
 	imageDeps.session = &sessionDeps
 
 	server, parent := net.Pipe()
 	done := make(chan int, 1)
-	go func() { done <- serve(server, 14, cfg, imageDeps) }()
+	go func() { done <- serve(server, 14, sessionPipelineTestConfig(), imageDeps) }()
 	conn := worker.NewIPCConn(parent)
 	if _, err := conn.Read(); err != nil {
 		t.Fatal(err)
 	}
-	job := worker.JobMsg{
-		JobID: 1401, Path: `C:\media\no-thumb.jpg`, Kind: worker.MediaImage,
-		Phase: worker.Phase1, FieldsMask: worker.MaskAllImage,
-		Size: 6, MTimeUnix: 123,
-	}
-	if err := conn.Write(worker.MsgJob, job); err != nil {
+	if err := conn.Write(worker.MsgJob, *job); err != nil {
 		t.Fatal(err)
 	}
 	envelope, err := conn.Read()
@@ -233,7 +243,11 @@ func TestImageNoThumbnailServeUsesImagePipelineEvenWithSessionConfigured(t *test
 	if err != nil || envelope.Type != worker.MsgSHAQuery {
 		t.Fatalf("image query = type %q %#v err=%v", envelope.Type, query, err)
 	}
-	if err := conn.Write(worker.MsgSHAReply, worker.SHAReplyMsg{JobID: query.JobID}); err != nil {
+	if err := conn.Write(worker.MsgSHAReply, worker.SHAReplyMsg{
+		JobID: query.JobID, Found: false,
+		RequestedFields: query.RequestedFields,
+		MissingFields:   worker.MaskImagePDQ,
+	}); err != nil {
 		t.Fatal(err)
 	}
 	envelope, err = conn.Read()
@@ -245,21 +259,16 @@ func TestImageNoThumbnailServeUsesImagePipelineEvenWithSessionConfigured(t *test
 		t.Fatal(err)
 	}
 	if envelope.Type != worker.MsgResult || result.FieldsDone != worker.MaskAllImage ||
-		len(result.PDQ) != 32 || result.Width <= 0 || result.Height <= 0 ||
-		result.ThumbPath != "" || result.ThumbGenerated || result.ThumbCacheHit {
+		len(result.PDQ) != 32 || result.Width != 640 || result.Height != 360 ||
+		len(result.Errors) != 0 {
 		t.Fatalf("image result = type %q %#v", envelope.Type, result)
 	}
-	if imageState.decodeCalls != 1 || sessionFake.opens != 0 || sessionFake.analyzes != 0 ||
-		sessionFake.closes != 0 {
-		t.Fatalf("image/session calls = decode:%d open/analyze/close:%d/%d/%d",
-			imageState.decodeCalls, sessionFake.opens, sessionFake.analyzes, sessionFake.closes)
-	}
-	entries, err := os.ReadDir(cacheDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) != 0 {
-		t.Fatalf("image pipeline created thumbnail cache entries: %#v", entries)
+	if legacyHashes != 0 || imageState.decodeCalls != 0 ||
+		sessionFake.opens != 1 || sessionFake.hashes != 1 || sessionFake.analyzes != 1 ||
+		sessionFake.rehashes != 1 || sessionFake.closes != 1 {
+		t.Fatalf("legacy/session calls = hash/decode:%d/%d open/hash/analyze/rehash/close:%d/%d/%d/%d/%d",
+			legacyHashes, imageState.decodeCalls, sessionFake.opens, sessionFake.hashes,
+			sessionFake.analyzes, sessionFake.rehashes, sessionFake.closes)
 	}
 	if err := conn.Write(worker.MsgShutdown, struct{}{}); err != nil {
 		t.Fatal(err)

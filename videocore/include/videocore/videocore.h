@@ -137,6 +137,7 @@ typedef struct vc_analysis_result {
     int32_t duration_status;
     int32_t image_status;
     int32_t contact_sheet_status;
+    /* Image media: decoded image size. Video media: contact-sheet size. */
     uint32_t contact_sheet_width;
     uint32_t contact_sheet_height;
     uint32_t completed_frame_mask;

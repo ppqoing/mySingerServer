@@ -57,6 +57,27 @@ type contactSheetPublishLock interface {
 // local writers from leaving a final JPEG and sidecar from different writers.
 var contactSheetPublishMu sync.Mutex
 
+// PrepareContactSheetRoot creates and validates the configured cache root once
+// during Agent startup. Per-job shard creation remains guarded by
+// ensureContactSheetDirectory.
+func PrepareContactSheetRoot(root string) error {
+	if root == "" {
+		return fmt.Errorf("contact sheet cache root is empty")
+	}
+	absoluteRoot, err := filepath.Abs(root)
+	if err != nil {
+		return fmt.Errorf("absolute contact sheet cache root: %w", err)
+	}
+	absoluteRoot = filepath.Clean(absoluteRoot)
+	if err := os.MkdirAll(absoluteRoot, 0o755); err != nil {
+		return fmt.Errorf("create contact sheet cache root: %w", err)
+	}
+	if _, err := contactSheetRoot(absoluteRoot); err != nil {
+		return err
+	}
+	return nil
+}
+
 func contactSheetPaths(root string, sha [64]byte, pid int, jobID int64, nonce string) (ContactSheetPaths, error) {
 	if root == "" {
 		return ContactSheetPaths{}, fmt.Errorf("contact sheet cache root is empty")
