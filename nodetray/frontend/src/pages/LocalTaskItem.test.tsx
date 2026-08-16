@@ -9,7 +9,7 @@ const runningTask: LocalTask = {
   instanceId: 'instance-new',
   revision: 7,
   source: 'D:\\Media',
-  mode: '扫描并自动三筛',
+  mode: 'scan_then_analysis',
   stage: 2,
   status: 'running',
   phase: 'stage2',
@@ -32,7 +32,7 @@ describe('LocalTaskItem', () => {
     render(<LocalTaskItem task={runningTask} locked={false} onAction={vi.fn()} />)
 
     const item = screen.getByRole('listitem')
-    expect(item).toHaveTextContent('扫描并自动三筛')
+    expect(item).toHaveTextContent('扫描并自动一、二、三筛')
     expect(item).toHaveTextContent('运行中 · 二筛')
     expect(item).toHaveTextContent('进度')
     expect(item).toHaveTextContent('40 / 100')
@@ -46,6 +46,13 @@ describe('LocalTaskItem', () => {
     expect(visibleId.textContent).not.toBe(runningTask.taskId)
     expect(screen.getByRole('progressbar')).toHaveAttribute('value', '40')
     expect(screen.getByRole('progressbar')).toHaveAttribute('max', '100')
+  })
+
+  it('将真实 scan_only 模式映射为中文', () => {
+    render(<LocalTaskItem task={{ ...runningTask, mode: 'scan_only' }} locked={false} onAction={vi.fn()} />)
+
+    expect(screen.getByRole('listitem')).toHaveTextContent('仅扫描')
+    expect(screen.getByRole('listitem')).not.toHaveTextContent('scan_only')
   })
 
   it('为未知总数使用不确定进度条和占位总数', () => {

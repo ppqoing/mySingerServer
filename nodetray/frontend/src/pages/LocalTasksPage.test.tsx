@@ -19,7 +19,7 @@ const path = (value: string, cancelled = false) => ({ ok: true, path: value, can
 
 const task = (overrides: Partial<LocalTask> = {}): LocalTask => ({
   taskId: 'task-1', instanceId: 'instance-1', revision: 1, source: 'D:\\Media',
-  mode: '扫描并自动三筛', stage: 1, status: 'running', phase: 'scan', roots: ['D:\\Media'],
+  mode: 'scan_then_analysis', stage: 1, status: 'running', phase: 'scan', roots: ['D:\\Media'],
   progressComplete: 10, progressTotal: 100, progressTotalKnown: true,
   speed: '10 文件/秒', failures: 0, duration: '00:00:01', syncStatus: '本机已保存',
   createdAt: 1_725_000_000_000, updatedAt: 1_725_000_001_000,
@@ -283,6 +283,37 @@ describe('自适应轮询与列表世代', () => {
     expect(screen.queryByText('状态可能已过期', { exact: false })).not.toBeInTheDocument()
   })
 
+  it('永不返回的列表请求在 10 秒超时后恢复单条 5 秒轮询链并忽略迟到结果', async () => {
+    vi.useFakeTimers()
+    const late = deferred<LocalTaskPage>()
+    const recovered = task({ taskId: 'recovered', instanceId: 'recovered-i', status: 'succeeded' })
+    const list = vi.fn().mockImplementationOnce(() => late.promise).mockResolvedValueOnce(page(recovered))
+    render(<LocalTasksPage api={api({ list })} />)
+    await flushPromises()
+
+    expect(list).toHaveBeenCalledTimes(1)
+    expect(vi.getTimerCount()).toBe(1)
+    await act(async () => { await vi.advanceTimersByTimeAsync(9_999) })
+    expect(list).toHaveBeenCalledTimes(1)
+    await act(async () => { await vi.advanceTimersByTimeAsync(1) })
+    expect(screen.getByText('状态可能已过期', { exact: false })).toBeVisible()
+    expect(vi.getTimerCount()).toBe(1)
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(4_999) })
+    expect(list).toHaveBeenCalledTimes(1)
+    await act(async () => { await vi.advanceTimersByTimeAsync(1) })
+    expect(list).toHaveBeenCalledTimes(2)
+    expect(within(taskList()).getByTitle('recovered')).toBeVisible()
+    expect(vi.getTimerCount()).toBe(1)
+
+    late.resolve(page(task({ taskId: 'too-late', instanceId: 'too-late-i' })))
+    await flushPromises()
+    expect(within(taskList()).getByTitle('recovered')).toBeVisible()
+    expect(screen.queryByTitle('too-late')).not.toBeInTheDocument()
+    expect(list).toHaveBeenCalledTimes(2)
+    expect(vi.getTimerCount()).toBe(1)
+  })
+
   it('卸载时清除定时器并忽略迟到列表响应', async () => {
     vi.useFakeTimers()
     const late = deferred<LocalTaskPage>()
@@ -399,10 +430,7 @@ describe('逐项生命周期操作', () => {
     await screen.findByRole('button', { name: '删除' })
     fireEvent.click(screen.getByRole('button', { name: '删除' }))
     const dialog = screen.getByRole('dialog', { name: '删除任务' })
-    expect(dialog).toHaveTextContent('删除本机任务及本机分析')
-    expect(dialog).toHaveTextContent('保留全局索引、特征与缓存')
-    expect(dialog).toHaveTextContent('保留文件删除审计')
-    expect(dialog).toHaveTextContent('不撤回已同步的中央数据')
+    expect(dialog).toHaveTextContent('删除本机任务及其分析、分组、评分和审核数据；保留文件、全局索引、特征与缓存；保留文件删除审计及其同步记录；不撤回已同步的中央数据。')
     fireEvent.click(within(dialog).getByRole('button', { name: '确认删除' }))
     await waitFor(() => expect(within(taskList()).queryByTitle('same-task')).not.toBeInTheDocument())
     expect(remove).toHaveBeenCalledWith({ taskId: 'same-task', instanceId: 'current-instance', expectedRevision: 9 })

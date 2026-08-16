@@ -1,6 +1,7 @@
 package proto
 
 import (
+	"encoding/json"
 	"reflect"
 	"strings"
 	"testing"
@@ -9,6 +10,23 @@ import (
 
 	"dedup/internal/nodectl"
 )
+
+func TestLocalTaskDisplayStatsJSONContract(t *testing.T) {
+	encoded, err := json.Marshal(LocalTaskDisplayStats{
+		SchemaVersion: LocalTaskDisplayStatsVersion,
+		Speed:         12.5, Failures: 3, DurationMS: 192_000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(encoded), `{"schema_version":1,"speed":12.5,"failures":3,"duration_ms":192000}`; got != want {
+		t.Fatalf("json=%s, want %s", got, want)
+	}
+	var invalid LocalTaskDisplayStats
+	if err := json.Unmarshal([]byte(`{"schema_version":1,"speed":"12.5","failures":3,"duration_ms":192000}`), &invalid); err == nil {
+		t.Fatal("string speed unexpectedly accepted by numeric display stats contract")
+	}
+}
 
 // These cases fail if local control messages permit more than the fixed
 // 4 MiB boundary, unknown commands, or topics that cannot be stable keys.

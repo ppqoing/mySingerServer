@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -122,28 +124,29 @@ type Dependencies struct {
 }
 
 type Service struct {
-	agentConfigMu     sync.Mutex
-	store             Store
-	validator         Validator
-	agentConfig       AgentConfigGateway
-	localAgent        LocalAgentGateway
-	deleteMu          sync.Mutex
-	deleteTokens      map[string]localDeleteToken
-	machineID         string
-	agent             Component
-	helper            Component
-	agentFingerprint  FingerprintUpdater
-	helperFingerprint FingerprintUpdater
-	task              TaskController
-	elevation         ElevationClient
-	loginStart        LoginStart
-	trayExecutable    string
-	taskDefinition    nodetask.Definition
-	locations         map[traymodel.LocationKind]Location
-	pathResolver      PathResolver
-	opener            LocationOpener
-	workers           WorkerProvider
-	processWaiter     ProcessWaiter
+	agentConfigMu       sync.Mutex
+	store               Store
+	validator           Validator
+	agentConfig         AgentConfigGateway
+	localAgent          LocalAgentGateway
+	localRequestTimeout time.Duration
+	deleteMu            sync.Mutex
+	deleteTokens        map[string]localDeleteToken
+	machineID           string
+	agent               Component
+	helper              Component
+	agentFingerprint    FingerprintUpdater
+	helperFingerprint   FingerprintUpdater
+	task                TaskController
+	elevation           ElevationClient
+	loginStart          LoginStart
+	trayExecutable      string
+	taskDefinition      nodetask.Definition
+	locations           map[traymodel.LocationKind]Location
+	pathResolver        PathResolver
+	opener              LocationOpener
+	workers             WorkerProvider
+	processWaiter       ProcessWaiter
 }
 
 func NewService(dependencies Dependencies) *Service {
@@ -153,7 +156,7 @@ func NewService(dependencies Dependencies) *Service {
 	}
 	return &Service{
 		store: dependencies.Store, validator: dependencies.Validator, agentConfig: dependencies.AgentConfig,
-		localAgent: dependencies.LocalAgent, deleteTokens: make(map[string]localDeleteToken),
+		localAgent: dependencies.LocalAgent, localRequestTimeout: localRequestTimeout, deleteTokens: make(map[string]localDeleteToken),
 		machineID: dependencies.MachineID,
 		agent:     dependencies.Agent, helper: dependencies.Helper, task: dependencies.Task,
 		agentFingerprint: dependencies.AgentFingerprint, helperFingerprint: dependencies.HelperFingerprint,
@@ -170,37 +173,58 @@ type localDeleteToken struct {
 	expiresAt int64
 }
 
+const localRequestTimeout = 10 * time.Second
+
 func (s *Service) localCall(ctx context.Context, operation string, request, response any) error {
 	if s == nil || s.localAgent == nil || ctx == nil {
 		return errors.New("agent_disconnected")
 	}
-	return s.localAgent.CallLocal(ctx, operation, request, response)
+	timeout := s.localRequestTimeout
+	if timeout <= 0 {
+		timeout = localRequestTimeout
+	}
+	callCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return s.localAgent.CallLocal(callCtx, operation, request, response)
 }
 
 func localError(err error) (string, string) {
-	if err == nil {
-		return "", ""
+	if code, summary, ok := mappedLocalRemoteError(err); ok {
+		return code, summary
 	}
-	code := "local_operation_failed"
-	var remote interface{ Error() string }
-	if errors.As(err, &remote) {
-		candidate := remote.Error()
-		if candidate != "" && !strings.ContainsAny(candidate, `:/\\ `) {
-			code = candidate
-		}
-	}
-	return code, "本机 Agent 暂不可用，请稍后重试"
+	return "local_operation_failed", "本机 Agent 暂不可用，请稍后重试"
 }
 
 func localTaskControlError(err error) (string, string) {
+	if code, summary, ok := mappedLocalRemoteError(err); ok {
+		return code, summary
+	}
+	return "local_operation_failed", "本机 Agent 暂不可用，请稍后重试"
+}
+
+func mappedLocalRemoteError(err error) (string, string, bool) {
 	var remote *agentclient.RemoteError
 	if errors.As(err, &remote) {
 		switch remote.Code {
-		case "stale_task", "task_instance_mismatch":
-			return remote.Code, "任务状态已更新，请刷新后重试"
+		case "stale_task":
+			return remote.Code, "任务状态已更新，请刷新后重试", true
+		case "task_instance_mismatch":
+			return remote.Code, "任务实例已更新，请刷新后重试", true
+		case "invalid_task_state":
+			return remote.Code, "当前任务状态不支持此操作", true
+		case "task_not_found":
+			return remote.Code, "任务不存在或已删除", true
+		case "local_task_unavailable":
+			return remote.Code, "本机任务服务暂不可用", true
+		case "task_delete_failed":
+			return remote.Code, "删除任务失败，请稍后重试", true
+		case "task_control_failed":
+			return remote.Code, "任务操作失败，请稍后重试", true
+		case "task_instance_required":
+			return remote.Code, "任务实例信息缺失，请刷新后重试", true
 		}
 	}
-	return "local_operation_failed", "本机 Agent 暂不可用，请稍后重试"
+	return "", "", false
 }
 
 func mapLocalTask(value proto.LocalTask) traymodel.LocalTask {
@@ -209,19 +233,31 @@ func mapLocalTask(value proto.LocalTask) traymodel.LocalTask {
 		ProgressComplete: value.ProgressComplete, ProgressTotal: value.ProgressTotal, ProgressTotalKnown: value.ProgressTotalKnown,
 		ErrorCode: value.SafeErrorCode, ErrorSummary: sanitizeText(value.SafeErrorMessage), CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt,
 		StartedAt: value.StartedAt, CompletedAt: value.CompletedAt, SyncStatus: "本机已保存"}
-	var stats struct {
-		Speed      string `json:"speed"`
-		Failures   int64  `json:"failures"`
-		Duration   string `json:"duration"`
-		SyncStatus string `json:"sync_status"`
-	}
-	if json.Unmarshal([]byte(value.StatsJSON), &stats) == nil {
-		result.Speed, result.Failures, result.Duration = sanitizeText(stats.Speed), stats.Failures, sanitizeText(stats.Duration)
+	var stats proto.LocalTaskDisplayStats
+	if json.Unmarshal([]byte(value.StatsJSON), &stats) == nil && stats.SchemaVersion == proto.LocalTaskDisplayStatsVersion {
+		result.Speed = formatLocalTaskSpeed(stats.Speed)
+		result.Failures = max(stats.Failures, 0)
+		result.Duration = formatLocalTaskDuration(stats.DurationMS)
 		if stats.SyncStatus != "" {
 			result.SyncStatus = sanitizeText(stats.SyncStatus)
 		}
 	}
 	return result
+}
+
+func formatLocalTaskSpeed(speed float64) string {
+	if speed <= 0 || math.IsNaN(speed) || math.IsInf(speed, 0) {
+		return ""
+	}
+	value := strings.TrimSuffix(strconv.FormatFloat(speed, 'f', 1, 64), ".0")
+	return value + " 文件/秒"
+}
+
+func formatLocalTaskDuration(durationMS int64) string {
+	seconds := max(durationMS, 0) / int64(time.Second/time.Millisecond)
+	hours := seconds / 3600
+	minutes := seconds % 3600 / 60
+	return fmt.Sprintf("%02d:%02d:%02d", hours, minutes, seconds%60)
 }
 
 func (s *Service) CreateLocalTask(ctx context.Context, request traymodel.LocalTaskCreate) traymodel.LocalTaskResult {

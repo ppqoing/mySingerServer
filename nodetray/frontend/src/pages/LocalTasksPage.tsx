@@ -36,6 +36,7 @@ type PendingConfirmation = {
 
 const ACTIVE_POLL_MS = 1_000
 const IDLE_POLL_MS = 5_000
+const LIST_REQUEST_TIMEOUT_MS = 10_000
 
 export type LocalTasksAPI = {
   choose: (currentPath: string) => Promise<PathSelectionResult>
@@ -144,8 +145,13 @@ export function LocalTasksPage({
       window.clearTimeout(timerRef.current)
       timerRef.current = undefined
       const requestSequence = ++listSequenceRef.current
+      let requestTimeout: number | undefined
       try {
-        const result = await api.list()
+        const timeout = new Promise<never>((_, reject) => {
+          requestTimeout = window.setTimeout(() => reject(new Error('local task list timeout')), LIST_REQUEST_TIMEOUT_MS)
+          timerRef.current = requestTimeout
+        })
+        const result = await Promise.race([api.list(), timeout])
         if (apiGeneration !== apiGenerationRef.current || requestSequence !== listSequenceRef.current) return
         if (!result.ok) {
           setStale(true)
@@ -162,6 +168,9 @@ export function LocalTasksPage({
         if (apiGeneration !== apiGenerationRef.current || requestSequence !== listSequenceRef.current) return
         setStale(true)
         scheduleNext(IDLE_POLL_MS)
+      } finally {
+        window.clearTimeout(requestTimeout)
+        if (timerRef.current === requestTimeout) timerRef.current = undefined
       }
     }
 
@@ -335,7 +344,7 @@ export function LocalTasksPage({
       open={confirmation !== undefined}
       title={deleting ? '删除任务' : '停止任务'}
       description={deleting
-        ? <span>删除本机任务及本机分析；保留全局索引、特征与缓存；保留文件删除审计；不撤回已同步的中央数据。</span>
+        ? <span>删除本机任务及其分析、分组、评分和审核数据；保留文件、全局索引、特征与缓存；保留文件删除审计及其同步记录；不撤回已同步的中央数据。</span>
         : <span>停止后不再继续处理；已完成结果会保留。</span>}
       confirmLabel={deleting ? '确认删除' : '确认停止'}
       onConfirm={confirmAction}

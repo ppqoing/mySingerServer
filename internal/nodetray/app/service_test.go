@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -104,6 +105,27 @@ type fakeLocalAgentGateway struct {
 	err       error
 }
 
+type deadlineInspectLocalAgentGateway struct {
+	deadlines []time.Time
+}
+
+func (f *deadlineInspectLocalAgentGateway) CallLocal(ctx context.Context, _ string, _, _ any) error {
+	deadline, ok := ctx.Deadline()
+	if ok {
+		f.deadlines = append(f.deadlines, deadline)
+	} else {
+		f.deadlines = append(f.deadlines, time.Time{})
+	}
+	return errors.New("deadline inspection")
+}
+
+type blockingLocalAgentGateway struct{}
+
+func (*blockingLocalAgentGateway) CallLocal(ctx context.Context, _ string, _, _ any) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
 func (f *fakeLocalAgentGateway) CallLocal(_ context.Context, operation string, request, response any) error {
 	f.requests = append(f.requests, operation)
 	f.operation = operation
@@ -181,19 +203,32 @@ func TestLocalTaskControlsRejectInvalidVersionAndRedactGatewayError(t *testing.T
 
 // Break caught: refreshable optimistic-concurrency codes are hidden from the
 // WebView, or arbitrary remote/private error text is exposed as a public code.
-func TestLocalTaskControlsExposeOnlyRefreshableRemoteCodes(t *testing.T) {
-	for _, code := range []string{"stale_task", "task_instance_mismatch"} {
-		t.Run(code, func(t *testing.T) {
+func TestLocalTaskControlsExposeAllSafeRemoteCodesWithFixedSummaries(t *testing.T) {
+	tests := []struct {
+		code    string
+		summary string
+	}{
+		{"stale_task", "任务状态已更新，请刷新后重试"},
+		{"task_instance_mismatch", "任务实例已更新，请刷新后重试"},
+		{"invalid_task_state", "当前任务状态不支持此操作"},
+		{"task_not_found", "任务不存在或已删除"},
+		{"local_task_unavailable", "本机任务服务暂不可用"},
+		{"task_delete_failed", "删除任务失败，请稍后重试"},
+		{"task_control_failed", "任务操作失败，请稍后重试"},
+		{"task_instance_required", "任务实例信息缺失，请刷新后重试"},
+	}
+	for _, test := range tests {
+		t.Run(test.code, func(t *testing.T) {
 			service, _, _, _, _, _ := serviceFixture(t)
-			service.localAgent = &fakeLocalAgentGateway{responses: map[string]any{}, err: fmt.Errorf("wrapped transport: %w", &agentclient.RemoteError{Code: code})}
+			service.localAgent = &fakeLocalAgentGateway{responses: map[string]any{}, err: fmt.Errorf("wrapped transport secret: %w", &agentclient.RemoteError{Code: test.code})}
 
 			result := service.PauseLocalTask(context.Background(), traymodel.LocalTaskControl{
 				TaskID: "task-1", InstanceID: "instance-1", ExpectedRevision: 7,
 			})
-			if result.OK || result.ErrorCode != code || result.ErrorSummary != "任务状态已更新，请刷新后重试" {
+			if result.OK || result.ErrorCode != test.code || result.ErrorSummary != test.summary {
 				t.Fatalf("result=%#v", result)
 			}
-			if strings.Contains(fmt.Sprintf("%#v", result), "wrapped transport") {
+			if strings.Contains(fmt.Sprintf("%#v", result), "secret") {
 				t.Fatalf("result leaked transport text: %#v", result)
 			}
 		})
@@ -207,6 +242,84 @@ func TestLocalTaskControlsExposeOnlyRefreshableRemoteCodes(t *testing.T) {
 	if result.OK || result.ErrorCode != "local_operation_failed" || result.ErrorSummary != "本机 Agent 暂不可用，请稍后重试" ||
 		strings.Contains(fmt.Sprintf("%#v", result), "private_backend_failure") {
 		t.Fatalf("result=%#v", result)
+	}
+	service.localAgent = &fakeLocalAgentGateway{responses: map[string]any{}, err: errors.New("raw_private_failure")}
+	page := service.ListLocalTasks(context.Background(), traymodel.PageRequest{Limit: 50})
+	if page.OK || page.ErrorCode != "local_operation_failed" || page.ErrorSummary != "本机 Agent 暂不可用，请稍后重试" ||
+		strings.Contains(fmt.Sprintf("%#v", page), "raw_private_failure") {
+		t.Fatalf("page leaked raw error: %#v", page)
+	}
+}
+
+// Break caught: a local request inherited the process lifetime context and
+// could leave Wails calls and frontend polling pending forever.
+func TestLocalTaskListAndControlUseBoundedRequestContexts(t *testing.T) {
+	service, _, _, _, _, _ := serviceFixture(t)
+	gateway := &deadlineInspectLocalAgentGateway{}
+	service.localAgent = gateway
+	started := time.Now()
+
+	_ = service.ListLocalTasks(context.Background(), traymodel.PageRequest{Limit: 50})
+	_ = service.PauseLocalTask(context.Background(), traymodel.LocalTaskControl{
+		TaskID: "task-1", InstanceID: "instance-1", ExpectedRevision: 7,
+	})
+
+	if len(gateway.deadlines) != 2 {
+		t.Fatalf("deadline observations=%v", gateway.deadlines)
+	}
+	for i, deadline := range gateway.deadlines {
+		if deadline.IsZero() {
+			t.Fatalf("call %d had no deadline", i)
+		}
+		remaining := deadline.Sub(started)
+		if remaining <= 0 || remaining > 11*time.Second {
+			t.Fatalf("call %d deadline bound=%v, want <= 11s", i, remaining)
+		}
+	}
+}
+
+func TestLocalTaskListDeadlineCancelsBlockingGateway(t *testing.T) {
+	service, _, _, _, _, _ := serviceFixture(t)
+	service.localAgent = &blockingLocalAgentGateway{}
+	service.localRequestTimeout = 5 * time.Millisecond
+	started := time.Now()
+
+	page := service.ListLocalTasks(context.Background(), traymodel.PageRequest{Limit: 50})
+
+	if page.OK || page.ErrorCode != "local_operation_failed" {
+		t.Fatalf("page=%#v", page)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("blocking gateway returned after %v", elapsed)
+	}
+}
+
+// Break caught: Agent display stats reached Store, but numeric production JSON
+// could not be decoded into the string-only Wails projection.
+func TestListLocalTasksMapsProductionDisplayStatsJSON(t *testing.T) {
+	service, _, _, _, _, _ := serviceFixture(t)
+	statsJSON, err := json.Marshal(proto.LocalTaskDisplayStats{
+		SchemaVersion: proto.LocalTaskDisplayStatsVersion,
+		Speed:         12.5, Failures: 3, DurationMS: 192_000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.localAgent = &fakeLocalAgentGateway{responses: map[string]any{
+		proto.LocalOperationTaskList: proto.LocalTaskListResponse{Tasks: []proto.LocalTask{{
+			TaskID: "stats-task", InstanceID: "stats-instance", Revision: 1,
+			Mode: proto.LocalTaskModeScanThenAnalysis, Status: "running",
+			StatsJSON: string(statsJSON),
+		}}},
+	}}
+
+	page := service.ListLocalTasks(context.Background(), traymodel.PageRequest{Limit: 50})
+	if !page.OK || len(page.Tasks) != 1 {
+		t.Fatalf("page=%#v", page)
+	}
+	task := page.Tasks[0]
+	if task.Speed != "12.5 文件/秒" || task.Failures != 3 || task.Duration != "00:03:12" {
+		t.Fatalf("mapped task=%#v", task)
 	}
 }
 

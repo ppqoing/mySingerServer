@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -764,6 +765,14 @@ type localScanRunner interface {
 type agentLocalTaskRunner struct {
 	scans    localScanRunner
 	analysis localAnalysisRunner
+	now      func() time.Time
+}
+
+func (r *agentLocalTaskRunner) currentTime() time.Time {
+	if r != nil && r.now != nil {
+		return r.now()
+	}
+	return time.Now()
 }
 
 func (r *agentLocalTaskRunner) Run(control localtask.RunControl, request localtask.CreateRequest, snapshot localtask.Task, report func(localtask.ProgressUpdate) error) error {
@@ -779,6 +788,7 @@ func (r *agentLocalTaskRunner) Run(control localtask.RunControl, request localta
 		}
 		return report(update)
 	}
+	displayStats := runnerDecodeDisplayStats(snapshot.StatsJSON)
 	if snapshot.Stage < 1 {
 		terminal := make(chan proto.TaskDone, 1)
 		var progressMu sync.Mutex
@@ -789,12 +799,18 @@ func (r *agentLocalTaskRunner) Run(control localtask.RunControl, request localta
 			latest.TotalKnown = snapshot.ProgressTotalKnown
 		}
 		var callbackErr error
-		reportScan := func(message proto.TaskProgress, checkpoint int, statsJSON string) {
+		reportScan := func(message proto.TaskProgress, checkpoint int, finalStats *proto.TaskStats) {
 			progressMu.Lock()
 			message.Done = max(message.Done, latest.Done)
 			message.Total = max(message.Total, latest.Total)
 			message.TotalKnown = message.TotalKnown || latest.TotalKnown
 			latest = message
+			if finalStats == nil {
+				displayStats = runnerMergeProgressStats(displayStats, message)
+			} else {
+				displayStats = runnerMergeFinalStats(displayStats, *finalStats)
+			}
+			statsJSON := runnerDisplayStatsJSON(displayStats)
 			progressMu.Unlock()
 			if err := emit(localtask.ProgressUpdate{Phase: "scan", Stage: checkpoint, ProgressComplete: message.Done, ProgressTotal: message.Total, ProgressTotalKnown: message.TotalKnown, StatsJSON: statsJSON}); err != nil {
 				progressMu.Lock()
@@ -804,11 +820,11 @@ func (r *agentLocalTaskRunner) Run(control localtask.RunControl, request localta
 				progressMu.Unlock()
 			}
 		}
-		reportScan(latest, 0, runnerStatsJSON(latest))
+		reportScan(latest, 0, nil)
 		ack, start := r.scans.Prepare(proto.ScanTask{TaskID: request.TaskID, InstanceID: snapshot.InstanceID, Roots: append([]string(nil), request.Roots...), Phase: 1, Options: proto.ScanOptions{Rescan: request.Rescan, Extensions: append([]string(nil), request.Extensions...)}}, func(messageType uint8, value any) error {
 			switch messageType {
 			case proto.MsgTaskProgress:
-				reportScan(*value.(*proto.TaskProgress), 0, runnerStatsJSON(value))
+				reportScan(*value.(*proto.TaskProgress), 0, nil)
 			case proto.MsgTaskDone:
 				select {
 				case terminal <- *value.(*proto.TaskDone):
@@ -859,7 +875,7 @@ func (r *agentLocalTaskRunner) Run(control localtask.RunControl, request localta
 		}
 		final.Stats.Total = message.Total
 		final.Stats.Done = message.Done
-		reportScan(message, checkpoint, runnerStatsJSON(final.Stats))
+		reportScan(message, checkpoint, &final.Stats)
 		progressMu.Lock()
 		reportError := callbackErr
 		progressMu.Unlock()
@@ -874,7 +890,7 @@ func (r *agentLocalTaskRunner) Run(control localtask.RunControl, request localta
 		snapshot.ProgressComplete = message.Done
 		snapshot.ProgressTotal = message.Total
 		snapshot.ProgressTotalKnown = true
-		snapshot.StatsJSON = runnerStatsJSON(final.Stats)
+		snapshot.StatsJSON = runnerDisplayStatsJSON(displayStats)
 	}
 	if request.Mode == proto.LocalTaskModeScanOnly {
 		if snapshot.Phase != "finalizing" || !snapshot.ProgressTotalKnown || snapshot.ProgressComplete < snapshot.ProgressTotal {
@@ -888,6 +904,8 @@ func (r *agentLocalTaskRunner) Run(control localtask.RunControl, request localta
 		return nil
 	}
 	if request.Mode == proto.LocalTaskModeScanThenAnalysis {
+		analysisStarted := r.currentTime()
+		analysisBaseDuration := displayStats.DurationMS
 		if err := r.analysis.RunWithProgress(control.Context, request.TaskID, control.Drain, func(progress localanalysis.AnalysisProgress) error {
 			if phaseRank(progress.Phase) < phaseRank(snapshot.Phase) {
 				return nil
@@ -898,7 +916,12 @@ func (r *agentLocalTaskRunner) Run(control localtask.RunControl, request localta
 				total = max(total, snapshot.ProgressTotal)
 				known = known || snapshot.ProgressTotalKnown
 			}
-			return emit(localtask.ProgressUpdate{Phase: progress.Phase, Stage: progress.CheckpointStage, ProgressComplete: complete, ProgressTotal: total, ProgressTotalKnown: known, StatsJSON: runnerStatsJSON(progress)})
+			analysisElapsed := r.currentTime().Sub(analysisStarted).Milliseconds()
+			if analysisElapsed < 0 {
+				analysisElapsed = 0
+			}
+			displayStats.DurationMS = max(displayStats.DurationMS, analysisBaseDuration+analysisElapsed)
+			return emit(localtask.ProgressUpdate{Phase: progress.Phase, Stage: progress.CheckpointStage, ProgressComplete: complete, ProgressTotal: total, ProgressTotalKnown: known, StatsJSON: runnerDisplayStatsJSON(displayStats)})
 		}); err != nil {
 			if errors.Is(err, localanalysis.ErrDrainRequested) {
 				return localtask.ErrDrainRequested
@@ -942,12 +965,41 @@ func phaseRank(phase string) int {
 	}
 }
 
-func runnerStatsJSON(value any) string {
-	encoded, err := json.Marshal(value)
+func runnerDisplayStatsJSON(stats proto.LocalTaskDisplayStats) string {
+	stats.SchemaVersion = proto.LocalTaskDisplayStatsVersion
+	encoded, err := json.Marshal(stats)
 	if err != nil {
 		return "{}"
 	}
 	return string(encoded)
+}
+
+func runnerDecodeDisplayStats(statsJSON string) proto.LocalTaskDisplayStats {
+	var stats proto.LocalTaskDisplayStats
+	if json.Unmarshal([]byte(statsJSON), &stats) != nil || stats.SchemaVersion != proto.LocalTaskDisplayStatsVersion {
+		return proto.LocalTaskDisplayStats{SchemaVersion: proto.LocalTaskDisplayStatsVersion}
+	}
+	if math.IsNaN(stats.Speed) || math.IsInf(stats.Speed, 0) || stats.Speed < 0 {
+		stats.Speed = 0
+	}
+	stats.Failures = max(stats.Failures, 0)
+	stats.DurationMS = max(stats.DurationMS, 0)
+	return stats
+}
+
+func runnerMergeProgressStats(current proto.LocalTaskDisplayStats, progress proto.TaskProgress) proto.LocalTaskDisplayStats {
+	if progress.Speed > 0 && !math.IsNaN(progress.Speed) && !math.IsInf(progress.Speed, 0) {
+		current.Speed = progress.Speed
+	}
+	current.Failures = max(current.Failures, progress.Failed)
+	current.DurationMS = max(current.DurationMS, progress.ElapsedMS)
+	return current
+}
+
+func runnerMergeFinalStats(current proto.LocalTaskDisplayStats, stats proto.TaskStats) proto.LocalTaskDisplayStats {
+	current.Failures = max(current.Failures, stats.Failed+stats.ScanErrors)
+	current.DurationMS = max(current.DurationMS, stats.ElapsedMS)
+	return current
 }
 
 func (h *agentLocalHandler) loadConfig() (*config.AgentConfig, []byte, string, error) {

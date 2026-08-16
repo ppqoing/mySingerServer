@@ -396,6 +396,77 @@ func TestLocalTaskRunnerAutoAnalysisPersistsEveryDurableCheckpoint(t *testing.T)
 	}
 }
 
+// Break caught: production scan/analysis progress structs were marshalled
+// directly, so the NodeTray display contract changed shape at every phase and
+// analysis erased the scan speed, failures, and elapsed duration.
+func TestLocalTaskRunnerEmitsStableDisplayStatsAcrossScanAndAnalysis(t *testing.T) {
+	base := time.Unix(1_700_000_000, 0)
+	times := []time.Time{base, base.Add(time.Second), base.Add(2 * time.Second), base.Add(3 * time.Second)}
+	nextTime := func() time.Time {
+		value := times[0]
+		times = times[1:]
+		return value
+	}
+	runner := &agentLocalTaskRunner{
+		scans:    &displayStatsLocalScanRunner{},
+		analysis: &recordingLocalAnalysisRunner{},
+		now:      nextTime,
+	}
+	var updates []localtask.ProgressUpdate
+	request := proto.LocalTaskCreateRequest{TaskID: "stats-contract", Roots: []string{`D:\media`}, Mode: proto.LocalTaskModeScanThenAnalysis}
+	if err := runner.Run(localtask.RunControl{Context: context.Background()}, request, localtask.Task{
+		TaskID: request.TaskID, InstanceID: "stats-instance", Phase: "waiting",
+	}, func(update localtask.ProgressUpdate) error {
+		updates = append(updates, update)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	type displayStats struct {
+		SchemaVersion int     `json:"schema_version"`
+		Speed         float64 `json:"speed"`
+		Failures      int64   `json:"failures"`
+		DurationMS    int64   `json:"duration_ms"`
+	}
+	var scanFinal *displayStats
+	analysisDurations := make([]int64, 0, 3)
+	for _, update := range updates {
+		var stats displayStats
+		if err := json.Unmarshal([]byte(update.StatsJSON), &stats); err != nil {
+			t.Fatalf("phase=%q stats_json=%q: %v", update.Phase, update.StatsJSON, err)
+		}
+		var raw map[string]any
+		if err := json.Unmarshal([]byte(update.StatsJSON), &raw); err != nil {
+			t.Fatal(err)
+		}
+		for _, key := range []string{"schema_version", "speed", "failures", "duration_ms"} {
+			if _, ok := raw[key]; !ok {
+				t.Fatalf("phase=%q stats_json=%q missing %q", update.Phase, update.StatsJSON, key)
+			}
+		}
+		if stats.SchemaVersion != proto.LocalTaskDisplayStatsVersion {
+			t.Fatalf("phase=%q schema_version=%d", update.Phase, stats.SchemaVersion)
+		}
+		if update.Phase == "scan" && update.Stage == 1 {
+			copy := stats
+			scanFinal = &copy
+		}
+		if phaseRank(update.Phase) >= phaseRank("stage2") {
+			if stats.Speed != 12.5 || stats.Failures != 3 {
+				t.Fatalf("analysis phase=%q stats=%#v, want preserved scan speed/failures", update.Phase, stats)
+			}
+			analysisDurations = append(analysisDurations, stats.DurationMS)
+		}
+	}
+	if scanFinal == nil || scanFinal.Speed != 12.5 || scanFinal.Failures != 3 || scanFinal.DurationMS != 4_000 {
+		t.Fatalf("scan final stats=%#v", scanFinal)
+	}
+	if want := []int64{5_000, 6_000, 7_000}; !reflect.DeepEqual(analysisDurations, want) {
+		t.Fatalf("analysis durations=%v, want %v", analysisDurations, want)
+	}
+}
+
 func TestAgentLocalTaskRunnerWaitsForScanDrainBeforeReturning(t *testing.T) {
 	scan := newBlockedLocalScanRunner()
 	runner := &agentLocalTaskRunner{scans: scan, analysis: &recordingLocalAnalysisRunner{}}
@@ -1332,6 +1403,26 @@ func (*recordingLocalScanRunner) DrainInstance(string, string, proto.TaskDrainRe
 	return true, &proto.TaskStats{}
 }
 func (*recordingLocalScanRunner) AbortInstance(string, string) bool { return true }
+
+type displayStatsLocalScanRunner struct{}
+
+func (*displayStatsLocalScanRunner) Prepare(task proto.ScanTask, sender agent.Sender) (proto.TaskAck, func()) {
+	return proto.TaskAck{TaskID: task.TaskID, Accepted: true}, func() {
+		_ = sender(proto.MsgTaskProgress, &proto.TaskProgress{
+			TaskID: task.TaskID, Done: 5, Total: 10, TotalKnown: true,
+			Failed: 2, ElapsedMS: 2_500, Speed: 12.5,
+		})
+		_ = sender(proto.MsgTaskDone, &proto.TaskDone{TaskID: task.TaskID, Stats: proto.TaskStats{
+			Total: 10, Done: 10, Failed: 2, ScanErrors: 1, ElapsedMS: 4_000,
+		}})
+	}
+}
+
+func (*displayStatsLocalScanRunner) DrainInstance(string, string, proto.TaskDrainReason) (bool, *proto.TaskStats) {
+	return true, &proto.TaskStats{}
+}
+
+func (*displayStatsLocalScanRunner) AbortInstance(string, string) bool { return true }
 
 type recordingLocalAnalysisRunner struct{ calls int }
 
