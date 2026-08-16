@@ -50,16 +50,20 @@ func replaceWindowsPath(text, target string) string {
 }
 
 const (
-	MsgReady    = "ready"
-	MsgJob      = "job"
-	MsgShutdown = "shutdown"
-	MsgSHAQuery = "sha_query"
-	MsgSHAReply = "sha_reply"
-	MsgResult   = "result"
+	MsgReady          = "ready"
+	MsgJob            = "job"
+	MsgShutdown       = "shutdown"
+	MsgSHAQuery       = "sha_query"
+	MsgSHAReply       = "sha_reply"
+	MsgResult         = "result"
+	MsgIOLeaseAcquire = "io_lease_acquire"
+	MsgIOLeaseGrant   = "io_lease_grant"
+	MsgIOLeaseReport  = "io_lease_report"
+	MsgIOLeaseCancel  = "io_lease_cancel"
 )
 
 const (
-	IPCCompatibilityVersion = 1
+	IPCCompatibilityVersion = 2
 	MediaCoreDLLVersion     = "1.0.0"
 	VideoCoreABIVersion     = 1
 	VideoCoreVersion        = "1.0.0"
@@ -158,6 +162,8 @@ type ReadyMsg struct {
 type JobMsg struct {
 	JobID            int64       `msgpack:"job_id"`
 	ScanTaskID       string      `msgpack:"scan_task_id"`
+	ScanInstanceID   string      `msgpack:"scan_instance_id"`
+	DiskKey          string      `msgpack:"disk_key"`
 	Path             string      `msgpack:"path"`
 	Kind             MediaKind   `msgpack:"kind"`
 	Phase            Phase       `msgpack:"phase"`
@@ -174,6 +180,93 @@ type JobMsg struct {
 	PreviewMaxWidth  int32       `msgpack:"preview_max_width,omitempty"`
 	PreviewMaxHeight int32       `msgpack:"preview_max_height,omitempty"`
 	PreviewQuality   int32       `msgpack:"preview_quality,omitempty"`
+}
+
+type IOLeaseAcquireMsg struct {
+	JobID      int64  `msgpack:"job_id"`
+	RequestID  uint64 `msgpack:"request_id"`
+	TaskID     string `msgpack:"task_id"`
+	InstanceID string `msgpack:"instance_id"`
+	DiskKey    string `msgpack:"disk_key"`
+	Class      uint8  `msgpack:"class"`
+	WantBytes  int64  `msgpack:"want_bytes"`
+	WantSeek   bool   `msgpack:"want_seek"`
+}
+
+type IOLeaseGrantMsg struct {
+	JobID      int64  `msgpack:"job_id"`
+	RequestID  uint64 `msgpack:"request_id"`
+	LeaseID    uint64 `msgpack:"lease_id"`
+	Generation uint64 `msgpack:"generation"`
+	Bytes      int64  `msgpack:"bytes"`
+	Seeks      uint32 `msgpack:"seeks"`
+}
+
+type IOLeaseReportMsg struct {
+	JobID      int64  `msgpack:"job_id"`
+	RequestID  uint64 `msgpack:"request_id"`
+	LeaseID    uint64 `msgpack:"lease_id"`
+	Generation uint64 `msgpack:"generation"`
+	TaskID     string `msgpack:"task_id"`
+	InstanceID string `msgpack:"instance_id"`
+	DiskKey    string `msgpack:"disk_key"`
+	Bytes      int64  `msgpack:"bytes"`
+	Seeks      uint32 `msgpack:"seeks"`
+	ReadNS     int64  `msgpack:"read_ns"`
+	WaitNS     int64  `msgpack:"wait_ns"`
+	Completed  bool   `msgpack:"completed"`
+	Cancelled  bool   `msgpack:"cancelled"`
+}
+
+type IOLeaseCancelMsg struct {
+	JobID     int64  `msgpack:"job_id"`
+	RequestID uint64 `msgpack:"request_id"`
+}
+
+func (msg IOLeaseAcquireMsg) Validate() error {
+	if msg.JobID <= 0 || msg.RequestID == 0 {
+		return fmt.Errorf("worker: I/O lease acquire identity is required")
+	}
+	if strings.TrimSpace(msg.TaskID) == "" || strings.TrimSpace(msg.InstanceID) == "" || strings.TrimSpace(msg.DiskKey) == "" {
+		return fmt.Errorf("worker: I/O lease acquire task, instance, and disk are required")
+	}
+	if msg.Class != 1 && msg.Class != 2 {
+		return fmt.Errorf("worker: I/O lease acquire class %d is unknown", msg.Class)
+	}
+	if msg.WantBytes <= 0 || msg.WantBytes > 16<<20 {
+		return fmt.Errorf("worker: I/O lease acquire want_bytes %d is outside range", msg.WantBytes)
+	}
+	return nil
+}
+
+func (msg IOLeaseGrantMsg) ValidateFor(request IOLeaseAcquireMsg) error {
+	if msg.JobID != request.JobID || msg.RequestID != request.RequestID || msg.LeaseID == 0 || msg.Generation == 0 {
+		return fmt.Errorf("worker: I/O lease grant identity mismatch")
+	}
+	if msg.Bytes <= 0 || msg.Bytes > request.WantBytes || msg.Bytes > 16<<20 {
+		return fmt.Errorf("worker: I/O lease grant bytes %d exceed request %d", msg.Bytes, request.WantBytes)
+	}
+	if msg.Seeks > 1 || (!request.WantSeek && msg.Seeks != 0) {
+		return fmt.Errorf("worker: I/O lease grant seeks %d exceed request", msg.Seeks)
+	}
+	return nil
+}
+
+func (msg IOLeaseReportMsg) ValidateFor(grant IOLeaseGrantMsg) error {
+	if msg.JobID != grant.JobID || msg.RequestID != grant.RequestID ||
+		msg.LeaseID != grant.LeaseID || msg.Generation != grant.Generation {
+		return fmt.Errorf("worker: I/O lease report identity or generation mismatch")
+	}
+	if strings.TrimSpace(msg.TaskID) == "" || strings.TrimSpace(msg.InstanceID) == "" || strings.TrimSpace(msg.DiskKey) == "" {
+		return fmt.Errorf("worker: I/O lease report task, instance, and disk are required")
+	}
+	if msg.Bytes < 0 || msg.Bytes > grant.Bytes || msg.Seeks > grant.Seeks || msg.ReadNS < 0 || msg.WaitNS < 0 {
+		return fmt.Errorf("worker: I/O lease report exceeds grant")
+	}
+	if msg.Completed && msg.Cancelled {
+		return fmt.Errorf("worker: I/O lease report cannot be completed and cancelled")
+	}
+	return nil
 }
 
 type SHAQueryMsg struct {

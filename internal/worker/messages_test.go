@@ -125,6 +125,97 @@ func TestMessageRoundTrip(t *testing.T) {
 	}
 }
 
+// Break caught: lease protocol fields are dropped or renamed on the wire, so
+// the Agent and Worker silently disagree about the lease they are exchanging.
+func TestIOLeaseMessagesRoundTrip(t *testing.T) {
+	acquire := IOLeaseAcquireMsg{
+		JobID: 71, RequestID: 72, TaskID: "task-71", InstanceID: "instance-71",
+		DiskKey: "disk-0", Class: 1, WantBytes: 4 << 20, WantSeek: true,
+	}
+	grant := IOLeaseGrantMsg{
+		JobID: 71, RequestID: 72, LeaseID: 73, Generation: 4,
+		Bytes: 4 << 20, Seeks: 1,
+	}
+	report := IOLeaseReportMsg{
+		JobID: 71, RequestID: 72, LeaseID: 73, Generation: 4,
+		TaskID: "task-71", InstanceID: "instance-71", DiskKey: "disk-0",
+		Bytes: 3 << 20, Seeks: 1, ReadNS: 20_000, WaitNS: 30_000,
+		Completed: true,
+	}
+	cancel := IOLeaseCancelMsg{JobID: 71, RequestID: 72}
+
+	for _, tc := range []struct {
+		name  string
+		value any
+		new   func() any
+	}{
+		{"acquire", acquire, func() any { return new(IOLeaseAcquireMsg) }},
+		{"grant", grant, func() any { return new(IOLeaseGrantMsg) }},
+		{"report", report, func() any { return new(IOLeaseReportMsg) }},
+		{"cancel", cancel, func() any { return new(IOLeaseCancelMsg) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			encoded, err := msgpack.Marshal(tc.value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := tc.new()
+			if err := msgpack.Unmarshal(encoded, got); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(tc.value, reflect.ValueOf(got).Elem().Interface()) {
+				t.Fatalf("round trip mismatch\nwant: %#v\n got: %#v", tc.value, got)
+			}
+		})
+	}
+}
+
+// Break caught: malformed or over-budget Worker lease requests reach the
+// broker, or an over-sized/mismatched grant/report is accepted as authoritative.
+func TestIOLeaseMessageValidationRejectsUnsafeBoundaries(t *testing.T) {
+	validAcquire := IOLeaseAcquireMsg{
+		JobID: 81, RequestID: 82, TaskID: "task-81", InstanceID: "instance-81",
+		DiskKey: "disk-1", Class: 1, WantBytes: 4 << 20,
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*IOLeaseAcquireMsg)
+	}{
+		{"empty task", func(msg *IOLeaseAcquireMsg) { msg.TaskID = "" }},
+		{"empty instance", func(msg *IOLeaseAcquireMsg) { msg.InstanceID = "" }},
+		{"empty disk", func(msg *IOLeaseAcquireMsg) { msg.DiskKey = "" }},
+		{"unknown class", func(msg *IOLeaseAcquireMsg) { msg.Class = 99 }},
+		{"over 16 MiB", func(msg *IOLeaseAcquireMsg) { msg.WantBytes = (16 << 20) + 1 }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			msg := validAcquire
+			tc.mutate(&msg)
+			if err := msg.Validate(); err == nil {
+				t.Fatalf("Validate(%#v) unexpectedly succeeded", msg)
+			}
+		})
+	}
+
+	validGrant := IOLeaseGrantMsg{
+		JobID: 81, RequestID: 82, LeaseID: 83, Generation: 2,
+		Bytes: validAcquire.WantBytes,
+	}
+	overGrant := validGrant
+	overGrant.Bytes++
+	if err := overGrant.ValidateFor(validAcquire); err == nil {
+		t.Fatal("grant larger than request unexpectedly validated")
+	}
+
+	report := IOLeaseReportMsg{
+		JobID: 81, RequestID: 82, LeaseID: 83, Generation: 3,
+		TaskID: "task-81", InstanceID: "instance-81", DiskKey: "disk-1",
+		Bytes: 1 << 20, Completed: true,
+	}
+	if err := report.ValidateFor(validGrant); err == nil {
+		t.Fatal("report with mismatched generation unexpectedly validated")
+	}
+}
+
 func TestDefaultStageOneWorkerMasksUseExplicitVideoFields(t *testing.T) {
 	if MaskAllImage != MaskSHA512|MaskImagePDQ {
 		t.Fatalf("image stage-one mask = %#x", uint32(MaskAllImage))

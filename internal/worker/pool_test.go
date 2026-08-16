@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"dedup/internal/diskio"
 	"dedup/internal/features"
 	"dedup/internal/store"
 
@@ -255,6 +256,280 @@ func TestPoolRejectsIncompatibleIPCOrDLLReadyAndRespawns(t *testing.T) {
 	if ready.IPCVersion != IPCCompatibilityVersion ||
 		ready.DLLVersion != MediaCoreDLLVersion {
 		t.Fatalf("replacement Ready = %#v", ready)
+	}
+}
+
+// Break caught: an IPC v1 Worker is admitted after lease messages become a
+// required part of the parent/child protocol.
+func TestWorkerCompatibilityRejectsIPCVersionOne(t *testing.T) {
+	ready := validReadyForTest()
+	ready.PID = 9001
+	ready.WorkerIndex = 3
+	ready.IPCVersion = 1
+	if err := validateReady(ready, 3, 9001); err == nil {
+		t.Fatal("IPC v1 Ready unexpectedly accepted")
+	}
+}
+
+type ioLeaseAcquireResult struct {
+	grant diskio.Grant
+	err   error
+}
+
+type ioLeaseBroker struct {
+	acquires chan diskio.Request
+	results  chan ioLeaseAcquireResult
+	reports  chan diskio.Report
+	reclaims chan int
+}
+
+func newIOLeaseBroker() *ioLeaseBroker {
+	return &ioLeaseBroker{
+		acquires: make(chan diskio.Request, 8), results: make(chan ioLeaseAcquireResult, 8),
+		reports: make(chan diskio.Report, 8), reclaims: make(chan int, 8),
+	}
+}
+
+func (broker *ioLeaseBroker) Acquire(ctx context.Context, request diskio.Request) (diskio.Grant, error) {
+	select {
+	case broker.acquires <- request:
+	case <-ctx.Done():
+		return diskio.Grant{}, ctx.Err()
+	}
+	select {
+	case result := <-broker.results:
+		return result.grant, result.err
+	case <-ctx.Done():
+		return diskio.Grant{}, ctx.Err()
+	}
+}
+
+func (broker *ioLeaseBroker) Report(report diskio.Report)      { broker.reports <- report }
+func (*ioLeaseBroker) CancelTask(string, string)               {}
+func (broker *ioLeaseBroker) ReclaimWorker(workerID int)       { broker.reclaims <- workerID }
+func (*ioLeaseBroker) Snapshot(string, string) diskio.Snapshot { return diskio.Snapshot{} }
+
+type ioLeaseWorkerHarness struct {
+	worker *workerProc
+	child  net.Conn
+	ipc    *IPCConn
+	out    chan workerOutcome
+}
+
+func newIOLeaseWorkerHarness(t *testing.T, broker diskio.Controller, index int, job *JobMsg) *ioLeaseWorkerHarness {
+	t.Helper()
+	parent, child := net.Pipe()
+	poolCtx, poolCancel := context.WithCancel(context.Background())
+	runCtx, runCancel := context.WithCancel(poolCtx)
+	pool := &Pool{ctx: poolCtx, cancel: poolCancel, cfg: Config{IOBroker: broker}}
+	worker := &workerProc{
+		pool: pool, index: index, proc: &snapshotProcess{pid: 9100 + index},
+		conn: parent, ipc: NewIPCConn(parent), done: make(chan struct{}),
+		current: &activeJob{message: job, ctx: runCtx, cancel: runCancel},
+	}
+	harness := &ioLeaseWorkerHarness{worker: worker, child: child, ipc: NewIPCConn(child), out: make(chan workerOutcome, 1)}
+	go worker.readLoop(harness.out)
+	t.Cleanup(func() {
+		runCancel()
+		poolCancel()
+		_ = parent.Close()
+		_ = child.Close()
+	})
+	return harness
+}
+
+func receiveLeaseAcquire(t *testing.T, broker *ioLeaseBroker) diskio.Request {
+	t.Helper()
+	select {
+	case request := <-broker.acquires:
+		return request
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for broker Acquire")
+		return diskio.Request{}
+	}
+}
+
+func receiveLeaseEnvelope(t *testing.T, ipc *IPCConn, wantType string) *Envelope {
+	t.Helper()
+	envelope, err := ipc.Read()
+	if err != nil {
+		t.Fatalf("read %s: %v", wantType, err)
+	}
+	if envelope.Type != wantType {
+		t.Fatalf("message type = %q, want %q", envelope.Type, wantType)
+	}
+	return envelope
+}
+
+// Break caught: a Worker can select another task, instance, disk, or worker
+// identity and thereby escape the lease policy selected by the parent job.
+func TestPoolIOLeaseAcquireUsesTrustedCurrentJobIdentity(t *testing.T) {
+	broker := newIOLeaseBroker()
+	job := &JobMsg{JobID: 101, ScanTaskID: "trusted-task", ScanInstanceID: "trusted-instance", DiskKey: "trusted-disk"}
+	h := newIOLeaseWorkerHarness(t, broker, 4, job)
+	acquire := IOLeaseAcquireMsg{
+		JobID: job.JobID, RequestID: 201, TaskID: "forged-task", InstanceID: "forged-instance",
+		DiskKey: "forged-disk", Class: 2, WantBytes: 2 << 20, WantSeek: true,
+	}
+	if err := h.ipc.Write(MsgIOLeaseAcquire, acquire); err != nil {
+		t.Fatal(err)
+	}
+	request := receiveLeaseAcquire(t, broker)
+	if request.TaskID != job.ScanTaskID || request.InstanceID != job.ScanInstanceID ||
+		request.Disk != diskio.DiskKey(job.DiskKey) || request.WorkerID != 4 {
+		t.Fatalf("broker request used untrusted identity: %#v", request)
+	}
+	broker.results <- ioLeaseAcquireResult{grant: diskio.Grant{LeaseID: 301, Generation: 7, Bytes: 2 << 20, Seeks: 1}}
+	grant, err := DecodeBody[IOLeaseGrantMsg](receiveLeaseEnvelope(t, h.ipc, MsgIOLeaseGrant))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if grant.JobID != job.JobID || grant.RequestID != acquire.RequestID || grant.LeaseID != 301 || grant.Generation != 7 {
+		t.Fatalf("grant = %#v", grant)
+	}
+}
+
+// Break caught: an absent broker is interpreted as unlimited I/O permission.
+func TestPoolIOLeaseBrokerUnavailableReturnsCancel(t *testing.T) {
+	job := &JobMsg{JobID: 102, ScanTaskID: "task", ScanInstanceID: "instance", DiskKey: "disk"}
+	h := newIOLeaseWorkerHarness(t, nil, 0, job)
+	request := IOLeaseAcquireMsg{
+		JobID: job.JobID, RequestID: 202, TaskID: "task", InstanceID: "instance",
+		DiskKey: "disk", Class: 1, WantBytes: 1 << 20,
+	}
+	if err := h.ipc.Write(MsgIOLeaseAcquire, request); err != nil {
+		t.Fatal(err)
+	}
+	cancel, err := DecodeBody[IOLeaseCancelMsg](receiveLeaseEnvelope(t, h.ipc, MsgIOLeaseCancel))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cancel.JobID != job.JobID || cancel.RequestID != request.RequestID {
+		t.Fatalf("cancel = %#v", cancel)
+	}
+}
+
+// Break caught: broker task cancellation is converted into an unlimited grant
+// or leaves the Worker blocked without an explicit cancel response.
+func TestPoolIOLeaseTaskCancellationReturnsCancel(t *testing.T) {
+	broker := newIOLeaseBroker()
+	job := &JobMsg{JobID: 103, ScanTaskID: "task", ScanInstanceID: "instance", DiskKey: "disk"}
+	h := newIOLeaseWorkerHarness(t, broker, 1, job)
+	request := IOLeaseAcquireMsg{
+		JobID: job.JobID, RequestID: 203, TaskID: "task", InstanceID: "instance",
+		DiskKey: "disk", Class: 1, WantBytes: 1 << 20,
+	}
+	if err := h.ipc.Write(MsgIOLeaseAcquire, request); err != nil {
+		t.Fatal(err)
+	}
+	_ = receiveLeaseAcquire(t, broker)
+	broker.results <- ioLeaseAcquireResult{err: diskio.ErrTaskCancelled}
+	cancel, err := DecodeBody[IOLeaseCancelMsg](receiveLeaseEnvelope(t, h.ipc, MsgIOLeaseCancel))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cancel.JobID != job.JobID || cancel.RequestID != request.RequestID {
+		t.Fatalf("cancel = %#v", cancel)
+	}
+}
+
+// Break caught: a broker grant is written after the slot has moved to another
+// job, letting the new job consume a stale lease.
+func TestPoolIOLeaseGrantRechecksCurrentBeforeWrite(t *testing.T) {
+	broker := newIOLeaseBroker()
+	oldJob := &JobMsg{JobID: 104, ScanTaskID: "task", ScanInstanceID: "old", DiskKey: "disk"}
+	h := newIOLeaseWorkerHarness(t, broker, 2, oldJob)
+	request := IOLeaseAcquireMsg{
+		JobID: oldJob.JobID, RequestID: 204, TaskID: "task", InstanceID: "old",
+		DiskKey: "disk", Class: 1, WantBytes: 1 << 20,
+	}
+	if err := h.ipc.Write(MsgIOLeaseAcquire, request); err != nil {
+		t.Fatal(err)
+	}
+	_ = receiveLeaseAcquire(t, broker)
+	newCtx, newCancel := context.WithCancel(context.Background())
+	t.Cleanup(newCancel)
+	h.worker.mu.Lock()
+	h.worker.current = &activeJob{
+		message: &JobMsg{JobID: 105, ScanTaskID: "task", ScanInstanceID: "new", DiskKey: "disk"},
+		ctx:     newCtx, cancel: newCancel,
+	}
+	h.worker.mu.Unlock()
+	broker.results <- ioLeaseAcquireResult{grant: diskio.Grant{LeaseID: 304, Generation: 8, Bytes: 1 << 20}}
+	select {
+	case report := <-broker.reports:
+		if !report.Cancelled || report.Completed || report.LeaseID != 304 {
+			t.Fatalf("stale grant reclaim report = %#v", report)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("stale grant was not reclaimed")
+	}
+	_ = h.child.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+	if envelope, err := h.ipc.Read(); err == nil {
+		t.Fatalf("stale grant was written to Worker: %#v", envelope)
+	}
+}
+
+// Break caught: a late report from an old instance contributes statistics to
+// the new current job instead of merely releasing the old lease.
+func TestPoolIOLeaseStaleInstanceReportOnlyReclaims(t *testing.T) {
+	broker := newIOLeaseBroker()
+	oldJob := &JobMsg{JobID: 106, ScanTaskID: "task", ScanInstanceID: "old", DiskKey: "disk-old"}
+	h := newIOLeaseWorkerHarness(t, broker, 3, oldJob)
+	request := IOLeaseAcquireMsg{
+		JobID: oldJob.JobID, RequestID: 206, TaskID: "task", InstanceID: "old",
+		DiskKey: "disk-old", Class: 1, WantBytes: 2 << 20,
+	}
+	if err := h.ipc.Write(MsgIOLeaseAcquire, request); err != nil {
+		t.Fatal(err)
+	}
+	_ = receiveLeaseAcquire(t, broker)
+	broker.results <- ioLeaseAcquireResult{grant: diskio.Grant{LeaseID: 306, Generation: 9, Bytes: 2 << 20}}
+	_, _ = DecodeBody[IOLeaseGrantMsg](receiveLeaseEnvelope(t, h.ipc, MsgIOLeaseGrant))
+	newCtx, newCancel := context.WithCancel(context.Background())
+	t.Cleanup(newCancel)
+	h.worker.mu.Lock()
+	h.worker.current = &activeJob{
+		message: &JobMsg{JobID: 107, ScanTaskID: "task", ScanInstanceID: "new", DiskKey: "disk-new"},
+		ctx:     newCtx, cancel: newCancel,
+	}
+	h.worker.mu.Unlock()
+	report := IOLeaseReportMsg{
+		JobID: oldJob.JobID, RequestID: request.RequestID, LeaseID: 306, Generation: 9,
+		TaskID: "forged", InstanceID: "forged", DiskKey: "forged",
+		Bytes: 1 << 20, ReadNS: 10, WaitNS: 20, Completed: true,
+	}
+	if err := h.ipc.Write(MsgIOLeaseReport, report); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-broker.reports:
+		if got.TaskID != "task" || got.InstanceID != "new" || got.Disk != "disk-new" ||
+			got.WorkerID != 3 || !got.Cancelled || got.Completed {
+			t.Fatalf("stale report was not trusted-identity reclaim only: %#v", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for stale report reclaim")
+	}
+}
+
+// Break caught: a dead Worker leaves its active or queued lease attached to a
+// slot forever, reducing broker capacity after respawn.
+func TestPoolIOLeaseWorkerExitReclaimsWorker(t *testing.T) {
+	broker := newIOLeaseBroker()
+	pool := &Pool{cfg: Config{IOBroker: broker}, active: map[int]*workerProc{}}
+	left, right := net.Pipe()
+	t.Cleanup(func() { _ = right.Close() })
+	worker := &workerProc{pool: pool, index: 5, conn: left}
+	pool.active[5] = worker
+	pool.unregister(worker)
+	select {
+	case got := <-broker.reclaims:
+		if got != 5 {
+			t.Fatalf("reclaimed worker = %d, want 5", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker exit did not reclaim broker slot")
 	}
 }
 

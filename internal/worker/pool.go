@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"dedup/internal/diskio"
 	"dedup/internal/store"
 )
 
@@ -36,6 +37,7 @@ type Config struct {
 	ExitGrace        time.Duration
 	WorkerEnv        []string
 	IPCMaxFrameBytes int
+	IOBroker         diskio.Controller
 }
 
 type FeatureStore interface {

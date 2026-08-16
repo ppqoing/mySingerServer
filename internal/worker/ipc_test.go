@@ -156,6 +156,19 @@ func TestIPCConnHonorsConfiguredFrameMaximum(t *testing.T) {
 	}
 }
 
+// Break caught: a lease message can bypass the configured IPC frame ceiling
+// merely because it uses a newly added message type.
+func TestIOLeaseFrameHonorsConfiguredMaximum(t *testing.T) {
+	var stream bytes.Buffer
+	err := NewIPCConnWithMax(&stream, 128).Write(MsgIOLeaseAcquire, IOLeaseAcquireMsg{
+		JobID: 1, RequestID: 2, TaskID: strings.Repeat("t", 256),
+		InstanceID: "instance", DiskKey: "disk", Class: 1, WantBytes: 1 << 20,
+	})
+	if err == nil || !strings.Contains(err.Error(), "length") {
+		t.Fatalf("oversized lease frame error = %v, want length rejection", err)
+	}
+}
+
 func TestIPCReadDistinguishesCleanEOFTruncatedBodyAndIncompatibleBody(t *testing.T) {
 	t.Run("clean EOF", func(t *testing.T) {
 		_, err := NewIPCConn(bytes.NewBuffer(nil)).Read()
