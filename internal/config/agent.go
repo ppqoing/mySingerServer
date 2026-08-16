@@ -2,10 +2,12 @@ package config
 
 import (
 	"bytes"
+	"dedup/internal/diskio"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -30,6 +32,7 @@ type AgentConfig struct {
 	IPC           IPCConfig      `json:"ipc"`
 	Delete        DeleteConfig   `json:"delete"`
 	Tuning        TuningConfig   `json:"tuning"`
+	IO            IOConfig       `json:"io"`
 }
 
 // UnmarshalJSON accepts the obsolete top-level machine_id field so existing
@@ -124,6 +127,53 @@ type TuningConfig struct {
 	PprofAddr      string `json:"pprof_addr"`
 }
 
+type IOConfig struct {
+	LeaseMB            int     `json:"lease_mb"`
+	MinLeaseMB         int     `json:"min_lease_mb"`
+	MaxLeaseMB         int     `json:"max_lease_mb"`
+	HDDInitial         int     `json:"hdd_initial"`
+	SSDInitial         int     `json:"ssd_initial"`
+	MaxPerDisk         int     `json:"max_per_disk"`
+	HDDRandomMax       int     `json:"hdd_random_max"`
+	WindowMS           int     `json:"window_ms"`
+	IncreaseThreshold  float64 `json:"increase_threshold"`
+	DecreaseThreshold  float64 `json:"decrease_threshold"`
+	MaxQueuedPerWorker int     `json:"max_queued_per_worker"`
+}
+
+func (c IOConfig) Policy(workerCount int) (diskio.PolicyConfig, error) {
+	if workerCount < 1 ||
+		c.LeaseMB < 1 || c.LeaseMB > 16 ||
+		c.MinLeaseMB < 1 || c.MinLeaseMB > c.LeaseMB ||
+		c.MaxLeaseMB < c.LeaseMB || c.MaxLeaseMB > 16 ||
+		c.MaxPerDisk < 1 || c.MaxPerDisk > 24 ||
+		c.HDDInitial < 1 || c.HDDInitial > c.MaxPerDisk ||
+		c.SSDInitial < 1 || c.SSDInitial > c.MaxPerDisk ||
+		c.HDDRandomMax < 1 || c.HDDRandomMax > c.HDDInitial ||
+		c.WindowMS < 1 || c.WindowMS > 60_000 ||
+		c.MaxQueuedPerWorker < 1 || c.MaxQueuedPerWorker > 1024 ||
+		math.IsNaN(c.IncreaseThreshold) || math.IsInf(c.IncreaseThreshold, 0) ||
+		math.IsNaN(c.DecreaseThreshold) || math.IsInf(c.DecreaseThreshold, 0) ||
+		c.DecreaseThreshold < 0 || c.IncreaseThreshold > 1 ||
+		c.DecreaseThreshold >= c.IncreaseThreshold {
+		return diskio.PolicyConfig{}, fmt.Errorf("config: IO policy value out of bounds")
+	}
+	const mebibyte = int64(1024 * 1024)
+	return diskio.PolicyConfig{
+		LeaseBytes:         int64(c.LeaseMB) * mebibyte,
+		MinLeaseBytes:      int64(c.MinLeaseMB) * mebibyte,
+		MaxLeaseBytes:      int64(c.MaxLeaseMB) * mebibyte,
+		HDDInitial:         c.HDDInitial,
+		SSDInitial:         c.SSDInitial,
+		MaxPerDisk:         c.MaxPerDisk,
+		HDDRandomMax:       c.HDDRandomMax,
+		Window:             time.Duration(c.WindowMS) * time.Millisecond,
+		IncreaseThreshold:  c.IncreaseThreshold,
+		DecreaseThreshold:  c.DecreaseThreshold,
+		MaxQueuedPerWorker: c.MaxQueuedPerWorker,
+	}, nil
+}
+
 func (c *AgentConfig) SyncInterval() time.Duration {
 	return time.Duration(c.Sync.IntervalS) * time.Second
 }
@@ -173,6 +223,19 @@ func DefaultAgent() *AgentConfig {
 			StatsHistoryS:  300,
 			PendingBytesMB: 1024,
 			StatsLogMB:     32,
+		},
+		IO: IOConfig{
+			LeaseMB:            4,
+			MinLeaseMB:         1,
+			MaxLeaseMB:         16,
+			HDDInitial:         2,
+			SSDInitial:         4,
+			MaxPerDisk:         24,
+			HDDRandomMax:       1,
+			WindowMS:           1000,
+			IncreaseThreshold:  0.80,
+			DecreaseThreshold:  0.60,
+			MaxQueuedPerWorker: 4,
 		},
 	}
 }
@@ -296,6 +359,9 @@ func ValidateAgent(cfg *AgentConfig, executable string, cpuCount int) (*AgentCon
 	}
 	if cfg.Tuning.PprofAddr != "" && !loopbackAddress(cfg.Tuning.PprofAddr) {
 		return nil, fmt.Errorf("config: pprof_addr must be a loopback host:port")
+	}
+	if _, err := cfg.IO.Policy(cfg.Worker.Count); err != nil {
+		return nil, err
 	}
 	return cfg, nil
 }

@@ -15,6 +15,41 @@ import (
 	"time"
 )
 
+func TestIOPolicyDefaultsUseDocumentedDiskSchedulerValues(t *testing.T) {
+	policy, err := DefaultAgent().IO.Policy(6)
+	if err != nil {
+		t.Fatalf("Policy: %v", err)
+	}
+	if policy.LeaseBytes != 4*1024*1024 || policy.MinLeaseBytes != 1*1024*1024 || policy.MaxLeaseBytes != 16*1024*1024 {
+		t.Fatalf("lease policy = %#v, want 4 MiB within 1-16 MiB", policy)
+	}
+	if policy.HDDInitial != 2 || policy.SSDInitial != 4 || policy.MaxPerDisk != 24 {
+		t.Fatalf("disk concurrency defaults = %#v, want HDD=2 SSD=4 max=24", policy)
+	}
+}
+
+func TestIOPolicyRejectsInvalidSchedulingBounds(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*IOConfig)
+	}{
+		{"zero window", func(c *IOConfig) { c.WindowMS = 0 }},
+		{"reversed thresholds", func(c *IOConfig) { c.IncreaseThreshold = 0.5; c.DecreaseThreshold = 0.6 }},
+		{"non finite threshold", func(c *IOConfig) { c.IncreaseThreshold = math.NaN() }},
+		{"lease above upper bound", func(c *IOConfig) { c.MaxLeaseMB = 17 }},
+		{"nonpositive total limit", func(c *IOConfig) { c.MaxPerDisk = 0 }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := DefaultAgent().IO
+			tt.mutate(&cfg)
+			if _, err := cfg.Policy(6); err == nil {
+				t.Fatalf("Policy accepted invalid IO config %#v", cfg)
+			}
+		})
+	}
+}
+
 func validGUIConfigForValidation() *GUIConfig {
 	cfg := DefaultGUI()
 	cfg.PGDSN = "postgres://user:pass@127.0.0.1:5432/dedup"
