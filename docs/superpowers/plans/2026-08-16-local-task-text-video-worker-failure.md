@@ -253,6 +253,7 @@ git commit -m "fix: preserve precise media field errors"
 
 **Files:**
 - Modify: `internal/wproc/run_test.go`
+- Modify: `internal/wproc/videocore/bindings.go:7-9,213-241`
 - Verify: `videocore/src/video_analysis.cpp:1258-1305`
 - Verify: `videocore/src/native_algorithms/image_decode.cpp:568-600`
 - Fixture: `testdata/videocore/compat/videos/h264-standard.mp4`
@@ -327,7 +328,77 @@ Expected: 六个用例 PASS。视频测试必须经过 `av_find_best_stream -> a
 
 若任一用例返回文件级错误，记录 `result.Errors` 的准确 stage/message 和 VideoCore 返回码并停止本任务；只在把该首个违约函数和最小修复代码补进本计划后继续，不启用旧管线或修改期望值。
 
-- [ ] **Step 4: 运行原生编码兼容测试与 Go race**
+- [ ] **Step 4: 修复 Analyze 请求内嵌未固定 Go 指针**
+
+真实 H.264 RED 已确定：`cgoBridge.analyze` 把 Go `[]uint16` 数据地址写入
+`C.vc_analysis_request.temporary_jpeg_path`，再传入包含该 Go 指针的 C struct，触发：
+
+```text
+panic: runtime error: argument of cgo function has Go pointer to unpinned Go pointer
+internal/wproc/videocore/bindings.go:238
+```
+
+这不是 codec 失败。必须让请求结构只引用 C 拥有的 UTF-16 副本。先在 cgo preamble
+加入 `<stdlib.h>` 和有溢出检查的复制/释放函数：
+
+```c
+#include <stdlib.h>
+
+static uint16_t* go_vc_copy_utf16(const uint16_t* source, uint32_t units) {
+    if (source == NULL || units == 0u ||
+        (size_t)units > SIZE_MAX / sizeof(uint16_t)) {
+        return NULL;
+    }
+    size_t bytes = (size_t)units * sizeof(uint16_t);
+    uint16_t* copy = (uint16_t*)malloc(bytes);
+    if (copy == NULL) return NULL;
+    memcpy(copy, source, bytes);
+    return copy;
+}
+
+static void go_vc_free(void* value) {
+    free(value);
+}
+```
+
+在 `cgoBridge.analyze` 组装 `nativeRequest` 时复制到 C heap，并在 Analyze 返回后释放：
+
+```go
+var nativeTemporaryPath *C.uint16_t
+if len(temporaryPath) != 0 {
+    nativeTemporaryPath = C.go_vc_copy_utf16(
+        (*C.uint16_t)(unsafe.Pointer(unsafe.SliceData(temporaryPath))),
+        C.uint32_t(len(temporaryPath)),
+    )
+    runtime.KeepAlive(temporaryPath)
+    if nativeTemporaryPath == nil {
+        return AnalysisResult{}, &NativeError{
+            Code: StatusOOM, Message: "temporary JPEG path allocation failed",
+        }
+    }
+    defer C.go_vc_free(unsafe.Pointer(nativeTemporaryPath))
+    nativeRequest.temporary_jpeg_path = nativeTemporaryPath
+    nativeRequest.temporary_jpeg_path_units = C.uint32_t(len(temporaryPath))
+}
+```
+
+删除旧的 `nativeRequest` 内嵌 Go slice 指针赋值和调用后的对应 `KeepAlive`。不要使用
+`cgocheck=0`、环境开关或旧管线绕过；C 副本的生命周期必须精确覆盖单次
+`vc_media_analyze`。
+
+- [ ] **Step 5: 重跑六夹具确认具体根因 GREEN**
+
+Run:
+
+```powershell
+$env:VC_TESTDATA_ROOT = (Resolve-Path 'testdata\videocore\compat\videos').Path
+& 'C:\tmp\go1.26.5\go\bin\go.exe' test -p=1 -count=1 ./internal/wproc -run 'TestServeProductionSessionDecodes(VideoTrackCodec|ImageContentFormat)'
+```
+
+Expected: H.264 不再触发 cgo panic，H.264/HEVC/VP9 与 JPEG/PNG/WebP 六项全部 PASS；
+每个用例都收到 `MsgResult` 并以 `MsgShutdown` 令 `serve` 返回 `0`。
+
+- [ ] **Step 6: 运行原生编码兼容测试与 Go race**
 
 Run:
 
@@ -338,11 +409,11 @@ Run:
 
 Expected: PASS；H.264、HEVC、VP9 现有 native golden 继续一致，无数据竞争。
 
-- [ ] **Step 5: 提交 Task 3**
+- [ ] **Step 7: 提交 Task 3**
 
 ```powershell
-git add -- internal/wproc/run_test.go
-git commit -m "test: verify codec-specific worker media decoding"
+git add -- internal/wproc/run_test.go internal/wproc/videocore/bindings.go
+git commit -m "fix: keep VideoCore analyze paths in C memory"
 ```
 
 ---
@@ -546,4 +617,3 @@ Expected: 不再出现批量 `exit status 2`。若仍有媒体失败，必须显
 - [ ] **Step 7: 记录发布证据**
 
 在最终交付消息中列出：HEAD、Compute/Manager ZIP 绝对路径、两个 SHA-256、stage 依赖闭包结果、真实夹具扫描结果、I 盘扫描结果，以及任何明确的 PARTIAL/BLOCKED 边界。发布产物不提交 Git。
-
