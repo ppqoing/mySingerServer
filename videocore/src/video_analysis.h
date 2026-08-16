@@ -77,6 +77,7 @@ void VideoAnalysisTestInjectSeekError(uint32_t frame_index,
                                       int32_t ffmpeg_error,
                                       uint32_t repetitions) noexcept;
 void VideoAnalysisTestOverrideStreamStart(int64_t start) noexcept;
+void VideoAnalysisTestOverrideAverageFrameRateUnknown() noexcept;
 int64_t VideoAnalysisTestTargetTimestamp(int64_t relative,
                                          int64_t start) noexcept;
 int64_t VideoAnalysisTestNormalizedTimestamp(int64_t timestamp,

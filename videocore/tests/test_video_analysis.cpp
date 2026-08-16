@@ -389,6 +389,34 @@ void TestNormalSampleUsesDirectSeekBeforeDecoderPrerollRecovery() {
     vc_media_close(session);
 }
 
+void TestUnknownCadenceUsesLastDecodedFrameAtCleanEof() {
+    const std::wstring path = FixturePath(L"h264-short.mp4");
+    vc_media_open_options options{};
+    options.struct_size = sizeof(options);
+    options.abi_version = VC_ABI_VERSION;
+    options.expected_media_type = VC_MEDIA_TYPE_VIDEO;
+    vc_media_session* session = nullptr;
+    vc_error error = FreshError();
+    Check(vc_media_open_w(reinterpret_cast<const uint16_t*>(path.data()),
+                          static_cast<uint32_t>(path.size()), &options,
+                          nullptr, &session, &error) == VC_OK,
+          "unknown-cadence fixture opens");
+    if (session == nullptr) return;
+    std::array<uint8_t, VC_SHA512_SIZE> digest{};
+    Check(vc_media_hash(session, digest.data(), &error) == VC_OK,
+          "unknown-cadence fixture hashes");
+    vc::detail::VideoAnalysisTestReset();
+    vc::detail::VideoAnalysisTestOverrideAverageFrameRateUnknown();
+    vc_analysis_request request = FreshRequest(0x20u);
+    vc_analysis_result result = FreshResult();
+    error = FreshError();
+    Check(vc_media_analyze(session, &request, &result, &error) == VC_OK &&
+              result.completed_frame_mask == 0x20u &&
+              result.frames[5].status == VC_OK,
+          "unknown-cadence sparse video publishes its final decoded frame");
+    vc_media_close(session);
+}
+
 void TestDirectSeekOvershootUsesDecoderPrerollRecovery() {
     const std::wstring path = FixturePath(L"corrupt-packet.ts");
     vc_media_open_options options{};
@@ -1140,6 +1168,7 @@ int main() {
     for (const auto& fixture : fixtures) TestFixture(fixture);
     TestFrameMaskZeroAndSparseMask();
     TestNormalSampleUsesDirectSeekBeforeDecoderPrerollRecovery();
+    TestUnknownCadenceUsesLastDecodedFrameAtCleanEof();
     TestDirectSeekOvershootUsesDecoderPrerollRecovery();
     TestRotatedRgbNegativeStrideUsesPixelFormatConversion();
     TestUnrotatedFramesUseExplicitColorspaceAndRangeConversion();

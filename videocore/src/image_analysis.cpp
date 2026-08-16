@@ -1,7 +1,9 @@
 #include "image_analysis.h"
 
+#include <algorithm>
 #include <array>
 #include <cstring>
+#include <new>
 
 #include "error.h"
 #include "native_algorithms/image_decode.h"
@@ -58,6 +60,50 @@ videocore::native::ImageStatus DecodeImageForAnalysis(
         encoded.data(), encoded.size(), out);
 }
 
+videocore::native::ImageStatus PrepareFeatureImage(
+    const videocore::native::GrayImage& decoded,
+    videocore::native::GrayImage* expanded,
+    const videocore::native::GrayImage** feature_image) noexcept {
+    if (expanded == nullptr || feature_image == nullptr ||
+        decoded.width <= 0 || decoded.height <= 0 ||
+        decoded.stride < decoded.width) {
+        return videocore::native::ImageStatus::invalid_argument;
+    }
+    const uint64_t decoded_bytes = static_cast<uint64_t>(decoded.stride) *
+                                   static_cast<uint64_t>(decoded.height);
+    if (decoded_bytes > decoded.pixels.size()) {
+        return videocore::native::ImageStatus::invalid_argument;
+    }
+    if (decoded.width >= 8 && decoded.height >= 8) {
+        *feature_image = &decoded;
+        return videocore::native::ImageStatus::ok;
+    }
+    const int32_t width = (std::max)(decoded.width, 8);
+    const int32_t height = (std::max)(decoded.height, 8);
+    try {
+        expanded->width = width;
+        expanded->height = height;
+        expanded->stride = width;
+        expanded->pixels.resize(static_cast<size_t>(width) * height);
+        for (int32_t y = 0; y < height; ++y) {
+            const int32_t source_y = y * decoded.height / height;
+            for (int32_t x = 0; x < width; ++x) {
+                const int32_t source_x = x * decoded.width / width;
+                expanded->pixels[static_cast<size_t>(y) * width + x] =
+                    decoded.pixels[static_cast<size_t>(source_y) *
+                                       decoded.stride +
+                                   source_x];
+            }
+        }
+    } catch (const std::bad_alloc&) {
+        return videocore::native::ImageStatus::out_of_memory;
+    } catch (...) {
+        return videocore::native::ImageStatus::internal_error;
+    }
+    *feature_image = expanded;
+    return videocore::native::ImageStatus::ok;
+}
+
 }  // namespace
 
 int32_t PublishImageFailure(vc_analysis_result* out,
@@ -97,6 +143,19 @@ int32_t AnalyzeImageBytes(const std::vector<uint8_t>& encoded,
                                    "image decode failed");
     }
 
+    // The feature algorithms require an 8x8 input. Preserve the decoded
+    // dimensions in the result, but expand smaller valid images by nearest
+    // neighbour so every analysis sample still comes from decoded pixels.
+    videocore::native::GrayImage expanded;
+    const videocore::native::GrayImage* feature_image = nullptr;
+    image_status = PrepareFeatureImage(gray, &expanded, &feature_image);
+    if (image_status != videocore::native::ImageStatus::ok) {
+        return PublishImageFailure(out,
+                                   error,
+                                   MapImageStatus(image_status),
+                                   "image feature input preparation failed");
+    }
+
     std::array<uint8_t, VC_PDQ_SIZE> pdq{};
     int32_t pdq_quality = 0;
     std::array<uint64_t, VC_PHASH_COUNT> phash{};
@@ -109,15 +168,17 @@ int32_t AnalyzeImageBytes(const std::vector<uint8_t>& encoded,
     if (image_status == videocore::native::ImageStatus::ok &&
         (feature_mask & VC_FEATURE_PDQ) != 0u) {
         image_status = videocore::native::ComputePdq(
-            gray, &pdq, &pdq_quality);
+            *feature_image, &pdq, &pdq_quality);
     }
     if (image_status == videocore::native::ImageStatus::ok &&
         (feature_mask & VC_FEATURE_PHASH) != 0u) {
-        image_status = videocore::native::ComputePHashParts(gray, &phash);
+        image_status = videocore::native::ComputePHashParts(
+            *feature_image, &phash);
     }
     if (image_status == videocore::native::ImageStatus::ok &&
         (feature_mask & VC_FEATURE_SOBEL) != 0u) {
-        image_status = videocore::native::ComputeSobelHistogram(gray, &sobel);
+        image_status = videocore::native::ComputeSobelHistogram(
+            *feature_image, &sobel);
     }
     if (image_status != videocore::native::ImageStatus::ok) {
         return PublishImageFailure(out,

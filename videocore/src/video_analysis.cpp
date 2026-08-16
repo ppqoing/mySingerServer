@@ -87,6 +87,7 @@ uint32_t video_test_read_plan_cursor = 0u;
 int32_t video_test_read_plan_slot = -1;
 bool video_test_stream_start_override_enabled = false;
 int64_t video_test_stream_start_override = 0;
+bool video_test_average_frame_rate_unknown = false;
 VideoAnalysisBeforePublishHook video_test_before_publish_hook = nullptr;
 void* video_test_before_publish_context = nullptr;
 VideoAnalysisAfterContactWriteHook video_test_after_contact_write_hook = nullptr;
@@ -111,6 +112,7 @@ void VideoAnalysisTestReset() noexcept {
     video_test_read_plan_slot = -1;
     video_test_stream_start_override_enabled = false;
     video_test_stream_start_override = 0;
+    video_test_average_frame_rate_unknown = false;
     video_test_before_publish_hook = nullptr;
     video_test_before_publish_context = nullptr;
     video_test_after_contact_write_hook = nullptr;
@@ -181,6 +183,10 @@ void VideoAnalysisTestInjectSeekError(uint32_t frame_index,
 void VideoAnalysisTestOverrideStreamStart(int64_t start) noexcept {
     video_test_stream_start_override_enabled = true;
     video_test_stream_start_override = start;
+}
+
+void VideoAnalysisTestOverrideAverageFrameRateUnknown() noexcept {
+    video_test_average_frame_rate_unknown = true;
 }
 
 int64_t VideoAnalysisTestTargetTimestamp(int64_t relative,
@@ -691,8 +697,8 @@ struct PacketOwner {
 };
 
 struct FrameOwner {
-    AVFrame* value = av_frame_alloc();
-    FrameOwner() noexcept {
+    explicit FrameOwner(bool allocate = true) noexcept
+        : value(allocate ? av_frame_alloc() : nullptr) {
 #if defined(VC_RESILIENCE_TESTING)
         if (value != nullptr) {
             live_frames.fetch_add(1u, std::memory_order_acq_rel);
@@ -709,6 +715,7 @@ struct FrameOwner {
         }
 #endif
     }
+    AVFrame* value;
 };
 
 int32_t ReceiveUntilTarget(AVCodecContext* codec,
@@ -728,17 +735,27 @@ int32_t ReceiveUntilTarget(AVCodecContext* codec,
                            int32_t* height,
                            GrayImage* selected_gray,
                            uint32_t frame_index,
-                           int32_t* decode_ordinal) noexcept {
+                           int32_t* decode_ordinal,
+                           AVFrame* prior_frame,
+                           bool allow_prior_at_eof) noexcept {
     for (;;) {
         const int32_t before_decode = CheckOperationBoundary(
             opaque.cancel, opaque.deadline, OperationBoundary::decode);
         if (before_decode != VC_OK) return before_decode;
         const int status = avcodec_receive_frame(codec, frame);
-        if (status == AVERROR(EAGAIN) || status == AVERROR_EOF) {
+        bool using_prior_frame = false;
+        if (status == AVERROR_EOF && allow_prior_at_eof &&
+            prior_frame != nullptr && prior_frame->data[0] != nullptr) {
+            av_frame_unref(frame);
+            if (av_frame_ref(frame, prior_frame) < 0) return VC_ERR_OOM;
+            using_prior_frame = true;
+        } else if (status == AVERROR(EAGAIN) || status == AVERROR_EOF) {
             return VC_ERR_NO_FRAME;
         }
-        if (status < 0) return VC_ERR_DECODE;
-        if (decode_ordinal != nullptr) ++(*decode_ordinal);
+        if (status < 0 && !using_prior_frame) return VC_ERR_DECODE;
+        if (!using_prior_frame && decode_ordinal != nullptr) {
+            ++(*decode_ordinal);
+        }
         const int64_t timestamp = frame->best_effort_timestamp;
         if (timestamp != AV_NOPTS_VALUE &&
             first_decoded_timestamp != nullptr &&
@@ -749,9 +766,16 @@ int32_t ReceiveUntilTarget(AVCodecContext* codec,
             av_frame_unref(frame);
             continue;
         }
-        if (timestamp < target_timestamp) {
+        if (timestamp < target_timestamp && !using_prior_frame) {
             if (decoded_before_target != nullptr) {
                 *decoded_before_target = true;
+            }
+            if (allow_prior_at_eof && prior_frame != nullptr) {
+                av_frame_unref(prior_frame);
+                if (av_frame_ref(prior_frame, frame) < 0) {
+                    av_frame_unref(frame);
+                    return VC_ERR_OOM;
+                }
             }
             av_frame_unref(frame);
             continue;
@@ -854,14 +878,28 @@ int32_t DecodeSample(AVFormatContext* format,
                               ? 0
                               : stream->start_time;
     const int64_t target = SaturatingAdd(relative_timestamp, start);
-    const int64_t seek_target = seek_from_stream_start ? start : target;
     const int64_t recovery_preroll = av_rescale_q(
         1, AVRational{1, 1}, stream->time_base);
-    const int64_t recovery_min =
-        SaturatingSubtract(seek_target, recovery_preroll);
-    // This is decoder-preroll recovery, not a seek-to-start operation.
-    // The real stream start anchors the upper bound while the requested
-    // timestamp is the earlier decode point needed for B-frame identity.
+    const int64_t recovery_from_start_limit = av_rescale_q(
+        5, AVRational{1, 1}, stream->time_base);
+    const bool recovery_near_stream_start =
+        relative_timestamp <= recovery_from_start_limit;
+    const int64_t recovery_min = recovery_near_stream_start
+                                     ? SaturatingSubtract(start,
+                                                          recovery_preroll)
+                                     : start;
+    const int64_t recovery_target = recovery_near_stream_start
+                                        ? recovery_min
+                                        : (std::max)(
+                                              start,
+                                              SaturatingSubtract(
+                                                  target,
+                                                  recovery_preroll));
+    const int64_t recovery_max =
+        recovery_near_stream_start ? start : target;
+    // Direct seek can land on a keyframe just after the requested timestamp.
+    // Recovery asks the demuxer for the preceding decodable point near the
+    // target instead of decoding the entire stream from its beginning.
     int seek_status = 0;
     for (uint32_t seek_attempt = 0u;; ++seek_attempt) {
         const int32_t before_seek = CheckOperationBoundary(
@@ -877,8 +915,8 @@ int32_t DecodeSample(AVFormatContext* format,
             video_test_stats.recovery_seek_stream_index = stream_index;
             video_test_stats.recovery_seek_flags = AVSEEK_FLAG_BACKWARD;
             video_test_stats.recovery_seek_min = recovery_min;
-            video_test_stats.recovery_seek_target = recovery_min;
-            video_test_stats.recovery_seek_max = seek_target;
+            video_test_stats.recovery_seek_target = recovery_target;
+            video_test_stats.recovery_seek_max = recovery_max;
         }
         const bool generalized_seek_injection = video_test_seek_error != 0;
         if (video_test_hard_seek_failure_slot ==
@@ -903,12 +941,12 @@ int32_t DecodeSample(AVFormatContext* format,
                               ? avformat_seek_file(format,
                                                    stream_index,
                                                    recovery_min,
-                                                   recovery_min,
-                                                   seek_target,
+                                                   recovery_target,
+                                                   recovery_max,
                                                    AVSEEK_FLAG_BACKWARD)
                               : av_seek_frame(format,
                                               stream_index,
-                                              seek_target,
+                                              target,
                                               AVSEEK_FLAG_BACKWARD);
         }
         if (seek_status != AVERROR(EAGAIN)) break;
@@ -939,8 +977,14 @@ int32_t DecodeSample(AVFormatContext* format,
     }
     avcodec_flush_buffers(codec);
     PacketOwner packet;
+    const bool allow_prior_at_eof = stream->avg_frame_rate.num <= 0 ||
+                                    stream->avg_frame_rate.den <= 0;
     FrameOwner frame;
-    if (packet.value == nullptr || frame.value == nullptr) return VC_ERR_OOM;
+    FrameOwner prior_frame(allow_prior_at_eof);
+    if (packet.value == nullptr || frame.value == nullptr ||
+        (allow_prior_at_eof && prior_frame.value == nullptr)) {
+        return VC_ERR_OOM;
+    }
     int32_t decode_ordinal = -1;
     bool decoded_before_target = false;
     bool seek_overshot = false;
@@ -1045,7 +1089,9 @@ int32_t DecodeSample(AVFormatContext* format,
                                       height,
                                       selected_gray,
                                       frame_index,
-                                      &decode_ordinal);
+                                      &decode_ordinal,
+                                      prior_frame.value,
+                                      allow_prior_at_eof);
         }
         transient_read_retries = 0u;
         if (packet.value->stream_index != stream_index) {
@@ -1113,7 +1159,9 @@ int32_t DecodeSample(AVFormatContext* format,
                                                              height,
                                                              selected_gray,
                                                              frame_index,
-                                                             &decode_ordinal);
+                                                             &decode_ordinal,
+                                                             prior_frame.value,
+                                                             allow_prior_at_eof);
             if (drain_status == VC_OK) {
                 target_ready = true;
             } else if (drain_status != VC_ERR_NO_FRAME) {
@@ -1150,7 +1198,9 @@ int32_t DecodeSample(AVFormatContext* format,
                                                            height,
                                                            selected_gray,
                                                            frame_index,
-                                                           &decode_ordinal);
+                                                           &decode_ordinal,
+                                                           prior_frame.value,
+                                                           allow_prior_at_eof);
         if (receive_status == VC_OK) return VC_OK;
         if (receive_status != VC_ERR_NO_FRAME) return receive_status;
         if (seek_overshot) return VC_ERR_NO_FRAME;
@@ -1340,6 +1390,9 @@ int32_t AnalyzeVideo(AvioBridge* avio,
 #if defined(VC_VIDEO_ANALYSIS_TESTING)
     if (video_test_stream_start_override_enabled) {
         stream->start_time = video_test_stream_start_override;
+    }
+    if (video_test_average_frame_rate_unknown) {
+        stream->avg_frame_rate = AVRational{0, 0};
     }
 #endif
     CodecOwner codec;

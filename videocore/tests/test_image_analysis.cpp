@@ -188,6 +188,30 @@ bool WriteInvalidFixture(const std::wstring& path) {
     return ok;
 }
 
+bool WriteTinyWebPFixture(const std::wstring& path) {
+    static constexpr std::array<uint8_t, 46> bytes{
+        0x52, 0x49, 0x46, 0x46, 0x22, 0x00, 0x00, 0x00,
+        0x57, 0x45, 0x42, 0x50, 0x56, 0x50, 0x38, 0x20,
+        0x16, 0x00, 0x00, 0x00, 0x30, 0x01, 0x00, 0x9d,
+        0x01, 0x2a, 0x01, 0x00, 0x01, 0x00, 0x01, 0x40,
+        0x26, 0x25, 0xa4, 0x00, 0x03, 0x70, 0x00, 0xfe,
+        0xff, 0x3d, 0x58, 0x00, 0x00, 0x00,
+    };
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE |
+                                  FILE_SHARE_DELETE,
+                              nullptr, CREATE_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    DWORD written = 0u;
+    const bool ok = WriteFile(file, bytes.data(),
+                              static_cast<DWORD>(bytes.size()), &written,
+                              nullptr) != FALSE &&
+                    written == bytes.size();
+    CloseHandle(file);
+    return ok;
+}
+
 int32_t Open(const std::wstring& path, vc_media_session** session,
              vc_error* error) {
     const vc_media_open_options options = FreshImageOptions();
@@ -314,6 +338,32 @@ void TestImageAnalysisLeavesUnrequestedFeaturesZero() {
                   << (decode_after - decode_before) << " fulfilled=0x"
                   << std::hex << result.completed_frame_mask << std::dec
                   << '\n';
+        vc_media_close(session);
+    }
+    DeleteFileW(path.c_str());
+}
+
+void TestTinyWebPUsesDecodedPixelForFeatures() {
+    const std::wstring path = MakeTemporaryPath() + L".webp";
+    Check(WriteTinyWebPFixture(path), "tiny WebP fixture write");
+    vc_media_session* session = nullptr;
+    vc_error error = FreshError();
+    const int32_t open_status = Open(path, &session, &error);
+    Check(open_status == VC_OK, "tiny WebP session opens");
+    if (open_status == VC_OK) {
+        std::array<uint8_t, VC_SHA512_SIZE> digest{};
+        error = FreshError();
+        Check(vc_media_hash(session, digest.data(), &error) == VC_OK,
+              "tiny WebP hashes its exact bytes");
+        vc_analysis_request request = FreshRequest(VC_FEATURE_PDQ);
+        vc_analysis_result result = FreshResult();
+        error = FreshError();
+        Check(vc_media_analyze(session, &request, &result, &error) == VC_OK,
+              "tiny WebP computes PDQ from its decoded pixel");
+        Check(result.image_status == VC_OK &&
+                  result.contact_sheet_width == 1u &&
+                  result.contact_sheet_height == 1u,
+              "tiny WebP preserves its decoded dimensions");
         vc_media_close(session);
     }
     DeleteFileW(path.c_str());
@@ -661,6 +711,7 @@ void TestOutputSizeValidationAndRequestOutputAliasing() {
 int main() {
     TestImageAnalysisUsesOneCachedDecodeAndHonorsMasks();
     TestImageAnalysisLeavesUnrequestedFeaturesZero();
+    TestTinyWebPUsesDecodedPixelForFeatures();
     TestInvalidAndEmptyMasksDoNotDecodeAndPublishSafeFailure();
     TestInvalidRequestSemanticsDoNotDecodeAndPublishSafeFailure();
     TestNonImageRequestSemanticFailureLeavesResultUnchanged();
