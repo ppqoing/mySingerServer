@@ -757,8 +757,8 @@ type localAnalysisRunner interface {
 
 type localScanRunner interface {
 	Prepare(proto.ScanTask, agent.Sender) (proto.TaskAck, func())
-	Drain(string, proto.TaskDrainReason) (bool, *proto.TaskStats)
-	Abort(string) bool
+	DrainInstance(string, string, proto.TaskDrainReason) (bool, *proto.TaskStats)
+	AbortInstance(string, string) bool
 }
 
 type agentLocalTaskRunner struct {
@@ -805,7 +805,7 @@ func (r *agentLocalTaskRunner) Run(control localtask.RunControl, request localta
 			}
 		}
 		reportScan(latest, 0, runnerStatsJSON(latest))
-		ack, start := r.scans.Prepare(proto.ScanTask{TaskID: request.TaskID, Roots: append([]string(nil), request.Roots...), Phase: 1, Options: proto.ScanOptions{Rescan: request.Rescan, Extensions: append([]string(nil), request.Extensions...)}}, func(messageType uint8, value any) error {
+		ack, start := r.scans.Prepare(proto.ScanTask{TaskID: request.TaskID, InstanceID: snapshot.InstanceID, Roots: append([]string(nil), request.Roots...), Phase: 1, Options: proto.ScanOptions{Rescan: request.Rescan, Extensions: append([]string(nil), request.Extensions...)}}, func(messageType uint8, value any) error {
 			switch messageType {
 			case proto.MsgTaskProgress:
 				reportScan(*value.(*proto.TaskProgress), 0, runnerStatsJSON(value))
@@ -831,11 +831,11 @@ func (r *agentLocalTaskRunner) Run(control localtask.RunControl, request localta
 		for {
 			select {
 			case <-control.Context.Done():
-				r.scans.Abort(request.TaskID)
+				r.scans.AbortInstance(request.TaskID, snapshot.InstanceID)
 				return control.Context.Err()
 			case <-drain:
 				reason := localDrainReason(control)
-				r.scans.Drain(request.TaskID, reason)
+				r.scans.DrainInstance(request.TaskID, snapshot.InstanceID, reason)
 				drainIssued = true
 				drain = nil
 			case final = <-terminal:

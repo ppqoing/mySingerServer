@@ -331,11 +331,6 @@ func (d *DB) BeginLocalAnalysis(ctx context.Context, machineID, taskID string) (
 		VALUES (?1,?2,?3,?4,'building',?5)`, runID, machineID, generation, taskID, now); err != nil {
 		return LocalAnalysisRun{}, fmt.Errorf("store: insert local analysis: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `
-		UPDATE local_tasks SET status='running',started_at=COALESCE(started_at,?2),updated_at=?2
-		WHERE task_id=?1`, taskID, now); err != nil {
-		return LocalAnalysisRun{}, fmt.Errorf("store: start local analysis task: %w", err)
-	}
 	if err := tx.Commit(); err != nil {
 		return LocalAnalysisRun{}, err
 	}

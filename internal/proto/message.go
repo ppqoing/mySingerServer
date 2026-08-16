@@ -187,10 +187,11 @@ type Hello struct {
 }
 
 type ScanTask struct {
-	TaskID  string      `msgpack:"task_id"`
-	Roots   []string    `msgpack:"roots"`
-	Phase   uint8       `msgpack:"phase"`
-	Options ScanOptions `msgpack:"options"`
+	TaskID     string      `msgpack:"task_id"`
+	InstanceID string      `msgpack:"instance_id,omitempty"`
+	Roots      []string    `msgpack:"roots"`
+	Phase      uint8       `msgpack:"phase"`
+	Options    ScanOptions `msgpack:"options"`
 }
 
 type ScanOptions struct {

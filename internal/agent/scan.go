@@ -47,9 +47,18 @@ type ScanManager struct {
 	progressTicks   func() (<-chan time.Time, func())
 
 	mu    sync.Mutex
-	tasks map[string]*ScanState
+	tasks map[scanIdentity]*ScanState
 	disks map[int64]bool
 	runMu sync.Mutex
+}
+
+type scanIdentity struct {
+	taskID     string
+	instanceID string
+}
+
+func scanTaskIdentity(task proto.ScanTask) scanIdentity {
+	return scanIdentity{taskID: task.TaskID, instanceID: task.InstanceID}
 }
 
 type ScanState struct {
@@ -152,7 +161,7 @@ func NewScanManagerWithResolver(
 		log:      log,
 		errLog:   errLog,
 		resolver: resolver,
-		tasks:    make(map[string]*ScanState),
+		tasks:    make(map[scanIdentity]*ScanState),
 		disks:    make(map[int64]bool),
 		limiter:  newByteLimiter(int64(cfg.Tuning.PendingBytesMB) << 20),
 	}
@@ -218,7 +227,8 @@ func (m *ScanManager) Prepare(
 	}
 
 	m.mu.Lock()
-	if state, exists := m.tasks[task.TaskID]; exists {
+	identity := scanTaskIdentity(task)
+	if state, exists := m.tasks[identity]; exists {
 		if !sameScanEnvelope(state.Task, task) {
 			m.mu.Unlock()
 			return rejectedAck(task.TaskID, "task_id envelope mismatch"), nil
@@ -232,7 +242,7 @@ func (m *ScanManager) Prepare(
 		if status == "done" && drainReason != "" {
 			resumed := newScanState(task)
 			resumed.bindSender(sender)
-			m.tasks[task.TaskID] = resumed
+			m.tasks[identity] = resumed
 			m.mu.Unlock()
 			return proto.TaskAck{
 				TaskID: task.TaskID, Accepted: true,
@@ -254,7 +264,7 @@ func (m *ScanManager) Prepare(
 
 	state := newScanState(task)
 	state.bindSender(sender)
-	m.tasks[task.TaskID] = state
+	m.tasks[identity] = state
 	m.mu.Unlock()
 	return proto.TaskAck{
 		TaskID: task.TaskID, Accepted: true, Reason: "accepted", Total: -1,
@@ -283,7 +293,7 @@ func (m *ScanManager) startScan(state *ScanState) func() {
 }
 
 func sameScanEnvelope(left, right proto.ScanTask) bool {
-	if left.TaskID != right.TaskID || left.Phase != right.Phase ||
+	if left.TaskID != right.TaskID || left.InstanceID != right.InstanceID || left.Phase != right.Phase ||
 		left.Options.Rescan != right.Options.Rescan ||
 		len(left.Roots) != len(right.Roots) ||
 		len(left.Options.Extensions) != len(right.Options.Extensions) {
@@ -367,12 +377,19 @@ func scanDrainPriority(reason proto.TaskDrainReason) int {
 	}
 }
 
+// Drain preserves the task-ID-only legacy scan contract. Instance-aware local
+// tasks must use DrainInstance so an old cached instance cannot control a new
+// task that reused the same task ID.
 func (m *ScanManager) Drain(taskID string, reason proto.TaskDrainReason) (bool, *proto.TaskStats) {
+	return m.DrainInstance(taskID, "", reason)
+}
+
+func (m *ScanManager) DrainInstance(taskID, instanceID string, reason proto.TaskDrainReason) (bool, *proto.TaskStats) {
 	if taskID == "" || scanDrainPriority(reason) == 0 {
 		return false, nil
 	}
 	m.mu.Lock()
-	state := m.tasks[taskID]
+	state := m.tasks[scanIdentity{taskID: taskID, instanceID: instanceID}]
 	m.mu.Unlock()
 	if state == nil {
 		return false, nil
@@ -400,9 +417,14 @@ func (m *ScanManager) Drain(taskID string, reason proto.TaskDrainReason) (bool, 
 	return true, &stats
 }
 
+// Abort preserves the task-ID-only legacy scan contract. See Drain.
 func (m *ScanManager) Abort(taskID string) bool {
+	return m.AbortInstance(taskID, "")
+}
+
+func (m *ScanManager) AbortInstance(taskID, instanceID string) bool {
 	m.mu.Lock()
-	state := m.tasks[taskID]
+	state := m.tasks[scanIdentity{taskID: taskID, instanceID: instanceID}]
 	m.mu.Unlock()
 	if state == nil {
 		return false
@@ -441,7 +463,9 @@ func (state *ScanState) publishFeatures(items []proto.FeatureItem) {
 func (m *ScanManager) run(state *ScanState) {
 	started := time.Now()
 	state.ensureControl()
+	state.mu.Lock()
 	state.startedAt = started
+	state.mu.Unlock()
 	ctx := state.workCtx
 	if m.pool != nil {
 		state.poolStart = m.pool.Metrics()
@@ -1155,9 +1179,12 @@ func (m *ScanManager) progressLoop(state *ScanState, done <-chan struct{}) {
 }
 
 func (m *ScanManager) scanProgress(state *ScanState) *proto.TaskProgress {
+	state.mu.Lock()
+	startedAt := state.startedAt
+	state.mu.Unlock()
 	elapsedMS := int64(0)
-	if !state.startedAt.IsZero() {
-		elapsedMS = time.Since(state.startedAt).Milliseconds()
+	if !startedAt.IsZero() {
+		elapsedMS = time.Since(startedAt).Milliseconds()
 	}
 	done := state.done.Load()
 	if !state.enumerationComplete.Load() {
@@ -1246,8 +1273,9 @@ func (m *ScanManager) finish(
 	}
 	time.AfterFunc(10*time.Minute, func() {
 		m.mu.Lock()
-		if m.tasks[state.Task.TaskID] == state {
-			delete(m.tasks, state.Task.TaskID)
+		identity := scanTaskIdentity(state.Task)
+		if m.tasks[identity] == state {
+			delete(m.tasks, identity)
 		}
 		m.mu.Unlock()
 	})

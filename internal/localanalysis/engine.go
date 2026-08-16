@@ -79,6 +79,9 @@ func (e *Engine) RunWithProgress(ctx context.Context, taskID string, drain <-cha
 	if e == nil || e.machineID == "" || taskID == "" || e.stageOne == nil || e.store == nil || e.worker == nil {
 		return fmt.Errorf("localanalysis: engine dependencies are required")
 	}
+	if drainRequested(drain) {
+		return ErrDrainRequested
+	}
 	run, err := e.store.BeginLocalAnalysis(ctx, e.machineID, taskID)
 	if err != nil {
 		return fmt.Errorf("localanalysis: begin run: %w", err)

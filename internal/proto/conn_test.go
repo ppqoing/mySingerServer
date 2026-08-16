@@ -21,9 +21,10 @@ func TestConnRoundTripUsesNamedMapFields(t *testing.T) {
 	send := NewConn(left)
 	recv := NewConn(right)
 	want := ScanTask{
-		TaskID: "task-1",
-		Roots:  []string{`D:\媒体`, `E:\video`},
-		Phase:  1,
+		TaskID:     "task-1",
+		InstanceID: "instance-1",
+		Roots:      []string{`D:\媒体`, `E:\video`},
+		Phase:      1,
 		Options: ScanOptions{
 			Rescan:     true,
 			Extensions: []string{".jpg"},
@@ -48,8 +49,8 @@ func TestConnRoundTripUsesNamedMapFields(t *testing.T) {
 	if err := msgpack.Unmarshal(body, &raw); err != nil {
 		t.Fatalf("decode body as map: %v", err)
 	}
-	if raw["task_id"] != "task-1" {
-		t.Fatalf("task_id = %#v, want task-1", raw["task_id"])
+	if raw["task_id"] != "task-1" || raw["instance_id"] != "instance-1" {
+		t.Fatalf("scan identity = %#v/%#v", raw["task_id"], raw["instance_id"])
 	}
 
 	decoded, err := Decode(msgType, body)
@@ -57,7 +58,7 @@ func TestConnRoundTripUsesNamedMapFields(t *testing.T) {
 		t.Fatalf("Decode: %v", err)
 	}
 	got := decoded.(*ScanTask)
-	if got.TaskID != want.TaskID || got.Phase != want.Phase ||
+	if got.TaskID != want.TaskID || got.InstanceID != want.InstanceID || got.Phase != want.Phase ||
 		len(got.Roots) != 2 || got.Roots[0] != want.Roots[0] ||
 		!got.Options.Rescan || len(got.Options.Extensions) != 1 {
 		t.Fatalf("round trip mismatch: %#v", got)

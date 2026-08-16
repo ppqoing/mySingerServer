@@ -149,6 +149,98 @@ func TestCompletedScanAckCarriesFinalStats(t *testing.T) {
 	}
 }
 
+// Break caught: a completed cache entry keyed only by task ID rejected or
+// skipped a newly-created instance before the ten-minute cache expiry.
+func TestScanNewInstanceWithReusedTaskIDStartsBeforeOldCacheExpires(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		secondRoot string
+	}{
+		{name: "same envelope", secondRoot: `D:\media`},
+		{name: "different envelope", secondRoot: `E:\other`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			enumr := &fakeEnumerator{records: map[string][]fileenum.FileRecord{}}
+			manager, cleanup := newTestScanManager(t, enumr, nil)
+			defer cleanup()
+			done := make(chan proto.TaskDone, 2)
+			first := proto.ScanTask{
+				TaskID: "reused-task", InstanceID: "instance-old",
+				Roots: []string{`D:\media`}, Phase: 1,
+			}
+			if ack := manager.Handle(first, captureTaskDone(done)); !ack.Accepted {
+				t.Fatalf("first ack=%#v", ack)
+			}
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("first instance did not finish")
+			}
+
+			second := first
+			second.InstanceID = "instance-new"
+			second.Roots = []string{test.secondRoot}
+			ack, start := manager.Prepare(second, captureTaskDone(done))
+			if !ack.Accepted || ack.Reason != "accepted" || start == nil {
+				t.Fatalf("new instance ack=%#v start=%v", ack, start != nil)
+			}
+			start()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("new instance did not finish")
+			}
+			if enumr.callCount() != 2 {
+				t.Fatalf("enumerator calls=%d want=2", enumr.callCount())
+			}
+		})
+	}
+}
+
+// Break caught: run wrote the multiword startedAt value without the state lock
+// while an immediately accepted Drain read it under the lock.
+func TestScanStartAndImmediateDrainSynchronizeStartedAt(t *testing.T) {
+	releaseEnumeration := make(chan struct{})
+	enumr := releaseScanEnumerator{release: releaseEnumeration}
+	manager, cleanup := newTestScanManager(t, enumr, nil)
+	defer cleanup()
+	task := proto.ScanTask{
+		TaskID: "start-drain-race", InstanceID: "instance-race",
+		Roots: []string{`D:\media`}, Phase: 1,
+	}
+	state := newScanState(task)
+	done := make(chan proto.TaskDone, 1)
+	state.bindSender(captureTaskDone(done))
+	manager.mu.Lock()
+	manager.tasks[scanTaskIdentity(task)] = state
+	manager.mu.Unlock()
+
+	start := make(chan struct{})
+	runDone := make(chan struct{})
+	drainDone := make(chan struct{})
+	go func() {
+		<-start
+		manager.run(state)
+		close(runDone)
+	}()
+	go func() {
+		<-start
+		accepted, _ := manager.DrainInstance(task.TaskID, task.InstanceID, proto.TaskDrainPause)
+		if !accepted {
+			t.Error("immediate drain was not accepted")
+		}
+		close(drainDone)
+	}()
+	close(start)
+	<-drainDone
+	close(releaseEnumeration)
+	<-runDone
+	final := <-done
+	if final.Reason != proto.TaskDrainPause {
+		t.Fatalf("TaskDone reason=%q", final.Reason)
+	}
+}
+
 func TestScanDrainStopsDispatchAndWaitsForInFlightResult(t *testing.T) {
 	enumr := &fakeEnumerator{records: map[string][]fileenum.FileRecord{
 		`D:\media`: {
@@ -1502,6 +1594,17 @@ type barrierEnumerator struct {
 	second  fileenum.FileRecord
 	visited chan struct{}
 	release chan struct{}
+}
+
+type releaseScanEnumerator struct {
+	release <-chan struct{}
+}
+
+func (releaseScanEnumerator) Name() string     { return "release" }
+func (releaseScanEnumerator) Available() error { return nil }
+func (e releaseScanEnumerator) Enum(_ string, _ func(fileenum.FileRecord) error) error {
+	<-e.release
+	return nil
 }
 
 func (*barrierEnumerator) Name() string     { return "barrier" }
