@@ -11,7 +11,9 @@ param(
     [Parameter(Mandatory = $true)] [string]$VsDevCmd,
     [Parameter(Mandatory = $true)] [string]$CompilerCommandTlog,
     [Parameter(Mandatory = $true)] [string]$CanonicalImageObjectDir,
-    [Parameter(Mandatory = $true)] [string]$BuildRoot
+    [Parameter(Mandatory = $true)] [string]$BuildRoot,
+    [Parameter(Mandatory = $true)] [ValidateNotNullOrEmpty()] [string]$VcpkgInstalledDir,
+    [Parameter(Mandatory = $true)] [ValidateNotNullOrEmpty()] [string]$VcpkgTargetTriplet
 )
 
 $ErrorActionPreference = 'Stop'
@@ -284,8 +286,8 @@ function Validate-CompileRecord(
         throw "$role compile include set mismatch"
     }
     $expectedExternal = @(
-        (Join-Path $script:BuildRootFull 'vcpkg_installed\x64-windows-static\include'),
-        (Join-Path $script:BuildRootFull 'vcpkg_installed\x64-windows-static\include\webp'))
+        (Join-Path $script:VcpkgTripletRoot 'include'),
+        (Join-Path $script:VcpkgTripletRoot 'include\webp'))
     if (-not (Compare-PathMultiset @($externalIncludes) $expectedExternal)) {
         throw "$role compile external include set mismatch"
     }
@@ -363,7 +365,7 @@ function Get-ExpectedLinkLibraries([bool]$IsDll) {
         }
     }
     foreach ($name in @('turbojpeg.lib','libpng16.lib','zs.lib','libwebp.lib','libsharpyuv.lib')) {
-        $libraries.Add('path:' + [IO.Path]::GetFullPath((Join-Path $script:BuildRootFull "vcpkg_installed\x64-windows-static\lib\$name")).ToLowerInvariant())
+        $libraries.Add('path:' + [IO.Path]::GetFullPath((Join-Path $script:VcpkgTripletRoot "lib\$name")).ToLowerInvariant())
     }
     foreach ($name in @('shlwapi.lib','ole32.lib','windowscodecs.lib','kernel32.lib','user32.lib',
         'gdi32.lib','winspool.lib','shell32.lib','ole32.lib','oleaut32.lib','uuid.lib','comdlg32.lib','advapi32.lib')) {
@@ -638,6 +640,19 @@ $script:SourceRootFull = [IO.Path]::GetFullPath($SourceRoot)
 $legacySourceRootFull = [IO.Path]::GetFullPath($LegacySourceRoot)
 $script:BuildRootFull = [IO.Path]::GetFullPath($BuildRoot)
 $script:CanonicalImageObjectDirFull = [IO.Path]::GetFullPath($CanonicalImageObjectDir)
+if (-not [IO.Path]::IsPathRooted($VcpkgInstalledDir)) {
+    throw 'VcpkgInstalledDir must be an absolute path'
+}
+if ($VcpkgTargetTriplet -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$' -or
+    $VcpkgTargetTriplet -in @('.', '..')) {
+    throw 'VcpkgTargetTriplet must be a non-empty path segment'
+}
+$script:VcpkgInstalledDirFull = [IO.Path]::GetFullPath($VcpkgInstalledDir).TrimEnd('\')
+$script:VcpkgTripletRoot = [IO.Path]::GetFullPath(
+    (Join-Path $script:VcpkgInstalledDirFull $VcpkgTargetTriplet))
+if (-not (Test-Within $script:VcpkgTripletRoot $script:VcpkgInstalledDirFull)) {
+    throw 'VcpkgTargetTriplet escapes VcpkgInstalledDir'
+}
 $compilerFile = Require-MicrosoftTool $Compiler 'cl.exe' 'MSVC compiler'
 $script:CompilerDirectory = $compilerFile.Directory.FullName.TrimEnd('\')
 $linkerFile = Require-MicrosoftTool (Join-Path $script:CompilerDirectory 'link.exe') 'link.exe' 'MSVC linker'

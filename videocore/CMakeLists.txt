@@ -534,6 +534,19 @@ target_link_libraries(test_vc_resilience PRIVATE videocore_image_algorithms)
 target_link_libraries(test_vc_video_sar_reference PRIVATE videocore_image_algorithms)
 add_test(NAME videocore_image_compat COMMAND test_vc_image_compat)
 
+if(NOT IS_ABSOLUTE "${VCPKG_INSTALLED_DIR}")
+  message(FATAL_ERROR
+    "VCPKG_INSTALLED_DIR must be an absolute path for provenance tests")
+endif()
+get_filename_component(_vc_vcpkg_installed_dir
+  "${VCPKG_INSTALLED_DIR}" ABSOLUTE)
+if("${VCPKG_TARGET_TRIPLET}" STREQUAL "" OR
+   VCPKG_TARGET_TRIPLET MATCHES "[/\\\\]")
+  message(FATAL_ERROR
+    "VCPKG_TARGET_TRIPLET must be a non-empty path segment for provenance tests")
+endif()
+set(_vc_vcpkg_target_triplet "${VCPKG_TARGET_TRIPLET}")
+
 add_test(
   NAME videocore_image_object_provenance
   COMMAND "${_vc_powershell}" -NoProfile
@@ -556,6 +569,8 @@ add_test(
     -CanonicalImageObjectDir
       "${CMAKE_CURRENT_BINARY_DIR}/videocore_image_algorithms.dir/$<CONFIG>"
     -BuildRoot "${CMAKE_CURRENT_BINARY_DIR}"
+    -VcpkgInstalledDir "${_vc_vcpkg_installed_dir}"
+    -VcpkgTargetTriplet "${_vc_vcpkg_target_triplet}"
 )
 
 add_test(
@@ -574,6 +589,8 @@ add_test(
     -CompilerCommandTlog
       "${CMAKE_CURRENT_BINARY_DIR}/videocore_image_algorithms.dir/$<CONFIG>"
     -BuildRoot "${CMAKE_CURRENT_BINARY_DIR}"
+    -VcpkgInstalledDir "${_vc_vcpkg_installed_dir}"
+    -VcpkgTargetTriplet "${_vc_vcpkg_target_triplet}"
 )
 
 set(_vc_dumpbin "${CMAKE_DUMPBIN}")
