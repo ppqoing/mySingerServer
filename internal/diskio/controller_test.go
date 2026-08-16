@@ -322,6 +322,36 @@ func TestControllerGlobalConcurrencyCapSpansDisks(t *testing.T) {
 	}
 }
 
+func TestControllerGlobalDiskRoundRobinPreventsLargerKeyStarvation(t *testing.T) {
+	clock := newFakeClock()
+	c := newTestController(t, clock, 3, 1, 1,
+		Identity{Key: "a", KnownSSD: true, SSD: true},
+		Identity{Key: "b", KnownSSD: true, SSD: true},
+	)
+	activeReq := request(1, "a-active", "1", 0, "a", SourceSequential)
+	active := receiveAcquire(t, acquireAsync(c, activeReq))
+	if active.err != nil {
+		t.Fatal(active.err)
+	}
+	aWaiting := acquireAsync(c, request(2, "a-waiting", "1", 1, "a", SourceSequential))
+	waitForSnapshot(t, c, "a-waiting", "1", func(s Snapshot) bool { return s.IOWaitWorkers == 1 })
+	bReq := request(3, "b-waiting", "1", 2, "b", SourceSequential)
+	bWaiting := acquireAsync(c, bReq)
+	waitForSnapshot(t, c, "b-waiting", "1", func(s Snapshot) bool { return s.IOWaitWorkers == 1 })
+
+	c.Report(reportFor(activeReq, active.grant, 4*mib, time.Second, 0))
+	bGrant := receiveAcquire(t, bWaiting)
+	if bGrant.err != nil {
+		t.Fatalf("larger disk key starved behind continuously queued smaller key: %v", bGrant.err)
+	}
+	assertStillWaiting(t, aWaiting)
+
+	c.Report(reportFor(bReq, bGrant.grant, 4*mib, time.Second, 0))
+	if got := receiveAcquire(t, aWaiting); got.err != nil {
+		t.Fatalf("round robin did not return to smaller disk: %v", got.err)
+	}
+}
+
 func TestControllerHDDSequentialWindowCanProbePastRandomCap(t *testing.T) {
 	clock := newFakeClock()
 	disk := DiskKey("hdd")
@@ -746,5 +776,44 @@ func TestControllerWindowWaitSamplesUseFixedCapacityRing(t *testing.T) {
 	}
 	if samples[0] != 17*time.Millisecond || samples[len(samples)-1] != time.Duration(maxWindowWaitSamples+16)*time.Millisecond {
 		t.Fatalf("ring did not retain newest bounded samples: first=%v last=%v", samples[0], samples[len(samples)-1])
+	}
+}
+
+func TestControllerRepeatedWorkerReclaimDoesNotRetainEmptyQueues(t *testing.T) {
+	clock := newFakeClock()
+	c := &controller{clock: clock, options: normalizeOptions(ControllerOptions{WorkerCount: 2, Policy: testPolicy(1, 1)})}
+	state := newOwnerState()
+	blockerDisk := &diskState{
+		identity: Identity{Key: "blocker", KnownSSD: true, SSD: true},
+		limit:    1,
+		active:   make(map[uint64]*activeLease),
+		queues:   make(map[TaskIdentity]*taskQueue),
+		fairness: make(map[TaskIdentity]*fairnessHistory),
+	}
+	blockerReq := request(1, "blocker", "1", 0, "blocker", SourceSequential)
+	blocker := &activeLease{req: blockerReq, grant: Grant{LeaseID: 1, Generation: 1}}
+	blockerDisk.active[1] = blocker
+	state.disks["blocker"] = blockerDisk
+	state.workers[0] = blocker
+	state.leases[1] = blocker
+
+	targetDisk := &diskState{
+		identity: Identity{Key: "target", KnownSSD: true, SSD: true},
+		limit:    1,
+		active:   make(map[uint64]*activeLease),
+		queues:   make(map[TaskIdentity]*taskQueue),
+		fairness: make(map[TaskIdentity]*fairnessHistory),
+	}
+	state.disks["target"] = targetDisk
+	for i := 0; i < maxTaskHistoryEntries+17; i++ {
+		identity := TaskIdentity{TaskID: fmt.Sprintf("crashed-%04d", i), InstanceID: "1"}
+		targetDisk.queues[identity] = &taskQueue{items: []*pendingRequest{{
+			req:   request(uint64(i+2), identity.TaskID, identity.InstanceID, 1, "target", SourceSequential),
+			reply: make(chan acquireReply, 1),
+		}}}
+		c.handleReclaimWorker(&state, 1)
+	}
+	if len(targetDisk.queues) != 0 {
+		t.Fatalf("worker reclaim retained %d empty task queues", len(targetDisk.queues))
 	}
 }

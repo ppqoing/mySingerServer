@@ -214,12 +214,14 @@ type diskState struct {
 }
 
 type ownerState struct {
-	disks     map[DiskKey]*diskState
-	workers   map[int]*activeLease
-	leases    map[uint64]*activeLease
-	histories map[TaskIdentity]*taskHistory
-	nextLease uint64
-	nextTouch uint64
+	disks       map[DiskKey]*diskState
+	workers     map[int]*activeLease
+	leases      map[uint64]*activeLease
+	histories   map[TaskIdentity]*taskHistory
+	nextLease   uint64
+	nextTouch   uint64
+	lastDisk    DiskKey
+	hasLastDisk bool
 }
 
 func NewController(ctx context.Context, options ControllerOptions) Controller {
@@ -611,11 +613,16 @@ func (c *controller) hardLimit(hddRandom bool) int {
 }
 
 func (c *controller) dispatch(state *ownerState, disk *diskState) {
+	for c.dispatchOne(state, disk) {
+	}
+}
+
+func (c *controller) dispatchOne(state *ownerState, disk *diskState) bool {
 	for len(disk.active) < disk.limit && len(state.workers) < c.hardLimit(false) {
 		c.pruneCancelled(state, disk)
 		eligible := c.eligibleQueues(state, disk)
 		if len(eligible) == 0 {
-			return
+			return false
 		}
 		identity := chooseTask(c.clock.Now(), eligible)
 		queue := disk.queues[identity]
@@ -631,7 +638,7 @@ func (c *controller) dispatch(state *ownerState, disk *diskState) {
 		if c.isHDDRandom(disk, pending.req) && c.hddRandomActive(disk) >= c.hardLimit(true) {
 			queue.items = append([]*pendingRequest{pending}, queue.items...)
 			disk.queues[identity] = queue
-			return
+			return false
 		}
 
 		state.nextLease++
@@ -649,6 +656,8 @@ func (c *controller) dispatch(state *ownerState, disk *diskState) {
 		disk.active[grant.LeaseID] = lease
 		state.leases[grant.LeaseID] = lease
 		state.workers[pending.req.WorkerID] = lease
+		state.lastDisk = pending.req.Disk
+		state.hasLastDisk = true
 		queue.lastGranted = c.clock.Now()
 		queue.grants++
 		fairness := disk.fairness[identity]
@@ -660,7 +669,9 @@ func (c *controller) dispatch(state *ownerState, disk *diskState) {
 			delete(disk.queues, identity)
 		}
 		pending.reply <- acquireReply{grant: grant}
+		return true
 	}
+	return false
 }
 
 func (c *controller) dispatchAll(state *ownerState) {
@@ -669,8 +680,26 @@ func (c *controller) dispatchAll(state *ownerState) {
 		keys = append(keys, key)
 	}
 	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
-	for _, key := range keys {
-		c.dispatch(state, state.disks[key])
+	for len(keys) != 0 && len(state.workers) < c.hardLimit(false) {
+		start := 0
+		if state.hasLastDisk {
+			index := sort.Search(len(keys), func(i int) bool { return keys[i] >= state.lastDisk })
+			if index < len(keys) && keys[index] == state.lastDisk {
+				start = (index + 1) % len(keys)
+			} else if index < len(keys) {
+				start = index
+			}
+		}
+		progress := false
+		for offset := 0; offset < len(keys) && len(state.workers) < c.hardLimit(false); offset++ {
+			key := keys[(start+offset)%len(keys)]
+			if c.dispatchOne(state, state.disks[key]) {
+				progress = true
+			}
+		}
+		if !progress {
+			return
+		}
 	}
 }
 
@@ -842,7 +871,7 @@ func (c *controller) handleCancelTask(state *ownerState, identity TaskIdentity) 
 func (c *controller) handleReclaimWorker(state *ownerState, workerID int) {
 	affected := make(map[*diskState]struct{})
 	for _, disk := range state.disks {
-		for _, queue := range disk.queues {
+		for identity, queue := range disk.queues {
 			kept := queue.items[:0]
 			for _, pending := range queue.items {
 				if pending.req.WorkerID == workerID {
@@ -853,6 +882,9 @@ func (c *controller) handleReclaimWorker(state *ownerState, workerID int) {
 				kept = append(kept, pending)
 			}
 			queue.items = kept
+			if len(queue.items) == 0 {
+				delete(disk.queues, identity)
+			}
 		}
 	}
 	if lease := state.workers[workerID]; lease != nil {
