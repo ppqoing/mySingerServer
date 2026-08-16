@@ -158,6 +158,67 @@ describe('本地任务表单', () => {
     expect(screen.getByRole('status')).toHaveTextContent('创建失败')
     expect(list).toHaveBeenCalledTimes(1)
   })
+
+  it('创建期间列表已接受同 task_id 新实例时忽略迟到创建实例并立即刷新', async () => {
+    vi.useFakeTimers()
+    const created = deferred<LocalTaskResult>()
+    const convergence = deferred<LocalTaskPage>()
+    let requestedTaskID = ''
+    const create = vi.fn((request: { taskId: string }) => {
+      requestedTaskID = request.taskId
+      return created.promise
+    })
+    const list = vi.fn()
+      .mockResolvedValueOnce(page())
+      .mockImplementationOnce(async () => page(task({
+        taskId: requestedTaskID, instanceId: 'new-instance', revision: 5, progressComplete: 50,
+      })))
+      .mockImplementationOnce(() => convergence.promise)
+    render(<LocalTasksPage api={api({ list, create })} />)
+    await flushPromises()
+
+    fireEvent.change(screen.getByLabelText('手工目录'), { target: { value: 'D:\\Media' } })
+    fireEvent.click(screen.getByRole('button', { name: '添加目录' }))
+    fireEvent.click(screen.getByRole('button', { name: '创建任务' }))
+    await flushPromises()
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_000) })
+    expect(taskList().querySelector('[data-instance-id="new-instance"]')).not.toBeNull()
+
+    created.resolve({ ok: true, task: task({
+      taskId: requestedTaskID, instanceId: 'old-instance', revision: 1, progressComplete: 1,
+    }) })
+    await flushPromises()
+    expect(taskList().querySelector('[data-instance-id="new-instance"]')).not.toBeNull()
+    expect(taskList().querySelector('[data-instance-id="old-instance"]')).toBeNull()
+    expect(within(taskList()).getByText('50 / 100')).toBeVisible()
+    expect(list).toHaveBeenCalledTimes(3)
+  })
+
+  it.each(['success', 'failure'] as const)('API generation 变化后忽略旧 create %s', async (settlement) => {
+    const oldCreate = deferred<LocalTaskResult>()
+    const first = api({ create: vi.fn(() => oldCreate.promise), list: vi.fn(async () => page()) })
+    const current = task({ taskId: 'current-task', instanceId: 'current-instance', revision: 4 })
+    const second = api({ list: vi.fn(async () => page(current)) })
+    const { rerender } = render(<LocalTasksPage api={first} />)
+    await flushPromises()
+
+    fireEvent.change(screen.getByLabelText('手工目录'), { target: { value: 'D:\\Media' } })
+    fireEvent.click(screen.getByRole('button', { name: '添加目录' }))
+    fireEvent.click(screen.getByRole('button', { name: '创建任务' }))
+    await flushPromises()
+    rerender(<LocalTasksPage api={second} />)
+    await flushPromises()
+
+    if (settlement === 'success') {
+      oldCreate.resolve({ ok: true, task: task({ taskId: 'old-task', instanceId: 'old-instance' }) })
+    } else {
+      oldCreate.reject(new Error('old create failed with private detail'))
+    }
+    await flushPromises()
+    expect(taskList().querySelector('[data-instance-id="current-instance"]')).not.toBeNull()
+    expect(screen.queryByTitle('old-task')).not.toBeInTheDocument()
+    expect(screen.queryByText('创建任务失败')).not.toBeInTheDocument()
+  })
 })
 
 describe('自适应轮询与列表世代', () => {
@@ -267,6 +328,36 @@ describe('自适应轮询与列表世代', () => {
     expect(within(taskList()).getByText('30 / 100')).toBeVisible()
     expect(taskList().querySelector('[data-instance-id="new-instance"]')).not.toBeNull()
   })
+
+  it('成功列表保留同实例较高 revision，同时仍权威删除消失任务并替换新实例', async () => {
+    vi.useFakeTimers()
+    const refresh = deferred<LocalTaskPage>()
+    const revision1 = task({ taskId: 'kept', instanceId: 'same-instance', revision: 1, progressComplete: 10 })
+    const disappearing = task({ taskId: 'gone', instanceId: 'gone-instance', revision: 1, createdAt: revision1.createdAt - 1 })
+    const revision3 = task({ ...revision1, revision: 3, status: 'pausing', progressComplete: 30 })
+    const revision2 = task({ ...revision1, revision: 2, progressComplete: 20 })
+    const replacement = task({ taskId: 'replacement', instanceId: 'new-instance', revision: 1, createdAt: revision1.createdAt + 1 })
+    const oldReplacement = task({ ...replacement, instanceId: 'old-instance', createdAt: replacement.createdAt - 1 })
+    const pause = vi.fn(async () => ({ ok: true, task: revision3 }))
+    const list = vi.fn()
+      .mockResolvedValueOnce(page(revision1, disappearing, oldReplacement))
+      .mockImplementationOnce(() => refresh.promise)
+    render(<LocalTasksPage api={api({ list, pause })} />)
+    await flushPromises()
+
+    const keptItem = taskList().querySelector<HTMLElement>('[data-instance-id="same-instance"]')!
+    fireEvent.click(within(keptItem).getByRole('button', { name: '暂停' }))
+    await flushPromises()
+    expect(within(taskList()).getByText('30 / 100')).toBeVisible()
+
+    refresh.resolve(page(revision2, replacement))
+    await flushPromises()
+    expect(within(taskList()).getByText('30 / 100')).toBeVisible()
+    expect(screen.getByText('正在暂停', { exact: false })).toBeVisible()
+    expect(screen.queryByTitle('gone')).not.toBeInTheDocument()
+    expect(taskList().querySelector('[data-instance-id="new-instance"]')).not.toBeNull()
+    expect(taskList().querySelector('[data-instance-id="old-instance"]')).toBeNull()
+  })
 })
 
 describe('逐项生命周期操作', () => {
@@ -316,6 +407,31 @@ describe('逐项生命周期操作', () => {
     await waitFor(() => expect(within(taskList()).queryByTitle('same-task')).not.toBeInTheDocument())
     expect(remove).toHaveBeenCalledWith({ taskId: 'same-task', instanceId: 'current-instance', expectedRevision: 9 })
     expect(taskList().querySelector('[data-instance-id]')).toBeNull()
+  })
+
+  it('迟到 deleted:true 不删除已升 revision 的同实例并立即刷新', async () => {
+    vi.useFakeTimers()
+    const deletion = deferred<LocalTaskResult>()
+    const convergence = deferred<LocalTaskPage>()
+    const revision1 = task({ status: 'succeeded', revision: 1, progressComplete: 10, completedAt: 10 })
+    const revision2 = task({ ...revision1, revision: 2, progressComplete: 20 })
+    const list = vi.fn()
+      .mockResolvedValueOnce(page(revision1))
+      .mockResolvedValueOnce(page(revision2))
+      .mockImplementationOnce(() => convergence.promise)
+    render(<LocalTasksPage api={api({ list, delete: vi.fn(() => deletion.promise) })} />)
+    await flushPromises()
+
+    fireEvent.click(screen.getByRole('button', { name: '删除' }))
+    fireEvent.click(screen.getByRole('button', { name: '确认删除' }))
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_000) })
+    expect(within(taskList()).getByText('20 / 100')).toBeVisible()
+
+    deletion.resolve({ ok: true, deleted: true })
+    await flushPromises()
+    expect(within(taskList()).getByText('20 / 100')).toBeVisible()
+    expect(taskList().querySelector('[data-instance-id="instance-1"]')).not.toBeNull()
+    expect(list).toHaveBeenCalledTimes(3)
   })
 
   it.each(['stale_task', 'task_instance_mismatch'] as const)('%s 安全失败保留 Item、释放匹配锁并即时刷新', async (errorCode) => {

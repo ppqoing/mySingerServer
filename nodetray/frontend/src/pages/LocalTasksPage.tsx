@@ -76,9 +76,17 @@ const newestFirst = (tasks: LocalTask[]): LocalTask[] => {
   return result
 }
 
-const upsertCreatedTask = (tasks: LocalTask[], incoming: LocalTask): LocalTask[] => {
+const mergeAuthoritativeList = (current: LocalTask[], incoming: LocalTask[]): LocalTask[] => newestFirst(incoming).map((candidate) => {
+  const existing = current.find((task) => task.taskId === candidate.taskId)
+  return existing?.instanceId === candidate.instanceId && existing.revision > candidate.revision
+    ? existing
+    : candidate
+}).sort(compareNewest)
+
+const upsertCreatedTask = (tasks: LocalTask[], incoming: LocalTask, allowInstanceReplacement: boolean): LocalTask[] => {
   const current = tasks.find((task) => task.taskId === incoming.taskId)
   if (current?.instanceId === incoming.instanceId && current.revision > incoming.revision) return tasks
+  if (current?.instanceId !== undefined && current.instanceId !== incoming.instanceId && !allowInstanceReplacement) return tasks
   return newestFirst([incoming, ...tasks.filter((task) => task.taskId !== incoming.taskId)])
 }
 
@@ -108,6 +116,8 @@ export function LocalTasksPage({
   const apiRef = useRef(api)
   const apiGenerationRef = useRef<RequestGeneration>(0)
   const listSequenceRef = useRef(0)
+  const acceptedListSequenceRef = useRef(0)
+  const tasksRef = useRef<LocalTask[]>([])
   const timerRef = useRef<number | undefined>(undefined)
   const refreshRef = useRef<() => void>(() => undefined)
   const locksRef = useRef<Map<string, OperationLock>>(new Map())
@@ -142,7 +152,9 @@ export function LocalTasksPage({
           scheduleNext(IDLE_POLL_MS)
           return
         }
-        const incoming = newestFirst(result.tasks)
+        const incoming = mergeAuthoritativeList(tasksRef.current, result.tasks)
+        acceptedListSequenceRef.current = requestSequence
+        tasksRef.current = incoming
         setTasks(incoming)
         setStale(false)
         scheduleNext(incoming.some((task) => isActiveLocalTaskStatus(task.status)) ? ACTIVE_POLL_MS : IDLE_POLL_MS)
@@ -187,6 +199,7 @@ export function LocalTasksPage({
   const submit = async (): Promise<void> => {
     if (!roots.length) { setMessage('请选择扫描目录'); return }
     const apiGeneration = apiGenerationRef.current
+    const acceptedListAtStart = acceptedListSequenceRef.current
     const request = { taskId: `local-${Date.now()}`, roots: [...roots], mode, rescan: false, extensions: [] }
     setCreating(true)
     try {
@@ -196,7 +209,13 @@ export function LocalTasksPage({
         setMessage(result.errorSummary ?? '创建任务失败')
         return
       }
-      setTasks((current) => upsertCreatedTask(current, result.task!))
+      const nextTasks = upsertCreatedTask(
+        tasksRef.current,
+        result.task,
+        acceptedListSequenceRef.current <= acceptedListAtStart,
+      )
+      tasksRef.current = nextTasks
+      setTasks(nextTasks)
       setRoots([])
       setManualRoot('')
       setMode('scan_then_analysis')
@@ -225,13 +244,15 @@ export function LocalTasksPage({
   }
 
   const setItemError = (control: LocalTaskControl, result: Pick<LocalTaskResult, 'errorCode' | 'errorSummary'>): void => {
-    setTasks((current) => current.map((task) =>
+    const nextTasks = tasksRef.current.map((task) =>
       task.taskId === control.taskId
       && task.instanceId === control.instanceId
       && task.revision === control.expectedRevision
         ? { ...task, errorCode: result.errorCode, errorSummary: result.errorSummary ?? '任务操作失败' }
         : task,
-    ))
+    )
+    tasksRef.current = nextTasks
+    setTasks(nextTasks)
   }
 
   const runOperation = async (operation: LocalTaskOperation, control: LocalTaskControl): Promise<void> => {
@@ -253,11 +274,15 @@ export function LocalTasksPage({
         return
       }
       if (result.deleted) {
-        setTasks((current) => current.filter((task) =>
-          task.taskId !== control.taskId || task.instanceId !== control.instanceId,
-        ))
+        const nextTasks = tasksRef.current.filter((task) =>
+          task.taskId !== control.taskId
+          || task.instanceId !== control.instanceId
+          || task.revision !== control.expectedRevision,
+        )
+        tasksRef.current = nextTasks
+        setTasks(nextTasks)
       } else if (result.task) {
-        setTasks((current) => current.map((task) =>
+        const nextTasks = tasksRef.current.map((task) =>
           task.taskId === control.taskId
           && task.instanceId === control.instanceId
           && result.task!.taskId === control.taskId
@@ -265,7 +290,9 @@ export function LocalTasksPage({
           && result.task!.revision >= task.revision
             ? result.task!
             : task,
-        ))
+        )
+        tasksRef.current = nextTasks
+        setTasks(nextTasks)
       }
       releaseLock(lock)
       refreshRef.current()

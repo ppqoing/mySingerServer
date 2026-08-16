@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"dedup/internal/nodetray/agentclient"
 	"dedup/internal/nodetray/config"
 	"dedup/internal/nodetray/traymodel"
 	"dedup/internal/nodetray/windows/elevation"
@@ -191,6 +192,17 @@ func localError(err error) (string, string) {
 	return code, "本机 Agent 暂不可用，请稍后重试"
 }
 
+func localTaskControlError(err error) (string, string) {
+	var remote *agentclient.RemoteError
+	if errors.As(err, &remote) {
+		switch remote.Code {
+		case "stale_task", "task_instance_mismatch":
+			return remote.Code, "任务状态已更新，请刷新后重试"
+		}
+	}
+	return "local_operation_failed", "本机 Agent 暂不可用，请稍后重试"
+}
+
 func mapLocalTask(value proto.LocalTask) traymodel.LocalTask {
 	result := traymodel.LocalTask{TaskID: value.TaskID, InstanceID: value.InstanceID, Revision: value.Revision, Source: value.Source, Mode: value.Mode,
 		Stage: value.Stage, Status: value.Status, Phase: value.Phase, Roots: append([]string(nil), value.Roots...),
@@ -251,7 +263,8 @@ func (s *Service) controlLocalTask(ctx context.Context, operation string, reques
 	}
 	var response proto.LocalTaskControlResponse
 	if err := s.localCall(ctx, operation, control, &response); err != nil {
-		return traymodel.LocalTaskResult{ErrorCode: "local_operation_failed", ErrorSummary: "本机 Agent 暂不可用，请稍后重试"}
+		code, summary := localTaskControlError(err)
+		return traymodel.LocalTaskResult{ErrorCode: code, ErrorSummary: summary}
 	}
 	result := traymodel.LocalTaskResult{OK: true, Deleted: response.Deleted}
 	if response.Task != nil {

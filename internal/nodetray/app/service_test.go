@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"dedup/internal/nodetray/agentclient"
 	"dedup/internal/nodetray/config"
 	"dedup/internal/nodetray/traymodel"
 	"dedup/internal/nodetray/windows/elevation"
@@ -175,6 +176,37 @@ func TestLocalTaskControlsRejectInvalidVersionAndRedactGatewayError(t *testing.T
 	failed := service.PauseLocalTask(context.Background(), traymodel.LocalTaskControl{TaskID: "task-1", InstanceID: "instance-1", ExpectedRevision: 7})
 	if failed.OK || failed.ErrorCode != "local_operation_failed" || strings.Contains(fmt.Sprintf("%#v", failed), "private_socket_failure") {
 		t.Fatalf("failed=%#v", failed)
+	}
+}
+
+// Break caught: refreshable optimistic-concurrency codes are hidden from the
+// WebView, or arbitrary remote/private error text is exposed as a public code.
+func TestLocalTaskControlsExposeOnlyRefreshableRemoteCodes(t *testing.T) {
+	for _, code := range []string{"stale_task", "task_instance_mismatch"} {
+		t.Run(code, func(t *testing.T) {
+			service, _, _, _, _, _ := serviceFixture(t)
+			service.localAgent = &fakeLocalAgentGateway{responses: map[string]any{}, err: fmt.Errorf("wrapped transport: %w", &agentclient.RemoteError{Code: code})}
+
+			result := service.PauseLocalTask(context.Background(), traymodel.LocalTaskControl{
+				TaskID: "task-1", InstanceID: "instance-1", ExpectedRevision: 7,
+			})
+			if result.OK || result.ErrorCode != code || result.ErrorSummary != "任务状态已更新，请刷新后重试" {
+				t.Fatalf("result=%#v", result)
+			}
+			if strings.Contains(fmt.Sprintf("%#v", result), "wrapped transport") {
+				t.Fatalf("result leaked transport text: %#v", result)
+			}
+		})
+	}
+
+	service, _, _, _, _, _ := serviceFixture(t)
+	service.localAgent = &fakeLocalAgentGateway{responses: map[string]any{}, err: &agentclient.RemoteError{Code: "private_backend_failure"}}
+	result := service.DeleteLocalTask(context.Background(), traymodel.LocalTaskControl{
+		TaskID: "task-1", InstanceID: "instance-1", ExpectedRevision: 7,
+	})
+	if result.OK || result.ErrorCode != "local_operation_failed" || result.ErrorSummary != "本机 Agent 暂不可用，请稍后重试" ||
+		strings.Contains(fmt.Sprintf("%#v", result), "private_backend_failure") {
+		t.Fatalf("result=%#v", result)
 	}
 }
 
