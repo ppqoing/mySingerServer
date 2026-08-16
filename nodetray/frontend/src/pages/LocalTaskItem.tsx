@@ -16,8 +16,6 @@ const actionLabel = (operation: LocalTaskOperation, status: string): string => {
   return status === 'delete_failed' ? '重试删除' : '删除'
 }
 
-const visibleTaskId = (taskId: string): string => taskId.length > 12 ? `${taskId.slice(0, 12)}…` : taskId
-
 const modeLabel = (mode: string): string => {
   if (mode === 'scan_only') return '仅扫描'
   if (mode === 'scan_then_analysis') return '扫描并自动一、二、三筛'
@@ -57,7 +55,7 @@ export function LocalTaskItem({
   return <li className="local-task-item" data-instance-id={task.instanceId}>
     <div className="local-task-item__identity" data-local-task-field="identity">
       <span>{modeLabel(task.mode)} / {createdAtLabel(task.createdAt)}</span>
-      <span className="local-task-item__id" title={task.taskId}>{visibleTaskId(task.taskId)}</span>
+      <span className="local-task-item__id" title={task.taskId}>{task.taskId}</span>
     </div>
     <div className="local-task-item__status" data-local-task-field="status">{statusLabelForTask(task.status)} · {phaseLabelForTask(task.phase)}</div>
     <div className="local-task-item__progress" data-local-task-field="progress">

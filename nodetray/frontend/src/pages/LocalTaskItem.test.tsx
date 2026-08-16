@@ -28,10 +28,11 @@ const runningTask: LocalTask = {
 }
 
 describe('LocalTaskItem', () => {
-  it('按紧凑行顺序显示已知进度和完整任务 ID 提示', () => {
+  it('完整显示任务 ID、进度和指标', () => {
     render(<LocalTaskItem task={runningTask} locked={false} onAction={vi.fn()} />)
 
     const item = screen.getByRole('listitem')
+    expect(screen.getByTitle(runningTask.taskId)).toHaveTextContent(runningTask.taskId)
     expect(item).toHaveTextContent('扫描并自动一、二、三筛')
     expect(item).toHaveTextContent('运行中 · 二筛')
     expect(item).toHaveTextContent('进度')
@@ -41,9 +42,6 @@ describe('LocalTaskItem', () => {
     expect([...item.querySelectorAll('[data-local-task-field]')].map((node) => node.getAttribute('data-local-task-field')))
       .toEqual(['identity', 'status', 'progress', 'count', 'metrics', 'actions'])
 
-    const visibleId = screen.getByTitle(runningTask.taskId)
-    expect(visibleId).toHaveClass('local-task-item__id')
-    expect(visibleId.textContent).not.toBe(runningTask.taskId)
     expect(screen.getByRole('progressbar')).toHaveAttribute('value', '40')
     expect(screen.getByRole('progressbar')).toHaveAttribute('max', '100')
   })
