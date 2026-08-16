@@ -1612,6 +1612,40 @@ func TestPoolDeduperLookupFailureFallsBackToWorkerComputation(t *testing.T) {
 	}
 }
 
+func TestPoolVideoLookupFailurePreservesRequestedMasks(t *testing.T) {
+	observed := make(chan SHAReplyMsg, 1)
+	fields := uint32(MaskVideoDuration | MaskVideoContactSheet)
+	query := SHAQueryMsg{
+		JobID: 204, SHA512: make([]byte, 64), Kind: MediaVideo,
+		RequestedFields: fields,
+	}
+	h := newLifecycleHarness(t, workerScript{
+		ready: true, queryOnJob: true, queryOverride: &query,
+		replyObserved: observed,
+	})
+	h.store.lookupErr = errors.New("sqlite temporarily unavailable")
+	p := h.newPool(Config{WorkerCount: 1})
+	p.Start()
+	t.Cleanup(p.Close)
+	h.ready(t)
+	if err := p.Submit(&JobMsg{
+		JobID: query.JobID, ScanTaskID: "scan-204",
+		Path: `D:\media\lookup-fallback.mp4`, Kind: MediaVideo,
+		Phase: Phase1, FieldsMask: MaskSHA512 | fields,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reply := <-observed
+	if reply.RequestedFields != fields || reply.MissingFields != fields ||
+		reply.FieldsPresent != 0 || reply.RequestedFrames != 0 ||
+		reply.MissingFrames != 0 {
+		t.Fatalf("fallback reply = %#v", reply)
+	}
+	if err := reply.ValidateMasks(); err != nil {
+		t.Fatalf("fallback reply masks: %v", err)
+	}
+}
+
 func TestPoolStoreFailureDoesNotResolveDeduperOrPublishSuccess(t *testing.T) {
 	sha := make([]byte, 64)
 	sha[0] = 0x44
@@ -2414,6 +2448,7 @@ type workerScript struct {
 	readyDLLVersion   string
 	readyOverride     *ReadyMsg
 	queryOverride     *SHAQueryMsg
+	replyObserved     chan<- SHAReplyMsg
 }
 
 func validReadyForTest() ReadyMsg {
@@ -2598,6 +2633,9 @@ func (h *lifecycleHarness) serveScript(conn net.Conn, proc *fakeProcess, index i
 					return
 				}
 				reply, err := DecodeBody[SHAReplyMsg](replyEnv)
+				if err == nil && script.replyObserved != nil {
+					script.replyObserved <- reply
+				}
 				if err != nil || (script.requireQueryFound && !reply.Found) {
 					proc.finish(2)
 					return

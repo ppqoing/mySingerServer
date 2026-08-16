@@ -569,7 +569,7 @@ func (worker *workerProc) readLoop(out chan<- workerOutcome) {
 			if askErr != nil {
 				worker.pool.deps.logger.Error("feature lookup failed; worker will compute",
 					"job_id", query.JobID, "err", askErr)
-				reply = SHAReplyMsg{JobID: query.JobID, Found: false}
+				reply = missingReply(query)
 			}
 			if reply.Found && reply.ReusedFlight {
 				worker.pool.metrics.singleFlightHits.Add(1)
