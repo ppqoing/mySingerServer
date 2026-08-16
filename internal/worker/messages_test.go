@@ -214,6 +214,13 @@ func TestIOLeaseMessageValidationRejectsUnsafeBoundaries(t *testing.T) {
 	if err := report.ValidateFor(validGrant); err == nil {
 		t.Fatal("report with mismatched generation unexpectedly validated")
 	}
+
+	report.Generation = validGrant.Generation
+	report.Completed = false
+	report.Cancelled = false
+	if err := report.ValidateFor(validGrant); err == nil {
+		t.Fatal("report without a terminal state unexpectedly validated")
+	}
 }
 
 func TestDefaultStageOneWorkerMasksUseExplicitVideoFields(t *testing.T) {

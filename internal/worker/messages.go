@@ -263,8 +263,8 @@ func (msg IOLeaseReportMsg) ValidateFor(grant IOLeaseGrantMsg) error {
 	if msg.Bytes < 0 || msg.Bytes > grant.Bytes || msg.Seeks > grant.Seeks || msg.ReadNS < 0 || msg.WaitNS < 0 {
 		return fmt.Errorf("worker: I/O lease report exceeds grant")
 	}
-	if msg.Completed && msg.Cancelled {
-		return fmt.Errorf("worker: I/O lease report cannot be completed and cancelled")
+	if msg.Completed == msg.Cancelled {
+		return fmt.Errorf("worker: I/O lease report must be completed or cancelled")
 	}
 	return nil
 }

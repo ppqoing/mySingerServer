@@ -533,6 +533,104 @@ func TestPoolIOLeaseWorkerExitReclaimsWorker(t *testing.T) {
 	}
 }
 
+type closeBlockingIOBroker struct {
+	started   chan struct{}
+	cancelled chan struct{}
+	release   chan struct{}
+	finished  chan struct{}
+	reclaimed chan int
+	releaseMu sync.Once
+}
+
+func newCloseBlockingIOBroker() *closeBlockingIOBroker {
+	return &closeBlockingIOBroker{
+		started: make(chan struct{}), cancelled: make(chan struct{}),
+		release: make(chan struct{}), finished: make(chan struct{}),
+		reclaimed: make(chan int, 1),
+	}
+}
+
+func (broker *closeBlockingIOBroker) Acquire(ctx context.Context, _ diskio.Request) (diskio.Grant, error) {
+	close(broker.started)
+	<-ctx.Done()
+	close(broker.cancelled)
+	<-broker.release
+	close(broker.finished)
+	return diskio.Grant{}, ctx.Err()
+}
+
+func (*closeBlockingIOBroker) Report(diskio.Report)                    {}
+func (*closeBlockingIOBroker) CancelTask(string, string)               {}
+func (broker *closeBlockingIOBroker) ReclaimWorker(workerID int)       { broker.reclaimed <- workerID }
+func (*closeBlockingIOBroker) Snapshot(string, string) diskio.Snapshot { return diskio.Snapshot{} }
+func (broker *closeBlockingIOBroker) releaseAcquire() {
+	broker.releaseMu.Do(func() { close(broker.release) })
+}
+
+// Break caught: Pool.Close returns while a context-cancelled broker Acquire
+// goroutine is still unwinding, leaking Worker-owned shutdown work.
+func TestPoolIOLeaseCloseWaitsForBlockedAcquire(t *testing.T) {
+	broker := newCloseBlockingIOBroker()
+	t.Cleanup(broker.releaseAcquire)
+	h := newLifecycleHarness(t, workerScript{ready: true, hangJob: true, acquireOnJob: true})
+	p := h.newPool(Config{WorkerCount: 1, IOBroker: broker})
+	p.Start()
+	h.ready(t)
+	job := JobMsg{
+		JobID: 108, ScanTaskID: "task-close", ScanInstanceID: "instance-close",
+		DiskKey: "disk-close", Path: `D:\media\close.jpg`, Kind: MediaImage, Phase: Phase1,
+	}
+	if err := p.Submit(&job); err != nil {
+		t.Fatal(err)
+	}
+	h.dispatched(t)
+	select {
+	case <-broker.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("broker Acquire did not start")
+	}
+
+	closeDone := make(chan struct{})
+	go func() {
+		p.Close()
+		close(closeDone)
+	}()
+	select {
+	case <-broker.cancelled:
+	case <-time.After(2 * time.Second):
+		broker.releaseAcquire()
+		t.Fatal("Pool.Close did not cancel broker Acquire")
+	}
+	select {
+	case workerID := <-broker.reclaimed:
+		if workerID != 0 {
+			broker.releaseAcquire()
+			t.Fatalf("reclaimed worker = %d, want 0", workerID)
+		}
+	case <-time.After(2 * time.Second):
+		broker.releaseAcquire()
+		t.Fatal("Pool.Close did not reclaim broker worker")
+	}
+	select {
+	case <-closeDone:
+		broker.releaseAcquire()
+		t.Fatal("Pool.Close returned before broker Acquire goroutine finished")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	broker.releaseAcquire()
+	select {
+	case <-broker.finished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("broker Acquire did not finish after release")
+	}
+	select {
+	case <-closeDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Pool.Close did not return after broker Acquire finished")
+	}
+}
+
 func TestPoolCrashDeliveryReservesBoundedChannelForActiveTerminals(t *testing.T) {
 	p := &Pool{
 		crashes: make(chan CrashRecord, 1),
@@ -2713,6 +2811,7 @@ type workerScript struct {
 	truncatedOnJob    bool
 	failParentWrite   bool
 	queryOnJob        bool
+	acquireOnJob      bool
 	requireQueryFound bool
 	result            *JobResultMsg
 	exitAfterResult   bool
@@ -2882,6 +2981,17 @@ func (h *lifecycleHarness) serveScript(conn net.Conn, proc *fakeProcess, index i
 				return
 			}
 			h.dispatch <- job
+			if script.acquireOnJob {
+				request := IOLeaseAcquireMsg{
+					JobID: job.JobID, RequestID: 1,
+					TaskID: job.ScanTaskID, InstanceID: job.ScanInstanceID, DiskKey: job.DiskKey,
+					Class: 1, WantBytes: 1 << 20,
+				}
+				if err := ipc.Write(MsgIOLeaseAcquire, request); err != nil {
+					proc.finish(2)
+					return
+				}
+			}
 			if script.gateFirstResult {
 				<-h.releaseResult
 				script.gateFirstResult = false

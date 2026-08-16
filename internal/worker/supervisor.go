@@ -222,6 +222,7 @@ type workerProc struct {
 	ready          bool
 	readyMsg       ReadyMsg
 	ioLeases       map[uint64]activeIOLease
+	ioAcquireWG    sync.WaitGroup
 	failureClaimed atomic.Bool
 	killOnce       sync.Once
 	done           chan struct{}
@@ -440,10 +441,11 @@ func (p *Pool) unregister(worker *workerProc) {
 	}
 	worker.stopWatchdog()
 	worker.cancelCurrentJob()
+	_ = worker.conn.Close()
 	if p.cfg.IOBroker != nil {
 		p.cfg.IOBroker.ReclaimWorker(worker.index)
 	}
-	_ = worker.conn.Close()
+	worker.ioAcquireWG.Wait()
 }
 
 func (p *Pool) offerFree(worker *workerProc) bool {
@@ -611,7 +613,11 @@ func (worker *workerProc) readLoop(out chan<- workerOutcome) {
 				worker.failProtocol(out, validationErr)
 				return
 			}
-			go worker.acquireIOLease(run, identity, requestContext, request, brokerRequest)
+			worker.ioAcquireWG.Add(1)
+			go func() {
+				defer worker.ioAcquireWG.Done()
+				worker.acquireIOLease(run, identity, requestContext, request, brokerRequest)
+			}()
 		case MsgIOLeaseReport:
 			report, decodeErr := DecodeBody[IOLeaseReportMsg](env)
 			if decodeErr != nil {
