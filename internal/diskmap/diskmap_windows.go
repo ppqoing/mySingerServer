@@ -215,6 +215,10 @@ func uniqueDiskNumbers(numbers []uint32) []uint32 {
 }
 
 func networkIdentity(path string) (diskio.Identity, bool) {
+	const extendedUNCPrefix = `\\?\UNC\`
+	if len(path) >= len(extendedUNCPrefix) && strings.EqualFold(path[:len(extendedUNCPrefix)], extendedUNCPrefix) {
+		path = `\\` + path[len(extendedUNCPrefix):]
+	}
 	if !strings.HasPrefix(path, `\\`) || strings.HasPrefix(path, `\\?\`) {
 		return diskio.Identity{}, false
 	}

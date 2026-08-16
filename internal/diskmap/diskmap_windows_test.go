@@ -131,6 +131,17 @@ func TestDiskIdentityUsesNetworkKeyForUNC(t *testing.T) {
 	}
 }
 
+func TestDiskIdentityNormalizesExtendedUNCToClassicNetworkKey(t *testing.T) {
+	classic, classicOK := networkIdentity(`\\SERVER\Share\folder`)
+	extended, extendedOK := networkIdentity(`\\?\UNC\SERVER\Share\folder`)
+	if !classicOK || !extendedOK {
+		t.Fatalf("network recognition = classic:%v extended:%v", classicOK, extendedOK)
+	}
+	if classic.Key != "network:server/share" || extended.Key != classic.Key {
+		t.Fatalf("network keys = classic:%q extended:%q, want network:server/share", classic.Key, extended.Key)
+	}
+}
+
 func TestInterpretSeekPenaltyFailureUsesUnknownHDDFallback(t *testing.T) {
 	isSSD, known := interpretSeekPenalty([12]byte{}, errors.New("unsupported"))
 	if isSSD || known {
