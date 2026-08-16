@@ -349,6 +349,75 @@ func TestScanDrainStopsDispatchAndWaitsForInFlightResult(t *testing.T) {
 	}
 }
 
+func TestScanHDDSerializesSmallImagesBeforeLargeImagesAndVideos(t *testing.T) {
+	enumr := &fakeEnumerator{records: map[string][]fileenum.FileRecord{
+		`D:\media`: {
+			{Path: `D:\media\a-video.mp4`, Size: 1 << 30, MTime: 20},
+			{Path: `D:\media\b-large.jpg`, Size: 200 << 20, MTime: 21},
+			{Path: `D:\media\c-small.jpg`, Size: 96_728, MTime: 22},
+		},
+	}}
+	manager, cleanup := newTestScanManager(t, enumr, nil)
+	defer cleanup()
+	manager.cfg.Scan.HDDStreams = 2
+	pool := newFakeScanPool()
+	submitted := make(chan worker.JobMsg, 3)
+	pool.onSubmit = func(job worker.JobMsg) { submitted <- job }
+	manager.pool = pool
+	manager.router = NewPoolRouter(pool, nil)
+	done := make(chan proto.TaskDone, 1)
+	task := proto.ScanTask{TaskID: "task-hdd-media-order", Roots: []string{`D:\media`}, Phase: 1}
+	if ack := manager.Handle(task, captureTaskDone(done)); !ack.Accepted {
+		t.Fatalf("ack=%#v", ack)
+	}
+
+	complete := func(job worker.JobMsg) {
+		result := &worker.JobResultMsg{
+			JobID: job.JobID, ScanTaskID: job.ScanTaskID, Path: job.Path,
+			Kind: job.Kind, Phase: job.Phase, Source: job.Source,
+			FieldsDone: job.FieldsMask, SHA512: bytes.Repeat([]byte{0x6a}, 64),
+		}
+		if job.Kind == worker.MediaImage {
+			result.PDQ = bytes.Repeat([]byte{0x3c}, 32)
+			result.Quality, result.Width, result.Height = 90, 1280, 1280
+		} else {
+			duration, quality := int64(60_000), int32(90)
+			result.DurationMS = &duration
+			result.ThumbPath = `D:\cache\sheet.jpg`
+			result.ThumbPDQ = bytes.Repeat([]byte{0x4d}, 32)
+			result.ThumbQuality = &quality
+			result.ContactSheetWidth, result.ContactSheetHeight = 768, 512
+		}
+		pool.results <- result
+	}
+	wantPaths := []string{`D:\media\c-small.jpg`, `D:\media\b-large.jpg`, `D:\media\a-video.mp4`}
+	for index, want := range wantPaths {
+		var job worker.JobMsg
+		select {
+		case job = <-submitted:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("submission %d did not arrive", index)
+		}
+		if job.Path != want {
+			t.Fatalf("submission %d path=%q want %q", index, job.Path, want)
+		}
+		select {
+		case unexpected := <-submitted:
+			t.Fatalf("submission %q overlapped unfinished HDD job %q", unexpected.Path, job.Path)
+		default:
+		}
+		complete(job)
+	}
+	select {
+	case final := <-done:
+		if final.Reason != "" || final.Stats.Failed != 0 {
+			t.Fatalf("TaskDone=%#v", final)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("HDD media scan did not finish")
+	}
+}
+
 func TestScanDrainFlushesEnumeratedTailWithWorkContext(t *testing.T) {
 	enumr := &barrierEnumerator{
 		first:   fileenum.FileRecord{Path: `D:\media\tail.bin`, Size: 10, MTime: 20},

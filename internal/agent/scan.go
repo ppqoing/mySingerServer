@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -788,6 +789,56 @@ func (m *ScanManager) processDisk(
 	hashOut chan<- store.HashResult,
 	mediaOut chan<- proto.FeatureItem,
 ) {
+	if m.isSSD(diskNo) {
+		m.processDiskBatch(state, diskNo, files, streams, hashOut, mediaOut)
+		return
+	}
+
+	images := make([]scanWork, 0, len(files))
+	other := make([]scanWork, 0, len(files))
+	videos := make([]scanWork, 0, len(files))
+	for _, work := range files {
+		switch {
+		case work.media != nil && work.media.Kind == worker.MediaImage:
+			images = append(images, work)
+		case work.media != nil && work.media.Kind == worker.MediaVideo:
+			videos = append(videos, work)
+		default:
+			other = append(other, work)
+		}
+	}
+	sort.SliceStable(images, func(left, right int) bool {
+		if images[left].file.Size != images[right].file.Size {
+			return images[left].file.Size < images[right].file.Size
+		}
+		return pathKey(images[left].file.Path) < pathKey(images[right].file.Path)
+	})
+
+	m.processDiskBatch(state, diskNo, images, 1, hashOut, mediaOut)
+	if state.stopRequested() {
+		cancelScanWorkBatch(other)
+		cancelScanWorkBatch(videos)
+		return
+	}
+	m.processDiskBatch(state, diskNo, other, streams, hashOut, mediaOut)
+	if state.stopRequested() {
+		cancelScanWorkBatch(videos)
+		return
+	}
+	m.processDiskBatch(state, diskNo, videos, streams, hashOut, mediaOut)
+}
+
+func (m *ScanManager) processDiskBatch(
+	state *ScanState,
+	diskNo int64,
+	files []scanWork,
+	streams int,
+	hashOut chan<- store.HashResult,
+	mediaOut chan<- proto.FeatureItem,
+) {
+	if len(files) == 0 {
+		return
+	}
 	jobs := make(chan scanWork)
 	var workers sync.WaitGroup
 	for index := 0; index < streams; index++ {
@@ -870,6 +921,12 @@ func (m *ScanManager) processDisk(
 	}
 	close(jobs)
 	workers.Wait()
+}
+
+func cancelScanWorkBatch(work []scanWork) {
+	for _, item := range work {
+		cancelScanWork(item)
+	}
 }
 
 func cancelScanWork(work scanWork) {
