@@ -300,7 +300,7 @@ func TestListLocalTasksMapsProductionDisplayStatsJSON(t *testing.T) {
 	service, _, _, _, _, _ := serviceFixture(t)
 	statsJSON, err := json.Marshal(proto.LocalTaskDisplayStats{
 		SchemaVersion: proto.LocalTaskDisplayStatsVersion,
-		Speed:         12.5, Failures: 3, DurationMS: 192_000,
+		Speed:         12.5, Failures: 1, DurationMS: 192_000,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -318,7 +318,7 @@ func TestListLocalTasksMapsProductionDisplayStatsJSON(t *testing.T) {
 		t.Fatalf("page=%#v", page)
 	}
 	task := page.Tasks[0]
-	if task.Speed != "12.5 文件/秒" || task.Failures != 3 || task.Duration != "00:03:12" {
+	if task.Speed != "12.5 文件/秒" || task.Failures != 1 || task.Duration != "00:03:12" {
 		t.Fatalf("mapped task=%#v", task)
 	}
 }

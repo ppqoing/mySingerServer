@@ -997,7 +997,7 @@ func runnerMergeProgressStats(current proto.LocalTaskDisplayStats, progress prot
 }
 
 func runnerMergeFinalStats(current proto.LocalTaskDisplayStats, stats proto.TaskStats) proto.LocalTaskDisplayStats {
-	current.Failures = max(current.Failures, stats.Failed+stats.ScanErrors)
+	current.Failures = max(current.Failures, stats.Failed)
 	current.DurationMS = max(current.DurationMS, stats.ElapsedMS)
 	return current
 }

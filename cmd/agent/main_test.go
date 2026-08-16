@@ -28,6 +28,8 @@ import (
 	"dedup/internal/localanalysis"
 	"dedup/internal/localtask"
 	"dedup/internal/machineid"
+	nodetrayapp "dedup/internal/nodetray/app"
+	"dedup/internal/nodetray/traymodel"
 	"dedup/internal/proto"
 	"dedup/internal/store"
 	"dedup/internal/worker"
@@ -453,17 +455,71 @@ func TestLocalTaskRunnerEmitsStableDisplayStatsAcrossScanAndAnalysis(t *testing.
 			scanFinal = &copy
 		}
 		if phaseRank(update.Phase) >= phaseRank("stage2") {
-			if stats.Speed != 12.5 || stats.Failures != 3 {
+			if stats.Speed != 12.5 || stats.Failures != 2 {
 				t.Fatalf("analysis phase=%q stats=%#v, want preserved scan speed/failures", update.Phase, stats)
 			}
 			analysisDurations = append(analysisDurations, stats.DurationMS)
 		}
 	}
-	if scanFinal == nil || scanFinal.Speed != 12.5 || scanFinal.Failures != 3 || scanFinal.DurationMS != 4_000 {
+	if scanFinal == nil || scanFinal.Speed != 12.5 || scanFinal.Failures != 2 || scanFinal.DurationMS != 4_000 {
 		t.Fatalf("scan final stats=%#v", scanFinal)
 	}
 	if want := []int64{5_000, 6_000, 7_000}; !reflect.DeepEqual(analysisDurations, want) {
 		t.Fatalf("analysis durations=%v, want %v", analysisDurations, want)
+	}
+}
+
+// Break caught: resolver/enumerator failures increment both Failed and its
+// diagnostic subset ScanErrors, and the display path counted both fields.
+func TestLocalTaskRunnerProductionResolverErrorCountsOneDisplayFailure(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "agent.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	cfg := config.DefaultAgent()
+	cfg.MachineID = "machine-display-failure"
+	logger := slog.New(slog.NewJSONHandler(&bytes.Buffer{}, nil))
+	scans := agent.NewScanManagerWithResolver(cfg, db, nil, nil, logger, logger, func(string) (int64, bool, error) {
+		return -1, false, errors.New("volume unavailable")
+	})
+	runner := &agentLocalTaskRunner{scans: scans, analysis: &recordingLocalAnalysisRunner{}}
+	request := proto.LocalTaskCreateRequest{
+		TaskID: "resolver-failure", Roots: []string{`Z:\missing`}, Mode: proto.LocalTaskModeScanOnly,
+	}
+	var updates []localtask.ProgressUpdate
+	if err := runner.Run(localtask.RunControl{Context: context.Background()}, request, localtask.Task{
+		TaskID: request.TaskID, InstanceID: "resolver-instance", Phase: "waiting",
+	}, func(update localtask.ProgressUpdate) error {
+		updates = append(updates, update)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var final proto.LocalTaskDisplayStats
+	var finalStatsJSON string
+	found := false
+	for _, update := range updates {
+		if update.Phase != "scan" || update.Stage != 1 {
+			continue
+		}
+		if err := json.Unmarshal([]byte(update.StatsJSON), &final); err != nil {
+			t.Fatalf("stats_json=%q: %v", update.StatsJSON, err)
+		}
+		finalStatsJSON = update.StatsJSON
+		found = true
+	}
+	if !found {
+		t.Fatal("final scan display stats were not emitted")
+	}
+	nodeService := nodetrayapp.NewService(nodetrayapp.Dependencies{LocalAgent: &displayStatsListGateway{task: proto.LocalTask{
+		TaskID: "resolver-failure", InstanceID: "resolver-instance", Revision: 1,
+		Mode: proto.LocalTaskModeScanOnly, Status: "succeeded", StatsJSON: finalStatsJSON,
+	}}})
+	page := nodeService.ListLocalTasks(context.Background(), traymodel.PageRequest{Limit: 50})
+	if !page.OK || len(page.Tasks) != 1 || page.Tasks[0].Failures != 1 {
+		t.Fatalf("NodeTray/Wails page=%#v, want one resolver failure", page)
 	}
 }
 
@@ -1405,6 +1461,22 @@ func (*recordingLocalScanRunner) DrainInstance(string, string, proto.TaskDrainRe
 func (*recordingLocalScanRunner) AbortInstance(string, string) bool { return true }
 
 type displayStatsLocalScanRunner struct{}
+
+type displayStatsListGateway struct {
+	task proto.LocalTask
+}
+
+func (g *displayStatsListGateway) CallLocal(_ context.Context, operation string, _, response any) error {
+	if operation != proto.LocalOperationTaskList {
+		return fmt.Errorf("unexpected operation %q", operation)
+	}
+	list, ok := response.(*proto.LocalTaskListResponse)
+	if !ok {
+		return fmt.Errorf("unexpected response %T", response)
+	}
+	*list = proto.LocalTaskListResponse{Tasks: []proto.LocalTask{g.task}}
+	return nil
+}
 
 func (*displayStatsLocalScanRunner) Prepare(task proto.ScanTask, sender agent.Sender) (proto.TaskAck, func()) {
 	return proto.TaskAck{TaskID: task.TaskID, Accepted: true}, func() {

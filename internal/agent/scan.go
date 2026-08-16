@@ -1196,7 +1196,7 @@ func (m *ScanManager) scanProgress(state *ScanState) *proto.TaskProgress {
 		Total:      state.total.Load(),
 		TotalKnown: state.enumerationComplete.Load(),
 		Speed:      state.speedWin.Rate(),
-		Failed:     state.failed.Load() + state.scanErrors.Load(),
+		Failed:     state.failed.Load(),
 		ElapsedMS:  elapsedMS,
 	}
 }
