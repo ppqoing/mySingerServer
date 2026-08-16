@@ -1,4 +1,13 @@
-import { chooseLocalTaskRoot, executeLocalDelete, prepareLocalDelete } from './localAgent'
+import {
+  cancelLocalTask,
+  chooseLocalTaskRoot,
+  deleteLocalTask,
+  executeLocalDelete,
+  pauseLocalTask,
+  prepareLocalDelete,
+  resumeLocalTask,
+  retryLocalTask,
+} from './localAgent'
 
 describe('local Agent API', () => {
   it('keeps one-time delete tokens outside frontend state', async () => {
@@ -23,5 +32,31 @@ describe('local Agent API', () => {
     Object.assign(window, { go: { main: { Backend: backend } } })
     await expect(chooseLocalTaskRoot('D:\\Media')).resolves.toEqual({ ok: true, path: 'D:\\Media\\Photos', cancelled: false })
     expect(backend.ChooseLocalTaskRoot).toHaveBeenCalledWith('D:\\Media')
+  })
+
+  it('forwards the current task instance and revision to every lifecycle control', async () => {
+    const result = { ok: false, errorCode: 'stale_task', errorSummary: '任务快照已变化' }
+    const backend = {
+      PauseLocalTask: vi.fn(async () => result),
+      ResumeLocalTask: vi.fn(async () => result),
+      CancelLocalTask: vi.fn(async () => result),
+      DeleteLocalTask: vi.fn(async () => result),
+      RetryLocalTask: vi.fn(async () => result),
+    }
+    Object.assign(window, { go: { main: { Backend: backend } } })
+    const control = { taskId: 'task-1', instanceId: 'instance-7', expectedRevision: 11 }
+
+    await expect(Promise.all([
+      pauseLocalTask(control),
+      resumeLocalTask(control),
+      cancelLocalTask(control),
+      deleteLocalTask(control),
+      retryLocalTask(control),
+    ])).resolves.toEqual([result, result, result, result, result])
+    expect(backend.PauseLocalTask).toHaveBeenCalledWith(control)
+    expect(backend.ResumeLocalTask).toHaveBeenCalledWith(control)
+    expect(backend.CancelLocalTask).toHaveBeenCalledWith(control)
+    expect(backend.DeleteLocalTask).toHaveBeenCalledWith(control)
+    expect(backend.RetryLocalTask).toHaveBeenCalledWith(control)
   })
 })
