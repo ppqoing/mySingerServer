@@ -521,6 +521,50 @@ git commit -m "fix: show complete local task details"
 
 ---
 
+### Task 5A: 修复正式构建的 VideoCore 供应链门禁基线
+
+**阻断证据（Task 5 首轮）：**
+- `videocore_image_object_provenance` 与 mutation baseline 的 11 个对象都只包含配置批准的 `C:\vcpkg\installed\x64-windows-static\include` 和 `...\include\webp`；测试仍硬编码旧 `videocore\build\vcpkg_installed`，没有发现额外 include 注入。
+- Level-B `legacy-golden.tsv` 的 SHA 与固定值一致，20 行和 9 个批准差异的内部验证一致；`manifest.json` 的 capture 规范序列化 SHA 精确等于既有独立固定值 `9a5528...`，但 `.gitattributes eol=crlf` 把 capture 输出末尾的裸 LF 转换成 CRLF，破坏了冻结字节。
+- `internal/wproc` 在 `scripts/test-cgo.ps1` 提供正确 VideoCore DLL PATH、fixture root 与规范 TEMP 后，普通和 race 均 PASS；直接 `go test` 的 `0xc0000135` 是 DLL 装载环境错误，不是产品回归。
+
+**Files:**
+- Modify: `videocore/CMakeLists.txt`
+- Modify: `videocore/tests/test_image_object_provenance.ps1`
+- Modify: `videocore/tests/test_image_object_provenance_mutation.ps1`
+- Modify: `.gitattributes`
+- Regenerate exactly: `videocore/testdata/legacy_level_b/manifest.json`
+
+**Interfaces:**
+- `test_image_object_provenance.ps1` 接收 CMake 配置解析出的 `VCPKG_INSTALLED_DIR` 和 `VCPKG_TARGET_TRIPLET`，仍只允许 `<installed>/<triplet>/include` 与其 `webp` 子目录，集合必须精确相等。
+- mutation gate 必须把同一配置透传给每个合成案例，现有 extra-include 等负例继续失败。
+- Level-B manifest 按 capture 脚本的规范序列化字节保存；`.gitattributes` 对该冻结证据使用 `-text`，禁止 Git checkout 改写字节。既有外部 pin 不变，禁止用当前错误哈希替换固定值。
+
+- [ ] **Step 1: 记录真实 RED**
+
+在当前标准依赖配置上运行 CTest #14/#15/#17，断言分别以旧 build-local include mismatch、manifest hash mismatch 失败；同时记录真实 TLog 仅含两个批准的标准 include。
+
+- [ ] **Step 2: 让 provenance gate 使用显式配置身份**
+
+从 CMake 将 `VCPKG_INSTALLED_DIR` 与 `VCPKG_TARGET_TRIPLET` 传给 provenance 与 mutation 脚本。脚本解析为绝对路径后构造两个且仅两个 expected external includes；缺失/空配置必须 fail closed。不得把任意实际 TLog 路径自动加入 allowlist。
+
+- [ ] **Step 3: 恢复冻结 manifest 的 capture 原始字节**
+
+把 `.gitattributes` 中该文件规则改为 `-text`，用与 `capture_videocore_level_b_legacy.ps1` 相同的 `ConvertTo-Json -Depth 8`、UTF-8 无 BOM、末尾单个 LF 机械重生成 `manifest.json`。断言文件 SHA 仍为既有 `9A552825...`，golden SHA 仍为 `95E019F0...`；不得修改两个 pin。
+
+- [ ] **Step 4: GREEN 与负例回归**
+
+重新 configure/build 后运行 #14/#15/#17/#18；预期通过。确认 mutation 测试仍拒绝 extra include、forced include、response file、工具 shadow 与自签 Level-B 变异。随后 fresh 全量 CTest 必须 18/18。
+
+- [ ] **Step 5: 提交 Task 5A**
+
+```powershell
+git add -- .gitattributes videocore/CMakeLists.txt videocore/tests/test_image_object_provenance.ps1 videocore/tests/test_image_object_provenance_mutation.ps1 videocore/testdata/legacy_level_b/manifest.json
+git commit -m "fix: align VideoCore provenance with standard dependencies"
+```
+
+---
+
 ### Task 5: 全量验证、构建和发布 Compute/Manager 包
 
 **Files:**
