@@ -12,12 +12,34 @@ export interface RemotePathBrowserProps {
 const pageSize = 100;
 
 export function RemotePathBrowser({ machineID, api, open, onAdd, onClose }: RemotePathBrowserProps) {
+  const [showHidden, setShowHidden] = useState(false);
+  if (!open) return null;
+
+  return <RemotePathBrowserSession
+    api={api}
+    key={machineID}
+    machineID={machineID}
+    onAdd={onAdd}
+    onClose={onClose}
+    onShowHiddenChange={setShowHidden}
+    showHidden={showHidden}
+  />;
+}
+
+function RemotePathBrowserSession({ machineID, api, onAdd, onClose, onShowHiddenChange, showHidden }: {
+  readonly machineID: string;
+  readonly api: AppApi;
+  readonly onAdd: (path: string) => void;
+  readonly onClose: () => void;
+  readonly onShowHiddenChange: (showHidden: boolean) => void;
+  readonly showHidden: boolean;
+}) {
   const [currentPath, setCurrentPath] = useState("");
   const [selectedPath, setSelectedPath] = useState("");
   const [entries, setEntries] = useState<FilesystemEntry[]>([]);
   const [nextCursor, setNextCursor] = useState("");
-  const [showHidden, setShowHidden] = useState(false);
-  const [loading, setLoading] = useState(false);
+  const [initialShowHidden] = useState(showHidden);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
   const controller = useRef<AbortController | undefined>(undefined);
 
@@ -27,12 +49,13 @@ export function RemotePathBrowser({ machineID, api, open, onAdd, onClose }: Remo
     setNextCursor(result.nextCursor);
   }, []);
 
-  const browse = useCallback(async (path: string, cursor: string, append: boolean, hidden: boolean) => {
-    controller.current?.abort();
-    const request = new AbortController();
-    controller.current = request;
-    setLoading(true);
-    setError(undefined);
+  const performBrowse = useCallback(async (
+    request: AbortController,
+    path: string,
+    cursor: string,
+    append: boolean,
+    hidden: boolean
+  ) => {
     try {
       const result = await api.browseAgentFilesystem(machineID, {
         path, showHidden: hidden, cursor, limit: pageSize
@@ -48,18 +71,31 @@ export function RemotePathBrowser({ machineID, api, open, onAdd, onClose }: Remo
     }
   }, [api, applyPage, machineID]);
 
+  const browse = useCallback((path: string, cursor: string, append: boolean, hidden: boolean) => {
+    controller.current?.abort();
+    const request = new AbortController();
+    controller.current = request;
+    setLoading(true);
+    setError(undefined);
+    return performBrowse(request, path, cursor, append, hidden);
+  }, [performBrowse]);
+
   useEffect(() => {
-    if (!open) {
-      controller.current?.abort();
-      return;
-    }
-    setSelectedPath("");
-    void browse("", "", false, showHidden);
+    const request = new AbortController();
+    controller.current = request;
+    void api.browseAgentFilesystem(machineID, {
+      path: "", showHidden: initialShowHidden, cursor: "", limit: pageSize
+    }, request.signal).then(result => {
+      if (!request.signal.aborted) applyPage(result, false);
+    }).catch(cause => {
+      if (!request.signal.aborted) setError(cause instanceof Error ? cause.message : "无法浏览远程目录。");
+    }).finally(() => {
+      if (controller.current === request) setLoading(false);
+    });
     return () => controller.current?.abort();
-  }, [browse, machineID, open]);
+  }, [api, applyPage, initialShowHidden, machineID]);
 
   const breadcrumbPaths = useMemo(() => windowsBreadcrumbs(currentPath), [currentPath]);
-  if (!open) return null;
 
   const navigate = async (path: string) => {
     if (await browse(path, "", false, showHidden)) setSelectedPath(path);
@@ -83,7 +119,7 @@ export function RemotePathBrowser({ machineID, api, open, onAdd, onClose }: Remo
         <label className="remote-path-browser__toggle">
           <input checked={showHidden} onChange={event => {
             const hidden = event.target.checked;
-            setShowHidden(hidden);
+            onShowHiddenChange(hidden);
             void browse(currentPath, "", false, hidden);
           }} type="checkbox" />显示隐藏和系统项目
         </label>
