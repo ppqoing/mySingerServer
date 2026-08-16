@@ -14,6 +14,8 @@ const (
 	absoluteMaxPerDisk    = 24
 	defaultHDDRandomMax   = 8
 	starvationAge         = 5 * time.Second
+	maxTaskHistoryEntries = 256
+	maxWindowWaitSamples  = 64
 )
 
 var (
@@ -21,6 +23,8 @@ var (
 	ErrWorkerReclaimed  = errors.New("disk I/O worker reclaimed")
 	ErrWorkerQueueFull  = errors.New("disk I/O worker queue full")
 	ErrControllerClosed = errors.New("disk I/O controller closed")
+	ErrHistoryCapacity  = errors.New("disk I/O history capacity reached")
+	ErrInvalidWorker    = errors.New("disk I/O worker ID outside configured set")
 )
 
 type Request struct {
@@ -177,12 +181,25 @@ type taskStats struct {
 	reports         int64
 }
 
+type taskHistory struct {
+	generation uint64
+	stats      taskStats
+	touched    uint64
+}
+
+type fairnessHistory struct {
+	lastGranted time.Time
+	grants      uint64
+	touched     uint64
+}
+
 type observationWindow struct {
 	started     time.Time
 	bytes       int64
 	seeks       int64
-	waits       []time.Duration
-	hddRandom   bool
+	waits       [maxWindowWaitSamples]time.Duration
+	waitCount   int
+	waitNext    int
 	previousBPS float64
 	previousP95 time.Duration
 }
@@ -192,16 +209,17 @@ type diskState struct {
 	limit    int
 	active   map[uint64]*activeLease
 	queues   map[TaskIdentity]*taskQueue
+	fairness map[TaskIdentity]*fairnessHistory
 	window   observationWindow
 }
 
 type ownerState struct {
-	disks       map[DiskKey]*diskState
-	workers     map[int]*activeLease
-	leases      map[uint64]*activeLease
-	generations map[TaskIdentity]uint64
-	stats       map[TaskIdentity]*taskStats
-	nextLease   uint64
+	disks     map[DiskKey]*diskState
+	workers   map[int]*activeLease
+	leases    map[uint64]*activeLease
+	histories map[TaskIdentity]*taskHistory
+	nextLease uint64
+	nextTouch uint64
 }
 
 func NewController(ctx context.Context, options ControllerOptions) Controller {
@@ -361,13 +379,7 @@ func (c *controller) Snapshot(taskID, instanceID string) Snapshot {
 
 func (c *controller) run() {
 	defer close(c.done)
-	state := ownerState{
-		disks:       make(map[DiskKey]*diskState),
-		workers:     make(map[int]*activeLease),
-		leases:      make(map[uint64]*activeLease),
-		generations: make(map[TaskIdentity]uint64),
-		stats:       make(map[TaskIdentity]*taskStats),
-	}
+	state := newOwnerState()
 	for {
 		select {
 		case <-c.ctx.Done():
@@ -396,6 +408,15 @@ func (c *controller) run() {
 	}
 }
 
+func newOwnerState() ownerState {
+	return ownerState{
+		disks:     make(map[DiskKey]*diskState),
+		workers:   make(map[int]*activeLease),
+		leases:    make(map[uint64]*activeLease),
+		histories: make(map[TaskIdentity]*taskHistory),
+	}
+}
+
 func (s *ownerState) failPending(err error) {
 	for _, disk := range s.disks {
 		for _, queue := range disk.queues {
@@ -406,9 +427,104 @@ func (s *ownerState) failPending(err error) {
 	}
 }
 
+func (s *ownerState) touch() uint64 {
+	s.nextTouch++
+	return s.nextTouch
+}
+
+func (c *controller) ensureTaskHistory(state *ownerState, identity TaskIdentity) (*taskHistory, bool) {
+	if history := state.histories[identity]; history != nil {
+		history.touched = state.touch()
+		return history, true
+	}
+	if len(state.histories) >= maxTaskHistoryEntries {
+		candidate, found := oldestEvictableTaskHistory(state)
+		if !found {
+			return nil, false
+		}
+		delete(state.histories, candidate)
+	}
+	history := &taskHistory{generation: 1, touched: state.touch()}
+	state.histories[identity] = history
+	return history, true
+}
+
+func oldestEvictableTaskHistory(state *ownerState) (TaskIdentity, bool) {
+	var candidate TaskIdentity
+	var candidateTouch uint64
+	found := false
+	for identity, history := range state.histories {
+		if identityInUse(state, identity) {
+			continue
+		}
+		if !found || history.touched < candidateTouch ||
+			(history.touched == candidateTouch && identityLess(identity, candidate)) {
+			candidate = identity
+			candidateTouch = history.touched
+			found = true
+		}
+	}
+	return candidate, found
+}
+
+func (c *controller) ensureDiskFairness(state *ownerState, disk *diskState, identity TaskIdentity) (*fairnessHistory, bool) {
+	if history := disk.fairness[identity]; history != nil {
+		history.touched = state.touch()
+		return history, true
+	}
+	if len(disk.fairness) >= maxTaskHistoryEntries {
+		var candidate TaskIdentity
+		var candidateTouch uint64
+		found := false
+		for other, history := range disk.fairness {
+			if identityInUse(state, other) {
+				continue
+			}
+			if !found || history.touched < candidateTouch ||
+				(history.touched == candidateTouch && identityLess(other, candidate)) {
+				candidate = other
+				candidateTouch = history.touched
+				found = true
+			}
+		}
+		if !found {
+			return nil, false
+		}
+		delete(disk.fairness, candidate)
+	}
+	history := &fairnessHistory{touched: state.touch()}
+	disk.fairness[identity] = history
+	return history, true
+}
+
+func identityInUse(state *ownerState, identity TaskIdentity) bool {
+	for _, disk := range state.disks {
+		if queue := disk.queues[identity]; queue != nil && len(queue.items) != 0 {
+			return true
+		}
+		for _, lease := range disk.active {
+			if identityOf(lease.req) == identity {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func identityLess(left, right TaskIdentity) bool {
+	if left.TaskID != right.TaskID {
+		return left.TaskID < right.TaskID
+	}
+	return left.InstanceID < right.InstanceID
+}
+
 func (c *controller) handleAcquire(state *ownerState, command acquireCommand) {
 	if err := command.ctx.Err(); err != nil {
 		command.reply <- acquireReply{err: err}
+		return
+	}
+	if command.req.WorkerID < 0 || command.req.WorkerID >= c.options.WorkerCount {
+		command.reply <- acquireReply{err: ErrInvalidWorker}
 		return
 	}
 	if c.queuedForWorker(state, command.req.WorkerID) >= c.options.Policy.MaxQueuedPerWorker {
@@ -417,9 +533,18 @@ func (c *controller) handleAcquire(state *ownerState, command acquireCommand) {
 	}
 	disk := c.ensureDisk(state, command.req.Disk)
 	identity := identityOf(command.req)
+	if _, ok := c.ensureTaskHistory(state, identity); !ok {
+		command.reply <- acquireReply{err: ErrHistoryCapacity}
+		return
+	}
+	fairness, ok := c.ensureDiskFairness(state, disk, identity)
+	if !ok {
+		command.reply <- acquireReply{err: ErrHistoryCapacity}
+		return
+	}
 	queue := disk.queues[identity]
 	if queue == nil {
-		queue = &taskQueue{}
+		queue = &taskQueue{lastGranted: fairness.lastGranted, grants: fairness.grants}
 		disk.queues[identity] = queue
 	}
 	queue.items = append(queue.items, &pendingRequest{
@@ -461,6 +586,7 @@ func (c *controller) ensureDisk(state *ownerState, key DiskKey) *diskState {
 		limit:    initial,
 		active:   make(map[uint64]*activeLease),
 		queues:   make(map[TaskIdentity]*taskQueue),
+		fairness: make(map[TaskIdentity]*fairnessHistory),
 		window:   observationWindow{started: c.clock.Now()},
 	}
 	state.disks[key] = disk
@@ -485,8 +611,8 @@ func (c *controller) hardLimit(hddRandom bool) int {
 }
 
 func (c *controller) dispatch(state *ownerState, disk *diskState) {
-	for len(disk.active) < disk.limit {
-		c.pruneCancelled(disk)
+	for len(disk.active) < disk.limit && len(state.workers) < c.hardLimit(false) {
+		c.pruneCancelled(state, disk)
 		eligible := c.eligibleQueues(state, disk)
 		if len(eligible) == 0 {
 			return
@@ -497,6 +623,9 @@ func (c *controller) dispatch(state *ownerState, disk *diskState) {
 		queue.items = queue.items[1:]
 		if pending.ctx.Err() != nil {
 			pending.reply <- acquireReply{err: pending.ctx.Err()}
+			if len(queue.items) == 0 {
+				delete(disk.queues, identity)
+			}
 			continue
 		}
 		if c.isHDDRandom(disk, pending.req) && c.hddRandomActive(disk) >= c.hardLimit(true) {
@@ -506,11 +635,8 @@ func (c *controller) dispatch(state *ownerState, disk *diskState) {
 		}
 
 		state.nextLease++
-		generation := state.generations[identity]
-		if generation == 0 {
-			generation = 1
-			state.generations[identity] = generation
-		}
+		history := state.histories[identity]
+		generation := history.generation
 		grant := Grant{
 			LeaseID:    state.nextLease,
 			Generation: generation,
@@ -525,12 +651,31 @@ func (c *controller) dispatch(state *ownerState, disk *diskState) {
 		state.workers[pending.req.WorkerID] = lease
 		queue.lastGranted = c.clock.Now()
 		queue.grants++
+		fairness := disk.fairness[identity]
+		fairness.lastGranted = queue.lastGranted
+		fairness.grants = queue.grants
+		fairness.touched = state.touch()
+		history.touched = state.touch()
+		if len(queue.items) == 0 {
+			delete(disk.queues, identity)
+		}
 		pending.reply <- acquireReply{grant: grant}
 	}
 }
 
-func (c *controller) pruneCancelled(disk *diskState) {
-	for _, queue := range disk.queues {
+func (c *controller) dispatchAll(state *ownerState) {
+	keys := make([]DiskKey, 0, len(state.disks))
+	for key := range state.disks {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	for _, key := range keys {
+		c.dispatch(state, state.disks[key])
+	}
+}
+
+func (c *controller) pruneCancelled(state *ownerState, disk *diskState) {
+	for identity, queue := range disk.queues {
 		kept := queue.items[:0]
 		for _, pending := range queue.items {
 			if err := pending.ctx.Err(); err != nil {
@@ -540,6 +685,9 @@ func (c *controller) pruneCancelled(disk *diskState) {
 			kept = append(kept, pending)
 		}
 		queue.items = kept
+		if len(queue.items) == 0 {
+			delete(disk.queues, identity)
+		}
 	}
 }
 
@@ -583,7 +731,13 @@ func (c *controller) grantBytes(want int64) int64 {
 	if minimum < absoluteMinLeaseBytes {
 		minimum = absoluteMinLeaseBytes
 	}
+	if minimum > absoluteMaxLeaseBytes {
+		minimum = absoluteMaxLeaseBytes
+	}
 	maximum := c.options.Policy.MaxLeaseBytes
+	if maximum < absoluteMinLeaseBytes {
+		maximum = absoluteMinLeaseBytes
+	}
 	if maximum > absoluteMaxLeaseBytes {
 		maximum = absoluteMaxLeaseBytes
 	}
@@ -644,12 +798,16 @@ func chooseTask(now time.Time, queues map[TaskIdentity]*taskQueue) TaskIdentity 
 
 func (c *controller) handleCancelAcquire(state *ownerState, token uint64) {
 	for _, disk := range state.disks {
-		for _, queue := range disk.queues {
+		for identity, queue := range disk.queues {
 			for i, pending := range queue.items {
 				if pending.token != token {
 					continue
 				}
 				queue.items = append(queue.items[:i], queue.items[i+1:]...)
+				if len(queue.items) == 0 {
+					delete(disk.queues, identity)
+				}
+				c.dispatch(state, disk)
 				return
 			}
 		}
@@ -658,18 +816,18 @@ func (c *controller) handleCancelAcquire(state *ownerState, token uint64) {
 		if lease.token == token {
 			disk := state.disks[lease.req.Disk]
 			c.releaseLease(state, disk, lease)
-			c.dispatch(state, disk)
+			c.dispatchAll(state)
 			return
 		}
 	}
 }
 
 func (c *controller) handleCancelTask(state *ownerState, identity TaskIdentity) {
-	generation := state.generations[identity]
-	if generation == 0 {
-		generation = 1
+	history := state.histories[identity]
+	if history != nil {
+		history.generation++
+		history.touched = state.touch()
 	}
-	state.generations[identity] = generation + 1
 	for _, disk := range state.disks {
 		if queue := disk.queues[identity]; queue != nil {
 			delete(disk.queues, identity)
@@ -702,8 +860,8 @@ func (c *controller) handleReclaimWorker(state *ownerState, workerID int) {
 		c.releaseLease(state, disk, lease)
 		affected[disk] = struct{}{}
 	}
-	for disk := range affected {
-		c.dispatch(state, disk)
+	if len(affected) != 0 {
+		c.dispatchAll(state)
 	}
 }
 
@@ -717,12 +875,12 @@ func (c *controller) handleReport(state *ownerState, report Report) {
 	valid := report.Generation == lease.grant.Generation &&
 		report.TaskID == lease.req.TaskID && report.InstanceID == lease.req.InstanceID &&
 		report.WorkerID == lease.req.WorkerID && report.Disk == lease.req.Disk &&
-		state.generations[identity] == report.Generation
+		state.histories[identity] != nil && state.histories[identity].generation == report.Generation
 	c.releaseLease(state, disk, lease)
 	if valid && report.Completed && !report.Cancelled {
 		c.recordReport(state, disk, identity, lease, report)
 	}
-	c.dispatch(state, disk)
+	c.dispatchAll(state)
 }
 
 func (c *controller) releaseLease(state *ownerState, disk *diskState, lease *activeLease) {
@@ -734,11 +892,9 @@ func (c *controller) releaseLease(state *ownerState, disk *diskState, lease *act
 }
 
 func (c *controller) recordReport(state *ownerState, disk *diskState, identity TaskIdentity, lease *activeLease, report Report) {
-	stats := state.stats[identity]
-	if stats == nil {
-		stats = &taskStats{}
-		state.stats[identity] = stats
-	}
+	history := state.histories[identity]
+	stats := &history.stats
+	history.touched = state.touch()
 	if lease.req.Class == SourceSequential {
 		stats.sequentialBytes += report.Bytes
 	}
@@ -749,13 +905,12 @@ func (c *controller) recordReport(state *ownerState, disk *diskState, identity T
 
 	disk.window.bytes += report.Bytes
 	disk.window.seeks += int64(report.Seeks)
-	disk.window.waits = append(disk.window.waits, report.WaitTime)
-	disk.window.hddRandom = disk.window.hddRandom || c.isHDDRandom(disk, lease.req)
+	disk.window.addWaitSample(report.WaitTime)
 	duration := c.clock.Now().Sub(disk.window.started)
 	if duration < c.options.Policy.Window {
 		return
 	}
-	p95 := percentile95(disk.window.waits)
+	p95 := percentile95(disk.window.waitSamples())
 	sample := WindowSample{
 		Duration:               duration,
 		Bytes:                  disk.window.bytes,
@@ -766,11 +921,31 @@ func (c *controller) recordReport(state *ownerState, disk *diskState, identity T
 		Queued:                 queuedCount(disk),
 		BusyWorkers:            len(state.workers),
 		WorkerCount:            c.options.WorkerCount,
-		HDDRandom:              disk.window.hddRandom,
+		HDDRandom:              false,
 	}
 	disk.limit = nextLimit(disk.limit, sample, c.options.Policy)
 	bps := float64(disk.window.bytes) / duration.Seconds()
 	disk.window = observationWindow{started: c.clock.Now(), previousBPS: bps, previousP95: p95}
+}
+
+func (window *observationWindow) addWaitSample(wait time.Duration) {
+	window.waits[window.waitNext] = wait
+	window.waitNext = (window.waitNext + 1) % maxWindowWaitSamples
+	if window.waitCount < maxWindowWaitSamples {
+		window.waitCount++
+	}
+}
+
+func (window *observationWindow) waitSamples() []time.Duration {
+	samples := make([]time.Duration, window.waitCount)
+	start := 0
+	if window.waitCount == maxWindowWaitSamples {
+		start = window.waitNext
+	}
+	for index := range samples {
+		samples[index] = window.waits[(start+index)%maxWindowWaitSamples]
+	}
+	return samples
 }
 
 func percentile95(values []time.Duration) time.Duration {
@@ -880,7 +1055,8 @@ func (c *controller) makeSnapshot(state *ownerState, identity TaskIdentity) Snap
 			}
 		}
 	}
-	if stats := state.stats[identity]; stats != nil {
+	if history := state.histories[identity]; history != nil {
+		stats := &history.stats
 		snapshot.SequentialBytes = stats.sequentialBytes
 		snapshot.SeekCount = stats.seekCount
 		if stats.readTime > 0 {

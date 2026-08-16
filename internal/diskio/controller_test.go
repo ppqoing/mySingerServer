@@ -3,6 +3,7 @@ package diskio
 import (
 	"context"
 	"errors"
+	"fmt"
 	"runtime"
 	"testing"
 	"time"
@@ -275,6 +276,52 @@ func TestControllerHDDRandomAndGlobalConcurrencyCaps(t *testing.T) {
 	assertStillWaiting(t, ssdResults[24])
 }
 
+func TestControllerRejectsWorkerIDsOutsideConfiguredSet(t *testing.T) {
+	clock := newFakeClock()
+	c := newTestController(t, clock, 2, 2, 2,
+		Identity{Key: "negative", KnownSSD: true, SSD: true},
+		Identity{Key: "upper", KnownSSD: true, SSD: true},
+	)
+	for _, req := range []Request{
+		request(1, "negative", "1", -1, "negative", SourceSequential),
+		request(2, "upper", "1", 2, "upper", SourceSequential),
+	} {
+		grant, err := c.Acquire(context.Background(), req)
+		if !errors.Is(err, ErrInvalidWorker) {
+			t.Fatalf("worker %d result grant=%+v err=%v, want ErrInvalidWorker", req.WorkerID, grant, err)
+		}
+	}
+}
+
+func TestControllerGlobalConcurrencyCapSpansDisks(t *testing.T) {
+	clock := newFakeClock()
+	c := newTestController(t, clock, 4, 4, 2,
+		Identity{Key: "a", KnownSSD: true, SSD: true},
+		Identity{Key: "b", KnownSSD: true, SSD: true},
+		Identity{Key: "c", KnownSSD: true, SSD: true},
+	)
+	firstReq := request(1, "task", "1", 0, "a", SourceSequential)
+	secondReq := request(2, "task", "1", 1, "b", SourceSequential)
+	first := receiveAcquire(t, acquireAsync(c, firstReq))
+	second := receiveAcquire(t, acquireAsync(c, secondReq))
+	if first.err != nil || second.err != nil {
+		t.Fatalf("initial grants failed: first=%v second=%v", first.err, second.err)
+	}
+	third := acquireAsync(c, request(3, "task", "1", 2, "c", SourceSequential))
+	snapshot := waitForSnapshot(t, c, "task", "1", func(s Snapshot) bool {
+		return s.Concurrency >= 3 || (s.Concurrency == 2 && s.IOWaitWorkers == 1)
+	})
+	if snapshot.Concurrency != 2 || snapshot.IOWaitWorkers != 1 {
+		t.Fatalf("cross-disk global cap bypassed: %+v", snapshot)
+	}
+	assertStillWaiting(t, third)
+
+	c.Report(reportFor(firstReq, first.grant, 4*mib, time.Second, 0))
+	if got := receiveAcquire(t, third); got.err != nil {
+		t.Fatalf("cross-disk waiter was not redispatched after global slot release: %v", got.err)
+	}
+}
+
 func TestControllerHDDSequentialWindowCanProbePastRandomCap(t *testing.T) {
 	clock := newFakeClock()
 	disk := DiskKey("hdd")
@@ -300,6 +347,51 @@ func TestControllerHDDSequentialWindowCanProbePastRandomCap(t *testing.T) {
 	}
 	if got := receiveAcquire(t, queuedSecond); got.err != nil {
 		t.Fatal(got.err)
+	}
+}
+
+func TestControllerMixedHDDWindowCapsOnlyRandomLeases(t *testing.T) {
+	clock := newFakeClock()
+	disk := DiskKey("hdd")
+	c := newTestController(t, clock, 12, 12, 12, Identity{Key: disk, KnownSSD: true, SSD: false})
+	randomRequests := make([]Request, 8)
+	randomGrants := make([]acquireResult, 8)
+	for i := range randomRequests {
+		randomRequests[i] = request(uint64(i+1), "random", "1", i, disk, SourceRandom)
+		randomRequests[i].WantSeek = true
+		randomGrants[i] = receiveAcquire(t, acquireAsync(c, randomRequests[i]))
+		if randomGrants[i].err != nil {
+			t.Fatal(randomGrants[i].err)
+		}
+	}
+	sequentialRequests := make([]Request, 4)
+	sequentialGrants := make([]acquireResult, 4)
+	for i := range sequentialRequests {
+		sequentialRequests[i] = request(uint64(9+i), "sequential", "1", 8+i, disk, SourceSequential)
+		sequentialGrants[i] = receiveAcquire(t, acquireAsync(c, sequentialRequests[i]))
+		if sequentialGrants[i].err != nil {
+			t.Fatal(sequentialGrants[i].err)
+		}
+	}
+
+	c.Report(reportFor(sequentialRequests[0], sequentialGrants[0].grant, 8*mib, time.Second, 0))
+	ninthRandomReq := request(20, "random", "1", 8, disk, SourceRandom)
+	ninthRandomReq.WantSeek = true
+	ninthRandom := acquireAsync(c, ninthRandomReq)
+	waitForSnapshot(t, c, "random", "1", func(s Snapshot) bool { return s.Concurrency == 8 && s.IOWaitWorkers == 1 })
+	assertStillWaiting(t, ninthRandom)
+
+	clock.Advance(2 * time.Second)
+	c.Report(reportFor(randomRequests[0], randomGrants[0].grant, 8*mib, time.Second, 0))
+	if got := receiveAcquire(t, ninthRandom); got.err != nil {
+		t.Fatal(got.err)
+	}
+	sequentialAfterMixed := acquireAsync(c, request(21, "sequential-new", "1", 0, disk, SourceSequential))
+	if got := receiveAcquire(t, sequentialAfterMixed); got.err != nil {
+		t.Fatal(got.err)
+	}
+	if snapshot := c.Snapshot("random", "1"); snapshot.Concurrency != 8 {
+		t.Fatalf("random concurrency = %d, want exactly 8", snapshot.Concurrency)
 	}
 }
 
@@ -399,6 +491,35 @@ func TestControllerCancelTaskAndContextCancelOnlyWaitingRequests(t *testing.T) {
 
 	c.Report(reportFor(activeReq, active.grant, 4*mib, time.Second, 0))
 	waitForSnapshot(t, c, "active", "1", func(s Snapshot) bool { return s.Concurrency == 0 })
+}
+
+func TestControllerContextCancelRedispatchesNextFIFORequest(t *testing.T) {
+	clock := newFakeClock()
+	disk := DiskKey("disk")
+	c := newTestController(t, clock, 2, 2, 2, Identity{Key: disk, KnownSSD: true, SSD: true})
+	active := receiveAcquire(t, acquireAsync(c, request(1, "task", "1", 0, disk, SourceSequential)))
+	if active.err != nil {
+		t.Fatal(active.err)
+	}
+
+	headContext, cancelHead := context.WithCancel(context.Background())
+	headResult := make(chan acquireResult, 1)
+	go func() {
+		grant, err := c.Acquire(headContext, request(2, "task", "1", 0, disk, SourceSequential))
+		headResult <- acquireResult{grant: grant, err: err}
+	}()
+	waitForSnapshot(t, c, "task", "1", func(s Snapshot) bool { return s.Concurrency == 1 && s.IOWaitWorkers == 1 })
+	tailResult := acquireAsync(c, request(3, "task", "1", 1, disk, SourceSequential))
+	waitForSnapshot(t, c, "task", "1", func(s Snapshot) bool { return s.Concurrency == 1 && s.IOWaitWorkers == 2 })
+	assertStillWaiting(t, tailResult)
+
+	cancelHead()
+	if got := receiveAcquire(t, headResult); !errors.Is(got.err, context.Canceled) {
+		t.Fatalf("cancelled FIFO head error = %v, want context.Canceled", got.err)
+	}
+	if got := receiveAcquire(t, tailResult); got.err != nil {
+		t.Fatalf("eligible FIFO tail did not receive idle slot: %v", got.err)
+	}
 }
 
 func TestControllerStaleReportsOnlyReclaimLease(t *testing.T) {
@@ -507,5 +628,123 @@ func TestControllerLeaseWindowIsBoundedAndSeekIsSingle(t *testing.T) {
 	seekGrant := receiveAcquire(t, acquireAsync(c, seek))
 	if seekGrant.grant.Bytes < mib || seekGrant.grant.Bytes > 16*mib || seekGrant.grant.Seeks != 1 {
 		t.Fatalf("seek grant = %+v, want bounded single-seek window", seekGrant.grant)
+	}
+}
+
+func TestControllerAbnormalLeaseConfigCannotExceedAbsoluteBounds(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		min  int64
+		max  int64
+	}{
+		{name: "both above absolute maximum", min: 32 * mib, max: 64 * mib},
+		{name: "minimum above configured maximum", min: 32 * mib, max: 2 * mib},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			clock := newFakeClock()
+			policy := testPolicy(1, 1)
+			policy.MinLeaseBytes = test.min
+			policy.MaxLeaseBytes = test.max
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			c := NewController(ctx, ControllerOptions{
+				Clock:       clock,
+				WorkerCount: 1,
+				Policy:      policy,
+				Identities: map[DiskKey]Identity{
+					"disk": {Key: "disk", KnownSSD: true, SSD: true},
+				},
+			})
+			req := request(1, "task", "1", 0, "disk", SourceSequential)
+			req.WantBytes = 64 * mib
+			grant, err := c.Acquire(context.Background(), req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if grant.Bytes != 16*mib {
+				t.Fatalf("grant bytes = %d, want absolute 16 MiB maximum", grant.Bytes)
+			}
+		})
+	}
+}
+
+func TestControllerHistoryCachesAreBoundedWithoutEvictingInUseFairness(t *testing.T) {
+	clock := newFakeClock()
+	c := &controller{clock: clock, options: normalizeOptions(ControllerOptions{WorkerCount: 4, Policy: testPolicy(2, 4)})}
+	state := newOwnerState()
+	disk := &diskState{
+		active:   make(map[uint64]*activeLease),
+		queues:   make(map[TaskIdentity]*taskQueue),
+		fairness: make(map[TaskIdentity]*fairnessHistory),
+	}
+	state.disks["disk"] = disk
+	activeID := TaskIdentity{TaskID: "active", InstanceID: "1"}
+	pendingID := TaskIdentity{TaskID: "pending", InstanceID: "1"}
+	activeReq := request(1, activeID.TaskID, activeID.InstanceID, 0, "disk", SourceSequential)
+	disk.active[1] = &activeLease{req: activeReq, grant: Grant{LeaseID: 1, Generation: 1}}
+	disk.queues[pendingID] = &taskQueue{items: []*pendingRequest{{req: request(2, pendingID.TaskID, pendingID.InstanceID, 1, "disk", SourceSequential)}}}
+
+	activeHistory, ok := c.ensureTaskHistory(&state, activeID)
+	if !ok {
+		t.Fatal("failed to admit active history")
+	}
+	activeHistory.stats.sequentialBytes = 11
+	pendingHistory, ok := c.ensureTaskHistory(&state, pendingID)
+	if !ok {
+		t.Fatal("failed to admit pending history")
+	}
+	pendingHistory.generation = 7
+	activeFairness, ok := c.ensureDiskFairness(&state, disk, activeID)
+	if !ok {
+		t.Fatal("failed to admit active fairness")
+	}
+	activeFairness.grants = 9
+	pendingFairness, ok := c.ensureDiskFairness(&state, disk, pendingID)
+	if !ok {
+		t.Fatal("failed to admit pending fairness")
+	}
+	pendingFairness.grants = 5
+
+	for i := 0; i < maxTaskHistoryEntries*2; i++ {
+		identity := TaskIdentity{TaskID: fmt.Sprintf("history-%04d", i), InstanceID: "1"}
+		if _, ok := c.ensureTaskHistory(&state, identity); !ok {
+			t.Fatalf("task history admission %d failed despite evictable entries", i)
+		}
+		if _, ok := c.ensureDiskFairness(&state, disk, identity); !ok {
+			t.Fatalf("fairness admission %d failed despite evictable entries", i)
+		}
+	}
+
+	if len(state.histories) > maxTaskHistoryEntries {
+		t.Fatalf("task histories grew to %d, limit %d", len(state.histories), maxTaskHistoryEntries)
+	}
+	if len(disk.fairness) > maxTaskHistoryEntries {
+		t.Fatalf("disk fairness histories grew to %d, limit %d", len(disk.fairness), maxTaskHistoryEntries)
+	}
+	if got := state.histories[activeID]; got == nil || got.stats.sequentialBytes != 11 {
+		t.Fatalf("active history was evicted or changed: %+v", got)
+	}
+	if got := state.histories[pendingID]; got == nil || got.generation != 7 {
+		t.Fatalf("pending history was evicted or changed: %+v", got)
+	}
+	if got := disk.fairness[activeID]; got == nil || got.grants != 9 {
+		t.Fatalf("active fairness was evicted or changed: %+v", got)
+	}
+	if got := disk.fairness[pendingID]; got == nil || got.grants != 5 {
+		t.Fatalf("pending fairness was evicted or changed: %+v", got)
+	}
+}
+
+func TestControllerWindowWaitSamplesUseFixedCapacityRing(t *testing.T) {
+	var window observationWindow
+	for i := 0; i < maxWindowWaitSamples+17; i++ {
+		window.addWaitSample(time.Duration(i) * time.Millisecond)
+	}
+	samples := window.waitSamples()
+	if len(samples) != maxWindowWaitSamples {
+		t.Fatalf("wait sample count = %d, want %d", len(samples), maxWindowWaitSamples)
+	}
+	if samples[0] != 17*time.Millisecond || samples[len(samples)-1] != time.Duration(maxWindowWaitSamples+16)*time.Millisecond {
+		t.Fatalf("ring did not retain newest bounded samples: first=%v last=%v", samples[0], samples[len(samples)-1])
 	}
 }
