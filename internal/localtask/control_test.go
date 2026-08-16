@@ -52,11 +52,13 @@ type watchedTaskStore struct {
 	deleteCommitted     chan<- struct{}
 	deleteReturnRelease <-chan struct{}
 
-	mu               sync.Mutex
-	deleteFailures   int
-	deleteCalls      int
-	progressFailures int
-	progressFailed   chan<- struct{}
+	mu                 sync.Mutex
+	deleteFailures     int
+	deleteFailureErr   error
+	deleteCalls        int
+	progressFailures   int
+	progressFailed     chan<- struct{}
+	transitionFailures map[string]int
 }
 
 func watchTaskStore(taskStore TaskStore) *watchedTaskStore {
@@ -70,6 +72,13 @@ func watchTaskStore(taskStore TaskStore) *watchedTaskStore {
 }
 
 func (s *watchedTaskStore) TransitionLocalTaskLifecycle(ctx context.Context, machineID string, control store.LocalTaskControl, status string, code, message *string) (store.LocalTask, error) {
+	s.mu.Lock()
+	if s.transitionFailures[status] > 0 {
+		s.transitionFailures[status]--
+		s.mu.Unlock()
+		return store.LocalTask{}, errors.New("transient lifecycle write")
+	}
+	s.mu.Unlock()
 	task, err := s.TaskStore.TransitionLocalTaskLifecycle(ctx, machineID, control, status, code, message)
 	if err == nil {
 		s.transitions <- task
@@ -101,11 +110,14 @@ func (s *watchedTaskStore) DeleteLocalTaskData(ctx context.Context, machineID st
 	s.deleteCalls++
 	if s.deleteFailures > 0 {
 		s.deleteFailures--
+		failure := s.deleteFailureErr
 		s.mu.Unlock()
 		s.deleteEntered <- control
-		err := store.ErrLocalTaskDeleteRetryable
-		s.deleteDone <- err
-		return store.LocalTaskDeleteResult{}, err
+		if failure == nil {
+			failure = store.ErrLocalTaskDeleteRetryable
+		}
+		s.deleteDone <- failure
+		return store.LocalTaskDeleteResult{}, failure
 	}
 	s.mu.Unlock()
 	s.deleteEntered <- control
@@ -215,6 +227,61 @@ func requireNoRun(t *testing.T, runs <-chan *controlledRun) {
 	}
 }
 
+type manualTerminalRetry struct {
+	requested chan time.Duration
+	ticks     chan time.Time
+}
+
+func newManualTerminalRetry() *manualTerminalRetry {
+	return &manualTerminalRetry{
+		requested: make(chan time.Duration),
+		ticks:     make(chan time.Time),
+	}
+}
+
+func (r *manualTerminalRetry) option() ServiceOption {
+	return withTerminalRetryAfter(func(delay time.Duration) <-chan time.Time {
+		r.requested <- delay
+		return r.ticks
+	})
+}
+
+func (r *manualTerminalRetry) receiveRequest(t *testing.T) time.Duration {
+	t.Helper()
+	select {
+	case delay := <-r.requested:
+		return delay
+	case <-time.After(time.Second):
+		t.Fatal("terminal persistence did not request a retry edge")
+		return 0
+	}
+}
+
+func (r *manualTerminalRetry) release(t *testing.T) {
+	t.Helper()
+	select {
+	case r.ticks <- time.Time{}:
+	case <-time.After(time.Second):
+		t.Fatal("terminal persistence was not waiting for the retry edge")
+	}
+}
+
+func failLifecycleTransitions(fixture *controlFixture, status string, count int) {
+	fixture.Store.mu.Lock()
+	defer fixture.Store.mu.Unlock()
+	if fixture.Store.transitionFailures == nil {
+		fixture.Store.transitionFailures = make(map[string]int)
+	}
+	fixture.Store.transitionFailures[status] = count
+}
+
+func requireAttemptRetained(t *testing.T, fixture *controlFixture, taskID string) {
+	t.Helper()
+	if fixture.Service.(*taskService).currentAttempt(taskID) == nil {
+		t.Fatal("terminal persistence failure cleaned the active settler")
+	}
+}
+
 // Break caught: pause used context cancellation, blocked its response on the
 // runner, or lost the last durable progress snapshot while draining.
 func TestLocalTaskPauseAcceptsImmediatelyThenPersistsPausedAfterDrain(t *testing.T) {
@@ -296,6 +363,149 @@ func TestLocalTaskStopAcceptsThenCancelsAfterExactAttemptReturns(t *testing.T) {
 	requireOpen(t, run.Returned, "runner return")
 	run.Release <- ErrDrainRequested
 	receiveTransition(t, fixture.Store.transitions, "cancelled")
+}
+
+// Break caught: a one-shot terminal write error removed the only in-memory
+// settler, leaving a naturally completed task durably running forever.
+func TestLocalTaskNaturalCompletionRetriesTerminalPersistence(t *testing.T) {
+	retry := newManualTerminalRetry()
+	fixture := newControlFixture(t, retry.option())
+	run := fixture.createAndWaitStarted("terminal-retry-natural")
+	failLifecycleTransitions(fixture, "succeeded", 1)
+
+	run.Release <- nil
+	if delay := retry.receiveRequest(t); delay != time.Second {
+		t.Fatalf("first retry delay=%v", delay)
+	}
+	requireAttemptRetained(t, fixture, run.Task.TaskID)
+	retry.release(t)
+	receiveTransition(t, fixture.Store.transitions, "succeeded")
+}
+
+// Break caught: paused persistence failed once and completeAttempt cleaned the
+// drained attempt instead of retaining a settler until the write converged.
+func TestLocalTaskPauseRetriesTerminalPersistence(t *testing.T) {
+	retry := newManualTerminalRetry()
+	fixture := newControlFixture(t, retry.option())
+	run := fixture.createAndWaitStarted("terminal-retry-pause")
+	if _, err := fixture.Service.Pause(context.Background(), controlRequest(run.Task)); err != nil {
+		t.Fatal(err)
+	}
+	failLifecycleTransitions(fixture, "paused", 1)
+
+	run.Release <- ErrDrainRequested
+	retry.receiveRequest(t)
+	requireAttemptRetained(t, fixture, run.Task.TaskID)
+	retry.release(t)
+	receiveTransition(t, fixture.Store.transitions, "paused")
+}
+
+// Break caught: cancelled persistence failed once and completeAttempt cleaned
+// the drained attempt instead of retaining a settler until the write converged.
+func TestLocalTaskStopRetriesTerminalPersistence(t *testing.T) {
+	retry := newManualTerminalRetry()
+	fixture := newControlFixture(t, retry.option())
+	run := fixture.createAndWaitStarted("terminal-retry-stop")
+	if _, err := fixture.Service.Cancel(context.Background(), controlRequest(run.Task)); err != nil {
+		t.Fatal(err)
+	}
+	failLifecycleTransitions(fixture, "cancelled", 1)
+
+	run.Release <- ErrDrainRequested
+	retry.receiveRequest(t)
+	requireAttemptRetained(t, fixture, run.Task.TaskID)
+	retry.release(t)
+	receiveTransition(t, fixture.Store.transitions, "cancelled")
+}
+
+// Break caught: an older natural-completion target was retried after a pause
+// revision superseded it, overwriting the stronger and newer control intent.
+func TestLocalTaskTerminalRetryRecomputesSupersedingRevision(t *testing.T) {
+	retry := newManualTerminalRetry()
+	fixture := newControlFixture(t, retry.option())
+	run := fixture.createAndWaitStarted("terminal-retry-revision")
+	failLifecycleTransitions(fixture, "succeeded", 1)
+
+	run.Release <- nil
+	retry.receiveRequest(t)
+	requireAttemptRetained(t, fixture, run.Task.TaskID)
+	pausing, err := fixture.Service.Pause(context.Background(), controlRequest(run.Task))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pausing.Status != "pausing" || pausing.Revision <= run.Task.Revision {
+		t.Fatalf("pausing=%#v running=%#v", pausing, run.Task)
+	}
+	retry.release(t)
+	paused := receiveTransition(t, fixture.Store.transitions, "paused")
+	if paused.InstanceID != run.Task.InstanceID || paused.Revision <= pausing.Revision {
+		t.Fatalf("paused=%#v pausing=%#v", paused, pausing)
+	}
+}
+
+// Break caught: a retained old-instance settler retried its terminal write
+// after the task ID was reused and overwrote the replacement instance.
+func TestLocalTaskTerminalRetryCannotOverwriteReplacementInstance(t *testing.T) {
+	retry := newManualTerminalRetry()
+	fixture := newControlFixture(t, retry.option())
+	run := fixture.createAndWaitStarted("terminal-retry-instance")
+	oldAttempt := fixture.Service.(*taskService).currentAttempt(run.Task.TaskID)
+	failLifecycleTransitions(fixture, "succeeded", 1)
+
+	run.Release <- nil
+	retry.receiveRequest(t)
+	requireAttemptRetained(t, fixture, run.Task.TaskID)
+	current, err := fixture.DB.LoadLocalTask(context.Background(), "machine-a", run.Task.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleting, err := fixture.DB.TransitionLocalTaskLifecycle(context.Background(), "machine-a", controlForStoreTask(current), "deleting", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.DB.DeleteLocalTaskData(context.Background(), "machine-a", controlForStoreTask(deleting)); err != nil {
+		t.Fatal(err)
+	}
+	replacement := seedServiceTask(t, fixture.DB, "machine-a", run.Task.TaskID)
+	if replacement.InstanceID == run.Task.InstanceID {
+		t.Fatalf("replacement reused old instance %q", replacement.InstanceID)
+	}
+
+	retry.release(t)
+	select {
+	case <-oldAttempt.done:
+	case <-time.After(time.Second):
+		t.Fatal("superseded old attempt was not cleaned")
+	}
+	loaded, err := fixture.DB.LoadLocalTask(context.Background(), "machine-a", run.Task.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.InstanceID != replacement.InstanceID || loaded.Revision != replacement.Revision || loaded.Status != replacement.Status {
+		t.Fatalf("replacement overwritten: loaded=%#v replacement=%#v", loaded, replacement)
+	}
+}
+
+// Break caught: repeated natural-success write errors kept retrying the same
+// target forever instead of falling back to the existing running->failed edge.
+func TestLocalTaskNaturalTerminalPermanentErrorFallsBackToFailed(t *testing.T) {
+	retry := newManualTerminalRetry()
+	fixture := newControlFixture(t, retry.option())
+	run := fixture.createAndWaitStarted("terminal-retry-fallback")
+	failLifecycleTransitions(fixture, "succeeded", 6)
+
+	run.Release <- nil
+	wantDelays := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second, 30 * time.Second}
+	for _, want := range wantDelays {
+		if got := retry.receiveRequest(t); got != want {
+			t.Fatalf("retry delay=%v, want %v", got, want)
+		}
+		retry.release(t)
+	}
+	failed := receiveTransition(t, fixture.Store.transitions, "failed")
+	if failed.SafeErrorCode == nil || *failed.SafeErrorCode != "terminal_persist_failed" {
+		t.Fatalf("failed safe error=%v", failed.SafeErrorCode)
+	}
 }
 
 // Break caught: delete waited on ctx.Done (which must remain open) rather than
@@ -383,6 +593,31 @@ func TestLocalTaskDeleteStableTaskSkipsRunnerDrain(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("stable delete did not finish")
+	}
+}
+
+// Break caught: persisting deleting->delete_failed failed once and discarded
+// the only settler instead of preserving the startup-recoverable deleting row.
+func TestLocalTaskDeleteFailedRetriesTerminalPersistence(t *testing.T) {
+	retry := newManualTerminalRetry()
+	fixture := newControlFixture(t, retry.option())
+	run := fixture.createAndWaitStarted("terminal-retry-delete-failed")
+	fixture.Store.mu.Lock()
+	fixture.Store.deleteFailures = 1
+	fixture.Store.deleteFailureErr = errors.New("permanent delete failure")
+	fixture.Store.mu.Unlock()
+	failLifecycleTransitions(fixture, "delete_failed", 1)
+
+	if _, err := fixture.Service.Delete(context.Background(), controlRequest(run.Task)); err != nil {
+		t.Fatal(err)
+	}
+	run.Release <- ErrDrainRequested
+	retry.receiveRequest(t)
+	requireAttemptRetained(t, fixture, run.Task.TaskID)
+	retry.release(t)
+	failed := receiveTransition(t, fixture.Store.transitions, "delete_failed")
+	if failed.SafeErrorCode == nil || *failed.SafeErrorCode != "delete_failed" {
+		t.Fatalf("delete_failed safe error=%v", failed.SafeErrorCode)
 	}
 }
 
@@ -572,6 +807,35 @@ func TestLocalTaskShutdownDrainsToWaitingRecoveryWithoutHardCancel(t *testing.T)
 	requireOpen(t, run.Control.Context.Done(), "hard-cancel context")
 	requireOpen(t, run.Returned, "runner return")
 	run.Release <- ErrDrainRequested
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	receiveTransition(t, fixture.Store.transitions, "waiting_recovery")
+}
+
+// Break caught: waiting_recovery persistence failed once, closed attempt.done,
+// and let Shutdown return while durable state still said running.
+func TestLocalTaskShutdownRetriesTerminalPersistenceBeforeReturning(t *testing.T) {
+	retry := newManualTerminalRetry()
+	fixture := newControlFixture(t, retry.option())
+	run := fixture.createAndWaitStarted("terminal-retry-shutdown")
+	failLifecycleTransitions(fixture, "waiting_recovery", 1)
+	done := make(chan error, 1)
+	go func() { done <- fixture.Service.Shutdown(context.Background()) }()
+	select {
+	case <-run.Control.Drain:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not request drain")
+	}
+	run.Release <- ErrDrainRequested
+	retry.receiveRequest(t)
+	requireAttemptRetained(t, fixture, run.Task.TaskID)
+	select {
+	case err := <-done:
+		t.Fatalf("Shutdown returned before terminal retry: %v", err)
+	default:
+	}
+	retry.release(t)
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}

@@ -144,9 +144,10 @@ type progressTicker struct {
 }
 
 type serviceOptions struct {
-	logf             func(string, ...any)
-	deleteRetryAfter func(time.Duration) <-chan time.Time
-	newTicker        func(time.Duration) progressTicker
+	logf               func(string, ...any)
+	deleteRetryAfter   func(time.Duration) <-chan time.Time
+	terminalRetryAfter func(time.Duration) <-chan time.Time
+	newTicker          func(time.Duration) progressTicker
 }
 
 type ServiceOption func(*serviceOptions)
@@ -167,6 +168,14 @@ func WithDeleteRetryAfter(after func(time.Duration) <-chan time.Time) ServiceOpt
 	}
 }
 
+func withTerminalRetryAfter(after func(time.Duration) <-chan time.Time) ServiceOption {
+	return func(options *serviceOptions) {
+		if after != nil {
+			options.terminalRetryAfter = after
+		}
+	}
+}
+
 func withProgressTicker(factory func(time.Duration) progressTicker) ServiceOption {
 	return func(options *serviceOptions) {
 		if factory != nil {
@@ -177,8 +186,9 @@ func withProgressTicker(factory func(time.Duration) progressTicker) ServiceOptio
 
 func defaultServiceOptions() serviceOptions {
 	return serviceOptions{
-		logf:             func(string, ...any) {},
-		deleteRetryAfter: time.After,
+		logf:               func(string, ...any) {},
+		deleteRetryAfter:   time.After,
+		terminalRetryAfter: time.After,
 		newTicker: func(interval time.Duration) progressTicker {
 			ticker := time.NewTicker(interval)
 			return progressTicker{channel: ticker.C, stop: ticker.Stop}

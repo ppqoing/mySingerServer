@@ -661,46 +661,97 @@ func (s *taskService) signalOrSettleHeld(updated store.LocalTask, reason DrainRe
 }
 
 func (s *taskService) completeAttempt(attempt *taskAttempt, runErr error) {
-	gate, err := s.acquireTaskGate(context.Background(), attempt.version().TaskID)
-	if err != nil {
-		attempt.finish()
-		return
-	}
-	if s.currentAttempt(attempt.version().TaskID) != attempt {
-		gate.release()
-		attempt.finish()
-		return
-	}
-	reason := attempt.drainReason()
-	if reason == DrainDelete {
-		attempt.markDone()
-		gate.release()
-		<-attempt.done
-		s.reconcileDelete(attempt)
-		return
-	}
-	target := "succeeded"
-	var code *string
-	switch reason {
-	case DrainPause:
-		target = "paused"
-	case DrainStop:
-		target = "cancelled"
-	case DrainProcessShutdown:
-		target = "waiting_recovery"
-	default:
-		if runErr != nil {
+	failures := 0
+	lastTarget := ""
+	var lastRevision int64
+	for {
+		version := attempt.version()
+		gate, err := s.acquireTaskGate(context.Background(), version.TaskID)
+		if err != nil {
+			attempt.finish()
+			return
+		}
+		if s.currentAttempt(version.TaskID) != attempt {
+			gate.release()
+			attempt.finish()
+			return
+		}
+
+		reason := attempt.drainReason()
+		if reason == DrainDelete {
+			attempt.markDone()
+			gate.release()
+			<-attempt.done
+			s.reconcileDelete(attempt)
+			return
+		}
+
+		version = attempt.version()
+		target := "succeeded"
+		var code *string
+		switch reason {
+		case DrainPause:
+			target = "paused"
+		case DrainStop:
+			target = "cancelled"
+		case DrainProcessShutdown:
+			target = "waiting_recovery"
+		default:
+			if runErr != nil {
+				target = "failed"
+				value := "task_failed"
+				code = &value
+			}
+		}
+		if target != lastTarget || version.ExpectedRevision != lastRevision {
+			failures = 0
+			lastTarget = target
+			lastRevision = version.ExpectedRevision
+		}
+		if reason == "" && runErr == nil && failures >= len(terminalPersistenceRetryDelays) {
 			target = "failed"
-			value := "task_failed"
+			value := "terminal_persist_failed"
 			code = &value
 		}
+
+		_, transitionErr := s.store.TransitionLocalTaskLifecycle(context.Background(), s.machineID, version, target, code, nil)
+		if transitionErr == nil {
+			s.cleanupAttemptHeld(attempt)
+			gate.release()
+			return
+		}
+		if terminalTransitionSuperseded(transitionErr) {
+			s.cleanupAttemptHeld(attempt)
+			gate.release()
+			return
+		}
+		s.options.logf("localtask: terminal transition failed for %s: %v", version.TaskID, transitionErr)
+		gate.release()
+
+		delay := terminalPersistenceRetryDelay(failures)
+		failures++
+		<-s.options.terminalRetryAfter(delay)
 	}
-	_, transitionErr := s.store.TransitionLocalTaskLifecycle(context.Background(), s.machineID, attempt.version(), target, code, nil)
-	if transitionErr != nil && !errors.Is(transitionErr, store.ErrLocalTaskStale) && !errors.Is(transitionErr, store.ErrLocalTaskInstanceMismatch) {
-		s.options.logf("localtask: terminal transition failed for %s: %v", attempt.version().TaskID, transitionErr)
+}
+
+var terminalPersistenceRetryDelays = [...]time.Duration{
+	time.Second,
+	2 * time.Second,
+	4 * time.Second,
+	8 * time.Second,
+	16 * time.Second,
+	30 * time.Second,
+}
+
+func terminalPersistenceRetryDelay(failures int) time.Duration {
+	if failures >= len(terminalPersistenceRetryDelays) {
+		return terminalPersistenceRetryDelays[len(terminalPersistenceRetryDelays)-1]
 	}
-	s.cleanupAttemptHeld(attempt)
-	gate.release()
+	return terminalPersistenceRetryDelays[failures]
+}
+
+func terminalTransitionSuperseded(err error) bool {
+	return errors.Is(err, store.ErrLocalTaskStale) || errors.Is(err, store.ErrLocalTaskInstanceMismatch)
 }
 
 func (s *taskService) reconcileDelete(attempt *taskAttempt) {
@@ -745,25 +796,35 @@ func (s *taskService) deleteAttempt(attempt *taskAttempt) error {
 }
 
 func (s *taskService) finishDeleteAttempt(attempt *taskAttempt, failureCode string) {
-	gate, err := s.acquireTaskGate(context.Background(), attempt.version().TaskID)
-	if err != nil {
-		attempt.finish()
-		return
-	}
-	if s.currentAttempt(attempt.version().TaskID) != attempt {
-		gate.release()
-		attempt.finish()
-		return
-	}
-	if failureCode != "" {
-		code := failureCode
-		_, err := s.store.TransitionLocalTaskLifecycle(context.Background(), s.machineID, attempt.version(), "delete_failed", &code, nil)
+	for failures := 0; ; failures++ {
+		version := attempt.version()
+		gate, err := s.acquireTaskGate(context.Background(), version.TaskID)
 		if err != nil {
-			s.options.logf("localtask: delete failure transition failed for %s: %v", attempt.version().TaskID, err)
+			attempt.finish()
+			return
 		}
+		if s.currentAttempt(version.TaskID) != attempt {
+			gate.release()
+			attempt.finish()
+			return
+		}
+		if failureCode == "" {
+			s.cleanupAttemptHeld(attempt)
+			gate.release()
+			return
+		}
+
+		code := failureCode
+		_, transitionErr := s.store.TransitionLocalTaskLifecycle(context.Background(), s.machineID, version, "delete_failed", &code, nil)
+		if transitionErr == nil || terminalTransitionSuperseded(transitionErr) {
+			s.cleanupAttemptHeld(attempt)
+			gate.release()
+			return
+		}
+		s.options.logf("localtask: delete failure transition failed for %s: %v", version.TaskID, transitionErr)
+		gate.release()
+		<-s.options.terminalRetryAfter(terminalPersistenceRetryDelay(failures))
 	}
-	s.cleanupAttemptHeld(attempt)
-	gate.release()
 }
 
 func (s *taskService) flushProgressHeld(attempt *taskAttempt) error {
