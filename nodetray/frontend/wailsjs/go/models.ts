@@ -1,16 +1,16 @@
 export namespace config {
-	
+
 	export class AgentDeleteForm {
 	    pipeName: string;
 	    maxEntriesPerFrame: number;
 	    dialTimeoutMs: number;
 	    helloTimeoutS: number;
 	    reportTimeoutS: number;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new AgentDeleteForm(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.pipeName = source["pipeName"];
@@ -27,11 +27,11 @@ export namespace config {
 	    pendingBytesMb: number;
 	    statsLogMb: number;
 	    pprofAddr: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new TuningForm(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.statsEnabled = source["statsEnabled"];
@@ -44,11 +44,11 @@ export namespace config {
 	}
 	export class IPCForm {
 	    maxFrameMb: number;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new IPCForm(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.maxFrameMb = source["maxFrameMb"];
@@ -60,11 +60,11 @@ export namespace config {
 	    probeTimeoutS: number;
 	    nativeTimeoutS: number;
 	    frameTimeoutS: number;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new ThumbForm(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.cacheDir = source["cacheDir"];
@@ -76,11 +76,11 @@ export namespace config {
 	}
 	export class PipelineForm {
 	    readChunkKb: number;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new PipelineForm(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.readChunkKb = source["readChunkKb"];
@@ -93,11 +93,11 @@ export namespace config {
 	    videoTimeoutS: number;
 	    imageMemoryMb: number;
 	    respawnDelayMs: number;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new WorkerForm(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.count = source["count"];
@@ -110,11 +110,11 @@ export namespace config {
 	}
 	export class ProtoForm {
 	    heartbeatS: number;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new ProtoForm(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.heartbeatS = source["heartbeatS"];
@@ -124,11 +124,11 @@ export namespace config {
 	    intervalS: number;
 	    triggerRows: number;
 	    upsertBatch: number;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new SyncForm(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.intervalS = source["intervalS"];
@@ -145,11 +145,11 @@ export namespace config {
 	    videoTimeoutS: number;
 	    imageExts: string[];
 	    videoExts: string[];
-	
+
 	    static createFrom(source: any = {}) {
 	        return new ScanForm(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.hddReadBlockMb = source["hddReadBlockMb"];
@@ -171,11 +171,11 @@ export namespace config {
 	    passwordStored: boolean;
 	    replacePassword: boolean;
 	    sslMode: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new DatabaseForm(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.host = source["host"];
@@ -203,11 +203,11 @@ export namespace config {
 	    ipc: IPCForm;
 	    delete: AgentDeleteForm;
 	    tuning: TuningForm;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new AgentForm(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.listenHost = source["listenHost"];
@@ -225,7 +225,7 @@ export namespace config {
 	        this.delete = this.convertValues(source["delete"], AgentDeleteForm);
 	        this.tuning = this.convertValues(source["tuning"], TuningForm);
 	    }
-	
+
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -244,16 +244,16 @@ export namespace config {
 		    return a;
 		}
 	}
-	
+
 	export class FieldError {
 	    field: string;
 	    code: string;
 	    message: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new FieldError(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.field = source["field"];
@@ -272,11 +272,11 @@ export namespace config {
 	    frameReadTimeoutSec: number;
 	    frameWriteTimeoutSec: number;
 	    logDir: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new HelperForm(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.pipeName = source["pipeName"];
@@ -291,27 +291,27 @@ export namespace config {
 	        this.logDir = source["logDir"];
 	    }
 	}
-	
-	
-	
-	
-	
-	
-	
+
+
+
+
+
+
+
 
 }
 
 export namespace main {
-	
+
 	export class BackendStartup {
 	    Ready: boolean;
 	    Duplicate: boolean;
 	    ErrorCode: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new BackendStartup(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.Ready = source["Ready"];
@@ -323,7 +323,7 @@ export namespace main {
 }
 
 export namespace traymodel {
-	
+
 	export class ComponentState {
 	    lifecycle: string;
 	    healthy: boolean;
@@ -340,11 +340,11 @@ export namespace traymodel {
 	    runtimeConfigSha256: string;
 	    savedConfigSha256: string;
 	    needsRestart: boolean;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new ComponentState(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.lifecycle = source["lifecycle"];
@@ -372,11 +372,11 @@ export namespace traymodel {
 	    needsRestart: boolean;
 	    errorCode: string;
 	    errorSummary: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new ConfigApplyResult(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.ok = source["ok"];
@@ -393,11 +393,11 @@ export namespace traymodel {
 	    failedComponents: string[];
 	    errorCode: string;
 	    errorSummary: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new ForceExitResult(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.ok = source["ok"];
@@ -414,11 +414,11 @@ export namespace traymodel {
 	    dataBase64: string;
 	    errorCode: string;
 	    errorSummary: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new ImagePreview(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.ok = source["ok"];
@@ -435,11 +435,11 @@ export namespace traymodel {
 	    result: string;
 	    errorCode: string;
 	    uncertain: boolean;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new LocalDeleteItem(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.fileId = source["fileId"];
@@ -459,11 +459,11 @@ export namespace traymodel {
 	    items: LocalDeleteItem[];
 	    errorCode: string;
 	    errorSummary: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new LocalDeleteBatch(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.ok = source["ok"];
@@ -477,7 +477,7 @@ export namespace traymodel {
 	        this.errorCode = source["errorCode"];
 	        this.errorSummary = source["errorSummary"];
 	    }
-	
+
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -499,11 +499,11 @@ export namespace traymodel {
 	export class LocalDeleteExecute {
 	    batchId: string;
 	    selectionDigest: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new LocalDeleteExecute(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.batchId = source["batchId"];
@@ -514,11 +514,11 @@ export namespace traymodel {
 	    fileId: number;
 	    path: string;
 	    size: number;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new LocalDeleteFile(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.fileId = source["fileId"];
@@ -526,15 +526,15 @@ export namespace traymodel {
 	        this.size = source["size"];
 	    }
 	}
-	
+
 	export class LocalDeletePrepare {
 	    runId: string;
 	    groupId: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new LocalDeletePrepare(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.runId = source["runId"];
@@ -551,11 +551,11 @@ export namespace traymodel {
 	    files: LocalDeleteFile[];
 	    errorCode: string;
 	    errorSummary: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new LocalDeletePreview(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.ok = source["ok"];
@@ -568,7 +568,7 @@ export namespace traymodel {
 	        this.errorCode = source["errorCode"];
 	        this.errorSummary = source["errorSummary"];
 	    }
-	
+
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -594,11 +594,11 @@ export namespace traymodel {
 	    size: number;
 	    status: string;
 	    decision: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new LocalGroupMember(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.fileId = source["fileId"];
@@ -620,11 +620,11 @@ export namespace traymodel {
 	    stageTwo: string;
 	    stageThree: string;
 	    members: LocalGroupMember[];
-	
+
 	    static createFrom(source: any = {}) {
 	        return new LocalGroup(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.runId = source["runId"];
@@ -638,7 +638,7 @@ export namespace traymodel {
 	        this.stageThree = source["stageThree"];
 	        this.members = this.convertValues(source["members"], LocalGroupMember);
 	    }
-	
+
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -657,7 +657,7 @@ export namespace traymodel {
 		    return a;
 		}
 	}
-	
+
 	export class LocalGroupPage {
 	    ok: boolean;
 	    groups: LocalGroup[];
@@ -665,11 +665,11 @@ export namespace traymodel {
 	    nextOffset: number;
 	    errorCode: string;
 	    errorSummary: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new LocalGroupPage(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.ok = source["ok"];
@@ -679,7 +679,7 @@ export namespace traymodel {
 	        this.errorCode = source["errorCode"];
 	        this.errorSummary = source["errorSummary"];
 	    }
-	
+
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -707,11 +707,11 @@ export namespace traymodel {
 	    reviewStatus: string;
 	    offset: number;
 	    limit: number;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new LocalGroupQuery(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.scope = source["scope"];
@@ -727,11 +727,11 @@ export namespace traymodel {
 	export class LocalReviewDecision {
 	    fileId: number;
 	    decision: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new LocalReviewDecision(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.fileId = source["fileId"];
@@ -744,11 +744,11 @@ export namespace traymodel {
 	    reviewer: string;
 	    note: string;
 	    decisions: LocalReviewDecision[];
-	
+
 	    static createFrom(source: any = {}) {
 	        return new LocalReviewSave(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.runId = source["runId"];
@@ -757,7 +757,7 @@ export namespace traymodel {
 	        this.note = source["note"];
 	        this.decisions = this.convertValues(source["decisions"], LocalReviewDecision);
 	    }
-	
+
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -799,11 +799,11 @@ export namespace traymodel {
 	    updatedAt: number;
 	    startedAt: number;
 	    completedAt: number;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new LocalTask(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.taskId = source["taskId"];
@@ -834,11 +834,11 @@ export namespace traymodel {
 	    taskId: string;
 	    instanceId: string;
 	    expectedRevision: number;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new LocalTaskControl(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.taskId = source["taskId"];
@@ -852,11 +852,11 @@ export namespace traymodel {
 	    mode: string;
 	    rescan: boolean;
 	    extensions: string[];
-	
+
 	    static createFrom(source: any = {}) {
 	        return new LocalTaskCreate(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.taskId = source["taskId"];
@@ -873,11 +873,11 @@ export namespace traymodel {
 	    nextOffset: number;
 	    errorCode: string;
 	    errorSummary: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new LocalTaskPage(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.ok = source["ok"];
@@ -887,7 +887,7 @@ export namespace traymodel {
 	        this.errorCode = source["errorCode"];
 	        this.errorSummary = source["errorSummary"];
 	    }
-	
+
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -912,11 +912,11 @@ export namespace traymodel {
 	    deleted: boolean;
 	    errorCode: string;
 	    errorSummary: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new LocalTaskResult(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.ok = source["ok"];
@@ -925,7 +925,7 @@ export namespace traymodel {
 	        this.errorCode = source["errorCode"];
 	        this.errorSummary = source["errorSummary"];
 	    }
-	
+
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -949,11 +949,11 @@ export namespace traymodel {
 	    errorCode: string;
 	    errorSummary: string;
 	    uacCancelled: boolean;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new OperationResult(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.ok = source["ok"];
@@ -968,11 +968,11 @@ export namespace traymodel {
 	    ready: boolean;
 	    currentTaskSummary: string;
 	    lastErrorSummary: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new WorkerState(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.index = source["index"];
@@ -992,11 +992,11 @@ export namespace traymodel {
 	    helperEnabled: boolean;
 	    helperTaskDrift: boolean;
 	    loginStartDrift: boolean;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new Overview(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.machineId = source["machineId"];
@@ -1009,7 +1009,7 @@ export namespace traymodel {
 	        this.helperTaskDrift = source["helperTaskDrift"];
 	        this.loginStartDrift = source["loginStartDrift"];
 	    }
-	
+
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -1031,11 +1031,11 @@ export namespace traymodel {
 	export class PageRequest {
 	    offset: number;
 	    limit: number;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new PageRequest(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.offset = source["offset"];
@@ -1048,11 +1048,11 @@ export namespace traymodel {
 	    cancelled: boolean;
 	    errorCode: string;
 	    errorSummary: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new PathSelectionResult(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.ok = source["ok"];
@@ -1070,11 +1070,11 @@ export namespace traymodel {
 	    closeToTray: boolean;
 	    refreshIntervalSeconds: number;
 	    notificationLevel: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new TraySettings(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.loginStartTray = source["loginStartTray"];
