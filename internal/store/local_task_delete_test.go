@@ -20,6 +20,80 @@ type localTaskDeletionFixture struct {
 	Before   map[string][][]any
 }
 
+type productionTaskDeleteSyncFixture struct {
+	DB       *DB
+	Control  LocalTaskControl
+	RunID    string
+	OtherRun string
+}
+
+// Break caught: task deletion matches synthetic topic prefixes instead of the
+// production analysis/review payload identities, leaving task-private pending
+// events behind or deleting acknowledged, unrelated, or central events.
+func TestDeleteLocalTaskDataRemovesProductionAnalysisAndReviewOutbox(t *testing.T) {
+	fixture := seedProductionTaskDeleteSyncFixture(t)
+	if _, err := fixture.DB.DeleteLocalTaskData(context.Background(), "machine-a", fixture.Control); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := countWhere(t, fixture.DB, "local_outbox", `ack_at IS NULL AND (
+		(topic='local.analysis.published' AND json_extract(payload_json,'$.run_id')='`+fixture.RunID+`') OR
+		(topic='local_analysis.stage' AND json_extract(payload_json,'$.run_id')='`+fixture.RunID+`') OR
+		(topic='local.review' AND json_extract(payload_json,'$.run_id')='`+fixture.RunID+`')
+	)`); got != 0 {
+		t.Fatalf("pending task-private production events = %d, want 0", got)
+	}
+	for _, predicate := range []string{
+		"topic='local_analysis.stage' AND entity_key='" + fixture.RunID + ":acked' AND ack_at=77",
+		"topic='local.delete' AND entity_key='sync-delete:6' AND ack_at=66 AND json_type(payload_json,'$.run_id') IS NULL",
+		"topic='local.analysis.published' AND entity_key='" + fixture.OtherRun + "' AND ack_at IS NULL",
+		"topic='central.keep' AND entity_key='" + fixture.RunID + "' AND ack_at=88",
+		"topic='local.delete' AND json_extract(payload_json,'$.batch_id')='sync-delete' AND json_extract(payload_json,'$.run_id')='" + fixture.RunID + "'",
+	} {
+		if got := countWhere(t, fixture.DB, "local_outbox", predicate); got != 1 {
+			t.Fatalf("preserved event %q rows = %d, want 1", predicate, got)
+		}
+	}
+	var detached sql.NullString
+	if err := fixture.DB.db.QueryRow(`SELECT run_id FROM local_delete_batches WHERE batch_id='sync-delete'`).Scan(&detached); err != nil {
+		t.Fatal(err)
+	}
+	if detached.Valid {
+		t.Fatalf("delete audit run_id = %q, want NULL", detached.String)
+	}
+	if got := countWhere(t, fixture.DB, "local_delete_items", "batch_id='sync-delete'"); got != 1 {
+		t.Fatalf("retained delete items = %d, want 1", got)
+	}
+}
+
+// Break caught: a retained local.delete event still scans a detached batch
+// run_id into string or reloads the deleted run, making it a permanent poison
+// event ahead of otherwise loadable local sync work.
+func TestDeleteLocalTaskDataLeavesLoadableDetachedDeleteSync(t *testing.T) {
+	fixture := seedProductionTaskDeleteSyncFixture(t)
+	ctx := context.Background()
+	if _, err := fixture.DB.DeleteLocalTaskData(ctx, "machine-a", fixture.Control); err != nil {
+		t.Fatal(err)
+	}
+	events, err := fixture.DB.PendingLocalSyncEvents(ctx, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch, err := fixture.DB.LoadLocalSyncBatch(ctx, events)
+	if err != nil {
+		t.Fatalf("LoadLocalSyncBatch after task delete: %v; events=%#v", err, events)
+	}
+	if len(batch.Events) != 2 || len(batch.Deletes) != 1 || len(batch.Runs) != 1 {
+		t.Fatalf("post-delete sync shape events/deletes/runs=%d/%d/%d", len(batch.Events), len(batch.Deletes), len(batch.Runs))
+	}
+	if batch.Deletes[0].RunID != fixture.RunID || batch.Deletes[0].BatchID != "sync-delete" || batch.Deletes[0].FileID != 6 {
+		t.Fatalf("detached delete row = %#v", batch.Deletes[0])
+	}
+	if batch.Runs[0].RunID != fixture.OtherRun {
+		t.Fatalf("deleted run was recalled into sync batch: %#v", batch.Runs)
+	}
+}
+
 // Break caught: deleting a task either leaves task-owned analysis rows behind,
 // removes global/audit/sync data, or promotes an older run after clearing the
 // current pointer.
@@ -129,18 +203,18 @@ func TestDeleteLocalTaskDataEnforcesControlAndPreservesAcknowledgedOutbox(t *tes
 	if _, err := fixture.DB.DeleteLocalTaskData(context.Background(), "machine-1", fixture.ControlA); err != nil {
 		t.Fatal(err)
 	}
-	var acked, nonAnalysis, central int
-	if err := fixture.DB.db.QueryRow(`SELECT count(*) FROM local_outbox WHERE topic='local_analysis.acked' AND entity_key=? AND ack_at IS NOT NULL`, fixture.RunA).Scan(&acked); err != nil {
+	var acked, taskReview, central int
+	if err := fixture.DB.db.QueryRow(`SELECT count(*) FROM local_outbox WHERE topic='local_analysis.stage' AND entity_key=? AND ack_at IS NOT NULL`, fixture.RunA+":acked").Scan(&acked); err != nil {
 		t.Fatal(err)
 	}
-	if err := fixture.DB.db.QueryRow(`SELECT count(*) FROM local_outbox WHERE topic='local.review' AND entity_key=?`, fixture.RunA).Scan(&nonAnalysis); err != nil {
+	if err := fixture.DB.db.QueryRow(`SELECT count(*) FROM local_outbox WHERE topic='local.review' AND json_extract(payload_json,'$.run_id')=?`, fixture.RunA).Scan(&taskReview); err != nil {
 		t.Fatal(err)
 	}
 	if err := fixture.DB.db.QueryRow(`SELECT count(*) FROM local_outbox WHERE topic LIKE 'central.%'`).Scan(&central); err != nil {
 		t.Fatal(err)
 	}
-	if acked != 1 || nonAnalysis != 1 || central != 1 {
-		t.Fatalf("preserved outbox = acked:%d non-analysis:%d central:%d, want 1/1/1", acked, nonAnalysis, central)
+	if acked != 1 || taskReview != 0 || central != 1 {
+		t.Fatalf("outbox boundary = acked:%d task-review:%d central:%d, want 1/0/1", acked, taskReview, central)
 	}
 }
 
@@ -202,7 +276,7 @@ func TestDeleteLocalTaskDataUsesDeclaredMutationOrder(t *testing.T) {
 		}
 		got = append(got, step)
 	}
-	want := []string{"current", "batches", "reviews", "members", "groups", "pairs", "outbox", "runs", "receipt", "task"}
+	want := []string{"current", "delete_event", "batches", "outbox", "reviews", "members", "groups", "pairs", "runs", "receipt", "task"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("mutation order = %v, want %v", got, want)
 	}
@@ -218,12 +292,13 @@ func TestDeleteLocalTaskDataRollsBackEveryMutationStep(t *testing.T) {
 		when  string
 	}{
 		{name: "current", table: "local_current_analysis", event: "DELETE", when: "OLD.run_id='run-a'"},
+		{name: "delete_event", table: "local_outbox", event: "UPDATE", when: "OLD.topic='local.delete' AND OLD.entity_key='batch-a:101'"},
 		{name: "batches", table: "local_delete_batches", event: "UPDATE", when: "OLD.run_id='run-a'"},
+		{name: "outbox", table: "local_outbox", event: "DELETE", when: "OLD.topic='local.analysis.published' AND OLD.entity_key='run-a'"},
 		{name: "reviews", table: "local_reviews", event: "DELETE", when: "OLD.run_id='run-a'"},
 		{name: "members", table: "local_dup_members", event: "DELETE", when: "OLD.run_id='run-a'"},
 		{name: "groups", table: "local_dup_groups", event: "DELETE", when: "OLD.run_id='run-a'"},
 		{name: "pairs", table: "local_pair_scores", event: "DELETE", when: "OLD.run_id='run-a'"},
-		{name: "outbox", table: "local_outbox", event: "DELETE", when: "OLD.topic='local_analysis.pending' AND OLD.entity_key='run-a'"},
 		{name: "runs", table: "local_analysis_runs", event: "DELETE", when: "OLD.run_id='run-a'"},
 		{name: "receipt", table: "local_task_deletion_receipts", event: "INSERT", when: "NEW.task_id='task-a'"},
 		{name: "task", table: "local_tasks", event: "DELETE", when: "OLD.task_id='task-a'"},
@@ -327,6 +402,70 @@ func TestDeleteLocalTaskDataClassifiesSQLiteBusyAndLockedAsRetryable(t *testing.
 	})
 }
 
+func seedProductionTaskDeleteSyncFixture(t *testing.T) productionTaskDeleteSyncFixture {
+	t.Helper()
+	db := openLocalTestDB(t)
+	ctx := context.Background()
+	run := seedLocalResultGroups(t, db)
+	if err := db.CommitLocalReview(ctx, LocalReviewCommit{
+		MachineID: "machine-a", RunID: run.RunID, GroupID: "group-video", Reviewer: "user",
+		Decisions: []LocalReviewChoice{{FileID: 5, Decision: "keep"}, {FileID: 6, Decision: "delete"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CommitDeletionResults(ctx, "sync-delete", []DeletionResult{{
+		FileID: 6, MachineID: "machine-a", Path: `D:\Video\copy.mp4`, SHA512: "sha-6",
+		Size: 500, MTime: 1000, BatchID: "sync-delete", RunID: run.RunID,
+		GroupID: "group-video", Generation: run.Generation, ConfirmationDigest: "digest", OK: true,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec(`
+		INSERT INTO local_outbox(topic,entity_key,generation,payload_json,ack_at,created_at,updated_at)
+		VALUES ('local.delete','sync-delete:6',101,
+		'{"file_id":6,"machine_id":"machine-a","status":"deleted","sha512":"sha-6","batch_id":"sync-delete"}',66,1,1)`); err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range []LocalOutboxEvent{
+		{Topic: "local_analysis.stage", EntityKey: run.RunID + ":final", Generation: run.Generation,
+			PayloadJSON: `{"run_id":"` + run.RunID + `","stage":"final","counts":{"groups":4}}`},
+		{Topic: "local_analysis.stage", EntityKey: run.RunID + ":acked", Generation: run.Generation + 1,
+			PayloadJSON: `{"run_id":"` + run.RunID + `","stage":"acked","counts":{}}`},
+	} {
+		if err := db.EnqueueLocalEvent(ctx, event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.db.Exec(`UPDATE local_outbox SET ack_at=77 WHERE topic='local_analysis.stage' AND entity_key=?`, run.RunID+":acked"); err != nil {
+		t.Fatal(err)
+	}
+
+	createAnalysisTask(t, db, "task-sync-other", "machine-a")
+	other, err := db.BeginLocalAnalysis(ctx, "machine-a", "task-sync-other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CompleteLocalAnalysis(ctx, other.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PublishLocalAnalysis(ctx, other.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec(`
+		INSERT INTO local_outbox(topic,entity_key,generation,payload_json,ack_at,created_at,updated_at)
+		VALUES ('central.keep',?1,0,'{"scope":"central"}',88,1,1)`, run.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec(`UPDATE local_tasks SET status='deleting',revision=7 WHERE task_id=?`, run.TaskID); err != nil {
+		t.Fatal(err)
+	}
+	task, err := db.LoadLocalTask(ctx, "machine-a", run.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return productionTaskDeleteSyncFixture{DB: db, Control: controlFor(task), RunID: run.RunID, OtherRun: other.RunID}
+}
+
 func seedTwoTaskDeletionFixture(t *testing.T) localTaskDeletionFixture {
 	t.Helper()
 	db := openLocalTestDB(t)
@@ -383,14 +522,15 @@ func seedTwoTaskDeletionFixture(t *testing.T) localTaskDeletionFixture {
 			('batch-a','machine-1',101,'D:\\a.jpg','sha-a','deleted',1,2),
 			('batch-b','machine-1',102,'D:\\b.jpg','sha-b','failed',3,4);
 		INSERT INTO local_outbox(topic,entity_key,generation,payload_json,ack_at,retry_count,next_retry_at,last_error,created_at,updated_at) VALUES
-			('local_analysis.pending','run-a',20,'{}',NULL,0,NULL,NULL,1,1),
-			('local_analysis.retry','run-a:group-a',20,'{}',NULL,2,10,'retry',2,2),
-			('local_analysis.acked','run-a',21,'{}',99,0,NULL,NULL,3,3),
-			('local_analysis.lookalike','run-a-extra',22,'{}',NULL,0,NULL,NULL,4,4),
-			('local_analysis.foreign','xrun-a:group',23,'{}',NULL,0,NULL,NULL,5,5),
-			('local.review','run-a',20,'{}',NULL,0,NULL,NULL,6,6),
-			('local_analysis.pending','run-b',10,'{}',NULL,0,NULL,NULL,7,7),
-			('central.sync','run-a',0,'{}',NULL,0,NULL,NULL,8,8);`); err != nil {
+			('local.analysis.published','run-a',20,'{"machine_id":"machine-1","run_id":"run-a","generation":20,"status":"published"}',NULL,0,NULL,NULL,1,1),
+			('local_analysis.stage','run-a:final',20,'{"run_id":"run-a","stage":"final","counts":{}}',NULL,2,10,'retry',2,2),
+			('local_analysis.stage','run-a:acked',21,'{"run_id":"run-a","stage":"acked","counts":{}}',99,0,NULL,NULL,3,3),
+			('local_analysis.stage','run-a-extra:final',22,'{"run_id":"run-other","stage":"final","counts":{}}',NULL,0,NULL,NULL,4,4),
+			('local_analysis.stage','xrun-a:final',23,'{"run_id":"xrun-a","stage":"final","counts":{}}',NULL,0,NULL,NULL,5,5),
+			('local.review','group-a',20,'{"machine_id":"machine-1","run_id":"run-a","generation":20,"group_id":"group-a","decisions":[]}',NULL,0,NULL,NULL,6,6),
+			('local.analysis.published','run-b',10,'{"machine_id":"machine-1","run_id":"run-b","generation":10,"status":"published"}',NULL,0,NULL,NULL,7,7),
+			('local.delete','batch-a:101',20,'{"file_id":101,"machine_id":"machine-1","status":"deleted","sha512":"sha-a","batch_id":"batch-a"}',NULL,0,NULL,NULL,8,8),
+			('central.sync','run-a',0,'{}',NULL,0,NULL,NULL,9,9);`); err != nil {
 		t.Fatal(err)
 	}
 	return localTaskDeletionFixture{
@@ -425,7 +565,11 @@ func assertTaskAAnalysisAbsent(t *testing.T, fixture localTaskDeletionFixture) {
 	if got := countWhere(t, fixture.DB, "local_delete_items", "batch_id='batch-a'"); got != 1 {
 		t.Fatalf("batch-a items = %d, want 1", got)
 	}
-	if got := countWhere(t, fixture.DB, "local_outbox", `ack_at IS NULL AND topic LIKE 'local_analysis.%' AND (entity_key='run-a' OR substr(entity_key,1,length('run-a')+1)='run-a:')`); got != 0 {
+	if got := countWhere(t, fixture.DB, "local_outbox", `ack_at IS NULL AND (
+		(topic='local.analysis.published' AND json_extract(payload_json,'$.run_id')='run-a') OR
+		(topic='local_analysis.stage' AND json_extract(payload_json,'$.run_id')='run-a') OR
+		(topic='local.review' AND json_extract(payload_json,'$.run_id')='run-a')
+	)`); got != 0 {
 		t.Fatalf("task-a pending analysis outbox = %d, want 0", got)
 	}
 	if got := countWhere(t, fixture.DB, "local_task_deletion_receipts", "machine_id='machine-1' AND task_id='task-a' AND instance_id='"+fixture.ControlA.InstanceID+"'"); got != 1 {
@@ -455,10 +599,10 @@ func assertTaskBAndGlobalDataUnchanged(t *testing.T, fixture localTaskDeletionFi
 		}
 	}
 	for _, predicate := range []string{
-		"topic='local_analysis.acked' AND entity_key='run-a'",
-		"topic='local_analysis.lookalike' AND entity_key='run-a-extra'",
-		"topic='local_analysis.foreign' AND entity_key='xrun-a:group'",
-		"topic='local.review' AND entity_key='run-a'",
+		"topic='local_analysis.stage' AND entity_key='run-a:acked' AND ack_at=99",
+		"topic='local_analysis.stage' AND entity_key='run-a-extra:final'",
+		"topic='local_analysis.stage' AND entity_key='xrun-a:final'",
+		"topic='local.delete' AND entity_key='batch-a:101' AND json_extract(payload_json,'$.run_id')='run-a'",
 		"topic='central.sync' AND entity_key='run-a'",
 	} {
 		if got := countWhere(t, fixture.DB, "local_outbox", predicate); got != 1 {
@@ -474,12 +618,13 @@ func installDeletionOrderTriggers(t *testing.T, fixture localTaskDeletionFixture
 	}
 	triggers := []string{
 		`CREATE TRIGGER order_current BEFORE DELETE ON local_current_analysis WHEN OLD.run_id='run-a' BEGIN INSERT INTO deletion_order(step) VALUES ('current'); END`,
+		`CREATE TRIGGER order_delete_event BEFORE UPDATE ON local_outbox WHEN OLD.topic='local.delete' AND OLD.entity_key='batch-a:101' BEGIN INSERT INTO deletion_order(step) VALUES ('delete_event'); END`,
 		`CREATE TRIGGER order_batches BEFORE UPDATE ON local_delete_batches WHEN OLD.run_id='run-a' BEGIN INSERT INTO deletion_order(step) VALUES ('batches'); END`,
+		`CREATE TRIGGER order_outbox BEFORE DELETE ON local_outbox WHEN OLD.topic='local.analysis.published' AND OLD.entity_key='run-a' BEGIN INSERT INTO deletion_order(step) VALUES ('outbox'); END`,
 		`CREATE TRIGGER order_reviews BEFORE DELETE ON local_reviews WHEN OLD.run_id='run-a' BEGIN INSERT INTO deletion_order(step) VALUES ('reviews'); END`,
 		`CREATE TRIGGER order_members BEFORE DELETE ON local_dup_members WHEN OLD.run_id='run-a' BEGIN INSERT INTO deletion_order(step) VALUES ('members'); END`,
 		`CREATE TRIGGER order_groups BEFORE DELETE ON local_dup_groups WHEN OLD.run_id='run-a' BEGIN INSERT INTO deletion_order(step) VALUES ('groups'); END`,
 		`CREATE TRIGGER order_pairs BEFORE DELETE ON local_pair_scores WHEN OLD.run_id='run-a' BEGIN INSERT INTO deletion_order(step) VALUES ('pairs'); END`,
-		`CREATE TRIGGER order_outbox BEFORE DELETE ON local_outbox WHEN OLD.topic='local_analysis.pending' AND OLD.entity_key='run-a' BEGIN INSERT INTO deletion_order(step) VALUES ('outbox'); END`,
 		`CREATE TRIGGER order_runs BEFORE DELETE ON local_analysis_runs WHEN OLD.run_id='run-a' BEGIN INSERT INTO deletion_order(step) VALUES ('runs'); END`,
 		`CREATE TRIGGER order_receipt BEFORE INSERT ON local_task_deletion_receipts WHEN NEW.task_id='task-a' BEGIN INSERT INTO deletion_order(step) VALUES ('receipt'); END`,
 		`CREATE TRIGGER order_task BEFORE DELETE ON local_tasks WHEN OLD.task_id='task-a' BEGIN INSERT INTO deletion_order(step) VALUES ('task'); END`,

@@ -93,9 +93,10 @@ func (d *DB) DeleteLocalTaskData(
 	}
 
 	var runID string
+	var runGeneration int64
 	err = tx.QueryRowContext(ctx, `
-		SELECT run_id FROM local_analysis_runs
-		WHERE machine_id=?1 AND task_id=?2`, machineID, control.TaskID).Scan(&runID)
+		SELECT run_id,generation FROM local_analysis_runs
+		WHERE machine_id=?1 AND task_id=?2`, machineID, control.TaskID).Scan(&runID, &runGeneration)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return LocalTaskDeleteResult{}, wrapLocalTaskDeleteError("locate analysis run", err)
 	}
@@ -107,19 +108,59 @@ func (d *DB) DeleteLocalTaskData(
 			args  []any
 		}{
 			{name: "delete current analysis", query: `DELETE FROM local_current_analysis WHERE machine_id=?1 AND run_id=?2`, args: []any{machineID, runID}},
+			{name: "make delete events self-contained", query: `
+			UPDATE local_outbox AS o
+			SET payload_json=json_set(o.payload_json,'$.run_id',?2)
+			WHERE o.topic='local.delete'
+			  AND o.ack_at IS NULL
+			  AND o.generation=?3
+			  AND EXISTS (
+				SELECT 1
+				FROM local_delete_batches b
+				JOIN local_delete_items i
+				  ON i.machine_id=b.machine_id AND i.batch_id=b.batch_id
+				WHERE b.machine_id=?1 AND b.run_id=?2
+				  AND json_extract(o.payload_json,'$.machine_id')=b.machine_id
+				  AND json_extract(o.payload_json,'$.batch_id')=b.batch_id
+				  AND json_extract(o.payload_json,'$.file_id')=i.file_id
+				  AND json_extract(o.payload_json,'$.sha512')=i.sha512
+				  AND json_extract(o.payload_json,'$.status')='deleted'
+				  AND i.result='deleted'
+				  AND o.entity_key=b.batch_id || ':' || CAST(i.file_id AS TEXT)
+			  )`, args: []any{machineID, runID, runGeneration}},
 			{name: "detach delete batches", query: `UPDATE local_delete_batches SET run_id=NULL WHERE machine_id=?1 AND run_id=?2`, args: []any{machineID, runID}},
+			{name: "delete task-owned sync events", query: `
+			DELETE FROM local_outbox
+			WHERE ack_at IS NULL
+			  AND (
+				(topic='local.analysis.published'
+				 AND generation=?3
+				 AND entity_key=?2
+				 AND json_extract(payload_json,'$.machine_id')=?1
+				 AND json_extract(payload_json,'$.run_id')=?2
+				 AND json_extract(payload_json,'$.generation')=?3)
+				OR
+				(topic='local_analysis.stage'
+				 AND generation=?3
+				 AND substr(entity_key,1,length(?2)+1)=?2 || ':'
+				 AND json_extract(payload_json,'$.run_id')=?2)
+				OR
+				(topic='local.review'
+				 AND generation=?3
+				 AND entity_key=json_extract(payload_json,'$.group_id')
+				 AND json_extract(payload_json,'$.machine_id')=?1
+				 AND json_extract(payload_json,'$.run_id')=?2
+				 AND json_extract(payload_json,'$.generation')=?3
+				 AND EXISTS (
+					SELECT 1 FROM local_dup_groups g
+					WHERE g.machine_id=?1 AND g.run_id=?2 AND g.generation=?3
+					  AND g.group_id=local_outbox.entity_key
+				 ))
+			  )`, args: []any{machineID, runID, runGeneration}},
 			{name: "delete reviews", query: `DELETE FROM local_reviews WHERE machine_id=?1 AND run_id=?2`, args: []any{machineID, runID}},
 			{name: "delete duplicate members", query: `DELETE FROM local_dup_members WHERE machine_id=?1 AND run_id=?2`, args: []any{machineID, runID}},
 			{name: "delete duplicate groups", query: `DELETE FROM local_dup_groups WHERE machine_id=?1 AND run_id=?2`, args: []any{machineID, runID}},
 			{name: "delete pair scores", query: `DELETE FROM local_pair_scores WHERE machine_id=?1 AND run_id=?2`, args: []any{machineID, runID}},
-			{name: "delete pending analysis outbox", query: `
-			DELETE FROM local_outbox
-			WHERE ack_at IS NULL
-			  AND topic LIKE 'local_analysis.%'
-			  AND (
-				entity_key=?1 OR
-				substr(entity_key,1,length(?1)+1)=?1 || ':'
-			  )`, args: []any{runID}},
 			{name: "delete analysis run", query: `DELETE FROM local_analysis_runs WHERE machine_id=?1 AND run_id=?2 AND task_id=?3`, args: []any{machineID, runID, control.TaskID}},
 		}
 		for _, statement := range statements {
