@@ -5,16 +5,26 @@ import (
 	"testing"
 )
 
-// Break caught: parent validation rejects one precise, requested field error
-// for each media field after a decoder failure.
+// Break caught: parent validation accepts a combined media error field instead
+// of rejecting it while accepting one precise requested field at a time.
 func TestVideoFileErrorsAcceptOneRequestedBitEach(t *testing.T) {
 	job := &JobMsg{JobID: 801, Path: `D:\media\broken.mp4`, Kind: MediaVideo,
-		Phase: Phase1, FieldsMask: MaskVideoDuration | MaskVideoContactSheet}
+		Phase: Phase2, ScreenStage: ScreenStageTwo, Source: JobSourceManager,
+		FieldsMask: MaskVideoDuration | MaskVideoContactSheet, KnownSHA: bytes64(0x81)}
 	result := &JobResultMsg{JobID: job.JobID, Path: job.Path, Kind: job.Kind,
-		Errors: []FieldError{
-			{Field: MaskVideoDuration, Stage: "video_probe", Msg: "decoder rejected stream"},
-			{Field: MaskVideoContactSheet, Stage: "video_probe", Msg: "decoder rejected stream"},
-		}}
+		ScreenStage: job.ScreenStage, Source: job.Source,
+		SHA512: append([]byte(nil), job.KnownSHA...)}
+	combined := *result
+	combined.Errors = []FieldError{{
+		Field: MaskVideoDuration | MaskVideoContactSheet, Stage: "video_probe", Msg: "decoder rejected stream",
+	}}
+	if err := validateWorkerResult(job, &combined); err == nil {
+		t.Fatal("combined video fields were accepted")
+	}
+	result.Errors = []FieldError{
+		{Field: MaskVideoDuration, Stage: "video_probe", Msg: "decoder rejected stream"},
+		{Field: MaskVideoContactSheet, Stage: "video_probe", Msg: "decoder rejected stream"},
+	}
 	if err := validateWorkerResult(job, result); err != nil {
 		t.Fatalf("file-level media errors rejected: %v", err)
 	}
