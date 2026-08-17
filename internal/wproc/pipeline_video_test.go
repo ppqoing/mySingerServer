@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
+	"image"
+	"image/color"
+	"image/jpeg"
 	"os"
 	"path/filepath"
 	"strings"
@@ -51,29 +53,34 @@ func TestVideoCompleteHitSkipsProbeFFmpegAndThumbPDQ(t *testing.T) {
 		JobID: 702, Found: true, DurationMS: &duration,
 		ThumbPath: `C:\cache\thumb.jpg`, ThumbPDQ: bytes.Repeat([]byte{7}, 32), ThumbQuality: &quality,
 	}
+	state.cacheHit = true
 	result, err := processVideoWithDeps(context.Background(), testVideoConfig(t.TempDir()), testVideoJob(702), deps)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Join(state.events, ","); got != "query" {
-		t.Fatalf("complete hit events = %q, want query only", got)
+	if got := strings.Join(state.events, ","); got != "query,cache" {
+		t.Fatalf("complete hit events = %q, want query and JPEG validation", got)
 	}
-	if result.FieldsDone != legacyPhase1VideoMask || result.Decoded || result.ThumbGenerated || result.ThumbCacheHit {
+	if result.FieldsDone != legacyPhase1VideoMask || result.Decoded || result.ThumbGenerated || !result.ThumbCacheHit {
 		t.Fatalf("complete hit result = %#v", result)
 	}
 }
 
-func TestVideoIncompleteFoundReplyIsFatal(t *testing.T) {
+func TestVideoIncompleteFoundReplyRepairsFromValidJPEG(t *testing.T) {
 	file := newFakeFile([]byte("video"), 5, 123)
 	deps, state := testVideoPipelineDeps(file)
 	duration := int64(5000)
 	state.queryReply = &worker.SHAReplyMsg{JobID: 703, Found: true, DurationMS: &duration}
-	_, err := processVideoWithDeps(context.Background(), testVideoConfig(t.TempDir()), testVideoJob(703), deps)
-	if err == nil || !strings.Contains(err.Error(), "incompatible SHA reply") {
-		t.Fatalf("error = %v, want incompatible SHA reply", err)
+	state.cacheHit = true
+	result, err := processVideoWithDeps(context.Background(), testVideoConfig(t.TempDir()), testVideoJob(703), deps)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got := strings.Join(state.events, ","); got != "query" {
-		t.Fatalf("incomplete hit events = %q, want query only", got)
+	if got := strings.Join(state.events, ","); got != "query,cache,thumb-read,thumb-pdq" {
+		t.Fatalf("incomplete hit events = %q, want JPEG-only repair", got)
+	}
+	if !result.ThumbCacheHit || result.ThumbGenerated || len(result.ThumbPDQ) != 32 {
+		t.Fatalf("repaired result = %#v", result)
 	}
 }
 
@@ -193,8 +200,8 @@ func TestVideoStatDriftDuringThumbnailDoesNotCommitOrPublishBundle(t *testing.T)
 	if result.FieldsDone != 0 || result.DurationMS != nil || result.ThumbPath != "" || len(result.ThumbPDQ) != 0 {
 		t.Fatalf("late drift published stale fields: %#v", result)
 	}
-	if state.writeMetaCalls != 0 {
-		t.Fatalf("sidecar writes = %d after source drift, want 0", state.writeMetaCalls)
+	if state.publishCalls != 1 {
+		t.Fatalf("guarded publish calls = %d after source drift, want 1", state.publishCalls)
 	}
 }
 
@@ -215,15 +222,15 @@ func TestVideoStatDriftDuringThumbnailPDQDoesNotCommitSidecar(t *testing.T) {
 	if result.FieldsDone != 0 || result.DurationMS != nil || result.ThumbPath != "" || len(result.ThumbPDQ) != 0 {
 		t.Fatalf("PDQ-time drift published stale fields: %#v", result)
 	}
-	if state.writeMetaCalls != 0 {
-		t.Fatalf("sidecar writes = %d before final PDQ drift check, want 0", state.writeMetaCalls)
+	if state.publishCalls != 1 {
+		t.Fatalf("publishes = %d before final PDQ drift check, want 1", state.publishCalls)
 	}
 }
 
 func TestVideoPublishConflictNeverEmitsThumbnailFromDifferentCacheFile(t *testing.T) {
 	file := newFakeFile([]byte("video"), 5, 123)
 	deps, state := testVideoPipelineDeps(file)
-	state.writeMetaErr = fmt.Errorf("%w: writer A lost to writer B", errThumbnailPublishConflict)
+	state.publishErr = errors.New("writer A publish failed")
 	result, err := processVideoWithDeps(context.Background(), testVideoConfig(t.TempDir()), testVideoJob(709), deps)
 	if err != nil {
 		t.Fatal(err)
@@ -238,7 +245,7 @@ func TestVideoPublishConflictNeverEmitsThumbnailFromDifferentCacheFile(t *testin
 		result.Width != 0 || result.Height != 0 || result.Decoded {
 		t.Fatalf("publish conflict emitted inconsistent thumbnail bundle: %#v", result)
 	}
-	if len(result.Errors) != 1 || result.Errors[0].Stage != "thumb_cache" || result.Errors[0].Field != 0 {
+	if len(result.Errors) != 1 || result.Errors[0].Stage != "thumb_cache" || result.Errors[0].Field != worker.MaskVideoThumb {
 		t.Fatalf("publish conflict errors = %#v, want one cache publication error", result.Errors)
 	}
 }
@@ -437,18 +444,18 @@ func (*videoBlackBoxStore) MarkCrash(context.Context, string, string, string) er
 }
 
 type videoTestState struct {
-	events         []string
-	queryReply     *worker.SHAReplyMsg
-	probeErr       error
-	generateErr    error
-	readErr        error
-	decodeErr      error
-	cacheHit       bool
-	seek           float64
-	pathStats      []fakeInfo
-	pathStatCall   int
-	writeMetaCalls int
-	writeMetaErr   error
+	events       []string
+	queryReply   *worker.SHAReplyMsg
+	probeErr     error
+	generateErr  error
+	readErr      error
+	decodeErr    error
+	cacheHit     bool
+	seek         float64
+	pathStats    []fakeInfo
+	pathStatCall int
+	publishCalls int
+	publishErr   error
 }
 
 func testVideoPipelineDeps(file *fakeFile) (videoPipelineDeps, *videoTestState) {
@@ -483,29 +490,51 @@ func testVideoPipelineDeps(file *fakeFile) (videoPipelineDeps, *videoTestState) 
 			state.events = append(state.events, "probe")
 			return 5000, state.probeErr
 		},
-		cache: func(Config, string, os.FileInfo) (string, bool, string, error) {
+		cache: func(Config, [64]byte) (ContactSheetJPEG, bool, error) {
 			state.events = append(state.events, "cache")
-			return `C:\cache\thumb.jpg`, state.cacheHit, bytesSHA256Hex([]byte("jpeg")), nil
+			return ContactSheetJPEG{Path: `C:\cache\thumb.jpg`, Width: 256, Height: 144}, state.cacheHit, nil
+		},
+		paths: func(Config, [64]byte, int, int64, string) (ContactSheetPaths, error) {
+			return ContactSheetPaths{JPEG: `C:\cache\thumb.jpg`, TempJPEG: `C:\cache\thumb.jpg.tmp-1-1-test`}, nil
 		},
 		generate: func(_ context.Context, _ Config, _ string, seek float64, _ string) (string, error) {
 			state.events = append(state.events, "ffmpeg")
 			state.seek = seek
-			return bytesSHA256Hex([]byte("jpeg")), state.generateErr
+			return bytesSHA256Hex(testRGBJPEGBytes()), state.generateErr
 		},
-		writeMeta: func(Config, string, os.FileInfo, string) error {
-			state.writeMetaCalls++
-			return state.writeMetaErr
+		publish: func(_ ContactSheetPaths, validate func() error) error {
+			state.publishCalls++
+			if state.publishErr != nil {
+				return state.publishErr
+			}
+			return validate()
 		},
 		readThumb: func(string) ([]byte, error) {
 			state.events = append(state.events, "thumb-read")
-			return []byte("jpeg"), state.readErr
+			return testRGBJPEGBytes(), state.readErr
 		},
 		decodeThumb: func([]byte) (imagePhase1, error) {
 			state.events = append(state.events, "thumb-pdq")
 			return imagePhase1{Hash: bytes.Repeat([]byte{9}, 32), Quality: 81, Width: 256, Height: 144}, state.decodeErr
 		},
+		pid:   func() int { return 1 },
+		nonce: func() string { return "test" },
 	}
 	return deps, state
+}
+
+func testRGBJPEGBytes() []byte {
+	img := image.NewRGBA(image.Rect(0, 0, 8, 8))
+	for y := 0; y < 8; y++ {
+		for x := 0; x < 8; x++ {
+			img.SetRGBA(x, y, color.RGBA{R: 200, G: 50, B: 20, A: 255})
+		}
+	}
+	var output bytes.Buffer
+	if err := jpeg.Encode(&output, img, &jpeg.Options{Quality: 90}); err != nil {
+		panic(err)
+	}
+	return output.Bytes()
 }
 
 func testVideoJob(id int64) *worker.JobMsg {
