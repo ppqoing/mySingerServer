@@ -1,11 +1,16 @@
 package store
 
 import (
+	"bytes"
 	"context"
+	"encoding/hex"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
+
+	"dedup/internal/proto"
 )
 
 func TestSyncVideoMetadataLoaderReturnsOneContainerWithAllOrderedStreams(t *testing.T) {
@@ -35,6 +40,117 @@ func TestSyncVideoMetadataLoaderReturnsOneContainerWithAllOrderedStreams(t *test
 	got := []string{rows[0].Streams[0].MediaType, rows[0].Streams[1].MediaType}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("ordered media types=%v, want %v", got, want)
+	}
+}
+
+func TestSyncVideoMetadataLoaderUsesOneSnapshotAcrossConcurrentExactReplace(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	dbPath := filepath.Join(t.TempDir(), "snapshot.db")
+	reader, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	writer, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+
+	shaBytes := bytes.Repeat([]byte{0x42}, 64)
+	sha := hex.EncodeToString(shaBytes)
+	path := `D:\snapshot\video.mkv`
+	if _, err := reader.db.ExecContext(ctx, `
+		INSERT INTO files(machine_id,path,size,mtime,sha512,missing_mask)
+		VALUES('m',?1,10,20,?2,?3)`, path, sha, proto.FieldVideoMetadata); err != nil {
+		t.Fatal(err)
+	}
+	save := func(db *DB, formatName, codecName string, streamIndex int32) error {
+		_, err := db.SaveAnalysis(ctx, AnalysisResult{
+			MachineID: "m", Path: path, Kind: MediaVideo, Size: 10, MTime: 20,
+			SHA512: shaBytes, RequestedFields: proto.FieldVideoMetadata,
+			FieldsDone:     proto.FieldVideoMetadata,
+			VideoContainer: &proto.VideoContainerMetadata{FormatName: formatName, TagsJSON: `{}`},
+			VideoStreams: []proto.VideoStreamMetadata{{
+				Index: streamIndex, MediaType: "video", CodecID: 27,
+				CodecName: codecName, TagsJSON: `{}`,
+			}},
+		})
+		return err
+	}
+	if err := save(reader, "old-container", "old-codec", 0); err != nil {
+		t.Fatal(err)
+	}
+	var observed []SyncQueueRow
+	for _, table := range []string{"video_containers", "video_streams"} {
+		rows, err := reader.PendingSyncRows(ctx, table, 1)
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("pending %s before replace=%#v err=%v", table, rows, err)
+		}
+		observed = append(observed, rows[0])
+	}
+
+	containerRead := make(chan struct{})
+	continueWithStreams := make(chan struct{})
+	type loadResult struct {
+		rows []VideoMetadataSyncRow
+		err  error
+	}
+	loaded := make(chan loadResult, 1)
+	go func() {
+		rows, err := reader.loadVideoMetadataBySHAsWithBarrier(ctx, []string{sha}, func() {
+			close(containerRead)
+			<-continueWithStreams
+		})
+		loaded <- loadResult{rows: rows, err: err}
+	}()
+
+	select {
+	case <-containerRead:
+	case <-ctx.Done():
+		t.Fatalf("loader did not reach container/streams barrier: %v", ctx.Err())
+	}
+	writerDone := make(chan error, 1)
+	go func() { writerDone <- save(writer, "new-container", "new-codec", 1) }()
+	select {
+	case err := <-writerDone:
+		if err != nil {
+			t.Fatalf("concurrent exact replace: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("writer could not commit while WAL reader snapshot was open: %v", ctx.Err())
+	}
+	close(continueWithStreams)
+
+	var result loadResult
+	select {
+	case result = <-loaded:
+	case <-ctx.Done():
+		t.Fatalf("loader did not complete after barrier release: %v", ctx.Err())
+	}
+	if result.err != nil || len(result.rows) != 1 || len(result.rows[0].Streams) != 1 {
+		t.Fatalf("snapshot load=%#v err=%v", result.rows, result.err)
+	}
+	containerName := result.rows[0].Container.FormatName
+	stream := result.rows[0].Streams[0]
+	oldSet := containerName == "old-container" && stream.CodecName == "old-codec" && stream.Index == 0
+	newSet := containerName == "new-container" && stream.CodecName == "new-codec" && stream.Index == 1
+	if !oldSet && !newSet {
+		t.Fatalf("loader returned mixed snapshot: container=%q stream=%#v", containerName, stream)
+	}
+
+	if err := reader.MarkSyncBatch(ctx, observed); err != nil {
+		t.Fatal(err)
+	}
+	for _, before := range observed {
+		rows, err := reader.PendingSyncRows(ctx, before.TableName, 1)
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("new generation %s pending=%#v err=%v", before.TableName, rows, err)
+		}
+		if rows[0].Generation != before.Generation+1 {
+			t.Fatalf("%s generation=%d, want %d pending", before.TableName, rows[0].Generation, before.Generation+1)
+		}
 	}
 }
 

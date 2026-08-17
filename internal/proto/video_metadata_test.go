@@ -54,6 +54,35 @@ func TestVideoMetadataContractRejectsNonCanonicalAndOversizedPayloads(t *testing
 	}
 }
 
+func TestVideoMetadataBudgetFailsClosedAtMaxIntWithoutOverflow(t *testing.T) {
+	maxInt := int(^uint(0) >> 1)
+	if videoMetadataPartsFit(maxInt, maxInt-7, 8) {
+		t.Fatal("budget accepted parts whose mathematical sum exceeds MaxInt")
+	}
+	if !videoMetadataPartsFit(maxInt, maxInt-7, 7) {
+		t.Fatal("budget rejected exact MaxInt boundary")
+	}
+}
+
+func TestVideoMetadataContractAcceptsExactlyOneMiBAndRejectsNextByte(t *testing.T) {
+	// Container cost: 64 fixed + "m" + "{}" = 67.
+	// Stream cost before Title: 160 fixed + "video" + "h264" + "{}" = 171.
+	const nonTitleCost = 67 + 171
+	payload := strings.Repeat("x", maxVideoMetadataSize-nonTitleCost+1)
+	container := VideoContainerMetadata{FormatName: "m", TagsJSON: `{}`}
+	stream := VideoStreamMetadata{
+		Index: 0, MediaType: "video", CodecName: "h264", TagsJSON: `{}`,
+		Title: payload[:maxVideoMetadataSize-nonTitleCost],
+	}
+	if err := ValidateVideoMetadata(&container, []VideoStreamMetadata{stream}); err != nil {
+		t.Fatalf("exact 1 MiB metadata rejected: %v", err)
+	}
+	stream.Title = payload
+	if err := ValidateVideoMetadata(&container, []VideoStreamMetadata{stream}); err == nil {
+		t.Fatal("metadata one byte over 1 MiB was accepted")
+	}
+}
+
 func TestVideoMetadataFeatureItemMessageRoundTripsEveryFieldAndNil(t *testing.T) {
 	value := int64(123)
 	index := int32(2)

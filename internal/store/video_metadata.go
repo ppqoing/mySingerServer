@@ -108,6 +108,15 @@ func loadVideoMetadata(
 	queryer videoMetadataQueryer,
 	sha string,
 ) (*proto.VideoContainerMetadata, []proto.VideoStreamMetadata, bool, error) {
+	return loadVideoMetadataWithBarrier(ctx, queryer, sha, nil)
+}
+
+func loadVideoMetadataWithBarrier(
+	ctx context.Context,
+	queryer videoMetadataQueryer,
+	sha string,
+	afterContainer func(),
+) (*proto.VideoContainerMetadata, []proto.VideoStreamMetadata, bool, error) {
 	var container proto.VideoContainerMetadata
 	var formatLongName, decoderName sql.NullString
 	var startTime, duration, bitRate, fileSize sql.NullInt64
@@ -134,6 +143,9 @@ func loadVideoMetadata(
 	container.ProbeScore = nullInt32Ptr(probeScore)
 	container.PrimaryVideoStream = nullInt32Ptr(primaryVideo)
 	container.DecoderName = nullStringValue(decoderName)
+	if afterContainer != nil {
+		afterContainer()
+	}
 
 	rows, err := queryer.QueryContext(ctx, `
 		SELECT stream_index,media_type,codec_id,codec_name,codec_long_name,codec_tag,

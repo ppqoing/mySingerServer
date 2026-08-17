@@ -80,8 +80,8 @@ func ValidateVideoMetadata(container *VideoContainerMetadata, streams []VideoStr
 		return fmt.Errorf("proto: video metadata has %d streams, maximum is %d", len(streams), maxVideoMetadataStreams)
 	}
 
-	total := videoContainerMetadataSize(*container)
-	if total > maxVideoMetadataSize {
+	budget := videoMetadataBudget{remaining: maxVideoMetadataSize}
+	if !consumeVideoContainerMetadataBudget(&budget, *container) {
 		return fmt.Errorf("proto: video metadata exceeds %d bytes", maxVideoMetadataSize)
 	}
 	seen := make(map[int32]string, len(streams))
@@ -104,8 +104,7 @@ func ValidateVideoMetadata(container *VideoContainerMetadata, streams []VideoStr
 		if err := validateCanonicalTagsJSON(fmt.Sprintf("stream %d", stream.Index), stream.TagsJSON); err != nil {
 			return err
 		}
-		total += videoStreamMetadataSize(stream)
-		if total > maxVideoMetadataSize {
+		if !consumeVideoStreamMetadataBudget(&budget, stream) {
 			return fmt.Errorf("proto: video metadata exceeds %d bytes", maxVideoMetadataSize)
 		}
 	}
@@ -138,15 +137,73 @@ func validateCanonicalTagsJSON(owner, value string) error {
 	return nil
 }
 
-func videoContainerMetadataSize(value VideoContainerMetadata) int {
-	return 64 + len(value.FormatName) + len(value.FormatLongName) + len(value.TagsJSON) + len(value.DecoderName)
+type videoMetadataBudget struct {
+	remaining int
 }
 
-func videoStreamMetadataSize(value VideoStreamMetadata) int {
-	return 160 + len(value.MediaType) + len(value.CodecName) + len(value.CodecLongName) +
-		len(value.CodecTag) + len(value.Profile) + len(value.TimeBase) + len(value.Language) +
-		len(value.Title) + len(value.TagsJSON) + len(value.PixelFormat) + len(value.SAR) +
-		len(value.DAR) + len(value.AvgFrameRate) + len(value.RealFrameRate) + len(value.ColorRange) +
-		len(value.ColorSpace) + len(value.ColorTransfer) + len(value.ColorPrimaries) +
-		len(value.ChromaLocation) + len(value.FieldOrder) + len(value.SampleFormat) + len(value.ChannelLayout)
+func (budget *videoMetadataBudget) consume(part int) bool {
+	if part < 0 || budget.remaining < 0 || part > budget.remaining {
+		return false
+	}
+	budget.remaining -= part
+	return true
+}
+
+func videoMetadataPartsFit(limit int, parts ...int) bool {
+	budget := videoMetadataBudget{remaining: limit}
+	for _, part := range parts {
+		if !budget.consume(part) {
+			return false
+		}
+	}
+	return true
+}
+
+func consumeVideoContainerMetadataBudget(budget *videoMetadataBudget, value VideoContainerMetadata) bool {
+	return consumeVideoMetadataBudgetParts(
+		budget,
+		64,
+		len(value.FormatName),
+		len(value.FormatLongName),
+		len(value.TagsJSON),
+		len(value.DecoderName),
+	)
+}
+
+func consumeVideoStreamMetadataBudget(budget *videoMetadataBudget, value VideoStreamMetadata) bool {
+	return consumeVideoMetadataBudgetParts(
+		budget,
+		160,
+		len(value.MediaType),
+		len(value.CodecName),
+		len(value.CodecLongName),
+		len(value.CodecTag),
+		len(value.Profile),
+		len(value.TimeBase),
+		len(value.Language),
+		len(value.Title),
+		len(value.TagsJSON),
+		len(value.PixelFormat),
+		len(value.SAR),
+		len(value.DAR),
+		len(value.AvgFrameRate),
+		len(value.RealFrameRate),
+		len(value.ColorRange),
+		len(value.ColorSpace),
+		len(value.ColorTransfer),
+		len(value.ColorPrimaries),
+		len(value.ChromaLocation),
+		len(value.FieldOrder),
+		len(value.SampleFormat),
+		len(value.ChannelLayout),
+	)
+}
+
+func consumeVideoMetadataBudgetParts(budget *videoMetadataBudget, parts ...int) bool {
+	for _, part := range parts {
+		if !budget.consume(part) {
+			return false
+		}
+	}
+	return true
 }

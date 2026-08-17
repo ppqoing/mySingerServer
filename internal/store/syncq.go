@@ -429,17 +429,36 @@ func (d *DB) LoadVideoMetadataBySHAs(
 	ctx context.Context,
 	shas []string,
 ) ([]VideoMetadataSyncRow, error) {
+	return d.loadVideoMetadataBySHAsWithBarrier(ctx, shas, nil)
+}
+
+func (d *DB) loadVideoMetadataBySHAsWithBarrier(
+	ctx context.Context,
+	shas []string,
+	afterFirstContainer func(),
+) ([]VideoMetadataSyncRow, error) {
 	seen := make(map[string]struct{}, len(shas))
-	result := make([]VideoMetadataSyncRow, 0, len(shas))
 	for _, sha := range shas {
 		if !canonicalFeatureSHA(sha) {
 			return nil, fmt.Errorf("store: invalid video metadata SHA %q", sha)
 		}
-		if _, exists := seen[sha]; exists {
+		seen[sha] = struct{}{}
+	}
+	tx, err := d.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, fmt.Errorf("store: begin video metadata snapshot: %w", err)
+	}
+	defer tx.Rollback()
+	loaded := make(map[string]struct{}, len(seen))
+	result := make([]VideoMetadataSyncRow, 0, len(seen))
+	barrier := afterFirstContainer
+	for _, sha := range shas {
+		if _, exists := loaded[sha]; exists {
 			continue
 		}
-		seen[sha] = struct{}{}
-		container, streams, complete, err := loadVideoMetadata(ctx, d.db, sha)
+		loaded[sha] = struct{}{}
+		container, streams, complete, err := loadVideoMetadataWithBarrier(ctx, tx, sha, barrier)
+		barrier = nil
 		if err != nil {
 			return nil, err
 		}
@@ -448,6 +467,9 @@ func (d *DB) LoadVideoMetadataBySHAs(
 				SHA512: sha, Container: *container, Streams: streams,
 			})
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("store: commit video metadata snapshot: %w", err)
 	}
 	return result, nil
 }
