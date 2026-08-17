@@ -113,12 +113,6 @@ if ($MyInvocation.InvocationName -eq '.') {
     return
 }
 
-$dependencyPaths = Resolve-StandardDependencyPaths `
-    -RepositoryRoot $repo -GoExecutable $Go -VcpkgRoot $VcpkgRoot
-Write-Host "Go module cache: $($dependencyPaths.GoModCache)"
-Write-Host "Go build cache: $($dependencyPaths.GoBuildCache)"
-Write-Host "vcpkg installed: $($dependencyPaths.VcpkgInstalled)"
-
 if ($VideoCoreOnly -and $MediacoreOnly) {
     throw "VIDEOCORE_BUILD_MODE_CONFLICT"
 }
@@ -148,6 +142,12 @@ if ($useVideoCore) {
     $out = Join-Path $repo $OutDir
     New-Item -ItemType Directory -Force -Path $out | Out-Null
 }
+
+$dependencyPaths = Resolve-StandardDependencyPaths `
+    -RepositoryRoot $repo -GoExecutable $Go -VcpkgRoot $VcpkgRoot
+Write-Host "Go module cache: $($dependencyPaths.GoModCache)"
+Write-Host "Go build cache: $($dependencyPaths.GoBuildCache)"
+Write-Host "vcpkg installed: $($dependencyPaths.VcpkgInstalled)"
 
 $cmakeExe = Resolve-CMakeExecutable -Requested $CMake -Root $VcpkgRoot
 $ctestExe = Join-Path (Split-Path -Parent $cmakeExe) "ctest.exe"

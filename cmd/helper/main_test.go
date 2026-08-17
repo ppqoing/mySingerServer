@@ -597,7 +597,7 @@ func TestManifestContractRemovesOwnedResourceWhenWindresFails(t *testing.T) {
 	}
 }
 
-func TestBuildScriptPackagesHelperWithoutOverwritingOperatorConfig(t *testing.T) {
+func TestBuildScriptPackagesHelperAndDefaultConfigInFreshStage(t *testing.T) {
 	root := repoRoot(t)
 	base := filepath.Join(root, ".superpowers", "tmp")
 	if err := os.MkdirAll(base, 0o700); err != nil {
@@ -608,19 +608,7 @@ func TestBuildScriptPackagesHelperWithoutOverwritingOperatorConfig(t *testing.T)
 		t.Fatal(err)
 	}
 	defer removeRunUniqueTemp(t, base, work)
-	out := filepath.Join(work, "out")
-	if err := os.MkdirAll(out, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	operatorConfig := filepath.Join(out, "helper.json")
-	const operatorConfigBody = "{\"operator_config\":true}\n"
-	if err := os.WriteFile(operatorConfig, []byte(operatorConfigBody), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	relativeOut, err := filepath.Rel(root, out)
-	if err != nil {
-		t.Fatal(err)
-	}
+	out := filepath.Join(work, "fresh-stage")
 	powershell := requiredPowerShell(t)
 	goExe := requiredExecutable(t, "Go", filepath.Join(runtime.GOROOT(), "bin", "go.exe"))
 	cc := os.Getenv("M5_CC")
@@ -632,7 +620,7 @@ func TestBuildScriptPackagesHelperWithoutOverwritingOperatorConfig(t *testing.T)
 	}
 	cc = requiredExecutable(t, "C compiler", cc)
 	windres := requiredWindres(t)
-	command := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", filepath.Join(root, "scripts", "build.ps1"), "-Go", goExe, "-CC", cc, "-Windres", windres, "-OutDir", relativeOut)
+	command := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", filepath.Join(root, "scripts", "build.ps1"), "-Go", goExe, "-CC", cc, "-Windres", windres, "-StageDir", out, "-SkipWebBuild", "-SkipNodeTrayBuild")
 	command.Dir = root
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("fresh build script failed: %v\n%s", err, output)
@@ -640,12 +628,11 @@ func TestBuildScriptPackagesHelperWithoutOverwritingOperatorConfig(t *testing.T)
 	if _, err := os.Stat(filepath.Join(out, "helper.exe")); err != nil {
 		t.Fatalf("helper.exe was not packaged: %v", err)
 	}
-	body, err := os.ReadFile(operatorConfig)
-	if err != nil {
-		t.Fatal(err)
+	if _, err := os.Stat(filepath.Join(out, "helper.default.json")); err != nil {
+		t.Fatalf("helper.default.json was not packaged: %v", err)
 	}
-	if string(body) != operatorConfigBody {
-		t.Fatalf("operator helper config was overwritten: %q", body)
+	if _, err := os.Stat(filepath.Join(out, "helper.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("fresh stage unexpectedly contains operator helper.json: %v", err)
 	}
 	if matches, err := filepath.Glob(filepath.Join(root, "cmd", "helper", "*.syso")); err != nil {
 		t.Fatal(err)
@@ -681,13 +668,6 @@ func TestBuildScriptFailsClosedWhenExactResourceCleanupFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := filepath.Join(work, "out")
-	if err := os.MkdirAll(out, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	relativeOut, err := filepath.Rel(root, out)
-	if err != nil {
-		t.Fatal(err)
-	}
 	powershell := requiredPowerShell(t)
 	goExe := requiredExecutable(t, "Go", filepath.Join(runtime.GOROOT(), "bin", "go.exe"))
 	cc := os.Getenv("M5_CC")
@@ -698,7 +678,7 @@ func TestBuildScriptFailsClosedWhenExactResourceCleanupFails(t *testing.T) {
 		t.Fatal("build script test requires M5_CC or CC")
 	}
 	cc = requiredExecutable(t, "C compiler", cc)
-	command := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", filepath.Join(root, "scripts", "build.ps1"), "-Go", goExe, "-CC", cc, "-Windres", fakeWindres, "-OutDir", relativeOut)
+	command := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", filepath.Join(root, "scripts", "build.ps1"), "-Go", goExe, "-CC", cc, "-Windres", fakeWindres, "-StageDir", out, "-SkipWebBuild", "-SkipNodeTrayBuild")
 	command.Dir = root
 	output, err := command.CombinedOutput()
 	if info, statErr := os.Stat(syso); statErr != nil || !info.IsDir() {

@@ -197,23 +197,29 @@ func TestVideoCoreCompatibilityFixturesAreImmutable(t *testing.T) {
 	verifyFixtureContract(t, manifest)
 	verifyAllSHA256(t, compatRoot, manifest)
 	probes := verifyProbeMetadata(t, root, compatRoot, manifest)
-	t.Run("capture rejects junction fixture path", func(t *testing.T) {
-		verifyCaptureRejectsJunction(t, root, compatRoot, manifestPath)
-	})
-	t.Run("capture deadline leaves no partial golden", func(t *testing.T) {
-		verifyCaptureDeadlineCleanup(t, root, compatRoot, manifestPath)
-	})
-	t.Run("capture timeout terminates helper process tree", func(t *testing.T) {
-		verifyCaptureTerminatesHelperTree(t, root, compatRoot)
-	})
-	t.Run("capture atomic write cleans flushed temporary on failure", func(t *testing.T) {
-		verifyCaptureAtomicFailureCleanup(t, root, compatRoot, manifestPath)
-	})
-	t.Run("capture success reproduces frozen golden", func(t *testing.T) {
-		verifyCaptureSuccessReproducesFrozenGolden(t, root, compatRoot, manifestPath, goldenPath)
-	})
-
 	golden := loadCompatGolden(t, goldenPath)
+	legacyBin, legacyAvailable := prepareLegacyGenerator(t, root)
+	t.Run("legacy generator runtime", func(t *testing.T) {
+		if !legacyAvailable {
+			t.Skip("legacy mediacore.dll is not available; frozen fixture and golden checks still run")
+		}
+		t.Run("capture rejects junction fixture path", func(t *testing.T) {
+			verifyCaptureRejectsJunction(t, root, legacyBin, compatRoot, manifestPath)
+		})
+		t.Run("capture deadline leaves no partial golden", func(t *testing.T) {
+			verifyCaptureDeadlineCleanup(t, root, legacyBin, compatRoot, manifestPath)
+		})
+		t.Run("capture timeout terminates helper process tree", func(t *testing.T) {
+			verifyCaptureTerminatesHelperTree(t, root, legacyBin, compatRoot)
+		})
+		t.Run("capture atomic write cleans flushed temporary on failure", func(t *testing.T) {
+			verifyCaptureAtomicFailureCleanup(t, root, legacyBin, compatRoot, manifestPath)
+		})
+		t.Run("capture success reproduces frozen golden", func(t *testing.T) {
+			verifyCaptureSuccessReproducesFrozenGolden(t, root, legacyBin, compatRoot, manifestPath, goldenPath)
+		})
+		verifyLegacyComponents(t, legacyBin, golden.Generator)
+	})
 	for _, violation := range qualityPresenceViolations(golden) {
 		t.Error(violation)
 	}
@@ -222,7 +228,6 @@ func TestVideoCoreCompatibilityFixturesAreImmutable(t *testing.T) {
 	})
 	verifyFileCheckpoint(t, manifestPath, compatManifestSHA256)
 	verifyFileCheckpoint(t, goldenPath, compatGoldenSHA256)
-	verifyLegacyComponents(t, root, golden.Generator)
 	verifyGoldenCoversEveryFixture(t, compatRoot, manifest, golden)
 	verifyGoldenMatchesProbe(t, golden, probes)
 	verifyGoldenFeatureSemantics(t, manifest, golden)
@@ -236,6 +241,32 @@ func repositoryRoot(t *testing.T) string {
 		t.Fatalf("resolve repository root: %v", err)
 	}
 	return root
+}
+
+func prepareLegacyGenerator(t *testing.T, root string) (string, bool) {
+	t.Helper()
+	sources := map[string]string{
+		"mediacore.dll":                       filepath.Join(root, "bin", "mediacore.dll"),
+		filepath.Join("tools", "ffmpeg.exe"):  filepath.Join(root, "third_party", "ffmpeg", "bin", "ffmpeg.exe"),
+		filepath.Join("tools", "ffprobe.exe"): filepath.Join(root, "third_party", "ffmpeg", "bin", "ffprobe.exe"),
+	}
+	for _, source := range sources {
+		if _, err := os.Stat(source); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return "", false
+			}
+			t.Fatalf("stat legacy generator component %s: %v", source, err)
+		}
+	}
+	legacyBin := filepath.Join(t.TempDir(), "legacy-bin")
+	for relative, source := range sources {
+		destination := filepath.Join(legacyBin, relative)
+		if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		copyFile(t, source, destination)
+	}
+	return legacyBin, true
 }
 
 func loadCompatManifest(t *testing.T, path string) compatManifest {
@@ -362,7 +393,7 @@ func fileDigest(t *testing.T, path string, hasher interface {
 
 func verifyProbeMetadata(t *testing.T, root, compatRoot string, manifest compatManifest) map[string]probedFixture {
 	t.Helper()
-	ffprobe := filepath.Join(root, "bin", "tools", "ffprobe.exe")
+	ffprobe := filepath.Join(root, "third_party", "ffmpeg", "bin", "ffprobe.exe")
 	results := make(map[string]probedFixture, len(allFixtures(manifest)))
 	for _, fixture := range allFixtures(manifest) {
 		probe := runFFprobe(t, ffprobe, filepath.Join(compatRoot, filepath.FromSlash(fixture.Path)))
@@ -455,7 +486,7 @@ func durationMicros(t *testing.T, label, raw string) int64 {
 	return int64(math.Round(value * 1_000_000))
 }
 
-func verifyLegacyComponents(t *testing.T, root string, generator compatGoldenGenerator) {
+func verifyLegacyComponents(t *testing.T, legacyBin string, generator compatGoldenGenerator) {
 	t.Helper()
 	if generator.Kind != "legacy-mediacore-plus-ffmpeg-exe" {
 		t.Errorf("legacy generator kind=%q", generator.Kind)
@@ -477,7 +508,7 @@ func verifyLegacyComponents(t *testing.T, root string, generator compatGoldenGen
 		if component != approved {
 			t.Errorf("legacy component %q=%+v, approved=%+v", component.Role, component, approved)
 		}
-		actual := fileDigest(t, filepath.Join(root, "bin", filepath.FromSlash(component.Path)), sha256.New())
+		actual := fileDigest(t, filepath.Join(legacyBin, filepath.FromSlash(component.Path)), sha256.New())
 		if actual != component.SHA256 {
 			t.Errorf("legacy component %q actual SHA-256=%s, golden=%s", component.Role, actual, component.SHA256)
 		}
@@ -751,7 +782,7 @@ func boolCount(values ...bool) int {
 	return count
 }
 
-func verifyCaptureRejectsJunction(t *testing.T, root, compatRoot, manifestPath string) {
+func verifyCaptureRejectsJunction(t *testing.T, root, legacyBin, compatRoot, manifestPath string) {
 	t.Helper()
 	if os.PathSeparator != '\\' {
 		t.Skip("junction behavior is Windows-specific")
@@ -793,7 +824,7 @@ func verifyCaptureRejectsJunction(t *testing.T, root, compatRoot, manifestPath s
 		filepath.Join(root, "scripts", "capture_videocore_legacy_golden.ps1"),
 		"-Manifest", filepath.Join(tempCompat, "manifest.json"),
 		"-OutFile", outPath,
-		"-LegacyBinDir", filepath.Join(root, "bin"),
+		"-LegacyBinDir", legacyBin,
 	)
 	output, runErr := command.CombinedOutput()
 	if ctx.Err() != nil {
@@ -821,12 +852,12 @@ func copyFile(t *testing.T, source, destination string) {
 	}
 }
 
-func verifyCaptureDeadlineCleanup(t *testing.T, root, compatRoot, manifestPath string) {
+func verifyCaptureDeadlineCleanup(t *testing.T, root, legacyBin, compatRoot, manifestPath string) {
 	t.Helper()
 	tempCompat := prepareCompatCopy(t, compatRoot, manifestPath)
 	outPath := filepath.Join(tempCompat, "legacy-golden.json")
 	output, runErr := runCaptureScript(
-		t, root, tempCompat, outPath,
+		t, root, legacyBin, tempCompat, outPath,
 		"VIDEOCORE_CAPTURE_PROCESS_TIMEOUT_MS=1",
 	)
 	if runErr == nil {
@@ -838,12 +869,12 @@ func verifyCaptureDeadlineCleanup(t *testing.T, root, compatRoot, manifestPath s
 	verifyNoCaptureOutputs(t, tempCompat, outPath)
 }
 
-func verifyCaptureAtomicFailureCleanup(t *testing.T, root, compatRoot, manifestPath string) {
+func verifyCaptureAtomicFailureCleanup(t *testing.T, root, legacyBin, compatRoot, manifestPath string) {
 	t.Helper()
 	tempCompat := prepareCompatCopy(t, compatRoot, manifestPath)
 	outPath := filepath.Join(tempCompat, "legacy-golden.json")
 	output, runErr := runCaptureScript(
-		t, root, tempCompat, outPath,
+		t, root, legacyBin, tempCompat, outPath,
 		"VIDEOCORE_CAPTURE_FAULT_AFTER_TEMP_WRITE=1",
 	)
 	if runErr == nil {
@@ -855,14 +886,14 @@ func verifyCaptureAtomicFailureCleanup(t *testing.T, root, compatRoot, manifestP
 	verifyNoCaptureOutputs(t, tempCompat, outPath)
 }
 
-func verifyCaptureTerminatesHelperTree(t *testing.T, root, compatRoot string) {
+func verifyCaptureTerminatesHelperTree(t *testing.T, root, legacyBin, compatRoot string) {
 	t.Helper()
 	testRoot := t.TempDir()
 	outPath := filepath.Join(testRoot, "legacy-golden.json")
 	pidFile := filepath.Join(testRoot, "helper-pids.txt")
 	helper := filepath.Join(root, "integration", "testdata", "videocore_timeout_tree_helper.ps1")
 	output, runErr := runCaptureScript(
-		t, root, compatRoot, outPath,
+		t, root, legacyBin, compatRoot, outPath,
 		"VIDEOCORE_CAPTURE_PROCESS_TIMEOUT_MS=1000",
 		"VIDEOCORE_CAPTURE_TIMEOUT_HELPER="+helper,
 		"VIDEOCORE_CAPTURE_TIMEOUT_HELPER_PID_FILE="+pidFile,
@@ -942,7 +973,7 @@ func prepareCompatCopy(t *testing.T, compatRoot, manifestPath string) string {
 	return tempCompat
 }
 
-func verifyCaptureSuccessReproducesFrozenGolden(t *testing.T, root, compatRoot, manifestPath, repositoryGoldenPath string) {
+func verifyCaptureSuccessReproducesFrozenGolden(t *testing.T, root, legacyBin, compatRoot, manifestPath, repositoryGoldenPath string) {
 	t.Helper()
 	tempCompat := prepareCompatCopy(t, compatRoot, manifestPath)
 	outPath := filepath.Join(tempCompat, "captured-legacy-golden.json")
@@ -951,7 +982,7 @@ func verifyCaptureSuccessReproducesFrozenGolden(t *testing.T, root, compatRoot, 
 	}
 
 	repositoryGoldenBefore := fileDigest(t, repositoryGoldenPath, sha256.New())
-	output, runErr := runCaptureScript(t, root, tempCompat, outPath)
+	output, runErr := runCaptureScript(t, root, legacyBin, tempCompat, outPath)
 	if runErr != nil {
 		t.Fatalf("normal capture failed: %v\n%s", runErr, output)
 	}
@@ -976,7 +1007,7 @@ func verifyCaptureSuccessReproducesFrozenGolden(t *testing.T, root, compatRoot, 
 	}
 }
 
-func runCaptureScript(t *testing.T, root, compatRoot, outPath string, environment ...string) ([]byte, error) {
+func runCaptureScript(t *testing.T, root, legacyBin, compatRoot, outPath string, environment ...string) ([]byte, error) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
@@ -986,7 +1017,7 @@ func runCaptureScript(t *testing.T, root, compatRoot, outPath string, environmen
 		filepath.Join(root, "scripts", "capture_videocore_legacy_golden.ps1"),
 		"-Manifest", filepath.Join(compatRoot, "manifest.json"),
 		"-OutFile", outPath,
-		"-LegacyBinDir", filepath.Join(root, "bin"),
+		"-LegacyBinDir", legacyBin,
 	)
 	command.Env = append(os.Environ(), environment...)
 	output, err := command.CombinedOutput()

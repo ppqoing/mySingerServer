@@ -164,7 +164,7 @@ func TestM2PDQTreePinRejectsModificationAdditionDeletion(t *testing.T) {
 	source := filepath.Join(repoRoot, "mediacore", "src", "pdq_upstream")
 	run := func(root string) ([]byte, error) {
 		command := exec.Command(
-			"powershell.exe", "-NoProfile", "-File", verifier,
+			"powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", verifier,
 			"-PinContract", "-PDQTreeRoot", root,
 		)
 		command.Dir = repoRoot
@@ -248,7 +248,7 @@ func TestM2CorpusGeneratorIsDeterministic(t *testing.T) {
 		t.Fatal(err)
 	}
 	goExe := filepath.Join(runtime.GOROOT(), "bin", "go.exe")
-	ffmpeg := filepath.Join(repoRoot, "bin", "tools", "ffmpeg.exe")
+	ffmpeg := filepath.Join(repoRoot, "third_party", "ffmpeg", "bin", "ffmpeg.exe")
 	for _, path := range []string{goExe, ffmpeg} {
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("required corpus dependency %s: %v", path, err)

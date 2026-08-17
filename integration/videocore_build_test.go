@@ -151,6 +151,8 @@ func TestVideoCoreExportGateRequiresExactlyDefExports(t *testing.T) {
 		"vc_abi_version", "vc_version", "vc_runtime_info",
 		"vc_cancel_create", "vc_cancel_request", "vc_cancel_free",
 		"vc_media_open_w", "vc_media_hash", "vc_media_analyze",
+		"vc_media_container_info", "vc_media_stream_count",
+		"vc_media_stream_info", "vc_media_metadata_json",
 		"vc_media_close",
 	}
 	for _, test := range []struct {
@@ -159,7 +161,7 @@ func TestVideoCoreExportGateRequiresExactlyDefExports(t *testing.T) {
 		wantCode string
 	}{
 		{name: "exact", exports: want},
-		{name: "missing", exports: want[:9], wantCode: "VIDEOCORE_EXPORT_MISMATCH"},
+		{name: "missing", exports: want[:13], wantCode: "VIDEOCORE_EXPORT_MISMATCH"},
 		{name: "extra", exports: append(append([]string{}, want...), "vc_private_leak"), wantCode: "VIDEOCORE_EXPORT_MISMATCH"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -171,7 +173,7 @@ func TestVideoCoreExportGateRequiresExactlyDefExports(t *testing.T) {
 				"-OutFile", outFile,
 			)
 			if test.wantCode == "" {
-				if result.exitCode != 0 || !strings.Contains(result.output, "10/10 exact exports") {
+				if result.exitCode != 0 || !strings.Contains(result.output, "14/14 exact exports") {
 					t.Fatalf("exact exports exit=%d:\n%s", result.exitCode, result.output)
 				}
 				data, err := os.ReadFile(outFile)
@@ -179,8 +181,8 @@ func TestVideoCoreExportGateRequiresExactlyDefExports(t *testing.T) {
 					t.Fatal(err)
 				}
 				lines := strings.Fields(string(data))
-				if len(lines) != 10 {
-					t.Fatalf("saved export list has %d entries, want 10", len(lines))
+				if len(lines) != 14 {
+					t.Fatalf("saved export list has %d entries, want 14", len(lines))
 				}
 			} else if result.exitCode == 0 || !strings.Contains(result.output, test.wantCode) {
 				t.Fatalf("mutation exit=%d, want %s:\n%s", result.exitCode, test.wantCode, result.output)
@@ -280,7 +282,7 @@ func TestVideoCoreBuildStaticContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	source := string(data)
+	source := strings.ReplaceAll(string(data), "\r\n", "\n")
 	if err := validateVideoCoreBuildContract(source); err != nil {
 		t.Fatalf("repository build contract: %v", err)
 	}
@@ -415,7 +417,7 @@ func validateVideoCoreBuildContract(source string) error {
 		{label: "MinGW import library", marker: `& $videoDlltoolExe`},
 		{label: "recursive dependency closure", marker: `& $pwshExe -NoProfile -File $resolver`},
 		{label: "non-CGO boundary", marker: `$env:CGO_ENABLED = "0"`},
-		{label: "Agent target", marker: `./cmd/agent`},
+		{label: "Agent build invocation", marker: `-Package './cmd/agent'`},
 		{label: "GUI target", marker: `./cmd/gui`},
 		{label: "Helper GUI subsystem linker flag", marker: `"-ldflags=-H=windowsgui"`},
 		{label: "Helper target", marker: `./cmd/helper`},
