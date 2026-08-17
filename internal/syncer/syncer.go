@@ -136,12 +136,21 @@ func (s *Syncer) Run(ctx context.Context) {
 }
 
 type loadedBatch struct {
-	queue  []store.SyncQueueRow
-	files  []store.FileRow
-	images []store.ImageFeatureSyncRow
-	videos []store.VideoFeatureSyncRow
-	frames []store.VideoFrameSyncRow
-	local  store.LocalSyncBatch
+	queue    []store.SyncQueueRow
+	files    []store.FileRow
+	images   []store.ImageFeatureSyncRow
+	videos   []store.VideoFeatureSyncRow
+	frames   []store.VideoFrameSyncRow
+	metadata []store.VideoMetadataSyncRow
+	local    store.LocalSyncBatch
+}
+
+type videoMetadataLoader interface {
+	LoadVideoMetadataBySHAs(context.Context, []string) ([]store.VideoMetadataSyncRow, error)
+}
+
+type videoMetadataRemoteTx interface {
+	UpsertVideoMetadata(context.Context, []store.VideoMetadataSyncRow) error
 }
 
 func (s *Syncer) syncOnce(ctx context.Context) {
@@ -262,7 +271,7 @@ func partitionQueueRows(
 		switch row.TableName {
 		case "files":
 			valid = append(valid, row)
-		case "image_features", "video_features":
+		case "image_features", "video_features", "video_containers", "video_streams":
 			if validFeatureSHA(row.RowPK) {
 				valid = append(valid, row)
 			} else {
@@ -286,16 +295,18 @@ func (s *Syncer) loadBatch(
 	queueRows []store.SyncQueueRow,
 ) (loadedBatch, []store.SyncQueueRow, error) {
 	keys := map[string][]string{
-		"files":          nil,
-		"image_features": nil,
-		"video_features": nil,
-		"video_frames":   nil,
+		"files":            nil,
+		"image_features":   nil,
+		"video_features":   nil,
+		"video_frames":     nil,
+		"video_containers": nil,
+		"video_streams":    nil,
 	}
 	queueByTableKey := make(map[string]store.SyncQueueRow, len(queueRows))
 	for _, row := range queueRows {
 		switch row.TableName {
 		case "files":
-		case "image_features", "video_features", "video_frames":
+		case "image_features", "video_features", "video_frames", "video_containers", "video_streams":
 		default:
 			return loadedBatch{}, nil, fmt.Errorf(
 				"sync: unsupported queue table %q", row.TableName,
@@ -320,6 +331,18 @@ func (s *Syncer) loadBatch(
 	loadedFrames, err := s.local.LoadVideoFramesByKeys(ctx, keys["video_frames"])
 	if err != nil {
 		return loadedBatch{}, nil, fmt.Errorf("load video frames: %w", err)
+	}
+	metadataKeys := append(append([]string(nil), keys["video_containers"]...), keys["video_streams"]...)
+	var loadedMetadata []store.VideoMetadataSyncRow
+	if len(metadataKeys) != 0 {
+		loader, ok := s.local.(videoMetadataLoader)
+		if !ok {
+			return loadedBatch{}, nil, fmt.Errorf("load video metadata: local store does not support video metadata")
+		}
+		loadedMetadata, err = loader.LoadVideoMetadataBySHAs(ctx, metadataKeys)
+		if err != nil {
+			return loadedBatch{}, nil, fmt.Errorf("load video metadata: %w", err)
+		}
 	}
 
 	found := make(map[string]bool, len(queueRows))
@@ -362,6 +385,23 @@ func (s *Syncer) loadBatch(
 			frames = append(frames, loadedFrames[index])
 		}
 	}
+	metadata := make([]store.VideoMetadataSyncRow, 0, len(loadedMetadata))
+	for index := range loadedMetadata {
+		matched := false
+		for _, table := range []string{"video_containers", "video_streams"} {
+			key := table + "\x00" + loadedMetadata[index].SHA512
+			if queued, ok := queueByTableKey[key]; ok {
+				found[key] = true
+				if queued.EnqueuedAt > loadedMetadata[index].UpdatedAt {
+					loadedMetadata[index].UpdatedAt = queued.EnqueuedAt
+				}
+				matched = true
+			}
+		}
+		if matched {
+			metadata = append(metadata, loadedMetadata[index])
+		}
+	}
 
 	var acknowledged, missing []store.SyncQueueRow
 	for _, row := range queueRows {
@@ -373,6 +413,7 @@ func (s *Syncer) loadBatch(
 	}
 	return loadedBatch{
 		queue: acknowledged, files: files, images: images, videos: videos, frames: frames,
+		metadata: metadata,
 	}, missing, nil
 }
 
@@ -409,6 +450,15 @@ func (s *Syncer) commitRemoteBatch(ctx context.Context, batch loadedBatch) error
 	}
 	if len(batch.frames) != 0 {
 		if err := tx.UpsertFrames(ctx, batch.frames); err != nil {
+			return err
+		}
+	}
+	if len(batch.metadata) != 0 {
+		remote, ok := tx.(videoMetadataRemoteTx)
+		if !ok {
+			return fmt.Errorf("remote transaction does not support video metadata")
+		}
+		if err := remote.UpsertVideoMetadata(ctx, batch.metadata); err != nil {
 			return err
 		}
 	}
@@ -528,6 +578,41 @@ ON CONFLICT (sha512, frame_idx) DO UPDATE SET
     phash_parts = EXCLUDED.phash_parts,
     sobel_hist = EXCLUDED.sobel_hist;`
 
+const upsertVideoContainerPG = `
+INSERT INTO video_containers (
+    sha512, format_name, format_long_name, start_time_us, duration_us, bit_rate,
+    file_size, probe_score, tags_json, primary_video_stream, decoder_name, updated_at
+)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11,to_timestamp($12))
+ON CONFLICT (sha512) DO UPDATE SET
+    format_name = EXCLUDED.format_name,
+    format_long_name = EXCLUDED.format_long_name,
+    start_time_us = EXCLUDED.start_time_us,
+    duration_us = EXCLUDED.duration_us,
+    bit_rate = EXCLUDED.bit_rate,
+    file_size = EXCLUDED.file_size,
+    probe_score = EXCLUDED.probe_score,
+    tags_json = EXCLUDED.tags_json,
+    primary_video_stream = EXCLUDED.primary_video_stream,
+    decoder_name = EXCLUDED.decoder_name,
+    updated_at = EXCLUDED.updated_at;`
+
+const deleteVideoStreamsPG = `DELETE FROM video_streams WHERE sha512=$1;`
+
+const insertVideoStreamPG = `
+INSERT INTO video_streams (
+    sha512, stream_index, media_type, codec_id, codec_name, codec_long_name, codec_tag,
+    profile, level, time_base, start_time_us, duration_us, bit_rate, frame_count,
+    disposition, language, title, tags_json, pixel_format, bit_depth, width, height,
+    sar, dar, avg_frame_rate, real_frame_rate, rotation, color_range, color_space,
+    color_transfer, color_primaries, chroma_location, field_order, sample_format,
+    sample_rate, channels, channel_layout, audio_bit_depth
+)
+VALUES (
+    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18::jsonb,$19,
+    $20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38
+);`
+
 const upsertLocalRunPG = `INSERT INTO local_analysis_runs(machine_id,run_id,generation,task_id,status,created_at,completed_at,published_at)
 VALUES($1,$2,$3,$4,$5,$6,$7,$8)
 ON CONFLICT(machine_id,run_id,generation) DO UPDATE SET task_id=EXCLUDED.task_id,status=EXCLUDED.status,
@@ -633,6 +718,56 @@ func (tx *pgRemoteTx) UpsertFrames(
 	return nil
 }
 
+func (tx *pgRemoteTx) UpsertVideoMetadata(
+	_ context.Context,
+	rows []store.VideoMetadataSyncRow,
+) error {
+	for _, row := range rows {
+		container := row.Container
+		tx.batch.Queue(
+			upsertVideoContainerPG,
+			row.SHA512,
+			container.FormatName,
+			nullableMetadataString(container.FormatLongName),
+			nullableInt64(container.StartTimeUS),
+			nullableInt64(container.DurationUS),
+			nullableInt64(container.BitRate),
+			nullableInt64(container.FileSize),
+			nullableInt32(container.ProbeScore),
+			container.TagsJSON,
+			nullableInt32(container.PrimaryVideoStream),
+			nullableMetadataString(container.DecoderName),
+			row.UpdatedAt,
+		)
+		tx.commands++
+		tx.batch.Queue(deleteVideoStreamsPG, row.SHA512)
+		tx.commands++
+		for _, stream := range row.Streams {
+			tx.batch.Queue(
+				insertVideoStreamPG,
+				row.SHA512, stream.Index, stream.MediaType, stream.CodecID, stream.CodecName,
+				nullableMetadataString(stream.CodecLongName), nullableMetadataString(stream.CodecTag),
+				nullableMetadataString(stream.Profile), nullableInt32(stream.Level),
+				nullableMetadataString(stream.TimeBase), nullableInt64(stream.StartTimeUS),
+				nullableInt64(stream.DurationUS), nullableInt64(stream.BitRate), nullableInt64(stream.FrameCount),
+				stream.Disposition, nullableMetadataString(stream.Language), nullableMetadataString(stream.Title),
+				stream.TagsJSON, nullableMetadataString(stream.PixelFormat), nullableInt32(stream.BitDepth),
+				nullableInt32(stream.Width), nullableInt32(stream.Height), nullableMetadataString(stream.SAR),
+				nullableMetadataString(stream.DAR), nullableMetadataString(stream.AvgFrameRate),
+				nullableMetadataString(stream.RealFrameRate), nullableInt32(stream.Rotation),
+				nullableMetadataString(stream.ColorRange), nullableMetadataString(stream.ColorSpace),
+				nullableMetadataString(stream.ColorTransfer), nullableMetadataString(stream.ColorPrimaries),
+				nullableMetadataString(stream.ChromaLocation), nullableMetadataString(stream.FieldOrder),
+				nullableMetadataString(stream.SampleFormat), nullableInt32(stream.SampleRate),
+				nullableInt32(stream.Channels), nullableMetadataString(stream.ChannelLayout),
+				nullableInt32(stream.AudioBitDepth),
+			)
+			tx.commands++
+		}
+	}
+	return nil
+}
+
 func (tx *pgRemoteTx) UpsertLocal(_ context.Context, batch store.LocalSyncBatch) error {
 	for _, row := range batch.Runs {
 		tx.batch.Queue(upsertLocalRunPG, row.MachineID, row.RunID, row.Generation, row.TaskID,
@@ -722,6 +857,13 @@ func nullableInt32(value *int32) any {
 		return nil
 	}
 	return *value
+}
+
+func nullableMetadataString(value string) any {
+	if value == "" {
+		return nil
+	}
+	return value
 }
 
 func boolToSmallint(value bool) int16 {

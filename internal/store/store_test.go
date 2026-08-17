@@ -159,6 +159,10 @@ func TestDefaultStageOneUnchangedVideoReusesOnlyCompleteContactCache(t *testing.
 		DurationMS: &duration, ThumbPath: `D:\cache\contact.jpg`,
 		ThumbPDQ: make([]byte, 32), ThumbQuality: &quality,
 		ThumbWidth: &width, ThumbHeight: &height,
+		VideoContainer: &proto.VideoContainerMetadata{FormatName: "mp4", TagsJSON: `{}`},
+		VideoStreams: []proto.VideoStreamMetadata{{
+			Index: 0, MediaType: "video", CodecID: 27, CodecName: "h264", TagsJSON: `{}`,
+		}},
 	}); err != nil {
 		t.Fatalf("SaveAnalysis: %v", err)
 	}
@@ -210,7 +214,10 @@ func TestDefaultStageOneRevalidateCompleteSharedCacheRestoresDone(t *testing.T) 
 			missing_mask=?2, phase1_done=0 WHERE path=?3;
 		INSERT INTO video_features
 			(sha512, duration_ms, thumb_path, thumb_pdq256, thumb_quality, thumb_width, thumb_height)
-		VALUES (?1, 1234, 'shared.jpg', zeroblob(32), 80, 960, 540)`,
+		VALUES (?1, 1234, 'shared.jpg', zeroblob(32), 80, 960, 540);
+		INSERT INTO video_containers(sha512,format_name,tags_json) VALUES(?1,'mp4','{}');
+		INSERT INTO video_streams(sha512,stream_index,media_type,codec_id,codec_name,tags_json)
+		VALUES(?1,0,'video',27,'h264','{}')`,
 		hex.EncodeToString(sha), proto.FieldVideoContactSheet, record.Path,
 	); err != nil {
 		t.Fatal(err)

@@ -60,6 +60,7 @@ const (
 	FieldVideoContactSheet uint32 = 1 << 7
 	FieldVideo6FPHash      uint32 = 1 << 8
 	FieldVideo6FSobel      uint32 = 1 << 9
+	FieldVideoMetadata     uint32 = 1 << 10
 )
 
 const FrameMaskFull uint8 = 0x3f
@@ -374,25 +375,27 @@ type TaskProgress struct {
 }
 
 type FeatureItem struct {
-	Path         string         `msgpack:"path"`
-	SHA512       string         `msgpack:"sha512,omitempty"`
-	Size         int64          `msgpack:"size"`
-	MTime        int64          `msgpack:"mtime"`
-	Status       string         `msgpack:"status"`
-	Err          string         `msgpack:"err,omitempty"`
-	FieldsDone   uint32         `msgpack:"fields_done,omitempty"`
-	PDQ256       string         `msgpack:"pdq256,omitempty"`
-	Quality      int32          `msgpack:"quality,omitempty"`
-	Width        int32          `msgpack:"width,omitempty"`
-	Height       int32          `msgpack:"height,omitempty"`
-	DurationMS   *int64         `msgpack:"duration_ms,omitempty"`
-	ThumbPath    string         `msgpack:"thumb_path,omitempty"`
-	ThumbPDQ256  string         `msgpack:"thumb_pdq256,omitempty"`
-	ThumbQuality *int32         `msgpack:"thumb_quality,omitempty"`
-	FieldErrors  []FieldError   `msgpack:"field_errors,omitempty"`
-	PHashParts   []byte         `msgpack:"phash_parts,omitempty"`
-	SobelHist    []byte         `msgpack:"sobel_hist,omitempty"`
-	Frames       []FrameFeature `msgpack:"frames,omitempty"`
+	Path           string                  `msgpack:"path"`
+	SHA512         string                  `msgpack:"sha512,omitempty"`
+	Size           int64                   `msgpack:"size"`
+	MTime          int64                   `msgpack:"mtime"`
+	Status         string                  `msgpack:"status"`
+	Err            string                  `msgpack:"err,omitempty"`
+	FieldsDone     uint32                  `msgpack:"fields_done,omitempty"`
+	PDQ256         string                  `msgpack:"pdq256,omitempty"`
+	Quality        int32                   `msgpack:"quality,omitempty"`
+	Width          int32                   `msgpack:"width,omitempty"`
+	Height         int32                   `msgpack:"height,omitempty"`
+	DurationMS     *int64                  `msgpack:"duration_ms,omitempty"`
+	ThumbPath      string                  `msgpack:"thumb_path,omitempty"`
+	ThumbPDQ256    string                  `msgpack:"thumb_pdq256,omitempty"`
+	ThumbQuality   *int32                  `msgpack:"thumb_quality,omitempty"`
+	FieldErrors    []FieldError            `msgpack:"field_errors,omitempty"`
+	PHashParts     []byte                  `msgpack:"phash_parts,omitempty"`
+	SobelHist      []byte                  `msgpack:"sobel_hist,omitempty"`
+	Frames         []FrameFeature          `msgpack:"frames,omitempty"`
+	VideoContainer *VideoContainerMetadata `msgpack:"video_container,omitempty"`
+	VideoStreams   []VideoStreamMetadata   `msgpack:"video_streams,omitempty"`
 }
 
 type FrameFeature struct {

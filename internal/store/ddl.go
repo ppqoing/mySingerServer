@@ -1,6 +1,6 @@
 package store
 
-const localSchemaVersion = 4
+const localSchemaVersion = 5
 
 const ddl = `
 PRAGMA foreign_keys = ON;
@@ -55,6 +55,62 @@ CREATE TABLE IF NOT EXISTS video_frames (
     phash_parts BLOB,
     sobel_hist  BLOB,
     PRIMARY KEY (sha512, frame_idx)
+);
+
+CREATE TABLE IF NOT EXISTS video_containers (
+    sha512              TEXT PRIMARY KEY,
+    format_name         TEXT NOT NULL,
+    format_long_name    TEXT,
+    start_time_us       INTEGER,
+    duration_us         INTEGER,
+    bit_rate            INTEGER,
+    file_size           INTEGER,
+    probe_score         INTEGER,
+    tags_json           TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(tags_json)),
+    primary_video_stream INTEGER,
+    decoder_name        TEXT
+);
+
+CREATE TABLE IF NOT EXISTS video_streams (
+    sha512          TEXT NOT NULL REFERENCES video_containers(sha512) ON DELETE CASCADE,
+    stream_index    INTEGER NOT NULL CHECK (stream_index >= 0),
+    media_type      TEXT NOT NULL CHECK (media_type IN ('video','audio','subtitle','data','attachment')),
+    codec_id        INTEGER NOT NULL,
+    codec_name      TEXT NOT NULL,
+    codec_long_name TEXT,
+    codec_tag       TEXT,
+    profile         TEXT,
+    level           INTEGER,
+    time_base       TEXT,
+    start_time_us   INTEGER,
+    duration_us     INTEGER,
+    bit_rate        INTEGER,
+    frame_count     INTEGER,
+    disposition     INTEGER NOT NULL DEFAULT 0,
+    language        TEXT,
+    title           TEXT,
+    tags_json       TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(tags_json)),
+    pixel_format    TEXT,
+    bit_depth       INTEGER,
+    width           INTEGER,
+    height          INTEGER,
+    sar             TEXT,
+    dar             TEXT,
+    avg_frame_rate  TEXT,
+    real_frame_rate TEXT,
+    rotation        INTEGER,
+    color_range     TEXT,
+    color_space     TEXT,
+    color_transfer  TEXT,
+    color_primaries TEXT,
+    chroma_location TEXT,
+    field_order     TEXT,
+    sample_format   TEXT,
+    sample_rate     INTEGER,
+    channels        INTEGER,
+    channel_layout  TEXT,
+    audio_bit_depth INTEGER,
+    PRIMARY KEY (sha512, stream_index)
 );
 
 CREATE TABLE IF NOT EXISTS sync_queue (

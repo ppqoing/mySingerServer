@@ -59,6 +59,22 @@ func TestDecodeClientAuthAndLocalEnvelope(t *testing.T) {
 	}
 }
 
+func TestVideoMetadataFieldBitPreservesEveryLegacyValue(t *testing.T) {
+	want := []uint32{1 << 0, 1 << 1, 1 << 2, 1 << 3, 1 << 4, 1 << 5, 1 << 6, 1 << 7, 1 << 8, 1 << 9}
+	got := []uint32{
+		FieldSHA512, FieldPDQ256, FieldThumb, FieldPHashParts, FieldSobelHist,
+		FieldVideo6F, FieldVideoDuration, FieldVideoContactSheet, FieldVideo6FPHash, FieldVideo6FSobel,
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("legacy field bit %d = %#x, want %#x", index, got[index], want[index])
+		}
+	}
+	if FieldVideoMetadata != 1<<10 {
+		t.Fatalf("FieldVideoMetadata = %#x, want %#x", FieldVideoMetadata, uint32(1<<10))
+	}
+}
+
 func TestTaskProgressAndDoneLifecycleFieldsRoundTrip(t *testing.T) {
 	progress := TaskProgress{TaskID: "task-1", Done: 4, Total: 10, TotalKnown: true, Failed: 1, ElapsedMS: 2500, Speed: 2.5}
 	body, err := msgpack.Marshal(progress)

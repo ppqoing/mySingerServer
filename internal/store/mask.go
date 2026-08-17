@@ -15,7 +15,7 @@ const (
 	MediaVideo MediaKind = "video"
 
 	phaseOneFieldsMask = proto.FieldSHA512 | proto.FieldPDQ256 | proto.FieldThumb |
-		proto.FieldVideoDuration | proto.FieldVideoContactSheet
+		proto.FieldVideoDuration | proto.FieldVideoContactSheet | proto.FieldVideoMetadata
 )
 
 // RequiredStageOneMask returns the non-optional fields required before a file
@@ -25,7 +25,8 @@ func RequiredStageOneMask(kind MediaKind) uint32 {
 	case MediaImage:
 		return proto.FieldSHA512 | proto.FieldPDQ256
 	case MediaVideo:
-		return proto.FieldSHA512 | proto.FieldVideoDuration | proto.FieldVideoContactSheet
+		return proto.FieldSHA512 | proto.FieldVideoDuration | proto.FieldVideoContactSheet |
+			proto.FieldVideoMetadata
 	default:
 		return proto.FieldSHA512
 	}
@@ -61,6 +62,7 @@ func (d *DB) MissingPhase1(ctx context.Context, row FileRow, kind MediaKind) (ui
 
 type phase1Queryer interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }
 
 func missingPhase1(
@@ -109,6 +111,15 @@ func missingPhase1(
 		}
 		return missing &^ proto.FieldPDQ256, nil
 	case MediaVideo:
+		if full&proto.FieldVideoMetadata != 0 {
+			_, _, complete, err := loadVideoMetadata(ctx, queryer, *row.SHA512)
+			if err != nil {
+				return 0, err
+			}
+			if complete {
+				missing &^= proto.FieldVideoMetadata
+			}
+		}
 		videoRequired := full & (proto.FieldThumb | proto.FieldVideoDuration | proto.FieldVideoContactSheet)
 		if videoRequired == 0 {
 			return missing, nil

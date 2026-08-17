@@ -3,9 +3,11 @@ package syncer
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
 	"log/slog"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -39,6 +41,102 @@ func TestSyncOnceUsesOneFairMixedTransactionWithinConfiguredMaximum(t *testing.T
 	}
 	if pending, err := local.PendingSyncCount(ctx); err != nil || pending != 0 {
 		t.Fatalf("pending after mixed commit = %d, err=%v; want 0", pending, err)
+	}
+}
+
+func TestSyncVideoMetadataComputeToFakeManagerRoundTripsEveryFieldAndNull(t *testing.T) {
+	ctx := context.Background()
+	local := openSyncStore(t)
+	shaBytes := bytes.Repeat([]byte{0x5a}, 64)
+	sha := hex.EncodeToString(shaBytes)
+	path := `D:\media\metadata.mkv`
+	if err := local.UpsertEnumerated(ctx, []store.EnumUpsert{{
+		MachineID: "machine-a", DiskNo: 1, Path: path, Size: 1, MTime: 1,
+		MissingBase: proto.FieldSHA512 | proto.FieldVideoMetadata,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := local.ApplyHashResults(ctx, "machine-a", []store.HashResult{{Path: path, SHA512: sha}}); err != nil {
+		t.Fatal(err)
+	}
+	start, duration, bitRate, fileSize := int64(-7), int64(9_000_000), int64(8_000_000), int64(123456)
+	probe, primary := int32(100), int32(2)
+	level, streamStart, streamDuration, streamRate, frames := int32(42), int64(0), int64(9_000_000), int64(7_500_000), int64(270)
+	bitDepth, width, height, rotation := int32(10), int32(1920), int32(1080), int32(90)
+	sampleRate, channels, audioDepth := int32(48000), int32(2), int32(24)
+	container := &proto.VideoContainerMetadata{
+		FormatName: "matroska,webm", FormatLongName: "Matroska / WebM", StartTimeUS: &start,
+		DurationUS: &duration, BitRate: &bitRate, FileSize: &fileSize, ProbeScore: &probe,
+		TagsJSON: `{"artist":"测试","title":"clip"}`, PrimaryVideoStream: &primary, DecoderName: "hevc",
+	}
+	streams := []proto.VideoStreamMetadata{
+		{
+			Index: 2, MediaType: "video", CodecID: 173, CodecName: "hevc", CodecLongName: "H.265",
+			CodecTag: "hvc1", Profile: "Main 10", Level: &level, TimeBase: "1/1000",
+			StartTimeUS: &streamStart, DurationUS: &streamDuration, BitRate: &streamRate,
+			FrameCount: &frames, Disposition: 1, Language: "jpn", Title: "主画面", TagsJSON: `{}`,
+			PixelFormat: "yuv420p10le", BitDepth: &bitDepth, Width: &width, Height: &height,
+			SAR: "1/1", DAR: "16/9", AvgFrameRate: "30/1", RealFrameRate: "30000/1001",
+			Rotation: &rotation, ColorRange: "tv", ColorSpace: "bt2020nc", ColorTransfer: "smpte2084",
+			ColorPrimaries: "bt2020", ChromaLocation: "left", FieldOrder: "progressive",
+		},
+		{
+			Index: 0, MediaType: "audio", CodecID: 86018, CodecName: "aac", TagsJSON: `{}`,
+			SampleFormat: "fltp", SampleRate: &sampleRate, Channels: &channels,
+			ChannelLayout: "stereo", AudioBitDepth: &audioDepth,
+		},
+	}
+	if _, err := local.SaveAnalysis(ctx, store.AnalysisResult{
+		MachineID: "machine-a", Path: path, Kind: store.MediaVideo, Size: 1, MTime: 1,
+		SHA512: shaBytes, RequestedFields: proto.FieldVideoMetadata, FieldsDone: proto.FieldVideoMetadata,
+		VideoContainer: container, VideoStreams: streams,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	remote := &transactionalRemote{}
+	uploader := NewWithRemote(local, remote, Config{UpsertBatch: 10}, discardLogger())
+	uploader.syncOnce(ctx)
+	if len(remote.committed) != 1 || len(remote.committed[0].metadata) != 1 {
+		t.Fatalf("committed metadata=%#v", remote.committed)
+	}
+	got := remote.committed[0].metadata[0]
+	wantStreams := []proto.VideoStreamMetadata{streams[1], streams[0]}
+	if got.SHA512 != sha || !reflect.DeepEqual(got.Container, *container) || !reflect.DeepEqual(got.Streams, wantStreams) {
+		t.Fatalf("metadata round trip mismatch\ngot=%#v\nwant=%#v %#v", got, *container, wantStreams)
+	}
+	if got.Streams[0].Level != nil || got.Streams[0].StartTimeUS != nil || got.Streams[0].Width != nil {
+		t.Fatalf("NULL optional fields became synthetic zeroes: %#v", got.Streams[0])
+	}
+	if pending, err := local.PendingSyncCount(ctx); err != nil || pending != 0 {
+		t.Fatalf("pending after metadata ack=%d err=%v", pending, err)
+	}
+}
+
+func TestSyncVideoMetadataPostgreSQLBatchUsesUpsertThenExactReplace(t *testing.T) {
+	tx := &pgRemoteTx{}
+	rows := []store.VideoMetadataSyncRow{{
+		SHA512:    strings.Repeat("a", 128),
+		Container: proto.VideoContainerMetadata{FormatName: "mp4", TagsJSON: `{}`},
+		Streams: []proto.VideoStreamMetadata{
+			{Index: 0, MediaType: "video", CodecID: 27, CodecName: "h264", TagsJSON: `{}`},
+			{Index: 1, MediaType: "audio", CodecID: 86018, CodecName: "aac", TagsJSON: `{}`},
+		},
+	}}
+	if err := tx.UpsertVideoMetadata(context.Background(), rows); err != nil {
+		t.Fatal(err)
+	}
+	if tx.commands != 4 || len(tx.batch.QueuedQueries) != 4 {
+		t.Fatalf("metadata PG command count=%d queued=%d, want 4", tx.commands, len(tx.batch.QueuedQueries))
+	}
+	wantOrder := []string{"INSERT INTO video_containers", "DELETE FROM video_streams", "INSERT INTO video_streams", "INSERT INTO video_streams"}
+	for index, prefix := range wantOrder {
+		if !strings.Contains(tx.batch.QueuedQueries[index].SQL, prefix) {
+			t.Fatalf("PG command %d=%q, want %q", index, tx.batch.QueuedQueries[index].SQL, prefix)
+		}
+	}
+	if !strings.Contains(upsertVideoContainerPG, "ON CONFLICT (sha512) DO UPDATE") {
+		t.Fatal("container SQL is not an upsert")
 	}
 }
 
@@ -340,11 +438,12 @@ func seedPhase1Video(t *testing.T, local *store.DB, path string, fill byte, comp
 }
 
 type recordedTx struct {
-	files  []store.FileRow
-	images []store.ImageFeatureSyncRow
-	videos []store.VideoFeatureSyncRow
-	frames []store.VideoFrameSyncRow
-	local  store.LocalSyncBatch
+	files    []store.FileRow
+	images   []store.ImageFeatureSyncRow
+	videos   []store.VideoFeatureSyncRow
+	frames   []store.VideoFrameSyncRow
+	local    store.LocalSyncBatch
+	metadata []store.VideoMetadataSyncRow
 }
 
 type transactionalRemote struct {
@@ -458,6 +557,14 @@ func (tx *transactionalRemoteTx) UpsertVideos(_ context.Context, rows []store.Vi
 		return err
 	}
 	tx.rows.videos = append(tx.rows.videos, rows...)
+	return nil
+}
+
+func (tx *transactionalRemoteTx) UpsertVideoMetadata(_ context.Context, rows []store.VideoMetadataSyncRow) error {
+	if err := tx.owner.fail("metadata"); err != nil {
+		return err
+	}
+	tx.rows.metadata = append(tx.rows.metadata, rows...)
 	return nil
 }
 

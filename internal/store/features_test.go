@@ -663,6 +663,10 @@ func TestVideoBaseFeaturesSavePhase1PersistsContactDimensions(t *testing.T) {
 		DurationMS: &duration, ThumbPath: `D:\cache\contact.jpg`,
 		ThumbPDQ: make([]byte, 32), ThumbQuality: &quality,
 		Width: 960, Height: 540,
+		VideoContainer: &proto.VideoContainerMetadata{FormatName: "mp4", TagsJSON: `{}`},
+		VideoStreams: []proto.VideoStreamMetadata{{
+			Index: 0, MediaType: "video", CodecID: 27, CodecName: "h264", TagsJSON: `{}`,
+		}},
 	}); err != nil {
 		t.Fatalf("SavePhase1: %v", err)
 	}

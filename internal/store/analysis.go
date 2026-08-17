@@ -31,12 +31,14 @@ type AnalysisResult struct {
 	Width   int32
 	Height  int32
 
-	DurationMS   *int64
-	ThumbPath    string
-	ThumbPDQ     []byte
-	ThumbQuality *int32
-	ThumbWidth   *int32
-	ThumbHeight  *int32
+	DurationMS     *int64
+	ThumbPath      string
+	ThumbPDQ       []byte
+	ThumbQuality   *int32
+	ThumbWidth     *int32
+	ThumbHeight    *int32
+	VideoContainer *proto.VideoContainerMetadata
+	VideoStreams   []proto.VideoStreamMetadata
 
 	PHashParts []byte
 	SobelHist  []byte
@@ -93,6 +95,7 @@ func (d *DB) SaveAnalysis(ctx context.Context, result AnalysisResult) (Committed
 
 	now := time.Now().Unix()
 	changedFeature := false
+	changedMetadata := false
 	changedFrames := make([]int, 0, len(result.Frames))
 	switch result.Kind {
 	case MediaImage:
@@ -133,6 +136,12 @@ func (d *DB) SaveAnalysis(ctx context.Context, result AnalysisResult) (Committed
 			changedFeature = true
 		}
 	case MediaVideo:
+		if result.FieldsDone&proto.FieldVideoMetadata != 0 {
+			if err := replaceVideoMetadata(ctx, tx, sha, result.VideoContainer, result.VideoStreams); err != nil {
+				return CommittedState{}, fmt.Errorf("store: save analysis video metadata: %w", err)
+			}
+			changedMetadata = true
+		}
 		if result.FieldsDone&(proto.FieldVideoDuration|proto.FieldThumb) != 0 {
 			if _, err := tx.ExecContext(ctx, `
 				INSERT INTO video_features (sha512, duration_ms) VALUES (?1, ?2)
@@ -248,6 +257,13 @@ func (d *DB) SaveAnalysis(ctx context.Context, result AnalysisResult) (Committed
 			return CommittedState{}, err
 		}
 	}
+	if changedMetadata {
+		for _, table := range []string{"video_containers", "video_streams"} {
+			if err := enqueuePhase1Sync(ctx, tx, table, sha, now); err != nil {
+				return CommittedState{}, err
+			}
+		}
+	}
 	for _, frameIdx := range changedFrames {
 		if err := enqueuePhase1Sync(
 			ctx, tx, "video_frames", fmt.Sprintf("%s:%d", sha, frameIdx), now,
@@ -317,13 +333,21 @@ func validateAnalysisResult(result AnalysisResult) (uint8, error) {
 			return 0, err
 		}
 		if result.DurationMS != nil || result.ThumbPath != "" || len(result.ThumbPDQ) != 0 ||
-			result.ThumbQuality != nil || result.ThumbWidth != nil || result.ThumbHeight != nil {
+			result.ThumbQuality != nil || result.ThumbWidth != nil || result.ThumbHeight != nil ||
+			result.VideoContainer != nil || len(result.VideoStreams) != 0 {
 			return 0, fmt.Errorf("store: image analysis contains video payload")
 		}
 	case MediaVideo:
 		if len(result.PDQ) != 0 || result.Quality != 0 || result.Width != 0 || result.Height != 0 ||
 			len(result.PHashParts) != 0 || len(result.SobelHist) != 0 {
 			return 0, fmt.Errorf("store: video analysis contains image payload")
+		}
+		if result.FieldsDone&proto.FieldVideoMetadata != 0 {
+			if err := proto.ValidateVideoMetadata(result.VideoContainer, result.VideoStreams); err != nil {
+				return 0, err
+			}
+		} else if result.VideoContainer != nil || len(result.VideoStreams) != 0 {
+			return 0, fmt.Errorf("store: unclaimed analysis video metadata payload")
 		}
 		durationDone := result.FieldsDone&(proto.FieldVideoDuration|proto.FieldThumb) != 0
 		if durationDone {
@@ -469,6 +493,16 @@ func committedAnalysisState(
 			}
 		}
 	case MediaVideo:
+		if requestedFields&proto.FieldVideoMetadata != 0 {
+			_, _, complete, err := loadVideoMetadata(ctx, tx, sha)
+			if err != nil {
+				return CommittedState{}, err
+			}
+			if complete {
+				state.FieldsPresent |= proto.FieldVideoMetadata
+				state.MissingFields &^= proto.FieldVideoMetadata
+			}
+		}
 		var duration, quality, thumbWidth, thumbHeight sql.NullInt64
 		var thumbPath sql.NullString
 		var thumbPDQ []byte

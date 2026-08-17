@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"dedup/internal/proto"
 )
 
 type SyncQueueRow struct {
@@ -50,7 +52,7 @@ func (d *DB) PendingSyncBatch(ctx context.Context, limit int) ([]SyncQueueRow, e
 	if limit <= 0 {
 		return nil, nil
 	}
-	tableOffset := (d.syncTableCursor.Add(1) - 1) % 4
+	tableOffset := (d.syncTableCursor.Add(1) - 1) % 6
 	rows, err := d.db.QueryContext(ctx, `
 		WITH ranked AS (
 			SELECT table_name, row_pk, generation, enqueued_at,
@@ -60,7 +62,10 @@ func (d *DB) PendingSyncBatch(ctx context.Context, limit int) ([]SyncQueueRow, e
 			       ) AS table_rank
 			FROM sync_queue
 			WHERE synced = 0
-			  AND table_name IN ('files', 'image_features', 'video_features', 'video_frames')
+			  AND table_name IN (
+			      'files', 'image_features', 'video_features', 'video_frames',
+			      'video_containers', 'video_streams'
+			  )
 		)
 		SELECT table_name, row_pk, generation, enqueued_at
 		FROM ranked
@@ -70,9 +75,11 @@ func (d *DB) PendingSyncBatch(ctx context.Context, limit int) ([]SyncQueueRow, e
 		                 WHEN 'files' THEN 0
 		                 WHEN 'image_features' THEN 1
 		                 WHEN 'video_features' THEN 2
-		                 WHEN 'video_frames' THEN 3
-		             END - ?2 + 4
-		         ) % 4,
+			                 WHEN 'video_frames' THEN 3
+			                 WHEN 'video_containers' THEN 4
+			                 WHEN 'video_streams' THEN 5
+			             END - ?2 + 6
+			         ) % 6,
 		         enqueued_at,
 		         row_pk
 		LIMIT ?1;`, limit, tableOffset)
@@ -248,6 +255,25 @@ func (d *DB) PruneMissingSyncRows(ctx context.Context, rows []SyncQueueRow) erro
 				)
 			}
 			continue
+		case "video_containers", "video_streams":
+			if !canonicalFeatureSHA(row.RowPK) {
+				return fmt.Errorf("store: invalid video metadata queue key %q", row.RowPK)
+			}
+			_, _, complete, err := loadVideoMetadata(ctx, tx, row.RowPK)
+			if err != nil {
+				return err
+			}
+			if complete {
+				continue
+			}
+			if _, err := tx.ExecContext(ctx, `
+				DELETE FROM sync_queue
+				WHERE table_name=?1 AND row_pk=?2 AND generation=?3 AND synced=0`,
+				row.TableName, row.RowPK, row.Generation,
+			); err != nil {
+				return fmt.Errorf("store: prune incomplete %s/%s@%d: %w", row.TableName, row.RowPK, row.Generation, err)
+			}
+			continue
 		default:
 			return fmt.Errorf("store: unsupported missing-row table %q", row.TableName)
 		}
@@ -282,7 +308,7 @@ func (d *DB) QuarantineSyncRows(ctx context.Context, rows []SyncQueueRow) error 
 	for _, row := range rows {
 		var malformed bool
 		switch row.TableName {
-		case "image_features", "video_features":
+		case "image_features", "video_features", "video_containers", "video_streams":
 			malformed = !canonicalFeatureSHA(row.RowPK)
 		case "video_frames":
 			_, _, valid := parseVideoFrameKey(row.RowPK)
@@ -390,6 +416,40 @@ type VideoFeatureSyncRow struct {
 	ThumbWidth   *int32
 	ThumbHeight  *int32
 	UpdatedAt    int64
+}
+
+type VideoMetadataSyncRow struct {
+	SHA512    string
+	Container proto.VideoContainerMetadata
+	Streams   []proto.VideoStreamMetadata
+	UpdatedAt int64
+}
+
+func (d *DB) LoadVideoMetadataBySHAs(
+	ctx context.Context,
+	shas []string,
+) ([]VideoMetadataSyncRow, error) {
+	seen := make(map[string]struct{}, len(shas))
+	result := make([]VideoMetadataSyncRow, 0, len(shas))
+	for _, sha := range shas {
+		if !canonicalFeatureSHA(sha) {
+			return nil, fmt.Errorf("store: invalid video metadata SHA %q", sha)
+		}
+		if _, exists := seen[sha]; exists {
+			continue
+		}
+		seen[sha] = struct{}{}
+		container, streams, complete, err := loadVideoMetadata(ctx, d.db, sha)
+		if err != nil {
+			return nil, err
+		}
+		if complete {
+			result = append(result, VideoMetadataSyncRow{
+				SHA512: sha, Container: *container, Streams: streams,
+			})
+		}
+	}
+	return result, nil
 }
 
 func (d *DB) LoadVideoFeaturesBySHAs(

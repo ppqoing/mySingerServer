@@ -98,6 +98,63 @@ CREATE TABLE IF NOT EXISTS video_frames (
     PRIMARY KEY (sha512, frame_idx)
 );
 
+CREATE TABLE IF NOT EXISTS video_containers (
+    sha512              TEXT PRIMARY KEY CHECK (sha512 ~ '^[0-9a-f]{128}$'),
+    format_name         TEXT NOT NULL,
+    format_long_name    TEXT,
+    start_time_us       BIGINT,
+    duration_us         BIGINT,
+    bit_rate            BIGINT,
+    file_size           BIGINT,
+    probe_score         INTEGER,
+    tags_json           JSONB NOT NULL DEFAULT '{}'::jsonb,
+    primary_video_stream INTEGER,
+    decoder_name        TEXT,
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS video_streams (
+    sha512          TEXT NOT NULL REFERENCES video_containers(sha512) ON DELETE CASCADE,
+    stream_index    INTEGER NOT NULL CHECK (stream_index >= 0),
+    media_type      TEXT NOT NULL CHECK (media_type IN ('video','audio','subtitle','data','attachment')),
+    codec_id        INTEGER NOT NULL,
+    codec_name      TEXT NOT NULL,
+    codec_long_name TEXT,
+    codec_tag       TEXT,
+    profile         TEXT,
+    level           INTEGER,
+    time_base       TEXT,
+    start_time_us   BIGINT,
+    duration_us     BIGINT,
+    bit_rate        BIGINT,
+    frame_count     BIGINT,
+    disposition     BIGINT NOT NULL DEFAULT 0,
+    language        TEXT,
+    title           TEXT,
+    tags_json       JSONB NOT NULL DEFAULT '{}'::jsonb,
+    pixel_format    TEXT,
+    bit_depth       INTEGER,
+    width           INTEGER,
+    height          INTEGER,
+    sar             TEXT,
+    dar             TEXT,
+    avg_frame_rate  TEXT,
+    real_frame_rate TEXT,
+    rotation        INTEGER,
+    color_range     TEXT,
+    color_space     TEXT,
+    color_transfer  TEXT,
+    color_primaries TEXT,
+    chroma_location TEXT,
+    field_order     TEXT,
+    sample_format   TEXT,
+    sample_rate     INTEGER,
+    channels        INTEGER,
+    channel_layout  TEXT,
+    audio_bit_depth INTEGER,
+    PRIMARY KEY (sha512, stream_index)
+);
+
 CREATE TABLE IF NOT EXISTS dup_groups (
     id                     BIGSERIAL PRIMARY KEY,
     kind                   TEXT NOT NULL

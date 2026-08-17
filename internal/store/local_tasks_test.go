@@ -35,8 +35,8 @@ func TestLocalTaskV3MigrationAddsVersionedLifecycleWithoutLosingDependents(t *te
 	if err := db.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 4 {
-		t.Fatalf("user_version=%d, want 4", version)
+	if version != localSchemaVersion {
+		t.Fatalf("user_version=%d, want %d", version, localSchemaVersion)
 	}
 	task, err := db.LoadLocalTask(context.Background(), "machine-1", "task-1")
 	if err != nil {
@@ -230,8 +230,8 @@ func TestLocalTaskMigrationRebuildsNearV4TablesWithWeakenedConstraints(t *testin
 	if err := db.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 4 {
-		t.Fatalf("user_version=%d, want 4 after rebuilt constraints", version)
+	if version != localSchemaVersion {
+		t.Fatalf("user_version=%d, want %d after rebuilt constraints", version, localSchemaVersion)
 	}
 }
 

@@ -18,20 +18,22 @@ type FieldError struct {
 }
 
 type Phase1Result struct {
-	MachineID    string
-	Path         string
-	Kind         MediaKind
-	SHA512       []byte
-	FieldsDone   uint32
-	PDQ          []byte
-	Quality      int32
-	Width        int32
-	Height       int32
-	DurationMS   *int64
-	ThumbPath    string
-	ThumbPDQ     []byte
-	ThumbQuality *int32
-	Errors       []FieldError
+	MachineID      string
+	Path           string
+	Kind           MediaKind
+	SHA512         []byte
+	FieldsDone     uint32
+	PDQ            []byte
+	Quality        int32
+	Width          int32
+	Height         int32
+	DurationMS     *int64
+	ThumbPath      string
+	ThumbPDQ       []byte
+	ThumbQuality   *int32
+	VideoContainer *proto.VideoContainerMetadata
+	VideoStreams   []proto.VideoStreamMetadata
+	Errors         []FieldError
 }
 
 type ImageFeature struct {
@@ -195,6 +197,12 @@ func (d *DB) SavePhase1(ctx context.Context, result Phase1Result) error {
 			succeeded |= proto.FieldPDQ256
 		}
 	case MediaVideo:
+		if result.FieldsDone&proto.FieldVideoMetadata != 0 {
+			if err := replaceVideoMetadata(ctx, tx, sha, result.VideoContainer, result.VideoStreams); err != nil {
+				return fmt.Errorf("store: save phase1 video metadata: %w", err)
+			}
+			succeeded |= proto.FieldVideoMetadata
+		}
 		if result.FieldsDone&(proto.FieldThumb|proto.FieldVideoDuration) != 0 &&
 			result.DurationMS != nil {
 			var duration any
@@ -244,6 +252,11 @@ func (d *DB) SavePhase1(ctx context.Context, result Phase1Result) error {
 	}
 	if sha != "" && result.Kind == MediaVideo {
 		updatedMissing &^= videoFeatureFields(ctx, tx, sha)
+		if _, _, complete, err := loadVideoMetadata(ctx, tx, sha); err != nil {
+			return err
+		} else if complete {
+			updatedMissing &^= proto.FieldVideoMetadata
+		}
 	}
 	status, phase1Done := stageOneState(result.Kind, updatedMissing, len(result.Errors) != 0)
 	var errorText any
@@ -273,6 +286,13 @@ func (d *DB) SavePhase1(ctx context.Context, result Phase1Result) error {
 				return err
 			}
 		}
+		if result.Kind == MediaVideo && succeeded&proto.FieldVideoMetadata != 0 {
+			for _, table := range []string{"video_containers", "video_streams"} {
+				if err := enqueuePhase1Sync(ctx, tx, table, sha, now); err != nil {
+					return err
+				}
+			}
+		}
 	}
 	return tx.Commit()
 }
@@ -288,7 +308,8 @@ func validPreSHAFailure(result Phase1Result) bool {
 		result.DurationMS != nil ||
 		result.ThumbPath != "" ||
 		len(result.ThumbPDQ) != 0 ||
-		result.ThumbQuality != nil {
+		result.ThumbQuality != nil ||
+		result.VideoContainer != nil || len(result.VideoStreams) != 0 {
 		return false
 	}
 	for _, fieldError := range result.Errors {
@@ -313,6 +334,13 @@ func validatePhase1FeaturePayload(result Phase1Result) error {
 			return fmt.Errorf("store: invalid phase1 image PDQ payload")
 		}
 	case MediaVideo:
+		if result.FieldsDone&proto.FieldVideoMetadata != 0 {
+			if err := proto.ValidateVideoMetadata(result.VideoContainer, result.VideoStreams); err != nil {
+				return err
+			}
+		} else if result.VideoContainer != nil || len(result.VideoStreams) != 0 {
+			return fmt.Errorf("store: unclaimed phase1 video metadata payload")
+		}
 		if result.FieldsDone&proto.FieldVideoDuration != 0 &&
 			(result.DurationMS == nil || *result.DurationMS < 0) {
 			return fmt.Errorf("store: invalid phase1 video duration payload")
