@@ -29,6 +29,7 @@ type sessionPipelineDeps struct {
 	sameFile            func(fs.FileInfo, fs.FileInfo) bool
 	runtime             func() (videocore.RuntimeInfo, error)
 	open                func(context.Context, string, videocore.OpenOptions) (mediaSession, error)
+	ioGovernor          videocore.IOGovernor
 	rehash              func(context.Context, string, fs.FileInfo, *worker.JobMsg) ([64]byte, error)
 	query               func(*worker.SHAQueryMsg) (*worker.SHAReplyMsg, error)
 	contactSheetLookup  func(string, [64]byte) (ContactSheetMeta, bool, error)
@@ -78,7 +79,10 @@ func processMediaWithDeps(ctx context.Context, cfg Config, job *worker.JobMsg, d
 		return sessionPipelineCancelled(result, ContactSheetPaths{}), err
 	}
 
-	session, err := deps.open(ctx, path, videocore.OpenOptions{Kind: job.Kind, ImageMemoryBytes: cfg.ImageMemBytes, NativeTimeout: cfg.FFmpegTimeout})
+	session, err := deps.open(ctx, path, videocore.OpenOptions{
+		Kind: job.Kind, ImageMemoryBytes: cfg.ImageMemBytes,
+		NativeTimeout: cfg.FFmpegTimeout, IOGovernor: deps.ioGovernor,
+	})
 	if err != nil {
 		return sessionPipelineFileError(result, job.FieldsMask, "native_open", err), nil
 	}

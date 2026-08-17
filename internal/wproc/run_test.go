@@ -335,6 +335,27 @@ func TestServeProductionSessionDecodesVideoTrackCodec(t *testing.T) {
 	}
 }
 
+// Break caught: serve creates a per-job lease client but the production
+// VideoCore session opens its native source without that governor, so native
+// hash reads/seeks emit no lease traffic before the final Go rehash.
+func TestServeProductionSessionGovernsNativeSourceIO(t *testing.T) {
+	path := productionSessionFixturePath(t, "videos", "h264-standard.mp4")
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := worker.JobMsg{
+		JobID: 3301, ScanTaskID: "task-5-native-governor",
+		ScanInstanceID: "instance-task-5-native-governor", DiskKey: "disk-task-5-native-governor",
+		Path: path, Kind: worker.MediaVideo, Phase: worker.Phase1, Source: worker.JobSourceLocal,
+		FieldsMask: worker.MaskSHA512, Size: info.Size(), MTimeUnix: info.ModTime().Unix(),
+	}
+	result := serveProductionSessionFixture(t, job)
+	if result.FieldsDone != worker.MaskSHA512 || len(result.SHA512) != sha512.Size || len(result.Errors) != 0 {
+		t.Fatalf("governed native source result = %#v", result)
+	}
+}
+
 // Break caught: extension-agnostic production image analysis can regress to a
 // single decoder branch and silently fail JPEG, PNG, or WebP content.
 func TestServeProductionSessionDecodesImageContentFormat(t *testing.T) {
@@ -489,12 +510,20 @@ func serveProductionSessionFixture(t *testing.T, job worker.JobMsg) worker.JobRe
 	if err := conn.Write(worker.MsgJob, job); err != nil {
 		t.Fatal(err)
 	}
-	queryEnvelope, err := conn.Read()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if queryEnvelope.Type != worker.MsgSHAQuery {
-		t.Fatalf("production session post-job message = %q, want %q", queryEnvelope.Type, worker.MsgSHAQuery)
+	leaseStats := productionLeaseStats{}
+	var queryEnvelope *worker.Envelope
+	for queryEnvelope == nil {
+		envelope, readErr := conn.Read()
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if handleProductionLeaseMessage(t, conn, envelope, job, audit, &leaseStats) {
+			continue
+		}
+		if envelope.Type != worker.MsgSHAQuery {
+			t.Fatalf("production session post-job message = %q, want lease traffic or %q", envelope.Type, worker.MsgSHAQuery)
+		}
+		queryEnvelope = envelope
 	}
 	query, err := worker.DecodeBody[worker.SHAQueryMsg](queryEnvelope)
 	if err != nil {
@@ -508,7 +537,6 @@ func serveProductionSessionFixture(t *testing.T, job worker.JobMsg) worker.JobRe
 		t.Fatal(err)
 	}
 	var result worker.JobResultMsg
-	leaseAcquires, leaseReports := 0, 0
 	for {
 		resultEnvelope, err := conn.Read()
 		if err != nil {
@@ -519,36 +547,10 @@ func serveProductionSessionFixture(t *testing.T, job worker.JobMsg) worker.JobRe
 				t.Fatal(err)
 			}
 		}
+		if handleProductionLeaseMessage(t, conn, resultEnvelope, job, audit, &leaseStats) {
+			continue
+		}
 		switch resultEnvelope.Type {
-		case worker.MsgIOLeaseAcquire:
-			request, err := worker.DecodeBody[worker.IOLeaseAcquireMsg](resultEnvelope)
-			if err != nil {
-				t.Fatal(err)
-			}
-			leaseAcquires++
-			if request.JobID != job.JobID || request.TaskID != job.ScanTaskID ||
-				request.InstanceID != job.ScanInstanceID || request.DiskKey != job.DiskKey {
-				t.Fatalf("production source lease request = %#v", request)
-			}
-			grant := worker.IOLeaseGrantMsg{
-				JobID: request.JobID, RequestID: request.RequestID,
-				LeaseID: uint64(800 + leaseAcquires), Generation: 12,
-				Bytes: request.WantBytes,
-			}
-			audit.grant(grant, request.WantSeek)
-			if err := conn.Write(worker.MsgIOLeaseGrant, grant); err != nil {
-				t.Fatal(err)
-			}
-		case worker.MsgIOLeaseReport:
-			report, err := worker.DecodeBody[worker.IOLeaseReportMsg](resultEnvelope)
-			if err != nil {
-				t.Fatal(err)
-			}
-			leaseReports++
-			audit.report()
-			if !report.Completed || report.Cancelled || report.Bytes != job.Size {
-				t.Fatalf("production source lease report = %#v", report)
-			}
 		case worker.MsgResult:
 			result, err = worker.DecodeBody[worker.JobResultMsg](resultEnvelope)
 			if err != nil {
@@ -562,8 +564,12 @@ func serveProductionSessionFixture(t *testing.T, job worker.JobMsg) worker.JobRe
 
 productionResultReceived:
 	audit.assertGoverned(t, false)
-	if leaseAcquires == 0 || leaseReports == 0 {
-		t.Fatalf("production final rehash lease traffic acquires=%d reports=%d", leaseAcquires, leaseReports)
+	if leaseStats.seekAcquires == 0 || leaseStats.reportedSeeks == 0 {
+		t.Fatalf("native source lease traffic acquires=%d seek_acquires=%d reports=%d reported_seeks=%d",
+			leaseStats.acquires, leaseStats.seekAcquires, leaseStats.reports, leaseStats.reportedSeeks)
+	}
+	if leaseStats.reportedBytes < job.Size {
+		t.Fatalf("source lease reported bytes=%d, want at least job size %d", leaseStats.reportedBytes, job.Size)
 	}
 	if err := conn.Write(worker.MsgShutdown, struct{}{}); err != nil {
 		t.Fatal(err)
@@ -574,6 +580,68 @@ productionResultReceived:
 	t.Logf("IPC chain: %s -> %s -> %s -> %s -> %s -> %s (serve=0)",
 		worker.MsgReady, worker.MsgJob, worker.MsgSHAQuery, worker.MsgSHAReply, worker.MsgResult, worker.MsgShutdown)
 	return result
+}
+
+type productionLeaseStats struct {
+	acquires      int
+	seekAcquires  int
+	reports       int
+	reportedBytes int64
+	reportedSeeks uint32
+}
+
+func handleProductionLeaseMessage(
+	t *testing.T,
+	conn *worker.IPCConn,
+	envelope *worker.Envelope,
+	job worker.JobMsg,
+	audit *sourceAccessAudit,
+	stats *productionLeaseStats,
+) bool {
+	t.Helper()
+	switch envelope.Type {
+	case worker.MsgIOLeaseAcquire:
+		request, err := worker.DecodeBody[worker.IOLeaseAcquireMsg](envelope)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stats.acquires++
+		if request.JobID != job.JobID || request.TaskID != job.ScanTaskID ||
+			request.InstanceID != job.ScanInstanceID || request.DiskKey != job.DiskKey {
+			t.Fatalf("production source lease request = %#v", request)
+		}
+		grant := worker.IOLeaseGrantMsg{
+			JobID: request.JobID, RequestID: request.RequestID,
+			LeaseID: uint64(800 + stats.acquires), Generation: 12,
+			Bytes: request.WantBytes,
+		}
+		if request.WantSeek {
+			stats.seekAcquires++
+			grant.Seeks = 1
+		}
+		audit.grant(grant, request.WantSeek)
+		if err := conn.Write(worker.MsgIOLeaseGrant, grant); err != nil {
+			t.Fatal(err)
+		}
+		return true
+	case worker.MsgIOLeaseReport:
+		report, err := worker.DecodeBody[worker.IOLeaseReportMsg](envelope)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stats.reports++
+		stats.reportedBytes += report.Bytes
+		stats.reportedSeeks += report.Seeks
+		audit.report()
+		if report.JobID != job.JobID || report.TaskID != job.ScanTaskID ||
+			report.InstanceID != job.ScanInstanceID || report.DiskKey != job.DiskKey ||
+			!report.Completed || report.Cancelled {
+			t.Fatalf("production source lease report = %#v", report)
+		}
+		return true
+	default:
+		return false
+	}
 }
 
 // sourceAccessAudit is the production-opener seam: a grant is recorded before
@@ -714,7 +782,7 @@ func TestServeReadyReportsVideoCoreRuntime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ready.VideoCoreABI != videocore.ABIVersion || ready.VideoCoreVersion != videocore.Version || len(ready.FFmpegComponents) != 4 || ready.FFmpegComponents[0].BuildMajor != 63 || ready.FFmpegComponents[0].RuntimeMajor != 63 {
+	if ready.DLLVersion != worker.MediaCoreDLLVersion || ready.VideoCoreABI != videocore.ABIVersion || ready.VideoCoreVersion != videocore.Version || len(ready.FFmpegComponents) != 4 || ready.FFmpegComponents[0].BuildMajor != 63 || ready.FFmpegComponents[0].RuntimeMajor != 63 {
 		t.Fatalf("runtime Ready=%#v", ready)
 	}
 	if err := conn.Write(worker.MsgShutdown, struct{}{}); err != nil {
@@ -1171,7 +1239,7 @@ func TestServeSendsReadyAndHandlesShutdown(t *testing.T) {
 	}
 	if env.Type != worker.MsgReady || ready.WorkerIndex != 7 ||
 		ready.IPCVersion != worker.IPCCompatibilityVersion ||
-		ready.DLLVersion != videocore.Version || ready.VideoCoreABI != videocore.ABIVersion {
+		ready.DLLVersion != worker.MediaCoreDLLVersion || ready.VideoCoreABI != videocore.ABIVersion {
 		t.Fatalf("ready = type %q body %#v", env.Type, ready)
 	}
 	if err := conn.Write(worker.MsgShutdown, struct{}{}); err != nil {

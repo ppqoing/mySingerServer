@@ -131,6 +131,20 @@ func task17Ready() ReadyMsg {
 	return validReadyForTest()
 }
 
+// Break caught: the current ABI v2 Ready is rejected, or a legacy VideoCore
+// v1 Ready is admitted after the ABI contract becomes mandatory.
+func TestTask5VideoCoreReadyGateAcceptsV2AndRejectsV1(t *testing.T) {
+	ready := task17Ready()
+	if err := validateReady(ready, ready.WorkerIndex, ready.PID); err != nil {
+		t.Fatalf("current VideoCore Ready rejected: %v", err)
+	}
+	ready.VideoCoreABI = 1
+	ready.VideoCoreVersion = "1.0.0"
+	if err := validateReady(ready, ready.WorkerIndex, ready.PID); err == nil {
+		t.Fatal("VideoCore v1 Ready unexpectedly accepted")
+	}
+}
+
 func TestPoolRejectsVideoCoreRuntimeMismatch(t *testing.T) {
 	bad := task17Ready()
 	bad.FFmpegComponents[0].RuntimeMajor++
@@ -188,7 +202,7 @@ func TestPoolReplacementReadyAfterNativeCrash(t *testing.T) {
 		t.Fatal("native crash was not published")
 	}
 	h.clock.next(t, 500*time.Millisecond).fire()
-	if replacement := h.ready(t); replacement.VideoCoreVersion != "1.0.0" {
+	if replacement := h.ready(t); replacement.VideoCoreVersion != VideoCoreVersion {
 		t.Fatalf("replacement did not pass runtime Ready gate: %#v", replacement)
 	}
 }

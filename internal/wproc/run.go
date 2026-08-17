@@ -67,7 +67,7 @@ func serve(conn net.Conn, index int, cfg Config, deps pipelineDeps) int {
 	}
 	if err := ipc.Write(worker.MsgReady, worker.ReadyMsg{
 		PID: os.Getpid(), WorkerIndex: index,
-		IPCVersion: worker.IPCCompatibilityVersion, DLLVersion: runtimeInfo.Version,
+		IPCVersion: worker.IPCCompatibilityVersion, DLLVersion: worker.MediaCoreDLLVersion,
 		VideoCoreABI: runtimeInfo.ABI, VideoCoreVersion: runtimeInfo.Version,
 		FFmpegComponents: components,
 	}); err != nil {
@@ -145,6 +145,9 @@ func serve(conn net.Conn, index int, cfg Config, deps pipelineDeps) int {
 				sessionDeps.rehash = func(ctx context.Context, path string, before os.FileInfo, job *worker.JobMsg) ([64]byte, error) {
 					return rehashMediaFileWithOpen(ctx, path, before, job, governedOpen)
 				}
+			}
+			if useSessionPipeline {
+				sessionDeps.ioGovernor = lease
 			}
 			var videoDeps videoPipelineDeps
 			if videoOverride == nil && !useSessionPipeline {
