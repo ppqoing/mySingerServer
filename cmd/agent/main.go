@@ -30,6 +30,7 @@ import (
 	agentdelete "dedup/internal/agent/delete"
 	"dedup/internal/agentinstance"
 	"dedup/internal/config"
+	"dedup/internal/diskio"
 	fileenum "dedup/internal/enum"
 	"dedup/internal/firstscreen"
 	"dedup/internal/localanalysis"
@@ -218,8 +219,22 @@ func runWithDependencies(
 		return fmt.Errorf("open sqlite: %w", err)
 	}
 	defer local.Close()
+	ioPolicy, err := cfg.IO.Policy(cfg.Worker.Count)
+	if err != nil {
+		return fmt.Errorf("configure disk I/O controller: %w", err)
+	}
+	ioContext, stopIO := context.WithCancel(context.Background())
+	var stopIOOnce sync.Once
+	stopIOController := func() { stopIOOnce.Do(stopIO) }
+	defer stopIOController()
+	ioIdentities := make(map[diskio.DiskKey]diskio.Identity)
+	ioController := diskio.NewController(ioContext, diskio.ControllerOptions{
+		WorkerCount: cfg.Worker.Count,
+		Policy:      ioPolicy,
+		Identities:  ioIdentities,
+	})
 	workerPool := worker.NewPool(
-		workerPoolConfig(cfg),
+		workerPoolConfig(cfg, ioController),
 		local,
 		logger,
 		errorLogger,
@@ -296,6 +311,7 @@ func runWithDependencies(
 		logger,
 		errorLogger,
 	)
+	scans.SetIOController(ioController, ioIdentities)
 	if statistics != nil {
 		scans.SetObserver(statistics)
 	}
@@ -345,7 +361,7 @@ func runWithDependencies(
 		Deletes:               agent.NewLocalDeleteHandler(deletes),
 	})
 	return runService(
-		workerPool,
+		managedPoolWithFinalizer(workerPool, stopIOController),
 		func() error {
 			businessLogger := slog.New(&listenerReadyHandler{
 				next: logger.Handler(),
@@ -473,6 +489,25 @@ func prepareLocalTaskLifecycle(ctx context.Context, tasks localTaskLifecycle, lo
 type managedPool interface {
 	Start()
 	Close()
+}
+
+type finalizingManagedPool struct {
+	managedPool
+	finalize func()
+	once     sync.Once
+}
+
+func managedPoolWithFinalizer(pool managedPool, finalize func()) managedPool {
+	return &finalizingManagedPool{managedPool: pool, finalize: finalize}
+}
+
+func (pool *finalizingManagedPool) Close() {
+	pool.managedPool.Close()
+	pool.once.Do(func() {
+		if pool.finalize != nil {
+			pool.finalize()
+		}
+	})
 }
 
 func runService(
@@ -1078,7 +1113,7 @@ func localAgentFailure(requestID, code string) proto.LocalResponse {
 	return proto.LocalResponse{RequestID: requestID, ErrorCode: code}
 }
 
-func workerPoolConfig(cfg *config.AgentConfig) worker.Config {
+func workerPoolConfig(cfg *config.AgentConfig, ioBroker diskio.Controller) worker.Config {
 	return worker.Config{
 		WorkerExe:        cfg.Worker.ExePath,
 		WorkerCount:      cfg.Worker.Count,
@@ -1088,5 +1123,6 @@ func workerPoolConfig(cfg *config.AgentConfig) worker.Config {
 		RespawnDelay:     time.Duration(cfg.Worker.RespawnDelayMS) * time.Millisecond,
 		WorkerEnv:        cfg.WorkerEnv(),
 		IPCMaxFrameBytes: cfg.IPC.MaxFrameMB << 20,
+		IOBroker:         ioBroker,
 	}
 }

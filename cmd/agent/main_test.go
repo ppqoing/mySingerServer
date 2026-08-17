@@ -23,6 +23,7 @@ import (
 	agentdelete "dedup/internal/agent/delete"
 	"dedup/internal/agentinstance"
 	"dedup/internal/config"
+	"dedup/internal/diskio"
 	fileenum "dedup/internal/enum"
 	"dedup/internal/firstscreen"
 	"dedup/internal/localanalysis"
@@ -287,7 +288,8 @@ func TestWorkerPoolConfigMapsAllAgentWorkerSettingsAndExactEnv(t *testing.T) {
 	cfg.Thumb.FrameTimeoutS = 21
 	cfg.IPC.MaxFrameMB = 8
 
-	got := workerPoolConfig(cfg)
+	broker := &mainTestDiskController{}
+	got := workerPoolConfig(cfg, broker)
 	if got.WorkerExe != cfg.Worker.ExePath ||
 		got.WorkerCount != 7 ||
 		got.MachineID != "machine-a" ||
@@ -295,10 +297,50 @@ func TestWorkerPoolConfigMapsAllAgentWorkerSettingsAndExactEnv(t *testing.T) {
 		got.VideoTimeout != 121*time.Second ||
 		got.RespawnDelay != 750*time.Millisecond ||
 		got.IPCMaxFrameBytes != 8<<20 ||
-		!reflect.DeepEqual(got.WorkerEnv, cfg.WorkerEnv()) {
+		!reflect.DeepEqual(got.WorkerEnv, cfg.WorkerEnv()) || got.IOBroker != broker {
 		t.Fatalf("worker pool config = %#v", got)
 	}
 }
+
+// Break caught: Agent constructs a disk controller but the Worker pool is
+// created from an unrelated config, so lease requests never reach the one
+// process-wide broker.
+func TestAgentRunnerDiskIdentityInjectsExactProcessController(t *testing.T) {
+	cfg := config.DefaultAgent()
+	broker := &mainTestDiskController{}
+	if got := workerPoolConfig(cfg, broker).IOBroker; got != broker {
+		t.Fatalf("worker pool I/O broker=%T, want exact injected controller", got)
+	}
+}
+
+// Break caught: the process-level disk controller is stopped by root-context
+// cancellation before scan TaskDone and Worker reporter/pool drain complete.
+func TestAgentRunnerDiskIdentityShutdownStopsControllerAfterTaskDoneAndPool(t *testing.T) {
+	var events []string
+	pool := &orderedLifecyclePool{events: &events}
+	managed := managedPoolWithFinalizer(pool, func() { events = append(events, "controller-stop") })
+	if err := runService(
+		managed,
+		func() error { events = append(events, "serve"); return nil },
+		func() error { events = append(events, "task-done"); return nil },
+	); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"start", "serve", "task-done", "close", "controller-stop"}
+	if !reflect.DeepEqual(events, want) {
+		t.Fatalf("shutdown order=%v want %v", events, want)
+	}
+}
+
+type mainTestDiskController struct{}
+
+func (*mainTestDiskController) Acquire(context.Context, diskio.Request) (diskio.Grant, error) {
+	return diskio.Grant{}, nil
+}
+func (*mainTestDiskController) Report(diskio.Report)                    {}
+func (*mainTestDiskController) CancelTask(string, string)               {}
+func (*mainTestDiskController) ReclaimWorker(int)                       {}
+func (*mainTestDiskController) Snapshot(string, string) diskio.Snapshot { return diskio.Snapshot{} }
 
 func TestRunServiceClosesStartedPoolWhenServerReturnsError(t *testing.T) {
 	sentinel := errors.New("listen failed")
@@ -480,8 +522,8 @@ func TestLocalTaskRunnerProductionResolverErrorCountsOneDisplayFailure(t *testin
 	cfg := config.DefaultAgent()
 	cfg.MachineID = "machine-display-failure"
 	logger := slog.New(slog.NewJSONHandler(&bytes.Buffer{}, nil))
-	scans := agent.NewScanManagerWithResolver(cfg, db, nil, nil, logger, logger, func(string) (int64, bool, error) {
-		return -1, false, errors.New("volume unavailable")
+	scans := agent.NewScanManagerWithResolver(cfg, db, nil, nil, logger, logger, func(string) (diskio.Identity, error) {
+		return diskio.Identity{}, errors.New("volume unavailable")
 	})
 	runner := &agentLocalTaskRunner{scans: scans, analysis: &recordingLocalAnalysisRunner{}}
 	request := proto.LocalTaskCreateRequest{
@@ -1469,12 +1511,13 @@ func TestAgentDeleteWiringClosesDedicatedLoggerOnLaterStartupError(t *testing.T)
 			return nil
 		}, nil
 	}
-	if err := runWithDependencies(configPath, openDeleteLogger, fixedMachineIdentity("c")); err == nil {
+	runErr := runWithDependencies(configPath, openDeleteLogger, fixedMachineIdentity("c"))
+	if runErr == nil {
 		t.Fatal("run unexpectedly accepted invalid listen address")
 	}
 	if acquisitions != 1 || closes != 1 {
-		t.Fatalf("delete logger lifecycle acquisitions=%d closes=%d, want 1/1",
-			acquisitions, closes)
+		t.Fatalf("delete logger lifecycle acquisitions=%d closes=%d, want 1/1; run error=%v",
+			acquisitions, closes, runErr)
 	}
 }
 

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"dedup/internal/config"
+	"dedup/internal/diskio"
 	"dedup/internal/diskmap"
 	fileenum "dedup/internal/enum"
 	"dedup/internal/proto"
@@ -23,7 +24,7 @@ import (
 
 type Sender func(msgType uint8, value any) error
 
-type DiskResolver func(root string) (diskNo int64, isSSD bool, err error)
+type DiskResolver func(root string) (diskio.Identity, error)
 
 type WorkerPool interface {
 	Submit(*worker.JobMsg) error
@@ -44,12 +45,14 @@ type ScanManager struct {
 	router          *PoolRouter
 	limiter         *byteLimiter
 	observer        ScanObserver
+	ioController    diskio.Controller
+	ioIdentities    map[diskio.DiskKey]diskio.Identity
 	pendingSnapshot func(context.Context, string) (map[int64][]store.PendingFile, error)
 	progressTicks   func() (<-chan time.Time, func())
 
 	mu    sync.Mutex
 	tasks map[scanIdentity]*ScanState
-	disks map[int64]bool
+	disks map[int64]diskio.Identity
 	runMu sync.Mutex
 }
 
@@ -163,7 +166,7 @@ func NewScanManagerWithResolver(
 		errLog:   errLog,
 		resolver: resolver,
 		tasks:    make(map[scanIdentity]*ScanState),
-		disks:    make(map[int64]bool),
+		disks:    make(map[int64]diskio.Identity),
 		limiter:  newByteLimiter(int64(cfg.Tuning.PendingBytesMB) << 20),
 	}
 	manager.pendingSnapshot = st.PendingSnapshot
@@ -180,25 +183,52 @@ func (m *ScanManager) SetObserver(observer ScanObserver) {
 	m.mu.Unlock()
 }
 
+func (m *ScanManager) SetIOController(
+	controller diskio.Controller,
+	identities ...map[diskio.DiskKey]diskio.Identity,
+) {
+	m.mu.Lock()
+	m.ioController = controller
+	if len(identities) != 0 {
+		m.ioIdentities = identities[0]
+	}
+	m.mu.Unlock()
+}
+
 func (m *ScanManager) currentObserver() ScanObserver {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.observer
 }
 
-func resolveDisk(root string) (int64, bool, error) {
+func resolveDisk(root string) (diskio.Identity, error) {
 	mountPoint, err := diskmap.MountPointOf(root)
 	if err != nil {
-		return -1, false, err
+		return diskio.Identity{}, err
 	}
 	info, err := diskmap.Resolve(mountPoint)
 	if err != nil {
-		return -1, false, err
+		return diskio.Identity{}, err
 	}
 	if !info.MediaTypeKnown {
 		logUnknownDiskMedia(slog.Default(), root, mountPoint, info.DeviceNumber)
 	}
-	return int64(info.DeviceNumber), info.IsSSD, nil
+	return info.Identity, nil
+}
+
+func diskNumber(identity diskio.Identity) int64 {
+	if len(identity.DiskNos) == 0 {
+		return 0
+	}
+	return int64(identity.DiskNos[0])
+}
+
+func resolvePhase2Disk(root string) (int64, bool, error) {
+	identity, err := resolveDisk(root)
+	if err != nil {
+		return 0, false, err
+	}
+	return diskNumber(identity), identity.KnownSSD && identity.SSD, nil
 }
 
 func logUnknownDiskMedia(logger *slog.Logger, root, _ string, deviceNumber uint32) {
@@ -412,6 +442,12 @@ func (m *ScanManager) DrainInstance(taskID, instanceID string, reason proto.Task
 		}
 	}
 	state.mu.Unlock()
+	m.mu.Lock()
+	controller := m.ioController
+	m.mu.Unlock()
+	if controller != nil {
+		controller.CancelTask(taskID, instanceID)
+	}
 	state.stopOnce.Do(func() { close(state.stopNew) })
 	state.stopDispatch()
 	state.dispatchMu.Unlock()
@@ -432,6 +468,12 @@ func (m *ScanManager) AbortInstance(taskID, instanceID string) bool {
 	}
 	state.ensureControl()
 	state.dispatchMu.Lock()
+	m.mu.Lock()
+	controller := m.ioController
+	m.mu.Unlock()
+	if controller != nil {
+		controller.CancelTask(taskID, instanceID)
+	}
 	state.stopOnce.Do(func() { close(state.stopNew) })
 	state.stopDispatch()
 	state.abortWork()
@@ -491,16 +533,33 @@ func (m *ScanManager) run(state *ScanState) {
 			drained = true
 			break
 		}
-		diskNo, isSSD, err := m.resolver(root)
+		identity, err := m.resolver(root)
 		if err != nil {
 			state.failed.Add(1)
 			state.scanErrors.Add(1)
 			m.reportErr(state, root, "enum", err)
 			continue
 		}
+		diskNo := diskNumber(identity)
 		m.mu.Lock()
-		m.disks[diskNo] = isSSD
+		m.disks[diskNo] = identity
+		controllerConfigured := m.ioController != nil
+		if m.ioIdentities != nil {
+			m.ioIdentities[identity.Key] = identity
+		}
 		m.mu.Unlock()
+		if controllerConfigured {
+			initial := m.cfg.IO.HDDInitial
+			if identity.KnownSSD && identity.SSD {
+				initial = m.cfg.IO.SSDInitial
+			}
+			m.log.Info(
+				"disk I/O configured",
+				"disk_key", identity.Key,
+				"initial_concurrency", initial,
+				"max_concurrency", max(1, min(m.cfg.IO.MaxPerDisk, m.cfg.Worker.Count)),
+			)
+		}
 
 		buffer := make([]store.EnumUpsert, 0, 10_000)
 		flush := func() error {
@@ -631,6 +690,11 @@ type scanWork struct {
 	prepareErr  error
 }
 
+type queuedScanWork struct {
+	order int
+	work  scanWork
+}
+
 type mediaRoute struct {
 	job    *worker.JobMsg
 	cancel func()
@@ -725,23 +789,13 @@ func (m *ScanManager) preparePending(
 			jobID := router.NextJobID()
 			current.media = &worker.JobMsg{
 				JobID: jobID, ScanTaskID: state.Task.TaskID,
-				Path: file.Path, Kind: spec.kind, Phase: worker.Phase1,
+				ScanInstanceID: state.Task.InstanceID,
+				DiskKey:        string(m.diskIdentity(diskNo).Key),
+				Path:           file.Path, Kind: spec.kind, Phase: worker.Phase1,
 				FieldsMask: spec.mask, Size: file.Size, MTimeUnix: file.MTime,
 				KnownSHA: knownSHA,
 			}
-			terminal, cancelRoute, err := router.Register(current.media)
-			if err != nil {
-				current.media = nil
-				current.prepareErr = err
-				work[diskNo] = append(work[diskNo], current)
-				continue
-			}
-			current.terminal = terminal
-			current.cancelRoute = cancelRoute
 			work[diskNo] = append(work[diskNo], current)
-			terminals[jobID] = mediaRoute{
-				job: current.media, cancel: current.cancelRoute,
-			}
 		}
 	}
 	return work, terminals
@@ -776,6 +830,13 @@ func pathKey(path string) string {
 }
 
 func (m *ScanManager) isSSD(diskNo int64) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	identity := m.disks[diskNo]
+	return identity.KnownSSD && identity.SSD
+}
+
+func (m *ScanManager) diskIdentity(diskNo int64) diskio.Identity {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.disks[diskNo]
@@ -814,7 +875,7 @@ func (m *ScanManager) processDisk(
 		return pathKey(images[left].file.Path) < pathKey(images[right].file.Path)
 	})
 
-	m.processDiskBatch(state, diskNo, images, 1, hashOut, mediaOut)
+	m.processDiskBatch(state, diskNo, images, streams, hashOut, mediaOut)
 	if state.stopRequested() {
 		cancelScanWorkBatch(other)
 		cancelScanWorkBatch(videos)
@@ -839,13 +900,34 @@ func (m *ScanManager) processDiskBatch(
 	if len(files) == 0 {
 		return
 	}
-	jobs := make(chan scanWork)
+	jobs := make(chan queuedScanWork, pendingJobCapacity(
+		m.cfg.Worker.Count,
+		m.cfg.IO.MaxQueuedPerWorker,
+	))
+	var orderMu sync.Mutex
+	orderCond := sync.NewCond(&orderMu)
+	nextOrder := 0
 	var workers sync.WaitGroup
 	for index := 0; index < streams; index++ {
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
-			for work := range jobs {
+			for queued := range jobs {
+				work := queued.work
+				orderMu.Lock()
+				for queued.order != nextOrder {
+					orderCond.Wait()
+				}
+				orderMu.Unlock()
+				var releaseOrder sync.Once
+				advanceOrder := func() {
+					releaseOrder.Do(func() {
+						orderMu.Lock()
+						nextOrder++
+						orderCond.Broadcast()
+						orderMu.Unlock()
+					})
+				}
 				err := runObservedWork(
 					state.dispatchCtx,
 					m.limiter,
@@ -857,13 +939,22 @@ func (m *ScanManager) processDiskBatch(
 						if state.stopRequested() {
 							state.dispatchMu.Unlock()
 							cancelScanWork(work)
+							advanceOrder()
 							return 0, 0
 						}
 						var submitErr error
 						if work.media != nil && work.prepareErr == nil {
-							submitErr = m.pool.Submit(work.media)
+							terminal, cancelRoute, registerErr := m.ensurePoolRouter().Register(work.media)
+							if registerErr != nil {
+								submitErr = registerErr
+							} else {
+								work.terminal = terminal
+								work.cancelRoute = cancelRoute
+								submitErr = m.pool.Submit(work.media)
+							}
 						}
 						state.dispatchMu.Unlock()
+						advanceOrder()
 						if work.media != nil || work.prepareErr != nil {
 							return m.processMediaWork(state, work, submitErr, mediaOut)
 						}
@@ -886,6 +977,7 @@ func (m *ScanManager) processDiskBatch(
 						return time.Since(started), 0
 					},
 				)
+				advanceOrder()
 				if err != nil {
 					cancelScanWork(work)
 					if state.stopRequested() {
@@ -909,7 +1001,7 @@ func (m *ScanManager) processDiskBatch(
 		default:
 		}
 		select {
-		case jobs <- file:
+		case jobs <- queuedScanWork{order: index, work: file}:
 		case <-state.stopNew:
 			for _, remaining := range files[index:] {
 				cancelScanWork(remaining)
@@ -959,7 +1051,7 @@ func (m *ScanManager) processMediaWork(
 		return 0, 0
 	}
 	if submitErr != nil {
-		work.cancelRoute()
+		cancelScanWork(work)
 		state.failed.Add(1)
 		m.reportErr(state, work.file.Path, "worker", submitErr)
 		out <- proto.FeatureItem{

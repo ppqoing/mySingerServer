@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"dedup/internal/config"
+	"dedup/internal/diskio"
 	fileenum "dedup/internal/enum"
 	"dedup/internal/proto"
 	"dedup/internal/store"
@@ -831,8 +832,8 @@ func TestScanDoesNotReportDurableSuccessWhenResultCommitFails(t *testing.T) {
 func TestScanCountsDiskResolutionFailure(t *testing.T) {
 	manager, cleanup := newTestScanManager(t, nil, nil)
 	defer cleanup()
-	manager.resolver = func(string) (int64, bool, error) {
-		return -1, false, errors.New("volume unavailable")
+	manager.resolver = func(string) (diskio.Identity, error) {
+		return diskio.Identity{}, errors.New("volume unavailable")
 	}
 
 	done := make(chan proto.TaskDone, 1)
@@ -1633,7 +1634,9 @@ func newTestScanManager(
 		hasher,
 		log,
 		log,
-		func(string) (int64, bool, error) { return 1, false, nil },
+		func(string) (diskio.Identity, error) {
+			return diskio.Identity{Key: "physical:7", Local: true, DiskNos: []uint32{1}, KnownSSD: true}, nil
+		},
 	)
 	return manager, func() { _ = db.Close() }
 }

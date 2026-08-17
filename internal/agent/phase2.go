@@ -18,12 +18,14 @@ import (
 
 const maxPhase2TaskItems = 5000
 
+type Phase2DiskResolver func(root string) (diskNo int64, isSSD bool, err error)
+
 type Phase2Manager struct {
 	machineID string
 	store     Phase2Store
 	pool      WorkerPool
 	router    *PoolRouter
-	resolver  DiskResolver
+	resolver  Phase2DiskResolver
 	log       *slog.Logger
 
 	mu          sync.Mutex
@@ -93,7 +95,7 @@ func NewPhase2ManagerWithRuntime(
 	phase2Store Phase2Store,
 	pool WorkerPool,
 	router *PoolRouter,
-	resolver DiskResolver,
+	resolver Phase2DiskResolver,
 	log *slog.Logger,
 ) *Phase2Manager {
 	manager := NewPhase2Manager(machineID)
@@ -102,7 +104,7 @@ func NewPhase2ManagerWithRuntime(
 	manager.router = router
 	manager.resolver = resolver
 	if manager.resolver == nil {
-		manager.resolver = resolveDisk
+		manager.resolver = resolvePhase2Disk
 	}
 	manager.log = log
 	manager.run = manager.runTask
