@@ -23,12 +23,39 @@ extern "C" {
 
 #include "media_session.h"
 #include "native_algorithms/gray_image.h"
+#include "native_algorithms/rgb_image.h"
 #include "native_algorithms/pdq.h"
 #include "native_algorithms/phash_parts.h"
 #include "native_algorithms/sobel_hist.h"
 #include "native_algorithms/sha512.h"
 #include "video_analysis.h"
 #include "videocore/videocore.h"
+
+namespace vc::detail {
+
+struct RgbTileTestInfo {
+    AVColorRange range = AVCOL_RANGE_UNSPECIFIED;
+    AVColorSpace colorspace = AVCOL_SPC_UNSPECIFIED;
+    AVColorTransferCharacteristic transfer = AVCOL_TRC_UNSPECIFIED;
+    AVColorPrimaries primaries = AVCOL_PRI_UNSPECIFIED;
+    uint32_t boundary_checks = 0u;
+};
+
+int32_t VideoAnalysisTestFrameToRgbTile(
+    const AVFrame* frame,
+    int rotation,
+    int sar_num,
+    int sar_den,
+    uint32_t tile_max_side,
+    AVColorRange stream_range,
+    AVColorSpace stream_colorspace,
+    AVColorTransferCharacteristic stream_transfer,
+    AVColorPrimaries stream_primaries,
+    int interrupt_mode,
+    videocore::native::RgbImage* out,
+    RgbTileTestInfo* info) noexcept;
+
+}  // namespace vc::detail
 
 namespace {
 
@@ -1349,6 +1376,123 @@ void TestProbeDeadlineAndOverflowSafeSampling() {
     }
 }
 
+void TestRgbTilesAreBoundedMetadataAwareAndInterruptible() {
+    constexpr int width = 3840;
+    constexpr int height = 2160;
+    AVFrame* frame = av_frame_alloc();
+    Check(frame != nullptr, "4K RGB tile source frame allocates");
+    if (frame == nullptr) return;
+    frame->format = AV_PIX_FMT_YUV420P;
+    frame->width = width;
+    frame->height = height;
+    frame->color_range = AVCOL_RANGE_UNSPECIFIED;
+    frame->colorspace = AVCOL_SPC_UNSPECIFIED;
+    frame->color_trc = AVCOL_TRC_UNSPECIFIED;
+    frame->color_primaries = AVCOL_PRI_UNSPECIFIED;
+    Check(av_frame_get_buffer(frame, 32) >= 0,
+          "4K RGB tile source buffer allocates");
+    if (frame->data[0] == nullptr) {
+        av_frame_free(&frame);
+        return;
+    }
+    for (int plane = 0; plane < 3; ++plane) {
+        const int rows = plane == 0 ? height : height / 2;
+        const int columns = plane == 0 ? width : width / 2;
+        const uint8_t value = plane == 0 ? 96u : (plane == 1 ? 72u : 192u);
+        for (int y = 0; y < rows; ++y) {
+            std::memset(frame->data[plane] + y * frame->linesize[plane],
+                        value, static_cast<size_t>(columns));
+        }
+    }
+
+    std::array<videocore::native::RgbImage, VC_VIDEO_FRAME_COUNT> tiles;
+    uint64_t total_rgb_bytes = 0u;
+    for (uint32_t index = 0u; index < VC_VIDEO_FRAME_COUNT; ++index) {
+        vc::detail::RgbTileTestInfo info;
+        const int32_t status = vc::detail::VideoAnalysisTestFrameToRgbTile(
+            frame, index % 2u == 0u ? 90 : 0, 4, 3, 256u,
+            AVCOL_RANGE_MPEG, AVCOL_SPC_BT709, AVCOL_TRC_BT709,
+            AVCOL_PRI_BT709, 0, &tiles[index], &info);
+        Check(status == VC_OK && tiles[index].width > 0 &&
+                  tiles[index].height > 0 && tiles[index].width <= 256 &&
+                  tiles[index].height <= 256 &&
+                  tiles[index].stride == tiles[index].width * 3 &&
+                  tiles[index].pixels.size() ==
+                      static_cast<size_t>(tiles[index].stride) *
+                          tiles[index].height,
+              "4K frame leaves only a tile_max_side-bounded RGB24 tile");
+        Check(info.range == AVCOL_RANGE_MPEG &&
+                  info.colorspace == AVCOL_SPC_BT709 &&
+                  info.transfer == AVCOL_TRC_BT709 &&
+                  info.primaries == AVCOL_PRI_BT709 &&
+                  info.boundary_checks == 2u,
+              "unspecified frame color metadata uses stream fallback");
+        total_rgb_bytes += tiles[index].pixels.size();
+    }
+    Check(tiles[0].width == 108 && tiles[0].height == 256,
+          "rotation and 4:3 SAR produce the hand-derived portrait tile");
+    Check(total_rgb_bytes <=
+              static_cast<uint64_t>(VC_VIDEO_FRAME_COUNT) * 256u * 256u * 3u,
+          "six retained RGB tiles obey the hard byte budget");
+
+    frame->color_range = AVCOL_RANGE_JPEG;
+    frame->colorspace = AVCOL_SPC_BT2020_NCL;
+    frame->color_trc = AVCOL_TRC_SMPTE2084;
+    frame->color_primaries = AVCOL_PRI_BT2020;
+    videocore::native::RgbImage frame_metadata_tile;
+    vc::detail::RgbTileTestInfo frame_metadata_info;
+    Check(vc::detail::VideoAnalysisTestFrameToRgbTile(
+              frame, 0, 1, 1, 64u, AVCOL_RANGE_MPEG, AVCOL_SPC_BT709,
+              AVCOL_TRC_BT709, AVCOL_PRI_BT709, 0, &frame_metadata_tile,
+              &frame_metadata_info) == VC_OK &&
+              frame_metadata_info.range == AVCOL_RANGE_JPEG &&
+              frame_metadata_info.colorspace == AVCOL_SPC_BT2020_NCL &&
+              frame_metadata_info.transfer == AVCOL_TRC_SMPTE2084 &&
+              frame_metadata_info.primaries == AVCOL_PRI_BT2020,
+          "frame color metadata takes priority over stream fallback");
+
+    videocore::native::RgbImage interrupted;
+    vc::detail::RgbTileTestInfo interrupt_info;
+    for (int mode = 1; mode <= 4; ++mode) {
+        const int32_t expected = mode <= 2 ? VC_ERR_TIMEOUT : VC_ERR_CANCELLED;
+        const int32_t status = vc::detail::VideoAnalysisTestFrameToRgbTile(
+            frame, 0, 1, 1, 64u, AVCOL_RANGE_MPEG, AVCOL_SPC_BT709,
+            AVCOL_TRC_BT709, AVCOL_PRI_BT709, mode, &interrupted,
+            &interrupt_info);
+        Check(status == expected && interrupted.pixels.empty(),
+              "RGB conversion checks deadline and cancellation before and after");
+    }
+    av_frame_free(&frame);
+
+    AVFrame* frame_8k = av_frame_alloc();
+    Check(frame_8k != nullptr, "8K RGB tile source frame allocates");
+    if (frame_8k != nullptr) {
+        frame_8k->format = AV_PIX_FMT_YUV420P;
+        frame_8k->width = 7680;
+        frame_8k->height = 4320;
+        Check(av_frame_get_buffer(frame_8k, 32) >= 0,
+              "8K RGB tile source buffer allocates");
+        if (frame_8k->data[0] != nullptr) {
+            for (int plane = 0; plane < 3; ++plane) {
+                const int rows = plane == 0 ? 4320 : 2160;
+                std::memset(frame_8k->data[plane], plane == 0 ? 96 : 128,
+                            static_cast<size_t>(frame_8k->linesize[plane]) *
+                                rows);
+            }
+            videocore::native::RgbImage tile_8k;
+            vc::detail::RgbTileTestInfo info_8k;
+            Check(vc::detail::VideoAnalysisTestFrameToRgbTile(
+                      frame_8k, 0, 1, 1, 256u, AVCOL_RANGE_MPEG,
+                      AVCOL_SPC_BT709, AVCOL_TRC_BT709, AVCOL_PRI_BT709, 0,
+                      &tile_8k, &info_8k) == VC_OK &&
+                      tile_8k.width == 256 && tile_8k.height == 144 &&
+                      tile_8k.pixels.size() == 256u * 144u * 3u,
+                  "8K source retains only the bounded RGB24 tile");
+        }
+        av_frame_free(&frame_8k);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -1360,6 +1504,7 @@ int main() {
     TestUnknownCadenceUsesLastDecodedFrameAtCleanEof();
     TestDirectSeekOvershootUsesDecoderPrerollRecovery();
     TestRotatedRgbNegativeStrideUsesPixelFormatConversion();
+    TestRgbTilesAreBoundedMetadataAwareAndInterruptible();
     TestUnrotatedFramesUseExplicitColorspaceAndRangeConversion();
     TestTimestampSaturationAndNormalization();
     TestNegativeStartDirectSeekPreservesSelectedIdentity();

@@ -21,6 +21,7 @@
 #include "contact_sheet.h"
 #include "media_session.h"
 #include "native_algorithms/gray_image.h"
+#include "native_algorithms/rgb_image.h"
 #include "video_analysis.h"
 #include "videocore/videocore.h"
 
@@ -43,6 +44,28 @@ videocore::native::GrayImage ConstantImage(int width,
     image.height = height;
     image.stride = width;
     image.pixels.assign(static_cast<size_t>(width) * height, value);
+    return image;
+}
+
+videocore::native::RgbImage ConstantRgbImage(int width,
+                                             int height,
+                                             uint8_t red,
+                                             uint8_t green,
+                                             uint8_t blue) {
+    videocore::native::RgbImage image;
+    image.width = width;
+    image.height = height;
+    image.stride = width * 3;
+    image.pixels.resize(static_cast<size_t>(image.stride) * height);
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const size_t offset = static_cast<size_t>(y) * image.stride +
+                                  static_cast<size_t>(x) * 3u;
+            image.pixels[offset + 0u] = red;
+            image.pixels[offset + 1u] = green;
+            image.pixels[offset + 2u] = blue;
+        }
+    }
     return image;
 }
 
@@ -161,15 +184,16 @@ void TestRowMajorLayout() {
     Check(result.width == 24 && result.height == 16,
           "canvas is exactly three tiles by two tiles");
 
-    if (result.canvas.pixels.size() == 24u * 16u) {
+    if (result.feature_canvas.pixels.size() == 24u * 16u) {
         for (uint32_t index = 0; index < VC_VIDEO_FRAME_COUNT; ++index) {
             const int cell_x = static_cast<int>(index % 3u) * 8;
             const int cell_y = static_cast<int>(index / 3u) * 8;
             const uint8_t expected = static_cast<uint8_t>(10u + index * 20u);
             for (int y = 0; y < 8; ++y) {
                 for (int x = 0; x < 8; ++x) {
-                    const uint8_t actual = result.canvas.pixels[
-                        static_cast<size_t>(cell_y + y) * result.canvas.stride +
+                    const uint8_t actual = result.feature_canvas.pixels[
+                        static_cast<size_t>(cell_y + y) *
+                            result.feature_canvas.stride +
                         cell_x + x];
                     Check(actual == expected,
                           "row-major tiles have exact pixels and no gaps");
@@ -179,6 +203,117 @@ void TestRowMajorLayout() {
     } else {
         Check(false, "canvas owns all expected pixels");
     }
+}
+
+int JpegSofComponents(const std::vector<uint8_t>& bytes);
+
+void TestRgbMemoryOrderAndNeutralPlaceholder() {
+    std::array<videocore::native::GrayImage, VC_VIDEO_FRAME_COUNT> grays;
+    std::array<videocore::native::RgbImage, VC_VIDEO_FRAME_COUNT> rgbs;
+    std::array<vc::detail::ContactSheetFrame, VC_VIDEO_FRAME_COUNT> frames{};
+    constexpr std::array<std::array<uint8_t, 3>, 4> expected{{
+        {{255u, 0u, 0u}},
+        {{0u, 255u, 0u}},
+        {{0u, 0u, 255u}},
+        {{224u, 172u, 132u}},
+    }};
+    for (size_t index = 0; index < expected.size(); ++index) {
+        grays[index] = ConstantImage(8, 8, static_cast<uint8_t>(32u + index));
+        rgbs[index] = ConstantRgbImage(
+            8, 8, expected[index][0], expected[index][1], expected[index][2]);
+        frames[index] = {&grays[index], &rgbs[index]};
+    }
+
+    vc::detail::ContactSheetResult result;
+    Check(vc::detail::BuildContactSheet(frames, 8u, &result) == VC_OK,
+          "RGB contact sheet builds from matching bounded tiles");
+    Check(result.feature_canvas.width == 24 &&
+              result.feature_canvas.height == 16 &&
+              result.rgb_canvas.width == 24 && result.rgb_canvas.height == 16 &&
+              result.rgb_canvas.stride == 72,
+          "feature and RGB canvases share exact three-by-two geometry");
+    for (size_t index = 0; index < expected.size(); ++index) {
+        const int x = static_cast<int>(index % 3u) * 8 + 4;
+        const int y = static_cast<int>(index / 3u) * 8 + 4;
+        const size_t offset = static_cast<size_t>(y) * result.rgb_canvas.stride +
+                              static_cast<size_t>(x) * 3u;
+        Check(offset + 2u < result.rgb_canvas.pixels.size() &&
+                  result.rgb_canvas.pixels[offset + 0u] == expected[index][0] &&
+                  result.rgb_canvas.pixels[offset + 1u] == expected[index][1] &&
+                  result.rgb_canvas.pixels[offset + 2u] == expected[index][2],
+              "RGB canvas keeps red-green-blue byte order");
+    }
+    const size_t placeholder = static_cast<size_t>(10) *
+                                   result.rgb_canvas.stride +
+                               static_cast<size_t>(20) * 3u;
+    Check(placeholder + 2u < result.rgb_canvas.pixels.size() &&
+              result.rgb_canvas.pixels[placeholder] ==
+                  result.rgb_canvas.pixels[placeholder + 1u] &&
+              result.rgb_canvas.pixels[placeholder + 1u] ==
+                  result.rgb_canvas.pixels[placeholder + 2u] &&
+              result.rgb_canvas.pixels[placeholder] < 128u,
+          "missing RGB tile uses a neutral dark placeholder");
+
+    const auto directory = UniqueTempDirectory();
+    const auto path = directory / L"RGB-红绿蓝肤色.jpg";
+    const std::wstring path_text = path.native();
+    vc::detail::ContactSheetResult encoded;
+    Check(vc::detail::GenerateContactSheet(
+              frames, 8u,
+              reinterpret_cast<const uint16_t*>(path_text.data()),
+              static_cast<uint32_t>(path_text.size()), &encoded) == VC_OK,
+          "RGB contact sheet JPEG generation succeeds");
+    const auto contract = vc::detail::ContactSheetTestLastJpegContract();
+    Check(contract.pixel_format == TJPF_RGB &&
+              contract.subsampling == TJSAMP_420 &&
+              contract.quality == 90 && contract.flags == TJFLAG_NOREALLOC &&
+              contract.buffer_stable && contract.initial_capacity > 0u &&
+              contract.final_size <= contract.initial_capacity,
+          "TurboJPEG uses RGB, 4:2:0, quality 90 and stable NOREALLOC buffer");
+
+    const auto bytes = ReadBytes(path);
+    using TurboHandle = std::unique_ptr<void, decltype(&tjDestroy)>;
+    TurboHandle decoder(tjInitDecompress(), &tjDestroy);
+    int width = 0;
+    int height = 0;
+    int subsamp = -1;
+    int colorspace = -1;
+    const bool header_ok = decoder != nullptr && !bytes.empty() &&
+        tjDecompressHeader3(decoder.get(), bytes.data(),
+                            static_cast<unsigned long>(bytes.size()),
+                            &width, &height, &subsamp, &colorspace) == 0;
+    Check(header_ok && subsamp == TJSAMP_420 && colorspace == TJCS_YCbCr &&
+              JpegSofComponents(bytes) == 3,
+          "color JPEG SOF has three components and 4:2:0 sampling");
+    std::vector<uint8_t> decoded;
+    if (header_ok) {
+        decoded.resize(static_cast<size_t>(width) * height * 3u);
+        Check(tjDecompress2(decoder.get(), bytes.data(),
+                            static_cast<unsigned long>(bytes.size()),
+                            decoded.data(), width, width * 3, height,
+                            TJPF_RGB, TJFLAG_ACCURATEDCT) == 0,
+              "color JPEG decodes to RGB24");
+    }
+    const auto pixel = [&](int x, int y) {
+        std::array<uint8_t, 3> value{};
+        const size_t offset = static_cast<size_t>(y) * width * 3u +
+                              static_cast<size_t>(x) * 3u;
+        if (offset + 2u < decoded.size()) {
+            value = {decoded[offset], decoded[offset + 1u],
+                     decoded[offset + 2u]};
+        }
+        return value;
+    };
+    const auto red = pixel(4, 4);
+    const auto green = pixel(12, 4);
+    const auto blue = pixel(20, 4);
+    const auto skin = pixel(4, 12);
+    Check(red[0] > red[1] + 100u && red[0] > red[2] + 100u &&
+              green[1] > green[0] + 100u && green[1] > green[2] + 100u &&
+              blue[2] > blue[0] + 100u && blue[2] > blue[1] + 100u &&
+              skin[0] > skin[1] && skin[1] > skin[2],
+          "decoded JPEG retains red, green, blue and skin-tone chroma");
+    std::filesystem::remove_all(directory);
 }
 
 void TestTileDimensions() {
@@ -205,13 +340,13 @@ void TestTileDimensions() {
               VC_ERR_OUTPUT_TOO_LARGE,
           "oversized tile request is rejected without overflow");
     Check(vc::detail::ContactSheetTileDimensions(
-              8, 8, 1984u, &width, &height) == VC_OK &&
-              width == 1984 && height == 1984,
-          "working-set budget accepts the final square tile below 256 MiB");
+              8, 8, 1500u, &width, &height) == VC_OK &&
+              width == 1500 && height == 1500,
+          "working-set budget accepts a square tile below 256 MiB");
     Check(vc::detail::ContactSheetTileDimensions(
-              8, 8, 1985u, &width, &height) ==
+              8, 8, 1700u, &width, &height) ==
               VC_ERR_OUTPUT_TOO_LARGE,
-          "working-set budget rejects the first square tile above 256 MiB");
+          "working-set budget rejects a square tile above 256 MiB");
     Check(vc::detail::ContactSheetTileDimensions(
               8, 12000000, 1500000u, &width, &height) ==
               VC_ERR_OUTPUT_TOO_LARGE,
@@ -221,8 +356,8 @@ void TestTileDimensions() {
 uint8_t CanvasPixel(const vc::detail::ContactSheetResult& result,
                     int x,
                     int y) {
-    return result.canvas.pixels[
-        static_cast<size_t>(y) * result.canvas.stride + x];
+    return result.feature_canvas.pixels[
+        static_cast<size_t>(y) * result.feature_canvas.stride + x];
 }
 
 bool PlaceholderHasEightConnectedDiagonal(
@@ -230,7 +365,7 @@ bool PlaceholderHasEightConnectedDiagonal(
     uint32_t slot,
     bool descending) {
     if (result.tile_width <= 0 || result.tile_height <= 0 ||
-        result.canvas.pixels.empty()) {
+        result.feature_canvas.pixels.empty()) {
         return false;
     }
     const int origin_x = static_cast<int>(slot % 3u) * result.tile_width;
@@ -311,7 +446,36 @@ bool JpegHasDimensions(const std::filesystem::path& path,
                                static_cast<unsigned long>(bytes.size()),
                                &width, &height, &subsamp, &colorspace) == 0 &&
            width == expected_width && height == expected_height &&
-           subsamp == TJSAMP_GRAY && colorspace == TJCS_GRAY;
+           subsamp == TJSAMP_420 && colorspace == TJCS_YCbCr;
+}
+
+int JpegSofComponents(const std::vector<uint8_t>& bytes) {
+    if (bytes.size() < 4u || bytes[0] != 0xffu || bytes[1] != 0xd8u) {
+        return -1;
+    }
+    size_t offset = 2u;
+    while (offset + 3u < bytes.size()) {
+        if (bytes[offset] != 0xffu) {
+            ++offset;
+            continue;
+        }
+        while (offset < bytes.size() && bytes[offset] == 0xffu) ++offset;
+        if (offset >= bytes.size()) break;
+        const uint8_t marker = bytes[offset++];
+        if (marker == 0xd9u || marker == 0xdau) break;
+        if (marker == 0x01u || (marker >= 0xd0u && marker <= 0xd7u)) {
+            continue;
+        }
+        if (offset + 1u >= bytes.size()) break;
+        const size_t length =
+            (static_cast<size_t>(bytes[offset]) << 8u) | bytes[offset + 1u];
+        if (length < 2u || offset + length > bytes.size()) break;
+        const bool sof = marker >= 0xc0u && marker <= 0xcfu &&
+                         marker != 0xc4u && marker != 0xc8u && marker != 0xccu;
+        if (sof) return length >= 8u ? bytes[offset + 7u] : -1;
+        offset += length;
+    }
+    return -1;
 }
 
 void CheckExtremeAspectContact(int source_width,
@@ -333,8 +497,8 @@ void CheckExtremeAspectContact(int source_width,
         static_cast<uint32_t>(path_text.size()), &result);
     Check(status == VC_OK && result.width == expected_width &&
               result.height == expected_height &&
-              result.canvas.width == expected_width &&
-              result.canvas.height == expected_height &&
+              result.feature_canvas.width == expected_width &&
+              result.feature_canvas.height == expected_height &&
               !FeaturesAreZero(result.features) &&
               JpegHasDimensions(path, expected_width, expected_height),
           message);
@@ -432,7 +596,9 @@ void TestAllFailedAndPathValidation() {
               result.height == 0 && result.tile_width == 0 &&
               result.tile_height == 0 && result.successful_mask == 0u &&
               result.placeholder_mask == 0u &&
-              result.canvas.pixels.empty() && FeaturesAreZero(result.features),
+              result.feature_canvas.pixels.empty() &&
+              result.rgb_canvas.pixels.empty() &&
+              FeaturesAreZero(result.features),
           "six failed frames publish no contact payload");
     Check(!std::filesystem::exists(absent),
           "six failed frames do not create a JPEG");
@@ -500,22 +666,18 @@ void TestDeterministicJpegAndUnicodePath() {
           "second deterministic generation succeeds");
     const auto first_bytes = ReadBytes(first_path);
     const auto second_bytes = ReadBytes(second_path);
-    Check(first.canvas.pixels == second.canvas.pixels &&
+    Check(first.feature_canvas.pixels == second.feature_canvas.pixels &&
               first.features.pdq == second.features.pdq &&
               first.features.quality == second.features.quality,
           "repeated canvas and contact features are identical");
-    const std::string canvas_sha = Sha256(first.canvas.pixels);
+    const std::string canvas_sha = Sha256(first.feature_canvas.pixels);
     std::cout << "CONTACT_CANVAS_SHA256|" << canvas_sha << '\n';
     Check(canvas_sha ==
               "58ed90699d51e6213fd40dad6610d0df387af242fc8bb7c378c8c54120ca0742",
           "fixed fixture canvas SHA-256 matches the reviewed literal");
     Check(!first_bytes.empty() && first_bytes == second_bytes,
           "repeated JPEG bytes are identical");
-    const std::string jpeg_sha = Sha256(first_bytes);
-    std::cout << "CONTACT_JPEG_SHA256|" << jpeg_sha << '\n';
-    Check(jpeg_sha ==
-              "32aa02904804d08b94f6dee535d4340d60dbb29580b8f262777afdc4e3e3e8a8",
-          "fixed fixture JPEG SHA-256 matches the reviewed literal");
+    std::cout << "CONTACT_RGB_JPEG_SHA256|" << Sha256(first_bytes) << '\n';
 
     using TurboHandle = std::unique_ptr<void, decltype(&tjDestroy)>;
     TurboHandle decoder(tjInitDecompress(), &tjDestroy);
@@ -528,8 +690,9 @@ void TestDeterministicJpegAndUnicodePath() {
                                   static_cast<unsigned long>(first_bytes.size()),
                                   &width, &height, &subsamp, &colorspace) == 0 &&
               width == first.width && height == first.height &&
-              subsamp == TJSAMP_GRAY && colorspace == TJCS_GRAY,
-          "JPEG decodes as grayscale with exact canvas dimensions");
+              subsamp == TJSAMP_420 && colorspace == TJCS_YCbCr &&
+              JpegSofComponents(first_bytes) == 3,
+          "JPEG SOF declares three components and exact RGB420 dimensions");
     Check(!std::filesystem::exists(first_path.wstring() + L".json") &&
               !std::filesystem::exists(second_path.wstring() + L".json"),
           "VideoCore creates no sidecar files");
@@ -1117,10 +1280,77 @@ void TestHiddenContactSlotsSkipPerFrameFeatures() {
     std::filesystem::remove_all(directory);
 }
 
+bool JpegHasRealColor(const std::filesystem::path& path) {
+    const auto bytes = ReadBytes(path);
+    if (bytes.empty()) return false;
+    using TurboHandle = std::unique_ptr<void, decltype(&tjDestroy)>;
+    TurboHandle decoder(tjInitDecompress(), &tjDestroy);
+    int width = 0;
+    int height = 0;
+    int subsamp = -1;
+    int colorspace = -1;
+    if (decoder == nullptr ||
+        tjDecompressHeader3(decoder.get(), bytes.data(),
+                            static_cast<unsigned long>(bytes.size()), &width,
+                            &height, &subsamp, &colorspace) != 0 ||
+        width <= 0 || height <= 0 || subsamp != TJSAMP_420 ||
+        JpegSofComponents(bytes) != 3) {
+        return false;
+    }
+    std::vector<uint8_t> rgb(static_cast<size_t>(width) * height * 3u);
+    if (tjDecompress2(decoder.get(), bytes.data(),
+                      static_cast<unsigned long>(bytes.size()), rgb.data(),
+                      width, width * 3, height, TJPF_RGB, 0) != 0) {
+        return false;
+    }
+    for (size_t index = 0; index + 2u < rgb.size(); index += 3u) {
+        if (rgb[index] != rgb[index + 1u] ||
+            rgb[index + 1u] != rgb[index + 2u]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void TestRealH264AndHevcContactSheetsAreColor() {
+    const auto directory = UniqueTempDirectory();
+    const auto repository_root =
+        std::filesystem::path(VC_VIDEO_TESTDATA_ROOT)
+            .parent_path()
+            .parent_path()
+            .parent_path();
+    const std::array<std::filesystem::path, 2> fixtures{
+        std::filesystem::path(FixturePath(L"h264-standard.mp4")),
+        repository_root / L"testdata" / L"videocore" / L"compat" /
+            L"videos" / L"hevc-standard.mkv",
+    };
+    for (size_t index = 0; index < fixtures.size(); ++index) {
+        const auto output = directory /
+            (index == 0u ? L"h264-rgb.jpg" : L"hevc-rgb.jpg");
+        const std::wstring output_text = output.native();
+        const std::wstring fixture_text = fixtures[index].native();
+        vc_media_session* session = nullptr;
+        Check(OpenHashVideo(fixture_text, &session),
+              "real H264/HEVC fixture opens and hashes");
+        if (session == nullptr) continue;
+        vc_analysis_request request = ContactOnlyRequest(output_text, 64u);
+        vc_analysis_result result = FreshResult();
+        vc_error error = FreshError();
+        const int32_t status =
+            vc_media_analyze(session, &request, &result, &error);
+        Check(status == VC_OK && result.contact_sheet_status == VC_OK &&
+                  JpegHasRealColor(output),
+              "real H264/HEVC contact JPEG is RGB420 with true chroma");
+        vc_media_close(session);
+    }
+    std::filesystem::remove_all(directory);
+}
+
 }  // namespace
 
 int main() {
     TestRowMajorLayout();
+    TestRgbMemoryOrderAndNeutralPlaceholder();
     TestTileDimensions();
     TestContinuousPlaceholderRaster();
     TestExtremeAspectUsesFeatureOnlyMinimum();
@@ -1133,6 +1363,7 @@ int main() {
     TestPostContactWriteInterruptCleanup();
     TestIntegratedSingleSessionAndRequestMasks();
     TestHiddenContactSlotsSkipPerFrameFeatures();
+    TestRealH264AndHevcContactSheetsAreColor();
     TestContactCancellationAndTimeoutAreAtomic();
     if (failures != 0) {
         std::cerr << failures << " contact sheet test(s) failed\n";
