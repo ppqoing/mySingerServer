@@ -316,21 +316,150 @@ func TestAgentRunnerDiskIdentityInjectsExactProcessController(t *testing.T) {
 // Break caught: the process-level disk controller is stopped by root-context
 // cancellation before scan TaskDone and Worker reporter/pool drain complete.
 func TestAgentRunnerDiskIdentityShutdownStopsControllerAfterTaskDoneAndPool(t *testing.T) {
-	var events []string
-	pool := &orderedLifecyclePool{events: &events}
-	managed := managedPoolWithFinalizer(pool, func() { events = append(events, "controller-stop") })
+	events := &shutdownEventLog{}
+	controllerCtx, stopController := context.WithCancel(context.Background())
+	controller := diskio.NewController(controllerCtx, diskio.ControllerOptions{
+		WorkerCount: 1,
+		Policy: diskio.PolicyConfig{
+			LeaseBytes: 1 << 20, MinLeaseBytes: 1 << 20, MaxLeaseBytes: 1 << 20,
+			HDDInitial: 1, SSDInitial: 1, MaxPerDisk: 1, HDDRandomMax: 1, MaxQueuedPerWorker: 4,
+		},
+		Identities: map[diskio.DiskKey]diskio.Identity{
+			"physical:shutdown": {Key: "physical:shutdown", Local: true, KnownSSD: true, SSD: false},
+		},
+	})
+	pool := newShutdownBrokerPool(controller, events)
+	fairPool := localtask.NewFairScheduler(pool)
+	managed := managedPoolWithFinalizer(pool, func() {
+		events.add("controller-stop")
+		stopController()
+	})
+	job := &worker.JobMsg{
+		JobID: 1, Path: `D:\media\shutdown.jpg`, Kind: worker.MediaImage,
+		ScanTaskID: "shutdown-task", ScanInstanceID: "shutdown-instance", DiskKey: "physical:shutdown",
+		Source: worker.JobSourceScan,
+	}
 	if err := runService(
 		managed,
-		func() error { events = append(events, "serve"); return nil },
-		func() error { events = append(events, "task-done"); return nil },
+		func() error {
+			if err := fairPool.Submit(job); err != nil {
+				return err
+			}
+			events.add("serve")
+			return nil
+		},
+		func() error {
+			pool.complete()
+			select {
+			case result := <-fairPool.Results():
+				if result == nil || result.JobID != job.JobID {
+					return fmt.Errorf("forwarded reporter result=%#v", result)
+				}
+				events.add("reporter-result")
+			case <-time.After(time.Second):
+				return errors.New("timed out waiting for real scheduler reporter")
+			}
+			events.add("task-done")
+			return nil
+		},
+		func() error {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if err := fairPool.Shutdown(shutdownCtx); err != nil {
+				return err
+			}
+			events.add("reporter-close")
+			return nil
+		},
 	); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"start", "serve", "task-done", "close", "controller-stop"}
-	if !reflect.DeepEqual(events, want) {
-		t.Fatalf("shutdown order=%v want %v", events, want)
+	want := []string{"start", "broker-acquire", "serve", "broker-report", "reporter-result", "task-done", "reporter-close", "pool-close", "controller-stop"}
+	if got := events.snapshot(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("shutdown order=%v want %v", got, want)
+	}
+	closedCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := controller.Acquire(closedCtx, diskio.Request{
+		RequestID: 2, TaskID: "after-shutdown", InstanceID: "after-shutdown", WorkerID: 0,
+		Disk: "physical:shutdown", Class: diskio.SourceRandom, WantBytes: 1 << 20,
+	}); !errors.Is(err, diskio.ErrControllerClosed) {
+		t.Fatalf("controller Acquire after shutdown error=%v, want ErrControllerClosed", err)
 	}
 }
+
+type shutdownEventLog struct {
+	mu     sync.Mutex
+	events []string
+}
+
+func (log *shutdownEventLog) add(event string) {
+	log.mu.Lock()
+	log.events = append(log.events, event)
+	log.mu.Unlock()
+}
+
+func (log *shutdownEventLog) snapshot() []string {
+	log.mu.Lock()
+	defer log.mu.Unlock()
+	return append([]string(nil), log.events...)
+}
+
+type shutdownBrokerPool struct {
+	controller diskio.Controller
+	events     *shutdownEventLog
+	results    chan *worker.JobResultMsg
+	crashes    chan worker.CrashRecord
+
+	mu    sync.Mutex
+	job   worker.JobMsg
+	grant diskio.Grant
+}
+
+func newShutdownBrokerPool(controller diskio.Controller, events *shutdownEventLog) *shutdownBrokerPool {
+	return &shutdownBrokerPool{
+		controller: controller, events: events,
+		results: make(chan *worker.JobResultMsg, 1), crashes: make(chan worker.CrashRecord),
+	}
+}
+
+func (pool *shutdownBrokerPool) Start() { pool.events.add("start") }
+
+func (pool *shutdownBrokerPool) Close() { pool.events.add("pool-close") }
+
+func (pool *shutdownBrokerPool) Submit(job *worker.JobMsg) error {
+	grant, err := pool.controller.Acquire(context.Background(), diskio.Request{
+		RequestID: 1, TaskID: job.ScanTaskID, InstanceID: job.ScanInstanceID,
+		WorkerID: 0, Disk: diskio.DiskKey(job.DiskKey), Class: diskio.SourceRandom, WantBytes: 1 << 20, WantSeek: true,
+	})
+	if err != nil {
+		return err
+	}
+	pool.mu.Lock()
+	pool.job = *job
+	pool.grant = grant
+	pool.mu.Unlock()
+	pool.events.add("broker-acquire")
+	return nil
+}
+
+func (pool *shutdownBrokerPool) complete() {
+	pool.mu.Lock()
+	job := pool.job
+	grant := pool.grant
+	pool.mu.Unlock()
+	pool.controller.Report(diskio.Report{
+		LeaseID: grant.LeaseID, Generation: grant.Generation,
+		TaskID: job.ScanTaskID, InstanceID: job.ScanInstanceID, WorkerID: 0,
+		Disk: diskio.DiskKey(job.DiskKey), Bytes: 1 << 20, Completed: true,
+	})
+	pool.events.add("broker-report")
+	pool.results <- &worker.JobResultMsg{JobID: job.JobID, ScanTaskID: job.ScanTaskID, Path: job.Path, Kind: job.Kind, Source: job.Source}
+}
+
+func (pool *shutdownBrokerPool) Results() <-chan *worker.JobResultMsg { return pool.results }
+func (pool *shutdownBrokerPool) Crashes() <-chan worker.CrashRecord   { return pool.crashes }
+func (*shutdownBrokerPool) Metrics() worker.MetricsSnapshot           { return worker.MetricsSnapshot{} }
 
 type mainTestDiskController struct{}
 

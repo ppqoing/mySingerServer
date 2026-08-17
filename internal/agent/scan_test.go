@@ -350,15 +350,22 @@ func TestScanDrainStopsDispatchAndWaitsForInFlightResult(t *testing.T) {
 	}
 }
 
-func TestScanHDDSerializesSmallImagesBeforeLargeImagesAndVideos(t *testing.T) {
+func TestScanHDDPreservesCategoryBoundariesAndImageOrderWithOverlap(t *testing.T) {
 	enumr := &fakeEnumerator{records: map[string][]fileenum.FileRecord{
 		`D:\media`: {
 			{Path: `D:\media\a-video.mp4`, Size: 1 << 30, MTime: 20},
 			{Path: `D:\media\b-large.jpg`, Size: 200 << 20, MTime: 21},
 			{Path: `D:\media\c-small.jpg`, Size: 96_728, MTime: 22},
+			{Path: `D:\media\d-other.txt`, Size: 100, MTime: 23},
 		},
 	}}
-	manager, cleanup := newTestScanManager(t, enumr, nil)
+	hashEntered := make(chan string, 1)
+	releaseHash := make(chan struct{})
+	manager, cleanup := newTestScanManager(t, enumr, hasherFunc(func(path string) (string, error) {
+		hashEntered <- path
+		<-releaseHash
+		return strings.Repeat("ab", 64), nil
+	}))
 	defer cleanup()
 	manager.cfg.Scan.HDDStreams = 2
 	pool := newFakeScanPool()
@@ -391,24 +398,39 @@ func TestScanHDDSerializesSmallImagesBeforeLargeImagesAndVideos(t *testing.T) {
 		}
 		pool.results <- result
 	}
-	wantPaths := []string{`D:\media\c-small.jpg`, `D:\media\b-large.jpg`, `D:\media\a-video.mp4`}
-	for index, want := range wantPaths {
-		var job worker.JobMsg
-		select {
-		case job = <-submitted:
-		case <-time.After(5 * time.Second):
-			t.Fatalf("submission %d did not arrive", index)
-		}
-		if job.Path != want {
-			t.Fatalf("submission %d path=%q want %q", index, job.Path, want)
-		}
-		select {
-		case unexpected := <-submitted:
-			t.Fatalf("submission %q overlapped unfinished HDD job %q", unexpected.Path, job.Path)
-		default:
-		}
-		complete(job)
+	images := []worker.JobMsg{
+		receiveSubmittedScanJob(t, submitted),
+		receiveSubmittedScanJob(t, submitted),
 	}
+	if images[0].Path != `D:\media\c-small.jpg` || images[1].Path != `D:\media\b-large.jpg` {
+		t.Fatalf("image submission order=[%q %q]", images[0].Path, images[1].Path)
+	}
+	select {
+	case unexpected := <-submitted:
+		t.Fatalf("later category crossed unfinished image batch: %#v", unexpected)
+	default:
+	}
+	complete(images[0])
+	complete(images[1])
+	select {
+	case path := <-hashEntered:
+		if path != `D:\media\d-other.txt` {
+			t.Fatalf("other category path=%q", path)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("other category did not start after images")
+	}
+	select {
+	case unexpected := <-submitted:
+		t.Fatalf("video crossed unfinished other category: %#v", unexpected)
+	default:
+	}
+	close(releaseHash)
+	video := receiveSubmittedScanJob(t, submitted)
+	if video.Path != `D:\media\a-video.mp4` {
+		t.Fatalf("video submission path=%q", video.Path)
+	}
+	complete(video)
 	select {
 	case final := <-done:
 		if final.Reason != "" || final.Stats.Failed != 0 {
