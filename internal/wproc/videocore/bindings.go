@@ -99,6 +99,18 @@ static void go_vc_init_analysis_result(vc_analysis_result* value) {
 	}
 }
 
+static void go_vc_init_container_info(vc_video_container_info* value) {
+	memset(value, 0, sizeof(*value));
+	value->struct_size = (uint32_t)sizeof(*value);
+	value->abi_version = VC_ABI_VERSION;
+}
+
+static void go_vc_init_stream_info(vc_video_stream_info* value) {
+	memset(value, 0, sizeof(*value));
+	value->struct_size = (uint32_t)sizeof(*value);
+	value->abi_version = VC_ABI_VERSION;
+}
+
 static const char* go_vc_error_message(const vc_error* value) {
 	return value->message_utf8;
 }
@@ -122,6 +134,7 @@ import (
 	"time"
 	"unsafe"
 
+	"dedup/internal/proto"
 	"dedup/internal/worker"
 )
 
@@ -311,6 +324,196 @@ func (cgoBridge) analyze(session nativeSession, request AnalysisRequest) (Analys
 	return analysisResultFromC(nativeResult), nil
 }
 
+func (cgoBridge) videoMetadata(session nativeSession) (*VideoMetadata, error) {
+	var container C.vc_video_container_info
+	var nativeErr C.vc_error
+	C.go_vc_init_container_info(&container)
+	C.go_vc_init_error(&nativeErr)
+	rc := int32(C.vc_media_container_info(
+		(*C.vc_media_session)(session.value), &container, &nativeErr,
+	))
+	if rc != StatusOK {
+		return nil, cgoCallError("media container info", rc, &nativeErr)
+	}
+	containerTags, err := cgoMetadataJSON(session, -1)
+	if err != nil {
+		return nil, err
+	}
+	result := &VideoMetadata{Container: proto.VideoContainerMetadata{
+		FormatName:     cgoFixedString(unsafe.Pointer(&container.format_name_utf8[0])),
+		FormatLongName: cgoFixedString(unsafe.Pointer(&container.format_long_name_utf8[0])),
+		TagsJSON:       containerTags,
+		DecoderName:    cgoFixedString(unsafe.Pointer(&container.decoder_name_utf8[0])),
+	}}
+	containerMask := uint64(container.present_mask)
+	if containerMask&uint64(C.VC_CONTAINER_HAS_START_TIME) != 0 {
+		result.Container.StartTimeUS = int64Pointer(int64(container.start_time_us))
+	}
+	if containerMask&uint64(C.VC_CONTAINER_HAS_DURATION) != 0 {
+		result.Container.DurationUS = int64Pointer(int64(container.duration_us))
+	}
+	if containerMask&uint64(C.VC_CONTAINER_HAS_BIT_RATE) != 0 {
+		result.Container.BitRate = int64Pointer(int64(container.bit_rate))
+	}
+	if containerMask&uint64(C.VC_CONTAINER_HAS_FILE_SIZE) != 0 {
+		result.Container.FileSize = int64Pointer(int64(container.file_size))
+	}
+	if containerMask&uint64(C.VC_CONTAINER_HAS_PROBE_SCORE) != 0 {
+		result.Container.ProbeScore = int32Pointer(int32(container.probe_score))
+	}
+	if containerMask&uint64(C.VC_CONTAINER_HAS_PRIMARY_VIDEO) != 0 {
+		result.Container.PrimaryVideoStream = int32Pointer(int32(container.primary_video_stream))
+	}
+
+	count := uint32(C.vc_media_stream_count((*C.vc_media_session)(session.value)))
+	if count > uint32(C.VC_MAX_STREAMS) {
+		return nil, &NativeError{Code: StatusOutputTooLarge, Message: "stream count exceeds native limit"}
+	}
+	result.Streams = make([]proto.VideoStreamMetadata, 0, count)
+	for ordinal := uint32(0); ordinal < count; ordinal++ {
+		var stream C.vc_video_stream_info
+		C.go_vc_init_stream_info(&stream)
+		C.go_vc_init_error(&nativeErr)
+		rc = int32(C.vc_media_stream_info(
+			(*C.vc_media_session)(session.value), C.uint32_t(ordinal),
+			&stream, &nativeErr,
+		))
+		if rc != StatusOK {
+			return nil, cgoCallError("media stream info", rc, &nativeErr)
+		}
+		if uint32(stream.stream_index) > math.MaxInt32 {
+			return nil, &NativeError{Code: StatusOutputTooLarge, Message: "stream index exceeds protocol range"}
+		}
+		tags, tagsErr := cgoMetadataJSON(session, int32(stream.stream_index))
+		if tagsErr != nil {
+			return nil, tagsErr
+		}
+		mediaType, mediaErr := cgoStreamMediaType(uint32(stream.media_type))
+		if mediaErr != nil {
+			return nil, mediaErr
+		}
+		value := proto.VideoStreamMetadata{
+			Index: int32(stream.stream_index), MediaType: mediaType,
+			CodecID: int32(stream.codec_id), CodecName: cgoFixedString(unsafe.Pointer(&stream.codec_name_utf8[0])),
+			CodecLongName: cgoFixedString(unsafe.Pointer(&stream.codec_long_name_utf8[0])),
+			CodecTag:      cgoFixedString(unsafe.Pointer(&stream.codec_tag_utf8[0])),
+			Profile:       cgoFixedString(unsafe.Pointer(&stream.profile_utf8[0])),
+			TimeBase:      cgoFixedString(unsafe.Pointer(&stream.time_base_utf8[0])),
+			Disposition:   uint32(stream.disposition),
+			Language:      cgoFixedString(unsafe.Pointer(&stream.language_utf8[0])),
+			Title:         cgoFixedString(unsafe.Pointer(&stream.title_utf8[0])), TagsJSON: tags,
+			PixelFormat: cgoFixedString(unsafe.Pointer(&stream.pixel_format_utf8[0])),
+			SAR:         cgoFixedString(unsafe.Pointer(&stream.sar_utf8[0])), DAR: cgoFixedString(unsafe.Pointer(&stream.dar_utf8[0])),
+			AvgFrameRate:   cgoFixedString(unsafe.Pointer(&stream.avg_frame_rate_utf8[0])),
+			RealFrameRate:  cgoFixedString(unsafe.Pointer(&stream.real_frame_rate_utf8[0])),
+			ColorRange:     cgoFixedString(unsafe.Pointer(&stream.color_range_utf8[0])),
+			ColorSpace:     cgoFixedString(unsafe.Pointer(&stream.color_space_utf8[0])),
+			ColorTransfer:  cgoFixedString(unsafe.Pointer(&stream.color_transfer_utf8[0])),
+			ColorPrimaries: cgoFixedString(unsafe.Pointer(&stream.color_primaries_utf8[0])),
+			ChromaLocation: cgoFixedString(unsafe.Pointer(&stream.chroma_location_utf8[0])),
+			FieldOrder:     cgoFixedString(unsafe.Pointer(&stream.field_order_utf8[0])),
+			SampleFormat:   cgoFixedString(unsafe.Pointer(&stream.sample_format_utf8[0])),
+			ChannelLayout:  cgoFixedString(unsafe.Pointer(&stream.channel_layout_utf8[0])),
+		}
+		streamMask := uint64(stream.present_mask)
+		if streamMask&uint64(C.VC_STREAM_HAS_LEVEL) != 0 {
+			value.Level = int32Pointer(int32(stream.level))
+		}
+		if streamMask&uint64(C.VC_STREAM_HAS_START_TIME) != 0 {
+			value.StartTimeUS = int64Pointer(int64(stream.start_time_us))
+		}
+		if streamMask&uint64(C.VC_STREAM_HAS_DURATION) != 0 {
+			value.DurationUS = int64Pointer(int64(stream.duration_us))
+		}
+		if streamMask&uint64(C.VC_STREAM_HAS_BIT_RATE) != 0 {
+			value.BitRate = int64Pointer(int64(stream.bit_rate))
+		}
+		if streamMask&uint64(C.VC_STREAM_HAS_FRAME_COUNT) != 0 {
+			value.FrameCount = int64Pointer(int64(stream.frame_count))
+		}
+		if streamMask&uint64(C.VC_STREAM_HAS_BIT_DEPTH) != 0 {
+			value.BitDepth = int32Pointer(int32(stream.bit_depth))
+		}
+		if streamMask&uint64(C.VC_STREAM_HAS_WIDTH) != 0 {
+			value.Width = int32Pointer(int32(stream.width))
+		}
+		if streamMask&uint64(C.VC_STREAM_HAS_HEIGHT) != 0 {
+			value.Height = int32Pointer(int32(stream.height))
+		}
+		if streamMask&uint64(C.VC_STREAM_HAS_ROTATION) != 0 {
+			value.Rotation = int32Pointer(int32(stream.rotation))
+		}
+		if streamMask&uint64(C.VC_STREAM_HAS_SAMPLE_RATE) != 0 {
+			value.SampleRate = int32Pointer(int32(stream.sample_rate))
+		}
+		if streamMask&uint64(C.VC_STREAM_HAS_CHANNELS) != 0 {
+			value.Channels = int32Pointer(int32(stream.channels))
+		}
+		if streamMask&uint64(C.VC_STREAM_HAS_AUDIO_BIT_DEPTH) != 0 {
+			value.AudioBitDepth = int32Pointer(int32(stream.audio_bit_depth))
+		}
+		result.Streams = append(result.Streams, value)
+	}
+	if err := proto.ValidateVideoMetadata(&result.Container, result.Streams); err != nil {
+		return nil, fmt.Errorf("videocore: invalid native video metadata: %w", err)
+	}
+	return result, nil
+}
+
+func cgoMetadataJSON(session nativeSession, streamIndex int32) (string, error) {
+	var required C.uint32_t
+	var nativeErr C.vc_error
+	C.go_vc_init_error(&nativeErr)
+	rc := int32(C.vc_media_metadata_json(
+		(*C.vc_media_session)(session.value), C.int32_t(streamIndex),
+		nil, 0, &required, &nativeErr,
+	))
+	if rc != StatusOK {
+		return "", cgoCallError("media metadata JSON size", rc, &nativeErr)
+	}
+	if required == 0 || uint64(required) > (64<<10)+1 {
+		return "", &NativeError{Code: StatusOutputTooLarge, Message: "metadata JSON size exceeds protocol limit"}
+	}
+	buffer := make([]byte, int(required))
+	C.go_vc_init_error(&nativeErr)
+	rc = int32(C.vc_media_metadata_json(
+		(*C.vc_media_session)(session.value), C.int32_t(streamIndex),
+		(*C.char)(unsafe.Pointer(unsafe.SliceData(buffer))), required,
+		&required, &nativeErr,
+	))
+	if rc != StatusOK {
+		return "", cgoCallError("media metadata JSON", rc, &nativeErr)
+	}
+	if len(buffer) == 0 || buffer[len(buffer)-1] != 0 {
+		return "", &NativeError{Code: StatusInternal, Message: "metadata JSON is not NUL terminated"}
+	}
+	return string(buffer[:len(buffer)-1]), nil
+}
+
+func cgoFixedString(pointer unsafe.Pointer) string {
+	return C.GoString((*C.char)(pointer))
+}
+
+func cgoStreamMediaType(value uint32) (string, error) {
+	switch value {
+	case uint32(C.VC_STREAM_MEDIA_TYPE_VIDEO):
+		return "video", nil
+	case uint32(C.VC_STREAM_MEDIA_TYPE_AUDIO):
+		return "audio", nil
+	case uint32(C.VC_STREAM_MEDIA_TYPE_SUBTITLE):
+		return "subtitle", nil
+	case uint32(C.VC_STREAM_MEDIA_TYPE_DATA):
+		return "data", nil
+	case uint32(C.VC_STREAM_MEDIA_TYPE_ATTACHMENT):
+		return "attachment", nil
+	default:
+		return "", &NativeError{Code: StatusInternal, Message: "native stream media type is unknown"}
+	}
+}
+
+func int32Pointer(value int32) *int32 { return &value }
+func int64Pointer(value int64) *int64 { return &value }
+
 func (cgoBridge) close(session nativeSession) {
 	if session.value != nil {
 		C.vc_media_close((*C.vc_media_session)(session.value))
@@ -364,7 +567,8 @@ func nativeMediaType(kind worker.MediaKind) (uint32, error) {
 func nativeFeatureMask(fields uint32) (uint64, error) {
 	const supported = worker.MaskImagePDQ | worker.MaskPHashParts |
 		worker.MaskSobelHist | worker.MaskVideo6F |
-		worker.MaskVideoDuration | worker.MaskVideoContactSheet
+		worker.MaskVideoDuration | worker.MaskVideoContactSheet |
+		worker.MaskVideoMetadata
 	if fields&^supported != 0 {
 		return 0, &NativeError{Code: StatusInvalidArg, Message: "unsupported analysis field mask"}
 	}
@@ -378,7 +582,7 @@ func nativeFeatureMask(fields uint32) (uint64, error) {
 	if fields&(worker.MaskSobelHist|worker.MaskVideo6F|worker.MaskVideoContactSheet) != 0 {
 		mask |= 1 << 2
 	}
-	if fields&worker.MaskVideoDuration != 0 {
+	if fields&(worker.MaskVideoDuration|worker.MaskVideoMetadata) != 0 {
 		mask |= 1 << 3
 	}
 	if fields&worker.MaskVideoContactSheet != 0 {

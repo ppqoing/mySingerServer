@@ -11,15 +11,22 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <sstream>
 #include <string>
+#include <utility>
+#include <vector>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/display.h>
+#include <libavutil/channel_layout.h>
+#include <libavutil/dict.h>
 #include <libavutil/error.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/mathematics.h>
+#include <libavutil/pixdesc.h>
+#include <libavutil/samplefmt.h>
 #include <libswscale/swscale.h>
 }
 
@@ -322,6 +329,397 @@ int NormalizedClockwiseRotation(const AVCodecParameters* parameters) noexcept {
     if (clockwise < 135) return 90;
     if (clockwise < 225) return 180;
     return 270;
+}
+
+struct Utf8Unit {
+    uint32_t codepoint = 0xfffdu;
+    size_t width = 1u;
+    bool valid = false;
+};
+
+bool IsUtf8Continuation(unsigned char value) noexcept {
+    return (value & 0xc0u) == 0x80u;
+}
+
+Utf8Unit DecodeUtf8Unit(const unsigned char* value,
+                        size_t remaining) noexcept {
+    if (value == nullptr || remaining == 0u) return {};
+    const unsigned char first = value[0];
+    if (first < 0x80u) return {first, 1u, true};
+    if (first >= 0xc2u && first <= 0xdfu && remaining >= 2u &&
+        IsUtf8Continuation(value[1])) {
+        return {static_cast<uint32_t>((first & 0x1fu) << 6u) |
+                    static_cast<uint32_t>(value[1] & 0x3fu),
+                2u, true};
+    }
+    if (first >= 0xe0u && first <= 0xefu && remaining >= 3u &&
+        IsUtf8Continuation(value[1]) && IsUtf8Continuation(value[2]) &&
+        !(first == 0xe0u && value[1] < 0xa0u) &&
+        !(first == 0xedu && value[1] >= 0xa0u)) {
+        return {static_cast<uint32_t>((first & 0x0fu) << 12u) |
+                    static_cast<uint32_t>((value[1] & 0x3fu) << 6u) |
+                    static_cast<uint32_t>(value[2] & 0x3fu),
+                3u, true};
+    }
+    if (first >= 0xf0u && first <= 0xf4u && remaining >= 4u &&
+        IsUtf8Continuation(value[1]) && IsUtf8Continuation(value[2]) &&
+        IsUtf8Continuation(value[3]) &&
+        !(first == 0xf0u && value[1] < 0x90u) &&
+        !(first == 0xf4u && value[1] >= 0x90u)) {
+        return {static_cast<uint32_t>((first & 0x07u) << 18u) |
+                    static_cast<uint32_t>((value[1] & 0x3fu) << 12u) |
+                    static_cast<uint32_t>((value[2] & 0x3fu) << 6u) |
+                    static_cast<uint32_t>(value[3] & 0x3fu),
+                4u, true};
+    }
+    return {};
+}
+
+template <size_t Size>
+void CopyUtf8(char (&destination)[Size], const char* source) noexcept {
+    static_assert(Size > 0u);
+    destination[0] = '\0';
+    if (source == nullptr) return;
+    const auto* bytes = reinterpret_cast<const unsigned char*>(source);
+    const size_t length = std::strlen(source);
+    size_t input = 0u;
+    size_t output = 0u;
+    while (input < length) {
+        const Utf8Unit unit = DecodeUtf8Unit(bytes + input, length - input);
+        const size_t output_width = unit.valid ? unit.width : 3u;
+        if (output + output_width >= Size) break;
+        if (unit.valid) {
+            std::memcpy(destination + output, bytes + input, unit.width);
+        } else {
+            std::memcpy(destination + output, "\xef\xbf\xbd", 3u);
+        }
+        input += unit.width;
+        output += output_width;
+    }
+    destination[output] = '\0';
+}
+
+std::string RationalText(AVRational value) {
+    if (value.num == 0 || value.den == 0) return {};
+    return std::to_string(value.num) + "/" + std::to_string(value.den);
+}
+
+void AppendJsonString(std::string* output, const char* value) {
+    output->push_back('"');
+    const unsigned char* bytes = reinterpret_cast<const unsigned char*>(
+        value == nullptr ? "" : value);
+    const size_t length = std::strlen(
+        value == nullptr ? "" : value);
+    for (size_t index = 0u; index < length;) {
+        const Utf8Unit unit = DecodeUtf8Unit(bytes + index, length - index);
+        const unsigned char byte = bytes[index];
+        index += unit.width;
+        if (!unit.valid) {
+            output->append("\\ufffd");
+            continue;
+        }
+        if (unit.codepoint == 0x2028u) {
+            output->append("\\u2028");
+            continue;
+        }
+        if (unit.codepoint == 0x2029u) {
+            output->append("\\u2029");
+            continue;
+        }
+        if (unit.width != 1u) {
+            output->append(reinterpret_cast<const char*>(
+                               bytes + index - unit.width),
+                           unit.width);
+            continue;
+        }
+        switch (byte) {
+        case '"': output->append("\\\""); break;
+        case '\\': output->append("\\\\"); break;
+        case '\b': output->append("\\b"); break;
+        case '\f': output->append("\\f"); break;
+        case '\n': output->append("\\n"); break;
+        case '\r': output->append("\\r"); break;
+        case '\t': output->append("\\t"); break;
+        case '<': output->append("\\u003c"); break;
+        case '>': output->append("\\u003e"); break;
+        case '&': output->append("\\u0026"); break;
+        default:
+            if (byte < 0x20u) {
+                constexpr char digits[] = "0123456789abcdef";
+                output->append("\\u00");
+                output->push_back(digits[byte >> 4u]);
+                output->push_back(digits[byte & 0x0fu]);
+            } else {
+                output->push_back(static_cast<char>(byte));
+            }
+        }
+    }
+    output->push_back('"');
+}
+
+bool CanonicalTags(const AVDictionary* dictionary, std::string* output) {
+    constexpr size_t kMaximumTagsBytes = 64u * 1024u;
+    std::vector<std::pair<std::string, std::string>> entries;
+    const AVDictionaryEntry* entry = nullptr;
+    size_t unescaped_budget = 2u;
+    while ((entry = av_dict_iterate(dictionary, entry)) != nullptr) {
+        const char* key = entry->key == nullptr ? "" : entry->key;
+        const char* value = entry->value == nullptr ? "" : entry->value;
+        const size_t key_size = std::strlen(key);
+        const size_t value_size = std::strlen(value);
+        if (key_size > kMaximumTagsBytes ||
+            value_size > kMaximumTagsBytes ||
+            unescaped_budget > kMaximumTagsBytes - key_size ||
+            unescaped_budget + key_size >
+                kMaximumTagsBytes - value_size ||
+            unescaped_budget + key_size + value_size >
+                kMaximumTagsBytes - 6u) {
+            return false;
+        }
+        unescaped_budget += key_size + value_size + 6u;
+        entries.emplace_back(key, value);
+    }
+    std::sort(entries.begin(), entries.end(),
+              [](const auto& left, const auto& right) {
+                  return left.first < right.first;
+              });
+    output->clear();
+    output->push_back('{');
+    for (size_t index = 0u; index < entries.size(); ++index) {
+        if (index != 0u) output->push_back(',');
+        AppendJsonString(output, entries[index].first.c_str());
+        output->push_back(':');
+        AppendJsonString(output, entries[index].second.c_str());
+        if (output->size() + 1u > kMaximumTagsBytes) return false;
+    }
+    output->push_back('}');
+    return output->size() <= kMaximumTagsBytes;
+}
+
+uint32_t StreamMediaType(AVMediaType type) noexcept {
+    switch (type) {
+    case AVMEDIA_TYPE_VIDEO: return VC_STREAM_MEDIA_TYPE_VIDEO;
+    case AVMEDIA_TYPE_AUDIO: return VC_STREAM_MEDIA_TYPE_AUDIO;
+    case AVMEDIA_TYPE_SUBTITLE: return VC_STREAM_MEDIA_TYPE_SUBTITLE;
+    case AVMEDIA_TYPE_DATA: return VC_STREAM_MEDIA_TYPE_DATA;
+    case AVMEDIA_TYPE_ATTACHMENT: return VC_STREAM_MEDIA_TYPE_ATTACHMENT;
+    default: return 0u;
+    }
+}
+
+const char* FieldOrderName(AVFieldOrder value) noexcept {
+    switch (value) {
+    case AV_FIELD_PROGRESSIVE: return "progressive";
+    case AV_FIELD_TT: return "tt";
+    case AV_FIELD_BB: return "bb";
+    case AV_FIELD_TB: return "tb";
+    case AV_FIELD_BT: return "bt";
+    default: return nullptr;
+    }
+}
+
+bool FreezeVideoMetadata(const AVFormatContext* format,
+                         int primary_stream,
+                         const AVCodec* decoder,
+                         uint64_t source_file_size,
+                         VideoMetadataSnapshot* output) {
+    constexpr size_t kMaximumTotalBytes = 1u << 20;
+    if (format == nullptr || output == nullptr ||
+        format->nb_streams > VC_MAX_STREAMS) {
+        return false;
+    }
+    VideoMetadataSnapshot snapshot;
+    snapshot.container.struct_size = sizeof(snapshot.container);
+    snapshot.container.abi_version = VC_ABI_VERSION;
+    if (format->iformat != nullptr) {
+        CopyUtf8(snapshot.container.format_name_utf8,
+                 format->iformat->name);
+        CopyUtf8(snapshot.container.format_long_name_utf8,
+                 format->iformat->long_name);
+    }
+    if (format->start_time != AV_NOPTS_VALUE) {
+        snapshot.container.present_mask |= VC_CONTAINER_HAS_START_TIME;
+        snapshot.container.start_time_us = format->start_time;
+    }
+    if (format->duration != AV_NOPTS_VALUE) {
+        snapshot.container.present_mask |= VC_CONTAINER_HAS_DURATION;
+        snapshot.container.duration_us = format->duration;
+    }
+    if (format->bit_rate > 0) {
+        snapshot.container.present_mask |= VC_CONTAINER_HAS_BIT_RATE;
+        snapshot.container.bit_rate = format->bit_rate;
+    }
+    if (source_file_size <=
+        static_cast<uint64_t>((std::numeric_limits<int64_t>::max)())) {
+        snapshot.container.present_mask |= VC_CONTAINER_HAS_FILE_SIZE;
+        snapshot.container.file_size = static_cast<int64_t>(source_file_size);
+    }
+    if (format->probe_score >= 0) {
+        snapshot.container.present_mask |= VC_CONTAINER_HAS_PROBE_SCORE;
+        snapshot.container.probe_score = format->probe_score;
+    }
+    if (primary_stream >= 0 && decoder != nullptr) {
+        snapshot.container.present_mask |= VC_CONTAINER_HAS_PRIMARY_VIDEO;
+        snapshot.container.primary_video_stream = primary_stream;
+        CopyUtf8(snapshot.container.decoder_name_utf8, decoder->name);
+    }
+    if (!CanonicalTags(format->metadata, &snapshot.container_tags)) {
+        return false;
+    }
+
+    snapshot.streams.reserve(format->nb_streams);
+    snapshot.stream_tags.reserve(format->nb_streams);
+    size_t total_bytes = snapshot.container_tags.size() +
+                         sizeof(snapshot.container);
+    for (uint32_t ordinal = 0u; ordinal < format->nb_streams; ++ordinal) {
+        const AVStream* stream = format->streams[ordinal];
+        if (stream == nullptr || stream->codecpar == nullptr) return false;
+        const AVCodecParameters* parameters = stream->codecpar;
+        vc_video_stream_info info{};
+        info.struct_size = sizeof(info);
+        info.abi_version = VC_ABI_VERSION;
+        info.stream_index = static_cast<uint32_t>(stream->index);
+        info.media_type = StreamMediaType(parameters->codec_type);
+        if (info.media_type == 0u) return false;
+        info.codec_id = static_cast<int32_t>(parameters->codec_id);
+        info.disposition = static_cast<uint32_t>(stream->disposition);
+        const AVCodecDescriptor* descriptor =
+            avcodec_descriptor_get(parameters->codec_id);
+        CopyUtf8(info.codec_name_utf8,
+                 descriptor != nullptr ? descriptor->name
+                                       : avcodec_get_name(parameters->codec_id));
+        CopyUtf8(info.codec_long_name_utf8,
+                 descriptor == nullptr ? nullptr : descriptor->long_name);
+        if (parameters->codec_tag != 0u) {
+            char tag[AV_FOURCC_MAX_STRING_SIZE]{};
+            CopyUtf8(info.codec_tag_utf8,
+                     av_fourcc_make_string(tag, parameters->codec_tag));
+        }
+        if (parameters->profile != AV_PROFILE_UNKNOWN) {
+            CopyUtf8(info.profile_utf8,
+                     avcodec_profile_name(parameters->codec_id,
+                                          parameters->profile));
+        }
+        if (parameters->level != AV_LEVEL_UNKNOWN) {
+            info.present_mask |= VC_STREAM_HAS_LEVEL;
+            info.level = parameters->level;
+        }
+        CopyUtf8(info.time_base_utf8, RationalText(stream->time_base).c_str());
+        if (stream->start_time != AV_NOPTS_VALUE) {
+            info.present_mask |= VC_STREAM_HAS_START_TIME;
+            info.start_time_us = av_rescale_q(
+                stream->start_time, stream->time_base, AV_TIME_BASE_Q);
+        }
+        if (stream->duration != AV_NOPTS_VALUE) {
+            info.present_mask |= VC_STREAM_HAS_DURATION;
+            info.duration_us = av_rescale_q(
+                stream->duration, stream->time_base, AV_TIME_BASE_Q);
+        }
+        if (parameters->bit_rate > 0) {
+            info.present_mask |= VC_STREAM_HAS_BIT_RATE;
+            info.bit_rate = parameters->bit_rate;
+        }
+        if (stream->nb_frames > 0) {
+            info.present_mask |= VC_STREAM_HAS_FRAME_COUNT;
+            info.frame_count = stream->nb_frames;
+        }
+        const AVDictionaryEntry* language =
+            av_dict_get(stream->metadata, "language", nullptr, 0);
+        const AVDictionaryEntry* title =
+            av_dict_get(stream->metadata, "title", nullptr, 0);
+        CopyUtf8(info.language_utf8,
+                 language == nullptr ? nullptr : language->value);
+        CopyUtf8(info.title_utf8, title == nullptr ? nullptr : title->value);
+        if (parameters->format >= 0) {
+            if (parameters->codec_type == AVMEDIA_TYPE_VIDEO) {
+                CopyUtf8(info.pixel_format_utf8,
+                         av_get_pix_fmt_name(
+                             static_cast<AVPixelFormat>(parameters->format)));
+            } else if (parameters->codec_type == AVMEDIA_TYPE_AUDIO) {
+                CopyUtf8(info.sample_format_utf8,
+                         av_get_sample_fmt_name(
+                             static_cast<AVSampleFormat>(parameters->format)));
+            }
+        }
+        const int bit_depth = parameters->bits_per_raw_sample > 0
+                                  ? parameters->bits_per_raw_sample
+                                  : parameters->bits_per_coded_sample;
+        if (bit_depth > 0) {
+            if (parameters->codec_type == AVMEDIA_TYPE_AUDIO) {
+                info.present_mask |= VC_STREAM_HAS_AUDIO_BIT_DEPTH;
+                info.audio_bit_depth = bit_depth;
+            } else {
+                info.present_mask |= VC_STREAM_HAS_BIT_DEPTH;
+                info.bit_depth = bit_depth;
+            }
+        }
+        if (parameters->width > 0) {
+            info.present_mask |= VC_STREAM_HAS_WIDTH;
+            info.width = parameters->width;
+        }
+        if (parameters->height > 0) {
+            info.present_mask |= VC_STREAM_HAS_HEIGHT;
+            info.height = parameters->height;
+        }
+        const int rotation = NormalizedClockwiseRotation(parameters);
+        if (rotation != 0) {
+            info.present_mask |= VC_STREAM_HAS_ROTATION;
+            info.rotation = rotation;
+        }
+        CopyUtf8(info.sar_utf8,
+                 RationalText(parameters->sample_aspect_ratio).c_str());
+        if (parameters->width > 0 && parameters->height > 0 &&
+            parameters->sample_aspect_ratio.num > 0 &&
+            parameters->sample_aspect_ratio.den > 0) {
+            int numerator = 0;
+            int denominator = 0;
+            av_reduce(&numerator, &denominator,
+                      static_cast<int64_t>(parameters->width) *
+                          parameters->sample_aspect_ratio.num,
+                      static_cast<int64_t>(parameters->height) *
+                          parameters->sample_aspect_ratio.den,
+                      (std::numeric_limits<int>::max)());
+            CopyUtf8(info.dar_utf8,
+                     RationalText({numerator, denominator}).c_str());
+        }
+        CopyUtf8(info.avg_frame_rate_utf8,
+                 RationalText(stream->avg_frame_rate).c_str());
+        CopyUtf8(info.real_frame_rate_utf8,
+                 RationalText(stream->r_frame_rate).c_str());
+        CopyUtf8(info.color_range_utf8,
+                 av_color_range_name(parameters->color_range));
+        CopyUtf8(info.color_space_utf8,
+                 av_color_space_name(parameters->color_space));
+        CopyUtf8(info.color_transfer_utf8,
+                 av_color_transfer_name(parameters->color_trc));
+        CopyUtf8(info.color_primaries_utf8,
+                 av_color_primaries_name(parameters->color_primaries));
+        CopyUtf8(info.chroma_location_utf8,
+                 av_chroma_location_name(parameters->chroma_location));
+        CopyUtf8(info.field_order_utf8,
+                 FieldOrderName(parameters->field_order));
+        if (parameters->sample_rate > 0) {
+            info.present_mask |= VC_STREAM_HAS_SAMPLE_RATE;
+            info.sample_rate = parameters->sample_rate;
+        }
+        if (parameters->ch_layout.nb_channels > 0) {
+            info.present_mask |= VC_STREAM_HAS_CHANNELS;
+            info.channels = parameters->ch_layout.nb_channels;
+            char layout[sizeof(info.channel_layout_utf8)]{};
+            if (av_channel_layout_describe(
+                    &parameters->ch_layout, layout, sizeof(layout)) >= 0) {
+                CopyUtf8(info.channel_layout_utf8, layout);
+            }
+        }
+        std::string tags;
+        if (!CanonicalTags(stream->metadata, &tags)) return false;
+        total_bytes += sizeof(info) + tags.size();
+        if (total_bytes > kMaximumTotalBytes) return false;
+        snapshot.streams.push_back(info);
+        snapshot.stream_tags.push_back(std::move(tags));
+    }
+    *output = std::move(snapshot);
+    return true;
 }
 
 AVRational ValidSar(AVFormatContext* format,
@@ -1211,6 +1609,22 @@ int32_t DecodeSample(AVFormatContext* format,
 
 }  // namespace
 
+#if defined(VC_VIDEO_ANALYSIS_TESTING)
+bool VideoAnalysisTestFreezeMetadata(
+    const AVFormatContext* format,
+    int primary_stream,
+    const AVCodec* decoder,
+    uint64_t source_file_size,
+    VideoMetadataSnapshot* output) noexcept {
+    try {
+        return FreezeVideoMetadata(format, primary_stream, decoder,
+                                   source_file_size, output);
+    } catch (...) {
+        return false;
+    }
+}
+#endif
+
 int32_t PublishVideoFailure(vc_analysis_result* out,
                             vc_error* error,
                             int32_t code,
@@ -1225,10 +1639,20 @@ int32_t PublishVideoFailure(vc_analysis_result* out,
 int32_t AnalyzeVideo(AvioBridge* avio,
                      const CancelState* cancel,
                      const vc_analysis_request& request,
+                     uint64_t source_file_size,
+                     VideoMetadataSnapshot* metadata,
                      vc_analysis_result* out,
                      vc_error* error) noexcept {
     const auto operation_start = std::chrono::steady_clock::now();
     InitializeVideoResult(out);
+    if (metadata != nullptr) {
+        try {
+            *metadata = VideoMetadataSnapshot{};
+        } catch (...) {
+            return PublishVideoFailure(
+                out, error, VC_ERR_OOM, "video metadata reset failed");
+        }
+    }
     if (avio == nullptr || avio->context() == nullptr) {
         return PublishVideoFailure(
             out, error, VC_ERR_INTERNAL, "video AVIO is unavailable");
@@ -1352,6 +1776,21 @@ int32_t AnalyzeVideo(AvioBridge* avio,
         return publish_early_failure(status, "video stream probe failed");
     }
 
+    const AVCodec* decoder = nullptr;
+    const int stream_index = av_find_best_stream(
+        format.value, AVMEDIA_TYPE_VIDEO, -1, -1, &decoder, 0);
+    try {
+        if (!FreezeVideoMetadata(format.value, stream_index, decoder,
+                                 source_file_size, metadata) &&
+            metadata != nullptr) {
+            *metadata = VideoMetadataSnapshot{};
+        }
+    } catch (...) {
+        if (metadata != nullptr) {
+            try { *metadata = VideoMetadataSnapshot{}; } catch (...) {}
+        }
+    }
+
     const int64_t duration_ms =
         DurationMilliseconds(format.value, request.known_duration_ms);
     if (duration_ms <= 0) {
@@ -1373,9 +1812,6 @@ int32_t AnalyzeVideo(AvioBridge* avio,
                 : VC_ERR_UNSUPPORTED;
     }
 
-    const AVCodec* decoder = nullptr;
-    const int stream_index = av_find_best_stream(
-        format.value, AVMEDIA_TYPE_VIDEO, -1, -1, &decoder, 0);
     if (stream_index < 0 || decoder == nullptr) {
         out->operation_elapsed_ms = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(

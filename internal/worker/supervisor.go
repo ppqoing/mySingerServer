@@ -1106,7 +1106,7 @@ func validateMergedWorkerResult(job *JobMsg, result *JobResultMsg) error {
 		allowed = MaskSHA512 | MaskImagePDQ | MaskPHashParts | MaskSobelHist
 	case MediaVideo:
 		allowed = MaskSHA512 | MaskVideoThumb | MaskVideo6F | MaskVideoDuration |
-			MaskVideoContactSheet | MaskVideo6FPHash | MaskVideo6FSobel
+			MaskVideoContactSheet | MaskVideo6FPHash | MaskVideo6FSobel | MaskVideoMetadata
 	default:
 		return fmt.Errorf("worker protocol: invalid media kind %d", job.Kind)
 	}

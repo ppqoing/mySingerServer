@@ -13,6 +13,7 @@ import (
 	"unicode/utf16"
 	"unsafe"
 
+	"dedup/internal/proto"
 	"dedup/internal/worker"
 )
 
@@ -256,6 +257,15 @@ type nativeBridge interface {
 	close(nativeSession)
 }
 
+type videoMetadataBridge interface {
+	videoMetadata(nativeSession) (*VideoMetadata, error)
+}
+
+type VideoMetadata struct {
+	Container proto.VideoContainerMetadata
+	Streams   []proto.VideoStreamMetadata
+}
+
 var defaultNative nativeBridge = platformNativeBridge()
 
 func Runtime() (RuntimeInfo, error) {
@@ -437,6 +447,22 @@ func (s *Session) Analyze(ctx context.Context, request AnalysisRequest) (Analysi
 		return AnalysisResult{}, contextErr
 	}
 	return result, nativeErr
+}
+
+func (s *Session) VideoMetadata() (*VideoMetadata, error) {
+	if s == nil {
+		return nil, ErrSessionClosed
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.handle.value == nil {
+		return nil, ErrSessionClosed
+	}
+	bridge, ok := s.bridge.(videoMetadataBridge)
+	if !ok {
+		return nil, ErrUnavailable
+	}
+	return bridge.videoMetadata(s.handle)
 }
 
 func (s *Session) Close() error {

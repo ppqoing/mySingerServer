@@ -5,7 +5,36 @@ import (
 	"errors"
 	"testing"
 	"unsafe"
+
+	"dedup/internal/proto"
+	"dedup/internal/worker"
 )
+
+// Break caught: metadata captured by the same native analysis call is dropped
+// while crossing the Go session boundary.
+func TestAnalyzeReturnsFrozenVideoMetadata(t *testing.T) {
+	primary := int32(2)
+	metadata := &VideoMetadata{
+		Container: proto.VideoContainerMetadata{
+			FormatName: "matroska,webm", TagsJSON: `{}`, PrimaryVideoStream: &primary,
+		},
+		Streams: []proto.VideoStreamMetadata{{
+			Index: 2, MediaType: "video", CodecID: 173, CodecName: "hevc", TagsJSON: `{}`,
+		}},
+	}
+	bridge := &fakeNativeBridge{metadataResult: metadata}
+	session := newSession(nativeSession{value: unsafe.Pointer(new(byte))}, nativeCancel{value: unsafe.Pointer(new(byte))}, bridge)
+	defer session.Close()
+
+	if _, err := session.Analyze(context.Background(), AnalysisRequest{Fields: worker.MaskVideoMetadata}); err != nil {
+		t.Fatalf("Analyze error = %v", err)
+	}
+	got, err := session.VideoMetadata()
+	if err != nil || got == nil || got.Container.FormatName != "matroska,webm" ||
+		len(got.Streams) != 1 || got.Streams[0].CodecName != "hevc" {
+		t.Fatalf("VideoMetadata = %#v, err=%v", got, err)
+	}
+}
 
 func TestSessionCloseIdempotent(t *testing.T) {
 	bridge := &fakeNativeBridge{}

@@ -1153,10 +1153,10 @@ void TestExactExports() {
     }
     const auto* exports = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY*>(
         base + directory.VirtualAddress);
-    Check(exports->NumberOfFunctions == 10u,
-          "DLL export function table must contain exactly ten entries");
-    Check(exports->NumberOfNames == 10u,
-          "DLL export name table must contain exactly ten entries");
+    Check(exports->NumberOfFunctions == 14u,
+          "DLL export function table must contain exactly fourteen entries");
+    Check(exports->NumberOfNames == 14u,
+          "DLL export name table must contain exactly fourteen entries");
     const auto* name_rvas =
         reinterpret_cast<const uint32_t*>(base + exports->AddressOfNames);
     std::vector<std::string> actual;
@@ -1173,12 +1173,16 @@ void TestExactExports() {
         "vc_cancel_request",
         "vc_media_analyze",
         "vc_media_close",
+        "vc_media_container_info",
         "vc_media_hash",
+        "vc_media_metadata_json",
         "vc_media_open_w",
+        "vc_media_stream_count",
+        "vc_media_stream_info",
         "vc_runtime_info",
         "vc_version",
     };
-    Check(actual == expected, "DLL must export exactly ten vc_* names");
+    Check(actual == expected, "DLL must export exactly fourteen vc_* names");
 
     std::cout << "ABI_EXPORTS";
     for (const auto& name : actual) {

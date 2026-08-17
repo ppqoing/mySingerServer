@@ -5,8 +5,83 @@ import (
 	"strings"
 	"testing"
 
+	"dedup/internal/proto"
+
 	"github.com/vmihailenco/msgpack/v5"
 )
+
+// Break caught: the worker wire mask renumbers an existing field or omits the
+// independently persisted video-metadata field.
+func TestVideoMetadataMaskPreservesWireBits(t *testing.T) {
+	if MaskVideo6FSobel != 1<<9 || MaskVideoMetadata != 1<<10 {
+		t.Fatalf("video mask bits sobel=%#x metadata=%#x", MaskVideo6FSobel, MaskVideoMetadata)
+	}
+}
+
+func validWorkerVideoMetadata() (*proto.VideoContainerMetadata, []proto.VideoStreamMetadata) {
+	primary := int32(0)
+	return &proto.VideoContainerMetadata{
+			FormatName: "matroska,webm", TagsJSON: `{"album":"demo"}`,
+			PrimaryVideoStream: &primary, DecoderName: "h264",
+		}, []proto.VideoStreamMetadata{
+			{Index: 0, MediaType: "video", CodecID: 27, CodecName: "h264", TagsJSON: `{}`},
+			{Index: 1, MediaType: "audio", CodecID: 86018, CodecName: "aac", TagsJSON: `{}`},
+		}
+}
+
+// Break caught: malicious or unclaimed metadata crosses the Worker boundary
+// and reaches the transactional store validator.
+func TestJobResultVideoMetadataValidation(t *testing.T) {
+	container, streams := validWorkerVideoMetadata()
+	valid := JobResultMsg{FieldsDone: MaskVideoMetadata, VideoContainer: container, VideoStreams: streams}
+	if err := valid.ValidateVideoCoreMasks(); err != nil {
+		t.Fatalf("valid metadata rejected: %v", err)
+	}
+	withIndependentFailure := valid
+	withIndependentFailure.Errors = []FieldError{{Field: MaskVideoContactSheet, Stage: "contact_sheet", Msg: "encode failed"}}
+	if err := withIndependentFailure.ValidateVideoCoreMasks(); err != nil {
+		t.Fatalf("metadata plus independent field error rejected: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		edit func(*JobResultMsg)
+	}{
+		{"payload without completed bit", func(msg *JobResultMsg) { msg.FieldsDone = 0 }},
+		{"257 streams", func(msg *JobResultMsg) { msg.VideoStreams = append(make([]proto.VideoStreamMetadata, 255), streams...) }},
+		{"duplicate index", func(msg *JobResultMsg) { msg.VideoStreams = append(streams, streams[0]) }},
+		{"unknown media type", func(msg *JobResultMsg) { msg.VideoStreams[0].MediaType = "control" }},
+		{"oversized payload", func(msg *JobResultMsg) { msg.VideoStreams[0].Title = strings.Repeat("x", 1<<20) }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := valid
+			candidate.VideoStreams = append([]proto.VideoStreamMetadata(nil), valid.VideoStreams...)
+			test.edit(&candidate)
+			if err := candidate.ValidateVideoCoreMasks(); err == nil {
+				t.Fatal("malicious metadata accepted")
+			}
+		})
+	}
+}
+
+// Break caught: a cache reply advertises metadata without a valid complete
+// payload, or carries payload while reporting that field missing.
+func TestSHAReplyVideoMetadataValidation(t *testing.T) {
+	container, streams := validWorkerVideoMetadata()
+	valid := SHAReplyMsg{
+		RequestedFields: MaskVideoMetadata, FieldsPresent: MaskVideoMetadata,
+		VideoContainer: container, VideoStreams: streams,
+	}
+	if err := valid.ValidateMasks(); err != nil {
+		t.Fatalf("valid cached metadata rejected: %v", err)
+	}
+	valid.FieldsPresent = 0
+	valid.MissingFields = MaskVideoMetadata
+	if err := valid.ValidateMasks(); err == nil {
+		t.Fatal("cached payload without present bit accepted")
+	}
+}
 
 func TestRedactKnownPathHandlesMixedSeparatorsAndUnicode(t *testing.T) {
 	tests := []struct {
@@ -227,7 +302,7 @@ func TestDefaultStageOneWorkerMasksUseExplicitVideoFields(t *testing.T) {
 	if MaskAllImage != MaskSHA512|MaskImagePDQ {
 		t.Fatalf("image stage-one mask = %#x", uint32(MaskAllImage))
 	}
-	wantVideo := uint32(MaskSHA512 | MaskVideoDuration | MaskVideoContactSheet)
+	wantVideo := uint32(MaskSHA512 | MaskVideoDuration | MaskVideoContactSheet | MaskVideoMetadata)
 	if MaskAllVideo != wantVideo {
 		t.Fatalf("video stage-one mask = %#x, want %#x", uint32(MaskAllVideo), wantVideo)
 	}

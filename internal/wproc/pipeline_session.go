@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"dedup/internal/features"
+	"dedup/internal/proto"
 	"dedup/internal/worker"
 	"dedup/internal/wproc/videocore"
 )
@@ -21,6 +22,7 @@ import (
 type mediaSession interface {
 	Hash() ([64]byte, error)
 	Analyze(context.Context, videocore.AnalysisRequest) (videocore.AnalysisResult, error)
+	VideoMetadata() (*videocore.VideoMetadata, error)
 	Close() error
 }
 
@@ -151,11 +153,35 @@ func processMediaWithDeps(ctx context.Context, cfg Config, job *worker.JobMsg, d
 	}
 
 	analysis, err := session.Analyze(ctx, request)
+	if analysisFields&worker.MaskVideoMetadata != 0 {
+		metadata, metadataErr := session.VideoMetadata()
+		if metadataErr == nil && metadata != nil {
+			result.VideoContainer = cloneSessionVideoContainer(&metadata.Container)
+			result.VideoStreams = cloneSessionVideoStreams(metadata.Streams)
+			result.FieldsDone |= worker.MaskVideoMetadata
+		} else if err == nil {
+			if metadataErr == nil {
+				metadataErr = errors.New("video metadata snapshot is unavailable")
+			}
+			sessionPipelineFileError(result, worker.MaskVideoMetadata,
+				"video_metadata", metadataErr)
+		}
+	}
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return sessionPipelineCancelled(result, paths), err
 		}
-		return sessionPipelineFileError(result, missingFields, sessionPipelineAnalyzeStage(job, analysisFields, missingFrames), err), nil
+		failedFields := missingFields &^ result.FieldsDone
+		if result.FieldsDone&worker.MaskVideoMetadata != 0 {
+			if failedFields != 0 {
+				sessionPipelineFileError(result, failedFields,
+					sessionPipelineAnalyzeStage(job, analysisFields, missingFrames), err)
+			}
+			return sessionPipelineFinalIdentity(
+				ctx, result, job, path, before, sha, deps, paths,
+			)
+		}
+		return sessionPipelineFileError(result, failedFields, sessionPipelineAnalyzeStage(job, analysisFields, missingFrames), err), nil
 	}
 	if err := ctx.Err(); err != nil {
 		return sessionPipelineCancelled(result, paths), err
@@ -348,7 +374,7 @@ func validateSessionPipelineJob(job *worker.JobMsg) error {
 	if job.Phase == worker.Phase2 && len(job.KnownSHA) != 64 {
 		return fmt.Errorf("phase-two job known SHA-512 length %d", len(job.KnownSHA))
 	}
-	if job.FieldsMask == 0 || job.FieldsMask&^(worker.MaskSHA512|worker.MaskImagePDQ|worker.MaskVideoThumb|worker.MaskPHashParts|worker.MaskSobelHist|worker.MaskVideo6F|worker.MaskVideoDuration|worker.MaskVideoContactSheet|worker.MaskVideo6FPHash|worker.MaskVideo6FSobel) != 0 || job.FrameMask&^worker.FrameMaskFull != 0 {
+	if job.FieldsMask == 0 || job.FieldsMask&^(worker.MaskSHA512|worker.MaskImagePDQ|worker.MaskVideoThumb|worker.MaskPHashParts|worker.MaskSobelHist|worker.MaskVideo6F|worker.MaskVideoDuration|worker.MaskVideoContactSheet|worker.MaskVideo6FPHash|worker.MaskVideo6FSobel|worker.MaskVideoMetadata) != 0 || job.FrameMask&^worker.FrameMaskFull != 0 {
 		return fmt.Errorf("invalid media job masks")
 	}
 	if err := validateSessionPipelineStage(job); err != nil {
@@ -481,6 +507,11 @@ func sessionPipelineMergeCached(result *worker.JobResultMsg, reply *worker.SHARe
 		result.DurationMS = &value
 		result.FieldsDone |= worker.MaskVideoDuration
 	}
+	if present&worker.MaskVideoMetadata != 0 && reply.VideoContainer != nil {
+		result.VideoContainer = cloneSessionVideoContainer(reply.VideoContainer)
+		result.VideoStreams = cloneSessionVideoStreams(reply.VideoStreams)
+		result.FieldsDone |= worker.MaskVideoMetadata
+	}
 	if contact != nil && present&(worker.MaskVideoThumb|worker.MaskVideoContactSheet) != 0 {
 		quality := *reply.ThumbQuality
 		result.ThumbPath = reply.ThumbPath
@@ -507,6 +538,59 @@ func cloneSessionFrameResult(frame worker.FrameResult) worker.FrameResult {
 	return frame
 }
 
+func cloneSessionVideoContainer(value *proto.VideoContainerMetadata) *proto.VideoContainerMetadata {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	cloned.StartTimeUS = cloneSessionInt64(value.StartTimeUS)
+	cloned.DurationUS = cloneSessionInt64(value.DurationUS)
+	cloned.BitRate = cloneSessionInt64(value.BitRate)
+	cloned.FileSize = cloneSessionInt64(value.FileSize)
+	cloned.ProbeScore = cloneSessionInt32(value.ProbeScore)
+	cloned.PrimaryVideoStream = cloneSessionInt32(value.PrimaryVideoStream)
+	return &cloned
+}
+
+func cloneSessionVideoStreams(values []proto.VideoStreamMetadata) []proto.VideoStreamMetadata {
+	if values == nil {
+		return nil
+	}
+	cloned := append([]proto.VideoStreamMetadata(nil), values...)
+	for index := range cloned {
+		value := &cloned[index]
+		value.Level = cloneSessionInt32(value.Level)
+		value.StartTimeUS = cloneSessionInt64(value.StartTimeUS)
+		value.DurationUS = cloneSessionInt64(value.DurationUS)
+		value.BitRate = cloneSessionInt64(value.BitRate)
+		value.FrameCount = cloneSessionInt64(value.FrameCount)
+		value.BitDepth = cloneSessionInt32(value.BitDepth)
+		value.Width = cloneSessionInt32(value.Width)
+		value.Height = cloneSessionInt32(value.Height)
+		value.Rotation = cloneSessionInt32(value.Rotation)
+		value.SampleRate = cloneSessionInt32(value.SampleRate)
+		value.Channels = cloneSessionInt32(value.Channels)
+		value.AudioBitDepth = cloneSessionInt32(value.AudioBitDepth)
+	}
+	return cloned
+}
+
+func cloneSessionInt32(value *int32) *int32 {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
+
+func cloneSessionInt64(value *int64) *int64 {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
+
 func sessionPipelineAnalyzeStage(job *worker.JobMsg, fields uint32, frames uint8) string {
 	if job.Kind == worker.MediaImage {
 		return "image_decode"
@@ -519,6 +603,9 @@ func sessionPipelineAnalyzeStage(job *worker.JobMsg, fields uint32, frames uint8
 	}
 	if fields&worker.MaskVideoDuration != 0 {
 		return "video_probe"
+	}
+	if fields&worker.MaskVideoMetadata != 0 {
+		return "video_metadata"
 	}
 	return "feature_compute"
 }
@@ -666,6 +753,8 @@ func clearSessionPipelineResult(result *worker.JobResultMsg) {
 	result.ContactSheetStatus, result.ContactSheetWidth, result.ContactSheetHeight = 0, 0, 0
 	result.FrameResults = [6]worker.FrameResult{}
 	result.Frames = nil
+	result.VideoContainer = nil
+	result.VideoStreams = nil
 }
 
 func removeContactSheetTemps(paths ContactSheetPaths) {

@@ -57,7 +57,8 @@ func TestDefaultStageOneMediaKindAndMissingBaseAreCaseInsensitive(t *testing.T) 
 		{path: `D:\照片\A.JPG`, kind: "image", mask: 3},
 		{
 			path: `D:\video\a.mkv`, kind: "video",
-			mask: proto.FieldSHA512 | proto.FieldVideoDuration | proto.FieldVideoContactSheet,
+			mask: proto.FieldSHA512 | proto.FieldVideoDuration |
+				proto.FieldVideoContactSheet | proto.FieldVideoMetadata,
 		},
 		{path: `D:\other\a.txt`, kind: "other", mask: 1},
 	}

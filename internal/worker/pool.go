@@ -552,6 +552,17 @@ func materializeFixedFrameResults(job JobMsg, result *JobResultMsg) {
 }
 
 func (p *Pool) saveAnalysisResult(job JobMsg, result *JobResultMsg) {
+	if err := validateWorkerVideoMetadata(
+		result.FieldsDone&MaskVideoMetadata != 0,
+		result.VideoContainer, result.VideoStreams,
+	); err != nil {
+		p.dedup.FailByJob(result.JobID)
+		clearAllAnalysisPayload(result)
+		result.Errors = append(result.Errors, FieldError{
+			Field: 0, Stage: "protocol", Msg: err.Error(),
+		})
+		return
+	}
 	if p.store == nil {
 		p.dedup.Resolve(*result)
 		return
@@ -603,7 +614,9 @@ func analysisStoreResult(machineID string, job JobMsg, result JobResultMsg) stor
 		DurationMS: cloneInt64(result.DurationMS), ThumbPath: result.ThumbPath,
 		ThumbPDQ: cloneBytes(result.ThumbPDQ), ThumbQuality: cloneInt32(result.ThumbQuality),
 		PHashParts: cloneBytes(result.PHashParts), SobelHist: cloneBytes(result.SobelHist),
-		Frames: frames, Errors: errorsOut,
+		VideoContainer: cloneVideoContainer(result.VideoContainer),
+		VideoStreams:   cloneVideoStreams(result.VideoStreams),
+		Frames:         frames, Errors: errorsOut,
 	}
 	if result.ContactSheetWidth > 0 {
 		width := result.ContactSheetWidth
@@ -663,6 +676,8 @@ func clearAllAnalysisPayload(result *JobResultMsg) {
 	result.ContactSheetWidth = 0
 	result.ContactSheetHeight = 0
 	result.FrameResults = [6]FrameResult{}
+	result.VideoContainer = nil
+	result.VideoStreams = nil
 }
 
 func pruneUncommittedPayload(result *JobResultMsg) {
@@ -684,6 +699,10 @@ func pruneUncommittedPayload(result *JobResultMsg) {
 	if result.FieldsDone&(MaskVideoContactSheet|MaskVideoThumb) == 0 {
 		result.ThumbPath, result.ThumbPDQ, result.ThumbQuality = "", nil, nil
 		result.ContactSheetStatus, result.ContactSheetWidth, result.ContactSheetHeight = 0, 0, 0
+	}
+	if result.FieldsDone&MaskVideoMetadata == 0 {
+		result.VideoContainer = nil
+		result.VideoStreams = nil
 	}
 	for index := range result.FrameResults {
 		if result.FramesDone&(1<<uint(index)) == 0 {
@@ -717,6 +736,8 @@ func clearFeaturePayload(result *JobResultMsg) {
 	result.ThumbPath = ""
 	result.ThumbPDQ = nil
 	result.ThumbQuality = nil
+	result.VideoContainer = nil
+	result.VideoStreams = nil
 }
 
 func clearPhase2FeaturePayload(result *JobResultMsg) {

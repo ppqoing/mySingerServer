@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 
+	"dedup/internal/proto"
 	"dedup/internal/store"
 )
 
@@ -126,6 +127,7 @@ const (
 	MaskVideoContactSheet uint32 = 1 << 7
 	MaskVideo6FPHash      uint32 = 1 << 8
 	MaskVideo6FSobel      uint32 = 1 << 9
+	MaskVideoMetadata     uint32 = 1 << 10
 )
 
 var (
@@ -138,7 +140,7 @@ const (
 	fieldMaskFull uint32 = MaskSHA512 | MaskImagePDQ | MaskVideoThumb |
 		MaskPHashParts | MaskSobelHist | MaskVideo6F |
 		MaskVideoDuration | MaskVideoContactSheet |
-		MaskVideo6FPHash | MaskVideo6FSobel
+		MaskVideo6FPHash | MaskVideo6FSobel | MaskVideoMetadata
 )
 
 type RuntimeComponent struct {
@@ -279,24 +281,26 @@ type SHAQueryMsg struct {
 }
 
 type SHAReplyMsg struct {
-	JobID           int64          `msgpack:"job_id"`
-	Found           bool           `msgpack:"found"`
-	RequestedFields uint32         `msgpack:"requested_fields"`
-	FieldsPresent   uint32         `msgpack:"present_fields"`
-	MissingFields   uint32         `msgpack:"missing_fields"`
-	RequestedFrames uint8          `msgpack:"requested_frames"`
-	FramesPresent   uint8          `msgpack:"present_frames"`
-	MissingFrames   uint8          `msgpack:"missing_frames"`
-	PDQ             []byte         `msgpack:"pdq,omitempty"`
-	Quality         int32          `msgpack:"quality,omitempty"`
-	Width           int32          `msgpack:"width,omitempty"`
-	Height          int32          `msgpack:"height,omitempty"`
-	DurationMS      *int64         `msgpack:"duration_ms,omitempty"`
-	ThumbPath       string         `msgpack:"thumb_path,omitempty"`
-	ThumbPDQ        []byte         `msgpack:"thumb_pdq,omitempty"`
-	ThumbQuality    *int32         `msgpack:"thumb_quality,omitempty"`
-	FrameResults    [6]FrameResult `msgpack:"frame_results,omitempty"`
-	ReusedFlight    bool           `msgpack:"reused_flight,omitempty"`
+	JobID           int64                         `msgpack:"job_id"`
+	Found           bool                          `msgpack:"found"`
+	RequestedFields uint32                        `msgpack:"requested_fields"`
+	FieldsPresent   uint32                        `msgpack:"present_fields"`
+	MissingFields   uint32                        `msgpack:"missing_fields"`
+	RequestedFrames uint8                         `msgpack:"requested_frames"`
+	FramesPresent   uint8                         `msgpack:"present_frames"`
+	MissingFrames   uint8                         `msgpack:"missing_frames"`
+	PDQ             []byte                        `msgpack:"pdq,omitempty"`
+	Quality         int32                         `msgpack:"quality,omitempty"`
+	Width           int32                         `msgpack:"width,omitempty"`
+	Height          int32                         `msgpack:"height,omitempty"`
+	DurationMS      *int64                        `msgpack:"duration_ms,omitempty"`
+	ThumbPath       string                        `msgpack:"thumb_path,omitempty"`
+	ThumbPDQ        []byte                        `msgpack:"thumb_pdq,omitempty"`
+	ThumbQuality    *int32                        `msgpack:"thumb_quality,omitempty"`
+	FrameResults    [6]FrameResult                `msgpack:"frame_results,omitempty"`
+	VideoContainer  *proto.VideoContainerMetadata `msgpack:"video_container,omitempty"`
+	VideoStreams    []proto.VideoStreamMetadata   `msgpack:"video_streams,omitempty"`
+	ReusedFlight    bool                          `msgpack:"reused_flight,omitempty"`
 }
 
 func (msg SHAQueryMsg) ValidateMasks() error {
@@ -328,6 +332,12 @@ func (msg SHAReplyMsg) ValidateMasks() error {
 	if msg.FramesPresent|msg.MissingFrames != msg.RequestedFrames {
 		return fmt.Errorf("worker: SHA reply frame masks do not exactly cover requested_frames")
 	}
+	if err := validateWorkerVideoMetadata(
+		msg.FieldsPresent&MaskVideoMetadata != 0,
+		msg.VideoContainer, msg.VideoStreams,
+	); err != nil {
+		return fmt.Errorf("worker: SHA reply: %w", err)
+	}
 	return nil
 }
 
@@ -358,47 +368,49 @@ type FrameResult struct {
 }
 
 type JobResultMsg struct {
-	JobID              int64          `msgpack:"job_id"`
-	ScanTaskID         string         `msgpack:"scan_task_id,omitempty"`
-	WorkerPID          int            `msgpack:"-"`
-	Phase              Phase          `msgpack:"-"`
-	ScreenStage        ScreenStage    `msgpack:"screen_stage,omitempty"`
-	Source             JobSource      `msgpack:"source,omitempty"`
-	Path               string         `msgpack:"path"`
-	Kind               MediaKind      `msgpack:"kind"`
-	SHA512             []byte         `msgpack:"sha512,omitempty"`
-	FieldsDone         uint32         `msgpack:"fields_done"`
-	FramesDone         uint8          `msgpack:"frames_done"`
-	DurationStatus     int32          `msgpack:"duration_status"`
-	ContactSheetStatus int32          `msgpack:"contact_sheet_status"`
-	ContactSheetWidth  int32          `msgpack:"contact_sheet_width"`
-	ContactSheetHeight int32          `msgpack:"contact_sheet_height"`
-	FrameResults       [6]FrameResult `msgpack:"frame_results"`
-	PDQ                []byte         `msgpack:"pdq,omitempty"`
-	Quality            int32          `msgpack:"quality,omitempty"`
-	Width              int32          `msgpack:"width,omitempty"`
-	Height             int32          `msgpack:"height,omitempty"`
-	DurationMS         *int64         `msgpack:"duration_ms,omitempty"`
-	ThumbPath          string         `msgpack:"thumb_path,omitempty"`
-	ThumbPDQ           []byte         `msgpack:"thumb_pdq,omitempty"`
-	ThumbQuality       *int32         `msgpack:"thumb_quality,omitempty"`
-	PHashParts         []byte         `msgpack:"phash_parts,omitempty"`
-	SobelHist          []byte         `msgpack:"sobel_hist,omitempty"`
-	Frames             []FrameFeature `msgpack:"frames,omitempty"`
-	Errors             []FieldError   `msgpack:"errors,omitempty"`
-	ReadAttempts       int64          `msgpack:"read_attempts,omitempty"`
-	DecodeAttempts     int64          `msgpack:"decode_attempts,omitempty"`
-	ReadNS             int64          `msgpack:"read_ns,omitempty"`
-	DecodeNS           int64          `msgpack:"decode_ns,omitempty"`
-	ThumbMS            int64          `msgpack:"thumb_ms,omitempty"`
-	Decoded            bool           `msgpack:"decoded,omitempty"`
-	ThumbGenerated     bool           `msgpack:"thumb_generated,omitempty"`
-	ThumbCacheHit      bool           `msgpack:"thumb_cache_hit,omitempty"`
-	PreviewFormat      string         `msgpack:"preview_format,omitempty"`
-	PreviewWidth       int32          `msgpack:"preview_width,omitempty"`
-	PreviewHeight      int32          `msgpack:"preview_height,omitempty"`
-	PreviewBytes       []byte         `msgpack:"preview_bytes,omitempty"`
-	PreviewErrorCode   string         `msgpack:"preview_error_code,omitempty"`
+	JobID              int64                         `msgpack:"job_id"`
+	ScanTaskID         string                        `msgpack:"scan_task_id,omitempty"`
+	WorkerPID          int                           `msgpack:"-"`
+	Phase              Phase                         `msgpack:"-"`
+	ScreenStage        ScreenStage                   `msgpack:"screen_stage,omitempty"`
+	Source             JobSource                     `msgpack:"source,omitempty"`
+	Path               string                        `msgpack:"path"`
+	Kind               MediaKind                     `msgpack:"kind"`
+	SHA512             []byte                        `msgpack:"sha512,omitempty"`
+	FieldsDone         uint32                        `msgpack:"fields_done"`
+	FramesDone         uint8                         `msgpack:"frames_done"`
+	DurationStatus     int32                         `msgpack:"duration_status"`
+	ContactSheetStatus int32                         `msgpack:"contact_sheet_status"`
+	ContactSheetWidth  int32                         `msgpack:"contact_sheet_width"`
+	ContactSheetHeight int32                         `msgpack:"contact_sheet_height"`
+	FrameResults       [6]FrameResult                `msgpack:"frame_results"`
+	PDQ                []byte                        `msgpack:"pdq,omitempty"`
+	Quality            int32                         `msgpack:"quality,omitempty"`
+	Width              int32                         `msgpack:"width,omitempty"`
+	Height             int32                         `msgpack:"height,omitempty"`
+	DurationMS         *int64                        `msgpack:"duration_ms,omitempty"`
+	ThumbPath          string                        `msgpack:"thumb_path,omitempty"`
+	ThumbPDQ           []byte                        `msgpack:"thumb_pdq,omitempty"`
+	ThumbQuality       *int32                        `msgpack:"thumb_quality,omitempty"`
+	PHashParts         []byte                        `msgpack:"phash_parts,omitempty"`
+	SobelHist          []byte                        `msgpack:"sobel_hist,omitempty"`
+	VideoContainer     *proto.VideoContainerMetadata `msgpack:"video_container,omitempty"`
+	VideoStreams       []proto.VideoStreamMetadata   `msgpack:"video_streams,omitempty"`
+	Frames             []FrameFeature                `msgpack:"frames,omitempty"`
+	Errors             []FieldError                  `msgpack:"errors,omitempty"`
+	ReadAttempts       int64                         `msgpack:"read_attempts,omitempty"`
+	DecodeAttempts     int64                         `msgpack:"decode_attempts,omitempty"`
+	ReadNS             int64                         `msgpack:"read_ns,omitempty"`
+	DecodeNS           int64                         `msgpack:"decode_ns,omitempty"`
+	ThumbMS            int64                         `msgpack:"thumb_ms,omitempty"`
+	Decoded            bool                          `msgpack:"decoded,omitempty"`
+	ThumbGenerated     bool                          `msgpack:"thumb_generated,omitempty"`
+	ThumbCacheHit      bool                          `msgpack:"thumb_cache_hit,omitempty"`
+	PreviewFormat      string                        `msgpack:"preview_format,omitempty"`
+	PreviewWidth       int32                         `msgpack:"preview_width,omitempty"`
+	PreviewHeight      int32                         `msgpack:"preview_height,omitempty"`
+	PreviewBytes       []byte                        `msgpack:"preview_bytes,omitempty"`
+	PreviewErrorCode   string                        `msgpack:"preview_error_code,omitempty"`
 }
 
 func (msg JobResultMsg) ValidateVideoCoreMasks() error {
@@ -407,6 +419,12 @@ func (msg JobResultMsg) ValidateVideoCoreMasks() error {
 	}
 	if msg.FramesDone&^FrameMaskFull != 0 {
 		return fmt.Errorf("worker: job result frames_done contains bits outside six frames")
+	}
+	if err := validateWorkerVideoMetadata(
+		msg.FieldsDone&MaskVideoMetadata != 0,
+		msg.VideoContainer, msg.VideoStreams,
+	); err != nil {
+		return fmt.Errorf("worker: job result: %w", err)
 	}
 
 	hasFrameResults := msg.FieldsDone&videoSixFrameWorkerFields() != 0 || msg.FramesDone != 0
@@ -434,6 +452,23 @@ func (msg JobResultMsg) ValidateVideoCoreMasks() error {
 		if !done && frameHasFeaturePayload(frame) {
 			return fmt.Errorf("worker: unsuccessful frame %d carries feature payload", index)
 		}
+	}
+	return nil
+}
+
+func validateWorkerVideoMetadata(
+	claimed bool,
+	container *proto.VideoContainerMetadata,
+	streams []proto.VideoStreamMetadata,
+) error {
+	if !claimed {
+		if container != nil || len(streams) != 0 {
+			return fmt.Errorf("video metadata payload exists without completed field bit")
+		}
+		return nil
+	}
+	if err := proto.ValidateVideoMetadata(container, streams); err != nil {
+		return fmt.Errorf("invalid video metadata: %w", err)
 	}
 	return nil
 }

@@ -24,6 +24,23 @@ int32_t AnalyzeMediaSession(
     const vc_analysis_request& request,
     vc_analysis_result* out,
     vc_error* error);
+int32_t MediaSessionContainerInfo(
+    vc_media_session* session,
+    vc_video_container_info* out,
+    vc_error* error);
+uint32_t MediaSessionStreamCount(vc_media_session* session) noexcept;
+int32_t MediaSessionStreamInfo(
+    vc_media_session* session,
+    uint32_t ordinal,
+    vc_video_stream_info* out,
+    vc_error* error);
+int32_t MediaSessionMetadataJson(
+    vc_media_session* session,
+    int32_t stream_index,
+    char* destination,
+    uint32_t capacity,
+    uint32_t* required,
+    vc_error* error);
 void CloseMediaSession(vc_media_session* session) noexcept;
 
 #if defined(VC_MEDIA_SESSION_TESTING)

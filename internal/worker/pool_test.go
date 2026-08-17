@@ -27,6 +27,7 @@ import (
 
 	"dedup/internal/diskio"
 	"dedup/internal/features"
+	"dedup/internal/proto"
 	"dedup/internal/store"
 
 	"github.com/Microsoft/go-winio"
@@ -792,10 +793,11 @@ func TestVideoBaseFeaturesValidatorAcceptsContactFailurePartial(t *testing.T) {
 		FieldsMask: store.RequiredStageOneMask(store.MediaVideo),
 	}
 	duration := int64(4321)
+	container, streams := validWorkerVideoMetadata()
 	result := &JobResultMsg{
 		JobID: job.JobID, ScanTaskID: job.ScanTaskID, Path: job.Path, Kind: job.Kind,
-		SHA512: bytes64(0x51), FieldsDone: MaskSHA512 | MaskVideoDuration,
-		DurationMS: &duration,
+		SHA512: bytes64(0x51), FieldsDone: MaskSHA512 | MaskVideoDuration | MaskVideoMetadata,
+		DurationMS: &duration, VideoContainer: container, VideoStreams: streams,
 		Errors: []FieldError{{
 			Field: MaskVideoContactSheet, Stage: "thumb_cache", Msg: "publish failed",
 		}},
@@ -3319,6 +3321,65 @@ func TestImagePreviewPoolBypassesFeatureStore(t *testing.T) {
 	<-pool.results
 	if got := pool.Metrics(); got.FilesDone != 0 || got.FilesFailed != 0 {
 		t.Fatalf("failed preview changed scan file metrics: %#v", got)
+	}
+}
+
+// Break caught: the Pool forwards aliases into the transactional store, so a
+// worker buffer reuse can mutate metadata while SaveAnalysis is consuming it.
+func TestAnalysisStoreResultDeepCopiesVideoMetadata(t *testing.T) {
+	container, streams := validWorkerVideoMetadata()
+	duration := int64(2_000_000)
+	width := int32(160)
+	container.DurationUS = &duration
+	streams[0].Width = &width
+	result := JobResultMsg{
+		FieldsDone:     MaskVideoMetadata,
+		VideoContainer: container,
+		VideoStreams:   streams,
+	}
+	stored := analysisStoreResult("machine", JobMsg{
+		Path: `D:\media\source.mkv`, Kind: MediaVideo,
+		FieldsMask: MaskVideoMetadata,
+	}, result)
+
+	*result.VideoContainer.DurationUS = 9
+	result.VideoContainer.FormatName = "mutated"
+	*result.VideoStreams[0].Width = 9
+	result.VideoStreams[0].CodecName = "mutated"
+	result.VideoStreams = append(result.VideoStreams, proto.VideoStreamMetadata{})
+	if stored.VideoContainer == nil || stored.VideoContainer.FormatName != "matroska,webm" ||
+		stored.VideoContainer.DurationUS == nil || *stored.VideoContainer.DurationUS != 2_000_000 {
+		t.Fatalf("container was not deeply copied: %#v", stored.VideoContainer)
+	}
+	if len(stored.VideoStreams) != 2 || stored.VideoStreams[0].CodecName != "h264" ||
+		stored.VideoStreams[0].Width == nil || *stored.VideoStreams[0].Width != 160 {
+		t.Fatalf("streams were not deeply copied: %#v", stored.VideoStreams)
+	}
+}
+
+// Break caught: the store declines the metadata bit but the Pool publishes the
+// uncommitted payload anyway.
+func TestSaveAnalysisResultClearsVideoMetadataWhenStoreDoesNotCommitBit(t *testing.T) {
+	backend := &poolTestStore{missingMask: MaskVideoMetadata}
+	pool := &Pool{
+		ctx: context.Background(), store: backend, dedup: NewDeduper(backend),
+	}
+	container, streams := validWorkerVideoMetadata()
+	job := JobMsg{
+		JobID: 703, Path: `D:\media\source.mkv`, Kind: MediaVideo,
+		FieldsMask: MaskVideoMetadata,
+	}
+	result := JobResultMsg{
+		JobID: job.JobID, Path: job.Path, Kind: job.Kind,
+		FieldsDone:     MaskVideoMetadata,
+		VideoContainer: container, VideoStreams: streams,
+	}
+	pool.saveAnalysisResult(job, &result)
+	if result.FieldsDone != 0 || result.VideoContainer != nil || result.VideoStreams != nil {
+		t.Fatalf("uncommitted metadata escaped: %#v", result)
+	}
+	if got := backend.saveCountValue(); got != 1 {
+		t.Fatalf("SaveAnalysis calls = %d, want 1", got)
 	}
 }
 

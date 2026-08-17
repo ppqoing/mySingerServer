@@ -14,21 +14,23 @@ type fakeNativeBridge struct {
 	runtimeInfo RuntimeInfo
 	runtimeErr  error
 
-	mu              sync.Mutex
-	openCalls       int
-	closeCalls      int
-	cancelCreates   int
-	cancelRequests  int
-	cancelFrees     int
-	analyzeStarted  chan struct{}
-	analyzeRelease  chan struct{}
-	analyzeResult   AnalysisResult
-	analyzeErr      error
-	openErr         error
-	openPanic       any
-	openEntered     chan struct{}
-	openRelease     chan struct{}
-	lastOpenOptions OpenOptions
+	mu               sync.Mutex
+	openCalls        int
+	closeCalls       int
+	cancelCreates    int
+	cancelRequests   int
+	cancelFrees      int
+	analyzeStarted   chan struct{}
+	analyzeRelease   chan struct{}
+	analyzeResult    AnalysisResult
+	analyzeErr       error
+	metadataResult   *VideoMetadata
+	videoMetadataErr error
+	openErr          error
+	openPanic        any
+	openEntered      chan struct{}
+	openRelease      chan struct{}
+	lastOpenOptions  OpenOptions
 }
 
 func (f *fakeNativeBridge) runtime() (RuntimeInfo, error) {
@@ -86,6 +88,10 @@ func (f *fakeNativeBridge) analyze(nativeSession, AnalysisRequest) (AnalysisResu
 		<-f.analyzeRelease
 	}
 	return f.analyzeResult, f.analyzeErr
+}
+
+func (f *fakeNativeBridge) videoMetadata(nativeSession) (*VideoMetadata, error) {
+	return f.metadataResult, f.videoMetadataErr
 }
 
 func (f *fakeNativeBridge) close(nativeSession) {

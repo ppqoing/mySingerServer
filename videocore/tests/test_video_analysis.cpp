@@ -79,6 +79,20 @@ vc_analysis_request FreshRequest(uint32_t frame_mask = 0u) {
     return request;
 }
 
+vc_video_container_info FreshContainerInfo() {
+    vc_video_container_info value{};
+    value.struct_size = sizeof(value);
+    value.abi_version = VC_ABI_VERSION;
+    return value;
+}
+
+vc_video_stream_info FreshStreamInfo() {
+    vc_video_stream_info value{};
+    value.struct_size = sizeof(value);
+    value.abi_version = VC_ABI_VERSION;
+    return value;
+}
+
 std::wstring FixturePath(const wchar_t* name) {
     return std::wstring(VC_VIDEO_TESTDATA_ROOT) + L"\\" + name;
 }
@@ -309,6 +323,179 @@ void TestFixture(const FixtureExpectation& expected) {
                << std::wstring(analysis_digest.begin(), analysis_digest.end())
                << L'\n';
     vc_media_close(session);
+}
+
+// Break caught: metadata is reprobed through another input traversal, or is
+// populated from decoder defaults instead of codecpar from the one probed
+// AVFormatContext.
+void TestFrozenMetadataUsesTheAnalyzedFormatContext() {
+    const std::wstring path = FixturePath(L"h264-standard.mp4");
+    vc_media_open_options options{};
+    options.struct_size = sizeof(options);
+    options.abi_version = VC_ABI_VERSION;
+    options.expected_media_type = VC_MEDIA_TYPE_VIDEO;
+    vc_media_session* session = nullptr;
+    vc_error error = FreshError();
+    Check(vc_media_open_w(reinterpret_cast<const uint16_t*>(path.data()),
+                          static_cast<uint32_t>(path.size()), &options,
+                          nullptr, &session, &error) == VC_OK,
+          "metadata fixture opens");
+    if (session == nullptr) return;
+
+    vc_video_container_info before = FreshContainerInfo();
+    error = FreshError();
+    Check(vc_media_container_info(session, &before, &error) ==
+              VC_ERR_UNSUPPORTED,
+          "metadata is unavailable before stream probing");
+    std::array<uint8_t, VC_SHA512_SIZE> digest{};
+    error = FreshError();
+    Check(vc_media_hash(session, digest.data(), &error) == VC_OK,
+          "metadata fixture hashes");
+    vc_analysis_request request = FreshRequest(0x01u);
+    vc_analysis_result result = FreshResult();
+    vc::detail::VideoAnalysisTestReset();
+    error = FreshError();
+    Check(vc_media_analyze(session, &request, &result, &error) == VC_OK,
+          "metadata fixture analyzes");
+
+    vc_video_container_info container = FreshContainerInfo();
+    error = FreshError();
+    Check(vc_media_container_info(session, &container, &error) == VC_OK,
+          "container snapshot is available");
+    Check(std::string(container.format_name_utf8).find("mp4") !=
+              std::string::npos,
+          "container format comes from AVInputFormat");
+    Check((container.present_mask & VC_CONTAINER_HAS_PRIMARY_VIDEO) != 0u &&
+              container.primary_video_stream == 0 &&
+              std::string(container.decoder_name_utf8) == "h264",
+          "primary stream and actual decoder are frozen together");
+    Check(vc_media_stream_count(session) == 1u,
+          "all probed streams are frozen once");
+    vc_video_stream_info stream = FreshStreamInfo();
+    error = FreshError();
+    Check(vc_media_stream_info(session, 0u, &stream, &error) == VC_OK,
+          "stream snapshot is available");
+    Check(stream.stream_index == 0u && stream.media_type ==
+              VC_STREAM_MEDIA_TYPE_VIDEO && stream.codec_id == 27 &&
+              std::string(stream.codec_name_utf8) == "h264",
+          "stream index and codec come from codecpar");
+    Check((stream.present_mask & VC_STREAM_HAS_WIDTH) != 0u &&
+              stream.width == 160 && stream.height == 90,
+          "known codecpar dimensions set the presence bit");
+    Check((stream.present_mask & VC_STREAM_HAS_AUDIO_BIT_DEPTH) == 0u,
+          "unavailable values do not masquerade as zero");
+
+    uint32_t required = 0u;
+    error = FreshError();
+    Check(vc_media_metadata_json(session, -1, nullptr, 0u, &required,
+                                 &error) == VC_OK && required >= 3u,
+          "container tags support required-length query");
+    std::vector<char> tags(required);
+    error = FreshError();
+    Check(vc_media_metadata_json(session, -1, tags.data(), required,
+                                 &required, &error) == VC_OK &&
+              tags.front() == '{' && tags[required - 2u] == '}',
+          "container tags return canonical JSON with NUL capacity");
+    const auto stats = vc::detail::VideoAnalysisTestGetStats();
+    vc::detail::MediaSessionTestSnapshot snapshot{};
+    Check(vc::detail::GetMediaSessionTestSnapshot(session, &snapshot) &&
+              snapshot.io.create_file_calls == 1u &&
+              stats.format_contexts == 1u,
+          "metadata performs no external process or second source traversal");
+    vc_media_close(session);
+}
+
+// Break caught: only the primary decoder is reported and packetless
+// audio/subtitle/attachment or secondary HEVC codecpar streams disappear.
+void TestFrozenMetadataIncludesEveryProbedStream() {
+    AVFormatContext* format = avformat_alloc_context();
+    Check(format != nullptr, "synthetic probed format context allocates");
+    if (format == nullptr) return;
+    format->iformat = av_find_input_format("matroska");
+    format->start_time = AV_NOPTS_VALUE;
+    format->duration = 2 * AV_TIME_BASE;
+    format->bit_rate = 900000;
+    format->probe_score = AVPROBE_SCORE_MAX;
+    av_dict_set(&format->metadata, "zeta", "2", 0);
+    av_dict_set(&format->metadata, "alpha", "1", 0);
+    av_dict_set(&format->metadata, "line", "\xe2\x80\xa8", 0);
+
+    struct StreamSpec {
+        AVMediaType type;
+        AVCodecID codec;
+    };
+    constexpr std::array<StreamSpec, 5> specs{{
+        {AVMEDIA_TYPE_VIDEO, AV_CODEC_ID_H264},
+        {AVMEDIA_TYPE_VIDEO, AV_CODEC_ID_HEVC},
+        {AVMEDIA_TYPE_AUDIO, AV_CODEC_ID_AAC},
+        {AVMEDIA_TYPE_SUBTITLE, AV_CODEC_ID_SUBRIP},
+        {AVMEDIA_TYPE_ATTACHMENT, AV_CODEC_ID_TTF},
+    }};
+    bool allocated = true;
+    for (const StreamSpec spec : specs) {
+        AVStream* stream = avformat_new_stream(format, nullptr);
+        if (stream == nullptr) {
+            allocated = false;
+            break;
+        }
+        stream->time_base = AVRational{1, 1000};
+        stream->codecpar->codec_type = spec.type;
+        stream->codecpar->codec_id = spec.codec;
+        if (spec.type == AVMEDIA_TYPE_VIDEO) {
+            stream->codecpar->width = spec.codec == AV_CODEC_ID_H264 ? 160 : 64;
+            stream->codecpar->height = spec.codec == AV_CODEC_ID_H264 ? 90 : 36;
+            stream->codecpar->format = AV_PIX_FMT_YUV420P;
+        }
+        if (spec.type == AVMEDIA_TYPE_AUDIO) {
+            stream->codecpar->sample_rate = 48000;
+            stream->codecpar->ch_layout = AV_CHANNEL_LAYOUT_STEREO;
+        }
+    }
+    Check(allocated, "all synthetic probed streams allocate");
+    if (!allocated) {
+        avformat_free_context(format);
+        return;
+    }
+    av_dict_set(&format->streams[0]->metadata, "title", "Primary", 0);
+    av_dict_set(&format->streams[2]->metadata, "language", "eng", 0);
+    av_dict_set(&format->streams[3]->metadata, "language", "zho", 0);
+
+    vc::detail::VideoMetadataSnapshot metadata;
+    const AVCodec* decoder = avcodec_find_decoder(AV_CODEC_ID_H264);
+    Check(decoder != nullptr && vc::detail::VideoAnalysisTestFreezeMetadata(
+              format, 0, decoder, 12345u, &metadata),
+          "one probed format context freezes all streams");
+    const uint32_t count = static_cast<uint32_t>(metadata.streams.size());
+    Check(count == 5u, "all five probed streams are frozen");
+    std::array<bool, 6> types{};
+    bool saw_h264 = false;
+    bool saw_hevc = false;
+    for (uint32_t ordinal = 0u; ordinal < count; ++ordinal) {
+        const vc_video_stream_info& stream = metadata.streams[ordinal];
+        if (stream.media_type < types.size()) types[stream.media_type] = true;
+        saw_h264 = saw_h264 ||
+            (stream.codec_id == AV_CODEC_ID_H264 &&
+             std::string(stream.codec_name_utf8) == "h264");
+        saw_hevc = saw_hevc ||
+            (stream.codec_id == AV_CODEC_ID_HEVC &&
+             std::string(stream.codec_name_utf8) == "hevc");
+    }
+    Check(saw_h264 && saw_hevc,
+          "H264 and HEVC codec identities come from codecpar");
+    Check(types[VC_STREAM_MEDIA_TYPE_VIDEO] &&
+              types[VC_STREAM_MEDIA_TYPE_AUDIO] &&
+              types[VC_STREAM_MEDIA_TYPE_SUBTITLE] &&
+              types[VC_STREAM_MEDIA_TYPE_ATTACHMENT],
+          "video audio subtitle and attachment types are preserved");
+    Check(metadata.container_tags ==
+              "{\"alpha\":\"1\",\"line\":\"\\u2028\",\"zeta\":\"2\"}",
+          "container tags use canonical key order");
+    Check(metadata.container.primary_video_stream == 0 &&
+              std::string(metadata.container.decoder_name_utf8) == "h264",
+          "primary stream and decoder match the selected H264 decoder");
+    Check((metadata.streams[3].present_mask & VC_STREAM_HAS_WIDTH) == 0u,
+          "N/A subtitle dimensions remain absent rather than zero-valued");
+    avformat_free_context(format);
 }
 
 void TestFrameMaskZeroAndSparseMask() {
@@ -1166,6 +1353,8 @@ void TestProbeDeadlineAndOverflowSafeSampling() {
 
 int main() {
     for (const auto& fixture : fixtures) TestFixture(fixture);
+    TestFrozenMetadataUsesTheAnalyzedFormatContext();
+    TestFrozenMetadataIncludesEveryProbedStream();
     TestFrameMaskZeroAndSparseMask();
     TestNormalSampleUsesDirectSeekBeforeDecoderPrerollRecovery();
     TestUnknownCadenceUsesLastDecodedFrameAtCleanEof();

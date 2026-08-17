@@ -11,9 +11,44 @@ import (
 	"testing"
 	"time"
 
+	"dedup/internal/proto"
 	"dedup/internal/worker"
 	"dedup/internal/wproc/videocore"
 )
+
+// Break caught: a frame/contact-sheet failure erases metadata that was frozen
+// successfully after the same AVFormatContext completed stream probing.
+func TestSessionPipelineKeepsVideoMetadataWhenContactSheetFails(t *testing.T) {
+	job, deps, fake := newSessionPipelineTest(t, worker.MediaVideo,
+		worker.MaskVideoMetadata|worker.MaskVideoContactSheet, 0)
+	job.Phase = worker.Phase1
+	deps.query = sessionPipelineMissingReply(job,
+		worker.MaskVideoMetadata|worker.MaskVideoContactSheet, 0)
+	primary := int32(0)
+	fake.videoMetadata = &videocore.VideoMetadata{
+		Container: proto.VideoContainerMetadata{
+			FormatName: "mov,mp4", TagsJSON: `{}`, PrimaryVideoStream: &primary,
+		},
+		Streams: []proto.VideoStreamMetadata{{
+			Index: 0, MediaType: "video", CodecID: 27, CodecName: "h264", TagsJSON: `{}`,
+		}},
+	}
+	fake.analyzeErr = errors.New("contact sheet decode failed")
+
+	result, err := processMediaWithDeps(context.Background(), sessionPipelineTestConfig(), job, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.FieldsDone&worker.MaskVideoMetadata == 0 || result.VideoContainer == nil || len(result.VideoStreams) != 1 {
+		t.Fatalf("metadata lost on independent failure: %#v", result)
+	}
+	if result.FieldsDone&worker.MaskVideoContactSheet != 0 || len(result.Errors) == 0 {
+		t.Fatalf("contact failure not isolated: %#v", result)
+	}
+	if fake.rehashes != 1 {
+		t.Fatalf("partial metadata result skipped final identity rehash: %d", fake.rehashes)
+	}
+}
 
 func TestSessionPipelineOneOpenOneHashOneAnalyze(t *testing.T) {
 	job, deps, fake := newSessionPipelineTest(t, worker.MediaImage,
@@ -440,7 +475,7 @@ func TestVideoBaseFeaturesSessionPublishesCompleteContactPayload(t *testing.T) {
 		return paths, nil
 	}
 	deps.query = sessionPipelineMissingReply(
-		job, worker.MaskVideoDuration|worker.MaskVideoContactSheet, 0,
+		job, worker.MaskVideoDuration|worker.MaskVideoContactSheet|worker.MaskVideoMetadata, 0,
 	)
 	published := 0
 	deps.publishContactSheet = func(got ContactSheetPaths, _ ContactSheetMeta, validate func() error) error {
@@ -518,7 +553,7 @@ func TestVideoBaseFeaturesUnpublishedContactPreservesDurationPartial(t *testing.
 				return paths, nil
 			}
 			deps.query = sessionPipelineMissingReply(
-				job, worker.MaskVideoDuration|worker.MaskVideoContactSheet, 0,
+				job, worker.MaskVideoDuration|worker.MaskVideoContactSheet|worker.MaskVideoMetadata, 0,
 			)
 			fake.result = videocore.AnalysisResult{
 				MediaType: 2, DurationStatus: videocore.StatusOK, DurationMS: 4321,
@@ -540,8 +575,9 @@ func TestVideoBaseFeaturesUnpublishedContactPreservesDurationPartial(t *testing.
 			if err != nil {
 				t.Fatal(err)
 			}
-			wantDone := uint32(worker.MaskSHA512 | worker.MaskVideoDuration)
+			wantDone := uint32(worker.MaskSHA512 | worker.MaskVideoDuration | worker.MaskVideoMetadata)
 			if result.FieldsDone != wantDone || result.DurationMS == nil || *result.DurationMS != 4321 ||
+				result.VideoContainer == nil || len(result.VideoStreams) != 1 ||
 				result.ContactSheetStatus != 0 || result.ContactSheetWidth != 0 || result.ContactSheetHeight != 0 ||
 				result.ThumbPath != "" || len(result.ThumbPDQ) != 0 || result.ThumbQuality != nil ||
 				result.ThumbGenerated || len(result.Errors) != 1 ||
@@ -720,18 +756,20 @@ func TestSessionPipelineUnrequestedSHABit(t *testing.T) {
 }
 
 type sessionPipelineFake struct {
-	sha        [64]byte
-	result     videocore.AnalysisResult
-	opens      int
-	hashes     int
-	analyzes   int
-	closes     int
-	request    videocore.AnalysisRequest
-	onAnalyze  func(videocore.AnalysisRequest)
-	analyzeErr error
-	rehashes   int
-	rehashSHA  *[64]byte
-	rehashErr  error
+	sha              [64]byte
+	result           videocore.AnalysisResult
+	opens            int
+	hashes           int
+	analyzes         int
+	closes           int
+	request          videocore.AnalysisRequest
+	onAnalyze        func(videocore.AnalysisRequest)
+	analyzeErr       error
+	videoMetadata    *videocore.VideoMetadata
+	videoMetadataErr error
+	rehashes         int
+	rehashSHA        *[64]byte
+	rehashErr        error
 }
 
 func (fake *sessionPipelineFake) Hash() ([64]byte, error) {
@@ -746,6 +784,10 @@ func (fake *sessionPipelineFake) Analyze(_ context.Context, request videocore.An
 		fake.onAnalyze(request)
 	}
 	return fake.result, fake.analyzeErr
+}
+
+func (fake *sessionPipelineFake) VideoMetadata() (*videocore.VideoMetadata, error) {
+	return fake.videoMetadata, fake.videoMetadataErr
 }
 
 func sessionPipelineMissingReply(job *worker.JobMsg, fields uint32, frames uint8) func(*worker.SHAQueryMsg) (*worker.SHAReplyMsg, error) {
@@ -798,6 +840,19 @@ func newSessionPipelineTest(t *testing.T, kind worker.MediaKind, fields uint32, 
 	t.Helper()
 	info := sessionPipelineTestInfo{size: 1234, mtime: time.Unix(1_700_000_000, 0)}
 	fake := &sessionPipelineFake{}
+	if kind == worker.MediaVideo {
+		primary := int32(0)
+		fake.videoMetadata = &videocore.VideoMetadata{
+			Container: proto.VideoContainerMetadata{
+				FormatName: "mov,mp4", TagsJSON: `{}`,
+				PrimaryVideoStream: &primary, DecoderName: "h264",
+			},
+			Streams: []proto.VideoStreamMetadata{{
+				Index: 0, MediaType: "video", CodecID: 27,
+				CodecName: "h264", TagsJSON: `{}`,
+			}},
+		}
+	}
 	for index := range fake.sha {
 		fake.sha[index] = byte(index)
 	}

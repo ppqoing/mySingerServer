@@ -9,8 +9,20 @@ import (
 	"testing"
 	"time"
 
+	"dedup/internal/proto"
 	"dedup/internal/store"
 )
+
+func deduperTestVideoMetadata() (*proto.VideoContainerMetadata, []proto.VideoStreamMetadata) {
+	primary := int32(0)
+	return &proto.VideoContainerMetadata{
+			FormatName: "mov,mp4", TagsJSON: `{}`,
+			PrimaryVideoStream: &primary, DecoderName: "h264",
+		}, []proto.VideoStreamMetadata{{
+			Index: 0, MediaType: "video", CodecID: 27,
+			CodecName: "h264", TagsJSON: `{}`,
+		}}
+}
 
 type lookupStub struct {
 	mu         sync.Mutex
@@ -128,6 +140,50 @@ func TestDeduperSingleFlight(t *testing.T) {
 	}
 }
 
+func TestDeduperVideoMetadataSingleFlightDeepCopiesPointers(t *testing.T) {
+	sha := bytes64(0x2f)
+	d := NewDeduper(missLookup())
+	owner, err := d.Ask(context.Background(), SHAQueryMsg{
+		JobID: 190, SHA512: sha, Kind: MediaVideo,
+		RequestedFields: MaskVideoMetadata,
+	})
+	if err != nil || owner.Found {
+		t.Fatalf("metadata owner Ask = (%+v, %v)", owner, err)
+	}
+	results := make(chan askResult, 2)
+	for jobID := int64(191); jobID <= 192; jobID++ {
+		go func(id int64) {
+			reply, askErr := d.Ask(context.Background(), SHAQueryMsg{
+				JobID: id, SHA512: sha, Kind: MediaVideo,
+				RequestedFields: MaskVideoMetadata,
+			})
+			results <- askResult{reply: reply, err: askErr}
+		}(jobID)
+	}
+	waitFor(t, "metadata waiters", func() bool {
+		return d.waiterCount(MediaVideo, sha) == 2
+	})
+	container, streams := deduperTestVideoMetadata()
+	width := int32(160)
+	streams[0].Width = &width
+	d.Resolve(JobResultMsg{
+		JobID: owner.JobID, Kind: MediaVideo, SHA512: sha,
+		FieldsDone:     MaskVideoMetadata,
+		VideoContainer: container, VideoStreams: streams,
+	})
+	first, second := (<-results).reply, (<-results).reply
+	if first.VideoContainer == nil || second.VideoContainer == nil ||
+		len(first.VideoStreams) != 1 || len(second.VideoStreams) != 1 {
+		t.Fatalf("metadata replies incomplete: %#v %#v", first, second)
+	}
+	*first.VideoContainer.PrimaryVideoStream = 9
+	*first.VideoStreams[0].Width = 9
+	if *second.VideoContainer.PrimaryVideoStream != 0 ||
+		*second.VideoStreams[0].Width != 160 {
+		t.Fatalf("metadata reply pointers were shared: %#v", second)
+	}
+}
+
 func TestDeduperReusesLateComputedResultOnlyWithinTask(t *testing.T) {
 	sha := bytes64(21)
 	d := NewDeduper(missLookup())
@@ -161,16 +217,25 @@ func TestDeduperStoreHit(t *testing.T) {
 	duration := int64(9100)
 	quality := int32(72)
 	width, height := int32(960), int32(540)
-	lookup := &lookupStub{
-		image: func(context.Context, []byte) (*store.ImageFeature, error) {
-			return &store.ImageFeature{SHA512: sha, PDQ: []byte{3, 4}, Quality: 70, Width: 640, Height: 480}, nil
-		},
-		video: func(context.Context, []byte) (*store.VideoFeature, error) {
-			return &store.VideoFeature{
+	container, streams := deduperTestVideoMetadata()
+	lookup := &contentLookupStub{
+		lookupStub: missLookup(),
+		content: func(_ context.Context, _ []byte, kind store.MediaKind, requested uint32, _ uint8) (store.ContentState, error) {
+			state := store.ContentState{
+				SHA512: sha, FieldsPresent: requested,
+			}
+			if kind == store.MediaImage {
+				state.Image = &store.ImageFeature{SHA512: sha, PDQ: []byte{3, 4}, Quality: 70, Width: 640, Height: 480}
+				return state, nil
+			}
+			state.Video = &store.VideoFeature{
 				SHA512: sha, DurationMS: &duration, ThumbPath: "thumb.jpg",
 				ThumbPDQ: bytes.Repeat([]byte{5}, 32), ThumbQuality: &quality,
 				ThumbWidth: &width, ThumbHeight: &height,
-			}, nil
+			}
+			state.VideoContainer = container
+			state.VideoStreams = streams
+			return state, nil
 		},
 	}
 	d := NewDeduper(lookup)
@@ -395,9 +460,26 @@ func TestDeduperPartialVideoStoreHitBecomesOwner(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			feature := complete()
 			tc.edit(feature)
-			d := NewDeduper(&lookupStub{
-				image: func(context.Context, []byte) (*store.ImageFeature, error) { return nil, nil },
-				video: func(context.Context, []byte) (*store.VideoFeature, error) { return feature, nil },
+			container, streams := deduperTestVideoMetadata()
+			d := NewDeduper(&contentLookupStub{
+				lookupStub: missLookup(),
+				content: func(_ context.Context, _ []byte, _ store.MediaKind, requested uint32, _ uint8) (store.ContentState, error) {
+					state := store.ContentState{
+						SHA512: sha, Video: feature,
+						FieldsPresent:  MaskSHA512 | MaskVideoMetadata,
+						VideoContainer: container, VideoStreams: streams,
+					}
+					if feature.DurationMS != nil {
+						state.FieldsPresent |= MaskVideoDuration
+					}
+					if feature.ThumbPath != "" && len(feature.ThumbPDQ) != 0 &&
+						feature.ThumbQuality != nil && feature.ThumbWidth != nil && feature.ThumbHeight != nil {
+						state.FieldsPresent |= MaskVideoContactSheet
+					}
+					state.FieldsPresent &= requested
+					state.MissingFields = requested &^ state.FieldsPresent
+					return state, nil
+				},
 			})
 			jobID := int64(220 + i)
 			reply, err := d.Ask(context.Background(), SHAQueryMsg{JobID: jobID, SHA512: sha, Kind: MediaVideo})
@@ -554,7 +636,13 @@ func TestDeduperOwnerCrashRetry(t *testing.T) {
 	}
 	duration := int64(1000)
 	quality := int32(80)
-	d.Resolve(JobResultMsg{JobID: newOwner.reply.JobID, Kind: MediaVideo, SHA512: sha, FieldsDone: MaskAllVideo, DurationMS: &duration, ThumbPath: "retry.jpg", ThumbPDQ: []byte{7, 8}, ThumbQuality: &quality})
+	container, streams := deduperTestVideoMetadata()
+	d.Resolve(JobResultMsg{
+		JobID: newOwner.reply.JobID, Kind: MediaVideo, SHA512: sha,
+		FieldsDone: MaskAllVideo, DurationMS: &duration,
+		ThumbPath: "retry.jpg", ThumbPDQ: []byte{7, 8}, ThumbQuality: &quality,
+		VideoContainer: container, VideoStreams: streams,
+	})
 	for i := 1; i < waiters; i++ {
 		result := <-results
 		if result.err != nil || !result.reply.Found {

@@ -260,6 +260,72 @@ VC_API int32_t VC_CALL vc_media_analyze(
         });
 }
 
+VC_API int32_t VC_CALL vc_media_container_info(
+    vc_media_session* session,
+    vc_video_container_info* out,
+    vc_error* err) {
+    return vc::detail::Guard(err, [session, out, err]() -> int32_t {
+        if (!ValidateError(err)) return VC_ERR_ABI;
+        if (session == nullptr) {
+            return Fail(err, VC_ERR_INVALID_ARG, "media session is null");
+        }
+        if (!ValidateStructure(out, err,
+                               "video container info ABI mismatch")) {
+            return out == nullptr ? VC_ERR_INVALID_ARG : VC_ERR_ABI;
+        }
+        return vc::detail::MediaSessionContainerInfo(session, out, err);
+    });
+}
+
+VC_API uint32_t VC_CALL vc_media_stream_count(vc_media_session* session) {
+    return session == nullptr
+               ? 0u
+               : vc::detail::MediaSessionStreamCount(session);
+}
+
+VC_API int32_t VC_CALL vc_media_stream_info(
+    vc_media_session* session,
+    uint32_t ordinal,
+    vc_video_stream_info* out,
+    vc_error* err) {
+    return vc::detail::Guard(err, [session, ordinal, out, err]() -> int32_t {
+        if (!ValidateError(err)) return VC_ERR_ABI;
+        if (session == nullptr) {
+            return Fail(err, VC_ERR_INVALID_ARG, "media session is null");
+        }
+        if (!ValidateStructure(out, err,
+                               "video stream info ABI mismatch")) {
+            return out == nullptr ? VC_ERR_INVALID_ARG : VC_ERR_ABI;
+        }
+        return vc::detail::MediaSessionStreamInfo(
+            session, ordinal, out, err);
+    });
+}
+
+VC_API int32_t VC_CALL vc_media_metadata_json(
+    vc_media_session* session,
+    int32_t stream_index,
+    char* destination,
+    uint32_t capacity,
+    uint32_t* required,
+    vc_error* err) {
+    return vc::detail::Guard(
+        err,
+        [session, stream_index, destination, capacity, required,
+         err]() -> int32_t {
+            if (!ValidateError(err)) return VC_ERR_ABI;
+            if (session == nullptr || required == nullptr ||
+                (destination == nullptr && capacity != 0u)) {
+                return Fail(err, VC_ERR_INVALID_ARG,
+                            "video metadata JSON arguments are invalid");
+            }
+            *required = 0u;
+            return vc::detail::MediaSessionMetadataJson(
+                session, stream_index, destination, capacity, required,
+                err);
+        });
+}
+
 VC_API void VC_CALL vc_media_close(vc_media_session* session) {
     try {
         vc::detail::CloseMediaSession(session);
