@@ -127,18 +127,19 @@ type LocalShutdownResponse struct {
 const (
 	LocalTaskModeScanOnly         = "scan_only"
 	LocalTaskModeScanThenAnalysis = "scan_then_analysis"
-	LocalTaskDisplayStatsVersion  = 1
+	LocalTaskDisplayStatsVersion  = 2
 )
 
 // LocalTaskDisplayStats is the stable JSON payload persisted in
 // LocalTask.StatsJSON. Speed preserves the last non-zero scan rate, Failures is
 // cumulative, and DurationMS accumulates scan and analysis wall-clock time.
 type LocalTaskDisplayStats struct {
-	SchemaVersion int     `json:"schema_version"`
-	Speed         float64 `json:"speed"`
-	Failures      int64   `json:"failures"`
-	DurationMS    int64   `json:"duration_ms"`
-	SyncStatus    string  `json:"sync_status,omitempty"`
+	SchemaVersion int         `json:"schema_version"`
+	Speed         float64     `json:"speed"`
+	Failures      int64       `json:"failures"`
+	DurationMS    int64       `json:"duration_ms"`
+	SyncStatus    string      `json:"sync_status,omitempty"`
+	IO            TaskIOStats `json:"io"`
 }
 
 type LocalTaskControlRequest struct {

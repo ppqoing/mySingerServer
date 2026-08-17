@@ -471,6 +471,27 @@ func (*mainTestDiskController) CancelTask(string, string)               {}
 func (*mainTestDiskController) ReclaimWorker(int)                       {}
 func (*mainTestDiskController) Snapshot(string, string) diskio.Snapshot { return diskio.Snapshot{} }
 
+type localTaskIOController struct {
+	calls     [][2]string
+	snapshots []diskio.Snapshot
+}
+
+func (*localTaskIOController) Acquire(context.Context, diskio.Request) (diskio.Grant, error) {
+	return diskio.Grant{}, nil
+}
+func (*localTaskIOController) Report(diskio.Report)      {}
+func (*localTaskIOController) CancelTask(string, string) {}
+func (*localTaskIOController) ReclaimWorker(int)         {}
+func (c *localTaskIOController) Snapshot(taskID, instanceID string) diskio.Snapshot {
+	c.calls = append(c.calls, [2]string{taskID, instanceID})
+	if len(c.snapshots) == 0 {
+		return diskio.Snapshot{}
+	}
+	result := c.snapshots[0]
+	c.snapshots = c.snapshots[1:]
+	return result
+}
+
 func TestRunServiceClosesStartedPoolWhenServerReturnsError(t *testing.T) {
 	sentinel := errors.New("listen failed")
 	pool := &lifecyclePool{}
@@ -637,6 +658,57 @@ func TestLocalTaskRunnerEmitsStableDisplayStatsAcrossScanAndAnalysis(t *testing.
 	}
 	if want := []int64{5_000, 6_000, 7_000}; !reflect.DeepEqual(analysisDurations, want) {
 		t.Fatalf("analysis durations=%v, want %v", analysisDurations, want)
+	}
+}
+
+// Break caught: local-task scan progress uses aggregate/stale controller data,
+// or a later lower snapshot regresses counters already shown for this instance.
+func TestLocalTaskIOSnapshotUsesExactInstanceAndDoesNotRegress(t *testing.T) {
+	controller := &localTaskIOController{snapshots: []diskio.Snapshot{
+		{},
+		{Concurrency: 4, EffectiveBytesPerSecond: 12_582_912, LeaseWait: 250 * time.Millisecond, SequentialBytes: 67_108_864, SeekCount: 7, BusyWorkers: 3, IOWaitWorkers: 2},
+		{Concurrency: 1, EffectiveBytesPerSecond: 1024, LeaseWait: time.Millisecond, SequentialBytes: 1024, SeekCount: 1, BusyWorkers: 1, IOWaitWorkers: 1},
+	}}
+	runner := &agentLocalTaskRunner{
+		scans: &displayStatsLocalScanRunner{}, analysis: &recordingLocalAnalysisRunner{}, ioController: controller,
+	}
+	request := proto.LocalTaskCreateRequest{TaskID: "io-task", Roots: []string{`D:\media`}, Mode: proto.LocalTaskModeScanThenAnalysis}
+	var updates []localtask.ProgressUpdate
+	if err := runner.Run(localtask.RunControl{Context: context.Background()}, request, localtask.Task{
+		TaskID: request.TaskID, InstanceID: "io-instance", Revision: 17, Phase: "waiting",
+	}, func(update localtask.ProgressUpdate) error {
+		updates = append(updates, update)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(controller.calls) < 3 {
+		t.Fatalf("Snapshot calls=%v, want progress and final snapshots", controller.calls)
+	}
+	for _, call := range controller.calls {
+		if call != [2]string{"io-task", "io-instance"} {
+			t.Fatalf("Snapshot identity=%v, want exact current instance", call)
+		}
+	}
+	var got proto.LocalTaskDisplayStats
+	if err := json.Unmarshal([]byte(updates[len(updates)-1].StatsJSON), &got); err != nil {
+		t.Fatal(err)
+	}
+	want := proto.TaskIOStats{
+		DiskConcurrency: 4, EffectiveReadBPS: 12_582_912, LeaseWaitMS: 250,
+		SequentialBytes: 67_108_864, SeekCount: 7, BusyWorkers: 3, IOWaitWorkers: 2,
+	}
+	if got.IO != want {
+		t.Fatalf("final I/O stats=%#v, want monotonic %#v", got.IO, want)
+	}
+}
+
+// Break caught: Stats v2 rejects persisted v1 values wholesale instead of
+// carrying the original display fields forward with zero-valued I/O metrics.
+func TestLocalTaskIOStatsV1DecodePreservesLegacyFields(t *testing.T) {
+	got := runnerDecodeDisplayStats(`{"schema_version":1,"speed":6.5,"failures":2,"duration_ms":9000}`)
+	if got.SchemaVersion != 2 || got.Speed != 6.5 || got.Failures != 2 || got.DurationMS != 9_000 || got.IO != (proto.TaskIOStats{}) {
+		t.Fatalf("decoded v1 stats=%#v", got)
 	}
 }
 

@@ -4,7 +4,19 @@ import userEvent from '@testing-library/user-event'
 import { LocalTaskItem } from './LocalTaskItem'
 import type { LocalTask } from './localTaskLifecycle'
 
-const runningTask: LocalTask = {
+type LocalTaskWithIO = LocalTask & {
+  io: {
+    diskConcurrency: number
+    effectiveReadBps: number
+    leaseWaitMs: number
+    sequentialBytes: number
+    seekCount: number
+    busyWorkers: number
+    ioWaitWorkers: number
+  }
+}
+
+const runningTask: LocalTaskWithIO = {
   taskId: 'task-abcdef0123456789',
   instanceId: 'instance-new',
   revision: 7,
@@ -20,6 +32,15 @@ const runningTask: LocalTask = {
   speed: '12 文件/秒',
   failures: 2,
   duration: '00:03:12',
+  io: {
+    diskConcurrency: 4,
+    effectiveReadBps: 12_582_912,
+    leaseWaitMs: 250,
+    sequentialBytes: 67_108_864,
+    seekCount: 7,
+    busyWorkers: 3,
+    ioWaitWorkers: 2,
+  },
   syncStatus: '本机已保存',
   createdAt: 1_725_000_000_000,
   updatedAt: 1_725_000_010_000,
@@ -44,6 +65,48 @@ describe('LocalTaskItem', () => {
 
     expect(screen.getByRole('progressbar')).toHaveAttribute('value', '40')
     expect(screen.getByRole('progressbar')).toHaveAttribute('max', '100')
+  })
+
+  it('在可展开详情中格式化七项磁盘 I/O 指标且不扩充主行字段', async () => {
+    render(<LocalTaskItem task={runningTask} locked={false} onAction={vi.fn()} />)
+    const user = userEvent.setup()
+
+    const details = screen.getByText('磁盘 I/O 详情').closest('details')
+    expect(details).not.toHaveAttribute('open')
+    await user.click(screen.getByText('磁盘 I/O 详情'))
+    expect(details).toHaveAttribute('open')
+    expect(details).toHaveTextContent('磁盘并发4')
+    expect(details).toHaveTextContent('有效读取速度12 MiB/s')
+    expect(details).toHaveTextContent('租约等待250 ms')
+    expect(details).toHaveTextContent('顺序字节64 MiB')
+    expect(details).toHaveTextContent('Seek7')
+    expect(details).toHaveTextContent('忙 Worker3')
+    expect(details).toHaveTextContent('I/O 等待 Worker2')
+    expect(screen.getByRole('listitem').querySelectorAll('[data-local-task-field]')).toHaveLength(6)
+  })
+
+  it('将零值和非有限 I/O 指标显示为占位符', async () => {
+    render(<LocalTaskItem task={{
+      ...runningTask,
+      io: {
+        diskConcurrency: 0,
+        effectiveReadBps: Number.NaN,
+        leaseWaitMs: 0,
+        sequentialBytes: Number.POSITIVE_INFINITY,
+        seekCount: 0,
+        busyWorkers: 0,
+        ioWaitWorkers: 0,
+      },
+    } as LocalTaskWithIO} locked={false} onAction={vi.fn()} />)
+    await userEvent.click(screen.getByText('磁盘 I/O 详情'))
+
+    const details = screen.getByText('磁盘 I/O 详情').closest('details')
+    expect(details?.querySelectorAll('dd')).toHaveLength(7)
+    for (const value of details?.querySelectorAll('dd') ?? []) {
+      expect(value).toHaveTextContent('—')
+    }
+    expect(details).not.toHaveTextContent('NaN')
+    expect(details).not.toHaveTextContent('Infinity')
   })
 
   it('将真实 scan_only 模式映射为中文', () => {

@@ -32,6 +32,32 @@ const safeProgress = (complete: number, total: number): { value: number; max: nu
   return { value, max }
 }
 
+type LocalTaskIO = {
+  diskConcurrency: number
+  effectiveReadBps: number
+  leaseWaitMs: number
+  sequentialBytes: number
+  seekCount: number
+  busyWorkers: number
+  ioWaitWorkers: number
+}
+
+const positive = (value: number | undefined): value is number => Number.isFinite(value) && (value ?? 0) > 0
+const compact = (value: number): string => Number.isInteger(value) ? String(value) : value.toFixed(1).replace(/\.0$/, '')
+const formatCount = (value: number | undefined): string => positive(value) ? String(Math.trunc(value)) : '—'
+const formatMilliseconds = (value: number | undefined): string => positive(value) ? `${compact(value)} ms` : '—'
+const formatBytes = (value: number | undefined, perSecond = false): string => {
+  if (!positive(value)) return '—'
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB']
+  let scaled = value
+  let unit = 0
+  while (scaled >= 1024 && unit < units.length - 1) {
+    scaled /= 1024
+    unit += 1
+  }
+  return `${compact(scaled)} ${units[unit]}${perSecond ? '/s' : ''}`
+}
+
 export function LocalTaskItem({
   task,
   locked,
@@ -51,6 +77,7 @@ export function LocalTaskItem({
   const knownProgress = task.progressTotalKnown
   const progress = safeProgress(complete, task.progressTotal)
   const displayTotal = Number.isFinite(task.progressTotal) ? Math.max(0, task.progressTotal) : 0
+  const io = (task as LocalTask & { io?: Partial<LocalTaskIO> }).io ?? {}
 
   return <li className="local-task-item" data-instance-id={task.instanceId}>
     <div className="local-task-item__identity" data-local-task-field="identity">
@@ -66,6 +93,18 @@ export function LocalTaskItem({
     </div>
     <div className="local-task-item__count" data-local-task-field="count">{complete} / {knownProgress ? displayTotal : '--'}</div>
     <div className="local-task-item__metrics" data-local-task-field="metrics">{task.speed || '—'} · 失败 {task.failures ?? 0} · {task.duration || '—'}</div>
+    <details className="local-task-item__io">
+      <summary>磁盘 I/O 详情</summary>
+      <dl>
+        <div><dt>磁盘并发</dt><dd>{formatCount(io.diskConcurrency)}</dd></div>
+        <div><dt>有效读取速度</dt><dd>{formatBytes(io.effectiveReadBps, true)}</dd></div>
+        <div><dt>租约等待</dt><dd>{formatMilliseconds(io.leaseWaitMs)}</dd></div>
+        <div><dt>顺序字节</dt><dd>{formatBytes(io.sequentialBytes)}</dd></div>
+        <div><dt>Seek</dt><dd>{formatCount(io.seekCount)}</dd></div>
+        <div><dt>忙 Worker</dt><dd>{formatCount(io.busyWorkers)}</dd></div>
+        <div><dt>I/O 等待 Worker</dt><dd>{formatCount(io.ioWaitWorkers)}</dd></div>
+      </dl>
+    </details>
     <div className="local-task-item__actions action-bar" data-local-task-field="actions" aria-label="任务操作">
       {actions.length > 0
         ? actions.map((operation) => <button key={operation} type="button" className="button-secondary" disabled={locked} onClick={() => onAction(operation, control)}>{actionLabel(operation, task.status)}</button>)

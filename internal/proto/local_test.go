@@ -15,16 +15,52 @@ func TestLocalTaskDisplayStatsJSONContract(t *testing.T) {
 	encoded, err := json.Marshal(LocalTaskDisplayStats{
 		SchemaVersion: LocalTaskDisplayStatsVersion,
 		Speed:         12.5, Failures: 3, DurationMS: 192_000,
+		IO: TaskIOStats{
+			DiskConcurrency: 4, EffectiveReadBPS: 12_582_912, LeaseWaitMS: 250,
+			SequentialBytes: 67_108_864, SeekCount: 7, BusyWorkers: 3, IOWaitWorkers: 2,
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := string(encoded), `{"schema_version":1,"speed":12.5,"failures":3,"duration_ms":192000}`; got != want {
+	if got, want := string(encoded), `{"schema_version":2,"speed":12.5,"failures":3,"duration_ms":192000,"io":{"disk_concurrency":4,"effective_read_bps":12582912,"lease_wait_ms":250,"sequential_bytes":67108864,"seek_count":7,"busy_workers":3,"io_wait_workers":2}}`; got != want {
 		t.Fatalf("json=%s, want %s", got, want)
 	}
 	var invalid LocalTaskDisplayStats
 	if err := json.Unmarshal([]byte(`{"schema_version":1,"speed":"12.5","failures":3,"duration_ms":192000}`), &invalid); err == nil {
 		t.Fatal("string speed unexpectedly accepted by numeric display stats contract")
+	}
+}
+
+// Break caught: bumping display stats to v2 makes persisted v1 tasks lose the
+// legacy speed/failure/duration fields instead of defaulting only new I/O data.
+func TestLocalTaskIOStatsV1JSONDefaultsIOToZero(t *testing.T) {
+	var stats LocalTaskDisplayStats
+	if err := json.Unmarshal([]byte(`{"schema_version":1,"speed":8.5,"failures":2,"duration_ms":4500}`), &stats); err != nil {
+		t.Fatal(err)
+	}
+	if stats.Speed != 8.5 || stats.Failures != 2 || stats.DurationMS != 4_500 || stats.IO != (TaskIOStats{}) {
+		t.Fatalf("decoded v1 stats=%#v", stats)
+	}
+}
+
+// Break caught: TaskProgress gains display-only JSON fields but omits its I/O
+// metrics from the MessagePack boundary used by Agent progress callbacks.
+func TestLocalTaskIOProgressMessagePackRoundTrip(t *testing.T) {
+	want := TaskProgress{TaskID: "io-task", Done: 3, Total: 9, IO: TaskIOStats{
+		DiskConcurrency: 2, EffectiveReadBPS: 4096, LeaseWaitMS: 12,
+		SequentialBytes: 8192, SeekCount: 4, BusyWorkers: 2, IOWaitWorkers: 1,
+	}}
+	raw, err := msgpack.Marshal(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got TaskProgress
+	if err := msgpack.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("round trip=%#v, want %#v", got, want)
 	}
 }
 

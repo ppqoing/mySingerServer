@@ -223,7 +223,8 @@ summary:focus-visible {
   grid-template-columns: minmax(220px, 1.4fr) minmax(150px, 0.8fr) auto;
   grid-template-areas:
     'identity status actions'
-    'progress count metrics';
+    'progress count metrics'
+    'details details details';
   gap: var(--space-1);
   align-items: center;
   min-width: 0;
@@ -249,6 +250,37 @@ summary:focus-visible {
 .local-task-item__count { grid-area: count; }
 .local-task-item__metrics { grid-area: metrics; }
 .local-task-item__actions { grid-area: actions; }
+
+.local-task-item__io {
+  grid-area: details;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.local-task-item__io dl {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: var(--space-1);
+  margin: var(--space-1) 0 0;
+}
+
+.local-task-item__io dl > div {
+  min-width: 0;
+}
+
+.local-task-item__io dt,
+.local-task-item__io dd {
+  overflow-wrap: anywhere;
+}
+
+.local-task-item__io dt {
+  color: var(--color-text-muted);
+  font-size: 13px;
+}
+
+.local-task-item__io dd {
+  margin: 2px 0 0;
+}
 
 .local-task-item__id,
 .local-task-item__count,
@@ -423,6 +455,7 @@ details > summary {
       'progress'
       'count'
       'metrics'
+      'details'
       'actions';
   }
 }

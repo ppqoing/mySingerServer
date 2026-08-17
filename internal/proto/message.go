@@ -364,14 +364,25 @@ type StatsReport struct {
 	DecodeP95MS  float64     `msgpack:"decode_p95_ms,omitempty"`
 }
 
+type TaskIOStats struct {
+	DiskConcurrency  int     `json:"disk_concurrency" msgpack:"disk_concurrency"`
+	EffectiveReadBPS float64 `json:"effective_read_bps" msgpack:"effective_read_bps"`
+	LeaseWaitMS      int64   `json:"lease_wait_ms" msgpack:"lease_wait_ms"`
+	SequentialBytes  int64   `json:"sequential_bytes" msgpack:"sequential_bytes"`
+	SeekCount        int64   `json:"seek_count" msgpack:"seek_count"`
+	BusyWorkers      int     `json:"busy_workers" msgpack:"busy_workers"`
+	IOWaitWorkers    int     `json:"io_wait_workers" msgpack:"io_wait_workers"`
+}
+
 type TaskProgress struct {
-	TaskID     string  `msgpack:"task_id"`
-	Done       int64   `msgpack:"done"`
-	Total      int64   `msgpack:"total"`
-	TotalKnown bool    `msgpack:"total_known"`
-	Failed     int64   `msgpack:"failed"`
-	ElapsedMS  int64   `msgpack:"elapsed_ms"`
-	Speed      float64 `msgpack:"speed"`
+	TaskID     string      `msgpack:"task_id"`
+	Done       int64       `msgpack:"done"`
+	Total      int64       `msgpack:"total"`
+	TotalKnown bool        `msgpack:"total_known"`
+	Failed     int64       `msgpack:"failed"`
+	ElapsedMS  int64       `msgpack:"elapsed_ms"`
+	Speed      float64     `msgpack:"speed"`
+	IO         TaskIOStats `msgpack:"io"`
 }
 
 type FeatureItem struct {

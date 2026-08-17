@@ -234,15 +234,28 @@ func mapLocalTask(value proto.LocalTask) traymodel.LocalTask {
 		ErrorCode: value.SafeErrorCode, ErrorSummary: sanitizeText(value.SafeErrorMessage), CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt,
 		StartedAt: value.StartedAt, CompletedAt: value.CompletedAt, SyncStatus: "本机已保存"}
 	var stats proto.LocalTaskDisplayStats
-	if json.Unmarshal([]byte(value.StatsJSON), &stats) == nil && stats.SchemaVersion == proto.LocalTaskDisplayStatsVersion {
+	if json.Unmarshal([]byte(value.StatsJSON), &stats) == nil && (stats.SchemaVersion == 1 || stats.SchemaVersion == proto.LocalTaskDisplayStatsVersion) {
 		result.Speed = formatLocalTaskSpeed(stats.Speed)
 		result.Failures = max(stats.Failures, 0)
 		result.Duration = formatLocalTaskDuration(stats.DurationMS)
+		result.IO = mapLocalTaskIO(stats.IO)
 		if stats.SyncStatus != "" {
 			result.SyncStatus = sanitizeText(stats.SyncStatus)
 		}
 	}
 	return result
+}
+
+func mapLocalTaskIO(value proto.TaskIOStats) traymodel.LocalTaskIOStats {
+	effectiveReadBPS := value.EffectiveReadBPS
+	if effectiveReadBPS < 0 || math.IsNaN(effectiveReadBPS) || math.IsInf(effectiveReadBPS, 0) {
+		effectiveReadBPS = 0
+	}
+	return traymodel.LocalTaskIOStats{
+		DiskConcurrency: max(value.DiskConcurrency, 0), EffectiveReadBPS: effectiveReadBPS,
+		LeaseWaitMS: max(value.LeaseWaitMS, 0), SequentialBytes: max(value.SequentialBytes, 0),
+		SeekCount: max(value.SeekCount, 0), BusyWorkers: max(value.BusyWorkers, 0), IOWaitWorkers: max(value.IOWaitWorkers, 0),
+	}
 }
 
 func formatLocalTaskSpeed(speed float64) string {

@@ -301,6 +301,10 @@ func TestListLocalTasksMapsProductionDisplayStatsJSON(t *testing.T) {
 	statsJSON, err := json.Marshal(proto.LocalTaskDisplayStats{
 		SchemaVersion: proto.LocalTaskDisplayStatsVersion,
 		Speed:         12.5, Failures: 1, DurationMS: 192_000,
+		IO: proto.TaskIOStats{
+			DiskConcurrency: 4, EffectiveReadBPS: 12_582_912, LeaseWaitMS: 250,
+			SequentialBytes: 67_108_864, SeekCount: 7, BusyWorkers: 3, IOWaitWorkers: 2,
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -320,6 +324,28 @@ func TestListLocalTasksMapsProductionDisplayStatsJSON(t *testing.T) {
 	task := page.Tasks[0]
 	if task.Speed != "12.5 文件/秒" || task.Failures != 1 || task.Duration != "00:03:12" {
 		t.Fatalf("mapped task=%#v", task)
+	}
+	if task.IO != (traymodel.LocalTaskIOStats{
+		DiskConcurrency: 4, EffectiveReadBPS: 12_582_912, LeaseWaitMS: 250,
+		SequentialBytes: 67_108_864, SeekCount: 7, BusyWorkers: 3, IOWaitWorkers: 2,
+	}) {
+		t.Fatalf("mapped I/O=%#v", task.IO)
+	}
+}
+
+// Break caught: NodeTray treats persisted schema v1 as invalid after the v2
+// rollout and blanks its legacy display fields instead of only zeroing I/O.
+func TestLocalTaskIOStatsV1MapsLegacyFieldsWithZeroIO(t *testing.T) {
+	service, _, _, _, _, _ := serviceFixture(t)
+	service.localAgent = &fakeLocalAgentGateway{responses: map[string]any{
+		proto.LocalOperationTaskList: proto.LocalTaskListResponse{Tasks: []proto.LocalTask{{
+			TaskID: "legacy", InstanceID: "legacy-instance", Revision: 3,
+			StatsJSON: `{"schema_version":1,"speed":5.5,"failures":2,"duration_ms":3000}`,
+		}}},
+	}}
+	task := service.ListLocalTasks(context.Background(), traymodel.PageRequest{Limit: 1}).Tasks[0]
+	if task.Speed != "5.5 文件/秒" || task.Failures != 2 || task.Duration != "00:00:03" || task.IO != (traymodel.LocalTaskIOStats{}) {
+		t.Fatalf("mapped legacy task=%#v", task)
 	}
 }
 

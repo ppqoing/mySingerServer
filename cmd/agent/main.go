@@ -326,7 +326,7 @@ func runWithDependencies(
 	stageOne := localanalysis.NewStageOne(local, local, firstscreen.DefaultConfig(), logger)
 	stageWorker := agent.NewLocalStageWorker(fairPool, router)
 	analysisEngine := localanalysis.NewEngine(cfg.MachineID, stageOne, local, stageWorker, config.DefaultGUI().Phase2)
-	tasks := localtask.NewService(cfg.MachineID, local, &agentLocalTaskRunner{scans: scans, analysis: analysisEngine})
+	tasks := localtask.NewService(cfg.MachineID, local, &agentLocalTaskRunner{scans: scans, analysis: analysisEngine, ioController: ioController})
 	reviews := localreview.NewService(cfg.MachineID, local)
 	previews := localpreview.NewService(cfg.MachineID, local, stageWorker)
 	resumeLocalTasks, err := prepareLocalTaskLifecycle(ctx, tasks, logger)
@@ -802,9 +802,10 @@ type localScanRunner interface {
 }
 
 type agentLocalTaskRunner struct {
-	scans    localScanRunner
-	analysis localAnalysisRunner
-	now      func() time.Time
+	scans        localScanRunner
+	analysis     localAnalysisRunner
+	ioController diskio.Controller
+	now          func() time.Time
 }
 
 func (r *agentLocalTaskRunner) currentTime() time.Time {
@@ -839,14 +840,16 @@ func (r *agentLocalTaskRunner) Run(control localtask.RunControl, request localta
 		}
 		var callbackErr error
 		reportScan := func(message proto.TaskProgress, checkpoint int, finalStats *proto.TaskStats) {
+			if r.ioController != nil {
+				message.IO = runnerTaskIOStats(r.ioController.Snapshot(request.TaskID, snapshot.InstanceID))
+			}
 			progressMu.Lock()
 			message.Done = max(message.Done, latest.Done)
 			message.Total = max(message.Total, latest.Total)
 			message.TotalKnown = message.TotalKnown || latest.TotalKnown
 			latest = message
-			if finalStats == nil {
-				displayStats = runnerMergeProgressStats(displayStats, message)
-			} else {
+			displayStats = runnerMergeProgressStats(displayStats, message)
+			if finalStats != nil {
 				displayStats = runnerMergeFinalStats(displayStats, *finalStats)
 			}
 			statsJSON := runnerDisplayStatsJSON(displayStats)
@@ -1015,14 +1018,16 @@ func runnerDisplayStatsJSON(stats proto.LocalTaskDisplayStats) string {
 
 func runnerDecodeDisplayStats(statsJSON string) proto.LocalTaskDisplayStats {
 	var stats proto.LocalTaskDisplayStats
-	if json.Unmarshal([]byte(statsJSON), &stats) != nil || stats.SchemaVersion != proto.LocalTaskDisplayStatsVersion {
+	if json.Unmarshal([]byte(statsJSON), &stats) != nil || (stats.SchemaVersion != 1 && stats.SchemaVersion != proto.LocalTaskDisplayStatsVersion) {
 		return proto.LocalTaskDisplayStats{SchemaVersion: proto.LocalTaskDisplayStatsVersion}
 	}
+	stats.SchemaVersion = proto.LocalTaskDisplayStatsVersion
 	if math.IsNaN(stats.Speed) || math.IsInf(stats.Speed, 0) || stats.Speed < 0 {
 		stats.Speed = 0
 	}
 	stats.Failures = max(stats.Failures, 0)
 	stats.DurationMS = max(stats.DurationMS, 0)
+	stats.IO = runnerMergeIOStats(proto.TaskIOStats{}, stats.IO)
 	return stats
 }
 
@@ -1032,12 +1037,34 @@ func runnerMergeProgressStats(current proto.LocalTaskDisplayStats, progress prot
 	}
 	current.Failures = max(current.Failures, progress.Failed)
 	current.DurationMS = max(current.DurationMS, progress.ElapsedMS)
+	current.IO = runnerMergeIOStats(current.IO, progress.IO)
 	return current
 }
 
 func runnerMergeFinalStats(current proto.LocalTaskDisplayStats, stats proto.TaskStats) proto.LocalTaskDisplayStats {
 	current.Failures = max(current.Failures, stats.Failed)
 	current.DurationMS = max(current.DurationMS, stats.ElapsedMS)
+	return current
+}
+
+func runnerTaskIOStats(snapshot diskio.Snapshot) proto.TaskIOStats {
+	return proto.TaskIOStats{
+		DiskConcurrency: snapshot.Concurrency, EffectiveReadBPS: snapshot.EffectiveBytesPerSecond,
+		LeaseWaitMS: snapshot.LeaseWait.Milliseconds(), SequentialBytes: snapshot.SequentialBytes,
+		SeekCount: snapshot.SeekCount, BusyWorkers: snapshot.BusyWorkers, IOWaitWorkers: snapshot.IOWaitWorkers,
+	}
+}
+
+func runnerMergeIOStats(current, update proto.TaskIOStats) proto.TaskIOStats {
+	current.DiskConcurrency = max(current.DiskConcurrency, max(update.DiskConcurrency, 0))
+	if update.EffectiveReadBPS > current.EffectiveReadBPS && !math.IsNaN(update.EffectiveReadBPS) && !math.IsInf(update.EffectiveReadBPS, 0) {
+		current.EffectiveReadBPS = update.EffectiveReadBPS
+	}
+	current.LeaseWaitMS = max(current.LeaseWaitMS, max(update.LeaseWaitMS, 0))
+	current.SequentialBytes = max(current.SequentialBytes, max(update.SequentialBytes, 0))
+	current.SeekCount = max(current.SeekCount, max(update.SeekCount, 0))
+	current.BusyWorkers = max(current.BusyWorkers, max(update.BusyWorkers, 0))
+	current.IOWaitWorkers = max(current.IOWaitWorkers, max(update.IOWaitWorkers, 0))
 	return current
 }
 

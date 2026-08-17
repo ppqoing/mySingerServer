@@ -776,6 +776,30 @@ export namespace traymodel {
 		    return a;
 		}
 	}
+	export class LocalTaskIOStats {
+	    diskConcurrency: number;
+	    effectiveReadBps: number;
+	    leaseWaitMs: number;
+	    sequentialBytes: number;
+	    seekCount: number;
+	    busyWorkers: number;
+	    ioWaitWorkers: number;
+
+	    static createFrom(source: any = {}) {
+	        return new LocalTaskIOStats(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.diskConcurrency = source["diskConcurrency"];
+	        this.effectiveReadBps = source["effectiveReadBps"];
+	        this.leaseWaitMs = source["leaseWaitMs"];
+	        this.sequentialBytes = source["sequentialBytes"];
+	        this.seekCount = source["seekCount"];
+	        this.busyWorkers = source["busyWorkers"];
+	        this.ioWaitWorkers = source["ioWaitWorkers"];
+	    }
+	}
 	export class LocalTask {
 	    taskId: string;
 	    instanceId: string;
@@ -792,6 +816,7 @@ export namespace traymodel {
 	    speed: string;
 	    failures: number;
 	    duration: string;
+	    io: LocalTaskIOStats;
 	    syncStatus: string;
 	    errorCode: string;
 	    errorSummary: string;
@@ -821,6 +846,7 @@ export namespace traymodel {
 	        this.speed = source["speed"];
 	        this.failures = source["failures"];
 	        this.duration = source["duration"];
+	        this.io = this.convertValues(source["io"], LocalTaskIOStats);
 	        this.syncStatus = source["syncStatus"];
 	        this.errorCode = source["errorCode"];
 	        this.errorSummary = source["errorSummary"];
@@ -829,6 +855,24 @@ export namespace traymodel {
 	        this.startedAt = source["startedAt"];
 	        this.completedAt = source["completedAt"];
 	    }
+
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
 	}
 	export class LocalTaskControl {
 	    taskId: string;
