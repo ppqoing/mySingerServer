@@ -152,6 +152,18 @@ bool ValidFrame(const ContactSheetFrame& frame) noexcept {
            frame.gray->height == frame.rgb->height;
 }
 
+bool CheckedMultiply(uint64_t left,
+                     uint64_t right,
+                     uint64_t* product) noexcept {
+    if (product == nullptr ||
+        (right != 0u &&
+         left > (std::numeric_limits<uint64_t>::max)() / right)) {
+        return false;
+    }
+    *product = left * right;
+    return true;
+}
+
 bool SafeCanvasSize(int32_t tile_width,
                     int32_t tile_height,
                     int32_t* canvas_width,
@@ -161,18 +173,30 @@ bool SafeCanvasSize(int32_t tile_width,
         canvas_height == nullptr || canvas_bytes == nullptr) {
         return false;
     }
-    const uint64_t width = static_cast<uint64_t>(tile_width) * 3u;
-    const uint64_t height = static_cast<uint64_t>(tile_height) * 2u;
-    const uint64_t bytes = width * height;
-    if (bytes > (std::numeric_limits<uint64_t>::max)() / 3u) {
+    uint64_t width = 0u;
+    uint64_t height = 0u;
+    if (!CheckedMultiply(static_cast<uint64_t>(tile_width), 3u, &width) ||
+        !CheckedMultiply(static_cast<uint64_t>(tile_height), 2u, &height) ||
+        width > static_cast<uint64_t>((std::numeric_limits<int32_t>::max)()) ||
+        height > static_cast<uint64_t>((std::numeric_limits<int32_t>::max)())) {
         return false;
     }
-    const uint64_t color_bytes = bytes * 3u;
-    const uint64_t retained_rgb_bytes =
-        static_cast<uint64_t>(tile_width) * tile_height * 3u *
-        VC_VIDEO_FRAME_COUNT;
-    if (width > static_cast<uint64_t>((std::numeric_limits<int32_t>::max)()) ||
-        height > static_cast<uint64_t>((std::numeric_limits<int32_t>::max)()) ||
+    uint64_t tile_pixels = 0u;
+    uint64_t bytes = 0u;
+    uint64_t color_bytes = 0u;
+    uint64_t retained_gray_bytes = 0u;
+    uint64_t retained_rgb_bytes = 0u;
+    uint64_t conversion_rgb_peak_bytes = 0u;
+    if (!CheckedMultiply(static_cast<uint64_t>(tile_width),
+                         static_cast<uint64_t>(tile_height), &tile_pixels) ||
+        !CheckedMultiply(width, height, &bytes) ||
+        !CheckedMultiply(bytes, 3u, &color_bytes) ||
+        !CheckedMultiply(tile_pixels, VC_VIDEO_FRAME_COUNT,
+                         &retained_gray_bytes) ||
+        !CheckedMultiply(tile_pixels, 3u * VC_VIDEO_FRAME_COUNT,
+                         &retained_rgb_bytes) ||
+        !CheckedMultiply(tile_pixels, 3u * 2u,
+                         &conversion_rgb_peak_bytes) ||
         bytes > static_cast<uint64_t>((std::numeric_limits<size_t>::max)())) {
         return false;
     }
@@ -183,12 +207,10 @@ bool SafeCanvasSize(int32_t tile_width,
         return false;
     }
     const uint64_t feature_pixels = feature_width * feature_height;
-    if (feature_pixels > (std::numeric_limits<uint64_t>::max)() /
-                             (sizeof(float) * 2u)) {
+    uint64_t pdq_bytes = 0u;
+    if (!CheckedMultiply(feature_pixels, sizeof(float) * 2u, &pdq_bytes)) {
         return false;
     }
-    const uint64_t pdq_bytes =
-        feature_pixels * sizeof(float) * 2u;
     const uint64_t feature_gray_bytes =
         (width < 8u || height < 8u) ? feature_pixels : 0u;
     const unsigned long jpeg_bytes = tjBufSize(
@@ -202,7 +224,9 @@ bool SafeCanvasSize(int32_t tile_width,
         total += value;
         return true;
     };
-    if (!add_to_budget(retained_rgb_bytes) ||
+    if (!add_to_budget(retained_gray_bytes) ||
+        !add_to_budget(retained_rgb_bytes) ||
+        !add_to_budget(conversion_rgb_peak_bytes) ||
         !add_to_budget(bytes) || !add_to_budget(color_bytes) ||
         !add_to_budget(feature_gray_bytes) ||
         !add_to_budget(pdq_bytes) ||

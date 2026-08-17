@@ -339,14 +339,16 @@ void TestTileDimensions() {
               INT32_MAX, INT32_MAX, UINT32_MAX, &width, &height) ==
               VC_ERR_OUTPUT_TOO_LARGE,
           "oversized tile request is rejected without overflow");
+    // 1472: 268,404,736 bytes; 1473: 269,059,174 bytes.
+    // The fixed limit is 268,435,456 bytes.
     Check(vc::detail::ContactSheetTileDimensions(
-              8, 8, 1500u, &width, &height) == VC_OK &&
-              width == 1500 && height == 1500,
-          "working-set budget accepts a square tile below 256 MiB");
+              8, 8, 1472u, &width, &height) == VC_OK &&
+              width == 1472 && height == 1472,
+          "peak working-set budget accepts the final square tile below 256 MiB");
     Check(vc::detail::ContactSheetTileDimensions(
-              8, 8, 1700u, &width, &height) ==
+              8, 8, 1473u, &width, &height) ==
               VC_ERR_OUTPUT_TOO_LARGE,
-          "working-set budget rejects a square tile above 256 MiB");
+          "peak working-set budget rejects the first square tile above 256 MiB");
     Check(vc::detail::ContactSheetTileDimensions(
               8, 12000000, 1500000u, &width, &height) ==
               VC_ERR_OUTPUT_TOO_LARGE,

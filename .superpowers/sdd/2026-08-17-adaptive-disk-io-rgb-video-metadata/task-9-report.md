@@ -23,3 +23,11 @@
 - 构建缓存：`C:\tmp\mysingerserver-task9-standard-build`。
 - 新鲜 stage：`C:\tmp\mysingerserver-task9-stage`。
 - 标准构建产生的非白名单 `internal/wproc/videocore/libvideocore.a` 已恢复到 BASE；工作树内原 `videocore/build` 已恢复。
+
+## 修复轮次 1：256 MiB 峰值预算
+
+- 复审确认原预算遗漏六张保留灰度 tile，以及旋转转换期间同时存在的 `pre_rotated` 与 `rotated` RGB tile。
+- 新增手算确定性边界测试：方形 tile 最大边 1472 时峰值低于 256 MiB 并接受，1473 时超过 256 MiB 并拒绝；旧实现对 1473 错误接受，取得有效 RED。
+- `SafeCanvasSize` 改用溢出安全乘法，统一计入六张灰度 tile、六张 RGB tile、单帧双 RGB 转换峰值、灰度/RGB 双 canvas、PDQ 临时区、JPEG 预分配缓冲及安全余量。
+- GREEN 后 focused 三项 3/3 通过，灰度联系表 SHA-256 与 legacy golden 保持不变。
+- 新鲜标准门禁 20/20 通过，14/14 精确导出及递归原生 DLL 闭包通过；缓存位于 `C:\tmp\mysingerserver-task9-repair1-build`，stage 位于 `C:\tmp\mysingerserver-task9-repair1-stage`。
