@@ -1,0 +1,405 @@
+syntax = "proto3";
+
+package mysingerserver.v2;
+
+message ContentKey {
+  bytes md5 = 1;
+  uint64 file_size = 2;
+}
+
+message LocationKey {
+  string machine_id = 1;
+  string normalized_path = 2;
+}
+
+message Thresholds {
+  uint32 pdq_quality_min = 1;
+  float aspect_tolerance = 2;
+  uint32 pdq_hamming_max = 3;
+  uint32 phash_part_hamming_max = 4;
+  uint32 phash_min_passed_parts = 5;
+  float sobel_min = 6;
+  uint32 video_min_valid_frames = 7;
+  float video_stage1_min = 8;
+  float video_stage2_min = 9;
+}
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  INVALID_REQUEST = 1;
+  NODE_BUSY = 2;
+  NOT_FOUND = 3;
+  CONFLICT = 4;
+  SNAPSHOT_REQUIRED = 5;
+  INTERNAL = 6;
+}
+
+enum TaskState {
+  TASK_STATE_UNSPECIFIED = 0;
+  TASK_QUEUED = 1;
+  TASK_RUNNING = 2;
+  TASK_COMPLETED = 3;
+  TASK_FAILED = 4;
+  TASK_CANCELLED = 5;
+}
+
+enum GroupKind {
+  GROUP_KIND_UNSPECIFIED = 0;
+  GROUP_EXACT = 1;
+  GROUP_SIMILAR_IMAGE = 2;
+  GROUP_SIMILAR_VIDEO = 3;
+}
+
+enum ReviewDecision {
+  REVIEW_UNDECIDED = 0;
+  REVIEW_KEEP = 1;
+  REVIEW_DELETE = 2;
+}
+
+enum DeleteMode {
+  DELETE_MODE_UNSPECIFIED = 0;
+  DELETE_RECYCLE_BIN = 1;
+  DELETE_PERMANENT = 2;
+}
+
+enum MediaKind {
+  MEDIA_KIND_UNSPECIFIED = 0;
+  MEDIA_IMAGE = 1;
+  MEDIA_VIDEO = 2;
+  MEDIA_OTHER = 3;
+}
+
+message Hello {
+  uint32 protocol_version = 1;
+  string product_id = 2;
+  string peer_name = 3;
+}
+
+message NodeStatus {
+  string machine_id = 1;
+  string listen_address = 2;
+  uint32 worker_count = 3;
+  uint32 busy_workers = 4;
+  uint64 queued_items = 5;
+  uint64 running_items = 6;
+  uint64 outbox_high_seq = 7;
+  bool engine_restarting = 8;
+}
+
+message Ping {
+  uint64 nonce = 1;
+}
+
+message Error {
+  ErrorCode code = 1;
+  string message = 2;
+}
+
+message CreateScan {
+  repeated string roots = 1;
+  bool force_recalculate = 2;
+  string enumerator = 3;
+}
+
+message TaskAccepted {
+  string task_id = 1;
+}
+
+message CancelTask {
+  string task_id = 1;
+}
+
+message QueryTask {
+  string task_id = 1;
+  TaskSummary task = 2;
+}
+
+message ListTasks {
+  string cursor = 1;
+  uint32 limit = 2;
+  repeated TaskSummary tasks = 3;
+  string next_cursor = 4;
+}
+
+message TaskSummary {
+  string task_id = 1;
+  string task_kind = 2;
+  TaskState state = 3;
+  uint64 total_items = 4;
+  uint64 completed_items = 5;
+  uint64 failed_items = 6;
+  uint64 skipped_items = 7;
+  uint64 outbox_high_seq = 8;
+}
+
+message TaskEvent {
+  string task_id = 1;
+  uint64 event_seq = 2;
+  TaskState state = 3;
+  uint64 completed_items = 4;
+  uint64 total_items = 5;
+  uint64 failed_items = 6;
+  string stage = 7;
+  string error_text = 8;
+}
+
+message BrowsePaths {
+  string parent_path = 1;
+  string cursor = 2;
+  uint32 limit = 3;
+  repeated PathEntry entries = 4;
+  string next_cursor = 5;
+}
+
+message PathEntry {
+  string display_path = 1;
+  bool is_directory = 2;
+}
+
+message CreateLocalAnalysis {
+  repeated string scan_task_ids = 1;
+  GroupKind group_kind = 2;
+  Thresholds thresholds = 3;
+}
+
+message QueryAnalysisRun {
+  string analysis_run_id = 1;
+  string state = 2;
+  uint64 input_count = 3;
+  uint64 candidate_count = 4;
+  string error_text = 5;
+}
+
+message ListGroups {
+  string analysis_run_id = 1;
+  GroupKind group_kind = 2;
+  string cursor = 3;
+  uint32 limit = 4;
+  repeated DuplicateGroup groups = 5;
+  string next_cursor = 6;
+}
+
+message DuplicateGroup {
+  string group_id = 1;
+  GroupKind kind = 2;
+  ContentKey representative = 3;
+  uint32 member_count = 4;
+  uint64 reclaimable_bytes = 5;
+}
+
+message ListGroupMembers {
+  string group_id = 1;
+  string cursor = 2;
+  uint32 limit = 3;
+  repeated GroupMember members = 4;
+  string next_cursor = 5;
+}
+
+message GroupMember {
+  LocationKey location = 1;
+  ContentKey content = 2;
+  bool representative = 3;
+  float stage1_score = 4;
+  uint32 phash_passed_parts = 5;
+  float stage2_score = 6;
+  ReviewDecision review = 7;
+  bool active = 8;
+}
+
+message SaveReviewMark {
+  string group_id = 1;
+  LocationKey location = 2;
+  ReviewDecision decision = 3;
+}
+
+message PrepareAnalysisInput {
+  string analysis_run_id = 1;
+  string cursor = 2;
+  uint32 limit = 3;
+  repeated AnalysisInput inputs = 4;
+  string next_cursor = 5;
+}
+
+message AnalysisInput {
+  ContentKey content = 1;
+  repeated LocationKey locations = 2;
+  MediaKind media_kind = 3;
+  bool stage1_complete = 4;
+  bool stage2_complete = 5;
+}
+
+message DispatchStage2 {
+  string analysis_run_id = 1;
+  repeated Stage2WorkItem items = 2;
+}
+
+message Stage2WorkItem {
+  ContentKey content = 1;
+  LocationKey source = 2;
+  repeated uint32 frame_slots = 3;
+}
+
+message PullChanges {
+  uint64 after_seq = 1;
+  uint32 limit = 2;
+}
+
+message SyncChangeBatch {
+  repeated SyncChange changes = 1;
+  uint64 high_seq = 2;
+  uint64 pruned_through_seq = 3;
+}
+
+message SyncChange {
+  uint64 seq = 1;
+  string entity_kind = 2;
+  bytes payload = 3;
+}
+
+message SyncAck {
+  uint64 committed_seq = 1;
+}
+
+message BeginSnapshot {
+  string snapshot_token = 1;
+  uint64 snapshot_high_seq = 2;
+}
+
+message ReadSnapshotPage {
+  string snapshot_token = 1;
+  string table_name = 2;
+  string cursor = 3;
+  uint32 limit = 4;
+  repeated bytes rows = 5;
+  string next_cursor = 6;
+  bool done = 7;
+}
+
+message ReadFile {
+  LocationKey location = 1;
+  string file_kind = 2;
+  uint64 offset = 3;
+  uint32 max_bytes = 4;
+}
+
+message FileChunk {
+  uint64 offset = 1;
+  bytes data = 2;
+  bool eof = 3;
+}
+
+message CreateDeleteBatch {
+  string delete_batch_id = 1;
+  DeleteMode mode = 2;
+  repeated DeleteItem items = 3;
+}
+
+message DeleteItem {
+  string delete_item_id = 1;
+  string group_id = 2;
+  LocationKey location = 3;
+  ContentKey expected_content = 4;
+}
+
+message RetryDeleteItems {
+  string delete_batch_id = 1;
+  repeated string delete_item_ids = 2;
+}
+
+message Envelope {
+  uint64 request_id = 1;
+  oneof payload {
+    Hello hello = 10;
+    NodeStatus node_status = 11;
+    Ping ping = 12;
+    Error error = 13;
+    CreateScan create_scan = 14;
+    TaskAccepted task_accepted = 15;
+    CancelTask cancel_task = 16;
+    QueryTask query_task = 17;
+    ListTasks list_tasks = 18;
+    TaskEvent task_event = 19;
+    BrowsePaths browse_paths = 20;
+    CreateLocalAnalysis create_local_analysis = 21;
+    QueryAnalysisRun query_analysis_run = 22;
+    ListGroups list_groups = 23;
+    ListGroupMembers list_group_members = 24;
+    SaveReviewMark save_review_mark = 25;
+    PrepareAnalysisInput prepare_analysis_input = 26;
+    DispatchStage2 dispatch_stage2 = 27;
+    PullChanges pull_changes = 28;
+    SyncChangeBatch sync_change_batch = 29;
+    SyncAck sync_ack = 30;
+    BeginSnapshot begin_snapshot = 31;
+    ReadSnapshotPage read_snapshot_page = 32;
+    ReadFile read_file = 33;
+    FileChunk file_chunk = 34;
+    CreateDeleteBatch create_delete_batch = 35;
+    RetryDeleteItems retry_delete_items = 36;
+  }
+}
+
+message ProbeAndStage1 {
+  string task_id = 1;
+  string item_id = 2;
+  string display_path = 3;
+  MediaKind media_kind = 4;
+}
+
+message ComputeStage2 {
+  string task_id = 1;
+  string item_id = 2;
+  string display_path = 3;
+  repeated uint32 frame_slots = 4;
+}
+
+message BuildContactSheet {
+  string task_id = 1;
+  string item_id = 2;
+  string display_path = 3;
+  repeated uint32 frame_slots = 4;
+}
+
+message WorkerReady {
+  uint32 process_id = 1;
+}
+
+message Stage1Result {
+  string task_id = 1;
+  string item_id = 2;
+  bytes payload = 3;
+}
+
+message Stage2Result {
+  string task_id = 1;
+  string item_id = 2;
+  bytes payload = 3;
+}
+
+message ContactSheetResult {
+  string task_id = 1;
+  string item_id = 2;
+  bytes jpeg = 3;
+  uint32 width = 4;
+  uint32 height = 5;
+}
+
+message WorkerFailure {
+  string task_id = 1;
+  string item_id = 2;
+  string stage = 3;
+  string message = 4;
+}
+
+message WorkerEnvelope {
+  oneof payload {
+    ProbeAndStage1 probe_and_stage1 = 10;
+    ComputeStage2 compute_stage2 = 11;
+    BuildContactSheet build_contact_sheet = 12;
+    WorkerReady worker_ready = 20;
+    Stage1Result stage1_result = 21;
+    Stage2Result stage2_result = 22;
+    ContactSheetResult contact_sheet_result = 23;
+    WorkerFailure worker_failure = 24;
+  }
+}

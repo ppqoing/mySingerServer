@@ -56,6 +56,11 @@ SQLite、PostgreSQL 或 TCP。三个 `apps` 目录只装配依赖和生命周期
 推导的 `AppLayout`，以及 Raw SMBIOS Type 1/2 读取和机器 ID 计算。生产机器身份只来自
 Win32 `GetSystemFirmwareTable(RSMB)`，不从配置注入。
 
+协议边界也已落地：`proto/node.proto` 是唯一消息源，`dedup-protocol` 用固定 vendored
+`protoc` 在 `OUT_DIR` 生成 Rust 类型和 descriptor set，并显式转换 `ContentKey`、
+`LocationKey` 与 `Thresholds`。节点 Envelope 覆盖状态、任务、路径、分析、同步、快照、
+文件读取和删除；WorkerEnvelope 只携带任务/项目/显示路径、槽位和计算结果，不含数据库或网络地址。
+
 ## 4. 数据所有权
 
 - 节点 actor 串行独占一个 `NodeStore` 和一个 `WorkerPool`，所有 SQLite 写入经 actor 排序。
@@ -91,6 +96,12 @@ pHash 与 128 维 Sobel；视频均匀抽六帧，每帧走同一图片判定并
 数据批量生成候选，一筛结束后才批量派发缺失 stage2；数据库已有二筛结果时不派发。所有节点
 计算完成且 stage2 同步过高水位后才最终筛选。失败运行保持 `partial`，显式重试只补缺失项。
 
+TCP 传输固定为四字节大端长度头加 Protobuf Envelope；零长度、截断和超过 8 MiB 的普通帧
+在 `dedup-transport` 边界拒绝，`FileChunk.data` 另限 1 MiB。`ClientConnection` 用非零
+原子 request ID 和 pending 表复用请求，读循环断开时一次性失败全部等待者，重连由
+`dedup-desktop-core` 负责且 transport 不重试。高低队列都有界；一个低优先级块被选中后，
+下一块发送前重新检查任务控制、进度、删除和同步 ACK 等高优先级消息。
+
 ## 6. 不可破坏的硬约束
 
 - 只构建 `x86_64-pc-windows-msvc`，不主动按 Windows 版本号拒绝启动。
@@ -123,8 +134,9 @@ cargo build --workspace --release --locked --target x86_64-pc-windows-msvc
 ## 8. 验收边界
 
 当前已建立 Rust 1.97.1 工具链和 13 成员工作区，并完成领域 ID、配置/阈值、应用目录、
-Windows 路径和 SMBIOS 机器身份边界；真实当前主机的 SMBIOS 读取测试已执行通过。协议、
-持久化、媒体算法和 UI 将在后续任务按本文件架构填充。
+Windows 路径、SMBIOS 机器身份、完整 Protobuf 清单和 TCP 传输边界；真实当前主机的
+SMBIOS 读取以及 loopback TCP 请求复用测试已执行通过。持久化、媒体算法和 UI 将在后续任务
+按本文件架构填充。
 静态测试、集成测试、发布包验证和 Windows 实际 GUI/托盘/回收站验收必须分开记录。没有实际
 运行的 GUI、托盘、回收站、第二台物理主机或 PostgreSQL 项不得标记 PASS；可用双节点进程
 集成测试证明协议与编排，但真实双物理机不可用时仍标 `BLOCKED`。
