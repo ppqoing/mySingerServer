@@ -10,7 +10,5 @@ path = "src/lib.rs"
 
 [dependencies]
 dedup-core = { path = "../core" }
-thiserror.workspace = true
-
-[dev-dependencies]
 image.workspace = true
+thiserror.workspace = true

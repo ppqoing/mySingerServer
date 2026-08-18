@@ -11,7 +11,7 @@ mod thresholds;
 pub use config::{DesktopConfig, NodeConfig, NodeEndpoint};
 pub use error::CoreError;
 pub use ids::{AnalysisRunId, ContentKey, GroupId, LocationKey, MachineId, TaskId};
-pub use model::{DeleteMode, EnumeratorKind, MediaKind};
+pub use model::{DeleteMode, EnumeratorKind, MediaKind, ScreeningOutcome};
 pub use path::{DisplayPath, NormalizedPath};
 pub use thresholds::Thresholds;
 

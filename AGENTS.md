@@ -80,6 +80,16 @@ PDQ 规范字节切成四个连续大端 `u64`，共享任一 band 才做完整�
 召回边界，不增加错位 band 或向量索引。`dedup-core::MediaKind` 是数据库、协议和任务共享的
 图片/视频领域枚举，不由文件扩展名直接充当类型。
 
+视频比较把每个槽位建模为 `VideoFrameFeatures { stage1, stage2 }`。`stage1=None` 明确表示
+该端解码失败，双方任一失败的槽位不进入分母；双方一筛存在但任一 `stage2=None` 则表示
+二筛数据尚未完整，整次结果保持 `ScreeningOutcome::Incomplete`。一筛有效但图片阈值失败
+的帧计零；二筛 pHash 未达到通过块数的帧也计零，pHash 通过时帧分数取 Sobel 余弦。
+有效帧达到四帧后才按冻结的视频平均阈值产生 Passed/Rejected，避免把缺失数据伪装为低分。
+
+`sample_positions` 只产生 `(1,3,5,7,9,11)/12` 六个固定中点。联系表直接消费同一六槽位，
+不触发额外解码；画布固定 3×2、RGB24，图片保持长宽比居中，缺失槽位填 `#60656F`，最后
+由 Rust `image` 以 JPG quality 80 编码。联系表只是节点本地预览缓存，不参与任何评分。
+
 ## 4. 数据所有权
 
 - 节点 actor 串行独占一个 `NodeStore` 和一个 `WorkerPool`，所有 SQLite 写入经 actor 排序。
@@ -131,6 +141,8 @@ TCP 传输固定为四字节大端长度头加 Protobuf Envelope；零长度、�
 - pHash 的 3×3 块序、DCT bit 序和小端 BLOB，以及 Sobel 的空间格、方向 bin 和零向量
   规则都是持久化契约；不得因性能重写改变输出字节或向量索引。
 - 图片不生成缩略图。视频联系表固定三列两行、RGB24、JPG 质量 80，复用六个成功抽帧。
+- 视频一筛/二筛不得把解码失败槽位计入分母，也不得把尚未计算的二筛特征计成零分；
+  二者分别对应“无有效槽位”和“Incomplete”语义。
 - FFmpeg 固定从 `worker.exe` 相对路径 `runtime/ffmpeg` 加载五个 8.0.1 x64 LGPL DLL；
   不搜索当前目录或 PATH，不运行或发布 FFmpeg EXE。
 - 删除默认进入回收站；永久删除必须由设置切换。每项删除前重新检查存在、大小和流式 MD5；
@@ -160,8 +172,9 @@ cargo build --workspace --release --locked --target x86_64-pc-windows-msvc
 Windows 路径、SMBIOS 机器身份、完整 Protobuf 清单和 TCP 传输边界；真实当前主机的
 SMBIOS 读取以及 loopback TCP 请求复用测试已执行通过。固定像素管线和 Meta PDQ 纯 Rust
 移植也已完成，三张固定上游 JPEG 的 256 位 golden 与 Quality 均逐位通过。九分块 pHash、
-128 维 Sobel、PDQ band 候选和图片两层联合筛选的位序/阈值测试也已通过。视频、持久化和
-UI 将在后续任务按本文件架构填充。
+128 维 Sobel、PDQ band 候选和图片两层联合筛选的位序/阈值测试也已通过。六帧中点、
+有效/缺失槽位平均规则以及 3×2 JPG 联系表测试已通过。持久化和 UI 将在后续任务按本文件
+架构填充。
 静态测试、集成测试、发布包验证和 Windows 实际 GUI/托盘/回收站验收必须分开记录。没有实际
 运行的 GUI、托盘、回收站、第二台物理主机或 PostgreSQL 项不得标记 PASS；可用双节点进程
 集成测试证明协议与编排，但真实双物理机不可用时仍标 `BLOCKED`。

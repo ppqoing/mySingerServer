@@ -33,3 +33,14 @@ pub enum MediaKind {
     /// 使用六个固定帧槽位处理的视频。
     Video,
 }
+
+/// 单次筛选比较的三态结果。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScreeningOutcome {
+    /// 完整数据满足本层全部阈值。
+    Passed,
+    /// 完整数据不满足本层阈值。
+    Rejected,
+    /// 有效帧不足或所需特征尚未完整计算。
+    Incomplete,
+}

@@ -1,13 +1,16 @@
 //! MD5、PDQ、分块 pHash、Sobel、视频评分和联系表算法。
 #![warn(missing_docs)]
 
+mod contact_sheet;
 mod image;
 mod image_score;
 mod pdq;
 mod phash;
 mod resize;
 mod sobel;
+mod video_score;
 
+pub use contact_sheet::encode_contact_sheet;
 pub use image::{GrayImage, MediaError, Rgb24Image, rgb24_to_gray};
 pub use image_score::{
     ImageStage1, ImageStage1Score, ImageStage2, ImageStage2Score, compute_image_stage2, pdq_bands,
@@ -17,6 +20,9 @@ pub use pdq::{PdqHash, PdqResult, pdq_hash};
 pub use phash::{compute_partition_phash, phash_parts_to_blob};
 pub use resize::resize_bilinear;
 pub use sobel::{compute_sobel, sobel_cosine};
+pub use video_score::{
+    VideoFrameFeatures, VideoScore, sample_positions, score_video_stage1, score_video_stage2,
+};
 
 #[cfg(test)]
 mod tests {
