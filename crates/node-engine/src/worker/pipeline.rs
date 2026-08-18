@@ -138,17 +138,17 @@ where
         Self { decoder }
     }
 
-    /// 探测并计算一筛；图片解码一次，视频严格按六个固定位置各解码一次。
+    /// 探测实际媒体类型并计算一筛；图片解码一次，视频严格按六个固定位置各解码一次。
     pub fn probe_and_stage1(
         &self,
         path: &Path,
-        media_kind: MediaKind,
+        _requested_media_kind: MediaKind,
     ) -> Result<Stage1Output, WorkerPipelineError> {
         let probe = self
             .decoder
             .probe_media(path)
             .map_err(WorkerPipelineError::Decoder)?;
-        match media_kind {
+        match probe.media_kind {
             MediaKind::Image => {
                 let frame = self
                     .decoder
@@ -156,7 +156,7 @@ where
                     .map_err(WorkerPipelineError::Decoder)?;
                 let (_, feature) = image_stage1(frame)?;
                 Ok(Stage1Output {
-                    media_kind,
+                    media_kind: MediaKind::Image,
                     width: probe.width,
                     height: probe.height,
                     duration_ms: None,
@@ -169,7 +169,14 @@ where
                 })
             }
             MediaKind::Video => self.video_stage1(path, probe),
-            MediaKind::Other => Err(WorkerPipelineError::UnsupportedMedia),
+            MediaKind::Other => Ok(Stage1Output {
+                media_kind: MediaKind::Other,
+                width: probe.width,
+                height: probe.height,
+                duration_ms: None,
+                frames: Vec::new(),
+                contact_sheet_jpeg: None,
+            }),
         }
     }
 

@@ -132,6 +132,59 @@ impl NodeStore {
             reused,
         })
     }
+
+    /// 返回内容当前由实际媒体探测确认的类别。
+    pub fn content_media_kind(&self, content_id: ContentId) -> Result<MediaKind, StoreError> {
+        let value: String = self.connection.query_row(
+            "SELECT media_kind FROM contents WHERE content_id=?1",
+            [content_id.as_i64()],
+            |row| row.get(0),
+        )?;
+        match value.as_str() {
+            "image" => Ok(MediaKind::Image),
+            "video" => Ok(MediaKind::Video),
+            "other" => Ok(MediaKind::Other),
+            _ => Err(StoreError::InvalidState(format!(
+                "未知内容媒体类型: {value}"
+            ))),
+        }
+    }
+
+    /// 用 FFmpeg 实际探测结果替换新内容的暂存类型。
+    pub fn set_content_media_kind(
+        &mut self,
+        content_id: ContentId,
+        media_kind: MediaKind,
+    ) -> Result<(), StoreError> {
+        let transaction = self.connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE contents SET media_kind=?2 WHERE content_id=?1",
+            params![content_id.as_i64(), media_kind_name(media_kind)],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::InvalidState("要更新的内容不存在".into()));
+        }
+        let key = content_key_in_transaction(&transaction, content_id)?;
+        append_sync_change(&transaction, "content", encode_content(key, media_kind))?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// 查询本机规范路径当前是否仍为活动位置。
+    pub fn is_location_active(
+        &self,
+        normalized_path: &dedup_core::NormalizedPath,
+    ) -> Result<bool, StoreError> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT active FROM files WHERE machine_id=?1 AND normalized_path=?2",
+                params![self.machine_id().as_str(), normalized_path.as_str()],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()?
+            .unwrap_or(false))
+    }
 }
 
 pub(crate) fn media_kind_name(kind: MediaKind) -> &'static str {

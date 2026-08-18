@@ -104,7 +104,8 @@ fn worker_envelope_maps_probe_command_to_stage_one_result() {
                     task_id: "task-1".into(),
                     item_id: "item-1".into(),
                     display_path: r"D:\photo.jpg".into(),
-                    media_kind: proto::MediaKind::MediaImage as i32,
+                    // 扩展名或调用方只能提供候选提示；最终类型必须来自 FFmpeg probe。
+                    media_kind: proto::MediaKind::MediaOther as i32,
                 },
             )),
         },

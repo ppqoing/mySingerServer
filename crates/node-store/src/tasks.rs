@@ -1,10 +1,17 @@
 //! 节点任务、任务项、崩溃恢复和持久化事件序号。
 
+use std::collections::HashSet;
+
 use dedup_core::{DisplayPath, LocationKey, MachineId, NormalizedPath, TaskId};
 use rusqlite::{OptionalExtension, Transaction, params};
 use uuid::Uuid;
 
-use crate::{ContentId, NodeStore, StoreError, open::sqlite_integer};
+use crate::{
+    ContentId, NodeStore, ScannedPath, StoreError,
+    content::{content_key_in_transaction, encode_file},
+    open::sqlite_integer,
+    outbox::append_sync_change,
+};
 
 /// 节点任务允许的五种持久化状态。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -162,6 +169,60 @@ pub struct TaskItemSnapshot {
 }
 
 impl NodeStore {
+    /// 在枚举前创建扫描任务并持久化规范扫描根。
+    pub fn create_scan_task(
+        &mut self,
+        roots: &[NormalizedPath],
+        now_ms: i64,
+    ) -> Result<TaskId, StoreError> {
+        if roots.is_empty() {
+            return Err(StoreError::InvalidState(
+                "扫描任务至少需要一个根目录".into(),
+            ));
+        }
+        let task_id = TaskId::new();
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO tasks(task_id,kind,status,total_items,created_at_ms,updated_at_ms)
+             VALUES(?1,'scan','queued',0,?2,?2)",
+            params![task_id.as_uuid().to_string(), now_ms],
+        )?;
+        for root in roots {
+            transaction.execute(
+                "INSERT OR IGNORE INTO task_scan_roots(task_id,normalized_root) VALUES(?1,?2)",
+                params![task_id.as_uuid().to_string(), root.as_str()],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(task_id)
+    }
+
+    /// 向已经持久化的扫描任务追加一项，并返回稳定 item ID。
+    pub fn append_task_item(
+        &mut self,
+        task_id: TaskId,
+        item: &NewTaskItem,
+        now_ms: i64,
+    ) -> Result<String, StoreError> {
+        let item_id = Uuid::now_v7().to_string();
+        let transaction = self.connection.transaction()?;
+        let status: String = transaction.query_row(
+            "SELECT status FROM tasks WHERE task_id=?1",
+            [task_id.as_uuid().to_string()],
+            |row| row.get(0),
+        )?;
+        if !matches!(status.as_str(), "queued" | "running") {
+            return Err(StoreError::InvalidState("只能向活动任务追加任务项".into()));
+        }
+        insert_task_item(&transaction, task_id, &item_id, item)?;
+        transaction.execute(
+            "UPDATE tasks SET total_items=total_items+1,updated_at_ms=?2 WHERE task_id=?1",
+            params![task_id.as_uuid().to_string(), now_ms],
+        )?;
+        transaction.commit()?;
+        Ok(item_id)
+    }
+
     /// 在一个事务中创建任务及全部初始 queued 项。
     pub fn create_task(
         &mut self,
@@ -184,36 +245,7 @@ impl NodeStore {
         )?;
         for item in items {
             let item_id = Uuid::now_v7().to_string();
-            let (machine_id, normalized_path) = item
-                .location
-                .as_ref()
-                .map(|location| {
-                    (
-                        Some(location.machine_id().as_str()),
-                        Some(location.normalized_path().as_str()),
-                    )
-                })
-                .unwrap_or((None, None));
-            let display_path = item
-                .display_path
-                .as_ref()
-                .map(|path| path.as_path().to_string_lossy());
-            transaction.execute(
-                "INSERT INTO task_items(
-                   item_id,task_id,machine_id,normalized_path,display_path,file_size,
-                   content_id,status,stage)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,'queued',?8)",
-                params![
-                    item_id,
-                    task_id.as_uuid().to_string(),
-                    machine_id,
-                    normalized_path,
-                    display_path.as_deref(),
-                    item.file_size.map(sqlite_integer).transpose()?,
-                    item.content_id.map(ContentId::as_i64),
-                    item.stage
-                ],
-            )?;
+            insert_task_item(&transaction, task_id, &item_id, item)?;
         }
         transaction.commit()?;
         Ok(task_id)
@@ -280,7 +312,18 @@ impl NodeStore {
             ],
         )?;
         let counts = item_counts(&transaction, &task_id_text)?;
-        let task_status = if counts.3 == 0 {
+        let kind: String = transaction.query_row(
+            "SELECT kind FROM tasks WHERE task_id=?1",
+            [&task_id_text],
+            |row| row.get(0),
+        )?;
+        let persisted_root_count: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM task_scan_roots WHERE task_id=?1",
+            [&task_id_text],
+            |row| row.get(0),
+        )?;
+        let waits_for_scan_finalize = kind == "scan" && persisted_root_count > 0;
+        let task_status = if counts.3 == 0 && !waits_for_scan_finalize {
             TaskStatus::Completed
         } else {
             TaskStatus::Running
@@ -339,6 +382,106 @@ impl NodeStore {
         Ok(changed)
     }
 
+    /// 把枚举或任务级基础设施失败记录为 scan failed；不会失效旧位置。
+    pub fn fail_task(&mut self, task_id: TaskId, now_ms: i64) -> Result<(), StoreError> {
+        self.connection.execute(
+            "UPDATE tasks SET status='failed',updated_at_ms=?2
+             WHERE task_id=?1 AND status IN ('queued','running')",
+            params![task_id.as_uuid().to_string(), now_ms],
+        )?;
+        Ok(())
+    }
+
+    /// 成功扫描的最后事务：按持久化根失效缺失路径、完成任务并返回提交后高水位。
+    pub fn finalize_scan_task(
+        &mut self,
+        task_id: TaskId,
+        seen_paths: &[NormalizedPath],
+        now_ms: i64,
+    ) -> Result<u64, StoreError> {
+        let machine_id = self.machine_id().clone();
+        let seen = seen_paths
+            .iter()
+            .map(|path| path.as_str().to_owned())
+            .collect::<HashSet<_>>();
+        let transaction = self.connection.transaction()?;
+        let (kind, status): (String, String) = transaction.query_row(
+            "SELECT kind,status FROM tasks WHERE task_id=?1",
+            [task_id.as_uuid().to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if kind != "scan" || !matches!(status.as_str(), "queued" | "running") {
+            return Err(StoreError::InvalidState("扫描任务不处于可完成状态".into()));
+        }
+        let pending: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM task_items
+             WHERE task_id=?1 AND status IN ('queued','running')",
+            [task_id.as_uuid().to_string()],
+            |row| row.get(0),
+        )?;
+        if pending != 0 {
+            return Err(StoreError::InvalidState("扫描仍有未完成任务项".into()));
+        }
+        let roots = {
+            let mut statement = transaction.prepare(
+                "SELECT normalized_root FROM task_scan_roots WHERE task_id=?1 ORDER BY normalized_root",
+            )?;
+            statement
+                .query_map([task_id.as_uuid().to_string()], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .map(|row| NormalizedPath::new(row?).map_err(StoreError::from))
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        type ActiveRow = (String, String, i64, i64);
+        let active = {
+            let mut statement = transaction.prepare(
+                "SELECT normalized_path,display_path,file_size,content_id FROM files
+                 WHERE machine_id=?1 AND active=1",
+            )?;
+            statement
+                .query_map([machine_id.as_str()], |row| {
+                    Ok(ActiveRow::from((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                    )))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (normalized, display, file_size, content_id) in active {
+            let normalized_path = NormalizedPath::new(&normalized)?;
+            if seen.contains(&normalized)
+                || !roots.iter().any(|root| normalized_path.is_within(root))
+            {
+                continue;
+            }
+            transaction.execute(
+                "UPDATE files SET active=0 WHERE machine_id=?1 AND normalized_path=?2",
+                params![machine_id.as_str(), normalized],
+            )?;
+            let scanned = ScannedPath::new(
+                normalized_path,
+                DisplayPath::new(display)?,
+                file_size as u64,
+            );
+            let key = content_key_in_transaction(&transaction, ContentId::from_i64(content_id))?;
+            append_sync_change(
+                &transaction,
+                "file",
+                encode_file(machine_id.as_str(), &scanned, key, false),
+            )?;
+        }
+        transaction.execute(
+            "UPDATE tasks SET status='completed',event_seq=event_seq+1,updated_at_ms=?2
+             WHERE task_id=?1",
+            params![task_id.as_uuid().to_string(), now_ms],
+        )?;
+        transaction.commit()?;
+        self.outbox_high_seq()
+    }
+
     /// 读取一个任务的持久化统计。
     pub fn task_snapshot(&self, task_id: TaskId) -> Result<TaskSnapshot, StoreError> {
         let row = self.connection.query_row(
@@ -388,6 +531,45 @@ impl NodeStore {
             })
             .collect()
     }
+}
+
+fn insert_task_item(
+    transaction: &Transaction<'_>,
+    task_id: TaskId,
+    item_id: &str,
+    item: &NewTaskItem,
+) -> Result<(), StoreError> {
+    let (machine_id, normalized_path) = item
+        .location
+        .as_ref()
+        .map(|location| {
+            (
+                Some(location.machine_id().as_str()),
+                Some(location.normalized_path().as_str()),
+            )
+        })
+        .unwrap_or((None, None));
+    let display_path = item
+        .display_path
+        .as_ref()
+        .map(|path| path.as_path().to_string_lossy());
+    transaction.execute(
+        "INSERT INTO task_items(
+           item_id,task_id,machine_id,normalized_path,display_path,file_size,
+           content_id,status,stage)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,'queued',?8)",
+        params![
+            item_id,
+            task_id.as_uuid().to_string(),
+            machine_id,
+            normalized_path,
+            display_path.as_deref(),
+            item.file_size.map(sqlite_integer).transpose()?,
+            item.content_id.map(ContentId::as_i64),
+            item.stage
+        ],
+    )?;
+    Ok(())
 }
 
 struct RawTaskItem {

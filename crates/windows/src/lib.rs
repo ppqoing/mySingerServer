@@ -5,11 +5,13 @@ mod app_layout;
 mod job;
 mod machine_id;
 mod smbios;
+mod walker;
 
 pub use app_layout::AppLayout;
 pub use job::{CREATE_WORKER_FLAGS, WorkerJob};
 pub use machine_id::{PhysicalMachineFields, machine_id_from_fields};
 pub use smbios::read_physical_machine_fields;
+pub use walker::{WalkedFile, WindowsWalker};
 
 #[cfg(test)]
 mod tests {

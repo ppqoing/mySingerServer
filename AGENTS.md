@@ -145,6 +145,26 @@ Worker 全部加入 `KILL_ON_JOB_CLOSE` Job，节点退出不会留下孤儿进�
 项和所属任务退回 `queued`，成功、失败、取消项不重算；单文件失败计入统计，但其他项结束后
 任务仍为 `completed`，只有任务级基础设施错误才使用 `failed`。
 
+扫描实现由 `dedup-node-engine::scan` 统一编排。`FileEnumerator` 只有两个生产实现：
+`WindowsWalker` 直接递归 Windows 文件系统，`EverythingEnumerator` 通过
+`everything-ipc 0.1.4` 对每个根查询并在 Rust 端再次使用 `NormalizedPath::is_within`
+确认组件边界。两者都返回全部普通文件的 `ScannedPath`，按规范路径排序去重；Everything
+不可用或查询失败时当前任务直接返回一条明确错误，不在任务中切换 Walker。文件扩展名不写入
+领域类型；Worker 以 FFmpeg 实际 probe 结果决定 `MediaKind`。
+
+`ScanEngine::run` 在枚举前用 `create_scan_task` 原子保存任务和扫描根。完整列表按 1000 条调用
+`lookup_scanned_paths`：机器、路径、大小命中直接完成 `reused` 项且不打开文件；未命中由
+`SystemMd5` 用 1 MiB 缓冲流式读取，再以 MD5 索引和大小确认 `ContentKey`。已有完整特征只新增
+位置引用；已有媒体内容缺少完整一筛时保存 `skipped_incomplete` 成功项，不自动启动 Worker；
+新内容和用户明确的强制重算才通过 `Stage1Processor` 派发。生产适配器串行借用 `WorkerPool`，
+Worker 只返回实际探测类型和拥有所有权的特征，NodeStore 负责写类型、图片/视频一筛、六槽记录、
+联系表引用和 outbox。单文件读取或计算失败只增加任务失败项，扫描仍可完成。
+
+真实扫描任务的最后一个任务项不会提前把任务标为 completed。只有全部项终态后，
+`finalize_scan_task` 才在一个事务内读取已持久化扫描根，按路径组件失效本轮未出现的活动位置、
+写 file outbox、推进任务事件并完成任务；返回值是该事务提交后的 outbox 高水位。枚举失败、
+任务级失败或取消绝不调用收尾事务，因此不会误失效旧位置；扫描 `D:\A` 也不会影响 `D:\AB`。
+
 ## 5. 同步与分析状态机
 
 扫描先生成文件列表，再以“机器 ID + 规范路径 + 文件大小”批量查询 SQLite。命中位置缓存
@@ -240,7 +260,9 @@ SMBIOS 读取以及 loopback TCP 请求复用测试已执行通过。固定像�
 架构填充。FFmpeg 固定供应清单、无 EXE 发布、受限 DLL 搜索、缺失 DLL 报错、JPEG/MP4 探测和
 MP4 首尾 RGB24 解码集成测试已通过。真实 worker.exe 的 Ready、图片一筛结果、连续调度、
 计划重启、意外退出补建、取消替换和 Job 关闭清理进程测试已通过；节点 actor 与 SQLite 的最终
-装配留在后续任务。
+装配留在后续任务。扫描阶段的 Walker 全文件契约、Everything 不可用明确错误、路径大小缓存、
+强制重算、已有内容复用、不完整内容跳过、局部根失效和失败不失效测试已通过；扫描一筛生产适配器
+已经直接连接 WorkerPool，节点 actor 后续只负责生命周期和命令串行化，不重新实现扫描规则。
 静态测试、集成测试、发布包验证和 Windows 实际 GUI/托盘/回收站验收必须分开记录。没有实际
 运行的 GUI、托盘、回收站、第二台物理主机或 PostgreSQL 项不得标记 PASS；可用双节点进程
 集成测试证明协议与编排，但真实双物理机不可用时仍标 `BLOCKED`。

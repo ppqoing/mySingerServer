@@ -12,9 +12,15 @@ path = "src/lib.rs"
 dedup-core = { path = "../core" }
 dedup-media = { path = "../media" }
 dedup-media-ffmpeg = { path = "../media-ffmpeg" }
+dedup-node-store = { path = "../node-store" }
 dedup-protocol = { path = "../protocol" }
 dedup-transport = { path = "../transport" }
 dedup-windows = { path = "../windows" }
+everything-ipc.workspace = true
+md-5.workspace = true
 prost.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

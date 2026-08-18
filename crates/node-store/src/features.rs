@@ -158,20 +158,6 @@ impl NodeStore {
         }
     }
 
-    fn content_media_kind(&self, content_id: ContentId) -> Result<MediaKind, StoreError> {
-        let value: String = self.connection.query_row(
-            "SELECT media_kind FROM contents WHERE content_id=?1",
-            [content_id.as_i64()],
-            |row| row.get(0),
-        )?;
-        match value.as_str() {
-            "image" => Ok(MediaKind::Image),
-            "video" => Ok(MediaKind::Video),
-            "other" => Ok(MediaKind::Other),
-            _ => Err(StoreError::InvalidFeature("未知 media_kind")),
-        }
-    }
-
     fn load_image_stage1(&self, content_id: ContentId) -> Result<Option<ImageStage1>, StoreError> {
         let row: Option<(u32, u32, Vec<u8>, u8)> = self
             .connection
