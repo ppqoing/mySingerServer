@@ -127,6 +127,12 @@ dependencies = [
 [[package]]
 name = "dedup-media-ffmpeg"
 version = "0.1.0"
+dependencies = [
+ "dedup-core",
+ "tempfile",
+ "thiserror",
+ "windows",
+]
 
 [[package]]
 name = "dedup-node-engine"

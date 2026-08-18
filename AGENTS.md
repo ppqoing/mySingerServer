@@ -90,6 +90,15 @@ PDQ 规范字节切成四个连续大端 `u64`，共享任一 band 才做完整�
 不触发额外解码；画布固定 3×2、RGB24，图片保持长宽比居中，缺失槽位填 `#60656F`，最后
 由 Rust `image` 以 JPG quality 80 编码。联系表只是节点本地预览缓存，不参与任何评分。
 
+FFmpeg 边界使用 BtbN 固定归档中的 8.0.1 x64 LGPL shared 构建，归档和五个 DLL 都在
+`third_party/ffmpeg-dependency.json` 固定 SHA-256。`fetch-ffmpeg.ps1` 只发布依赖闭包中的
+`avutil`、`swresample`、`swscale`、`avcodec`、`avformat` 与许可证；bindgen 产物已经提交，
+普通构建不需要 LLVM 或头文件。加载器先固定默认搜索目录，再把
+`worker.exe\..\runtime\ffmpeg` 加入白名单并以绝对路径按依赖顺序加载，因此当前目录和 PATH
+不能替换 DLL。动态函数表与五个模块句柄由同一个 `Ffmpeg` 值持有，裸 format、codec、packet、
+frame 和 sws context 只存在于短生命周期解码会话，安全边界外只返回媒体信息或紧凑 RGB24。
+探测媒体类型读取实际解复用器；`image2`/`*_pipe` 的单帧伪时长不被误判为视频。
+
 ## 4. 数据所有权
 
 - 节点 actor 串行独占一个 `NodeStore` 和一个 `WorkerPool`，所有 SQLite 写入经 actor 排序。
@@ -212,7 +221,9 @@ SMBIOS 读取以及 loopback TCP 请求复用测试已执行通过。固定像�
 有效/缺失槽位平均规则以及 3×2 JPG 联系表测试已通过。SQLite V2 schema、路径缓存、内容复用、
 图片/视频特征完整性、事务 outbox、ACK 裁剪与稳定快照测试已通过。任务恢复、分析状态链、
 冻结输入、稳定组分页、复核恢复和删除后缩组测试也已通过。Worker、节点服务和 UI 将在后续
-任务按本文件架构填充。
+任务按本文件架构填充。FFmpeg 固定供应清单、无 EXE 发布、受限 DLL 搜索、缺失 DLL 报错、
+JPEG/MP4 探测和 MP4 首尾 RGB24 解码集成测试已通过；这只证明 DLL 与解码边界，不代表
+Worker 进程池已完成。
 静态测试、集成测试、发布包验证和 Windows 实际 GUI/托盘/回收站验收必须分开记录。没有实际
 运行的 GUI、托盘、回收站、第二台物理主机或 PostgreSQL 项不得标记 PASS；可用双节点进程
 集成测试证明协议与编排，但真实双物理机不可用时仍标 `BLOCKED`。

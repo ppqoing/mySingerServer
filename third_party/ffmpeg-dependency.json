@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "provider": "BtbN/FFmpeg-Builds",
+  "ffmpeg_version": "8.0.1",
+  "target": "win64-lgpl-shared-8.0",
+  "release_tag": "autobuild-2026-02-28-12-59",
+  "archive_name": "ffmpeg-n8.0.1-66-g27b8d1a017-win64-lgpl-shared-8.0.zip",
+  "archive_url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-02-28-12-59/ffmpeg-n8.0.1-66-g27b8d1a017-win64-lgpl-shared-8.0.zip",
+  "archive_sha256": "e7b1087c310cf8b91f5467b8ada6d7e47ce26f2777efa2317c7cc271087e5100",
+  "archive_root": "ffmpeg-n8.0.1-66-g27b8d1a017-win64-lgpl-shared-8.0",
+  "license": "LGPL-3.0-or-later",
+  "license_source": "LICENSE.txt",
+  "runtime_files": [
+    {
+      "name": "avutil-60.dll",
+      "sha256": "d353317bbe824c8794657608378e9c71d7b0bf264300b5371e7c6d213aeb903a"
+    },
+    {
+      "name": "swresample-6.dll",
+      "sha256": "52f94587a2ec32a47be82d8108c827fbb07960a86f64850e89258bdc869ce596"
+    },
+    {
+      "name": "swscale-9.dll",
+      "sha256": "5ee25bd365bbb02d84f9f3a6211754fb4d09df8dafd00c3e4c043b018bfbc5e8"
+    },
+    {
+      "name": "avcodec-62.dll",
+      "sha256": "f85886c353c7067ac971d159dfb1e9c392b3edab5c283d335485bf68e132af45"
+    },
+    {
+      "name": "avformat-62.dll",
+      "sha256": "2399250478f66966661adb99b9589f38c9a53f6542977aee6fd9e9ca56931666"
+    }
+  ],
+  "license_sha256": "da7eabb7bafdf7d3ae5e9f223aa5bdc1eece45ac569dc21b3b037520b4464768",
+  "forbidden_runtime_files": [
+    "ffmpeg.exe",
+    "ffprobe.exe",
+    "ffplay.exe",
+    "avdevice-62.dll",
+    "avfilter-11.dll"
+  ]
+}
