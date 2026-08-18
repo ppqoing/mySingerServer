@@ -51,6 +51,11 @@ SQLite、PostgreSQL 或 TCP。三个 `apps` 目录只装配依赖和生命周期
 业务 crate 启用 `#![warn(missing_docs)]`。`unsafe` 只留在 FFmpeg FFI 和必要 Windows API
 边界，安全接口之外不得传播裸指针或原生句柄。
 
+当前领域边界已经落地：`dedup-core` 提供 UUID v7 业务 ID、内容/位置键、九阈值验证、
+桌面/节点 TOML 配置和 Windows 路径值对象；`dedup-windows` 提供从可执行文件绝对路径
+推导的 `AppLayout`，以及 Raw SMBIOS Type 1/2 读取和机器 ID 计算。生产机器身份只来自
+Win32 `GetSystemFirmwareTable(RSMB)`，不从配置注入。
+
 ## 4. 数据所有权
 
 - 节点 actor 串行独占一个 `NodeStore` 和一个 `WorkerPool`，所有 SQLite 写入经 actor 排序。
@@ -58,9 +63,14 @@ SQLite、PostgreSQL 或 TCP。三个 `apps` 目录只装配依赖和生命周期
 - PostgreSQL 由 `desktop.exe` 独占访问，只存中心索引、外部键、同步游标和跨机器结果；
   `desktop.exe` 不打开节点 SQLite，节点也不连接 PostgreSQL。
 - 跨边界键固定为 `MachineId`、`ContentKey(md5,file_size)` 和
-  `LocationKey(machine_id,normalized_path,file_size)`；SQLite 自增 ID 不通过网络或同步传播。
+  `LocationKey(machine_id,normalized_path)`；扫描缓存查询再把 `file_size` 作为独立条件，
+  因此跳过 MD5 的完整条件仍是机器 ID、规范路径和文件大小。SQLite 自增 ID 不通过网络或同步传播。
 - 配置、SQLite、日志和缓存只写可执行程序同目录下的 `data`。当前工作目录和用户目录不作
   运行时回退。
+- `NormalizedPath` 只接受 Windows 绝对盘符或 UNC 路径，统一大小写、尾分隔符、`.`、`..`
+  和 `\\?\` 形式；目录归属比较路径组件。`DisplayPath` 单独保留原始拼写供 UI 与文件访问。
+- `MachineId` 的输入顺序固定为 System UUID、System Serial、Baseboard Serial；字段 trim、
+  转大写、跳过空值后以 NUL 分隔，对固定命名空间前缀与字段计算 SHA-256。
 
 ## 5. 同步与分析状态机
 
@@ -106,13 +116,15 @@ cargo build --workspace --release --locked --target x86_64-pc-windows-msvc
 ```
 
 真实 PostgreSQL 测试默认 `#[ignore]`，只在固定测试容器和
-`DEDUP_TEST_POSTGRES_URL` 存在时显式运行。FFmpeg 集成测试使用已校验的测试 DLL来源，
+`DEDUP_TEST_POSTGRES_URL` 存在时显式运行。FFmpeg 集成测试使用已校验的测试 DLL 来源，
 但仍通过生产相对路径加载。每项实现遵循 RED→GREEN→REFACTOR，并只运行计划指定门禁和一次
 最终综合门禁，不追加无休止审查。
 
 ## 8. 验收边界
 
-当前已建立 Rust 1.97.1 工具链和 13 成员工作区骨架；业务模块将在后续任务按本文件架构填充。
+当前已建立 Rust 1.97.1 工具链和 13 成员工作区，并完成领域 ID、配置/阈值、应用目录、
+Windows 路径和 SMBIOS 机器身份边界；真实当前主机的 SMBIOS 读取测试已执行通过。协议、
+持久化、媒体算法和 UI 将在后续任务按本文件架构填充。
 静态测试、集成测试、发布包验证和 Windows 实际 GUI/托盘/回收站验收必须分开记录。没有实际
 运行的 GUI、托盘、回收站、第二台物理主机或 PostgreSQL 项不得标记 PASS；可用双节点进程
 集成测试证明协议与编排，但真实双物理机不可用时仍标 `BLOCKED`。
