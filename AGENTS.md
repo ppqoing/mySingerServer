@@ -61,6 +61,13 @@ Win32 `GetSystemFirmwareTable(RSMB)`，不从配置注入。
 `LocationKey` 与 `Thresholds`。节点 Envelope 覆盖状态、任务、路径、分析、同步、快照、
 文件读取和删除；WorkerEnvelope 只携带任务/项目/显示路径、槽位和计算结果，不含数据库或网络地址。
 
+媒体像素边界已经落地：`Rgb24Image` 和 `GrayImage` 在构造时一次性验证紧凑缓冲区长度，
+内部算法不重复检查尺寸。所有图片特征共用整数亮度公式和像素中心双线性缩放，避免一筛、
+二筛使用不同像素语义。PDQ 按 `third_party/pdq/UPSTREAM.md` 固定的 Meta commit 独立移植为
+纯 Rust；模块依次负责两轮 Jarosz 滤波与中心抽样、图像域 Quality、非 DC 16×16 DCT、
+Torben 中位数和 256 位阈值。上游低 word 优先布局只在 `PdqHash` 构造边界转为 32 字节
+规范序，SQLite、PostgreSQL、Protobuf 和汉明距离都直接使用该字节序，不再二次解释。
+
 ## 4. 数据所有权
 
 - 节点 actor 串行独占一个 `NodeStore` 和一个 `WorkerPool`，所有 SQLite 写入经 actor 排序。
@@ -107,6 +114,8 @@ TCP 传输固定为四字节大端长度头加 Protobuf Envelope；零长度、�
 - 只构建 `x86_64-pc-windows-msvc`，不主动按 Windows 版本号拒绝启动。
 - 不添加旧代码兼容、TLS、认证、自动发现、云服务、Web 前端、移动端或自动删除。
 - 算法定义和采样位置硬编码；九个匹配阈值可配置并快照到分析运行。
+- PDQ 输入固定先用 `(77R + 150G + 29B + 128) >> 8` 转灰度；64×64 特例直接复制，
+  其余尺寸按上游两轮 Jarosz 算法降采样。不得用通用缩放器替换 PDQ 降采样。
 - 图片不生成缩略图。视频联系表固定三列两行、RGB24、JPG 质量 80，复用六个成功抽帧。
 - FFmpeg 固定从 `worker.exe` 相对路径 `runtime/ffmpeg` 加载五个 8.0.1 x64 LGPL DLL；
   不搜索当前目录或 PATH，不运行或发布 FFmpeg EXE。
@@ -135,8 +144,9 @@ cargo build --workspace --release --locked --target x86_64-pc-windows-msvc
 
 当前已建立 Rust 1.97.1 工具链和 13 成员工作区，并完成领域 ID、配置/阈值、应用目录、
 Windows 路径、SMBIOS 机器身份、完整 Protobuf 清单和 TCP 传输边界；真实当前主机的
-SMBIOS 读取以及 loopback TCP 请求复用测试已执行通过。持久化、媒体算法和 UI 将在后续任务
-按本文件架构填充。
+SMBIOS 读取以及 loopback TCP 请求复用测试已执行通过。固定像素管线和 Meta PDQ 纯 Rust
+移植也已完成，三张固定上游 JPEG 的 256 位 golden 与 Quality 均逐位通过。pHash、Sobel、
+视频、持久化和 UI 将在后续任务按本文件架构填充。
 静态测试、集成测试、发布包验证和 Windows 实际 GUI/托盘/回收站验收必须分开记录。没有实际
 运行的 GUI、托盘、回收站、第二台物理主机或 PostgreSQL 项不得标记 PASS；可用双节点进程
 集成测试证明协议与编排，但真实双物理机不可用时仍标 `BLOCKED`。
