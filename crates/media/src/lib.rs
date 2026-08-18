@@ -2,12 +2,21 @@
 #![warn(missing_docs)]
 
 mod image;
+mod image_score;
 mod pdq;
+mod phash;
 mod resize;
+mod sobel;
 
 pub use image::{GrayImage, MediaError, Rgb24Image, rgb24_to_gray};
+pub use image_score::{
+    ImageStage1, ImageStage1Score, ImageStage2, ImageStage2Score, compute_image_stage2, pdq_bands,
+    screen_image_stage1, screen_image_stage2, shares_pdq_band,
+};
 pub use pdq::{PdqHash, PdqResult, pdq_hash};
+pub use phash::{compute_partition_phash, phash_parts_to_blob};
 pub use resize::resize_bilinear;
+pub use sobel::{compute_sobel, sobel_cosine};
 
 #[cfg(test)]
 mod tests {

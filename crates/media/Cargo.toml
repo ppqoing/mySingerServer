@@ -9,6 +9,7 @@ publish.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+dedup-core = { path = "../core" }
 thiserror.workspace = true
 
 [dev-dependencies]

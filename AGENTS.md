@@ -68,6 +68,18 @@ Win32 `GetSystemFirmwareTable(RSMB)`，不从配置注入。
 Torben 中位数和 256 位阈值。上游低 word 优先布局只在 `PdqHash` 构造边界转为 32 字节
 规范序，SQLite、PostgreSQL、Protobuf 和汉明距离都直接使用该字节序，不再二次解释。
 
+图片二筛也保持一个清晰入口：`compute_image_stage2` 从同一 `GrayImage` 生成九块 pHash 和
+Sobel，调用者不能把两种特征拆成不同解码任务。pHash 先用共享的像素中心缩放到 96×96，
+再按 3×3 行优先计算包含 DC 的 8×8 DCT；bit 使用系数行优先序，数据库 BLOB 固定为九个
+小端 `u64`。Sobel 用同一缩放语义得到 128×128 灰度面，以 4×4 空间格和八个 `[0,π)`
+硬方向 bin 形成 128 维 L2 向量。比较函数显式定义双零向量为 1、单零向量为 0。
+
+`screen_image_stage1` 和 `screen_image_stage2` 只消费已验证的 `Thresholds` 快照：一筛返回
+PDQ 汉明距离及 `1-hamming/256`，联合二筛返回 pHash 通过块数及 Sobel 余弦。候选索引把
+PDQ 规范字节切成四个连续大端 `u64`，共享任一 band 才做完整阈值判断；这是已确认的近似
+召回边界，不增加错位 band 或向量索引。`dedup-core::MediaKind` 是数据库、协议和任务共享的
+图片/视频领域枚举，不由文件扩展名直接充当类型。
+
 ## 4. 数据所有权
 
 - 节点 actor 串行独占一个 `NodeStore` 和一个 `WorkerPool`，所有 SQLite 写入经 actor 排序。
@@ -116,6 +128,8 @@ TCP 传输固定为四字节大端长度头加 Protobuf Envelope；零长度、�
 - 算法定义和采样位置硬编码；九个匹配阈值可配置并快照到分析运行。
 - PDQ 输入固定先用 `(77R + 150G + 29B + 128) >> 8` 转灰度；64×64 特例直接复制，
   其余尺寸按上游两轮 Jarosz 算法降采样。不得用通用缩放器替换 PDQ 降采样。
+- pHash 的 3×3 块序、DCT bit 序和小端 BLOB，以及 Sobel 的空间格、方向 bin 和零向量
+  规则都是持久化契约；不得因性能重写改变输出字节或向量索引。
 - 图片不生成缩略图。视频联系表固定三列两行、RGB24、JPG 质量 80，复用六个成功抽帧。
 - FFmpeg 固定从 `worker.exe` 相对路径 `runtime/ffmpeg` 加载五个 8.0.1 x64 LGPL DLL；
   不搜索当前目录或 PATH，不运行或发布 FFmpeg EXE。
@@ -145,8 +159,9 @@ cargo build --workspace --release --locked --target x86_64-pc-windows-msvc
 当前已建立 Rust 1.97.1 工具链和 13 成员工作区，并完成领域 ID、配置/阈值、应用目录、
 Windows 路径、SMBIOS 机器身份、完整 Protobuf 清单和 TCP 传输边界；真实当前主机的
 SMBIOS 读取以及 loopback TCP 请求复用测试已执行通过。固定像素管线和 Meta PDQ 纯 Rust
-移植也已完成，三张固定上游 JPEG 的 256 位 golden 与 Quality 均逐位通过。pHash、Sobel、
-视频、持久化和 UI 将在后续任务按本文件架构填充。
+移植也已完成，三张固定上游 JPEG 的 256 位 golden 与 Quality 均逐位通过。九分块 pHash、
+128 维 Sobel、PDQ band 候选和图片两层联合筛选的位序/阈值测试也已通过。视频、持久化和
+UI 将在后续任务按本文件架构填充。
 静态测试、集成测试、发布包验证和 Windows 实际 GUI/托盘/回收站验收必须分开记录。没有实际
 运行的 GUI、托盘、回收站、第二台物理主机或 PostgreSQL 项不得标记 PASS；可用双节点进程
 集成测试证明协议与编排，但真实双物理机不可用时仍标 `BLOCKED`。

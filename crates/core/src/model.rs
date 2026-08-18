@@ -23,3 +23,13 @@ pub enum EnumeratorKind {
     /// 使用 Everything 本机 IPC 查询。
     Everything,
 }
+
+/// 内容探测后进入特征表和分析输入的媒体类别。
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaKind {
+    /// 使用图片两层算法处理的静态图像。
+    Image,
+    /// 使用六个固定帧槽位处理的视频。
+    Video,
+}
