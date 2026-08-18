@@ -68,6 +68,11 @@ macro_rules! uuid_id {
             pub const fn as_uuid(&self) -> &Uuid {
                 &self.0
             }
+
+            /// 从数据库或协议已经验证过的 UUID 恢复业务标识。
+            pub const fn from_uuid(value: Uuid) -> Self {
+                Self(value)
+            }
         }
 
         impl Default for $name {

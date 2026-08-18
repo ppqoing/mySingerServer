@@ -48,6 +48,24 @@ pub enum StoreError {
     /// 快照请求了不属于同步基础数据的表。
     #[error("不支持的快照表: {0}")]
     InvalidSnapshotTable(String),
+    /// 任务、分析或删除操作不符合当前持久化状态。
+    #[error("状态操作无效: {0}")]
+    InvalidState(String),
+    /// 分析输入已经冻结，当前运行不能继续追加。
+    #[error("分析运行的输入已经冻结")]
+    AnalysisInputsFrozen,
+    /// 分页游标不是当前 V2 编码。
+    #[error("分页游标无效")]
+    InvalidCursor,
+    /// 删除组没有至少一个当前活动且明确保留的成员。
+    #[error("重复组 {0} 没有活动 Keep 成员")]
+    MissingKeep(String),
+    /// 分页大小必须大于零。
+    #[error("分页大小必须大于零")]
+    EmptyPageLimit,
+    /// 分数不是当前 schema 可保存的有限值。
+    #[error("分数字段必须是有限值")]
+    NonFiniteScore,
     /// 从数据库恢复强类型路径或机器 ID 失败。
     #[error("数据库领域值无效: {0}")]
     Core(#[from] CoreError),

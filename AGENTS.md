@@ -115,6 +115,11 @@ PDQ 规范字节切成四个连续大端 `u64`，共享任一 band 才做完整�
 九分块 pHash 与 128 维有限 Sobel；视频必须有六个槽位、至少四个成功且完整的一筛帧，二筛还须
 覆盖每个成功帧。部分结果允许保存以支持恢复，但查询只向分析层返回完整结果。
 
+任务与任务项分别持久化状态。领取只把一个稳定排序的 `queued` 项改为 `running`；结果、统计、
+任务终态和任务内单调 `event_seq` 在同一事务提交后才能发事件。进程恢复只把遗留 `running`
+项和所属任务退回 `queued`，成功、失败、取消项不重算；单文件失败计入统计，但其他项结束后
+任务仍为 `completed`，只有任务级基础设施错误才使用 `failed`。
+
 ## 5. 同步与分析状态机
 
 扫描先生成文件列表，再以“机器 ID + 规范路径 + 文件大小”批量查询 SQLite。命中位置缓存
@@ -125,6 +130,18 @@ PDQ 规范字节切成四个连续大端 `u64`，共享任一 band 才做完整�
 开始筛选。精确重复为 MD5 索引后比较文件大小；图片一筛为 PDQ/Quality，二筛联合 9 分块
 pHash 与 128 维 Sobel；视频均匀抽六帧，每帧走同一图片判定并取平均。分组以最小稳定键
 作为代表，只加入与代表直接通过的成员，不做传递闭包。
+
+分析状态链固定为 `collecting_stage1 → stage1_synced → screening → phase2_dispatched →
+phase2_synced → finalizing → completed`；活动态可到 `partial/cancelled`，只有显式重试允许
+`partial → phase2_dispatched`。输入只从所选 `completed` 任务的成功项连接当前活动文件，按
+`(ContentKey,LocationKey)` 去重排序后一次封存。候选和最终组都是整批事务替换。
+
+组分页游标编码 `(group_kind,representative_content_key,group_id)`，成员游标编码
+`(machine_id,normalized_path)`，因此成员删除后可从旧位置继续且不重复。复核决定 UPSERT 到
+SQLite；创建删除批次时才一次性验证每组至少一个当前活动 `Keep` 并冻结 Delete 项的 MD5/大小。
+`recycled/deleted` 结果在一个事务中写结果、位置墓碑和 outbox，并移除组成员；少于两项即删组。
+若删除代表，只从该计划中剩余的明确 Keep 按位置升序选择新代表，不重新筛选或扩组；
+`failed/skipped` 保留位置和组，相同成功结果重复提交幂等。
 
 中心同步每批最多 1000 条：先以 PostgreSQL 已提交 cursor 向节点 ACK，再拉取增量；中心
 事务提交后才 ACK 新 cursor。节点 outbox 被裁剪而中心落后时执行整次快照。自动同步只由
@@ -193,7 +210,8 @@ SMBIOS 读取以及 loopback TCP 请求复用测试已执行通过。固定像�
 移植也已完成，三张固定上游 JPEG 的 256 位 golden 与 Quality 均逐位通过。九分块 pHash、
 128 维 Sobel、PDQ band 候选和图片两层联合筛选的位序/阈值测试也已通过。六帧中点、
 有效/缺失槽位平均规则以及 3×2 JPG 联系表测试已通过。SQLite V2 schema、路径缓存、内容复用、
-图片/视频特征完整性、事务 outbox、ACK 裁剪与稳定快照测试已通过。任务状态机和 UI 将在后续
+图片/视频特征完整性、事务 outbox、ACK 裁剪与稳定快照测试已通过。任务恢复、分析状态链、
+冻结输入、稳定组分页、复核恢复和删除后缩组测试也已通过。Worker、节点服务和 UI 将在后续
 任务按本文件架构填充。
 静态测试、集成测试、发布包验证和 Windows 实际 GUI/托盘/回收站验收必须分开记录。没有实际
 运行的 GUI、托盘、回收站、第二台物理主机或 PostgreSQL 项不得标记 PASS；可用双节点进程

@@ -142,6 +142,8 @@ dependencies = [
  "rusqlite",
  "tempfile",
  "thiserror",
+ "toml",
+ "uuid",
 ]
 
 [[package]]
