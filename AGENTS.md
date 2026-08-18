@@ -106,6 +106,15 @@ PDQ 规范字节切成四个连续大端 `u64`，共享任一 band 才做完整�
 - `MachineId` 的输入顺序固定为 System UUID、System Serial、Baseboard Serial；字段 trim、
   转大写、跳过空值后以 NUL 分隔，对固定命名空间前缀与字段计算 SHA-256。
 
+节点 SQLite V2 使用 22 张严格表闭合内容、位置、特征、任务、分析、分组、复核、同步和删除。
+`metadata.schema_id` 是不兼容版本标记：只自动初始化空数据库，旧库或未知 schema 直接拒绝打开。
+`NodeStore` 独占连接并启用外键、WAL 与五秒 busy timeout；上层 actor 负责串行调用，不在每个
+仓储函数内重复加锁。内容先按 `(md5,file_size)` 复用，再在同一事务写位置和 outbox。
+
+特征完整性由存储边界统一定义：图片一筛必须同时具备尺寸、PDQ 和 Quality，二筛必须同时具备
+九分块 pHash 与 128 维有限 Sobel；视频必须有六个槽位、至少四个成功且完整的一筛帧，二筛还须
+覆盖每个成功帧。部分结果允许保存以支持恢复，但查询只向分析层返回完整结果。
+
 ## 5. 同步与分析状态机
 
 扫描先生成文件列表，再以“机器 ID + 规范路径 + 文件大小”批量查询 SQLite。命中位置缓存
@@ -120,6 +129,10 @@ pHash 与 128 维 Sobel；视频均匀抽六帧，每帧走同一图片判定并
 中心同步每批最多 1000 条：先以 PostgreSQL 已提交 cursor 向节点 ACK，再拉取增量；中心
 事务提交后才 ACK 新 cursor。节点 outbox 被裁剪而中心落后时执行整次快照。自动同步只由
 连接成功、任务完成和每 5 秒追赶检查触发；手动同步进入同一队列，每节点最多一个同步循环。
+
+SQLite 的业务更新与 outbox 递增序号同事务提交。ACK 只前进、不越过节点真实高水位，并裁剪
+已确认行；请求游标落后于裁剪边界时返回 `SnapshotRequired`。整库快照固定一个读事务和起始
+高水位，按稳定主键逐表分页；快照载荷和增量载荷只传播跨边界键，不泄露本地自增 `content_id`。
 
 跨机器分析先冻结节点集合、各节点 task highwater 和 sync highwater。中心使用完整 stage1
 数据批量生成候选，一筛结束后才批量派发缺失 stage2；数据库已有二筛结果时不派发。所有节点
@@ -155,11 +168,17 @@ TCP 传输固定为四字节大端长度头加 Protobuf Envelope；零长度、�
 固定工具链为 Rust `1.97.1-x86_64-pc-windows-msvc`，根 `.cargo/config.toml` 固定默认目标。
 
 ```powershell
+Remove-Item Env:CC -ErrorAction SilentlyContinue
+Remove-Item Env:CXX -ErrorAction SilentlyContinue
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked -- --test-threads=1
 cargo build --workspace --release --locked --target x86_64-pc-windows-msvc
 ```
+
+构建前清除泛化的 `CC`/`CXX` 覆盖，让 `cc-rs` 按 MSVC 目标自动发现 Visual Studio；若继承
+MinGW GCC，bundled SQLite 会生成 MinGW ABI 符号并在 MSVC 链接阶段失败。不得把本机 VS
+安装绝对路径写入项目。
 
 真实 PostgreSQL 测试默认 `#[ignore]`，只在固定测试容器和
 `DEDUP_TEST_POSTGRES_URL` 存在时显式运行。FFmpeg 集成测试使用已校验的测试 DLL 来源，
@@ -173,8 +192,9 @@ Windows 路径、SMBIOS 机器身份、完整 Protobuf 清单和 TCP 传输边�
 SMBIOS 读取以及 loopback TCP 请求复用测试已执行通过。固定像素管线和 Meta PDQ 纯 Rust
 移植也已完成，三张固定上游 JPEG 的 256 位 golden 与 Quality 均逐位通过。九分块 pHash、
 128 维 Sobel、PDQ band 候选和图片两层联合筛选的位序/阈值测试也已通过。六帧中点、
-有效/缺失槽位平均规则以及 3×2 JPG 联系表测试已通过。持久化和 UI 将在后续任务按本文件
-架构填充。
+有效/缺失槽位平均规则以及 3×2 JPG 联系表测试已通过。SQLite V2 schema、路径缓存、内容复用、
+图片/视频特征完整性、事务 outbox、ACK 裁剪与稳定快照测试已通过。任务状态机和 UI 将在后续
+任务按本文件架构填充。
 静态测试、集成测试、发布包验证和 Windows 实际 GUI/托盘/回收站验收必须分开记录。没有实际
 运行的 GUI、托盘、回收站、第二台物理主机或 PostgreSQL 项不得标记 PASS；可用双节点进程
 集成测试证明协议与编排，但真实双物理机不可用时仍标 `BLOCKED`。
