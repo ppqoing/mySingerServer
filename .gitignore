@@ -15,6 +15,9 @@
 /videocore/build/
 /mediacore/build/
 /third_party/es/
+/target/
+/dist-rust-v2/
+/downloads/
 /*.exe
 *.db
 *.db-shm
