@@ -99,6 +99,22 @@ FFmpeg 边界使用 BtbN 固定归档中的 8.0.1 x64 LGPL shared 构建，归�
 frame 和 sws context 只存在于短生命周期解码会话，安全边界外只返回媒体信息或紧凑 RGB24。
 探测媒体类型读取实际解复用器；`image2`/`*_pipe` 的单帧伪时长不被误判为视频。
 
+Worker 媒体流水线通过 `MediaDecoder` 隔离 FFmpeg：图片一筛只解码一次且绝不生成缩略图；
+视频一筛严格按六个中点解码，单次灰度面计算 PDQ/Quality，并把同一批 RGB24 直接交给联系表，
+不做第七次解码。联合二筛的每个请求槽位也只解码、转灰度一次，再共同生成九块 pHash 与
+128 维 Sobel。槽位失败作为结果保存，不让一个坏帧终止其他视频帧。Worker 的内部结果使用
+独立 Protobuf 载荷，进程边界一次校验固定 hash/向量长度，NodeEngine 只接收拥有所有权的值。
+
+`worker.exe` 启动后先加载相对 DLL，成功才向 stdout 写 `WorkerReady`；stdin/stdout 永远只传
+四字节长度头的 `WorkerEnvelope`，日志直接写 `data/node/logs/worker-<pid>.log`。`WorkerPool`
+由单 actor 独占队列、进程槽位和 Job Object，空闲槽位与等待项配对后才更新运行快照。正常
+结果、意外退出、用户取消和计划重启是四条独立路径：意外退出增加 failure count、当前项失败
+并补建；取消删除等待项并终止/替换命中的 Worker，但不增加 failure count。计划重启必须先
+`prepare_planned_restart` 冻结调度并返回运行项，NodeEngine 在 SQLite 将这些项改回 queued 后，
+才能调用 `restart_after_requeue`；第二阶段会核对同一项集合，再终止、补建并等待全部 Ready。
+Worker 全部加入 `KILL_ON_JOB_CLOSE` Job，节点退出不会留下孤儿进程，创建标志固定包含
+`CREATE_NO_WINDOW`。
+
 ## 4. 数据所有权
 
 - 节点 actor 串行独占一个 `NodeStore` 和一个 `WorkerPool`，所有 SQLite 写入经 actor 排序。
@@ -220,10 +236,11 @@ SMBIOS 读取以及 loopback TCP 请求复用测试已执行通过。固定像�
 128 维 Sobel、PDQ band 候选和图片两层联合筛选的位序/阈值测试也已通过。六帧中点、
 有效/缺失槽位平均规则以及 3×2 JPG 联系表测试已通过。SQLite V2 schema、路径缓存、内容复用、
 图片/视频特征完整性、事务 outbox、ACK 裁剪与稳定快照测试已通过。任务恢复、分析状态链、
-冻结输入、稳定组分页、复核恢复和删除后缩组测试也已通过。Worker、节点服务和 UI 将在后续
-任务按本文件架构填充。FFmpeg 固定供应清单、无 EXE 发布、受限 DLL 搜索、缺失 DLL 报错、
-JPEG/MP4 探测和 MP4 首尾 RGB24 解码集成测试已通过；这只证明 DLL 与解码边界，不代表
-Worker 进程池已完成。
+冻结输入、稳定组分页、复核恢复和删除后缩组测试也已通过。节点服务和 UI 将在后续任务按本文件
+架构填充。FFmpeg 固定供应清单、无 EXE 发布、受限 DLL 搜索、缺失 DLL 报错、JPEG/MP4 探测和
+MP4 首尾 RGB24 解码集成测试已通过。真实 worker.exe 的 Ready、图片一筛结果、连续调度、
+计划重启、意外退出补建、取消替换和 Job 关闭清理进程测试已通过；节点 actor 与 SQLite 的最终
+装配留在后续任务。
 静态测试、集成测试、发布包验证和 Windows 实际 GUI/托盘/回收站验收必须分开记录。没有实际
 运行的 GUI、托盘、回收站、第二台物理主机或 PostgreSQL 项不得标记 PASS；可用双节点进程
 集成测试证明协议与编排，但真实双物理机不可用时仍标 `BLOCKED`。

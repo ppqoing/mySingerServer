@@ -7,3 +7,14 @@ publish.workspace = true
 
 [lib]
 path = "src/lib.rs"
+
+[dependencies]
+dedup-core = { path = "../core" }
+dedup-media = { path = "../media" }
+dedup-media-ffmpeg = { path = "../media-ffmpeg" }
+dedup-protocol = { path = "../protocol" }
+dedup-transport = { path = "../transport" }
+dedup-windows = { path = "../windows" }
+prost.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

@@ -2,10 +2,12 @@
 #![warn(missing_docs)]
 
 mod app_layout;
+mod job;
 mod machine_id;
 mod smbios;
 
 pub use app_layout::AppLayout;
+pub use job::{CREATE_WORKER_FLAGS, WorkerJob};
 pub use machine_id::{PhysicalMachineFields, machine_id_from_fields};
 pub use smbios::read_physical_machine_fields;
 
