@@ -119,7 +119,7 @@ export component ReviewDeleteWorkspace inherits Rectangle {
             }
 
             TabStrip {
-                labels: ["待审核", "已决定", "已忽略"];
+                labels: ["未决定", "保留", "删除"];
                 active-index <=> root.review-filter;
             }
 

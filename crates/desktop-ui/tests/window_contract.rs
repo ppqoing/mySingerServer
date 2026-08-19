@@ -568,13 +568,13 @@ fn task_tabs_filter_loaded_models_and_cancel_active_task() {
     window.invoke_navigate_to(3);
 
     assert_eq!(window.get_task_tab(), 0);
-    assert!(
+    assert_eq!(
         accessible(
             &window,
             "任务项：媒体扫描；节点 7；枚举文件；35%；7 / 20 · 失败 0 · 跳过 1；运行中"
         )
-        .accessible_item_selected()
-        .is_some()
+        .accessible_item_selected(),
+        Some(true)
     );
     assert!(
         ElementHandle::find_by_accessible_label(
@@ -637,13 +637,13 @@ fn task_tabs_filter_loaded_models_and_cancel_active_task() {
         .next()
         .is_none()
     );
-    assert!(
+    assert_eq!(
         accessible(
             &window,
             "任务项：图片分析；节点 0；完成；100%；18 / 18 · 失败 0 · 跳过 0；已完成"
         )
-        .accessible_item_selected()
-        .is_some()
+        .accessible_item_selected(),
+        Some(false)
     );
     assert!(
         ElementHandle::find_by_accessible_label(&window, "取消任务：task-completed")
@@ -661,13 +661,13 @@ fn task_tabs_filter_loaded_models_and_cancel_active_task() {
         .next()
         .is_none()
     );
-    assert!(
+    assert_eq!(
         accessible(
             &window,
             "任务项：视频分析；节点 3；提取特征；60%；6 / 10 · 失败 1 · 跳过 0；失败"
         )
-        .accessible_item_selected()
-        .is_some()
+        .accessible_item_selected(),
+        Some(false)
     );
     assert!(
         ElementHandle::find_by_accessible_label(&window, "取消任务：task-failed")
@@ -982,6 +982,22 @@ fn review_filters_loaded_members_and_delete_confirmation_obeys_gate() {
 
     assert_eq!(window.get_review_tab(), 0);
     assert_eq!(window.get_review_filter(), 0);
+    for label in ["未决定", "保留", "删除"] {
+        assert!(
+            ElementHandle::find_by_accessible_label(&window, label)
+                .next()
+                .is_some(),
+            "审核筛选应使用真实领域语义：{label}",
+        );
+    }
+    for stale_label in ["待审核", "已决定", "已忽略"] {
+        assert!(
+            ElementHandle::find_by_accessible_label(&window, stale_label)
+                .next()
+                .is_none(),
+            "不得继续显示误导性的审核筛选：{stale_label}",
+        );
+    }
     assert!(
         ElementHandle::find_by_accessible_label(&window, "成员：D:\\Media\\pending.jpg")
             .next()
@@ -998,7 +1014,7 @@ fn review_filters_loaded_members_and_delete_confirmation_obeys_gate() {
             .is_none()
     );
 
-    accessible(&window, "已决定").invoke_accessible_default_action();
+    accessible(&window, "保留").invoke_accessible_default_action();
     assert_eq!(window.get_review_filter(), 1);
     assert!(
         ElementHandle::find_by_accessible_label(&window, "成员：D:\\Media\\pending.jpg")
@@ -1016,7 +1032,7 @@ fn review_filters_loaded_members_and_delete_confirmation_obeys_gate() {
             .is_none()
     );
 
-    accessible(&window, "已忽略").invoke_accessible_default_action();
+    accessible(&window, "删除").invoke_accessible_default_action();
     assert_eq!(window.get_review_filter(), 2);
     assert!(
         ElementHandle::find_by_accessible_label(&window, "成员：D:\\Media\\pending.jpg")

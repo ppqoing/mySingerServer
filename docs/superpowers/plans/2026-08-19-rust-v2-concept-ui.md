@@ -628,11 +628,11 @@ git commit -m "feat: unify concept duplicate result workspace"
 
 **Interfaces:**
 - Consumes: 当前成员、选中组、预览、路径规则、删除确认属性和现有审核删除回调。
-- Produces: 审核/删除双模式；待审核/已决定/已忽略本地过滤；待执行/执行中/历史记录删除标签；浅色删除覆盖层。
+- Produces: 审核/删除双模式；未决定/保留/删除本地过滤；待执行/执行中/历史记录删除标签；浅色删除覆盖层。
 
 - [ ] **Step 1: 添加审核筛选和删除门禁行为 RED**
 
-在 `window_contract.rs` 新增 `review_filters_loaded_members_and_delete_confirmation_obeys_gate`。注入未决定、保留、删除三种 `UiMemberRow.review` 的字面 fixture，导航到审核删除页后，通过“待审核 / 已决定 / 已忽略”可访问动作切换根 `review-filter`，断言可访问树只暴露当前筛选的成员；通过“审核工作台 / 删除中心”和“待执行 / 执行中 / 历史记录”动作断言根 `review-tab`、`delete-filter` 的状态映射。
+在 `window_contract.rs` 新增 `review_filters_loaded_members_and_delete_confirmation_obeys_gate`。注入未决定、保留、删除三种 `UiMemberRow.review` 的字面 fixture，导航到审核删除页后，通过“未决定 / 保留 / 删除”可访问动作切换根 `review-filter`，断言可访问树只暴露当前筛选的成员；通过“审核工作台 / 删除中心”和“待执行 / 执行中 / 历史记录”动作断言根 `review-tab`、`delete-filter` 的状态映射。
 
 测试为 `prepare-delete` 和 `confirm-delete` 安装捕获闭包：点击“准备删除”只调用一次现有准备回调；打开根删除覆盖层并令 `delete-can-execute = false` 时，“确认执行”的默认动作不得调用确认回调；改为 `true` 后同一动作只调用一次。分别设置 `delete-mode = "回收站"` 和 `"永久删除"`，断言可访问名称/描述反映当前模式，永久删除描述包含“不可恢复”。
 

@@ -34,11 +34,26 @@ fn decodes_beginning_and_end_to_tight_rgb24() {
         return;
     };
     let video = fixture_root().join("video-12s.mp4");
-    for position in [1.0 / 12.0, 11.0 / 12.0] {
+    for position in [1.0 / 12.0, 11.0 / 12.0, 1.0] {
         let frame = ffmpeg.decode_frame_at(&video, position).unwrap();
         assert_eq!((frame.width, frame.height), (160, 90));
         assert_eq!(frame.rgb24.len(), 160 * 90 * 3);
     }
+}
+
+/// 固定 H.264 夹具在不同时间段有可区分画面；后向 seek 不能都返回同一早期关键帧。
+#[test]
+fn backward_seek_decodes_forward_to_the_requested_time() {
+    let Some((ffmpeg, _runtime)) = load_fixture() else {
+        return;
+    };
+    let video = fixture_root().join("video-12s.mp4");
+    let beginning = ffmpeg.decode_frame_at(&video, 0.0).unwrap();
+    let middle = ffmpeg.decode_frame_at(&video, 0.5).unwrap();
+    let ending = ffmpeg.decode_frame_at(&video, 0.9).unwrap();
+
+    assert_ne!(beginning.rgb24, middle.rgb24);
+    assert_ne!(middle.rgb24, ending.rgb24);
 }
 
 fn fixture_root() -> PathBuf {

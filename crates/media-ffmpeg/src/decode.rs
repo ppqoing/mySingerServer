@@ -76,8 +76,8 @@ impl Ffmpeg {
             return Err(FfmpegError::InvalidPosition(normalized_position));
         }
         let mut session = DecoderSession::open(&self.api, path)?;
-        session.seek(normalized_position)?;
-        session.decode_one()
+        let target_timestamp = session.seek(normalized_position)?;
+        session.decode_one(target_timestamp)
     }
 }
 
@@ -238,21 +238,28 @@ impl<'api> DecoderSession<'api> {
         }
     }
 
-    fn seek(&mut self, normalized_position: f64) -> Result<(), FfmpegError> {
-        let duration = self.duration();
-        if duration <= 0 || normalized_position <= 0.0 {
-            return Ok(());
+    fn seek(&mut self, normalized_position: f64) -> Result<Option<i64>, FfmpegError> {
+        if normalized_position <= 0.0 {
+            return Ok(None);
         }
         let stream = self.stream()?;
         // SAFETY: stream 已验证且属于当前 format。
-        let time_base = unsafe { (*stream).time_base };
+        let (time_base, stream_duration) = unsafe { ((*stream).time_base, (*stream).duration) };
         if time_base.num <= 0 || time_base.den <= 0 {
             return Err(FfmpegError::InvalidMedia("video time base is invalid"));
         }
-        let target_us = (duration as f64 * normalized_position).round() as i64;
-        let target_offset = (target_us as i128 * time_base.den as i128
-            / (AV_TIME_BASE as i128 * time_base.num as i128))
-            .clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+        let target_offset = if stream_duration > 0 {
+            (stream_duration as f64 * normalized_position).round() as i64
+        } else {
+            let duration = self.duration();
+            if duration <= 0 {
+                return Ok(None);
+            }
+            let target_us = (duration as f64 * normalized_position).round() as i64;
+            (target_us as i128 * time_base.den as i128
+                / (AV_TIME_BASE as i128 * time_base.num as i128))
+                .clamp(i64::MIN as i128, i64::MAX as i128) as i64
+        };
         // SAFETY: stream 已验证且字段只读。
         let start_time = unsafe { (*stream).start_time };
         let target = if start_time == i64::MIN {
@@ -273,11 +280,31 @@ impl<'api> DecoderSession<'api> {
         })?;
         // SAFETY: codec 上下文已经打开；seek 后按 FFmpeg 要求清空缓冲。
         unsafe { (self.api.avcodec_flush_buffers)(self.codec) };
-        Ok(())
+        Ok(Some(target))
     }
 
-    fn decode_one(&mut self) -> Result<DecodedFrame, FfmpegError> {
+    /// 持续排空每个 packet 产生的帧，直到到达目标 PTS；目标位于末帧之后时回退到最后一帧。
+    fn decode_one(&mut self, target_timestamp: Option<i64>) -> Result<DecodedFrame, FfmpegError> {
+        let mut last_before_target = None;
         loop {
+            match self.receive_frame()? {
+                ReceiveFrame::Frame { timestamp, frame } => {
+                    if target_timestamp
+                        .is_none_or(|target| timestamp != i64::MIN && timestamp >= target)
+                    {
+                        return Ok(frame);
+                    }
+                    last_before_target = Some(frame);
+                    continue;
+                }
+                ReceiveFrame::End => {
+                    return last_before_target.ok_or(FfmpegError::InvalidMedia(
+                        "decoder produced no visual frame",
+                    ));
+                }
+                ReceiveFrame::NeedPacket => {}
+            }
+
             // SAFETY: format 和 packet 均由当前 session 持有。
             let read = unsafe { (self.api.av_read_frame)(self.format, self.packet) };
             if read < 0 {
@@ -286,11 +313,7 @@ impl<'api> DecoderSession<'api> {
                 if sent < 0 && sent != AVERROR_EOF {
                     return Err(api_error("avcodec_send_packet(flush)", sent));
                 }
-                return self.receive_frame().and_then(|frame| {
-                    frame.ok_or(FfmpegError::InvalidMedia(
-                        "decoder produced no visual frame",
-                    ))
-                });
+                continue;
             }
 
             // SAFETY: av_read_frame 成功后 packet 已初始化。
@@ -303,8 +326,10 @@ impl<'api> DecoderSession<'api> {
                 if sent < 0 && sent != AVERROR_EAGAIN {
                     return Err(api_error("avcodec_send_packet", sent));
                 }
-                if let Some(frame) = self.receive_frame()? {
-                    return Ok(frame);
+                if sent == AVERROR_EAGAIN {
+                    return Err(FfmpegError::InvalidMedia(
+                        "decoder refused a packet after its output was drained",
+                    ));
                 }
             } else {
                 // SAFETY: 非目标流 packet 不再使用，立即释放其引用。
@@ -313,12 +338,18 @@ impl<'api> DecoderSession<'api> {
         }
     }
 
-    fn receive_frame(&mut self) -> Result<Option<DecodedFrame>, FfmpegError> {
+    fn receive_frame(&mut self) -> Result<ReceiveFrame, FfmpegError> {
         // SAFETY: codec 已打开，frame 由当前 session 持有并可供 FFmpeg 写入。
         let received = unsafe { (self.api.avcodec_receive_frame)(self.codec, self.frame) };
         match received {
-            0 => self.rgb24().map(Some),
-            AVERROR_EAGAIN | AVERROR_EOF => Ok(None),
+            0 => {
+                // SAFETY: receive 成功后该字段属于刚取得的视频帧，单位为流 time_base。
+                let timestamp = unsafe { (*self.frame).best_effort_timestamp };
+                self.rgb24()
+                    .map(|frame| ReceiveFrame::Frame { timestamp, frame })
+            }
+            AVERROR_EAGAIN => Ok(ReceiveFrame::NeedPacket),
+            AVERROR_EOF => Ok(ReceiveFrame::End),
             code => Err(api_error("avcodec_receive_frame", code)),
         }
     }
@@ -389,6 +420,13 @@ impl<'api> DecoderSession<'api> {
     }
 }
 
+/// 解码器一次 receive 的三种状态，避免把需要输入与真正 EOF 混为一谈。
+enum ReceiveFrame {
+    Frame { timestamp: i64, frame: DecodedFrame },
+    NeedPacket,
+    End,
+}
+
 impl Drop for DecoderSession<'_> {
     fn drop(&mut self) {
         if !self.frame.is_null() {
@@ -424,4 +462,67 @@ fn check(operation: &'static str, code: i32) -> Result<i32, FfmpegError> {
 
 fn api_error(operation: &'static str, code: i32) -> FfmpegError {
     FfmpegError::Api { operation, code }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use std::{env, path::PathBuf};
+
+    use super::*;
+    use crate::required_dlls;
+
+    /// 后向 seek 返回的首帧通常早于目标；解码边界必须继续推进到目标 PTS。
+    #[test]
+    fn seeked_decode_reaches_the_requested_stream_timestamp() {
+        let Some(source) = env::var_os("DEDUP_FFMPEG_TEST_SOURCE_DIR").map(PathBuf::from) else {
+            return;
+        };
+        let runtime = tempfile::tempdir().unwrap();
+        let worker = runtime.path().join("worker.exe");
+        let dlls = runtime.path().join("runtime").join("ffmpeg");
+        std::fs::create_dir_all(&dlls).unwrap();
+        std::fs::write(&worker, []).unwrap();
+        for name in required_dlls() {
+            std::fs::copy(source.join(name), dlls.join(name)).unwrap();
+        }
+        let ffmpeg = Ffmpeg::load_from_worker_executable(&worker).unwrap();
+        let video = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("tests")
+            .join("fixtures")
+            .join("media")
+            .join("video-12s.mp4");
+        let mut session = DecoderSession::open(&ffmpeg.api, &video).unwrap();
+        let stream = session.stream().unwrap();
+        // SAFETY: stream 属于仍存活的 session，测试只读取时间字段。
+        let (time_base, start_time, stream_duration) = unsafe {
+            (
+                (*stream).time_base,
+                (*stream).start_time,
+                (*stream).duration,
+            )
+        };
+        let target_offset = if stream_duration > 0 {
+            stream_duration / 2
+        } else {
+            session.duration() * time_base.den as i64
+                / (2 * i64::from(AV_TIME_BASE) * i64::from(time_base.num))
+        };
+        let target = if start_time == i64::MIN {
+            target_offset
+        } else {
+            start_time.saturating_add(target_offset)
+        };
+
+        let actual_target = session.seek(0.5).unwrap();
+        assert_eq!(actual_target, Some(target));
+        session.decode_one(actual_target).unwrap();
+        // SAFETY: decode_one 成功后 frame 保存刚返回帧，时间戳属于视频流 time_base。
+        let decoded = unsafe { (*session.frame).best_effort_timestamp };
+        assert!(
+            decoded >= target,
+            "后向 seek 后返回了目标之前的帧: decoded={decoded}, target={target}"
+        );
+    }
 }
