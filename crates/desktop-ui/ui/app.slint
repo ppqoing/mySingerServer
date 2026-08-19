@@ -9,7 +9,7 @@ import { ScanPage } from "pages/scan-page.slint";
 import { TaskCenterPage } from "pages/task-center-page.slint";
 import { DuplicateWorkspace } from "pages/duplicate-workspace.slint";
 import { ReviewDeleteWorkspace } from "pages/review-delete-workspace.slint";
-import { SettingsDiagnosticsPage } from "pages/settings-diagnostics.slint";
+import { SettingsWorkspace } from "pages/settings-workspace.slint";
 
 export component MainWindow inherits Window {
     title: "mySingerServer · Media Dedup";
@@ -198,9 +198,10 @@ export component MainWindow inherits Window {
                     quick-review(rule, value) => { root.quick-review(rule, value); }
                     prepare-delete => { root.prepare-delete(); }
                 }
-                if root.current-page == 7 : SettingsDiagnosticsPage {
+                if root.current-page == 7 : SettingsWorkspace {
+                    active-section <=> root.settings-section;
                     data-path: root.data-path; logs-path: root.logs-path; cache-path: root.cache-path; config-path: root.config-path;
-                    postgres-status: root.postgres-status; postgres-color: root.postgres-color; postgres-url <=> root.postgres-url;
+                    postgres-status: root.postgres-status; postgres-color: root.postgres-color; last-error: root.last-error; postgres-url <=> root.postgres-url;
                     reconnect-seconds <=> root.reconnect-seconds; delete-mode-index <=> root.delete-mode-index;
                     pdq-quality <=> root.pdq-quality; aspect-tolerance <=> root.aspect-tolerance; pdq-hamming <=> root.pdq-hamming;
                     phash-hamming <=> root.phash-hamming; phash-parts <=> root.phash-parts; sobel-min <=> root.sobel-min;

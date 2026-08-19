@@ -163,6 +163,75 @@ fn duplicate_workspace_columns_stay_ordered_inside_content_area() {
 }
 
 #[test]
+fn settings_workspace_stays_reachable_at_minimum_size() {
+    install_testing_backend();
+
+    let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    window.invoke_navigate_to(6);
+    window
+        .window()
+        .set_size(slint::PhysicalSize::new(1080, 700));
+    window.show().expect("应能显示真实设置工作区");
+    window
+        .window()
+        .take_snapshot()
+        .expect("最小窗口设置工作区应完成软件渲染");
+
+    let mut previous_bottom = 0.0;
+    let mut menu_right: f32 = 0.0;
+    for label in [
+        "常规",
+        "相似度算法",
+        "存储",
+        "节点服务",
+        "扫描与性能",
+        "外部工具",
+        "日志与诊断",
+    ] {
+        let menu = ElementHandle::find_by_accessible_label(&window, label)
+            .next()
+            .unwrap_or_else(|| panic!("应能找到设置二级菜单：{label}"));
+        let position = menu.absolute_position();
+        let size = menu.size();
+        assert!(
+            position.y >= previous_bottom,
+            "设置二级菜单必须从上到下排列：{label} 位置={position:?}，上一项底部={previous_bottom}"
+        );
+        assert!(
+            position.x >= 144.0
+                && position.y >= 58.0
+                && position.x + size.width <= 1080.0
+                && position.y + size.height <= 668.0,
+            "{label} 必须位于最小窗口内容区内，位置={position:?}，尺寸={size:?}"
+        );
+        previous_bottom = position.y + size.height;
+        menu_right = menu_right.max(position.x + size.width);
+    }
+
+    let content = ElementHandle::find_by_accessible_label(&window, "设置内容卡")
+        .next()
+        .expect("设置工作区应公开右侧内容卡");
+    let content_position = content.absolute_position();
+    assert!(
+        content_position.x >= menu_right,
+        "设置内容卡必须在二级菜单右侧：菜单右边={menu_right}，内容位置={content_position:?}"
+    );
+
+    let save = ElementHandle::find_by_accessible_label(&window, "保存设置")
+        .next()
+        .expect("最小窗口仍应提供保存设置动作");
+    let save_position = save.absolute_position();
+    let save_size = save.size();
+    assert!(
+        save_position.x >= 0.0
+            && save_position.y >= 0.0
+            && save_position.x + save_size.width <= 1080.0
+            && save_position.y + save_size.height <= 700.0,
+        "保存设置必须位于 1080×700 窗口边界内，位置={save_position:?}，尺寸={save_size:?}"
+    );
+}
+
+#[test]
 fn delete_confirmation_is_a_centered_root_level_light_overlay() {
     install_testing_backend();
 

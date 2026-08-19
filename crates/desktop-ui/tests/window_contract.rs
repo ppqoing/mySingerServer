@@ -246,6 +246,126 @@ fn navigation_actions_preserve_page_mapping() {
 }
 
 #[test]
+fn settings_sections_preserve_real_values_and_save_once() {
+    i_slint_backend_testing::init_no_event_loop();
+
+    let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    window
+        .window()
+        .set_size(slint::PhysicalSize::new(1440, 900));
+    window.set_postgres_url("postgresql://fixture@db.internal:5432/dedup".into());
+    window.set_reconnect_seconds(17);
+    window.set_delete_mode_index(1);
+    window.set_pdq_quality("61".into());
+    window.set_aspect_tolerance("0.07".into());
+    window.set_pdq_hamming("27".into());
+    window.set_phash_hamming("8".into());
+    window.set_phash_parts("7".into());
+    window.set_sobel_min("0.91".into());
+    window.set_video_valid("5".into());
+    window.set_video_stage1("0.86".into());
+    window.set_video_stage2("0.89".into());
+    window.set_data_path("D:\\Fixture\\data".into());
+    window.set_config_path("D:\\Fixture\\data\\desktop\\config.toml".into());
+    window.set_logs_path("D:\\Fixture\\data\\desktop\\logs".into());
+    window.set_cache_path("D:\\Fixture\\data\\desktop\\cache".into());
+    window.set_postgres_status("中心数据库健康".into());
+    window.set_last_error("fixture：上次同步连接中断".into());
+
+    accessible(&window, "设置").invoke_accessible_default_action();
+    assert_eq!(window.get_current_page(), 7);
+
+    let expected_values = || {
+        assert_eq!(
+            window.get_postgres_url(),
+            "postgresql://fixture@db.internal:5432/dedup"
+        );
+        assert_eq!(window.get_reconnect_seconds(), 17);
+        assert_eq!(window.get_delete_mode_index(), 1);
+        assert_eq!(window.get_pdq_quality(), "61");
+        assert_eq!(window.get_aspect_tolerance(), "0.07");
+        assert_eq!(window.get_pdq_hamming(), "27");
+        assert_eq!(window.get_phash_hamming(), "8");
+        assert_eq!(window.get_phash_parts(), "7");
+        assert_eq!(window.get_sobel_min(), "0.91");
+        assert_eq!(window.get_video_valid(), "5");
+        assert_eq!(window.get_video_stage1(), "0.86");
+        assert_eq!(window.get_video_stage2(), "0.89");
+    };
+    for (section, label) in [
+        (0, "常规"),
+        (1, "相似度算法"),
+        (2, "存储"),
+        (3, "节点服务"),
+        (4, "扫描与性能"),
+        (5, "外部工具"),
+        (6, "日志与诊断"),
+    ] {
+        accessible(&window, label).invoke_accessible_default_action();
+        assert_eq!(
+            window.get_settings_section(),
+            section,
+            "{label} 必须映射到固定设置分区"
+        );
+        expected_values();
+    }
+
+    accessible(&window, "存储").invoke_accessible_default_action();
+    for label in [
+        "数据路径：D:\\Fixture\\data",
+        "配置路径：D:\\Fixture\\data\\desktop\\config.toml",
+        "日志路径：D:\\Fixture\\data\\desktop\\logs",
+        "缓存路径：D:\\Fixture\\data\\desktop\\cache",
+    ] {
+        assert!(
+            ElementHandle::find_by_accessible_label(&window, label)
+                .next()
+                .is_some(),
+            "存储分区必须显示真实只读值：{label}"
+        );
+    }
+
+    for (section, control) in [
+        ("节点服务", "节点服务配置（当前版本未提供）"),
+        ("扫描与性能", "扫描性能配置（当前版本未提供）"),
+        ("外部工具", "外部工具配置（当前版本未提供）"),
+    ] {
+        accessible(&window, section).invoke_accessible_default_action();
+        assert_eq!(
+            accessible(&window, control).accessible_enabled(),
+            Some(false),
+            "{section} 的概念控件必须明确禁用"
+        );
+    }
+
+    accessible(&window, "日志与诊断").invoke_accessible_default_action();
+    for label in [
+        "PostgreSQL 状态：中心数据库健康",
+        "最后错误：fixture：上次同步连接中断",
+    ] {
+        assert!(
+            ElementHandle::find_by_accessible_label(&window, label)
+                .next()
+                .is_some(),
+            "诊断分区必须显示真实状态：{label}"
+        );
+    }
+    assert_eq!(
+        accessible(&window, "日志筛选（当前版本未提供）").accessible_enabled(),
+        Some(false),
+        "日志诊断占位能力必须明确禁用"
+    );
+
+    let saves = Rc::new(Cell::new(0));
+    window.on_save_settings({
+        let saves = saves.clone();
+        move || saves.set(saves.get() + 1)
+    });
+    accessible(&window, "保存设置").invoke_accessible_default_action();
+    assert_eq!(saves.get(), 1, "保存设置动作必须只转发现有回调一次");
+}
+
+#[test]
 fn overview_and_nodes_consume_real_models() {
     i_slint_backend_testing::init_no_event_loop();
 

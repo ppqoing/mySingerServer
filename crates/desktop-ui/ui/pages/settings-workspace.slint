@@ -1,0 +1,274 @@
+// 设置工作区只编辑 MainWindow 已有配置属性；缺失能力保持可见但禁用。
+
+import { AboutSlint, Button, ComboBox, LineEdit, ScrollView, SpinBox } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
+
+component SettingsMenuItem inherits Rectangle {
+    in property <string> label;
+    in property <bool> selected;
+    callback activated();
+
+    height: 44px;
+    border-radius: 7px;
+    background: root.selected ? Theme.accent-soft : menu-touch.has-hover ? Theme.panel-hover : transparent;
+    accessible-role: AccessibleRole.button;
+    accessible-label: root.label;
+    accessible-action-default => { root.activated(); }
+
+    Rectangle {
+        visible: root.selected;
+        width: 3px;
+        x: 0px;
+        y: 8px;
+        height: 28px;
+        border-radius: 2px;
+        background: Theme.accent;
+    }
+    Text {
+        x: 16px;
+        width: parent.width - 24px;
+        text: root.label;
+        color: root.selected ? Theme.text : Theme.muted;
+        font-size: 13px;
+        font-weight: root.selected ? 650 : 450;
+        vertical-alignment: center;
+    }
+    menu-touch := TouchArea { clicked => { root.activated(); } }
+}
+
+component FormLabel inherits Text {
+    color: Theme.muted;
+    font-size: 11px;
+    vertical-alignment: center;
+}
+
+component ValueRow inherits Rectangle {
+    in property <string> label;
+    in property <string> value;
+
+    height: 40px;
+    border-radius: 6px;
+    background: Theme.window;
+    accessible-role: AccessibleRole.groupbox;
+    accessible-label: root.label + "：" + root.value;
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        spacing: 12px;
+        Text { text: root.label; width: 76px; color: Theme.muted; font-size: 11px; vertical-alignment: center; }
+        Text { text: root.value; color: Theme.text; font-size: 12px; overflow: elide; vertical-alignment: center; }
+    }
+}
+
+export component SettingsWorkspace inherits Rectangle {
+    in-out property <int> active-section: 0;
+    in property <string> data-path;
+    in property <string> logs-path;
+    in property <string> cache-path;
+    in property <string> config-path;
+    in property <string> postgres-status;
+    in property <color> postgres-color;
+    in property <string> last-error;
+    in-out property <string> postgres-url;
+    in-out property <int> reconnect-seconds;
+    in-out property <int> delete-mode-index;
+    in-out property <string> pdq-quality;
+    in-out property <string> aspect-tolerance;
+    in-out property <string> pdq-hamming;
+    in-out property <string> phash-hamming;
+    in-out property <string> phash-parts;
+    in-out property <string> sobel-min;
+    in-out property <string> video-valid;
+    in-out property <string> video-stage1;
+    in-out property <string> video-stage2;
+    in-out property <bool> about-open: false;
+    callback save-settings();
+
+    background: transparent;
+
+    VerticalLayout {
+        padding: 20px;
+        spacing: 14px;
+
+        HorizontalLayout {
+            height: 42px;
+            Text { text: "设置"; color: Theme.text; font-size: 26px; font-weight: 750; vertical-alignment: center; }
+            Rectangle { horizontal-stretch: 1; background: transparent; }
+            Button {
+                text: root.about-open ? "返回设置" : "关于 Slint";
+                accessible-label: root.about-open ? "返回设置" : "关于 Slint";
+                clicked => { root.about-open = !root.about-open; }
+            }
+            Button {
+                text: "保存设置";
+                accessible-label: "保存设置";
+                clicked => { root.save-settings(); }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 14px;
+
+            Rectangle {
+                width: 190px;
+                background: Theme.panel;
+                border-radius: 8px;
+                border-width: 1px;
+                border-color: Theme.border;
+                VerticalLayout {
+                    padding: 12px;
+                    spacing: 6px;
+                    SettingsMenuItem { label: "常规"; selected: root.active-section == 0; activated => { root.active-section = 0; root.about-open = false; } }
+                    SettingsMenuItem { label: "相似度算法"; selected: root.active-section == 1; activated => { root.active-section = 1; root.about-open = false; } }
+                    SettingsMenuItem { label: "存储"; selected: root.active-section == 2; activated => { root.active-section = 2; root.about-open = false; } }
+                    SettingsMenuItem { label: "节点服务"; selected: root.active-section == 3; activated => { root.active-section = 3; root.about-open = false; } }
+                    SettingsMenuItem { label: "扫描与性能"; selected: root.active-section == 4; activated => { root.active-section = 4; root.about-open = false; } }
+                    SettingsMenuItem { label: "外部工具"; selected: root.active-section == 5; activated => { root.active-section = 5; root.about-open = false; } }
+                    SettingsMenuItem { label: "日志与诊断"; selected: root.active-section == 6; activated => { root.active-section = 6; root.about-open = false; } }
+                    Rectangle { vertical-stretch: 1; background: transparent; }
+                }
+            }
+
+            content-card := Rectangle {
+                background: Theme.panel;
+                border-radius: 8px;
+                border-width: 1px;
+                border-color: Theme.border;
+                accessible-role: AccessibleRole.groupbox;
+                accessible-label: "设置内容卡";
+
+                if root.about-open : Rectangle {
+                    VerticalLayout {
+                        padding: 22px;
+                        spacing: 16px;
+                        Text { text: "关于 mySingerServer Rust V2"; color: Theme.text; font-size: 18px; font-weight: 700; }
+                        Text { text: "Windows x64 媒体重复检测工具 · Slint Royalty-free 2.0"; color: Theme.muted; font-size: 12px; }
+                        AboutSlint { horizontal-stretch: 1; vertical-stretch: 1; }
+                    }
+                }
+
+                if !root.about-open && root.active-section == 0 : ScrollView {
+                    VerticalLayout {
+                        padding: 22px;
+                        spacing: 14px;
+                        Text { text: "常规"; color: Theme.text; font-size: 18px; font-weight: 700; }
+                        FormLabel { text: "PostgreSQL URL"; }
+                        LineEdit {
+                            text <=> root.postgres-url;
+                            placeholder-text: "postgresql://user:password@host:5432/database";
+                            accessible-label: "PostgreSQL URL";
+                        }
+                        HorizontalLayout {
+                            spacing: 12px;
+                            VerticalLayout {
+                                spacing: 6px;
+                                FormLabel { text: "重连间隔（秒）"; }
+                                SpinBox { value <=> root.reconnect-seconds; minimum: 1; maximum: 3600; accessible-label: "重连间隔（秒）"; }
+                            }
+                            VerticalLayout {
+                                spacing: 6px;
+                                FormLabel { text: "删除方式"; }
+                                ComboBox { model: ["回收站（默认）", "永久删除"]; current-index <=> root.delete-mode-index; accessible-label: "删除方式"; }
+                            }
+                        }
+                        Text { text: "安全提示：节点通信和 PostgreSQL 连接均为明文，只应在可信局域网使用。"; color: Theme.warning; font-size: 11px; wrap: word-wrap; }
+                    }
+                }
+
+                if !root.about-open && root.active-section == 1 : ScrollView {
+                    VerticalLayout {
+                        padding: 22px;
+                        spacing: 12px;
+                        Text { text: "相似度算法"; color: Theme.text; font-size: 18px; font-weight: 700; }
+                        Text { text: "九个阈值会在分析创建时快照；后续修改不改变已有运行。"; color: Theme.muted; font-size: 11px; }
+                        GridLayout {
+                            spacing: 10px;
+                            Row { FormLabel { text: "PDQ 最低 Quality"; } LineEdit { text <=> root.pdq-quality; accessible-label: "PDQ 最低 Quality"; } FormLabel { text: "长宽比容差"; } LineEdit { text <=> root.aspect-tolerance; accessible-label: "长宽比容差"; } FormLabel { text: "PDQ 最大汉明"; } LineEdit { text <=> root.pdq-hamming; accessible-label: "PDQ 最大汉明"; } }
+                            Row { FormLabel { text: "pHash 单块汉明"; } LineEdit { text <=> root.phash-hamming; accessible-label: "pHash 单块汉明"; } FormLabel { text: "pHash 最少通过块"; } LineEdit { text <=> root.phash-parts; accessible-label: "pHash 最少通过块"; } FormLabel { text: "Sobel 最低相似"; } LineEdit { text <=> root.sobel-min; accessible-label: "Sobel 最低相似"; } }
+                            Row { FormLabel { text: "视频最少有效帧"; } LineEdit { text <=> root.video-valid; accessible-label: "视频最少有效帧"; } FormLabel { text: "视频一筛平均"; } LineEdit { text <=> root.video-stage1; accessible-label: "视频一筛平均"; } FormLabel { text: "视频二筛平均"; } LineEdit { text <=> root.video-stage2; accessible-label: "视频二筛平均"; } }
+                        }
+                        Text { text: "图片不生成缩略图；视频预览继续使用计算阶段已有的六帧 3×2 联系表。"; color: Theme.muted; font-size: 11px; wrap: word-wrap; }
+                    }
+                }
+
+                if !root.about-open && root.active-section == 2 : ScrollView {
+                    VerticalLayout {
+                        padding: 22px;
+                        spacing: 10px;
+                        Text { text: "存储"; color: Theme.text; font-size: 18px; font-weight: 700; }
+                        Text { text: "以下路径由可执行文件绝对路径推导，只读显示。"; color: Theme.muted; font-size: 11px; }
+                        ValueRow { label: "数据路径"; value: root.data-path; }
+                        ValueRow { label: "配置路径"; value: root.config-path; }
+                        ValueRow { label: "日志路径"; value: root.logs-path; }
+                        ValueRow { label: "缓存路径"; value: root.cache-path; }
+                    }
+                }
+
+                if !root.about-open && root.active-section == 3 : ScrollView {
+                    VerticalLayout {
+                        padding: 22px;
+                        spacing: 12px;
+                        Text { text: "节点服务"; color: Theme.text; font-size: 18px; font-weight: 700; }
+                        Text { text: "概念布局：监听、Worker 数量与连接策略将集中显示在此处。"; color: Theme.muted; font-size: 12px; wrap: word-wrap; }
+                        Button { text: "节点服务配置（当前版本未提供）"; accessible-label: "节点服务配置（当前版本未提供）"; enabled: false; }
+                    }
+                }
+
+                if !root.about-open && root.active-section == 4 : ScrollView {
+                    VerticalLayout {
+                        padding: 22px;
+                        spacing: 12px;
+                        Text { text: "扫描与性能"; color: Theme.text; font-size: 18px; font-weight: 700; }
+                        Text { text: "概念布局：枚举、并发与资源限制。当前后端没有这些可配置字段。"; color: Theme.muted; font-size: 12px; wrap: word-wrap; }
+                        Button { text: "扫描性能配置（当前版本未提供）"; accessible-label: "扫描性能配置（当前版本未提供）"; enabled: false; }
+                    }
+                }
+
+                if !root.about-open && root.active-section == 5 : ScrollView {
+                    VerticalLayout {
+                        padding: 22px;
+                        spacing: 12px;
+                        Text { text: "外部工具"; color: Theme.text; font-size: 18px; font-weight: 700; }
+                        Text { text: "FFmpeg 由 worker.exe 的固定运行目录加载，页面不允许选择任意 EXE。"; color: Theme.muted; font-size: 12px; wrap: word-wrap; }
+                        Button { text: "外部工具配置（当前版本未提供）"; accessible-label: "外部工具配置（当前版本未提供）"; enabled: false; }
+                    }
+                }
+
+                if !root.about-open && root.active-section == 6 : ScrollView {
+                    VerticalLayout {
+                        padding: 22px;
+                        spacing: 10px;
+                        Text { text: "日志与诊断"; color: Theme.text; font-size: 18px; font-weight: 700; }
+                        status-row := Rectangle {
+                            height: 40px; border-radius: 6px; background: Theme.window;
+                            accessible-role: AccessibleRole.groupbox;
+                            accessible-label: "PostgreSQL 状态：" + root.postgres-status;
+                            HorizontalLayout { padding-left: 12px; padding-right: 12px;
+                                Text { text: "PostgreSQL 状态"; color: Theme.muted; font-size: 11px; vertical-alignment: center; }
+                                Rectangle { horizontal-stretch: 1; background: transparent; }
+                                Text { text: root.postgres-status; color: root.postgres-color; font-size: 12px; vertical-alignment: center; }
+                            }
+                        }
+                        error-row := Rectangle {
+                            height: 54px; border-radius: 6px; background: Theme.window;
+                            accessible-role: AccessibleRole.groupbox;
+                            accessible-label: "最后错误：" + root.last-error;
+                            HorizontalLayout { padding-left: 12px; padding-right: 12px; spacing: 12px;
+                                Text { text: "最后错误"; width: 76px; color: Theme.muted; font-size: 11px; vertical-alignment: center; }
+                                Text { text: root.last-error == "" ? "—" : root.last-error; color: Theme.text; font-size: 12px; overflow: elide; vertical-alignment: center; }
+                            }
+                        }
+                        Text { text: "数据 " + root.data-path + "\n配置 " + root.config-path + "\n日志 " + root.logs-path + "\n缓存 " + root.cache-path; color: Theme.muted; font-size: 11px; wrap: word-wrap; }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Button { text: "日志筛选"; accessible-label: "日志筛选（当前版本未提供）"; enabled: false; }
+                            Button { text: "导出"; accessible-label: "日志导出（当前版本未提供）"; enabled: false; }
+                            Button { text: "清空"; accessible-label: "日志清空（当前版本未提供）"; enabled: false; }
+                            Button { text: "环境版本"; accessible-label: "环境版本（当前版本未提供）"; enabled: false; }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
