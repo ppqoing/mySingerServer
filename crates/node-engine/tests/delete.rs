@@ -10,8 +10,8 @@ use dedup_node_engine::{
     scan::md5_bytes,
 };
 use dedup_node_store::{
-    AnalysisMode, DeleteOutcome, FeatureWrite, GroupKind, GroupMemberWrite, GroupWrite, NodeStore,
-    ReviewDecision, ScannedPath,
+    AnalysisMode, DeleteBatchPlan, DeleteOutcome, FeatureWrite, GroupKind, GroupMemberWrite,
+    GroupWrite, NodeStore, PlannedDeleteItem, ReviewDecision, ScannedPath,
 };
 
 #[test]
@@ -51,6 +51,43 @@ fn permanent_delete_rechecks_identity_and_immediately_updates_group() {
             .unwrap()
             .items
             .is_empty()
+    );
+}
+
+#[test]
+fn central_plan_deletes_without_a_local_analysis_and_publishes_tombstone() {
+    let directory = tempfile::tempdir().unwrap();
+    let target_path = directory.path().join("central-target.bin");
+    fs::write(&target_path, b"central").unwrap();
+    let mut store = NodeStore::open_in_memory(machine()).unwrap();
+    let scanned = scanned(&target_path);
+    let expected = ContentKey::new(md5_bytes(b"central"), scanned.file_size);
+    store
+        .upsert_content_and_location(&scanned, expected.md5(), MediaKind::Other)
+        .unwrap();
+    let location = LocationKey::new(machine(), scanned.normalized_path.clone());
+    let plan = DeleteBatchPlan {
+        batch_id: "central-batch".into(),
+        mode: DeleteMode::Permanent,
+        items: vec![PlannedDeleteItem {
+            item_id: "central-item".into(),
+            group_id: "central-group".into(),
+            location: location.clone(),
+            expected,
+        }],
+    };
+
+    let results = DeleteEngine::execute_external(&mut store, &plan).unwrap();
+
+    assert_eq!(results[0].outcome, DeleteOutcome::Deleted);
+    assert!(!target_path.exists());
+    assert!(!store.location_is_active(&location).unwrap());
+    let changes = store.pull_changes(0, 100).unwrap();
+    assert!(
+        changes
+            .changes
+            .iter()
+            .any(|change| change.entity_kind == "deletion_tombstone")
     );
 }
 

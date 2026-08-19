@@ -120,6 +120,14 @@ pub struct CentralGroupMember {
     pub phash_passed_parts: Option<u8>,
     /// 与代表文件直接比较的联合二筛得分。
     pub stage2_score: Option<f64>,
+    /// 从中心复核表恢复的决定；新分组写入时使用 Undecided。
+    pub review: CentralReviewDecision,
+    /// 图片或视频宽度；写分组时可为 None。
+    pub width: Option<u32>,
+    /// 图片或视频高度；写分组时可为 None。
+    pub height: Option<u32>,
+    /// 图片 PDQ Quality；视频和其他文件为 None。
+    pub quality: Option<u8>,
 }
 
 /// 一次中心分析最终写入的一组结果。
@@ -467,13 +475,21 @@ impl CentralStore {
         let rows = self
             .client
             .query(
-                "SELECT machine_id,normalized_path,md5,file_size,representative,
-                        stage1_score,phash_passed_parts,stage2_score
-                 FROM group_members
-                 WHERE analysis_run_id=$1 AND group_id=$2 AND active=TRUE AND (
-                   $3::text IS NULL OR machine_id>$3 OR
-                   (machine_id=$3 AND normalized_path>$4))
-                 ORDER BY machine_id,normalized_path LIMIT $5",
+                "SELECT gm.machine_id,gm.normalized_path,gm.md5,gm.file_size,gm.representative,
+                        gm.stage1_score,gm.phash_passed_parts,gm.stage2_score,
+                        COALESCE(rm.decision,'undecided'),COALESCE(i.width,v.width),
+                        COALESCE(i.height,v.height),i.quality
+                 FROM group_members gm
+                 LEFT JOIN contents c ON c.md5=gm.md5 AND c.file_size=gm.file_size
+                 LEFT JOIN image_stage1 i ON i.content_id=c.content_id
+                 LEFT JOIN video_metadata v ON v.content_id=c.content_id
+                 LEFT JOIN review_marks rm ON rm.analysis_run_id=gm.analysis_run_id
+                   AND rm.group_id=gm.group_id AND rm.machine_id=gm.machine_id
+                   AND rm.normalized_path=gm.normalized_path
+                 WHERE gm.analysis_run_id=$1 AND gm.group_id=$2 AND gm.active=TRUE AND (
+                   $3::text IS NULL OR gm.machine_id>$3 OR
+                   (gm.machine_id=$3 AND gm.normalized_path>$4))
+                 ORDER BY gm.machine_id,gm.normalized_path LIMIT $5",
                 &[
                     &run_id.as_uuid().to_string(),
                     &group_id,
@@ -504,6 +520,10 @@ impl CentralStore {
                     stage1_score: row.get(5),
                     phash_passed_parts: row.get::<_, Option<i16>>(6).map(|value| value as u8),
                     stage2_score: row.get(7),
+                    review: CentralReviewDecision::parse(row.get(8))?,
+                    width: row.get::<_, Option<i32>>(9).map(|value| value as u32),
+                    height: row.get::<_, Option<i32>>(10).map(|value| value as u32),
+                    quality: row.get::<_, Option<i16>>(11).map(|value| value as u8),
                 })
             })
             .collect::<Result<Vec<_>, CentralError>>()?;
@@ -706,6 +726,17 @@ impl CentralReviewDecision {
             Self::Undecided => "undecided",
             Self::Keep => "keep",
             Self::Delete => "delete",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, CentralError> {
+        match value {
+            "undecided" => Ok(Self::Undecided),
+            "keep" => Ok(Self::Keep),
+            "delete" => Ok(Self::Delete),
+            _ => Err(CentralError::InvalidState(format!(
+                "未知中心复核决定: {value}"
+            ))),
         }
     }
 }

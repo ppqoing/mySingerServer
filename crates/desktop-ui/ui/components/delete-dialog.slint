@@ -1,0 +1,36 @@
+// 删除执行前唯一显式确认；默认回收站，永久删除只增加明显警示。
+
+import { Button } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
+
+export component DeleteDialog inherits Rectangle {
+    in property <int> file-count;
+    in property <int> node-count;
+    in property <string> reclaimable;
+    in property <string> mode;
+    in property <bool> can-execute;
+    in property <string> warning;
+    callback cancel();
+    callback confirm();
+    background: #00000099;
+    Rectangle {
+        width: 520px; height: 320px;
+        x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+        background: Theme.panel; border-radius: 12px; border-width: 1px; border-color: root.mode == "永久删除" ? Theme.danger : Theme.border;
+        VerticalLayout { padding: 24px; spacing: 16px;
+            Text { text: "确认文件处理"; color: Theme.text; font-size: 22px; font-weight: 720; }
+            Text { text: root.file-count + " 个文件 · " + root.node-count + " 个节点"; color: Theme.text; font-size: 16px; }
+            Text { text: "预计释放 " + root.reclaimable; color: Theme.success; font-size: 15px; }
+            Rectangle { height: 54px; background: root.mode == "永久删除" ? #5b1f2a : Theme.accent-soft; border-radius: 8px;
+                Text { text: "处理方式：" + root.mode; color: root.mode == "永久删除" ? Theme.danger : Theme.text; font-size: 14px; font-weight: 680; horizontal-alignment: center; vertical-alignment: center; }
+            }
+            Text { text: root.warning == "" ? "每个组已确认至少一个活动 Keep。" : root.warning; color: root.warning == "" ? Theme.muted : Theme.warning; wrap: word-wrap; }
+            Rectangle { vertical-stretch: 1; background: transparent; }
+            HorizontalLayout {
+                Rectangle { horizontal-stretch: 1; background: transparent; }
+                Button { text: "取消"; clicked => { root.cancel(); } }
+                Button { text: "确认执行"; enabled: root.can-execute; clicked => { root.confirm(); } }
+            }
+        }
+    }
+}

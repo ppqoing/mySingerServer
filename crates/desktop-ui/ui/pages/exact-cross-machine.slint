@@ -1,0 +1,72 @@
+// 精确结果与跨机器编排共用稳定分页模型；跨机器模式额外显示门禁状态。
+
+import { Button, ComboBox, LineEdit, ScrollView, SpinBox } from "std-widgets.slint";
+import { Theme, UiGroupRow, UiMemberRow } from "../theme.slint";
+import { GroupTable } from "../components/group-table.slint";
+import { MemberList } from "../components/member-list.slint";
+
+export component ExactCrossMachinePage inherits Rectangle {
+    in property <bool> cross-mode;
+    in property <[UiGroupRow]> groups;
+    in property <[UiMemberRow]> members;
+    in property <string> group-next-cursor;
+    in property <string> member-next-cursor;
+    in-out property <int> source-index;
+    in-out property <int> node-index;
+    in-out property <string> run-id;
+    in-out property <string> selected-group-id;
+    in-out property <string> cross-selections;
+    in property <string> cross-status;
+    in property <string> cross-summary;
+    callback load-groups(bool, int, string, int, string);
+    callback load-members(bool, int, string, string, int, string);
+    callback save-review(string, string, int);
+    callback preview(string, string);
+    callback start-cross(string);
+    callback poll-cross();
+    callback retry-cross();
+    background: transparent;
+
+    ScrollView {
+        VerticalLayout { padding: 28px; spacing: 16px;
+            Text { text: root.cross-mode ? "跨机器分析" : "精确重复"; color: Theme.text; font-size: 26px; font-weight: 750; }
+            if root.cross-mode : Rectangle {
+                height: 126px; background: Theme.panel; border-radius: 10px; border-width: 1px; border-color: Theme.border;
+                VerticalLayout { padding: 16px; spacing: 10px;
+                    Text { text: "节点索引:扫描任务 UUID，逗号分隔"; color: Theme.muted; font-size: 11px; }
+                    LineEdit { text <=> root.cross-selections; placeholder-text: "0:任务UUID, 1:任务UUID"; }
+                    HorizontalLayout { spacing: 10px;
+                        Button { text: "创建中心分析"; clicked => { root.start-cross(root.cross-selections); } }
+                        Button { text: "推进到下一门禁"; clicked => { root.poll-cross(); } }
+                        Button { text: "重试未解决二筛"; enabled: root.cross-status == "partial"; clicked => { root.retry-cross(); } }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        Text { text: root.cross-status + " · " + root.cross-summary; color: Theme.muted; vertical-alignment: center; }
+                    }
+                }
+            }
+            Rectangle {
+                height: 84px; background: Theme.panel; border-radius: 10px; border-width: 1px; border-color: Theme.border;
+                HorizontalLayout { padding: 14px; spacing: 10px; alignment: center;
+                    if !root.cross-mode : ComboBox { model: ["节点 SQLite", "PostgreSQL 中心"]; current-index <=> root.source-index; width: 170px; }
+                    if !root.cross-mode : SpinBox { value <=> root.node-index; minimum: 0; maximum: 99; width: 105px; }
+                    LineEdit { text <=> root.run-id; placeholder-text: "分析运行 UUID"; horizontal-stretch: 1; }
+                    Button { text: "加载结果"; clicked => { root.load-groups(root.cross-mode || root.source-index == 1, root.node-index, root.run-id, 0, ""); } }
+                    Button { text: "下一页"; enabled: root.group-next-cursor != ""; clicked => { root.load-groups(root.cross-mode || root.source-index == 1, root.node-index, root.run-id, 0, root.group-next-cursor); } }
+                }
+            }
+            Text { text: "重复组"; color: Theme.text; font-size: 16px; font-weight: 680; }
+            GroupTable {
+                groups: root.groups; selected-id: root.selected-group-id; has-more: root.group-next-cursor != "";
+                select-group(id) => { root.selected-group-id = id; root.load-members(root.cross-mode || root.source-index == 1, root.node-index, root.run-id, id, 0, ""); }
+                load-more => { root.load-groups(root.cross-mode || root.source-index == 1, root.node-index, root.run-id, 0, root.group-next-cursor); }
+            }
+            Text { text: "组成员"; color: Theme.text; font-size: 16px; font-weight: 680; }
+            MemberList {
+                members: root.members;
+                preview(machine, path) => { root.preview(machine, path); }
+                review(machine, path, decision) => { root.save-review(machine, path, decision); }
+            }
+            if root.member-next-cursor != "" : Button { text: "加载更多成员"; clicked => { root.load-members(root.cross-mode || root.source-index == 1, root.node-index, root.run-id, root.selected-group-id, 0, root.member-next-cursor); } }
+        }
+    }
+}

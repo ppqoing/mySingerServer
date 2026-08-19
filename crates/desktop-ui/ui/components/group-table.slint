@@ -1,0 +1,40 @@
+// 有限窗口重复组表；翻页只传服务端不透明游标。
+
+import { Button } from "std-widgets.slint";
+import { Theme, UiGroupRow } from "../theme.slint";
+
+export component GroupTable inherits Rectangle {
+    in property <[UiGroupRow]> groups;
+    in property <string> selected-id;
+    in property <bool> has-more;
+    callback select-group(string);
+    callback load-more();
+    background: transparent;
+
+    VerticalLayout {
+        spacing: 8px;
+        if root.groups.length == 0 : Rectangle {
+            height: 130px; background: Theme.panel; border-radius: 9px; border-width: 1px; border-color: Theme.border;
+            Text { text: "当前运行没有此类重复组"; color: Theme.muted; horizontal-alignment: center; vertical-alignment: center; }
+        }
+        for group in root.groups : Rectangle {
+            height: 72px;
+            background: group.id == root.selected-id ? Theme.accent-soft : Theme.panel;
+            border-radius: 9px; border-width: 1px; border-color: group.id == root.selected-id ? Theme.accent : Theme.border;
+            HorizontalLayout { padding: 12px; spacing: 12px; alignment: center;
+                VerticalLayout { width: 175px; spacing: 4px;
+                    Text { text: group.kind; color: Theme.text; font-size: 13px; font-weight: 650; }
+                    Text { text: group.id; color: Theme.muted; font-size: 10px; overflow: elide; }
+                }
+                VerticalLayout { horizontal-stretch: 1; spacing: 4px;
+                    Text { text: "MD5  " + group.md5; color: Theme.muted; font-size: 11px; }
+                    Text { text: "代表大小  " + group.size; color: Theme.text; font-size: 11px; }
+                }
+                Text { text: group.members + " 个成员"; color: Theme.text; font-size: 12px; width: 90px; }
+                Text { text: "可释放 " + group.reclaimable; color: Theme.success; font-size: 12px; width: 130px; }
+                Button { text: "选择"; clicked => { root.select-group(group.id); } }
+            }
+        }
+        if root.has-more : Button { text: "加载下一页"; clicked => { root.load-more(); } }
+    }
+}

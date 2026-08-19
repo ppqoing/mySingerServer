@@ -213,6 +213,34 @@ impl NodeStore {
         Ok(())
     }
 
+    /// 应用中心下发计划的成功结果，只更新本机位置和同步墓碑，不要求本地分析组存在。
+    ///
+    /// 中心 PostgreSQL 自己负责立即收缩跨机器组；节点随后通过同一 outbox 把文件失活和
+    /// 墓碑同步回中心。失败与跳过不改变 SQLite，允许用户重新确认后创建新批次。
+    pub fn apply_external_delete_results(
+        &mut self,
+        plan: &DeleteBatchPlan,
+        results: &[DeleteResult],
+    ) -> Result<(), StoreError> {
+        let transaction = self.connection.transaction()?;
+        for result in results {
+            if !matches!(
+                result.outcome,
+                DeleteOutcome::Recycled | DeleteOutcome::Deleted
+            ) {
+                continue;
+            }
+            let item = plan
+                .items
+                .iter()
+                .find(|item| item.item_id == result.item_id)
+                .ok_or_else(|| StoreError::InvalidState("中心删除结果没有对应计划项".into()))?;
+            apply_external_success(&transaction, item, result.outcome)?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// 判断一个位置是否仍是当前节点的活动文件。
     pub fn location_is_active(&self, location: &LocationKey) -> Result<bool, StoreError> {
         let active: Option<i64> = self
@@ -373,6 +401,59 @@ fn apply_successful_delete(
     } else if was_representative != 0 {
         select_new_representative(transaction, run_id, &item.group_id)?;
     }
+    Ok(())
+}
+
+fn apply_external_success(
+    transaction: &Transaction<'_>,
+    item: &PlannedDeleteItem,
+    outcome: DeleteOutcome,
+) -> Result<(), StoreError> {
+    let machine_id = item.location.machine_id().as_str();
+    let normalized_path = item.location.normalized_path().as_str();
+    let display_path: Option<String> = transaction
+        .query_row(
+            "SELECT display_path FROM files
+             WHERE machine_id=?1 AND normalized_path=?2 AND active=1",
+            params![machine_id, normalized_path],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(display_path) = display_path else {
+        return Ok(());
+    };
+    transaction.execute(
+        "UPDATE files SET active=0 WHERE machine_id=?1 AND normalized_path=?2",
+        params![machine_id, normalized_path],
+    )?;
+    let scanned = ScannedPath::new(
+        item.location.normalized_path().clone(),
+        DisplayPath::new(display_path)?,
+        item.expected.file_size(),
+    );
+    append_sync_change(
+        transaction,
+        "file",
+        encode_file(machine_id, &scanned, item.expected, false),
+    )?;
+    transaction.execute(
+        "INSERT INTO deletion_tombstones(machine_id,normalized_path,md5,file_size,outcome)
+         VALUES(?1,?2,?3,?4,?5)
+         ON CONFLICT(machine_id,normalized_path) DO UPDATE SET
+           md5=excluded.md5,file_size=excluded.file_size,outcome=excluded.outcome",
+        params![
+            machine_id,
+            normalized_path,
+            item.expected.md5().as_slice(),
+            sqlite_integer(item.expected.file_size())?,
+            outcome.as_str()
+        ],
+    )?;
+    append_sync_change(
+        transaction,
+        "deletion_tombstone",
+        encode_deletion_tombstone(machine_id, normalized_path, item.expected, outcome),
+    )?;
     Ok(())
 }
 

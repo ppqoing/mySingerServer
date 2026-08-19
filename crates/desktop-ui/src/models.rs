@@ -1,11 +1,15 @@
 //! desktop-core 强类型状态到 Slint 行模型的单向映射。
 
-use dedup_desktop_core::view_state::{
-    DesktopViewState, NodeConnectionState, TaskView, ViewTaskState,
+use std::fmt::Write as _;
+
+use dedup_desktop_core::{
+    results::{GroupKind, GroupPage, MemberPage},
+    review::ReviewDecision,
+    view_state::{DesktopViewState, NodeConnectionState, TaskView, ViewTaskState},
 };
 use slint::{Color, ModelRc, SharedString, VecModel};
 
-use crate::{UiNodeRow, UiTaskRow};
+use crate::{UiGroupRow, UiMemberRow, UiNodeRow, UiTaskRow};
 
 /// 把节点快照映射为 Slint 只读列表。
 pub(crate) fn nodes(state: &DesktopViewState) -> ModelRc<UiNodeRow> {
@@ -63,6 +67,55 @@ pub(crate) fn tasks(state: &DesktopViewState) -> ModelRc<UiTaskRow> {
     ModelRc::new(VecModel::from(rows))
 }
 
+/// 把统一结果页映射为 Slint 有限组列表；游标仍由调用方单独保存。
+pub(crate) fn groups(page: &GroupPage) -> ModelRc<UiGroupRow> {
+    let rows = page
+        .items
+        .iter()
+        .map(|group| UiGroupRow {
+            id: group.group_id.clone().into(),
+            kind: group_kind(group.kind).into(),
+            md5: md5_hex(group.representative.md5()).into(),
+            size: bytes(group.representative.file_size()).into(),
+            members: group.member_count as i32,
+            reclaimable: bytes(group.reclaimable_bytes).into(),
+        })
+        .collect::<Vec<_>>();
+    ModelRc::new(VecModel::from(rows))
+}
+
+/// 把统一成员页映射为可直接驱动预览、复核和删除门禁的 Slint 行。
+pub(crate) fn members(page: &MemberPage) -> ModelRc<UiMemberRow> {
+    let rows = page
+        .items
+        .iter()
+        .map(|member| {
+            let (review, review_color) = review(member.review);
+            UiMemberRow {
+                machine_id: member.location.machine_id().as_str().into(),
+                path: member.display_path.clone().into(),
+                md5: md5_hex(member.content.md5()).into(),
+                size: bytes(member.content.file_size()).into(),
+                representative: member.representative,
+                stage1: format!("{:.3}", member.stage1_score).into(),
+                phash: member
+                    .phash_passed_parts
+                    .map_or_else(|| "—".into(), |passed| format!("{passed}/9").into()),
+                stage2: member
+                    .stage2_score
+                    .map_or_else(|| "—".into(), |score| format!("{score:.3}").into()),
+                metadata: metadata(member.dimensions, member.quality).into(),
+                review: review.into(),
+                review_color,
+                online: member.online,
+                preview_enabled: member.actions.preview,
+                delete_enabled: member.actions.delete,
+            }
+        })
+        .collect::<Vec<_>>();
+    ModelRc::new(VecModel::from(rows))
+}
+
 fn task_row(task: &TaskView) -> UiTaskRow {
     let (status, color) = match task.state {
         ViewTaskState::Queued => ("排队中", rgb(148, 163, 184)),
@@ -84,6 +137,53 @@ fn task_row(task: &TaskView) -> UiTaskRow {
             task.completed_items, task.total_items, task.failed_items, task.skipped_incomplete
         )
         .into(),
+    }
+}
+
+fn group_kind(kind: GroupKind) -> &'static str {
+    match kind {
+        GroupKind::Exact => "精确重复",
+        GroupKind::SimilarImage => "相似图片",
+        GroupKind::SimilarVideo => "相似视频",
+    }
+}
+
+fn review(decision: ReviewDecision) -> (&'static str, Color) {
+    match decision {
+        ReviewDecision::Undecided => ("未决定", rgb(148, 163, 184)),
+        ReviewDecision::Keep => ("保留", rgb(34, 197, 94)),
+        ReviewDecision::Delete => ("删除", rgb(248, 113, 113)),
+    }
+}
+
+fn metadata(dimensions: Option<(u32, u32)>, quality: Option<u8>) -> String {
+    let dimensions =
+        dimensions.map_or_else(|| "—".into(), |(width, height)| format!("{width}×{height}"));
+    quality.map_or(dimensions.clone(), |value| {
+        format!("{dimensions} · Q{value}")
+    })
+}
+
+fn md5_hex(md5: [u8; 16]) -> String {
+    let mut value = String::with_capacity(32);
+    for byte in md5 {
+        write!(&mut value, "{byte:02x}").expect("写入 String 不会失败");
+    }
+    value
+}
+
+pub(crate) fn bytes(value: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut amount = value as f64;
+    let mut unit = 0;
+    while amount >= 1024.0 && unit < UNITS.len() - 1 {
+        amount /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{value} B")
+    } else {
+        format!("{amount:.1} {}", UNITS[unit])
     }
 }
 

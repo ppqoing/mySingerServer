@@ -13,8 +13,8 @@ use dedup_core::{
     MachineId, NodeConfig, TaskId, Thresholds,
 };
 use dedup_node_store::{
-    AnalysisStatus, DeleteOutcome, GroupKind, NodeStore, OwnedSnapshot, ReviewDecision, StoreError,
-    TaskSnapshot, TaskStatus,
+    AnalysisStatus, DeleteBatchPlan, DeleteOutcome, GroupKind, NodeStore, OwnedSnapshot,
+    PlannedDeleteItem, ReviewDecision, StoreError, TaskSnapshot, TaskStatus,
 };
 use dedup_protocol::proto;
 use thiserror::Error;
@@ -708,6 +708,9 @@ impl EngineState {
                     stage2_score: member.stage2_score.unwrap_or_default() as f32,
                     review: review as i32,
                     active: true,
+                    width: member.width.unwrap_or_default(),
+                    height: member.height.unwrap_or_default(),
+                    quality: member.quality.map_or(0, u32::from),
                 })
             })
             .collect::<Result<Vec<_>, (proto::ErrorCode, String)>>()?;
@@ -892,16 +895,54 @@ impl EngineState {
             Ok(proto::DeleteMode::DeletePermanent) => DeleteMode::Permanent,
             _ => return Err(invalid("删除模式无效")),
         };
-        let plan = self
-            .store
-            .create_delete_batch(
-                parse_analysis_id(&request.analysis_run_id)?,
-                &request.group_ids,
+        let external = !request.items.is_empty();
+        let plan = if external {
+            if request.delete_batch_id.is_empty() {
+                return Err(invalid("中心删除批次缺少 ID"));
+            }
+            let items = request
+                .items
+                .iter()
+                .map(|item| {
+                    Ok(PlannedDeleteItem {
+                        item_id: item.delete_item_id.clone(),
+                        group_id: item.group_id.clone(),
+                        location: item
+                            .location
+                            .clone()
+                            .ok_or_else(|| invalid("中心删除项缺少位置"))?
+                            .try_into()
+                            .map_err(invalid)?,
+                        expected: item
+                            .expected_content
+                            .clone()
+                            .ok_or_else(|| invalid("中心删除项缺少内容键"))?
+                            .try_into()
+                            .map_err(invalid)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, (proto::ErrorCode, String)>>()?;
+            DeleteBatchPlan {
+                batch_id: request.delete_batch_id.clone(),
                 mode,
-                now_ms(),
-            )
-            .map_err(store_error)?;
-        let results = DeleteEngine::execute_batch(&mut self.store, &plan).map_err(internal)?;
+                items,
+            }
+        } else {
+            self.store
+                .create_delete_batch(
+                    parse_analysis_id(&request.analysis_run_id)?,
+                    &request.group_ids,
+                    mode,
+                    now_ms(),
+                )
+                .map_err(store_error)?
+        };
+        let results = if external {
+            DeleteEngine::execute_external(&mut self.store, &plan)
+        } else {
+            DeleteEngine::execute_batch(&mut self.store, &plan)
+        }
+        .map_err(internal)?;
         let items = plan
             .items
             .iter()

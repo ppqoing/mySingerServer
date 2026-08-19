@@ -1161,6 +1161,7 @@ version = "0.1.0"
 dependencies = [
  "dedup-core",
  "dedup-desktop-core",
+ "image",
  "slint",
  "slint-build",
  "tokio",

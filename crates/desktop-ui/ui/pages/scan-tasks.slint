@@ -12,8 +12,11 @@ export component ScanTasksPage inherits Rectangle {
     in-out property <int> selected-node: 0;
     in-out property <int> enumerator-index: 0;
     in-out property <bool> force-recalculate: false;
+    in-out property <string> analysis-task-ids;
+    in-out property <int> analysis-kind-index: 0;
     callback browse(int, string);
     callback start-scan(int, string, bool, int);
+    callback start-analysis(int, string, int);
     callback cancel-task(int, string);
     background: transparent;
 
@@ -24,7 +27,7 @@ export component ScanTasksPage inherits Rectangle {
             Text { text: "扫描与任务"; color: Theme.text; font-size: 26px; font-weight: 750; }
             HorizontalLayout { spacing: 16px;
                 Rectangle {
-                    height: 214px; horizontal-stretch: 2; background: Theme.panel; border-radius: 10px; border-width: 1px; border-color: Theme.border;
+                    height: 246px; horizontal-stretch: 2; background: Theme.panel; border-radius: 10px; border-width: 1px; border-color: Theme.border;
                     VerticalLayout { padding: 18px; spacing: 12px;
                         Text { text: "新建扫描"; color: Theme.text; font-size: 16px; font-weight: 680; }
                         HorizontalLayout { spacing: 10px;
@@ -45,12 +48,18 @@ export component ScanTasksPage inherits Rectangle {
                     }
                 }
                 Rectangle {
-                    height: 214px; horizontal-stretch: 1; background: Theme.panel; border-radius: 10px; border-width: 1px; border-color: Theme.border;
+                    height: 246px; horizontal-stretch: 1; background: Theme.panel; border-radius: 10px; border-width: 1px; border-color: Theme.border;
                     VerticalLayout { padding: 18px; spacing: 10px;
                         Text { text: "筛选门禁"; color: Theme.text; font-size: 16px; font-weight: 680; }
                         StatusPill { label: root.filtering-enabled ? "可以筛选" : "等待计算"; tone: root.filtering-enabled ? Theme.success : Theme.warning; }
                         Text { text: root.filtering-enabled ? "全部节点任务已进入终态。" : root.filtering-reason; color: Theme.muted; wrap: word-wrap; }
-                        Button { text: "开始筛选"; enabled: root.filtering-enabled; }
+                        LineEdit { text <=> root.analysis-task-ids; placeholder-text: "扫描任务 UUID，逗号分隔"; }
+                        ComboBox { model: ["精确重复", "相似图片", "相似视频"]; current-index <=> root.analysis-kind-index; }
+                        Button {
+                            text: "开始本地分析";
+                            enabled: root.filtering-enabled && root.analysis-task-ids != "";
+                            clicked => { root.start-analysis(root.selected-node, root.analysis-task-ids, root.analysis-kind-index); }
+                        }
                     }
                 }
             }

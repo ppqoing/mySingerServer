@@ -24,6 +24,32 @@ export struct UiTaskRow {
     counts: string,
 }
 
+export struct UiGroupRow {
+    id: string,
+    kind: string,
+    md5: string,
+    size: string,
+    members: int,
+    reclaimable: string,
+}
+
+export struct UiMemberRow {
+    machine-id: string,
+    path: string,
+    md5: string,
+    size: string,
+    representative: bool,
+    stage1: string,
+    phash: string,
+    stage2: string,
+    metadata: string,
+    review: string,
+    review-color: color,
+    online: bool,
+    preview-enabled: bool,
+    delete-enabled: bool,
+}
+
 export global Theme {
     in-out property <color> window: #0b1020;
     in-out property <color> sidebar: #10182b;

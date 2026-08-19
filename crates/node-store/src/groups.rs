@@ -99,6 +99,12 @@ pub struct StoredGroupMember {
     pub phash_passed_parts: Option<u8>,
     /// 联合二筛直接得分。
     pub stage2_score: Option<f64>,
+    /// 图片或视频宽度。
+    pub width: Option<u32>,
+    /// 图片或视频高度。
+    pub height: Option<u32>,
+    /// 图片 PDQ Quality。
+    pub quality: Option<u8>,
 }
 
 /// 组成员分页结果。
@@ -275,14 +281,18 @@ impl NodeStore {
             .map(|value| (Some(value.0), Some(value.1)))
             .unwrap_or((None, None));
         let mut statement = self.connection.prepare_cached(
-            "SELECT machine_id,normalized_path,md5,file_size,representative,
-                    stage1_score,phash_passed_parts,stage2_score
-             FROM group_members
-             WHERE analysis_run_id=?1 AND group_id=?2 AND active=1 AND (
-               ?3 IS NULL OR machine_id>?3 OR
-               (machine_id=?3 AND normalized_path>?4)
+            "SELECT gm.machine_id,gm.normalized_path,gm.md5,gm.file_size,gm.representative,
+                    gm.stage1_score,gm.phash_passed_parts,gm.stage2_score,
+                    COALESCE(i.width,v.width),COALESCE(i.height,v.height),i.quality
+             FROM group_members gm
+             LEFT JOIN contents c ON c.md5=gm.md5 AND c.file_size=gm.file_size
+             LEFT JOIN image_stage1 i ON i.content_id=c.content_id
+             LEFT JOIN video_metadata v ON v.content_id=c.content_id
+             WHERE gm.analysis_run_id=?1 AND gm.group_id=?2 AND gm.active=1 AND (
+               ?3 IS NULL OR gm.machine_id>?3 OR
+               (gm.machine_id=?3 AND gm.normalized_path>?4)
              )
-             ORDER BY machine_id,normalized_path LIMIT ?5",
+             ORDER BY gm.machine_id,gm.normalized_path LIMIT ?5",
         )?;
         let raw = statement
             .query_map(
@@ -303,6 +313,9 @@ impl NodeStore {
                         row.get::<_, f64>(5)?,
                         row.get::<_, Option<u8>>(6)?,
                         row.get::<_, Option<f64>>(7)?,
+                        row.get::<_, Option<u32>>(8)?,
+                        row.get::<_, Option<u32>>(9)?,
+                        row.get::<_, Option<u8>>(10)?,
                     ))
                 },
             )?
@@ -323,6 +336,9 @@ impl NodeStore {
                     stage1_score: row.5,
                     phash_passed_parts: row.6,
                     stage2_score: row.7,
+                    width: row.8,
+                    height: row.9,
+                    quality: row.10,
                 })
             })
             .collect::<Result<Vec<_>, StoreError>>()?;

@@ -2,7 +2,10 @@
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-use dedup_core::{AnalysisRunId, CoreError, MachineId, NodeEndpoint, TaskId, product_id};
+use dedup_core::{
+    AnalysisRunId, CoreError, DeleteMode, LocationKey, MachineId, NodeEndpoint, TaskId, Thresholds,
+    product_id,
+};
 use dedup_protocol::{PROTOCOL_VERSION, proto};
 use dedup_transport::{ClientConnection, TransportError};
 use thiserror::Error;
@@ -31,6 +34,12 @@ pub enum SessionError {
     /// 节点响应中的任务 ID 不是 UUID。
     #[error("节点返回无效任务 ID: {0}")]
     InvalidTaskId(String),
+    /// 节点响应中的分析运行 ID 不是 UUID。
+    #[error("节点返回无效分析运行 ID: {0}")]
+    InvalidAnalysisRunId(String),
+    /// 节点返回的结构字段未满足当前协议约定。
+    #[error("节点响应无效: {0}")]
+    InvalidResponse(String),
 }
 
 /// `desktop.exe` 与一个手工 IP:port 之间的已握手 V2 连接。
@@ -208,6 +217,214 @@ impl NodeSession {
         }
     }
 
+    /// 创建节点 SQLite 本地分析运行，并返回持久运行 ID。
+    pub async fn create_local_analysis(
+        &self,
+        scan_task_ids: &[TaskId],
+        group_kind: proto::GroupKind,
+        thresholds: &Thresholds,
+    ) -> Result<AnalysisRunId, SessionError> {
+        let response = self
+            .connection
+            .request(proto::envelope::Payload::CreateLocalAnalysis(
+                proto::CreateLocalAnalysis {
+                    scan_task_ids: scan_task_ids
+                        .iter()
+                        .map(|task| task.as_uuid().to_string())
+                        .collect(),
+                    group_kind: group_kind as i32,
+                    thresholds: Some(thresholds.into()),
+                },
+            ))
+            .await?;
+        match payload_or_error(response)? {
+            proto::envelope::Payload::QueryAnalysisRun(run) => {
+                parse_analysis_id(&run.analysis_run_id)
+            }
+            _ => Err(SessionError::UnexpectedResponse("QueryAnalysisRun")),
+        }
+    }
+
+    /// 查询节点本地分析状态、输入数和候选数。
+    pub async fn query_analysis_run(
+        &self,
+        run_id: AnalysisRunId,
+    ) -> Result<proto::QueryAnalysisRun, SessionError> {
+        let response = self
+            .connection
+            .request(proto::envelope::Payload::QueryAnalysisRun(
+                proto::QueryAnalysisRun {
+                    analysis_run_id: run_id.as_uuid().to_string(),
+                    ..Default::default()
+                },
+            ))
+            .await?;
+        match payload_or_error(response)? {
+            proto::envelope::Payload::QueryAnalysisRun(run) => Ok(run),
+            _ => Err(SessionError::UnexpectedResponse("QueryAnalysisRun")),
+        }
+    }
+
+    /// 使用节点生成的不透明游标分页读取本地重复组。
+    pub async fn list_groups(
+        &self,
+        run_id: AnalysisRunId,
+        group_kind: proto::GroupKind,
+        cursor: &str,
+        limit: u32,
+    ) -> Result<proto::ListGroups, SessionError> {
+        let response = self
+            .connection
+            .request(proto::envelope::Payload::ListGroups(proto::ListGroups {
+                analysis_run_id: run_id.as_uuid().to_string(),
+                group_kind: group_kind as i32,
+                cursor: cursor.into(),
+                limit,
+                groups: Vec::new(),
+                next_cursor: String::new(),
+            }))
+            .await?;
+        match payload_or_error(response)? {
+            proto::envelope::Payload::ListGroups(page) => Ok(page),
+            _ => Err(SessionError::UnexpectedResponse("ListGroups")),
+        }
+    }
+
+    /// 使用位置游标分页读取本地组成员及已持久复核标记。
+    pub async fn list_group_members(
+        &self,
+        run_id: AnalysisRunId,
+        group_id: &str,
+        cursor: &str,
+        limit: u32,
+    ) -> Result<proto::ListGroupMembers, SessionError> {
+        let response = self
+            .connection
+            .request(proto::envelope::Payload::ListGroupMembers(
+                proto::ListGroupMembers {
+                    analysis_run_id: run_id.as_uuid().to_string(),
+                    group_id: group_id.into(),
+                    cursor: cursor.into(),
+                    limit,
+                    members: Vec::new(),
+                    next_cursor: String::new(),
+                },
+            ))
+            .await?;
+        match payload_or_error(response)? {
+            proto::envelope::Payload::ListGroupMembers(page) => Ok(page),
+            _ => Err(SessionError::UnexpectedResponse("ListGroupMembers")),
+        }
+    }
+
+    /// 把一个成员的复核决定 UPSERT 到节点 SQLite。
+    pub async fn save_review_mark(
+        &self,
+        run_id: AnalysisRunId,
+        group_id: &str,
+        location: &LocationKey,
+        decision: proto::ReviewDecision,
+    ) -> Result<(), SessionError> {
+        let response = self
+            .connection
+            .request(proto::envelope::Payload::SaveReviewMark(
+                proto::SaveReviewMark {
+                    analysis_run_id: run_id.as_uuid().to_string(),
+                    group_id: group_id.into(),
+                    location: Some(location.into()),
+                    decision: decision as i32,
+                },
+            ))
+            .await?;
+        match payload_or_error(response)? {
+            proto::envelope::Payload::SaveReviewMark(_) => Ok(()),
+            _ => Err(SessionError::UnexpectedResponse("SaveReviewMark")),
+        }
+    }
+
+    /// 按最多 1 MiB 读取原图或视频联系表的一块数据。
+    pub async fn read_file_chunk(
+        &self,
+        location: &LocationKey,
+        file_kind: &str,
+        offset: u64,
+        max_bytes: u32,
+    ) -> Result<proto::FileChunk, SessionError> {
+        let response = self
+            .connection
+            .request(proto::envelope::Payload::ReadFile(proto::ReadFile {
+                location: Some(location.into()),
+                file_kind: file_kind.into(),
+                offset,
+                max_bytes,
+            }))
+            .await?;
+        match payload_or_error(response)? {
+            proto::envelope::Payload::FileChunk(chunk) => {
+                dedup_protocol::validate_file_chunk(&chunk)
+                    .map_err(|error| SessionError::InvalidResponse(error.to_string()))?;
+                Ok(chunk)
+            }
+            _ => Err(SessionError::UnexpectedResponse("FileChunk")),
+        }
+    }
+
+    /// 验证 Keep/Delete 后由节点立即执行本地删除批次并返回逐项结果。
+    pub async fn create_delete_batch(
+        &self,
+        run_id: AnalysisRunId,
+        group_ids: Vec<String>,
+        mode: DeleteMode,
+    ) -> Result<proto::CreateDeleteBatch, SessionError> {
+        let response = self
+            .connection
+            .request(proto::envelope::Payload::CreateDeleteBatch(
+                proto::CreateDeleteBatch {
+                    delete_batch_id: String::new(),
+                    mode: match mode {
+                        DeleteMode::RecycleBin => proto::DeleteMode::DeleteRecycleBin as i32,
+                        DeleteMode::Permanent => proto::DeleteMode::DeletePermanent as i32,
+                    },
+                    items: Vec::new(),
+                    analysis_run_id: run_id.as_uuid().to_string(),
+                    group_ids,
+                },
+            ))
+            .await?;
+        match payload_or_error(response)? {
+            proto::envelope::Payload::CreateDeleteBatch(batch) => Ok(batch),
+            _ => Err(SessionError::UnexpectedResponse("CreateDeleteBatch")),
+        }
+    }
+
+    /// 执行 PostgreSQL 已冻结并按物理机器分配的删除项。
+    pub async fn execute_central_delete_batch(
+        &self,
+        batch_id: &str,
+        items: Vec<proto::DeleteItem>,
+        mode: DeleteMode,
+    ) -> Result<proto::CreateDeleteBatch, SessionError> {
+        let response = self
+            .connection
+            .request(proto::envelope::Payload::CreateDeleteBatch(
+                proto::CreateDeleteBatch {
+                    delete_batch_id: batch_id.into(),
+                    mode: match mode {
+                        DeleteMode::RecycleBin => proto::DeleteMode::DeleteRecycleBin as i32,
+                        DeleteMode::Permanent => proto::DeleteMode::DeletePermanent as i32,
+                    },
+                    items,
+                    analysis_run_id: String::new(),
+                    group_ids: Vec::new(),
+                },
+            ))
+            .await?;
+        match payload_or_error(response)? {
+            proto::envelope::Payload::CreateDeleteBatch(batch) => Ok(batch),
+            _ => Err(SessionError::UnexpectedResponse("CreateDeleteBatch")),
+        }
+    }
+
     /// 幂等确认 PostgreSQL 已提交游标；节点自行限制到本地真实高水位。
     pub async fn acknowledge(&self, committed_seq: u64) -> Result<(), SessionError> {
         let response = self
@@ -366,4 +583,10 @@ fn task_accepted(payload: proto::envelope::Payload) -> Result<TaskId, SessionErr
     uuid::Uuid::parse_str(&accepted.task_id)
         .map(TaskId::from_uuid)
         .map_err(|_| SessionError::InvalidTaskId(accepted.task_id))
+}
+
+fn parse_analysis_id(value: &str) -> Result<AnalysisRunId, SessionError> {
+    uuid::Uuid::parse_str(value)
+        .map(AnalysisRunId::from_uuid)
+        .map_err(|_| SessionError::InvalidAnalysisRunId(value.into()))
 }

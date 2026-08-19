@@ -375,6 +375,10 @@ fn group_member(
         stage1_score: 1.0,
         phash_passed_parts: None,
         stage2_score: None,
+        review: dedup_desktop_core::central::CentralReviewDecision::Undecided,
+        width: None,
+        height: None,
+        quality: None,
     }
 }
 

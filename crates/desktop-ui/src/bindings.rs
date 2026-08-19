@@ -5,9 +5,11 @@ use std::sync::{Arc, Mutex};
 use dedup_core::{DeleteMode, DesktopConfig, EnumeratorKind, Thresholds};
 use dedup_desktop_core::{
     app::{UiCommand, UiEvent},
+    results::GroupKind,
+    review::{QuickReviewRule, ReviewDecision},
     view_state::{NodeConnectionState, ViewTaskState},
 };
-use slint::{ComponentHandle, SharedString};
+use slint::{ComponentHandle, Image, Rgba8Pixel, SharedPixelBuffer, SharedString};
 use tokio::sync::mpsc;
 
 use crate::{MainWindow, models};
@@ -32,6 +34,7 @@ pub fn bind_commands(
     };
 
     bind_simple(window, &sender);
+    bind_results(window, &sender);
     let add_sender = sender.clone();
     let add_window = window.as_weak();
     window.on_add_node(move |ip, port| {
@@ -213,10 +216,269 @@ pub fn apply_event(window: &MainWindow, binding: &UiBinding, event: UiEvent) {
                 .into(),
             );
         }
+        UiEvent::AnalysisStarted {
+            central,
+            run_id,
+            status,
+        } => {
+            window.set_result_run_id(run_id.clone().into());
+            window.set_result_source_index(i32::from(central));
+            if central {
+                window.set_cross_status(status.clone().into());
+            }
+            window.set_last_error(format!("分析已创建：{run_id} · {status}").into());
+        }
+        UiEvent::CrossAnalysisChanged(report) => {
+            window.set_result_run_id(report.run_id.as_uuid().to_string().into());
+            window.set_result_source_index(1);
+            window.set_cross_status(report.status.as_str().into());
+            window.set_cross_summary(
+                format!(
+                    "候选 {} · 未决 {} · 二筛任务 {} · 跳过不完整 {}",
+                    report.candidate_count,
+                    report.unresolved_candidates,
+                    report.phase2_task_count,
+                    report.skipped_incomplete
+                )
+                .into(),
+            );
+            window.set_last_error(SharedString::default());
+        }
+        UiEvent::GroupsChanged(page) => {
+            window.set_groups(models::groups(&page));
+            window.set_group_next_cursor(page.next_cursor.clone().unwrap_or_default().into());
+            window.set_selected_group_id(SharedString::default());
+            window.set_members(empty_members());
+            window.set_member_next_cursor(SharedString::default());
+            window.set_last_error(SharedString::default());
+        }
+        UiEvent::MembersChanged { group_id, page } => {
+            window.set_selected_group_id(group_id.into());
+            apply_members(window, &page);
+            window.set_last_error(SharedString::default());
+        }
+        UiEvent::PreviewReady {
+            display_path,
+            file_kind,
+            bytes,
+        } => match decode_preview(&bytes) {
+            Ok((image, width, height)) => {
+                window.set_preview_image(image);
+                window.set_preview_info(
+                    format!(
+                        "{} · {}×{} · {} · {}",
+                        if file_kind == "contact_sheet" {
+                            "JPG 联系表"
+                        } else {
+                            "原图"
+                        },
+                        width,
+                        height,
+                        models::bytes(bytes.len() as u64),
+                        display_path
+                    )
+                    .into(),
+                );
+                window.set_last_error(SharedString::default());
+            }
+            Err(error) => window.set_last_error(error.into()),
+        },
+        UiEvent::ReviewChanged(page) => {
+            apply_members(window, &page);
+            window.set_last_error(SharedString::default());
+        }
+        UiEvent::DeleteConfirmationChanged(confirmation) => {
+            window.set_delete_file_count(confirmation.file_count as i32);
+            window.set_delete_node_count(confirmation.node_count as i32);
+            window.set_delete_reclaimable(models::bytes(confirmation.reclaimable_bytes).into());
+            window.set_delete_mode(
+                if confirmation.mode == DeleteMode::Permanent {
+                    "永久删除"
+                } else {
+                    "回收站"
+                }
+                .into(),
+            );
+            window.set_delete_can_execute(confirmation.can_execute);
+            window.set_delete_warning(confirmation.warning.into());
+            window.set_delete_dialog_open(true);
+        }
+        UiEvent::DeleteFinished(summary) => {
+            window.set_delete_dialog_open(false);
+            window.set_groups(empty_groups());
+            window.set_members(empty_members());
+            window.set_selected_group_id(SharedString::default());
+            window.set_group_next_cursor(SharedString::default());
+            window.set_member_next_cursor(SharedString::default());
+            window.set_last_error(summary.into());
+        }
         UiEvent::Error(error) => window.set_last_error(error.into()),
         UiEvent::ShutdownComplete => {
             let _ = window.hide();
         }
+    }
+}
+
+fn bind_results(window: &MainWindow, sender: &mpsc::Sender<UiCommand>) {
+    let analysis_sender = sender.clone();
+    let analysis_window = window.as_weak();
+    window.on_start_local_analysis(move |node_index, task_ids, kind| {
+        send(
+            &analysis_sender,
+            UiCommand::StartLocalAnalysis {
+                node_index: node_index.max(0) as usize,
+                scan_task_ids: task_ids.to_string(),
+                kind: group_kind(kind),
+            },
+            &analysis_window,
+        );
+    });
+
+    let cross_sender = sender.clone();
+    let cross_window = window.as_weak();
+    window.on_start_cross_analysis(move |selections| {
+        send(
+            &cross_sender,
+            UiCommand::StartCrossAnalysis {
+                selections: selections.to_string(),
+            },
+            &cross_window,
+        );
+    });
+    let poll_sender = sender.clone();
+    let poll_window = window.as_weak();
+    window.on_poll_cross_analysis(move || {
+        send(&poll_sender, UiCommand::PollCrossAnalysis, &poll_window);
+    });
+    let retry_sender = sender.clone();
+    let retry_window = window.as_weak();
+    window.on_retry_cross_analysis(move || {
+        send(&retry_sender, UiCommand::RetryCrossAnalysis, &retry_window);
+    });
+
+    let groups_sender = sender.clone();
+    let groups_window = window.as_weak();
+    window.on_load_groups(move |central, node_index, run_id, kind, cursor| {
+        send(
+            &groups_sender,
+            UiCommand::LoadGroups {
+                central,
+                node_index: node_index.max(0) as usize,
+                analysis_run_id: run_id.to_string(),
+                kind: group_kind(kind),
+                cursor: cursor.to_string(),
+            },
+            &groups_window,
+        );
+    });
+    let members_sender = sender.clone();
+    let members_window = window.as_weak();
+    window.on_load_members(move |central, node_index, run_id, group_id, kind, cursor| {
+        send(
+            &members_sender,
+            UiCommand::LoadMembers {
+                central,
+                node_index: node_index.max(0) as usize,
+                analysis_run_id: run_id.to_string(),
+                group_id: group_id.to_string(),
+                kind: group_kind(kind),
+                cursor: cursor.to_string(),
+            },
+            &members_window,
+        );
+    });
+
+    let review_sender = sender.clone();
+    let review_window = window.as_weak();
+    window.on_save_review(move |machine_id, path, decision| {
+        send(
+            &review_sender,
+            UiCommand::SaveReview {
+                machine_id: machine_id.to_string(),
+                normalized_path: path.to_string(),
+                decision: review_decision(decision),
+            },
+            &review_window,
+        );
+    });
+    let quick_sender = sender.clone();
+    let quick_window = window.as_weak();
+    window.on_quick_review(move |rule, value| {
+        send(
+            &quick_sender,
+            UiCommand::ApplyQuickReview(quick_rule(rule, value.to_string())),
+            &quick_window,
+        );
+    });
+    let preview_sender = sender.clone();
+    let preview_window = window.as_weak();
+    window.on_load_preview(move |machine_id, path| {
+        send(
+            &preview_sender,
+            UiCommand::LoadPreview {
+                machine_id: machine_id.to_string(),
+                normalized_path: path.to_string(),
+            },
+            &preview_window,
+        );
+    });
+
+    let prepare_sender = sender.clone();
+    let prepare_window = window.as_weak();
+    window.on_prepare_delete(move || {
+        send(&prepare_sender, UiCommand::PrepareDelete, &prepare_window);
+    });
+    let confirm_sender = sender.clone();
+    let confirm_window = window.as_weak();
+    window.on_confirm_delete(move || {
+        send(&confirm_sender, UiCommand::ConfirmDelete, &confirm_window);
+    });
+}
+
+fn apply_members(window: &MainWindow, page: &dedup_desktop_core::results::MemberPage) {
+    window.set_members(models::members(page));
+    window.set_member_next_cursor(page.next_cursor.clone().unwrap_or_default().into());
+}
+
+fn empty_groups() -> slint::ModelRc<crate::UiGroupRow> {
+    slint::ModelRc::new(slint::VecModel::from(Vec::new()))
+}
+
+fn empty_members() -> slint::ModelRc<crate::UiMemberRow> {
+    slint::ModelRc::new(slint::VecModel::from(Vec::new()))
+}
+
+fn decode_preview(bytes: &[u8]) -> Result<(Image, u32, u32), String> {
+    let decoded = image::load_from_memory(bytes)
+        .map_err(|error| format!("预览格式无法解码：{error}"))?
+        .into_rgba8();
+    let (width, height) = decoded.dimensions();
+    let buffer = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(decoded.as_raw(), width, height);
+    Ok((Image::from_rgba8(buffer), width, height))
+}
+
+fn group_kind(value: i32) -> GroupKind {
+    match value {
+        1 => GroupKind::SimilarImage,
+        2 => GroupKind::SimilarVideo,
+        _ => GroupKind::Exact,
+    }
+}
+
+fn review_decision(value: i32) -> ReviewDecision {
+    match value {
+        1 => ReviewDecision::Keep,
+        2 => ReviewDecision::Delete,
+        _ => ReviewDecision::Undecided,
+    }
+}
+
+fn quick_rule(value: i32, path: String) -> QuickReviewRule {
+    match value {
+        1 => QuickReviewRule::HighestResolution,
+        2 => QuickReviewRule::HighestQuality,
+        3 => QuickReviewRule::PathContains(path),
+        _ => QuickReviewRule::LargestFile,
     }
 }
 

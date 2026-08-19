@@ -330,7 +330,36 @@ phase2 对 queued/running 或游标落后继续等待；completed/failed/cancell
 删除复核、设置诊断。总览聚合在线数、任务、同步游标和 Worker 状态；扫描页显示持久任务逐项进度、
 失败与不完整跳过计数，并在任何节点有 queued/running 项时统一禁用筛选。设置页一次校验 PostgreSQL
 NoTls 连接、九项阈值、回收站/永久删除与重连间隔，并嵌入 `AboutSlint` 归属入口及可信局域网明文
-警告。结果、按需预览、复核与删除页面的数据绑定由下一阶段接入，当前导航位置保持稳定。
+警告。
+
+结果交互层以 `dedup-desktop-core::results` 为唯一界面模型，不把 SQLite/Protobuf/PostgreSQL
+记录直接暴露给 Slint。`ResultScope` 明确区分单节点运行和中心运行，二者都转换为 `GroupPage`、
+`MemberPage`、`GroupView` 与 `MemberView`；每行携带稳定外部内容键/位置键、代表标志、两层分数、
+媒体元数据、持久复核标记及一次派生的在线动作能力。组和成员分别沿用服务端复合游标；
+`PagedWindow` 只保留固定数量的最近行，避免浏览大量结果时在管理端一次物化整库。Slint 页面
+仅保存当前页模型和不透明 next cursor，不使用 offset，也不自行重算相似分数或删除资格。
+
+八个导航入口现已形成闭环：扫描页可从已完成扫描任务创建本地精确/图片/视频分析；精确页在
+节点 SQLite 与中心 PostgreSQL 之间切换；相似图片和相似视频页共用同一分页组件，但按组类别
+请求正确分数和预览；跨机器页只触发 `start/poll/retry` 三个协调器入口并展示当前持久门禁；
+删除复核页只操作当前已加载组。所有 Slint callback 仍只投递强类型 `UiCommand`，控制循环串行
+持有当前 `LoadedMembersContext` 和 `PreparedDeleteContext`，任何换组或复核变化都会使旧确认失效，
+因此 UI 不可能把旧组确认用于新组。完整 `UiEvent` 在 GUI 线程整体替换模型，避免控件各自维护
+网络请求和可变业务状态。
+
+图片预览在用户点击后由节点按 1 MiB 分块读取原文件，在 desktop 内存中解码并直接交给 Slint，
+不写缓存、不生成缩略图；视频预览只读取计算阶段已经生成的六帧 3×2 JPG 联系表。离线或失活
+成员仍显示路径和评分，但 `MemberActions` 会同时禁用预览、打开和删除。复核板从 SQLite/PG 已有
+标记恢复；单项 Keep/Delete 与最大文件、最高分辨率、最高 Quality、路径包含四个快捷规则只
+持久化标记，绝不隐式生成或执行删除任务。
+
+删除分成“准备确认”和“执行”两个命令。确认摘要固定显示文件数、节点数、预计空间和当前
+RecycleBin/Permanent 模式；任一组缺活动 Keep、没有显式 Delete 或目标节点离线都会禁用执行，
+Permanent 只增加醒目且明确的不可恢复警示。单机删除使用节点已有分析组创建批次；中心删除先在
+PostgreSQL 冻结外部键计划，再按物理 MachineId 批量派发给节点。节点可在没有对应本地分析运行时
+执行中心计划，但仍逐项重验大小和 MD5；成功项在本机立即失活并发布 file/tombstone outbox，管理端
+收到响应后立即调用 PG `apply_delete_results` 缩组。后续同步到达相同墓碑保持幂等；failed/skipped
+保留在结果中，只有用户重新复核并再次确认才会重试。
 
 `create_analysis_run` 把九项阈值 TOML、所选机器任务与两个高水位一次保存；
 `insert_analysis_inputs` 只允许执行一次，事务提交时将运行标记为 frozen，数据库触发器拒绝原地
@@ -395,8 +424,9 @@ SMBIOS 读取以及 loopback TCP 请求复用测试已执行通过。固定像�
 128 维 Sobel、PDQ band 候选和图片两层联合筛选的位序/阈值测试也已通过。六帧中点、
 有效/缺失槽位平均规则以及 3×2 JPG 联系表测试已通过。SQLite V2 schema、路径缓存、内容复用、
 图片/视频特征完整性、事务 outbox、ACK 裁剪与稳定快照测试已通过。任务恢复、分析状态链、
-冻结输入、稳定组分页、复核恢复和删除后缩组测试也已通过；桌面管理 UI 将在后续任务按本文件
-架构填充。FFmpeg 固定供应清单、无 EXE 发布、受限 DLL 搜索、缺失 DLL 报错、JPEG/MP4 探测和
+冻结输入、稳定组分页、复核恢复和删除后缩组测试也已通过；桌面管理 UI 的八个页面、统一本地/
+中心结果模型、有限分页窗口、按需内存预览、快捷复核、删除确认和中心外部删除计划已接入并通过
+定向测试与 x64 Release 编译。FFmpeg 固定供应清单、无 EXE 发布、受限 DLL 搜索、缺失 DLL 报错、JPEG/MP4 探测和
 MP4 首尾 RGB24 解码集成测试已通过。真实 worker.exe 的 Ready、图片一筛结果、连续调度、
 计划重启、意外退出补建、取消替换和 Job 关闭清理进程测试已通过，节点 actor、SQLite、WorkerPool
 与 TCP listener 已由 NodeRuntime 完成装配。扫描阶段的 Walker 全文件契约、Everything 不可用明确错误、路径大小缓存、

@@ -25,72 +25,85 @@ impl DeleteEngine {
         store: &mut NodeStore,
         plan: &DeleteBatchPlan,
     ) -> Result<Vec<DeleteResult>, DeleteError> {
-        let results = plan
-            .items
-            .iter()
-            .map(|item| {
-                let active = match store.active_file(&item.location) {
-                    Ok(Some(active)) => active,
-                    Ok(None) => {
-                        return DeleteResult::new(
-                            item.item_id.clone(),
-                            DeleteOutcome::Skipped,
-                            Some("文件不存在或已经失活".into()),
-                        );
-                    }
-                    Err(error) => {
-                        return DeleteResult::new(
-                            item.item_id.clone(),
-                            DeleteOutcome::Failed,
-                            Some(error.to_string()),
-                        );
-                    }
-                };
-                let path = active.display_path.as_path();
-                let size = match fs::metadata(path) {
-                    Ok(metadata) => metadata.len(),
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        return DeleteResult::new(
-                            item.item_id.clone(),
-                            DeleteOutcome::Skipped,
-                            Some("文件不存在".into()),
-                        );
-                    }
-                    Err(error) => return failed(&item.item_id, error),
-                };
-                if size != item.expected.file_size() {
-                    return DeleteResult::new(
-                        item.item_id.clone(),
-                        DeleteOutcome::Skipped,
-                        Some("文件大小已变化".into()),
-                    );
-                }
-                match md5_file(path) {
-                    Ok(md5) if md5 == item.expected.md5() => {}
-                    Ok(_) => {
-                        return DeleteResult::new(
-                            item.item_id.clone(),
-                            DeleteOutcome::Skipped,
-                            Some("文件 MD5 已变化".into()),
-                        );
-                    }
-                    Err(error) => return failed(&item.item_id, error),
-                }
-                let outcome = match plan.mode {
-                    DeleteMode::RecycleBin => {
-                        dedup_windows::move_to_recycle_bin(path).map(|()| DeleteOutcome::Recycled)
-                    }
-                    DeleteMode::Permanent => fs::remove_file(path).map(|()| DeleteOutcome::Deleted),
-                };
-                match outcome {
-                    Ok(outcome) => DeleteResult::new(item.item_id.clone(), outcome, None),
-                    Err(error) => failed(&item.item_id, error),
-                }
-            })
-            .collect::<Vec<_>>();
+        let results = execute_items(store, plan);
         store.apply_delete_results(&plan.batch_id, &results)?;
         Ok(results)
     }
+
+    /// 执行 PostgreSQL 已冻结并按机器派发的计划，不要求节点存在同 ID 本地分析组。
+    pub fn execute_external(
+        store: &mut NodeStore,
+        plan: &DeleteBatchPlan,
+    ) -> Result<Vec<DeleteResult>, DeleteError> {
+        let results = execute_items(store, plan);
+        store.apply_external_delete_results(plan, &results)?;
+        Ok(results)
+    }
+}
+
+fn execute_items(store: &NodeStore, plan: &DeleteBatchPlan) -> Vec<DeleteResult> {
+    plan.items
+        .iter()
+        .map(|item| {
+            let active = match store.active_file(&item.location) {
+                Ok(Some(active)) => active,
+                Ok(None) => {
+                    return DeleteResult::new(
+                        item.item_id.clone(),
+                        DeleteOutcome::Skipped,
+                        Some("文件不存在或已经失活".into()),
+                    );
+                }
+                Err(error) => {
+                    return DeleteResult::new(
+                        item.item_id.clone(),
+                        DeleteOutcome::Failed,
+                        Some(error.to_string()),
+                    );
+                }
+            };
+            let path = active.display_path.as_path();
+            let size = match fs::metadata(path) {
+                Ok(metadata) => metadata.len(),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return DeleteResult::new(
+                        item.item_id.clone(),
+                        DeleteOutcome::Skipped,
+                        Some("文件不存在".into()),
+                    );
+                }
+                Err(error) => return failed(&item.item_id, error),
+            };
+            if size != item.expected.file_size() {
+                return DeleteResult::new(
+                    item.item_id.clone(),
+                    DeleteOutcome::Skipped,
+                    Some("文件大小已变化".into()),
+                );
+            }
+            match md5_file(path) {
+                Ok(md5) if md5 == item.expected.md5() => {}
+                Ok(_) => {
+                    return DeleteResult::new(
+                        item.item_id.clone(),
+                        DeleteOutcome::Skipped,
+                        Some("文件 MD5 已变化".into()),
+                    );
+                }
+                Err(error) => return failed(&item.item_id, error),
+            }
+            let outcome = match plan.mode {
+                DeleteMode::RecycleBin => {
+                    dedup_windows::move_to_recycle_bin(path).map(|()| DeleteOutcome::Recycled)
+                }
+                DeleteMode::Permanent => fs::remove_file(path).map(|()| DeleteOutcome::Deleted),
+            };
+            match outcome {
+                Ok(outcome) => DeleteResult::new(item.item_id.clone(), outcome, None),
+                Err(error) => failed(&item.item_id, error),
+            }
+        })
+        .collect()
 }
 
 fn failed(item_id: &str, error: impl std::fmt::Display) -> DeleteResult {

@@ -1,29 +1,15 @@
 // desktop.exe 唯一主窗口；页面只通过属性与回调接触 Rust。
 
-import { Theme, UiNodeRow, UiTaskRow } from "theme.slint";
+import { Theme, UiGroupRow, UiMemberRow, UiNodeRow, UiTaskRow } from "theme.slint";
 import { Navigation } from "components/navigation.slint";
 import { StatusPill } from "components/status-pill.slint";
+import { DeleteDialog } from "components/delete-dialog.slint";
 import { OverviewPage } from "pages/overview.slint";
 import { ScanTasksPage } from "pages/scan-tasks.slint";
+import { ExactCrossMachinePage } from "pages/exact-cross-machine.slint";
+import { SimilarMediaPage } from "pages/similar-media.slint";
+import { ReviewDeletePage } from "pages/review-delete.slint";
 import { SettingsDiagnosticsPage } from "pages/settings-diagnostics.slint";
-
-component PlaceholderPage inherits Rectangle {
-    in property <string> title;
-    in property <string> description;
-    background: transparent;
-    VerticalLayout {
-        padding: 28px;
-        spacing: 18px;
-        Text { text: root.title; color: Theme.text; font-size: 26px; font-weight: 750; }
-        Rectangle {
-            height: 240px; background: Theme.panel; border-radius: 10px; border-width: 1px; border-color: Theme.border;
-            VerticalLayout { padding: 28px; alignment: center; spacing: 12px;
-                Text { text: "当前阶段已建立页面入口"; color: Theme.text; font-size: 18px; font-weight: 650; horizontal-alignment: center; }
-                Text { text: root.description; color: Theme.muted; font-size: 13px; wrap: word-wrap; horizontal-alignment: center; }
-            }
-        }
-    }
-}
 
 export component MainWindow inherits Window {
     title: "mySingerServer · Media Dedup";
@@ -35,6 +21,8 @@ export component MainWindow inherits Window {
 
     in property <[UiNodeRow]> nodes;
     in property <[UiTaskRow]> tasks;
+    in property <[UiGroupRow]> groups;
+    in property <[UiMemberRow]> members;
     in property <int> online-count;
     in property <int> running-count;
     in property <string> indexed-text: "—";
@@ -56,6 +44,29 @@ export component MainWindow inherits Window {
     in-out property <int> scan-node-index: 0;
     in-out property <int> enumerator-index: 0;
     in-out property <bool> force-recalculate: false;
+    in-out property <string> analysis-task-ids;
+    in-out property <int> analysis-kind-index: 0;
+
+    in-out property <int> result-source-index: 0;
+    in-out property <int> result-node-index: 0;
+    in-out property <string> result-run-id;
+    in-out property <string> selected-group-id;
+    in-out property <string> group-next-cursor;
+    in-out property <string> member-next-cursor;
+    in-out property <image> preview-image;
+    in-out property <string> preview-info;
+    in-out property <string> cross-selections;
+    in-out property <string> cross-status: "未创建";
+    in-out property <string> cross-summary;
+    in-out property <string> review-path-rule;
+
+    in-out property <bool> delete-dialog-open: false;
+    in-out property <int> delete-file-count;
+    in-out property <int> delete-node-count;
+    in-out property <string> delete-reclaimable;
+    in-out property <string> delete-mode: "回收站";
+    in-out property <bool> delete-can-execute;
+    in-out property <string> delete-warning;
 
     in-out property <string> postgres-url;
     in-out property <int> reconnect-seconds: 5;
@@ -78,6 +89,17 @@ export component MainWindow inherits Window {
     callback sync-node(int);
     callback browse-paths(int, string);
     callback start-scan(int, string, bool, int);
+    callback start-local-analysis(int, string, int);
+    callback start-cross-analysis(string);
+    callback poll-cross-analysis();
+    callback retry-cross-analysis();
+    callback load-groups(bool, int, string, int, string);
+    callback load-members(bool, int, string, string, int, string);
+    callback save-review(string, string, int);
+    callback quick-review(int, string);
+    callback load-preview(string, string);
+    callback prepare-delete();
+    callback confirm-delete();
     callback cancel-task(int, string);
     callback save-settings();
 
@@ -112,15 +134,64 @@ export component MainWindow inherits Window {
                 if root.current-page == 1 : ScanTasksPage {
                     tasks: root.tasks; filtering-enabled: root.filtering-enabled; filtering-reason: root.filtering-reason;
                     scan-root <=> root.scan-root; selected-node <=> root.scan-node-index; enumerator-index <=> root.enumerator-index; force-recalculate <=> root.force-recalculate;
+                    analysis-task-ids <=> root.analysis-task-ids; analysis-kind-index <=> root.analysis-kind-index;
                     browse(index, path) => { root.browse-paths(index, path); }
                     start-scan(index, path, force, enumerator) => { root.start-scan(index, path, force, enumerator); }
+                    start-analysis(index, task-ids, kind) => { root.start-local-analysis(index, task-ids, kind); }
                     cancel-task(index, id) => { root.cancel-task(index, id); }
                 }
-                if root.current-page == 2 : PlaceholderPage { title: "精确重复"; description: "按 MD5 与文件大小显示本地和跨机器精确重复组。结果分页与复核控件在下一阶段接入。"; }
-                if root.current-page == 3 : PlaceholderPage { title: "相似图片"; description: "四 band 一筛、九分块 pHash 与 128 维 Sobel 的联合结果将在此按需预览。"; }
-                if root.current-page == 4 : PlaceholderPage { title: "相似视频"; description: "六帧平均结果与 3×2 JPG 联系表将在此按需加载。"; }
-                if root.current-page == 5 : PlaceholderPage { title: "跨机器"; description: "这里显示 stage1/phase2 任务高水位、同步游标和显式 Partial 重试。"; }
-                if root.current-page == 6 : PlaceholderPage { title: "删除复核"; description: "先标记 Keep/Delete，再生成默认进入回收站的删除计划；不会自动删除。"; }
+                if root.current-page == 2 : ExactCrossMachinePage {
+                    cross-mode: false; groups: root.groups; members: root.members;
+                    group-next-cursor: root.group-next-cursor; member-next-cursor: root.member-next-cursor;
+                    source-index <=> root.result-source-index; node-index <=> root.result-node-index; run-id <=> root.result-run-id; selected-group-id <=> root.selected-group-id;
+                    cross-selections <=> root.cross-selections; cross-status: root.cross-status; cross-summary: root.cross-summary;
+                    load-groups(central, node, run, kind, cursor) => { root.load-groups(central, node, run, kind, cursor); }
+                    load-members(central, node, run, group, kind, cursor) => { root.load-members(central, node, run, group, kind, cursor); }
+                    save-review(machine, path, decision) => { root.save-review(machine, path, decision); }
+                    preview(machine, path) => { root.load-preview(machine, path); }
+                    start-cross(selections) => { root.start-cross-analysis(selections); }
+                    poll-cross => { root.poll-cross-analysis(); }
+                    retry-cross => { root.retry-cross-analysis(); }
+                }
+                if root.current-page == 3 : SimilarMediaPage {
+                    media-kind: 1; groups: root.groups; members: root.members; group-next-cursor: root.group-next-cursor; member-next-cursor: root.member-next-cursor;
+                    preview-image: root.preview-image; preview-info: root.preview-info;
+                    source-index <=> root.result-source-index; node-index <=> root.result-node-index; run-id <=> root.result-run-id; selected-group-id <=> root.selected-group-id;
+                    load-groups(central, node, run, kind, cursor) => { root.load-groups(central, node, run, kind, cursor); }
+                    load-members(central, node, run, group, kind, cursor) => { root.load-members(central, node, run, group, kind, cursor); }
+                    save-review(machine, path, decision) => { root.save-review(machine, path, decision); }
+                    preview(machine, path) => { root.load-preview(machine, path); }
+                }
+                if root.current-page == 4 : SimilarMediaPage {
+                    media-kind: 2; groups: root.groups; members: root.members; group-next-cursor: root.group-next-cursor; member-next-cursor: root.member-next-cursor;
+                    preview-image: root.preview-image; preview-info: root.preview-info;
+                    source-index <=> root.result-source-index; node-index <=> root.result-node-index; run-id <=> root.result-run-id; selected-group-id <=> root.selected-group-id;
+                    load-groups(central, node, run, kind, cursor) => { root.load-groups(central, node, run, kind, cursor); }
+                    load-members(central, node, run, group, kind, cursor) => { root.load-members(central, node, run, group, kind, cursor); }
+                    save-review(machine, path, decision) => { root.save-review(machine, path, decision); }
+                    preview(machine, path) => { root.load-preview(machine, path); }
+                }
+                if root.current-page == 5 : ExactCrossMachinePage {
+                    cross-mode: true; groups: root.groups; members: root.members;
+                    group-next-cursor: root.group-next-cursor; member-next-cursor: root.member-next-cursor;
+                    source-index <=> root.result-source-index; node-index <=> root.result-node-index; run-id <=> root.result-run-id; selected-group-id <=> root.selected-group-id;
+                    cross-selections <=> root.cross-selections; cross-status: root.cross-status; cross-summary: root.cross-summary;
+                    load-groups(central, node, run, kind, cursor) => { root.load-groups(central, node, run, kind, cursor); }
+                    load-members(central, node, run, group, kind, cursor) => { root.load-members(central, node, run, group, kind, cursor); }
+                    save-review(machine, path, decision) => { root.save-review(machine, path, decision); }
+                    preview(machine, path) => { root.load-preview(machine, path); }
+                    start-cross(selections) => { root.start-cross-analysis(selections); }
+                    poll-cross => { root.poll-cross-analysis(); }
+                    retry-cross => { root.retry-cross-analysis(); }
+                }
+                if root.current-page == 6 : ReviewDeletePage {
+                    members: root.members; selected-group-id: root.selected-group-id;
+                    preview-image: root.preview-image; preview-info: root.preview-info; path-rule <=> root.review-path-rule;
+                    save-review(machine, path, decision) => { root.save-review(machine, path, decision); }
+                    preview(machine, path) => { root.load-preview(machine, path); }
+                    quick-review(rule, value) => { root.quick-review(rule, value); }
+                    prepare-delete => { root.prepare-delete(); }
+                }
                 if root.current-page == 7 : SettingsDiagnosticsPage {
                     data-path: root.data-path; logs-path: root.logs-path; cache-path: root.cache-path; config-path: root.config-path;
                     postgres-status: root.postgres-status; postgres-color: root.postgres-color; postgres-url <=> root.postgres-url;
@@ -132,5 +203,13 @@ export component MainWindow inherits Window {
                 }
             }
         }
+    }
+
+    if root.delete-dialog-open : DeleteDialog {
+        file-count: root.delete-file-count; node-count: root.delete-node-count;
+        reclaimable: root.delete-reclaimable; mode: root.delete-mode;
+        can-execute: root.delete-can-execute; warning: root.delete-warning;
+        cancel => { root.delete-dialog-open = false; }
+        confirm => { root.confirm-delete(); }
     }
 }

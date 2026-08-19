@@ -59,6 +59,10 @@ fn exact_groups(locations: &BTreeMap<ContentKey, Vec<LocationKey>>) -> Vec<Centr
                     stage1_score: 1.0,
                     phash_passed_parts: None,
                     stage2_score: None,
+                    review: crate::central::CentralReviewDecision::Undecided,
+                    width: None,
+                    height: None,
+                    quality: None,
                 })
                 .collect(),
         })
@@ -110,6 +114,10 @@ fn similar_groups(
                             stage1_score: evidence.map_or(1.0, |edge| edge.stage1_score),
                             phash_passed_parts: evidence.and_then(|edge| edge.phash_passed_parts),
                             stage2_score: evidence.map(|edge| edge.stage2_score),
+                            review: crate::central::CentralReviewDecision::Undecided,
+                            width: None,
+                            height: None,
+                            quality: None,
                         });
                     }
                 }
