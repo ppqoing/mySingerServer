@@ -91,3 +91,28 @@ fn snapshot_has_fixed_highwater_and_stable_content_order() {
     assert!(second.done);
     assert!(first.rows[0].key < second.rows[0].key);
 }
+
+/// 网络快照使用独立只读连接；主 actor 后续写入不会改变已经建立的快照视图。
+#[test]
+fn owned_snapshot_keeps_one_read_transaction_across_pages() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("node.db");
+    let mut store = NodeStore::open(&database, machine()).unwrap();
+    store
+        .upsert_content_and_location(&scan(r"D:\before.bin", 1), [1; 16], MediaKind::Other)
+        .unwrap();
+    let snapshot = store.begin_owned_snapshot().unwrap();
+    let frozen_highwater = snapshot.high_seq();
+
+    store
+        .upsert_content_and_location(&scan(r"D:\after.bin", 2), [2; 16], MediaKind::Other)
+        .unwrap();
+
+    assert!(store.outbox_high_seq().unwrap() > frozen_highwater);
+    let page = snapshot.read_page("contents", "", 1000).unwrap();
+    assert_eq!(page.rows.len(), 1);
+    assert!(matches!(
+        snapshot.read_page("contact_sheets", "", 1000),
+        Err(StoreError::InvalidSnapshotTable(_))
+    ));
+}

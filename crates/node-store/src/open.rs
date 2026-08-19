@@ -1,6 +1,9 @@
 //! SQLite V2 的创建、兼容性拒绝和单连接所有权边界。
 
-use std::{path::Path, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use dedup_core::{CoreError, MachineId, product_id};
 use rusqlite::{Connection, OptionalExtension};
@@ -77,6 +80,7 @@ pub enum StoreError {
 pub struct NodeStore {
     pub(crate) connection: Connection,
     machine_id: MachineId,
+    pub(crate) database_path: Option<PathBuf>,
 }
 
 impl NodeStore {
@@ -84,14 +88,14 @@ impl NodeStore {
     pub fn open(path: &Path, machine_id: MachineId) -> Result<Self, StoreError> {
         let connection = Connection::open(path)?;
         configure(&connection, true)?;
-        initialize_or_validate(connection, machine_id)
+        initialize_or_validate(connection, machine_id, Some(path.to_path_buf()))
     }
 
     /// 创建用于单元测试和纯本地计算的内存 V2 数据库。
     pub fn open_in_memory(machine_id: MachineId) -> Result<Self, StoreError> {
         let connection = Connection::open_in_memory()?;
         configure(&connection, false)?;
-        initialize_or_validate(connection, machine_id)
+        initialize_or_validate(connection, machine_id, None)
     }
 
     /// 返回数据库 schema 的稳定产品标记。
@@ -121,6 +125,7 @@ fn configure(connection: &Connection, file_backed: bool) -> Result<(), StoreErro
 fn initialize_or_validate(
     connection: Connection,
     machine_id: MachineId,
+    database_path: Option<PathBuf>,
 ) -> Result<NodeStore, StoreError> {
     let table_count: i64 = connection.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
@@ -157,6 +162,7 @@ fn initialize_or_validate(
     Ok(NodeStore {
         connection,
         machine_id,
+        database_path,
     })
 }
 

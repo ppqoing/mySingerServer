@@ -16,6 +16,7 @@ pub use analysis::{
     CentralGroupMemberPage, CentralGroupPage, CentralGroupWrite, CentralPairKind,
     CentralReviewDecision,
 };
+pub use content::CentralSnapshot;
 pub use delete::{CentralDeleteItem, CentralDeleteOutcome, CentralDeletePlan, CentralDeleteResult};
 pub use schema::validate_schema;
 

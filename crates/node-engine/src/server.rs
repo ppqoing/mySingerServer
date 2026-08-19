@@ -25,6 +25,11 @@ pub enum ServerError {
 pub trait NodeRequestHandler: Clone + Send + Sync + 'static {
     /// 处理一个已握手连接上的请求，并保留原 request_id 返回响应。
     fn handle(&self, request: proto::Envelope) -> impl Future<Output = proto::Envelope> + Send;
+
+    /// 管理连接结束后释放该连接持有的快照等短生命周期资源。
+    fn connection_closed(&self) -> impl Future<Output = ()> + Send {
+        async {}
+    }
 }
 
 /// 只允许一个管理端连接、但允许该连接复用并发请求的 TCP 服务。
@@ -141,6 +146,7 @@ where
     }
     drop(responses);
     let _ = writer_task.await;
+    handler.connection_closed().await;
 }
 
 async fn read_envelope<R>(reader: &mut FrameReader<R>) -> Result<proto::Envelope, ConnectionError>

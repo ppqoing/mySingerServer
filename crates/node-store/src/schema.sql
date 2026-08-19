@@ -193,6 +193,15 @@ CREATE TABLE sync_state (
 ) STRICT;
 INSERT INTO sync_state(singleton, acked_seq, pruned_through_seq) VALUES(1, 0, 0);
 
+CREATE TABLE deletion_tombstones (
+    machine_id      TEXT NOT NULL,
+    normalized_path TEXT NOT NULL,
+    md5             BLOB NOT NULL CHECK(length(md5) = 16),
+    file_size       INTEGER NOT NULL,
+    outcome         TEXT NOT NULL CHECK(outcome IN ('recycled','deleted')),
+    PRIMARY KEY(machine_id, normalized_path)
+) STRICT;
+
 CREATE TABLE delete_batches (
     delete_batch_id TEXT PRIMARY KEY,
     analysis_run_id TEXT NOT NULL,

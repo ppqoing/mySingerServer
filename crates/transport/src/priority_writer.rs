@@ -1,6 +1,12 @@
 //! 两个有界发送队列之间的控制消息优先调度。
 
-use std::{collections::VecDeque, sync::Arc};
+use std::{
+    collections::VecDeque,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use tokio::sync::{Mutex, Notify};
 
@@ -15,6 +21,7 @@ struct PriorityInner<T> {
     state: Mutex<PriorityState<T>>,
     items: Notify,
     spaces: Notify,
+    closed: AtomicBool,
 }
 
 struct PriorityState<T> {
@@ -50,6 +57,7 @@ impl<T> PriorityWriter<T> {
                 }),
                 items: Notify::new(),
                 spaces: Notify::new(),
+                closed: AtomicBool::new(false),
             }),
         }
     }
@@ -79,7 +87,7 @@ impl<T> PriorityWriter<T> {
                     self.inner.spaces.notify_waiters();
                     return next;
                 }
-                if state.closed {
+                if state.closed || self.inner.closed.load(Ordering::Acquire) {
                     return None;
                 }
             }
@@ -89,17 +97,26 @@ impl<T> PriorityWriter<T> {
 
     /// 关闭队列并唤醒所有等待的发送者和消费者。
     pub async fn close(&self) {
+        self.close_now();
         self.inner.state.lock().await.closed = true;
+    }
+
+    /// 从同步 Drop 边界标记关闭并唤醒读写循环；已排队消息仍按原顺序排空。
+    pub fn close_now(&self) {
+        self.inner.closed.store(true, Ordering::Release);
         self.inner.items.notify_waiters();
         self.inner.spaces.notify_waiters();
     }
 
     async fn send(&self, value: T, high_priority: bool) -> Result<(), TransportError> {
         loop {
+            if self.inner.closed.load(Ordering::Acquire) {
+                return Err(TransportError::ConnectionClosed);
+            }
             let notified = self.inner.spaces.notified();
             {
                 let mut state = self.inner.state.lock().await;
-                if state.closed {
+                if state.closed || self.inner.closed.load(Ordering::Acquire) {
                     return Err(TransportError::ConnectionClosed);
                 }
                 let has_space = if high_priority {

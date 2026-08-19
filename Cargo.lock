@@ -1143,8 +1143,11 @@ name = "dedup-desktop-core"
 version = "0.1.0"
 dependencies = [
  "dedup-core",
+ "dedup-media",
+ "dedup-node-engine",
  "dedup-node-store",
  "dedup-protocol",
+ "dedup-transport",
  "thiserror 2.0.20",
  "tokio",
  "tokio-postgres",

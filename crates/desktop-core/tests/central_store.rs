@@ -6,7 +6,12 @@ use dedup_desktop_core::central::{
     CentralDeleteOutcome, CentralDeleteResult, CentralGroupKind, CentralGroupMember,
     CentralGroupWrite, CentralPairKind, CentralReviewDecision, CentralStore,
 };
-use dedup_node_store::{NodeStore, ScannedPath};
+use dedup_media::{ImageStage2, PdqHash};
+use dedup_node_store::{
+    AnalysisMode, DeleteOutcome, DeleteResult, FeatureWrite, GroupKind, GroupMemberWrite,
+    GroupWrite, ImageStage1Fields, NodeStore, ReviewDecision, ScannedPath, VideoFrameStage1Fields,
+    VideoFrameStage2Fields, VideoMetadataFields,
+};
 
 #[tokio::test]
 #[ignore = "requires DEDUP_TEST_POSTGRES_URL"]
@@ -170,6 +175,136 @@ async fn analysis_groups_use_stable_pages_and_successful_delete_shrinks_group() 
     assert_eq!(remaining.items[0].kind, CentralGroupKind::Image);
 }
 
+#[tokio::test]
+#[ignore = "requires DEDUP_TEST_POSTGRES_URL"]
+async fn incremental_sync_covers_features_and_tombstones_but_not_contact_sheets() {
+    let url = std::env::var("DEDUP_TEST_POSTGRES_URL").unwrap();
+    let machine = MachineId::parse(&"f7".repeat(32)).unwrap();
+    let mut node = NodeStore::open_in_memory(machine.clone()).unwrap();
+    let image = add_content(
+        &mut node,
+        r"C:\SyncScope\image.jpg",
+        310,
+        [0x61; 16],
+        MediaKind::Image,
+    );
+    node.commit_feature_result(
+        image.id,
+        None,
+        FeatureWrite::ImageStage1(ImageStage1Fields {
+            width: Some(640),
+            height: Some(480),
+            pdq: Some(PdqHash::from_bytes([0x62; 32])),
+            quality: Some(90),
+        }),
+    )
+    .unwrap();
+    node.commit_feature_result(image.id, None, FeatureWrite::ImageStage2(stage2(0x63)))
+        .unwrap();
+
+    let video = add_content(
+        &mut node,
+        r"C:\SyncScope\video.mp4",
+        320,
+        [0x64; 16],
+        MediaKind::Video,
+    );
+    node.commit_feature_result(
+        video.id,
+        None,
+        FeatureWrite::VideoMetadata(VideoMetadataFields {
+            duration_ms: Some(60_000),
+            width: Some(1920),
+            height: Some(1080),
+        }),
+    )
+    .unwrap();
+    for slot in 0..6 {
+        node.commit_feature_result(
+            video.id,
+            None,
+            FeatureWrite::VideoFrameStage1(VideoFrameStage1Fields {
+                slot,
+                time_ms: u64::from(slot) * 10_000,
+                decoded: true,
+                width: Some(1920),
+                height: Some(1080),
+                pdq: Some(PdqHash::from_bytes([slot + 1; 32])),
+                quality: Some(80),
+            }),
+        )
+        .unwrap();
+        node.commit_feature_result(
+            video.id,
+            None,
+            FeatureWrite::VideoFrameStage2(VideoFrameStage2Fields {
+                slot,
+                features: stage2(slot + 1),
+            }),
+        )
+        .unwrap();
+    }
+    node.commit_feature_result(
+        video.id,
+        None,
+        FeatureWrite::ContactSheet("contact-sheets/local-only.jpg".into()),
+    )
+    .unwrap();
+
+    add_successful_delete(&mut node, &machine);
+    let pulled = node.pull_changes(0, 1000).unwrap();
+    assert!(
+        pulled
+            .changes
+            .iter()
+            .any(|change| change.entity_kind == "deletion_tombstone")
+    );
+    assert!(
+        pulled
+            .changes
+            .iter()
+            .any(|change| change.entity_kind == "contact_sheet")
+    );
+
+    let mut central = CentralStore::connect(&url).await.unwrap();
+    central
+        .apply_sync_batch(
+            &machine,
+            &dedup_protocol::proto::SyncChangeBatch {
+                changes: pulled.changes,
+                high_seq: pulled.high_seq,
+                pruned_through_seq: pulled.pruned_through_seq,
+            },
+        )
+        .await
+        .unwrap();
+
+    let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(async move { connection.await.unwrap() });
+    assert_eq!(table_count(&client, "image_stage1").await, 1);
+    assert_eq!(table_count(&client, "image_stage2").await, 1);
+    assert_eq!(table_count(&client, "video_metadata").await, 1);
+    assert_eq!(table_count(&client, "video_frame_stage1").await, 6);
+    assert_eq!(table_count(&client, "video_frame_stage2").await, 6);
+    let tombstones: i64 = client
+        .query_one(
+            "SELECT COUNT(*) FROM deletion_tombstones WHERE machine_id=$1",
+            &[&machine.as_str()],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(tombstones, 1);
+    let contact_table: Option<String> = client
+        .query_one("SELECT to_regclass('public.contact_sheets')::text", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert!(contact_table.is_none());
+}
+
 fn node_batch(
     machine: &MachineId,
     path: &str,
@@ -241,4 +376,97 @@ fn group_member(
         phash_passed_parts: None,
         stage2_score: None,
     }
+}
+
+fn add_content(
+    store: &mut NodeStore,
+    path: &str,
+    size: u64,
+    md5: [u8; 16],
+    kind: MediaKind,
+) -> dedup_node_store::ContentRecord {
+    store
+        .upsert_content_and_location(
+            &ScannedPath::new(
+                NormalizedPath::new(path).unwrap(),
+                DisplayPath::new(path).unwrap(),
+                size,
+            ),
+            md5,
+            kind,
+        )
+        .unwrap()
+}
+
+fn stage2(seed: u8) -> ImageStage2 {
+    let mut sobel = [0.0; 128];
+    sobel[usize::from(seed) % 128] = 1.0;
+    ImageStage2 {
+        phash_parts: [u64::from(seed); 9],
+        sobel,
+    }
+}
+
+fn add_successful_delete(store: &mut NodeStore, machine: &MachineId) {
+    let deleted = add_content(
+        store,
+        r"C:\SyncScope\deleted.bin",
+        330,
+        [0x65; 16],
+        MediaKind::Other,
+    );
+    let kept = add_content(
+        store,
+        r"C:\SyncScope\kept.bin",
+        340,
+        [0x66; 16],
+        MediaKind::Other,
+    );
+    let deleted_location = location(machine.clone(), r"C:\SyncScope\deleted.bin");
+    let kept_location = location(machine.clone(), r"C:\SyncScope\kept.bin");
+    let run = store
+        .create_analysis_run(AnalysisMode::Local, Thresholds::default(), 1)
+        .unwrap();
+    let group_id = format!("sync-delete-{}", run.as_uuid());
+    store
+        .replace_groups(
+            run,
+            &[GroupWrite {
+                group_id: group_id.clone(),
+                kind: GroupKind::Image,
+                representative: kept.key,
+                members: vec![
+                    GroupMemberWrite::new(kept_location.clone(), kept.key, true),
+                    GroupMemberWrite::new(deleted_location.clone(), deleted.key, false),
+                ],
+            }],
+        )
+        .unwrap();
+    store
+        .save_review_mark(run, &group_id, &kept_location, ReviewDecision::Keep)
+        .unwrap();
+    store
+        .save_review_mark(run, &group_id, &deleted_location, ReviewDecision::Delete)
+        .unwrap();
+    let batch = store
+        .create_delete_batch(run, &[group_id], DeleteMode::RecycleBin, 2)
+        .unwrap();
+    store
+        .apply_delete_results(
+            &batch.batch_id,
+            &[DeleteResult::new(
+                batch.items[0].item_id.clone(),
+                DeleteOutcome::Recycled,
+                None,
+            )],
+        )
+        .unwrap();
+}
+
+async fn table_count(client: &tokio_postgres::Client, table: &str) -> i64 {
+    client
+        .query_one(&format!("SELECT COUNT(*) FROM {table}"), &[])
+        .await
+        .unwrap()
+        .get(0)
 }

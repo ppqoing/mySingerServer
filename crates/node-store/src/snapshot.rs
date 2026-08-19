@@ -2,12 +2,13 @@
 
 use dedup_core::{ContentKey, MediaKind};
 use dedup_media::{ImageStage2, PdqHash};
-use rusqlite::{Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior, params};
 
 use crate::{
     ImageStage1Fields, NodeStore, SnapshotPage, SnapshotRow, StoreError, VideoFrameStage1Fields,
     VideoFrameStage2Fields, VideoMetadataFields,
     content::encode_content,
+    delete::{DeleteOutcome, encode_deletion_tombstone},
     features::{
         encode_image_stage1, encode_image_stage2, encode_video_frame_stage1,
         encode_video_frame_stage2, encode_video_metadata,
@@ -23,6 +24,12 @@ pub struct Snapshot<'store> {
     high_seq: u64,
 }
 
+/// 节点 actor 跨多个网络请求持有的独立 SQLite 只读事务。
+pub struct OwnedSnapshot {
+    connection: Connection,
+    high_seq: u64,
+}
+
 impl NodeStore {
     /// 开启只读快照并冻结开始时已经提交的 outbox 高水位。
     pub fn begin_snapshot(&mut self) -> Result<Snapshot<'_>, StoreError> {
@@ -32,6 +39,22 @@ impl NodeStore {
         let high_seq = outbox_high_seq_from(&transaction)?;
         Ok(Snapshot {
             transaction,
+            high_seq,
+        })
+    }
+
+    /// 为节点 actor 打开独立只读连接，并在同一 SQLite 事务中保持整个网络快照。
+    pub fn begin_owned_snapshot(&self) -> Result<OwnedSnapshot, StoreError> {
+        let path = self
+            .database_path
+            .as_ref()
+            .ok_or_else(|| StoreError::InvalidState("内存数据库不能创建跨请求只读快照".into()))?;
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        connection.execute_batch("BEGIN DEFERRED TRANSACTION")?;
+        let high_seq = outbox_high_seq_from(&connection)?;
+        Ok(OwnedSnapshot {
+            connection,
             high_seq,
         })
     }
@@ -50,6 +73,37 @@ impl Snapshot<'_> {
         cursor: &str,
         limit: usize,
     ) -> Result<SnapshotPage, StoreError> {
+        SnapshotReader(&self.transaction).read_page(table_name, cursor, limit)
+    }
+}
+
+impl OwnedSnapshot {
+    /// 返回独立只读事务开始时的本地 outbox 高水位。
+    pub const fn high_seq(&self) -> u64 {
+        self.high_seq
+    }
+
+    /// 从同一个独立只读事务按固定表和稳定主键读取一页。
+    pub fn read_page(
+        &self,
+        table_name: &str,
+        cursor: &str,
+        limit: usize,
+    ) -> Result<SnapshotPage, StoreError> {
+        SnapshotReader(&self.connection).read_page(table_name, cursor, limit)
+    }
+}
+
+struct SnapshotReader<'connection>(&'connection Connection);
+
+impl SnapshotReader<'_> {
+    /// 按固定表名和稳定主键读取一页；空 cursor 表示从该表开头读取。
+    pub fn read_page(
+        &self,
+        table_name: &str,
+        cursor: &str,
+        limit: usize,
+    ) -> Result<SnapshotPage, StoreError> {
         let fetch_limit = limit.saturating_add(1);
         let rows = match table_name {
             "contents" => self.read_contents(cursor, fetch_limit)?,
@@ -59,14 +113,14 @@ impl Snapshot<'_> {
             "video_metadata" => self.read_video_metadata(cursor, fetch_limit)?,
             "video_frame_stage1" => self.read_video_frame_stage1(cursor, fetch_limit)?,
             "video_frame_stage2" => self.read_video_frame_stage2(cursor, fetch_limit)?,
-            "contact_sheets" => self.read_contact_sheets(cursor, fetch_limit)?,
+            "deletion_tombstones" => self.read_deletion_tombstones(cursor, fetch_limit)?,
             _ => return Err(StoreError::InvalidSnapshotTable(table_name.to_owned())),
         };
         Ok(finish_page(table_name, rows, limit))
     }
 
     fn read_contents(&self, cursor: &str, limit: usize) -> Result<Vec<SnapshotRow>, StoreError> {
-        let mut statement = self.transaction.prepare(
+        let mut statement = self.0.prepare(
             "SELECT hex(md5)||':'||printf('%020d',file_size),md5,file_size,media_kind
              FROM contents
              WHERE hex(md5)||':'||printf('%020d',file_size)>?1
@@ -95,7 +149,7 @@ impl Snapshot<'_> {
     }
 
     fn read_files(&self, cursor: &str, limit: usize) -> Result<Vec<SnapshotRow>, StoreError> {
-        let mut statement = self.transaction.prepare(
+        let mut statement = self.0.prepare(
             "SELECT f.machine_id||':'||f.normalized_path,
                     f.machine_id,f.normalized_path,f.display_path,f.file_size,
                     c.md5,c.file_size,f.active
@@ -140,7 +194,7 @@ impl Snapshot<'_> {
         cursor: &str,
         limit: usize,
     ) -> Result<Vec<SnapshotRow>, StoreError> {
-        let mut statement = self.transaction.prepare(
+        let mut statement = self.0.prepare(
             "SELECT hex(c.md5)||':'||printf('%020d',c.file_size),c.md5,c.file_size,
                     f.width,f.height,f.pdq,f.quality
              FROM image_stage1 f JOIN contents c ON c.content_id=f.content_id
@@ -187,7 +241,7 @@ impl Snapshot<'_> {
         cursor: &str,
         limit: usize,
     ) -> Result<Vec<SnapshotRow>, StoreError> {
-        let mut statement = self.transaction.prepare(
+        let mut statement = self.0.prepare(
             "SELECT hex(c.md5)||':'||printf('%020d',c.file_size),c.md5,c.file_size,
                     f.phash_parts,f.sobel
              FROM image_stage2 f JOIN contents c ON c.content_id=f.content_id
@@ -223,7 +277,7 @@ impl Snapshot<'_> {
         cursor: &str,
         limit: usize,
     ) -> Result<Vec<SnapshotRow>, StoreError> {
-        let mut statement = self.transaction.prepare(
+        let mut statement = self.0.prepare(
             "SELECT hex(c.md5)||':'||printf('%020d',c.file_size),c.md5,c.file_size,
                     f.duration_ms,f.width,f.height
              FROM video_metadata f JOIN contents c ON c.content_id=f.content_id
@@ -265,7 +319,7 @@ impl Snapshot<'_> {
         cursor: &str,
         limit: usize,
     ) -> Result<Vec<SnapshotRow>, StoreError> {
-        let mut statement = self.transaction.prepare(
+        let mut statement = self.0.prepare(
             "SELECT hex(c.md5)||':'||printf('%020d',c.file_size)||':'||printf('%01d',f.slot),
                     c.md5,c.file_size,f.slot,f.time_ms,f.decoded,f.width,f.height,f.pdq,f.quality
              FROM video_frame_stage1 f JOIN contents c ON c.content_id=f.content_id
@@ -323,7 +377,7 @@ impl Snapshot<'_> {
         cursor: &str,
         limit: usize,
     ) -> Result<Vec<SnapshotRow>, StoreError> {
-        let mut statement = self.transaction.prepare(
+        let mut statement = self.0.prepare(
             "SELECT hex(c.md5)||':'||printf('%020d',c.file_size)||':'||printf('%01d',f.slot),
                     c.md5,c.file_size,f.slot,f.phash_parts,f.sobel
              FROM video_frame_stage2 f JOIN contents c ON c.content_id=f.content_id
@@ -358,37 +412,40 @@ impl Snapshot<'_> {
             .collect()
     }
 
-    fn read_contact_sheets(
+    fn read_deletion_tombstones(
         &self,
         cursor: &str,
         limit: usize,
     ) -> Result<Vec<SnapshotRow>, StoreError> {
-        let mut statement = self.transaction.prepare(
-            "SELECT hex(c.md5)||':'||printf('%020d',c.file_size),c.md5,c.file_size,f.relative_path
-             FROM contact_sheets f JOIN contents c ON c.content_id=f.content_id
-             WHERE hex(c.md5)||':'||printf('%020d',c.file_size)>?1
-             ORDER BY c.md5,c.file_size LIMIT ?2",
+        let mut statement = self.0.prepare(
+            "SELECT machine_id||':'||normalized_path,machine_id,normalized_path,md5,file_size,outcome
+             FROM deletion_tombstones
+             WHERE machine_id||':'||normalized_path>?1
+             ORDER BY machine_id,normalized_path LIMIT ?2",
         )?;
         let raw = statement
             .query_map(params![cursor, limit as i64], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         raw.into_iter()
-            .map(|(key, md5, size, relative_path)| {
+            .map(|(key, machine, path, md5, size, outcome)| {
                 let content_key = ContentKey::new(fixed_bytes(md5, "contents.md5")?, size as u64);
+                let outcome = match outcome.as_str() {
+                    "recycled" => DeleteOutcome::Recycled,
+                    "deleted" => DeleteOutcome::Deleted,
+                    _ => return Err(StoreError::InvalidState("未知删除墓碑结果".into())),
+                };
                 Ok(SnapshotRow {
                     key,
-                    payload: RowEncoder::new(1)
-                        .bytes(&content_key.md5())
-                        .u64(content_key.file_size())
-                        .text(&relative_path)
-                        .finish(),
+                    payload: encode_deletion_tombstone(&machine, &path, content_key, outcome),
                 })
             })
             .collect()

@@ -9,6 +9,7 @@ use crate::{
     content::encode_file,
     open::{fixed_bytes, sqlite_integer},
     outbox::append_sync_change,
+    rows::RowEncoder,
 };
 
 /// 删除执行器可提交的四种固定结果。
@@ -285,7 +286,7 @@ fn apply_one_result(
         result.outcome,
         DeleteOutcome::Recycled | DeleteOutcome::Deleted
     ) {
-        apply_successful_delete(transaction, run_id, &item)?;
+        apply_successful_delete(transaction, run_id, &item, result.outcome)?;
     }
     Ok(())
 }
@@ -294,6 +295,7 @@ fn apply_successful_delete(
     transaction: &Transaction<'_>,
     run_id: &str,
     item: &StoredDeleteItem,
+    outcome: DeleteOutcome,
 ) -> Result<(), StoreError> {
     let display_path: String = transaction.query_row(
         "SELECT display_path FROM files
@@ -318,6 +320,29 @@ fn apply_successful_delete(
             &scanned,
             ContentKey::new(item.expected_md5, item.expected_size),
             false,
+        ),
+    )?;
+    transaction.execute(
+        "INSERT INTO deletion_tombstones(machine_id,normalized_path,md5,file_size,outcome)
+         VALUES(?1,?2,?3,?4,?5)
+         ON CONFLICT(machine_id,normalized_path) DO UPDATE SET
+           md5=excluded.md5,file_size=excluded.file_size,outcome=excluded.outcome",
+        params![
+            item.machine_id,
+            item.normalized_path,
+            item.expected_md5.as_slice(),
+            sqlite_integer(item.expected_size)?,
+            outcome.as_str()
+        ],
+    )?;
+    append_sync_change(
+        transaction,
+        "deletion_tombstone",
+        encode_deletion_tombstone(
+            &item.machine_id,
+            &item.normalized_path,
+            ContentKey::new(item.expected_md5, item.expected_size),
+            outcome,
         ),
     )?;
 
@@ -389,7 +414,7 @@ fn select_new_representative(
 }
 
 impl DeleteOutcome {
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Recycled => "recycled",
             Self::Deleted => "deleted",
@@ -397,6 +422,21 @@ impl DeleteOutcome {
             Self::Failed => "failed",
         }
     }
+}
+
+pub(crate) fn encode_deletion_tombstone(
+    machine_id: &str,
+    normalized_path: &str,
+    content: ContentKey,
+    outcome: DeleteOutcome,
+) -> Vec<u8> {
+    RowEncoder::new(1)
+        .text(machine_id)
+        .text(normalized_path)
+        .bytes(&content.md5())
+        .u64(content.file_size())
+        .text(outcome.as_str())
+        .finish()
 }
 
 const fn delete_mode_name(mode: DeleteMode) -> &'static str {

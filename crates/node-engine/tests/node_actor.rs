@@ -1,8 +1,8 @@
 use std::path::Path;
 
-use dedup_core::MachineId;
+use dedup_core::{DisplayPath, MachineId, MediaKind, NormalizedPath};
 use dedup_node_engine::{actor::NodeEngine, server::NodeRequestHandler};
-use dedup_node_store::NodeStore;
+use dedup_node_store::{NodeStore, ScannedPath};
 use dedup_protocol::proto;
 
 #[tokio::test]
@@ -64,6 +64,79 @@ async fn protocol_requests_cross_the_actor_and_ack_persisted_outbox() {
     assert!(matches!(
         ack.payload,
         Some(proto::envelope::Payload::SyncAck(_))
+    ));
+
+    handle.shutdown().await.unwrap();
+    actor.await.unwrap();
+}
+
+#[tokio::test]
+async fn actor_holds_snapshot_until_last_table_or_connection_close() {
+    let directory = tempfile::tempdir().unwrap();
+    let machine = MachineId::parse(&"89".repeat(32)).unwrap();
+    let mut store = NodeStore::open(&directory.path().join("node.db"), machine).unwrap();
+    store
+        .upsert_content_and_location(
+            &ScannedPath::new(
+                NormalizedPath::new(r"D:\snapshot.bin").unwrap(),
+                DisplayPath::new(r"D:\snapshot.bin").unwrap(),
+                7,
+            ),
+            [7; 16],
+            MediaKind::Other,
+        )
+        .unwrap();
+    let (handle, actor) =
+        NodeEngine::spawn_for_test(store, "127.0.0.1:39091".parse().unwrap(), directory.path());
+
+    let begin = handle
+        .handle(envelope(
+            1,
+            proto::envelope::Payload::BeginSnapshot(Default::default()),
+        ))
+        .await;
+    let Some(proto::envelope::Payload::BeginSnapshot(begin)) = begin.payload else {
+        panic!("expected snapshot token");
+    };
+    assert!(!begin.snapshot_token.is_empty());
+    let page = handle
+        .handle(envelope(
+            2,
+            proto::envelope::Payload::ReadSnapshotPage(proto::ReadSnapshotPage {
+                snapshot_token: begin.snapshot_token.clone(),
+                table_name: "contents".into(),
+                cursor: String::new(),
+                limit: 1000,
+                rows: Vec::new(),
+                next_cursor: String::new(),
+                done: false,
+            }),
+        ))
+        .await;
+    let Some(proto::envelope::Payload::ReadSnapshotPage(page)) = page.payload else {
+        panic!("expected snapshot page");
+    };
+    assert_eq!(page.rows.len(), 1);
+
+    handle.connection_closed().await;
+    let stale = handle
+        .handle(envelope(
+            3,
+            proto::envelope::Payload::ReadSnapshotPage(proto::ReadSnapshotPage {
+                snapshot_token: begin.snapshot_token,
+                table_name: "files".into(),
+                cursor: String::new(),
+                limit: 1000,
+                rows: Vec::new(),
+                next_cursor: String::new(),
+                done: false,
+            }),
+        ))
+        .await;
+    assert!(matches!(
+        stale.payload,
+        Some(proto::envelope::Payload::Error(proto::Error { code, .. }))
+            if code == proto::ErrorCode::NotFound as i32
     ));
 
     handle.shutdown().await.unwrap();

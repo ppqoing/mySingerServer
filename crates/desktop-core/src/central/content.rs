@@ -6,6 +6,16 @@ use tokio_postgres::Transaction;
 
 use super::{CentralError, CentralStore, invalid_payload, pg_i64};
 
+/// 一次全量节点快照对应的未提交 PostgreSQL 事务。
+///
+/// 类型离开作用域而未调用 `commit` 时，`tokio-postgres` 会回滚所有页面，下一连接必须
+/// 重新向节点请求新的 snapshot token。
+pub struct CentralSnapshot<'a> {
+    transaction: Transaction<'a>,
+    machine_id: MachineId,
+    high_seq: u64,
+}
+
 impl CentralStore {
     /// 在一个事务中按依赖顺序写入一批节点变更并推进该机器唯一游标。
     pub async fn apply_sync_batch(
@@ -96,6 +106,84 @@ impl CentralStore {
             .await?;
         Ok(row.map_or(0, |row| row.get::<_, i64>(0) as u64))
     }
+
+    /// 开启整次快照事务；旧位置先统一失效，页面写完前中心对外不可见半份数据。
+    pub async fn begin_snapshot_replace(
+        &mut self,
+        machine_id: &MachineId,
+        high_seq: u64,
+    ) -> Result<CentralSnapshot<'_>, CentralError> {
+        let transaction = self.client.transaction().await?;
+        transaction
+            .execute(
+                "INSERT INTO nodes(machine_id) VALUES($1)
+                 ON CONFLICT(machine_id) DO UPDATE SET last_seen_at=now()",
+                &[&machine_id.as_str()],
+            )
+            .await?;
+        transaction
+            .execute(
+                "INSERT INTO sync_cursors(machine_id,committed_seq) VALUES($1,0)
+                 ON CONFLICT(machine_id) DO NOTHING",
+                &[&machine_id.as_str()],
+            )
+            .await?;
+        transaction
+            .execute(
+                "UPDATE file_locations SET active=FALSE,updated_seq=$2 WHERE machine_id=$1",
+                &[&machine_id.as_str(), &pg_i64(high_seq, "快照高水位")?],
+            )
+            .await?;
+        transaction
+            .execute(
+                "DELETE FROM deletion_tombstones WHERE machine_id=$1",
+                &[&machine_id.as_str()],
+            )
+            .await?;
+        Ok(CentralSnapshot {
+            transaction,
+            machine_id: machine_id.clone(),
+            high_seq,
+        })
+    }
+}
+
+impl CentralSnapshot<'_> {
+    /// 按固定表顺序把一页版本化载荷写入当前快照事务。
+    pub async fn apply_page(
+        &mut self,
+        table_name: &str,
+        rows: &[Vec<u8>],
+    ) -> Result<(), CentralError> {
+        let entity_kind = snapshot_entity_kind(table_name)?;
+        for payload in rows {
+            let change = proto::SyncChange {
+                seq: self.high_seq,
+                entity_kind: entity_kind.into(),
+                payload: payload.clone(),
+            };
+            let decoded = decode_change(&change)?;
+            apply_change(&self.transaction, &self.machine_id, self.high_seq, &decoded).await?;
+        }
+        Ok(())
+    }
+
+    /// 原子提交全部快照页面，并把中心游标推进到快照起始高水位。
+    pub async fn commit(self) -> Result<u64, CentralError> {
+        self.transaction
+            .execute(
+                "UPDATE sync_cursors
+                 SET committed_seq=GREATEST(committed_seq,$2),updated_at=now()
+                 WHERE machine_id=$1",
+                &[
+                    &self.machine_id.as_str(),
+                    &pg_i64(self.high_seq, "快照高水位")?,
+                ],
+            )
+            .await?;
+        self.transaction.commit().await?;
+        Ok(self.high_seq)
+    }
 }
 
 #[derive(Debug)]
@@ -145,6 +233,12 @@ enum DecodedChange {
         slot: u8,
         phash_parts: Vec<u8>,
         sobel: Vec<u8>,
+    },
+    DeletionTombstone {
+        machine_id: String,
+        normalized_path: String,
+        key: ContentKey,
+        outcome: &'static str,
     },
     ContactSheet,
 }
@@ -310,6 +404,34 @@ async fn apply_change(
                 )
                 .await?;
         }
+        DecodedChange::DeletionTombstone {
+            machine_id,
+            normalized_path,
+            key,
+            outcome,
+        } => {
+            if machine_id != source_machine.as_str() {
+                return Err(invalid_payload("删除墓碑 machine_id 与同步来源不一致"));
+            }
+            transaction
+                .execute(
+                    "INSERT INTO deletion_tombstones(
+                       machine_id,normalized_path,md5,file_size,outcome,updated_seq)
+                     VALUES($1,$2,$3,$4,$5,$6)
+                     ON CONFLICT(machine_id,normalized_path) DO UPDATE SET
+                       md5=excluded.md5,file_size=excluded.file_size,outcome=excluded.outcome,
+                       updated_seq=excluded.updated_seq",
+                    &[
+                        machine_id,
+                        normalized_path,
+                        &key.md5().as_slice(),
+                        &pg_i64(key.file_size(), "删除墓碑文件大小")?,
+                        outcome,
+                        &pg_i64(sequence, "删除墓碑同步序号")?,
+                    ],
+                )
+                .await?;
+        }
         DecodedChange::ContactSheet => {}
     }
     Ok(())
@@ -382,10 +504,34 @@ fn decode_change(change: &proto::SyncChange) -> Result<DecodedChange, CentralErr
             phash_parts: reader.bytes()?,
             sobel: reader.bytes()?,
         },
+        "deletion_tombstone" => DecodedChange::DeletionTombstone {
+            machine_id: reader.text()?,
+            normalized_path: reader.text()?,
+            key: reader.content_key()?,
+            outcome: match reader.text()?.as_str() {
+                "recycled" => "recycled",
+                "deleted" => "deleted",
+                _ => return Err(invalid_payload("删除墓碑 outcome 无效")),
+            },
+        },
         other => return Err(invalid_payload(format!("未知 entity_kind: {other}"))),
     };
     reader.finish()?;
     Ok(decoded)
+}
+
+fn snapshot_entity_kind(table_name: &str) -> Result<&'static str, CentralError> {
+    match table_name {
+        "contents" => Ok("content"),
+        "files" => Ok("file"),
+        "image_stage1" => Ok("image_stage1"),
+        "image_stage2" => Ok("image_stage2"),
+        "video_metadata" => Ok("video_metadata"),
+        "video_frame_stage1" => Ok("video_frame_stage1"),
+        "video_frame_stage2" => Ok("video_frame_stage2"),
+        "deletion_tombstones" => Ok("deletion_tombstone"),
+        other => Err(invalid_payload(format!("未知快照表: {other}"))),
+    }
 }
 
 struct PayloadReader<'a> {

@@ -115,6 +115,12 @@ impl ClientConnection {
     }
 }
 
+impl Drop for ClientConnection {
+    fn drop(&mut self) {
+        self.outgoing.close_now();
+    }
+}
+
 async fn read_loop(
     read: OwnedReadHalf,
     pending: Arc<PendingRequests>,

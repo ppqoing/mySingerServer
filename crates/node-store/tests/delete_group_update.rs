@@ -79,6 +79,24 @@ fn successful_delete_removes_member_and_small_group() {
     assert!(store.page_groups(run, None, 20).unwrap().items.is_empty());
     assert!(!store.location_is_active(&delete_location).unwrap());
     assert!(store.location_is_active(&keep_location).unwrap());
+    let changes = store.pull_changes(0, 1000).unwrap().changes;
+    assert_eq!(
+        changes
+            .iter()
+            .filter(|change| change.entity_kind == "deletion_tombstone")
+            .count(),
+        1,
+        "重复提交成功结果只能产生一个墓碑 outbox"
+    );
+    let snapshot = store.begin_snapshot().unwrap();
+    assert_eq!(
+        snapshot
+            .read_page("deletion_tombstones", "", 1000)
+            .unwrap()
+            .rows
+            .len(),
+        1
+    );
 }
 
 /// failed/skipped 不改变位置或成员；创建批次前必须存在至少一个活动 Keep。

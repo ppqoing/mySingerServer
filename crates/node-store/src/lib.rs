@@ -29,7 +29,7 @@ pub use rows::{
     FeatureWrite, ImageStage1Fields, ScannedPath, SnapshotPage, SnapshotRow, SyncBatch, SyncState,
     VideoFrameStage1Fields, VideoFrameStage2Fields, VideoMetadataFields,
 };
-pub use snapshot::Snapshot;
+pub use snapshot::{OwnedSnapshot, Snapshot};
 pub use tasks::{
     ClaimedTaskItem, NewTaskItem, TaskEvent, TaskItemCompletion, TaskItemSnapshot, TaskItemStatus,
     TaskPage, TaskSnapshot, TaskStatus,

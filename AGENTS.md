@@ -131,7 +131,7 @@ Worker 全部加入 `KILL_ON_JOB_CLOSE` Job，节点退出不会留下孤儿进�
 - `MachineId` 的输入顺序固定为 System UUID、System Serial、Baseboard Serial；字段 trim、
   转大写、跳过空值后以 NUL 分隔，对固定命名空间前缀与字段计算 SHA-256。
 
-节点 SQLite V2 使用 22 张严格表闭合内容、位置、特征、任务、分析、分组、复核、同步和删除。
+节点 SQLite V2 使用 23 张严格表闭合内容、位置、特征、任务、分析、分组、复核、同步和删除。
 `metadata.schema_id` 是不兼容版本标记：只自动初始化空数据库，旧库或未知 schema 直接拒绝打开。
 `NodeStore` 独占连接并启用外键、WAL 与五秒 busy timeout；上层 actor 负责串行调用，不在每个
 仓储函数内重复加锁。内容先按 `(md5,file_size)` 复用，再在同一事务写位置和 outbox。
@@ -248,9 +248,33 @@ SQLite；创建删除批次时才一次性验证每组至少一个当前活动 `
 事务提交后才 ACK 新 cursor。节点 outbox 被裁剪而中心落后时执行整次快照。自动同步只由
 连接成功、任务完成和每 5 秒追赶检查触发；手动同步进入同一队列，每节点最多一个同步循环。
 
+`NodeSession::connect` 通过 `ClientConnection` 把 Hello 作为 TCP 首帧发送，严格校验协议版本与
+产品标识后查询 NodeStatus，并以节点返回的物理 MachineId 绑定该会话。任一传输错误结束当前
+请求；`connect_with_retry` 只按配置的固定间隔重连同一个手工 IP:port，不重建或重试远端任务。
+`ClientConnection` 最后一个所有者 Drop 时同步关闭发送队列，后台写端随即释放 TCP，使节点的
+单管理连接名额可以被下一会话取得。每个节点使用一个有界 `SyncTrigger` 通道：连接成功、任务
+完成、五秒 tick 只能产生 Automatic，用户操作产生 Manual；二者都进入同一个 `SyncEngine` 锁。
+
+`SyncEngine::sync_node` 每轮先从 PG 读取该机器 cursor 并 ACK，即使上次发生“PG 已提交、ACK
+发送前断线”也能先裁剪节点旧行。增量固定请求 1000 条，只有 `CentralStore::apply_sync_batch`
+事务提交成功后才更新内存进度并 ACK；提交前失败保持旧 cursor，重连重放同一批。同步进度只
+发布 Acknowledging、Incremental、Snapshot、CaughtUp 四个不可变阶段快照，UI 不自行推导游标。
+
 SQLite 的业务更新与 outbox 递增序号同事务提交。ACK 只前进、不越过节点真实高水位，并裁剪
 已确认行；请求游标落后于裁剪边界时返回 `SnapshotRequired`。整库快照固定一个读事务和起始
 高水位，按稳定主键逐表分页；快照载荷和增量载荷只传播跨边界键，不泄露本地自增 `content_id`。
+
+网络快照由节点 actor 保存 `OwnedSnapshot`：它用数据库文件的新只读连接执行一次 Deferred
+事务，先读 outbox 高水位建立固定视图，再跨多个 ReadSnapshotPage 请求保留该事务。借用型
+`Snapshot` 只服务节点内部同步测试，绝不以不安全方式跨线程。固定表序为 contents、files、图片
+两层、视频元数据/两层六帧、deletion_tombstones；contact_sheets 不开放为中心快照表。最后墓碑
+页完成或管理连接关闭时 token 和只读连接立即释放，断线不保留页游标。
+
+中心收到 SnapshotRequired 后开启一个 `CentralSnapshot` PostgreSQL 事务，先把该机器旧位置设为
+非活动并清空旧墓碑，再按上述表序写每页外部键载荷；全部页面完成才原子推进中心 cursor 并提交。
+页面读取或连接中断时 Drop 自动回滚，下一连接重新 BeginSnapshot。节点成功删除在同一 SQLite
+事务更新 delete item、位置、重复组、`deletion_tombstones` 与 file/tombstone 两条 outbox；中心
+墓碑以机器/路径 UPSERT，因此即时删除结果更新组后再收到同一墓碑仍然幂等。
 
 跨机器分析先冻结节点集合、各节点 task highwater 和 sync highwater。中心使用完整 stage1
 数据批量生成候选，一筛结束后才批量派发缺失 stage2；数据库已有二筛结果时不派发。所有节点
@@ -347,6 +371,10 @@ computer-use 验收中单独执行，当前不据静态测试标记为 GUI PASS�
 中心 `central-v2.sql` 已在计划专用 PostgreSQL 16 Alpine 空库手工执行成功，第二次执行因表已存在
 明确失败；另一个空库经 `CentralStore::connect` 后仍无业务表。真实数据库测试已验证两机器共享
 内容键、同 MD5 不同大小、不可变输入、候选事务、两页稳定组游标、复核删除计划和成功删除后缩组。
+同步门禁已验证 2501 条严格拆为 1000/1000/501、提交前失败不 ACK、提交后 ACK 丢失由下一连接
+首 ACK 收敛、快照中断整次重来、同端点断开重连和连接 Drop 释放单管理名额。真实 PostgreSQL
+测试另已覆盖图片/视频 stage1+stage2、六帧、位置活动状态、删除墓碑、全量快照替换与未提交
+快照 Drop 回滚；联系表 outbox 被中心明确忽略，PostgreSQL 不存在联系表或原媒体表。
 静态测试、集成测试、发布包验证和 Windows 实际 GUI/托盘/回收站验收必须分开记录。没有实际
 运行的 GUI、托盘、回收站、第二台物理主机或 PostgreSQL 项不得标记 PASS；可用双节点进程
 集成测试证明协议与编排，但真实双物理机不可用时仍标 `BLOCKED`。

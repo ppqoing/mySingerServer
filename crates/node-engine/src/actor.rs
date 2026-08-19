@@ -13,8 +13,8 @@ use dedup_core::{
     MachineId, NodeConfig, TaskId, Thresholds,
 };
 use dedup_node_store::{
-    AnalysisStatus, DeleteOutcome, GroupKind, NodeStore, ReviewDecision, StoreError, TaskSnapshot,
-    TaskStatus,
+    AnalysisStatus, DeleteOutcome, GroupKind, NodeStore, OwnedSnapshot, ReviewDecision, StoreError,
+    TaskSnapshot, TaskStatus,
 };
 use dedup_protocol::proto;
 use thiserror::Error;
@@ -101,6 +101,10 @@ impl NodeEngineHandle {
                 "节点计算引擎没有返回响应",
             )
         })
+    }
+
+    async fn connection_closed(&self) {
+        let _ = self.commands.send(EngineCommand::ConnectionClosed).await;
     }
 }
 
@@ -250,6 +254,11 @@ impl NodeRequestHandler for NodeEngineHandle {
         let handle = self.clone();
         async move { handle.request(request).await }
     }
+
+    fn connection_closed(&self) -> impl std::future::Future<Output = ()> + Send {
+        let handle = self.clone();
+        async move { handle.connection_closed().await }
+    }
 }
 
 /// 创建并运行单一 NodeEngine actor 的工厂。
@@ -307,6 +316,7 @@ fn spawn_actor(
             cache_root: cache_root.to_path_buf(),
             enumerator,
             restarting: false,
+            snapshots: BTreeMap::new(),
         },
         receiver,
     ));
@@ -320,10 +330,12 @@ struct EngineState {
     cache_root: std::path::PathBuf,
     enumerator: EnumeratorKind,
     restarting: bool,
+    snapshots: BTreeMap<String, OwnedSnapshot>,
 }
 
 enum EngineCommand {
     Protocol(proto::Envelope, oneshot::Sender<proto::Envelope>),
+    ConnectionClosed,
     Restart(oneshot::Sender<Result<(), String>>),
     Shutdown(oneshot::Sender<()>),
 }
@@ -334,6 +346,7 @@ async fn run_actor(mut state: EngineState, mut commands: mpsc::Receiver<EngineCo
             EngineCommand::Protocol(request, reply) => {
                 let _ = reply.send(state.handle_protocol(request).await);
             }
+            EngineCommand::ConnectionClosed => state.snapshots.clear(),
             EngineCommand::Restart(reply) => {
                 let _ = reply.send(state.restart_engine().await);
             }
@@ -372,6 +385,8 @@ impl EngineState {
             }
             Some(proto::envelope::Payload::PullChanges(pull)) => self.pull_changes(pull),
             Some(proto::envelope::Payload::SyncAck(ack)) => self.sync_ack(ack),
+            Some(proto::envelope::Payload::BeginSnapshot(_)) => self.begin_snapshot(),
+            Some(proto::envelope::Payload::ReadSnapshotPage(page)) => self.read_snapshot_page(page),
             Some(proto::envelope::Payload::ReadFile(read)) => self.read_file(read),
             Some(proto::envelope::Payload::CreateDeleteBatch(create)) => {
                 self.create_delete_batch(create)
@@ -436,6 +451,48 @@ impl EngineState {
             .ack_changes(ack.committed_seq)
             .map_err(store_error)?;
         Ok(proto::envelope::Payload::SyncAck(ack))
+    }
+
+    fn begin_snapshot(&mut self) -> ProtocolResult {
+        self.snapshots.clear();
+        let snapshot = self.store.begin_owned_snapshot().map_err(store_error)?;
+        let high_seq = snapshot.high_seq();
+        let token = Uuid::now_v7().to_string();
+        self.snapshots.insert(token.clone(), snapshot);
+        Ok(proto::envelope::Payload::BeginSnapshot(
+            proto::BeginSnapshot {
+                snapshot_token: token,
+                snapshot_high_seq: high_seq,
+            },
+        ))
+    }
+
+    fn read_snapshot_page(&mut self, request: proto::ReadSnapshotPage) -> ProtocolResult {
+        let page = self
+            .snapshots
+            .get(&request.snapshot_token)
+            .ok_or_else(|| {
+                (
+                    proto::ErrorCode::NotFound,
+                    "快照 token 不存在或连接已经结束".to_owned(),
+                )
+            })?
+            .read_page(&request.table_name, &request.cursor, request.limit as usize)
+            .map_err(store_error)?;
+        let finished_snapshot = request.table_name == "deletion_tombstones" && page.done;
+        let response = proto::ReadSnapshotPage {
+            snapshot_token: request.snapshot_token.clone(),
+            table_name: page.table_name,
+            cursor: request.cursor,
+            limit: request.limit,
+            rows: page.rows.into_iter().map(|row| row.payload).collect(),
+            next_cursor: page.next_cursor.unwrap_or_default(),
+            done: page.done,
+        };
+        if finished_snapshot {
+            self.snapshots.remove(&request.snapshot_token);
+        }
+        Ok(proto::envelope::Payload::ReadSnapshotPage(response))
     }
 
     async fn create_scan(&mut self, request: proto::CreateScan) -> ProtocolResult {
