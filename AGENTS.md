@@ -415,7 +415,56 @@ MinGW GCC，bundled SQLite 会生成 MinGW ABI 符号并在 MSVC 链接阶段失
 但仍通过生产相对路径加载。每项实现遵循 RED→GREEN→REFACTOR，并只运行计划指定门禁和一次
 最终综合门禁，不追加无休止审查。
 
-## 8. 验收边界
+## 8. 任务 19：Windows x64 便携发布包
+
+任务 19 的设计目的，是把 Rust V2 已冻结的 Windows x64 运行闭包组装为可审计、可重复验证的
+最小便携 ZIP，而不是制作安装器、迁移旧版目录或代替最终运行时验收。`scripts/build-release.ps1`
+固定构建 `x86_64-pc-windows-msvc` Release 工作区，从全新的 `dist-rust-v2/staging` 开始组装；
+`scripts/verify-release.ps1` 对 staging 目录或最终 ZIP 做同一套文件集合、PE 架构、许可证和哈希
+检查。发布失败时不得沿用旧归档冒充本轮产物，也不得因打包方便而把仓库、target 或既有运行目录
+整体复制进去。
+
+x64 发布白名单只允许顶层 `desktop.exe`、`node.exe`、`worker.exe`，
+`runtime/ffmpeg` 下固定五个 DLL，`schema/central-v2.sql`，`licenses` 许可证闭包，以及
+`manifest/files.sha256`。不复制 `data`、`config.toml`、任何 SQLite/数据库、日志、缓存、旧 Go/C++
+EXE 或 DLL，也不复制其他 Cargo 产物。三个 EXE 必须唯一存在且 PE Machine 为 `0x8664`；这既是
+目标架构约束，也是防止旧版或调试辅助程序混入发布包的显式门禁。
+
+staging 每次组装前只清理固定 `dist-rust-v2/staging`，并验证该路径确实是发布根的直接子目录。
+组装完成后，`manifest/files.sha256` 以小写 SHA-256、正斜杠相对路径和确定性排序覆盖当时除清单
+自身外的每个普通文件；验证器要求实际文件与清单一一对应，并重新计算每个文件哈希。ZIP 直接以
+staging 内容为归档根，不额外嵌套 `staging` 目录，固定输出
+`dist-rust-v2/mySingerServer-rust-v2-win-x64.zip`；同目录 `.zip.sha256` sidecar 保存归档 SHA-256，
+验证器在 sidecar 存在时重新计算并拒绝不一致值。包内文件清单证明解压内容，sidecar 证明 ZIP
+本体，二者不能互相替代。
+
+许可证闭包固定包含 `Project-MIT.txt`、`Rust-Third-Party-Licenses.html`、
+`Slint-Royalty-Free-2.0.txt`、`PDQ-BSD-3-Clause.txt` 和 `FFmpeg-LGPL-3.0.txt`，且每项必须非空。
+项目根 MIT 许可证只复制为 `Project-MIT.txt`，不被第三方生成流程改写。
+`scripts/generate-third-party-notices.ps1 -Destination <licenses目录>` 固定验证
+`cargo-about 0.9.1`，以 `cargo metadata --locked --offline` 得到解析闭包并逐项核对 Cargo.lock；
+随后只为 `x86_64-pc-windows-msvc` 生成包含 crate 名称、版本和许可证正文的 Rust HTML。Slint
+子 crate 的 LicenseRef 正文不是 cargo-about 可自动映射的 license file，因此脚本从 metadata
+选出全部 Slint 包并把官方 Royalty-free 2.0 正文显式追加到 HTML，同时复制独立 Slint 和 Meta PDQ
+BSD-3-Clause 文本。FFmpeg LGPL 文本仍只由已校验的 `fetch-ffmpeg.ps1` 写入同一目录；任一工具、
+正文或锁定依赖缺失都会终止发布，不允许用空文件或跳过许可证检查继续打包。
+
+FFmpeg 运行闭包严格等于 `avutil-60.dll`、`swresample-6.dll`、`swscale-9.dll`、
+`avcodec-62.dll`、`avformat-62.dll`，名称集合和数量都必须完全相等。任何位置出现
+`ffmpeg.exe`、`ffprobe.exe` 或 `ffplay.exe` 都是发布失败；便携包只携带 Worker 所需 LGPL shared
+DLL，不提供转码命令行工具，也不把下载归档的 `bin` 目录整体复制进包。
+
+`deploy/central-v2.sql` 仅复制为包内 `schema/central-v2.sql`，供用户在目标 PostgreSQL 上手工
+执行。构建器、验证器、node 和 desktop 都不得执行该脚本、创建中心业务表或修改现有数据库；
+验证器只能确认 schema 文件存在，不能把“文件已打包”解释为“数据库已建库”。
+
+`scripts/verify-release.ps1` 是静态发布物验证器，不启动三个程序，也不证明 DLL 可真实加载、Worker
+Ready、任意当前目录启动、首次运行只在包旁创建 `data`、GUI/托盘/回收站或双物理机可用。
+`tests/windows/Test-RustV2Package.ps1` 使用最小 PE fixture 验证静态规则的成功与拒绝路径，也不能
+替代一次使用真实 Release EXE、真实 FFmpeg DLL 和真实许可证生成物构建 ZIP。静态脚本检查、package
+fixture、真实打包验证和 Windows 运行时验收必须分别记录，后一步不得由前一步推导 PASS。
+
+## 9. 验收边界
 
 当前已建立 Rust 1.97.1 工具链和 13 成员工作区，并完成领域 ID、配置/阈值、应用目录、
 Windows 路径、SMBIOS 机器身份、完整 Protobuf 清单和 TCP 传输边界；真实当前主机的
@@ -452,3 +501,12 @@ PostgreSQL 容器上执行整链集成：扫描任务查询、outbox 同步、�
 静态测试、集成测试、发布包验证和 Windows 实际 GUI/托盘/回收站验收必须分开记录。没有实际
 运行的 GUI、托盘、回收站、第二台物理主机或 PostgreSQL 项不得标记 PASS；可用双节点进程
 集成测试证明协议与编排，但真实双物理机不可用时仍标 `BLOCKED`。
+
+任务 19 的四个 PowerShell 文件已经全部通过 AST 解析；package fixture 实际输出
+`RUST_V2_PACKAGE_TEST_PASS`，覆盖完整目录、完整 ZIP，以及错误 sidecar、禁带 FFmpeg EXE、缺失
+`worker.exe`、非 x64 PE 和缺失 Slint 许可证的拒绝路径。固定 Cargo x64 工作区 Release 构建已
+实际通过；notices 生成实际核对 699 个解析包并输出约 488 KiB Rust HTML；FFmpeg 锁定归档和五 DLL
+SHA 已验证。完整 `build-release.ps1` 默认构建分支与独立 `verify-release.ps1` 均输出 PASS，当前 ZIP
+为 `dist-rust-v2/mySingerServer-rust-v2-win-x64.zip`，大小 64,765,452 字节，SHA-256 为
+`f543609044869c0d8b74b13ea3ca949d8609f995deef744272a7bb6ea84978d5`。这些结果只证明静态发布闭包；
+任意 cwd Worker Ready、首次启动数据目录、GUI、托盘和回收站仍留给任务 20，不得由包验证推导 PASS。
