@@ -213,8 +213,9 @@ SQLite，Worker 忙碌数来自唯一 WorkerPool，不由 TCP 层维护第二份
 预览只接受当前活动 `LocationKey`。图片 `original` 直接 seek 并读取原文件，每块最多 1 MiB，
 不创建目录或缩略图；视频 `contact_sheet` 只读取一筛已经写入 `data/node/cache/contact-sheets`
 的 JPG。删除执行顺序固定为活动位置→实际大小→1 MiB 缓冲流式 MD5→文件系统操作；默认回收站
-在短生命周期 STA 线程调用 Windows `IFileOperation` 和允许撤销标志，永久删除才调用
-`std::fs::remove_file`。所有结果整批交回 NodeStore；只有 recycled/deleted 写墓碑并立即缩组。
+在短生命周期 STA 线程调用 Windows `IFileOperation`，同时设置 `FOF_ALLOWUNDO` 和
+`FOFX_RECYCLEONDELETE`：前者保留旧系统语义，后者在 Windows 8+ 明确要求进入回收站；永久删除
+才调用 `std::fs::remove_file`。所有结果整批交回 NodeStore；只有 recycled/deleted 写墓碑并立即缩组。
 
 `dedup-core::logging::SizeRotatingWriter` 是三个进程共用的同步日志边界，生产固定 20 MiB、包含
 当前文件在内保留 10 个文件。`node.exe` 首次启动只写 `data/node/config.toml`，Release 使用
@@ -249,6 +250,11 @@ SQLite；创建删除批次时才一次性验证每组至少一个当前活动 `
 中心同步每批最多 1000 条：先以 PostgreSQL 已提交 cursor 向节点 ACK，再拉取增量；中心
 事务提交后才 ACK 新 cursor。节点 outbox 被裁剪而中心落后时执行整次快照。自动同步只由
 连接成功、任务完成和每 5 秒追赶检查触发；手动同步进入同一队列，每节点最多一个同步循环。
+`DesktopApp` 控制循环分别维护“配置的固定重连间隔”和“固定 5 秒追赶”两个 interval。重连 tick
+先剔除已经失败的会话，再只连接缺失的手工端点；连接成功、首次观察到任务完成和追赶 tick 只向
+节点自己的 `SyncTrigger` 通道排队。每个后台同步循环独占一个 `SyncEngine` 和一条 PG client，多个
+节点并行，长增量或快照不阻塞唯一 UI 命令循环。设置更新只重建重连 interval 和同步循环，不创建
+第二份 UI 状态。传输失败的会话必须从索引移除；PG client 失败则丢弃并在后续触发重新连接。
 
 `NodeSession::connect` 通过 `ClientConnection` 把 Hello 作为 TCP 首帧发送，严格校验协议版本与
 产品标识后查询 NodeStatus，并以节点返回的物理 MachineId 绑定该会话。任一传输错误结束当前
@@ -316,9 +322,10 @@ phase2 对 queued/running 或游标落后继续等待；completed/failed/cancell
 同一 `(md5,file_size)` 在任意机器只映射一个中心内容，而每个机器路径各自保留位置记录。
 
 桌面端采用严格单向交互。Slint 回调只把手工节点编辑、连接、刷新、同步、扫描、取消、路径浏览
-和设置保存转换为有界 `UiCommand`；`DesktopApp` 的 Tokio 控制循环才持有 `NodeSession`、
-`SyncEngine` 与 `CentralStore`，完成后发布完整不可变 `UiEvent::ViewChanged`。GUI 线程只把事件
-映射为 Slint model 和属性，不直接读写 TCP、SQLite、PostgreSQL、FFmpeg 或配置文件。节点连接按
+和设置保存转换为有界 `UiCommand`；`DesktopApp` 的 Tokio 控制循环持有 `NodeSession`、中心查询
+`CentralStore` 和唯一视图，每个节点后台同步循环另持有自己的 `SyncEngine` 与 PG client，结果再
+作为不可变内部事件归并并发布 `UiEvent::ViewChanged`。GUI 线程只把事件映射为 Slint model 和属性，
+不直接读写 TCP、SQLite、PostgreSQL、FFmpeg 或配置文件。节点连接按
 手工配置顺序展示、并行建立，每个列表索引最多保存一个 session；编辑节点会丢弃旧会话，避免把
 新地址错误绑定到旧物理 MachineId。PostgreSQL 未配置、schema 缺失或连接失败只改变中心能力和
 诊断文案，节点扫描及本地 SQLite 分析仍然可用。
@@ -485,8 +492,11 @@ MP4 首尾 RGB24 解码集成测试已通过。真实 worker.exe 的 Ready、图
 单端缺失、partial 精确重试、代表直连不传递、稳定成员分页及关闭重开后的复核恢复测试已通过。
 节点单管理连接、连接内并发、actor 命令边界、任务高水位、原图/联系表分块、永久删除复核、
 删除后缩组、20 MiB×10 日志和无 GUI 托盘命令状态测试已通过；Slint SystemTrayIcon 声明与
-`node.exe` 已完成真实 MSVC 编译。实际托盘图标、右键菜单、回收站恢复和有序退出仍必须在最终
-computer-use 验收中单独执行，当前不据静态测试标记为 GUI PASS。
+`node.exe` 已完成真实 MSVC 编译。Windows 桌面用户上下文中的真实删除验收已经用
+`SHQueryRecycleBinW` 和 Explorer 同时证明默认删除进入回收站、存在“还原”动作，而 Permanent
+不增加回收站项目；测试项随后已精确还原并清理。Computer Use 能读取 desktop 总览、八个导航标签、
+在线本地节点和 24 个 Worker，但当前辅助接口不能提供 Slint 文本坐标、不能截屏且不暴露任务栏托盘，
+因此页面逐项交互与托盘右键/重启/退出仍为 `PARTIAL`，不得由静态托盘测试推导 GUI PASS。
 中心 `central-v2.sql` 已在计划专用 PostgreSQL 16 Alpine 空库手工执行成功，第二次执行因表已存在
 明确失败；另一个空库经 `CentralStore::connect` 后仍无业务表。真实数据库测试已验证两机器共享
 内容键、同 MD5 不同大小、不可变输入、候选事务、两页稳定组游标、复核删除计划和成功删除后缩组。
@@ -505,8 +515,16 @@ PostgreSQL 容器上执行整链集成：扫描任务查询、outbox 同步、�
 任务 19 的四个 PowerShell 文件已经全部通过 AST 解析；package fixture 实际输出
 `RUST_V2_PACKAGE_TEST_PASS`，覆盖完整目录、完整 ZIP，以及错误 sidecar、禁带 FFmpeg EXE、缺失
 `worker.exe`、非 x64 PE 和缺失 Slint 许可证的拒绝路径。固定 Cargo x64 工作区 Release 构建已
-实际通过；notices 生成实际核对 699 个解析包并输出约 488 KiB Rust HTML；FFmpeg 锁定归档和五 DLL
-SHA 已验证。完整 `build-release.ps1` 默认构建分支与独立 `verify-release.ps1` 均输出 PASS，当前 ZIP
-为 `dist-rust-v2/mySingerServer-rust-v2-win-x64.zip`，大小 64,765,452 字节，SHA-256 为
-`f543609044869c0d8b74b13ea3ca949d8609f995deef744272a7bb6ea84978d5`。这些结果只证明静态发布闭包；
-任意 cwd Worker Ready、首次启动数据目录、GUI、托盘和回收站仍留给任务 20，不得由包验证推导 PASS。
+实际通过；notices 生成实际核对 699 个解析包；FFmpeg 锁定归档和五 DLL SHA 已验证。任务 20 在
+回收站修复之后重新执行完整构建，`build-release.ps1`、独立 `verify-release.ps1` 和 package fixture
+均输出 PASS。当前 ZIP 为 `dist-rust-v2/mySingerServer-rust-v2-win-x64.zip`，大小 64,804,379 字节，
+SHA-256 为 `b99f71d79f51aab92092360cde32b6d9d13f887a7729b008927232fe9c7b4c9e`，白名单共 15 个文件。
+
+任务 20 的真实单节点便携链覆盖扫描缓存、精确/图片/视频分析、分页、复核、永久删除和重启恢复；
+双 loopback 节点覆盖独立机器身份、SQLite、高水位和输入隔离；真实 PostgreSQL 16 测试覆盖
+1000/1000/501 增量、stage2、提交失败、ACK 丢失、八表快照与墓碑重放，并完成 stage1→双节点
+phase2→最终图片组。桌面控制器另以已成功建立后再关闭/重启的真实 TCP 节点验证重连；真实 PG
+backend 被服务端终止后能重新连接并再次 ACK，故障期间的长 PullChanges 也不阻塞 Shutdown。完整命令、结果、
+GUI/托盘限制、回收站证据和复跑方法记录在
+`docs/verification/2026-08-19-rust-v2-acceptance.md`。第二台真实 Windows x64 物理主机不可用，
+所以真实多物理机仍为 `BLOCKED`；loopback 双节点 PASS 不能替代这一边界。

@@ -82,6 +82,17 @@ async fn fixed_automatic_sources_and_manual_action_share_one_trigger_channel() {
     assert_eq!(receiver.next().await, Some(SyncTrigger::Manual));
 }
 
+#[tokio::test]
+async fn full_trigger_channel_coalesces_without_blocking_the_controller() {
+    let (sender, mut receiver) = sync_trigger_channel(1);
+    sender.connected().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_millis(50), sender.manual())
+        .await
+        .expect("已满触发通道不得阻塞 UI 控制循环")
+        .unwrap();
+    assert_eq!(receiver.next().await, Some(SyncTrigger::Automatic));
+}
+
 struct FakeNode {
     machine_id: MachineId,
     state: Mutex<FakeNodeState>,

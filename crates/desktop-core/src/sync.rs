@@ -94,10 +94,11 @@ impl SyncTriggerSender {
     }
 
     async fn send(&self, trigger: SyncTrigger) -> Result<(), SyncTriggerClosed> {
-        self.sender
-            .send(trigger)
-            .await
-            .map_err(|_| SyncTriggerClosed)
+        // 一次同步会持续追到当前高水位；队列已满时已有触发足够，合并重复请求可避免 UI 控制循环等待。
+        match self.sender.try_send(trigger) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(SyncTriggerClosed),
+        }
     }
 }
 

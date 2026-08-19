@@ -9,8 +9,9 @@ use windows::{
             CoUninitialize, IBindCtx,
         },
         UI::Shell::{
-            FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FileOperation,
-            IFileOperation, IFileOperationProgressSink, IShellItem, SHCreateItemFromParsingName,
+            FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOFX_RECYCLEONDELETE,
+            FileOperation, IFileOperation, IFileOperationProgressSink, IShellItem,
+            SHCreateItemFromParsingName,
         },
     },
     core::PCWSTR,
@@ -51,7 +52,10 @@ fn recycle_on_sta(path: &Path) -> io::Result<()> {
     let operation: IFileOperation =
         unsafe { CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER) }
             .map_err(shell_error)?;
-    let flags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
+    // FOF_ALLOWUNDO 保留旧系统兼容语义；Windows 8+ 以 FOFX_RECYCLEONDELETE 明确禁止
+    // IFileOperation 在静默模式下把 DeleteItem 降级为永久删除。
+    let flags =
+        FOF_ALLOWUNDO | FOFX_RECYCLEONDELETE | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
     // SAFETY: item 和 operation 均为当前 STA 中的有效 COM 接口；不注册进度回调。
     unsafe {
         operation.SetOperationFlags(flags).map_err(shell_error)?;

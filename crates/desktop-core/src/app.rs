@@ -5,6 +5,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use dedup_core::{
@@ -12,7 +13,11 @@ use dedup_core::{
     NormalizedPath, TaskId,
 };
 use dedup_protocol::proto;
-use tokio::sync::mpsc;
+use tokio::{
+    sync::mpsc,
+    task::JoinHandle,
+    time::{Interval, MissedTickBehavior, interval},
+};
 use uuid::Uuid;
 
 use crate::{
@@ -28,7 +33,10 @@ use crate::{
         group_page_from_node, load_preview, member_page_from_central, member_page_from_node,
     },
     review::{QuickReviewRule, ReviewBoard, ReviewDecision},
-    sync::{SyncEngine, SyncTrigger},
+    sync::{
+        AUTO_CATCH_UP_INTERVAL_SECONDS, SyncEngine, SyncError, SyncTriggerReceiver,
+        SyncTriggerSender, sync_trigger_channel,
+    },
     view_state::{
         DesktopPaths, DesktopViewState, NodeConnectionState, NodeRuntimeStats, PostgresHealth,
         TaskView, ViewTaskState,
@@ -277,6 +285,40 @@ struct PreparedDeleteContext {
     confirmation: DeleteConfirmation,
 }
 
+/// 一个节点独占的同步触发端和后台任务；丢弃时立即结束其 PG 连接与同步请求。
+struct NodeSyncWorker {
+    id: Uuid,
+    triggers: SyncTriggerSender,
+    task: JoinHandle<()>,
+}
+
+impl Drop for NodeSyncWorker {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// 节点同步后台任务返回给唯一控制循环的不可变结果。
+struct NodeSyncEvent {
+    index: usize,
+    worker_id: Uuid,
+    machine_id: String,
+    outcome: NodeSyncOutcome,
+}
+
+/// 同步成功携带真实节点状态；失败明确指出应重建哪一侧连接。
+enum NodeSyncOutcome {
+    Succeeded {
+        committed_seq: u64,
+        status: proto::NodeStatus,
+    },
+    Failed {
+        message: String,
+        session_failed: bool,
+        central_failed: bool,
+    },
+}
+
 async fn run_controller(
     mut state: DesktopViewState,
     config_path: PathBuf,
@@ -285,12 +327,56 @@ async fn run_controller(
 ) {
     let mut sessions = BTreeMap::<usize, Arc<NodeSession>>::new();
     let mut central = connect_central(&mut state).await;
-    let mut sync_engines = BTreeMap::<usize, SyncEngine>::new();
+    let mut sync_workers = BTreeMap::<usize, NodeSyncWorker>::new();
+    let (sync_result_sender, mut sync_results) = mpsc::unbounded_channel();
     let mut cross_analysis: Option<CrossAnalysisCoordinator> = None;
     let mut loaded_members: Option<LoadedMembersContext> = None;
     let mut prepared_delete: Option<PreparedDeleteContext> = None;
+    let mut reconnect_ticks = repeating_interval(state.config().reconnect_interval_seconds);
+    let mut catch_up_ticks = repeating_interval(AUTO_CATCH_UP_INTERVAL_SECONDS);
+    catch_up_ticks.tick().await;
     publish(&events, &state).await;
-    while let Some(command) = commands.recv().await {
+    loop {
+        let command = tokio::select! {
+            command = commands.recv() => match command {
+                Some(command) => command,
+                None => break,
+            },
+            _ = reconnect_ticks.tick() => {
+                reconnect_and_sync(
+                    &mut state,
+                    &mut sessions,
+                    &mut central,
+                    &mut sync_workers,
+                    &sync_result_sender,
+                ).await;
+                publish(&events, &state).await;
+                continue;
+            }
+            _ = catch_up_ticks.tick() => {
+                catch_up_and_refresh(
+                    &mut state,
+                    &mut sessions,
+                    &mut central,
+                    &mut sync_workers,
+                    &sync_result_sender,
+                ).await;
+                publish(&events, &state).await;
+                continue;
+            }
+            Some(sync_result) = sync_results.recv() => {
+                apply_sync_result(
+                    sync_result,
+                    &mut state,
+                    &mut sessions,
+                    &mut central,
+                    &mut sync_workers,
+                    &events,
+                ).await;
+                publish(&events, &state).await;
+                continue;
+            }
+        };
         let result = match command {
             UiCommand::AddNode { ip, port } => state
                 .add_node(&ip, port)
@@ -302,6 +388,7 @@ async fn run_controller(
                 .map_err(|error| error.to_string())
                 .and_then(|_| {
                     sessions.clear();
+                    sync_workers.clear();
                     persist(&config_path, state.config())
                 }),
             UiCommand::RemoveNode { index } => state
@@ -309,29 +396,38 @@ async fn run_controller(
                 .map_err(|error| error.to_string())
                 .and_then(|_| {
                     sessions.clear();
+                    sync_workers.clear();
                     persist(&config_path, state.config())
                 }),
             UiCommand::ConnectAll => {
+                sync_workers.clear();
                 connect_all(&mut state, &mut sessions).await;
                 if central.is_none() {
                     central = connect_central(&mut state).await;
                 }
+                let indexes = sessions.keys().copied().collect::<Vec<_>>();
+                ensure_sync_workers(
+                    &indexes,
+                    &sessions,
+                    state.config().postgres_url.as_deref(),
+                    &mut sync_workers,
+                    &sync_result_sender,
+                );
+                queue_automatic(&indexes, &sync_workers, AutomaticSyncCause::Connected).await;
                 Ok(())
             }
             UiCommand::Refresh => {
-                refresh_nodes(&mut state, &sessions, central.as_ref()).await;
+                let report = refresh_nodes(&mut state, &sessions, central.as_ref()).await;
+                apply_refresh_report(
+                    report,
+                    &mut state,
+                    &mut sessions,
+                    &mut central,
+                    &mut sync_workers,
+                );
                 Ok(())
             }
-            UiCommand::SyncNow { index } => {
-                sync_now(
-                    index,
-                    &mut state,
-                    &sessions,
-                    central.as_mut(),
-                    &mut sync_engines,
-                )
-                .await
-            }
+            UiCommand::SyncNow { index } => queue_manual(index, &sync_workers).await,
             UiCommand::CreateScan {
                 node_index,
                 roots,
@@ -532,8 +628,9 @@ async fn run_controller(
                     .and_then(|_| persist(&config_path, state.config()));
                 if result.is_ok() {
                     sessions.clear();
-                    sync_engines.clear();
+                    sync_workers.clear();
                     central = connect_central(&mut state).await;
+                    reconnect_ticks = repeating_interval(state.config().reconnect_interval_seconds);
                 }
                 result
             }
@@ -554,10 +651,21 @@ async fn connect_all(
     sessions: &mut BTreeMap<usize, Arc<NodeSession>>,
 ) {
     sessions.clear();
+    connect_missing(state, sessions).await;
+}
+
+/// 并行连接当前配置中尚无活动会话的节点，并返回本轮新建会话索引。
+///
+/// 失败节点只更新视图，保留在配置中等待下一次固定间隔重连。
+async fn connect_missing(
+    state: &mut DesktopViewState,
+    sessions: &mut BTreeMap<usize, Arc<NodeSession>>,
+) -> Vec<usize> {
     let endpoints = state
         .nodes()
         .iter()
         .enumerate()
+        .filter(|(index, _)| !sessions.contains_key(index))
         .map(|(index, node)| (index, node.endpoint.clone()))
         .collect::<Vec<_>>();
     for (index, _) in &endpoints {
@@ -567,6 +675,7 @@ async fn connect_all(
     for (index, endpoint) in endpoints {
         attempts.spawn(async move { (index, NodeSession::connect(endpoint).await) });
     }
+    let mut connected = Vec::new();
     while let Some(joined) = attempts.join_next().await {
         let Ok((index, result)) = joined else {
             continue;
@@ -583,6 +692,7 @@ async fn connect_all(
                             Some(runtime_stats(status, 0)),
                         );
                         sessions.insert(index, session);
+                        connected.push(index);
                     }
                     Err(error) => state.set_node_error(index, error.to_string()),
                 }
@@ -590,18 +700,38 @@ async fn connect_all(
             Err(error) => state.set_node_error(index, error.to_string()),
         }
     }
+    connected
 }
 
+#[derive(Default)]
+/// 一次状态刷新发现的断线会话和首次进入完成态的任务所属节点。
+struct RefreshReport {
+    /// 状态请求失败、必须丢弃旧 TCP 会话的节点索引。
+    failed_sessions: Vec<usize>,
+    /// 本轮首次观察到任务完成、应立即走自动同步路径的节点索引。
+    completed_nodes: Vec<usize>,
+    /// 中心 cursor 查询失败；控制器必须丢弃旧 PG client，等待下一次重连。
+    central_error: Option<String>,
+}
+
+/// 查询所有活动会话的节点状态与持久任务，并归并进唯一桌面视图。
 async fn refresh_nodes(
     state: &mut DesktopViewState,
     sessions: &BTreeMap<usize, Arc<NodeSession>>,
     central: Option<&CentralStore>,
-) {
+) -> RefreshReport {
+    let mut report = RefreshReport::default();
     for (index, session) in sessions {
         match session.status().await {
             Ok(status) => {
                 let sync = if let Some(central) = central {
-                    central.sync_cursor(session.machine_id()).await.unwrap_or(0)
+                    match central.sync_cursor(session.machine_id()).await {
+                        Ok(cursor) => cursor,
+                        Err(error) => {
+                            report.central_error.get_or_insert(error.to_string());
+                            0
+                        }
+                    }
                 } else {
                     0
                 };
@@ -613,40 +743,325 @@ async fn refresh_nodes(
                 if let Ok(page) = session.list_tasks("", 1000).await {
                     for task in page.tasks {
                         if let Ok(task) = task_view(*index, task) {
+                            let became_completed = task.state == ViewTaskState::Completed
+                                && !state.tasks().iter().any(|current| {
+                                    current.task_id == task.task_id
+                                        && current.state == ViewTaskState::Completed
+                                });
                             state.upsert_task(task);
+                            if became_completed && !report.completed_nodes.contains(index) {
+                                report.completed_nodes.push(*index);
+                            }
                         }
                     }
                 }
             }
-            Err(error) => state.set_node_error(*index, error.to_string()),
+            Err(error) => {
+                state.set_node_error(*index, error.to_string());
+                report.failed_sessions.push(*index);
+            }
+        }
+    }
+    report
+}
+
+#[derive(Clone, Copy)]
+/// 自动同步的三个固定来源；它们与手动操作进入同一节点级通道。
+enum AutomaticSyncCause {
+    Connected,
+    TaskCompleted,
+    CatchUp,
+}
+
+/// 为在线节点创建彼此独立的后台同步循环；每个循环独占自己的 PG 连接。
+fn ensure_sync_workers(
+    indexes: &[usize],
+    sessions: &BTreeMap<usize, Arc<NodeSession>>,
+    postgres_url: Option<&str>,
+    workers: &mut BTreeMap<usize, NodeSyncWorker>,
+    results: &mpsc::UnboundedSender<NodeSyncEvent>,
+) {
+    let Some(postgres_url) = postgres_url else {
+        return;
+    };
+    for index in indexes {
+        if workers.contains_key(index) {
+            continue;
+        }
+        let Some(session) = sessions.get(index) else {
+            continue;
+        };
+        let worker_id = Uuid::now_v7();
+        let (triggers, receiver) = sync_trigger_channel(8);
+        let task = tokio::spawn(run_node_sync_worker(
+            *index,
+            worker_id,
+            Arc::clone(session),
+            postgres_url.to_owned(),
+            receiver,
+            results.clone(),
+        ));
+        workers.insert(
+            *index,
+            NodeSyncWorker {
+                id: worker_id,
+                triggers,
+                task,
+            },
+        );
+    }
+}
+
+/// 节点后台循环顺序消费统一触发通道；PG 失败只丢弃本循环连接并等待下一触发重建。
+async fn run_node_sync_worker(
+    index: usize,
+    worker_id: Uuid,
+    session: Arc<NodeSession>,
+    postgres_url: String,
+    mut triggers: SyncTriggerReceiver,
+    results: mpsc::UnboundedSender<NodeSyncEvent>,
+) {
+    let engine = SyncEngine::new();
+    let machine_id = session.machine_id().as_str().to_owned();
+    let mut central = None;
+    while let Some(trigger) = triggers.next().await {
+        if central.is_none() {
+            match CentralStore::connect(&postgres_url).await {
+                Ok(store) => central = Some(store),
+                Err(error) => {
+                    let _ = results.send(NodeSyncEvent {
+                        index,
+                        worker_id,
+                        machine_id: machine_id.clone(),
+                        outcome: NodeSyncOutcome::Failed {
+                            message: error.to_string(),
+                            session_failed: false,
+                            central_failed: true,
+                        },
+                    });
+                    continue;
+                }
+            }
+        }
+        let outcome = engine
+            .sync_node(
+                session.as_ref(),
+                central.as_mut().expect("PG 连接已经建立"),
+                trigger,
+            )
+            .await;
+        match outcome {
+            Ok(report) => match session.status().await {
+                Ok(status) => {
+                    let _ = results.send(NodeSyncEvent {
+                        index,
+                        worker_id,
+                        machine_id: machine_id.clone(),
+                        outcome: NodeSyncOutcome::Succeeded {
+                            committed_seq: report.committed_seq,
+                            status,
+                        },
+                    });
+                }
+                Err(error) => {
+                    let _ = results.send(NodeSyncEvent {
+                        index,
+                        worker_id,
+                        machine_id: machine_id.clone(),
+                        outcome: NodeSyncOutcome::Failed {
+                            message: error.to_string(),
+                            session_failed: true,
+                            central_failed: false,
+                        },
+                    });
+                    break;
+                }
+            },
+            Err(error) => {
+                let session_failed = matches!(&error, SyncError::Session(_));
+                let central_failed = matches!(&error, SyncError::Central(_));
+                let _ = results.send(NodeSyncEvent {
+                    index,
+                    worker_id,
+                    machine_id: machine_id.clone(),
+                    outcome: NodeSyncOutcome::Failed {
+                        message: error.to_string(),
+                        session_failed,
+                        central_failed,
+                    },
+                });
+                if central_failed {
+                    central = None;
+                }
+                if session_failed {
+                    break;
+                }
+            }
         }
     }
 }
 
-async fn sync_now(
+/// 把连接、任务完成或五秒 tick 放入每个节点自己的同一有界触发通道。
+async fn queue_automatic(
+    indexes: &[usize],
+    workers: &BTreeMap<usize, NodeSyncWorker>,
+    cause: AutomaticSyncCause,
+) {
+    for index in indexes {
+        let Some(worker) = workers.get(index) else {
+            continue;
+        };
+        let _ = match cause {
+            AutomaticSyncCause::Connected => worker.triggers.connected().await,
+            AutomaticSyncCause::TaskCompleted => worker.triggers.task_completed().await,
+            AutomaticSyncCause::CatchUp => worker.triggers.catch_up_tick().await,
+        };
+    }
+}
+
+/// 手动按钮只排入节点现有的同步通道，不在控制循环内执行网络或 PG IO。
+async fn queue_manual(
     index: usize,
-    state: &mut DesktopViewState,
-    sessions: &BTreeMap<usize, Arc<NodeSession>>,
-    central: Option<&mut CentralStore>,
-    engines: &mut BTreeMap<usize, SyncEngine>,
+    workers: &BTreeMap<usize, NodeSyncWorker>,
 ) -> Result<(), String> {
-    let session = sessions
+    workers
         .get(&index)
-        .ok_or_else(|| "节点当前未连接".to_owned())?;
-    let central = central.ok_or_else(|| "PostgreSQL 中心模式未启用".to_owned())?;
-    let report = engines
-        .entry(index)
-        .or_default()
-        .sync_node(session.as_ref(), central, SyncTrigger::Manual)
+        .ok_or_else(|| "节点未连接或 PostgreSQL 中心模式未启用".to_owned())?
+        .triggers
+        .manual()
         .await
-        .map_err(|error| error.to_string())?;
-    let status = session.status().await.map_err(|error| error.to_string())?;
-    state.set_node_connection(
-        index,
-        NodeConnectionState::Online,
-        Some(runtime_stats(status, report.committed_seq)),
+        .map_err(|error| error.to_string())
+}
+
+/// 应用一次刷新结果，并关闭已经确定失效的节点会话或中心连接。
+fn apply_refresh_report(
+    report: RefreshReport,
+    state: &mut DesktopViewState,
+    sessions: &mut BTreeMap<usize, Arc<NodeSession>>,
+    central: &mut Option<CentralStore>,
+    workers: &mut BTreeMap<usize, NodeSyncWorker>,
+) {
+    for index in report.failed_sessions {
+        sessions.remove(&index);
+        workers.remove(&index);
+    }
+    if let Some(error) = report.central_error {
+        central.take();
+        state.set_postgres_health(PostgresHealth::Error(error));
+    }
+}
+
+/// 把后台同步结果归并回唯一视图；过期机器结果不能写入已编辑的节点行。
+async fn apply_sync_result(
+    result: NodeSyncEvent,
+    state: &mut DesktopViewState,
+    sessions: &mut BTreeMap<usize, Arc<NodeSession>>,
+    central: &mut Option<CentralStore>,
+    workers: &mut BTreeMap<usize, NodeSyncWorker>,
+    events: &mpsc::Sender<UiEvent>,
+) {
+    if workers.get(&result.index).map(|worker| worker.id) != Some(result.worker_id) {
+        return;
+    }
+    let current_machine = sessions
+        .get(&result.index)
+        .map(|session| session.machine_id().as_str());
+    if current_machine != Some(result.machine_id.as_str()) {
+        return;
+    }
+    match result.outcome {
+        NodeSyncOutcome::Succeeded {
+            committed_seq,
+            status,
+        } => state.set_node_connection(
+            result.index,
+            NodeConnectionState::Online,
+            Some(runtime_stats(status, committed_seq)),
+        ),
+        NodeSyncOutcome::Failed {
+            message,
+            session_failed,
+            central_failed,
+        } => {
+            if central_failed {
+                central.take();
+                state.set_postgres_health(PostgresHealth::Error(message.clone()));
+            }
+            if session_failed {
+                sessions.remove(&result.index);
+                workers.remove(&result.index);
+                state.set_node_error(result.index, message.clone());
+            }
+            let _ = events
+                .send(UiEvent::Error(format!(
+                    "节点 {} 自动同步失败：{message}",
+                    result.index
+                )))
+                .await;
+        }
+    }
+}
+
+/// 固定重连 tick：清除已断会话、重试节点/中心，并给新连接或刚完成任务排队。
+async fn reconnect_and_sync(
+    state: &mut DesktopViewState,
+    sessions: &mut BTreeMap<usize, Arc<NodeSession>>,
+    central: &mut Option<CentralStore>,
+    workers: &mut BTreeMap<usize, NodeSyncWorker>,
+    results: &mpsc::UnboundedSender<NodeSyncEvent>,
+) {
+    let report = refresh_nodes(state, sessions, central.as_ref()).await;
+    let completed_nodes = report.completed_nodes.clone();
+    apply_refresh_report(report, state, sessions, central, workers);
+    if central.is_none() && state.config().postgres_url.is_some() {
+        *central = connect_central(state).await;
+    }
+    let connected_nodes = connect_missing(state, sessions).await;
+    let mut worker_indexes = connected_nodes.clone();
+    worker_indexes.extend(completed_nodes.iter().copied());
+    ensure_sync_workers(
+        &worker_indexes,
+        sessions,
+        state.config().postgres_url.as_deref(),
+        workers,
+        results,
     );
-    Ok(())
+    queue_automatic(&connected_nodes, workers, AutomaticSyncCause::Connected).await;
+    queue_automatic(&completed_nodes, workers, AutomaticSyncCause::TaskCompleted).await;
+}
+
+/// 固定五秒追赶 tick：刷新任务后只排队，不等待任一节点完成同步。
+async fn catch_up_and_refresh(
+    state: &mut DesktopViewState,
+    sessions: &mut BTreeMap<usize, Arc<NodeSession>>,
+    central: &mut Option<CentralStore>,
+    workers: &mut BTreeMap<usize, NodeSyncWorker>,
+    results: &mpsc::UnboundedSender<NodeSyncEvent>,
+) {
+    let report = refresh_nodes(state, sessions, central.as_ref()).await;
+    let completed_nodes = report.completed_nodes.clone();
+    apply_refresh_report(report, state, sessions, central, workers);
+    let indexes = sessions.keys().copied().collect::<Vec<_>>();
+    ensure_sync_workers(
+        &indexes,
+        sessions,
+        state.config().postgres_url.as_deref(),
+        workers,
+        results,
+    );
+    queue_automatic(&completed_nodes, workers, AutomaticSyncCause::TaskCompleted).await;
+    let catch_up_nodes = indexes
+        .into_iter()
+        .filter(|index| !completed_nodes.contains(index))
+        .collect::<Vec<_>>();
+    queue_automatic(&catch_up_nodes, workers, AutomaticSyncCause::CatchUp).await;
+}
+
+/// 创建错过 tick 后从当前时刻继续计时的固定间隔，避免恢复时突发补跑。
+fn repeating_interval(seconds: u64) -> Interval {
+    let mut ticks = interval(Duration::from_secs(seconds));
+    ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    ticks
 }
 
 async fn create_scan(

@@ -22,3 +22,5 @@ uuid.workspace = true
 [dev-dependencies]
 dedup-node-engine = { path = "../node-engine" }
 dedup-node-store = { path = "../node-store" }
+dedup-windows = { path = "../windows" }
+tempfile.workspace = true

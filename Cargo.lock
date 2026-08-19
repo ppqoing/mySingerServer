@@ -1148,6 +1148,8 @@ dependencies = [
  "dedup-node-store",
  "dedup-protocol",
  "dedup-transport",
+ "dedup-windows",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "tokio-postgres",
