@@ -2,13 +2,9 @@
 
 import { Theme, UiGroupRow, UiMemberRow, UiNodeRow, UiTaskRow } from "theme.slint";
 import { DeleteDialog } from "components/delete-dialog.slint";
-import { FluentCard } from "components/fluent-card.slint";
-import { MetricCard } from "components/metric-card.slint";
-import { TabStrip } from "components/tab-strip.slint";
-import { EmptyState } from "components/empty-state.slint";
-import { DetailPanel } from "components/detail-panel.slint";
 import { AppShell } from "layout/app-shell.slint";
-import { OverviewPage } from "pages/overview.slint";
+import { OverviewDashboard } from "pages/overview-dashboard.slint";
+import { NodesPage } from "pages/nodes-page.slint";
 import { ScanTasksPage } from "pages/scan-tasks.slint";
 import { ExactCrossMachinePage } from "pages/exact-cross-machine.slint";
 import { SimilarMediaPage } from "pages/similar-media.slint";
@@ -147,10 +143,15 @@ export component MainWindow inherits Window {
         last-error: root.last-error;
         navigate(index) => { root.navigate-to(index); }
         refresh => { root.refresh(); }
-                if root.current-page == 0 : OverviewPage {
-                    nodes: root.nodes; online-count: root.online-count; running-count: root.running-count; indexed-text: root.indexed-text; sync-text: root.sync-text;
+                if root.current-page == 0 && root.overview-mode == 0 : OverviewDashboard {
+                    nodes: root.nodes; tasks: root.tasks;
+                    online-count: root.online-count; running-count: root.running-count;
+                    indexed-text: root.indexed-text; sync-text: root.sync-text;
+                }
+                if root.current-page == 0 && root.overview-mode == 1 : NodesPage {
+                    nodes: root.nodes;
                     new-node-ip <=> root.new-node-ip; new-node-port <=> root.new-node-port;
-                    connect-all => { root.connect-all(); } refresh => { root.refresh(); }
+                    connect-all => { root.connect-all(); }
                     add-node(ip, port) => { root.add-node(ip, port); }
                     edit-node(index, ip, port) => { root.edit-node(index, ip, port); }
                     sync-node(index) => { root.sync-node(index); }
