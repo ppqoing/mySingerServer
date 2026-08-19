@@ -3,6 +3,7 @@
 import { AboutSlint, Button, ComboBox, LineEdit, ScrollView, SpinBox } from "std-widgets.slint";
 import { Theme } from "../theme.slint";
 
+// 二级菜单项统一选择态、鼠标动作和无障碍默认动作。
 component SettingsMenuItem inherits Rectangle {
     in property <string> label;
     in property <bool> selected;
@@ -36,12 +37,14 @@ component SettingsMenuItem inherits Rectangle {
     menu-touch := TouchArea { clicked => { root.activated(); } }
 }
 
+// 表单标签统一弱化颜色和字段提示字号。
 component FormLabel inherits Text {
     color: Theme.muted;
     font-size: 11px;
     vertical-alignment: center;
 }
 
+// 只读值行把名称与真实路径合并为稳定的可访问文本。
 component ValueRow inherits Rectangle {
     in property <string> label;
     in property <string> value;
@@ -61,7 +64,11 @@ component ValueRow inherits Rectangle {
 }
 
 export component SettingsWorkspace inherits Rectangle {
+    // 页面状态只记录当前分区和关于面板开关。
     in-out property <int> active-section: 0;
+    in-out property <bool> about-open: false;
+
+    // 诊断输入来自 MainWindow 已发布的路径、中心健康和最后错误。
     in property <string> data-path;
     in property <string> logs-path;
     in property <string> cache-path;
@@ -69,6 +76,8 @@ export component SettingsWorkspace inherits Rectangle {
     in property <string> postgres-status;
     in property <color> postgres-color;
     in property <string> last-error;
+
+    // 真实设置字段保持双向绑定，跨二级菜单切换不得重建或重置。
     in-out property <string> postgres-url;
     in-out property <int> reconnect-seconds;
     in-out property <int> delete-mode-index;
@@ -81,15 +90,18 @@ export component SettingsWorkspace inherits Rectangle {
     in-out property <string> video-valid;
     in-out property <string> video-stage1;
     in-out property <string> video-stage2;
-    in-out property <bool> about-open: false;
+
+    // 保存动作只转发现有 MainWindow 回调，不在页面内持久化配置。
     callback save-settings();
 
     background: transparent;
 
+    // 主布局固定为顶栏加“二级菜单 / 当前分区内容”两列。
     VerticalLayout {
         padding: 20px;
         spacing: 14px;
 
+        // 顶栏集中承载标题、Slint 归属入口和唯一保存动作。
         HorizontalLayout {
             height: 42px;
             Text { text: "设置"; color: Theme.text; font-size: 26px; font-weight: 750; vertical-alignment: center; }
@@ -106,9 +118,11 @@ export component SettingsWorkspace inherits Rectangle {
             }
         }
 
+        // 设置主体保持左侧菜单与右侧内容卡的稳定横向拓扑。
         HorizontalLayout {
             spacing: 14px;
 
+            // 七项二级菜单只切换 active-section，不改动真实设置值。
             Rectangle {
                 width: 190px;
                 background: Theme.panel;
@@ -129,6 +143,7 @@ export component SettingsWorkspace inherits Rectangle {
                 }
             }
 
+            // 右侧内容卡按 active-section 只渲染一个设置分区。
             content-card := Rectangle {
                 background: Theme.panel;
                 border-radius: 8px;
@@ -137,6 +152,7 @@ export component SettingsWorkspace inherits Rectangle {
                 accessible-role: AccessibleRole.groupbox;
                 accessible-label: "设置内容卡";
 
+                // 关于面板仅承载 Slint 归属信息，不属于设置数据模型。
                 if root.about-open : Rectangle {
                     VerticalLayout {
                         padding: 22px;
@@ -147,6 +163,7 @@ export component SettingsWorkspace inherits Rectangle {
                     }
                 }
 
+                // 常规：编辑中心连接、重连间隔和删除模式。
                 if !root.about-open && root.active-section == 0 : ScrollView {
                     VerticalLayout {
                         padding: 22px;
@@ -175,6 +192,7 @@ export component SettingsWorkspace inherits Rectangle {
                     }
                 }
 
+                // 相似度算法：编辑分析创建时会快照的九个阈值。
                 if !root.about-open && root.active-section == 1 : ScrollView {
                     VerticalLayout {
                         padding: 22px;
@@ -191,6 +209,7 @@ export component SettingsWorkspace inherits Rectangle {
                     }
                 }
 
+                // 存储：只读展示从可执行文件目录推导的四个真实路径。
                 if !root.about-open && root.active-section == 2 : ScrollView {
                     VerticalLayout {
                         padding: 22px;
@@ -204,6 +223,7 @@ export component SettingsWorkspace inherits Rectangle {
                     }
                 }
 
+                // 节点服务：保留概念布局，未有后端字段的控件保持禁用。
                 if !root.about-open && root.active-section == 3 : ScrollView {
                     VerticalLayout {
                         padding: 22px;
@@ -214,6 +234,7 @@ export component SettingsWorkspace inherits Rectangle {
                     }
                 }
 
+                // 扫描与性能：明确当前没有可配置的枚举、并发或资源字段。
                 if !root.about-open && root.active-section == 4 : ScrollView {
                     VerticalLayout {
                         padding: 22px;
@@ -224,6 +245,7 @@ export component SettingsWorkspace inherits Rectangle {
                     }
                 }
 
+                // 外部工具：说明固定 FFmpeg 运行边界，不开放任意 EXE 选择。
                 if !root.about-open && root.active-section == 5 : ScrollView {
                     VerticalLayout {
                         padding: 22px;
@@ -234,6 +256,7 @@ export component SettingsWorkspace inherits Rectangle {
                     }
                 }
 
+                // 日志与诊断：展示真实健康、路径和错误，缺失动作保持禁用。
                 if !root.about-open && root.active-section == 6 : ScrollView {
                     VerticalLayout {
                         padding: 22px;
