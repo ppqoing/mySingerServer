@@ -5,7 +5,8 @@ import { DeleteDialog } from "components/delete-dialog.slint";
 import { AppShell } from "layout/app-shell.slint";
 import { OverviewDashboard } from "pages/overview-dashboard.slint";
 import { NodesPage } from "pages/nodes-page.slint";
-import { ScanTasksPage } from "pages/scan-tasks.slint";
+import { ScanPage } from "pages/scan-page.slint";
+import { TaskCenterPage } from "pages/task-center-page.slint";
 import { ExactCrossMachinePage } from "pages/exact-cross-machine.slint";
 import { SimilarMediaPage } from "pages/similar-media.slint";
 import { ReviewDeletePage } from "pages/review-delete.slint";
@@ -39,6 +40,7 @@ export component MainWindow inherits Window {
     in-out property <int> active-nav: 0;
     in-out property <int> overview-mode: 0;
     in-out property <int> task-mode: 0;
+    in-out property <int> task-tab: 0;
     in-out property <int> review-tab: 0;
     in-out property <int> settings-section: 0;
     in-out property <string> last-error;
@@ -157,13 +159,17 @@ export component MainWindow inherits Window {
                     sync-node(index) => { root.sync-node(index); }
                     remove-node(index) => { root.remove-node(index); }
                 }
-                if root.current-page == 1 : ScanTasksPage {
-                    tasks: root.tasks; filtering-enabled: root.filtering-enabled; filtering-reason: root.filtering-reason;
+                if root.current-page == 1 && root.task-mode == 0 : ScanPage {
+                    filtering-enabled: root.filtering-enabled; filtering-reason: root.filtering-reason;
                     scan-root <=> root.scan-root; selected-node <=> root.scan-node-index; enumerator-index <=> root.enumerator-index; force-recalculate <=> root.force-recalculate;
                     analysis-task-ids <=> root.analysis-task-ids; analysis-kind-index <=> root.analysis-kind-index;
                     browse(index, path) => { root.browse-paths(index, path); }
                     start-scan(index, path, force, enumerator) => { root.start-scan(index, path, force, enumerator); }
                     start-analysis(index, task-ids, kind) => { root.start-local-analysis(index, task-ids, kind); }
+                }
+                if root.current-page == 1 && root.task-mode == 1 : TaskCenterPage {
+                    tasks: root.tasks;
+                    task-tab <=> root.task-tab;
                     cancel-task(index, id) => { root.cancel-task(index, id); }
                 }
                 if root.current-page == 2 : ExactCrossMachinePage {

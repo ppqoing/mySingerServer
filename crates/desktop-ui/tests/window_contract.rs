@@ -69,6 +69,42 @@ fn install_overview_fixture(window: &MainWindow) {
     window.set_sync_text("游标 120 / 125".into());
 }
 
+// 使用三种状态字面量验证任务页签只筛选已加载模型，不模拟后端查询。
+fn install_task_center_fixture(window: &MainWindow) {
+    window.set_tasks(ModelRc::new(VecModel::from(vec![
+        UiTaskRow {
+            id: "task-running".into(),
+            node_index: 7,
+            title: "媒体扫描".into(),
+            stage: "枚举文件".into(),
+            status: "运行中".into(),
+            status_color: Color::from_rgb_u8(59, 130, 246),
+            progress: 35,
+            counts: "7 / 20 · 失败 0 · 跳过 1".into(),
+        },
+        UiTaskRow {
+            id: "task-completed".into(),
+            node_index: 0,
+            title: "图片分析".into(),
+            stage: "完成".into(),
+            status: "已完成".into(),
+            status_color: Color::from_rgb_u8(22, 163, 74),
+            progress: 100,
+            counts: "18 / 18 · 失败 0 · 跳过 0".into(),
+        },
+        UiTaskRow {
+            id: "task-failed".into(),
+            node_index: 3,
+            title: "视频分析".into(),
+            stage: "提取特征".into(),
+            status: "失败".into(),
+            status_color: Color::from_rgb_u8(239, 68, 68),
+            progress: 60,
+            counts: "6 / 10 · 失败 1 · 跳过 0".into(),
+        },
+    ])));
+}
+
 fn accessible(window: &MainWindow, label: &str) -> ElementHandle {
     ElementHandle::find_by_accessible_label(window, label)
         .next()
@@ -299,4 +335,175 @@ fn selected_node_actions_forward_existing_callbacks() {
     assert_eq!(*synced.borrow(), Some(7));
     assert_eq!(*removed.borrow(), Some(7));
     assert_eq!(connected.get(), 1);
+}
+
+#[test]
+fn scan_start_forwards_four_arguments_in_order() {
+    i_slint_backend_testing::init_no_event_loop();
+
+    let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    window.invoke_navigate_to(2);
+    window.set_scan_node_index(7);
+    window.set_scan_root("D:\\fixture".into());
+    window.set_force_recalculate(true);
+    window.set_enumerator_index(1);
+    window.set_analysis_kind_index(2);
+
+    let captured = Rc::new(RefCell::new(None));
+    window.on_start_scan({
+        let captured = captured.clone();
+        move |node_index, path, force, enumerator| {
+            *captured.borrow_mut() = Some((node_index, path.to_string(), force, enumerator));
+        }
+    });
+    accessible(&window, "开始扫描").invoke_accessible_default_action();
+
+    assert_eq!(
+        captured.borrow().as_ref(),
+        Some(&(7, String::from("D:\\fixture"), true, 1)),
+        "扫描动作必须保持 node_index、path、force、enumerator 的原有顺序，且不混入分析类型",
+    );
+
+    window.invoke_navigate_to(3);
+    assert!(
+        ElementHandle::find_by_accessible_label(&window, "开始扫描")
+            .next()
+            .is_none(),
+        "任务工作区不得继续暴露扫描创建动作",
+    );
+}
+
+#[test]
+fn scan_browse_and_local_analysis_forward_only_existing_arguments() {
+    i_slint_backend_testing::init_no_event_loop();
+
+    let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    window.invoke_navigate_to(2);
+    window.set_scan_node_index(7);
+    window.set_scan_root("D:\\fixture".into());
+    window.set_filtering_enabled(true);
+    window.set_analysis_task_ids("scan-a,scan-b".into());
+    window.set_analysis_kind_index(2);
+
+    let browsed = Rc::new(RefCell::new(None));
+    window.on_browse_paths({
+        let browsed = browsed.clone();
+        move |node_index, path| {
+            *browsed.borrow_mut() = Some((node_index, path.to_string()));
+        }
+    });
+    let analyzed = Rc::new(RefCell::new(None));
+    window.on_start_local_analysis({
+        let analyzed = analyzed.clone();
+        move |node_index, task_ids, kind| {
+            *analyzed.borrow_mut() = Some((node_index, task_ids.to_string(), kind));
+        }
+    });
+
+    accessible(&window, "浏览节点路径").invoke_accessible_default_action();
+    accessible(&window, "开始本地分析").invoke_accessible_default_action();
+
+    assert_eq!(
+        browsed.borrow().as_ref(),
+        Some(&(7, String::from("D:\\fixture"))),
+    );
+    assert_eq!(
+        analyzed.borrow().as_ref(),
+        Some(&(7, String::from("scan-a,scan-b"), 2)),
+    );
+}
+
+#[test]
+fn task_tabs_filter_loaded_models_and_cancel_active_task() {
+    i_slint_backend_testing::init_no_event_loop();
+
+    let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    install_task_center_fixture(&window);
+    window.invoke_navigate_to(3);
+
+    assert_eq!(window.get_task_tab(), 0);
+    assert!(
+        accessible(
+            &window,
+            "任务项：媒体扫描；节点 7；枚举文件；35%；7 / 20 · 失败 0 · 跳过 1；运行中"
+        )
+        .accessible_item_selected()
+        .is_some()
+    );
+    assert!(
+        ElementHandle::find_by_accessible_label(
+            &window,
+            "任务项：图片分析；节点 0；完成；100%；18 / 18 · 失败 0 · 跳过 0；已完成"
+        )
+        .next()
+        .is_none()
+    );
+    assert!(
+        ElementHandle::find_by_accessible_label(
+            &window,
+            "任务项：视频分析；节点 3；提取特征；60%；6 / 10 · 失败 1 · 跳过 0；失败"
+        )
+        .next()
+        .is_none()
+    );
+
+    let cancelled = Rc::new(RefCell::new(Vec::new()));
+    window.on_cancel_task({
+        let cancelled = cancelled.clone();
+        move |node_index, id| cancelled.borrow_mut().push((node_index, id.to_string()))
+    });
+    accessible(&window, "取消任务：task-running").invoke_accessible_default_action();
+    assert_eq!(
+        cancelled.borrow().as_slice(),
+        &[(7, String::from("task-running"))]
+    );
+
+    accessible(&window, "已完成").invoke_accessible_default_action();
+    assert_eq!(window.get_task_tab(), 1);
+    assert!(
+        ElementHandle::find_by_accessible_label(
+            &window,
+            "任务项：媒体扫描；节点 7；枚举文件；35%；7 / 20 · 失败 0 · 跳过 1；运行中"
+        )
+        .next()
+        .is_none()
+    );
+    assert!(
+        accessible(
+            &window,
+            "任务项：图片分析；节点 0；完成；100%；18 / 18 · 失败 0 · 跳过 0；已完成"
+        )
+        .accessible_item_selected()
+        .is_some()
+    );
+    assert!(
+        ElementHandle::find_by_accessible_label(&window, "取消任务：task-completed")
+            .next()
+            .is_none()
+    );
+
+    accessible(&window, "失败").invoke_accessible_default_action();
+    assert_eq!(window.get_task_tab(), 2);
+    assert!(
+        ElementHandle::find_by_accessible_label(
+            &window,
+            "任务项：图片分析；节点 0；完成；100%；18 / 18 · 失败 0 · 跳过 0；已完成"
+        )
+        .next()
+        .is_none()
+    );
+    assert!(
+        accessible(
+            &window,
+            "任务项：视频分析；节点 3；提取特征；60%；6 / 10 · 失败 1 · 跳过 0；失败"
+        )
+        .accessible_item_selected()
+        .is_some()
+    );
+    assert!(
+        ElementHandle::find_by_accessible_label(&window, "取消任务：task-failed")
+            .next()
+            .is_none()
+    );
+    assert_eq!(cancelled.borrow().len(), 1, "终态任务不得产生新的取消动作");
 }

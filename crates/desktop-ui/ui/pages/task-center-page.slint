@@ -1,0 +1,157 @@
+// 任务中心只筛选当前已加载行模型，并原样转发现有取消命令。
+
+import { Button, ScrollView } from "std-widgets.slint";
+import { Theme, UiTaskRow } from "../theme.slint";
+import { DetailPanel } from "../components/detail-panel.slint";
+import { EmptyState } from "../components/empty-state.slint";
+import { FluentCard } from "../components/fluent-card.slint";
+import { StatusPill } from "../components/status-pill.slint";
+import { TabStrip } from "../components/tab-strip.slint";
+
+export component TaskCenterPage inherits Rectangle {
+    in property <[UiTaskRow]> tasks;
+    in-out property <int> task-tab: 0;
+    in-out property <int> selected-task-index: 0;
+    callback cancel-task(int, string);
+
+    background: transparent;
+
+    HorizontalLayout {
+        padding: 20px;
+        spacing: 16px;
+
+        VerticalLayout {
+            spacing: 14px;
+            horizontal-stretch: 1;
+
+            Text { text: "任务中心"; color: Theme.text; font-size: 24px; font-weight: 750; }
+            TabStrip {
+                labels: ["运行中", "已完成", "失败"];
+                active-index <=> root.task-tab;
+            }
+
+            FluentCard {
+                vertical-stretch: 1;
+                VerticalLayout {
+                    padding: 12px;
+                    spacing: 8px;
+                    HorizontalLayout {
+                        spacing: 10px;
+                        Text { text: "任务"; color: Theme.muted; font-size: 11px; horizontal-stretch: 1; }
+                        Text { text: "节点"; color: Theme.muted; font-size: 11px; width: 58px; }
+                        Text { text: "阶段"; color: Theme.muted; font-size: 11px; width: 100px; }
+                        Text { text: "进度"; color: Theme.muted; font-size: 11px; width: 170px; }
+                        Text { text: "状态"; color: Theme.muted; font-size: 11px; width: 82px; }
+                        Text { text: "动作"; color: Theme.muted; font-size: 11px; width: 82px; }
+                    }
+                    ScrollView {
+                        VerticalLayout {
+                            spacing: 6px;
+
+                            // 三个页签仅在当前模型上做精确状态判断，不请求或构造新数据。
+                            for task[index] in root.tasks : task-row := Rectangle {
+                                visible: (root.task-tab == 0 && (task.status == "排队中" || task.status == "运行中"))
+                                    || (root.task-tab == 1 && task.status == "已完成")
+                                    || (root.task-tab == 2 && task.status == "失败");
+                                height: 88px;
+                                border-radius: 6px;
+                                background: root.selected-task-index == index ? Theme.accent-soft : task-touch.has-hover ? Theme.panel-hover : transparent;
+                                accessible-role: AccessibleRole.list-item;
+                                accessible-label: "任务项：" + task.title + "；节点 " + task.node-index + "；" + task.stage
+                                    + "；" + task.progress + "%；" + task.counts + "；" + task.status;
+                                accessible-item-selectable: true;
+                                accessible-item-selected: root.selected-task-index == index;
+                                accessible-action-default => { root.selected-task-index = index; }
+
+                                VerticalLayout {
+                                    padding: 8px;
+                                    spacing: 8px;
+                                    HorizontalLayout {
+                                        spacing: 10px;
+                                        Text { text: task.title; color: Theme.text; font-size: 12px; font-weight: 650; horizontal-stretch: 1; overflow: elide; }
+                                        Text { text: task.node-index; color: Theme.text; font-size: 12px; width: 58px; }
+                                        Text { text: task.stage; color: Theme.muted; font-size: 12px; width: 100px; overflow: elide; }
+                                        Rectangle {
+                                            width: 126px;
+                                            height: 8px;
+                                            border-radius: 4px;
+                                            background: Theme.border;
+                                            Rectangle {
+                                                height: 8px;
+                                                width: parent.width * task.progress / 100;
+                                                border-radius: 4px;
+                                                background: task.status-color;
+                                            }
+                                        }
+                                        Text { text: task.progress + "%"; color: Theme.text; font-size: 12px; width: 34px; }
+                                        StatusPill { label: task.status; tone: task.status-color; width: 82px; }
+                                        if task.status == "排队中" || task.status == "运行中" : Button {
+                                            text: "取消";
+                                            width: 82px;
+                                            accessible-label: "取消任务：" + task.id;
+                                            clicked => { root.cancel-task(task.node-index, task.id); }
+                                        }
+                                        if task.status != "排队中" && task.status != "运行中" : Text {
+                                            text: "不可取消";
+                                            color: Theme.muted;
+                                            font-size: 11px;
+                                            width: 82px;
+                                            vertical-alignment: center;
+                                            horizontal-alignment: center;
+                                        }
+                                    }
+                                    Text { text: task.counts; color: Theme.muted; font-size: 11px; }
+                                }
+                                task-touch := TouchArea { clicked => { root.selected-task-index = index; } }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 详情只读取选中 UiTaskRow；未提供字段统一显示禁用状态。
+        DetailPanel {
+            if root.tasks.length > 0
+                && root.selected-task-index >= 0
+                && root.selected-task-index < root.tasks.length
+                && ((root.task-tab == 0 && (root.tasks[root.selected-task-index].status == "排队中" || root.tasks[root.selected-task-index].status == "运行中"))
+                    || (root.task-tab == 1 && root.tasks[root.selected-task-index].status == "已完成")
+                    || (root.task-tab == 2 && root.tasks[root.selected-task-index].status == "失败"))
+            : VerticalLayout {
+                padding: 18px;
+                spacing: 12px;
+                Text { text: root.tasks[root.selected-task-index].title; color: Theme.text; font-size: 20px; font-weight: 720; }
+                Text { text: "任务 ID  " + root.tasks[root.selected-task-index].id; color: Theme.muted; font-size: 11px; wrap: word-wrap; }
+                Text { text: "节点  " + root.tasks[root.selected-task-index].node-index; color: Theme.text; font-size: 12px; }
+                Text { text: "阶段  " + root.tasks[root.selected-task-index].stage; color: Theme.text; font-size: 12px; }
+                Text { text: "进度  " + root.tasks[root.selected-task-index].progress + "%"; color: Theme.text; font-size: 12px; }
+                Text { text: root.tasks[root.selected-task-index].counts; color: Theme.muted; font-size: 11px; wrap: word-wrap; }
+                StatusPill {
+                    label: root.tasks[root.selected-task-index].status;
+                    tone: root.tasks[root.selected-task-index].status-color;
+                }
+                Text { text: "速度  —"; color: Theme.muted; font-size: 11px; }
+                Text { text: "剩余时间  —"; color: Theme.muted; font-size: 11px; }
+                Text { text: "当前文件  —"; color: Theme.muted; font-size: 11px; }
+                EmptyState {
+                    vertical-stretch: 1;
+                    title: "事件日志暂不可用";
+                    detail: "当前任务模型未提供事件日志字段";
+                    disabled-feature: true;
+                }
+                Button { text: "重试当前任务"; enabled: false; }
+            }
+            if root.tasks.length == 0
+                || root.selected-task-index < 0
+                || root.selected-task-index >= root.tasks.length
+                || !((root.task-tab == 0 && (root.tasks[root.selected-task-index].status == "排队中" || root.tasks[root.selected-task-index].status == "运行中"))
+                    || (root.task-tab == 1 && root.tasks[root.selected-task-index].status == "已完成")
+                    || (root.task-tab == 2 && root.tasks[root.selected-task-index].status == "失败"))
+            : EmptyState {
+                title: root.tasks.length == 0 ? "暂无任务" : "请选择当前页签中的任务";
+                detail: "任务标签只筛选当前已加载模型";
+            }
+        }
+    }
+}
