@@ -747,7 +747,7 @@ impl EngineState {
                     phash_passed_parts: member.phash_passed_parts.map_or(0, u32::from),
                     stage2_score: member.stage2_score.unwrap_or_default() as f32,
                     review: review as i32,
-                    active: true,
+                    active: member.active,
                     width: member.width.unwrap_or_default(),
                     height: member.height.unwrap_or_default(),
                     quality: member.quality.map_or(0, u32::from),

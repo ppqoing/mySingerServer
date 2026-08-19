@@ -63,6 +63,7 @@ fn exact_groups(locations: &BTreeMap<ContentKey, Vec<LocationKey>>) -> Vec<Centr
                     width: None,
                     height: None,
                     quality: None,
+                    active: true,
                 })
                 .collect(),
         })
@@ -118,6 +119,7 @@ fn similar_groups(
                             width: None,
                             height: None,
                             quality: None,
+                            active: true,
                         });
                     }
                 }

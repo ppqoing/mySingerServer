@@ -129,6 +129,10 @@ fn analysis_inputs_are_deduplicated_and_immutable() {
 #[test]
 fn group_pages_have_stable_cursors() {
     let mut store = NodeStore::open_in_memory(machine()).unwrap();
+    add_content(&mut store, r"D:\A1.bin", 1, 1);
+    add_content(&mut store, r"D:\A2.bin", 11, 11);
+    add_content(&mut store, r"D:\B1.jpg", 2, 2);
+    add_content(&mut store, r"D:\B2.jpg", 12, 12);
     let run = store
         .create_analysis_run(AnalysisMode::Local, Thresholds::default(), 1)
         .unwrap();
@@ -157,6 +161,122 @@ fn group_pages_have_stable_cursors() {
         .unwrap();
     assert_eq!(second.items.len(), 1);
     assert_ne!(first.items[0].group_id, second.items[0].group_id);
+}
+
+/// 结果页必须按当前位置收缩，而不是继续信任分析时冻结的成员活动位。
+#[test]
+fn group_pages_follow_current_location_activity() {
+    let mut store = NodeStore::open_in_memory(machine()).unwrap();
+    let first = add_content(&mut store, r"D:\Activity\a.bin", 100, 0x31);
+    let second = add_content(&mut store, r"D:\Activity\b.bin", 200, 0x32);
+    let third = add_content(&mut store, r"D:\Activity\c.bin", 300, 0x33);
+    let run = store
+        .create_analysis_run(AnalysisMode::Local, Thresholds::default(), 1)
+        .unwrap();
+    let group_id = GroupId::new().as_uuid().to_string();
+    store
+        .replace_groups(
+            run,
+            &[GroupWrite {
+                group_id: group_id.clone(),
+                kind: GroupKind::Exact,
+                representative: first,
+                members: vec![
+                    GroupMemberWrite::new(location(r"D:\Activity\a.bin"), first, true),
+                    GroupMemberWrite::new(location(r"D:\Activity\b.bin"), second, false),
+                    GroupMemberWrite::new(location(r"D:\Activity\c.bin"), third, false),
+                ],
+            }],
+        )
+        .unwrap();
+
+    let scan = store
+        .create_scan_task(&[NormalizedPath::new(r"D:\Activity").unwrap()], 2)
+        .unwrap();
+    store
+        .finalize_scan_task(
+            scan,
+            &[
+                NormalizedPath::new(r"D:\Activity\a.bin").unwrap(),
+                NormalizedPath::new(r"D:\Activity\c.bin").unwrap(),
+            ],
+            3,
+        )
+        .unwrap();
+
+    let group = store.page_groups(run, None, 10).unwrap().items.remove(0);
+    assert_eq!(group.member_count, 2);
+    assert_eq!(group.representative, first);
+    assert_eq!(group.reclaimable_bytes, 300);
+    let members = store
+        .page_group_members(run, &group_id, None, 10)
+        .unwrap()
+        .items;
+    assert_eq!(members.len(), 3);
+    assert_eq!(
+        members
+            .iter()
+            .map(|member| member.active)
+            .collect::<Vec<_>>(),
+        [true, false, true]
+    );
+
+    let scan = store
+        .create_scan_task(&[NormalizedPath::new(r"D:\Activity").unwrap()], 4)
+        .unwrap();
+    store
+        .finalize_scan_task(
+            scan,
+            &[NormalizedPath::new(r"D:\Activity\c.bin").unwrap()],
+            5,
+        )
+        .unwrap();
+    assert!(store.page_groups(run, None, 10).unwrap().items.is_empty());
+}
+
+/// 路径仍活动但内容键改变时，旧分组成员必须失活并重新选择当前代表。
+#[test]
+fn group_pages_reject_replaced_content_at_same_path() {
+    let mut store = NodeStore::open_in_memory(machine()).unwrap();
+    let first = add_content(&mut store, r"D:\Replaced\a.bin", 100, 0x41);
+    let second = add_content(&mut store, r"D:\Replaced\b.bin", 200, 0x42);
+    let third = add_content(&mut store, r"D:\Replaced\c.bin", 300, 0x43);
+    let run = store
+        .create_analysis_run(AnalysisMode::Local, Thresholds::default(), 1)
+        .unwrap();
+    let group_id = GroupId::new().as_uuid().to_string();
+    store
+        .replace_groups(
+            run,
+            &[GroupWrite {
+                group_id: group_id.clone(),
+                kind: GroupKind::Exact,
+                representative: first,
+                members: vec![
+                    GroupMemberWrite::new(location(r"D:\Replaced\a.bin"), first, true),
+                    GroupMemberWrite::new(location(r"D:\Replaced\b.bin"), second, false),
+                    GroupMemberWrite::new(location(r"D:\Replaced\c.bin"), third, false),
+                ],
+            }],
+        )
+        .unwrap();
+    add_content(&mut store, r"D:\Replaced\a.bin", 110, 0x44);
+
+    let group = store.page_groups(run, None, 10).unwrap().items.remove(0);
+    assert_eq!(group.member_count, 2);
+    assert_eq!(group.representative, second);
+    assert_eq!(group.reclaimable_bytes, 300);
+    let members = store
+        .page_group_members(run, &group_id, None, 10)
+        .unwrap()
+        .items;
+    assert_eq!(
+        members
+            .iter()
+            .map(|member| (member.active, member.representative))
+            .collect::<Vec<_>>(),
+        [(false, false), (true, true), (true, false)]
+    );
 }
 
 /// 复核选择持久化在 SQLite，进程重开后不依赖 UI 内存恢复。
@@ -212,4 +332,11 @@ fn group(id: GroupId, kind: GroupKind, seed: u8, first: &str, second: &str) -> G
             ),
         ],
     }
+}
+
+fn add_content(store: &mut NodeStore, path: &str, size: u64, seed: u8) -> ContentKey {
+    store
+        .upsert_content_and_location(&scan(path, size), [seed; 16], MediaKind::Other)
+        .unwrap()
+        .key
 }

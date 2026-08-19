@@ -385,6 +385,7 @@ where
                 view.review = review_from_central(member.review);
                 view.dimensions = member.width.zip(member.height);
                 view.quality = member.quality;
+                view.set_availability(member.active, online);
                 view
             })
             .collect(),

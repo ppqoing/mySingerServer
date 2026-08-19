@@ -84,7 +84,7 @@ pub struct GroupPage {
     pub next_cursor: Option<String>,
 }
 
-/// 重复组内的一个活动位置。
+/// 重复组内的一个冻结位置及其当前位置状态。
 #[derive(Clone, Debug, PartialEq)]
 pub struct StoredGroupMember {
     /// 机器与规范路径。
@@ -105,12 +105,14 @@ pub struct StoredGroupMember {
     pub height: Option<u32>,
     /// 图片 PDQ Quality。
     pub quality: Option<u8>,
+    /// 当前位置和冻结内容键是否仍同时有效。
+    pub active: bool,
 }
 
 /// 组成员分页结果。
 #[derive(Clone, Debug, PartialEq)]
 pub struct GroupMemberPage {
-    /// 当前页，按 `(machine_id,normalized_path)` 排序。
+    /// 当前页，按 `(machine_id,normalized_path)` 排序；失活位置仍可用于审计展示。
     pub items: Vec<StoredGroupMember>,
     /// 还有下一页时返回的不透明十六进制游标。
     pub next_cursor: Option<String>,
@@ -200,21 +202,42 @@ impl NodeStore {
             })
             .unwrap_or((None, None, None, None));
         let mut statement = self.connection.prepare_cached(
-            "SELECT dg.group_id,dg.group_kind,dg.representative_md5,dg.representative_size,
-                    COUNT(gm.normalized_path),
-                    COALESCE(SUM(CASE WHEN gm.representative=0 THEN gm.file_size ELSE 0 END),0)
+            "WITH current_members AS (
+               SELECT gm.*,
+                      ROW_NUMBER() OVER (
+                        PARTITION BY gm.analysis_run_id,gm.group_id
+                        ORDER BY gm.representative DESC,gm.machine_id,gm.normalized_path
+                      ) AS current_rank
+               FROM group_members gm
+               JOIN files f ON f.machine_id=gm.machine_id
+                 AND f.normalized_path=gm.normalized_path AND f.active=1
+               JOIN contents c ON c.content_id=f.content_id
+                 AND c.md5=gm.md5 AND c.file_size=gm.file_size
+               WHERE gm.active=1
+             ), current_groups AS (
+               SELECT analysis_run_id,group_id,
+                      MAX(CASE WHEN current_rank=1 THEN md5 END) AS representative_md5,
+                      MAX(CASE WHEN current_rank=1 THEN file_size END) AS representative_size,
+                      COUNT(*) AS member_count,
+                      COALESCE(SUM(CASE WHEN current_rank<>1 THEN file_size ELSE 0 END),0)
+                        AS reclaimable_bytes
+               FROM current_members
+               GROUP BY analysis_run_id,group_id
+               HAVING COUNT(*)>=2
+             )
+             SELECT dg.group_id,dg.group_kind,cg.representative_md5,cg.representative_size,
+                    cg.member_count,cg.reclaimable_bytes
              FROM duplicate_groups dg
-             JOIN group_members gm ON gm.analysis_run_id=dg.analysis_run_id
-               AND gm.group_id=dg.group_id AND gm.active=1
+             JOIN current_groups cg ON cg.analysis_run_id=dg.analysis_run_id
+               AND cg.group_id=dg.group_id
              WHERE dg.analysis_run_id=?1 AND (
                ?2 IS NULL OR dg.group_kind>?2 OR
-               (dg.group_kind=?2 AND dg.representative_md5>?3) OR
-               (dg.group_kind=?2 AND dg.representative_md5=?3 AND dg.representative_size>?4) OR
-               (dg.group_kind=?2 AND dg.representative_md5=?3 AND dg.representative_size=?4 AND dg.group_id>?5)
+               (dg.group_kind=?2 AND cg.representative_md5>?3) OR
+               (dg.group_kind=?2 AND cg.representative_md5=?3 AND cg.representative_size>?4) OR
+               (dg.group_kind=?2 AND cg.representative_md5=?3 AND cg.representative_size=?4 AND dg.group_id>?5)
              )
              AND (?6 IS NULL OR dg.group_kind=?6)
-             GROUP BY dg.analysis_run_id,dg.group_id
-             ORDER BY dg.group_kind,dg.representative_md5,dg.representative_size,dg.group_id
+             ORDER BY dg.group_kind,cg.representative_md5,cg.representative_size,dg.group_id
              LIMIT ?7",
         )?;
         let raw = statement
@@ -265,7 +288,7 @@ impl NodeStore {
         Ok(GroupPage { items, next_cursor })
     }
 
-    /// 使用位置二元组游标分页读取一个组的当前活动成员。
+    /// 使用位置二元组游标分页读取一个组的冻结成员，并附上实时活动状态。
     pub fn page_group_members(
         &self,
         run_id: AnalysisRunId,
@@ -281,14 +304,35 @@ impl NodeStore {
             .map(|value| (Some(value.0), Some(value.1)))
             .unwrap_or((None, None));
         let mut statement = self.connection.prepare_cached(
-            "SELECT gm.machine_id,gm.normalized_path,gm.md5,gm.file_size,gm.representative,
+            "WITH member_state AS (
+               SELECT gm.*,
+                      CASE WHEN f.active=1 AND current.md5=gm.md5
+                             AND current.file_size=gm.file_size THEN 1 ELSE 0 END
+                        AS current_active
+               FROM group_members gm
+               LEFT JOIN files f ON f.machine_id=gm.machine_id
+                 AND f.normalized_path=gm.normalized_path
+               LEFT JOIN contents current ON current.content_id=f.content_id
+               WHERE gm.analysis_run_id=?1 AND gm.group_id=?2 AND gm.active=1
+             ), ranked_members AS (
+               SELECT member_state.*,
+                      ROW_NUMBER() OVER (
+                        PARTITION BY analysis_run_id,group_id
+                        ORDER BY current_active DESC,representative DESC,
+                                 machine_id,normalized_path
+                      ) AS current_rank
+               FROM member_state
+             )
+             SELECT gm.machine_id,gm.normalized_path,gm.md5,gm.file_size,
+                    CASE WHEN gm.current_active=1 AND gm.current_rank=1 THEN 1 ELSE 0 END,
                     gm.stage1_score,gm.phash_passed_parts,gm.stage2_score,
-                    COALESCE(i.width,v.width),COALESCE(i.height,v.height),i.quality
-             FROM group_members gm
+                    COALESCE(i.width,v.width),COALESCE(i.height,v.height),i.quality,
+                    gm.current_active
+             FROM ranked_members gm
              LEFT JOIN contents c ON c.md5=gm.md5 AND c.file_size=gm.file_size
              LEFT JOIN image_stage1 i ON i.content_id=c.content_id
              LEFT JOIN video_metadata v ON v.content_id=c.content_id
-             WHERE gm.analysis_run_id=?1 AND gm.group_id=?2 AND gm.active=1 AND (
+             WHERE (
                ?3 IS NULL OR gm.machine_id>?3 OR
                (gm.machine_id=?3 AND gm.normalized_path>?4)
              )
@@ -316,6 +360,7 @@ impl NodeStore {
                         row.get::<_, Option<u32>>(8)?,
                         row.get::<_, Option<u32>>(9)?,
                         row.get::<_, Option<u8>>(10)?,
+                        row.get::<_, bool>(11)?,
                     ))
                 },
             )?
@@ -339,6 +384,7 @@ impl NodeStore {
                     width: row.8,
                     height: row.9,
                     quality: row.10,
+                    active: row.11,
                 })
             })
             .collect::<Result<Vec<_>, StoreError>>()?;

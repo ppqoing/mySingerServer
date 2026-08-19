@@ -1,8 +1,12 @@
 use std::path::Path;
 
-use dedup_core::{DisplayPath, MachineId, MediaKind, NormalizedPath};
+use dedup_core::{
+    ContentKey, DisplayPath, GroupId, LocationKey, MachineId, MediaKind, NormalizedPath, Thresholds,
+};
 use dedup_node_engine::{actor::NodeEngine, server::NodeRequestHandler};
-use dedup_node_store::{NodeStore, ScannedPath};
+use dedup_node_store::{
+    AnalysisMode, GroupKind, GroupMemberWrite, GroupWrite, NodeStore, ScannedPath,
+};
 use dedup_protocol::proto;
 
 #[tokio::test]
@@ -138,6 +142,126 @@ async fn actor_holds_snapshot_until_last_table_or_connection_close() {
         Some(proto::envelope::Payload::Error(proto::Error { code, .. }))
             if code == proto::ErrorCode::NotFound as i32
     ));
+
+    handle.shutdown().await.unwrap();
+    actor.await.unwrap();
+}
+
+#[tokio::test]
+async fn actor_reports_current_member_activity_in_result_pages() {
+    let machine = MachineId::parse(&"8a".repeat(32)).unwrap();
+    let mut store = NodeStore::open_in_memory(machine.clone()).unwrap();
+    let paths = [
+        r"D:\ActorResults\a.bin",
+        r"D:\ActorResults\b.bin",
+        r"D:\ActorResults\c.bin",
+    ];
+    let contents = [
+        ContentKey::new([0xa1; 16], 101),
+        ContentKey::new([0xa2; 16], 102),
+        ContentKey::new([0xa3; 16], 103),
+    ];
+    for (path, content) in paths.iter().zip(contents) {
+        store
+            .upsert_content_and_location(
+                &ScannedPath::new(
+                    NormalizedPath::new(path).unwrap(),
+                    DisplayPath::new(path).unwrap(),
+                    content.file_size(),
+                ),
+                content.md5(),
+                MediaKind::Other,
+            )
+            .unwrap();
+    }
+    let run = store
+        .create_analysis_run(AnalysisMode::Local, Thresholds::default(), 1)
+        .unwrap();
+    let group_id = GroupId::new().as_uuid().to_string();
+    store
+        .replace_groups(
+            run,
+            &[GroupWrite {
+                group_id: group_id.clone(),
+                kind: GroupKind::Exact,
+                representative: contents[0],
+                members: paths
+                    .iter()
+                    .zip(contents)
+                    .enumerate()
+                    .map(|(index, (path, content))| {
+                        GroupMemberWrite::new(
+                            LocationKey::new(machine.clone(), NormalizedPath::new(path).unwrap()),
+                            content,
+                            index == 0,
+                        )
+                    })
+                    .collect(),
+            }],
+        )
+        .unwrap();
+    let scan = store
+        .create_scan_task(&[NormalizedPath::new(r"D:\ActorResults").unwrap()], 2)
+        .unwrap();
+    store
+        .finalize_scan_task(
+            scan,
+            &[
+                NormalizedPath::new(paths[0]).unwrap(),
+                NormalizedPath::new(paths[2]).unwrap(),
+            ],
+            3,
+        )
+        .unwrap();
+    let (handle, actor) = NodeEngine::spawn_for_test(
+        store,
+        "127.0.0.1:39091".parse().unwrap(),
+        Path::new(r"C:\fixture\cache"),
+    );
+
+    let groups = handle
+        .handle(envelope(
+            1,
+            proto::envelope::Payload::ListGroups(proto::ListGroups {
+                analysis_run_id: run.as_uuid().to_string(),
+                group_kind: proto::GroupKind::GroupExact as i32,
+                cursor: String::new(),
+                limit: 10,
+                groups: Vec::new(),
+                next_cursor: String::new(),
+            }),
+        ))
+        .await;
+    let Some(proto::envelope::Payload::ListGroups(groups)) = groups.payload else {
+        panic!("expected group page");
+    };
+    assert_eq!(groups.groups[0].member_count, 2);
+    assert_eq!(groups.groups[0].reclaimable_bytes, 103);
+
+    let members = handle
+        .handle(envelope(
+            2,
+            proto::envelope::Payload::ListGroupMembers(proto::ListGroupMembers {
+                analysis_run_id: run.as_uuid().to_string(),
+                group_id,
+                cursor: String::new(),
+                limit: 10,
+                members: Vec::new(),
+                next_cursor: String::new(),
+            }),
+        ))
+        .await;
+    let Some(proto::envelope::Payload::ListGroupMembers(members)) = members.payload else {
+        panic!("expected member page");
+    };
+    assert_eq!(
+        members
+            .members
+            .iter()
+            .map(|member| member.active)
+            .collect::<Vec<_>>(),
+        [true, false, true]
+    );
 
     handle.shutdown().await.unwrap();
     actor.await.unwrap();

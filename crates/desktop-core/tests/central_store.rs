@@ -6,6 +6,7 @@ use dedup_desktop_core::central::{
     CentralDeleteOutcome, CentralDeleteResult, CentralDeleteSelection, CentralGroupKind,
     CentralGroupMember, CentralGroupWrite, CentralPairKind, CentralReviewDecision, CentralStore,
 };
+use dedup_desktop_core::sync::SNAPSHOT_TABLES;
 use dedup_media::{ImageStage2, PdqHash};
 use dedup_node_store::{
     AnalysisMode, ConfirmedDeleteItem, DeleteOutcome, DeleteResult, FeatureWrite, GroupKind,
@@ -177,6 +178,177 @@ async fn analysis_groups_use_stable_pages_and_successful_delete_shrinks_group() 
     let remaining = central.page_groups(run_id, None, 10).await.unwrap();
     assert_eq!(remaining.items.len(), 1);
     assert_eq!(remaining.items[0].kind, CentralGroupKind::Image);
+}
+
+#[tokio::test]
+#[ignore = "requires DEDUP_TEST_POSTGRES_URL"]
+async fn central_results_follow_incremental_and_snapshot_location_activity() {
+    let url = std::env::var("DEDUP_TEST_POSTGRES_URL").unwrap();
+    let machine = unique_machine(0x27);
+    let content = ContentKey::new([0x81; 16], 810);
+    let paths = [
+        r"C:\CurrentResults\a.bin",
+        r"C:\CurrentResults\b.bin",
+        r"C:\CurrentResults\c.bin",
+    ];
+    let locations = paths.map(|path| location(machine.clone(), path));
+    let mut node = NodeStore::open_in_memory(machine.clone()).unwrap();
+    for path in paths {
+        add_content(
+            &mut node,
+            path,
+            content.file_size(),
+            content.md5(),
+            MediaKind::Other,
+        );
+    }
+    let initial = node.pull_changes(0, 1000).unwrap();
+    let initial_highwater = initial.high_seq;
+    let mut central = CentralStore::connect(&url).await.unwrap();
+    central
+        .apply_sync_batch(
+            &machine,
+            &dedup_protocol::proto::SyncChangeBatch {
+                changes: initial.changes,
+                high_seq: initial.high_seq,
+                pruned_through_seq: initial.pruned_through_seq,
+            },
+        )
+        .await
+        .unwrap();
+    let run = central
+        .create_analysis_run(&Thresholds::default(), &[analysis_node(machine.clone())])
+        .await
+        .unwrap();
+    central
+        .insert_analysis_inputs(
+            run,
+            &locations
+                .iter()
+                .cloned()
+                .map(|location| analysis_input(content, location))
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .unwrap();
+    let group_id = format!("current-results-{}", run.as_uuid());
+    central
+        .replace_groups(
+            run,
+            &[CentralGroupWrite {
+                group_id: group_id.clone(),
+                kind: CentralGroupKind::Exact,
+                representative: content,
+                members: locations
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .map(|(index, location)| group_member(location, content, index == 0))
+                    .collect(),
+            }],
+        )
+        .await
+        .unwrap();
+
+    let scan = node
+        .create_scan_task(&[NormalizedPath::new(r"C:\CurrentResults").unwrap()], 1)
+        .unwrap();
+    node.finalize_scan_task(
+        scan,
+        &[
+            NormalizedPath::new(paths[0]).unwrap(),
+            NormalizedPath::new(paths[2]).unwrap(),
+        ],
+        2,
+    )
+    .unwrap();
+    let incremental = node.pull_changes(initial_highwater, 1000).unwrap();
+    central
+        .apply_sync_batch(
+            &machine,
+            &dedup_protocol::proto::SyncChangeBatch {
+                changes: incremental.changes,
+                high_seq: incremental.high_seq,
+                pruned_through_seq: incremental.pruned_through_seq,
+            },
+        )
+        .await
+        .unwrap();
+
+    let group = central
+        .page_groups(run, None, 10)
+        .await
+        .unwrap()
+        .items
+        .remove(0);
+    assert_eq!(group.member_count, 2);
+    assert_eq!(group.reclaimable_bytes, 810);
+    let members = central
+        .page_group_members(run, &group_id, None, 10)
+        .await
+        .unwrap()
+        .items;
+    assert_eq!(
+        members
+            .iter()
+            .map(|member| member.active)
+            .collect::<Vec<_>>(),
+        [true, false, true]
+    );
+
+    let mut fresh = NodeStore::open_in_memory(machine.clone()).unwrap();
+    add_content(
+        &mut fresh,
+        paths[2],
+        content.file_size(),
+        content.md5(),
+        MediaKind::Other,
+    );
+    for seed in 0x91..=0x93 {
+        add_content(
+            &mut fresh,
+            &format!(r"C:\CurrentResults\padding-{seed}.bin"),
+            u64::from(seed),
+            [seed; 16],
+            MediaKind::Other,
+        );
+    }
+    let snapshot = fresh.begin_snapshot().unwrap();
+    let mut writer = central
+        .begin_snapshot_replace(&machine, snapshot.high_seq())
+        .await
+        .unwrap();
+    for table in SNAPSHOT_TABLES {
+        let page = snapshot.read_page(table, "", 1000).unwrap();
+        let rows = page
+            .rows
+            .into_iter()
+            .map(|row| row.payload)
+            .collect::<Vec<_>>();
+        writer.apply_page(table, &rows).await.unwrap();
+    }
+    writer.commit().await.unwrap();
+
+    assert!(
+        central
+            .page_groups(run, None, 10)
+            .await
+            .unwrap()
+            .items
+            .is_empty()
+    );
+    let members = central
+        .page_group_members(run, &group_id, None, 10)
+        .await
+        .unwrap()
+        .items;
+    assert_eq!(
+        members
+            .iter()
+            .map(|member| member.active)
+            .collect::<Vec<_>>(),
+        [false, false, true]
+    );
 }
 
 #[tokio::test]
@@ -467,6 +639,7 @@ fn group_member(
         width: None,
         height: None,
         quality: None,
+        active: true,
     }
 }
 

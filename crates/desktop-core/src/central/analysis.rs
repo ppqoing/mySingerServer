@@ -128,6 +128,8 @@ pub struct CentralGroupMember {
     pub height: Option<u32>,
     /// 图片 PDQ Quality；视频和其他文件为 None。
     pub quality: Option<u8>,
+    /// 当前位置仍活动且内容键与分析快照一致。
+    pub active: bool,
 }
 
 /// 一次中心分析最终写入的一组结果。
@@ -170,7 +172,7 @@ pub struct CentralGroupPage {
 /// 使用位置游标返回的一页组成员。
 #[derive(Clone, Debug, PartialEq)]
 pub struct CentralGroupMemberPage {
-    /// 当前页活动成员。
+    /// 当前页冻结成员；每项同时携带当前位置活动状态。
     pub items: Vec<CentralGroupMember>,
     /// 还有后续结果时返回的游标。
     pub next_cursor: Option<String>,
@@ -401,22 +403,40 @@ impl CentralStore {
         let rows = self
             .client
             .query(
-                "SELECT dg.group_id,dg.group_kind,dg.representative_md5,dg.representative_size,
-                        COUNT(gm.normalized_path),
-                        COALESCE(SUM(
-                          CASE WHEN gm.representative=FALSE THEN gm.file_size ELSE 0 END
-                        ),0)::BIGINT
+                "WITH current_members AS (
+                   SELECT gm.*
+                   FROM group_members gm
+                   JOIN file_locations f ON f.machine_id=gm.machine_id
+                     AND f.normalized_path=gm.normalized_path AND f.active=TRUE
+                   JOIN contents c ON c.content_id=f.content_id
+                     AND c.md5=gm.md5 AND c.file_size=gm.file_size
+                   WHERE gm.active=TRUE
+                 ), current_groups AS (
+                   SELECT analysis_run_id,group_id,
+                          (ARRAY_AGG(md5 ORDER BY representative DESC,machine_id,normalized_path))[1]
+                            AS representative_md5,
+                          (ARRAY_AGG(file_size ORDER BY representative DESC,machine_id,normalized_path))[1]
+                            AS representative_size,
+                          COUNT(*) AS member_count,
+                          (SUM(file_size) -
+                            (ARRAY_AGG(file_size ORDER BY representative DESC,machine_id,normalized_path))[1])::BIGINT
+                            AS reclaimable_bytes
+                   FROM current_members
+                   GROUP BY analysis_run_id,group_id
+                   HAVING COUNT(*)>=2
+                 )
+                 SELECT dg.group_id,dg.group_kind,cg.representative_md5,cg.representative_size,
+                        cg.member_count,cg.reclaimable_bytes
                  FROM duplicate_groups dg
-                 JOIN group_members gm ON gm.analysis_run_id=dg.analysis_run_id
-                   AND gm.group_id=dg.group_id AND gm.active=TRUE
+                 JOIN current_groups cg ON cg.analysis_run_id=dg.analysis_run_id
+                   AND cg.group_id=dg.group_id
                  WHERE dg.analysis_run_id=$1 AND (
                    $2::text IS NULL OR dg.group_kind>$2 OR
-                   (dg.group_kind=$2 AND dg.representative_md5>$3) OR
-                   (dg.group_kind=$2 AND dg.representative_md5=$3 AND dg.representative_size>$4) OR
-                   (dg.group_kind=$2 AND dg.representative_md5=$3
-                     AND dg.representative_size=$4 AND dg.group_id>$5))
-                 GROUP BY dg.analysis_run_id,dg.group_id
-                 ORDER BY dg.group_kind,dg.representative_md5,dg.representative_size,dg.group_id
+                   (dg.group_kind=$2 AND cg.representative_md5>$3) OR
+                   (dg.group_kind=$2 AND cg.representative_md5=$3 AND cg.representative_size>$4) OR
+                   (dg.group_kind=$2 AND cg.representative_md5=$3
+                     AND cg.representative_size=$4 AND dg.group_id>$5))
+                 ORDER BY dg.group_kind,cg.representative_md5,cg.representative_size,dg.group_id
                  LIMIT $6",
                 &[
                     &run_id.as_uuid().to_string(),
@@ -456,7 +476,7 @@ impl CentralStore {
         Ok(CentralGroupPage { items, next_cursor })
     }
 
-    /// 用 `(machine_id, normalized_path)` 固定键分页读取一个组的活动成员。
+    /// 用 `(machine_id, normalized_path)` 固定键分页读取冻结成员及当前位置状态。
     pub async fn page_group_members(
         &self,
         run_id: AnalysisRunId,
@@ -475,18 +495,37 @@ impl CentralStore {
         let rows = self
             .client
             .query(
-                "SELECT gm.machine_id,gm.normalized_path,gm.md5,gm.file_size,gm.representative,
+                "WITH member_state AS (
+                   SELECT gm.*,
+                          COALESCE(f.active=TRUE AND current.md5=gm.md5
+                            AND current.file_size=gm.file_size,FALSE) AS current_active
+                   FROM group_members gm
+                   LEFT JOIN file_locations f ON f.machine_id=gm.machine_id
+                     AND f.normalized_path=gm.normalized_path
+                   LEFT JOIN contents current ON current.content_id=f.content_id
+                   WHERE gm.analysis_run_id=$1 AND gm.group_id=$2 AND gm.active=TRUE
+                 ), ranked_members AS (
+                   SELECT member_state.*,
+                          ROW_NUMBER() OVER (
+                            PARTITION BY analysis_run_id,group_id
+                            ORDER BY current_active DESC,representative DESC,
+                                     machine_id,normalized_path
+                          ) AS current_rank
+                   FROM member_state
+                 )
+                 SELECT gm.machine_id,gm.normalized_path,gm.md5,gm.file_size,
+                        (gm.current_active=TRUE AND gm.current_rank=1),
                         gm.stage1_score,gm.phash_passed_parts,gm.stage2_score,
                         COALESCE(rm.decision,'undecided'),COALESCE(i.width,v.width),
-                        COALESCE(i.height,v.height),i.quality
-                 FROM group_members gm
+                        COALESCE(i.height,v.height),i.quality,gm.current_active
+                 FROM ranked_members gm
                  LEFT JOIN contents c ON c.md5=gm.md5 AND c.file_size=gm.file_size
                  LEFT JOIN image_stage1 i ON i.content_id=c.content_id
                  LEFT JOIN video_metadata v ON v.content_id=c.content_id
                  LEFT JOIN review_marks rm ON rm.analysis_run_id=gm.analysis_run_id
                    AND rm.group_id=gm.group_id AND rm.machine_id=gm.machine_id
                    AND rm.normalized_path=gm.normalized_path
-                 WHERE gm.analysis_run_id=$1 AND gm.group_id=$2 AND gm.active=TRUE AND (
+                 WHERE (
                    $3::text IS NULL OR gm.machine_id>$3 OR
                    (gm.machine_id=$3 AND gm.normalized_path>$4))
                  ORDER BY gm.machine_id,gm.normalized_path LIMIT $5",
@@ -524,6 +563,7 @@ impl CentralStore {
                     width: row.get::<_, Option<i32>>(9).map(|value| value as u32),
                     height: row.get::<_, Option<i32>>(10).map(|value| value as u32),
                     quality: row.get::<_, Option<i16>>(11).map(|value| value as u8),
+                    active: row.get(12),
                 })
             })
             .collect::<Result<Vec<_>, CentralError>>()?;
