@@ -1,0 +1,177 @@
+// 四类重复结果共享一个状态工作区；页签只改页面映射，不重置任何已加载状态。
+
+import { Button, ComboBox, LineEdit, SpinBox } from "std-widgets.slint";
+import { Theme, UiGroupRow, UiMemberRow } from "../theme.slint";
+import { TabStrip } from "../components/tab-strip.slint";
+import { GroupTable } from "../components/group-table.slint";
+import { MemberList } from "../components/member-list.slint";
+import { DetailPanel } from "../components/detail-panel.slint";
+
+export component DuplicateWorkspace inherits Rectangle {
+    in-out property <int> duplicate-tab;
+    in property <[UiGroupRow]> groups;
+    in property <[UiMemberRow]> members;
+    in property <string> group-next-cursor;
+    in property <string> member-next-cursor;
+    in property <image> preview-image;
+    in property <string> preview-info;
+    in-out property <int> source-index;
+    in-out property <int> node-index;
+    in-out property <string> run-id;
+    in-out property <string> selected-group-id;
+    in-out property <string> cross-selections;
+    in property <string> cross-status;
+    in property <string> cross-summary;
+    callback select-tab(int);
+    callback load-groups(bool, int, string, int, string);
+    callback load-members(bool, int, string, string, int, string);
+    callback save-review(string, string, int);
+    callback preview(string, string);
+    callback start-cross(string);
+    callback poll-cross();
+    callback retry-cross();
+
+    // 跨机器结果仍只选择现有 0/1/2 类型，绝不引入第四种 GroupKind。
+    property <int> cross-result-kind: 0;
+    property <int> query-kind: root.duplicate-tab < 3 ? root.duplicate-tab : root.cross-result-kind;
+    property <bool> central-source: root.duplicate-tab == 3 || root.source-index == 1;
+    background: transparent;
+
+    VerticalLayout {
+        padding: 20px;
+        spacing: 12px;
+        TabStrip {
+            labels: ["精确重复", "相似图片", "相似视频", "跨机器"];
+            active-index: root.duplicate-tab;
+            changed(index) => {
+                root.select-tab(index);
+            }
+        }
+        if root.duplicate-tab == 3 : Rectangle {
+            height: 104px;
+            background: Theme.panel;
+            border-radius: 9px;
+            border-width: 1px;
+            border-color: Theme.border;
+            VerticalLayout {
+                padding: 12px;
+                spacing: 7px;
+                LineEdit {
+                    text <=> root.cross-selections;
+                    placeholder-text: "0:任务UUID, 1:任务UUID";
+                    accessible-label: "跨机器任务选择";
+                }
+                HorizontalLayout {
+                    spacing: 7px;
+                    Button { text: "创建中心分析"; accessible-label: "创建中心分析"; clicked => { root.start-cross(root.cross-selections); } }
+                    Button { text: "推进到下一门禁"; accessible-label: "推进到下一门禁"; clicked => { root.poll-cross(); } }
+                    Button {
+                        text: "重试未解决二筛";
+                        accessible-label: "重试未解决二筛";
+                        enabled: root.cross-status == "partial";
+                        clicked => { root.retry-cross(); }
+                    }
+                    Rectangle { horizontal-stretch: 1; background: transparent; }
+                    Text { text: root.cross-status + " · " + root.cross-summary; color: Theme.muted; font-size: 10px; vertical-alignment: center; overflow: elide; }
+                }
+            }
+        }
+        Rectangle {
+            height: 66px;
+            background: Theme.panel;
+            border-radius: 9px;
+            border-width: 1px;
+            border-color: Theme.border;
+            HorizontalLayout {
+                padding: 10px;
+                spacing: 8px;
+                alignment: center;
+                if root.duplicate-tab < 3 : ComboBox {
+                    model: ["节点 SQLite", "PostgreSQL 中心"];
+                    current-index <=> root.source-index;
+                    width: 150px;
+                    accessible-label: "结果来源";
+                }
+                if root.duplicate-tab < 3 : SpinBox {
+                    value <=> root.node-index;
+                    minimum: 0;
+                    maximum: 99;
+                    width: 92px;
+                    accessible-label: "结果节点";
+                }
+                if root.duplicate-tab == 3 : ComboBox {
+                    model: ["精确重复", "相似图片", "相似视频"];
+                    current-index <=> root.cross-result-kind;
+                    width: 150px;
+                    accessible-label: "跨机器结果类型";
+                }
+                LineEdit {
+                    text <=> root.run-id;
+                    placeholder-text: "分析运行 UUID";
+                    horizontal-stretch: 1;
+                    accessible-label: "结果运行 ID";
+                }
+                Button {
+                    text: "加载结果";
+                    accessible-label: "加载结果";
+                    clicked => { root.load-groups(root.central-source, root.node-index, root.run-id, root.query-kind, ""); }
+                }
+            }
+        }
+        // 三列始终同屏：组、成员和固定 300px 详情，分页按钮不会触发全量预取。
+        HorizontalLayout {
+            spacing: 12px;
+            vertical-stretch: 1;
+            GroupTable {
+                width: 380px;
+                groups: root.groups;
+                selected-id: root.selected-group-id;
+                has-more: root.group-next-cursor != "";
+                select-group(id) => {
+                    root.selected-group-id = id;
+                    root.load-members(root.central-source, root.node-index, root.run-id, id, root.query-kind, "");
+                }
+                load-more => { root.load-groups(root.central-source, root.node-index, root.run-id, root.query-kind, root.group-next-cursor); }
+            }
+            VerticalLayout {
+                horizontal-stretch: 1;
+                MemberList {
+                    vertical-stretch: 1;
+                    members: root.members;
+                    preview(machine, path) => { root.preview(machine, path); }
+                    review(machine, path, decision) => { root.save-review(machine, path, decision); }
+                }
+                if root.member-next-cursor != "" : Button {
+                    text: "加载更多成员";
+                    accessible-label: "加载下一页成员";
+                    clicked => { root.load-members(root.central-source, root.node-index, root.run-id, root.selected-group-id, root.query-kind, root.member-next-cursor); }
+                }
+            }
+            DetailPanel {
+                width: 300px;
+                accessible-role: AccessibleRole.groupbox;
+                accessible-label: "详情面板";
+                VerticalLayout {
+                    padding: 12px;
+                    spacing: 8px;
+                    Text {
+                        text: root.duplicate-tab == 1 ? "原图按需预览（内存）"
+                            : root.duplicate-tab == 2 ? "六帧 3×2 JPG 联系表"
+                            : root.duplicate-tab == 3 ? "跨机器成员详情"
+                            : "精确重复成员详情";
+                        color: Theme.text;
+                        font-size: 13px;
+                        font-weight: 650;
+                    }
+                    Image {
+                        source: root.preview-image;
+                        image-fit: contain;
+                        horizontal-stretch: 1;
+                        vertical-stretch: 1;
+                    }
+                    Text { text: root.preview-info; color: Theme.muted; font-size: 10px; overflow: elide; }
+                }
+            }
+        }
+    }
+}

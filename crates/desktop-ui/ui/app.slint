@@ -7,8 +7,7 @@ import { OverviewDashboard } from "pages/overview-dashboard.slint";
 import { NodesPage } from "pages/nodes-page.slint";
 import { ScanPage } from "pages/scan-page.slint";
 import { TaskCenterPage } from "pages/task-center-page.slint";
-import { ExactCrossMachinePage } from "pages/exact-cross-machine.slint";
-import { SimilarMediaPage } from "pages/similar-media.slint";
+import { DuplicateWorkspace } from "pages/duplicate-workspace.slint";
 import { ReviewDeletePage } from "pages/review-delete.slint";
 import { SettingsDiagnosticsPage } from "pages/settings-diagnostics.slint";
 
@@ -172,42 +171,14 @@ export component MainWindow inherits Window {
                     task-tab <=> root.task-tab;
                     cancel-task(index, id) => { root.cancel-task(index, id); }
                 }
-                if root.current-page == 2 : ExactCrossMachinePage {
-                    cross-mode: false; groups: root.groups; members: root.members;
+                if root.current-page >= 2 && root.current-page <= 5 : DuplicateWorkspace {
+                    duplicate-tab: root.current-page - 2;
+                    groups: root.groups; members: root.members;
                     group-next-cursor: root.group-next-cursor; member-next-cursor: root.member-next-cursor;
-                    source-index <=> root.result-source-index; node-index <=> root.result-node-index; run-id <=> root.result-run-id; selected-group-id <=> root.selected-group-id;
-                    cross-selections <=> root.cross-selections; cross-status: root.cross-status; cross-summary: root.cross-summary;
-                    load-groups(central, node, run, kind, cursor) => { root.load-groups(central, node, run, kind, cursor); }
-                    load-members(central, node, run, group, kind, cursor) => { root.load-members(central, node, run, group, kind, cursor); }
-                    save-review(machine, path, decision) => { root.save-review(machine, path, decision); }
-                    preview(machine, path) => { root.load-preview(machine, path); }
-                    start-cross(selections) => { root.start-cross-analysis(selections); }
-                    poll-cross => { root.poll-cross-analysis(); }
-                    retry-cross => { root.retry-cross-analysis(); }
-                }
-                if root.current-page == 3 : SimilarMediaPage {
-                    media-kind: 1; groups: root.groups; members: root.members; group-next-cursor: root.group-next-cursor; member-next-cursor: root.member-next-cursor;
                     preview-image: root.preview-image; preview-info: root.preview-info;
                     source-index <=> root.result-source-index; node-index <=> root.result-node-index; run-id <=> root.result-run-id; selected-group-id <=> root.selected-group-id;
-                    load-groups(central, node, run, kind, cursor) => { root.load-groups(central, node, run, kind, cursor); }
-                    load-members(central, node, run, group, kind, cursor) => { root.load-members(central, node, run, group, kind, cursor); }
-                    save-review(machine, path, decision) => { root.save-review(machine, path, decision); }
-                    preview(machine, path) => { root.load-preview(machine, path); }
-                }
-                if root.current-page == 4 : SimilarMediaPage {
-                    media-kind: 2; groups: root.groups; members: root.members; group-next-cursor: root.group-next-cursor; member-next-cursor: root.member-next-cursor;
-                    preview-image: root.preview-image; preview-info: root.preview-info;
-                    source-index <=> root.result-source-index; node-index <=> root.result-node-index; run-id <=> root.result-run-id; selected-group-id <=> root.selected-group-id;
-                    load-groups(central, node, run, kind, cursor) => { root.load-groups(central, node, run, kind, cursor); }
-                    load-members(central, node, run, group, kind, cursor) => { root.load-members(central, node, run, group, kind, cursor); }
-                    save-review(machine, path, decision) => { root.save-review(machine, path, decision); }
-                    preview(machine, path) => { root.load-preview(machine, path); }
-                }
-                if root.current-page == 5 : ExactCrossMachinePage {
-                    cross-mode: true; groups: root.groups; members: root.members;
-                    group-next-cursor: root.group-next-cursor; member-next-cursor: root.member-next-cursor;
-                    source-index <=> root.result-source-index; node-index <=> root.result-node-index; run-id <=> root.result-run-id; selected-group-id <=> root.selected-group-id;
                     cross-selections <=> root.cross-selections; cross-status: root.cross-status; cross-summary: root.cross-summary;
+                    select-tab(tab) => { root.current-page = 2 + tab; }
                     load-groups(central, node, run, kind, cursor) => { root.load-groups(central, node, run, kind, cursor); }
                     load-members(central, node, run, group, kind, cursor) => { root.load-members(central, node, run, group, kind, cursor); }
                     save-review(machine, path, decision) => { root.save-review(machine, path, decision); }

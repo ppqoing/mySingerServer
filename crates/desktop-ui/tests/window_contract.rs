@@ -1,7 +1,7 @@
-use dedup_desktop_ui::{MainWindow, UiNodeRow, UiTaskRow};
+use dedup_desktop_ui::{MainWindow, UiGroupRow, UiMemberRow, UiNodeRow, UiTaskRow};
 use i_slint_backend_testing::ElementHandle;
 use slint::{
-    Color, ComponentHandle, ModelRc, VecModel,
+    Color, ComponentHandle, Model, ModelRc, VecModel,
     platform::{PointerEventButton, WindowEvent},
 };
 use std::{cell::Cell, cell::RefCell, rc::Rc};
@@ -555,4 +555,245 @@ fn task_tabs_filter_loaded_models_and_cancel_active_task() {
             .is_none()
     );
     assert_eq!(cancelled.borrow().len(), 1, "终态任务不得产生新的取消动作");
+}
+
+#[test]
+fn duplicate_tabs_preserve_loaded_state_and_forward_existing_callbacks() {
+    i_slint_backend_testing::init_no_event_loop();
+
+    let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    window
+        .window()
+        .set_size(slint::PhysicalSize::new(1440, 900));
+    // 字面模型独立定义期望，防止测试复用生产映射而形成镜像断言。
+    window.set_groups(ModelRc::new(VecModel::from(vec![UiGroupRow {
+        id: "group-001".into(),
+        kind: "相似图片".into(),
+        md5: "0123456789abcdef0123456789abcdef".into(),
+        size: "8.0 MiB".into(),
+        members: 2,
+        reclaimable: "8.0 MiB".into(),
+    }])));
+    window.set_members(ModelRc::new(VecModel::from(vec![
+        UiMemberRow {
+            machine_id: "machine-a".into(),
+            path: "D:\\Media\\photo-a.jpg".into(),
+            md5: "0123456789abcdef0123456789abcdef".into(),
+            size: "8.0 MiB".into(),
+            representative: true,
+            stage1: "0.99".into(),
+            phash: "2".into(),
+            stage2: "0.97".into(),
+            metadata: "3840×2160 JPEG".into(),
+            review: "未复核".into(),
+            review_color: Color::from_rgb_u8(107, 114, 128),
+            online: true,
+            preview_enabled: true,
+            delete_enabled: false,
+        },
+        UiMemberRow {
+            machine_id: "machine-b".into(),
+            path: "E:\\Archive\\photo-b.jpg".into(),
+            md5: "fedcba9876543210fedcba9876543210".into(),
+            size: "8.0 MiB".into(),
+            representative: false,
+            stage1: "0.98".into(),
+            phash: "3".into(),
+            stage2: "0.96".into(),
+            metadata: "3840×2160 JPEG".into(),
+            review: "待确认".into(),
+            review_color: Color::from_rgb_u8(245, 158, 11),
+            online: true,
+            preview_enabled: true,
+            delete_enabled: true,
+        },
+    ])));
+    window.set_group_next_cursor("opaque-group-cursor".into());
+    window.set_member_next_cursor("opaque-member-cursor".into());
+    window.set_result_source_index(1);
+    window.set_result_node_index(7);
+    window.set_result_run_id("run-state-001".into());
+    window.set_selected_group_id("group-001".into());
+    window.set_cross_selections("7:scan-a,8:scan-b".into());
+    window.set_cross_status("partial".into());
+    window.invoke_navigate_to(4);
+
+    let loaded_groups = Rc::new(RefCell::new(Vec::new()));
+    window.on_load_groups({
+        let loaded_groups = loaded_groups.clone();
+        move |central, node, run, kind, cursor| {
+            loaded_groups.borrow_mut().push((
+                central,
+                node,
+                run.to_string(),
+                kind,
+                cursor.to_string(),
+            ));
+        }
+    });
+    let loaded_members = Rc::new(RefCell::new(Vec::new()));
+    window.on_load_members({
+        let loaded_members = loaded_members.clone();
+        move |central, node, run, group, kind, cursor| {
+            loaded_members.borrow_mut().push((
+                central,
+                node,
+                run.to_string(),
+                group.to_string(),
+                kind,
+                cursor.to_string(),
+            ));
+        }
+    });
+    let previews = Rc::new(RefCell::new(Vec::new()));
+    window.on_load_preview({
+        let previews = previews.clone();
+        move |machine, path| {
+            previews
+                .borrow_mut()
+                .push((machine.to_string(), path.to_string()));
+        }
+    });
+    let reviews = Rc::new(RefCell::new(Vec::new()));
+    window.on_save_review({
+        let reviews = reviews.clone();
+        move |machine, path, decision| {
+            reviews
+                .borrow_mut()
+                .push((machine.to_string(), path.to_string(), decision));
+        }
+    });
+    let cross_starts = Rc::new(RefCell::new(Vec::new()));
+    window.on_start_cross_analysis({
+        let cross_starts = cross_starts.clone();
+        move |selections| cross_starts.borrow_mut().push(selections.to_string())
+    });
+    let cross_polls = Rc::new(Cell::new(0));
+    window.on_poll_cross_analysis({
+        let cross_polls = cross_polls.clone();
+        move || cross_polls.set(cross_polls.get() + 1)
+    });
+    let cross_retries = Rc::new(Cell::new(0));
+    window.on_retry_cross_analysis({
+        let cross_retries = cross_retries.clone();
+        move || cross_retries.set(cross_retries.get() + 1)
+    });
+
+    assert_eq!(previews.borrow().len(), 0, "注入模型不得触发预览加载");
+    for (label, page) in [
+        ("精确重复", 2),
+        ("相似图片", 3),
+        ("相似视频", 4),
+        ("跨机器", 5),
+    ] {
+        accessible(&window, label).invoke_accessible_default_action();
+        assert_eq!(
+            window.get_current_page(),
+            page,
+            "{label} 必须映射到固定页面"
+        );
+        assert_eq!(
+            window.get_groups().row_count(),
+            1,
+            "切换 {label} 不得清空组模型"
+        );
+        assert_eq!(
+            window.get_members().row_count(),
+            2,
+            "切换 {label} 不得清空成员模型"
+        );
+        assert_eq!(
+            window.get_groups().row_data(0).expect("组行应保留").id,
+            "group-001"
+        );
+        assert_eq!(window.get_group_next_cursor(), "opaque-group-cursor");
+        assert_eq!(window.get_member_next_cursor(), "opaque-member-cursor");
+        assert_eq!(window.get_result_run_id(), "run-state-001");
+        assert_eq!(window.get_selected_group_id(), "group-001");
+    }
+    assert_eq!(previews.borrow().len(), 0, "图片和视频标签切换不得预取预览");
+
+    accessible(&window, "精确重复").invoke_accessible_default_action();
+    accessible(&window, "加载结果").invoke_accessible_default_action();
+    accessible(&window, "加载下一页重复组").invoke_accessible_default_action();
+    accessible(&window, "重复组：group-001").invoke_accessible_default_action();
+    accessible(&window, "加载下一页成员").invoke_accessible_default_action();
+    accessible(&window, "预览成员：D:\\Media\\photo-a.jpg").invoke_accessible_default_action();
+    assert_eq!(
+        previews.borrow().len(),
+        1,
+        "用户选择成员后才允许加载一次预览"
+    );
+    accessible(&window, "保留成员：D:\\Media\\photo-a.jpg").invoke_accessible_default_action();
+
+    accessible(&window, "相似图片").invoke_accessible_default_action();
+    accessible(&window, "加载结果").invoke_accessible_default_action();
+    accessible(&window, "相似视频").invoke_accessible_default_action();
+    accessible(&window, "加载结果").invoke_accessible_default_action();
+    accessible(&window, "跨机器").invoke_accessible_default_action();
+    accessible(&window, "加载结果").invoke_accessible_default_action();
+    accessible(&window, "创建中心分析").invoke_accessible_default_action();
+    accessible(&window, "推进到下一门禁").invoke_accessible_default_action();
+    accessible(&window, "重试未解决二筛").invoke_accessible_default_action();
+
+    assert_eq!(
+        loaded_groups.borrow().as_slice(),
+        &[
+            (true, 7, String::from("run-state-001"), 0, String::new()),
+            (
+                true,
+                7,
+                String::from("run-state-001"),
+                0,
+                String::from("opaque-group-cursor")
+            ),
+            (true, 7, String::from("run-state-001"), 1, String::new()),
+            (true, 7, String::from("run-state-001"), 2, String::new()),
+            (true, 7, String::from("run-state-001"), 0, String::new()),
+        ],
+        "四标签和有限分页必须保持 load-groups 参数顺序与普通类型 0/1/2",
+    );
+    assert_eq!(
+        loaded_members.borrow().as_slice(),
+        &[
+            (
+                true,
+                7,
+                String::from("run-state-001"),
+                String::from("group-001"),
+                0,
+                String::new(),
+            ),
+            (
+                true,
+                7,
+                String::from("run-state-001"),
+                String::from("group-001"),
+                0,
+                String::from("opaque-member-cursor"),
+            ),
+        ],
+        "选择组和成员分页必须保持 load-members 六参数顺序",
+    );
+    assert_eq!(
+        previews.borrow().as_slice(),
+        &[(
+            String::from("machine-a"),
+            String::from("D:\\Media\\photo-a.jpg")
+        )]
+    );
+    assert_eq!(
+        reviews.borrow().as_slice(),
+        &[(
+            String::from("machine-a"),
+            String::from("D:\\Media\\photo-a.jpg"),
+            1,
+        )]
+    );
+    assert_eq!(
+        cross_starts.borrow().as_slice(),
+        &[String::from("7:scan-a,8:scan-b")]
+    );
+    assert_eq!(cross_polls.get(), 1);
+    assert_eq!(cross_retries.get(), 1);
 }

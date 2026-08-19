@@ -2,6 +2,16 @@ use dedup_desktop_ui::MainWindow;
 use i_slint_backend_testing::{ElementHandle, TestingBackend, TestingBackendOptions};
 use slint::ComponentHandle;
 
+fn install_testing_backend() {
+    // Rust 测试用例各在线程中运行；Slint 平台也是线程局部状态，因此每个用例独立安装。
+    slint::platform::set_platform(Box::new(TestingBackend::new(TestingBackendOptions {
+        mock_time: true,
+        threading: false,
+        renderer_name: Some("software".into()),
+    })))
+    .expect("应能安装软件渲染测试后端");
+}
+
 fn assert_light_opaque(pixel: slint::Rgba8Pixel, region: &str) {
     assert_eq!(pixel.a, u8::MAX, "{region} 应完全不透明");
     assert!(
@@ -16,12 +26,7 @@ fn assert_light_opaque(pixel: slint::Rgba8Pixel, region: &str) {
 
 #[test]
 fn light_shell_renders_at_target_size() {
-    slint::platform::set_platform(Box::new(TestingBackend::new(TestingBackendOptions {
-        mock_time: true,
-        threading: false,
-        renderer_name: Some("software".into()),
-    })))
-    .expect("应能安装软件渲染测试后端");
+    install_testing_backend();
 
     let window = MainWindow::new().expect("应能构造真实 MainWindow");
     window.show().expect("应能显示真实 MainWindow");
@@ -93,5 +98,66 @@ fn light_shell_renders_at_target_size() {
                 && position.y + size.height <= 700.0,
             "{label} 应位于 1080×700 窗口边界内，位置={position:?}，尺寸={size:?}",
         );
+    }
+}
+
+#[test]
+fn duplicate_workspace_columns_stay_ordered_inside_content_area() {
+    install_testing_backend();
+
+    let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    window.show().expect("应能显示真实 MainWindow");
+    window.invoke_navigate_to(4);
+    window
+        .window()
+        .set_size(slint::PhysicalSize::new(1440, 900));
+
+    for (label, page) in [
+        ("精确重复", 2),
+        ("相似图片", 3),
+        ("相似视频", 4),
+        ("跨机器", 5),
+    ] {
+        ElementHandle::find_by_accessible_label(&window, label)
+            .next()
+            .unwrap_or_else(|| panic!("应能找到重复类型标签：{label}"))
+            .invoke_accessible_default_action();
+        assert_eq!(window.get_current_page(), page);
+        window
+            .window()
+            .take_snapshot()
+            .expect("切页后应完成软件渲染");
+
+        let group = ElementHandle::find_by_accessible_label(&window, "重复组表")
+            .next()
+            .expect("统一工作区应公开组表区域");
+        let member = ElementHandle::find_by_accessible_label(&window, "成员表")
+            .next()
+            .expect("统一工作区应公开成员表区域");
+        let detail = ElementHandle::find_by_accessible_label(&window, "详情面板")
+            .next()
+            .expect("统一工作区应公开详情区域");
+        let (group_position, group_size) = (group.absolute_position(), group.size());
+        let (member_position, member_size) = (member.absolute_position(), member.size());
+        let (detail_position, detail_size) = (detail.absolute_position(), detail.size());
+
+        assert!(
+            group_position.x + group_size.width <= member_position.x
+                && member_position.x + member_size.width <= detail_position.x,
+            "{label} 的组表、成员表、详情面板应从左到右排列：组={group_position:?}/{group_size:?}，成员={member_position:?}/{member_size:?}，详情={detail_position:?}/{detail_size:?}",
+        );
+        for (name, position, size) in [
+            ("重复组表", group_position, group_size),
+            ("成员表", member_position, member_size),
+            ("详情面板", detail_position, detail_size),
+        ] {
+            assert!(
+                position.x >= 144.0
+                    && position.y >= 58.0
+                    && position.x + size.width <= 1440.0
+                    && position.y + size.height <= 868.0,
+                "{label} 的{name}必须位于内容区内，位置={position:?}，尺寸={size:?}",
+            );
+        }
     }
 }
