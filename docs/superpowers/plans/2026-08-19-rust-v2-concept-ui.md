@@ -32,7 +32,9 @@
 ```text
 crates/desktop-ui/
   build.rs                              # 选择 Slint fluent 构建风格
-  tests/concept_ui_contract.rs          # 概念图结构、主题和桥接契约测试
+  tests/window_contract.rs              # 真实 MainWindow、导航和删除门禁行为测试
+  tests/bindings_contract.rs            # 21 个回调到 UiCommand 的桥接契约测试
+  tests/offscreen_layout.rs             # Slint software renderer 布局与浅色区域冒烟
   ui/app.slint                          # MainWindow 稳定契约与页面转发
   ui/theme.slint                        # 浅色令牌及现有 Ui*Row 模型
   ui/layout/app-shell.slint             # 侧栏、顶栏、内容插槽、底栏
@@ -71,86 +73,41 @@ docs/verification/rust-v2-concept-ui/*.png
 
 ## 多 Agent 执行策略
 
-- 用户允许最多 20 个子 Agent 并行；当前平台硬上限为 3 个子 Agent 加主线程。
-- 计划开始时并行派发三个只读预检 Agent，分别核对壳层、业务页面和验证方案。
+- 用户允许最多 20 个子 Agent；执行仍遵循 SDD 的单实现者写入规则，不同时派发两个实现 Agent 修改共享工作树。
 - 共享工作树中的写入任务按 Task 1–8 依赖顺序执行；每个任务使用独立实现 Agent 和独立审查 Agent，避免两个 Agent 同时修改 `app.slint` 或测试文件。
 - Agent 只精确提交本任务文件；主线程负责审查包、回归门禁和跨任务接口一致性。
 
 ---
 
-### Task 1: 建立 UI 契约测试并切换浅色 Fluent 主题
+### Task 1: 建立行为契约测试并切换浅色 Fluent 主题
 
 **Files:**
-- Create: `crates/desktop-ui/tests/concept_ui_contract.rs`
+- Modify: `crates/desktop-ui/Cargo.toml`
+- Create: `crates/desktop-ui/tests/window_contract.rs`
+- Create: `crates/desktop-ui/tests/bindings_contract.rs`
+- Create: `crates/desktop-ui/tests/offscreen_layout.rs`
 - Modify: `crates/desktop-ui/build.rs`
 - Modify: `crates/desktop-ui/ui/theme.slint`
+- Modify: `crates/desktop-ui/src/bindings.rs`
 
 **Interfaces:**
-- Consumes: 当前 `MainWindow` 源码和 `Theme` 全局属性。
-- Produces: `read_source(relative: &str) -> String` 测试辅助函数；固定浅色令牌；后续任务复用的静态契约测试文件。
+- Consumes: 真实生成的 `MainWindow` API、`bind_commands()` 和 `UiCommand`。
+- Produces: 精确锁定的 `i-slint-backend-testing = 1.17.1` 测试后端；根窗口默认值行为测试；21 个桥接回调的命令测试；软件渲染尺寸/不透明度冒烟；固定浅色令牌。
 
-- [ ] **Step 1: 编写主题和根回调契约的失败测试**
+- [ ] **Step 1: 添加精确版本测试后端并编写真实行为 RED**
 
-在 `concept_ui_contract.rs` 写入以下测试骨架；读取失败必须形成带路径的断言失败，而不是编译期 `include_str!` 错误：
+在 `Cargo.toml` 增加：
 
-```rust
-use std::{fs, path::PathBuf};
-
-fn read_source(relative: &str) -> String {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative);
-    fs::read_to_string(&path)
-        .unwrap_or_else(|error| panic!("无法读取 {}：{error}", path.display()))
-}
-
-fn assert_contains_all(source: &str, expected: &[&str]) {
-    for value in expected {
-        assert!(source.contains(value), "缺少 UI 契约：{value}");
-    }
-}
-
-#[test]
-fn concept_theme_uses_light_fluent_tokens() {
-    let build = read_source("build.rs");
-    let theme = read_source("ui/theme.slint").to_ascii_lowercase();
-    assert!(build.contains("with_style(\"fluent\".into())"));
-    assert!(!build.contains("fluent-dark"));
-    assert_contains_all(
-        &theme,
-        &["#f8fafc", "#ffffff", "#e5e7eb", "#111827", "#6b7280", "#2563eb", "#16a34a", "#f59e0b", "#ef4444"],
-    );
-}
-
-#[test]
-fn main_window_keeps_all_rust_callbacks() {
-    let app = read_source("ui/app.slint");
-    assert_contains_all(
-        &app,
-        &[
-            "callback add-node(string, int);",
-            "callback edit-node(int, string, int);",
-            "callback remove-node(int);",
-            "callback connect-all();",
-            "callback refresh();",
-            "callback sync-node(int);",
-            "callback browse-paths(int, string);",
-            "callback start-scan(int, string, bool, int);",
-            "callback start-local-analysis(int, string, int);",
-            "callback start-cross-analysis(string);",
-            "callback poll-cross-analysis();",
-            "callback retry-cross-analysis();",
-            "callback load-groups(bool, int, string, int, string);",
-            "callback load-members(bool, int, string, string, int, string);",
-            "callback save-review(string, string, int);",
-            "callback quick-review(int, string);",
-            "callback load-preview(string, string);",
-            "callback prepare-delete();",
-            "callback confirm-delete();",
-            "callback cancel-task(int, string);",
-            "callback save-settings();",
-        ],
-    );
-}
+```toml
+[dev-dependencies]
+i-slint-backend-testing = { version = "=1.17.1", features = ["renderer-software"] }
 ```
+
+`window_contract.rs` 必须在创建窗口之前调用 `i_slint_backend_testing::init_no_event_loop()`，然后真实构造 `MainWindow`，断言 `current-page = 0`、默认节点地址/端口、扫描根、枚举器、`delete-mode = "回收站"`。测试随后调用现有 `set_*`/`get_*` 和一个现有 `invoke_*`，证明生成 API 可用，不读取 `.slint` 源文件。
+
+`bindings_contract.rs` 使用真实 `tokio::sync::mpsc` channel 调用 `bind_commands()`。先覆盖 `start-scan` 的参数顺序、负节点索引归零、枚举器 `1 -> Everything`/其他值 `-> WindowsWalker`；再按同样方式覆盖全部 21 个现有根回调。配置非法时断言只更新 `last-error` 且 channel 不产生 `UiCommand`。这是外部命令边界，不使用 mock 结构。
+
+`offscreen_layout.rs` 先写会失败的浅色背景测试：创建带 `renderer-software` 的 `TestingBackend`，构造并显示 `MainWindow`，设置 `1440×900`，取得 RGBA8 snapshot，断言尺寸、像素数、非透明像素占比，以及左上/内容区的浅色亮度范围。禁止使用整图哈希或逐像素 golden。
 
 - [ ] **Step 2: 运行测试并确认 RED**
 
@@ -159,10 +116,10 @@ Run:
 ```powershell
 Remove-Item Env:CC -ErrorAction SilentlyContinue
 Remove-Item Env:CXX -ErrorAction SilentlyContinue
-cargo test -p dedup-desktop-ui --test concept_ui_contract concept_theme_uses_light_fluent_tokens -- --exact
+cargo test -p dedup-desktop-ui --test offscreen_layout light_shell_renders_at_target_size -- --exact
 ```
 
-Expected: `concept_theme_uses_light_fluent_tokens` 失败，因为 `build.rs` 仍为 `fluent-dark` 且主题仍是深色。
+Expected: 浅色区域断言失败，因为当前构建仍使用 `fluent-dark`；其余窗口/桥接测试先建立现有基线。
 
 - [ ] **Step 3: 切换构建风格并重写浅色令牌**
 
@@ -202,17 +159,19 @@ export global Theme {
 Run:
 
 ```powershell
-cargo test -p dedup-desktop-ui --test concept_ui_contract --locked
+cargo test -p dedup-desktop-ui --test window_contract --locked -- --test-threads=1
+cargo test -p dedup-desktop-ui --test bindings_contract --locked -- --test-threads=1
+cargo test -p dedup-desktop-ui --test offscreen_layout --locked -- --test-threads=1
 cargo fmt --all -- --check
 ```
 
-Expected: 两个契约测试通过，格式门禁通过。
+Expected: 真实生成 API、21 个命令桥接、软件渲染浅色冒烟和格式门禁全部通过。修正 `bindings.rs` 中过时的“17 回调”注释为“21 回调”。
 
 - [ ] **Step 5: 精确提交 Task 1**
 
 ```powershell
-git add -- crates/desktop-ui/tests/concept_ui_contract.rs crates/desktop-ui/build.rs crates/desktop-ui/ui/theme.slint
-git commit -m "test: lock Rust V2 concept UI theme contract"
+git add -- crates/desktop-ui/Cargo.toml Cargo.lock crates/desktop-ui/tests/window_contract.rs crates/desktop-ui/tests/bindings_contract.rs crates/desktop-ui/tests/offscreen_layout.rs crates/desktop-ui/build.rs crates/desktop-ui/ui/theme.slint crates/desktop-ui/src/bindings.rs
+git commit -m "test: establish Rust V2 UI behavior contracts"
 ```
 
 ---
@@ -220,7 +179,8 @@ git commit -m "test: lock Rust V2 concept UI theme contract"
 ### Task 2: 实现概念图应用壳、七项导航和复用基础组件
 
 **Files:**
-- Modify: `crates/desktop-ui/tests/concept_ui_contract.rs`
+- Modify: `crates/desktop-ui/tests/window_contract.rs`
+- Modify: `crates/desktop-ui/tests/offscreen_layout.rs`
 - Create: `crates/desktop-ui/ui/layout/app-shell.slint`
 - Create: `crates/desktop-ui/ui/layout/top-command-bar.slint`
 - Create: `crates/desktop-ui/ui/layout/side-navigation.slint`
@@ -234,45 +194,33 @@ git commit -m "test: lock Rust V2 concept UI theme contract"
 
 **Interfaces:**
 - Consumes: Task 1 `Theme` 令牌和原 `MainWindow` 根属性/回调。
-- Produces: `AppShell.active-nav`、`AppShell.navigate(int)`、`AppShell.refresh()`；`@children` 内容插槽；`TabStrip.active-index` 与 `TabStrip.changed(int)`；七项视觉导航。
+- Produces: `AppShell.active-nav`、`AppShell.navigate(int)`、`AppShell.refresh()`；`@children` 内容插槽；`TabStrip.active-index` 与 `TabStrip.changed(int)`；七项视觉导航；仅供 UI 状态机使用的根 `navigate-to(int)` 回调。
 
-- [ ] **Step 1: 添加壳层结构失败测试**
+- [ ] **Step 1: 添加导航状态机和离屏布局 RED**
 
-追加：
+在 `window_contract.rs` 添加单个串行行为测试，真实构造窗口后调用将被侧栏共用的 `invoke_navigate_to()`，逐项断言：
 
 ```rust
-#[test]
-fn concept_shell_has_seven_navigation_entries_and_fixed_regions() {
-    let shell = read_source("ui/layout/app-shell.slint");
-    let navigation = read_source("ui/layout/side-navigation.slint");
-    assert_contains_all(&shell, &["width: 144px", "height: 58px", "height: 32px", "@children"]);
-    assert_contains_all(
-        &navigation,
-        &["总览", "节点", "扫描", "任务", "重复文件", "审核删除", "设置"],
-    );
-    assert_eq!(navigation.matches("NavItem {").count(), 7);
-}
-
-#[test]
-fn concept_shell_exposes_reusable_light_components() {
-    for path in [
-        "ui/components/fluent-card.slint",
-        "ui/components/metric-card.slint",
-        "ui/components/tab-strip.slint",
-        "ui/components/empty-state.slint",
-        "ui/components/detail-panel.slint",
-    ] {
-        let source = read_source(path);
-        assert!(source.contains("export component"), "{path} 没有导出组件");
-    }
-}
+let expected = [
+    (0, 0, 0, 0), // 总览
+    (0, 1, 1, 0), // 节点
+    (1, 2, 1, 0), // 扫描
+    (1, 3, 1, 1), // 任务
+    (2, 4, 1, 1), // 重复文件
+    (6, 5, 1, 1), // 审核删除
+    (7, 6, 1, 1), // 设置
+];
 ```
+
+每个元组顺序为 `(current_page, active_nav, overview_mode, task_mode)`。先将 `current-page` 设置为 `3/4/5` 再导航到“重复文件”，断言不会重置已选重复类型。给七个侧栏按钮和刷新按钮增加稳定的中文 `accessible-label`；用 `ElementHandle::find_by_accessible_label()` 触发至少“节点”和“刷新”的默认动作，断言前者走同一映射、后者只触发一次现有 `refresh` 回调。
+
+在 `offscreen_layout.rs` 增加区域冒烟：1440×900 时侧栏、顶栏、内容区、底栏都非透明且明度符合浅色主题；把窗口缩到 `1080×700` 后仍能渲染且关键导航按钮处于窗口边界内。只断言区域关系和可访问元素边界，不断言字体像素或整图哈希。
 
 - [ ] **Step 2: 运行测试并确认 RED**
 
-Run: `cargo test -p dedup-desktop-ui --test concept_ui_contract concept_shell_ -- --nocapture`
+Run: `cargo test -p dedup-desktop-ui --test window_contract navigation_actions_preserve_page_mapping -- --exact --test-threads=1`
 
-Expected: 两个测试因 `ui/layout/app-shell.slint` 尚不存在而失败。
+Expected: 编译 RED，因为根窗口尚未提供 `navigate-to` 生成 API；离屏布局测试随后因旧壳区域关系不匹配而失败。
 
 - [ ] **Step 3: 创建固定应用壳**
 
@@ -346,9 +294,10 @@ in-out property <int> overview-mode: 0;
 in-out property <int> task-mode: 0;
 in-out property <int> review-tab: 0;
 in-out property <int> settings-section: 0;
+callback navigate-to(int);
 ```
 
-`AppShell.navigate(index)` 的映射必须为：
+`navigate-to(index)` 是侧栏和行为测试共同使用的唯一导航状态机；`AppShell.navigate(index)` 只转发到它。映射必须为：
 
 ```slint
 if index == 0 { root.current-page = 0; root.overview-mode = 0; }
@@ -366,17 +315,18 @@ root.active-nav = index;
 - [ ] **Step 6: 运行 GREEN、编译和 Clippy**
 
 ```powershell
-cargo test -p dedup-desktop-ui --test concept_ui_contract --locked
+cargo test -p dedup-desktop-ui --test window_contract --locked -- --test-threads=1
+cargo test -p dedup-desktop-ui --test offscreen_layout --locked -- --test-threads=1
 cargo check -p dedup-desktop-ui -p desktop --locked
 cargo clippy -p dedup-desktop-ui -p desktop --all-targets --locked -- -D warnings
 ```
 
-Expected: 契约测试、Slint 编译和 Clippy 全部通过。
+Expected: 导航真实动作、离屏区域关系、Slint 编译和 Clippy 全部通过。
 
 - [ ] **Step 7: 精确提交 Task 2**
 
 ```powershell
-git add -- crates/desktop-ui/tests/concept_ui_contract.rs crates/desktop-ui/ui/app.slint crates/desktop-ui/ui/layout crates/desktop-ui/ui/components/fluent-card.slint crates/desktop-ui/ui/components/metric-card.slint crates/desktop-ui/ui/components/tab-strip.slint crates/desktop-ui/ui/components/empty-state.slint crates/desktop-ui/ui/components/detail-panel.slint
+git add -- crates/desktop-ui/tests/window_contract.rs crates/desktop-ui/tests/offscreen_layout.rs crates/desktop-ui/ui/app.slint crates/desktop-ui/ui/layout crates/desktop-ui/ui/components/fluent-card.slint crates/desktop-ui/ui/components/metric-card.slint crates/desktop-ui/ui/components/tab-strip.slint crates/desktop-ui/ui/components/empty-state.slint crates/desktop-ui/ui/components/detail-panel.slint
 git commit -m "feat: add Rust V2 concept application shell"
 ```
 
@@ -385,7 +335,7 @@ git commit -m "feat: add Rust V2 concept application shell"
 ### Task 3: 拆分总览和节点管理视图
 
 **Files:**
-- Modify: `crates/desktop-ui/tests/concept_ui_contract.rs`
+- Modify: `crates/desktop-ui/tests/window_contract.rs`
 - Create: `crates/desktop-ui/ui/pages/overview-dashboard.slint`
 - Create: `crates/desktop-ui/ui/pages/nodes-page.slint`
 - Modify: `crates/desktop-ui/ui/app.slint`
@@ -394,23 +344,17 @@ git commit -m "feat: add Rust V2 concept application shell"
 - Consumes: `nodes`、`tasks`、`online-count`、`running-count`、`indexed-text`、`sync-text`，以及现有六个节点回调。
 - Produces: `OverviewDashboard` 和 `NodesPage`；`overview-mode` 选择总览或节点视图。
 
-- [ ] **Step 1: 添加两视图失败测试**
+- [ ] **Step 1: 添加真实模型消费和节点操作 RED**
 
-```rust
-#[test]
-fn overview_and_nodes_match_the_concept_workspace_split() {
-    let overview = read_source("ui/pages/overview-dashboard.slint");
-    let nodes = read_source("ui/pages/nodes-page.slint");
-    assert_contains_all(&overview, &["export component OverviewDashboard", "节点健康状态", "最近扫描任务", "当前数据源未提供"]);
-    assert_contains_all(&nodes, &["export component NodesPage", "节点管理", "添加节点", "机器 ID", "当前版本未提供"]);
-}
-```
+在 `window_contract.rs` 使用 `VecModel<UiNodeRow>` 和 `VecModel<UiTaskRow>` 注入两个节点、三种任务状态的字面 fixture。导航到总览后，通过可访问标签断言指标卡和对应节点/任务行可见；导航到节点页后断言同一节点模型仍可见且选中项可以改变。
+
+新增 `node_add_forwards_entered_ip_and_port`：设置根 `new-node-ip`/`new-node-port`，为现有 `add-node` 安装捕获闭包，再通过“添加节点”按钮的 `accessible-label` 触发默认动作，断言参数原样转发。编辑、同步、移除、连接按钮分别捕获现有回调的节点索引或调用次数，不读取控件源码，也不测试“机器 ID/当前版本未提供”等静态文案。
 
 - [ ] **Step 2: 运行测试并确认 RED**
 
-Run: `cargo test -p dedup-desktop-ui --test concept_ui_contract overview_and_nodes_match_the_concept_workspace_split -- --exact`
+Run: `cargo test -p dedup-desktop-ui --test window_contract overview_and_nodes_consume_real_models -- --exact --test-threads=1`
 
-Expected: `overview-dashboard.slint` 不存在导致测试失败。
+Expected: RED，因为新总览/节点组件及其可访问操作尚不存在。
 
 - [ ] **Step 3: 实现 OverviewDashboard**
 
@@ -457,7 +401,7 @@ if root.current-page == 0 && root.overview-mode == 1 : NodesPage { /* 节点表�
 - [ ] **Step 6: 运行 GREEN 和定向回归**
 
 ```powershell
-cargo test -p dedup-desktop-ui --test concept_ui_contract --locked
+cargo test -p dedup-desktop-ui --test window_contract --locked -- --test-threads=1
 cargo check -p dedup-desktop-ui -p desktop --locked
 cargo test -p dedup-desktop-core --locked view_state
 ```
@@ -465,7 +409,7 @@ cargo test -p dedup-desktop-core --locked view_state
 - [ ] **Step 7: 精确提交 Task 3**
 
 ```powershell
-git add -- crates/desktop-ui/tests/concept_ui_contract.rs crates/desktop-ui/ui/app.slint crates/desktop-ui/ui/pages/overview-dashboard.slint crates/desktop-ui/ui/pages/nodes-page.slint
+git add -- crates/desktop-ui/tests/window_contract.rs crates/desktop-ui/ui/app.slint crates/desktop-ui/ui/pages/overview-dashboard.slint crates/desktop-ui/ui/pages/nodes-page.slint
 git commit -m "feat: split overview and node management workspaces"
 ```
 
@@ -474,7 +418,7 @@ git commit -m "feat: split overview and node management workspaces"
 ### Task 4: 拆分新建扫描和任务中心视图
 
 **Files:**
-- Modify: `crates/desktop-ui/tests/concept_ui_contract.rs`
+- Modify: `crates/desktop-ui/tests/window_contract.rs`
 - Create: `crates/desktop-ui/ui/pages/scan-page.slint`
 - Create: `crates/desktop-ui/ui/pages/task-center-page.slint`
 - Modify: `crates/desktop-ui/ui/app.slint`
@@ -483,25 +427,17 @@ git commit -m "feat: split overview and node management workspaces"
 - Consumes: `tasks`、筛选门禁、扫描表单、分析表单，以及 `browse-paths`、`start-scan`、`start-local-analysis`、`cancel-task`。
 - Produces: `ScanPage` 和 `TaskCenterPage`；`task-mode` 选择扫描创建或任务列表；任务标签只筛选已加载模型。
 
-- [ ] **Step 1: 添加扫描/任务失败测试**
+- [ ] **Step 1: 添加扫描参数和任务筛选 RED**
 
-```rust
-#[test]
-fn scan_and_task_center_use_separate_concept_views() {
-    let scan = read_source("ui/pages/scan-page.slint");
-    let tasks = read_source("ui/pages/task-center-page.slint");
-    assert_contains_all(&scan, &["export component ScanPage", "新建扫描", "扫描范围", "执行节点", "预估信息", "—"]);
-    assert_contains_all(&tasks, &["export component TaskCenterPage", "运行中", "已完成", "失败", "任务详情", "剩余时间", "—"]);
-    assert!(!scan.contains("182 MB/s"));
-    assert!(!tasks.contains("00:48:32"));
-}
-```
+在 `window_contract.rs` 添加 `scan_start_forwards_four_arguments_in_order`：设置节点、路径、强制重算和 Everything 后通过“开始扫描”的可访问默认动作触发现有 `start-scan`，断言得到 `(7, "D:\\fixture", true, 1)`；同时把分析类型设为非默认值，证明它没有混入扫描参数。再测试浏览和本地分析按钮分别只转发原有参数。
+
+添加 `task_tabs_filter_loaded_models_and_cancel_active_task`：注入运行中、完成、失败各一条 `UiTaskRow`，通过三个标签的默认动作切换根 `task-tab`，断言可访问树中只出现对应任务行；运行中任务的取消按钮触发一次 `(node_index, task_id)`，完成/失败行无可执行取消动作。速度、ETA 和日志没有模型字段，因此只在 Windows GUI 验收检查禁用呈现，不写负向源码测试。
 
 - [ ] **Step 2: 运行测试并确认 RED**
 
-Run: `cargo test -p dedup-desktop-ui --test concept_ui_contract scan_and_task_center_use_separate_concept_views -- --exact`
+Run: `cargo test -p dedup-desktop-ui --test window_contract scan_start_forwards_four_arguments_in_order -- --exact --test-threads=1`
 
-Expected: `scan-page.slint` 不存在导致失败。
+Expected: RED，因为“开始扫描”可访问动作尚未接入新扫描页。
 
 - [ ] **Step 3: 实现 ScanPage**
 
@@ -536,6 +472,8 @@ export component TaskCenterPage inherits Rectangle {
 }
 ```
 
+根窗口新增 `in-out property <int> task-tab: 0` 并与组件双向绑定，使标签状态可由 Rust 行为测试和后续状态恢复观察；它不改变任何后端命令。
+
 - [ ] **Step 5: 接入 app.slint 并保持回调语义**
 
 当 `current-page == 1 && task-mode == 0` 渲染 `ScanPage`；当 `current-page == 1 && task-mode == 1` 渲染 `TaskCenterPage`。`start-scan` 仍严格传入 `(node_index, path, force, enumerator)`，分析类型不得追加到扫描参数。
@@ -548,7 +486,7 @@ if root.current-page == 1 && root.task-mode == 1 : TaskCenterPage { /* tasks 与
 - [ ] **Step 6: 运行 GREEN 和回归**
 
 ```powershell
-cargo test -p dedup-desktop-ui --test concept_ui_contract --locked
+cargo test -p dedup-desktop-ui --test window_contract --locked -- --test-threads=1
 cargo check -p dedup-desktop-ui -p desktop --locked
 cargo test -p dedup-desktop-core --locked task
 ```
@@ -556,7 +494,7 @@ cargo test -p dedup-desktop-core --locked task
 - [ ] **Step 7: 精确提交 Task 4**
 
 ```powershell
-git add -- crates/desktop-ui/tests/concept_ui_contract.rs crates/desktop-ui/ui/app.slint crates/desktop-ui/ui/pages/scan-page.slint crates/desktop-ui/ui/pages/task-center-page.slint
+git add -- crates/desktop-ui/tests/window_contract.rs crates/desktop-ui/ui/app.slint crates/desktop-ui/ui/pages/scan-page.slint crates/desktop-ui/ui/pages/task-center-page.slint
 git commit -m "feat: split scan and task center workspaces"
 ```
 
@@ -565,7 +503,8 @@ git commit -m "feat: split scan and task center workspaces"
 ### Task 5: 统一四类重复结果工作区并改造高密度表格
 
 **Files:**
-- Modify: `crates/desktop-ui/tests/concept_ui_contract.rs`
+- Modify: `crates/desktop-ui/tests/window_contract.rs`
+- Modify: `crates/desktop-ui/tests/offscreen_layout.rs`
 - Modify: `crates/desktop-ui/ui/components/group-table.slint`
 - Modify: `crates/desktop-ui/ui/components/member-list.slint`
 - Create: `crates/desktop-ui/ui/pages/duplicate-workspace.slint`
@@ -575,33 +514,19 @@ git commit -m "feat: split scan and task center workspaces"
 - Consumes: `groups`、`members`、两个游标、结果来源/节点/运行 ID、预览、跨机器状态，以及现有结果/复核/跨机器回调。
 - Produces: `DuplicateWorkspace.duplicate-tab` 0–3；四标签统一结果查询；高密度组表、成员表和 `300px` 详情面板。
 
-- [ ] **Step 1: 添加重复结果失败测试**
+- [ ] **Step 1: 添加结果状态、分页和按需预览行为 RED**
 
-```rust
-#[test]
-fn duplicate_workspace_has_four_tabs_and_on_demand_preview_only() {
-    let page = read_source("ui/pages/duplicate-workspace.slint");
-    let members = read_source("ui/components/member-list.slint").to_ascii_lowercase();
-    assert_contains_all(&page, &["精确重复", "相似图片", "相似视频", "跨机器", "算法证据", "六帧 3×2 JPG 联系表"]);
-    assert!(!page.to_ascii_lowercase().contains("thumbnail"));
-    assert!(!members.contains("thumbnail"));
-}
+在 `window_contract.rs` 新增 `duplicate_tabs_preserve_loaded_state_and_forward_existing_callbacks`。使用字面 `VecModel<UiGroupRow>` 和 `VecModel<UiMemberRow>` 注入一组两成员数据，同时设置 `group-next-cursor`、`member-next-cursor`、`result-run-id` 和 `selected-group-id`。依次通过“精确重复 / 相似图片 / 相似视频 / 跨机器”的 `accessible-label` 触发默认动作，断言 `current-page` 精确变为 2–5，并且模型、两个不透明游标、运行 ID 和已选组都未被清空。
 
-#[test]
-fn duplicate_workspace_keeps_cursor_and_cross_machine_callbacks() {
-    let page = read_source("ui/pages/duplicate-workspace.slint");
-    assert_contains_all(
-        &page,
-        &["group-next-cursor", "member-next-cursor", "load-groups", "load-members", "start-cross", "poll-cross", "retry-cross"],
-    );
-}
-```
+为现有 `load-groups`、`load-members`、`load-preview`、`save-review`、`start-cross-analysis`、`poll-cross-analysis` 和 `retry-cross-analysis` 安装捕获闭包。通过加载结果、选择组、成员预览/复核和跨机器操作的真实可访问动作触发，断言参数顺序和调用次数保持。创建窗口和注入模型后先断言预览回调计数为 0，再点击成员预览并断言只增加为 1，证明图片和视频都没有进入即加载路径。
+
+在 `offscreen_layout.rs` 新增四标签布局冒烟：1440×900 下依次切换 2–5 页，断言组表、成员表和详情面板的可访问边界按从左到右排列且都在内容区内。图片和视频的具体预览文案留给 Task 8 的真实 GUI 验收，不写源码负向断言。
 
 - [ ] **Step 2: 运行测试并确认 RED**
 
-Run: `cargo test -p dedup-desktop-ui --test concept_ui_contract duplicate_workspace_ -- --nocapture`
+Run: `cargo test -p dedup-desktop-ui --test window_contract duplicate_tabs_preserve_loaded_state_and_forward_existing_callbacks -- --exact --test-threads=1`
 
-Expected: `duplicate-workspace.slint` 不存在导致两项失败。
+Expected: RED，因为四个结果标签和统一工作区的可访问动作尚不存在。
 
 - [ ] **Step 3: 将 GroupTable 改为高密度列式组表**
 
@@ -676,7 +601,8 @@ if root.current-page >= 2 && root.current-page <= 5 : DuplicateWorkspace {
 - [ ] **Step 7: 运行 GREEN、UI 编译和结果回归**
 
 ```powershell
-cargo test -p dedup-desktop-ui --test concept_ui_contract --locked
+cargo test -p dedup-desktop-ui --test window_contract --locked -- --test-threads=1
+cargo test -p dedup-desktop-ui --test offscreen_layout --locked -- --test-threads=1
 cargo check -p dedup-desktop-ui -p desktop --locked
 cargo test -p dedup-desktop-core --locked results
 cargo test -p dedup-desktop-core --locked review
@@ -685,7 +611,7 @@ cargo test -p dedup-desktop-core --locked review
 - [ ] **Step 8: 精确提交 Task 5**
 
 ```powershell
-git add -- crates/desktop-ui/tests/concept_ui_contract.rs crates/desktop-ui/ui/app.slint crates/desktop-ui/ui/components/group-table.slint crates/desktop-ui/ui/components/member-list.slint crates/desktop-ui/ui/pages/duplicate-workspace.slint
+git add -- crates/desktop-ui/tests/window_contract.rs crates/desktop-ui/tests/offscreen_layout.rs crates/desktop-ui/ui/app.slint crates/desktop-ui/ui/components/group-table.slint crates/desktop-ui/ui/components/member-list.slint crates/desktop-ui/ui/pages/duplicate-workspace.slint
 git commit -m "feat: unify concept duplicate result workspace"
 ```
 
@@ -694,7 +620,8 @@ git commit -m "feat: unify concept duplicate result workspace"
 ### Task 6: 实现审核工作台和删除中心
 
 **Files:**
-- Modify: `crates/desktop-ui/tests/concept_ui_contract.rs`
+- Modify: `crates/desktop-ui/tests/window_contract.rs`
+- Modify: `crates/desktop-ui/tests/offscreen_layout.rs`
 - Modify: `crates/desktop-ui/ui/components/delete-dialog.slint`
 - Create: `crates/desktop-ui/ui/pages/review-delete-workspace.slint`
 - Modify: `crates/desktop-ui/ui/app.slint`
@@ -703,35 +630,25 @@ git commit -m "feat: unify concept duplicate result workspace"
 - Consumes: 当前成员、选中组、预览、路径规则、删除确认属性和现有审核删除回调。
 - Produces: 审核/删除双模式；待审核/已决定/已忽略本地过滤；待执行/执行中/历史记录删除标签；浅色删除覆盖层。
 
-- [ ] **Step 1: 添加审核和删除安全失败测试**
+- [ ] **Step 1: 添加审核筛选和删除门禁行为 RED**
 
-```rust
-#[test]
-fn review_delete_workspace_exposes_review_and_delete_states_without_fake_history() {
-    let page = read_source("ui/pages/review-delete-workspace.slint");
-    assert_contains_all(&page, &["审核工作台", "删除中心", "待审核", "已决定", "已忽略", "待执行", "执行中", "历史记录", "当前版本没有持久删除批次"]);
-    assert!(!page.contains("D-20250519"));
-}
+在 `window_contract.rs` 新增 `review_filters_loaded_members_and_delete_confirmation_obeys_gate`。注入未决定、保留、删除三种 `UiMemberRow.review` 的字面 fixture，导航到审核删除页后，通过“待审核 / 已决定 / 已忽略”可访问动作切换根 `review-filter`，断言可访问树只暴露当前筛选的成员；通过“审核工作台 / 删除中心”和“待执行 / 执行中 / 历史记录”动作断言根 `review-tab`、`delete-filter` 的状态映射。
 
-#[test]
-fn delete_confirmation_defaults_to_recycle_bin_and_keeps_gate() {
-    let app = read_source("ui/app.slint");
-    let dialog = read_source("ui/components/delete-dialog.slint");
-    assert!(app.contains("delete-mode: \"回收站\""));
-    assert!(dialog.contains("enabled: root.can-execute"));
-    assert_contains_all(&dialog, &["永久删除", "不可恢复", "确认执行"]);
-}
-```
+测试为 `prepare-delete` 和 `confirm-delete` 安装捕获闭包：点击“准备删除”只调用一次现有准备回调；打开根删除覆盖层并令 `delete-can-execute = false` 时，“确认执行”的默认动作不得调用确认回调；改为 `true` 后同一动作只调用一次。分别设置 `delete-mode = "回收站"` 和 `"永久删除"`，断言可访问名称/描述反映当前模式，永久删除描述包含“不可恢复”。
+
+在 `offscreen_layout.rs` 增加浅色根级覆盖层冒烟，断言确认卡片位于窗口中央并覆盖内容区，但不使用像素哈希。
 
 - [ ] **Step 2: 运行测试并确认 RED**
 
-Run: `cargo test -p dedup-desktop-ui --test concept_ui_contract review_delete_workspace_exposes_review_and_delete_states_without_fake_history -- --exact`
+Run: `cargo test -p dedup-desktop-ui --test window_contract review_filters_loaded_members_and_delete_confirmation_obeys_gate -- --exact --test-threads=1`
 
-Expected: `review-delete-workspace.slint` 不存在导致失败。
+Expected: RED，因为新审核/删除状态动作和可观察筛选状态尚不存在。
 
 - [ ] **Step 3: 实现 ReviewDeleteWorkspace**
 
 `review-tab` 选择审核工作台或删除中心。审核标签只按当前 `members` 的 `review` 值筛选并明确“当前组范围”；快捷规则继续传 0–3。删除中心的待执行只调用 `prepare-delete`；执行中和历史记录使用 `EmptyState`，文案固定为“当前版本没有持久删除批次”。
+
+根窗口新增 `in-out property <int> review-filter: 0` 和 `in-out property <int> delete-filter: 0`，与工作区双向绑定，供真实行为测试和后续状态恢复观察；不得映射到新的后端命令。
 
 ```slint
 export component ReviewDeleteWorkspace inherits Rectangle {
@@ -777,7 +694,8 @@ if root.delete-dialog-open : DeleteDialog { /* 保持根级覆盖层 */ }
 - [ ] **Step 6: 运行 GREEN 和删除链回归**
 
 ```powershell
-cargo test -p dedup-desktop-ui --test concept_ui_contract --locked
+cargo test -p dedup-desktop-ui --test window_contract --locked -- --test-threads=1
+cargo test -p dedup-desktop-ui --test offscreen_layout --locked -- --test-threads=1
 cargo check -p dedup-desktop-ui -p desktop --locked
 cargo test -p dedup-desktop-core --locked delete
 ```
@@ -785,7 +703,7 @@ cargo test -p dedup-desktop-core --locked delete
 - [ ] **Step 7: 精确提交 Task 6**
 
 ```powershell
-git add -- crates/desktop-ui/tests/concept_ui_contract.rs crates/desktop-ui/ui/app.slint crates/desktop-ui/ui/components/delete-dialog.slint crates/desktop-ui/ui/pages/review-delete-workspace.slint
+git add -- crates/desktop-ui/tests/window_contract.rs crates/desktop-ui/tests/offscreen_layout.rs crates/desktop-ui/ui/app.slint crates/desktop-ui/ui/components/delete-dialog.slint crates/desktop-ui/ui/pages/review-delete-workspace.slint
 git commit -m "feat: add concept review and delete workspaces"
 ```
 
@@ -794,7 +712,8 @@ git commit -m "feat: add concept review and delete workspaces"
 ### Task 7: 实现设置与日志诊断并更新 AGENTS 架构说明
 
 **Files:**
-- Modify: `crates/desktop-ui/tests/concept_ui_contract.rs`
+- Modify: `crates/desktop-ui/tests/window_contract.rs`
+- Modify: `crates/desktop-ui/tests/offscreen_layout.rs`
 - Create: `crates/desktop-ui/ui/pages/settings-workspace.slint`
 - Modify: `crates/desktop-ui/ui/app.slint`
 - Delete: `crates/desktop-ui/ui/pages/overview.slint`
@@ -810,34 +729,19 @@ git commit -m "feat: add concept review and delete workspaces"
 - Consumes: PostgreSQL 状态、四个路径、所有设置字段和 `save-settings()`。
 - Produces: 七项设置二级菜单；常规/算法/存储真实表单；节点服务、扫描性能、外部工具、日志诊断禁用说明；最终新 UI 文件拓扑。
 
-- [ ] **Step 1: 添加设置/诊断失败测试**
+- [ ] **Step 1: 添加设置状态和保存行为 RED**
 
-```rust
-#[test]
-fn settings_workspace_separates_supported_settings_from_diagnostics_placeholders() {
-    let page = read_source("ui/pages/settings-workspace.slint");
-    assert_contains_all(
-        &page,
-        &["常规", "节点服务", "扫描与性能", "相似度算法", "外部工具", "存储", "日志与诊断", "PostgreSQL", "回收站（默认）", "当前版本未提供"],
-    );
-    assert!(!page.contains("G:\\Code\\ffmpeg"));
-}
+在 `window_contract.rs` 新增 `settings_sections_preserve_real_values_and_save_once`。导航到设置页后依次通过七个二级菜单的中文 `accessible-label` 触发默认动作，断言根 `settings-section` 精确变为 0–6。通过生成 API 设置 PostgreSQL URL、重连秒数、删除模式索引和九个阈值，再跨常规、相似度算法、存储、日志与诊断往返，断言所有真实值保持不变。
 
-#[test]
-fn app_imports_only_the_new_concept_pages() {
-    let app = read_source("ui/app.slint");
-    assert_contains_all(&app, &["OverviewDashboard", "NodesPage", "ScanPage", "TaskCenterPage", "DuplicateWorkspace", "ReviewDeleteWorkspace", "SettingsWorkspace"]);
-    for old in ["OverviewPage", "ScanTasksPage", "ExactCrossMachinePage", "SimilarMediaPage", "SettingsDiagnosticsPage"] {
-        assert!(!app.contains(old), "仍引用旧页面：{old}");
-    }
-}
-```
+为现有 `save-settings` 安装捕获闭包，通过“保存设置”可访问动作触发并断言只调用一次。将四个应用路径、PostgreSQL 状态和 `last-error` 设置为字面 fixture，在存储/诊断页通过可访问文本确认这些真实值可见；禁用项目只要求存在 `accessible-disabled = true` 的代表性控件，不断言源码文案或旧文件名。
+
+在 `offscreen_layout.rs` 增加设置页冒烟，断言七项二级菜单边界纵向排列、右侧内容卡在其右侧，最小窗口 `1080×700` 下“保存设置”仍处于窗口边界内。旧页面删除由新页面编译和完整 UI 回归证明，不为文件名写变更检测器。
 
 - [ ] **Step 2: 运行测试并确认 RED**
 
-Run: `cargo test -p dedup-desktop-ui --test concept_ui_contract settings_workspace_separates_supported_settings_from_diagnostics_placeholders -- --exact`
+Run: `cargo test -p dedup-desktop-ui --test window_contract settings_sections_preserve_real_values_and_save_once -- --exact --test-threads=1`
 
-Expected: `settings-workspace.slint` 不存在导致失败。
+Expected: RED，因为七项设置菜单和保存可访问动作尚未接入新工作区。
 
 - [ ] **Step 3: 实现 SettingsWorkspace**
 
@@ -895,7 +799,8 @@ if root.current-page == 7 : SettingsWorkspace {
 - [ ] **Step 6: 运行 GREEN、文档和全 UI 回归**
 
 ```powershell
-cargo test -p dedup-desktop-ui --test concept_ui_contract --locked
+cargo test -p dedup-desktop-ui --test window_contract --locked -- --test-threads=1
+cargo test -p dedup-desktop-ui --test offscreen_layout --locked -- --test-threads=1
 cargo test -p dedup-desktop-ui --locked
 cargo check -p dedup-desktop-ui -p desktop --locked
 cargo clippy -p dedup-desktop-ui -p desktop --all-targets --locked -- -D warnings
@@ -905,7 +810,7 @@ git diff --check
 - [ ] **Step 7: 精确提交 Task 7**
 
 ```powershell
-git add -- AGENTS.md crates/desktop-ui/tests/concept_ui_contract.rs crates/desktop-ui/ui/app.slint crates/desktop-ui/ui/pages/settings-workspace.slint crates/desktop-ui/ui/pages/overview.slint crates/desktop-ui/ui/pages/scan-tasks.slint crates/desktop-ui/ui/pages/exact-cross-machine.slint crates/desktop-ui/ui/pages/similar-media.slint crates/desktop-ui/ui/pages/review-delete.slint crates/desktop-ui/ui/pages/settings-diagnostics.slint crates/desktop-ui/ui/components/navigation.slint
+git add -- AGENTS.md crates/desktop-ui/tests/window_contract.rs crates/desktop-ui/tests/offscreen_layout.rs crates/desktop-ui/ui/app.slint crates/desktop-ui/ui/pages/settings-workspace.slint crates/desktop-ui/ui/pages/overview.slint crates/desktop-ui/ui/pages/scan-tasks.slint crates/desktop-ui/ui/pages/exact-cross-machine.slint crates/desktop-ui/ui/pages/similar-media.slint crates/desktop-ui/ui/pages/review-delete.slint crates/desktop-ui/ui/pages/settings-diagnostics.slint crates/desktop-ui/ui/components/navigation.slint
 git commit -m "feat: complete Rust V2 concept UI architecture"
 ```
 
