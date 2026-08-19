@@ -4,3 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
+
+[dependencies]
+dedup-core = { path = "../../crates/core" }
+dedup-node-engine = { path = "../../crates/node-engine" }
+dedup-windows = { path = "../../crates/windows" }
+slint.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[build-dependencies]
+slint-build.workspace = true

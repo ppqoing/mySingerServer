@@ -1,7 +1,8 @@
 //! 媒体计算子进程入口；只负责匿名管道协议与媒体流水线装配。
 
-use std::{env, fs, process};
+use std::{env, process, sync::Mutex};
 
+use dedup_core::logging::SizeRotatingWriter;
 use dedup_media_ffmpeg::Ffmpeg;
 use dedup_node_engine::worker::{FfmpegDecoder, WorkerPipeline, handle_worker_request};
 use dedup_protocol::proto::{self, worker_envelope};
@@ -47,13 +48,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 /// 使用同步文件 writer，避免后台日志线程在 Worker 被 Job 强制结束时持有额外生命周期。
 fn initialize_file_log(layout: &AppLayout) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let directory = layout.node_logs();
-    fs::create_dir_all(&directory)?;
-    let filename = format!("worker-{}.log", process::id());
-    let appender = tracing_appender::rolling::never(directory, filename);
+    let writer = SizeRotatingWriter::production(directory, format!("worker-{}", process::id()))?;
     tracing_subscriber::fmt()
         .with_ansi(false)
         .with_target(false)
-        .with_writer(appender)
+        .with_writer(Mutex::new(writer))
         .try_init()?;
     Ok(())
 }

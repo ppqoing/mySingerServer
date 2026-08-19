@@ -157,6 +157,17 @@ pub struct TaskSnapshot {
     pub failed: u64,
     /// 取消项数。
     pub cancelled: u64,
+    /// 任务进入 completed 时同事务可见的同步 outbox 高水位。
+    pub outbox_high_seq: u64,
+}
+
+/// 任务列表的稳定 ID 游标页。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskPage {
+    /// 当前页任务，按 UUID v7 文本升序返回。
+    pub items: Vec<TaskSnapshot>,
+    /// 仍有下一页时返回最后一个任务 ID。
+    pub next_cursor: Option<String>,
 }
 
 /// 用于诊断恢复结果的单项快照。
@@ -177,6 +188,19 @@ impl NodeStore {
             |row| row.get(0),
         )?;
         Ok(count > 0)
+    }
+
+    /// 返回所有任务项中 queued 与 running 的当前数量，供节点状态展示。
+    pub fn task_activity_counts(&self) -> Result<(u64, u64), StoreError> {
+        let (queued, running): (i64, i64) = self.connection.query_row(
+            "SELECT
+               COALESCE(SUM(CASE WHEN status='queued' THEN 1 ELSE 0 END),0),
+               COALESCE(SUM(CASE WHEN status='running' THEN 1 ELSE 0 END),0)
+             FROM task_items",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok((queued as u64, running as u64))
     }
     /// 在枚举前创建扫描任务并持久化规范扫描根。
     pub fn create_scan_task(
@@ -339,7 +363,10 @@ impl NodeStore {
         };
         transaction.execute(
             "UPDATE tasks SET status=?2,event_seq=event_seq+1,
-               succeeded=?3,failed_items=?4,cancelled=?5,updated_at_ms=?6
+               succeeded=?3,failed_items=?4,cancelled=?5,updated_at_ms=?6,
+               outbox_high_seq=CASE WHEN ?2='completed' THEN
+                 COALESCE((SELECT seq FROM sqlite_sequence WHERE name='sync_outbox'),0)
+                 ELSE outbox_high_seq END
              WHERE task_id=?1",
             params![
                 task_id_text,
@@ -389,6 +416,41 @@ impl NodeStore {
         }
         transaction.commit()?;
         Ok(changed)
+    }
+
+    /// 在 Worker 计划重启的 prepare 与 restart 之间原子重排指定 running 项。
+    pub fn requeue_planned_items(
+        &mut self,
+        item_ids: &[String],
+        now_ms: i64,
+    ) -> Result<(), StoreError> {
+        let transaction = self.connection.transaction()?;
+        let mut task_ids = HashSet::new();
+        for item_id in item_ids {
+            let (task_id, status): (String, String) = transaction.query_row(
+                "SELECT task_id,status FROM task_items WHERE item_id=?1",
+                [item_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if status != "running" {
+                return Err(StoreError::InvalidState(format!(
+                    "计划重启项 {item_id} 不处于 running"
+                )));
+            }
+            transaction.execute(
+                "UPDATE task_items SET status='queued' WHERE item_id=?1",
+                [item_id],
+            )?;
+            task_ids.insert(task_id);
+        }
+        for task_id in task_ids {
+            transaction.execute(
+                "UPDATE tasks SET status='queued',updated_at_ms=?2 WHERE task_id=?1",
+                params![task_id, now_ms],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     /// 把枚举或任务级基础设施失败记录为 scan failed；不会失效旧位置。
@@ -501,7 +563,9 @@ impl NodeStore {
             )?;
         }
         transaction.execute(
-            "UPDATE tasks SET status='completed',event_seq=event_seq+1,updated_at_ms=?2
+            "UPDATE tasks SET status='completed',event_seq=event_seq+1,updated_at_ms=?2,
+               outbox_high_seq=COALESCE(
+                 (SELECT seq FROM sqlite_sequence WHERE name='sync_outbox'),0)
              WHERE task_id=?1",
             params![task_id.as_uuid().to_string(), now_ms],
         )?;
@@ -512,7 +576,8 @@ impl NodeStore {
     /// 读取一个任务的持久化统计。
     pub fn task_snapshot(&self, task_id: TaskId) -> Result<TaskSnapshot, StoreError> {
         let row = self.connection.query_row(
-            "SELECT kind,status,event_seq,total_items,succeeded,failed_items,cancelled
+            "SELECT kind,status,event_seq,total_items,succeeded,failed_items,cancelled,
+                    outbox_high_seq
              FROM tasks WHERE task_id=?1",
             [task_id.as_uuid().to_string()],
             |row| {
@@ -524,6 +589,7 @@ impl NodeStore {
                     row.get::<_, i64>(4)?,
                     row.get::<_, i64>(5)?,
                     row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
                 ))
             },
         )?;
@@ -536,7 +602,58 @@ impl NodeStore {
             succeeded: row.4 as u64,
             failed: row.5 as u64,
             cancelled: row.6 as u64,
+            outbox_high_seq: row.7 as u64,
         })
+    }
+
+    /// 按任务 ID 稳定分页，供管理端恢复后发现已有任务。
+    pub fn page_tasks(&self, cursor: Option<&str>, limit: usize) -> Result<TaskPage, StoreError> {
+        if limit == 0 {
+            return Err(StoreError::EmptyPageLimit);
+        }
+        let cursor = cursor.unwrap_or("");
+        let mut statement = self.connection.prepare_cached(
+            "SELECT task_id,kind,status,event_seq,total_items,succeeded,failed_items,cancelled,
+                    outbox_high_seq
+             FROM tasks WHERE task_id>?1 ORDER BY task_id LIMIT ?2",
+        )?;
+        let raw = statement
+            .query_map(params![cursor, (limit + 1) as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let has_more = raw.len() > limit;
+        let items = raw
+            .into_iter()
+            .take(limit)
+            .map(|row| {
+                Ok(TaskSnapshot {
+                    task_id: parse_task_id(&row.0)?,
+                    kind: row.1,
+                    status: TaskStatus::parse(&row.2)?,
+                    event_seq: row.3 as u64,
+                    total_items: row.4 as u64,
+                    succeeded: row.5 as u64,
+                    failed: row.6 as u64,
+                    cancelled: row.7 as u64,
+                    outbox_high_seq: row.8 as u64,
+                })
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?;
+        let next_cursor = has_more
+            .then(|| items.last().map(|task| task.task_id.as_uuid().to_string()))
+            .flatten();
+        Ok(TaskPage { items, next_cursor })
     }
 
     /// 按稳定 item ID 返回任务项状态，供恢复诊断与 UI 使用。

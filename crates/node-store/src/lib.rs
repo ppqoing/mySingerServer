@@ -25,12 +25,12 @@ pub use groups::{
 pub use open::{NodeStore, StoreError};
 pub use review::ReviewDecision;
 pub use rows::{
-    CacheLookup, CompleteStage1, CompleteStage2, ContentId, ContentRecord, FeatureWrite,
-    ImageStage1Fields, ScannedPath, SnapshotPage, SnapshotRow, SyncBatch, SyncState,
+    ActiveFile, CacheLookup, CompleteStage1, CompleteStage2, ContentId, ContentRecord,
+    FeatureWrite, ImageStage1Fields, ScannedPath, SnapshotPage, SnapshotRow, SyncBatch, SyncState,
     VideoFrameStage1Fields, VideoFrameStage2Fields, VideoMetadataFields,
 };
 pub use snapshot::Snapshot;
 pub use tasks::{
     ClaimedTaskItem, NewTaskItem, TaskEvent, TaskItemCompletion, TaskItemSnapshot, TaskItemStatus,
-    TaskSnapshot, TaskStatus,
+    TaskPage, TaskSnapshot, TaskStatus,
 };

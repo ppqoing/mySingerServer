@@ -189,6 +189,38 @@ Worker 只返回实际探测类型和拥有所有权的特征，NodeStore 负责
 候选最终状态与精确/图片/视频组分别用整批事务替换，结果可在关闭并重开 SQLite 后通过分页 API
 和复核 API 完整恢复，管理端不需要也不得直接读取节点数据库。
 
+节点组合由 `dedup-node-engine::actor`、`server`、`preview` 和 `delete` 四个边界完成。
+`NodeRuntime::start` 先经 `IdentityProvider` 取得物理 MachineId；生产入口只能使用
+`SmbiosIdentityProvider`，`FixedIdentityProvider` 只供测试，MachineId 不进入配置文件。运行时随后
+打开 `data/node/node.db`、恢复遗留 running 项、创建唯一 WorkerPool、绑定 TCP listener，再启动
+唯一 NodeEngine actor。actor 通过容量 64 的命令通道串行独占 `NodeStore` 与 `WorkerPool`；网络
+handler、托盘回调和后续桌面会话都只持有可克隆 `NodeEngineHandle`，不能直接访问 SQLite。
+
+节点 TCP 首帧必须是协议版本 2、产品标识 `mysingerserver-rust-v2` 的 Hello。一个节点同时只接受
+一个管理连接，第二连接立即收到 `NodeBusy`；已取得名额的连接使用 request_id 并发处理多个请求，
+独立写任务串行输出响应。连接断开释放名额，服务关闭会停止 listener 并终止连接任务。actor 已
+统一接入状态、任务查询/取消、路径浏览、扫描、本地分析、结果分页、复核、分析输入、同步、预览
+和删除；快照、跨机器批量二筛及删除失败项重试分别由后续同步、中心分析和复核任务扩展同一入口，
+不得另建旁路协议。
+
+`tasks.outbox_high_seq` 是任务终态的一部分：普通计算任务在最后一项完成事务中、扫描任务在路径
+失效和完成事务中，保存当时 SQLite outbox 的真实高水位。管理端只能用这个持久值等待 PostgreSQL
+游标，不能把查询时全库最高序号冒充某任务高水位。节点状态中的 queued/running 项数也直接来自
+SQLite，Worker 忙碌数来自唯一 WorkerPool，不由 TCP 层维护第二份事实。
+
+预览只接受当前活动 `LocationKey`。图片 `original` 直接 seek 并读取原文件，每块最多 1 MiB，
+不创建目录或缩略图；视频 `contact_sheet` 只读取一筛已经写入 `data/node/cache/contact-sheets`
+的 JPG。删除执行顺序固定为活动位置→实际大小→1 MiB 缓冲流式 MD5→文件系统操作；默认回收站
+在短生命周期 STA 线程调用 Windows `IFileOperation` 和允许撤销标志，永久删除才调用
+`std::fs::remove_file`。所有结果整批交回 NodeStore；只有 recycled/deleted 写墓碑并立即缩组。
+
+`dedup-core::logging::SizeRotatingWriter` 是三个进程共用的同步日志边界，生产固定 20 MiB、包含
+当前文件在内保留 10 个文件。`node.exe` 首次启动只写 `data/node/config.toml`，Release 使用
+Windows 子系统且不创建控制台；Slint `SystemTrayIcon` 复用旧托盘图标的独立副本，菜单只包含
+运行状态、监听地址、打开日志目录、重启计算引擎和退出节点。重启严格执行 WorkerPool prepare、
+SQLite 单事务 requeue、Worker terminate/recreate/Ready；退出先停 listener，再关闭 actor 并释放
+Job Object。托盘回调只映射 `TrayCommand`，重复 Exit 不会发送第二次关闭。
+
 ## 5. 同步与分析状态机
 
 扫描先生成文件列表，再以“机器 ID + 规范路径 + 文件大小”批量查询 SQLite。命中位置缓存
@@ -280,15 +312,19 @@ SMBIOS 读取以及 loopback TCP 请求复用测试已执行通过。固定像�
 128 维 Sobel、PDQ band 候选和图片两层联合筛选的位序/阈值测试也已通过。六帧中点、
 有效/缺失槽位平均规则以及 3×2 JPG 联系表测试已通过。SQLite V2 schema、路径缓存、内容复用、
 图片/视频特征完整性、事务 outbox、ACK 裁剪与稳定快照测试已通过。任务恢复、分析状态链、
-冻结输入、稳定组分页、复核恢复和删除后缩组测试也已通过。节点服务和 UI 将在后续任务按本文件
+冻结输入、稳定组分页、复核恢复和删除后缩组测试也已通过；桌面管理 UI 将在后续任务按本文件
 架构填充。FFmpeg 固定供应清单、无 EXE 发布、受限 DLL 搜索、缺失 DLL 报错、JPEG/MP4 探测和
 MP4 首尾 RGB24 解码集成测试已通过。真实 worker.exe 的 Ready、图片一筛结果、连续调度、
-计划重启、意外退出补建、取消替换和 Job 关闭清理进程测试已通过；节点 actor 与 SQLite 的最终
-装配留在后续任务。扫描阶段的 Walker 全文件契约、Everything 不可用明确错误、路径大小缓存、
+计划重启、意外退出补建、取消替换和 Job 关闭清理进程测试已通过，节点 actor、SQLite、WorkerPool
+与 TCP listener 已由 NodeRuntime 完成装配。扫描阶段的 Walker 全文件契约、Everything 不可用明确错误、路径大小缓存、
 强制重算、已有内容复用、不完整内容跳过、局部根失效和失败不失效测试已通过；扫描一筛生产适配器
 已经直接连接 WorkerPool，节点 actor 后续只负责生命周期和命令串行化，不重新实现扫描规则。
 纯 SQLite 本地分析的活动任务门禁、失败/取消重选、精确组、图片与视频一筛、二筛缓存零派发、
 单端缺失、partial 精确重试、代表直连不传递、稳定成员分页及关闭重开后的复核恢复测试已通过。
+节点单管理连接、连接内并发、actor 命令边界、任务高水位、原图/联系表分块、永久删除复核、
+删除后缩组、20 MiB×10 日志和无 GUI 托盘命令状态测试已通过；Slint SystemTrayIcon 声明与
+`node.exe` 已完成真实 MSVC 编译。实际托盘图标、右键菜单、回收站恢复和有序退出仍必须在最终
+computer-use 验收中单独执行，当前不据静态测试标记为 GUI PASS。
 静态测试、集成测试、发布包验证和 Windows 实际 GUI/托盘/回收站验收必须分开记录。没有实际
 运行的 GUI、托盘、回收站、第二台物理主机或 PostgreSQL 项不得标记 PASS；可用双节点进程
 集成测试证明协议与编排，但真实双物理机不可用时仍标 `BLOCKED`。

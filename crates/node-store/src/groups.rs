@@ -69,6 +69,10 @@ pub struct StoredGroup {
     pub kind: GroupKind,
     /// 当前代表内容；删除代表后会在原组内更新。
     pub representative: ContentKey,
+    /// 当前活动成员数量。
+    pub member_count: u32,
+    /// 除代表位置外所有活动成员的可释放字节估算。
+    pub reclaimable_bytes: u64,
 }
 
 /// 一个重复组分页结果。
@@ -164,6 +168,17 @@ impl NodeStore {
         cursor: Option<&str>,
         limit: usize,
     ) -> Result<GroupPage, StoreError> {
+        self.page_groups_filtered(run_id, None, cursor, limit)
+    }
+
+    /// 使用同一稳定游标分页，并可限制为精确、图片或视频一种组。
+    pub fn page_groups_filtered(
+        &self,
+        run_id: AnalysisRunId,
+        kind_filter: Option<GroupKind>,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<GroupPage, StoreError> {
         if limit == 0 {
             return Err(StoreError::EmptyPageLimit);
         }
@@ -179,16 +194,22 @@ impl NodeStore {
             })
             .unwrap_or((None, None, None, None));
         let mut statement = self.connection.prepare_cached(
-            "SELECT group_id,group_kind,representative_md5,representative_size
-             FROM duplicate_groups
-             WHERE analysis_run_id=?1 AND (
-               ?2 IS NULL OR group_kind>?2 OR
-               (group_kind=?2 AND representative_md5>?3) OR
-               (group_kind=?2 AND representative_md5=?3 AND representative_size>?4) OR
-               (group_kind=?2 AND representative_md5=?3 AND representative_size=?4 AND group_id>?5)
+            "SELECT dg.group_id,dg.group_kind,dg.representative_md5,dg.representative_size,
+                    COUNT(gm.normalized_path),
+                    COALESCE(SUM(CASE WHEN gm.representative=0 THEN gm.file_size ELSE 0 END),0)
+             FROM duplicate_groups dg
+             JOIN group_members gm ON gm.analysis_run_id=dg.analysis_run_id
+               AND gm.group_id=dg.group_id AND gm.active=1
+             WHERE dg.analysis_run_id=?1 AND (
+               ?2 IS NULL OR dg.group_kind>?2 OR
+               (dg.group_kind=?2 AND dg.representative_md5>?3) OR
+               (dg.group_kind=?2 AND dg.representative_md5=?3 AND dg.representative_size>?4) OR
+               (dg.group_kind=?2 AND dg.representative_md5=?3 AND dg.representative_size=?4 AND dg.group_id>?5)
              )
-             ORDER BY group_kind,representative_md5,representative_size,group_id
-             LIMIT ?6",
+             AND (?6 IS NULL OR dg.group_kind=?6)
+             GROUP BY dg.analysis_run_id,dg.group_id
+             ORDER BY dg.group_kind,dg.representative_md5,dg.representative_size,dg.group_id
+             LIMIT ?7",
         )?;
         let raw = statement
             .query_map(
@@ -198,6 +219,7 @@ impl NodeStore {
                     md5,
                     size,
                     group_id,
+                    kind_filter.map(GroupKind::as_str),
                     i64::try_from(limit + 1).map_err(|_| StoreError::EmptyPageLimit)?
                 ],
                 |row| {
@@ -206,22 +228,28 @@ impl NodeStore {
                         row.get::<_, String>(1)?,
                         row.get::<_, Vec<u8>>(2)?,
                         row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
                     ))
                 },
             )?
             .collect::<Result<Vec<_>, _>>()?;
         let mut items = raw
             .into_iter()
-            .map(|(group_id, kind, md5, size)| {
-                Ok(StoredGroup {
-                    group_id,
-                    kind: GroupKind::parse(&kind)?,
-                    representative: ContentKey::new(
-                        fixed_bytes(md5, "duplicate_groups.representative_md5")?,
-                        size as u64,
-                    ),
-                })
-            })
+            .map(
+                |(group_id, kind, md5, size, member_count, reclaimable_bytes)| {
+                    Ok(StoredGroup {
+                        group_id,
+                        kind: GroupKind::parse(&kind)?,
+                        representative: ContentKey::new(
+                            fixed_bytes(md5, "duplicate_groups.representative_md5")?,
+                            size as u64,
+                        ),
+                        member_count: member_count as u32,
+                        reclaimable_bytes: reclaimable_bytes as u64,
+                    })
+                },
+            )
             .collect::<Result<Vec<_>, StoreError>>()?;
         let has_more = items.len() > limit;
         items.truncate(limit);

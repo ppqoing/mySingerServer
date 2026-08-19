@@ -193,6 +193,7 @@ message ListGroupMembers {
   uint32 limit = 3;
   repeated GroupMember members = 4;
   string next_cursor = 5;
+  string analysis_run_id = 6;
 }
 
 message GroupMember {
@@ -210,6 +211,7 @@ message SaveReviewMark {
   string group_id = 1;
   LocationKey location = 2;
   ReviewDecision decision = 3;
+  string analysis_run_id = 4;
 }
 
 message PrepareAnalysisInput {
@@ -292,6 +294,8 @@ message CreateDeleteBatch {
   string delete_batch_id = 1;
   DeleteMode mode = 2;
   repeated DeleteItem items = 3;
+  string analysis_run_id = 4;
+  repeated string group_ids = 5;
 }
 
 message DeleteItem {
@@ -299,6 +303,8 @@ message DeleteItem {
   string group_id = 2;
   LocationKey location = 3;
   ContentKey expected_content = 4;
+  string outcome = 5;
+  string message = 6;
 }
 
 message RetryDeleteItems {

@@ -21,6 +21,7 @@ md-5.workspace = true
 prost.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

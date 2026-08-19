@@ -1,6 +1,6 @@
 //! SQLite 边界使用的行值对象、完整特征结果和同步分页结构。
 
-use dedup_core::{ContentKey, DisplayPath, NormalizedPath};
+use dedup_core::{ContentKey, DisplayPath, MediaKind, NormalizedPath};
 use dedup_media::{ImageStage1, ImageStage2, PdqHash};
 use dedup_protocol::proto;
 
@@ -77,6 +77,19 @@ pub struct ContentRecord {
     pub key: ContentKey,
     /// 内容行是否在本次调用前已经存在。
     pub reused: bool,
+}
+
+/// 预览和删除边界读取的当前活动文件身份。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActiveFile {
+    /// SQLite 内部内容 ID，只用于继续查询节点本地特征。
+    pub content_id: ContentId,
+    /// 扫描时确认的 MD5 与大小。
+    pub content_key: ContentKey,
+    /// 保留原始拼写并用于实际文件访问的绝对路径。
+    pub display_path: DisplayPath,
+    /// FFmpeg 实际探测后保存的媒体类别。
+    pub media_kind: MediaKind,
 }
 
 /// 允许保存部分图片一筛字段，以便失败项在数据库中保持可诊断状态。

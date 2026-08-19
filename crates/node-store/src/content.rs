@@ -1,10 +1,10 @@
 //! 批量路径缓存查询，以及 MD5 索引后按文件大小确认的内容/位置事务。
 
-use dedup_core::{ContentKey, MediaKind};
+use dedup_core::{ContentKey, LocationKey, MediaKind};
 use rusqlite::{OptionalExtension, Transaction, params};
 
 use crate::{
-    CacheLookup, ContentId, ContentRecord, NodeStore, ScannedPath, StoreError,
+    ActiveFile, CacheLookup, ContentId, ContentRecord, NodeStore, ScannedPath, StoreError,
     open::{fixed_bytes, sqlite_integer},
     outbox::append_sync_change,
     rows::RowEncoder,
@@ -228,6 +228,63 @@ impl NodeStore {
             ))
         })
         .transpose()
+    }
+
+    /// 按完整位置键返回当前活动文件；预览和删除不会使用历史位置。
+    pub fn active_file(&self, location: &LocationKey) -> Result<Option<ActiveFile>, StoreError> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT f.content_id,c.md5,c.file_size,f.display_path,c.media_kind
+                 FROM files f JOIN contents c ON c.content_id=f.content_id
+                 WHERE f.machine_id=?1 AND f.normalized_path=?2 AND f.active=1",
+                params![
+                    location.machine_id().as_str(),
+                    location.normalized_path().as_str()
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(|(content_id, md5, file_size, display_path, media_kind)| {
+            Ok(ActiveFile {
+                content_id: ContentId::from_i64(content_id),
+                content_key: ContentKey::new(fixed_bytes(md5, "contents.md5")?, file_size as u64),
+                display_path: dedup_core::DisplayPath::new(display_path)?,
+                media_kind: parse_media_kind(&media_kind)?,
+            })
+        })
+        .transpose()
+    }
+
+    /// 返回视频内容已生成的 JPEG 联系表相对缓存路径。
+    pub fn contact_sheet_path(&self, content_id: ContentId) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT relative_path FROM contact_sheets WHERE content_id=?1",
+                [content_id.as_i64()],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+}
+
+fn parse_media_kind(value: &str) -> Result<MediaKind, StoreError> {
+    match value {
+        "image" => Ok(MediaKind::Image),
+        "video" => Ok(MediaKind::Video),
+        "other" => Ok(MediaKind::Other),
+        _ => Err(StoreError::InvalidState(format!(
+            "未知内容媒体类型: {value}"
+        ))),
     }
 }
 

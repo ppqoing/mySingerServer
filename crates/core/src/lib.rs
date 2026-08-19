@@ -5,6 +5,7 @@ mod config;
 mod error;
 mod grouping;
 mod ids;
+pub mod logging;
 mod model;
 mod path;
 mod thresholds;

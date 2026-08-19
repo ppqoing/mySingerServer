@@ -82,6 +82,7 @@ CREATE TABLE tasks (
     succeeded     INTEGER NOT NULL DEFAULT 0,
     failed_items  INTEGER NOT NULL DEFAULT 0,
     cancelled     INTEGER NOT NULL DEFAULT 0,
+    outbox_high_seq INTEGER NOT NULL DEFAULT 0,
     created_at_ms INTEGER NOT NULL,
     updated_at_ms INTEGER NOT NULL
 ) STRICT;
