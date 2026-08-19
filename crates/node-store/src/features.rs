@@ -158,6 +158,36 @@ impl NodeStore {
         }
     }
 
+    /// 把本机已经完整保存的联合二筛特征重新写入 outbox，供中心缓存缺口按需补同步。
+    ///
+    /// 返回 `false` 表示本机缓存也不完整，调用方随后才需要启动 Worker；已有结果不会
+    /// 重新解码媒体。视频会重新发布每个一筛成功槽位，保持中心完整性判定不变。
+    pub fn republish_complete_stage2(&mut self, content_id: ContentId) -> Result<bool, StoreError> {
+        let Some(features) = self.load_complete_stage2(content_id)? else {
+            return Ok(false);
+        };
+        match features {
+            CompleteStage2::Image(feature) => {
+                self.commit_feature_result(content_id, None, FeatureWrite::ImageStage2(*feature))?;
+            }
+            CompleteStage2::Video(frames) => {
+                for (slot, feature) in frames.iter().enumerate() {
+                    if let Some(feature) = feature {
+                        self.commit_feature_result(
+                            content_id,
+                            None,
+                            FeatureWrite::VideoFrameStage2(VideoFrameStage2Fields {
+                                slot: slot as u8,
+                                features: *feature,
+                            }),
+                        )?;
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+
     fn load_image_stage1(&self, content_id: ContentId) -> Result<Option<ImageStage1>, StoreError> {
         let row: Option<(u32, u32, Vec<u8>, u8)> = self
             .connection

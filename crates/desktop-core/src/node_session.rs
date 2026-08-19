@@ -2,7 +2,7 @@
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-use dedup_core::{CoreError, MachineId, NodeEndpoint, product_id};
+use dedup_core::{AnalysisRunId, CoreError, MachineId, NodeEndpoint, TaskId, product_id};
 use dedup_protocol::{PROTOCOL_VERSION, proto};
 use dedup_transport::{ClientConnection, TransportError};
 use thiserror::Error;
@@ -28,6 +28,9 @@ pub enum SessionError {
     /// 节点状态中的机器 ID 不是规范物理标识。
     #[error(transparent)]
     Core(#[from] CoreError),
+    /// 节点响应中的任务 ID 不是 UUID。
+    #[error("节点返回无效任务 ID: {0}")]
+    InvalidTaskId(String),
 }
 
 /// `desktop.exe` 与一个手工 IP:port 之间的已握手 V2 连接。
@@ -177,6 +180,77 @@ impl NodeSession {
             proto::envelope::Payload::ReadSnapshotPage(page) => Ok(page),
             _ => Err(SessionError::UnexpectedResponse("ReadSnapshotPage")),
         }
+    }
+
+    /// 查询一个持久节点任务的当前状态和真实 outbox 高水位。
+    pub async fn query_task(&self, task_id: TaskId) -> Result<proto::TaskSummary, SessionError> {
+        let response = self
+            .connection
+            .request(proto::envelope::Payload::QueryTask(proto::QueryTask {
+                task_id: task_id.as_uuid().to_string(),
+                task: None,
+            }))
+            .await?;
+        match payload_or_error(response)? {
+            proto::envelope::Payload::QueryTask(response) => response
+                .task
+                .ok_or(SessionError::UnexpectedResponse("QueryTask.task")),
+            _ => Err(SessionError::UnexpectedResponse("QueryTask")),
+        }
+    }
+
+    /// 分页读取所选已完成扫描任务对应的当前活动内容位置及本机缓存完整性。
+    pub async fn prepare_analysis_input(
+        &self,
+        run_id: AnalysisRunId,
+        scan_task_ids: &[TaskId],
+        cursor: &str,
+        limit: u32,
+    ) -> Result<proto::PrepareAnalysisInput, SessionError> {
+        let response = self
+            .connection
+            .request(proto::envelope::Payload::PrepareAnalysisInput(
+                proto::PrepareAnalysisInput {
+                    analysis_run_id: run_id.as_uuid().to_string(),
+                    cursor: cursor.into(),
+                    limit,
+                    inputs: Vec::new(),
+                    next_cursor: String::new(),
+                    scan_task_ids: scan_task_ids
+                        .iter()
+                        .map(|task_id| task_id.as_uuid().to_string())
+                        .collect(),
+                },
+            ))
+            .await?;
+        match payload_or_error(response)? {
+            proto::envelope::Payload::PrepareAnalysisInput(page) => Ok(page),
+            _ => Err(SessionError::UnexpectedResponse("PrepareAnalysisInput")),
+        }
+    }
+
+    /// 把一筛完成后汇总的缺失二筛内容作为一个节点批次派发。
+    pub async fn dispatch_stage2(
+        &self,
+        run_id: AnalysisRunId,
+        items: Vec<proto::Stage2WorkItem>,
+    ) -> Result<TaskId, SessionError> {
+        let response = self
+            .connection
+            .request(proto::envelope::Payload::DispatchStage2(
+                proto::DispatchStage2 {
+                    analysis_run_id: run_id.as_uuid().to_string(),
+                    items,
+                },
+            ))
+            .await?;
+        let accepted = match payload_or_error(response)? {
+            proto::envelope::Payload::TaskAccepted(accepted) => accepted,
+            _ => return Err(SessionError::UnexpectedResponse("TaskAccepted")),
+        };
+        uuid::Uuid::parse_str(&accepted.task_id)
+            .map(TaskId::from_uuid)
+            .map_err(|_| SessionError::InvalidTaskId(accepted.task_id))
     }
 
     /// 等待节点主动推送的任务事件；断线时返回当前会话错误，由上层重新连接。

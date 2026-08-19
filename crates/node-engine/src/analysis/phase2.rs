@@ -114,6 +114,123 @@ struct MissingWork {
     frame_slots: Vec<u8>,
 }
 
+/// 中心协调器派给一个节点的唯一内容及固定来源位置。
+#[derive(Clone, Debug)]
+pub struct Stage2BatchItem {
+    /// 需要联合二筛的跨数据库内容键。
+    pub content: ContentKey,
+    /// 中心从冻结输入中选择的本机活动位置。
+    pub source: LocationKey,
+    /// 图片为空；视频只列出双方一筛可能使用的成功槽位。
+    pub frame_slots: Vec<u8>,
+}
+
+/// 执行一个中心二筛批次；先复用并重新发布本机缓存，只有真正缺失时才调用 Worker。
+///
+/// 整个批次先持久化任务和任务项，再按稳定项顺序执行。返回的任务 ID 可由管理端查询其
+/// `outbox_high_seq`，并作为 phase2 的固定同步门禁。
+pub async fn dispatch_stage2_batch<P: Stage2Processor>(
+    store: &mut NodeStore,
+    items: &[Stage2BatchItem],
+    processor: &mut P,
+    now_ms: i64,
+) -> Result<TaskId, AnalysisBlocked> {
+    if items.is_empty() {
+        return Err(AnalysisBlocked::InvalidState("二筛批次不能为空".into()));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut work = Vec::with_capacity(items.len());
+    for requested in items {
+        if !seen.insert(requested.content) {
+            return Err(AnalysisBlocked::InvalidState(
+                "同一二筛批次不能包含重复内容".into(),
+            ));
+        }
+        let active = store
+            .active_file(&requested.source)?
+            .ok_or_else(|| AnalysisBlocked::InvalidState("二筛来源位置已失效".into()))?;
+        if active.content_key != requested.content {
+            return Err(AnalysisBlocked::InvalidState(
+                "二筛来源位置的内容已经变化".into(),
+            ));
+        }
+        let frame_slots = requested
+            .frame_slots
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if frame_slots.iter().any(|slot| *slot > 5) {
+            return Err(AnalysisBlocked::InvalidState(
+                "视频二筛槽位必须位于 0..=5".into(),
+            ));
+        }
+        work.push(MissingWork {
+            content: requested.content,
+            content_id: active.content_id,
+            location: requested.source.clone(),
+            display_path: active.display_path,
+            media_kind: active.media_kind,
+            frame_slots,
+        });
+    }
+    let task_items = work
+        .iter()
+        .map(|item| {
+            NewTaskItem::for_content(
+                item.location.clone(),
+                item.display_path.clone(),
+                item.content.file_size(),
+                item.content_id,
+                "stage2",
+            )
+        })
+        .collect::<Vec<_>>();
+    let task_id = store.create_task("analysis_stage2", &task_items, now_ms)?;
+    for _ in 0..work.len() {
+        let item = store
+            .claim_next_item(task_id, now_ms)?
+            .ok_or_else(|| AnalysisBlocked::InvalidState("二筛任务项不足".into()))?;
+        let item_content = item
+            .content_id
+            .ok_or_else(|| AnalysisBlocked::InvalidState("二筛任务项缺少内容 ID".into()))?;
+        let expected = work
+            .iter()
+            .find(|candidate| candidate.content_id == item_content)
+            .ok_or_else(|| AnalysisBlocked::InvalidState("二筛任务项不属于当前批次".into()))?;
+        let completion = if store.republish_complete_stage2(expected.content_id)? {
+            TaskItemCompletion::Succeeded {
+                content_id: Some(expected.content_id),
+            }
+        } else {
+            let request = Stage2Request {
+                task_id,
+                item_id: item.item_id.clone(),
+                content: expected.content,
+                content_id: expected.content_id,
+                display_path: expected.display_path.clone(),
+                media_kind: expected.media_kind,
+                frame_slots: expected.frame_slots.clone(),
+            };
+            match processor.process(request).await {
+                Ok(output) => {
+                    if persist_stage2(store, expected, output)? {
+                        TaskItemCompletion::Succeeded {
+                            content_id: Some(expected.content_id),
+                        }
+                    } else {
+                        TaskItemCompletion::Failed("二筛结果不完整".into())
+                    }
+                }
+                Err(error) => TaskItemCompletion::Failed(error),
+            }
+        };
+        store.complete_item(&item.item_id, completion, now_ms)?;
+    }
+    Ok(task_id)
+}
+
 /// 对未解决候选收集缺失 ContentKey，一次创建完整批次后逐项等待终态。
 pub(crate) async fn dispatch_missing<P: Stage2Processor>(
     store: &mut NodeStore,

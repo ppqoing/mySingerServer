@@ -27,7 +27,9 @@ use uuid::Uuid;
 use dedup_windows::{AppLayout, machine_id_from_fields, read_physical_machine_fields};
 
 use crate::{
-    analysis::{LocalAnalysisEngine, WorkerPoolStage2Processor},
+    analysis::{
+        LocalAnalysisEngine, Stage2BatchItem, WorkerPoolStage2Processor, dispatch_stage2_batch,
+    },
     delete::DeleteEngine,
     preview::{PreviewKind, PreviewService},
     scan::{
@@ -382,6 +384,9 @@ impl EngineState {
             Some(proto::envelope::Payload::SaveReviewMark(mark)) => self.save_review_mark(mark),
             Some(proto::envelope::Payload::PrepareAnalysisInput(query)) => {
                 self.prepare_analysis_input(query)
+            }
+            Some(proto::envelope::Payload::DispatchStage2(dispatch)) => {
+                self.dispatch_stage2(dispatch).await
             }
             Some(proto::envelope::Payload::PullChanges(pull)) => self.pull_changes(pull),
             Some(proto::envelope::Payload::SyncAck(ack)) => self.sync_ack(ack),
@@ -743,8 +748,19 @@ impl EngineState {
     }
 
     fn prepare_analysis_input(&self, request: proto::PrepareAnalysisInput) -> ProtocolResult {
-        let run_id = parse_analysis_id(&request.analysis_run_id)?;
-        let rows = self.store.analysis_inputs(run_id).map_err(store_error)?;
+        let rows = if request.scan_task_ids.is_empty() {
+            let run_id = parse_analysis_id(&request.analysis_run_id)?;
+            self.store.analysis_inputs(run_id).map_err(store_error)?
+        } else {
+            let tasks = request
+                .scan_task_ids
+                .iter()
+                .map(|task_id| parse_task_id(task_id))
+                .collect::<Result<Vec<_>, _>>()?;
+            self.store
+                .analysis_inputs_for_tasks(&tasks)
+                .map_err(store_error)?
+        };
         let mut grouped = BTreeMap::<ContentKey, Vec<LocationKey>>::new();
         for row in rows {
             grouped.entry(row.content).or_default().push(row.location);
@@ -795,6 +811,50 @@ impl EngineState {
                 } else {
                     String::new()
                 },
+                scan_task_ids: request.scan_task_ids,
+            },
+        ))
+    }
+
+    async fn dispatch_stage2(&mut self, request: proto::DispatchStage2) -> ProtocolResult {
+        parse_analysis_id(&request.analysis_run_id)?;
+        let items = request
+            .items
+            .into_iter()
+            .map(|item| {
+                let content = item
+                    .content
+                    .ok_or_else(|| invalid("二筛项缺少内容键"))?
+                    .try_into()
+                    .map_err(invalid)?;
+                let source = item
+                    .source
+                    .ok_or_else(|| invalid("二筛项缺少来源位置"))?
+                    .try_into()
+                    .map_err(invalid)?;
+                let frame_slots = item
+                    .frame_slots
+                    .into_iter()
+                    .map(|slot| u8::try_from(slot).map_err(invalid))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Stage2BatchItem {
+                    content,
+                    source,
+                    frame_slots,
+                })
+            })
+            .collect::<Result<Vec<_>, (proto::ErrorCode, String)>>()?;
+        let pool = self
+            .worker_pool
+            .as_mut()
+            .ok_or_else(|| invalid("测试节点没有 WorkerPool"))?;
+        let mut processor = WorkerPoolStage2Processor::new(pool);
+        let task_id = dispatch_stage2_batch(&mut self.store, &items, &mut processor, now_ms())
+            .await
+            .map_err(internal)?;
+        Ok(proto::envelope::Payload::TaskAccepted(
+            proto::TaskAccepted {
+                task_id: task_id.as_uuid().to_string(),
             },
         ))
     }

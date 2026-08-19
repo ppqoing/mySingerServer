@@ -2,6 +2,7 @@
 
 mod analysis;
 mod content;
+mod cross_analysis;
 mod delete;
 mod schema;
 
@@ -17,6 +18,7 @@ pub use analysis::{
     CentralReviewDecision,
 };
 pub use content::CentralSnapshot;
+pub use cross_analysis::CentralRunSnapshot;
 pub use delete::{CentralDeleteItem, CentralDeleteOutcome, CentralDeletePlan, CentralDeleteResult};
 pub use schema::validate_schema;
 

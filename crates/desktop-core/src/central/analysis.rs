@@ -618,6 +618,23 @@ impl CentralAnalysisStatus {
             Self::Cancelled => "cancelled",
         }
     }
+
+    pub(crate) fn parse(value: &str) -> Result<Self, CentralError> {
+        match value {
+            "collecting_stage1" => Ok(Self::CollectingStage1),
+            "stage1_synced" => Ok(Self::Stage1Synced),
+            "screening" => Ok(Self::Screening),
+            "phase2_dispatched" => Ok(Self::Phase2Dispatched),
+            "phase2_synced" => Ok(Self::Phase2Synced),
+            "finalizing" => Ok(Self::Finalizing),
+            "completed" => Ok(Self::Completed),
+            "partial" => Ok(Self::Partial),
+            "cancelled" => Ok(Self::Cancelled),
+            _ => Err(CentralError::InvalidState(format!(
+                "未知中心分析状态: {value}"
+            ))),
+        }
+    }
 }
 
 impl CentralPairKind {
@@ -625,6 +642,16 @@ impl CentralPairKind {
         match self {
             Self::Image => "image",
             Self::Video => "video",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self, CentralError> {
+        match value {
+            "image" => Ok(Self::Image),
+            "video" => Ok(Self::Video),
+            _ => Err(CentralError::InvalidState(format!(
+                "未知中心候选类别: {value}"
+            ))),
         }
     }
 }
@@ -636,6 +663,18 @@ impl CentralCandidateStatus {
             Self::Passed => "passed",
             Self::Rejected => "rejected",
             Self::Incomplete => "incomplete",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self, CentralError> {
+        match value {
+            "stage1_passed" => Ok(Self::Stage1Passed),
+            "passed" => Ok(Self::Passed),
+            "rejected" => Ok(Self::Rejected),
+            "incomplete" => Ok(Self::Incomplete),
+            _ => Err(CentralError::InvalidState(format!(
+                "未知中心候选状态: {value}"
+            ))),
         }
     }
 }

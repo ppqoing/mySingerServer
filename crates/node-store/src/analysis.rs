@@ -1,5 +1,7 @@
 //! 不可变分析输入、确认状态机和候选对替换事务。
 
+use std::collections::BTreeSet;
+
 use dedup_core::{
     AnalysisRunId, ContentKey, CoreError, LocationKey, MachineId, NormalizedPath, TaskId,
     Thresholds,
@@ -294,6 +296,63 @@ impl NodeStore {
                 })
             })
             .collect()
+    }
+
+    /// 从给定已完成扫描任务读取当前活动且内容一致的位置，不创建节点本地分析运行。
+    ///
+    /// 这是跨机器中心分析冻结输入的唯一节点查询。调用方把全部页收齐后在 PostgreSQL
+    /// 一次封存；节点后续新增、失效或同步的位置不会改变已经封存的中心运行。
+    pub fn analysis_inputs_for_tasks(
+        &self,
+        selected_task_ids: &[TaskId],
+    ) -> Result<Vec<AnalysisInput>, StoreError> {
+        let mut inputs = BTreeSet::<(ContentKey, LocationKey)>::new();
+        let mut rows = self.connection.prepare_cached(
+            "SELECT c.md5,c.file_size,f.machine_id,f.normalized_path
+             FROM task_items ti
+             JOIN files f ON f.machine_id=ti.machine_id
+               AND f.normalized_path=ti.normalized_path
+               AND f.content_id=ti.content_id AND f.active=1
+             JOIN contents c ON c.content_id=f.content_id
+             WHERE ti.task_id=?1 AND ti.status='succeeded'
+             ORDER BY c.md5,c.file_size,f.machine_id,f.normalized_path",
+        )?;
+        for task_id in selected_task_ids {
+            let status: Option<String> = self
+                .connection
+                .query_row(
+                    "SELECT status FROM tasks WHERE task_id=?1",
+                    [task_id.as_uuid().to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if status.as_deref() != Some("completed") {
+                return Err(StoreError::InvalidState(format!(
+                    "任务 {} 尚未 completed",
+                    task_id.as_uuid()
+                )));
+            }
+            let task_rows = rows
+                .query_map([task_id.as_uuid().to_string()], |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            for (md5, size, machine, path) in task_rows {
+                inputs.insert((
+                    ContentKey::new(fixed_bytes(md5, "contents.md5")?, size as u64),
+                    LocationKey::new(MachineId::parse(&machine)?, NormalizedPath::new(path)?),
+                ));
+            }
+        }
+        Ok(inputs
+            .into_iter()
+            .map(|(content, location)| AnalysisInput { content, location })
+            .collect())
     }
 
     /// 用一个事务替换当前运行的完整候选集合。

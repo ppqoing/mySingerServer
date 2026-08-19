@@ -10,6 +10,7 @@ path = "src/lib.rs"
 
 [dependencies]
 dedup-core = { path = "../core" }
+dedup-media = { path = "../media" }
 dedup-protocol = { path = "../protocol" }
 dedup-transport = { path = "../transport" }
 thiserror.workspace = true
@@ -19,6 +20,5 @@ toml.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-dedup-media = { path = "../media" }
 dedup-node-engine = { path = "../node-engine" }
 dedup-node-store = { path = "../node-store" }

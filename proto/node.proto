@@ -220,6 +220,7 @@ message PrepareAnalysisInput {
   uint32 limit = 3;
   repeated AnalysisInput inputs = 4;
   string next_cursor = 5;
+  repeated string scan_task_ids = 6;
 }
 
 message AnalysisInput {

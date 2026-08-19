@@ -199,9 +199,11 @@ handler、托盘回调和后续桌面会话都只持有可克隆 `NodeEngineHand
 节点 TCP 首帧必须是协议版本 2、产品标识 `mysingerserver-rust-v2` 的 Hello。一个节点同时只接受
 一个管理连接，第二连接立即收到 `NodeBusy`；已取得名额的连接使用 request_id 并发处理多个请求，
 独立写任务串行输出响应。连接断开释放名额，服务关闭会停止 listener 并终止连接任务。actor 已
-统一接入状态、任务查询/取消、路径浏览、扫描、本地分析、结果分页、复核、分析输入、同步、预览
-和删除；快照、跨机器批量二筛及删除失败项重试分别由后续同步、中心分析和复核任务扩展同一入口，
-不得另建旁路协议。
+统一接入状态、任务查询/取消、路径浏览、扫描、本地分析、结果分页、复核、分析输入、跨机器批量
+二筛、同步、快照、预览和删除，不得另建旁路协议。`PrepareAnalysisInput.scan_task_ids` 直接表达
+中心运行选择的扫描任务；节点只从这些已完成任务的 succeeded 项连接当前活动位置，不创建伪本地
+分析运行。`DispatchStage2` 先把整批唯一内容保存为 `analysis_stage2` 任务：SQLite 已有完整二筛时
+只重新发布特征 outbox，不启动 Worker；本机也缺失时才调用唯一 WorkerPool 计算并保存。
 
 `tasks.outbox_high_seq` 是任务终态的一部分：普通计算任务在最后一项完成事务中、扫描任务在路径
 失效和完成事务中，保存当时 SQLite outbox 的真实高水位。管理端只能用这个持久值等待 PostgreSQL
@@ -276,9 +278,30 @@ SQLite 的业务更新与 outbox 递增序号同事务提交。ACK 只前进、�
 事务更新 delete item、位置、重复组、`deletion_tombstones` 与 file/tombstone 两条 outbox；中心
 墓碑以机器/路径 UPSERT，因此即时删除结果更新组后再收到同一墓碑仍然幂等。
 
-跨机器分析先冻结节点集合、各节点 task highwater 和 sync highwater。中心使用完整 stage1
-数据批量生成候选，一筛结束后才批量派发缺失 stage2；数据库已有二筛结果时不派发。所有节点
-计算完成且 stage2 同步过高水位后才最终筛选。失败运行保持 `partial`，显式重试只补缺失项。
+跨机器分析由 `dedup-desktop-core::analysis::CrossAnalysisCoordinator` 负责，公开入口固定为
+`start`、`poll` 和 `retry_unresolved`。`start` 保存节点、扫描任务、创建时状态以及当时已知的两个
+高水位；`poll` 每次都重新查询节点任务真实 `outbox_high_seq`，调用同一 `SyncEngine` 追赶中心，
+再使用纯函数门禁判断，不让 UI 或网络层自行推断阶段。stage1 只有全部所选任务 `completed` 且
+各机器 PG cursor 达到各任务 highwater 才继续；queued/running/failed/cancelled 或游标落后都保持
+`collecting_stage1`，不生成部分候选。
+
+门禁通过后，协调器按节点把同机所选任务合并分页读取，以 `(ContentKey,LocationKey)` 排序去重，
+在 PostgreSQL 单事务插入 `analysis_run_inputs` 并封存。后续自动同步的新位置不进入既有运行；重试
+选择二筛来源时也只允许冻结位置。中心特征查询始终从冻结输入反向连接 `contents` 和特征表：图片
+缺任一宽高、PDQ、Quality 就跳过；视频必须有六槽记录、至少四个成功完整帧。图片按带位置四 band
+建索引，视频按“槽位、band 位置、band 值”做并集，再调用与本地分析相同的完整评分函数。
+
+一筛的完整 Candidate 集合必须先由 `replace_candidates` 提交，之后才能规划二筛。规划先跳过 PG
+已有完整 stage2 的内容；PG 缺失时优先选择报告本机 SQLite 已缓存结果的在线节点，否则按
+`(MachineId,NormalizedPath)` 选择在线活动位置。内容按节点归并，每个协议批次最多 1000 项，图片
+不带槽位，视频只带一筛成功槽位。同机缓存命中仍派发一个持久任务来重新发布 outbox，但不会解码；
+返回的任务 ID 追加到 `analysis_run_nodes`，其真实完成 highwater 构成新的 phase2 门禁。
+
+phase2 对 queued/running 或游标落后继续等待；completed/failed/cancelled 都视为终态，随后只以 PG
+特征完整性决定结果。任一候选缺一端完整联合特征即保存 `Incomplete` 并进入 `partial`，绝不以零分
+拒绝。`retry_unresolved` 先重新读取 PG，已同步完整者直接复用，只对仍为 Incomplete 的唯一内容
+重新选择节点和派发。全部完整后用共享 `dedup-core::group_by_representative` 生成代表直连组，精确
+组按同一 ContentKey 的冻结位置生成；候选、直接证据分数、最终组和成员均由 PostgreSQL 事务保存。
 
 中心 PostgreSQL 只接受管理员在空库手动执行 `deploy/central-v2.sql`。脚本使用
 `schema_metadata.schema_id=mysingerserver-rust-v2` 标记全新且不兼容的产品 schema，建立节点、
@@ -375,6 +398,10 @@ computer-use 验收中单独执行，当前不据静态测试标记为 GUI PASS�
 首 ACK 收敛、快照中断整次重来、同端点断开重连和连接 Drop 释放单管理名额。真实 PostgreSQL
 测试另已覆盖图片/视频 stage1+stage2、六帧、位置活动状态、删除墓碑、全量快照替换与未提交
 快照 Drop 回滚；联系表 outbox 被中心明确忽略，PostgreSQL 不存在联系表或原媒体表。
+跨机器编排的纯测试已覆盖 stage1/phase2 双门禁、完整一筛、PG 缓存跳过、节点缓存零 Worker 重发、
+确定性节点选择、Incomplete 语义和 A-B-C 代表不传递。另已在真实 loopback TCP、节点 SQLite 与
+PostgreSQL 容器上执行整链集成：扫描任务查询、outbox 同步、输入封存、中心图片两筛缓存复用和
+最终图片组均通过；第二台物理主机仍留到最终验收，不由该 loopback 测试冒充。
 静态测试、集成测试、发布包验证和 Windows 实际 GUI/托盘/回收站验收必须分开记录。没有实际
 运行的 GUI、托盘、回收站、第二台物理主机或 PostgreSQL 项不得标记 PASS；可用双节点进程
 集成测试证明协议与编排，但真实双物理机不可用时仍标 `BLOCKED`。

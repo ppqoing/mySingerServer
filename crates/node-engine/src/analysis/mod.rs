@@ -15,7 +15,10 @@ use dedup_node_store::{
 };
 use thiserror::Error;
 
-pub use phase2::{Stage2Processor, Stage2Request, WorkerPoolStage2Processor};
+pub use phase2::{
+    Stage2BatchItem, Stage2Processor, Stage2Request, WorkerPoolStage2Processor,
+    dispatch_stage2_batch,
+};
 
 use grouping::final_groups;
 use image::image_candidates;
