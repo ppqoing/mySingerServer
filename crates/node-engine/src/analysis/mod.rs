@@ -22,6 +22,7 @@ pub use phase2::{
 
 use grouping::final_groups;
 use image::image_candidates;
+pub(crate) use phase2::{Stage2BatchPlan, begin_stage2_batch, run_stage2_batch};
 use phase2::{dispatch_missing, evaluate_candidates};
 use video::video_candidates;
 
@@ -72,6 +73,19 @@ pub struct LocalAnalysisReport {
 pub struct LocalAnalysisEngine;
 
 impl LocalAnalysisEngine {
+    /// 通过开始门禁，持久化真实运行 ID 并冻结输入；媒体工作可在后台继续。
+    pub fn begin(
+        store: &mut NodeStore,
+        selected_tasks: &[TaskId],
+        thresholds: Thresholds,
+        now_ms: i64,
+    ) -> Result<AnalysisRunId, AnalysisBlocked> {
+        ensure_start_gate(store, selected_tasks)?;
+        let run_id = store.create_analysis_run(AnalysisMode::Local, thresholds, now_ms)?;
+        store.freeze_analysis_inputs(run_id, selected_tasks, now_ms)?;
+        Ok(run_id)
+    }
+
     /// 冻结所选 completed 任务并完成精确、一筛、按需二筛和最终分组。
     pub async fn start<P: Stage2Processor>(
         store: &mut NodeStore,
@@ -80,12 +94,21 @@ impl LocalAnalysisEngine {
         processor: &mut P,
         now_ms: i64,
     ) -> Result<LocalAnalysisReport, AnalysisBlocked> {
-        ensure_start_gate(store, selected_tasks)?;
-        let run_id = store.create_analysis_run(AnalysisMode::Local, thresholds, now_ms)?;
-        store.freeze_analysis_inputs(run_id, selected_tasks, now_ms)?;
+        let run_id = Self::begin(store, selected_tasks, thresholds, now_ms)?;
+        Self::run_existing(store, run_id, processor, now_ms).await
+    }
+
+    /// 从已持久化且已冻结输入的本地运行继续筛选、二筛和最终分组。
+    pub async fn run_existing<P: Stage2Processor>(
+        store: &mut NodeStore,
+        run_id: AnalysisRunId,
+        processor: &mut P,
+        now_ms: i64,
+    ) -> Result<LocalAnalysisReport, AnalysisBlocked> {
         store.transition_analysis_run(run_id, AnalysisStatus::Stage1Synced, now_ms)?;
         store.transition_analysis_run(run_id, AnalysisStatus::Screening, now_ms)?;
 
+        let thresholds = store.analysis_thresholds(run_id)?;
         let inputs = store.analysis_inputs(run_id)?;
         let mut images = BTreeMap::<ContentKey, ImageStage1>::new();
         let mut videos = BTreeMap::<ContentKey, Box<[Option<ImageStage1>; 6]>>::new();

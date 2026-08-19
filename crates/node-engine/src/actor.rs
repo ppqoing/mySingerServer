@@ -28,16 +28,17 @@ use dedup_windows::{AppLayout, machine_id_from_fields, read_physical_machine_fie
 
 use crate::{
     analysis::{
-        LocalAnalysisEngine, Stage2BatchItem, WorkerPoolStage2Processor, dispatch_stage2_batch,
+        LocalAnalysisEngine, Stage2BatchItem, Stage2BatchPlan, WorkerPoolStage2Processor,
+        begin_stage2_batch, run_stage2_batch,
     },
     delete::DeleteEngine,
     preview::{PreviewKind, PreviewService},
     scan::{
         EverythingEnumerator, ScanEngine, ScanOptions, SystemMd5, WindowsWalker,
-        WorkerPoolStage1Processor,
+        WorkerPoolStage1Processor, begin_scan_task,
     },
     server::{NodeRequestHandler, NodeServer, ServerError},
-    worker::{WorkerLaunch, WorkerPool, WorkerPoolConfig, WorkerPoolError},
+    worker::{WorkerLaunch, WorkerPool, WorkerPoolConfig, WorkerPoolError, WorkerPoolHandle},
 };
 
 /// 节点 actor 命令通道或运行状态错误。
@@ -309,16 +310,22 @@ fn spawn_actor(
     enumerator: EnumeratorKind,
 ) -> (NodeEngineHandle, JoinHandle<()>) {
     let (commands, receiver) = mpsc::channel(64);
-    let handle = NodeEngineHandle { commands };
+    let handle = NodeEngineHandle {
+        commands: commands.clone(),
+    };
+    let worker_control = worker_pool.as_ref().map(WorkerPool::handle);
     let actor = tokio::spawn(run_actor(
         EngineState {
             store,
             worker_pool,
+            worker_control,
             listen_address,
             cache_root: cache_root.to_path_buf(),
             enumerator,
             restarting: false,
             snapshots: BTreeMap::new(),
+            active_job: None,
+            commands: commands.downgrade(),
         },
         receiver,
     ));
@@ -328,11 +335,14 @@ fn spawn_actor(
 struct EngineState {
     store: NodeStore,
     worker_pool: Option<WorkerPool>,
+    worker_control: Option<WorkerPoolHandle>,
     listen_address: SocketAddr,
     cache_root: std::path::PathBuf,
     enumerator: EnumeratorKind,
     restarting: bool,
     snapshots: BTreeMap<String, OwnedSnapshot>,
+    active_job: Option<ActiveJob>,
+    commands: mpsc::WeakSender<EngineCommand>,
 }
 
 enum EngineCommand {
@@ -340,6 +350,46 @@ enum EngineCommand {
     ConnectionClosed,
     Restart(oneshot::Sender<Result<(), String>>),
     Shutdown(oneshot::Sender<()>),
+    BackgroundFinished {
+        identity: JobIdentity,
+        worker_pool: WorkerPool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JobIdentity {
+    Task(TaskId),
+    Analysis(AnalysisRunId),
+}
+
+struct ActiveJob {
+    identity: JobIdentity,
+    abort: tokio::task::AbortHandle,
+}
+
+enum BackgroundJob {
+    Scan {
+        task_id: TaskId,
+        options: ScanOptions,
+        enumerator: EnumeratorKind,
+        contact_sheets: PathBuf,
+    },
+    LocalAnalysis {
+        run_id: AnalysisRunId,
+    },
+    Stage2 {
+        plan: Stage2BatchPlan,
+    },
+}
+
+impl BackgroundJob {
+    const fn identity(&self) -> JobIdentity {
+        match self {
+            Self::Scan { task_id, .. } => JobIdentity::Task(*task_id),
+            Self::LocalAnalysis { run_id } => JobIdentity::Analysis(*run_id),
+            Self::Stage2 { plan } => JobIdentity::Task(plan.task_id),
+        }
+    }
 }
 
 async fn run_actor(mut state: EngineState, mut commands: mpsc::Receiver<EngineCommand>) {
@@ -353,9 +403,14 @@ async fn run_actor(mut state: EngineState, mut commands: mpsc::Receiver<EngineCo
                 let _ = reply.send(state.restart_engine().await);
             }
             EngineCommand::Shutdown(reply) => {
+                state.stop_background_for_shutdown().await;
                 let _ = reply.send(());
                 break;
             }
+            EngineCommand::BackgroundFinished {
+                identity,
+                worker_pool,
+            } => state.finish_background(identity, worker_pool),
         }
     }
 }
@@ -366,13 +421,13 @@ impl EngineState {
         let result = match request.payload {
             Some(proto::envelope::Payload::Ping(ping)) => Ok(proto::envelope::Payload::Ping(ping)),
             Some(proto::envelope::Payload::NodeStatus(_)) => self.node_status(),
-            Some(proto::envelope::Payload::CreateScan(scan)) => self.create_scan(scan).await,
+            Some(proto::envelope::Payload::CreateScan(scan)) => self.create_scan(scan),
             Some(proto::envelope::Payload::CancelTask(cancel)) => self.cancel_task(cancel).await,
             Some(proto::envelope::Payload::QueryTask(query)) => self.query_task(query),
             Some(proto::envelope::Payload::ListTasks(query)) => self.list_tasks(query),
             Some(proto::envelope::Payload::BrowsePaths(query)) => browse_paths(query),
             Some(proto::envelope::Payload::CreateLocalAnalysis(create)) => {
-                self.create_local_analysis(create).await
+                self.create_local_analysis(create)
             }
             Some(proto::envelope::Payload::QueryAnalysisRun(query)) => {
                 self.query_analysis_run(query)
@@ -386,7 +441,7 @@ impl EngineState {
                 self.prepare_analysis_input(query)
             }
             Some(proto::envelope::Payload::DispatchStage2(dispatch)) => {
-                self.dispatch_stage2(dispatch).await
+                self.dispatch_stage2(dispatch)
             }
             Some(proto::envelope::Payload::PullChanges(pull)) => self.pull_changes(pull),
             Some(proto::envelope::Payload::SyncAck(ack)) => self.sync_ack(ack),
@@ -418,13 +473,13 @@ impl EngineState {
         let (queued_items, running_items) =
             self.store.task_activity_counts().map_err(store_error)?;
         let worker_count = self
-            .worker_pool
+            .worker_control
             .as_ref()
             .map_or(0, |pool| pool.worker_process_ids().len());
         let busy_workers = self
-            .worker_pool
+            .worker_control
             .as_ref()
-            .map_or(0, WorkerPool::busy_workers);
+            .map_or(0, WorkerPoolHandle::busy_workers);
         Ok(proto::envelope::Payload::NodeStatus(proto::NodeStatus {
             machine_id: self.store.machine_id().as_str().to_owned(),
             listen_address: self.listen_address.to_string(),
@@ -500,7 +555,8 @@ impl EngineState {
         Ok(proto::envelope::Payload::ReadSnapshotPage(response))
     }
 
-    async fn create_scan(&mut self, request: proto::CreateScan) -> ProtocolResult {
+    fn create_scan(&mut self, request: proto::CreateScan) -> ProtocolResult {
+        self.ensure_job_idle()?;
         let roots = request
             .roots
             .iter()
@@ -517,40 +573,32 @@ impl EngineState {
             "everything" => EnumeratorKind::Everything,
             _ => return Err(invalid("未知文件枚举器")),
         };
-        let pool = self
-            .worker_pool
-            .as_mut()
-            .ok_or_else(|| invalid("测试节点没有 WorkerPool"))?;
-        let mut processor = WorkerPoolStage1Processor::new(pool);
         let contact_sheets = self.cache_root.join("contact-sheets");
-        let summary = match enumerator {
-            EnumeratorKind::WindowsWalker => {
-                ScanEngine::new(WindowsWalker, SystemMd5, contact_sheets)
-                    .run(&mut self.store, options, &mut processor, now_ms())
-                    .await
-            }
-            EnumeratorKind::Everything => {
-                ScanEngine::new(EverythingEnumerator, SystemMd5, contact_sheets)
-                    .run(&mut self.store, options, &mut processor, now_ms())
-                    .await
-            }
+        let task_id = begin_scan_task(&mut self.store, &options, now_ms()).map_err(internal)?;
+        if let Err(error) = self.start_background(BackgroundJob::Scan {
+            task_id,
+            options,
+            enumerator,
+            contact_sheets,
+        }) {
+            let _ = self.store.fail_task(task_id, now_ms());
+            return Err(internal(error));
         }
-        .map_err(internal)?;
         Ok(proto::envelope::Payload::TaskAccepted(
             proto::TaskAccepted {
-                task_id: summary.task_id.as_uuid().to_string(),
+                task_id: task_id.as_uuid().to_string(),
             },
         ))
     }
 
     async fn cancel_task(&mut self, request: proto::CancelTask) -> ProtocolResult {
         let task_id = parse_task_id(&request.task_id)?;
-        if let Some(pool) = &self.worker_pool {
-            pool.cancel_task(&request.task_id).await.map_err(internal)?;
-        }
         self.store
             .cancel_task(task_id, now_ms())
             .map_err(store_error)?;
+        if let Some(pool) = &self.worker_control {
+            pool.cancel_task(&request.task_id).await.map_err(internal)?;
+        }
         Ok(proto::envelope::Payload::CancelTask(request))
     }
 
@@ -578,10 +626,8 @@ impl EngineState {
         }))
     }
 
-    async fn create_local_analysis(
-        &mut self,
-        request: proto::CreateLocalAnalysis,
-    ) -> ProtocolResult {
+    fn create_local_analysis(&mut self, request: proto::CreateLocalAnalysis) -> ProtocolResult {
+        self.ensure_job_idle()?;
         if request.group_kind == proto::GroupKind::Unspecified as i32 {
             return Err(invalid("必须选择分析结果类型"));
         }
@@ -596,24 +642,18 @@ impl EngineState {
             .transpose()
             .map_err(invalid)?
             .unwrap_or_default();
-        let pool = self
-            .worker_pool
-            .as_mut()
-            .ok_or_else(|| invalid("测试节点没有 WorkerPool"))?;
-        let mut processor = WorkerPoolStage2Processor::new(pool);
-        let report = LocalAnalysisEngine::start(
-            &mut self.store,
-            &tasks,
-            thresholds,
-            &mut processor,
-            now_ms(),
-        )
-        .await
-        .map_err(internal)?;
+        let run_id = LocalAnalysisEngine::begin(&mut self.store, &tasks, thresholds, now_ms())
+            .map_err(internal)?;
+        if let Err(error) = self.start_background(BackgroundJob::LocalAnalysis { run_id }) {
+            let _ = self
+                .store
+                .transition_analysis_run(run_id, AnalysisStatus::Partial, now_ms());
+            return Err(internal(error));
+        }
         Ok(proto::envelope::Payload::QueryAnalysisRun(
             proto::QueryAnalysisRun {
-                analysis_run_id: report.run_id.as_uuid().to_string(),
-                state: analysis_status_name(report.status).into(),
+                analysis_run_id: run_id.as_uuid().to_string(),
+                state: analysis_status_name(AnalysisStatus::CollectingStage1).into(),
                 input_count: 0,
                 candidate_count: 0,
                 error_text: String::new(),
@@ -819,7 +859,8 @@ impl EngineState {
         ))
     }
 
-    async fn dispatch_stage2(&mut self, request: proto::DispatchStage2) -> ProtocolResult {
+    fn dispatch_stage2(&mut self, request: proto::DispatchStage2) -> ProtocolResult {
+        self.ensure_job_idle()?;
         parse_analysis_id(&request.analysis_run_id)?;
         let items = request
             .items
@@ -847,14 +888,12 @@ impl EngineState {
                 })
             })
             .collect::<Result<Vec<_>, (proto::ErrorCode, String)>>()?;
-        let pool = self
-            .worker_pool
-            .as_mut()
-            .ok_or_else(|| invalid("测试节点没有 WorkerPool"))?;
-        let mut processor = WorkerPoolStage2Processor::new(pool);
-        let task_id = dispatch_stage2_batch(&mut self.store, &items, &mut processor, now_ms())
-            .await
-            .map_err(internal)?;
+        let plan = begin_stage2_batch(&mut self.store, &items, now_ms()).map_err(internal)?;
+        let task_id = plan.task_id;
+        if let Err(error) = self.start_background(BackgroundJob::Stage2 { plan }) {
+            let _ = self.store.fail_task(task_id, now_ms());
+            return Err(internal(error));
+        }
         Ok(proto::envelope::Payload::TaskAccepted(
             proto::TaskAccepted {
                 task_id: task_id.as_uuid().to_string(),
@@ -999,11 +1038,82 @@ impl EngineState {
         ))
     }
 
+    fn ensure_job_idle(&self) -> Result<(), (proto::ErrorCode, String)> {
+        if self.worker_control.is_none() {
+            return Err(invalid("测试节点没有 WorkerPool"));
+        }
+        if self.active_job.is_some() || self.worker_pool.is_none() {
+            return Err(invalid("节点已有媒体任务正在后台运行"));
+        }
+        Ok(())
+    }
+
+    fn start_background(&mut self, job: BackgroundJob) -> Result<(), String> {
+        if self.active_job.is_some() {
+            return Err("节点已有媒体任务正在后台运行".into());
+        }
+        let mut store = self.store.reopen().map_err(|error| error.to_string())?;
+        let mut worker_pool = self
+            .worker_pool
+            .take()
+            .ok_or_else(|| "后台 WorkerPool owner 不可用".to_owned())?;
+        let identity = job.identity();
+        let commands = self
+            .commands
+            .upgrade()
+            .ok_or_else(|| "节点计算引擎已经关闭".to_owned())?;
+        let task = tokio::spawn(async move {
+            run_background_job(&mut store, &mut worker_pool, job).await;
+            let _ = commands
+                .send(EngineCommand::BackgroundFinished {
+                    identity,
+                    worker_pool,
+                })
+                .await;
+        });
+        self.active_job = Some(ActiveJob {
+            identity,
+            abort: task.abort_handle(),
+        });
+        Ok(())
+    }
+
+    fn finish_background(&mut self, identity: JobIdentity, worker_pool: WorkerPool) {
+        if self
+            .active_job
+            .as_ref()
+            .is_some_and(|active| active.identity == identity)
+        {
+            self.active_job = None;
+        }
+        self.worker_pool = Some(worker_pool);
+    }
+
+    async fn stop_background_for_shutdown(&mut self) {
+        let Some(active) = self.active_job.take() else {
+            return;
+        };
+        match active.identity {
+            JobIdentity::Task(task_id) => {
+                let _ = self.store.cancel_task(task_id, now_ms());
+            }
+            JobIdentity::Analysis(run_id) => {
+                let _ =
+                    self.store
+                        .transition_analysis_run(run_id, AnalysisStatus::Cancelled, now_ms());
+            }
+        }
+        active.abort.abort();
+    }
+
     async fn restart_engine(&mut self) -> Result<(), String> {
+        if self.active_job.is_some() {
+            return Err("节点仍有后台媒体任务，不能重启计算引擎".into());
+        }
         self.restarting = true;
         let result = async {
             let pool = self
-                .worker_pool
+                .worker_control
                 .as_ref()
                 .ok_or_else(|| "测试节点没有 WorkerPool".to_owned())?;
             let items = pool
@@ -1020,6 +1130,57 @@ impl EngineState {
         .await;
         self.restarting = false;
         result
+    }
+}
+
+async fn run_background_job(
+    store: &mut NodeStore,
+    worker_pool: &mut WorkerPool,
+    job: BackgroundJob,
+) {
+    match job {
+        BackgroundJob::Scan {
+            task_id,
+            options,
+            enumerator,
+            contact_sheets,
+        } => {
+            let mut processor = WorkerPoolStage1Processor::new(worker_pool);
+            let result = match enumerator {
+                EnumeratorKind::WindowsWalker => {
+                    ScanEngine::new(WindowsWalker, SystemMd5, contact_sheets)
+                        .run_existing(store, task_id, options, &mut processor, now_ms())
+                        .await
+                }
+                EnumeratorKind::Everything => {
+                    ScanEngine::new(EverythingEnumerator, SystemMd5, contact_sheets)
+                        .run_existing(store, task_id, options, &mut processor, now_ms())
+                        .await
+                }
+            };
+            if result.is_err() {
+                let _ = store.fail_task(task_id, now_ms());
+            }
+        }
+        BackgroundJob::LocalAnalysis { run_id } => {
+            let mut processor = WorkerPoolStage2Processor::new(worker_pool);
+            if LocalAnalysisEngine::run_existing(store, run_id, &mut processor, now_ms())
+                .await
+                .is_err()
+            {
+                let _ = store.transition_analysis_run(run_id, AnalysisStatus::Partial, now_ms());
+            }
+        }
+        BackgroundJob::Stage2 { plan } => {
+            let task_id = plan.task_id;
+            let mut processor = WorkerPoolStage2Processor::new(worker_pool);
+            if run_stage2_batch(store, plan, &mut processor, now_ms())
+                .await
+                .is_err()
+            {
+                let _ = store.fail_task(task_id, now_ms());
+            }
+        }
     }
 }
 
@@ -1194,5 +1355,274 @@ fn error_response(request_id: u64, code: proto::ErrorCode, message: &str) -> pro
             code: code as i32,
             message: message.to_owned(),
         })),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, time::Duration};
+
+    use dedup_media::{ImageStage1, PdqHash};
+    use dedup_node_store::{FeatureWrite, ImageStage1Fields, ScannedPath};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn scan_create_query_and_cancel_stay_responsive_while_worker_is_held() {
+        let directory = tempfile::tempdir().unwrap();
+        let scan_root = directory.path().join("scan");
+        fs::create_dir(&scan_root).unwrap();
+        fs::write(scan_root.join("held.bin"), b"held worker input").unwrap();
+        let machine = MachineId::parse(&"c1".repeat(32)).unwrap();
+        let store = NodeStore::open(&directory.path().join("node.db"), machine).unwrap();
+        let (pool, mut started) = WorkerPool::controlled_for_test();
+        let (handle, actor) = NodeEngine::spawn(
+            store,
+            pool,
+            "127.0.0.1:39091".parse().unwrap(),
+            directory.path(),
+            EnumeratorKind::WindowsWalker,
+        );
+
+        let create_handle = handle.clone();
+        let root = scan_root.to_string_lossy().into_owned();
+        let create = tokio::spawn(async move {
+            create_handle
+                .handle(proto::Envelope {
+                    request_id: 1,
+                    payload: Some(proto::envelope::Payload::CreateScan(proto::CreateScan {
+                        roots: vec![root],
+                        force_recalculate: false,
+                        enumerator: "windows_walker".into(),
+                    })),
+                })
+                .await
+        });
+        let (running_task_id, _) = tokio::time::timeout(Duration::from_secs(2), started.recv())
+            .await
+            .expect("扫描必须到达可控 Worker 屏障")
+            .expect("可控 Worker 不应提前关闭");
+
+        let accepted = tokio::time::timeout(Duration::from_secs(2), create)
+            .await
+            .expect("CreateScan 必须在 Worker 屏障释放前返回")
+            .unwrap();
+        let Some(proto::envelope::Payload::TaskAccepted(accepted)) = accepted.payload else {
+            panic!("CreateScan 必须返回真实任务 ID");
+        };
+        assert_eq!(accepted.task_id, running_task_id);
+
+        let busy = handle
+            .handle(proto::Envelope {
+                request_id: 5,
+                payload: Some(proto::envelope::Payload::CreateScan(proto::CreateScan {
+                    roots: vec![scan_root.to_string_lossy().into_owned()],
+                    force_recalculate: false,
+                    enumerator: "windows_walker".into(),
+                })),
+            })
+            .await;
+        assert!(matches!(
+            busy.payload,
+            Some(proto::envelope::Payload::Error(proto::Error { code, .. }))
+                if code == proto::ErrorCode::InvalidRequest as i32
+        ));
+
+        let query = handle
+            .handle(proto::Envelope {
+                request_id: 2,
+                payload: Some(proto::envelope::Payload::QueryTask(proto::QueryTask {
+                    task_id: accepted.task_id.clone(),
+                    task: None,
+                })),
+            })
+            .await;
+        let Some(proto::envelope::Payload::QueryTask(query)) = query.payload else {
+            panic!("持久任务必须可查询");
+        };
+        assert_eq!(
+            query.task.unwrap().state,
+            proto::TaskState::TaskRunning as i32
+        );
+
+        let cancel = tokio::time::timeout(
+            Duration::from_secs(2),
+            handle.handle(proto::Envelope {
+                request_id: 3,
+                payload: Some(proto::envelope::Payload::CancelTask(proto::CancelTask {
+                    task_id: accepted.task_id.clone(),
+                })),
+            }),
+        )
+        .await
+        .expect("CancelTask 必须在 Worker 仍被屏障控制时返回");
+        assert!(matches!(
+            cancel.payload,
+            Some(proto::envelope::Payload::CancelTask(_))
+        ));
+
+        let final_query = handle
+            .handle(proto::Envelope {
+                request_id: 4,
+                payload: Some(proto::envelope::Payload::QueryTask(proto::QueryTask {
+                    task_id: accepted.task_id,
+                    task: None,
+                })),
+            })
+            .await;
+        let Some(proto::envelope::Payload::QueryTask(final_query)) = final_query.payload else {
+            panic!("取消后的任务必须可查询");
+        };
+        assert_eq!(
+            final_query.task.unwrap().state,
+            proto::TaskState::TaskCancelled as i32
+        );
+
+        handle.shutdown().await.unwrap();
+        actor.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn scan_background_error_is_persisted_as_failed() {
+        let directory = tempfile::tempdir().unwrap();
+        let machine = MachineId::parse(&"c3".repeat(32)).unwrap();
+        let store = NodeStore::open(&directory.path().join("node.db"), machine).unwrap();
+        let (pool, _) = WorkerPool::controlled_for_test();
+        let (handle, actor) = NodeEngine::spawn(
+            store,
+            pool,
+            "127.0.0.1:39091".parse().unwrap(),
+            directory.path(),
+            EnumeratorKind::WindowsWalker,
+        );
+        let response = handle
+            .handle(proto::Envelope {
+                request_id: 20,
+                payload: Some(proto::envelope::Payload::CreateScan(proto::CreateScan {
+                    roots: vec![
+                        directory
+                            .path()
+                            .join("missing")
+                            .to_string_lossy()
+                            .into_owned(),
+                    ],
+                    force_recalculate: false,
+                    enumerator: "windows_walker".into(),
+                })),
+            })
+            .await;
+        let Some(proto::envelope::Payload::TaskAccepted(accepted)) = response.payload else {
+            panic!("后台枚举失败前必须先返回持久任务 ID");
+        };
+
+        let mut state = proto::TaskState::TaskQueued as i32;
+        for request_id in 21..1021 {
+            let response = handle
+                .handle(proto::Envelope {
+                    request_id,
+                    payload: Some(proto::envelope::Payload::QueryTask(proto::QueryTask {
+                        task_id: accepted.task_id.clone(),
+                        task: None,
+                    })),
+                })
+                .await;
+            let Some(proto::envelope::Payload::QueryTask(query)) = response.payload else {
+                panic!("失败任务必须保持可查询");
+            };
+            state = query.task.unwrap().state;
+            if state == proto::TaskState::TaskFailed as i32 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(state, proto::TaskState::TaskFailed as i32);
+
+        handle.shutdown().await.unwrap();
+        actor.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stage2_create_and_shutdown_stay_responsive_while_worker_is_held() {
+        let directory = tempfile::tempdir().unwrap();
+        let machine = MachineId::parse(&"c2".repeat(32)).unwrap();
+        let mut store = NodeStore::open(&directory.path().join("node.db"), machine).unwrap();
+        let media_path = directory.path().join("held.jpg");
+        fs::write(&media_path, b"stage2 fixture").unwrap();
+        let scanned = ScannedPath::new(
+            dedup_core::NormalizedPath::new(&media_path).unwrap(),
+            DisplayPath::new(&media_path).unwrap(),
+            14,
+        );
+        let content = store
+            .upsert_content_and_location(&scanned, [0x42; 16], dedup_core::MediaKind::Image)
+            .unwrap();
+        store
+            .commit_feature_result(
+                content.id,
+                None,
+                FeatureWrite::ImageStage1(ImageStage1Fields::from(ImageStage1 {
+                    width: 10,
+                    height: 10,
+                    pdq: PdqHash::from_bytes([0; 32]),
+                    quality: 100,
+                })),
+            )
+            .unwrap();
+        let location =
+            LocationKey::new(store.machine_id().clone(), scanned.normalized_path.clone());
+        let (pool, mut started) = WorkerPool::controlled_for_test();
+        let (handle, actor) = NodeEngine::spawn(
+            store,
+            pool,
+            "127.0.0.1:39091".parse().unwrap(),
+            directory.path(),
+            EnumeratorKind::WindowsWalker,
+        );
+
+        let dispatch_handle = handle.clone();
+        let dispatch = tokio::spawn(async move {
+            dispatch_handle
+                .handle(proto::Envelope {
+                    request_id: 10,
+                    payload: Some(proto::envelope::Payload::DispatchStage2(
+                        proto::DispatchStage2 {
+                            analysis_run_id: AnalysisRunId::new().as_uuid().to_string(),
+                            items: vec![proto::Stage2WorkItem {
+                                content: Some((&content.key).into()),
+                                source: Some((&location).into()),
+                                frame_slots: Vec::new(),
+                            }],
+                        },
+                    )),
+                })
+                .await
+        });
+        let (running_task_id, _) = tokio::time::timeout(Duration::from_secs(2), started.recv())
+            .await
+            .expect("二筛必须到达可控 Worker 屏障")
+            .expect("可控 Worker 不应提前关闭");
+
+        let accepted = tokio::time::timeout(Duration::from_secs(2), dispatch)
+            .await
+            .expect("DispatchStage2 必须在 Worker 屏障释放前返回")
+            .unwrap();
+        let Some(proto::envelope::Payload::TaskAccepted(accepted)) = accepted.payload else {
+            panic!("DispatchStage2 必须返回真实任务 ID");
+        };
+        assert_eq!(accepted.task_id, running_task_id);
+
+        let restart = tokio::time::timeout(Duration::from_secs(2), handle.restart_engine())
+            .await
+            .expect("运行中重启必须返回明确错误，不能排在长任务之后");
+        assert!(matches!(restart, Err(EngineError::Operation(_))));
+
+        tokio::time::timeout(Duration::from_secs(2), handle.shutdown())
+            .await
+            .expect("Shutdown 必须在二筛 Worker 仍被控制时返回")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), actor)
+            .await
+            .expect("actor 关闭不能等待长二筛")
+            .unwrap();
     }
 }

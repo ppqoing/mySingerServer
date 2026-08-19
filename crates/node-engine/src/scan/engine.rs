@@ -87,6 +87,21 @@ pub trait Stage1Processor {
     ) -> Result<crate::worker::Stage1Output, String>;
 }
 
+/// 校验根目录并在 SQLite 持久化真实扫描任务，计算可随后在独立 owner 中继续。
+pub fn begin_scan_task(
+    store: &mut NodeStore,
+    options: &ScanOptions,
+    now_ms: i64,
+) -> Result<TaskId, ScanError> {
+    let roots = options
+        .roots
+        .iter()
+        .map(|root| NormalizedPath::new(root.as_path()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| ScanError::InvalidResult(error.to_string()))?;
+    store.create_scan_task(&roots, now_ms).map_err(Into::into)
+}
+
 /// 串行借用真实 WorkerPool 完成一次扫描一筛请求的适配器。
 pub struct WorkerPoolStage1Processor<'a> {
     pool: &'a mut WorkerPool,
@@ -188,13 +203,23 @@ where
     where
         P: Stage1Processor,
     {
-        let roots = options
-            .roots
-            .iter()
-            .map(|root| NormalizedPath::new(root.as_path()))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| ScanError::InvalidResult(error.to_string()))?;
-        let task_id = store.create_scan_task(&roots, now_ms)?;
+        let task_id = begin_scan_task(store, &options, now_ms)?;
+        self.run_existing(store, task_id, options, processor, now_ms)
+            .await
+    }
+
+    /// 从已持久化的真实任务继续枚举、哈希、一筛和成功收尾。
+    pub async fn run_existing<P>(
+        &mut self,
+        store: &mut NodeStore,
+        task_id: TaskId,
+        options: ScanOptions,
+        processor: &mut P,
+        now_ms: i64,
+    ) -> Result<ScanSummary, ScanError>
+    where
+        P: Stage1Processor,
+    {
         let rows = match self.enumerator.enumerate(&options.roots) {
             Ok(rows) => rows,
             Err(error) => {

@@ -91,6 +91,64 @@ pub struct WorkerPool {
     state: Arc<Mutex<PoolState>>,
 }
 
+/// 可克隆的 WorkerPool 控制面；唯一事件接收器仍由一个计算 owner 持有。
+#[derive(Clone)]
+pub struct WorkerPoolHandle {
+    commands: mpsc::Sender<PoolCommand>,
+    state: Arc<Mutex<PoolState>>,
+}
+
+impl WorkerPoolHandle {
+    /// 取消任务：删除等待项，终止并替换正在执行该任务的 Worker。
+    pub async fn cancel_task(&self, task_id: &str) -> Result<(), WorkerPoolError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.commands
+            .send(PoolCommand::Cancel(task_id.to_owned(), reply_tx))
+            .await
+            .map_err(|_| WorkerPoolError::Closed)?;
+        reply_rx.await.map_err(|_| WorkerPoolError::Closed)?
+    }
+
+    /// 第一阶段冻结调度并返回所有运行项；此调用不终止 Worker。
+    pub async fn prepare_planned_restart(&self) -> Result<Vec<String>, WorkerPoolError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.commands
+            .send(PoolCommand::PrepareRestart(reply_tx))
+            .await
+            .map_err(|_| WorkerPoolError::Closed)?;
+        reply_rx.await.map_err(|_| WorkerPoolError::Closed)?
+    }
+
+    /// 调用方写回 SQLite queued 后，执行 Worker 终止、补建和 Ready 等待。
+    pub async fn restart_after_requeue(
+        &self,
+        requeued_item_ids: &[String],
+    ) -> Result<(), WorkerPoolError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.commands
+            .send(PoolCommand::Restart(requeued_item_ids.to_vec(), reply_tx))
+            .await
+            .map_err(|_| WorkerPoolError::Closed)?;
+        reply_rx.await.map_err(|_| WorkerPoolError::Closed)?
+    }
+
+    /// 返回按槽位排序的当前 Worker PID。
+    pub fn worker_process_ids(&self) -> Vec<u32> {
+        self.state
+            .lock()
+            .unwrap()
+            .process_ids
+            .values()
+            .copied()
+            .collect()
+    }
+
+    /// 返回已经派发且尚未收回结果的 Worker 数量。
+    pub fn busy_workers(&self) -> usize {
+        self.state.lock().unwrap().running.len()
+    }
+}
+
 impl WorkerPool {
     /// 创建 Job Object，启动全部 Worker，并等待每个进程发出 Ready 后返回。
     pub async fn start(config: WorkerPoolConfig) -> Result<Self, WorkerPoolError> {
@@ -132,6 +190,14 @@ impl WorkerPool {
             events: events_rx,
             state,
         })
+    }
+
+    /// 克隆只发送命令并读取快照的控制面，不转移事件接收所有权。
+    pub fn handle(&self) -> WorkerPoolHandle {
+        WorkerPoolHandle {
+            commands: self.commands.clone(),
+            state: Arc::clone(&self.state),
+        }
     }
 
     /// 把一个三类 Worker 请求排入池；响应由 `next_event` 返回。
@@ -212,6 +278,71 @@ impl WorkerPool {
             .await
             .map_err(|_| WorkerPoolError::Closed)?;
         reply_rx.await.map_err(|_| WorkerPoolError::Closed)?
+    }
+
+    #[cfg(test)]
+    pub(crate) fn controlled_for_test() -> (Self, mpsc::Receiver<(String, String)>) {
+        let state = Arc::new(Mutex::new(PoolState::default()));
+        let actor_state = Arc::clone(&state);
+        let (commands, mut command_rx) = mpsc::channel(64);
+        let (events, event_rx) = mpsc::channel(256);
+        let (started, started_rx) = mpsc::channel(8);
+        tokio::spawn(async move {
+            let mut active = None::<WorkIdentity>;
+            while let Some(command) = command_rx.recv().await {
+                match command {
+                    PoolCommand::Dispatch(envelope, reply) => {
+                        let result = WorkItem::try_from(envelope).map(|work| {
+                            active = Some(work.identity.clone());
+                            actor_state
+                                .lock()
+                                .unwrap()
+                                .running
+                                .insert(0, work.identity.clone());
+                            let _ = started.try_send((
+                                work.identity.task_id.clone(),
+                                work.identity.item_id.clone(),
+                            ));
+                        });
+                        let _ = reply.send(result);
+                    }
+                    PoolCommand::Cancel(task_id, reply) => {
+                        if active.as_ref().is_some_and(|work| work.task_id == task_id) {
+                            let work = active.take().expect("活动测试项已经确认存在");
+                            actor_state.lock().unwrap().running.clear();
+                            let _ = events
+                                .send(WorkerEvent::Cancelled {
+                                    task_id: work.task_id,
+                                    item_id: work.item_id,
+                                })
+                                .await;
+                        }
+                        let _ = reply.send(Ok(()));
+                    }
+                    PoolCommand::PrepareRestart(reply) => {
+                        let items = active
+                            .iter()
+                            .map(|work| work.item_id.clone())
+                            .collect::<Vec<_>>();
+                        let _ = reply.send(Ok(items));
+                    }
+                    PoolCommand::Restart(_, reply) => {
+                        let _ = reply.send(Ok(()));
+                    }
+                    PoolCommand::TerminateUnexpected(_, reply) => {
+                        let _ = reply.send(Ok(()));
+                    }
+                }
+            }
+        });
+        (
+            Self {
+                commands,
+                events: event_rx,
+                state,
+            },
+            started_rx,
+        )
     }
 }
 

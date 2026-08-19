@@ -125,6 +125,12 @@ pub struct Stage2BatchItem {
     pub frame_slots: Vec<u8>,
 }
 
+/// 已持久化任务及其稳定二筛工作集合。
+pub(crate) struct Stage2BatchPlan {
+    pub(crate) task_id: TaskId,
+    work: Vec<MissingWork>,
+}
+
 /// 执行一个中心二筛批次；先复用并重新发布本机缓存，只有真正缺失时才调用 Worker。
 ///
 /// 整个批次先持久化任务和任务项，再按稳定项顺序执行。返回的任务 ID 可由管理端查询其
@@ -135,6 +141,16 @@ pub async fn dispatch_stage2_batch<P: Stage2Processor>(
     processor: &mut P,
     now_ms: i64,
 ) -> Result<TaskId, AnalysisBlocked> {
+    let plan = begin_stage2_batch(store, items, now_ms)?;
+    run_stage2_batch(store, plan, processor, now_ms).await
+}
+
+/// 校验来源并一次持久化真实二筛任务，Worker 计算可随后在后台继续。
+pub(crate) fn begin_stage2_batch(
+    store: &mut NodeStore,
+    items: &[Stage2BatchItem],
+    now_ms: i64,
+) -> Result<Stage2BatchPlan, AnalysisBlocked> {
     if items.is_empty() {
         return Err(AnalysisBlocked::InvalidState("二筛批次不能为空".into()));
     }
@@ -188,6 +204,17 @@ pub async fn dispatch_stage2_batch<P: Stage2Processor>(
         })
         .collect::<Vec<_>>();
     let task_id = store.create_task("analysis_stage2", &task_items, now_ms)?;
+    Ok(Stage2BatchPlan { task_id, work })
+}
+
+/// 从已持久化批次继续缓存重发、Worker 计算和任务项终态提交。
+pub(crate) async fn run_stage2_batch<P: Stage2Processor>(
+    store: &mut NodeStore,
+    plan: Stage2BatchPlan,
+    processor: &mut P,
+    now_ms: i64,
+) -> Result<TaskId, AnalysisBlocked> {
+    let Stage2BatchPlan { task_id, work } = plan;
     for _ in 0..work.len() {
         let item = store
             .claim_next_item(task_id, now_ms)?

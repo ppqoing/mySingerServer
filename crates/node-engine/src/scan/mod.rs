@@ -7,7 +7,8 @@ mod hash;
 
 pub use dedup_windows::WindowsWalker;
 pub use engine::{
-    ScanEngine, ScanOptions, ScanSummary, Stage1Processor, Stage1Request, WorkerPoolStage1Processor,
+    ScanEngine, ScanOptions, ScanSummary, Stage1Processor, Stage1Request,
+    WorkerPoolStage1Processor, begin_scan_task,
 };
 pub use enumerator::FileEnumerator;
 pub use everything::EverythingEnumerator;

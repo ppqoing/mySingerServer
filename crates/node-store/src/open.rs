@@ -98,6 +98,15 @@ impl NodeStore {
         initialize_or_validate(connection, machine_id, None)
     }
 
+    /// 为同一文件数据库打开独立 WAL 连接，供后台计算与控制 actor 分离所有权。
+    pub fn reopen(&self) -> Result<Self, StoreError> {
+        let path = self
+            .database_path
+            .as_ref()
+            .ok_or_else(|| StoreError::InvalidState("内存数据库不能打开独立后台连接".into()))?;
+        Self::open(path, self.machine_id.clone())
+    }
+
     /// 返回数据库 schema 的稳定产品标记。
     pub fn schema_id(&self) -> Result<String, StoreError> {
         Ok(self.connection.query_row(
