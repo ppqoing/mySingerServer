@@ -63,6 +63,8 @@ export component TaskCenterPage inherits Rectangle {
                                 accessible-item-selected: root.selected-task-index == index;
                                 accessible-action-default => { root.selected-task-index = index; }
 
+                                // 行触摸层先声明在内容下方；普通区域仍可选中，后声明的取消按钮优先命中。
+                                task-touch := TouchArea { clicked => { root.selected-task-index = index; } }
                                 VerticalLayout {
                                     padding: 8px;
                                     spacing: 8px;
@@ -102,7 +104,6 @@ export component TaskCenterPage inherits Rectangle {
                                     }
                                     Text { text: task.counts; color: Theme.muted; font-size: 11px; }
                                 }
-                                task-touch := TouchArea { clicked => { root.selected-task-index = index; } }
                             }
                         }
                     }

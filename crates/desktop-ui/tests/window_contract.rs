@@ -1,6 +1,9 @@
 use dedup_desktop_ui::{MainWindow, UiNodeRow, UiTaskRow};
 use i_slint_backend_testing::ElementHandle;
-use slint::{Color, ModelRc, VecModel};
+use slint::{
+    Color, ComponentHandle, ModelRc, VecModel,
+    platform::{PointerEventButton, WindowEvent},
+};
 use std::{cell::Cell, cell::RefCell, rc::Rc};
 
 // 使用完整字面行模型驱动真实 MainWindow，避免从生产映射反推预期结果。
@@ -109,6 +112,29 @@ fn accessible(window: &MainWindow, label: &str) -> ElementHandle {
     ElementHandle::find_by_accessible_label(window, label)
         .next()
         .unwrap_or_else(|| panic!("应能找到可访问元素：{label}"))
+}
+
+// 从真实元素边界计算中心点，直接向测试窗口发送鼠标移动、按下和释放事件。
+fn click_element_center(window: &MainWindow, element: &ElementHandle) {
+    let position = element.absolute_position();
+    let size = element.size();
+    let center = slint::LogicalPosition::new(
+        position.x + size.width / 2.0,
+        position.y + size.height / 2.0,
+    );
+    window
+        .window()
+        .dispatch_event(WindowEvent::PointerMoved { position: center });
+    window.window().dispatch_event(WindowEvent::PointerPressed {
+        position: center,
+        button: PointerEventButton::Left,
+    });
+    window
+        .window()
+        .dispatch_event(WindowEvent::PointerReleased {
+            position: center,
+            button: PointerEventButton::Left,
+        });
 }
 
 #[test]
@@ -447,12 +473,35 @@ fn task_tabs_filter_loaded_models_and_cancel_active_task() {
         .is_none()
     );
 
+    // 先用真实指针选择另一行，再证明运行中行的非按钮中心区域能恢复选中。
+    accessible(&window, "失败").invoke_accessible_default_action();
+    let failed_row = accessible(
+        &window,
+        "任务项：视频分析；节点 3；提取特征；60%；6 / 10 · 失败 1 · 跳过 0；失败",
+    );
+    click_element_center(&window, &failed_row);
+    assert_eq!(failed_row.accessible_item_selected(), Some(true));
+
+    accessible(&window, "运行中").invoke_accessible_default_action();
+    let running_row = accessible(
+        &window,
+        "任务项：媒体扫描；节点 7；枚举文件；35%；7 / 20 · 失败 0 · 跳过 1；运行中",
+    );
+    assert_eq!(running_row.accessible_item_selected(), Some(false));
+    click_element_center(&window, &running_row);
+    assert_eq!(
+        running_row.accessible_item_selected(),
+        Some(true),
+        "点击运行中任务行的非按钮区域应更新 selected-task-index",
+    );
+
     let cancelled = Rc::new(RefCell::new(Vec::new()));
     window.on_cancel_task({
         let cancelled = cancelled.clone();
         move |node_index, id| cancelled.borrow_mut().push((node_index, id.to_string()))
     });
-    accessible(&window, "取消任务：task-running").invoke_accessible_default_action();
+    let cancel_button = accessible(&window, "取消任务：task-running");
+    click_element_center(&window, &cancel_button);
     assert_eq!(
         cancelled.borrow().as_slice(),
         &[(7, String::from("task-running"))]
