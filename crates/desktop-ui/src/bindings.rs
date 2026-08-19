@@ -23,7 +23,7 @@ pub struct UiBinding {
     config: Arc<Mutex<DesktopConfig>>,
 }
 
-/// 绑定主窗口全部任务 17 回调，并返回事件应用所需的共享配置快照。
+/// 绑定主窗口全部任务 21 回调，并返回事件应用所需的共享配置快照。
 pub fn bind_commands(
     window: &MainWindow,
     sender: mpsc::Sender<UiCommand>,

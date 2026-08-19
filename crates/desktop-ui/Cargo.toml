@@ -17,3 +17,6 @@ tokio.workspace = true
 
 [build-dependencies]
 slint-build.workspace = true
+
+[dev-dependencies]
+i-slint-backend-testing = { version = "=1.17.1", features = ["renderer-software"] }
