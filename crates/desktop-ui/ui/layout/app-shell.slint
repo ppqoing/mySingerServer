@@ -1,0 +1,49 @@
+// 固定应用壳统一侧栏、命令栏、内容槽和底部状态栏。
+
+import { Theme } from "../theme.slint";
+import { SideNavigation } from "side-navigation.slint";
+import { TopCommandBar } from "top-command-bar.slint";
+import { StatusBar } from "status-bar.slint";
+
+export component AppShell inherits Rectangle {
+    in-out property <int> active-nav: 0;
+    in property <int> online-count;
+    in property <string> sync-text;
+    in property <string> postgres-status;
+    in property <color> postgres-color;
+    in property <string> last-error;
+    callback navigate(int);
+    callback refresh();
+    background: Theme.window;
+
+    HorizontalLayout {
+        spacing: 0px;
+        SideNavigation {
+            width: 144px;
+            active-index: root.active-nav;
+            navigate(index) => { root.navigate(index); }
+        }
+        VerticalLayout {
+            spacing: 0px;
+            TopCommandBar {
+                height: 58px;
+                online-count: root.online-count;
+                last-error: root.last-error;
+                refresh => { root.refresh(); }
+            }
+            Rectangle {
+                background: Theme.window;
+                horizontal-stretch: 1;
+                vertical-stretch: 1;
+                clip: true;
+                @children
+            }
+            StatusBar {
+                height: 32px;
+                sync-text: root.sync-text;
+                postgres-status: root.postgres-status;
+                postgres-color: root.postgres-color;
+            }
+        }
+    }
+}

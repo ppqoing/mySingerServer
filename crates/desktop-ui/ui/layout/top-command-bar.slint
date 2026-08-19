@@ -1,0 +1,77 @@
+// 顶栏只承载节点范围外观、在线摘要、本地搜索和刷新入口。
+
+import { LineEdit } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
+
+export component TopCommandBar inherits Rectangle {
+    in property <int> online-count;
+    in property <string> last-error;
+    callback refresh();
+
+    background: Theme.sidebar;
+    border-width: 1px;
+    border-color: Theme.border;
+
+    HorizontalLayout {
+        padding-left: 18px;
+        padding-right: 18px;
+        spacing: 12px;
+        alignment: center;
+
+        Rectangle {
+            width: 142px;
+            height: 30px;
+            border-radius: 6px;
+            background: Theme.panel-hover;
+            border-width: 1px;
+            border-color: Theme.border;
+            Text {
+                text: "节点范围 · 全部";
+                color: Theme.text;
+                font-size: 12px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+        Text {
+            text: root.online-count + " 个节点在线";
+            color: root.online-count > 0 ? Theme.success : Theme.muted;
+            font-size: 12px;
+            font-weight: 600;
+            vertical-alignment: center;
+        }
+        if root.last-error != "" : Text {
+            width: 340px;
+            text: root.last-error;
+            color: Theme.danger;
+            font-size: 11px;
+            overflow: elide;
+            vertical-alignment: center;
+        }
+        Rectangle { horizontal-stretch: 1; background: transparent; }
+        LineEdit {
+            width: 260px;
+            placeholder-text: "本地搜索";
+            accessible-label: "本地搜索";
+        }
+        refresh-button := Rectangle {
+            width: 70px;
+            height: 32px;
+            border-radius: 6px;
+            background: refresh-touch.has-hover ? Theme.panel-hover : Theme.panel;
+            border-width: 1px;
+            border-color: Theme.border;
+            accessible-role: AccessibleRole.button;
+            accessible-label: "刷新";
+            accessible-action-default => { root.refresh(); }
+            Text {
+                text: "↻  刷新";
+                color: Theme.text;
+                font-size: 12px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            refresh-touch := TouchArea { clicked => { root.refresh(); } }
+        }
+    }
+}

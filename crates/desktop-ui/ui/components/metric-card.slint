@@ -1,0 +1,23 @@
+// 指标卡只展示标题、数值、补充说明与语义色。
+
+import { Theme } from "../theme.slint";
+
+export component MetricCard inherits Rectangle {
+    in property <string> title;
+    in property <string> value;
+    in property <string> detail;
+    in property <color> tone: Theme.accent;
+
+    height: 104px;
+    background: Theme.panel;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: Theme.border;
+    VerticalLayout {
+        padding: 16px;
+        spacing: 5px;
+        Text { text: root.title; color: Theme.muted; font-size: 12px; }
+        Text { text: root.value; color: root.tone; font-size: 25px; font-weight: 720; }
+        Text { text: root.detail; color: Theme.muted; font-size: 11px; overflow: elide; }
+    }
+}

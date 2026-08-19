@@ -1,0 +1,11 @@
+// 通用浅色 Fluent 卡片容器。
+
+import { Theme } from "../theme.slint";
+
+export component FluentCard inherits Rectangle {
+    background: Theme.panel;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: Theme.border;
+    @children
+}

@@ -1,6 +1,18 @@
 use dedup_desktop_ui::MainWindow;
-use i_slint_backend_testing::{TestingBackend, TestingBackendOptions};
+use i_slint_backend_testing::{ElementHandle, TestingBackend, TestingBackendOptions};
 use slint::ComponentHandle;
+
+fn assert_light_opaque(pixel: slint::Rgba8Pixel, region: &str) {
+    assert_eq!(pixel.a, u8::MAX, "{region} 应完全不透明");
+    assert!(
+        pixel.r >= 235 && pixel.g >= 235 && pixel.b >= 235,
+        "{region} 应符合浅色主题，实际 RGBA=({}, {}, {}, {})",
+        pixel.r,
+        pixel.g,
+        pixel.b,
+        pixel.a,
+    );
+}
 
 #[test]
 fn light_shell_renders_at_target_size() {
@@ -30,16 +42,56 @@ fn light_shell_renders_at_target_size() {
         .count();
     assert!(opaque * 100 >= snapshot.as_slice().len() * 99);
 
-    let left_top = snapshot.as_slice()[20 * 1440 + 20];
-    let content = snapshot.as_slice()[700 * 1440 + 1000];
-    for pixel in [left_top, content] {
+    let sidebar = snapshot.as_slice()[400 * 1440 + 20];
+    let top_bar = snapshot.as_slice()[5 * 1440 + 600];
+    let content = snapshot.as_slice()[400 * 1440 + 160];
+    let status_bar = snapshot.as_slice()[884 * 1440 + 800];
+    for (pixel, region) in [
+        (sidebar, "侧栏"),
+        (top_bar, "顶栏"),
+        (content, "内容区"),
+        (status_bar, "底栏"),
+    ] {
+        assert_light_opaque(pixel, region);
+    }
+    assert!(
+        sidebar.r > content.r && status_bar.r > content.r,
+        "白色侧栏和底栏应围绕稍深的内容区：侧栏={sidebar:?}，内容={content:?}，底栏={status_bar:?}",
+    );
+
+    window
+        .window()
+        .set_size(slint::PhysicalSize::new(1080, 700));
+    let compact_snapshot = window
+        .window()
+        .take_snapshot()
+        .expect("最小窗口尺寸仍应完成软件渲染");
+    assert_eq!(
+        (compact_snapshot.width(), compact_snapshot.height()),
+        (1080, 700),
+    );
+
+    for label in [
+        "总览",
+        "节点",
+        "扫描",
+        "任务",
+        "重复文件",
+        "审核删除",
+        "设置",
+        "刷新",
+    ] {
+        let element = ElementHandle::find_by_accessible_label(&window, label)
+            .next()
+            .unwrap_or_else(|| panic!("最小窗口应保留可访问动作：{label}"));
+        let position = element.absolute_position();
+        let size = element.size();
         assert!(
-            pixel.r >= 235 && pixel.g >= 235 && pixel.b >= 235,
-            "概念 UI 外壳应在采样区域呈现浅色，实际 RGBA=({}, {}, {}, {})",
-            pixel.r,
-            pixel.g,
-            pixel.b,
-            pixel.a
+            position.x >= 0.0
+                && position.y >= 0.0
+                && position.x + size.width <= 1080.0
+                && position.y + size.height <= 700.0,
+            "{label} 应位于 1080×700 窗口边界内，位置={position:?}，尺寸={size:?}",
         );
     }
 }

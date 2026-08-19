@@ -1,0 +1,111 @@
+// 七项固定入口共用同一导航状态机，标签同时作为稳定的可访问动作名称。
+
+import { Theme } from "../theme.slint";
+
+component NavItem inherits Rectangle {
+    in property <string> icon;
+    in property <string> label;
+    in property <bool> selected;
+    callback activated();
+
+    height: 46px;
+    border-radius: 7px;
+    background: root.selected ? Theme.accent-soft : touch.has-hover ? Theme.panel-hover : transparent;
+    accessible-role: AccessibleRole.button;
+    accessible-label: root.label;
+    accessible-action-default => { root.activated(); }
+
+    Rectangle {
+        visible: root.selected;
+        width: 3px;
+        height: 24px;
+        x: 0px;
+        y: 11px;
+        border-radius: 2px;
+        background: Theme.accent;
+    }
+    HorizontalLayout {
+        padding-left: 13px;
+        padding-right: 8px;
+        spacing: 9px;
+        Text {
+            text: root.icon;
+            width: 20px;
+            color: root.selected ? Theme.accent : Theme.muted;
+            font-size: 15px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+        Text {
+            text: root.label;
+            color: root.selected ? Theme.text : Theme.muted;
+            font-size: 13px;
+            font-weight: root.selected ? 650 : 450;
+            vertical-alignment: center;
+        }
+    }
+    touch := TouchArea { clicked => { root.activated(); } }
+}
+
+export component SideNavigation inherits Rectangle {
+    in property <int> active-index;
+    callback navigate(int);
+
+    width: 144px;
+    background: Theme.sidebar;
+    border-width: 1px;
+    border-color: Theme.border;
+
+    VerticalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        padding-top: 12px;
+        padding-bottom: 10px;
+        spacing: 4px;
+
+        Rectangle {
+            height: 58px;
+            background: transparent;
+            HorizontalLayout {
+                spacing: 8px;
+                alignment: center;
+                Rectangle {
+                    width: 30px;
+                    height: 30px;
+                    border-radius: 8px;
+                    background: Theme.accent;
+                    Text {
+                        text: "M";
+                        color: white;
+                        font-size: 16px;
+                        font-weight: 800;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Text { text: "Media"; color: Theme.text; font-size: 14px; font-weight: 700; }
+                    Text { text: "Dedup V2"; color: Theme.muted; font-size: 10px; }
+                }
+            }
+        }
+        Rectangle { height: 1px; background: Theme.border; }
+        NavItem { icon: "⌂"; label: "总览"; selected: root.active-index == 0; activated => { root.navigate(0); } }
+        NavItem { icon: "◉"; label: "节点"; selected: root.active-index == 1; activated => { root.navigate(1); } }
+        NavItem { icon: "⌕"; label: "扫描"; selected: root.active-index == 2; activated => { root.navigate(2); } }
+        NavItem { icon: "≡"; label: "任务"; selected: root.active-index == 3; activated => { root.navigate(3); } }
+        NavItem { icon: "▧"; label: "重复文件"; selected: root.active-index == 4; activated => { root.navigate(4); } }
+        NavItem { icon: "✓"; label: "审核删除"; selected: root.active-index == 5; activated => { root.navigate(5); } }
+        Rectangle { vertical-stretch: 1; background: transparent; }
+        NavItem { icon: "⚙"; label: "设置"; selected: root.active-index == 6; activated => { root.navigate(6); } }
+        Text {
+            height: 24px;
+            text: "本地管理端";
+            color: Theme.muted;
+            font-size: 9px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+}

@@ -1,0 +1,25 @@
+// 底栏仅显示引擎、同步和 PostgreSQL 三项只读状态。
+
+import { Theme } from "../theme.slint";
+
+export component StatusBar inherits Rectangle {
+    in property <string> sync-text;
+    in property <string> postgres-status;
+    in property <color> postgres-color;
+
+    background: Theme.sidebar;
+    border-width: 1px;
+    border-color: Theme.border;
+
+    HorizontalLayout {
+        padding-left: 16px;
+        padding-right: 16px;
+        spacing: 18px;
+        alignment: center;
+        Text { text: "●  引擎就绪"; color: Theme.success; font-size: 10px; }
+        Rectangle { width: 1px; height: 14px; background: Theme.border; }
+        Text { text: "同步  " + root.sync-text; color: Theme.muted; font-size: 10px; }
+        Rectangle { horizontal-stretch: 1; background: transparent; }
+        Text { text: "PostgreSQL  " + root.postgres-status; color: root.postgres-color; font-size: 10px; }
+    }
+}

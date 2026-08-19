@@ -1,0 +1,11 @@
+// 固定宽度的右侧详情容器。
+
+import { Theme } from "../theme.slint";
+
+export component DetailPanel inherits Rectangle {
+    width: 300px;
+    background: Theme.panel;
+    border-width: 1px;
+    border-color: Theme.border;
+    @children
+}
