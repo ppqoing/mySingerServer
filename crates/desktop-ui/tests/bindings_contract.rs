@@ -1,4 +1,4 @@
-use dedup_core::{DesktopConfig, EnumeratorKind};
+use dedup_core::{DeleteMode, DesktopConfig, EnumeratorKind};
 use dedup_desktop_core::{
     app::UiCommand,
     results::GroupKind,
@@ -204,8 +204,42 @@ fn root_callbacks_emit_their_ui_commands_and_reject_invalid_settings() {
     assert!(matches!(next(&mut receiver), UiCommand::PrepareDelete));
     window.invoke_confirm_delete();
     assert!(matches!(next(&mut receiver), UiCommand::ConfirmDelete));
+    window.set_postgres_url("postgres://dedup:secret@10.0.0.20:5432/media".into());
+    window.set_reconnect_seconds(17);
+    window.set_delete_mode_index(1);
+    window.set_pdq_quality("61".into());
+    window.set_aspect_tolerance("0.27".into());
+    window.set_pdq_hamming("42".into());
+    window.set_phash_hamming("13".into());
+    window.set_phash_parts("6".into());
+    window.set_sobel_min("0.73".into());
+    window.set_video_valid("5".into());
+    window.set_video_stage1("0.66".into());
+    window.set_video_stage2("0.91".into());
     window.invoke_save_settings();
-    assert!(matches!(next(&mut receiver), UiCommand::SaveSettings(_)));
+    match next(&mut receiver) {
+        UiCommand::SaveSettings(config) => {
+            assert_eq!(config.nodes.len(), 1);
+            assert_eq!(config.nodes[0].ip.to_string(), "127.0.0.1");
+            assert_eq!(config.nodes[0].port, 39091);
+            assert_eq!(
+                config.postgres_url.as_deref(),
+                Some("postgres://dedup:secret@10.0.0.20:5432/media")
+            );
+            assert_eq!(config.reconnect_interval_seconds, 17);
+            assert_eq!(config.delete_mode, DeleteMode::Permanent);
+            assert_eq!(config.thresholds.pdq_quality_min, 61);
+            assert_eq!(config.thresholds.aspect_tolerance, 0.27);
+            assert_eq!(config.thresholds.pdq_hamming_max, 42);
+            assert_eq!(config.thresholds.phash_part_hamming_max, 13);
+            assert_eq!(config.thresholds.phash_min_passed_parts, 6);
+            assert_eq!(config.thresholds.sobel_min, 0.73);
+            assert_eq!(config.thresholds.video_min_valid_frames, 5);
+            assert_eq!(config.thresholds.video_stage1_min, 0.66);
+            assert_eq!(config.thresholds.video_stage2_min, 0.91);
+        }
+        command => panic!("save-settings 命令错误：{command:?}"),
+    }
 
     window.set_pdq_quality("not-a-number".into());
     window.invoke_save_settings();
