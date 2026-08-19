@@ -1158,6 +1158,13 @@ dependencies = [
 [[package]]
 name = "dedup-desktop-ui"
 version = "0.1.0"
+dependencies = [
+ "dedup-core",
+ "dedup-desktop-core",
+ "slint",
+ "slint-build",
+ "tokio",
+]
 
 [[package]]
 name = "dedup-media"
@@ -1280,6 +1287,16 @@ dependencies = [
 [[package]]
 name = "desktop"
 version = "0.1.0"
+dependencies = [
+ "dedup-core",
+ "dedup-desktop-core",
+ "dedup-desktop-ui",
+ "dedup-windows",
+ "slint",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "digest"

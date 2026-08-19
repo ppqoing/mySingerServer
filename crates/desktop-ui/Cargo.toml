@@ -7,3 +7,12 @@ publish.workspace = true
 
 [lib]
 path = "src/lib.rs"
+
+[dependencies]
+dedup-core = { path = "../core" }
+dedup-desktop-core = { path = "../desktop-core" }
+slint.workspace = true
+tokio.workspace = true
+
+[build-dependencies]
+slint-build.workspace = true

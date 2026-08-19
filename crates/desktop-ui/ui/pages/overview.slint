@@ -1,0 +1,101 @@
+// 总览聚合节点健康度、任务计数和手工连接入口。
+
+import { Button, LineEdit, SpinBox, ScrollView } from "std-widgets.slint";
+import { Theme, UiNodeRow } from "../theme.slint";
+import { StatusPill } from "../components/status-pill.slint";
+
+export component OverviewPage inherits Rectangle {
+    in property <[UiNodeRow]> nodes;
+    in property <int> online-count;
+    in property <int> running-count;
+    in property <string> indexed-text;
+    in property <string> sync-text;
+    in-out property <string> new-node-ip: "127.0.0.1";
+    in-out property <int> new-node-port: 39091;
+    callback connect-all();
+    callback refresh();
+    callback add-node(string, int);
+    callback edit-node(int, string, int);
+    callback sync-node(int);
+    callback remove-node(int);
+    background: transparent;
+
+    ScrollView {
+        VerticalLayout {
+            padding: 28px;
+            spacing: 18px;
+            HorizontalLayout {
+                Text { text: "总览与节点"; color: Theme.text; font-size: 26px; font-weight: 750; }
+                Rectangle { horizontal-stretch: 1; background: transparent; }
+                Button { text: "连接全部"; clicked => { root.connect-all(); } }
+                Button { text: "刷新"; clicked => { root.refresh(); } }
+            }
+            HorizontalLayout {
+                spacing: 12px;
+                for metric in [
+                    { title: "在线节点", value: root.online-count, suffix: " 台" },
+                    { title: "运行任务", value: root.running-count, suffix: " 个" }
+                ] : Rectangle {
+                    height: 104px; horizontal-stretch: 1; background: Theme.panel; border-radius: 10px; border-width: 1px; border-color: Theme.border;
+                    VerticalLayout { padding: 16px; spacing: 7px;
+                        Text { text: metric.title; color: Theme.muted; font-size: 12px; }
+                        Text { text: metric.value + metric.suffix; color: Theme.text; font-size: 25px; font-weight: 720; }
+                    }
+                }
+                Rectangle {
+                    height: 104px; horizontal-stretch: 1; background: Theme.panel; border-radius: 10px; border-width: 1px; border-color: Theme.border;
+                    VerticalLayout { padding: 16px; spacing: 7px;
+                        Text { text: "中心同步"; color: Theme.muted; font-size: 12px; }
+                        Text { text: root.sync-text; color: Theme.text; font-size: 18px; font-weight: 650; }
+                    }
+                }
+                Rectangle {
+                    height: 104px; horizontal-stretch: 1; background: Theme.panel; border-radius: 10px; border-width: 1px; border-color: Theme.border;
+                    VerticalLayout { padding: 16px; spacing: 7px;
+                        Text { text: "已索引内容"; color: Theme.muted; font-size: 12px; }
+                        Text { text: root.indexed-text; color: Theme.text; font-size: 18px; font-weight: 650; }
+                    }
+                }
+            }
+            Rectangle {
+                height: 88px; background: Theme.panel; border-radius: 10px; border-width: 1px; border-color: Theme.border;
+                HorizontalLayout { padding: 16px; spacing: 12px; alignment: center;
+                    VerticalLayout { width: 150px; alignment: center;
+                        Text { text: "添加计算节点"; color: Theme.text; font-size: 15px; font-weight: 650; }
+                        Text { text: "手工 IP 与端口"; color: Theme.muted; font-size: 11px; }
+                    }
+                    LineEdit { text <=> root.new-node-ip; placeholder-text: "192.168.1.20"; }
+                    SpinBox { value <=> root.new-node-port; minimum: 1; maximum: 65535; width: 150px; }
+                    Button { text: "添加并连接"; clicked => { root.add-node(root.new-node-ip, root.new-node-port); } }
+                }
+            }
+            Text { text: "节点状态"; color: Theme.text; font-size: 16px; font-weight: 680; }
+            if root.nodes.length == 0 : Rectangle {
+                height: 160px; background: Theme.panel; border-radius: 10px; border-width: 1px; border-color: Theme.border;
+                Text { text: "尚未配置节点"; color: Theme.muted; horizontal-alignment: center; vertical-alignment: center; }
+            }
+            for node in root.nodes : Rectangle {
+                height: node.error-text == "" ? 116px : 138px;
+                background: Theme.panel; border-radius: 10px; border-width: 1px; border-color: Theme.border;
+                VerticalLayout { padding: 16px; spacing: 10px;
+                    HorizontalLayout { spacing: 12px;
+                        Text { text: node.name; color: Theme.text; font-size: 16px; font-weight: 680; width: 150px; }
+                        Text { text: node.address; color: Theme.muted; font-size: 13px; width: 190px; }
+                        StatusPill { label: node.status; tone: node.status-color; }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        Button { text: "用上方地址更新"; clicked => { root.edit-node(node.index, root.new-node-ip, root.new-node-port); } }
+                        Button { text: "立即同步"; enabled: node.status == "在线"; clicked => { root.sync-node(node.index); } }
+                        Button { text: "移除"; clicked => { root.remove-node(node.index); } }
+                    }
+                    HorizontalLayout { spacing: 18px;
+                        Text { text: "机器 ID  " + node.machine-id; color: Theme.muted; font-size: 11px; horizontal-stretch: 1; overflow: elide; }
+                        Text { text: "Worker  " + node.worker-text; color: Theme.muted; font-size: 11px; }
+                        Text { text: "任务  " + node.task-text; color: Theme.muted; font-size: 11px; }
+                        Text { text: "PG 游标 / Outbox  " + node.sync-text; color: Theme.muted; font-size: 11px; }
+                    }
+                    if node.error-text != "" : Text { text: node.error-text; color: Theme.danger; font-size: 11px; }
+                }
+            }
+        }
+    }
+}

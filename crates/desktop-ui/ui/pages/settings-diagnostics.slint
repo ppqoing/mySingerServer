@@ -1,0 +1,99 @@
+// 设置与诊断集中编辑唯一配置边界，并嵌入 Slint 归属信息。
+
+import { AboutSlint, Button, ComboBox, LineEdit, ScrollView, SpinBox } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
+import { StatusPill } from "../components/status-pill.slint";
+
+component FieldLabel inherits Text {
+    color: Theme.muted;
+    font-size: 11px;
+    vertical-alignment: center;
+}
+
+export component SettingsDiagnosticsPage inherits Rectangle {
+    in property <string> data-path;
+    in property <string> logs-path;
+    in property <string> cache-path;
+    in property <string> config-path;
+    in property <string> postgres-status;
+    in property <color> postgres-color;
+    in-out property <string> postgres-url;
+    in-out property <int> reconnect-seconds: 5;
+    in-out property <int> delete-mode-index: 0;
+    in-out property <string> pdq-quality: "50";
+    in-out property <string> aspect-tolerance: "0.10";
+    in-out property <string> pdq-hamming: "31";
+    in-out property <string> phash-hamming: "10";
+    in-out property <string> phash-parts: "8";
+    in-out property <string> sobel-min: "0.85";
+    in-out property <string> video-valid: "4";
+    in-out property <string> video-stage1: "0.80";
+    in-out property <string> video-stage2: "0.80";
+    in-out property <bool> about-open: false;
+    callback save-settings();
+    background: transparent;
+
+    ScrollView {
+        VerticalLayout {
+            padding: 28px;
+            spacing: 18px;
+            HorizontalLayout {
+                Text { text: "设置与诊断"; color: Theme.text; font-size: 26px; font-weight: 750; }
+                Rectangle { horizontal-stretch: 1; background: transparent; }
+                Button { text: root.about-open ? "关闭关于" : "关于 Slint"; clicked => { root.about-open = !root.about-open; } }
+                Button { text: "保存设置"; clicked => { root.save-settings(); } }
+            }
+            Rectangle {
+                height: 148px; background: Theme.panel; border-radius: 10px; border-width: 1px; border-color: Theme.border;
+                VerticalLayout { padding: 18px; spacing: 10px;
+                    HorizontalLayout {
+                        Text { text: "PostgreSQL 中心"; color: Theme.text; font-size: 16px; font-weight: 680; }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        StatusPill { label: "中心状态"; tone: root.postgres-color; }
+                    }
+                    LineEdit { text <=> root.postgres-url; placeholder-text: "postgresql://user:password@host:5432/database"; }
+                    Text { text: root.postgres-status; color: root.postgres-color; font-size: 11px; }
+                }
+            }
+            Rectangle {
+                height: 330px; background: Theme.panel; border-radius: 10px; border-width: 1px; border-color: Theme.border;
+                VerticalLayout { padding: 18px; spacing: 10px;
+                    Text { text: "两层筛选阈值（分析运行创建时快照）"; color: Theme.text; font-size: 16px; font-weight: 680; }
+                    GridLayout { spacing: 10px;
+                        Row { FieldLabel { text: "PDQ 最低 Quality"; } LineEdit { text <=> root.pdq-quality; } FieldLabel { text: "长宽比容差"; } LineEdit { text <=> root.aspect-tolerance; } FieldLabel { text: "PDQ 最大汉明"; } LineEdit { text <=> root.pdq-hamming; } }
+                        Row { FieldLabel { text: "pHash 单块汉明"; } LineEdit { text <=> root.phash-hamming; } FieldLabel { text: "pHash 最少通过块"; } LineEdit { text <=> root.phash-parts; } FieldLabel { text: "Sobel 最低相似"; } LineEdit { text <=> root.sobel-min; } }
+                        Row { FieldLabel { text: "视频最少有效帧"; } LineEdit { text <=> root.video-valid; } FieldLabel { text: "视频一筛平均"; } LineEdit { text <=> root.video-stage1; } FieldLabel { text: "视频二筛平均"; } LineEdit { text <=> root.video-stage2; } }
+                    }
+                    HorizontalLayout { spacing: 12px;
+                        FieldLabel { text: "删除方式"; width: 120px; }
+                        ComboBox { model: ["回收站（默认）", "永久删除"]; current-index <=> root.delete-mode-index; }
+                        FieldLabel { text: "重连间隔（秒）"; width: 130px; }
+                        SpinBox { value <=> root.reconnect-seconds; minimum: 1; maximum: 3600; width: 150px; }
+                    }
+                    Text { text: "算法结构和六帧采样位置硬编码；这里只调整已确认的九个阈值。"; color: Theme.muted; font-size: 11px; }
+                }
+            }
+            Rectangle {
+                height: 196px; background: Theme.panel; border-radius: 10px; border-width: 1px; border-color: Theme.border;
+                VerticalLayout { padding: 18px; spacing: 9px;
+                    Text { text: "应用路径"; color: Theme.text; font-size: 16px; font-weight: 680; }
+                    FieldLabel { text: "数据：" + root.data-path; }
+                    FieldLabel { text: "配置：" + root.config-path; }
+                    FieldLabel { text: "日志：" + root.logs-path; }
+                    FieldLabel { text: "缓存：" + root.cache-path; }
+                    Text { text: "安全提示：节点通信和 PostgreSQL 连接均为明文，只应在可信局域网使用。"; color: Theme.warning; font-size: 11px; }
+                }
+            }
+            if root.about-open : Rectangle {
+                height: 180px; background: Theme.panel; border-radius: 10px; border-width: 1px; border-color: Theme.border;
+                HorizontalLayout { padding: 18px; spacing: 20px;
+                    VerticalLayout { width: 330px; spacing: 8px;
+                        Text { text: "关于 mySingerServer Rust V2"; color: Theme.text; font-size: 16px; font-weight: 680; }
+                        Text { text: "Windows x64 媒体重复检测工具\nSlint Royalty-free 2.0 桌面应用"; color: Theme.muted; wrap: word-wrap; }
+                    }
+                    AboutSlint { horizontal-stretch: 1; }
+                }
+            }
+        }
+    }
+}

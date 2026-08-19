@@ -315,6 +315,23 @@ phase2 对 queued/running 或游标落后继续等待；completed/failed/cancell
 `INTEGER` 写入，文件大小、时间和序号按 `BIGINT` 写入，避免依赖数据库隐式类型转换。
 同一 `(md5,file_size)` 在任意机器只映射一个中心内容，而每个机器路径各自保留位置记录。
 
+桌面端采用严格单向交互。Slint 回调只把手工节点编辑、连接、刷新、同步、扫描、取消、路径浏览
+和设置保存转换为有界 `UiCommand`；`DesktopApp` 的 Tokio 控制循环才持有 `NodeSession`、
+`SyncEngine` 与 `CentralStore`，完成后发布完整不可变 `UiEvent::ViewChanged`。GUI 线程只把事件
+映射为 Slint model 和属性，不直接读写 TCP、SQLite、PostgreSQL、FFmpeg 或配置文件。节点连接按
+手工配置顺序展示、并行建立，每个列表索引最多保存一个 session；编辑节点会丢弃旧会话，避免把
+新地址错误绑定到旧物理 MachineId。PostgreSQL 未配置、schema 缺失或连接失败只改变中心能力和
+诊断文案，节点扫描及本地 SQLite 分析仍然可用。
+
+`desktop.exe` 首次启动只创建 `data/desktop/config.toml`、`data/desktop/cache` 和
+`data/desktop/logs`，并写入默认节点 `127.0.0.1:39091`。日志复用 20 MiB × 10 滚动 writer；
+应用路径全部从 executable 绝对路径推导，设置页显示实际值。界面使用 Slint fluent-dark 与项目
+深色中性主题，固定八个导航入口：总览与节点、扫描任务、精确重复、相似图片、相似视频、跨机器、
+删除复核、设置诊断。总览聚合在线数、任务、同步游标和 Worker 状态；扫描页显示持久任务逐项进度、
+失败与不完整跳过计数，并在任何节点有 queued/running 项时统一禁用筛选。设置页一次校验 PostgreSQL
+NoTls 连接、九项阈值、回收站/永久删除与重连间隔，并嵌入 `AboutSlint` 归属入口及可信局域网明文
+警告。结果、按需预览、复核与删除页面的数据绑定由下一阶段接入，当前导航位置保持稳定。
+
 `create_analysis_run` 把九项阈值 TOML、所选机器任务与两个高水位一次保存；
 `insert_analysis_inputs` 只允许执行一次，事务提交时将运行标记为 frozen，数据库触发器拒绝原地
 更新输入。候选键必须严格左右升序；候选与最终组都整批事务替换。中心组和成员分页沿用节点端的

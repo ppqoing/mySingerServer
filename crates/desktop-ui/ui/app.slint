@@ -1,0 +1,136 @@
+// desktop.exe 唯一主窗口；页面只通过属性与回调接触 Rust。
+
+import { Theme, UiNodeRow, UiTaskRow } from "theme.slint";
+import { Navigation } from "components/navigation.slint";
+import { StatusPill } from "components/status-pill.slint";
+import { OverviewPage } from "pages/overview.slint";
+import { ScanTasksPage } from "pages/scan-tasks.slint";
+import { SettingsDiagnosticsPage } from "pages/settings-diagnostics.slint";
+
+component PlaceholderPage inherits Rectangle {
+    in property <string> title;
+    in property <string> description;
+    background: transparent;
+    VerticalLayout {
+        padding: 28px;
+        spacing: 18px;
+        Text { text: root.title; color: Theme.text; font-size: 26px; font-weight: 750; }
+        Rectangle {
+            height: 240px; background: Theme.panel; border-radius: 10px; border-width: 1px; border-color: Theme.border;
+            VerticalLayout { padding: 28px; alignment: center; spacing: 12px;
+                Text { text: "当前阶段已建立页面入口"; color: Theme.text; font-size: 18px; font-weight: 650; horizontal-alignment: center; }
+                Text { text: root.description; color: Theme.muted; font-size: 13px; wrap: word-wrap; horizontal-alignment: center; }
+            }
+        }
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "mySingerServer · Media Dedup";
+    preferred-width: 1440px;
+    preferred-height: 900px;
+    min-width: 1080px;
+    min-height: 700px;
+    background: Theme.window;
+
+    in property <[UiNodeRow]> nodes;
+    in property <[UiTaskRow]> tasks;
+    in property <int> online-count;
+    in property <int> running-count;
+    in property <string> indexed-text: "—";
+    in property <string> sync-text: "未同步";
+    in property <bool> filtering-enabled;
+    in property <string> filtering-reason;
+    in property <string> postgres-status;
+    in property <color> postgres-color: Theme.warning;
+    in property <string> data-path;
+    in property <string> logs-path;
+    in property <string> cache-path;
+    in property <string> config-path;
+    in-out property <int> current-page: 0;
+    in-out property <string> last-error;
+
+    in-out property <string> new-node-ip: "127.0.0.1";
+    in-out property <int> new-node-port: 39091;
+    in-out property <string> scan-root: "D:\\Media";
+    in-out property <int> scan-node-index: 0;
+    in-out property <int> enumerator-index: 0;
+    in-out property <bool> force-recalculate: false;
+
+    in-out property <string> postgres-url;
+    in-out property <int> reconnect-seconds: 5;
+    in-out property <int> delete-mode-index: 0;
+    in-out property <string> pdq-quality: "50";
+    in-out property <string> aspect-tolerance: "0.10";
+    in-out property <string> pdq-hamming: "31";
+    in-out property <string> phash-hamming: "10";
+    in-out property <string> phash-parts: "8";
+    in-out property <string> sobel-min: "0.85";
+    in-out property <string> video-valid: "4";
+    in-out property <string> video-stage1: "0.80";
+    in-out property <string> video-stage2: "0.80";
+
+    callback add-node(string, int);
+    callback edit-node(int, string, int);
+    callback remove-node(int);
+    callback connect-all();
+    callback refresh();
+    callback sync-node(int);
+    callback browse-paths(int, string);
+    callback start-scan(int, string, bool, int);
+    callback cancel-task(int, string);
+    callback save-settings();
+
+    HorizontalLayout {
+        spacing: 0px;
+        navigation := Navigation {
+            current-page <=> root.current-page;
+            navigate(page) => { root.current-page = page; }
+        }
+        VerticalLayout {
+            spacing: 0px;
+            Rectangle {
+                height: 58px; background: Theme.sidebar; border-width: 1px; border-color: Theme.border;
+                HorizontalLayout { padding-left: 22px; padding-right: 22px; spacing: 12px; alignment: center;
+                    Text { text: root.current-page == 0 ? "节点控制台" : root.current-page == 1 ? "任务中心" : root.current-page == 7 ? "运行设置" : "重复结果"; color: Theme.text; font-size: 14px; font-weight: 650; }
+                    Rectangle { horizontal-stretch: 1; background: transparent; }
+                    if root.last-error != "" : Text { text: root.last-error; color: Theme.danger; font-size: 11px; overflow: elide; width: 420px; horizontal-alignment: right; }
+                    StatusPill { label: root.online-count + " 个节点在线"; tone: root.online-count > 0 ? Theme.success : Theme.muted; }
+                }
+            }
+            Rectangle {
+                horizontal-stretch: 1; vertical-stretch: 1; background: Theme.window;
+                if root.current-page == 0 : OverviewPage {
+                    nodes: root.nodes; online-count: root.online-count; running-count: root.running-count; indexed-text: root.indexed-text; sync-text: root.sync-text;
+                    new-node-ip <=> root.new-node-ip; new-node-port <=> root.new-node-port;
+                    connect-all => { root.connect-all(); } refresh => { root.refresh(); }
+                    add-node(ip, port) => { root.add-node(ip, port); }
+                    edit-node(index, ip, port) => { root.edit-node(index, ip, port); }
+                    sync-node(index) => { root.sync-node(index); }
+                    remove-node(index) => { root.remove-node(index); }
+                }
+                if root.current-page == 1 : ScanTasksPage {
+                    tasks: root.tasks; filtering-enabled: root.filtering-enabled; filtering-reason: root.filtering-reason;
+                    scan-root <=> root.scan-root; selected-node <=> root.scan-node-index; enumerator-index <=> root.enumerator-index; force-recalculate <=> root.force-recalculate;
+                    browse(index, path) => { root.browse-paths(index, path); }
+                    start-scan(index, path, force, enumerator) => { root.start-scan(index, path, force, enumerator); }
+                    cancel-task(index, id) => { root.cancel-task(index, id); }
+                }
+                if root.current-page == 2 : PlaceholderPage { title: "精确重复"; description: "按 MD5 与文件大小显示本地和跨机器精确重复组。结果分页与复核控件在下一阶段接入。"; }
+                if root.current-page == 3 : PlaceholderPage { title: "相似图片"; description: "四 band 一筛、九分块 pHash 与 128 维 Sobel 的联合结果将在此按需预览。"; }
+                if root.current-page == 4 : PlaceholderPage { title: "相似视频"; description: "六帧平均结果与 3×2 JPG 联系表将在此按需加载。"; }
+                if root.current-page == 5 : PlaceholderPage { title: "跨机器"; description: "这里显示 stage1/phase2 任务高水位、同步游标和显式 Partial 重试。"; }
+                if root.current-page == 6 : PlaceholderPage { title: "删除复核"; description: "先标记 Keep/Delete，再生成默认进入回收站的删除计划；不会自动删除。"; }
+                if root.current-page == 7 : SettingsDiagnosticsPage {
+                    data-path: root.data-path; logs-path: root.logs-path; cache-path: root.cache-path; config-path: root.config-path;
+                    postgres-status: root.postgres-status; postgres-color: root.postgres-color; postgres-url <=> root.postgres-url;
+                    reconnect-seconds <=> root.reconnect-seconds; delete-mode-index <=> root.delete-mode-index;
+                    pdq-quality <=> root.pdq-quality; aspect-tolerance <=> root.aspect-tolerance; pdq-hamming <=> root.pdq-hamming;
+                    phash-hamming <=> root.phash-hamming; phash-parts <=> root.phash-parts; sobel-min <=> root.sobel-min;
+                    video-valid <=> root.video-valid; video-stage1 <=> root.video-stage1; video-stage2 <=> root.video-stage2;
+                    save-settings => { root.save-settings(); }
+                }
+            }
+        }
+    }
+}

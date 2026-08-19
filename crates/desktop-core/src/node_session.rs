@@ -120,6 +120,94 @@ impl NodeSession {
         &self.machine_id
     }
 
+    /// 刷新节点 Worker、任务和 outbox 统计。
+    pub async fn status(&self) -> Result<proto::NodeStatus, SessionError> {
+        let response = self
+            .connection
+            .request(proto::envelope::Payload::NodeStatus(Default::default()))
+            .await?;
+        match payload_or_error(response)? {
+            proto::envelope::Payload::NodeStatus(status) => Ok(status),
+            _ => Err(SessionError::UnexpectedResponse("NodeStatus")),
+        }
+    }
+
+    /// 在节点创建一个持久扫描任务；媒体计算由节点唯一 WorkerPool 执行。
+    pub async fn create_scan(
+        &self,
+        roots: Vec<String>,
+        force_recalculate: bool,
+        enumerator: &str,
+    ) -> Result<TaskId, SessionError> {
+        let response = self
+            .connection
+            .request(proto::envelope::Payload::CreateScan(proto::CreateScan {
+                roots,
+                force_recalculate,
+                enumerator: enumerator.into(),
+            }))
+            .await?;
+        task_accepted(payload_or_error(response)?)
+    }
+
+    /// 请求节点取消持久任务及其等待/运行 Worker 项。
+    pub async fn cancel_task(&self, task_id: TaskId) -> Result<(), SessionError> {
+        let response = self
+            .connection
+            .request(proto::envelope::Payload::CancelTask(proto::CancelTask {
+                task_id: task_id.as_uuid().to_string(),
+            }))
+            .await?;
+        match payload_or_error(response)? {
+            proto::envelope::Payload::CancelTask(_) => Ok(()),
+            _ => Err(SessionError::UnexpectedResponse("CancelTask")),
+        }
+    }
+
+    /// 分页列出节点持久任务，供任务页刷新而不读取 SQLite。
+    pub async fn list_tasks(
+        &self,
+        cursor: &str,
+        limit: u32,
+    ) -> Result<proto::ListTasks, SessionError> {
+        let response = self
+            .connection
+            .request(proto::envelope::Payload::ListTasks(proto::ListTasks {
+                cursor: cursor.into(),
+                limit,
+                tasks: Vec::new(),
+                next_cursor: String::new(),
+            }))
+            .await?;
+        match payload_or_error(response)? {
+            proto::envelope::Payload::ListTasks(page) => Ok(page),
+            _ => Err(SessionError::UnexpectedResponse("ListTasks")),
+        }
+    }
+
+    /// 分页浏览节点本机目录；空父路径列出可用盘符。
+    pub async fn browse_paths(
+        &self,
+        parent_path: &str,
+        cursor: &str,
+        limit: u32,
+    ) -> Result<proto::BrowsePaths, SessionError> {
+        let response = self
+            .connection
+            .request(proto::envelope::Payload::BrowsePaths(proto::BrowsePaths {
+                parent_path: parent_path.into(),
+                cursor: cursor.into(),
+                limit,
+                entries: Vec::new(),
+                next_cursor: String::new(),
+            }))
+            .await?;
+        match payload_or_error(response)? {
+            proto::envelope::Payload::BrowsePaths(page) => Ok(page),
+            _ => Err(SessionError::UnexpectedResponse("BrowsePaths")),
+        }
+    }
+
     /// 幂等确认 PostgreSQL 已提交游标；节点自行限制到本地真实高水位。
     pub async fn acknowledge(&self, committed_seq: u64) -> Result<(), SessionError> {
         let response = self
@@ -268,4 +356,14 @@ fn payload_or_error(envelope: proto::Envelope) -> Result<proto::envelope::Payloa
         Some(payload) => Ok(payload),
         None => Err(SessionError::UnexpectedResponse("非空 Envelope.payload")),
     }
+}
+
+fn task_accepted(payload: proto::envelope::Payload) -> Result<TaskId, SessionError> {
+    let accepted = match payload {
+        proto::envelope::Payload::TaskAccepted(accepted) => accepted,
+        _ => return Err(SessionError::UnexpectedResponse("TaskAccepted")),
+    };
+    uuid::Uuid::parse_str(&accepted.task_id)
+        .map(TaskId::from_uuid)
+        .map_err(|_| SessionError::InvalidTaskId(accepted.task_id))
 }

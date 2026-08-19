@@ -1,0 +1,40 @@
+// 管理端统一深色主题和跨页面只读行模型。
+
+export struct UiNodeRow {
+    index: int,
+    name: string,
+    address: string,
+    status: string,
+    status-color: color,
+    machine-id: string,
+    worker-text: string,
+    task-text: string,
+    sync-text: string,
+    error-text: string,
+}
+
+export struct UiTaskRow {
+    id: string,
+    node-index: int,
+    title: string,
+    stage: string,
+    status: string,
+    status-color: color,
+    progress: int,
+    counts: string,
+}
+
+export global Theme {
+    in-out property <color> window: #0b1020;
+    in-out property <color> sidebar: #10182b;
+    in-out property <color> panel: #141e33;
+    in-out property <color> panel-hover: #1a2740;
+    in-out property <color> border: #263650;
+    in-out property <color> text: #eef4ff;
+    in-out property <color> muted: #94a3b8;
+    in-out property <color> accent: #4f8cff;
+    in-out property <color> accent-soft: #18386d;
+    in-out property <color> success: #22c55e;
+    in-out property <color> warning: #f59e0b;
+    in-out property <color> danger: #f87171;
+}
