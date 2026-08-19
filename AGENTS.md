@@ -256,6 +256,25 @@ SQLite 的业务更新与 outbox 递增序号同事务提交。ACK 只前进、�
 数据批量生成候选，一筛结束后才批量派发缺失 stage2；数据库已有二筛结果时不派发。所有节点
 计算完成且 stage2 同步过高水位后才最终筛选。失败运行保持 `partial`，显式重试只补缺失项。
 
+中心 PostgreSQL 只接受管理员在空库手动执行 `deploy/central-v2.sql`。脚本使用
+`schema_metadata.schema_id=mysingerserver-rust-v2` 标记全新且不兼容的产品 schema，建立节点、
+同步游标、全局内容、机器位置、图片/视频两层特征、删除墓碑、分析输入、候选、分组、复核和
+删除批次共 20 张表；故意不使用 `IF NOT EXISTS`，重复执行会失败，不承担迁移职责。
+`CentralStore::connect` 只读验证产品标记和所需表列，缺失时只禁用中心模式，绝不创建或修改表。
+
+中心内部 `contents.content_id` 只用于 PostgreSQL 连接；所有公开接口和节点同步载荷都使用
+`ContentKey`/`LocationKey`。`apply_sync_batch` 先解码完整批次，在一个事务内先写内容、再写位置与
+特征，最后按机器推进单一 cursor；来自节点的本地联系表路径不进中心库。宽高按 PostgreSQL
+`INTEGER` 写入，文件大小、时间和序号按 `BIGINT` 写入，避免依赖数据库隐式类型转换。
+同一 `(md5,file_size)` 在任意机器只映射一个中心内容，而每个机器路径各自保留位置记录。
+
+`create_analysis_run` 把九项阈值 TOML、所选机器任务与两个高水位一次保存；
+`insert_analysis_inputs` 只允许执行一次，事务提交时将运行标记为 frozen，数据库触发器拒绝原地
+更新输入。候选键必须严格左右升序；候选与最终组都整批事务替换。中心组和成员分页沿用节点端的
+稳定复合游标，复核使用外部位置键 UPSERT。中心删除计划只冻结已明确 Delete 且所在组至少有一个
+活动 Keep 的成员；节点回报成功后直接移除相应组成员，少于两项即删组，删除代表时按机器/路径
+选择明确 Keep。实际文件活动状态和墓碑仍由节点 outbox 同步，不由管理端猜测。
+
 TCP 传输固定为四字节大端长度头加 Protobuf Envelope；零长度、截断和超过 8 MiB 的普通帧
 在 `dedup-transport` 边界拒绝，`FileChunk.data` 另限 1 MiB。`ClientConnection` 用非零
 原子 request ID 和 pending 表复用请求，读循环断开时一次性失败全部等待者，重连由
@@ -325,6 +344,9 @@ MP4 首尾 RGB24 解码集成测试已通过。真实 worker.exe 的 Ready、图
 删除后缩组、20 MiB×10 日志和无 GUI 托盘命令状态测试已通过；Slint SystemTrayIcon 声明与
 `node.exe` 已完成真实 MSVC 编译。实际托盘图标、右键菜单、回收站恢复和有序退出仍必须在最终
 computer-use 验收中单独执行，当前不据静态测试标记为 GUI PASS。
+中心 `central-v2.sql` 已在计划专用 PostgreSQL 16 Alpine 空库手工执行成功，第二次执行因表已存在
+明确失败；另一个空库经 `CentralStore::connect` 后仍无业务表。真实数据库测试已验证两机器共享
+内容键、同 MD5 不同大小、不可变输入、候选事务、两页稳定组游标、复核删除计划和成功删除后缩组。
 静态测试、集成测试、发布包验证和 Windows 实际 GUI/托盘/回收站验收必须分开记录。没有实际
 运行的 GUI、托盘、回收站、第二台物理主机或 PostgreSQL 项不得标记 PASS；可用双节点进程
 集成测试证明协议与编排，但真实双物理机不可用时仍标 `BLOCKED`。
