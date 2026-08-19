@@ -23,8 +23,8 @@ use uuid::Uuid;
 use crate::{
     analysis::{CrossAnalysisCoordinator, CrossNodeSelection, CrossPollReport},
     central::{
-        CentralDeleteOutcome, CentralDeleteResult, CentralError, CentralReviewDecision,
-        CentralStore,
+        CentralDeleteOutcome, CentralDeleteResult, CentralDeleteSelection, CentralError,
+        CentralReviewDecision, CentralStore,
     },
     delete::{DeleteConfirmation, ReviewGroup},
     node_session::NodeSession,
@@ -283,6 +283,7 @@ struct PreparedDeleteContext {
     scope: ResultScope,
     group_id: String,
     confirmation: DeleteConfirmation,
+    items: Vec<MemberView>,
 }
 
 /// 一个节点独占的同步触发端和后台任务；丢弃时立即结束其 PG 连接与同步请求。
@@ -602,6 +603,8 @@ async fn run_controller(
                 prepare_delete(
                     state.config().delete_mode,
                     loaded_members.as_ref(),
+                    &sessions,
+                    central.as_ref(),
                     &mut prepared_delete,
                     &events,
                 )
@@ -1434,20 +1437,81 @@ async fn load_member_preview(
 async fn prepare_delete(
     mode: DeleteMode,
     context: Option<&LoadedMembersContext>,
+    sessions: &BTreeMap<usize, Arc<NodeSession>>,
+    central: Option<&CentralStore>,
     prepared: &mut Option<PreparedDeleteContext>,
     events: &mpsc::Sender<UiEvent>,
 ) -> Result<(), String> {
     let context = context.ok_or_else(|| "尚未载入重复组成员".to_owned())?;
-    let confirmation = DeleteConfirmation::from_groups(
-        mode,
-        &[ReviewGroup::new(&context.group_id, context.items.clone())],
-    );
+    let group = load_complete_review_group(context, sessions, central).await?;
+    let confirmation = DeleteConfirmation::from_groups(mode, std::slice::from_ref(&group));
+    let items = group
+        .members
+        .into_iter()
+        .filter(|member| member.active && member.review == ReviewDecision::Delete)
+        .collect();
     *prepared = Some(PreparedDeleteContext {
         scope: context.scope,
         group_id: context.group_id.clone(),
         confirmation: confirmation.clone(),
+        items,
     });
     send_event(events, UiEvent::DeleteConfirmationChanged(confirmation)).await
+}
+
+async fn load_complete_review_group(
+    context: &LoadedMembersContext,
+    sessions: &BTreeMap<usize, Arc<NodeSession>>,
+    central: Option<&CentralStore>,
+) -> Result<ReviewGroup, String> {
+    let mut members = Vec::new();
+    let mut cursor = None::<String>;
+    let mut seen = std::collections::BTreeSet::new();
+    loop {
+        let page = match context.scope {
+            ResultScope::Local { node_index, run_id } => {
+                let session = sessions
+                    .get(&node_index)
+                    .ok_or_else(|| "节点当前未连接".to_owned())?;
+                member_page_from_node(
+                    session
+                        .list_group_members(
+                            run_id,
+                            &context.group_id,
+                            cursor.as_deref().unwrap_or_default(),
+                            200,
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?,
+                    true,
+                )
+                .map_err(|error| error.to_string())?
+            }
+            ResultScope::Central { run_id } => {
+                let central = central.ok_or_else(|| "PostgreSQL 中心模式未启用".to_owned())?;
+                let online = sessions
+                    .values()
+                    .map(|session| session.machine_id().clone())
+                    .collect::<std::collections::BTreeSet<_>>();
+                member_page_from_central(
+                    central
+                        .page_group_members(run_id, &context.group_id, cursor.as_deref(), 200)
+                        .await
+                        .map_err(|error| error.to_string())?,
+                    |machine| online.contains(machine),
+                )
+            }
+        };
+        members.extend(page.items);
+        let Some(next) = page.next_cursor else {
+            break;
+        };
+        if !seen.insert(next.clone()) {
+            return Err("组成员分页游标没有前进".into());
+        }
+        cursor = Some(next);
+    }
+    Ok(ReviewGroup::new(&context.group_id, members))
 }
 
 async fn confirm_delete(
@@ -1462,14 +1526,22 @@ async fn confirm_delete(
     }
     let summary = match prepared.scope {
         ResultScope::Local { node_index, run_id } => {
+            let items = prepared
+                .items
+                .iter()
+                .map(|member| proto::DeleteItem {
+                    delete_item_id: String::new(),
+                    group_id: prepared.group_id.clone(),
+                    location: Some((&member.location).into()),
+                    expected_content: Some((&member.content).into()),
+                    outcome: String::new(),
+                    message: String::new(),
+                })
+                .collect();
             let batch = sessions
                 .get(&node_index)
                 .ok_or_else(|| "节点当前未连接".to_owned())?
-                .create_delete_batch(
-                    run_id,
-                    vec![prepared.group_id.clone()],
-                    prepared.confirmation.mode,
-                )
+                .create_delete_batch(run_id, items, prepared.confirmation.mode)
                 .await
                 .map_err(|error| error.to_string())?;
             summarize_delete_items(&batch.items)
@@ -1478,6 +1550,7 @@ async fn confirm_delete(
             execute_central_delete(
                 run_id,
                 &prepared.group_id,
+                &prepared.items,
                 prepared.confirmation.mode,
                 sessions,
                 central.ok_or_else(|| "PostgreSQL 中心模式未启用".to_owned())?,
@@ -1491,12 +1564,23 @@ async fn confirm_delete(
 async fn execute_central_delete(
     run_id: AnalysisRunId,
     group_id: &str,
+    confirmed: &[MemberView],
     mode: DeleteMode,
     sessions: &BTreeMap<usize, Arc<NodeSession>>,
     central: &mut CentralStore,
 ) -> Result<String, String> {
+    let selected = confirmed
+        .iter()
+        .map(|member| {
+            CentralDeleteSelection::new(
+                group_id.to_owned(),
+                member.location.clone(),
+                member.content,
+            )
+        })
+        .collect::<Vec<_>>();
     let plan = central
-        .create_delete_plan(run_id, &[group_id.into()], mode)
+        .create_delete_plan(run_id, &selected, mode)
         .await
         .map_err(|error| error.to_string())?;
     let mut by_machine = BTreeMap::<MachineId, Vec<_>>::new();

@@ -10,8 +10,8 @@ use dedup_node_engine::{
     scan::md5_bytes,
 };
 use dedup_node_store::{
-    AnalysisMode, DeleteBatchPlan, DeleteOutcome, FeatureWrite, GroupKind, GroupMemberWrite,
-    GroupWrite, NodeStore, PlannedDeleteItem, ReviewDecision, ScannedPath,
+    AnalysisMode, ConfirmedDeleteItem, DeleteBatchPlan, DeleteOutcome, FeatureWrite, GroupKind,
+    GroupMemberWrite, GroupWrite, NodeStore, PlannedDeleteItem, ReviewDecision, ScannedPath,
 };
 
 #[test]
@@ -206,7 +206,11 @@ fn delete_fixture(
     let plan = store
         .create_delete_batch(
             run_id,
-            std::slice::from_ref(&group_id),
+            &[ConfirmedDeleteItem::new(
+                group_id.clone(),
+                target_location.clone(),
+                target_key,
+            )],
             DeleteMode::Permanent,
             2,
         )

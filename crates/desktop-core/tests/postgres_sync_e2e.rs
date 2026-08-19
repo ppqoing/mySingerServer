@@ -15,9 +15,9 @@ use dedup_desktop_core::{
 };
 use dedup_media::{ImageStage2, PdqHash};
 use dedup_node_store::{
-    AnalysisMode, DeleteOutcome, DeleteResult, FeatureWrite, GroupKind, GroupMemberWrite,
-    GroupWrite, ImageStage1Fields, NodeStore, OwnedSnapshot, ReviewDecision, ScannedPath,
-    StoreError, SyncBatch, SyncState,
+    AnalysisMode, ConfirmedDeleteItem, DeleteOutcome, DeleteResult, FeatureWrite, GroupKind,
+    GroupMemberWrite, GroupWrite, ImageStage1Fields, NodeStore, OwnedSnapshot, ReviewDecision,
+    ScannedPath, StoreError, SyncBatch, SyncState,
 };
 use dedup_protocol::proto;
 use tempfile::TempDir;
@@ -631,7 +631,16 @@ fn seed_successful_delete(node: &StoreNode, machine: &MachineId) -> LocationKey 
             .save_review_mark(run, &group_id, &deleted_location, ReviewDecision::Delete)
             .unwrap();
         let batch = store
-            .create_delete_batch(run, &[group_id], DeleteMode::RecycleBin, 2)
+            .create_delete_batch(
+                run,
+                &[ConfirmedDeleteItem::new(
+                    group_id,
+                    deleted_location.clone(),
+                    deleted.key,
+                )],
+                DeleteMode::RecycleBin,
+                2,
+            )
             .unwrap();
         store
             .apply_delete_results(

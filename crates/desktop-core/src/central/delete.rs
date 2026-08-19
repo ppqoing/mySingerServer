@@ -1,6 +1,8 @@
 //! 中心删除计划冻结与节点执行结果落库；物理文件操作始终由对应节点完成。
 
-use dedup_core::{AnalysisRunId, ContentKey, DeleteMode, LocationKey, MachineId, NormalizedPath};
+use std::collections::BTreeSet;
+
+use dedup_core::{AnalysisRunId, ContentKey, DeleteMode, LocationKey};
 use tokio_postgres::Transaction;
 use uuid::Uuid;
 
@@ -17,6 +19,28 @@ pub struct CentralDeleteItem {
     pub location: LocationKey,
     /// 节点删除前必须复核的 MD5 与大小。
     pub expected: ContentKey,
+}
+
+/// 删除摘要已向用户展示并冻结的一项中心位置与内容身份。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CentralDeleteSelection {
+    /// 所属重复组。
+    pub group_id: String,
+    /// 用户确认的机器与规范路径。
+    pub location: LocationKey,
+    /// 用户确认时看到的 MD5 与文件大小。
+    pub expected: ContentKey,
+}
+
+impl CentralDeleteSelection {
+    /// 创建一项由 PostgreSQL 事务重新验证的确认身份。
+    pub const fn new(group_id: String, location: LocationKey, expected: ContentKey) -> Self {
+        Self {
+            group_id,
+            location,
+            expected,
+        }
+    }
 }
 
 /// 中心一次性冻结后按机器派发的删除批次。
@@ -55,39 +79,34 @@ pub struct CentralDeleteResult {
 }
 
 impl CentralStore {
-    /// 验证每个选中组至少有一个活动 Keep，并冻结所有明确 Delete 成员。
+    /// 只冻结用户确认的精确集合，并重新验证 Delete、活动内容身份和集合外 Keep。
     pub async fn create_delete_plan(
         &mut self,
         run_id: AnalysisRunId,
-        group_ids: &[String],
+        confirmed: &[CentralDeleteSelection],
         mode: DeleteMode,
     ) -> Result<CentralDeletePlan, CentralError> {
+        if confirmed.is_empty() {
+            return Err(CentralError::InvalidState("删除批次没有确认项".into()));
+        }
         let run_text = run_id.as_uuid().to_string();
         let transaction = self.client.transaction().await?;
-        let mut items = Vec::new();
-        for group_id in group_ids {
-            let keep_count: i64 = transaction
-                .query_one(
-                    "SELECT COUNT(*)
-                     FROM group_members gm
-                     JOIN review_marks rm ON rm.analysis_run_id=gm.analysis_run_id
-                       AND rm.group_id=gm.group_id AND rm.machine_id=gm.machine_id
-                       AND rm.normalized_path=gm.normalized_path AND rm.decision='keep'
-                     JOIN file_locations f ON f.machine_id=gm.machine_id
-                       AND f.normalized_path=gm.normalized_path AND f.active=TRUE
-                     WHERE gm.analysis_run_id=$1 AND gm.group_id=$2 AND gm.active=TRUE",
-                    &[&run_text, group_id],
-                )
-                .await?
-                .get(0);
-            if keep_count == 0 {
-                return Err(CentralError::InvalidState(format!(
-                    "重复组 {group_id} 没有活动 Keep 成员"
-                )));
+        let mut keys = BTreeSet::new();
+        for item in confirmed {
+            let key = (
+                item.group_id.clone(),
+                item.location.machine_id().as_str().to_owned(),
+                item.location.normalized_path().as_str().to_owned(),
+            );
+            if !keys.insert(key) {
+                return Err(CentralError::InvalidState(
+                    "删除确认集合包含重复位置".into(),
+                ));
             }
-            let rows = transaction
-                .query(
-                    "SELECT gm.machine_id,gm.normalized_path,gm.md5,gm.file_size
+            let valid: bool = transaction
+                .query_one(
+                    "SELECT EXISTS(
+                     SELECT 1
                      FROM group_members gm
                      JOIN review_marks rm ON rm.analysis_run_id=gm.analysis_run_id
                        AND rm.group_id=gm.group_id AND rm.machine_id=gm.machine_id
@@ -97,37 +116,76 @@ impl CentralStore {
                      JOIN contents c ON c.content_id=f.content_id
                        AND c.md5=gm.md5 AND c.file_size=gm.file_size
                      WHERE gm.analysis_run_id=$1 AND gm.group_id=$2 AND gm.active=TRUE
-                     ORDER BY gm.machine_id,gm.normalized_path",
-                    &[&run_text, group_id],
+                       AND gm.machine_id=$3 AND gm.normalized_path=$4
+                       AND gm.md5=$5 AND gm.file_size=$6)",
+                    &[
+                        &run_text,
+                        &item.group_id,
+                        &item.location.machine_id().as_str(),
+                        &item.location.normalized_path().as_str(),
+                        &item.expected.md5().as_slice(),
+                        &pg_i64(item.expected.file_size(), "删除项文件大小")?,
+                    ],
                 )
-                .await?;
-            for row in rows {
-                let machine: String = row.get(0);
-                let path: String = row.get(1);
-                let md5: Vec<u8> = row.get(2);
-                items.push(CentralDeleteItem {
-                    item_id: Uuid::now_v7().to_string(),
-                    group_id: group_id.clone(),
-                    location: LocationKey::new(
-                        MachineId::parse(machine.trim_end())?,
-                        NormalizedPath::new(path)?,
-                    ),
-                    expected: ContentKey::new(
-                        md5.try_into().map_err(|_| {
-                            CentralError::InvalidState("删除项 MD5 长度不是 16".into())
-                        })?,
-                        u64::try_from(row.get::<_, i64>(3)).map_err(|_| {
-                            CentralError::InvalidState("删除项文件大小为负数".into())
-                        })?,
-                    ),
-                });
+                .await?
+                .get(0);
+            if !valid {
+                return Err(CentralError::InvalidState(format!(
+                    "删除确认项不再是活动且内容一致的 Delete: {}",
+                    item.location.normalized_path().as_str()
+                )));
             }
         }
-        if items.is_empty() {
-            return Err(CentralError::InvalidState(
-                "删除批次没有明确 Delete 成员".into(),
-            ));
+        for group_id in confirmed
+            .iter()
+            .map(|item| item.group_id.as_str())
+            .collect::<BTreeSet<_>>()
+        {
+            let keep_rows = transaction
+                .query(
+                    "SELECT gm.machine_id,gm.normalized_path
+                     FROM group_members gm
+                     JOIN review_marks rm ON rm.analysis_run_id=gm.analysis_run_id
+                       AND rm.group_id=gm.group_id AND rm.machine_id=gm.machine_id
+                       AND rm.normalized_path=gm.normalized_path AND rm.decision='keep'
+                     JOIN file_locations f ON f.machine_id=gm.machine_id
+                       AND f.normalized_path=gm.normalized_path AND f.active=TRUE
+                     WHERE gm.analysis_run_id=$1 AND gm.group_id=$2 AND gm.active=TRUE",
+                    &[&run_text, &group_id],
+                )
+                .await?;
+            if !keep_rows.into_iter().any(|row| {
+                let machine = row.get::<_, String>(0).trim_end().to_owned();
+                let path = row.get::<_, String>(1);
+                !keys.contains(&(group_id.to_owned(), machine, path))
+            }) {
+                return Err(CentralError::InvalidState(format!(
+                    "重复组 {group_id} 没有确认集合外的活动 Keep 成员"
+                )));
+            }
         }
+        let mut frozen = confirmed.to_vec();
+        frozen.sort_by(|left, right| {
+            (
+                &left.group_id,
+                left.location.machine_id().as_str(),
+                left.location.normalized_path().as_str(),
+            )
+                .cmp(&(
+                    &right.group_id,
+                    right.location.machine_id().as_str(),
+                    right.location.normalized_path().as_str(),
+                ))
+        });
+        let items = frozen
+            .into_iter()
+            .map(|item| CentralDeleteItem {
+                item_id: Uuid::now_v7().to_string(),
+                group_id: item.group_id,
+                location: item.location,
+                expected: item.expected,
+            })
+            .collect::<Vec<_>>();
         let batch_id = Uuid::now_v7().to_string();
         transaction
             .execute(

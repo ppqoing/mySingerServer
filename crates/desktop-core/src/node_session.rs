@@ -369,11 +369,11 @@ impl NodeSession {
         }
     }
 
-    /// 验证 Keep/Delete 后由节点立即执行本地删除批次并返回逐项结果。
+    /// 由节点重新验证并立即执行用户确认的本地精确删除集合。
     pub async fn create_delete_batch(
         &self,
         run_id: AnalysisRunId,
-        group_ids: Vec<String>,
+        items: Vec<proto::DeleteItem>,
         mode: DeleteMode,
     ) -> Result<proto::CreateDeleteBatch, SessionError> {
         let response = self
@@ -385,9 +385,9 @@ impl NodeSession {
                         DeleteMode::RecycleBin => proto::DeleteMode::DeleteRecycleBin as i32,
                         DeleteMode::Permanent => proto::DeleteMode::DeletePermanent as i32,
                     },
-                    items: Vec::new(),
+                    items,
                     analysis_run_id: run_id.as_uuid().to_string(),
-                    group_ids,
+                    group_ids: Vec::new(),
                 },
             ))
             .await?;

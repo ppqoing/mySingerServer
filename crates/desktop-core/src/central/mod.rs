@@ -19,7 +19,10 @@ pub use analysis::{
 };
 pub use content::CentralSnapshot;
 pub use cross_analysis::CentralRunSnapshot;
-pub use delete::{CentralDeleteItem, CentralDeleteOutcome, CentralDeletePlan, CentralDeleteResult};
+pub use delete::{
+    CentralDeleteItem, CentralDeleteOutcome, CentralDeletePlan, CentralDeleteResult,
+    CentralDeleteSelection,
+};
 pub use schema::validate_schema;
 
 /// 发布包内供管理员手动执行的建库脚本相对路径。

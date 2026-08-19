@@ -3,14 +3,14 @@ use dedup_core::{
 };
 use dedup_desktop_core::central::{
     CentralAnalysisInput, CentralAnalysisNode, CentralCandidate, CentralCandidateStatus,
-    CentralDeleteOutcome, CentralDeleteResult, CentralGroupKind, CentralGroupMember,
-    CentralGroupWrite, CentralPairKind, CentralReviewDecision, CentralStore,
+    CentralDeleteOutcome, CentralDeleteResult, CentralDeleteSelection, CentralGroupKind,
+    CentralGroupMember, CentralGroupWrite, CentralPairKind, CentralReviewDecision, CentralStore,
 };
 use dedup_media::{ImageStage2, PdqHash};
 use dedup_node_store::{
-    AnalysisMode, DeleteOutcome, DeleteResult, FeatureWrite, GroupKind, GroupMemberWrite,
-    GroupWrite, ImageStage1Fields, NodeStore, ReviewDecision, ScannedPath, VideoFrameStage1Fields,
-    VideoFrameStage2Fields, VideoMetadataFields,
+    AnalysisMode, ConfirmedDeleteItem, DeleteOutcome, DeleteResult, FeatureWrite, GroupKind,
+    GroupMemberWrite, GroupWrite, ImageStage1Fields, NodeStore, ReviewDecision, ScannedPath,
+    VideoFrameStage1Fields, VideoFrameStage2Fields, VideoMetadataFields,
 };
 
 #[tokio::test]
@@ -153,7 +153,11 @@ async fn analysis_groups_use_stable_pages_and_successful_delete_shrinks_group() 
     let plan = central
         .create_delete_plan(
             run_id,
-            std::slice::from_ref(&exact_group),
+            &[CentralDeleteSelection::new(
+                exact_group.clone(),
+                exact_d.clone(),
+                exact,
+            )],
             DeleteMode::RecycleBin,
         )
         .await
@@ -173,6 +177,83 @@ async fn analysis_groups_use_stable_pages_and_successful_delete_shrinks_group() 
     let remaining = central.page_groups(run_id, None, 10).await.unwrap();
     assert_eq!(remaining.items.len(), 1);
     assert_eq!(remaining.items[0].kind, CentralGroupKind::Image);
+}
+
+#[tokio::test]
+#[ignore = "requires DEDUP_TEST_POSTGRES_URL"]
+async fn central_delete_plan_never_expands_beyond_confirmed_locations() {
+    let url = std::env::var("DEDUP_TEST_POSTGRES_URL").unwrap();
+    let mut central = CentralStore::connect(&url).await.unwrap();
+    let keep_machine = unique_machine(0x31);
+    let confirmed_machine = unique_machine(0x32);
+    let late_machine = unique_machine(0x33);
+    let content = ContentKey::new([0x71; 16], 710);
+    let keep = location(keep_machine.clone(), r"C:\Freeze\keep.bin");
+    let confirmed = location(confirmed_machine.clone(), r"D:\Freeze\confirmed.bin");
+    let late = location(late_machine.clone(), r"E:\Freeze\late.bin");
+    for location in [&keep, &confirmed, &late] {
+        sync_location(&mut central, location, content).await;
+    }
+    let run = central
+        .create_analysis_run(
+            &Thresholds::default(),
+            &[
+                analysis_node(keep_machine),
+                analysis_node(confirmed_machine),
+                analysis_node(late_machine),
+            ],
+        )
+        .await
+        .unwrap();
+    central
+        .insert_analysis_inputs(
+            run,
+            &[
+                analysis_input(content, keep.clone()),
+                analysis_input(content, confirmed.clone()),
+                analysis_input(content, late.clone()),
+            ],
+        )
+        .await
+        .unwrap();
+    let group_id = format!("central-freeze-{}", run.as_uuid());
+    central
+        .replace_groups(
+            run,
+            &[CentralGroupWrite {
+                group_id: group_id.clone(),
+                kind: CentralGroupKind::Exact,
+                representative: content,
+                members: vec![
+                    group_member(keep.clone(), content, true),
+                    group_member(confirmed.clone(), content, false),
+                    group_member(late.clone(), content, false),
+                ],
+            }],
+        )
+        .await
+        .unwrap();
+    central
+        .save_review_mark(run, &group_id, &keep, CentralReviewDecision::Keep)
+        .await
+        .unwrap();
+    central
+        .save_review_mark(run, &group_id, &confirmed, CentralReviewDecision::Delete)
+        .await
+        .unwrap();
+    let frozen = CentralDeleteSelection::new(group_id.clone(), confirmed.clone(), content);
+    central
+        .save_review_mark(run, &group_id, &late, CentralReviewDecision::Delete)
+        .await
+        .unwrap();
+
+    let plan = central
+        .create_delete_plan(run, &[frozen], DeleteMode::RecycleBin)
+        .await
+        .unwrap();
+
+    assert_eq!(plan.items.len(), 1);
+    assert_eq!(plan.items[0].location, confirmed);
 }
 
 #[tokio::test]
@@ -332,6 +413,13 @@ fn location(machine: MachineId, path: &str) -> dedup_core::LocationKey {
     dedup_core::LocationKey::new(machine, NormalizedPath::new(path).unwrap())
 }
 
+fn unique_machine(seed: u8) -> MachineId {
+    let id = uuid::Uuid::now_v7();
+    let mut bytes = [seed; 32];
+    bytes[..16].copy_from_slice(id.as_bytes());
+    MachineId::from_sha256(bytes)
+}
+
 async fn sync_location(
     central: &mut CentralStore,
     location: &dedup_core::LocationKey,
@@ -453,7 +541,16 @@ fn add_successful_delete(store: &mut NodeStore, machine: &MachineId) {
         .save_review_mark(run, &group_id, &deleted_location, ReviewDecision::Delete)
         .unwrap();
     let batch = store
-        .create_delete_batch(run, &[group_id], DeleteMode::RecycleBin, 2)
+        .create_delete_batch(
+            run,
+            &[ConfirmedDeleteItem::new(
+                group_id,
+                deleted_location,
+                deleted.key,
+            )],
+            DeleteMode::RecycleBin,
+            2,
+        )
         .unwrap();
     store
         .apply_delete_results(

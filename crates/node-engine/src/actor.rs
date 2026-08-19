@@ -13,8 +13,8 @@ use dedup_core::{
     MachineId, NodeConfig, TaskId, Thresholds,
 };
 use dedup_node_store::{
-    AnalysisStatus, DeleteBatchPlan, DeleteOutcome, GroupKind, NodeStore, OwnedSnapshot,
-    PlannedDeleteItem, ReviewDecision, StoreError, TaskSnapshot, TaskStatus,
+    AnalysisStatus, ConfirmedDeleteItem, DeleteBatchPlan, DeleteOutcome, GroupKind, NodeStore,
+    OwnedSnapshot, PlannedDeleteItem, ReviewDecision, StoreError, TaskSnapshot, TaskStatus,
 };
 use dedup_protocol::proto;
 use thiserror::Error;
@@ -895,10 +895,45 @@ impl EngineState {
             Ok(proto::DeleteMode::DeletePermanent) => DeleteMode::Permanent,
             _ => return Err(invalid("删除模式无效")),
         };
-        let external = !request.items.is_empty();
-        let plan = if external {
+        let local = !request.analysis_run_id.is_empty();
+        let external = !local;
+        let plan = if local {
+            if !request.delete_batch_id.is_empty() || !request.group_ids.is_empty() {
+                return Err(invalid("本地删除只接受确认的精确成员集合"));
+            }
+            let confirmed = request
+                .items
+                .iter()
+                .map(|item| {
+                    Ok(ConfirmedDeleteItem::new(
+                        item.group_id.clone(),
+                        item.location
+                            .clone()
+                            .ok_or_else(|| invalid("本地删除项缺少位置"))?
+                            .try_into()
+                            .map_err(invalid)?,
+                        item.expected_content
+                            .clone()
+                            .ok_or_else(|| invalid("本地删除项缺少内容键"))?
+                            .try_into()
+                            .map_err(invalid)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, (proto::ErrorCode, String)>>()?;
+            self.store
+                .create_delete_batch(
+                    parse_analysis_id(&request.analysis_run_id)?,
+                    &confirmed,
+                    mode,
+                    now_ms(),
+                )
+                .map_err(store_error)?
+        } else {
             if request.delete_batch_id.is_empty() {
                 return Err(invalid("中心删除批次缺少 ID"));
+            }
+            if !request.group_ids.is_empty() {
+                return Err(invalid("中心删除不接受组范围"));
             }
             let items = request
                 .items
@@ -927,15 +962,6 @@ impl EngineState {
                 mode,
                 items,
             }
-        } else {
-            self.store
-                .create_delete_batch(
-                    parse_analysis_id(&request.analysis_run_id)?,
-                    &request.group_ids,
-                    mode,
-                    now_ms(),
-                )
-                .map_err(store_error)?
         };
         let results = if external {
             DeleteEngine::execute_external(&mut self.store, &plan)

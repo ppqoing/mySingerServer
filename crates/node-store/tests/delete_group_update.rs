@@ -5,8 +5,8 @@ use dedup_core::{
     NormalizedPath, Thresholds,
 };
 use dedup_node_store::{
-    AnalysisMode, DeleteOutcome, DeleteResult, GroupKind, GroupMemberWrite, GroupWrite, NodeStore,
-    ReviewDecision, ScannedPath,
+    AnalysisMode, ConfirmedDeleteItem, DeleteOutcome, DeleteResult, GroupKind, GroupMemberWrite,
+    GroupWrite, NodeStore, ReviewDecision, ScannedPath,
 };
 
 fn machine() -> MachineId {
@@ -61,7 +61,12 @@ fn successful_delete_removes_member_and_small_group() {
         .save_review_mark(run, &group_id, &keep_location, ReviewDecision::Keep)
         .unwrap();
     let batch = store
-        .create_delete_batch(run, &[group_id], DeleteMode::RecycleBin, 2)
+        .create_delete_batch(
+            run,
+            &[confirmed(&group_id, &delete_location, delete_key)],
+            DeleteMode::RecycleBin,
+            2,
+        )
         .unwrap();
 
     let result = DeleteResult::new(
@@ -130,7 +135,7 @@ fn failed_or_unprotected_delete_keeps_group() {
         store
             .create_delete_batch(
                 run,
-                std::slice::from_ref(&group_id),
+                &[confirmed(&group_id, &first_location, first_key)],
                 DeleteMode::Permanent,
                 2
             )
@@ -143,7 +148,7 @@ fn failed_or_unprotected_delete_keeps_group() {
     let batch = store
         .create_delete_batch(
             run,
-            std::slice::from_ref(&group_id),
+            &[confirmed(&group_id, &first_location, first_key)],
             DeleteMode::Permanent,
             3,
         )
@@ -203,7 +208,7 @@ fn representative_delete_selects_first_keep_and_cursor_continues() {
     let batch = store
         .create_delete_batch(
             run,
-            std::slice::from_ref(&group_id),
+            &[confirmed(&group_id, &a_location, a_key)],
             DeleteMode::Permanent,
             2,
         )
@@ -227,4 +232,65 @@ fn representative_delete_selects_first_keep_and_cursor_continues() {
     assert_eq!(continued.items.len(), 2);
     assert_eq!(continued.items[0].location, b_location);
     assert_eq!(continued.items[1].location, c_location);
+}
+
+/// 破坏点：若存储端仍按 group_id 重查全部 Delete，确认后新增的 Delete 会扩大当前批次。
+#[test]
+fn delete_batch_never_expands_beyond_confirmed_locations() {
+    let mut store = NodeStore::open_in_memory(machine()).unwrap();
+    let run = store
+        .create_analysis_run(AnalysisMode::Local, Thresholds::default(), 1)
+        .unwrap();
+    let (keep_location, keep_key) = add_file(&mut store, r"D:\Freeze\keep.bin", 10);
+    let (confirmed_location, confirmed_key) = add_file(&mut store, r"D:\Freeze\confirmed.bin", 11);
+    let (late_location, late_key) = add_file(&mut store, r"D:\Freeze\late.bin", 12);
+    let group_id = GroupId::new().as_uuid().to_string();
+    store
+        .replace_groups(
+            run,
+            &[GroupWrite {
+                group_id: group_id.clone(),
+                kind: GroupKind::Exact,
+                representative: keep_key,
+                members: vec![
+                    GroupMemberWrite::new(keep_location.clone(), keep_key, true),
+                    GroupMemberWrite::new(confirmed_location.clone(), confirmed_key, false),
+                    GroupMemberWrite::new(late_location.clone(), late_key, false),
+                ],
+            }],
+        )
+        .unwrap();
+    store
+        .save_review_mark(run, &group_id, &keep_location, ReviewDecision::Keep)
+        .unwrap();
+    store
+        .save_review_mark(run, &group_id, &confirmed_location, ReviewDecision::Delete)
+        .unwrap();
+    let frozen = confirmed(&group_id, &confirmed_location, confirmed_key);
+    store
+        .save_review_mark(run, &group_id, &late_location, ReviewDecision::Delete)
+        .unwrap();
+
+    let stale_identity = ConfirmedDeleteItem::new(
+        group_id.clone(),
+        confirmed_location.clone(),
+        ContentKey::new([0xff; 16], confirmed_key.file_size()),
+    );
+    assert!(
+        store
+            .create_delete_batch(run, &[stale_identity], DeleteMode::Permanent, 2)
+            .is_err(),
+        "确认时的 ContentKey 与当前活动成员不一致时必须在文件操作前拒绝"
+    );
+
+    let batch = store
+        .create_delete_batch(run, &[frozen], DeleteMode::Permanent, 2)
+        .unwrap();
+
+    assert_eq!(batch.items.len(), 1);
+    assert_eq!(batch.items[0].location, confirmed_location);
+}
+
+fn confirmed(group_id: &str, location: &LocationKey, expected: ContentKey) -> ConfirmedDeleteItem {
+    ConfirmedDeleteItem::new(group_id.to_owned(), location.clone(), expected)
 }

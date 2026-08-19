@@ -177,7 +177,14 @@ async fn run_local_node_e2e() {
     let deleted = session
         .create_delete_batch(
             exact_run,
-            vec![delete_group.group_id.clone()],
+            vec![proto::DeleteItem {
+                delete_item_id: String::new(),
+                group_id: delete_group.group_id.clone(),
+                location: Some((&target_location).into()),
+                expected_content: target.content.clone(),
+                outcome: String::new(),
+                message: String::new(),
+            }],
             DeleteMode::Permanent,
         )
         .await

@@ -17,7 +17,9 @@ pub use analysis::{
     AnalysisInput, AnalysisMode, AnalysisRunSnapshot, AnalysisStatus, CandidateStatus,
     CandidateWrite, PairKind,
 };
-pub use delete::{DeleteBatchPlan, DeleteOutcome, DeleteResult, PlannedDeleteItem};
+pub use delete::{
+    ConfirmedDeleteItem, DeleteBatchPlan, DeleteOutcome, DeleteResult, PlannedDeleteItem,
+};
 pub use groups::{
     GroupKind, GroupMemberPage, GroupMemberWrite, GroupPage, GroupWrite, StoredGroup,
     StoredGroupMember,

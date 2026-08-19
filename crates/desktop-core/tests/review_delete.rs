@@ -140,6 +140,38 @@ fn delete_confirmation_requires_active_keep_and_reports_totals() {
 }
 
 #[test]
+fn central_historical_page_offline_delete_disables_complete_confirmation() {
+    let mut historical = (0..200)
+        .map(|index| member(&format!("history-{index:03}"), 10, true, None, None))
+        .collect::<Vec<_>>();
+    historical[0].review = ReviewDecision::Keep;
+    historical[1].review = ReviewDecision::Delete;
+    historical[1].set_availability(true, false);
+    let current = MemberView {
+        review: ReviewDecision::Delete,
+        ..member("current-delete", 20, true, None, None)
+    };
+
+    let current_only = DeleteConfirmation::from_groups(
+        DeleteMode::RecycleBin,
+        &[ReviewGroup::new(
+            "central",
+            vec![historical[0].clone(), current.clone()],
+        )],
+    );
+    assert!(current_only.can_execute, "当前页本身不能暴露历史页离线目标");
+
+    historical.push(current);
+    let complete = DeleteConfirmation::from_groups(
+        DeleteMode::RecycleBin,
+        &[ReviewGroup::new("central", historical)],
+    );
+    assert_eq!(complete.file_count, 2);
+    assert!(!complete.can_execute);
+    assert!(complete.warning.contains("在线"));
+}
+
+#[test]
 fn mixed_delete_results_only_remove_successes_and_leave_retryable_items() {
     let members = vec![
         member("recycled", 10, true, None, None),

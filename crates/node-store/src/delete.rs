@@ -1,5 +1,7 @@
 //! 删除批次保护条件，以及成功后位置墓碑和重复组即时收缩事务。
 
+use std::collections::BTreeSet;
+
 use dedup_core::{AnalysisRunId, ContentKey, DeleteMode, DisplayPath, LocationKey, NormalizedPath};
 use rusqlite::{OptionalExtension, Transaction, params};
 use uuid::Uuid;
@@ -60,6 +62,28 @@ pub struct PlannedDeleteItem {
     pub expected: ContentKey,
 }
 
+/// 管理端确认摘要绑定的一项精确删除身份，不包含由节点生成的持久计划项 ID。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfirmedDeleteItem {
+    /// 所属重复组。
+    pub group_id: String,
+    /// 用户确认的机器与规范路径。
+    pub location: LocationKey,
+    /// 用户确认时看到的 MD5 与文件大小。
+    pub expected: ContentKey,
+}
+
+impl ConfirmedDeleteItem {
+    /// 创建一项由节点存储边界重新验证的确认身份。
+    pub const fn new(group_id: String, location: LocationKey, expected: ContentKey) -> Self {
+        Self {
+            group_id,
+            location,
+            expected,
+        }
+    }
+}
+
 /// 一次删除批次的执行计划。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeleteBatchPlan {
@@ -72,74 +96,110 @@ pub struct DeleteBatchPlan {
 }
 
 impl NodeStore {
-    /// 在删除边界一次性验证每组至少一个活动 Keep，并冻结所有 Delete 身份。
+    /// 只冻结管理端已确认的精确集合，并重新验证 Delete、活动内容身份和集合外 Keep。
     pub fn create_delete_batch(
         &mut self,
         run_id: AnalysisRunId,
-        group_ids: &[String],
+        confirmed: &[ConfirmedDeleteItem],
         mode: DeleteMode,
         now_ms: i64,
     ) -> Result<DeleteBatchPlan, StoreError> {
+        if confirmed.is_empty() {
+            return Err(StoreError::InvalidState("删除批次没有确认项".into()));
+        }
         let transaction = self.connection.transaction()?;
-        let mut planned = Vec::new();
-        for group_id in group_ids {
-            let keep_count: i64 = transaction.query_row(
+        let run_text = run_id.as_uuid().to_string();
+        let mut keys = BTreeSet::new();
+        for item in confirmed {
+            let key = (
+                item.group_id.clone(),
+                item.location.machine_id().as_str().to_owned(),
+                item.location.normalized_path().as_str().to_owned(),
+            );
+            if !keys.insert(key) {
+                return Err(StoreError::InvalidState("删除确认集合包含重复位置".into()));
+            }
+            let valid: i64 = transaction.query_row(
                 "SELECT COUNT(*)
                  FROM group_members gm
                  JOIN review_marks rm ON rm.analysis_run_id=gm.analysis_run_id
                    AND rm.group_id=gm.group_id AND rm.machine_id=gm.machine_id
-                   AND rm.normalized_path=gm.normalized_path AND rm.decision='keep'
+                   AND rm.normalized_path=gm.normalized_path AND rm.decision='delete'
                  JOIN files f ON f.machine_id=gm.machine_id
                    AND f.normalized_path=gm.normalized_path AND f.active=1
-                 WHERE gm.analysis_run_id=?1 AND gm.group_id=?2 AND gm.active=1",
-                params![run_id.as_uuid().to_string(), group_id],
+                 JOIN contents c ON c.content_id=f.content_id
+                   AND c.md5=gm.md5 AND c.file_size=gm.file_size
+                 WHERE gm.analysis_run_id=?1 AND gm.group_id=?2 AND gm.active=1
+                   AND gm.machine_id=?3 AND gm.normalized_path=?4
+                   AND gm.md5=?5 AND gm.file_size=?6",
+                params![
+                    run_text,
+                    item.group_id,
+                    item.location.machine_id().as_str(),
+                    item.location.normalized_path().as_str(),
+                    item.expected.md5().as_slice(),
+                    sqlite_integer(item.expected.file_size())?
+                ],
                 |row| row.get(0),
             )?;
-            if keep_count == 0 {
-                return Err(StoreError::MissingKeep(group_id.clone()));
+            if valid != 1 {
+                return Err(StoreError::InvalidState(format!(
+                    "删除确认项不再是活动且内容一致的 Delete: {}",
+                    item.location.normalized_path().as_str()
+                )));
             }
-            let rows = {
+        }
+        for group_id in confirmed
+            .iter()
+            .map(|item| item.group_id.as_str())
+            .collect::<BTreeSet<_>>()
+        {
+            let keep_locations = {
                 let mut statement = transaction.prepare(
-                    "SELECT gm.machine_id,gm.normalized_path,gm.md5,gm.file_size
+                    "SELECT gm.machine_id,gm.normalized_path
                      FROM group_members gm
                      JOIN review_marks rm ON rm.analysis_run_id=gm.analysis_run_id
                        AND rm.group_id=gm.group_id AND rm.machine_id=gm.machine_id
-                       AND rm.normalized_path=gm.normalized_path AND rm.decision='delete'
+                       AND rm.normalized_path=gm.normalized_path AND rm.decision='keep'
                      JOIN files f ON f.machine_id=gm.machine_id
                        AND f.normalized_path=gm.normalized_path AND f.active=1
-                     JOIN contents c ON c.content_id=f.content_id
-                       AND c.md5=gm.md5 AND c.file_size=gm.file_size
-                     WHERE gm.analysis_run_id=?1 AND gm.group_id=?2 AND gm.active=1
-                     ORDER BY gm.machine_id,gm.normalized_path",
+                     WHERE gm.analysis_run_id=?1 AND gm.group_id=?2 AND gm.active=1",
                 )?;
                 statement
-                    .query_map(params![run_id.as_uuid().to_string(), group_id], |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, Vec<u8>>(2)?,
-                            row.get::<_, i64>(3)?,
-                        ))
+                    .query_map(params![run_text, group_id], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                     })?
                     .collect::<Result<Vec<_>, _>>()?
             };
-            for (machine, path, md5, size) in rows {
-                planned.push(PlannedDeleteItem {
-                    item_id: Uuid::now_v7().to_string(),
-                    group_id: group_id.clone(),
-                    location: LocationKey::new(
-                        dedup_core::MachineId::parse(&machine)?,
-                        NormalizedPath::new(path)?,
-                    ),
-                    expected: ContentKey::new(fixed_bytes(md5, "group_members.md5")?, size as u64),
-                });
+            if !keep_locations
+                .into_iter()
+                .any(|(machine, path)| !keys.contains(&(group_id.to_owned(), machine, path)))
+            {
+                return Err(StoreError::MissingKeep(group_id.to_owned()));
             }
         }
-        if planned.is_empty() {
-            return Err(StoreError::InvalidState(
-                "删除批次没有明确 Delete 成员".into(),
-            ));
-        }
+        let mut frozen = confirmed.to_vec();
+        frozen.sort_by(|left, right| {
+            (
+                &left.group_id,
+                left.location.machine_id().as_str(),
+                left.location.normalized_path().as_str(),
+            )
+                .cmp(&(
+                    &right.group_id,
+                    right.location.machine_id().as_str(),
+                    right.location.normalized_path().as_str(),
+                ))
+        });
+        let planned = frozen
+            .into_iter()
+            .map(|item| PlannedDeleteItem {
+                item_id: Uuid::now_v7().to_string(),
+                group_id: item.group_id,
+                location: item.location,
+                expected: item.expected,
+            })
+            .collect::<Vec<_>>();
         let batch_id = Uuid::now_v7().to_string();
         transaction.execute(
             "INSERT INTO delete_batches(
