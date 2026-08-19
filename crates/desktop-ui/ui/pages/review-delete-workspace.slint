@@ -1,0 +1,204 @@
+// 当前已载入组的本地复核筛选与删除入口；不创建新后端命令或持久批次。
+
+import { Button, LineEdit, ScrollView } from "std-widgets.slint";
+import { Theme, UiMemberRow } from "../theme.slint";
+import { EmptyState } from "../components/empty-state.slint";
+import { StatusPill } from "../components/status-pill.slint";
+import { TabStrip } from "../components/tab-strip.slint";
+
+// 复核成员只按已加载模型的 review 字面状态显示，动作继续转发现有回调。
+component ReviewMemberList inherits Rectangle {
+    in property <[UiMemberRow]> members;
+    in property <int> review-filter;
+    callback preview(string, string);
+    callback review(string, string, int);
+
+    background: Theme.panel;
+    border-radius: 9px;
+    border-width: 1px;
+    border-color: Theme.border;
+    accessible-role: AccessibleRole.groupbox;
+    accessible-label: "当前组复核成员";
+
+    ScrollView {
+        VerticalLayout {
+            spacing: 0px;
+            for member in root.members : row := Rectangle {
+                private property <bool> matches-filter:
+                    root.review-filter == 0 ? member.review == "未决定" :
+                    root.review-filter == 1 ? member.review == "保留" :
+                    member.review == "删除";
+                visible: row.matches-filter;
+                height: row.matches-filter ? 68px : 0px;
+                background: member.representative ? Theme.accent-soft : Theme.panel;
+                accessible-role: AccessibleRole.list-item;
+                accessible-label: "成员：" + member.path;
+                accessible-description: "复核状态：" + member.review;
+
+                HorizontalLayout {
+                    padding-left: 12px;
+                    padding-right: 12px;
+                    spacing: 8px;
+                    alignment: center;
+                    StatusPill {
+                        width: 62px;
+                        label: member.review;
+                        tone: member.review-color;
+                    }
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        spacing: 3px;
+                        alignment: center;
+                        Text { text: member.path; color: Theme.text; font-size: 11px; overflow: elide; }
+                        Text { text: member.machine-id + " · " + member.size + " · " + member.metadata; color: Theme.muted; font-size: 9px; overflow: elide; }
+                    }
+                    Text { text: "Stage1 " + member.stage1; width: 76px; color: Theme.muted; font-size: 9px; }
+                    Text { text: "Stage2 " + member.stage2; width: 80px; color: Theme.muted; font-size: 9px; }
+                    Button {
+                        text: "预览";
+                        enabled: member.preview-enabled;
+                        accessible-label: "预览成员：" + member.path;
+                        clicked => { root.preview(member.machine-id, member.path); }
+                    }
+                    Button {
+                        text: "保留";
+                        accessible-label: "保留成员：" + member.path;
+                        clicked => { root.review(member.machine-id, member.path, 1); }
+                    }
+                    Button {
+                        text: "删除";
+                        enabled: member.delete-enabled;
+                        accessible-label: "删除成员：" + member.path;
+                        clicked => { root.review(member.machine-id, member.path, 2); }
+                    }
+                }
+                Rectangle { y: parent.height - 1px; height: 1px; background: Theme.border; }
+            }
+        }
+    }
+}
+
+export component ReviewDeleteWorkspace inherits Rectangle {
+    in property <[UiMemberRow]> members;
+    in property <string> selected-group-id;
+    in property <image> preview-image;
+    in property <string> preview-info;
+    in-out property <string> path-rule;
+    in-out property <int> review-tab: 0;
+    in-out property <int> review-filter: 0;
+    in-out property <int> delete-filter: 0;
+    callback save-review(string, string, int);
+    callback preview(string, string);
+    callback quick-review(int, string);
+    callback prepare-delete();
+    background: transparent;
+
+    VerticalLayout {
+        padding: 24px;
+        spacing: 12px;
+
+        // 一级模式只切换当前 UI，不触发后端读取或删除命令。
+        TabStrip {
+            labels: ["审核工作台", "删除中心"];
+            active-index <=> root.review-tab;
+        }
+
+        if root.review-tab == 0 : VerticalLayout {
+            spacing: 12px;
+            HorizontalLayout {
+                VerticalLayout {
+                    spacing: 3px;
+                    Text { text: "审核工作台"; color: Theme.text; font-size: 24px; font-weight: 750; }
+                    Text {
+                        text: root.selected-group-id == "" ? "当前组范围：请先选择重复组" : "当前组范围：" + root.selected-group-id;
+                        color: Theme.muted;
+                        font-size: 11px;
+                    }
+                }
+                Rectangle { horizontal-stretch: 1; background: transparent; }
+            }
+
+            TabStrip {
+                labels: ["待审核", "已决定", "已忽略"];
+                active-index <=> root.review-filter;
+            }
+
+            // 快捷规则保持既有 0–3 枚举及参数顺序。
+            Rectangle {
+                height: 70px;
+                background: Theme.panel;
+                border-radius: 9px;
+                border-width: 1px;
+                border-color: Theme.border;
+                HorizontalLayout {
+                    padding: 11px;
+                    spacing: 8px;
+                    alignment: center;
+                    Text { text: "快捷复核（当前组）"; color: Theme.text; font-size: 11px; font-weight: 650; }
+                    Button { text: "保留最大文件"; clicked => { root.quick-review(0, ""); } }
+                    Button { text: "保留最高分辨率"; clicked => { root.quick-review(1, ""); } }
+                    Button { text: "保留最高 Quality"; clicked => { root.quick-review(2, ""); } }
+                    LineEdit { text <=> root.path-rule; placeholder-text: "路径包含"; horizontal-stretch: 1; }
+                    Button { text: "按路径保留"; clicked => { root.quick-review(3, root.path-rule); } }
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 12px;
+                ReviewMemberList {
+                    horizontal-stretch: 1;
+                    members: root.members;
+                    review-filter: root.review-filter;
+                    preview(machine, path) => { root.preview(machine, path); }
+                    review(machine, path, decision) => { root.save-review(machine, path, decision); }
+                }
+                Rectangle {
+                    width: 320px;
+                    background: Theme.panel;
+                    border-radius: 9px;
+                    border-width: 1px;
+                    border-color: Theme.border;
+                    VerticalLayout {
+                        padding: 12px;
+                        spacing: 8px;
+                        Text { text: "当前按需预览"; color: Theme.text; font-size: 13px; font-weight: 650; }
+                        Image { source: root.preview-image; image-fit: contain; horizontal-stretch: 1; vertical-stretch: 1; }
+                        Text { text: root.preview-info; color: Theme.muted; font-size: 10px; overflow: elide; }
+                    }
+                }
+            }
+        }
+
+        if root.review-tab == 1 : VerticalLayout {
+            spacing: 12px;
+            Text { text: "删除中心"; color: Theme.text; font-size: 24px; font-weight: 750; }
+            TabStrip {
+                labels: ["待执行", "执行中", "历史记录"];
+                active-index <=> root.delete-filter;
+            }
+            if root.delete-filter == 0 : Rectangle {
+                background: Theme.panel;
+                border-radius: 9px;
+                border-width: 1px;
+                border-color: Theme.border;
+                VerticalLayout {
+                    padding: 24px;
+                    spacing: 12px;
+                    alignment: center;
+                    Text { text: "当前组已复核成员可进入删除确认"; color: Theme.text; font-size: 16px; font-weight: 680; horizontal-alignment: center; }
+                    Text { text: "准备动作只生成现有确认数据，不会直接删除文件。"; color: Theme.muted; font-size: 12px; horizontal-alignment: center; }
+                    Button {
+                        text: "准备删除";
+                        enabled: root.members.length > 0;
+                        clicked => { root.prepare-delete(); }
+                    }
+                }
+            }
+            if root.delete-filter == 1 || root.delete-filter == 2 : EmptyState {
+                title: "当前版本没有持久删除批次";
+                detail: "执行中和历史记录暂不生成模拟数据。";
+                disabled-feature: true;
+            }
+        }
+    }
+}

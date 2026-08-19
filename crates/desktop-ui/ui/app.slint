@@ -8,7 +8,7 @@ import { NodesPage } from "pages/nodes-page.slint";
 import { ScanPage } from "pages/scan-page.slint";
 import { TaskCenterPage } from "pages/task-center-page.slint";
 import { DuplicateWorkspace } from "pages/duplicate-workspace.slint";
-import { ReviewDeletePage } from "pages/review-delete.slint";
+import { ReviewDeleteWorkspace } from "pages/review-delete-workspace.slint";
 import { SettingsDiagnosticsPage } from "pages/settings-diagnostics.slint";
 
 export component MainWindow inherits Window {
@@ -41,6 +41,8 @@ export component MainWindow inherits Window {
     in-out property <int> task-mode: 0;
     in-out property <int> task-tab: 0;
     in-out property <int> review-tab: 0;
+    in-out property <int> review-filter: 0;
+    in-out property <int> delete-filter: 0;
     in-out property <int> settings-section: 0;
     in-out property <string> last-error;
 
@@ -187,9 +189,10 @@ export component MainWindow inherits Window {
                     poll-cross => { root.poll-cross-analysis(); }
                     retry-cross => { root.retry-cross-analysis(); }
                 }
-                if root.current-page == 6 : ReviewDeletePage {
+                if root.current-page == 6 : ReviewDeleteWorkspace {
                     members: root.members; selected-group-id: root.selected-group-id;
                     preview-image: root.preview-image; preview-info: root.preview-info; path-rule <=> root.review-path-rule;
+                    review-tab <=> root.review-tab; review-filter <=> root.review-filter; delete-filter <=> root.delete-filter;
                     save-review(machine, path, decision) => { root.save-review(machine, path, decision); }
                     preview(machine, path) => { root.load-preview(machine, path); }
                     quick-review(rule, value) => { root.quick-review(rule, value); }

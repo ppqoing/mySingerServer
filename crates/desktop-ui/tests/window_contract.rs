@@ -797,3 +797,188 @@ fn duplicate_tabs_preserve_loaded_state_and_forward_existing_callbacks() {
     assert_eq!(cross_polls.get(), 1);
     assert_eq!(cross_retries.get(), 1);
 }
+
+#[test]
+fn review_filters_loaded_members_and_delete_confirmation_obeys_gate() {
+    i_slint_backend_testing::init_no_event_loop();
+
+    let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    window
+        .window()
+        .set_size(slint::PhysicalSize::new(1440, 900));
+    // 三种字面状态分别守护三个本地筛选分支；期望不复用生产筛选逻辑。
+    window.set_members(ModelRc::new(VecModel::from(vec![
+        UiMemberRow {
+            machine_id: "machine-pending".into(),
+            path: "D:\\Media\\pending.jpg".into(),
+            md5: "00000000000000000000000000000001".into(),
+            size: "1.0 MiB".into(),
+            representative: true,
+            stage1: "0.99".into(),
+            phash: "1".into(),
+            stage2: "0.98".into(),
+            metadata: "1920×1080 JPEG".into(),
+            review: "未决定".into(),
+            review_color: Color::from_rgb_u8(107, 114, 128),
+            online: true,
+            preview_enabled: true,
+            delete_enabled: false,
+        },
+        UiMemberRow {
+            machine_id: "machine-kept".into(),
+            path: "D:\\Media\\kept.jpg".into(),
+            md5: "00000000000000000000000000000002".into(),
+            size: "2.0 MiB".into(),
+            representative: false,
+            stage1: "0.97".into(),
+            phash: "2".into(),
+            stage2: "0.96".into(),
+            metadata: "2560×1440 JPEG".into(),
+            review: "保留".into(),
+            review_color: Color::from_rgb_u8(22, 163, 74),
+            online: true,
+            preview_enabled: true,
+            delete_enabled: false,
+        },
+        UiMemberRow {
+            machine_id: "machine-delete".into(),
+            path: "D:\\Media\\delete.jpg".into(),
+            md5: "00000000000000000000000000000003".into(),
+            size: "3.0 MiB".into(),
+            representative: false,
+            stage1: "0.95".into(),
+            phash: "3".into(),
+            stage2: "0.94".into(),
+            metadata: "3840×2160 JPEG".into(),
+            review: "删除".into(),
+            review_color: Color::from_rgb_u8(239, 68, 68),
+            online: true,
+            preview_enabled: true,
+            delete_enabled: true,
+        },
+    ])));
+    window.set_selected_group_id("group-review-001".into());
+    window.invoke_navigate_to(5);
+
+    assert_eq!(window.get_review_tab(), 0);
+    assert_eq!(window.get_review_filter(), 0);
+    assert!(
+        ElementHandle::find_by_accessible_label(&window, "成员：D:\\Media\\pending.jpg")
+            .next()
+            .is_some()
+    );
+    assert!(
+        ElementHandle::find_by_accessible_label(&window, "成员：D:\\Media\\kept.jpg")
+            .next()
+            .is_none()
+    );
+    assert!(
+        ElementHandle::find_by_accessible_label(&window, "成员：D:\\Media\\delete.jpg")
+            .next()
+            .is_none()
+    );
+
+    accessible(&window, "已决定").invoke_accessible_default_action();
+    assert_eq!(window.get_review_filter(), 1);
+    assert!(
+        ElementHandle::find_by_accessible_label(&window, "成员：D:\\Media\\pending.jpg")
+            .next()
+            .is_none()
+    );
+    assert!(
+        ElementHandle::find_by_accessible_label(&window, "成员：D:\\Media\\kept.jpg")
+            .next()
+            .is_some()
+    );
+    assert!(
+        ElementHandle::find_by_accessible_label(&window, "成员：D:\\Media\\delete.jpg")
+            .next()
+            .is_none()
+    );
+
+    accessible(&window, "已忽略").invoke_accessible_default_action();
+    assert_eq!(window.get_review_filter(), 2);
+    assert!(
+        ElementHandle::find_by_accessible_label(&window, "成员：D:\\Media\\pending.jpg")
+            .next()
+            .is_none()
+    );
+    assert!(
+        ElementHandle::find_by_accessible_label(&window, "成员：D:\\Media\\kept.jpg")
+            .next()
+            .is_none()
+    );
+    assert!(
+        ElementHandle::find_by_accessible_label(&window, "成员：D:\\Media\\delete.jpg")
+            .next()
+            .is_some()
+    );
+
+    accessible(&window, "删除中心").invoke_accessible_default_action();
+    assert_eq!(window.get_review_tab(), 1);
+    assert_eq!(window.get_delete_filter(), 0);
+
+    let prepared = Rc::new(Cell::new(0));
+    window.on_prepare_delete({
+        let prepared = prepared.clone();
+        move || prepared.set(prepared.get() + 1)
+    });
+    accessible(&window, "准备删除").invoke_accessible_default_action();
+    assert_eq!(prepared.get(), 1, "待执行只能转发一次现有准备删除回调");
+
+    accessible(&window, "执行中").invoke_accessible_default_action();
+    assert_eq!(window.get_delete_filter(), 1);
+    accessible(&window, "历史记录").invoke_accessible_default_action();
+    assert_eq!(window.get_delete_filter(), 2);
+    accessible(&window, "待执行").invoke_accessible_default_action();
+    assert_eq!(window.get_delete_filter(), 0);
+    accessible(&window, "审核工作台").invoke_accessible_default_action();
+    assert_eq!(window.get_review_tab(), 0);
+
+    let confirmed = Rc::new(Cell::new(0));
+    window.on_confirm_delete({
+        let confirmed = confirmed.clone();
+        move || confirmed.set(confirmed.get() + 1)
+    });
+    window.set_delete_file_count(3);
+    window.set_delete_node_count(2);
+    window.set_delete_reclaimable("6.0 MiB".into());
+    window.set_delete_mode("回收站".into());
+    window.set_delete_can_execute(false);
+    window.set_delete_dialog_open(true);
+
+    let recycle_card = accessible(&window, "删除确认：回收站");
+    assert!(
+        recycle_card
+            .accessible_description()
+            .expect("回收站确认应提供可访问描述")
+            .contains("回收站")
+    );
+    let disabled_confirm = accessible(&window, "确认执行");
+    assert_eq!(disabled_confirm.accessible_enabled(), Some(false));
+    disabled_confirm.invoke_accessible_default_action();
+    click_element_center(&window, &disabled_confirm);
+    assert_eq!(
+        confirmed.get(),
+        0,
+        "禁用门禁必须同时拦截可访问默认动作和真实指针路径",
+    );
+
+    window.set_delete_can_execute(true);
+    let enabled_confirm = accessible(&window, "确认执行");
+    assert_eq!(enabled_confirm.accessible_enabled(), Some(true));
+    enabled_confirm.invoke_accessible_default_action();
+    assert_eq!(confirmed.get(), 1, "启用后可访问默认动作只确认一次");
+    click_element_center(&window, &enabled_confirm);
+    assert_eq!(confirmed.get(), 2, "启用后真实指针单击只确认一次");
+
+    window.set_delete_mode("永久删除".into());
+    let permanent_card = accessible(&window, "删除确认：永久删除");
+    assert!(
+        permanent_card
+            .accessible_description()
+            .expect("永久删除确认应提供可访问描述")
+            .contains("不可恢复"),
+        "永久删除描述必须明确不可恢复",
+    );
+}

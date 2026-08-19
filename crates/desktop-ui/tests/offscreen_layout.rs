@@ -161,3 +161,44 @@ fn duplicate_workspace_columns_stay_ordered_inside_content_area() {
         }
     }
 }
+
+#[test]
+fn delete_confirmation_is_a_centered_root_level_light_overlay() {
+    install_testing_backend();
+
+    let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    window
+        .window()
+        .set_size(slint::PhysicalSize::new(1440, 900));
+    window.set_delete_mode("回收站".into());
+    window.set_delete_dialog_open(true);
+    window.show().expect("应能显示删除确认覆盖层");
+    window
+        .window()
+        .take_snapshot()
+        .expect("删除确认覆盖层应完成软件渲染");
+
+    let overlay = ElementHandle::find_by_accessible_label(&window, "删除确认覆盖层")
+        .next()
+        .expect("根窗口应公开删除确认覆盖层");
+    let card = ElementHandle::find_by_accessible_label(&window, "删除确认：回收站")
+        .next()
+        .expect("删除确认覆盖层应公开白色确认卡片");
+    let (overlay_position, overlay_size) = (overlay.absolute_position(), overlay.size());
+    let (card_position, card_size) = (card.absolute_position(), card.size());
+
+    assert_eq!(overlay_position, slint::LogicalPosition::new(0.0, 0.0));
+    assert_eq!(overlay_size, slint::LogicalSize::new(1440.0, 900.0));
+    assert_eq!(card_size, slint::LogicalSize::new(520.0, 320.0));
+    assert!(
+        (card_position.x - 460.0).abs() < 0.5 && (card_position.y - 290.0).abs() < 0.5,
+        "确认卡片应在根窗口居中，实际位置={card_position:?}",
+    );
+    assert!(
+        overlay_position.x <= 144.0
+            && overlay_position.y <= 58.0
+            && overlay_position.x + overlay_size.width >= 1440.0
+            && overlay_position.y + overlay_size.height >= 868.0,
+        "根级覆盖层应遮住 AppShell 内容区，位置={overlay_position:?}，尺寸={overlay_size:?}",
+    );
+}
