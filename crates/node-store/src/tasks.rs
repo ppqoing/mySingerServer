@@ -169,6 +169,15 @@ pub struct TaskItemSnapshot {
 }
 
 impl NodeStore {
+    /// 是否仍有 queued/running 计算任务；分析开始前用作节点级门禁。
+    pub fn has_active_computation_tasks(&self) -> Result<bool, StoreError> {
+        let count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM tasks WHERE status IN ('queued','running')",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
     /// 在枚举前创建扫描任务并持久化规范扫描根。
     pub fn create_scan_task(
         &mut self,
@@ -390,6 +399,24 @@ impl NodeStore {
             params![task_id.as_uuid().to_string(), now_ms],
         )?;
         Ok(())
+    }
+
+    /// 把活动任务和所有尚未终态的项标记为 cancelled。
+    pub fn cancel_task(&mut self, task_id: TaskId, now_ms: i64) -> Result<usize, StoreError> {
+        let transaction = self.connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE task_items SET status='cancelled'
+             WHERE task_id=?1 AND status IN ('queued','running')",
+            [task_id.as_uuid().to_string()],
+        )?;
+        transaction.execute(
+            "UPDATE tasks SET status='cancelled',cancelled=cancelled+?2,
+               event_seq=event_seq+1,updated_at_ms=?3
+             WHERE task_id=?1 AND status IN ('queued','running')",
+            params![task_id.as_uuid().to_string(), changed as i64, now_ms],
+        )?;
+        transaction.commit()?;
+        Ok(changed)
     }
 
     /// 成功扫描的最后事务：按持久化根失效缺失路径、完成任务并返回提交后高水位。

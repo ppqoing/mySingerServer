@@ -50,6 +50,8 @@ pub struct AnalysisRunSnapshot {
     pub status: AnalysisStatus,
     /// 输入是否已经封存。
     pub inputs_frozen: bool,
+    /// 一筛数据不完整而没有进入候选的唯一内容数。
+    pub skipped_incomplete: u64,
 }
 
 /// 从所选完成任务冻结出的一个稳定内容位置对。
@@ -159,15 +161,49 @@ impl NodeStore {
         &self,
         run_id: AnalysisRunId,
     ) -> Result<AnalysisRunSnapshot, StoreError> {
-        let (status, frozen): (String, i64) = self.connection.query_row(
-            "SELECT status,inputs_frozen FROM analysis_runs WHERE analysis_run_id=?1",
+        let (status, frozen, skipped): (String, i64, i64) = self.connection.query_row(
+            "SELECT status,inputs_frozen,skipped_incomplete FROM analysis_runs
+             WHERE analysis_run_id=?1",
             [run_id.as_uuid().to_string()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         Ok(AnalysisRunSnapshot {
             status: AnalysisStatus::parse(&status)?,
             inputs_frozen: frozen != 0,
+            skipped_incomplete: skipped as u64,
         })
+    }
+
+    /// 读取创建运行时冻结的完整阈值快照。
+    pub fn analysis_thresholds(&self, run_id: AnalysisRunId) -> Result<Thresholds, StoreError> {
+        let value: String = self.connection.query_row(
+            "SELECT thresholds_toml FROM analysis_runs WHERE analysis_run_id=?1",
+            [run_id.as_uuid().to_string()],
+            |row| row.get(0),
+        )?;
+        let thresholds = toml::from_str::<Thresholds>(&value).map_err(CoreError::from)?;
+        thresholds.validate()?;
+        Ok(thresholds)
+    }
+
+    /// 保存本运行在完整性门禁处跳过的唯一内容数量。
+    pub fn set_analysis_skipped_incomplete(
+        &mut self,
+        run_id: AnalysisRunId,
+        skipped: usize,
+        now_ms: i64,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "UPDATE analysis_runs SET skipped_incomplete=?2,updated_at_ms=?3
+             WHERE analysis_run_id=?1",
+            params![
+                run_id.as_uuid().to_string(),
+                i64::try_from(skipped)
+                    .map_err(|_| StoreError::InvalidState("跳过数量过大".into()))?,
+                now_ms
+            ],
+        )?;
+        Ok(())
     }
 
     /// 从所选已完成任务冻结当前活动且内容一致的位置，之后拒绝追加。
@@ -306,6 +342,64 @@ impl NodeStore {
         transaction.commit()?;
         Ok(())
     }
+
+    /// 按媒体类型和内容键稳定读取当前运行候选。
+    pub fn analysis_candidates(
+        &self,
+        run_id: AnalysisRunId,
+    ) -> Result<Vec<CandidateWrite>, StoreError> {
+        type RawCandidate = (
+            String,
+            Vec<u8>,
+            i64,
+            Vec<u8>,
+            i64,
+            f64,
+            Option<u8>,
+            Option<f64>,
+            String,
+        );
+        let mut statement = self.connection.prepare_cached(
+            "SELECT pair_kind,left_md5,left_size,right_md5,right_size,stage1_score,
+                    phash_passed_parts,stage2_score,status
+             FROM candidate_pairs WHERE analysis_run_id=?1
+             ORDER BY pair_kind,left_md5,left_size,right_md5,right_size",
+        )?;
+        let rows = statement
+            .query_map([run_id.as_uuid().to_string()], |row| {
+                Ok(RawCandidate::from((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                )))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(CandidateWrite {
+                    kind: PairKind::parse(&row.0)?,
+                    left: ContentKey::new(
+                        fixed_bytes(row.1, "candidate_pairs.left_md5")?,
+                        row.2 as u64,
+                    ),
+                    right: ContentKey::new(
+                        fixed_bytes(row.3, "candidate_pairs.right_md5")?,
+                        row.4 as u64,
+                    ),
+                    stage1_score: row.5,
+                    phash_passed_parts: row.6,
+                    stage2_score: row.7,
+                    status: CandidateStatus::parse(&row.8)?,
+                })
+            })
+            .collect()
+    }
 }
 
 impl AnalysisMode {
@@ -373,6 +467,14 @@ impl PairKind {
             Self::Video => "video",
         }
     }
+
+    fn parse(value: &str) -> Result<Self, StoreError> {
+        match value {
+            "image" => Ok(Self::Image),
+            "video" => Ok(Self::Video),
+            _ => Err(StoreError::InvalidState(format!("未知候选类型: {value}"))),
+        }
+    }
 }
 
 impl CandidateStatus {
@@ -382,6 +484,16 @@ impl CandidateStatus {
             Self::Passed => "passed",
             Self::Rejected => "rejected",
             Self::Incomplete => "incomplete",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, StoreError> {
+        match value {
+            "stage1_passed" => Ok(Self::Stage1Passed),
+            "passed" => Ok(Self::Passed),
+            "rejected" => Ok(Self::Rejected),
+            "incomplete" => Ok(Self::Incomplete),
+            _ => Err(StoreError::InvalidState(format!("未知候选状态: {value}"))),
         }
     }
 }

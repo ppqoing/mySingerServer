@@ -185,6 +185,50 @@ impl NodeStore {
             .optional()?
             .unwrap_or(false))
     }
+
+    /// 用跨边界 ContentKey 查找本机 SQLite 内容 ID。
+    pub fn content_id_by_key(&self, key: ContentKey) -> Result<Option<ContentId>, StoreError> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT content_id FROM contents WHERE md5=?1 AND file_size=?2",
+                params![key.md5().as_slice(), sqlite_integer(key.file_size())?],
+                |row| row.get::<_, i64>(0).map(ContentId::from_i64),
+            )
+            .optional()?)
+    }
+
+    /// 返回拥有该内容的第一个活动位置和实际显示路径，顺序固定为机器、规范路径。
+    pub fn active_location_for_content(
+        &self,
+        content_id: ContentId,
+    ) -> Result<Option<(dedup_core::LocationKey, dedup_core::DisplayPath)>, StoreError> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT machine_id,normalized_path,display_path FROM files
+                 WHERE content_id=?1 AND active=1 ORDER BY machine_id,normalized_path LIMIT 1",
+                [content_id.as_i64()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(|(machine, normalized, display)| {
+            Ok((
+                dedup_core::LocationKey::new(
+                    dedup_core::MachineId::parse(&machine)?,
+                    dedup_core::NormalizedPath::new(normalized)?,
+                ),
+                dedup_core::DisplayPath::new(display)?,
+            ))
+        })
+        .transpose()
+    }
 }
 
 pub(crate) fn media_kind_name(kind: MediaKind) -> &'static str {

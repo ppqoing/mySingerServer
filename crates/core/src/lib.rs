@@ -3,6 +3,7 @@
 
 mod config;
 mod error;
+mod grouping;
 mod ids;
 mod model;
 mod path;
@@ -10,6 +11,9 @@ mod thresholds;
 
 pub use config::{DesktopConfig, NodeConfig, NodeEndpoint};
 pub use error::CoreError;
+pub use grouping::{
+    RepresentativeGroup, RepresentativeMember, SimilarityEdge, group_by_representative,
+};
 pub use ids::{AnalysisRunId, ContentKey, GroupId, LocationKey, MachineId, TaskId};
 pub use model::{DeleteMode, EnumeratorKind, MediaKind, ScreeningOutcome};
 pub use path::{DisplayPath, NormalizedPath};

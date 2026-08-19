@@ -112,6 +112,7 @@ CREATE TABLE analysis_runs (
     status          TEXT NOT NULL,
     thresholds_toml TEXT NOT NULL,
     inputs_frozen   INTEGER NOT NULL DEFAULT 0 CHECK(inputs_frozen IN (0,1)),
+    skipped_incomplete INTEGER NOT NULL DEFAULT 0,
     created_at_ms   INTEGER NOT NULL,
     updated_at_ms   INTEGER NOT NULL
 ) STRICT;
