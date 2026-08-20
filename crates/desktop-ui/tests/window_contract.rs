@@ -391,6 +391,9 @@ fn overview_and_nodes_consume_real_models() {
     i_slint_backend_testing::init_no_event_loop();
 
     let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    window
+        .window()
+        .set_size(slint::PhysicalSize::new(1440, 900));
     install_overview_fixture(&window);
     window.invoke_navigate_to(0);
 
@@ -428,6 +431,12 @@ fn overview_and_nodes_consume_real_models() {
     remote.invoke_accessible_default_action();
     assert_eq!(local.accessible_item_selected(), Some(false));
     assert_eq!(remote.accessible_item_selected(), Some(true));
+    assert!(
+        ElementHandle::find_by_accessible_label(&window, "节点错误：等待连接")
+            .next()
+            .is_some(),
+        "节点详情必须通过完整可访问文本表达连接错误，不能只使用颜色",
+    );
 }
 
 #[test]
@@ -459,6 +468,9 @@ fn selected_node_actions_forward_existing_callbacks() {
     i_slint_backend_testing::init_no_event_loop();
 
     let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    window
+        .window()
+        .set_size(slint::PhysicalSize::new(1440, 900));
     install_overview_fixture(&window);
     window.invoke_navigate_to(1);
     window.set_new_node_ip("10.20.30.40".into());

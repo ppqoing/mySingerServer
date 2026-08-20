@@ -1,5 +1,5 @@
 use dedup_desktop_ui::{MainWindow, UiGroupRow, UiMemberRow, UiNodeRow, UiTaskRow};
-use i_slint_backend_testing::{TestingBackend, TestingBackendOptions};
+use i_slint_backend_testing::{ElementHandle, TestingBackend, TestingBackendOptions};
 use slint::{Color, ComponentHandle, ModelRc, VecModel};
 use std::path::{Path, PathBuf};
 
@@ -260,6 +260,16 @@ fn render_all_views(fixture: &VisualFixture, destination: PreviewDestination) {
             window
                 .window()
                 .set_size(slint::PhysicalSize::new(width, height));
+            // 节点预览选择真实错误行，令完整错误块和危险动作一并进入视觉验收。
+            if view == "02-nodes" {
+                ElementHandle::find_by_accessible_label(
+                    &window,
+                    "节点项：视频节点；10.0.0.9:39091；错误；Worker 0/8 忙碌；任务 等待连接；同步 —",
+                )
+                .next()
+                .expect("节点预览应包含错误状态夹具")
+                .invoke_accessible_default_action();
+            }
             let snapshot = window
                 .window()
                 .take_snapshot()
@@ -317,6 +327,12 @@ fn visual_fixture_covers_every_real_row_state() {
     assert!(fixture.nodes.iter().any(|row| row.status == "在线"));
     assert!(fixture.nodes.iter().any(|row| row.status == "离线"));
     assert!(fixture.nodes.iter().any(|row| row.status == "错误"));
+    assert!(
+        fixture
+            .nodes
+            .iter()
+            .any(|row| row.error_text == "目标机器拒绝连接")
+    );
     assert!(fixture.tasks.iter().any(|row| row.status == "运行中"));
     assert!(fixture.tasks.iter().any(|row| row.status == "已完成"));
     assert!(fixture.tasks.iter().any(|row| row.status == "失败"));

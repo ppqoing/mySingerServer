@@ -1,4 +1,4 @@
-use dedup_desktop_ui::{MainWindow, UiGroupRow, UiMemberRow};
+use dedup_desktop_ui::{MainWindow, UiGroupRow, UiMemberRow, UiNodeRow, UiTaskRow};
 use i_slint_backend_testing::{ElementHandle, TestingBackend, TestingBackendOptions};
 use slint::{Color, ComponentHandle, ModelRc, VecModel};
 
@@ -51,12 +51,7 @@ fn assert_inside_window(window: &MainWindow, width: f32, height: f32) {
     }
 }
 
-fn assert_element_inside_window(
-    element: &ElementHandle,
-    label: &str,
-    width: f32,
-    height: f32,
-) {
+fn assert_element_inside_window(element: &ElementHandle, label: &str, width: f32, height: f32) {
     let position = element.absolute_position();
     let size = element.size();
     assert!(
@@ -94,6 +89,170 @@ fn install_duplicate_workspace_fixture(window: &MainWindow) {
         preview_enabled: true,
         delete_enabled: false,
     }])));
+}
+
+// 使用完整字面模型同时撑开总览表格与节点详情，几何预期不从生产布局反推。
+fn install_overview_and_nodes_fixture(window: &MainWindow) {
+    window.set_nodes(ModelRc::new(VecModel::from(vec![
+        UiNodeRow {
+            index: 0,
+            name: "本机节点".into(),
+            address: "127.0.0.1:39091".into(),
+            status: "在线".into(),
+            status_color: Color::from_rgb_u8(22, 163, 74),
+            machine_id: "machine-local".into(),
+            worker_text: "1/2 忙碌".into(),
+            task_text: "1 排队 / 1 运行".into(),
+            sync_text: "120 / 125".into(),
+            error_text: "".into(),
+        },
+        UiNodeRow {
+            index: 1,
+            name: "影像节点".into(),
+            address: "10.0.0.8:39091".into(),
+            status: "离线".into(),
+            status_color: Color::from_rgb_u8(148, 163, 184),
+            machine_id: "machine-image".into(),
+            worker_text: "0/4 忙碌".into(),
+            task_text: "无任务".into(),
+            sync_text: "98 / 98".into(),
+            error_text: "".into(),
+        },
+        UiNodeRow {
+            index: 2,
+            name: "视频节点".into(),
+            address: "10.0.0.9:39091".into(),
+            status: "错误".into(),
+            status_color: Color::from_rgb_u8(239, 68, 68),
+            machine_id: "machine-video".into(),
+            worker_text: "0/8 忙碌".into(),
+            task_text: "等待连接".into(),
+            sync_text: "—".into(),
+            error_text: "目标机器拒绝连接".into(),
+        },
+    ])));
+    window.set_tasks(ModelRc::new(VecModel::from(vec![
+        UiTaskRow {
+            id: "task-media-scan".into(),
+            node_index: 0,
+            title: "媒体扫描".into(),
+            stage: "枚举文件".into(),
+            status: "运行中".into(),
+            status_color: Color::from_rgb_u8(59, 130, 246),
+            progress: 35,
+            counts: "7 / 20 · 失败 0 · 跳过 1".into(),
+        },
+        UiTaskRow {
+            id: "task-image-analysis".into(),
+            node_index: 1,
+            title: "图片分析".into(),
+            stage: "完成".into(),
+            status: "已完成".into(),
+            status_color: Color::from_rgb_u8(22, 163, 74),
+            progress: 100,
+            counts: "18 / 18 · 失败 0 · 跳过 0".into(),
+        },
+        UiTaskRow {
+            id: "task-video-analysis".into(),
+            node_index: 2,
+            title: "视频分析".into(),
+            stage: "提取特征".into(),
+            status: "失败".into(),
+            status_color: Color::from_rgb_u8(239, 68, 68),
+            progress: 60,
+            counts: "6 / 10 · 失败 1 · 跳过 0".into(),
+        },
+    ])));
+}
+
+#[test]
+fn overview_and_nodes_start_at_the_top_without_blank_stretch() {
+    install_testing_backend();
+
+    let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    install_overview_and_nodes_fixture(&window);
+    window.show().expect("应能显示总览与节点工作区");
+
+    for (width, height) in [(1440.0, 900.0), (1080.0, 700.0)] {
+        window
+            .window()
+            .set_size(slint::PhysicalSize::new(width as u32, height as u32));
+        window.invoke_navigate_to(0);
+        window
+            .window()
+            .take_snapshot()
+            .expect("总览应能完成软件渲染");
+
+        let title = ElementHandle::find_by_accessible_label(&window, "总览标题")
+            .next()
+            .expect("总览应公开标题地标");
+        let main = ElementHandle::find_by_accessible_label(&window, "总览主要内容")
+            .next()
+            .expect("总览应公开第一组主要内容");
+        let title_bottom = title.absolute_position().y + title.size().height;
+        assert!(
+            main.absolute_position().y - title_bottom <= 32.0,
+            "总览标题到第一组主要内容不得超过 32px",
+        );
+
+        window.invoke_navigate_to(1);
+        window
+            .window()
+            .take_snapshot()
+            .expect("节点工作区应能完成软件渲染");
+
+        let table = ElementHandle::find_by_accessible_label(&window, "节点表")
+            .next()
+            .expect("节点工作区应公开节点表");
+        let detail = ElementHandle::find_by_accessible_label(&window, "节点详情")
+            .next()
+            .expect("节点工作区应公开节点详情");
+        let add_bar = ElementHandle::find_by_accessible_label(&window, "添加节点栏")
+            .next()
+            .expect("节点工作区应公开添加节点栏");
+        let (table_position, table_size) = (table.absolute_position(), table.size());
+        let (detail_position, detail_size) = (detail.absolute_position(), detail.size());
+        let (add_position, add_size) = (add_bar.absolute_position(), add_bar.size());
+
+        assert!(
+            table_position.x + table_size.width <= detail_position.x
+                && add_position.x + add_size.width <= detail_position.x,
+            "节点表和添加栏必须位于详情左侧且互不覆盖：表={table_position:?}/{table_size:?}，添加={add_position:?}/{add_size:?}，详情={detail_position:?}/{detail_size:?}",
+        );
+        assert!(
+            table_position.y + table_size.height <= add_position.y,
+            "添加节点栏必须位于节点表下方：表={table_position:?}/{table_size:?}，添加={add_position:?}/{add_size:?}",
+        );
+        assert!(
+            (280.0..=320.0).contains(&detail_size.width),
+            "节点详情宽度必须保持 280–320px，实际={detail_size:?}",
+        );
+        for (label, position, size) in [
+            ("节点表", table_position, table_size),
+            ("节点详情", detail_position, detail_size),
+            ("添加节点栏", add_position, add_size),
+        ] {
+            assert!(
+                position.x >= 144.0
+                    && position.y >= 58.0
+                    && position.x + size.width <= width
+                    && position.y + size.height <= height - 32.0,
+                "{label} 必须位于内容区内，位置={position:?}，尺寸={size:?}，窗口={width}×{height}",
+            );
+        }
+        for label in [
+            "连接全部节点",
+            "添加节点",
+            "编辑节点",
+            "立即同步",
+            "移除节点",
+        ] {
+            let action = ElementHandle::find_by_accessible_label(&window, label)
+                .next()
+                .unwrap_or_else(|| panic!("{width}×{height} 应公开节点动作：{label}"));
+            assert_element_inside_window(&action, label, width, height);
+        }
+    }
 }
 
 #[test]
@@ -339,10 +498,8 @@ fn duplicate_workspace_regions_keep_their_own_scroll_views_at_minimum_size() {
                 && scroll_size.height > 0.0
                 && scroll_position.x >= region_position.x
                 && scroll_position.y >= region_position.y
-                && scroll_position.x + scroll_size.width
-                    <= region_position.x + region_size.width
-                && scroll_position.y + scroll_size.height
-                    <= region_position.y + region_size.height,
+                && scroll_position.x + scroll_size.width <= region_position.x + region_size.width
+                && scroll_position.y + scroll_size.height <= region_position.y + region_size.height,
             "{label} 的 ScrollView 必须可在自身区域内到达，区域={region_position:?}/{region_size:?}，滚动区={scroll_position:?}/{scroll_size:?}",
         );
     }
