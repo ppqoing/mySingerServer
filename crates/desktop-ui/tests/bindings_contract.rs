@@ -1,10 +1,12 @@
+use std::{io::Cursor, sync::Arc};
+
 use dedup_core::{DeleteMode, DesktopConfig, EnumeratorKind};
 use dedup_desktop_core::{
-    app::UiCommand,
+    app::{UiCommand, UiEvent},
     results::GroupKind,
     review::{QuickReviewRule, ReviewDecision},
 };
-use dedup_desktop_ui::{MainWindow, bind_commands};
+use dedup_desktop_ui::{MainWindow, apply_event, bind_commands};
 use tokio::sync::mpsc;
 
 fn next(receiver: &mut mpsc::Receiver<UiCommand>) -> UiCommand {
@@ -245,4 +247,77 @@ fn root_callbacks_emit_their_ui_commands_and_reject_invalid_settings() {
     window.invoke_save_settings();
     assert!(receiver.try_recv().is_err());
     assert!(window.get_last_error().contains("PDQ Quality 不是有效数值"));
+}
+
+#[test]
+fn preview_completions_preserve_identity_and_increment_sequence() {
+    i_slint_backend_testing::init_no_event_loop();
+
+    let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    let (sender, _receiver) = mpsc::channel(4);
+    let binding = bind_commands(&window, sender, DesktopConfig::default());
+
+    let same_failure = UiEvent::PreviewFailed {
+        machine_id: "machine-a".into(),
+        normalized_path: "D:\\Media\\same-failure.jpg".into(),
+        error: "节点拒绝读取".into(),
+    };
+    apply_event(&window, &binding, same_failure.clone());
+    assert_eq!(window.get_preview_result_machine(), "machine-a");
+    assert_eq!(
+        window.get_preview_result_path(),
+        "D:\\Media\\same-failure.jpg"
+    );
+    assert!(!window.get_preview_result_succeeded());
+    assert_eq!(window.get_preview_result_sequence(), 1);
+    assert_eq!(window.get_last_error(), "节点拒绝读取");
+
+    apply_event(&window, &binding, same_failure);
+    assert_eq!(
+        window.get_preview_result_sequence(),
+        2,
+        "相同身份和相同错误连续完成也必须产生新 sequence",
+    );
+
+    apply_event(
+        &window,
+        &binding,
+        UiEvent::PreviewReady {
+            machine_id: "machine-b".into(),
+            normalized_path: "D:\\Media\\decode-failure.jpg".into(),
+            display_path: "D:\\Display\\decode-failure.jpg".into(),
+            file_kind: "original".into(),
+            bytes: Arc::from([0_u8, 1, 2, 3]),
+        },
+    );
+    assert_eq!(window.get_preview_result_machine(), "machine-b");
+    assert_eq!(
+        window.get_preview_result_path(),
+        "D:\\Media\\decode-failure.jpg"
+    );
+    assert!(!window.get_preview_result_succeeded());
+    assert_eq!(window.get_preview_result_sequence(), 3);
+    assert!(window.get_last_error().contains("预览格式无法解码"));
+
+    let mut png = Cursor::new(Vec::new());
+    image::DynamicImage::new_rgba8(1, 1)
+        .write_to(&mut png, image::ImageFormat::Png)
+        .expect("应能生成内存 PNG fixture");
+    apply_event(
+        &window,
+        &binding,
+        UiEvent::PreviewReady {
+            machine_id: "machine-b".into(),
+            normalized_path: "D:\\Media\\ready.jpg".into(),
+            display_path: "D:\\Display\\ready.jpg".into(),
+            file_kind: "original".into(),
+            bytes: Arc::from(png.into_inner()),
+        },
+    );
+    assert_eq!(window.get_preview_result_machine(), "machine-b");
+    assert_eq!(window.get_preview_result_path(), "D:\\Media\\ready.jpg");
+    assert!(window.get_preview_result_succeeded());
+    assert_eq!(window.get_preview_result_sequence(), 4);
+    assert_eq!(window.get_last_error(), "");
+    assert!(window.get_preview_info().contains("D:\\Display\\ready.jpg"));
 }

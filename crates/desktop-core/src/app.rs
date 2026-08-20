@@ -224,12 +224,25 @@ pub enum UiEvent {
     },
     /// 原图或视频联系表已经完整读入内存。
     PreviewReady {
+        /// 预览请求所属物理机器 ID。
+        machine_id: String,
+        /// 预览请求使用的规范路径。
+        normalized_path: String,
         /// 预览所属路径。
         display_path: String,
         /// `original` 或 `contact_sheet`。
         file_kind: String,
         /// 原始编码数据，不写入缓存目录。
         bytes: Arc<[u8]>,
+    },
+    /// 一次带身份的预览请求已经失败。
+    PreviewFailed {
+        /// 预览请求所属物理机器 ID。
+        machine_id: String,
+        /// 预览请求使用的规范路径。
+        normalized_path: String,
+        /// 原始业务错误文本。
+        error: String,
     },
     /// 快捷或单项复核已持久化，返回刷新后的成员。
     ReviewChanged(Box<MemberPage>),
@@ -1408,30 +1421,40 @@ async fn load_member_preview(
     sessions: &BTreeMap<usize, Arc<NodeSession>>,
     events: &mpsc::Sender<UiEvent>,
 ) -> Result<(), String> {
-    let context = context.ok_or_else(|| "尚未载入重复组成员".to_owned())?;
-    let location = location(machine, path)?;
-    let member = context
-        .items
-        .iter()
-        .find(|member| member.location == location)
-        .ok_or_else(|| "预览位置不在当前组窗口中".to_owned())?;
-    if !member.actions.preview {
-        return Err("成员离线或已经失活，不能预览".into());
+    let result: Result<_, String> = async {
+        let context = context.ok_or_else(|| "尚未载入重复组成员".to_owned())?;
+        let location = location(machine, path)?;
+        let member = context
+            .items
+            .iter()
+            .find(|member| member.location == location)
+            .ok_or_else(|| "预览位置不在当前组窗口中".to_owned())?;
+        if !member.actions.preview {
+            return Err("成员离线或已经失活，不能预览".into());
+        }
+        let session = session_by_machine(sessions, location.machine_id())
+            .ok_or_else(|| "成员所在节点当前未连接".to_owned())?;
+        let preview = load_preview(session, &location, context.kind)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok((member.display_path.clone(), preview))
     }
-    let session = session_by_machine(sessions, location.machine_id())
-        .ok_or_else(|| "成员所在节点当前未连接".to_owned())?;
-    let preview = load_preview(session, &location, context.kind)
-        .await
-        .map_err(|error| error.to_string())?;
-    send_event(
-        events,
-        UiEvent::PreviewReady {
-            display_path: member.display_path.clone(),
+    .await;
+    let event = match result {
+        Ok((display_path, preview)) => UiEvent::PreviewReady {
+            machine_id: machine.to_owned(),
+            normalized_path: path.to_owned(),
+            display_path,
             file_kind: preview.file_kind.into(),
             bytes: Arc::from(preview.bytes),
         },
-    )
-    .await
+        Err(error) => UiEvent::PreviewFailed {
+            machine_id: machine.to_owned(),
+            normalized_path: path.to_owned(),
+            error,
+        },
+    };
+    send_event(events, event).await
 }
 
 async fn prepare_delete(

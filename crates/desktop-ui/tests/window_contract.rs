@@ -1152,6 +1152,8 @@ fn review_preview_is_single_flight_and_keeps_decision_target_aligned() {
         )],
         "A 行预览按钮只应触发一次精确回调",
     );
+    window.set_last_error("无关的节点同步错误".into());
+    slint::platform::update_timers_and_animations();
     click_element_center(
         &window,
         &accessible(&window, "预览成员：D:\\Media\\review-b.jpg"),
@@ -1188,6 +1190,10 @@ fn review_preview_is_single_flight_and_keeps_decision_target_aligned() {
     );
     window.set_preview_image(image_a);
     window.set_preview_info("A 预览".into());
+    window.set_preview_result_machine("machine-a".into());
+    window.set_preview_result_path("D:\\Media\\review-a.jpg".into());
+    window.set_preview_result_succeeded(true);
+    window.set_preview_result_sequence(1);
     slint::platform::update_timers_and_animations();
     assert!(
         ElementHandle::find_by_accessible_label(&window, "当前预览：D:\\Media\\review-a.jpg")
@@ -1234,6 +1240,10 @@ fn review_preview_is_single_flight_and_keeps_decision_target_aligned() {
     );
     window.set_preview_image(image_b);
     window.set_preview_info("B 预览".into());
+    window.set_preview_result_machine("machine-b".into());
+    window.set_preview_result_path("D:\\Media\\review-b.jpg".into());
+    window.set_preview_result_succeeded(true);
+    window.set_preview_result_sequence(2);
     slint::platform::update_timers_and_animations();
     assert!(
         ElementHandle::find_by_accessible_label(&window, "当前预览：D:\\Media\\review-b.jpg")
@@ -1269,11 +1279,15 @@ fn review_preview_is_single_flight_and_keeps_decision_target_aligned() {
         "新 A 请求在途时不得继续显示上一次 B 图片",
     );
     window.set_last_error("A 预览失败：测试错误".into());
+    window.set_preview_result_machine("machine-a".into());
+    window.set_preview_result_path("D:\\Media\\review-a.jpg".into());
+    window.set_preview_result_succeeded(false);
+    window.set_preview_result_sequence(3);
     slint::platform::update_timers_and_animations();
     assert_eq!(
         accessible(&window, "预览成员：D:\\Media\\review-b.jpg").accessible_enabled(),
         Some(true),
-        "现有 last-error 变化必须解除 single-flight 门禁",
+        "关联到 pending A 的失败完成必须解除 single-flight 门禁",
     );
     assert!(
         ElementHandle::find_by_accessible_label(
@@ -1283,6 +1297,37 @@ fn review_preview_is_single_flight_and_keeps_decision_target_aligned() {
         .next()
         .is_some(),
         "A 失败后旧图片仍不得冒充当前 B",
+    );
+
+    click_element_at_fraction(&window, &row_a, 0.35, 0.5);
+    click_element_center(
+        &window,
+        &accessible(&window, "预览成员：D:\\Media\\review-a.jpg"),
+    );
+    assert_eq!(
+        previews.borrow().as_slice(),
+        &[
+            (
+                String::from("machine-a"),
+                String::from("D:\\Media\\review-a.jpg"),
+            ),
+            (
+                String::from("machine-a"),
+                String::from("D:\\Media\\review-a.jpg"),
+            ),
+        ],
+        "第一次 A 失败后必须允许精确重试同一 A",
+    );
+    window.set_last_error("A 预览失败：测试错误".into());
+    window.set_preview_result_machine("machine-a".into());
+    window.set_preview_result_path("D:\\Media\\review-a.jpg".into());
+    window.set_preview_result_succeeded(false);
+    window.set_preview_result_sequence(4);
+    slint::platform::update_timers_and_animations();
+    assert_eq!(
+        accessible(&window, "预览成员：D:\\Media\\review-b.jpg").accessible_enabled(),
+        Some(true),
+        "相同 A 和相同错误文本的第二次失败也必须靠新 sequence 释放门禁",
     );
 
     click_element_center(
@@ -1297,11 +1342,15 @@ fn review_preview_is_single_flight_and_keeps_decision_target_aligned() {
                 String::from("D:\\Media\\review-a.jpg"),
             ),
             (
+                String::from("machine-a"),
+                String::from("D:\\Media\\review-a.jpg"),
+            ),
+            (
                 String::from("machine-b"),
                 String::from("D:\\Media\\review-b.jpg"),
             ),
         ],
-        "A 失败后重新启用的 B 只能精确入队一次",
+        "两次 A 失败后重新启用的 B 只能精确入队一次",
     );
     let recovered_b = slint::Image::from_rgba8(
         slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
@@ -1313,6 +1362,10 @@ fn review_preview_is_single_flight_and_keeps_decision_target_aligned() {
     window.set_preview_image(recovered_b);
     window.set_preview_info("B 恢复预览".into());
     window.set_last_error("".into());
+    window.set_preview_result_machine("machine-b".into());
+    window.set_preview_result_path("D:\\Media\\review-b.jpg".into());
+    window.set_preview_result_succeeded(true);
+    window.set_preview_result_sequence(5);
     slint::platform::update_timers_and_animations();
     assert!(
         ElementHandle::find_by_accessible_label(&window, "当前预览：D:\\Media\\review-b.jpg")

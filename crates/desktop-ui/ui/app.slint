@@ -64,6 +64,11 @@ export component MainWindow inherits Window {
     in-out property <string> member-next-cursor;
     in-out property <image> preview-image;
     in-out property <string> preview-info;
+    // 预览完成状态只供页面关联唯一在途请求，不增加业务回调或持久状态。
+    in property <string> preview-result-machine;
+    in property <string> preview-result-path;
+    in property <bool> preview-result-succeeded;
+    in property <int> preview-result-sequence;
     in-out property <string> cross-selections;
     in-out property <string> cross-status: "未创建";
     in-out property <string> cross-summary;
@@ -192,7 +197,10 @@ export component MainWindow inherits Window {
                 }
                 if root.current-page == 6 : ReviewDeleteWorkspace {
                     groups: root.groups; members: root.members; selected-group-id: root.selected-group-id;
-                    preview-image: root.preview-image; preview-info: root.preview-info; last-error: root.last-error; path-rule <=> root.review-path-rule;
+                    preview-image: root.preview-image; preview-info: root.preview-info;
+                    preview-result-machine: root.preview-result-machine; preview-result-path: root.preview-result-path;
+                    preview-result-succeeded: root.preview-result-succeeded; preview-result-sequence: root.preview-result-sequence;
+                    path-rule <=> root.review-path-rule;
                     review-tab <=> root.review-tab; review-filter <=> root.review-filter; delete-filter <=> root.delete-filter;
                     delete-file-count: root.delete-file-count; delete-node-count: root.delete-node-count;
                     delete-reclaimable: root.delete-reclaimable; delete-mode: root.delete-mode;

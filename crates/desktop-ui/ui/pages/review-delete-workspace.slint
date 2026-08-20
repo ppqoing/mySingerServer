@@ -170,7 +170,10 @@ export component ReviewDeleteWorkspace inherits Rectangle {
     in property <string> selected-group-id;
     in property <image> preview-image;
     in property <string> preview-info;
-    in property <string> last-error;
+    in property <string> preview-result-machine;
+    in property <string> preview-result-path;
+    in property <bool> preview-result-succeeded;
+    in property <int> preview-result-sequence;
     in-out property <string> path-rule;
     in-out property <int> review-tab: 0;
     in-out property <int> review-filter: 0;
@@ -196,21 +199,20 @@ export component ReviewDeleteWorkspace inherits Rectangle {
         root.preview-owner-path != ""
         && root.preview-owner-machine == root.selected-review-machine
         && root.preview-owner-path == root.selected-review-path;
-    changed preview-image => {
-        if root.preview-in-flight && root.preview-pending-path != "" {
-            root.preview-owner-machine = root.preview-pending-machine;
-            root.preview-owner-path = root.preview-pending-path;
+    // 只有带完整身份且匹配唯一 pending 的完成信号才能释放 single-flight。
+    changed preview-result-sequence => {
+        if root.preview-in-flight
+            && root.preview-result-machine == root.preview-pending-machine
+            && root.preview-result-path == root.preview-pending-path {
+            if root.preview-result-succeeded {
+                root.preview-owner-machine = root.preview-result-machine;
+                root.preview-owner-path = root.preview-result-path;
+            } else {
+                root.preview-owner-machine = "";
+                root.preview-owner-path = "";
+            }
             root.preview-pending-machine = "";
             root.preview-pending-path = "";
-            root.preview-in-flight = false;
-        }
-    }
-    changed last-error => {
-        if root.preview-in-flight && root.last-error != "" {
-            root.preview-pending-machine = "";
-            root.preview-pending-path = "";
-            root.preview-owner-machine = "";
-            root.preview-owner-path = "";
             root.preview-in-flight = false;
         }
     }

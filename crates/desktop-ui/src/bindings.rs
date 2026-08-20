@@ -258,6 +258,8 @@ pub fn apply_event(window: &MainWindow, binding: &UiBinding, event: UiEvent) {
             window.set_last_error(SharedString::default());
         }
         UiEvent::PreviewReady {
+            machine_id,
+            normalized_path,
             display_path,
             file_kind,
             bytes,
@@ -280,9 +282,21 @@ pub fn apply_event(window: &MainWindow, binding: &UiBinding, event: UiEvent) {
                     .into(),
                 );
                 window.set_last_error(SharedString::default());
+                finish_preview(window, &machine_id, &normalized_path, true);
             }
-            Err(error) => window.set_last_error(error.into()),
+            Err(error) => {
+                window.set_last_error(error.into());
+                finish_preview(window, &machine_id, &normalized_path, false);
+            }
         },
+        UiEvent::PreviewFailed {
+            machine_id,
+            normalized_path,
+            error,
+        } => {
+            window.set_last_error(error.into());
+            finish_preview(window, &machine_id, &normalized_path, false);
+        }
         UiEvent::ReviewChanged(page) => {
             apply_members(window, &page);
             window.set_last_error(SharedString::default());
@@ -438,6 +452,13 @@ fn bind_results(window: &MainWindow, sender: &mpsc::Sender<UiCommand>) {
 fn apply_members(window: &MainWindow, page: &dedup_desktop_core::results::MemberPage) {
     window.set_members(models::members(page));
     window.set_member_next_cursor(page.next_cursor.clone().unwrap_or_default().into());
+}
+
+fn finish_preview(window: &MainWindow, machine_id: &str, normalized_path: &str, succeeded: bool) {
+    window.set_preview_result_machine(machine_id.into());
+    window.set_preview_result_path(normalized_path.into());
+    window.set_preview_result_succeeded(succeeded);
+    window.set_preview_result_sequence(window.get_preview_result_sequence().wrapping_add(1));
 }
 
 fn empty_groups() -> slint::ModelRc<crate::UiGroupRow> {
