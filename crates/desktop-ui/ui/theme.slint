@@ -51,16 +51,30 @@ export struct UiMemberRow {
 }
 
 export global Theme {
+    // 基础表面与边界色供应用壳和各业务页面共享。
     in-out property <color> window: #f8fafc;
     in-out property <color> sidebar: #ffffff;
     in-out property <color> panel: #ffffff;
     in-out property <color> panel-hover: #f1f5f9;
     in-out property <color> border: #e5e7eb;
+    // 正文、辅助文字、图标和禁用态形成统一的文字层级。
     in-out property <color> text: #111827;
     in-out property <color> muted: #6b7280;
+    in-out property <color> nav-icon: #475569;
+    in-out property <color> disabled-text: #94a3b8;
+    // 强调与语义色只表达选择、成功、警告和危险状态。
     in-out property <color> accent: #2563eb;
     in-out property <color> accent-soft: #eff6ff;
     in-out property <color> success: #16a34a;
     in-out property <color> warning: #f59e0b;
     in-out property <color> danger: #ef4444;
+    in-out property <color> danger-soft: #fef2f2;
+    // 固定长度令牌避免页面、表格和详情面板各自漂移。
+    in-out property <length> page-padding: 20px;
+    in-out property <length> section-gap: 16px;
+    in-out property <length> control-height: 34px;
+    in-out property <length> table-header-height: 34px;
+    in-out property <length> table-row-height: 38px;
+    in-out property <length> member-row-height: 44px;
+    in-out property <length> detail-width: 300px;
 }

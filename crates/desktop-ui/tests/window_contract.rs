@@ -246,6 +246,27 @@ fn navigation_actions_preserve_page_mapping() {
 }
 
 #[test]
+fn shell_exposes_menu_search_and_one_refresh_action() {
+    i_slint_backend_testing::init_no_event_loop();
+
+    let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    let menu = accessible(&window, "应用菜单");
+    assert_eq!(menu.size(), slint::LogicalSize::new(44.0, 44.0));
+    assert!(accessible(&window, "本地搜索").size().width >= 220.0);
+
+    let refresh_count = Rc::new(Cell::new(0));
+    window.on_refresh({
+        let refresh_count = refresh_count.clone();
+        move || refresh_count.set(refresh_count.get() + 1)
+    });
+    let refresh = accessible(&window, "刷新");
+    refresh.invoke_accessible_default_action();
+    assert_eq!(refresh_count.get(), 1);
+    click_element_center(&window, &refresh);
+    assert_eq!(refresh_count.get(), 2, "刷新真实指针单击也必须只转发一次");
+}
+
+#[test]
 fn settings_sections_preserve_real_values_and_save_once() {
     i_slint_backend_testing::init_no_event_loop();
 

@@ -51,6 +51,110 @@ fn assert_inside_window(window: &MainWindow, width: f32, height: f32) {
     }
 }
 
+fn assert_element_inside_window(
+    element: &ElementHandle,
+    label: &str,
+    width: f32,
+    height: f32,
+) {
+    let position = element.absolute_position();
+    let size = element.size();
+    assert!(
+        position.x >= 0.0
+            && position.y >= 0.0
+            && position.x + size.width <= width
+            && position.y + size.height <= height,
+        "{label} 应位于 {width}×{height} 窗口边界内，位置={position:?}，尺寸={size:?}",
+    );
+}
+
+#[test]
+fn shell_landmarks_fit_both_window_sizes() {
+    install_testing_backend();
+
+    let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    window.set_sync_text("游标 120 / 125".into());
+    window.set_postgres_status("已连接".into());
+    let full_error = "节点 10.0.0.8 的同步连接在提交后断开，完整诊断必须保留给辅助技术";
+    window.set_last_error(full_error.into());
+    window.show().expect("应能显示真实 MainWindow");
+
+    for (width, height) in [(1440.0, 900.0), (1080.0, 700.0)] {
+        window
+            .window()
+            .set_size(slint::PhysicalSize::new(width as u32, height as u32));
+        window
+            .window()
+            .take_snapshot()
+            .expect("固定应用壳应能完成软件渲染");
+
+        let menu = ElementHandle::find_by_accessible_label(&window, "应用菜单")
+            .next()
+            .expect("侧栏顶部应公开应用菜单动作");
+        let overview = ElementHandle::find_by_accessible_label(&window, "总览")
+            .next()
+            .expect("侧栏应保留总览动作");
+        let search = ElementHandle::find_by_accessible_label(&window, "本地搜索")
+            .next()
+            .expect("顶栏应公开本地搜索框");
+        let refresh = ElementHandle::find_by_accessible_label(&window, "刷新")
+            .next()
+            .expect("顶栏应公开刷新动作");
+
+        let (menu_position, menu_size) = (menu.absolute_position(), menu.size());
+        assert!(
+            menu_position.x < 144.0
+                && menu_position.y < 58.0
+                && menu_position.x + menu_size.width <= 144.0
+                && menu_position.y + menu_size.height <= 58.0,
+            "应用菜单必须完整位于 144×58 侧栏头部，位置={menu_position:?}，尺寸={menu_size:?}",
+        );
+        let overview_position = overview.absolute_position();
+        assert!(
+            overview_position.x < 144.0 && overview_position.y >= 58.0,
+            "总览必须位于侧栏头部下方，位置={overview_position:?}",
+        );
+
+        let (search_position, search_size) = (search.absolute_position(), search.size());
+        let (refresh_position, refresh_size) = (refresh.absolute_position(), refresh.size());
+        assert!(
+            search_position.x >= 144.0
+                && search_position.y < 58.0
+                && search_position.y + search_size.height <= 58.0,
+            "本地搜索必须位于顶栏，位置={search_position:?}，尺寸={search_size:?}",
+        );
+        assert!(
+            refresh_position.x >= search_position.x + search_size.width
+                && refresh_position.y < 58.0
+                && refresh_position.y + refresh_size.height <= 58.0,
+            "刷新必须位于搜索框右侧且互不覆盖，搜索={search_position:?}/{search_size:?}，刷新={refresh_position:?}/{refresh_size:?}",
+        );
+
+        let status_label = format!(
+            "状态栏：引擎就绪；同步 游标 120 / 125；PostgreSQL 已连接；最后错误 {full_error}"
+        );
+        let status = ElementHandle::find_by_accessible_label(&window, &status_label)
+            .next()
+            .expect("状态栏根可访问名称应包含完整最后错误");
+        assert_element_inside_window(&status, "状态栏", width, height);
+        for label in [
+            "引擎状态：就绪",
+            "同步状态：游标 120 / 125",
+            "PostgreSQL 状态：已连接",
+        ] {
+            let segment = ElementHandle::find_by_accessible_label(&window, label)
+                .next()
+                .unwrap_or_else(|| panic!("状态栏应公开三段只读状态：{label}"));
+            let position = segment.absolute_position();
+            assert!(
+                position.y >= height - 32.0,
+                "{label} 必须位于 32px 底栏内，位置={position:?}",
+            );
+            assert_element_inside_window(&segment, label, width, height);
+        }
+    }
+}
+
 #[test]
 fn light_shell_renders_at_target_size() {
     install_testing_backend();

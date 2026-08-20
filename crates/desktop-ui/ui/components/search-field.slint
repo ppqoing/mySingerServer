@@ -1,0 +1,52 @@
+// 纯本地搜索框只暴露双向 query，不创建任何业务回调或网络行为。
+
+import { Theme } from "../theme.slint";
+
+export component SearchField inherits Rectangle {
+    // query 由使用方双向绑定；accessible-name 是输入框的稳定中文名称。
+    in-out property <string> query;
+    in property <string> accessible-name;
+
+    width: 260px;
+    height: Theme.control-height;
+    border-radius: 6px;
+    background: Theme.panel;
+    border-width: 1px;
+    border-color: search-input.has-focus ? Theme.accent : Theme.border;
+    clip: true;
+    forward-focus: search-input;
+
+    // Image 2 搜索图标固定 16×16，与输入文字保持 6px 间隔。
+    Image {
+        source: @image-url("../assets/icons/search.png");
+        width: 16px;
+        height: 16px;
+        x: 10px;
+        y: 9px;
+        image-fit: contain;
+        colorize: Theme.nav-icon;
+    }
+    Text {
+        visible: root.query == "";
+        x: 32px;
+        width: root.width - 36px;
+        height: root.height;
+        text: "本地搜索";
+        color: Theme.disabled-text;
+        font-size: 12px;
+        vertical-alignment: center;
+    }
+    // 原生 TextInput 提供编辑和可访问输入行为，文本只与 query 双向绑定。
+    search-input := TextInput {
+        x: 32px;
+        width: root.width - 36px;
+        height: root.height;
+        text <=> root.query;
+        color: Theme.text;
+        font-size: 12px;
+        vertical-alignment: center;
+        selection-background-color: Theme.accent;
+        selection-foreground-color: white;
+        accessible-label: root.accessible-name;
+    }
+}
