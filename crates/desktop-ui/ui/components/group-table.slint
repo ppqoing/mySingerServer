@@ -52,6 +52,8 @@ export component GroupTable inherits Rectangle {
                     accessible-label: "重复组：" + group.id;
                     accessible-item-selected: group.id == root.selected-id;
                     accessible-action-default => { root.select-group(group.id); }
+                    // 整行选择层先声明在内容下方；后续行内动作可自然取得更高命中优先级。
+                    row-touch := TouchArea { clicked => { root.select-group(group.id); } }
                     HorizontalLayout {
                         padding-left: 10px;
                         padding-right: 10px;
@@ -69,7 +71,6 @@ export component GroupTable inherits Rectangle {
                         Text { text: group.members; width: 38px; color: Theme.text; font-size: 10px; horizontal-alignment: right; }
                         Text { text: group.reclaimable; width: 78px; color: Theme.success; font-size: 10px; horizontal-alignment: right; overflow: elide; }
                     }
-                    row-touch := TouchArea { clicked => { root.select-group(group.id); } }
                     Rectangle { y: parent.height - 1px; height: 1px; background: Theme.border; }
                 }
             }

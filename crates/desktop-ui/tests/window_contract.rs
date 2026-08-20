@@ -848,7 +848,7 @@ fn duplicate_tabs_preserve_loaded_state_and_forward_existing_callbacks() {
             phash: "2".into(),
             stage2: "0.97".into(),
             metadata: "3840×2160 JPEG".into(),
-            review: "未复核".into(),
+            review: "未决定".into(),
             review_color: Color::from_rgb_u8(107, 114, 128),
             online: true,
             preview_enabled: true,
@@ -864,8 +864,8 @@ fn duplicate_tabs_preserve_loaded_state_and_forward_existing_callbacks() {
             phash: "3".into(),
             stage2: "0.96".into(),
             metadata: "3840×2160 JPEG".into(),
-            review: "待确认".into(),
-            review_color: Color::from_rgb_u8(245, 158, 11),
+            review: "未决定".into(),
+            review_color: Color::from_rgb_u8(107, 114, 128),
             online: true,
             preview_enabled: true,
             delete_enabled: true,
@@ -979,15 +979,21 @@ fn duplicate_tabs_preserve_loaded_state_and_forward_existing_callbacks() {
     accessible(&window, "精确重复").invoke_accessible_default_action();
     accessible(&window, "加载结果").invoke_accessible_default_action();
     accessible(&window, "加载下一页重复组").invoke_accessible_default_action();
-    accessible(&window, "重复组：group-001").invoke_accessible_default_action();
+    click_element_at_fraction(&window, &accessible(&window, "重复组：group-001"), 0.2, 0.5);
     accessible(&window, "加载下一页成员").invoke_accessible_default_action();
-    accessible(&window, "预览成员：D:\\Media\\photo-a.jpg").invoke_accessible_default_action();
+    click_element_center(
+        &window,
+        &accessible(&window, "预览成员：D:\\Media\\photo-a.jpg"),
+    );
     assert_eq!(
         previews.borrow().len(),
         1,
         "用户选择成员后才允许加载一次预览"
     );
-    accessible(&window, "保留成员：D:\\Media\\photo-a.jpg").invoke_accessible_default_action();
+    click_element_center(
+        &window,
+        &accessible(&window, "保留成员：D:\\Media\\photo-a.jpg"),
+    );
 
     accessible(&window, "相似图片").invoke_accessible_default_action();
     accessible(&window, "加载结果").invoke_accessible_default_action();

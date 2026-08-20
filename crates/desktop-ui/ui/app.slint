@@ -191,9 +191,12 @@ export component MainWindow inherits Window {
                     retry-cross => { root.retry-cross-analysis(); }
                 }
                 if root.current-page == 6 : ReviewDeleteWorkspace {
-                    members: root.members; selected-group-id: root.selected-group-id;
+                    groups: root.groups; members: root.members; selected-group-id: root.selected-group-id;
                     preview-image: root.preview-image; preview-info: root.preview-info; path-rule <=> root.review-path-rule;
                     review-tab <=> root.review-tab; review-filter <=> root.review-filter; delete-filter <=> root.delete-filter;
+                    delete-file-count: root.delete-file-count; delete-node-count: root.delete-node-count;
+                    delete-reclaimable: root.delete-reclaimable; delete-mode: root.delete-mode;
+                    delete-can-execute: root.delete-can-execute; delete-warning: root.delete-warning;
                     save-review(machine, path, decision) => { root.save-review(machine, path, decision); }
                     preview(machine, path) => { root.load-preview(machine, path); }
                     quick-review(rule, value) => { root.quick-review(rule, value); }

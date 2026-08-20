@@ -1,11 +1,15 @@
 // 四类重复结果共享一个状态工作区；页签只改页面映射，不重置任何已加载状态。
 
-import { Button, ComboBox, LineEdit, SpinBox } from "std-widgets.slint";
+import { ComboBox, LineEdit, SpinBox } from "std-widgets.slint";
 import { Theme, UiGroupRow, UiMemberRow } from "../theme.slint";
-import { TabStrip } from "../components/tab-strip.slint";
+import { ActionButton } from "../components/action-button.slint";
+import { DetailPanel } from "../components/detail-panel.slint";
+import { EmptyState } from "../components/empty-state.slint";
+import { FilterBar } from "../components/filter-bar.slint";
 import { GroupTable } from "../components/group-table.slint";
 import { MemberList } from "../components/member-list.slint";
-import { DetailPanel } from "../components/detail-panel.slint";
+import { SectionHeader } from "../components/section-header.slint";
+import { TabStrip } from "../components/tab-strip.slint";
 
 export component DuplicateWorkspace inherits Rectangle {
     in-out property <int> duplicate-tab;
@@ -35,118 +39,160 @@ export component DuplicateWorkspace inherits Rectangle {
     property <int> cross-result-kind: 0;
     property <int> query-kind: root.duplicate-tab < 3 ? root.duplicate-tab : root.cross-result-kind;
     property <bool> central-source: root.duplicate-tab == 3 || root.source-index == 1;
+    property <string> result-title: root.duplicate-tab == 0 ? "精确重复结果"
+        : root.duplicate-tab == 1 ? "相似图片结果"
+        : root.duplicate-tab == 2 ? "相似视频结果"
+        : "跨机器重复结果";
     background: transparent;
 
     VerticalLayout {
         padding: 20px;
         spacing: 12px;
+
         TabStrip {
             labels: ["精确重复", "相似图片", "相似视频", "跨机器"];
             active-index: root.duplicate-tab;
-            changed(index) => {
-                root.select-tab(index);
+            changed(index) => { root.select-tab(index); }
+        }
+
+        FilterBar {
+            accessible-role: AccessibleRole.groupbox;
+            accessible-label: "结果过滤栏";
+            if root.duplicate-tab < 3 : ComboBox {
+                model: ["节点 SQLite", "PostgreSQL 中心"];
+                current-index <=> root.source-index;
+                width: 150px;
+                accessible-label: "结果来源";
+            }
+            if root.duplicate-tab < 3 : SpinBox {
+                value <=> root.node-index;
+                minimum: 0;
+                maximum: 99;
+                width: 92px;
+                accessible-label: "结果节点";
+            }
+            if root.duplicate-tab == 3 : ComboBox {
+                model: ["精确重复", "相似图片", "相似视频"];
+                current-index <=> root.cross-result-kind;
+                width: 150px;
+                accessible-label: "跨机器结果类型";
+            }
+            LineEdit {
+                text <=> root.run-id;
+                placeholder-text: "分析运行 UUID";
+                horizontal-stretch: 1;
+                accessible-label: "结果运行 ID";
+            }
+            ActionButton {
+                label: "加载结果";
+                icon: @image-url("../assets/icons/filter.png");
+                tone: 1;
+                clicked => { root.load-groups(root.central-source, root.node-index, root.run-id, root.query-kind, ""); }
             }
         }
+
         if root.duplicate-tab == 3 : Rectangle {
-            height: 104px;
+            height: 96px;
             background: Theme.panel;
-            border-radius: 9px;
+            border-radius: 8px;
             border-width: 1px;
             border-color: Theme.border;
             VerticalLayout {
                 padding: 12px;
-                spacing: 7px;
+                spacing: 8px;
                 LineEdit {
                     text <=> root.cross-selections;
                     placeholder-text: "0:任务UUID, 1:任务UUID";
                     accessible-label: "跨机器任务选择";
                 }
                 HorizontalLayout {
-                    spacing: 7px;
-                    Button { text: "创建中心分析"; accessible-label: "创建中心分析"; clicked => { root.start-cross(root.cross-selections); } }
-                    Button { text: "推进到下一门禁"; accessible-label: "推进到下一门禁"; clicked => { root.poll-cross(); } }
-                    Button {
-                        text: "重试未解决二筛";
-                        accessible-label: "重试未解决二筛";
-                        enabled: root.cross-status == "partial";
+                    spacing: 8px;
+                    ActionButton {
+                        label: "创建中心分析";
+                        icon: @image-url("../assets/icons/duplicates.png");
+                        tone: 1;
+                        clicked => { root.start-cross(root.cross-selections); }
+                    }
+                    ActionButton {
+                        label: "推进到下一门禁";
+                        icon: @image-url("../assets/icons/sync.png");
+                        clicked => { root.poll-cross(); }
+                    }
+                    ActionButton {
+                        label: "重试未解决二筛";
+                        icon: @image-url("../assets/icons/retry.png");
+                        action-enabled: root.cross-status == "partial";
                         clicked => { root.retry-cross(); }
                     }
                     Rectangle { horizontal-stretch: 1; background: transparent; }
-                    Text { text: root.cross-status + " · " + root.cross-summary; color: Theme.muted; font-size: 10px; vertical-alignment: center; overflow: elide; }
+                    Text {
+                        text: root.cross-status + " · " + root.cross-summary;
+                        color: Theme.muted;
+                        font-size: 10px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
                 }
             }
         }
-        Rectangle {
-            height: 66px;
-            background: Theme.panel;
-            border-radius: 9px;
-            border-width: 1px;
-            border-color: Theme.border;
-            HorizontalLayout {
-                padding: 10px;
-                spacing: 8px;
-                alignment: center;
-                if root.duplicate-tab < 3 : ComboBox {
-                    model: ["节点 SQLite", "PostgreSQL 中心"];
-                    current-index <=> root.source-index;
-                    width: 150px;
-                    accessible-label: "结果来源";
-                }
-                if root.duplicate-tab < 3 : SpinBox {
-                    value <=> root.node-index;
-                    minimum: 0;
-                    maximum: 99;
-                    width: 92px;
-                    accessible-label: "结果节点";
-                }
-                if root.duplicate-tab == 3 : ComboBox {
-                    model: ["精确重复", "相似图片", "相似视频"];
-                    current-index <=> root.cross-result-kind;
-                    width: 150px;
-                    accessible-label: "跨机器结果类型";
-                }
-                LineEdit {
-                    text <=> root.run-id;
-                    placeholder-text: "分析运行 UUID";
-                    horizontal-stretch: 1;
-                    accessible-label: "结果运行 ID";
-                }
-                Button {
-                    text: "加载结果";
-                    accessible-label: "加载结果";
-                    clicked => { root.load-groups(root.central-source, root.node-index, root.run-id, root.query-kind, ""); }
-                }
-            }
-        }
-        // 三列始终同屏：组、成员和固定 300px 详情，分页按钮不会触发全量预取。
+
+        // 1440 固定 370 / 伸展 / 300；最小窗口保留三列并让组、成员各自横向滚动。
         HorizontalLayout {
             spacing: 12px;
             vertical-stretch: 1;
-            GroupTable {
-                width: 380px;
-                groups: root.groups;
-                selected-id: root.selected-group-id;
-                has-more: root.group-next-cursor != "";
-                select-group(id) => {
-                    root.selected-group-id = id;
-                    root.load-members(root.central-source, root.node-index, root.run-id, id, root.query-kind, "");
+
+            Rectangle {
+                width: 370px;
+                background: transparent;
+                accessible-role: AccessibleRole.groupbox;
+                accessible-label: "重复组表";
+                VerticalLayout {
+                    spacing: 8px;
+                    SectionHeader {
+                        title: "重复组";
+                        subtitle: root.groups.length == 0 ? "当前筛选没有组；调整来源或运行 ID 后重新加载。" : "有限游标分页，选择一组后加载成员。";
+                    }
+                    GroupTable {
+                        vertical-stretch: 1;
+                        groups: root.groups;
+                        selected-id: root.selected-group-id;
+                        has-more: root.group-next-cursor != "";
+                        select-group(id) => {
+                            root.selected-group-id = id;
+                            root.load-members(root.central-source, root.node-index, root.run-id, id, root.query-kind, "");
+                        }
+                        load-more => { root.load-groups(root.central-source, root.node-index, root.run-id, root.query-kind, root.group-next-cursor); }
+                    }
                 }
-                load-more => { root.load-groups(root.central-source, root.node-index, root.run-id, root.query-kind, root.group-next-cursor); }
             }
-            VerticalLayout {
+
+            Rectangle {
                 horizontal-stretch: 1;
-                MemberList {
-                    vertical-stretch: 1;
-                    members: root.members;
-                    preview(machine, path) => { root.preview(machine, path); }
-                    review(machine, path, decision) => { root.save-review(machine, path, decision); }
-                }
-                if root.member-next-cursor != "" : Button {
-                    text: "加载更多成员";
-                    accessible-label: "加载下一页成员";
-                    clicked => { root.load-members(root.central-source, root.node-index, root.run-id, root.selected-group-id, root.query-kind, root.member-next-cursor); }
+                min-width: 50px;
+                background: transparent;
+                accessible-role: AccessibleRole.groupbox;
+                accessible-label: "成员表";
+                VerticalLayout {
+                    spacing: 8px;
+                    SectionHeader {
+                        title: "成员列表";
+                        subtitle: root.members.length == 0 ? "选择重复组后显示成员；预览不会自动加载。" : "在线能力、相似分数和复核决定均来自已加载模型。";
+                    }
+                    if root.member-next-cursor != "" : ActionButton {
+                        label: "加载更多成员";
+                        accessible-label: "加载下一页成员";
+                        icon: @image-url("../assets/icons/filter.png");
+                        clicked => { root.load-members(root.central-source, root.node-index, root.run-id, root.selected-group-id, root.query-kind, root.member-next-cursor); }
+                    }
+                    MemberList {
+                        vertical-stretch: 1;
+                        members: root.members;
+                        preview(machine, path) => { root.preview(machine, path); }
+                        review(machine, path, decision) => { root.save-review(machine, path, decision); }
+                    }
                 }
             }
+
             DetailPanel {
                 width: 300px;
                 accessible-role: AccessibleRole.groupbox;
@@ -154,22 +200,31 @@ export component DuplicateWorkspace inherits Rectangle {
                 VerticalLayout {
                     padding: 12px;
                     spacing: 8px;
-                    Text {
-                        text: root.duplicate-tab == 1 ? "原图按需预览（内存）"
-                            : root.duplicate-tab == 2 ? "六帧 3×2 JPG 联系表"
-                            : root.duplicate-tab == 3 ? "跨机器成员详情"
-                            : "精确重复成员详情";
-                        color: Theme.text;
-                        font-size: 13px;
-                        font-weight: 650;
+                    SectionHeader {
+                        title: root.result-title;
+                        subtitle: root.duplicate-tab == 1 ? "原图按需解码到内存，不写缩略图。"
+                            : root.duplicate-tab == 2 ? "视频只读取既有六帧 3×2 JPG 联系表。"
+                            : root.duplicate-tab == 3 ? "跨机器成员仍沿用当前门禁与游标。"
+                            : "精确重复只展示已加载成员详情。";
                     }
-                    Image {
+                    if root.preview-image.width > 0 && root.preview-image.height > 0 : Image {
                         source: root.preview-image;
                         image-fit: contain;
                         horizontal-stretch: 1;
                         vertical-stretch: 1;
                     }
-                    Text { text: root.preview-info; color: Theme.muted; font-size: 10px; overflow: elide; }
+                    if root.preview-image.width <= 0 || root.preview-image.height <= 0 : EmptyState {
+                        vertical-stretch: 1;
+                        title: "尚未加载预览";
+                        detail: "使用成员行的预览动作后，图片或联系表才会显示在这里。";
+                        icon: @image-url("../assets/icons/preview.png");
+                    }
+                    if root.preview-info != "" : Text {
+                        text: root.preview-info;
+                        color: Theme.muted;
+                        font-size: 10px;
+                        wrap: word-wrap;
+                    }
                 }
             }
         }

@@ -198,6 +198,13 @@ impl VisualFixture {
         window.set_sync_text("120 / 125".into());
         window.set_cross_status("partial".into());
         window.set_cross_summary("候选 3 · 未决 2 · 二筛任务 1 · 跳过不完整 0".into());
+        window.set_selected_group_id("exact-001".into());
+        window.set_delete_file_count(2);
+        window.set_delete_node_count(2);
+        window.set_delete_reclaimable("1.1 GiB".into());
+        window.set_delete_mode("回收站".into());
+        window.set_delete_can_execute(false);
+        window.set_delete_warning("视频节点离线，当前不能确认执行。".into());
         window.set_postgres_status("中心数据库健康".into());
         window.set_postgres_color(Color::from_rgb_u8(22, 163, 74));
         window.set_last_error("目标机器拒绝连接".into());

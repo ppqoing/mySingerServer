@@ -92,7 +92,7 @@ fn install_duplicate_workspace_fixture(window: &MainWindow) {
         phash: "4".into(),
         stage2: "0.96".into(),
         metadata: "1920×1080 · JPEG".into(),
-        review: "未复核".into(),
+        review: "未决定".into(),
         review_color: Color::from_rgb_u8(107, 114, 128),
         online: true,
         preview_enabled: true,
@@ -670,6 +670,159 @@ fn duplicate_workspace_regions_keep_their_own_scroll_views_at_minimum_size() {
                 && scroll_position.x + scroll_size.width <= region_position.x + region_size.width
                 && scroll_position.y + scroll_size.height <= region_position.y + region_size.height,
             "{label} 的 ScrollView 必须可在自身区域内到达，区域={region_position:?}/{region_size:?}，滚动区={scroll_position:?}/{scroll_size:?}",
+        );
+    }
+}
+
+#[test]
+fn result_review_and_delete_workspaces_keep_named_regions() {
+    install_testing_backend();
+
+    let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    install_duplicate_workspace_fixture(&window);
+    window.set_selected_group_id("group-001".into());
+    window.set_delete_file_count(1);
+    window.set_delete_node_count(1);
+    window.set_delete_reclaimable("8.0 MiB".into());
+    window.set_delete_mode("回收站".into());
+    window.set_delete_can_execute(false);
+    window.set_delete_warning("目标节点离线，当前不能确认执行。".into());
+    window.show().expect("应能显示结果、审核与删除工作区");
+
+    for (width, height) in [(1440.0, 900.0), (1080.0, 700.0)] {
+        window
+            .window()
+            .set_size(slint::PhysicalSize::new(width as u32, height as u32));
+
+        for (label, page) in [
+            ("精确重复", 2),
+            ("相似图片", 3),
+            ("相似视频", 4),
+            ("跨机器", 5),
+        ] {
+            window.set_current_page(page);
+            window
+                .window()
+                .take_snapshot()
+                .unwrap_or_else(|_| panic!("{label} 在 {width}×{height} 下应能完成软件渲染"));
+
+            let group = ElementHandle::find_by_accessible_label(&window, "重复组表")
+                .next()
+                .expect("结果工作区应公开重复组表");
+            let member = ElementHandle::find_by_accessible_label(&window, "成员表")
+                .next()
+                .expect("结果工作区应公开成员表");
+            let detail = ElementHandle::find_by_accessible_label(&window, "详情面板")
+                .next()
+                .expect("结果工作区应公开详情面板");
+            let (group_position, group_size) = (group.absolute_position(), group.size());
+            let (member_position, member_size) = (member.absolute_position(), member.size());
+            let (detail_position, detail_size) = (detail.absolute_position(), detail.size());
+            let filter = ElementHandle::find_by_accessible_label(&window, "结果过滤栏")
+                .next()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{label} 应公开结果过滤栏；当前三栏几何：组={group_position:?}/{group_size:?}，成员={member_position:?}/{member_size:?}，详情={detail_position:?}/{detail_size:?}"
+                    )
+                });
+            assert_element_has_positive_size(&filter, "结果过滤栏");
+
+            for (name, region) in [
+                ("重复组表", &group),
+                ("成员表", &member),
+                ("详情面板", &detail),
+            ] {
+                assert_element_has_positive_size(region, name);
+            }
+            assert!(
+                group_position.x + group_size.width <= member_position.x
+                    && member_position.x + member_size.width <= detail_position.x,
+                "{label} 在 {width}×{height} 下必须保持组、成员、详情从左到右且不覆盖：组={group_position:?}/{group_size:?}，成员={member_position:?}/{member_size:?}，详情={detail_position:?}/{detail_size:?}",
+            );
+            if width == 1440.0 {
+                assert!(
+                    (360.0..=380.0).contains(&group_size.width),
+                    "{label} 的组表宽度应为 360–380px，实际={group_size:?}",
+                );
+                assert!(
+                    (280.0..=320.0).contains(&detail_size.width),
+                    "{label} 的详情宽度应为 280–320px，实际={detail_size:?}",
+                );
+                assert!(
+                    member_size.width > group_size.width,
+                    "{label} 的成员表应占中间剩余宽度，组={group_size:?}，成员={member_size:?}",
+                );
+            } else {
+                for (name, region) in [("重复组表", &group), ("成员表", &member)] {
+                    assert!(
+                        region
+                            .query_descendants()
+                            .match_inherits("ScrollView")
+                            .find_first()
+                            .is_some(),
+                        "{name} 在 1080×700 下必须通过自己的 ScrollView 横向到达内容",
+                    );
+                }
+            }
+        }
+
+        window.set_current_page(6);
+        window.set_review_tab(0);
+        window
+            .window()
+            .take_snapshot()
+            .expect("审核工作台应能完成软件渲染");
+        let review_regions = ["审核过滤栏", "审核组队列", "审核成员列表", "复核详情"].map(|name| {
+            ElementHandle::find_by_accessible_label(&window, name)
+                .next()
+                .unwrap_or_else(|| panic!("审核工作台应公开{name}"))
+        });
+        for (name, region) in ["审核过滤栏", "审核组队列", "审核成员列表", "复核详情"]
+            .into_iter()
+            .zip(review_regions.iter())
+        {
+            assert_element_has_positive_size(region, name);
+        }
+        for pair in review_regions[1..].windows(2) {
+            assert!(
+                pair[0].absolute_position().x + pair[0].size().width
+                    <= pair[1].absolute_position().x,
+                "审核组队列、审核成员列表和复核详情必须从左到右且不覆盖",
+            );
+        }
+
+        window.set_review_tab(1);
+        window.set_delete_filter(0);
+        window
+            .window()
+            .take_snapshot()
+            .expect("删除中心应能完成软件渲染");
+        let summary = ElementHandle::find_by_accessible_label(&window, "删除批次摘要")
+            .next()
+            .expect("删除中心应公开删除批次摘要");
+        let execution = ElementHandle::find_by_accessible_label(&window, "删除执行详情")
+            .next()
+            .expect("删除中心应公开删除执行详情");
+        assert_element_has_positive_size(&summary, "删除批次摘要");
+        assert_element_has_positive_size(&execution, "删除执行详情");
+        assert!(
+            summary.absolute_position().x + summary.size().width <= execution.absolute_position().x,
+            "删除批次摘要与删除执行详情必须左右分栏且不覆盖",
+        );
+
+        window.set_delete_filter(2);
+        window
+            .window()
+            .take_snapshot()
+            .expect("删除历史空态应能完成软件渲染");
+        assert!(
+            ElementHandle::find_by_accessible_label(
+                &window,
+                "删除历史空态：当前版本没有持久删除批次；当前后端没有删除批次历史模型，因此不生成模拟记录。",
+            )
+            .next()
+            .is_some(),
+            "没有历史模型时必须同时显示标题和原因，不得制造虚假批次",
         );
     }
 }

@@ -54,6 +54,7 @@ export component MemberList inherits Rectangle {
     in property <[UiMemberRow]> members;
     callback preview(string, string);
     callback review(string, string, int);
+    private property <string> selected-path;
 
     background: Theme.panel;
     min-width: 50px;
@@ -93,10 +94,14 @@ export component MemberList inherits Rectangle {
             }
             for member in root.members : Rectangle {
                     height: Theme.member-row-height;
-                    background: member.representative ? Theme.accent-soft : Theme.panel;
+                    background: member.path == root.selected-path || member.representative ? Theme.accent-soft : Theme.panel;
                     border-width: 0px;
                     accessible-role: AccessibleRole.list-item;
                     accessible-label: "成员：" + member.path;
+                    accessible-item-selected: member.path == root.selected-path;
+                    accessible-action-default => { root.selected-path = member.path; }
+                    // 整行选择层先声明在内容下方；后声明的预览/保留/删除动作优先命中。
+                    row-touch := TouchArea { clicked => { root.selected-path = member.path; } }
                     HorizontalLayout {
                         padding-left: 9px;
                         padding-right: 9px;
