@@ -24,6 +24,33 @@ fn assert_light_opaque(pixel: slint::Rgba8Pixel, region: &str) {
     );
 }
 
+fn assert_inside_window(window: &MainWindow, width: f32, height: f32) {
+    for label in [
+        "总览",
+        "节点",
+        "扫描",
+        "任务",
+        "重复文件",
+        "审核删除",
+        "设置",
+        "刷新",
+        "在线节点：0 台",
+    ] {
+        let element = ElementHandle::find_by_accessible_label(window, label)
+            .next()
+            .unwrap_or_else(|| panic!("窗口应保留可访问元素：{label}"));
+        let position = element.absolute_position();
+        let size = element.size();
+        assert!(
+            position.x >= 0.0
+                && position.y >= 0.0
+                && position.x + size.width <= width
+                && position.y + size.height <= height,
+            "{label} 应位于 {width}×{height} 窗口边界内，位置={position:?}，尺寸={size:?}",
+        );
+    }
+}
+
 #[test]
 fn light_shell_renders_at_target_size() {
     install_testing_backend();
@@ -63,6 +90,7 @@ fn light_shell_renders_at_target_size() {
         sidebar.r > content.r && status_bar.r > content.r,
         "白色侧栏和底栏应围绕稍深的内容区：侧栏={sidebar:?}，内容={content:?}，底栏={status_bar:?}",
     );
+    assert_inside_window(&window, 1440.0, 900.0);
 
     window
         .window()
@@ -76,29 +104,7 @@ fn light_shell_renders_at_target_size() {
         (1080, 700),
     );
 
-    for label in [
-        "总览",
-        "节点",
-        "扫描",
-        "任务",
-        "重复文件",
-        "审核删除",
-        "设置",
-        "刷新",
-    ] {
-        let element = ElementHandle::find_by_accessible_label(&window, label)
-            .next()
-            .unwrap_or_else(|| panic!("最小窗口应保留可访问动作：{label}"));
-        let position = element.absolute_position();
-        let size = element.size();
-        assert!(
-            position.x >= 0.0
-                && position.y >= 0.0
-                && position.x + size.width <= 1080.0
-                && position.y + size.height <= 700.0,
-            "{label} 应位于 1080×700 窗口边界内，位置={position:?}，尺寸={size:?}",
-        );
-    }
+    assert_inside_window(&window, 1080.0, 700.0);
 }
 
 #[test]
