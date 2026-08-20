@@ -127,13 +127,21 @@ component ReviewMemberList inherits Rectangle {
                             icon: @image-url("../assets/icons/preview.png");
                             action-enabled: member.preview-enabled;
                             accessible-label: "预览成员：" + member.path;
-                            clicked => { root.preview(member.machine-id, member.path); }
+                            clicked => {
+                                root.selected-machine = member.machine-id;
+                                root.selected-path = member.path;
+                                root.preview(member.machine-id, member.path);
+                            }
                         }
                         ActionButton {
                             label: "保留";
                             icon: @image-url("../assets/icons/keep.png");
                             accessible-label: "保留成员：" + member.path;
-                            clicked => { root.review(member.machine-id, member.path, 1); }
+                            clicked => {
+                                root.selected-machine = member.machine-id;
+                                root.selected-path = member.path;
+                                root.review(member.machine-id, member.path, 1);
+                            }
                         }
                         ActionButton {
                             label: "删除";
@@ -141,7 +149,11 @@ component ReviewMemberList inherits Rectangle {
                             tone: 2;
                             action-enabled: member.delete-enabled;
                             accessible-label: "删除成员：" + member.path;
-                            clicked => { root.review(member.machine-id, member.path, 2); }
+                            clicked => {
+                                root.selected-machine = member.machine-id;
+                                root.selected-path = member.path;
+                                root.review(member.machine-id, member.path, 2);
+                            }
                         }
                     }
                 }
@@ -173,6 +185,20 @@ export component ReviewDeleteWorkspace inherits Rectangle {
     callback prepare-delete();
     private property <string> selected-review-machine;
     private property <string> selected-review-path;
+    private property <string> preview-pending-machine;
+    private property <string> preview-pending-path;
+    private property <string> preview-owner-machine;
+    private property <string> preview-owner-path;
+    private property <bool> preview-matches-selection:
+        root.preview-owner-path != ""
+        && root.preview-owner-machine == root.selected-review-machine
+        && root.preview-owner-path == root.selected-review-path;
+    changed preview-image => {
+        if root.preview-pending-path != "" {
+            root.preview-owner-machine = root.preview-pending-machine;
+            root.preview-owner-path = root.preview-pending-path;
+        }
+    }
     background: transparent;
 
     VerticalLayout {
@@ -248,7 +274,13 @@ export component ReviewDeleteWorkspace inherits Rectangle {
                             review-filter: root.review-filter;
                             selected-machine <=> root.selected-review-machine;
                             selected-path <=> root.selected-review-path;
-                            preview(machine, path) => { root.preview(machine, path); }
+                            preview(machine, path) => {
+                                root.selected-review-machine = machine;
+                                root.selected-review-path = path;
+                                root.preview-pending-machine = machine;
+                                root.preview-pending-path = path;
+                                root.preview(machine, path);
+                            }
                             review(machine, path, decision) => { root.save-review(machine, path, decision); }
                         }
                     }
@@ -265,18 +297,35 @@ export component ReviewDeleteWorkspace inherits Rectangle {
                             title: "复核详情";
                             subtitle: root.selected-review-path == "" ? "选择成员行后可执行明确复核动作。" : root.selected-review-path;
                         }
-                        if root.preview-image.width > 0 && root.preview-image.height > 0 : Image {
-                            source: root.preview-image;
+                        if root.preview-image.width > 0 && root.preview-image.height > 0 && root.preview-matches-selection : Rectangle {
                             height: 150px;
-                            image-fit: contain;
+                            background: transparent;
+                            accessible-role: AccessibleRole.groupbox;
+                            accessible-label: "当前预览：" + root.preview-owner-path;
+                            Image {
+                                source: root.preview-image;
+                                image-fit: contain;
+                            }
                         }
-                        if root.preview-image.width <= 0 || root.preview-image.height <= 0 : EmptyState {
+                        if root.preview-image.width > 0 && root.preview-image.height > 0 && !root.preview-matches-selection && root.selected-review-path != "" : Rectangle {
+                            height: 150px;
+                            background: transparent;
+                            accessible-role: AccessibleRole.groupbox;
+                            accessible-label: "预览需要重新加载：" + root.selected-review-path;
+                            EmptyState {
+                                density: 0;
+                                title: "需重新预览";
+                                detail: "当前图片属于另一成员；请预览当前选择后再核对。";
+                                icon: @image-url("../assets/icons/preview.png");
+                            }
+                        }
+                        if root.preview-image.width <= 0 || root.preview-image.height <= 0 || root.selected-review-path == "" : EmptyState {
                             density: 0;
                             title: "尚未触发预览";
                             detail: "只有成员行的预览动作会调用现有按需加载回调。";
                             icon: @image-url("../assets/icons/preview.png");
                         }
-                        if root.preview-info != "" : Text { text: root.preview-info; color: Theme.muted; font-size: 10px; wrap: word-wrap; }
+                        if root.preview-info != "" && root.preview-matches-selection : Text { text: root.preview-info; color: Theme.muted; font-size: 10px; wrap: word-wrap; }
 
                         Rectangle {
                             height: 150px;

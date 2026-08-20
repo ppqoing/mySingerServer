@@ -1068,6 +1068,194 @@ fn duplicate_tabs_preserve_loaded_state_and_forward_existing_callbacks() {
 }
 
 #[test]
+fn review_pointer_actions_keep_detail_target_and_preview_owner_aligned() {
+    i_slint_backend_testing::init_no_event_loop();
+
+    let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    window
+        .window()
+        .set_size(slint::PhysicalSize::new(1440, 900));
+    window.set_members(ModelRc::new(VecModel::from(vec![
+        UiMemberRow {
+            machine_id: "machine-a".into(),
+            path: "D:\\Media\\review-a.jpg".into(),
+            md5: "0000000000000000000000000000000a".into(),
+            size: "1.0 MiB".into(),
+            representative: false,
+            stage1: "0.99".into(),
+            phash: "1".into(),
+            stage2: "0.98".into(),
+            metadata: "1920×1080 JPEG".into(),
+            review: "未决定".into(),
+            review_color: Color::from_rgb_u8(107, 114, 128),
+            online: true,
+            preview_enabled: true,
+            delete_enabled: true,
+        },
+        UiMemberRow {
+            machine_id: "machine-b".into(),
+            path: "D:\\Media\\review-b.jpg".into(),
+            md5: "0000000000000000000000000000000b".into(),
+            size: "2.0 MiB".into(),
+            representative: false,
+            stage1: "0.97".into(),
+            phash: "2".into(),
+            stage2: "0.96".into(),
+            metadata: "2560×1440 JPEG".into(),
+            review: "未决定".into(),
+            review_color: Color::from_rgb_u8(107, 114, 128),
+            online: true,
+            preview_enabled: true,
+            delete_enabled: true,
+        },
+    ])));
+    window.invoke_navigate_to(5);
+
+    let previews = Rc::new(RefCell::new(Vec::new()));
+    window.on_load_preview({
+        let previews = previews.clone();
+        move |machine, path| {
+            previews
+                .borrow_mut()
+                .push((machine.to_string(), path.to_string()));
+        }
+    });
+    let reviews = Rc::new(RefCell::new(Vec::new()));
+    window.on_save_review({
+        let reviews = reviews.clone();
+        move |machine, path, decision| {
+            reviews
+                .borrow_mut()
+                .push((machine.to_string(), path.to_string(), decision));
+        }
+    });
+
+    let row_a = accessible(&window, "成员：D:\\Media\\review-a.jpg");
+    let row_b = accessible(&window, "成员：D:\\Media\\review-b.jpg");
+    click_element_at_fraction(&window, &row_a, 0.35, 0.5);
+    assert_eq!(row_a.accessible_item_selected(), Some(true));
+    assert_eq!(row_b.accessible_item_selected(), Some(false));
+    assert!(
+        previews.borrow().is_empty(),
+        "点击行空白只能选择，不得触发预览"
+    );
+
+    click_element_center(
+        &window,
+        &accessible(&window, "预览成员：D:\\Media\\review-a.jpg"),
+    );
+    assert_eq!(
+        previews.borrow().as_slice(),
+        &[(
+            String::from("machine-a"),
+            String::from("D:\\Media\\review-a.jpg"),
+        )],
+        "A 行预览按钮只应触发一次精确回调",
+    );
+    let image_a = slint::Image::from_rgba8(
+        slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&[20, 40, 60, 255], 1, 1),
+    );
+    window.set_preview_image(image_a);
+    window.set_preview_info("A 预览".into());
+    slint::platform::update_timers_and_animations();
+
+    click_element_center(
+        &window,
+        &accessible(&window, "预览成员：D:\\Media\\review-b.jpg"),
+    );
+    assert_eq!(
+        previews.borrow().as_slice(),
+        &[
+            (
+                String::from("machine-a"),
+                String::from("D:\\Media\\review-a.jpg"),
+            ),
+            (
+                String::from("machine-b"),
+                String::from("D:\\Media\\review-b.jpg"),
+            ),
+        ],
+        "B 行预览按钮不得被整行 TouchArea 吞掉或重复触发",
+    );
+    assert_eq!(row_a.accessible_item_selected(), Some(false));
+    assert_eq!(
+        row_b.accessible_item_selected(),
+        Some(true),
+        "B 行内预览动作必须同时把详情目标切换到 B",
+    );
+    assert!(
+        ElementHandle::find_by_accessible_label(&window, "当前预览：D:\\Media\\review-a.jpg")
+            .next()
+            .is_none(),
+        "选中 B 后不得继续把 A 的旧图片暴露为当前预览",
+    );
+    assert!(
+        ElementHandle::find_by_accessible_label(
+            &window,
+            "预览需要重新加载：D:\\Media\\review-b.jpg",
+        )
+        .next()
+        .is_some(),
+        "B 的响应尚未到达时必须明确显示预览失配",
+    );
+
+    click_element_center(&window, &accessible(&window, "标记删除"));
+    assert_eq!(
+        reviews.borrow().as_slice(),
+        &[(
+            String::from("machine-b"),
+            String::from("D:\\Media\\review-b.jpg"),
+            2,
+        )],
+        "详情复核必须精确保存当前 B，不能误写先前的 A",
+    );
+
+    let image_b = slint::Image::from_rgba8(
+        slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&[80, 100, 120, 255], 1, 1),
+    );
+    window.set_preview_image(image_b);
+    window.set_preview_info("B 预览".into());
+    slint::platform::update_timers_and_animations();
+    let current_b =
+        ElementHandle::find_by_accessible_label(&window, "当前预览：D:\\Media\\review-b.jpg")
+            .next()
+            .is_some();
+    let current_a =
+        ElementHandle::find_by_accessible_label(&window, "当前预览：D:\\Media\\review-a.jpg")
+            .next()
+            .is_some();
+    let mismatch_b = ElementHandle::find_by_accessible_label(
+        &window,
+        "预览需要重新加载：D:\\Media\\review-b.jpg",
+    )
+    .next()
+    .is_some();
+    assert!(
+        current_b,
+        "B 的响应变化后应绑定到当时 pending 的 B 请求；current_a={current_a}, mismatch_b={mismatch_b}",
+    );
+
+    click_element_at_fraction(&window, &row_a, 0.35, 0.5);
+    assert_eq!(row_a.accessible_item_selected(), Some(true));
+    assert_eq!(row_b.accessible_item_selected(), Some(false));
+    assert!(
+        ElementHandle::find_by_accessible_label(&window, "当前预览：D:\\Media\\review-b.jpg")
+            .next()
+            .is_none(),
+        "切回 A 后必须隐藏属于 B 的旧预览",
+    );
+    assert!(
+        ElementHandle::find_by_accessible_label(
+            &window,
+            "预览需要重新加载：D:\\Media\\review-a.jpg",
+        )
+        .next()
+        .is_some(),
+        "选择改变后应明确提示重新预览当前成员",
+    );
+}
+
+#[test]
 fn review_filters_loaded_members_and_delete_confirmation_obeys_gate() {
     i_slint_backend_testing::init_no_event_loop();
 
