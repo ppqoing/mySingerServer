@@ -1068,7 +1068,7 @@ fn duplicate_tabs_preserve_loaded_state_and_forward_existing_callbacks() {
 }
 
 #[test]
-fn review_pointer_actions_keep_detail_target_and_preview_owner_aligned() {
+fn review_preview_is_single_flight_and_keeps_decision_target_aligned() {
     i_slint_backend_testing::init_no_event_loop();
 
     let window = MainWindow::new().expect("应能构造真实 MainWindow");
@@ -1152,12 +1152,63 @@ fn review_pointer_actions_keep_detail_target_and_preview_owner_aligned() {
         )],
         "A 行预览按钮只应触发一次精确回调",
     );
+    click_element_center(
+        &window,
+        &accessible(&window, "预览成员：D:\\Media\\review-b.jpg"),
+    );
+    assert_eq!(
+        previews.borrow().as_slice(),
+        &[(
+            String::from("machine-a"),
+            String::from("D:\\Media\\review-a.jpg"),
+        )],
+        "A 未返回时 B 行预览必须禁用，不能把第二个请求加入控制器队列",
+    );
+    assert_eq!(
+        accessible(&window, "预览成员：D:\\Media\\review-a.jpg").accessible_enabled(),
+        Some(false),
+        "A 在途时所有预览动作都应禁用",
+    );
+    assert_eq!(
+        accessible(&window, "预览成员：D:\\Media\\review-b.jpg").accessible_enabled(),
+        Some(false),
+        "A 在途时 B 预览动作必须显示为禁用",
+    );
+
+    click_element_at_fraction(&window, &row_b, 0.35, 0.5);
+    assert_eq!(row_a.accessible_item_selected(), Some(false));
+    assert_eq!(
+        row_b.accessible_item_selected(),
+        Some(true),
+        "预览在途时仍应允许通过行空白把详情目标切换到 B",
+    );
+
     let image_a = slint::Image::from_rgba8(
         slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&[20, 40, 60, 255], 1, 1),
     );
     window.set_preview_image(image_a);
     window.set_preview_info("A 预览".into());
     slint::platform::update_timers_and_animations();
+    assert!(
+        ElementHandle::find_by_accessible_label(&window, "当前预览：D:\\Media\\review-a.jpg")
+            .next()
+            .is_none(),
+        "A 在选择 B 后返回时不得把 A 图片冒充成 B 的当前预览",
+    );
+    assert!(
+        ElementHandle::find_by_accessible_label(
+            &window,
+            "预览需要重新加载：D:\\Media\\review-b.jpg",
+        )
+        .next()
+        .is_some(),
+        "A 返回后仍应提示用户重新预览当前选择 B",
+    );
+    assert_eq!(
+        accessible(&window, "预览成员：D:\\Media\\review-b.jpg").accessible_enabled(),
+        Some(true),
+        "唯一在途的 A 返回后应重新启用 B 预览",
+    );
 
     click_element_center(
         &window,
@@ -1175,19 +1226,54 @@ fn review_pointer_actions_keep_detail_target_and_preview_owner_aligned() {
                 String::from("D:\\Media\\review-b.jpg"),
             ),
         ],
-        "B 行预览按钮不得被整行 TouchArea 吞掉或重复触发",
+        "A 完成后用户重新点击 B 才能发出第二个预览请求",
     );
-    assert_eq!(row_a.accessible_item_selected(), Some(false));
-    assert_eq!(
-        row_b.accessible_item_selected(),
-        Some(true),
-        "B 行内预览动作必须同时把详情目标切换到 B",
+
+    let image_b = slint::Image::from_rgba8(
+        slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&[80, 100, 120, 255], 1, 1),
     );
+    window.set_preview_image(image_b);
+    window.set_preview_info("B 预览".into());
+    slint::platform::update_timers_and_animations();
     assert!(
-        ElementHandle::find_by_accessible_label(&window, "当前预览：D:\\Media\\review-a.jpg")
+        ElementHandle::find_by_accessible_label(&window, "当前预览：D:\\Media\\review-b.jpg")
+            .next()
+            .is_some(),
+        "single-flight 的 B 成功响应应归属 B",
+    );
+
+    previews.borrow_mut().clear();
+    click_element_at_fraction(&window, &row_a, 0.35, 0.5);
+    click_element_center(
+        &window,
+        &accessible(&window, "预览成员：D:\\Media\\review-a.jpg"),
+    );
+    assert_eq!(
+        previews.borrow().as_slice(),
+        &[(
+            String::from("machine-a"),
+            String::from("D:\\Media\\review-a.jpg"),
+        )],
+        "失败恢复场景应先只发出 A",
+    );
+    assert_eq!(
+        accessible(&window, "预览成员：D:\\Media\\review-b.jpg").accessible_enabled(),
+        Some(false),
+    );
+
+    click_element_at_fraction(&window, &row_b, 0.35, 0.5);
+    assert!(
+        ElementHandle::find_by_accessible_label(&window, "当前预览：D:\\Media\\review-b.jpg")
             .next()
             .is_none(),
-        "选中 B 后不得继续把 A 的旧图片暴露为当前预览",
+        "新 A 请求在途时不得继续显示上一次 B 图片",
+    );
+    window.set_last_error("A 预览失败：测试错误".into());
+    slint::platform::update_timers_and_animations();
+    assert_eq!(
+        accessible(&window, "预览成员：D:\\Media\\review-b.jpg").accessible_enabled(),
+        Some(true),
+        "现有 last-error 变化必须解除 single-flight 门禁",
     );
     assert!(
         ElementHandle::find_by_accessible_label(
@@ -1196,7 +1282,43 @@ fn review_pointer_actions_keep_detail_target_and_preview_owner_aligned() {
         )
         .next()
         .is_some(),
-        "B 的响应尚未到达时必须明确显示预览失配",
+        "A 失败后旧图片仍不得冒充当前 B",
+    );
+
+    click_element_center(
+        &window,
+        &accessible(&window, "预览成员：D:\\Media\\review-b.jpg"),
+    );
+    assert_eq!(
+        previews.borrow().as_slice(),
+        &[
+            (
+                String::from("machine-a"),
+                String::from("D:\\Media\\review-a.jpg"),
+            ),
+            (
+                String::from("machine-b"),
+                String::from("D:\\Media\\review-b.jpg"),
+            ),
+        ],
+        "A 失败后重新启用的 B 只能精确入队一次",
+    );
+    let recovered_b = slint::Image::from_rgba8(
+        slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
+            &[100, 120, 140, 255],
+            1,
+            1,
+        ),
+    );
+    window.set_preview_image(recovered_b);
+    window.set_preview_info("B 恢复预览".into());
+    window.set_last_error("".into());
+    slint::platform::update_timers_and_animations();
+    assert!(
+        ElementHandle::find_by_accessible_label(&window, "当前预览：D:\\Media\\review-b.jpg")
+            .next()
+            .is_some(),
+        "失败恢复后的 B 成功响应应重新建立 B owner",
     );
 
     click_element_center(&window, &accessible(&window, "标记删除"));
@@ -1207,51 +1329,7 @@ fn review_pointer_actions_keep_detail_target_and_preview_owner_aligned() {
             String::from("D:\\Media\\review-b.jpg"),
             2,
         )],
-        "详情复核必须精确保存当前 B，不能误写先前的 A",
-    );
-
-    let image_b = slint::Image::from_rgba8(
-        slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&[80, 100, 120, 255], 1, 1),
-    );
-    window.set_preview_image(image_b);
-    window.set_preview_info("B 预览".into());
-    slint::platform::update_timers_and_animations();
-    let current_b =
-        ElementHandle::find_by_accessible_label(&window, "当前预览：D:\\Media\\review-b.jpg")
-            .next()
-            .is_some();
-    let current_a =
-        ElementHandle::find_by_accessible_label(&window, "当前预览：D:\\Media\\review-a.jpg")
-            .next()
-            .is_some();
-    let mismatch_b = ElementHandle::find_by_accessible_label(
-        &window,
-        "预览需要重新加载：D:\\Media\\review-b.jpg",
-    )
-    .next()
-    .is_some();
-    assert!(
-        current_b,
-        "B 的响应变化后应绑定到当时 pending 的 B 请求；current_a={current_a}, mismatch_b={mismatch_b}",
-    );
-
-    click_element_at_fraction(&window, &row_a, 0.35, 0.5);
-    assert_eq!(row_a.accessible_item_selected(), Some(true));
-    assert_eq!(row_b.accessible_item_selected(), Some(false));
-    assert!(
-        ElementHandle::find_by_accessible_label(&window, "当前预览：D:\\Media\\review-b.jpg")
-            .next()
-            .is_none(),
-        "切回 A 后必须隐藏属于 B 的旧预览",
-    );
-    assert!(
-        ElementHandle::find_by_accessible_label(
-            &window,
-            "预览需要重新加载：D:\\Media\\review-a.jpg",
-        )
-        .next()
-        .is_some(),
-        "选择改变后应明确提示重新预览当前成员",
+        "恢复后详情复核必须精确保存 B 一次，不能误写 A",
     );
 }
 

@@ -15,6 +15,7 @@ import { TabStrip } from "../components/tab-strip.slint";
 component ReviewMemberList inherits Rectangle {
     in property <[UiMemberRow]> members;
     in property <int> review-filter;
+    in property <bool> preview-in-flight;
     in-out property <string> selected-machine;
     in-out property <string> selected-path;
     callback preview(string, string);
@@ -125,7 +126,7 @@ component ReviewMemberList inherits Rectangle {
                         ActionButton {
                             label: "预览";
                             icon: @image-url("../assets/icons/preview.png");
-                            action-enabled: member.preview-enabled;
+                            action-enabled: member.preview-enabled && !root.preview-in-flight;
                             accessible-label: "预览成员：" + member.path;
                             clicked => {
                                 root.selected-machine = member.machine-id;
@@ -169,6 +170,7 @@ export component ReviewDeleteWorkspace inherits Rectangle {
     in property <string> selected-group-id;
     in property <image> preview-image;
     in property <string> preview-info;
+    in property <string> last-error;
     in-out property <string> path-rule;
     in-out property <int> review-tab: 0;
     in-out property <int> review-filter: 0;
@@ -189,14 +191,27 @@ export component ReviewDeleteWorkspace inherits Rectangle {
     private property <string> preview-pending-path;
     private property <string> preview-owner-machine;
     private property <string> preview-owner-path;
+    private property <bool> preview-in-flight;
     private property <bool> preview-matches-selection:
         root.preview-owner-path != ""
         && root.preview-owner-machine == root.selected-review-machine
         && root.preview-owner-path == root.selected-review-path;
     changed preview-image => {
-        if root.preview-pending-path != "" {
+        if root.preview-in-flight && root.preview-pending-path != "" {
             root.preview-owner-machine = root.preview-pending-machine;
             root.preview-owner-path = root.preview-pending-path;
+            root.preview-pending-machine = "";
+            root.preview-pending-path = "";
+            root.preview-in-flight = false;
+        }
+    }
+    changed last-error => {
+        if root.preview-in-flight && root.last-error != "" {
+            root.preview-pending-machine = "";
+            root.preview-pending-path = "";
+            root.preview-owner-machine = "";
+            root.preview-owner-path = "";
+            root.preview-in-flight = false;
         }
     }
     background: transparent;
@@ -272,14 +287,20 @@ export component ReviewDeleteWorkspace inherits Rectangle {
                             vertical-stretch: 1;
                             members: root.members;
                             review-filter: root.review-filter;
+                            preview-in-flight: root.preview-in-flight;
                             selected-machine <=> root.selected-review-machine;
                             selected-path <=> root.selected-review-path;
                             preview(machine, path) => {
-                                root.selected-review-machine = machine;
-                                root.selected-review-path = path;
-                                root.preview-pending-machine = machine;
-                                root.preview-pending-path = path;
-                                root.preview(machine, path);
+                                if !root.preview-in-flight {
+                                    root.selected-review-machine = machine;
+                                    root.selected-review-path = path;
+                                    root.preview-pending-machine = machine;
+                                    root.preview-pending-path = path;
+                                    root.preview-owner-machine = "";
+                                    root.preview-owner-path = "";
+                                    root.preview-in-flight = true;
+                                    root.preview(machine, path);
+                                }
                             }
                             review(machine, path, decision) => { root.save-review(machine, path, decision); }
                         }
