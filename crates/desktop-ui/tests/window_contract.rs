@@ -351,6 +351,22 @@ fn settings_sections_preserve_real_values_and_save_once() {
         expected_values();
     }
 
+    accessible(&window, "相似度算法").invoke_accessible_default_action();
+    accessible(&window, "关于 Slint").invoke_accessible_default_action();
+    assert_eq!(
+        window.get_settings_section(),
+        1,
+        "关于 Slint 只能切换视觉面板，不得改变当前设置分区"
+    );
+    expected_values();
+    accessible(&window, "返回设置").invoke_accessible_default_action();
+    assert_eq!(
+        window.get_settings_section(),
+        1,
+        "返回设置也不得重置当前分区"
+    );
+    expected_values();
+
     accessible(&window, "存储").invoke_accessible_default_action();
     for label in [
         "数据路径：D:\\Fixture\\data",

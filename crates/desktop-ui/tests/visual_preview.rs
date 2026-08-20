@@ -208,6 +208,14 @@ impl VisualFixture {
         window.set_postgres_status("中心数据库健康".into());
         window.set_postgres_color(Color::from_rgb_u8(22, 163, 74));
         window.set_last_error("目标机器拒绝连接".into());
+        window.set_data_path("D:\\Fixture\\mySingerServer\\data\\desktop".into());
+        window.set_config_path("D:\\Fixture\\mySingerServer\\data\\desktop\\config.toml".into());
+        window.set_logs_path(
+            "D:\\Fixture\\mySingerServer\\data\\desktop\\logs\\desktop-current.log".into(),
+        );
+        window.set_cache_path(
+            "D:\\Fixture\\mySingerServer\\data\\desktop\\cache\\contact-sheets".into(),
+        );
         // 扫描预览只填充现有表单字段，右侧摘要由这些真实值直接生成。
         window.set_scan_root("D:\\Media".into());
         window.set_scan_node_index(0);

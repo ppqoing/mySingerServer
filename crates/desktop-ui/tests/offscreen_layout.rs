@@ -72,6 +72,12 @@ fn assert_element_has_positive_size(element: &ElementHandle, label: &str) {
     );
 }
 
+fn accessible(window: &MainWindow, label: &str) -> ElementHandle {
+    ElementHandle::find_by_accessible_label(window, label)
+        .next()
+        .unwrap_or_else(|| panic!("应能找到可访问元素：{label}"))
+}
+
 // 使用真实只读行模型令组表和成员表创建各自的 ScrollView，不预取任何预览内容。
 fn install_duplicate_workspace_fixture(window: &MainWindow) {
     window.set_groups(ModelRc::new(VecModel::from(vec![UiGroupRow {
@@ -833,67 +839,156 @@ fn settings_workspace_stays_reachable_at_minimum_size() {
 
     let window = MainWindow::new().expect("应能构造真实 MainWindow");
     window.invoke_navigate_to(6);
+    window.show().expect("应能显示真实设置工作区");
+
+    for (width, height) in [(1440.0, 900.0), (1080.0, 700.0)] {
+        window
+            .window()
+            .set_size(slint::PhysicalSize::new(width as u32, height as u32));
+        window
+            .window()
+            .take_snapshot()
+            .expect("设置工作区应完成软件渲染");
+
+        let title = ElementHandle::find_by_accessible_label(&window, "设置标题")
+            .next()
+            .expect("设置工作区应公开标题地标");
+        let main = ElementHandle::find_by_accessible_label(&window, "设置主要内容")
+            .next()
+            .expect("设置工作区应公开主要内容地标");
+        assert_element_has_positive_size(&title, "设置标题");
+        assert_element_has_positive_size(&main, "设置主要内容");
+        let title_bottom = title.absolute_position().y + title.size().height;
+        let main_gap = main.absolute_position().y - title_bottom;
+        assert!(
+            (0.0..=32.0).contains(&main_gap),
+            "设置标题到主要内容的间距必须位于 0–32px，实际={main_gap}px"
+        );
+
+        let menu = ElementHandle::find_by_accessible_label(&window, "设置二级菜单")
+            .next()
+            .expect("设置工作区应公开二级菜单容器");
+        assert!(
+            (menu.size().width - 190.0).abs() < 0.5,
+            "二级菜单宽度必须严格为 190px，实际={:?}",
+            menu.size(),
+        );
+        assert!(
+            menu.absolute_position().x + menu.size().width <= main.absolute_position().x,
+            "二级菜单必须位于主要内容左侧且不覆盖：菜单={:?}/{:?}，主要内容={:?}/{:?}",
+            menu.absolute_position(),
+            menu.size(),
+            main.absolute_position(),
+            main.size(),
+        );
+
+        for label in [
+            "常规",
+            "相似度算法",
+            "存储",
+            "节点服务",
+            "扫描与性能",
+            "外部工具",
+            "日志与诊断",
+        ] {
+            let item = ElementHandle::find_by_accessible_label(&window, label)
+                .next()
+                .unwrap_or_else(|| panic!("应能找到设置二级菜单：{label}"));
+            assert!(
+                (item.size().height - 40.0).abs() < 0.5,
+                "{label} 菜单项高度必须为 40px，实际={:?}",
+                item.size(),
+            );
+        }
+
+        let save = ElementHandle::find_by_accessible_label(&window, "保存设置")
+            .next()
+            .expect("设置页必须提供保存动作");
+        assert_element_inside_window(&save, "保存设置", width, height);
+    }
+
+    accessible(&window, "常规").invoke_accessible_default_action();
     window
         .window()
         .set_size(slint::PhysicalSize::new(1080, 700));
-    window.show().expect("应能显示真实设置工作区");
     window
         .window()
         .take_snapshot()
-        .expect("最小窗口设置工作区应完成软件渲染");
-
-    let mut previous_bottom = 0.0;
-    let mut menu_right: f32 = 0.0;
-    for label in [
-        "常规",
-        "相似度算法",
-        "存储",
-        "节点服务",
-        "扫描与性能",
-        "外部工具",
-        "日志与诊断",
-    ] {
-        let menu = ElementHandle::find_by_accessible_label(&window, label)
+        .expect("常规设置应完成软件渲染");
+    let grid = ElementHandle::find_by_accessible_label(&window, "常规表单网格")
+        .next()
+        .expect("常规设置应公开标签、控件与说明三列网格");
+    assert_element_has_positive_size(&grid, "常规表单网格");
+    let labels = ["PostgreSQL URL 标签", "重连间隔（秒）标签", "删除方式标签"].map(|label| {
+        ElementHandle::find_by_accessible_label(&window, label)
             .next()
-            .unwrap_or_else(|| panic!("应能找到设置二级菜单：{label}"));
-        let position = menu.absolute_position();
-        let size = menu.size();
+            .unwrap_or_else(|| panic!("常规表单应公开 {label}"))
+    });
+    let controls = ["PostgreSQL URL 控件", "重连间隔（秒）控件", "删除方式控件"].map(|label| {
+        ElementHandle::find_by_accessible_label(&window, label)
+            .next()
+            .unwrap_or_else(|| panic!("常规表单应公开 {label}"))
+    });
+    let label_x = labels[0].absolute_position().x;
+    let control_x = controls[0].absolute_position().x;
+    for (label, control) in labels.iter().zip(controls.iter()) {
         assert!(
-            position.y >= previous_bottom,
-            "设置二级菜单必须从上到下排列：{label} 位置={position:?}，上一项底部={previous_bottom}"
+            (label.absolute_position().x - label_x).abs() < 0.5
+                && (control.absolute_position().x - control_x).abs() < 0.5
+                && (control.size().height - 34.0).abs() < 0.5,
+            "常规表单的标签列、控件列和 34px 控件高度必须稳定对齐：标签={:?}/{:?}，控件={:?}/{:?}",
+            label.absolute_position(),
+            label.size(),
+            control.absolute_position(),
+            control.size(),
         );
-        assert!(
-            position.x >= 144.0
-                && position.y >= 58.0
-                && position.x + size.width <= 1080.0
-                && position.y + size.height <= 668.0,
-            "{label} 必须位于最小窗口内容区内，位置={position:?}，尺寸={size:?}"
-        );
-        previous_bottom = position.y + size.height;
-        menu_right = menu_right.max(position.x + size.width);
     }
 
-    let content = ElementHandle::find_by_accessible_label(&window, "设置内容卡")
+    accessible(&window, "日志与诊断").invoke_accessible_default_action();
+    window
+        .window()
+        .take_snapshot()
+        .expect("日志与诊断应完成软件渲染");
+    let diagnostics_scroll = ElementHandle::find_by_accessible_label(&window, "诊断内容滚动区")
         .next()
-        .expect("设置工作区应公开右侧内容卡");
-    let content_position = content.absolute_position();
-    assert!(
-        content_position.x >= menu_right,
-        "设置内容卡必须在二级菜单右侧：菜单右边={menu_right}，内容位置={content_position:?}"
-    );
-
-    let save = ElementHandle::find_by_accessible_label(&window, "保存设置")
+        .expect("日志与诊断必须有自己的内容 ScrollView");
+    assert_element_has_positive_size(&diagnostics_scroll, "诊断内容滚动区");
+    let status = ElementHandle::find_by_accessible_label(&window, "诊断状态卡")
         .next()
-        .expect("最小窗口仍应提供保存设置动作");
-    let save_position = save.absolute_position();
-    let save_size = save.size();
+        .expect("日志与诊断必须公开状态卡");
     assert!(
-        save_position.x >= 0.0
-            && save_position.y >= 0.0
-            && save_position.x + save_size.width <= 1080.0
-            && save_position.y + save_size.height <= 700.0,
-        "保存设置必须位于 1080×700 窗口边界内，位置={save_position:?}，尺寸={save_size:?}"
+        status.absolute_position().y >= diagnostics_scroll.absolute_position().y
+            && status.absolute_position().y + status.size().height
+                <= diagnostics_scroll.absolute_position().y + diagnostics_scroll.size().height,
+        "诊断状态卡必须在滚动区初始视口内，状态卡={:?}/{:?}，滚动区={:?}/{:?}",
+        status.absolute_position(),
+        status.size(),
+        diagnostics_scroll.absolute_position(),
+        diagnostics_scroll.size(),
     );
+    diagnostics_scroll.scroll(0.0, -1000.0);
+    window
+        .window()
+        .take_snapshot()
+        .expect("滚动后的日志与诊断应完成软件渲染");
+    for label in ["诊断路径卡", "诊断动作栏"] {
+        let card = ElementHandle::find_by_accessible_label(&window, label)
+            .next()
+            .unwrap_or_else(|| panic!("日志与诊断必须公开 {label}"));
+        assert!(
+            card.absolute_position().x >= diagnostics_scroll.absolute_position().x
+                && card.absolute_position().x + card.size().width
+                    <= diagnostics_scroll.absolute_position().x + diagnostics_scroll.size().width
+                && card.absolute_position().y >= diagnostics_scroll.absolute_position().y
+                && card.absolute_position().y + card.size().height
+                    <= diagnostics_scroll.absolute_position().y + diagnostics_scroll.size().height,
+            "{label} 必须经诊断 ScrollView 到达且完整落在视口内：卡片={:?}/{:?}，滚动区={:?}/{:?}",
+            card.absolute_position(),
+            card.size(),
+            diagnostics_scroll.absolute_position(),
+            diagnostics_scroll.size(),
+        );
+    }
 }
 
 #[test]
