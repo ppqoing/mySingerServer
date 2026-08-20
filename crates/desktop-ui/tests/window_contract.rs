@@ -581,6 +581,32 @@ fn scan_browse_and_local_analysis_forward_only_existing_arguments() {
 }
 
 #[test]
+fn shared_components_keep_task_rows_dense_and_progress_readable() {
+    i_slint_backend_testing::init_no_event_loop();
+
+    let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    install_task_center_fixture(&window);
+    window.invoke_navigate_to(3);
+
+    let row = accessible(
+        &window,
+        "任务项：媒体扫描；节点 7；枚举文件；35%；7 / 20 · 失败 0 · 跳过 1；运行中",
+    );
+    assert!(
+        (44.0..=64.0).contains(&row.size().height),
+        "双行任务行应在 44–64px 内，实际={:?}",
+        row.size(),
+    );
+
+    let progress = accessible(&window, "任务进度：35%");
+    assert!(
+        progress.size().width >= 120.0 && progress.size().height >= 8.0,
+        "任务进度必须保留可读尺寸，实际={:?}",
+        progress.size(),
+    );
+}
+
+#[test]
 fn task_tabs_filter_loaded_models_and_cancel_active_task() {
     i_slint_backend_testing::init_no_event_loop();
 

@@ -1,6 +1,6 @@
-use dedup_desktop_ui::MainWindow;
+use dedup_desktop_ui::{MainWindow, UiGroupRow, UiMemberRow};
 use i_slint_backend_testing::{ElementHandle, TestingBackend, TestingBackendOptions};
-use slint::ComponentHandle;
+use slint::{Color, ComponentHandle, ModelRc, VecModel};
 
 fn install_testing_backend() {
     // Rust 测试用例各在线程中运行；Slint 平台也是线程局部状态，因此每个用例独立安装。
@@ -66,6 +66,34 @@ fn assert_element_inside_window(
             && position.y + size.height <= height,
         "{label} 应位于 {width}×{height} 窗口边界内，位置={position:?}，尺寸={size:?}",
     );
+}
+
+// 使用真实只读行模型令组表和成员表创建各自的 ScrollView，不预取任何预览内容。
+fn install_duplicate_workspace_fixture(window: &MainWindow) {
+    window.set_groups(ModelRc::new(VecModel::from(vec![UiGroupRow {
+        id: "group-001".into(),
+        kind: "相似图片".into(),
+        md5: "0123456789abcdef0123456789abcdef".into(),
+        size: "8.0 MiB".into(),
+        members: 2,
+        reclaimable: "8.0 MiB".into(),
+    }])));
+    window.set_members(ModelRc::new(VecModel::from(vec![UiMemberRow {
+        machine_id: "machine-a".into(),
+        path: "D:\\Media\\photo-a.jpg".into(),
+        md5: "0123456789abcdef0123456789abcdef".into(),
+        size: "8.0 MiB".into(),
+        representative: true,
+        stage1: "0.99".into(),
+        phash: "4".into(),
+        stage2: "0.96".into(),
+        metadata: "1920×1080 · JPEG".into(),
+        review: "未复核".into(),
+        review_color: Color::from_rgb_u8(107, 114, 128),
+        online: true,
+        preview_enabled: true,
+        delete_enabled: false,
+    }])));
 }
 
 #[test]
@@ -269,6 +297,54 @@ fn duplicate_workspace_columns_stay_ordered_inside_content_area() {
                 "{label} 的{name}必须位于内容区内，位置={position:?}，尺寸={size:?}",
             );
         }
+    }
+}
+
+#[test]
+fn duplicate_workspace_regions_keep_their_own_scroll_views_at_minimum_size() {
+    install_testing_backend();
+
+    let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    install_duplicate_workspace_fixture(&window);
+    window.invoke_navigate_to(4);
+    window
+        .window()
+        .set_size(slint::PhysicalSize::new(1080, 700));
+    window.show().expect("应能显示真实重复工作区");
+    window
+        .window()
+        .take_snapshot()
+        .expect("1080×700 重复工作区应能完成软件渲染");
+
+    for label in ["重复组表", "成员表", "详情面板"] {
+        let region = ElementHandle::find_by_accessible_label(&window, label)
+            .next()
+            .unwrap_or_else(|| panic!("最小窗口应公开{label}"));
+        let region_position = region.absolute_position();
+        let region_size = region.size();
+        assert!(
+            region_size.width > 0.0 && region_size.height > 0.0,
+            "{label} 在 1080×700 下必须拥有正尺寸，实际={region_size:?}",
+        );
+
+        let scroll = region
+            .query_descendants()
+            .match_inherits("ScrollView")
+            .find_first()
+            .unwrap_or_else(|| panic!("{label} 必须通过自己的 ScrollView 到达内容"));
+        let scroll_position = scroll.absolute_position();
+        let scroll_size = scroll.size();
+        assert!(
+            scroll_size.width > 0.0
+                && scroll_size.height > 0.0
+                && scroll_position.x >= region_position.x
+                && scroll_position.y >= region_position.y
+                && scroll_position.x + scroll_size.width
+                    <= region_position.x + region_size.width
+                && scroll_position.y + scroll_size.height
+                    <= region_position.y + region_size.height,
+            "{label} 的 ScrollView 必须可在自身区域内到达，区域={region_position:?}/{region_size:?}，滚动区={scroll_position:?}/{scroll_size:?}",
+        );
     }
 }
 

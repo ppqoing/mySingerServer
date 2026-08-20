@@ -1,7 +1,7 @@
 // 删除执行前唯一显式确认；默认回收站，永久删除只增加明显警示。
 
-import { Button } from "std-widgets.slint";
 import { Theme } from "../theme.slint";
+import { ActionButton } from "action-button.slint";
 
 export component DeleteDialog inherits Rectangle {
     in property <int> file-count;
@@ -23,26 +23,29 @@ export component DeleteDialog inherits Rectangle {
         accessible-role: AccessibleRole.groupbox;
         accessible-label: "删除确认：" + root.mode;
         accessible-description: root.mode == "永久删除" ? "永久删除模式，文件删除后不可恢复" : "回收站模式，文件默认移入回收站";
-        VerticalLayout { padding: 24px; spacing: 16px;
-            Text { text: "确认文件处理"; color: root.mode == "永久删除" ? Theme.danger : Theme.text; font-size: 22px; font-weight: 720; }
-            Text { text: root.file-count + " 个文件 · " + root.node-count + " 个节点"; color: Theme.text; font-size: 16px; }
-            Text { text: "预计释放 " + root.reclaimable; color: Theme.success; font-size: 15px; }
+        VerticalLayout { padding: 24px; spacing: 14px;
+            Text { text: "确认文件处理"; color: Theme.text; font-size: 20px; font-weight: 720; }
+            Text { text: root.file-count + " 个文件 · " + root.node-count + " 个节点"; color: Theme.text; font-size: 15px; }
+            Text { text: "预计释放 " + root.reclaimable; color: Theme.success; font-size: 14px; }
             Rectangle { height: 54px; background: root.mode == "永久删除" ? #fef2f2 : Theme.accent-soft; border-radius: 8px;
                 Text { text: "处理方式：" + root.mode; color: root.mode == "永久删除" ? Theme.danger : Theme.text; font-size: 14px; font-weight: 680; horizontal-alignment: center; vertical-alignment: center; }
             }
             Text {
                 text: root.mode == "永久删除" ? "永久删除不可恢复。" + (root.warning == "" ? "每个组已确认至少一个活动 Keep。" : root.warning) : root.warning == "" ? "每个组已确认至少一个活动 Keep。" : root.warning;
                 color: root.mode == "永久删除" ? Theme.danger : root.warning == "" ? Theme.muted : Theme.warning;
+                font-size: 12px;
                 wrap: word-wrap;
             }
             Rectangle { vertical-stretch: 1; background: transparent; }
             HorizontalLayout {
                 Rectangle { horizontal-stretch: 1; background: transparent; }
-                Button { text: "取消"; clicked => { root.cancel(); } }
-                Button {
-                    text: "确认执行";
-                    enabled: root.can-execute;
-                    // 可访问默认动作与指针路径都必须经过同一门禁。
+                ActionButton { width: 88px; label: "取消"; clicked => { root.cancel(); } }
+                ActionButton {
+                    width: 96px;
+                    label: "确认执行";
+                    tone: 2;
+                    action-enabled: root.can-execute;
+                    // 组件内部与此处处理器形成可访问和指针双路径门禁。
                     clicked => { if root.can-execute { root.confirm(); } }
                 }
             }

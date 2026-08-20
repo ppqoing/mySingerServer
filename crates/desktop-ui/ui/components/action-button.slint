@@ -1,0 +1,63 @@
+// 统一动作按钮只通过一个 clicked 回调转发动作，禁用态同时约束指针和可访问路径。
+
+import { Theme } from "../theme.slint";
+
+export component ActionButton inherits Rectangle {
+    in property <string> label;
+    in property <image> icon;
+    // 0 次要、1 主要、2 危险；危险色只供删除等破坏性动作使用。
+    in property <int> tone: 0;
+    in property <bool> action-enabled: true;
+    callback clicked();
+
+    min-width: 72px;
+    height: 34px;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: !root.action-enabled ? Theme.border
+        : root.tone == 1 ? Theme.accent
+        : root.tone == 2 ? Theme.danger.with-alpha(0.5)
+        : Theme.border;
+    background: !root.action-enabled ? Theme.panel-hover
+        : root.tone == 1 ? action-touch.has-hover ? Theme.accent.with-alpha(0.88) : Theme.accent
+        : root.tone == 2 ? action-touch.has-hover ? Theme.danger.with-alpha(0.18) : Theme.danger-soft
+        : action-touch.has-hover ? Theme.panel-hover : Theme.panel;
+    opacity: root.action-enabled ? 1 : 0.55;
+    accessible-role: AccessibleRole.button;
+    accessible-label: root.label;
+    accessible-enabled: root.action-enabled;
+    accessible-action-default => { if root.action-enabled { root.clicked(); } }
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 6px;
+        alignment: center;
+        if root.icon.width > 0 && root.icon.height > 0 : Image {
+            source: root.icon;
+            width: 16px;
+            height: 16px;
+            image-fit: contain;
+            colorize: !root.action-enabled ? Theme.disabled-text
+                : root.tone == 1 ? #ffffff
+                : root.tone == 2 ? Theme.danger
+                : Theme.nav-icon;
+        }
+        Text {
+            text: root.label;
+            color: !root.action-enabled ? Theme.disabled-text
+                : root.tone == 1 ? #ffffff
+                : root.tone == 2 ? Theme.danger
+                : Theme.text;
+            font-size: 12px;
+            font-weight: root.tone == 0 ? 500 : 650;
+            overflow: elide;
+            vertical-alignment: center;
+        }
+    }
+    // 触摸层后声明，避免图标或正文截断真实指针命中。
+    action-touch := TouchArea {
+        enabled: root.action-enabled;
+        clicked => { if root.action-enabled { root.clicked(); } }
+    }
+}

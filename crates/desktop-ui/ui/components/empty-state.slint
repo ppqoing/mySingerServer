@@ -6,12 +6,26 @@ export component EmptyState inherits Rectangle {
     in property <string> title;
     in property <string> detail;
     in property <bool> disabled-feature: false;
+    // 0 为紧凑卡片，1 为工作区；默认工作区保持既有调用方布局兼容。
+    in property <int> density: 1;
+    in property <image> icon;
 
+    min-height: root.density == 0 ? 120px : 0px;
+    preferred-height: root.density == 0 ? 144px : 0px;
+    max-height: root.density == 0 ? 180px : 10000px;
+    vertical-stretch: root.density == 0 ? 0 : 1;
     background: transparent;
     VerticalLayout {
-        padding: 24px;
+        padding: root.density == 0 ? 16px : 24px;
         spacing: 8px;
         alignment: center;
+        if root.icon.width > 0 && root.icon.height > 0 : Image {
+            source: root.icon;
+            width: 32px;
+            height: 32px;
+            image-fit: contain;
+            colorize: root.disabled-feature ? Theme.warning : Theme.nav-icon;
+        }
         Text {
             text: root.disabled-feature ? "功能暂不可用" : "暂无内容";
             color: root.disabled-feature ? Theme.warning : Theme.muted;

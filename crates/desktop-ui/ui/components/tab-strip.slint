@@ -12,7 +12,7 @@ export component TabStrip inherits Rectangle {
     HorizontalLayout {
         spacing: 0px;
         for label[index] in root.labels : tab := Rectangle {
-            width: 112px;
+            width: max(72px, tab-label.preferred-width + 24px);
             background: touch.has-hover ? Theme.panel-hover : transparent;
             accessible-role: AccessibleRole.tab;
             accessible-label: label;
@@ -21,8 +21,10 @@ export component TabStrip inherits Rectangle {
                 root.active-index = index;
                 root.changed(index);
             }
-            Text {
+            tab-label := Text {
                 text: label;
+                x: 12px;
+                width: parent.width - 24px;
                 color: root.active-index == index ? Theme.accent : Theme.muted;
                 font-size: 12px;
                 font-weight: root.active-index == index ? 650 : 450;

@@ -1,0 +1,20 @@
+// 统一进度条公开真实进度语义，并将输入值限制在 0–100 的视觉范围内。
+
+import { Theme } from "../theme.slint";
+
+export component ProgressBar inherits Rectangle {
+    in property <int> value;
+    in property <color> tone: Theme.accent;
+    in property <string> accessible-name: "进度";
+    height: 8px;
+    border-radius: 4px;
+    background: Theme.border;
+    accessible-role: AccessibleRole.progress-indicator;
+    accessible-label: root.accessible-name + "：" + root.value + "%";
+    Rectangle {
+        width: parent.width * max(0, min(100, root.value)) / 100;
+        height: parent.height;
+        border-radius: 4px;
+        background: root.tone;
+    }
+}

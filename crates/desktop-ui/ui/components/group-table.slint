@@ -12,7 +12,7 @@ export component GroupTable inherits Rectangle {
     callback load-more();
 
     background: Theme.panel;
-    border-radius: 9px;
+    border-radius: 8px;
     border-width: 1px;
     border-color: Theme.border;
     accessible-role: AccessibleRole.groupbox;
@@ -20,7 +20,7 @@ export component GroupTable inherits Rectangle {
 
     VerticalLayout {
         Rectangle {
-            height: 34px;
+            height: Theme.table-header-height;
             background: Theme.panel-hover;
             HorizontalLayout {
                 padding-left: 10px;
@@ -45,7 +45,7 @@ export component GroupTable inherits Rectangle {
             VerticalLayout {
                 spacing: 0px;
                 for group in root.groups : row := Rectangle {
-                    height: 44px;
+                    height: Theme.table-row-height;
                     background: group.id == root.selected-id ? Theme.accent-soft : row-touch.has-hover ? Theme.panel-hover : Theme.panel;
                     border-width: 0px;
                     accessible-role: AccessibleRole.list-item;
@@ -63,11 +63,11 @@ export component GroupTable inherits Rectangle {
                             spacing: 1px;
                             alignment: center;
                             Text { text: group.id; color: Theme.text; font-size: 10px; font-weight: 620; overflow: elide; }
-                            Text { text: group.md5; color: Theme.muted; font-size: 8px; overflow: elide; }
+                            Text { text: group.md5; color: Theme.muted; font-size: 10px; overflow: elide; }
                         }
-                        Text { text: group.size; width: 70px; color: Theme.text; font-size: 9px; horizontal-alignment: right; overflow: elide; }
+                        Text { text: group.size; width: 70px; color: Theme.text; font-size: 10px; horizontal-alignment: right; overflow: elide; }
                         Text { text: group.members; width: 38px; color: Theme.text; font-size: 10px; horizontal-alignment: right; }
-                        Text { text: group.reclaimable; width: 78px; color: Theme.success; font-size: 9px; horizontal-alignment: right; overflow: elide; }
+                        Text { text: group.reclaimable; width: 78px; color: Theme.success; font-size: 10px; horizontal-alignment: right; overflow: elide; }
                     }
                     row-touch := TouchArea { clicked => { root.select-group(group.id); } }
                     Rectangle { y: parent.height - 1px; height: 1px; background: Theme.border; }
