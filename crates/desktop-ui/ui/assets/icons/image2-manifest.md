@@ -1,7 +1,7 @@
 # Image 2 图标资产清单
 
 - 生成方式：Codex 内置 `image_gen`（GPT Image 2），每个语义单独调用。
-- 生成日期：2026-08-20；`add`、`preview` 于同日按独立审查结论重新生成并目视确认单枚语义。
+- 生成日期：2026-08-20；`add`、`preview` 于同日按 Fix round 2 的候选表门禁重新生成，并经目视与显著连通组件统计确认是单枚语义。
 - 原始输出保存位置：`C:\tmp\rust-v2-visual-fidelity-target\image2-icons\raw`，不进入 Git。
 - 后处理：Alpha 包围盒最小裁剪、Lanczos3 等比缩放、整数像素质心定位、非透明像素 RGB 归一为纯黑；不拉伸语义轮廓。
 - 最终几何：导航画布 20×20，最长边优先 18px、必要时回退 17px；行内画布 16×16，最长边优先 14px、质心无法满足时依次回退 13px/12px；四边至少 1px 透明，Alpha 质心两轴偏差不超过 0.5px。
@@ -14,7 +14,11 @@ Create a coherent Windows desktop utility icon family. Pure black monochrome lin
 
 ## 语义资产
 
-每轮调用只在母提示词后追加表中的单一语义尾句。
+每轮调用只在母提示词后追加表中的单一语义尾句。Fix round 2 重生 `add`、`preview` 时，仅在原母提示词和原语义尾句后追加以下输出格式约束，未修改风格或语义：
+
+```text
+Output exactly one standalone centered icon, not a collection, grid, sheet, variations, or mockup.
+```
 
 | 最终文件 | 语义尾句 | 选用的内置原始输出名 | 最终画布 | 实际使用位置 |
 |---|---|---|---:|---|
@@ -31,7 +35,7 @@ Create a coherent Windows desktop utility icon family. Pure black monochrome lin
 | `sync.png` | `two balanced opposing arrows` | `exec-d65630a8-cf61-4369-a4e1-bb07aa98c526.png` | 20×20 | 节点同步状态与动作 |
 | `search.png` | `magnifying glass` | `exec-06690bfc-188c-4c7b-b14c-9f83ab66c0f3.png` | 16×16 | 搜索输入与搜索动作 |
 | `refresh.png` | `one clockwise circular refresh arrow` | `exec-9d7bcbe2-3e59-4d32-94d2-89839d6aa16b.png` | 16×16 | 顶部命令栏刷新动作 |
-| `add.png` | `plus inside a compact circle` | `exec-8028193c-f40d-4c45-bf3d-f2ee20f1e228.png` | 16×16 | 新增节点/扫描根动作 |
+| `add.png` | `plus inside a compact circle` | `exec-1b4100bb-d777-43af-8080-7cca7ed7548b.png` | 16×16 | 新增节点/扫描根动作 |
 | `edit.png` | `simple pencil` | `exec-70c9fc76-a540-4bb2-bd97-57c45957a12b.png` | 16×16 | 编辑节点与设置动作 |
 | `remove.png` | `minus inside a compact circle` | `exec-3e30e82c-3f40-4355-a916-eba1452bc3b8.png` | 16×16 | 移除配置项动作 |
 | `connect.png` | `link between two endpoints` | `exec-26210c2a-f473-4d86-879f-a154c9c1f1f1.png` | 16×16 | 节点连接动作 |
@@ -40,7 +44,7 @@ Create a coherent Windows desktop utility icon family. Pure black monochrome lin
 | `info.png` | `lowercase information mark inside circle` | `exec-81e794b1-ce72-4cb7-ad2f-f607387d1eb1.png` | 16×16 | 信息与诊断提示 |
 | `cancel.png` | `stop square inside circle` | `exec-943a86e4-247b-49b6-be9d-55cef13974f0.png` | 16×16 | 取消任务动作 |
 | `filter.png` | `funnel` | `exec-1b75000e-cb29-42db-8918-478307b3f4bc.png` | 16×16 | 结果筛选动作 |
-| `preview.png` | `eye` | `exec-a48dfcd4-7a1c-4362-84a1-39afad67d60b.png` | 16×16 | 媒体预览动作 |
+| `preview.png` | `eye` | `exec-f8c1d27c-630b-49a4-984c-182520425fd1.png` | 16×16 | 媒体预览动作 |
 | `retry.png` | `compact clockwise retry arrow` | `exec-a3bce2a5-04d4-42fa-85c9-0498bbcd2709.png` | 16×16 | 任务/二筛重试动作 |
 | `keep.png` | `shield check` | `exec-9f3954cf-efc7-4f27-ab6f-e2ea84226b47.png` | 16×16 | 保留复核决定 |
 | `delete.png` | `restrained trash can` | `exec-f3028f77-5438-4236-a021-029280442e78.png` | 16×16 | 删除复核决定与删除动作 |

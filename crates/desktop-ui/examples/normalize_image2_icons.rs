@@ -6,7 +6,7 @@ use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
 use image::codecs::ico::IcoEncoder;
-use image::imageops::{FilterType, crop_imm, overlay, resize};
+use image::imageops::{crop_imm, overlay, resize, FilterType};
 use image::{ExtendedColorType, ImageEncoder, Rgba, RgbaImage};
 
 const NAVIGATION: [&str; 11] = [
@@ -58,6 +58,19 @@ struct Geometry {
     alpha_total: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RawTopology {
+    width: u32,
+    height: u32,
+    significant_components: usize,
+    dominant_component_ratio: f64,
+    subject_span_ratio: f64,
+}
+
+const RAW_ALPHA_THRESHOLD: u8 = 32;
+const MAX_SIGNIFICANT_COMPONENTS: usize = 12;
+const MIN_DOMINANT_COMPONENT_RATIO: f64 = 0.20;
+
 fn main() -> Result<(), Box<dyn Error>> {
     let (input, output) = parse_arguments()?;
     fs::create_dir_all(&output)?;
@@ -66,6 +79,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     let inline = normalize_group(&input, &INLINE, 16, 14, 12)?;
 
     for (name, image) in navigation.iter().chain(inline.iter()) {
+        let topology = icon_topology(image, 1)?;
+        println!(
+            "final-stats {name}: {}x{}, components={}, dominant={:.1}%, subject-span={:.1}%",
+            topology.width,
+            topology.height,
+            topology.significant_components,
+            topology.dominant_component_ratio * 100.0,
+            topology.subject_span_ratio * 100.0
+        );
         image.save(output.join(name))?;
     }
 
@@ -136,7 +158,130 @@ fn load_transparent_source(path: &Path) -> Result<RgbaImage, Box<dyn Error>> {
     }
     geometry(&image)
         .map_err(|error| -> Box<dyn Error> { format!("{}：{error}", path.display()).into() })?;
+    let topology = raw_topology(&image)?;
+    println!(
+        "raw-stats {}: {}x{}, significant-components={}, dominant={:.1}%, subject-span={:.1}%",
+        path.file_name().map_or_else(
+            || path.display().to_string(),
+            |name| name.to_string_lossy().into_owned()
+        ),
+        topology.width,
+        topology.height,
+        topology.significant_components,
+        topology.dominant_component_ratio * 100.0,
+        topology.subject_span_ratio * 100.0
+    );
+    validate_raw_topology(path, topology)?;
     Ok(image)
+}
+
+fn validate_raw_topology(path: &Path, topology: RawTopology) -> Result<(), Box<dyn Error>> {
+    if topology.significant_components <= MAX_SIGNIFICANT_COMPONENTS
+        && topology.dominant_component_ratio >= MIN_DOMINANT_COMPONENT_RATIO
+    {
+        return Ok(());
+    }
+
+    Err(format!(
+        "Image 2 原图 {} 疑似候选表：显著组件 {}（最多 {}），最大组件占比 {:.1}%（至少 {:.1}%），主体跨度 {:.1}%",
+        path.display(),
+        topology.significant_components,
+        MAX_SIGNIFICANT_COMPONENTS,
+        topology.dominant_component_ratio * 100.0,
+        MIN_DOMINANT_COMPONENT_RATIO * 100.0,
+        topology.subject_span_ratio * 100.0
+    )
+    .into())
+}
+
+fn raw_topology(image: &RgbaImage) -> Result<RawTopology, Box<dyn Error>> {
+    icon_topology(image, 64)
+}
+
+fn icon_topology(
+    image: &RgbaImage,
+    minimum_component_pixels: usize,
+) -> Result<RawTopology, Box<dyn Error>> {
+    let width = image.width();
+    let height = image.height();
+    let pixel_count = usize::try_from(u64::from(width) * u64::from(height))?;
+    let mut foreground = vec![false; pixel_count];
+    let mut foreground_count = 0_usize;
+    let mut min_x = width;
+    let mut min_y = height;
+    let mut max_x = 0_u32;
+    let mut max_y = 0_u32;
+    for (x, y, pixel) in image.enumerate_pixels() {
+        if pixel.0[3] < RAW_ALPHA_THRESHOLD {
+            continue;
+        }
+        let index = usize::try_from(u64::from(y) * u64::from(width) + u64::from(x))?;
+        foreground[index] = true;
+        foreground_count += 1;
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x);
+        max_y = max_y.max(y);
+    }
+    if foreground_count == 0 {
+        return Err(format!("图像在 Alpha>={RAW_ALPHA_THRESHOLD} 时没有可见像素").into());
+    }
+
+    let mut visited = vec![false; pixel_count];
+    let mut component_sizes = Vec::new();
+    for start in 0..pixel_count {
+        if !foreground[start] || visited[start] {
+            continue;
+        }
+        visited[start] = true;
+        let mut stack = vec![start];
+        let mut size = 0_usize;
+        while let Some(index) = stack.pop() {
+            size += 1;
+            let x = index % usize::try_from(width)?;
+            let y = index / usize::try_from(width)?;
+            for offset_y in -1_i32..=1 {
+                for offset_x in -1_i32..=1 {
+                    if offset_x == 0 && offset_y == 0 {
+                        continue;
+                    }
+                    let neighbor_x = i32::try_from(x)? + offset_x;
+                    let neighbor_y = i32::try_from(y)? + offset_y;
+                    if neighbor_x < 0
+                        || neighbor_y < 0
+                        || neighbor_x >= i32::try_from(width)?
+                        || neighbor_y >= i32::try_from(height)?
+                    {
+                        continue;
+                    }
+                    let neighbor = usize::try_from(neighbor_y)? * usize::try_from(width)?
+                        + usize::try_from(neighbor_x)?;
+                    if foreground[neighbor] && !visited[neighbor] {
+                        visited[neighbor] = true;
+                        stack.push(neighbor);
+                    }
+                }
+            }
+        }
+        component_sizes.push(size);
+    }
+
+    let minimum_significant_pixels = (foreground_count / 100).max(minimum_component_pixels);
+    let significant: Vec<usize> = component_sizes
+        .into_iter()
+        .filter(|size| *size >= minimum_significant_pixels)
+        .collect();
+    let dominant = significant.iter().copied().max().unwrap_or(0);
+    let subject_span_ratio = (f64::from(max_x - min_x + 1) / f64::from(width))
+        .max(f64::from(max_y - min_y + 1) / f64::from(height));
+
+    Ok(RawTopology {
+        width,
+        height,
+        significant_components: significant.len(),
+        dominant_component_ratio: dominant as f64 / foreground_count as f64,
+        subject_span_ratio,
+    })
 }
 
 fn normalize_icon(
@@ -201,7 +346,7 @@ fn normalize_cropped_icon(
     }
 
     let resized = resize(cropped, resized_width, resized_height, FilterType::Lanczos3);
-    let image = center_on_canvas(name, &resized, canvas, true)?;
+    let image = center_semantic_on_canvas(name, &resized, canvas)?;
     let bounds = geometry(&image)?.bounds;
     let bbox_width = bounds.max_x - bounds.min_x + 1;
     let bbox_height = bounds.max_y - bounds.min_y + 1;
@@ -245,7 +390,7 @@ fn normalize_brand(source: &RgbaImage, canvas: u32) -> Result<RgbaImage, Box<dyn
             + u64::from(longest) / 2)
             / u64::from(longest)) as u32;
         let resized = resize(&cropped, width, height, FilterType::Lanczos3);
-        match center_on_canvas("app 品牌图标", &resized, canvas, true) {
+        match center_brand_on_canvas("app 品牌图标", &resized, canvas) {
             Ok(image) => return Ok(image),
             Err(error) => failures.push(format!("{target_longest}px: {error}")),
         }
@@ -257,11 +402,56 @@ fn normalize_brand(source: &RgbaImage, canvas: u32) -> Result<RgbaImage, Box<dyn
     .into())
 }
 
-fn center_on_canvas(
+fn center_semantic_on_canvas(
     name: &str,
     source: &RgbaImage,
     canvas: u32,
-    enforce_centroid: bool,
+) -> Result<RgbaImage, Box<dyn Error>> {
+    if source.width() + 2 > canvas || source.height() + 2 > canvas {
+        return Err(format!("{name} 无法在 {canvas}x{canvas} 画布中保留 1px 透明边距").into());
+    }
+    let source_geometry = geometry(source)?;
+    let center = (f64::from(canvas) - 1.0) / 2.0;
+    let base_x = i64::from((canvas - source.width()) / 2);
+    let base_y = i64::from((canvas - source.height()) / 2);
+    let mut best = None;
+    for delta_y in -1_i64..=1 {
+        for delta_x in -1_i64..=1 {
+            let x = base_x + delta_x;
+            let y = base_y + delta_y;
+            if x < 1
+                || y < 1
+                || x + i64::from(source.width()) > i64::from(canvas - 1)
+                || y + i64::from(source.height()) > i64::from(canvas - 1)
+            {
+                continue;
+            }
+            let deviation_x = (source_geometry.centroid_x + x as f64 - center).abs();
+            let deviation_y = (source_geometry.centroid_y + y as f64 - center).abs();
+            let score = deviation_x + deviation_y;
+            if best
+                .as_ref()
+                .is_none_or(|(best_score, _, _, _, _)| score < *best_score)
+            {
+                best = Some((score, deviation_x, deviation_y, x, y));
+            }
+        }
+    }
+    let (_, deviation_x, deviation_y, x, y) =
+        best.ok_or_else(|| format!("{name} 无法在 {canvas}x{canvas} 画布中保留 1px 透明边距"))?;
+    if deviation_x > 0.5 || deviation_y > 0.5 {
+        return Err(format!(
+            "{name} Alpha 质心偏差为 ({deviation_x:.3},{deviation_y:.3})px，超过 0.5px；必须重新生成"
+        )
+        .into());
+    }
+    render_on_canvas(source, canvas, x, y)
+}
+
+fn center_brand_on_canvas(
+    name: &str,
+    source: &RgbaImage,
+    canvas: u32,
 ) -> Result<RgbaImage, Box<dyn Error>> {
     if source.width() + 2 > canvas || source.height() + 2 > canvas {
         return Err(format!("{name} 无法在 {canvas}x{canvas} 画布中保留 1px 透明边距").into());
@@ -286,14 +476,23 @@ fn center_on_canvas(
     }
     let (_, deviation_x, deviation_y, x, y) =
         best.ok_or_else(|| format!("{name} 无法在 {canvas}x{canvas} 画布中保留 1px 透明边距"))?;
-    if enforce_centroid && (deviation_x > 0.5 || deviation_y > 0.5) {
+    if deviation_x > 0.5 || deviation_y > 0.5 {
         return Err(format!(
             "{name} Alpha 质心偏差为 ({deviation_x:.3},{deviation_y:.3})px，超过 0.5px；必须重新生成"
         )
         .into());
     }
+    render_on_canvas(source, canvas, i64::from(x), i64::from(y))
+}
+
+fn render_on_canvas(
+    source: &RgbaImage,
+    canvas: u32,
+    x: i64,
+    y: i64,
+) -> Result<RgbaImage, Box<dyn Error>> {
     let mut image = RgbaImage::from_pixel(canvas, canvas, Rgba([0, 0, 0, 0]));
-    overlay(&mut image, source, i64::from(x), i64::from(y));
+    overlay(&mut image, source, x, y);
     for pixel in image.pixels_mut() {
         if pixel.0[3] != 0 {
             pixel.0[0] = 0;
@@ -364,4 +563,29 @@ fn encode_ico(png_path: &Path, ico_path: &Path) -> Result<(), Box<dyn Error>> {
         ExtendedColorType::Rgba8,
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_significant_multi_component_candidate_sheet() {
+        let mut sheet = RgbaImage::from_pixel(128, 128, Rgba([0, 0, 0, 0]));
+        for row in 0..4 {
+            for column in 0..4 {
+                for y in (row * 24 + 4)..(row * 24 + 12) {
+                    for x in (column * 24 + 4)..(column * 24 + 12) {
+                        sheet.put_pixel(x, y, Rgba([0, 0, 0, 255]));
+                    }
+                }
+            }
+        }
+
+        let topology = raw_topology(&sheet).expect("候选表应有可分析的前景");
+        assert_eq!(topology.significant_components, 16);
+        let error = validate_raw_topology(Path::new("candidate-sheet.png"), topology)
+            .expect_err("多枚显著候选必须在归一化前被拒绝");
+        assert!(error.to_string().contains("疑似候选表"));
+    }
 }
