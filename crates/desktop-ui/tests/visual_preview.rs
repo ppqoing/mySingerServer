@@ -201,6 +201,13 @@ impl VisualFixture {
         window.set_postgres_status("中心数据库健康".into());
         window.set_postgres_color(Color::from_rgb_u8(22, 163, 74));
         window.set_last_error("目标机器拒绝连接".into());
+        // 扫描预览只填充现有表单字段，右侧摘要由这些真实值直接生成。
+        window.set_scan_root("D:\\Media".into());
+        window.set_scan_node_index(0);
+        window.set_enumerator_index(1);
+        window.set_filtering_enabled(true);
+        window.set_filtering_reason("全部节点任务已进入终态。".into());
+        window.set_analysis_task_ids("task-media-scan".into());
     }
 }
 

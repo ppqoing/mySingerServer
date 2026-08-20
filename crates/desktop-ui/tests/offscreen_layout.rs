@@ -174,6 +174,159 @@ fn install_overview_and_nodes_fixture(window: &MainWindow) {
     ])));
 }
 
+// 使用单个运行中任务验证最小窗口中的取消动作，不依赖总览夹具的任务 ID。
+fn install_scan_and_task_fixture(window: &MainWindow) {
+    window.set_scan_root("D:\\Media".into());
+    window.set_scan_node_index(7);
+    window.set_enumerator_index(1);
+    window.set_filtering_enabled(true);
+    window.set_analysis_task_ids("task-running".into());
+    window.set_tasks(ModelRc::new(VecModel::from(vec![UiTaskRow {
+        id: "task-running".into(),
+        node_index: 7,
+        title: "媒体扫描".into(),
+        stage: "枚举文件".into(),
+        status: "运行中".into(),
+        status_color: Color::from_rgb_u8(59, 130, 246),
+        progress: 35,
+        counts: "7 / 20 · 失败 0 · 跳过 1".into(),
+    }])));
+}
+
+#[test]
+fn scan_and_task_primary_actions_stay_above_the_fold() {
+    install_testing_backend();
+
+    let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    install_scan_and_task_fixture(&window);
+    window.show().expect("应能显示扫描和任务工作区");
+
+    for (width, height) in [(1440.0, 900.0), (1080.0, 700.0)] {
+        window
+            .window()
+            .set_size(slint::PhysicalSize::new(width as u32, height as u32));
+        let content_bottom = height - 32.0;
+
+        window.invoke_navigate_to(2);
+        window
+            .window()
+            .take_snapshot()
+            .expect("扫描工作区应能完成软件渲染");
+        let scan_title = ElementHandle::find_by_accessible_label(&window, "新建扫描标题")
+            .next()
+            .expect("扫描工作区应公开标题地标");
+        let scan_main = ElementHandle::find_by_accessible_label(&window, "扫描主要内容")
+            .next()
+            .expect("扫描工作区应公开主要内容地标");
+        assert_element_has_positive_size(&scan_title, "新建扫描标题");
+        assert_element_has_positive_size(&scan_main, "扫描主要内容");
+        assert!(
+            scan_title.size().height <= 40.0,
+            "扫描标题不得吸收首屏富余高度，实际尺寸={:?}",
+            scan_title.size(),
+        );
+        let scan_gap = scan_main.absolute_position().y
+            - (scan_title.absolute_position().y + scan_title.size().height);
+        assert!(
+            (0.0..=32.0).contains(&scan_gap),
+            "扫描主要内容必须紧随标题，实际间距={scan_gap}px",
+        );
+        for label in ["浏览节点路径", "开始扫描"] {
+            let action = ElementHandle::find_by_accessible_label(&window, label)
+                .next()
+                .unwrap_or_else(|| panic!("扫描工作区应公开{label}"));
+            let position = action.absolute_position();
+            let size = action.size();
+            assert!(
+                position.x >= 144.0
+                    && position.y >= 58.0
+                    && position.x + size.width <= width
+                    && position.y + size.height <= content_bottom,
+                "{label} 必须位于 {width}×{height} 内容区首屏内，位置={position:?}，尺寸={size:?}",
+            );
+        }
+
+        window.invoke_navigate_to(3);
+        window
+            .window()
+            .take_snapshot()
+            .expect("任务工作区应能完成软件渲染");
+        let task_title = ElementHandle::find_by_accessible_label(&window, "任务中心标题")
+            .next()
+            .expect("任务工作区应公开标题地标");
+        let tabs = ElementHandle::find_by_accessible_label(&window, "任务标签栏")
+            .next()
+            .expect("任务工作区应公开标签栏地标");
+        let table = ElementHandle::find_by_accessible_label(&window, "任务主表")
+            .next()
+            .expect("任务工作区应公开主表地标");
+        for (element, label) in [
+            (&task_title, "任务中心标题"),
+            (&tabs, "任务标签栏"),
+            (&table, "任务主表"),
+        ] {
+            assert_element_has_positive_size(element, label);
+            let position = element.absolute_position();
+            let size = element.size();
+            assert!(
+                position.x >= 144.0
+                    && position.y >= 58.0
+                    && position.x + size.width <= width
+                    && position.y + size.height <= content_bottom,
+                "{label} 必须位于任务内容区内，位置={position:?}，尺寸={size:?}",
+            );
+        }
+        assert!(
+            task_title.size().height <= 40.0,
+            "任务标题不得吸收主表剩余高度，实际尺寸={:?}",
+            task_title.size(),
+        );
+        let tab_gap = tabs.absolute_position().y
+            - (task_title.absolute_position().y + task_title.size().height);
+        let table_gap =
+            table.absolute_position().y - (tabs.absolute_position().y + tabs.size().height);
+        assert!(
+            (0.0..=32.0).contains(&tab_gap) && (0.0..=32.0).contains(&table_gap),
+            "任务标题、标签栏和主表必须连续置顶，间距分别为 {tab_gap}px / {table_gap}px",
+        );
+
+        let task_scroll = table
+            .query_descendants()
+            .match_inherits("ScrollView")
+            .find_first()
+            .expect("任务主表必须拥有自己的 ScrollView");
+        let scroll_position = task_scroll.absolute_position();
+        let scroll_size = task_scroll.size();
+        let mut cancel =
+            ElementHandle::find_by_accessible_label(&window, "取消任务：task-running").next();
+        if cancel.is_none() {
+            // 最小窗口允许取消列位于主表自己的横向滚动内容中，但必须能通过真实滚轮到达。
+            task_scroll.scroll(-1000.0, 0.0);
+            window
+                .window()
+                .take_snapshot()
+                .expect("横向滚动后的任务表应能完成软件渲染");
+            cancel =
+                ElementHandle::find_by_accessible_label(&window, "取消任务：task-running").next();
+        }
+        let cancel = cancel.expect("运行中任务取消动作必须直接可见或经任务表横向滚动到达");
+        let cancel_position = cancel.absolute_position();
+        let cancel_size = cancel.size();
+        let cancel_inside_window = cancel_position.x >= 0.0
+            && cancel_position.y >= 0.0
+            && cancel_position.x + cancel_size.width <= width
+            && cancel_position.y + cancel_size.height <= height;
+        let cancel_reachable_in_table = scroll_size.width > 0.0
+            && scroll_size.height > 0.0
+            && cancel_position.y >= scroll_position.y
+            && cancel_position.y + cancel_size.height <= scroll_position.y + scroll_size.height;
+        assert!(
+            cancel_inside_window || cancel_reachable_in_table,
+            "取消动作必须直接可见或位于任务表自己的滚动区域，动作={cancel_position:?}/{cancel_size:?}，滚动区={scroll_position:?}/{scroll_size:?}",
+        );
+    }
+}
+
 #[test]
 fn overview_and_nodes_start_at_the_top_without_blank_stretch() {
     install_testing_backend();

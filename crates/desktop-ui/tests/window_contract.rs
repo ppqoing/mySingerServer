@@ -105,6 +105,16 @@ fn install_task_center_fixture(window: &MainWindow) {
             progress: 60,
             counts: "6 / 10 · 失败 1 · 跳过 0".into(),
         },
+        UiTaskRow {
+            id: "task-queued".into(),
+            node_index: 4,
+            title: "视频扫描".into(),
+            stage: "等待调度".into(),
+            status: "排队中".into(),
+            status_color: Color::from_rgb_u8(107, 114, 128),
+            progress: 0,
+            counts: "0 / 8 · 失败 0 · 跳过 0".into(),
+        },
     ])));
 }
 
@@ -116,11 +126,21 @@ fn accessible(window: &MainWindow, label: &str) -> ElementHandle {
 
 // 从真实元素边界计算中心点，直接向测试窗口发送鼠标移动、按下和释放事件。
 fn click_element_center(window: &MainWindow, element: &ElementHandle) {
+    click_element_at_fraction(window, element, 0.5, 0.5);
+}
+
+// 横向可滚动行使用左侧可见标题区作为选择命中点，避免把内容宽度中心误当视口中心。
+fn click_element_at_fraction(
+    window: &MainWindow,
+    element: &ElementHandle,
+    x_fraction: f32,
+    y_fraction: f32,
+) {
     let position = element.absolute_position();
     let size = element.size();
     let center = slint::LogicalPosition::new(
-        position.x + size.width / 2.0,
-        position.y + size.height / 2.0,
+        position.x + size.width * x_fraction,
+        position.y + size.height * y_fraction,
     );
     window
         .window()
@@ -530,6 +550,9 @@ fn scan_start_forwards_four_arguments_in_order() {
     i_slint_backend_testing::init_no_event_loop();
 
     let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    window
+        .window()
+        .set_size(slint::PhysicalSize::new(1080, 700));
     window.invoke_navigate_to(2);
     window.set_scan_node_index(7);
     window.set_scan_root("D:\\fixture".into());
@@ -566,6 +589,9 @@ fn scan_browse_and_local_analysis_forward_only_existing_arguments() {
     i_slint_backend_testing::init_no_event_loop();
 
     let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    window
+        .window()
+        .set_size(slint::PhysicalSize::new(1080, 700));
     window.invoke_navigate_to(2);
     window.set_scan_node_index(7);
     window.set_scan_root("D:\\fixture".into());
@@ -634,6 +660,11 @@ fn task_tabs_filter_loaded_models_and_cancel_active_task() {
     let window = MainWindow::new().expect("应能构造真实 MainWindow");
     install_task_center_fixture(&window);
     window.invoke_navigate_to(3);
+    let cancelled = Rc::new(RefCell::new(Vec::new()));
+    window.on_cancel_task({
+        let cancelled = cancelled.clone();
+        move |node_index, id| cancelled.borrow_mut().push((node_index, id.to_string()))
+    });
 
     assert_eq!(window.get_task_tab(), 0);
     assert_eq!(
@@ -667,8 +698,15 @@ fn task_tabs_filter_loaded_models_and_cancel_active_task() {
         &window,
         "任务项：视频分析；节点 3；提取特征；60%；6 / 10 · 失败 1 · 跳过 0；失败",
     );
-    click_element_center(&window, &failed_row);
-    assert_eq!(failed_row.accessible_item_selected(), Some(true));
+    click_element_at_fraction(&window, &failed_row, 0.2, 0.5);
+    assert_eq!(
+        failed_row.accessible_item_selected(),
+        Some(true),
+        "失败行标题区点击应只选择自身，位置={:?}，尺寸={:?}",
+        failed_row.absolute_position(),
+        failed_row.size(),
+    );
+    assert!(cancelled.borrow().is_empty(), "任务行选择不得命中取消回调");
 
     accessible(&window, "运行中").invoke_accessible_default_action();
     let running_row = accessible(
@@ -676,23 +714,35 @@ fn task_tabs_filter_loaded_models_and_cancel_active_task() {
         "任务项：媒体扫描；节点 7；枚举文件；35%；7 / 20 · 失败 0 · 跳过 1；运行中",
     );
     assert_eq!(running_row.accessible_item_selected(), Some(false));
-    click_element_center(&window, &running_row);
+    click_element_at_fraction(&window, &running_row, 0.2, 0.5);
     assert_eq!(
         running_row.accessible_item_selected(),
         Some(true),
         "点击运行中任务行的非按钮区域应更新 selected-task-index",
     );
+    assert!(
+        cancelled.borrow().is_empty(),
+        "运行中任务行选择也不得命中取消回调"
+    );
 
-    let cancelled = Rc::new(RefCell::new(Vec::new()));
-    window.on_cancel_task({
-        let cancelled = cancelled.clone();
-        move |node_index, id| cancelled.borrow_mut().push((node_index, id.to_string()))
-    });
+    let task_table = accessible(&window, "任务主表");
+    let task_scroll = task_table
+        .query_descendants()
+        .match_inherits("ScrollView")
+        .find_first()
+        .expect("任务主表应通过自己的 ScrollView 到达取消列");
+    task_scroll.scroll(-1000.0, 0.0);
     let cancel_button = accessible(&window, "取消任务：task-running");
     click_element_center(&window, &cancel_button);
     assert_eq!(
         cancelled.borrow().as_slice(),
         &[(7, String::from("task-running"))]
+    );
+    assert!(
+        ElementHandle::find_by_accessible_label(&window, "取消任务：task-queued")
+            .next()
+            .is_none(),
+        "排队中任务不得生成取消可访问元素",
     );
 
     accessible(&window, "已完成").invoke_accessible_default_action();
@@ -743,6 +793,31 @@ fn task_tabs_filter_loaded_models_and_cancel_active_task() {
             .is_none()
     );
     assert_eq!(cancelled.borrow().len(), 1, "终态任务不得产生新的取消动作");
+
+    window.set_tasks(ModelRc::new(VecModel::from(vec![UiTaskRow {
+        id: "task-running-only".into(),
+        node_index: 7,
+        title: "仅运行中任务".into(),
+        stage: "枚举文件".into(),
+        status: "运行中".into(),
+        status_color: Color::from_rgb_u8(59, 130, 246),
+        progress: 20,
+        counts: "2 / 10 · 失败 0 · 跳过 0".into(),
+    }])));
+    accessible(&window, "已完成").invoke_accessible_default_action();
+    accessible(&window, "失败").invoke_accessible_default_action();
+    assert!(
+        ElementHandle::find_by_accessible_label(&window, "任务表空态：失败")
+            .next()
+            .is_some(),
+        "模型非空但当前页签没有匹配任务时，空态必须留在表体内",
+    );
+    assert!(
+        ElementHandle::find_by_accessible_label(&window, "任务详情")
+            .next()
+            .is_some(),
+        "无匹配任务时仍应保留固定详情结构",
+    );
 }
 
 #[test]

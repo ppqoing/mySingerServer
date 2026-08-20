@@ -1,7 +1,8 @@
 // 新建扫描页只转发现有扫描与本地分析参数，不扩展后端命令。
 
-import { Button, CheckBox, ComboBox, LineEdit, ScrollView, SpinBox } from "std-widgets.slint";
+import { CheckBox, ComboBox, LineEdit, ScrollView, SpinBox } from "std-widgets.slint";
 import { Theme } from "../theme.slint";
+import { ActionButton } from "../components/action-button.slint";
 import { DetailPanel } from "../components/detail-panel.slint";
 import { EmptyState } from "../components/empty-state.slint";
 import { FluentCard } from "../components/fluent-card.slint";
@@ -29,71 +30,98 @@ export component ScanPage inherits Rectangle {
         ScrollView {
             horizontal-stretch: 1;
             VerticalLayout {
+                min-width: 520px;
                 spacing: 14px;
 
-                Text { text: "新建扫描"; color: Theme.text; font-size: 24px; font-weight: 750; }
+                Text {
+                    text: "新建扫描";
+                    height: 30px;
+                    vertical-stretch: 0;
+                    color: Theme.text;
+                    font-size: 24px;
+                    font-weight: 750;
+                    accessible-role: AccessibleRole.groupbox;
+                    accessible-label: "新建扫描标题";
+                }
 
-                // 扫描表单保持 start-scan 四参数的既有顺序。
+                // 第一张卡完整承载扫描四参数，动作顺序仍为 node、path、force、enumerator。
                 FluentCard {
-                    height: 250px;
+                    height: 228px;
+                    accessible-role: AccessibleRole.groupbox;
+                    accessible-label: "扫描主要内容";
                     VerticalLayout {
-                        padding: 18px;
-                        spacing: 12px;
-                        Text { text: "扫描根"; color: Theme.text; font-size: 16px; font-weight: 680; }
+                        padding: 16px;
+                        spacing: 10px;
+                        Text { text: "扫描根与计算节点"; color: Theme.text; font-size: 16px; font-weight: 680; }
                         HorizontalLayout {
-                            spacing: 10px;
+                            height: 34px;
+                            spacing: 8px;
                             LineEdit {
+                                horizontal-stretch: 1;
                                 text <=> root.scan-root;
                                 placeholder-text: "选择节点上的扫描根目录";
                                 accessible-label: "扫描根目录";
                             }
-                            Button {
-                                text: "浏览节点路径";
-                                accessible-label: "浏览节点路径";
+                            ActionButton {
+                                width: 122px;
+                                label: "浏览节点路径";
+                                icon: @image-url("../assets/icons/browse.png");
                                 clicked => { root.browse(root.selected-node, root.scan-root); }
                             }
                         }
                         HorizontalLayout {
-                            spacing: 10px;
-                            Text { text: "节点索引"; color: Theme.muted; vertical-alignment: center; }
+                            height: 34px;
+                            spacing: 8px;
+                            Text { text: "节点"; color: Theme.muted; font-size: 11px; vertical-alignment: center; }
                             SpinBox {
                                 value <=> root.selected-node;
                                 minimum: 0;
                                 maximum: 99;
-                                width: 120px;
+                                width: 104px;
                                 accessible-label: "扫描节点索引";
                             }
+                            Text { text: "枚举器"; color: Theme.muted; font-size: 11px; vertical-alignment: center; }
                             ComboBox {
                                 model: ["Windows Walker", "Everything"];
                                 current-index <=> root.enumerator-index;
+                                horizontal-stretch: 1;
                                 accessible-label: "扫描枚举器";
                             }
                         }
-                        CheckBox {
-                            text: "强制重新计算";
-                            checked <=> root.force-recalculate;
-                            accessible-label: "强制重新计算";
-                        }
                         HorizontalLayout {
-                            Button {
-                                text: "开始扫描";
-                                accessible-label: "开始扫描";
+                            height: 34px;
+                            spacing: 10px;
+                            CheckBox {
+                                text: "强制重新计算";
+                                checked <=> root.force-recalculate;
+                                accessible-label: "强制重新计算";
+                            }
+                            Rectangle { horizontal-stretch: 1; background: transparent; }
+                            ActionButton {
+                                width: 112px;
+                                label: "开始扫描";
+                                icon: @image-url("../assets/icons/scan.png");
+                                tone: 1;
                                 clicked => {
                                     root.start-scan(root.selected-node, root.scan-root, root.force-recalculate, root.enumerator-index);
                                 }
                             }
-                            Rectangle { horizontal-stretch: 1; background: transparent; }
-                            Text { text: "扫描后按机器 ID + 路径 + 大小复用缓存"; color: Theme.muted; font-size: 11px; vertical-alignment: center; }
+                        }
+                        Text {
+                            text: "按机器 ID、规范路径和文件大小复用缓存；强制重算仍沿用同一任务入口。";
+                            color: Theme.muted;
+                            font-size: 11px;
+                            overflow: elide;
                         }
                     }
                 }
 
-                // 本地分析紧随扫描创建，分析类型不会进入 start-scan。
+                // 本地分析保留任务 UUID、类型、门禁状态与既有三参数回调。
                 FluentCard {
-                    height: 190px;
+                    height: 178px;
                     VerticalLayout {
                         padding: 14px;
-                        spacing: 10px;
+                        spacing: 9px;
                         HorizontalLayout {
                             Text { text: "本地分析"; color: Theme.text; font-size: 16px; font-weight: 680; }
                             Rectangle { horizontal-stretch: 1; background: transparent; }
@@ -105,7 +133,8 @@ export component ScanPage inherits Rectangle {
                         Text {
                             text: root.filtering-enabled ? "全部节点任务已进入终态。" : root.filtering-reason;
                             color: Theme.muted;
-                            wrap: word-wrap;
+                            font-size: 11px;
+                            overflow: elide;
                         }
                         LineEdit {
                             text <=> root.analysis-task-ids;
@@ -113,17 +142,20 @@ export component ScanPage inherits Rectangle {
                             accessible-label: "本地分析任务 ID";
                         }
                         HorizontalLayout {
-                            spacing: 10px;
+                            height: 34px;
+                            spacing: 8px;
                             ComboBox {
                                 model: ["精确重复", "相似图片", "相似视频"];
                                 current-index <=> root.analysis-kind-index;
+                                width: 180px;
                                 accessible-label: "本地分析类型";
-                                width: 190px;
                             }
-                            Button {
-                                text: "开始本地分析";
-                                accessible-label: "开始本地分析";
-                                enabled: root.filtering-enabled && root.analysis-task-ids != "";
+                            ActionButton {
+                                width: 126px;
+                                label: "开始本地分析";
+                                icon: @image-url("../assets/icons/index.png");
+                                tone: 1;
+                                action-enabled: root.filtering-enabled && root.analysis-task-ids != "";
                                 clicked => { root.start-analysis(root.selected-node, root.analysis-task-ids, root.analysis-kind-index); }
                             }
                             Rectangle { horizontal-stretch: 1; background: transparent; }
@@ -131,37 +163,71 @@ export component ScanPage inherits Rectangle {
                     }
                 }
 
-                // 概念图中的高级扫描参数没有模型字段，明确保持禁用。
+                // 未进入领域模型的高级项合并为一张紧凑信息卡，不绘制伪输入框。
                 FluentCard {
-                    height: 150px;
-                    EmptyState {
-                        title: "高级扫描参数";
-                        detail: "多根目录、排除目录、最小大小、后缀和高级视频选项当前版本未提供";
-                        disabled-feature: true;
+                    height: 132px;
+                    HorizontalLayout {
+                        padding: 14px;
+                        spacing: 12px;
+                        Image {
+                            source: @image-url("../assets/icons/info.png");
+                            width: 24px;
+                            height: 24px;
+                            image-fit: contain;
+                            colorize: Theme.warning;
+                        }
+                        VerticalLayout {
+                            spacing: 5px;
+                            Text { text: "高级扫描边界"; color: Theme.text; font-size: 14px; font-weight: 650; }
+                            Text {
+                                text: "多根目录 · 排除目录 · 最小大小 · 后缀 · 高级视频选项";
+                                color: Theme.muted;
+                                font-size: 11px;
+                                wrap: word-wrap;
+                            }
+                            Text {
+                                text: "当前模型未提供这些字段，因此本页不保存也不提交它们。";
+                                color: Theme.warning;
+                                font-size: 11px;
+                                wrap: word-wrap;
+                            }
+                        }
                     }
                 }
             }
         }
 
-        // 右侧仅解释当前表单值和既有算法阶段，不补造扫描结果。
+        // 右侧只复述当前输入与扫描引擎的四步真实流程，不显示伪进度。
         DetailPanel {
+            accessible-label: "扫描摘要";
             VerticalLayout {
                 padding: 18px;
-                spacing: 14px;
-                Text { text: "扫描摘要"; color: Theme.text; font-size: 20px; font-weight: 720; }
-                Text { text: "当前根"; color: Theme.muted; font-size: 11px; }
-                Text { text: root.scan-root == "" ? "—" : root.scan-root; color: Theme.text; font-size: 12px; wrap: word-wrap; }
-                Text { text: "节点  " + root.selected-node; color: Theme.text; font-size: 12px; }
+                spacing: 11px;
+                Text { text: "扫描摘要"; height: 28px; vertical-stretch: 0; color: Theme.text; font-size: 20px; font-weight: 720; }
+                Text { text: "当前根"; height: 16px; vertical-stretch: 0; color: Theme.muted; font-size: 11px; }
+                Text { text: root.scan-root == "" ? "—" : root.scan-root; min-height: 20px; vertical-stretch: 0; color: Theme.text; font-size: 12px; wrap: word-wrap; }
+                Text { text: "节点  " + root.selected-node; height: 20px; vertical-stretch: 0; color: Theme.text; font-size: 12px; }
                 Text {
                     text: "枚举器  " + (root.enumerator-index == 1 ? "Everything" : "Windows Walker");
+                    height: 20px;
+                    vertical-stretch: 0;
                     color: Theme.text;
                     font-size: 12px;
                 }
-                Text { text: "算法流程"; color: Theme.text; font-size: 14px; font-weight: 650; }
-                Text { text: "1. 枚举路径\n2. 读取媒体元数据\n3. 复用或计算特征\n4. 持久化任务进度"; color: Theme.muted; font-size: 12px; }
+                Rectangle { height: 1px; vertical-stretch: 0; background: Theme.border; }
+                Text { text: "真实流程"; height: 20px; vertical-stretch: 0; color: Theme.text; font-size: 14px; font-weight: 650; }
+                Text {
+                    text: "1  枚举普通文件\n2  查询路径与大小缓存\n3  复用或计算媒体特征\n4  持久化任务与扫描结果";
+                    height: 72px;
+                    vertical-stretch: 0;
+                    color: Theme.muted;
+                    font-size: 12px;
+                }
+                Rectangle { vertical-stretch: 1; background: transparent; }
                 EmptyState {
-                    vertical-stretch: 1;
-                    title: "高级流程暂不可用";
+                    density: 0;
+                    icon: @image-url("../assets/icons/info.png");
+                    title: "高级流程未接入";
                     detail: "高级视频参数当前版本未提供";
                     disabled-feature: true;
                 }
