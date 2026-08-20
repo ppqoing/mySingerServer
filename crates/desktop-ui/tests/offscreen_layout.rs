@@ -63,6 +63,15 @@ fn assert_element_inside_window(element: &ElementHandle, label: &str, width: f32
     );
 }
 
+// Task 5 的相对位置断言必须先证明元素真实参与布局，避免零尺寸元素误过边界比较。
+fn assert_element_has_positive_size(element: &ElementHandle, label: &str) {
+    let size = element.size();
+    assert!(
+        size.width > 0.0 && size.height > 0.0,
+        "{label} 必须拥有正尺寸，实际={size:?}",
+    );
+}
+
 // 使用真实只读行模型令组表和成员表创建各自的 ScrollView，不预取任何预览内容。
 fn install_duplicate_workspace_fixture(window: &MainWindow) {
     window.set_groups(ModelRc::new(VecModel::from(vec![UiGroupRow {
@@ -189,10 +198,13 @@ fn overview_and_nodes_start_at_the_top_without_blank_stretch() {
         let main = ElementHandle::find_by_accessible_label(&window, "总览主要内容")
             .next()
             .expect("总览应公开第一组主要内容");
+        assert_element_has_positive_size(&title, "总览标题");
+        assert_element_has_positive_size(&main, "总览主要内容");
         let title_bottom = title.absolute_position().y + title.size().height;
+        let gap = main.absolute_position().y - title_bottom;
         assert!(
-            main.absolute_position().y - title_bottom <= 32.0,
-            "总览标题到第一组主要内容不得超过 32px",
+            (0.0..=32.0).contains(&gap),
+            "总览标题到第一组主要内容的间距必须位于 0–32px，实际={gap}px",
         );
 
         window.invoke_navigate_to(1);
@@ -210,6 +222,9 @@ fn overview_and_nodes_start_at_the_top_without_blank_stretch() {
         let add_bar = ElementHandle::find_by_accessible_label(&window, "添加节点栏")
             .next()
             .expect("节点工作区应公开添加节点栏");
+        assert_element_has_positive_size(&table, "节点表");
+        assert_element_has_positive_size(&detail, "节点详情");
+        assert_element_has_positive_size(&add_bar, "添加节点栏");
         let (table_position, table_size) = (table.absolute_position(), table.size());
         let (detail_position, detail_size) = (detail.absolute_position(), detail.size());
         let (add_position, add_size) = (add_bar.absolute_position(), add_bar.size());
@@ -250,6 +265,7 @@ fn overview_and_nodes_start_at_the_top_without_blank_stretch() {
             let action = ElementHandle::find_by_accessible_label(&window, label)
                 .next()
                 .unwrap_or_else(|| panic!("{width}×{height} 应公开节点动作：{label}"));
+            assert_element_has_positive_size(&action, label);
             assert_element_inside_window(&action, label, width, height);
         }
     }

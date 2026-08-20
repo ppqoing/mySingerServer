@@ -449,17 +449,17 @@ fn node_add_forwards_entered_ip_and_port() {
     window.set_new_node_ip("192.168.50.18".into());
     window.set_new_node_port(40123);
 
-    let captured = Rc::new(RefCell::new(None));
+    let captured = Rc::new(RefCell::new(Vec::new()));
     window.on_add_node({
         let captured = captured.clone();
-        move |ip, port| *captured.borrow_mut() = Some((ip.to_string(), port))
+        move |ip, port| captured.borrow_mut().push((ip.to_string(), port))
     });
     accessible(&window, "添加节点").invoke_accessible_default_action();
 
     assert_eq!(
-        captured.borrow().as_ref(),
-        Some(&(String::from("192.168.50.18"), 40123)),
-        "添加动作应原样转发根表单双向绑定值",
+        captured.borrow().as_slice(),
+        &[(String::from("192.168.50.18"), 40123)],
+        "添加动作应只调用一次，并原样转发根表单双向绑定值",
     );
 }
 
@@ -481,20 +481,20 @@ fn selected_node_actions_forward_existing_callbacks() {
     )
     .invoke_accessible_default_action();
 
-    let edited = Rc::new(RefCell::new(None));
+    let edited = Rc::new(RefCell::new(Vec::new()));
     window.on_edit_node({
         let edited = edited.clone();
-        move |index, ip, port| *edited.borrow_mut() = Some((index, ip.to_string(), port))
+        move |index, ip, port| edited.borrow_mut().push((index, ip.to_string(), port))
     });
-    let synced = Rc::new(RefCell::new(None));
+    let synced = Rc::new(RefCell::new(Vec::new()));
     window.on_sync_node({
         let synced = synced.clone();
-        move |index| *synced.borrow_mut() = Some(index)
+        move |index| synced.borrow_mut().push(index)
     });
-    let removed = Rc::new(RefCell::new(None));
+    let removed = Rc::new(RefCell::new(Vec::new()));
     window.on_remove_node({
         let removed = removed.clone();
-        move |index| *removed.borrow_mut() = Some(index)
+        move |index| removed.borrow_mut().push(index)
     });
     let connected = Rc::new(Cell::new(0));
     window.on_connect_all({
@@ -508,11 +508,20 @@ fn selected_node_actions_forward_existing_callbacks() {
     accessible(&window, "连接全部节点").invoke_accessible_default_action();
 
     assert_eq!(
-        edited.borrow().as_ref(),
-        Some(&(7, String::from("10.20.30.40"), 41000)),
+        edited.borrow().as_slice(),
+        &[(7, String::from("10.20.30.40"), 41000)],
+        "编辑动作应只调用一次，并保持索引、IP 和端口顺序",
     );
-    assert_eq!(*synced.borrow(), Some(7));
-    assert_eq!(*removed.borrow(), Some(7));
+    assert_eq!(
+        synced.borrow().as_slice(),
+        &[7],
+        "同步动作应只调用一次并转发选中节点索引",
+    );
+    assert_eq!(
+        removed.borrow().as_slice(),
+        &[7],
+        "移除动作应只调用一次并转发选中节点索引",
+    );
     assert_eq!(connected.get(), 1);
 }
 
