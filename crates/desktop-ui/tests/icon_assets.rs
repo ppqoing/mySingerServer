@@ -157,6 +157,15 @@ fn brand_variants_and_ico_decode_at_declared_sizes() {
             (size, size),
             "{name} 尺寸必须匹配文件名"
         );
+        let geometry = alpha_geometry(&name, &image);
+        let center = (f64::from(size) - 1.0) / 2.0;
+        assert!(
+            (geometry.centroid_x - center).abs() <= 0.5
+                && (geometry.centroid_y - center).abs() <= 0.5,
+            "{name} Alpha 质心必须贴近画布中心 ({center},{center})，实际 ({:.3},{:.3})",
+            geometry.centroid_x,
+            geometry.centroid_y
+        );
     }
 
     let ico = icons_dir().join("app.ico");

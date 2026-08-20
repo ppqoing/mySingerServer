@@ -233,14 +233,28 @@ fn normalize_brand(source: &RgbaImage, canvas: u32) -> Result<RgbaImage, Box<dyn
         bounds.max_y - bounds.min_y + 1,
     )
     .to_image();
-    let target = canvas - 2;
     let longest = cropped.width().max(cropped.height());
-    let width = ((u64::from(cropped.width()) * u64::from(target) + u64::from(longest) / 2)
-        / u64::from(longest)) as u32;
-    let height = ((u64::from(cropped.height()) * u64::from(target) + u64::from(longest) / 2)
-        / u64::from(longest)) as u32;
-    let resized = resize(&cropped, width, height, FilterType::Lanczos3);
-    center_on_canvas("app 品牌图标", &resized, canvas, false)
+    let maximum_longest = canvas - 2;
+    let minimum_longest = (canvas * 3).div_ceil(4);
+    let mut failures = Vec::new();
+    for target_longest in (minimum_longest..=maximum_longest).rev() {
+        let width = ((u64::from(cropped.width()) * u64::from(target_longest)
+            + u64::from(longest) / 2)
+            / u64::from(longest)) as u32;
+        let height = ((u64::from(cropped.height()) * u64::from(target_longest)
+            + u64::from(longest) / 2)
+            / u64::from(longest)) as u32;
+        let resized = resize(&cropped, width, height, FilterType::Lanczos3);
+        match center_on_canvas("app 品牌图标", &resized, canvas, true) {
+            Ok(image) => return Ok(image),
+            Err(error) => failures.push(format!("{target_longest}px: {error}")),
+        }
+    }
+    Err(format!(
+        "app 品牌图标在 {canvas}x{canvas} 画布的 75%-最大合法尺寸内均无法满足质心门禁：{}",
+        failures.join("；")
+    )
+    .into())
 }
 
 fn center_on_canvas(
@@ -249,49 +263,43 @@ fn center_on_canvas(
     canvas: u32,
     enforce_centroid: bool,
 ) -> Result<RgbaImage, Box<dyn Error>> {
-    let base_x = i64::from((canvas - source.width()) / 2);
-    let base_y = i64::from((canvas - source.height()) / 2);
+    if source.width() + 2 > canvas || source.height() + 2 > canvas {
+        return Err(format!("{name} 无法在 {canvas}x{canvas} 画布中保留 1px 透明边距").into());
+    }
+    let source_geometry = geometry(source)?;
+    let center = (f64::from(canvas) - 1.0) / 2.0;
+    let maximum_x = canvas - source.width() - 1;
+    let maximum_y = canvas - source.height() - 1;
     let mut best = None;
-    for delta_y in -1_i64..=1 {
-        for delta_x in -1_i64..=1 {
-            let x = base_x + delta_x;
-            let y = base_y + delta_y;
-            if x < 1
-                || y < 1
-                || x + i64::from(source.width()) > i64::from(canvas - 1)
-                || y + i64::from(source.height()) > i64::from(canvas - 1)
-            {
-                continue;
-            }
-            let mut candidate = RgbaImage::from_pixel(canvas, canvas, Rgba([0, 0, 0, 0]));
-            overlay(&mut candidate, source, x, y);
-            for pixel in candidate.pixels_mut() {
-                if pixel.0[3] != 0 {
-                    pixel.0[0] = 0;
-                    pixel.0[1] = 0;
-                    pixel.0[2] = 0;
-                }
-            }
-            let geometry = geometry(&candidate)?;
-            let center = (f64::from(canvas) - 1.0) / 2.0;
-            let deviation_x = (geometry.centroid_x - center).abs();
-            let deviation_y = (geometry.centroid_y - center).abs();
+    for y in 1..=maximum_y {
+        for x in 1..=maximum_x {
+            let deviation_x = (source_geometry.centroid_x + f64::from(x) - center).abs();
+            let deviation_y = (source_geometry.centroid_y + f64::from(y) - center).abs();
             let score = deviation_x + deviation_y;
             if best
                 .as_ref()
-                .is_none_or(|(best_score, _, _, _)| score < *best_score)
+                .is_none_or(|(best_score, _, _, _, _)| score < *best_score)
             {
-                best = Some((score, deviation_x, deviation_y, candidate));
+                best = Some((score, deviation_x, deviation_y, x, y));
             }
         }
     }
-    let (_, deviation_x, deviation_y, image) =
+    let (_, deviation_x, deviation_y, x, y) =
         best.ok_or_else(|| format!("{name} 无法在 {canvas}x{canvas} 画布中保留 1px 透明边距"))?;
     if enforce_centroid && (deviation_x > 0.5 || deviation_y > 0.5) {
         return Err(format!(
             "{name} Alpha 质心偏差为 ({deviation_x:.3},{deviation_y:.3})px，超过 0.5px；必须重新生成"
         )
         .into());
+    }
+    let mut image = RgbaImage::from_pixel(canvas, canvas, Rgba([0, 0, 0, 0]));
+    overlay(&mut image, source, i64::from(x), i64::from(y));
+    for pixel in image.pixels_mut() {
+        if pixel.0[3] != 0 {
+            pixel.0[0] = 0;
+            pixel.0[1] = 0;
+            pixel.0[2] = 0;
+        }
     }
     Ok(image)
 }
