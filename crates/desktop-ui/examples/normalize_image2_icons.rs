@@ -59,17 +59,35 @@ struct Geometry {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct SignificantComponent {
+    area: usize,
+    bounds: Bounds,
+    center_x: f64,
+    center_y: f64,
+}
+
+#[derive(Clone, Debug)]
 struct RawTopology {
     width: u32,
     height: u32,
     significant_components: usize,
     dominant_component_ratio: f64,
     subject_span_ratio: f64,
+    components: Vec<SignificantComponent>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct AssetMetadata {
+    allows_semantic_grid: bool,
 }
 
 const RAW_ALPHA_THRESHOLD: u8 = 32;
 const MAX_SIGNIFICANT_COMPONENTS: usize = 12;
 const MIN_DOMINANT_COMPONENT_RATIO: f64 = 0.20;
+const MIN_GRID_SUBJECT_SPAN_RATIO: f64 = 0.60;
+const MIN_GRID_AXIS_SPAN_RATIO: f64 = 0.60;
+const MIN_GRID_BAND_GAP_RATIO: f64 = 0.15;
+const MIN_GRID_PEER_AREA_RATIO: f64 = 0.60;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let (input, output) = parse_arguments()?;
@@ -171,19 +189,22 @@ fn load_transparent_source(path: &Path) -> Result<RgbaImage, Box<dyn Error>> {
         topology.dominant_component_ratio * 100.0,
         topology.subject_span_ratio * 100.0
     );
-    validate_raw_topology(path, topology)?;
+    validate_raw_topology(path, &topology)?;
     Ok(image)
 }
 
-fn validate_raw_topology(path: &Path, topology: RawTopology) -> Result<(), Box<dyn Error>> {
+fn validate_raw_topology(path: &Path, topology: &RawTopology) -> Result<(), Box<dyn Error>> {
+    let candidate_grid = is_candidate_grid(topology);
+    let metadata = asset_metadata(path);
     if topology.significant_components <= MAX_SIGNIFICANT_COMPONENTS
         && topology.dominant_component_ratio >= MIN_DOMINANT_COMPONENT_RATIO
+        && (!candidate_grid || metadata.allows_semantic_grid)
     {
         return Ok(());
     }
 
     Err(format!(
-        "Image 2 原图 {} 疑似候选表：显著组件 {}（最多 {}），最大组件占比 {:.1}%（至少 {:.1}%），主体跨度 {:.1}%",
+        "Image 2 原图 {} 疑似候选表：显著组件 {}（最多 {}），最大组件占比 {:.1}%（至少 {:.1}%），主体跨度 {:.1}%，空间候选网格={candidate_grid}",
         path.display(),
         topology.significant_components,
         MAX_SIGNIFICANT_COMPONENTS,
@@ -192,6 +213,99 @@ fn validate_raw_topology(path: &Path, topology: RawTopology) -> Result<(), Box<d
         topology.subject_span_ratio * 100.0
     )
     .into())
+}
+
+fn asset_metadata(path: &Path) -> AssetMetadata {
+    match path.file_name().and_then(|name| name.to_str()) {
+        Some("overview.png") => AssetMetadata {
+            allows_semantic_grid: true,
+        },
+        _ => AssetMetadata::default(),
+    }
+}
+
+fn is_candidate_grid(topology: &RawTopology) -> bool {
+    if topology.subject_span_ratio < MIN_GRID_SUBJECT_SPAN_RATIO {
+        return false;
+    }
+    let Some(largest_area) = topology
+        .components
+        .iter()
+        .map(|component| component.area)
+        .max()
+    else {
+        return false;
+    };
+    let peers: Vec<&SignificantComponent> = topology
+        .components
+        .iter()
+        .filter(|component| component.area as f64 >= largest_area as f64 * MIN_GRID_PEER_AREA_RATIO)
+        .collect();
+    if peers.len() < 4 {
+        return false;
+    }
+
+    let peer_min_x = peers
+        .iter()
+        .map(|component| component.bounds.min_x)
+        .min()
+        .unwrap_or(0);
+    let peer_max_x = peers
+        .iter()
+        .map(|component| component.bounds.max_x)
+        .max()
+        .unwrap_or(0);
+    let peer_min_y = peers
+        .iter()
+        .map(|component| component.bounds.min_y)
+        .min()
+        .unwrap_or(0);
+    let peer_max_y = peers
+        .iter()
+        .map(|component| component.bounds.max_y)
+        .max()
+        .unwrap_or(0);
+    let peer_span_x = f64::from(peer_max_x - peer_min_x + 1) / f64::from(topology.width);
+    let peer_span_y = f64::from(peer_max_y - peer_min_y + 1) / f64::from(topology.height);
+    if peer_span_x < MIN_GRID_AXIS_SPAN_RATIO || peer_span_y < MIN_GRID_AXIS_SPAN_RATIO {
+        return false;
+    }
+
+    let Some(x_split) = separated_band_split(
+        peers.iter().map(|component| component.center_x).collect(),
+        topology.width,
+    ) else {
+        return false;
+    };
+    let Some(y_split) = separated_band_split(
+        peers.iter().map(|component| component.center_y).collect(),
+        topology.height,
+    ) else {
+        return false;
+    };
+
+    let mut quadrants = [false; 4];
+    for component in peers {
+        let column = usize::from(component.center_x > x_split);
+        let row = usize::from(component.center_y > y_split);
+        quadrants[row * 2 + column] = true;
+    }
+    quadrants.into_iter().all(|occupied| occupied)
+}
+
+fn separated_band_split(mut centers: Vec<f64>, canvas: u32) -> Option<f64> {
+    if centers.len() < 4 {
+        return None;
+    }
+    centers.sort_by(f64::total_cmp);
+    let minimum_gap = f64::from(canvas) * MIN_GRID_BAND_GAP_RATIO;
+    (2..=(centers.len() - 2))
+        .filter_map(|index| {
+            let gap = centers[index] - centers[index - 1];
+            (gap >= minimum_gap).then_some((gap, (centers[index] + centers[index - 1]) / 2.0))
+        })
+        .max_by(|left, right| left.0.total_cmp(&right.0))
+        .map(|(_, split)| split)
 }
 
 fn raw_topology(image: &RgbaImage) -> Result<RawTopology, Box<dyn Error>> {
@@ -228,7 +342,7 @@ fn icon_topology(
     }
 
     let mut visited = vec![false; pixel_count];
-    let mut component_sizes = Vec::new();
+    let mut component_stats = Vec::new();
     for start in 0..pixel_count {
         if !foreground[start] || visited[start] {
             continue;
@@ -236,10 +350,24 @@ fn icon_topology(
         visited[start] = true;
         let mut stack = vec![start];
         let mut size = 0_usize;
+        let mut component_min_x = width;
+        let mut component_min_y = height;
+        let mut component_max_x = 0_u32;
+        let mut component_max_y = 0_u32;
+        let mut total_x = 0_u64;
+        let mut total_y = 0_u64;
         while let Some(index) = stack.pop() {
             size += 1;
             let x = index % usize::try_from(width)?;
             let y = index / usize::try_from(width)?;
+            let x_u32 = u32::try_from(x)?;
+            let y_u32 = u32::try_from(y)?;
+            component_min_x = component_min_x.min(x_u32);
+            component_min_y = component_min_y.min(y_u32);
+            component_max_x = component_max_x.max(x_u32);
+            component_max_y = component_max_y.max(y_u32);
+            total_x += u64::from(x_u32);
+            total_y += u64::from(y_u32);
             for offset_y in -1_i32..=1 {
                 for offset_x in -1_i32..=1 {
                     if offset_x == 0 && offset_y == 0 {
@@ -263,15 +391,29 @@ fn icon_topology(
                 }
             }
         }
-        component_sizes.push(size);
+        component_stats.push(SignificantComponent {
+            area: size,
+            bounds: Bounds {
+                min_x: component_min_x,
+                min_y: component_min_y,
+                max_x: component_max_x,
+                max_y: component_max_y,
+            },
+            center_x: total_x as f64 / size as f64,
+            center_y: total_y as f64 / size as f64,
+        });
     }
 
     let minimum_significant_pixels = (foreground_count / 100).max(minimum_component_pixels);
-    let significant: Vec<usize> = component_sizes
+    let significant: Vec<SignificantComponent> = component_stats
         .into_iter()
-        .filter(|size| *size >= minimum_significant_pixels)
+        .filter(|component| component.area >= minimum_significant_pixels)
         .collect();
-    let dominant = significant.iter().copied().max().unwrap_or(0);
+    let dominant = significant
+        .iter()
+        .map(|component| component.area)
+        .max()
+        .unwrap_or(0);
     let subject_span_ratio = (f64::from(max_x - min_x + 1) / f64::from(width))
         .max(f64::from(max_y - min_y + 1) / f64::from(height));
 
@@ -281,6 +423,7 @@ fn icon_topology(
         significant_components: significant.len(),
         dominant_component_ratio: dominant as f64 / foreground_count as f64,
         subject_span_ratio,
+        components: significant,
     })
 }
 
@@ -569,23 +712,68 @@ fn encode_ico(png_path: &Path, ico_path: &Path) -> Result<(), Box<dyn Error>> {
 mod tests {
     use super::*;
 
+    fn draw_solid_rect(image: &mut RgbaImage, x: u32, y: u32, width: u32, height: u32) {
+        for pixel_y in y..(y + height) {
+            for pixel_x in x..(x + width) {
+                image.put_pixel(pixel_x, pixel_y, Rgba([0, 0, 0, 255]));
+            }
+        }
+    }
+
+    fn four_candidate_grid() -> RgbaImage {
+        let mut sheet = RgbaImage::from_pixel(128, 128, Rgba([0, 0, 0, 0]));
+        for y in [16, 80] {
+            for x in [16, 80] {
+                draw_solid_rect(&mut sheet, x, y, 32, 32);
+            }
+        }
+        sheet
+    }
+
     #[test]
-    fn rejects_significant_multi_component_candidate_sheet() {
+    fn rejects_sixteen_candidate_sheet() {
         let mut sheet = RgbaImage::from_pixel(128, 128, Rgba([0, 0, 0, 0]));
         for row in 0..4 {
             for column in 0..4 {
-                for y in (row * 24 + 4)..(row * 24 + 12) {
-                    for x in (column * 24 + 4)..(column * 24 + 12) {
-                        sheet.put_pixel(x, y, Rgba([0, 0, 0, 255]));
-                    }
-                }
+                draw_solid_rect(&mut sheet, column * 24 + 4, row * 24 + 4, 8, 8);
             }
         }
 
         let topology = raw_topology(&sheet).expect("候选表应有可分析的前景");
         assert_eq!(topology.significant_components, 16);
-        let error = validate_raw_topology(Path::new("candidate-sheet.png"), topology)
+        let error = validate_raw_topology(Path::new("candidate-sheet.png"), &topology)
             .expect_err("多枚显著候选必须在归一化前被拒绝");
         assert!(error.to_string().contains("疑似候选表"));
+    }
+
+    #[test]
+    fn rejects_four_candidate_two_by_two_grid() {
+        let sheet = four_candidate_grid();
+        let topology = raw_topology(&sheet).expect("2x2 候选表应有可分析的前景");
+        assert_eq!(topology.significant_components, 4);
+        assert!((topology.dominant_component_ratio - 0.25).abs() < f64::EPSILON);
+
+        let error = validate_raw_topology(Path::new("candidate-grid.png"), &topology)
+            .expect_err("跨画布的 2x2 等面积候选网格必须被拒绝");
+        assert!(error.to_string().contains("疑似候选表"));
+    }
+
+    #[test]
+    fn accepts_single_standalone_subject() {
+        let mut icon = RgbaImage::from_pixel(128, 128, Rgba([0, 0, 0, 0]));
+        draw_solid_rect(&mut icon, 32, 40, 64, 48);
+        let topology = raw_topology(&icon).expect("单主体应有可分析的前景");
+
+        validate_raw_topology(Path::new("single.png"), &topology)
+            .expect("单个居中主体不应被候选表门禁拒绝");
+    }
+
+    #[test]
+    fn accepts_explicit_overview_four_cell_dashboard() {
+        let overview = four_candidate_grid();
+        let topology = raw_topology(&overview).expect("overview 四格应有可分析的前景");
+
+        validate_raw_topology(Path::new("overview.png"), &topology)
+            .expect("overview 的固定四格语义应显式允许");
     }
 }
