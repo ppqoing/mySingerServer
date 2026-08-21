@@ -56,10 +56,12 @@ SQLite、PostgreSQL 或 TCP。三个 `apps` 目录只装配依赖和生命周期
 推导的 `AppLayout`，以及 Raw SMBIOS Type 1/2 读取和机器 ID 计算。生产机器身份只来自
 Win32 `GetSystemFirmwareTable(RSMB)`，不从配置注入。
 
-协议边界也已落地：`proto/node.proto` 是唯一消息源，`dedup-protocol` 用固定 vendored
+协议边界也已落地且当前版本为 V3：`proto/node.proto` 是唯一消息源，`dedup-protocol` 用固定 vendored
 `protoc` 在 `OUT_DIR` 生成 Rust 类型和 descriptor set，并显式转换 `ContentKey`、
 `LocationKey` 与 `Thresholds`。节点 Envelope 覆盖状态、任务、路径、分析、同步、快照、
-文件读取和删除；WorkerEnvelope 只携带任务/项目/显示路径、槽位和计算结果，不含数据库或网络地址。
+文件读取、删除和版本化 Node 配置；配置协议固定为 `GetNodeConfig`、`NodeConfigSnapshot`、
+`SaveNodeConfigAndRestart` 与 `NodeRestartAccepted`，不含认证、密钥或 TLS 字段。WorkerEnvelope
+只携带任务/项目/显示路径、槽位和计算结果，不含数据库或网络地址。
 
 媒体像素边界已经落地：`Rgb24Image` 和 `GrayImage` 在构造时一次性验证紧凑缓冲区长度，
 内部算法不重复检查尺寸。所有图片特征共用整数亮度公式和像素中心双线性缩放，避免一筛、
@@ -124,8 +126,9 @@ Worker 全部加入 `KILL_ON_JOB_CLOSE` Job，节点退出不会留下孤儿进�
 - 跨边界键固定为 `MachineId`、`ContentKey(md5,file_size)` 和
   `LocationKey(machine_id,normalized_path)`；扫描缓存查询再把 `file_size` 作为独立条件，
   因此跳过 MD5 的完整条件仍是机器 ID、规范路径和文件大小。SQLite 自增 ID 不通过网络或同步传播。
-- 配置、SQLite、日志和缓存只写可执行程序同目录下的 `data`。当前工作目录和用户目录不作
-  运行时回退。
+- `bootstrap.toml` 固定放在 `node.exe` 同目录，只拥有实际完整配置文件的原始路径；首次启动的
+  `data/node/config.toml` 只是默认值。配置、SQLite、日志和缓存使用 NodeConfigRepository 验证后的
+  本机路径；相对路径以可执行文件目录解析，当前工作目录和用户目录不作运行时回退。
 - `NormalizedPath` 只接受 Windows 绝对盘符或 UNC 路径，统一大小写、尾分隔符、`.`、`..`
   和 `\\?\` 形式；目录归属比较路径组件。`DisplayPath` 单独保留原始拼写供 UI 与文件访问。
 - `MachineId` 的输入顺序固定为 System UUID、System Serial、Baseboard Serial；字段 trim、
@@ -192,11 +195,12 @@ Worker 只返回实际探测类型和拥有所有权的特征，NodeStore 负责
 节点组合由 `dedup-node-engine::actor`、`server`、`preview` 和 `delete` 四个边界完成。
 `NodeRuntime::start` 先经 `IdentityProvider` 取得物理 MachineId；生产入口只能使用
 `SmbiosIdentityProvider`，`FixedIdentityProvider` 只供测试，MachineId 不进入配置文件。运行时随后
-打开 `data/node/node.db`、恢复遗留 running 项、创建唯一 WorkerPool、绑定 TCP listener，再启动
-唯一 NodeEngine actor。actor 通过容量 64 的命令通道串行独占 `NodeStore` 与 `WorkerPool`；网络
+按 repository 已解析的 data/cache/log 路径打开 `node.db`、恢复遗留 running 项，以 Worker 自动/手动
+配置计算有效进程数，创建唯一 WorkerPool、绑定 TCP listener，再启动唯一 NodeEngine actor。actor
+通过容量 64 的命令通道串行独占 `NodeStore` 与 `WorkerPool`；网络
 handler、托盘回调和后续桌面会话都只持有可克隆 `NodeEngineHandle`，不能直接访问 SQLite。
 
-节点 TCP 首帧必须是协议版本 2、产品标识 `mysingerserver-rust-v2` 的 Hello。一个节点同时只接受
+节点 TCP 首帧必须是协议版本 3、产品标识 `mysingerserver-rust-v2` 的 Hello。一个节点同时只接受
 一个管理连接，第二连接立即收到 `NodeBusy`；已取得名额的连接使用 request_id 并发处理多个请求，
 独立写任务串行输出响应。连接断开释放名额，服务关闭会停止 listener 并终止连接任务。actor 已
 统一接入状态、任务查询/取消、路径浏览、扫描、本地分析、结果分页、复核、分析输入、跨机器批量
@@ -204,6 +208,14 @@ handler、托盘回调和后续桌面会话都只持有可克隆 `NodeEngineHand
 中心运行选择的扫描任务；节点只从这些已完成任务的 succeeded 项连接当前活动位置，不创建伪本地
 分析运行。`DispatchStage2` 先把整批唯一内容保存为 `analysis_stage2` 任务：SQLite 已有完整二筛时
 只重新发布特征 outbox，不启动 Worker；本机也缺失时才调用唯一 WorkerPool 计算并保存。
+
+Node 配置快照直接来自当前完整配置原文的 SHA-256 与原始字段。保存先确认宿主重启能力，再在
+NodeConfigRepository 的同一进程锁内校验摘要、路径和字段，通过 journal 双文件事务提交完整配置与
+bootstrap；版本冲突不写文件。替代进程 prepare 失败时以新摘要 CAS 恢复保存前原始 config/bootstrap
+字节，保持旧摘要；补偿失败明确报告配置可能已经保存。只有保存和 prepare 都成功才返回
+`NodeRestartAccepted`。server 完整写出该响应后，以同 request_id 最多两次调用幂等 host commit；
+耗尽则主动结束连接并保留 pending。新 `node.exe --wait-for-parent <PID>` 等待旧进程完全退出后，
+才按 bootstrap→配置→日志→SQLite/Worker/listener 顺序启动。
 
 `tasks.outbox_high_seq` 是任务终态的一部分：普通计算任务在最后一项完成事务中、扫描任务在路径
 失效和完成事务中，保存当时 SQLite outbox 的真实高水位。管理端只能用这个持久值等待 PostgreSQL
@@ -218,7 +230,8 @@ SQLite，Worker 忙碌数来自唯一 WorkerPool，不由 TCP 层维护第二份
 才调用 `std::fs::remove_file`。所有结果整批交回 NodeStore；只有 recycled/deleted 写墓碑并立即缩组。
 
 `dedup-core::logging::SizeRotatingWriter` 是三个进程共用的同步日志边界，生产固定 20 MiB、包含
-当前文件在内保留 10 个文件。`node.exe` 首次启动只写 `data/node/config.toml`，Release 使用
+当前文件在内保留 10 个文件。`node.exe` 首次启动创建固定 bootstrap 和默认完整配置，后续先加载
+bootstrap/config，再按解析后的日志路径初始化 writer；Release 使用
 Windows 子系统且不创建控制台；Slint `SystemTrayIcon` 复用旧托盘图标的独立副本，菜单只包含
 运行状态、监听地址、打开日志目录、重启计算引擎和退出节点。重启严格执行 WorkerPool prepare、
 SQLite 单事务 requeue、Worker terminate/recreate/Ready；退出先停 listener，再关闭 actor 并释放
@@ -322,13 +335,20 @@ phase2 对 queued/running 或游标落后继续等待；completed/failed/cancell
 同一 `(md5,file_size)` 在任意机器只映射一个中心内容，而每个机器路径各自保留位置记录。
 
 桌面端采用严格单向交互。Slint 回调只把手工节点编辑、连接、刷新、同步、扫描、取消、路径浏览
-和设置保存转换为有界 `UiCommand`；`DesktopApp` 的 Tokio 控制循环持有 `NodeSession`、中心查询
+和设置保存转换为有界 `UiCommand`；远程配置只使用 `LoadNodeConfig` 与
+`SaveNodeConfigAndRestart`，Desktop 不打开远程文件。`DesktopApp` 的 Tokio 控制循环持有 `NodeSession`、中心查询
 `CentralStore` 和唯一视图，每个节点后台同步循环另持有自己的 `SyncEngine` 与 PG client，结果再
 作为不可变内部事件归并并发布 `UiEvent::ViewChanged`。GUI 线程只把事件映射为 Slint model 和属性，
 不直接读写 TCP、SQLite、PostgreSQL、FFmpeg 或配置文件。节点连接按
 手工配置顺序展示、并行建立，每个列表索引最多保存一个 session；编辑节点会丢弃旧会话，避免把
 新地址错误绑定到旧物理 MachineId。PostgreSQL 未配置、schema 缺失或连接失败只改变中心能力和
 诊断文案，节点扫描及本地 SQLite 分析仍然可用。
+
+远程配置保存严格按 `Validating → Saving → Restarting → WaitingForReconnect → Verifying →
+Completed/Failed` 发布状态。加载时冻结握手 MachineId、手工 endpoint 和旧摘要；Accepted 后旧会话
+立即失效，pending endpoint 在验签前不得进入通用 session/sync。重连候选先检查 deadline，再核对
+同一物理 MachineId，并自动 GetNodeConfig 验证 saved SHA；两者都匹配后才注册 session 和同步。
+非终态期间重复保存、切换、编辑或移除目标明确拒绝，不能清空 pending 或把索引当机器身份。
 
 `desktop.exe` 首次启动只创建 `data/desktop/config.toml`、`data/desktop/cache` 和
 `data/desktop/logs`，并写入默认节点 `127.0.0.1:39091`。日志复用 20 MiB × 10 滚动 writer；
