@@ -36,27 +36,18 @@ const MAX_EXTENT_CAPACITY: usize = 4096;
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct PhysicalDiskId {
     disk_numbers: Vec<u32>,
-    composite: bool,
 }
 
 impl PhysicalDiskId {
-    fn new(mut disk_numbers: Vec<u32>, composite: bool) -> Self {
+    fn new(mut disk_numbers: Vec<u32>) -> Self {
         disk_numbers.sort_unstable();
         disk_numbers.dedup();
-        Self {
-            disk_numbers,
-            composite,
-        }
+        Self { disk_numbers }
     }
 
     /// 返回按编号排序去重的底层物理磁盘集合。
     pub fn disk_numbers(&self) -> &[u32] {
         &self.disk_numbers
-    }
-
-    /// 是否来自多 extent 卷并必须按复合 Unknown 调度。
-    pub const fn is_composite(&self) -> bool {
-        self.composite
     }
 }
 
@@ -121,7 +112,7 @@ where
         return Err(unsupported("路径没有可用的物理磁盘 extent"));
     }
     let composite = extents.len() != 1;
-    let physical_disk_id = PhysicalDiskId::new(extents, composite);
+    let physical_disk_id = PhysicalDiskId::new(extents);
     let disk_kind = if composite {
         LocalDiskKind::Unknown
     } else {

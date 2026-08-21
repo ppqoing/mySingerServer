@@ -1,7 +1,7 @@
 //! 物理磁盘身份和介质类型解析的可控 Windows 查询行为测试。
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet, HashSet},
     io,
     path::{Path, PathBuf},
 };
@@ -108,9 +108,37 @@ fn multiple_extents_form_a_stable_composite_unknown_location() {
     let location =
         resolve_storage_location_with(Path::new(r"G:\Striped\movie.mkv"), &queries).unwrap();
 
-    assert!(location.physical_disk_id().is_composite());
     assert_eq!(location.physical_disk_id().disk_numbers(), &[5, 12]);
     assert_eq!(location.disk_kind(), LocalDiskKind::Unknown);
+}
+
+#[test]
+fn physical_disk_identity_is_independent_from_extent_layout() {
+    let queries = FakeQueries::default()
+        .volume("H:", 3, &[7])
+        .volume("I:", 3, &[7, 7])
+        .volume("J:", 3, &[7, 8])
+        .media(7, Some(false))
+        .media(8, Some(false));
+
+    let single = resolve_storage_location_with(Path::new(r"H:\one.bin"), &queries).unwrap();
+    let repeated = resolve_storage_location_with(Path::new(r"I:\two.bin"), &queries).unwrap();
+    let mixed = resolve_storage_location_with(Path::new(r"J:\three.bin"), &queries).unwrap();
+
+    assert_eq!(single.physical_disk_id(), repeated.physical_disk_id());
+    assert_ne!(single.physical_disk_id(), mixed.physical_disk_id());
+    assert_eq!(repeated.disk_kind(), LocalDiskKind::Unknown);
+    assert_eq!(mixed.disk_kind(), LocalDiskKind::Unknown);
+
+    let mut hash_ids = HashSet::new();
+    hash_ids.insert(single.physical_disk_id().clone());
+    hash_ids.insert(repeated.physical_disk_id().clone());
+    assert_eq!(hash_ids.len(), 1);
+
+    let mut ordered_ids = BTreeSet::new();
+    ordered_ids.insert(single.physical_disk_id().clone());
+    ordered_ids.insert(repeated.physical_disk_id().clone());
+    assert_eq!(ordered_ids.len(), 1);
 }
 
 #[test]
