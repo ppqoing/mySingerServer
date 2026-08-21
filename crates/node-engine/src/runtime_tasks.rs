@@ -458,9 +458,7 @@ impl TaskEntry {
         now: Duration,
     ) -> Result<(), RuntimeTaskError> {
         let stage = self.stages.entry(update.stage).or_default();
-        if stage_rank(update.state) < stage_rank(stage.state)
-            || (is_stage_terminal(stage.state) && update.state == stage.state)
-        {
+        if is_stage_terminal(stage.state) || stage_rank(update.state) < stage_rank(stage.state) {
             return Err(RuntimeTaskError::StageRegression);
         }
         if update.state == proto::RuntimeStageState::RuntimeStageRunning

@@ -170,3 +170,69 @@ async fn recreated_registry_is_empty_and_never_restores_process_history() {
     let recreated = RuntimeTaskRegistry::with_clock(clock);
     assert!(recreated.list().await.is_empty());
 }
+
+#[tokio::test]
+async fn every_terminal_stage_state_rejects_all_later_terminal_replacements_without_mutation() {
+    let transitions = [
+        (
+            proto::RuntimeStageState::RuntimeStageCompleted,
+            proto::RuntimeStageState::RuntimeStageFailed,
+        ),
+        (
+            proto::RuntimeStageState::RuntimeStageFailed,
+            proto::RuntimeStageState::RuntimeStageSkipped,
+        ),
+        (
+            proto::RuntimeStageState::RuntimeStageSkipped,
+            proto::RuntimeStageState::RuntimeStageCompleted,
+        ),
+    ];
+    for (terminal, replacement) in transitions {
+        let clock = Arc::new(ManualClock::default());
+        let registry = RuntimeTaskRegistry::with_clock(clock.clone());
+        let task = registry
+            .begin(
+                RuntimeTaskKind::Scan,
+                MachineId::from_sha256([terminal as u8; 32]),
+                "阶段终态",
+            )
+            .await;
+        task.update_stage(RuntimeStageUpdate::running(
+            RuntimeStage::ReadMd5,
+            RuntimeProgressUnit::Bytes,
+            10,
+            Some(100),
+        ))
+        .await
+        .unwrap();
+        clock.advance(Duration::from_secs(2));
+        task.update_stage(RuntimeStageUpdate {
+            stage: RuntimeStage::ReadMd5,
+            state: terminal,
+            unit: RuntimeProgressUnit::Bytes,
+            completed: 80,
+            total: Some(100),
+            failed: 2,
+            skipped: 3,
+        })
+        .await
+        .expect("Running 必须能合法进入任一 terminal");
+        let before = registry.details(task.id()).await.unwrap().stages[0].clone();
+        clock.advance(Duration::from_secs(5));
+        assert!(
+            task.update_stage(RuntimeStageUpdate {
+                stage: RuntimeStage::ReadMd5,
+                state: replacement,
+                unit: RuntimeProgressUnit::Files,
+                completed: 99,
+                total: Some(999),
+                failed: 9,
+                skipped: 9,
+            })
+            .await
+            .is_err()
+        );
+        let after = registry.details(task.id()).await.unwrap().stages[0].clone();
+        assert_eq!(after, before, "拒绝后 state/count/speed/elapsed/ETA 必须完全不变");
+    }
+}
