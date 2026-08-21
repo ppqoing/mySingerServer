@@ -12,6 +12,9 @@ pub use generated::{FILE_DESCRIPTOR_SET, proto};
 /// 当前 Rust V2 节点与管理端握手使用的固定协议版本。
 pub const PROTOCOL_VERSION: u32 = 3;
 
+/// 每个运行时任务详情最多保留并通过 wire 返回的最近失败数量。
+pub const MAX_RUNTIME_FAILURES: usize = 20;
+
 #[cfg(test)]
 mod tests {
     use dedup_core::ContentKey;

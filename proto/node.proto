@@ -410,6 +410,84 @@ message ClearFileFault {
   uint32 cleared = 4;
 }
 
+enum RuntimeStageState {
+  RUNTIME_STAGE_STATE_UNSPECIFIED = 0;
+  RUNTIME_STAGE_WAITING = 1;
+  RUNTIME_STAGE_RUNNING = 2;
+  RUNTIME_STAGE_COMPLETED = 3;
+  RUNTIME_STAGE_FAILED = 4;
+  RUNTIME_STAGE_SKIPPED = 5;
+}
+
+message RuntimeTaskSummary {
+  string runtime_task_id = 1;
+  string machine_id = 2;
+  string task_kind = 3;
+  string title = 4;
+  string state = 5;
+  string stage_summary = 6;
+  uint64 overall_completed = 7;
+  uint64 overall_total = 8;
+  bool overall_total_known = 9;
+  uint64 overall_failed = 10;
+  uint64 overall_skipped = 11;
+}
+
+message RuntimeStageDetails {
+  string stage_id = 1;
+  string display_name = 2;
+  RuntimeStageState state = 3;
+  string unit = 4;
+  uint64 completed = 5;
+  uint64 total = 6;
+  bool total_known = 7;
+  uint64 failed = 8;
+  uint64 skipped = 9;
+  double speed_per_second = 10;
+  uint64 elapsed_ms = 11;
+  optional uint64 eta_ms = 12;
+}
+
+message RuntimeWorkerDetails {
+  uint32 slot = 1;
+  optional uint32 process_id = 2;
+  string stage_id = 3;
+  string display_path = 4;
+  string physical_disk_id = 5;
+  uint64 completed_files = 6;
+  double speed_per_second = 7;
+}
+
+message RuntimeFailureDetails {
+  string stage_id = 1;
+  string display_path = 2;
+  string message = 3;
+}
+
+message RuntimeTaskDetails {
+  RuntimeTaskSummary summary = 1;
+  repeated RuntimeStageDetails stages = 2;
+  repeated RuntimeWorkerDetails workers = 3;
+  repeated RuntimeFailureDetails failures = 4;
+}
+
+message ListRuntimeTasks {
+  string cursor = 1;
+  uint32 limit = 2;
+  repeated RuntimeTaskSummary tasks = 3;
+  string next_cursor = 4;
+}
+
+message GetRuntimeTaskDetails {
+  string runtime_task_id = 1;
+  RuntimeTaskDetails details = 2;
+}
+
+message RuntimeTaskChanged {
+  string runtime_task_id = 1;
+  string state = 2;
+}
+
 message Envelope {
   uint64 request_id = 1;
   oneof payload {
@@ -446,6 +524,9 @@ message Envelope {
     NodeRestartAccepted node_restart_accepted = 40;
     ListFileFaults list_file_faults = 41;
     ClearFileFault clear_file_fault = 42;
+    ListRuntimeTasks list_runtime_tasks = 43;
+    GetRuntimeTaskDetails get_runtime_task_details = 44;
+    RuntimeTaskChanged runtime_task_changed = 45;
   }
 }
 
