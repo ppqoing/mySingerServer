@@ -317,80 +317,9 @@ impl NodeStore {
         now_ms: i64,
     ) -> Result<TaskEvent, StoreError> {
         let transaction = self.connection.transaction()?;
-        let (task_id_text, current): (String, String) = transaction.query_row(
-            "SELECT task_id,status FROM task_items WHERE item_id=?1",
-            [item_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        if current != "running" {
-            return Err(StoreError::InvalidState(format!(
-                "任务项 {item_id} 不是 running"
-            )));
-        }
-        let (item_status, error, content_id) = match completion {
-            TaskItemCompletion::Succeeded { content_id } => {
-                (TaskItemStatus::Succeeded, None, content_id)
-            }
-            TaskItemCompletion::Failed(error) => (TaskItemStatus::Failed, Some(error), None),
-            TaskItemCompletion::Cancelled => (TaskItemStatus::Cancelled, None, None),
-        };
-        transaction.execute(
-            "UPDATE task_items SET status=?2,error=?3,
-               content_id=COALESCE(?4,content_id) WHERE item_id=?1",
-            params![
-                item_id,
-                item_status.as_str(),
-                error,
-                content_id.map(ContentId::as_i64)
-            ],
-        )?;
-        let counts = item_counts(&transaction, &task_id_text)?;
-        let kind: String = transaction.query_row(
-            "SELECT kind FROM tasks WHERE task_id=?1",
-            [&task_id_text],
-            |row| row.get(0),
-        )?;
-        let persisted_root_count: i64 = transaction.query_row(
-            "SELECT COUNT(*) FROM task_scan_roots WHERE task_id=?1",
-            [&task_id_text],
-            |row| row.get(0),
-        )?;
-        let waits_for_scan_finalize = kind == "scan" && persisted_root_count > 0;
-        let task_status = if counts.3 == 0 && !waits_for_scan_finalize {
-            TaskStatus::Completed
-        } else {
-            TaskStatus::Running
-        };
-        transaction.execute(
-            "UPDATE tasks SET status=?2,event_seq=event_seq+1,
-               succeeded=?3,failed_items=?4,cancelled=?5,updated_at_ms=?6,
-               outbox_high_seq=CASE WHEN ?2='completed' THEN
-                 COALESCE((SELECT seq FROM sqlite_sequence WHERE name='sync_outbox'),0)
-                 ELSE outbox_high_seq END
-             WHERE task_id=?1",
-            params![
-                task_id_text,
-                task_status.as_str(),
-                counts.0,
-                counts.1,
-                counts.2,
-                now_ms
-            ],
-        )?;
-        let event_seq: i64 = transaction.query_row(
-            "SELECT event_seq FROM tasks WHERE task_id=?1",
-            [&task_id_text],
-            |row| row.get(0),
-        )?;
-        let task_id = parse_task_id(&task_id_text)?;
+        let event = complete_item_in_transaction(&transaction, item_id, completion, now_ms)?;
         transaction.commit()?;
-        Ok(TaskEvent {
-            task_id,
-            item_id: item_id.to_owned(),
-            item_status,
-            task_status,
-            event_seq: event_seq as u64,
-        })
+        Ok(event)
     }
 
     /// 把上次进程遗留的 running 项重新排队，其他四种项状态保持不变。
@@ -785,6 +714,86 @@ fn item_counts(
         [task_id],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
     )?)
+}
+
+pub(crate) fn complete_item_in_transaction(
+    transaction: &Transaction<'_>,
+    item_id: &str,
+    completion: TaskItemCompletion,
+    now_ms: i64,
+) -> Result<TaskEvent, StoreError> {
+    let (task_id_text, current): (String, String) = transaction.query_row(
+        "SELECT task_id,status FROM task_items WHERE item_id=?1",
+        [item_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if current != "running" {
+        return Err(StoreError::InvalidState(format!(
+            "任务项 {item_id} 不是 running"
+        )));
+    }
+    let (item_status, error, content_id) = match completion {
+        TaskItemCompletion::Succeeded { content_id } => {
+            (TaskItemStatus::Succeeded, None, content_id)
+        }
+        TaskItemCompletion::Failed(error) => (TaskItemStatus::Failed, Some(error), None),
+        TaskItemCompletion::Cancelled => (TaskItemStatus::Cancelled, None, None),
+    };
+    transaction.execute(
+        "UPDATE task_items SET status=?2,error=?3,
+           content_id=COALESCE(?4,content_id) WHERE item_id=?1",
+        params![
+            item_id,
+            item_status.as_str(),
+            error,
+            content_id.map(ContentId::as_i64)
+        ],
+    )?;
+    let counts = item_counts(transaction, &task_id_text)?;
+    let kind: String = transaction.query_row(
+        "SELECT kind FROM tasks WHERE task_id=?1",
+        [&task_id_text],
+        |row| row.get(0),
+    )?;
+    let persisted_root_count: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM task_scan_roots WHERE task_id=?1",
+        [&task_id_text],
+        |row| row.get(0),
+    )?;
+    let waits_for_scan_finalize = kind == "scan" && persisted_root_count > 0;
+    let task_status = if counts.3 == 0 && !waits_for_scan_finalize {
+        TaskStatus::Completed
+    } else {
+        TaskStatus::Running
+    };
+    transaction.execute(
+        "UPDATE tasks SET status=?2,event_seq=event_seq+1,
+           succeeded=?3,failed_items=?4,cancelled=?5,updated_at_ms=?6,
+           outbox_high_seq=CASE WHEN ?2='completed' THEN
+             COALESCE((SELECT seq FROM sqlite_sequence WHERE name='sync_outbox'),0)
+             ELSE outbox_high_seq END
+         WHERE task_id=?1",
+        params![
+            task_id_text,
+            task_status.as_str(),
+            counts.0,
+            counts.1,
+            counts.2,
+            now_ms
+        ],
+    )?;
+    let event_seq: i64 = transaction.query_row(
+        "SELECT event_seq FROM tasks WHERE task_id=?1",
+        [&task_id_text],
+        |row| row.get(0),
+    )?;
+    Ok(TaskEvent {
+        task_id: parse_task_id(&task_id_text)?,
+        item_id: item_id.to_owned(),
+        item_status,
+        task_status,
+        event_seq: event_seq as u64,
+    })
 }
 
 fn parse_task_id(value: &str) -> Result<TaskId, StoreError> {

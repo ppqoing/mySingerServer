@@ -6,11 +6,13 @@ use rusqlite::{OptionalExtension, params};
 
 use crate::{
     CompleteStage1, CompleteStage2, ContentId, FeatureWrite, ImageStage1Fields, NodeStore,
-    StoreError, VideoFrameStage1Fields, VideoFrameStage2Fields, VideoMetadataFields,
+    StoreError, TaskItemCompletion, VideoFrameStage1Fields, VideoFrameStage2Fields,
+    VideoMetadataFields,
     content::content_key_in_transaction,
     open::{fixed_bytes, sqlite_integer},
     outbox::append_sync_change,
     rows::RowEncoder,
+    tasks::complete_item_in_transaction,
 };
 
 impl NodeStore {
@@ -128,6 +130,124 @@ impl NodeStore {
         let sequence = append_sync_change(&transaction, entity_kind, payload)?;
         transaction.commit()?;
         Ok(sequence)
+    }
+
+    /// 仅当扫描项仍为 running 且任务未取消时，在一个事务提交全部一筛、outbox 与项成功。
+    ///
+    /// 返回 `false` 表示取消或晚到结果被忽略；此时内容类型、特征和联系表引用均不改变。
+    pub fn commit_scan_stage1_if_running(
+        &mut self,
+        item_id: &str,
+        content_id: ContentId,
+        media_kind: MediaKind,
+        writes: Vec<FeatureWrite>,
+        now_ms: i64,
+    ) -> Result<bool, StoreError> {
+        let transaction = self.connection.transaction()?;
+        let (item_status, task_status): (String, String) = transaction.query_row(
+            "SELECT ti.status,t.status
+             FROM task_items ti JOIN tasks t ON t.task_id=ti.task_id
+             WHERE ti.item_id=?1",
+            [item_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if item_status != "running" || !matches!(task_status.as_str(), "queued" | "running") {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        transaction.execute(
+            "UPDATE contents SET media_kind=?2 WHERE content_id=?1",
+            params![
+                content_id.as_i64(),
+                match media_kind {
+                    MediaKind::Image => "image",
+                    MediaKind::Video => "video",
+                    MediaKind::Other => "other",
+                }
+            ],
+        )?;
+        let key = content_key_in_transaction(&transaction, content_id)?;
+        for write in writes {
+            let (entity_kind, payload) = match write {
+                FeatureWrite::ImageStage1(fields) => {
+                    transaction.execute(
+                        "INSERT INTO image_stage1(content_id,width,height,pdq,quality)
+                         VALUES(?1,?2,?3,?4,?5)
+                         ON CONFLICT(content_id) DO UPDATE SET
+                           width=excluded.width,height=excluded.height,
+                           pdq=excluded.pdq,quality=excluded.quality",
+                        params![
+                            content_id.as_i64(),
+                            fields.width,
+                            fields.height,
+                            fields.pdq.map(|hash| hash.as_bytes().to_vec()),
+                            fields.quality
+                        ],
+                    )?;
+                    ("image_stage1", encode_image_stage1(key, fields))
+                }
+                FeatureWrite::VideoMetadata(fields) => {
+                    transaction.execute(
+                        "INSERT INTO video_metadata(content_id,duration_ms,width,height)
+                         VALUES(?1,?2,?3,?4)
+                         ON CONFLICT(content_id) DO UPDATE SET
+                           duration_ms=excluded.duration_ms,width=excluded.width,height=excluded.height",
+                        params![
+                            content_id.as_i64(),
+                            fields.duration_ms.map(sqlite_integer).transpose()?,
+                            fields.width,
+                            fields.height
+                        ],
+                    )?;
+                    ("video_metadata", encode_video_metadata(key, fields))
+                }
+                FeatureWrite::VideoFrameStage1(frame) => {
+                    validate_slot(frame.slot)?;
+                    transaction.execute(
+                        "INSERT INTO video_frame_stage1(
+                           content_id,slot,time_ms,decoded,width,height,pdq,quality)
+                         VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+                         ON CONFLICT(content_id,slot) DO UPDATE SET
+                           time_ms=excluded.time_ms,decoded=excluded.decoded,
+                           width=excluded.width,height=excluded.height,
+                           pdq=excluded.pdq,quality=excluded.quality",
+                        params![
+                            content_id.as_i64(),
+                            frame.slot,
+                            sqlite_integer(frame.time_ms)?,
+                            frame.decoded,
+                            frame.width,
+                            frame.height,
+                            frame.pdq.map(|hash| hash.as_bytes().to_vec()),
+                            frame.quality
+                        ],
+                    )?;
+                    ("video_frame_stage1", encode_video_frame_stage1(key, frame))
+                }
+                FeatureWrite::ContactSheet(relative_path) => {
+                    transaction.execute(
+                        "INSERT INTO contact_sheets(content_id,relative_path) VALUES(?1,?2)
+                         ON CONFLICT(content_id) DO UPDATE SET relative_path=excluded.relative_path",
+                        params![content_id.as_i64(), &relative_path],
+                    )?;
+                    contact_sheet_payload(key, &relative_path)
+                }
+                FeatureWrite::ImageStage2(_) | FeatureWrite::VideoFrameStage2(_) => {
+                    return Err(StoreError::InvalidFeature("扫描一筛事务不能写入二筛结果"));
+                }
+            };
+            append_sync_change(&transaction, entity_kind, payload)?;
+        }
+        complete_item_in_transaction(
+            &transaction,
+            item_id,
+            TaskItemCompletion::Succeeded {
+                content_id: Some(content_id),
+            },
+            now_ms,
+        )?;
+        transaction.commit()?;
+        Ok(true)
     }
 
     /// 只返回图片完整四字段，或六槽位记录且至少四个成功帧字段完整的视频一筛。

@@ -1,18 +1,26 @@
 //! 扫描缓存短路径、内容复用、一筛提交和成功收尾事务。
 
-use std::{fs, path::PathBuf, time::Duration};
+use std::{collections::BTreeMap, fs, path::PathBuf, time::Duration};
 
 use dedup_core::{DisplayPath, LocationKey, MediaKind, NormalizedPath, TaskId};
 use dedup_media::sample_positions;
 use dedup_node_store::{
     ContentId, FeatureWrite, ImageStage1Fields, NewTaskItem, NodeStore, ScannedPath,
-    TaskItemCompletion, VideoFrameStage1Fields, VideoMetadataFields,
+    TaskItemCompletion, TaskStatus, VideoFrameStage1Fields, VideoMetadataFields,
 };
 use dedup_protocol::proto::{self, worker_envelope};
+use dedup_windows::ReadCancellationToken;
+use tokio::task::JoinSet;
 
-use crate::worker::{WorkerEvent, WorkerPool, decode_stage1_payload};
+use crate::{
+    io::ReadFailure,
+    worker::{WorkerEvent, WorkerPool, decode_stage1_payload},
+};
 
-use super::{FileEnumerator, FileHasher, ScanError};
+use super::{
+    FileEnumerator, FileHasher, PipelineFileReader, PipelineLimits, ReadProduct, ScanError,
+    pipeline::spawn_bounded_enumeration,
+};
 
 const LOOKUP_BATCH_SIZE: usize = 1000;
 
@@ -77,6 +85,14 @@ pub struct Stage1Request {
     pub content_id: ContentId,
 }
 
+/// 一条可乱序返回但仍以 item ID 归并的一筛结果。
+pub struct Stage1BatchResult {
+    /// 原持久任务项 ID。
+    pub item_id: String,
+    /// 该项的 Worker 输出或文件级错误。
+    pub output: Result<crate::worker::Stage1Output, String>,
+}
+
 /// 扫描引擎调用的媒体探测与一筛计算边界。
 #[allow(async_fn_in_trait)]
 pub trait Stage1Processor {
@@ -85,6 +101,24 @@ pub trait Stage1Processor {
         &mut self,
         request: Stage1Request,
     ) -> Result<crate::worker::Stage1Output, String>;
+
+    /// 当前处理器可以同时保持的不同任务项数量。
+    fn max_in_flight(&self) -> usize {
+        1
+    }
+
+    /// 批量派发并允许按任意完成顺序返回；默认保持旧处理器的串行兼容。
+    async fn process_batch(&mut self, requests: Vec<Stage1Request>) -> Vec<Stage1BatchResult> {
+        let mut results = Vec::with_capacity(requests.len());
+        for request in requests {
+            let item_id = request.item_id.clone();
+            results.push(Stage1BatchResult {
+                item_id,
+                output: self.process(request).await,
+            });
+        }
+        results
+    }
 }
 
 /// 校验根目录并在 SQLite 持久化真实扫描任务，计算可随后在独立 owner 中继续。
@@ -105,12 +139,14 @@ pub fn begin_scan_task(
 /// 串行借用真实 WorkerPool 完成一次扫描一筛请求的适配器。
 pub struct WorkerPoolStage1Processor<'a> {
     pool: &'a mut WorkerPool,
+    capacity: usize,
 }
 
 impl<'a> WorkerPoolStage1Processor<'a> {
     /// 借用由 NodeEngine actor 独占的 WorkerPool。
-    pub const fn new(pool: &'a mut WorkerPool) -> Self {
-        Self { pool }
+    pub fn new(pool: &'a mut WorkerPool) -> Self {
+        let capacity = pool.worker_process_ids().len().max(1);
+        Self { pool, capacity }
     }
 }
 
@@ -164,6 +200,110 @@ impl Stage1Processor for WorkerPoolStage1Processor<'_> {
             None => Err("WorkerPool 已关闭".into()),
         }
     }
+
+    fn max_in_flight(&self) -> usize {
+        self.capacity
+    }
+
+    async fn process_batch(&mut self, requests: Vec<Stage1Request>) -> Vec<Stage1BatchResult> {
+        let mut pending = BTreeMap::new();
+        let mut results = Vec::with_capacity(requests.len());
+        for request in requests {
+            let task_id = request.task_id.as_uuid().to_string();
+            let item_id = request.item_id.clone();
+            let envelope = proto::WorkerEnvelope {
+                payload: Some(worker_envelope::Payload::ProbeAndStage1(
+                    proto::ProbeAndStage1 {
+                        task_id: task_id.clone(),
+                        item_id: item_id.clone(),
+                        display_path: request
+                            .display_path
+                            .as_path()
+                            .to_string_lossy()
+                            .into_owned(),
+                        media_kind: proto::MediaKind::MediaOther as i32,
+                    },
+                )),
+            };
+            match self.pool.dispatch(envelope).await {
+                Ok(()) => {
+                    pending.insert(item_id, task_id);
+                }
+                Err(error) => results.push(Stage1BatchResult {
+                    item_id,
+                    output: Err(error.to_string()),
+                }),
+            }
+        }
+        while !pending.is_empty() {
+            let Some(event) = self.pool.next_event().await else {
+                for item_id in pending.into_keys() {
+                    results.push(Stage1BatchResult {
+                        item_id,
+                        output: Err("WorkerPool 已关闭".into()),
+                    });
+                }
+                break;
+            };
+            match event {
+                WorkerEvent::Completed {
+                    task_id,
+                    item_id,
+                    response,
+                } if pending.get(&item_id) == Some(&task_id) => {
+                    pending.remove(&item_id);
+                    let output = match response.payload {
+                        Some(worker_envelope::Payload::Stage1Result(result)) => {
+                            decode_stage1_payload(&result.payload)
+                                .map_err(|error| error.to_string())
+                        }
+                        Some(worker_envelope::Payload::WorkerFailure(failure)) => {
+                            Err(failure.message)
+                        }
+                        _ => Err("Worker 返回了非一筛响应".into()),
+                    };
+                    results.push(Stage1BatchResult { item_id, output });
+                }
+                WorkerEvent::Crashed {
+                    task_id,
+                    item_id,
+                    message,
+                } if pending.get(&item_id) == Some(&task_id) => {
+                    pending.remove(&item_id);
+                    results.push(Stage1BatchResult {
+                        item_id,
+                        output: Err(message),
+                    });
+                }
+                WorkerEvent::Cancelled { task_id, item_id }
+                    if pending.get(&item_id) == Some(&task_id) =>
+                {
+                    pending.remove(&item_id);
+                    results.push(Stage1BatchResult {
+                        item_id,
+                        output: Err("一筛已取消".into()),
+                    });
+                }
+                WorkerEvent::InfrastructureFailure { message } => {
+                    for item_id in std::mem::take(&mut pending).into_keys() {
+                        results.push(Stage1BatchResult {
+                            item_id,
+                            output: Err(message.clone()),
+                        });
+                    }
+                }
+                _ => {
+                    for item_id in std::mem::take(&mut pending).into_keys() {
+                        results.push(Stage1BatchResult {
+                            item_id,
+                            output: Err("WorkerPool 返回了不属于当前扫描批次的事件".into()),
+                        });
+                    }
+                }
+            }
+        }
+        results
+    }
 }
 
 /// 组合一个枚举器、一个可计数哈希实现和联系表缓存目录的扫描引擎。
@@ -206,6 +346,186 @@ where
         let task_id = begin_scan_task(store, &options, now_ms)?;
         self.run_existing(store, task_id, options, processor, now_ms)
             .await
+    }
+
+    /// 使用有界枚举、并行读取、批量 Worker 和当前任务唯一 SQLite writer 执行扫描。
+    pub async fn run_parallel_with<R, P>(
+        &mut self,
+        store: &mut NodeStore,
+        options: ScanOptions,
+        reader: R,
+        processor: &mut P,
+        limits: PipelineLimits,
+        cancellation: ReadCancellationToken,
+        now_ms: i64,
+    ) -> Result<ScanSummary, ScanError>
+    where
+        E: Clone + Send + 'static,
+        R: PipelineFileReader,
+        P: Stage1Processor,
+    {
+        let task_id = begin_scan_task(store, &options, now_ms)?;
+        self.run_existing_parallel_with(
+            store,
+            task_id,
+            options,
+            reader,
+            processor,
+            limits,
+            cancellation,
+            now_ms,
+        )
+        .await
+    }
+
+    /// 从已持久化扫描任务继续运行同一有界流水线。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_existing_parallel_with<R, P>(
+        &mut self,
+        store: &mut NodeStore,
+        task_id: TaskId,
+        options: ScanOptions,
+        reader: R,
+        processor: &mut P,
+        limits: PipelineLimits,
+        cancellation: ReadCancellationToken,
+        now_ms: i64,
+    ) -> Result<ScanSummary, ScanError>
+    where
+        E: Clone + Send + 'static,
+        R: PipelineFileReader,
+        P: Stage1Processor,
+    {
+        if limits.channel_capacity() == 0 || limits.max_read_tasks() == 0 {
+            return Err(ScanError::Stage1("扫描管道容量必须大于零".into()));
+        }
+        let (mut enumerated, enumeration_task) = spawn_bounded_enumeration(
+            self.enumerator.clone(),
+            options.roots.clone(),
+            limits.channel_capacity(),
+            cancellation.clone(),
+        );
+        let mut reads = JoinSet::new();
+        let mut enumeration_closed = false;
+        let mut seen = Vec::new();
+        let mut pending_stage1 = Vec::new();
+        let mut summary = ScanSummary {
+            task_id,
+            total_files: 0,
+            cache_hits: 0,
+            hashed: 0,
+            reused_contents: 0,
+            scheduled_stage1: 0,
+            skipped_incomplete: 0,
+            file_failures: 0,
+            outbox_high_seq: 0,
+        };
+        loop {
+            if cancellation.is_cancelled() {
+                drop(enumerated);
+                reads.abort_all();
+                while reads.join_next().await.is_some() {}
+                let _ = enumeration_task.await;
+                return Err(ScanError::Cancelled);
+            }
+            while reads.len() < limits.max_read_tasks() {
+                match enumerated.try_recv() {
+                    Ok(scanned) => self.accept_parallel_row(
+                        store,
+                        task_id,
+                        &options,
+                        &reader,
+                        &cancellation,
+                        &mut reads,
+                        &mut seen,
+                        &mut summary,
+                        scanned,
+                        now_ms,
+                    )?,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        enumeration_closed = true;
+                        break;
+                    }
+                }
+            }
+            if pending_stage1.len() >= processor.max_in_flight().max(1) {
+                flush_stage1_batch(
+                    store,
+                    processor,
+                    &self.contact_sheet_root,
+                    &cancellation,
+                    &mut pending_stage1,
+                    &mut summary,
+                    now_ms,
+                )
+                .await?;
+            }
+            if enumeration_closed && reads.is_empty() {
+                break;
+            }
+            if reads.len() >= limits.max_read_tasks() || enumeration_closed {
+                let joined = reads
+                    .join_next()
+                    .await
+                    .ok_or_else(|| ScanError::Stage1("读取任务意外为空".into()))?;
+                self.accept_parallel_read(
+                    store,
+                    task_id,
+                    &options,
+                    &mut pending_stage1,
+                    &mut summary,
+                    joined.map_err(|error| ScanError::Stage1(error.to_string()))?,
+                    now_ms,
+                )?;
+                continue;
+            }
+            tokio::select! {
+                row = enumerated.recv() => match row {
+                    Some(scanned) => self.accept_parallel_row(
+                        store, task_id, &options, &reader, &cancellation, &mut reads,
+                        &mut seen, &mut summary, scanned, now_ms,
+                    )?,
+                    None => enumeration_closed = true,
+                },
+                joined = reads.join_next(), if !reads.is_empty() => {
+                    self.accept_parallel_read(
+                        store, task_id, &options, &mut pending_stage1, &mut summary,
+                        joined.expect("分支保证存在").map_err(|error| ScanError::Stage1(error.to_string()))?,
+                        now_ms,
+                    )?;
+                }
+            }
+        }
+        flush_stage1_batch(
+            store,
+            processor,
+            &self.contact_sheet_root,
+            &cancellation,
+            &mut pending_stage1,
+            &mut summary,
+            now_ms,
+        )
+        .await?;
+        match enumeration_task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(ScanError::Cancelled)) => return Err(ScanError::Cancelled),
+            Ok(Err(error)) => {
+                store.fail_task(task_id, now_ms)?;
+                return Err(error);
+            }
+            Err(error) => {
+                store.fail_task(task_id, now_ms)?;
+                return Err(ScanError::Stage1(error.to_string()));
+            }
+        }
+        if cancellation.is_cancelled()
+            || store.task_snapshot(task_id)?.status == TaskStatus::Cancelled
+        {
+            return Err(ScanError::Cancelled);
+        }
+        summary.outbox_high_seq = store.finalize_scan_task(task_id, &seen, now_ms)?;
+        Ok(summary)
     }
 
     /// 从已持久化的真实任务继续枚举、哈希、一筛和成功收尾。
@@ -300,6 +620,103 @@ where
         Ok(summary)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn accept_parallel_row<R>(
+        &self,
+        store: &mut NodeStore,
+        task_id: TaskId,
+        options: &ScanOptions,
+        reader: &R,
+        cancellation: &ReadCancellationToken,
+        reads: &mut JoinSet<(ScannedPath, Result<ReadProduct<R::Lease>, ReadFailure>)>,
+        seen: &mut Vec<NormalizedPath>,
+        summary: &mut ScanSummary,
+        scanned: ScannedPath,
+        now_ms: i64,
+    ) -> Result<(), ScanError>
+    where
+        R: PipelineFileReader,
+    {
+        summary.total_files += 1;
+        seen.push(scanned.normalized_path.clone());
+        let cached_content = if options.force_recompute {
+            None
+        } else {
+            store.lookup_scanned_paths(std::slice::from_ref(&scanned))?[0].content_id
+        };
+        if let Some(content_id) = cached_content {
+            summary.cache_hits += 1;
+            if self.complete_reused_item(store, task_id, &scanned, content_id, now_ms)? {
+                summary.skipped_incomplete += 1;
+            }
+            return Ok(());
+        }
+        let task_reader = reader.clone();
+        let task_scanned = scanned.clone();
+        let task_cancellation = cancellation.clone();
+        reads.spawn(async move {
+            let result = task_reader
+                .read(task_scanned.clone(), task_cancellation)
+                .await;
+            (task_scanned, result)
+        });
+        Ok(())
+    }
+
+    fn accept_parallel_read<L>(
+        &self,
+        store: &mut NodeStore,
+        task_id: TaskId,
+        options: &ScanOptions,
+        pending_stage1: &mut Vec<PendingStage1<L>>,
+        summary: &mut ScanSummary,
+        (scanned, result): (ScannedPath, Result<ReadProduct<L>, ReadFailure>),
+        now_ms: i64,
+    ) -> Result<(), ScanError> {
+        let ReadProduct { md5, lease } = match result {
+            Ok(value) => value,
+            Err(ReadFailure::Cancelled) => return Err(ScanError::Cancelled),
+            Err(error) => {
+                summary.file_failures += 1;
+                if store.task_snapshot(task_id)?.status != TaskStatus::Cancelled {
+                    complete_file_failure(
+                        store,
+                        task_id,
+                        &scanned,
+                        None,
+                        "md5",
+                        error.to_string(),
+                        now_ms,
+                    )?;
+                }
+                return Ok(());
+            }
+        };
+        summary.hashed += 1;
+        let content = store.upsert_content_and_location(&scanned, md5, MediaKind::Other)?;
+        if content.reused && !options.force_recompute {
+            summary.reused_contents += 1;
+            if self.complete_reused_item(store, task_id, &scanned, content.id, now_ms)? {
+                summary.skipped_incomplete += 1;
+            }
+            drop(lease);
+            return Ok(());
+        }
+        summary.scheduled_stage1 += 1;
+        let item_id =
+            append_and_claim(store, task_id, &scanned, content.id, "probe_stage1", now_ms)?;
+        pending_stage1.push(PendingStage1 {
+            request: Stage1Request {
+                task_id,
+                item_id,
+                display_path: scanned.display_path.clone(),
+                content_id: content.id,
+            },
+            lease,
+        });
+        Ok(())
+    }
+
     fn complete_reused_item(
         &self,
         store: &mut NodeStore,
@@ -355,6 +772,75 @@ where
         }
         Ok(true)
     }
+}
+
+struct PendingStage1<L> {
+    request: Stage1Request,
+    lease: L,
+}
+
+async fn flush_stage1_batch<P, L>(
+    store: &mut NodeStore,
+    processor: &mut P,
+    contact_sheet_root: &PathBuf,
+    cancellation: &ReadCancellationToken,
+    pending: &mut Vec<PendingStage1<L>>,
+    summary: &mut ScanSummary,
+    now_ms: i64,
+) -> Result<(), ScanError>
+where
+    P: Stage1Processor,
+{
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let works = std::mem::take(pending);
+    let requests = works
+        .iter()
+        .map(|work| work.request.clone())
+        .collect::<Vec<_>>();
+    let mut results = processor
+        .process_batch(requests)
+        .await
+        .into_iter()
+        .map(|result| (result.item_id, result.output))
+        .collect::<BTreeMap<_, _>>();
+    for PendingStage1 { request, lease } in works {
+        if cancellation.is_cancelled()
+            || store.task_snapshot(request.task_id)?.status == TaskStatus::Cancelled
+        {
+            drop(lease);
+            continue;
+        }
+        let output = results
+            .remove(&request.item_id)
+            .unwrap_or_else(|| Err("Worker 批次缺少对应 item 结果".into()));
+        match output {
+            Ok(output) => {
+                let (media_kind, writes) =
+                    prepare_stage1_writes(request.content_id, contact_sheet_root, output)?;
+                let _ = store.commit_scan_stage1_if_running(
+                    &request.item_id,
+                    request.content_id,
+                    media_kind,
+                    writes,
+                    now_ms,
+                )?;
+            }
+            Err(error) => {
+                if store.task_snapshot(request.task_id)?.status != TaskStatus::Cancelled {
+                    store.complete_item(
+                        &request.item_id,
+                        TaskItemCompletion::Failed(error),
+                        now_ms,
+                    )?;
+                    summary.file_failures += 1;
+                }
+            }
+        }
+        drop(lease);
+    }
+    Ok(())
 }
 
 fn append_and_claim(
@@ -439,8 +925,22 @@ fn persist_stage1(
     contact_sheet_root: &PathBuf,
     output: crate::worker::Stage1Output,
 ) -> Result<(), ScanError> {
-    store.set_content_media_kind(content_id, output.media_kind)?;
-    match output.media_kind {
+    let (media_kind, writes) = prepare_stage1_writes(content_id, contact_sheet_root, output)?;
+    store.set_content_media_kind(content_id, media_kind)?;
+    for write in writes {
+        store.commit_feature_result(content_id, None, write)?;
+    }
+    Ok(())
+}
+
+fn prepare_stage1_writes(
+    content_id: ContentId,
+    contact_sheet_root: &PathBuf,
+    output: crate::worker::Stage1Output,
+) -> Result<(MediaKind, Vec<FeatureWrite>), ScanError> {
+    let media_kind = output.media_kind;
+    let mut writes = Vec::new();
+    match media_kind {
         MediaKind::Other => {}
         MediaKind::Image => {
             let fields = output
@@ -449,51 +949,38 @@ fn persist_stage1(
                 .and_then(|frame| frame.feature)
                 .map(ImageStage1Fields::from)
                 .unwrap_or_default();
-            store.commit_feature_result(content_id, None, FeatureWrite::ImageStage1(fields))?;
+            writes.push(FeatureWrite::ImageStage1(fields));
         }
         MediaKind::Video => {
-            store.commit_feature_result(
-                content_id,
-                None,
-                FeatureWrite::VideoMetadata(VideoMetadataFields {
-                    duration_ms: output.duration_ms,
-                    width: Some(output.width),
-                    height: Some(output.height),
-                }),
-            )?;
+            writes.push(FeatureWrite::VideoMetadata(VideoMetadataFields {
+                duration_ms: output.duration_ms,
+                width: Some(output.width),
+                height: Some(output.height),
+            }));
             let positions =
                 sample_positions(Duration::from_millis(output.duration_ms.unwrap_or(0)));
             for slot in 0..6_u8 {
                 let frame = output.frames.iter().find(|frame| frame.slot == slot);
                 let feature = frame.and_then(|frame| frame.feature);
-                store.commit_feature_result(
-                    content_id,
-                    None,
-                    FeatureWrite::VideoFrameStage1(VideoFrameStage1Fields {
-                        slot,
-                        time_ms: positions[slot as usize].as_millis() as u64,
-                        decoded: feature.is_some(),
-                        width: feature.map(|value| value.width),
-                        height: feature.map(|value| value.height),
-                        pdq: feature.map(|value| value.pdq),
-                        quality: feature.map(|value| value.quality),
-                    }),
-                )?;
+                writes.push(FeatureWrite::VideoFrameStage1(VideoFrameStage1Fields {
+                    slot,
+                    time_ms: positions[slot as usize].as_millis() as u64,
+                    decoded: feature.is_some(),
+                    width: feature.map(|value| value.width),
+                    height: feature.map(|value| value.height),
+                    pdq: feature.map(|value| value.pdq),
+                    quality: feature.map(|value| value.quality),
+                }));
             }
             if let Some(jpeg) = output.contact_sheet_jpeg {
                 fs::create_dir_all(contact_sheet_root)?;
-                let key = store
-                    .lookup_scanned_paths(&[])
-                    .map(|_| content_id.as_i64().to_string())?;
-                let file_name = format!("{key}.jpg");
+                let file_name = format!("{}.jpg", content_id.as_i64());
                 fs::write(contact_sheet_root.join(&file_name), jpeg)?;
-                store.commit_feature_result(
-                    content_id,
-                    None,
-                    FeatureWrite::ContactSheet(format!("contact-sheets/{file_name}")),
-                )?;
+                writes.push(FeatureWrite::ContactSheet(format!(
+                    "contact-sheets/{file_name}"
+                )));
             }
         }
     }
-    Ok(())
+    Ok((media_kind, writes))
 }

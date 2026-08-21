@@ -21,26 +21,55 @@ impl WindowsWalker {
     /// 递归读取每个根；目录符号链接不继续下钻，避免扫描环。
     pub fn walk(&self, roots: &[DisplayPath]) -> io::Result<Vec<WalkedFile>> {
         let mut files = Vec::new();
-        let mut pending = roots
+        self.walk_into(roots, |file| {
+            files.push(file);
+            Ok(())
+        })?;
+        Ok(files)
+    }
+
+    /// 遍历时逐项交给调用方；回调阻塞时不继续读取后续目录项。
+    pub fn walk_into(
+        &self,
+        roots: &[DisplayPath],
+        mut emit: impl FnMut(WalkedFile) -> io::Result<()>,
+    ) -> io::Result<()> {
+        enum Pending {
+            Directory(PathBuf),
+            File(WalkedFile),
+        }
+        let mut root_paths = roots
             .iter()
-            .rev()
             .map(|root| root.as_path().to_path_buf())
             .collect::<Vec<_>>();
-        while let Some(directory) = pending.pop() {
+        root_paths.sort_by_key(|path| path.to_string_lossy().to_uppercase());
+        let mut pending = root_paths
+            .into_iter()
+            .rev()
+            .map(Pending::Directory)
+            .collect::<Vec<_>>();
+        while let Some(next) = pending.pop() {
+            let directory = match next {
+                Pending::Directory(directory) => directory,
+                Pending::File(file) => {
+                    emit(file)?;
+                    continue;
+                }
+            };
             let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
-            entries.sort_by_key(fs::DirEntry::path);
-            for entry in entries {
+            entries.sort_by_key(|entry| entry.path().to_string_lossy().to_uppercase());
+            for entry in entries.into_iter().rev() {
                 let file_type = entry.file_type()?;
                 if file_type.is_dir() && !file_type.is_symlink() {
-                    pending.push(entry.path());
+                    pending.push(Pending::Directory(entry.path()));
                 } else if file_type.is_file() {
-                    files.push(WalkedFile {
+                    pending.push(Pending::File(WalkedFile {
                         path: entry.path(),
                         file_size: entry.metadata()?.len(),
-                    });
+                    }));
                 }
             }
         }
-        Ok(files)
+        Ok(())
     }
 }

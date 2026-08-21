@@ -4,22 +4,27 @@ mod engine;
 mod enumerator;
 mod everything;
 mod hash;
+mod pipeline;
 
 pub use dedup_windows::WindowsWalker;
 pub use engine::{
-    ScanEngine, ScanOptions, ScanSummary, Stage1Processor, Stage1Request,
+    ScanEngine, ScanOptions, ScanSummary, Stage1BatchResult, Stage1Processor, Stage1Request,
     WorkerPoolStage1Processor, begin_scan_task,
 };
 pub use enumerator::FileEnumerator;
 pub use everything::EverythingEnumerator;
 pub(crate) use everything::{PreferredEverythingEnumerator, ensure_everything_ready};
 pub use hash::{FileHasher, SystemMd5, md5_bytes, md5_file};
+pub use pipeline::{PipelineFileReader, PipelineLimits, ReadProduct, ScheduledFileReader};
 
 use thiserror::Error;
 
 /// 枚举、文件读取、SQLite 或一筛编排失败。
 #[derive(Debug, Error)]
 pub enum ScanError {
+    /// 用户取消当前扫描，不能继续枚举、读取、计算或成功收尾。
+    #[error("扫描已取消")]
+    Cancelled,
     /// 当前枚举器无法完成整次文件列表。
     #[error("文件枚举失败: {0}")]
     Enumeration(String),

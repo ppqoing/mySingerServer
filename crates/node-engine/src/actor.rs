@@ -9,8 +9,8 @@ use std::{
 };
 
 use dedup_core::{
-    AnalysisRunId, ContentKey, CoreError, DeleteMode, DisplayPath, EnumeratorKind, LocationKey,
-    MachineId, NodeConfig, TaskId, Thresholds,
+    AnalysisRunId, ContentKey, CoreError, DeleteMode, DiskReadConfig, DisplayPath, EnumeratorKind,
+    LocationKey, MachineId, NodeConfig, TaskId, Thresholds,
 };
 use dedup_node_store::{
     AnalysisStatus, ConfirmedDeleteItem, DeleteBatchPlan, DeleteOutcome, GroupKind, NodeStore,
@@ -24,7 +24,9 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use dedup_windows::{AppLayout, machine_id_from_fields, read_physical_machine_fields};
+use dedup_windows::{
+    AppLayout, ReadCancellationToken, machine_id_from_fields, read_physical_machine_fields,
+};
 
 use crate::{
     analysis::{
@@ -38,8 +40,8 @@ use crate::{
     host_control::NodeHostControl,
     preview::{PreviewKind, PreviewService},
     scan::{
-        PreferredEverythingEnumerator, ScanEngine, ScanOptions, SystemMd5, WindowsWalker,
-        WorkerPoolStage1Processor, begin_scan_task, ensure_everything_ready,
+        PreferredEverythingEnumerator, ScanEngine, ScanOptions, ScheduledFileReader, SystemMd5,
+        WindowsWalker, WorkerPoolStage1Processor, begin_scan_task, ensure_everything_ready,
     },
     server::{NodeRequestHandler, NodeServer, ServerError},
     worker::{WorkerLaunch, WorkerPool, WorkerPoolConfig, WorkerPoolError, WorkerPoolHandle},
@@ -336,9 +338,10 @@ impl NodeRuntime {
         let logical_cpu_count = std::thread::available_parallelism()
             .map(usize::from)
             .unwrap_or(1);
+        let effective_worker_count = config.worker.effective_worker_count(logical_cpu_count);
         let worker_pool = WorkerPool::start(WorkerPoolConfig::new(
             WorkerLaunch::new(layout.executable_dir().join("worker.exe")),
-            config.worker.effective_worker_count(logical_cpu_count),
+            effective_worker_count,
         ))
         .await?;
         let listener = tokio::net::TcpListener::bind((config.listen_ip, config.port)).await?;
@@ -350,6 +353,8 @@ impl NodeRuntime {
             listen_address,
             &paths.cache_path,
             config.enumerator,
+            config.read.clone(),
+            effective_worker_count,
             Some(Box::new(repository)),
             host_control,
         );
@@ -430,6 +435,8 @@ impl NodeEngine {
             listen_address,
             cache_root,
             EnumeratorKind::WindowsWalker,
+            DiskReadConfig::default(),
+            1,
             None,
             None,
         )
@@ -450,6 +457,8 @@ impl NodeEngine {
             listen_address,
             cache_root,
             EnumeratorKind::WindowsWalker,
+            DiskReadConfig::default(),
+            1,
             Some(repository),
             host_control,
         )
@@ -463,12 +472,15 @@ impl NodeEngine {
         cache_root: &Path,
         enumerator: EnumeratorKind,
     ) -> (NodeEngineHandle, JoinHandle<()>) {
+        let effective_worker_count = worker_pool.worker_process_ids().len().max(1);
         spawn_actor(
             store,
             Some(worker_pool),
             listen_address,
             cache_root,
             enumerator,
+            DiskReadConfig::default(),
+            effective_worker_count,
             None,
             None,
         )
@@ -481,6 +493,8 @@ fn spawn_actor(
     listen_address: SocketAddr,
     cache_root: &Path,
     enumerator: EnumeratorKind,
+    read_config: DiskReadConfig,
+    effective_worker_count: usize,
     config_repository: Option<Box<dyn NodeConfigRepositoryAccess>>,
     host_control: Option<Box<dyn NodeHostControl>>,
 ) -> (NodeEngineHandle, JoinHandle<()>) {
@@ -497,6 +511,8 @@ fn spawn_actor(
             listen_address,
             cache_root: cache_root.to_path_buf(),
             enumerator,
+            read_config,
+            effective_worker_count,
             restarting: false,
             snapshots: BTreeMap::new(),
             active_job: None,
@@ -517,6 +533,8 @@ struct EngineState {
     listen_address: SocketAddr,
     cache_root: std::path::PathBuf,
     enumerator: EnumeratorKind,
+    read_config: DiskReadConfig,
+    effective_worker_count: usize,
     restarting: bool,
     snapshots: BTreeMap<String, OwnedSnapshot>,
     active_job: Option<ActiveJob>,
@@ -547,6 +565,7 @@ enum JobIdentity {
 struct ActiveJob {
     identity: JobIdentity,
     abort: tokio::task::AbortHandle,
+    cancellation: Option<ReadCancellationToken>,
 }
 
 enum BackgroundJob {
@@ -555,6 +574,9 @@ enum BackgroundJob {
         options: ScanOptions,
         enumerator: EnumeratorKind,
         contact_sheets: PathBuf,
+        read_config: DiskReadConfig,
+        effective_worker_count: usize,
+        cancellation: ReadCancellationToken,
     },
     LocalAnalysis {
         run_id: AnalysisRunId,
@@ -855,11 +877,15 @@ impl EngineState {
         };
         let contact_sheets = self.cache_root.join("contact-sheets");
         let task_id = begin_scan_task(&mut self.store, &options, now_ms()).map_err(internal)?;
+        let cancellation = ReadCancellationToken::new();
         if let Err(error) = self.start_background(BackgroundJob::Scan {
             task_id,
             options,
             enumerator,
             contact_sheets,
+            read_config: self.read_config.clone(),
+            effective_worker_count: self.effective_worker_count,
+            cancellation,
         }) {
             let _ = self.store.fail_task(task_id, now_ms());
             return Err(internal(error));
@@ -876,6 +902,12 @@ impl EngineState {
         self.store
             .cancel_task(task_id, now_ms())
             .map_err(store_error)?;
+        if let Some(active) = &self.active_job
+            && active.identity == JobIdentity::Task(task_id)
+            && let Some(cancellation) = &active.cancellation
+        {
+            cancellation.cancel();
+        }
         if let Some(pool) = &self.worker_control {
             pool.cancel_task(&request.task_id).await.map_err(internal)?;
         }
@@ -1338,6 +1370,10 @@ impl EngineState {
             .take()
             .ok_or_else(|| "后台 WorkerPool owner 不可用".to_owned())?;
         let identity = job.identity();
+        let cancellation = match &job {
+            BackgroundJob::Scan { cancellation, .. } => Some(cancellation.clone()),
+            _ => None,
+        };
         let commands = self
             .commands
             .upgrade()
@@ -1354,6 +1390,7 @@ impl EngineState {
         self.active_job = Some(ActiveJob {
             identity,
             abort: task.abort_handle(),
+            cancellation,
         });
         Ok(())
     }
@@ -1424,21 +1461,45 @@ async fn run_background_job(
             options,
             enumerator,
             contact_sheets,
+            read_config,
+            effective_worker_count,
+            cancellation,
         } => {
             let mut processor = WorkerPoolStage1Processor::new(worker_pool);
             let enumerator =
                 resolve_scan_enumerator_with(enumerator, ensure_everything_ready).await;
-            let result = match enumerator {
-                EnumeratorKind::WindowsWalker => {
-                    ScanEngine::new(WindowsWalker, SystemMd5, contact_sheets)
-                        .run_existing(store, task_id, options, &mut processor, now_ms())
-                        .await
-                }
-                EnumeratorKind::Everything => {
-                    ScanEngine::new(PreferredEverythingEnumerator, SystemMd5, contact_sheets)
-                        .run_existing(store, task_id, options, &mut processor, now_ms())
-                        .await
-                }
+            let result = match ScheduledFileReader::new(&read_config, effective_worker_count) {
+                Err(error) => Err(error),
+                Ok((reader, limits)) => match enumerator {
+                    EnumeratorKind::WindowsWalker => {
+                        ScanEngine::new(WindowsWalker, SystemMd5, contact_sheets)
+                            .run_existing_parallel_with(
+                                store,
+                                task_id,
+                                options,
+                                reader,
+                                &mut processor,
+                                limits,
+                                cancellation,
+                                now_ms(),
+                            )
+                            .await
+                    }
+                    EnumeratorKind::Everything => {
+                        ScanEngine::new(PreferredEverythingEnumerator, SystemMd5, contact_sheets)
+                            .run_existing_parallel_with(
+                                store,
+                                task_id,
+                                options,
+                                reader,
+                                &mut processor,
+                                limits,
+                                cancellation,
+                                now_ms(),
+                            )
+                            .await
+                    }
+                },
             };
             if result.is_err() {
                 let _ = store.fail_task(task_id, now_ms());
