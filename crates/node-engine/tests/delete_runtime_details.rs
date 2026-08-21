@@ -221,15 +221,20 @@ async fn assert_precommit_clean(registry: &RuntimeTaskRegistry, reporter_id: &st
         .unwrap();
     assert_eq!(
         revalidate.state,
-        RuntimeStageState::RuntimeStageCompleted as i32,
-        "committer 前重校验必须已收束"
+        RuntimeStageState::RuntimeStageRunning as i32,
+        "committer 前重校验 telemetry 必须保持未发布"
     );
+    assert_eq!(revalidate.completed, 0);
+    assert_eq!(revalidate.failed, 0);
+    assert_eq!(revalidate.skipped, 0);
     let delete = details
         .stages
         .iter()
         .find(|stage| stage.stage_id == "delete_items")
         .unwrap();
     assert_eq!(delete.failed, 0, "committer 前不得发布未持久 item failure");
+    assert_eq!(delete.completed, 0);
+    assert_eq!(delete.skipped, 0);
     assert!(details.failures.is_empty());
 }
 
@@ -368,8 +373,9 @@ async fn summarize_store_failure_is_terminal_and_never_repeats_or_expands_delete
             .find(|stage| stage.stage_id == id)
             .unwrap();
         assert_eq!(stage.state, RuntimeStageState::RuntimeStageCompleted as i32);
-        assert_eq!(stage.completed, plan.items.len() as u64);
+        assert_eq!(stage.completed, 0);
         assert_eq!(stage.failed, 0);
+        assert_eq!(stage.skipped, plan.items.len() as u64);
     }
     assert!(details.summary.as_ref().unwrap().overall_failed > 0);
     assert_eq!(details.failures.len(), 1);
@@ -425,8 +431,56 @@ async fn summarize_failure_suppresses_uncommitted_item_failure_telemetry() {
         RuntimeStageState::RuntimeStageCompleted as i32
     );
     assert_eq!(delete.failed, 0);
-    assert_eq!(delete.completed, 1);
-    assert_eq!(delete.skipped, 1);
+    assert_eq!(delete.completed, 0);
+    assert_eq!(delete.skipped, plan.items.len() as u64);
+}
+
+#[tokio::test]
+async fn stale_revalidation_and_store_failure_publish_only_summarize_failure() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut store, plan, stale, _other, _outside) = local_confirmed_fixture(directory.path());
+    fs::remove_file(&stale).unwrap();
+    let registry = RuntimeTaskRegistry::new();
+    let reporter = registry
+        .begin(
+            RuntimeTaskKind::Delete,
+            store.machine_id().clone(),
+            "重校验和提交同时失败",
+        )
+        .await;
+
+    DeleteEngine::execute_batch_with_runtime_using(
+        &mut store,
+        &plan,
+        &reporter,
+        &ControlledDeleteFilesystem {
+            fail_path: None,
+            calls: Arc::new(AtomicUsize::new(0)),
+        },
+        &FailingCommitter {
+            calls: Arc::new(AtomicUsize::new(0)),
+            registry: registry.clone(),
+            reporter_id: reporter.id().to_owned(),
+        },
+    )
+    .await
+    .unwrap_err();
+
+    let details = registry.details(reporter.id()).await.unwrap();
+    assert_eq!(details.failures.len(), 1);
+    assert_eq!(details.failures[0].stage_id, "summarize");
+    for id in ["revalidate_selection", "delete_items"] {
+        let stage = details
+            .stages
+            .iter()
+            .find(|stage| stage.stage_id == id)
+            .unwrap();
+        assert_eq!(stage.state, RuntimeStageState::RuntimeStageCompleted as i32);
+        assert_eq!(stage.completed, 0);
+        assert_eq!(stage.failed, 0);
+        assert_eq!(stage.skipped, plan.items.len() as u64);
+        assert_eq!(stage.total, plan.items.len() as u64);
+    }
 }
 
 fn local_confirmed_fixture(

@@ -206,7 +206,6 @@ where
         .iter()
         .map(|item| item.result.clone())
         .collect::<Vec<_>>();
-    report_revalidation_terminal(reporter, &executed);
     report_delete_stage(
         reporter,
         RuntimeStage::Summarize,
@@ -219,8 +218,10 @@ where
     let applied = committer.apply(store, plan, &results, external).await;
     match applied {
         Ok(()) => {
-            report_delete_terminal(reporter, &executed, true);
-            record_delete_failures(reporter, &executed);
+            report_revalidation_terminal(reporter, &executed);
+            record_item_failures(reporter, &executed, RuntimeStage::RevalidateSelection);
+            report_delete_terminal(reporter, &executed);
+            record_item_failures(reporter, &executed, RuntimeStage::DeleteItems);
             if let Some(reporter) = reporter {
                 let completed = results
                     .iter()
@@ -258,7 +259,7 @@ where
             Ok(results)
         }
         Err(error) => {
-            report_delete_terminal(reporter, &executed, false);
+            report_uncommitted_terminal(reporter, plan.items.len() as u64);
             if let Some(reporter) = reporter {
                 let _ = reporter.update_overall_nowait(0, Some(plan.items.len() as u64), 1, 0);
             }
@@ -489,11 +490,7 @@ fn report_revalidation_terminal(
     );
 }
 
-fn report_delete_terminal(
-    reporter: Option<&RuntimeTaskReporter>,
-    executed: &[ExecutedDeleteItem],
-    publish_item_failures: bool,
-) {
+fn report_delete_terminal(reporter: Option<&RuntimeTaskReporter>, executed: &[ExecutedDeleteItem]) {
     let total = executed.len() as u64;
     let revalidation_failed = executed
         .iter()
@@ -504,38 +501,49 @@ fn report_delete_terminal(
         .filter(|item| matches!(item.revalidation, RevalidationOutcome::Skipped))
         .count() as u64;
     let delete_failed = executed.iter().filter(|item| item.delete_failed).count() as u64;
-    let published_failed = if publish_item_failures {
-        delete_failed
-    } else {
-        0
-    };
-    let unpublished_failures = delete_failed.saturating_sub(published_failed);
     report_delete_stage(
         reporter,
         RuntimeStage::DeleteItems,
-        if published_failed == 0 {
+        if delete_failed == 0 {
             dedup_protocol::proto::RuntimeStageState::RuntimeStageCompleted
         } else {
             dedup_protocol::proto::RuntimeStageState::RuntimeStageFailed
         },
         total.saturating_sub(revalidation_failed + revalidation_skipped + delete_failed),
         total,
-        published_failed,
-        revalidation_failed + revalidation_skipped + unpublished_failures,
+        delete_failed,
+        revalidation_failed + revalidation_skipped,
     );
 }
 
-fn record_delete_failures(reporter: Option<&RuntimeTaskReporter>, executed: &[ExecutedDeleteItem]) {
+fn report_uncommitted_terminal(reporter: Option<&RuntimeTaskReporter>, total: u64) {
+    for stage in [RuntimeStage::RevalidateSelection, RuntimeStage::DeleteItems] {
+        report_delete_stage(
+            reporter,
+            stage,
+            dedup_protocol::proto::RuntimeStageState::RuntimeStageCompleted,
+            0,
+            total,
+            0,
+            total,
+        );
+    }
+}
+
+fn record_item_failures(
+    reporter: Option<&RuntimeTaskReporter>,
+    executed: &[ExecutedDeleteItem],
+    stage: RuntimeStage,
+) {
     let Some(reporter) = reporter else { return };
-    for item in executed
-        .iter()
-        .filter(|item| item.result.outcome == DeleteOutcome::Failed)
-    {
-        let stage = if item.delete_failed {
-            RuntimeStage::DeleteItems
-        } else {
-            RuntimeStage::RevalidateSelection
-        };
+    for item in executed.iter().filter(|item| {
+        item.result.outcome == DeleteOutcome::Failed
+            && match stage {
+                RuntimeStage::DeleteItems => item.delete_failed,
+                RuntimeStage::RevalidateSelection => !item.delete_failed,
+                _ => false,
+            }
+    }) {
         let _ = reporter.record_failure_nowait(RuntimeFailureUpdate {
             stage,
             display_path: item.display_path.clone(),
