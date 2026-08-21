@@ -19,6 +19,7 @@ use tokio::sync::oneshot;
 #[derive(Clone)]
 struct ConfigHandler {
     state: Arc<Mutex<HandlerState>>,
+    post_save_status_delay: Duration,
 }
 
 struct HandlerState {
@@ -29,6 +30,9 @@ struct HandlerState {
     config: proto::NodeConfigValue,
     saved: bool,
     saves: Vec<proto::SaveNodeConfigAndRestart>,
+    post_save_status_calls: usize,
+    post_save_sync_side_effects: usize,
+    delay_next_post_save_status: bool,
 }
 
 impl ConfigHandler {
@@ -42,16 +46,46 @@ impl ConfigHandler {
                 config: config_value(39100),
                 saved: false,
                 saves: Vec::new(),
+                post_save_status_calls: 0,
+                post_save_sync_side_effects: 0,
+                delay_next_post_save_status: false,
             })),
+            post_save_status_delay: Duration::ZERO,
         }
+    }
+
+    fn with_reconnect_delay(machine: &str, delay: Duration) -> Self {
+        let mut handler = Self::new(machine, machine, "saved-sha");
+        handler.post_save_status_delay = delay;
+        handler.state.lock().unwrap().delay_next_post_save_status = true;
+        handler
     }
 }
 
 impl NodeRequestHandler for ConfigHandler {
     async fn handle(&self, request: proto::Envelope) -> proto::Envelope {
+        let delay_status = if matches!(
+            &request.payload,
+            Some(proto::envelope::Payload::NodeStatus(_))
+        ) {
+            let mut state = self.state.lock().unwrap();
+            let delay = state.saved && state.delay_next_post_save_status;
+            if delay {
+                state.delay_next_post_save_status = false;
+            }
+            delay
+        } else {
+            false
+        };
+        if delay_status {
+            tokio::time::sleep(self.post_save_status_delay).await;
+        }
         let mut state = self.state.lock().unwrap();
         let payload = match request.payload {
             Some(proto::envelope::Payload::NodeStatus(_)) => {
+                if state.saved {
+                    state.post_save_status_calls += 1;
+                }
                 proto::envelope::Payload::NodeStatus(proto::NodeStatus {
                     machine_id: if state.saved {
                         state.reconnect_machine_id.clone()
@@ -63,6 +97,9 @@ impl NodeRequestHandler for ConfigHandler {
                 })
             }
             Some(proto::envelope::Payload::ListTasks(mut page)) => {
+                if state.saved {
+                    state.post_save_sync_side_effects += 1;
+                }
                 page.tasks.clear();
                 page.next_cursor.clear();
                 proto::envelope::Payload::ListTasks(page)
@@ -93,6 +130,18 @@ impl NodeRequestHandler for ConfigHandler {
                     machine_id: accepted_machine,
                     saved_version_sha256: "saved-sha".into(),
                 })
+            }
+            Some(proto::envelope::Payload::SyncAck(ack)) => {
+                if state.saved {
+                    state.post_save_sync_side_effects += 1;
+                }
+                proto::envelope::Payload::SyncAck(ack)
+            }
+            Some(proto::envelope::Payload::PullChanges(_)) => {
+                if state.saved {
+                    state.post_save_sync_side_effects += 1;
+                }
+                proto::envelope::Payload::SyncChangeBatch(proto::SyncChangeBatch::default())
             }
             _ => proto::envelope::Payload::Error(proto::Error {
                 code: proto::ErrorCode::InvalidRequest as i32,
@@ -157,6 +206,7 @@ async fn reconnect_with_a_different_machine_id_fails_even_at_the_same_index() {
     let initial_machine = "b2".repeat(32);
     let other_machine = "c2".repeat(32);
     let handler = ConfigHandler::new(&initial_machine, &other_machine, "saved-sha");
+    let handler_state = Arc::clone(&handler.state);
     let (address, shutdown, server) = start_server(handler).await;
     let temp = TempDir::new().unwrap();
     let (app, mut events) = DesktopApp::start(config(address, 1), desktop_paths(&temp));
@@ -178,6 +228,10 @@ async fn reconnect_with_a_different_machine_id_fails_even_at_the_same_index() {
     .await;
     assert!(failed.error().unwrap().contains(&initial_machine));
     assert!(failed.error().unwrap().contains(&other_machine));
+    let handler_state = handler_state.lock().unwrap();
+    assert_eq!(handler_state.post_save_status_calls, 1);
+    assert_eq!(handler_state.post_save_sync_side_effects, 0);
+    drop(handler_state);
 
     app.send(UiCommand::Shutdown).await.unwrap();
     shutdown.send(()).unwrap();
@@ -290,6 +344,105 @@ async fn accepted_save_without_reconnect_ends_in_explicit_timeout_failure() {
     app.send(UiCommand::Shutdown).await.unwrap();
 }
 
+#[tokio::test]
+async fn pending_save_rejects_load_edit_and_remove_without_losing_target() {
+    let machine = "b6".repeat(32);
+    let handler = ConfigHandler::new(&machine, &machine, "saved-sha");
+    let (address, shutdown, server) = start_server(handler).await;
+    let unused = unused_endpoint().await;
+    let temp = TempDir::new().unwrap();
+    let desktop_config = DesktopConfig {
+        nodes: vec![
+            NodeEndpoint {
+                ip: address.ip(),
+                port: address.port(),
+            },
+            unused,
+        ],
+        reconnect_interval_seconds: 10,
+        ..DesktopConfig::default()
+    };
+    let (app, mut events) = DesktopApp::start(desktop_config, desktop_paths(&temp));
+    wait_until_online(&mut events, 0).await;
+    app.send(UiCommand::LoadNodeConfig { node_index: 0 })
+        .await
+        .unwrap();
+    wait_for_config_state(&mut events, |state| state.snapshot().is_some()).await;
+    app.send(UiCommand::SaveNodeConfigAndRestart {
+        node_index: 0,
+        config: config_value(39204),
+    })
+    .await
+    .unwrap();
+    let waiting = wait_for_config_state(&mut events, |state| {
+        state.phase() == NodeConfigSavePhase::WaitingForReconnect
+    })
+    .await;
+    let target_machine = waiting.target_machine_id().unwrap().to_owned();
+    let target_endpoint = waiting.target_endpoint().unwrap().clone();
+
+    app.send(UiCommand::LoadNodeConfig { node_index: 1 })
+        .await
+        .unwrap();
+    assert!(wait_for_error(&mut events).await.contains("重启验证进行中"));
+    assert_pending_target_unchanged(&mut events, &target_machine, &target_endpoint).await;
+
+    app.send(UiCommand::EditNode {
+        index: 0,
+        ip: "127.0.0.2".into(),
+        port: address.port(),
+    })
+    .await
+    .unwrap();
+    assert!(wait_for_error(&mut events).await.contains("重启验证进行中"));
+    assert_pending_target_unchanged(&mut events, &target_machine, &target_endpoint).await;
+
+    app.send(UiCommand::RemoveNode { index: 0 }).await.unwrap();
+    assert!(wait_for_error(&mut events).await.contains("重启验证进行中"));
+    assert_pending_target_unchanged(&mut events, &target_machine, &target_endpoint).await;
+
+    app.send(UiCommand::Shutdown).await.unwrap();
+    shutdown.send(()).unwrap();
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn candidate_that_appears_after_deadline_remains_failed() {
+    let machine = "b7".repeat(32);
+    let handler = ConfigHandler::with_reconnect_delay(&machine, Duration::from_millis(3_200));
+    let (address, shutdown, server) = start_server(handler).await;
+    let temp = TempDir::new().unwrap();
+    let (app, mut events) = DesktopApp::start(config(address, 1), desktop_paths(&temp));
+    wait_until_online(&mut events, 0).await;
+    app.send(UiCommand::LoadNodeConfig { node_index: 0 })
+        .await
+        .unwrap();
+    wait_for_config_state(&mut events, |state| state.snapshot().is_some()).await;
+    app.send(UiCommand::SaveNodeConfigAndRestart {
+        node_index: 0,
+        config: config_value(39205),
+    })
+    .await
+    .unwrap();
+    wait_for_config_state(&mut events, |state| {
+        state.phase() == NodeConfigSavePhase::WaitingForReconnect
+    })
+    .await;
+    let terminal = wait_for_config_state(&mut events, |state| {
+        matches!(
+            state.phase(),
+            NodeConfigSavePhase::Completed | NodeConfigSavePhase::Failed
+        )
+    })
+    .await;
+    assert_eq!(terminal.phase(), NodeConfigSavePhase::Failed);
+    assert!(terminal.error().unwrap().contains("重连超时"));
+
+    app.send(UiCommand::Shutdown).await.unwrap();
+    shutdown.send(()).unwrap();
+    server.await.unwrap().unwrap();
+}
+
 async fn start_server(
     handler: ConfigHandler,
 ) -> (
@@ -367,6 +520,26 @@ async fn wait_for_error(events: &mut tokio::sync::mpsc::Receiver<UiEvent>) -> St
     })
     .await
     .unwrap()
+}
+
+async fn assert_pending_target_unchanged(
+    events: &mut tokio::sync::mpsc::Receiver<UiEvent>,
+    machine_id: &str,
+    endpoint: &NodeEndpoint,
+) {
+    let state = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(UiEvent::ViewChanged(state)) = events.recv().await
+                && state.node_config().phase() == NodeConfigSavePhase::WaitingForReconnect
+            {
+                break state;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(state.node_config().target_machine_id(), Some(machine_id));
+    assert_eq!(state.node_config().target_endpoint(), Some(endpoint));
 }
 
 fn config(address: std::net::SocketAddr, reconnect_seconds: u64) -> DesktopConfig {

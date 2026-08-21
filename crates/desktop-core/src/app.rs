@@ -315,6 +315,7 @@ struct PreparedDeleteContext {
     items: Vec<MemberView>,
 }
 
+#[derive(Clone)]
 struct PendingNodeConfigSave {
     machine_id: String,
     endpoint: NodeEndpoint,
@@ -381,12 +382,16 @@ async fn run_controller(
                 None => break,
             },
             _ = reconnect_ticks.tick() => {
+                let pending_endpoint = pending_node_config
+                    .as_ref()
+                    .map(|pending| pending.endpoint.clone());
                 reconnect_and_sync(
                     &mut state,
                     &mut sessions,
                     &mut central,
                     &mut sync_workers,
                     &sync_result_sender,
+                    pending_endpoint.as_ref(),
                 ).await;
                 verify_reconnected_node_config(
                     &mut state,
@@ -394,6 +399,7 @@ async fn run_controller(
                     &mut sync_workers,
                     &mut pending_node_config,
                     &events,
+                    &sync_result_sender,
                 ).await;
                 publish(&events, &state).await;
                 continue;
@@ -428,38 +434,54 @@ async fn run_controller(
                 .map(|_| ())
                 .map_err(|error| error.to_string())
                 .and_then(|_| persist(&config_path, state.config())),
-            UiCommand::EditNode { index, ip, port } => state
-                .edit_node(index, &ip, port)
-                .map_err(|error| error.to_string())
-                .and_then(|_| {
-                    sessions.clear();
-                    sync_workers.clear();
-                    persist(&config_path, state.config())
-                }),
-            UiCommand::RemoveNode { index } => state
-                .remove_node(index)
-                .map_err(|error| error.to_string())
-                .and_then(|_| {
-                    sessions.clear();
-                    sync_workers.clear();
-                    persist(&config_path, state.config())
-                }),
-            UiCommand::ConnectAll => {
-                sync_workers.clear();
-                connect_all(&mut state, &mut sessions).await;
-                if central.is_none() {
-                    central = connect_central(&mut state).await;
+            UiCommand::EditNode { index, ip, port } => {
+                if state.node_config().is_in_progress() {
+                    Err(node_config_target_change_error())
+                } else {
+                    state
+                        .edit_node(index, &ip, port)
+                        .map_err(|error| error.to_string())
+                        .and_then(|_| {
+                            sessions.clear();
+                            sync_workers.clear();
+                            persist(&config_path, state.config())
+                        })
                 }
-                let indexes = sessions.keys().copied().collect::<Vec<_>>();
-                ensure_sync_workers(
-                    &indexes,
-                    &sessions,
-                    state.config().postgres_url.as_deref(),
-                    &mut sync_workers,
-                    &sync_result_sender,
-                );
-                queue_automatic(&indexes, &sync_workers, AutomaticSyncCause::Connected).await;
-                Ok(())
+            }
+            UiCommand::RemoveNode { index } => {
+                if state.node_config().is_in_progress() {
+                    Err(node_config_target_change_error())
+                } else {
+                    state
+                        .remove_node(index)
+                        .map_err(|error| error.to_string())
+                        .and_then(|_| {
+                            sessions.clear();
+                            sync_workers.clear();
+                            persist(&config_path, state.config())
+                        })
+                }
+            }
+            UiCommand::ConnectAll => {
+                if state.node_config().is_in_progress() {
+                    Err(node_config_target_change_error())
+                } else {
+                    sync_workers.clear();
+                    connect_all(&mut state, &mut sessions).await;
+                    if central.is_none() {
+                        central = connect_central(&mut state).await;
+                    }
+                    let indexes = sessions.keys().copied().collect::<Vec<_>>();
+                    ensure_sync_workers(
+                        &indexes,
+                        &sessions,
+                        state.config().postgres_url.as_deref(),
+                        &mut sync_workers,
+                        &sync_result_sender,
+                    );
+                    queue_automatic(&indexes, &sync_workers, AutomaticSyncCause::Connected).await;
+                    Ok(())
+                }
             }
             UiCommand::Refresh => {
                 let report = refresh_nodes(&mut state, &sessions, central.as_ref()).await;
@@ -669,10 +691,14 @@ async fn run_controller(
                 result
             }
             UiCommand::LoadNodeConfig { node_index } => {
-                pending_node_config = None;
-                state.select_node_config(node_index);
-                publish_node_config(&events, &state).await;
-                load_node_config(node_index, &mut state, &sessions, &events).await
+                if state.node_config().is_in_progress() {
+                    Err(node_config_target_change_error())
+                } else {
+                    pending_node_config = None;
+                    state.select_node_config(node_index);
+                    publish_node_config(&events, &state).await;
+                    load_node_config(node_index, &mut state, &sessions, &events).await
+                }
             }
             UiCommand::SaveNodeConfigAndRestart { node_index, config } => {
                 let result = save_node_config_and_restart(
@@ -697,10 +723,14 @@ async fn run_controller(
                 }
             }
             UiCommand::SaveSettings(config) => {
-                let result = state
-                    .apply_settings(config)
-                    .map_err(|error| error.to_string())
-                    .and_then(|_| persist(&config_path, state.config()));
+                let result = if state.node_config().is_in_progress() {
+                    Err(node_config_target_change_error())
+                } else {
+                    state
+                        .apply_settings(config)
+                        .map_err(|error| error.to_string())
+                        .and_then(|_| persist(&config_path, state.config()))
+                };
                 if result.is_ok() {
                     pending_node_config = None;
                     sessions.clear();
@@ -737,11 +767,21 @@ async fn connect_missing(
     state: &mut DesktopViewState,
     sessions: &mut BTreeMap<usize, Arc<NodeSession>>,
 ) -> Vec<usize> {
+    connect_missing_except(state, sessions, None).await
+}
+
+async fn connect_missing_except(
+    state: &mut DesktopViewState,
+    sessions: &mut BTreeMap<usize, Arc<NodeSession>>,
+    excluded_endpoint: Option<&NodeEndpoint>,
+) -> Vec<usize> {
     let endpoints = state
         .nodes()
         .iter()
         .enumerate()
-        .filter(|(index, _)| !sessions.contains_key(index))
+        .filter(|(index, node)| {
+            !sessions.contains_key(index) && excluded_endpoint != Some(&node.endpoint)
+        })
         .map(|(index, node)| (index, node.endpoint.clone()))
         .collect::<Vec<_>>();
     for (index, _) in &endpoints {
@@ -1085,6 +1125,7 @@ async fn reconnect_and_sync(
     central: &mut Option<CentralStore>,
     workers: &mut BTreeMap<usize, NodeSyncWorker>,
     results: &mpsc::UnboundedSender<NodeSyncEvent>,
+    excluded_endpoint: Option<&NodeEndpoint>,
 ) {
     let report = refresh_nodes(state, sessions, central.as_ref()).await;
     let completed_nodes = report.completed_nodes.clone();
@@ -1092,7 +1133,7 @@ async fn reconnect_and_sync(
     if central.is_none() && state.config().postgres_url.is_some() {
         *central = connect_central(state).await;
     }
-    let connected_nodes = connect_missing(state, sessions).await;
+    let connected_nodes = connect_missing_except(state, sessions, excluded_endpoint).await;
     let mut worker_indexes = connected_nodes.clone();
     worker_indexes.extend(completed_nodes.iter().copied());
     ensure_sync_workers(
@@ -1263,24 +1304,53 @@ async fn verify_reconnected_node_config(
     sync_workers: &mut BTreeMap<usize, NodeSyncWorker>,
     pending: &mut Option<PendingNodeConfigSave>,
     events: &mpsc::Sender<UiEvent>,
+    sync_results: &mpsc::UnboundedSender<NodeSyncEvent>,
 ) {
-    let Some(target) = pending.as_ref() else {
+    let Some(target) = pending.clone() else {
         return;
     };
-    let candidate = sessions
+    if Instant::now() >= target.deadline {
+        state.fail_node_config(node_config_timeout_message(&target));
+        pending.take();
+        publish_node_config(events, state).await;
+        return;
+    }
+
+    let existing = sessions
         .iter()
         .find(|(_, session)| session.endpoint() == &target.endpoint)
         .map(|(index, session)| (*index, Arc::clone(session)));
-    let Some((index, session)) = candidate else {
+    let (index, session) = if let Some(candidate) = existing {
+        candidate
+    } else {
+        let session = match NodeSession::connect(target.endpoint.clone()).await {
+            Ok(session) => Arc::new(session),
+            Err(_) => {
+                if Instant::now() >= target.deadline {
+                    state.fail_node_config(node_config_timeout_message(&target));
+                    pending.take();
+                    publish_node_config(events, state).await;
+                }
+                return;
+            }
+        };
         if Instant::now() >= target.deadline {
-            state.fail_node_config(format!(
-                "等待机器 {} 在 {}:{} 重连超时",
-                target.machine_id, target.endpoint.ip, target.endpoint.port
-            ));
+            state.fail_node_config(node_config_timeout_message(&target));
             pending.take();
             publish_node_config(events, state).await;
+            return;
         }
-        return;
+        let Some(index) = state
+            .nodes()
+            .iter()
+            .position(|node| node.endpoint == target.endpoint)
+        else {
+            state.fail_node_config("等待重连期间目标 endpoint 已从配置移除");
+            pending.take();
+            publish_node_config(events, state).await;
+            return;
+        };
+        (index, session)
     };
 
     if session.machine_id().as_str() != target.machine_id {
@@ -1306,19 +1376,49 @@ async fn verify_reconnected_node_config(
             if snapshot.machine_id == target.machine_id
                 && snapshot.version_sha256 == target.saved_version_sha256 =>
         {
+            state.set_node_identity(index, target.machine_id.clone());
+            state.set_node_connection(index, NodeConnectionState::Online, None);
+            sessions.insert(index, Arc::clone(&session));
             state.complete_node_config(snapshot);
+            ensure_sync_workers(
+                &[index],
+                sessions,
+                state.config().postgres_url.as_deref(),
+                sync_workers,
+                sync_results,
+            );
+            queue_automatic(&[index], sync_workers, AutomaticSyncCause::Connected).await;
         }
-        Ok(snapshot) => state.fail_node_config(format!(
-            "重连配置验证失败：目标机器 {} / 摘要 {}，实际机器 {} / 摘要 {}",
-            target.machine_id,
-            target.saved_version_sha256,
-            snapshot.machine_id,
-            snapshot.version_sha256
-        )),
-        Err(error) => state.fail_node_config(format!("重连后加载 Node 配置失败：{error}")),
+        Ok(snapshot) => {
+            let message = format!(
+                "重连配置验证失败：目标机器 {} / 摘要 {}，实际机器 {} / 摘要 {}",
+                target.machine_id,
+                target.saved_version_sha256,
+                snapshot.machine_id,
+                snapshot.version_sha256
+            );
+            state.set_node_error(index, message.clone());
+            state.fail_node_config(message);
+        }
+        Err(error) => {
+            let message = format!("重连后加载 Node 配置失败：{error}");
+            state.set_node_error(index, message.clone());
+            state.fail_node_config(message);
+        }
     }
     pending.take();
     publish_node_config(events, state).await;
+}
+
+fn node_config_timeout_message(target: &PendingNodeConfigSave) -> String {
+    format!(
+        "等待机器 {} 在 {}:{} 重连超时",
+        target.machine_id, target.endpoint.ip, target.endpoint.port
+    )
+}
+
+fn node_config_target_change_error() -> String {
+    "远程 Node 配置重启验证进行中，不能切换、编辑或移除目标节点".into()
 }
 
 async fn publish_node_config(events: &mpsc::Sender<UiEvent>, state: &DesktopViewState) {

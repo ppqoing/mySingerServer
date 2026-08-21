@@ -187,6 +187,18 @@ impl NodeConfigControllerState {
         self.phase
     }
 
+    /// 返回是否处于不能切换节点或修改 endpoint 的非终态。
+    pub const fn is_in_progress(&self) -> bool {
+        matches!(
+            self.phase,
+            NodeConfigSavePhase::Validating
+                | NodeConfigSavePhase::Saving
+                | NodeConfigSavePhase::Restarting
+                | NodeConfigSavePhase::WaitingForReconnect
+                | NodeConfigSavePhase::Verifying
+        )
+    }
+
     /// 返回冻结的目标物理机器 ID。
     pub fn target_machine_id(&self) -> Option<&str> {
         self.target_machine_id.as_deref()
