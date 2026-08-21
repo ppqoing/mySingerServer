@@ -9,6 +9,7 @@ use std::{
     time::Duration,
 };
 
+use dedup_core::{DisplayPath, MachineId, NormalizedPath};
 use dedup_protocol::proto::{self, worker_envelope};
 use dedup_windows::{ReadCancellationToken, WorkerJob};
 use thiserror::Error;
@@ -71,6 +72,8 @@ pub enum WorkerEvent {
         task_id: String,
         /// 任务项 ID。
         item_id: String,
+        /// dispatch 时冻结并随真实运行项返回的文件身份。
+        identity: WorkerFileIdentity,
         /// 进程或管道诊断。
         message: String,
     },
@@ -86,6 +89,21 @@ pub enum WorkerEvent {
         /// 启动失败诊断。
         message: String,
     },
+}
+
+/// 扫描 Worker dispatch 时冻结的批准文件身份，不含进程或尝试诊断。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkerFileIdentity {
+    /// 节点物理机器 ID。
+    pub machine_id: MachineId,
+    /// SQLite、去重和故障唯一键使用的规范路径。
+    pub normalized_path: NormalizedPath,
+    /// Worker 实际访问并供诊断显示的路径。
+    pub display_path: DisplayPath,
+    /// 枚举/任务项冻结的文件大小。
+    pub file_size: u64,
+    /// Worker 正在执行的流水线阶段。
+    pub stage: String,
 }
 
 /// 拥有 Worker 进程 actor 的客户端句柄。
@@ -384,6 +402,7 @@ impl WorkerPool {
         envelope: proto::WorkerEnvelope,
         cancellation: ReadCancellationToken,
         persisted_active: bool,
+        file_identity: WorkerFileIdentity,
     ) -> Result<(), WorkerPoolError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.commands
@@ -392,6 +411,7 @@ impl WorkerPool {
                 Some(ScanDispatchGuard {
                     cancellation,
                     persisted_active,
+                    file_identity,
                 }),
                 reply_tx,
             ))
@@ -502,7 +522,7 @@ impl WorkerPool {
                         match command {
                             PoolCommand::Dispatch(envelope, guard, reply) => {
                                 let result = WorkItem::try_from(envelope).map(|mut work| {
-                                    work.scan_guard = guard;
+                                    work.set_scan_guard(guard);
                                     queue.push_back(work);
                                     controlled_schedule(
                                         &mut queue, &mut idle, &mut active, &started,
@@ -533,17 +553,30 @@ impl WorkerPool {
                     }
                     control = control_rx.recv() => {
                         let Some(control) = control else { break };
-                        let (task_id, item_id, event) = match control {
-                            ControlledWorkerCommand::Crash { task_id, item_id, message } => {
-                                let event = WorkerEvent::Crashed {
-                                    task_id: task_id.clone(),
-                                    item_id: item_id.clone(),
-                                    message,
-                                };
-                                (task_id, item_id, event)
+                        let (task_id, item_id) = match &control {
+                            ControlledWorkerCommand::Crash { task_id, item_id, .. }
+                            | ControlledWorkerCommand::Complete { task_id, item_id, .. } => {
+                                (task_id.clone(), item_id.clone())
                             }
-                            ControlledWorkerCommand::Complete { task_id, item_id, output } => {
-                                let event = WorkerEvent::Completed {
+                        };
+                        let Some((slot, identity)) = active.remove(&item_id) else { continue };
+                        if identity.task_id != task_id { continue; }
+                        let event = match control {
+                            ControlledWorkerCommand::Crash { message, .. } => {
+                                match identity.file_identity.clone() {
+                                    Some(file_identity) => WorkerEvent::Crashed {
+                                        task_id: task_id.clone(),
+                                        item_id: item_id.clone(),
+                                        identity: file_identity,
+                                        message,
+                                    },
+                                    None => WorkerEvent::InfrastructureFailure {
+                                        message: "可控崩溃项缺少冻结文件身份".into(),
+                                    },
+                                }
+                            }
+                            ControlledWorkerCommand::Complete { output, .. } => {
+                                WorkerEvent::Completed {
                                     task_id: task_id.clone(),
                                     item_id: item_id.clone(),
                                     response: proto::WorkerEnvelope {
@@ -555,12 +588,9 @@ impl WorkerPool {
                                             },
                                         )),
                                     },
-                                };
-                                (task_id, item_id, event)
+                                }
                             }
                         };
-                        let Some((slot, identity)) = active.remove(&item_id) else { continue };
-                        if identity.task_id != task_id { continue; }
                         actor_state.lock().unwrap().running.remove(&slot);
                         idle.push_back(slot);
                         actor_available.store(idle.len(), Ordering::Release);
@@ -619,7 +649,7 @@ impl WorkerPool {
                 match command {
                     PoolCommand::Dispatch(envelope, guard, reply) => {
                         let result = WorkItem::try_from(envelope).map(|mut work| {
-                            work.scan_guard = guard;
+                            work.set_scan_guard(guard);
                             let mut locked = actor_state.lock().unwrap();
                             let registry_blocked =
                                 locked.cancelled_tasks.contains(&work.identity.task_id)
@@ -776,6 +806,7 @@ struct PoolState {
 struct WorkIdentity {
     task_id: String,
     item_id: String,
+    file_identity: Option<WorkerFileIdentity>,
 }
 
 /// 等待调度的一条完整协议请求及其任务归属。
@@ -788,9 +819,17 @@ struct WorkItem {
 struct ScanDispatchGuard {
     cancellation: ReadCancellationToken,
     persisted_active: bool,
+    file_identity: WorkerFileIdentity,
 }
 
 impl WorkItem {
+    fn set_scan_guard(&mut self, guard: Option<ScanDispatchGuard>) {
+        if let Some(guard) = &guard {
+            self.identity.file_identity = Some(guard.file_identity.clone());
+        }
+        self.scan_guard = guard;
+    }
+
     fn dispatch_allowed(&self) -> bool {
         self.scan_guard
             .as_ref()
@@ -863,7 +902,7 @@ async fn run_pool(
                         } else {
                             match WorkItem::try_from(envelope) {
                                 Ok(mut work) => {
-                                    work.scan_guard = guard;
+                                    work.set_scan_guard(guard);
                                     queue.push_back(work);
                                     schedule(&mut queue, &mut idle, &slots, &events, &state).await;
                                     Ok(())
@@ -1215,13 +1254,25 @@ async fn handle_slot_event(
                 locked.failure_count += 1;
             }
             if let Some(work) = work {
-                let _ = events
-                    .send(WorkerEvent::Crashed {
-                        task_id: work.task_id,
-                        item_id: work.item_id,
-                        message,
-                    })
-                    .await;
+                if let Some(identity) = work.file_identity {
+                    let _ = events
+                        .send(WorkerEvent::Crashed {
+                            task_id: work.task_id,
+                            item_id: work.item_id,
+                            identity,
+                            message,
+                        })
+                        .await;
+                } else {
+                    let _ = events
+                        .send(WorkerEvent::InfrastructureFailure {
+                            message: format!(
+                                "Worker 崩溃项缺少冻结文件身份: {}/{}: {message}",
+                                work.task_id, work.item_id
+                            ),
+                        })
+                        .await;
+                }
             }
             replace_slot(
                 slot_id,
@@ -1413,14 +1464,17 @@ impl TryFrom<proto::WorkerEnvelope> for WorkItem {
             Some(worker_envelope::Payload::ProbeAndStage1(command)) => WorkIdentity {
                 task_id: command.task_id.clone(),
                 item_id: command.item_id.clone(),
+                file_identity: None,
             },
             Some(worker_envelope::Payload::ComputeStage2(command)) => WorkIdentity {
                 task_id: command.task_id.clone(),
                 item_id: command.item_id.clone(),
+                file_identity: None,
             },
             Some(worker_envelope::Payload::BuildContactSheet(command)) => WorkIdentity {
                 task_id: command.task_id.clone(),
                 item_id: command.item_id.clone(),
+                file_identity: None,
             },
             _ => return Err(WorkerPoolError::InvalidRequest),
         };

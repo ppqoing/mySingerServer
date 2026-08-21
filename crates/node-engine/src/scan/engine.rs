@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use dedup_core::{DisplayPath, LocationKey, MediaKind, NormalizedPath, TaskId};
+use dedup_core::{DisplayPath, LocationKey, MachineId, MediaKind, NormalizedPath, TaskId};
 use dedup_media::sample_positions;
 use dedup_node_store::{
     ContentId, FeatureWrite, FileFaultKind, FileFaultRecord, ImageStage1Fields, NewTaskItem,
@@ -86,10 +86,30 @@ pub struct Stage1Request {
     pub task_id: TaskId,
     /// SQLite 任务项 ID。
     pub item_id: String,
+    /// dispatch 时冻结的物理机器身份。
+    pub machine_id: MachineId,
+    /// 与持久任务项相同的规范路径。
+    pub normalized_path: NormalizedPath,
     /// 真实文件访问路径。
     pub display_path: DisplayPath,
+    /// 与持久任务项相同的文件大小。
+    pub file_size: u64,
+    /// 当前 Worker 处理阶段。
+    pub stage: String,
     /// 本机内容行。
     pub content_id: ContentId,
+}
+
+impl Stage1Request {
+    fn worker_file_identity(&self) -> crate::worker::WorkerFileIdentity {
+        crate::worker::WorkerFileIdentity {
+            machine_id: self.machine_id.clone(),
+            normalized_path: self.normalized_path.clone(),
+            display_path: self.display_path.clone(),
+            file_size: self.file_size,
+            stage: self.stage.clone(),
+        }
+    }
 }
 
 /// 一条可乱序返回但仍以 item ID 归并的一筛结果。
@@ -107,8 +127,13 @@ pub enum Stage1ProcessError {
     #[error("{0}")]
     Processing(String),
     /// Worker 进程在当前文件运行期间意外退出。
-    #[error("{0}")]
-    WorkerCrash(String),
+    #[error("{message}")]
+    WorkerCrash {
+        /// dispatch 时冻结并由真实 Crashed event 返回的文件身份。
+        identity: crate::worker::WorkerFileIdentity,
+        /// Worker 进程/管道的非持久诊断文案。
+        message: String,
+    },
     /// 当前任务或任务项已取消。
     #[error("一筛已取消")]
     Cancelled,
@@ -189,6 +214,7 @@ impl Stage1Processor for WorkerPoolStage1Processor<'_> {
     ) -> Result<crate::worker::Stage1Output, String> {
         let task_id = request.task_id.as_uuid().to_string();
         let item_id = request.item_id.clone();
+        let file_identity = request.worker_file_identity();
         self.pool
             .dispatch_scan(
                 proto::WorkerEnvelope {
@@ -207,6 +233,7 @@ impl Stage1Processor for WorkerPoolStage1Processor<'_> {
                 },
                 self.cancellation.clone(),
                 true,
+                file_identity,
             )
             .await
             .map_err(|error| error.to_string())?;
@@ -226,6 +253,7 @@ impl Stage1Processor for WorkerPoolStage1Processor<'_> {
                 task_id: event_task,
                 item_id: event_item,
                 message,
+                ..
             }) if event_task == task_id && event_item == item_id => Err(message),
             Some(WorkerEvent::Cancelled {
                 task_id: event_task,
@@ -247,6 +275,7 @@ impl Stage1Processor for WorkerPoolStage1Processor<'_> {
         for request in requests {
             let task_id = request.task_id.as_uuid().to_string();
             let item_id = request.item_id.clone();
+            let file_identity = request.worker_file_identity();
             let envelope = proto::WorkerEnvelope {
                 payload: Some(worker_envelope::Payload::ProbeAndStage1(
                     proto::ProbeAndStage1 {
@@ -263,7 +292,7 @@ impl Stage1Processor for WorkerPoolStage1Processor<'_> {
             };
             match self
                 .pool
-                .dispatch_scan(envelope, self.cancellation.clone(), true)
+                .dispatch_scan(envelope, self.cancellation.clone(), true, file_identity)
                 .await
             {
                 Ok(()) => {
@@ -311,12 +340,13 @@ impl Stage1Processor for WorkerPoolStage1Processor<'_> {
                 WorkerEvent::Crashed {
                     task_id,
                     item_id,
+                    identity,
                     message,
                 } if pending.get(&item_id) == Some(&task_id) => {
                     pending.remove(&item_id);
                     results.push(Stage1BatchResult {
                         item_id,
-                        output: Err(Stage1ProcessError::WorkerCrash(message)),
+                        output: Err(Stage1ProcessError::WorkerCrash { identity, message }),
                     });
                 }
                 WorkerEvent::Cancelled { task_id, item_id }
@@ -769,13 +799,20 @@ where
             return Ok(());
         }
         summary.scheduled_stage1 += 1;
+        store.set_running_item_content_and_stage(&item_id, content.id, "probe_stage1")?;
+        let machine_id = store.machine_id().clone();
+        let normalized_path = scanned.normalized_path.clone();
         let display_path = scanned.display_path.clone();
+        let file_size = scanned.file_size;
         pending_stage1.push(PendingStage1 {
-            scanned,
             request: Stage1Request {
                 task_id,
                 item_id,
+                machine_id,
+                normalized_path,
                 display_path,
+                file_size,
+                stage: "probe_stage1".into(),
                 content_id: content.id,
             },
             lease,
@@ -837,7 +874,11 @@ where
         let request = Stage1Request {
             task_id,
             item_id: item_id.clone(),
+            machine_id: store.machine_id().clone(),
+            normalized_path: scanned.normalized_path.clone(),
             display_path: scanned.display_path.clone(),
+            file_size: scanned.file_size,
+            stage: "probe_stage1".into(),
             content_id,
         };
         match processor.process(request).await {
@@ -874,7 +915,6 @@ async fn drain_parallel_reads<L>(
 }
 
 struct PendingStage1<L> {
-    scanned: ScannedPath,
     request: Stage1Request,
     lease: L,
 }
@@ -924,12 +964,7 @@ where
         .into_iter()
         .map(|result| (result.item_id, result.output))
         .collect::<BTreeMap<_, _>>();
-    for PendingStage1 {
-        scanned,
-        request,
-        lease,
-    } in works
-    {
+    for PendingStage1 { request, lease } in works {
         if cancellation.is_cancelled()
             || store.task_snapshot(request.task_id)?.status == TaskStatus::Cancelled
         {
@@ -985,15 +1020,15 @@ where
                     })?;
                 }
             }
-            Err(Stage1ProcessError::WorkerCrash(message)) => {
+            Err(Stage1ProcessError::WorkerCrash { identity, message }) => {
                 if store.task_snapshot(request.task_id)?.status != TaskStatus::Cancelled {
                     let fault = FileFaultRecord {
-                        machine_id: store.machine_id().clone(),
-                        normalized_path: scanned.normalized_path.clone(),
-                        display_path: scanned.display_path.clone(),
-                        file_size: scanned.file_size,
+                        machine_id: identity.machine_id,
+                        normalized_path: identity.normalized_path,
+                        display_path: identity.display_path,
+                        file_size: identity.file_size,
                         kind: FileFaultKind::WorkerCrash,
-                        stage: "probe_stage1".into(),
+                        stage: identity.stage,
                         windows_error_code: None,
                         message: message.clone(),
                     };

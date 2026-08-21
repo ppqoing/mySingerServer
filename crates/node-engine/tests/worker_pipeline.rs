@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use dedup_core::{DisplayPath, MachineId, MediaKind, TaskId};
+use dedup_core::{DisplayPath, MachineId, MediaKind};
 use dedup_media::sample_positions;
 use dedup_media_ffmpeg::{DecodedFrame, MediaProbe};
 use dedup_node_engine::scan::{
@@ -14,10 +14,13 @@ use dedup_node_engine::scan::{
 };
 use dedup_node_engine::worker::WorkerPool;
 use dedup_node_engine::worker::{
-    MediaDecoder, Stage1Output, WorkerEvent, WorkerPipeline, decode_stage1_payload,
-    decode_stage2_payload, encode_stage1_payload, encode_stage2_payload, handle_worker_request,
+    MediaDecoder, Stage1Output, WorkerEvent, WorkerFileIdentity, WorkerPipeline,
+    decode_stage1_payload, decode_stage2_payload, encode_stage1_payload, encode_stage2_payload,
+    handle_worker_request,
 };
-use dedup_node_store::{NodeStore, ScannedPath};
+use dedup_node_store::{
+    FileFaultKind, FileFaultRecord, NodeStore, ScannedPath, TaskItemCompletion,
+};
 use dedup_protocol::proto::{self, worker_envelope};
 use dedup_windows::ReadCancellationToken;
 
@@ -146,6 +149,7 @@ async fn cancelled_scan_is_rejected_at_the_worker_pool_send_boundary() {
         },
         cancellation,
         true,
+        worker_file_identity(r"D:\cancelled.bin"),
     )
     .await
     .unwrap();
@@ -177,7 +181,12 @@ async fn cancel_gate_cannot_cross_the_registry_check_to_slot_send_window() {
     };
     let dispatch = tokio::spawn(async move {
         let result = pool
-            .dispatch_scan(first, ReadCancellationToken::new(), true)
+            .dispatch_scan(
+                first,
+                ReadCancellationToken::new(),
+                true,
+                worker_file_identity(r"D:\before.bin"),
+            )
             .await;
         (pool, result)
     });
@@ -215,6 +224,7 @@ async fn cancel_gate_cannot_cross_the_registry_check_to_slot_send_window() {
         },
         ReadCancellationToken::new(),
         true,
+        worker_file_identity(r"D:\after.bin"),
     )
     .await
     .unwrap();
@@ -232,41 +242,59 @@ async fn cancel_gate_cannot_cross_the_registry_check_to_slot_send_window() {
 async fn crash_fault_fails_file_a_once_while_file_b_completes_and_slot_is_replaced() {
     let (pool, mut started, control) = WorkerPool::controlled_batch_for_test(2);
     let machine = MachineId::from_sha256([0x61; 32]);
-    let mut store = NodeStore::open_in_memory(machine).unwrap();
-    let task_id = TaskId::new();
+    let mut store = NodeStore::open_in_memory(machine.clone()).unwrap();
+    let task_id = store
+        .create_scan_task(&[dedup_core::NormalizedPath::new(r"D:\Crash").unwrap()], 1)
+        .unwrap();
+    let scanned_a = ScannedPath::new(
+        dedup_core::NormalizedPath::new(r"D:\Crash\a.bin").unwrap(),
+        DisplayPath::new(r"D:\Crash\a.bin").unwrap(),
+        1,
+    );
+    let scanned_b = ScannedPath::new(
+        dedup_core::NormalizedPath::new(r"D:\Crash\b.bin").unwrap(),
+        DisplayPath::new(r"D:\Crash\b.bin").unwrap(),
+        1,
+    );
     let a = store
-        .upsert_content_and_location(
-            &ScannedPath::new(
-                dedup_core::NormalizedPath::new(r"D:\Crash\a.bin").unwrap(),
-                DisplayPath::new(r"D:\Crash\a.bin").unwrap(),
-                1,
-            ),
-            [1; 16],
-            MediaKind::Other,
-        )
+        .upsert_content_and_location(&scanned_a, [1; 16], MediaKind::Other)
         .unwrap();
     let b = store
-        .upsert_content_and_location(
-            &ScannedPath::new(
-                dedup_core::NormalizedPath::new(r"D:\Crash\b.bin").unwrap(),
-                DisplayPath::new(r"D:\Crash\b.bin").unwrap(),
-                1,
-            ),
-            [2; 16],
-            MediaKind::Other,
-        )
+        .upsert_content_and_location(&scanned_b, [2; 16], MediaKind::Other)
+        .unwrap();
+    let item_a = store
+        .reserve_scan_path(task_id, &scanned_a, 2)
+        .unwrap()
+        .unwrap();
+    let item_b = store
+        .reserve_scan_path(task_id, &scanned_b, 2)
+        .unwrap()
+        .unwrap();
+    store
+        .set_running_item_content_and_stage(&item_a, a.id, "probe_stage1")
+        .unwrap();
+    store
+        .set_running_item_content_and_stage(&item_b, b.id, "probe_stage1")
         .unwrap();
     let requests = vec![
         Stage1Request {
             task_id,
-            item_id: "file-a".into(),
-            display_path: DisplayPath::new(r"D:\Crash\a.bin").unwrap(),
+            item_id: item_a.clone(),
+            machine_id: machine.clone(),
+            normalized_path: scanned_a.normalized_path.clone(),
+            display_path: scanned_a.display_path.clone(),
+            file_size: scanned_a.file_size,
+            stage: "probe_stage1".into(),
             content_id: a.id,
         },
         Stage1Request {
             task_id,
-            item_id: "file-b".into(),
-            display_path: DisplayPath::new(r"D:\Crash\b.bin").unwrap(),
+            item_id: item_b.clone(),
+            machine_id: machine.clone(),
+            normalized_path: scanned_b.normalized_path.clone(),
+            display_path: scanned_b.display_path.clone(),
+            file_size: scanned_b.file_size,
+            stage: "probe_stage1".into(),
             content_id: b.id,
         },
     ];
@@ -280,21 +308,21 @@ async fn crash_fault_fails_file_a_once_while_file_b_completes_and_slot_is_replac
     assert_eq!(
         dispatched,
         vec![
-            (task_id.as_uuid().to_string(), "file-a".into()),
-            (task_id.as_uuid().to_string(), "file-b".into())
+            (task_id.as_uuid().to_string(), item_a.clone()),
+            (task_id.as_uuid().to_string(), item_b.clone())
         ]
     );
     control
         .crash(
             task_id.as_uuid().to_string(),
-            "file-a".into(),
+            item_a.clone(),
             "worker crashed".into(),
         )
         .await;
     control
         .complete(
             task_id.as_uuid().to_string(),
-            "file-b".into(),
+            item_b.clone(),
             Stage1Output {
                 media_kind: MediaKind::Other,
                 width: 0,
@@ -308,20 +336,56 @@ async fn crash_fault_fails_file_a_once_while_file_b_completes_and_slot_is_replac
     let results = task.await.unwrap();
     let crash = results
         .iter()
-        .find(|result| result.item_id == "file-a")
+        .find(|result| result.item_id == item_a)
         .unwrap();
-    assert!(matches!(
-        &crash.output,
-        Err(Stage1ProcessError::WorkerCrash(message)) if message == "worker crashed"
-    ));
+    let (identity, message) = match &crash.output {
+        Err(Stage1ProcessError::WorkerCrash { identity, message }) => (identity, message),
+        other => panic!("expected WorkerCrash, got {other:?}"),
+    };
+    let identity: &WorkerFileIdentity = identity;
+    assert_eq!(message, "worker crashed");
+    assert_eq!(identity.machine_id, machine);
+    assert_eq!(identity.normalized_path, scanned_a.normalized_path);
+    assert_eq!(identity.display_path, scanned_a.display_path);
+    assert_eq!(identity.file_size, 1);
+    assert_eq!(identity.stage, "probe_stage1");
+    store
+        .fail_running_item_with_file_fault(
+            &item_a,
+            &FileFaultRecord {
+                machine_id: identity.machine_id.clone(),
+                normalized_path: identity.normalized_path.clone(),
+                display_path: identity.display_path.clone(),
+                file_size: identity.file_size,
+                kind: FileFaultKind::WorkerCrash,
+                stage: identity.stage.clone(),
+                windows_error_code: None,
+                message: message.clone(),
+            },
+            message,
+            3,
+        )
+        .unwrap();
+    store
+        .complete_item(
+            &item_b,
+            TaskItemCompletion::Succeeded {
+                content_id: Some(b.id),
+            },
+            3,
+        )
+        .unwrap();
     assert!(
         results
             .iter()
-            .find(|result| result.item_id == "file-b")
+            .find(|result| result.item_id == item_b)
             .unwrap()
             .output
             .is_ok()
     );
+    let faults = store.page_file_faults(None, 10).unwrap();
+    assert_eq!(faults.items.len(), 1);
+    assert_eq!(faults.items[0].normalized_path, identity.normalized_path);
     assert_eq!(control.available_slots(), 2);
     assert!(started.try_recv().is_err(), "崩溃项不得重新派发");
 }
@@ -329,6 +393,16 @@ async fn crash_fault_fails_file_a_once_while_file_b_completes_and_slot_is_replac
 /// 把媒体层 Duration 采样定义转换为测试解码器记录的归一化值。
 fn normalized_positions() -> [f64; 6] {
     sample_positions(Duration::from_secs(12)).map(|value| value.as_secs_f64() / 12.0)
+}
+
+fn worker_file_identity(path: &str) -> WorkerFileIdentity {
+    WorkerFileIdentity {
+        machine_id: MachineId::from_sha256([0x60; 32]),
+        normalized_path: dedup_core::NormalizedPath::new(path).unwrap(),
+        display_path: DisplayPath::new(path).unwrap(),
+        file_size: 1,
+        stage: "probe_stage1".into(),
+    }
 }
 
 /// 返回固定 8×8 RGB 的可计数解码器。

@@ -399,6 +399,52 @@ impl NodeStore {
             ));
         }
         let transaction = self.connection.transaction()?;
+        let (machine_id, normalized_path, display_path, file_size, stage, status): (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            String,
+            String,
+        ) = transaction.query_row(
+            "SELECT machine_id,normalized_path,display_path,file_size,stage,status
+             FROM task_items WHERE item_id=?1",
+            [item_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )?;
+        let (Some(machine_id), Some(normalized_path), Some(display_path), Some(file_size)) =
+            (machine_id, normalized_path, display_path, file_size)
+        else {
+            return Err(StoreError::InvalidState(
+                "Worker 崩溃项缺少持久文件身份".into(),
+            ));
+        };
+        let persisted_machine = MachineId::parse(&machine_id)?;
+        let persisted_normalized = NormalizedPath::new(&normalized_path)?;
+        let persisted_display = DisplayPath::new(&display_path)?;
+        let persisted_size = u64::try_from(file_size)
+            .map_err(|_| StoreError::InvalidState("Worker 崩溃项文件大小无效".into()))?;
+        if status != "running"
+            || fault.machine_id != persisted_machine
+            || fault.normalized_path != persisted_normalized
+            || fault.display_path != persisted_display
+            || fault.file_size != persisted_size
+            || fault.stage != stage
+            || fault.windows_error_code.is_some()
+        {
+            return Err(StoreError::InvalidState(
+                "Worker 崩溃事件身份与持久任务项不一致".into(),
+            ));
+        }
         let event = complete_item_in_transaction(
             &transaction,
             item_id,
@@ -416,17 +462,37 @@ impl NodeStore {
                 windows_error_code=NULL,
                 message=excluded.message",
             params![
-                fault.machine_id.as_str(),
-                fault.normalized_path.as_str(),
-                fault.display_path.as_path().to_string_lossy().as_ref(),
-                sqlite_integer(fault.file_size)?,
+                machine_id,
+                normalized_path,
+                display_path,
+                file_size,
                 fault.kind.as_str(),
-                fault.stage,
+                stage,
                 fault.message,
             ],
         )?;
         transaction.commit()?;
         Ok(event)
+    }
+
+    /// 在 Worker dispatch 前把 running 扫描项冻结为实际 content 与处理阶段。
+    pub fn set_running_item_content_and_stage(
+        &mut self,
+        item_id: &str,
+        content_id: ContentId,
+        stage: &str,
+    ) -> Result<(), StoreError> {
+        let changed = self.connection.execute(
+            "UPDATE task_items SET content_id=?2,stage=?3
+             WHERE item_id=?1 AND status='running'",
+            params![item_id, content_id.as_i64(), stage],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::InvalidState(
+                "只能为 running 项冻结 Worker 文件身份".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// 把上次进程遗留的 running 项重新排队，其他四种项状态保持不变。

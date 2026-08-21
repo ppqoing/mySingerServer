@@ -154,7 +154,7 @@ fn crashed_item_is_failed_with_fault_and_never_requeued_after_reopen() {
                     display_path: DisplayPath::new(r"D:\Crash\file-a.mp4").unwrap(),
                     file_size: 1234,
                     kind: FileFaultKind::WorkerCrash,
-                    stage: "probe_stage1".into(),
+                    stage: "enumerated".into(),
                     windows_error_code: None,
                     message: "Worker 处理文件时崩溃".into(),
                 },
@@ -180,6 +180,53 @@ fn crashed_item_is_failed_with_fault_and_never_requeued_after_reopen() {
     assert_eq!(faults.items[0].normalized_path, path);
     assert_eq!(faults.items[0].file_size, 1234);
     assert_eq!(faults.items[0].kind, FileFaultKind::WorkerCrash);
-    assert_eq!(faults.items[0].stage, "probe_stage1");
+    assert_eq!(faults.items[0].stage, "enumerated");
     assert_eq!(faults.items[0].windows_error_code, None);
+}
+
+#[test]
+fn crashed_item_rejects_mismatched_fault_identity_without_side_effects() {
+    let mut store = NodeStore::open_in_memory(machine()).unwrap();
+    let task = store
+        .create_scan_task(&[NormalizedPath::new(r"D:\Crash").unwrap()], 10)
+        .unwrap();
+    let item_id = store
+        .reserve_scan_path(
+            task,
+            &ScannedPath::new(
+                NormalizedPath::new(r"D:\Crash\file-a.mp4").unwrap(),
+                DisplayPath::new(r"D:\Crash\file-a.mp4").unwrap(),
+                10,
+            ),
+            11,
+        )
+        .unwrap()
+        .unwrap();
+
+    let result = store.fail_running_item_with_file_fault(
+        &item_id,
+        &FileFaultRecord {
+            machine_id: machine(),
+            normalized_path: NormalizedPath::new(r"D:\Crash\file-b.mp4").unwrap(),
+            display_path: DisplayPath::new(r"D:\Crash\file-b.mp4").unwrap(),
+            file_size: 99,
+            kind: FileFaultKind::WorkerCrash,
+            stage: "different-stage".into(),
+            windows_error_code: None,
+            message: "mismatched".into(),
+        },
+        "mismatched",
+        12,
+    );
+
+    assert!(result.is_err());
+    let item = store
+        .task_items(task)
+        .unwrap()
+        .into_iter()
+        .find(|item| item.item_id == item_id)
+        .unwrap();
+    assert_eq!(item.status, TaskItemStatus::Running);
+    assert_eq!(store.task_snapshot(task).unwrap().failed, 0);
+    assert!(store.page_file_faults(None, 10).unwrap().items.is_empty());
 }

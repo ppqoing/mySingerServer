@@ -93,6 +93,7 @@ impl Stage2Processor for WorkerPoolStage2Processor<'_> {
                 task_id: event_task,
                 item_id: event_item,
                 message,
+                ..
             }) if event_task == task_id && event_item == item_id => Err(message),
             Some(WorkerEvent::Cancelled {
                 task_id: event_task,

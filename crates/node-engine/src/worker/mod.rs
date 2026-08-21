@@ -10,7 +10,7 @@ pub use pipeline::{
     encode_stage1_payload, encode_stage2_payload, handle_worker_request,
 };
 pub use pool::{
-    WorkerDispatchBarrier, WorkerEvent, WorkerPool, WorkerPoolConfig, WorkerPoolError,
-    WorkerPoolHandle,
+    WorkerDispatchBarrier, WorkerEvent, WorkerFileIdentity, WorkerPool, WorkerPoolConfig,
+    WorkerPoolError, WorkerPoolHandle,
 };
 pub use process::WorkerLaunch;
