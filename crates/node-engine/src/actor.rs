@@ -38,8 +38,8 @@ use crate::{
     host_control::NodeHostControl,
     preview::{PreviewKind, PreviewService},
     scan::{
-        EverythingEnumerator, ScanEngine, ScanOptions, SystemMd5, WindowsWalker,
-        WorkerPoolStage1Processor, begin_scan_task,
+        PreferredEverythingEnumerator, ScanEngine, ScanOptions, SystemMd5, WindowsWalker,
+        WorkerPoolStage1Processor, begin_scan_task, ensure_everything_ready,
     },
     server::{NodeRequestHandler, NodeServer, ServerError},
     worker::{WorkerLaunch, WorkerPool, WorkerPoolConfig, WorkerPoolError, WorkerPoolHandle},
@@ -1426,6 +1426,8 @@ async fn run_background_job(
             contact_sheets,
         } => {
             let mut processor = WorkerPoolStage1Processor::new(worker_pool);
+            let enumerator =
+                resolve_scan_enumerator_with(enumerator, ensure_everything_ready).await;
             let result = match enumerator {
                 EnumeratorKind::WindowsWalker => {
                     ScanEngine::new(WindowsWalker, SystemMd5, contact_sheets)
@@ -1433,7 +1435,7 @@ async fn run_background_job(
                         .await
                 }
                 EnumeratorKind::Everything => {
-                    ScanEngine::new(EverythingEnumerator, SystemMd5, contact_sheets)
+                    ScanEngine::new(PreferredEverythingEnumerator, SystemMd5, contact_sheets)
                         .run_existing(store, task_id, options, &mut processor, now_ms())
                         .await
                 }
@@ -1461,6 +1463,21 @@ async fn run_background_job(
                 let _ = store.fail_task(task_id, now_ms());
             }
         }
+    }
+}
+
+async fn resolve_scan_enumerator_with<Ensure, EnsureFuture>(
+    requested: EnumeratorKind,
+    mut ensure_everything: Ensure,
+) -> EnumeratorKind
+where
+    Ensure: FnMut() -> EnsureFuture,
+    EnsureFuture: std::future::Future<Output = bool>,
+{
+    match requested {
+        EnumeratorKind::WindowsWalker => EnumeratorKind::WindowsWalker,
+        EnumeratorKind::Everything if ensure_everything().await => EnumeratorKind::Everything,
+        EnumeratorKind::Everything => EnumeratorKind::WindowsWalker,
     }
 }
 
@@ -1651,12 +1668,40 @@ fn error_response(request_id: u64, code: proto::ErrorCode, message: &str) -> pro
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, time::Duration};
+    use std::{cell::Cell, fs, future, time::Duration};
 
     use dedup_media::{ImageStage1, PdqHash};
     use dedup_node_store::{FeatureWrite, ImageStage1Fields, ScannedPath};
 
     use super::*;
+
+    #[tokio::test]
+    async fn everything_readiness_is_checked_only_for_everything_scan_requests() {
+        let checks = Cell::new(0);
+        let selected = resolve_scan_enumerator_with(EnumeratorKind::WindowsWalker, || {
+            checks.set(checks.get() + 1);
+            future::ready(true)
+        })
+        .await;
+        assert_eq!(selected, EnumeratorKind::WindowsWalker);
+        assert_eq!(checks.get(), 0);
+
+        let selected = resolve_scan_enumerator_with(EnumeratorKind::Everything, || {
+            checks.set(checks.get() + 1);
+            future::ready(true)
+        })
+        .await;
+        assert_eq!(selected, EnumeratorKind::Everything);
+        assert_eq!(checks.get(), 1);
+
+        let selected = resolve_scan_enumerator_with(EnumeratorKind::Everything, || {
+            checks.set(checks.get() + 1);
+            future::ready(false)
+        })
+        .await;
+        assert_eq!(selected, EnumeratorKind::WindowsWalker);
+        assert_eq!(checks.get(), 2);
+    }
 
     #[tokio::test]
     async fn scan_create_query_and_cancel_stay_responsive_while_worker_is_held() {

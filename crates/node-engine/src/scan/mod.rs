@@ -12,6 +12,7 @@ pub use engine::{
 };
 pub use enumerator::FileEnumerator;
 pub use everything::EverythingEnumerator;
+pub(crate) use everything::{PreferredEverythingEnumerator, ensure_everything_ready};
 pub use hash::{FileHasher, SystemMd5, md5_bytes, md5_file};
 
 use thiserror::Error;

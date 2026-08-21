@@ -39,7 +39,7 @@ fn everything_has_the_same_sorted_output_contract_when_ipc_is_available() {
     let rows = match EverythingEnumerator.enumerate(&[root]) {
         Ok(rows) => rows,
         Err(error) => {
-            // Everything 是显式配置依赖；当前机未运行时返回单一明确错误，任务不回退。
+            // 原始 IPC 适配器保持严格错误；Node 上层负责把整次扫描回退到 Walker。
             assert!(error.to_string().contains("Everything IPC 不可用"));
             return;
         }
