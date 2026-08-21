@@ -72,6 +72,11 @@ impl AppLayout {
         self.node_root.join("config.toml")
     }
 
+    /// 返回固定放在 `node.exe` 目录中的 Node 配置引导文件路径。
+    pub fn node_bootstrap(&self) -> PathBuf {
+        self.executable_dir.join("bootstrap.toml")
+    }
+
     /// 返回节点当前 V2 SQLite 文件路径。
     pub fn node_database(&self) -> PathBuf {
         self.node_root.join("node.db")

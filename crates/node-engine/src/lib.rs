@@ -3,6 +3,8 @@
 
 /// 串行独占 NodeStore 与 WorkerPool 的节点业务 actor。
 pub mod actor;
+/// 固定 bootstrap 与完整 Node 配置的本机原子持久化边界。
+pub mod config_repository;
 /// 纯 SQLite 本地精确、相似两层分析和代表分组。
 pub mod analysis;
 /// 文件删除前复核和成功后的 SQLite 收缩事务。

@@ -1203,9 +1203,11 @@ dependencies = [
  "everything-ipc",
  "md-5 0.10.6",
  "prost",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "toml 1.1.4+spec-1.1.0",
  "uuid",
 ]
 
@@ -1250,6 +1252,7 @@ version = "0.1.0"
 dependencies = [
  "dedup-core",
  "sha2 0.10.9",
+ "tempfile",
  "uuid",
  "windows",
 ]
