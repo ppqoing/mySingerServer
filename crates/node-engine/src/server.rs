@@ -8,6 +8,7 @@ use dedup_transport::{FrameClass, FrameError, FrameReader, FrameWriter};
 use prost::Message;
 use thiserror::Error;
 use tokio::{
+    io::{AsyncRead, AsyncWrite},
     net::{TcpListener, TcpStream},
     sync::{Semaphore, mpsc, oneshot},
     task::JoinSet,
@@ -25,6 +26,11 @@ pub enum ServerError {
 pub trait NodeRequestHandler: Clone + Send + Sync + 'static {
     /// 处理一个已握手连接上的请求，并保留原 request_id 返回响应。
     fn handle(&self, request: proto::Envelope) -> impl Future<Output = proto::Envelope> + Send;
+
+    /// 指定 request 的响应完整写入客户端后通知业务层。
+    fn response_flushed(&self, _request_id: u64) -> impl Future<Output = ()> + Send {
+        async {}
+    }
 
     /// 管理连接结束后释放该连接持有的快照等短生命周期资源。
     fn connection_closed(&self) -> impl Future<Output = ()> + Send {
@@ -72,6 +78,17 @@ impl NodeServer {
         while connections.join_next().await.is_some() {}
         Ok(())
     }
+
+    /// 通过与真实 TCP 连接相同的握手、并发请求和写出路径运行测试流。
+    #[doc(hidden)]
+    pub async fn serve_stream_for_test<S, H>(stream: S, handler: H)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        H: NodeRequestHandler,
+    {
+        let (read, write) = tokio::io::split(stream);
+        serve_connection_io(read, write, handler).await;
+    }
 }
 
 async fn send_busy(stream: TcpStream) {
@@ -86,6 +103,15 @@ where
     H: NodeRequestHandler,
 {
     let (read, write) = stream.into_split();
+    serve_connection_io(read, write, handler).await;
+}
+
+async fn serve_connection_io<R, W, H>(read: R, write: W, handler: H)
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+    H: NodeRequestHandler,
+{
     let mut reader = FrameReader::new(read);
     let mut writer = FrameWriter::new(write);
     let Ok(first) = read_envelope(&mut reader).await else {
@@ -129,11 +155,13 @@ where
     }
 
     let (responses, mut response_reader) = mpsc::channel::<proto::Envelope>(64);
+    let writer_handler = handler.clone();
     let writer_task = tokio::spawn(async move {
         while let Some(response) = response_reader.recv().await {
             if write_envelope(&mut writer, &response).await.is_err() {
                 break;
             }
+            writer_handler.response_flushed(response.request_id).await;
         }
     });
     while let Ok(request) = read_envelope(&mut reader).await {

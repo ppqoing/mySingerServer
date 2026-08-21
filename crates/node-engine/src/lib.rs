@@ -9,6 +9,8 @@ pub mod config_repository;
 pub mod analysis;
 /// 文件删除前复核和成功后的 SQLite 收缩事务。
 pub mod delete;
+/// Node 替代进程与响应刷出后的退出通知边界。
+pub mod host_control;
 /// 图片原文件和视频 JPEG 联系表的有界分块预览。
 pub mod preview;
 /// 文件枚举、缓存复用、MD5 与一筛任务编排。

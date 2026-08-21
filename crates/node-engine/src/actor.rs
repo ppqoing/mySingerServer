@@ -31,7 +31,9 @@ use crate::{
         LocalAnalysisEngine, Stage2BatchItem, Stage2BatchPlan, WorkerPoolStage2Processor,
         begin_stage2_batch, run_stage2_batch,
     },
+    config_repository::{ConfigRepositoryError, NodeConfigRepository},
     delete::DeleteEngine,
+    host_control::NodeHostControl,
     preview::{PreviewKind, PreviewService},
     scan::{
         EverythingEnumerator, ScanEngine, ScanOptions, SystemMd5, WindowsWalker,
@@ -108,6 +110,64 @@ impl NodeEngineHandle {
 
     async fn connection_closed(&self) {
         let _ = self.commands.send(EngineCommand::ConnectionClosed).await;
+    }
+
+    async fn response_flushed(&self, request_id: u64) {
+        let (reply, response) = oneshot::channel();
+        if self
+            .commands
+            .send(EngineCommand::ResponseFlushed(request_id, reply))
+            .await
+            .is_ok()
+        {
+            let _ = response.await;
+        }
+    }
+}
+
+/// 供 actor 使用且不暴露仓库内部恢复字段的配置状态。
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq)]
+pub struct NodeConfigState {
+    /// 原样保留的当前 Node 配置。
+    pub config: NodeConfig,
+    /// 当前完整配置文件的 SHA-256 摘要。
+    pub version_sha256: String,
+}
+
+/// actor 配置协议对原子仓库使用的最小可替换边界。
+#[doc(hidden)]
+pub trait NodeConfigRepositoryAccess: Send + Sync {
+    /// 加载当前原始配置和版本摘要。
+    fn snapshot(&self) -> Result<NodeConfigState, ConfigRepositoryError>;
+
+    /// 仅在版本摘要匹配时原子保存配置并返回新状态。
+    fn save_if_version(
+        &self,
+        expected_version_sha256: &str,
+        config: &NodeConfig,
+    ) -> Result<NodeConfigState, ConfigRepositoryError>;
+}
+
+impl NodeConfigRepositoryAccess for NodeConfigRepository {
+    fn snapshot(&self) -> Result<NodeConfigState, ConfigRepositoryError> {
+        let loaded = NodeConfigRepository::snapshot(self)?;
+        Ok(NodeConfigState {
+            config: loaded.config,
+            version_sha256: loaded.version_sha256,
+        })
+    }
+
+    fn save_if_version(
+        &self,
+        expected_version_sha256: &str,
+        config: &NodeConfig,
+    ) -> Result<NodeConfigState, ConfigRepositoryError> {
+        let loaded = NodeConfigRepository::save_if_version(self, expected_version_sha256, config)?;
+        Ok(NodeConfigState {
+            config: loaded.config,
+            version_sha256: loaded.version_sha256,
+        })
     }
 }
 
@@ -205,12 +265,15 @@ impl NodeRuntime {
         .await?;
         let listener = tokio::net::TcpListener::bind((config.listen_ip, config.port)).await?;
         let listen_address = listener.local_addr()?;
-        let (handle, actor_task) = NodeEngine::spawn(
+        let repository = NodeConfigRepository::from_layout(layout);
+        let (handle, actor_task) = spawn_actor(
             store,
-            worker_pool,
+            Some(worker_pool),
             listen_address,
             &layout.node_cache(),
             config.enumerator,
+            Some(Box::new(repository)),
+            None,
         );
         let (server_shutdown, shutdown) = oneshot::channel();
         let server_task = tokio::spawn(NodeServer::serve_until(listener, handle.clone(), shutdown));
@@ -262,6 +325,11 @@ impl NodeRequestHandler for NodeEngineHandle {
         let handle = self.clone();
         async move { handle.connection_closed().await }
     }
+
+    fn response_flushed(&self, request_id: u64) -> impl std::future::Future<Output = ()> + Send {
+        let handle = self.clone();
+        async move { handle.response_flushed(request_id).await }
+    }
 }
 
 /// 创建并运行单一 NodeEngine actor 的工厂。
@@ -281,6 +349,28 @@ impl NodeEngine {
             listen_address,
             cache_root,
             EnumeratorKind::WindowsWalker,
+            None,
+            None,
+        )
+    }
+
+    /// 创建注入配置仓库和可选宿主控制器的测试 actor。
+    #[doc(hidden)]
+    pub fn spawn_with_remote_config_for_test(
+        store: NodeStore,
+        listen_address: SocketAddr,
+        cache_root: &Path,
+        repository: Box<dyn NodeConfigRepositoryAccess>,
+        host_control: Option<Box<dyn NodeHostControl>>,
+    ) -> (NodeEngineHandle, JoinHandle<()>) {
+        spawn_actor(
+            store,
+            None,
+            listen_address,
+            cache_root,
+            EnumeratorKind::WindowsWalker,
+            Some(repository),
+            host_control,
         )
     }
 
@@ -298,6 +388,8 @@ impl NodeEngine {
             listen_address,
             cache_root,
             enumerator,
+            None,
+            None,
         )
     }
 }
@@ -308,6 +400,8 @@ fn spawn_actor(
     listen_address: SocketAddr,
     cache_root: &Path,
     enumerator: EnumeratorKind,
+    config_repository: Option<Box<dyn NodeConfigRepositoryAccess>>,
+    host_control: Option<Box<dyn NodeHostControl>>,
 ) -> (NodeEngineHandle, JoinHandle<()>) {
     let (commands, receiver) = mpsc::channel(64);
     let handle = NodeEngineHandle {
@@ -326,6 +420,9 @@ fn spawn_actor(
             snapshots: BTreeMap::new(),
             active_job: None,
             commands: commands.downgrade(),
+            config_repository,
+            host_control,
+            pending_restart_request_id: None,
         },
         receiver,
     ));
@@ -343,11 +440,15 @@ struct EngineState {
     snapshots: BTreeMap<String, OwnedSnapshot>,
     active_job: Option<ActiveJob>,
     commands: mpsc::WeakSender<EngineCommand>,
+    config_repository: Option<Box<dyn NodeConfigRepositoryAccess>>,
+    host_control: Option<Box<dyn NodeHostControl>>,
+    pending_restart_request_id: Option<u64>,
 }
 
 enum EngineCommand {
     Protocol(proto::Envelope, oneshot::Sender<proto::Envelope>),
     ConnectionClosed,
+    ResponseFlushed(u64, oneshot::Sender<()>),
     Restart(oneshot::Sender<Result<(), String>>),
     Shutdown(oneshot::Sender<()>),
     BackgroundFinished {
@@ -399,6 +500,10 @@ async fn run_actor(mut state: EngineState, mut commands: mpsc::Receiver<EngineCo
                 let _ = reply.send(state.handle_protocol(request).await);
             }
             EngineCommand::ConnectionClosed => state.snapshots.clear(),
+            EngineCommand::ResponseFlushed(request_id, reply) => {
+                state.response_flushed(request_id);
+                let _ = reply.send(());
+            }
             EngineCommand::Restart(reply) => {
                 let _ = reply.send(state.restart_engine().await);
             }
@@ -448,6 +553,10 @@ impl EngineState {
             Some(proto::envelope::Payload::BeginSnapshot(_)) => self.begin_snapshot(),
             Some(proto::envelope::Payload::ReadSnapshotPage(page)) => self.read_snapshot_page(page),
             Some(proto::envelope::Payload::ReadFile(read)) => self.read_file(read),
+            Some(proto::envelope::Payload::GetNodeConfig(_)) => self.get_node_config(),
+            Some(proto::envelope::Payload::SaveNodeConfigAndRestart(save)) => {
+                self.save_node_config_and_restart(request_id, save)
+            }
             Some(proto::envelope::Payload::CreateDeleteBatch(create)) => {
                 self.create_delete_batch(create)
             }
@@ -466,6 +575,82 @@ impl EngineState {
                 payload: Some(payload),
             },
             Err((code, message)) => error_response(request_id, code, &message),
+        }
+    }
+
+    fn get_node_config(&self) -> ProtocolResult {
+        let repository = self
+            .config_repository
+            .as_ref()
+            .ok_or_else(|| (proto::ErrorCode::Internal, "节点未装配配置仓库".to_owned()))?;
+        let loaded = repository.snapshot().map_err(config_repository_error)?;
+        let logical_cpu_count = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1);
+        let effective_worker_count = loaded
+            .config
+            .worker
+            .effective_worker_count(logical_cpu_count);
+        let config = proto::NodeConfigValue::try_from(&loaded.config).map_err(internal)?;
+        Ok(proto::envelope::Payload::NodeConfigSnapshot(
+            proto::NodeConfigSnapshot {
+                machine_id: self.store.machine_id().as_str().to_owned(),
+                version_sha256: loaded.version_sha256,
+                config: Some(config),
+                logical_cpu_count: u32::try_from(logical_cpu_count).unwrap_or(u32::MAX),
+                effective_worker_count: u32::try_from(effective_worker_count).unwrap_or(u32::MAX),
+            },
+        ))
+    }
+
+    fn save_node_config_and_restart(
+        &mut self,
+        request_id: u64,
+        save: proto::SaveNodeConfigAndRestart,
+    ) -> ProtocolResult {
+        let host_control = self.host_control.as_ref().ok_or_else(|| {
+            (
+                proto::ErrorCode::Internal,
+                "节点宿主尚未支持远程配置重启".to_owned(),
+            )
+        })?;
+        if self.pending_restart_request_id.is_some() {
+            return Err((
+                proto::ErrorCode::Conflict,
+                "节点已有等待响应刷出的重启请求".to_owned(),
+            ));
+        }
+        let repository = self
+            .config_repository
+            .as_ref()
+            .ok_or_else(|| (proto::ErrorCode::Internal, "节点未装配配置仓库".to_owned()))?;
+        let config = save
+            .config
+            .ok_or_else(|| invalid("保存请求缺少 config"))?
+            .try_into()
+            .map_err(invalid)?;
+        let saved = repository
+            .save_if_version(&save.expected_version_sha256, &config)
+            .map_err(config_repository_error)?;
+        host_control
+            .prepare_replacement(&saved.version_sha256)
+            .map_err(internal)?;
+        self.pending_restart_request_id = Some(request_id);
+        Ok(proto::envelope::Payload::NodeRestartAccepted(
+            proto::NodeRestartAccepted {
+                machine_id: self.store.machine_id().as_str().to_owned(),
+                saved_version_sha256: saved.version_sha256,
+            },
+        ))
+    }
+
+    fn response_flushed(&mut self, request_id: u64) {
+        if self.pending_restart_request_id != Some(request_id) {
+            return;
+        }
+        self.pending_restart_request_id = None;
+        if let Some(host_control) = &self.host_control {
+            let _ = host_control.commit_exit_after_response();
         }
     }
 
@@ -1191,6 +1376,17 @@ fn store_error(error: StoreError) -> (proto::ErrorCode, String) {
         proto::ErrorCode::SnapshotRequired
     } else {
         proto::ErrorCode::Internal
+    };
+    (code, error.to_string())
+}
+
+fn config_repository_error(error: ConfigRepositoryError) -> (proto::ErrorCode, String) {
+    let code = match &error {
+        ConfigRepositoryError::VersionConflict { .. } => proto::ErrorCode::Conflict,
+        ConfigRepositoryError::Core(_) | ConfigRepositoryError::RepositoryControlPath { .. } => {
+            proto::ErrorCode::InvalidRequest
+        }
+        _ => proto::ErrorCode::Internal,
     };
     (code, error.to_string())
 }
