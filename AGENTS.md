@@ -134,6 +134,15 @@ Worker 全部加入 `KILL_ON_JOB_CLOSE` Job，节点退出不会留下孤儿进�
 - `MachineId` 的输入顺序固定为 System UUID、System Serial、Baseboard Serial；字段 trim、
   转大写、跳过空值后以 NUL 分隔，对固定命名空间前缀与字段计算 SHA-256。
 
+运行任务详情采用进程内双 registry 所有权：`node.exe` 的 `RuntimeTaskRegistry` 由唯一 Node actor
+创建并观察扫描、本地分析、二筛和删除；`desktop.exe` 的 `DesktopRuntimeTaskRegistry` 由唯一
+Desktop 控制循环创建并观察跨机器编排、同步和管理端删除。二者都不写 SQLite、PostgreSQL、TOML
+或日志，进程重启后旧阶段、Worker、速度和失败详情全部清空。Desktop 对在线 Node 每 2 秒稳定分页
+刷新摘要和当前选中详情；Node 终态通过同一管理连接的 `request_id=0` 主动事件立即触发刷新，不把
+高频进度变成事件流。连接断开时保留最后成功详情并标记 stale；重连只接受当前会话机器身份和新
+registry 代次，旧运行 ID 不恢复。SQLite `TaskSummary` 仍只负责持久任务恢复、同步门禁和任务统计，
+恢复未完成工作时必须创建新的临时 recovery 运行 ID，不能把持久任务 ID 或旧详情回填进 registry。
+
 节点 SQLite V2 使用 23 张严格表闭合内容、位置、特征、任务、分析、分组、复核、同步和删除。
 `metadata.schema_id` 是不兼容版本标记：只自动初始化空数据库，旧库或未知 schema 直接拒绝打开。
 `NodeStore` 独占连接并启用外键、WAL 与五秒 busy timeout；上层 actor 负责串行调用，不在每个
