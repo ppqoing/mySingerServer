@@ -564,7 +564,8 @@ impl WorkerPool {
         }
         let actor_state = state.clone();
         let (commands, mut command_rx) = mpsc::channel(64);
-        let (events, event_rx) = mpsc::channel(256);
+        // 小容量直接锁定 dispatch/event owner 必须并发推进，不能依赖大缓冲掩盖死锁。
+        let (events, event_rx) = mpsc::channel(2);
         let (started, started_rx) = mpsc::channel(16);
         let (control_tx, mut control_rx) = mpsc::channel(16);
         let available_slots = Arc::new(AtomicUsize::new(worker_count));

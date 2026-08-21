@@ -1,26 +1,70 @@
-use std::{future::Future, fs, pin::Pin};
+use std::{collections::BTreeSet, future::Future, fs, path::Path, pin::Pin, sync::{Arc, Condvar, Mutex}, time::Duration};
 
 use dedup_core::{DisplayPath, MachineId, MediaKind, NormalizedPath};
 use dedup_node_engine::{
-    io::ReadFailure,
+    io::{BlockReadError, BlockReader, ReadFailure},
     runtime_tasks::{
         RuntimeProgressUnit, RuntimeStage, RuntimeTaskKind, RuntimeTaskRegistry,
         RuntimeWorkerUpdate,
     },
     scan::{
         FileEnumerator, PipelineFileReader, PipelineLimits, ReadProduct, ScanEngine, ScanError,
-        ScanOptions, Stage1Processor, Stage1Request, SystemMd5, md5_bytes,
+        ScanOptions, ScheduledFileReader, Stage1Processor, Stage1Request, SystemMd5,
+        WorkerPoolStage1Processor, md5_bytes,
     },
-    worker::Stage1Output,
+    worker::{Stage1Output, WorkerPool},
 };
 use dedup_node_store::{NodeStore, ScannedPath};
-use dedup_windows::ReadCancellationToken;
+use dedup_windows::{LocalDiskKind, ReadCancellationToken};
+
+#[derive(Clone, Default)]
+struct ReadGate(Arc<(Mutex<GateState>, Condvar)>);
+#[derive(Default)]
+struct GateState { started: BTreeSet<String>, released: BTreeSet<String>, all_released: bool }
+impl ReadGate {
+    fn release(&self, path: &Path) {
+        let (lock, cv) = &*self.0;
+        lock.lock().unwrap().released.insert(path.file_name().unwrap().to_string_lossy().into_owned());
+        cv.notify_all();
+    }
+    fn release_all(&self) {
+        let (lock, cv) = &*self.0;
+        lock.lock().unwrap().all_released = true;
+        cv.notify_all();
+    }
+}
+impl BlockReader for ReadGate {
+    fn read_at(&self, path: &Path, offset: u64, buffer: &mut [u8], _: Duration, _: &ReadCancellationToken) -> Result<usize, BlockReadError> {
+        let (lock, cv) = &*self.0;
+        let mut state = lock.lock().unwrap();
+        let key = path.file_name().unwrap().to_string_lossy().into_owned();
+        state.started.insert(key.clone());
+        cv.notify_all();
+        while (key.contains('2') || key.contains('3')) && !state.all_released && !state.released.contains(&key) {
+            state = cv.wait(state).unwrap();
+        }
+        drop(state);
+        let data = fs::read(path).map_err(BlockReadError::Io)?;
+        let offset = offset as usize;
+        if offset >= data.len() { return Ok(0); }
+        let len = buffer.len().min(data.len() - offset);
+        buffer[..len].copy_from_slice(&data[offset..offset + len]);
+        Ok(len)
+    }
+}
 
 #[derive(Clone)]
 struct Rows(Vec<ScannedPath>);
 impl FileEnumerator for Rows {
     fn enumerate(&self, _: &[DisplayPath]) -> Result<Vec<ScannedPath>, ScanError> {
         Ok(self.0.clone())
+    }
+}
+#[derive(Clone)]
+struct FailingRows;
+impl FileEnumerator for FailingRows {
+    fn enumerate(&self, _: &[DisplayPath]) -> Result<Vec<ScannedPath>, ScanError> {
+        Err(ScanError::Stage1("controlled enumeration failure".into()))
     }
 }
 
@@ -151,4 +195,136 @@ async fn concurrent_telemetry_updates_are_exact_and_never_become_io_failures() {
         registry.details(reporter.id()).await.unwrap().stages[0].completed,
         800
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn controlled_two_disks_and_actual_two_worker_slots_expose_live_known_totals() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = ["a1.bin", "b1.bin", "a2.bin", "b2.bin", "a3.bin"]
+        .map(|name| dir.path().join(name));
+    for (index, path) in paths.iter().enumerate() {
+        fs::write(path, vec![index as u8 + 1; 16]).unwrap();
+    }
+    let rows = paths.iter().map(|path| ScannedPath::new(
+        NormalizedPath::new(path).unwrap(), DisplayPath::new(path).unwrap(), 16,
+    )).collect::<Vec<_>>();
+    let gate = ReadGate::default();
+    struct ReleaseAll(ReadGate);
+    impl Drop for ReleaseAll { fn drop(&mut self) { self.0.release_all(); } }
+    let _release_all = ReleaseAll(gate.clone());
+    let mut config = dedup_core::DiskReadConfig::default();
+    config.hdd_threads_per_disk = 2;
+    config.total_threads = 4;
+    let (reader, limits) = ScheduledFileReader::controlled_for_test(
+        &config, 2, gate.clone(), |path| {
+            let disk = if path.file_name().unwrap().to_string_lossy().starts_with('a') { 7 } else { 12 };
+            (vec![disk], LocalDiskKind::Hdd)
+        },
+    ).unwrap();
+    let registry = RuntimeTaskRegistry::new();
+    let reporter = registry.begin(RuntimeTaskKind::Scan, MachineId::from_sha256([0xa3; 32]), "双盘").await;
+    let (pool, mut started, control) = WorkerPool::controlled_batch_for_test(2);
+    let (first_started_tx, first_started_rx) = tokio::sync::oneshot::channel();
+    let release_workers = Arc::new(tokio::sync::Notify::new());
+    let controller_release = release_workers.clone();
+    let controller = tokio::spawn(async move {
+        let first = [started.recv().await.unwrap(), started.recv().await.unwrap()];
+        let _ = first_started_tx.send(());
+        controller_release.notified().await;
+        for (task_id, item_id) in first {
+            control.complete(task_id, item_id, Stage1Output { media_kind: MediaKind::Other, width: 0, height: 0, duration_ms: None, frames: Vec::new(), contact_sheet_jpeg: None }).await;
+        }
+        for _ in 0..2 {
+            let (task_id, item_id) = started.recv().await.unwrap();
+            control.complete(task_id, item_id, Stage1Output { media_kind: MediaKind::Other, width: 0, height: 0, duration_ms: None, frames: Vec::new(), contact_sheet_jpeg: None }).await;
+        }
+        let (task_id, item_id) = started.recv().await.unwrap();
+        control.crash(task_id, item_id, "controlled worker crash".into()).await;
+    });
+    let root = DisplayPath::new(dir.path()).unwrap();
+    let sheets = dir.path().join("sheets");
+    let run_reporter = reporter.clone();
+    let cancellation = ReadCancellationToken::new();
+    let run_cancellation = cancellation.clone();
+    let run = tokio::spawn(async move {
+        let mut pool = pool;
+        let mut processor = WorkerPoolStage1Processor::new(&mut pool, ReadCancellationToken::new())
+            .with_runtime_reporter(run_reporter.clone());
+        let mut engine = ScanEngine::new(Rows(rows), SystemMd5, sheets)
+            .with_runtime_reporter(run_reporter);
+        let mut store = NodeStore::open_in_memory(MachineId::from_sha256([0xa3; 32])).unwrap();
+        let result = engine.run_parallel_with(
+            &mut store, ScanOptions::new(vec![root]).force_recompute(), reader,
+            &mut processor, limits, run_cancellation, 10,
+        ).await;
+        (store, result)
+    });
+    gate.release(&paths[0]); gate.release(&paths[1]);
+    let first_ready = tokio::time::timeout(Duration::from_secs(3), first_started_rx).await;
+    if first_ready.is_err() {
+        cancellation.cancel();
+        gate.release_all();
+        release_workers.notify_one();
+        let _ = tokio::time::timeout(Duration::from_secs(3), controller).await;
+        let _ = tokio::time::timeout(Duration::from_secs(3), run).await;
+        panic!("两盘首批读取必须进入两个真实Worker slot");
+    }
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while registry.details(reporter.id()).await.unwrap().workers.len() != 2 {
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("Started telemetry 必须到达registry");
+    let held = registry.details(reporter.id()).await.unwrap();
+    let summary = held.summary.as_ref().unwrap();
+    assert!(summary.overall_total_known);
+    assert_eq!(summary.overall_total, 5);
+    let read = held.stages.iter().find(|stage| stage.stage_id == "read_md5").unwrap();
+    assert!(read.total_known);
+    assert_eq!(read.total, 80);
+    assert!(held.stages.iter().any(|s| s.stage_id == "read_md5" && s.state == dedup_protocol::proto::RuntimeStageState::RuntimeStageRunning as i32));
+    assert!(held.stages.iter().any(|s| s.stage_id == "probe_stage1" && s.state == dedup_protocol::proto::RuntimeStageState::RuntimeStageRunning as i32));
+    assert_eq!(held.workers.len(), 2);
+    assert!(held.workers.iter().all(|worker| worker.process_id.is_some() && !worker.physical_disk_id.is_empty()));
+    gate.release(&paths[2]); gate.release(&paths[3]);
+    gate.release(&paths[4]);
+    release_workers.notify_one();
+    if tokio::time::timeout(Duration::from_secs(3), controller).await.is_err() {
+        cancellation.cancel();
+        gate.release_all();
+        let _ = tokio::time::timeout(Duration::from_secs(3), run).await;
+        panic!("第二批必须复用两个slot并完成");
+    }
+    let (_store, result) = tokio::time::timeout(Duration::from_secs(3), run)
+        .await.expect("扫描必须完成").unwrap();
+    result.unwrap();
+    let done = registry.details(reporter.id()).await.unwrap();
+    assert_eq!(done.workers.iter().map(|worker| worker.completed_files).sum::<u64>(), 4);
+    assert!(done.workers.iter().all(|worker| worker.completed_files >= 2));
+    assert!(done.workers.iter().all(|worker| worker.speed_per_second > 0.0));
+    assert_eq!(done.failures.len(), 1);
+    assert!(done.failures[0].message.contains("controlled worker crash"));
+    assert_eq!(_store.page_file_faults(None, 10).unwrap().items.len(), 1);
+}
+
+#[tokio::test]
+async fn enumeration_error_marks_runtime_task_and_all_started_stages_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = RuntimeTaskRegistry::new();
+    let reporter = registry.begin(RuntimeTaskKind::Scan, MachineId::from_sha256([0xa4; 32]), "枚举失败").await;
+    let mut engine = ScanEngine::new(FailingRows, SystemMd5, dir.path().join("sheets"))
+        .with_runtime_reporter(reporter.clone());
+    let mut store = NodeStore::open_in_memory(MachineId::from_sha256([0xa4; 32])).unwrap();
+    let result = engine.run_parallel_with(
+        &mut store, ScanOptions::new(vec![DisplayPath::new(dir.path()).unwrap()]),
+        Reader(reporter.clone()), &mut Processor(reporter.clone()),
+        PipelineLimits::new(2, 2), ReadCancellationToken::new(), 1,
+    ).await;
+    assert!(result.is_err());
+    let details = registry.details(reporter.id()).await.unwrap();
+    assert_eq!(details.summary.unwrap().state, "failed");
+    assert!(details.stages.iter().all(|stage| {
+        stage.state != dedup_protocol::proto::RuntimeStageState::RuntimeStageRunning as i32
+    }));
+    let enumerate = details.stages.iter().find(|stage| stage.stage_id == "enumerate").unwrap();
+    assert_eq!(enumerate.state, dedup_protocol::proto::RuntimeStageState::RuntimeStageFailed as i32);
 }

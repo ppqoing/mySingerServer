@@ -144,8 +144,8 @@ impl DiskReadScheduler {
         response.await.map_err(|_| SchedulerError::Closed)
     }
 
-    #[cfg(test)]
-    pub(super) async fn acquire_for_test(
+    #[doc(hidden)]
+    pub async fn acquire_for_test(
         &self,
         disk_numbers: &[u32],
         kind: LocalDiskKind,

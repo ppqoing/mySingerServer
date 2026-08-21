@@ -4,11 +4,11 @@ use std::{collections::BTreeMap, future::Future, io, path::{Path, PathBuf}, pin:
 
 use dedup_core::{DiskReadConfig, NodeConfig};
 use dedup_node_store::ScannedPath;
-use dedup_windows::{OverlappedFileReader, ReadCancellationToken, resolve_storage_location};
+use dedup_windows::{LocalDiskKind, ReadCancellationToken, resolve_storage_location};
 use tokio::{sync::mpsc, task::JoinHandle};
 
 use crate::{
-    io::{DiskReadPermit, DiskReadScheduler, ReadFailure, RetryingFileReader},
+    io::{BlockReader, DiskReadPermit, DiskReadScheduler, ReadFailure, RetryingFileReader},
     runtime_tasks::{RuntimeStage, RuntimeTaskReporter},
 };
 
@@ -69,9 +69,36 @@ pub trait PipelineFileReader: Clone + Send + Sync + 'static {
 #[derive(Clone)]
 pub struct ScheduledFileReader {
     scheduler: DiskReadScheduler,
-    reader: Arc<RetryingFileReader<OverlappedFileReader>>,
+    reader: Arc<dyn Md5ReadBackend>,
+    resolver: LocationResolver,
     reporter: Option<RuntimeTaskReporter>,
     locations: Arc<Mutex<BTreeMap<PathBuf, String>>>,
+}
+
+trait Md5ReadBackend: Send + Sync {
+    fn read(
+        &self,
+        path: &Path,
+        cancellation: &ReadCancellationToken,
+        progress: &mut dyn FnMut(usize) -> io::Result<()>,
+    ) -> Result<[u8; 16], ReadFailure>;
+}
+
+impl<R: BlockReader + Send + Sync> Md5ReadBackend for RetryingFileReader<R> {
+    fn read(
+        &self,
+        path: &Path,
+        cancellation: &ReadCancellationToken,
+        progress: &mut dyn FnMut(usize) -> io::Result<()>,
+    ) -> Result<[u8; 16], ReadFailure> {
+        self.read_file_md5_with_progress(path, cancellation, progress)
+    }
+}
+
+#[derive(Clone)]
+enum LocationResolver {
+    System,
+    Injected(Arc<dyn Fn(&Path) -> (Vec<u32>, LocalDiskKind) + Send + Sync>),
 }
 
 impl ScheduledFileReader {
@@ -99,11 +126,40 @@ impl ScheduledFileReader {
             Self {
                 scheduler,
                 reader: Arc::new(reader),
+                resolver: LocationResolver::System,
                 reporter: None,
                 locations: Arc::new(Mutex::new(BTreeMap::new())),
             },
             PipelineLimits::new(capacity, capacity),
         ))
+    }
+
+    /// 使用真实 scheduler/retrying reader 与测试物理盘 resolver 装配可控 reader。
+    #[doc(hidden)]
+    pub fn controlled_for_test<R, F>(
+        read_config: &DiskReadConfig,
+        effective_worker_count: usize,
+        block_reader: R,
+        resolver: F,
+    ) -> Result<(Self, PipelineLimits), ScanError>
+    where
+        R: BlockReader + Send + Sync + 'static,
+        F: Fn(&Path) -> (Vec<u32>, LocalDiskKind) + Send + Sync + 'static,
+    {
+        let scheduler = DiskReadScheduler::new(read_config, effective_worker_count)
+            .map_err(|error| ScanError::Stage1(error.to_string()))?;
+        let mut config = NodeConfig::default();
+        config.read = read_config.clone();
+        let reader = RetryingFileReader::new(block_reader, &config)
+            .map_err(|error| ScanError::Stage1(error.to_string()))?;
+        let capacity = read_config.total_threads.saturating_mul(4).max(effective_worker_count * 2);
+        Ok((Self {
+            scheduler,
+            reader: Arc::new(reader),
+            resolver: LocationResolver::Injected(Arc::new(resolver)),
+            reporter: None,
+            locations: Arc::new(Mutex::new(BTreeMap::new())),
+        }, PipelineLimits::new(capacity, capacity)))
     }
 
     /// 接入扫描运行时读取字节 reporter。
@@ -126,47 +182,41 @@ impl PipelineFileReader for ScheduledFileReader {
         let reader = self.reader.clone();
         let reporter = self.reporter.clone();
         let locations = self.locations.clone();
+        let resolver = self.resolver.clone();
         Box::pin(async move {
             let path = scanned.display_path.as_path().to_path_buf();
             if cancellation.is_cancelled() {
                 return Err(ReadFailure::Cancelled);
             }
-            let resolved_path = path.clone();
-            let storage =
-                tokio::task::spawn_blocking(move || resolve_storage_location(&resolved_path))
-                    .await
-                    .map_err(|error| join_failure(&path, error.to_string()))?
-                    .map_err(|source| ReadFailure::Io {
-                        path: path.clone(),
-                        block_offset: 0,
-                        source,
+            let (disk_numbers, lease) = match &resolver {
+                LocationResolver::System => {
+                    let resolved_path = path.clone();
+                    let storage = tokio::task::spawn_blocking(move || resolve_storage_location(&resolved_path))
+                        .await.map_err(|error| join_failure(&path, error.to_string()))?
+                        .map_err(|source| ReadFailure::Io { path: path.clone(), block_offset: 0, source })?;
+                    let numbers = storage.physical_disk_id().disk_numbers().to_vec();
+                    let lease = scheduler.acquire(storage).await.map_err(|error| ReadFailure::Io {
+                        path: path.clone(), block_offset: 0, source: io::Error::other(error.to_string()),
                     })?;
-            let physical_disk_id = format!(
-                "PhysicalDisk{}",
-                storage
-                    .physical_disk_id()
-                    .disk_numbers()
-                    .iter()
-                    .map(u32::to_string)
-                    .collect::<Vec<_>>()
-                    .join("+")
-            );
+                    (numbers, lease)
+                }
+                LocationResolver::Injected(resolver) => {
+                    let (numbers, kind) = resolver(&path);
+                    let lease = scheduler.acquire_for_test(&numbers, kind).await.map_err(|error| ReadFailure::Io {
+                        path: path.clone(), block_offset: 0, source: io::Error::other(error.to_string()),
+                    })?;
+                    (numbers, lease)
+                }
+            };
+            let physical_disk_id = format!("PhysicalDisk{}", disk_numbers.iter().map(u32::to_string).collect::<Vec<_>>().join("+"));
             locations.lock().unwrap().insert(path.clone(), physical_disk_id);
-            let lease = scheduler
-                .acquire(storage)
-                .await
-                .map_err(|error| ReadFailure::Io {
-                    path: path.clone(),
-                    block_offset: 0,
-                    source: io::Error::other(error.to_string()),
-                })?;
             let read_path = path.clone();
             let read_cancellation = cancellation.clone();
             let (md5, lease) = tokio::task::spawn_blocking(move || {
-                let result = reader.read_file_md5_with_progress(
+                let result = reader.read(
                     &read_path,
                     &read_cancellation,
-                    |bytes| {
+                    &mut |bytes| {
                         if let Some(reporter) = &reporter {
                             let _ = reporter.advance_stage_nowait(
                                 RuntimeStage::ReadMd5,
