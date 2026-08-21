@@ -24,7 +24,21 @@ use crate::{MainWindow, models};
 #[derive(Clone)]
 pub struct UiBinding {
     config: Arc<Mutex<DesktopConfig>>,
-    node_config: Arc<Mutex<Option<NodeConfig>>>,
+    node_config: Arc<Mutex<Option<LoadedNodeConfig>>>,
+    selected_node: Arc<Mutex<NodeConfigSelection>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct LoadedNodeConfig {
+    config: NodeConfig,
+    machine_id: String,
+    version_sha256: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct NodeConfigSelection {
+    index: i32,
+    machine_id: String,
 }
 
 /// 绑定主窗口全部任务 21 回调，并返回事件应用所需的共享配置快照。
@@ -36,6 +50,10 @@ pub fn bind_commands(
     let binding = UiBinding {
         config: Arc::new(Mutex::new(initial)),
         node_config: Arc::new(Mutex::new(None)),
+        selected_node: Arc::new(Mutex::new(NodeConfigSelection {
+            index: window.get_node_config_selected_index().max(0),
+            machine_id: String::new(),
+        })),
     };
 
     bind_simple(window, &sender);
@@ -131,7 +149,12 @@ pub fn bind_commands(
         );
     });
 
-    bind_node_config(window, &sender, &binding.node_config);
+    bind_node_config(
+        window,
+        &sender,
+        &binding.node_config,
+        &binding.selected_node,
+    );
 
     let save_sender = sender;
     let save_window = window.as_weak();
@@ -155,22 +178,22 @@ pub fn bind_commands(
 fn bind_node_config(
     window: &MainWindow,
     sender: &mpsc::Sender<UiCommand>,
-    loaded: &Arc<Mutex<Option<NodeConfig>>>,
+    loaded: &Arc<Mutex<Option<LoadedNodeConfig>>>,
+    selected: &Arc<Mutex<NodeConfigSelection>>,
 ) {
     let select_window = window.as_weak();
     let select_loaded = Arc::clone(loaded);
+    let selected_for_callback = Arc::clone(selected);
     window.on_select_node_config(move |index| {
         let Some(window) = select_window.upgrade() else {
             return;
         };
         let index = index.max(0);
-        let changed = window.get_node_config_selected_index() != index;
         window.set_node_config_selected_index(index);
         window.set_node_config_node_online(selected_node_online(&window, index));
+        let changed = update_node_config_selection(&window, index, &selected_for_callback);
         if changed {
-            clear_node_config_form(&window);
-            *select_loaded.lock().expect("Node 配置锁未中毒") = None;
-            window.set_scan_root(SharedString::default());
+            clear_node_config_context(&window, &select_loaded);
         }
     });
 
@@ -184,8 +207,7 @@ fn bind_node_config(
         if !window.get_node_config_node_online() || window.get_node_config_saving() {
             return;
         }
-        clear_node_config_form(&window);
-        *load_loaded.lock().expect("Node 配置锁未中毒") = None;
+        clear_node_config_context(&window, &load_loaded);
         send(
             &load_sender,
             UiCommand::LoadNodeConfig {
@@ -203,7 +225,12 @@ fn bind_node_config(
         };
         let is_dirty = match node_config_from_window(&window) {
             Ok(current) => {
-                edit_loaded.lock().expect("Node 配置锁未中毒").as_ref() != Some(&current)
+                edit_loaded
+                    .lock()
+                    .expect("Node 配置锁未中毒")
+                    .as_ref()
+                    .map(|loaded| &loaded.config)
+                    != Some(&current)
             }
             Err(_) => true,
         };
@@ -230,7 +257,13 @@ fn bind_node_config(
                 return;
             }
         };
-        if save_loaded.lock().expect("Node 配置锁未中毒").as_ref() == Some(&config) {
+        if save_loaded
+            .lock()
+            .expect("Node 配置锁未中毒")
+            .as_ref()
+            .map(|loaded| &loaded.config)
+            == Some(&config)
+        {
             window.set_node_config_dirty(false);
             return;
         }
@@ -252,6 +285,33 @@ fn bind_node_config(
     });
 }
 
+fn update_node_config_selection(
+    window: &MainWindow,
+    index: i32,
+    selected: &Arc<Mutex<NodeConfigSelection>>,
+) -> bool {
+    let next = node_config_selection(window, index);
+    let mut previous = selected.lock().expect("Node 选择锁未中毒");
+    let index_changed = previous.index != next.index;
+    let machine_changed = previous.index == next.index
+        && !previous.machine_id.is_empty()
+        && !next.machine_id.is_empty()
+        && previous.machine_id != next.machine_id;
+    *previous = next;
+    index_changed || machine_changed
+}
+
+fn node_config_selection(window: &MainWindow, index: i32) -> NodeConfigSelection {
+    let machine_id = slint::Model::row_data(&window.get_nodes(), index.max(0) as usize)
+        .map(|node| node.machine_id.to_string())
+        .filter(|machine_id| machine_id != "尚未握手")
+        .unwrap_or_default();
+    NodeConfigSelection {
+        index: index.max(0),
+        machine_id,
+    }
+}
+
 fn selected_node_online(window: &MainWindow, index: i32) -> bool {
     slint::Model::row_data(&window.get_nodes(), index.max(0) as usize)
         .is_some_and(|node| node.status == "在线" && node.machine_id != "尚未握手")
@@ -266,12 +326,31 @@ fn clear_node_config_form(window: &MainWindow) {
     window.set_node_config_phase("未加载".into());
     window.set_node_config_error(SharedString::default());
     window.set_node_config_listen_ip(SharedString::default());
+    window.set_node_config_port(39091);
+    window.set_node_config_enumerator_index(1);
     window.set_node_config_data_path(SharedString::default());
     window.set_node_config_config_path(SharedString::default());
     window.set_node_config_log_path(SharedString::default());
     window.set_node_config_cache_path(SharedString::default());
+    window.set_node_config_hdd_threads(1);
+    window.set_node_config_ssd_threads(2);
+    window.set_node_config_unknown_threads(1);
+    window.set_node_config_total_threads(4);
+    window.set_node_config_block_size(4 * 1024 * 1024);
+    window.set_node_config_timeout_seconds(3);
+    window.set_node_config_retries(2);
+    window.set_node_config_legacy_workers(1);
+    window.set_node_config_worker_mode_index(0);
+    window.set_node_config_reserved_cores(1);
+    window.set_node_config_manual_workers(1);
     window.set_node_config_logical_cpus(0);
     window.set_node_config_effective_workers(0);
+    window.set_scan_root(SharedString::default());
+}
+
+fn clear_node_config_context(window: &MainWindow, loaded: &Arc<Mutex<Option<LoadedNodeConfig>>>) {
+    clear_node_config_form(window);
+    *loaded.lock().expect("Node 配置锁未中毒") = None;
 }
 
 fn node_config_from_window(window: &MainWindow) -> Result<NodeConfig, String> {
@@ -379,6 +458,9 @@ pub fn apply_event(window: &MainWindow, binding: &UiBinding, event: UiEvent) {
             window.set_node_config_node_online(state.nodes().get(selected).is_some_and(|node| {
                 node.connection == NodeConnectionState::Online && node.machine_id.is_some()
             }));
+            if update_node_config_selection(window, selected as i32, &binding.selected_node) {
+                clear_node_config_context(window, &binding.node_config);
+            }
             let sync = state
                 .nodes()
                 .iter()
@@ -402,7 +484,6 @@ pub fn apply_event(window: &MainWindow, binding: &UiBinding, event: UiEvent) {
             window.set_config_path(path(&state.paths().config));
             apply_settings(window, state.config());
             window.set_last_error(SharedString::default());
-            apply_node_config_state(window, binding, state.node_config());
         }
         UiEvent::PathsChanged {
             parent_path,
@@ -554,6 +635,9 @@ fn apply_node_config_state(
     if let Some(index) = state.selected_node_index() {
         window.set_node_config_selected_index(index as i32);
         window.set_node_config_node_online(selected_node_online(window, index as i32));
+        if update_node_config_selection(window, index as i32, &binding.selected_node) {
+            clear_node_config_context(window, &binding.node_config);
+        }
     }
     window.set_node_config_saving(state.is_in_progress());
     window.set_node_config_phase(node_config_phase(state.phase()).into());
@@ -563,9 +647,10 @@ fn apply_node_config_state(
     }
 
     let Some(snapshot) = state.snapshot() else {
-        clear_node_config_form(window);
         window.set_node_config_phase(
-            if state.phase() == dedup_desktop_core::view_state::NodeConfigSavePhase::Idle {
+            if !window.get_node_config_loaded()
+                && state.phase() == dedup_desktop_core::view_state::NodeConfigSavePhase::Idle
+            {
                 "未加载"
             } else {
                 node_config_phase(state.phase())
@@ -573,9 +658,22 @@ fn apply_node_config_state(
             .into(),
         );
         window.set_node_config_error(state.error().unwrap_or_default().into());
-        *binding.node_config.lock().expect("Node 配置锁未中毒") = None;
         return;
     };
+    let snapshot_unchanged = binding
+        .node_config
+        .lock()
+        .expect("Node 配置锁未中毒")
+        .as_ref()
+        .is_some_and(|loaded| {
+            loaded.machine_id == snapshot.machine_id
+                && loaded.version_sha256 == snapshot.version_sha256
+        });
+    if snapshot_unchanged {
+        window.set_node_config_logical_cpus(snapshot.logical_cpu_count as i32);
+        window.set_node_config_effective_workers(snapshot.effective_worker_count as i32);
+        return;
+    }
     let Some(wire) = snapshot.config.as_ref() else {
         clear_node_config_form(window);
         window.set_node_config_error("Node 配置响应缺少 config".into());
@@ -603,7 +701,11 @@ fn apply_node_config_state(
     window.set_node_config_effective_workers(snapshot.effective_worker_count as i32);
     window.set_node_config_phase(node_config_phase(state.phase()).into());
     window.set_node_config_error(state.error().unwrap_or_default().into());
-    *binding.node_config.lock().expect("Node 配置锁未中毒") = Some(config);
+    *binding.node_config.lock().expect("Node 配置锁未中毒") = Some(LoadedNodeConfig {
+        config,
+        machine_id: snapshot.machine_id.clone(),
+        version_sha256: snapshot.version_sha256.clone(),
+    });
 }
 
 fn apply_node_config(window: &MainWindow, config: &NodeConfig) {

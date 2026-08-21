@@ -422,3 +422,154 @@ fn remote_node_config_callbacks_map_identity_and_send_only_task6_commands() {
     assert!(matches!(next(&mut receiver), UiCommand::SaveSettings(_)));
     assert!(receiver.try_recv().is_err(), "旧保存设置不得冒充 Node 保存");
 }
+
+#[test]
+fn remote_node_config_combo_order_clears_once_and_resets_every_field() {
+    i_slint_backend_testing::init_no_event_loop();
+
+    let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    let (sender, _receiver) = mpsc::channel(4);
+    let binding = bind_commands(&window, sender, DesktopConfig::default());
+    let mut state = dedup_desktop_core::view_state::DesktopViewState::new(
+        DesktopConfig::default(),
+        dedup_desktop_core::view_state::DesktopPaths {
+            data: std::path::PathBuf::from(r"C:\fixture\desktop"),
+            logs: std::path::PathBuf::from(r"C:\fixture\desktop\logs"),
+            cache: std::path::PathBuf::from(r"C:\fixture\desktop\cache"),
+            config: std::path::PathBuf::from(r"C:\fixture\desktop\config.toml"),
+        },
+    );
+    state.set_node_identity(0, "machine-local");
+    let second = state.add_node("10.0.0.8", 39091).expect("第二节点 fixture");
+    state.set_node_identity(second, "machine-second");
+    apply_event(&window, &binding, UiEvent::ViewChanged(Box::new(state)));
+
+    window.set_scan_root("D:\\Media".into());
+    window.set_node_config_loaded(true);
+    window.set_node_config_dirty(true);
+    window.set_node_config_saving(true);
+    window.set_node_config_machine_id("stale-machine".into());
+    window.set_node_config_version("stale-version".into());
+    window.set_node_config_phase("stale-phase".into());
+    window.set_node_config_error("stale-error".into());
+    window.set_node_config_listen_ip("192.0.2.10".into());
+    window.set_node_config_port(49999);
+    window.set_node_config_enumerator_index(0);
+    window.set_node_config_data_path("stale-data".into());
+    window.set_node_config_config_path("stale-config".into());
+    window.set_node_config_log_path("stale-log".into());
+    window.set_node_config_cache_path("stale-cache".into());
+    window.set_node_config_hdd_threads(63);
+    window.set_node_config_ssd_threads(62);
+    window.set_node_config_unknown_threads(61);
+    window.set_node_config_total_threads(60);
+    window.set_node_config_block_size(65536);
+    window.set_node_config_timeout_seconds(59);
+    window.set_node_config_retries(10);
+    window.set_node_config_legacy_workers(59);
+    window.set_node_config_worker_mode_index(1);
+    window.set_node_config_reserved_cores(58);
+    window.set_node_config_manual_workers(57);
+    window.set_node_config_logical_cpus(56);
+    window.set_node_config_effective_workers(55);
+
+    // 真实 ComboBox 顺序：双向绑定先把根属性写成第二项，再触发 selected 回调。
+    window.set_node_config_selected_index(1);
+    window.invoke_select_node_config(1);
+
+    assert_eq!(window.get_node_config_selected_index(), 1);
+    assert!(!window.get_node_config_loaded());
+    assert!(!window.get_node_config_dirty());
+    assert!(!window.get_node_config_saving());
+    assert_eq!(window.get_scan_root(), "");
+    assert_eq!(window.get_node_config_machine_id(), "");
+    assert_eq!(window.get_node_config_version(), "");
+    assert_eq!(window.get_node_config_phase(), "未加载");
+    assert_eq!(window.get_node_config_error(), "");
+    assert_eq!(window.get_node_config_listen_ip(), "");
+    assert_eq!(window.get_node_config_port(), 39091);
+    assert_eq!(window.get_node_config_enumerator_index(), 1);
+    assert_eq!(window.get_node_config_data_path(), "");
+    assert_eq!(window.get_node_config_config_path(), "");
+    assert_eq!(window.get_node_config_log_path(), "");
+    assert_eq!(window.get_node_config_cache_path(), "");
+    assert_eq!(window.get_node_config_hdd_threads(), 1);
+    assert_eq!(window.get_node_config_ssd_threads(), 2);
+    assert_eq!(window.get_node_config_unknown_threads(), 1);
+    assert_eq!(window.get_node_config_total_threads(), 4);
+    assert_eq!(window.get_node_config_block_size(), 4 * 1024 * 1024);
+    assert_eq!(window.get_node_config_timeout_seconds(), 3);
+    assert_eq!(window.get_node_config_retries(), 2);
+    assert_eq!(window.get_node_config_legacy_workers(), 1);
+    assert_eq!(window.get_node_config_worker_mode_index(), 0);
+    assert_eq!(window.get_node_config_reserved_cores(), 1);
+    assert_eq!(window.get_node_config_manual_workers(), 1);
+    assert_eq!(window.get_node_config_logical_cpus(), 0);
+    assert_eq!(window.get_node_config_effective_workers(), 0);
+
+    window.set_node_config_listen_ip("same-selection-must-survive".into());
+    window.set_node_config_dirty(true);
+    window.set_scan_root("E:\\Keep".into());
+    window.invoke_select_node_config(1);
+    assert_eq!(
+        window.get_node_config_listen_ip(),
+        "same-selection-must-survive"
+    );
+    assert!(window.get_node_config_dirty());
+    assert_eq!(window.get_scan_root(), "E:\\Keep");
+}
+
+#[test]
+fn remote_node_config_view_and_phase_events_preserve_dirty_fields() {
+    i_slint_backend_testing::init_no_event_loop();
+
+    let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    let (sender, _receiver) = mpsc::channel(4);
+    let binding = bind_commands(&window, sender, DesktopConfig::default());
+    let mut state = dedup_desktop_core::view_state::DesktopViewState::new(
+        DesktopConfig::default(),
+        dedup_desktop_core::view_state::DesktopPaths {
+            data: std::path::PathBuf::from(r"C:\fixture\desktop"),
+            logs: std::path::PathBuf::from(r"C:\fixture\desktop\logs"),
+            cache: std::path::PathBuf::from(r"C:\fixture\desktop\cache"),
+            config: std::path::PathBuf::from(r"C:\fixture\desktop\config.toml"),
+        },
+    );
+    state.set_node_identity(0, "machine-local");
+    state.set_node_connection(
+        0,
+        dedup_desktop_core::view_state::NodeConnectionState::Online,
+        None,
+    );
+    apply_event(
+        &window,
+        &binding,
+        UiEvent::ViewChanged(Box::new(state.clone())),
+    );
+
+    window.set_node_config_loaded(true);
+    window.set_node_config_dirty(true);
+    window.set_node_config_listen_ip("198.51.100.23".into());
+    window.set_node_config_data_path("edited-data".into());
+    window.set_node_config_retries(9);
+    apply_event(&window, &binding, UiEvent::ViewChanged(Box::new(state)));
+    assert!(window.get_node_config_loaded());
+    assert!(window.get_node_config_dirty());
+    assert_eq!(window.get_node_config_listen_ip(), "198.51.100.23");
+    assert_eq!(window.get_node_config_data_path(), "edited-data");
+    assert_eq!(window.get_node_config_retries(), 9);
+
+    // 没有新快照的阶段事件也不得把用户编辑当成一次加载覆盖。
+    apply_event(
+        &window,
+        &binding,
+        UiEvent::NodeConfigChanged(
+            dedup_desktop_core::view_state::NodeConfigControllerState::default(),
+        ),
+    );
+    assert!(window.get_node_config_loaded());
+    assert!(window.get_node_config_dirty());
+    assert_eq!(window.get_node_config_listen_ip(), "198.51.100.23");
+    assert_eq!(window.get_node_config_data_path(), "edited-data");
+    assert_eq!(window.get_node_config_retries(), 9);
+}
