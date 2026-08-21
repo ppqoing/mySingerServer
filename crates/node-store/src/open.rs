@@ -87,15 +87,13 @@ impl NodeStore {
     /// 打开应用目录下的数据库；空库创建当前全量 schema，非 V2 旧库直接拒绝。
     pub fn open(path: &Path, machine_id: MachineId) -> Result<Self, StoreError> {
         let connection = Connection::open(path)?;
-        configure(&connection, true)?;
-        initialize_or_validate(connection, machine_id, Some(path.to_path_buf()))
+        initialize_or_validate(connection, machine_id, Some(path.to_path_buf()), true)
     }
 
     /// 创建用于单元测试和纯本地计算的内存 V2 数据库。
     pub fn open_in_memory(machine_id: MachineId) -> Result<Self, StoreError> {
         let connection = Connection::open_in_memory()?;
-        configure(&connection, false)?;
-        initialize_or_validate(connection, machine_id, None)
+        initialize_or_validate(connection, machine_id, None, false)
     }
 
     /// 为同一文件数据库打开独立 WAL 连接，供后台计算与控制 actor 分离所有权。
@@ -135,6 +133,7 @@ fn initialize_or_validate(
     connection: Connection,
     machine_id: MachineId,
     database_path: Option<PathBuf>,
+    file_backed: bool,
 ) -> Result<NodeStore, StoreError> {
     let table_count: i64 = connection.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
@@ -142,6 +141,7 @@ fn initialize_or_validate(
         |row| row.get(0),
     )?;
     if table_count == 0 {
+        configure(&connection, file_backed)?;
         connection.execute_batch(SCHEMA)?;
         connection.execute(
             "INSERT INTO metadata(key,value) VALUES('schema_id',?1),('machine_id',?2)",
@@ -159,14 +159,23 @@ fn initialize_or_validate(
         if schema.as_deref() != Some(product_id()) {
             return Err(StoreError::IncompatibleSchema);
         }
-        let stored_machine: String = connection.query_row(
-            "SELECT value FROM metadata WHERE key='machine_id'",
-            [],
-            |row| row.get(0),
-        )?;
+        let schema_version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(|_| StoreError::IncompatibleSchema)?;
+        if schema_version != 2 {
+            return Err(StoreError::IncompatibleSchema);
+        }
+        let stored_machine: String = connection
+            .query_row(
+                "SELECT value FROM metadata WHERE key='machine_id'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| StoreError::IncompatibleSchema)?;
         if stored_machine != machine_id.as_str() {
             return Err(StoreError::MachineMismatch);
         }
+        configure(&connection, file_backed)?;
     }
     Ok(NodeStore {
         connection,

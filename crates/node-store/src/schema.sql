@@ -1,5 +1,5 @@
 -- mySingerServer Rust V2 节点数据库。只在空数据库一次创建，不兼容旧表结构。
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;
 
 CREATE TABLE metadata (
     key   TEXT PRIMARY KEY,
@@ -25,6 +25,18 @@ CREATE TABLE files (
     PRIMARY KEY(machine_id, normalized_path)
 ) STRICT;
 CREATE INDEX files_content_idx ON files(content_id, active);
+
+CREATE TABLE file_faults (
+    machine_id TEXT NOT NULL,
+    normalized_path TEXT NOT NULL,
+    display_path TEXT NOT NULL,
+    file_size INTEGER NOT NULL CHECK(file_size >= 0),
+    fault_kind TEXT NOT NULL CHECK(fault_kind IN ('suspected_physical_read','worker_crash')),
+    stage TEXT NOT NULL,
+    windows_error_code INTEGER,
+    message TEXT NOT NULL,
+    PRIMARY KEY(machine_id, normalized_path, fault_kind)
+) STRICT;
 
 -- 一筛允许保存部分结果；完整性只在查询边界集中判断。
 CREATE TABLE image_stage1 (

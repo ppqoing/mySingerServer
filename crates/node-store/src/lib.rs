@@ -5,6 +5,7 @@ mod analysis;
 mod content;
 mod delete;
 mod features;
+mod faults;
 mod groups;
 mod open;
 mod outbox;
@@ -20,6 +21,7 @@ pub use analysis::{
 pub use delete::{
     ConfirmedDeleteItem, DeleteBatchPlan, DeleteOutcome, DeleteResult, PlannedDeleteItem,
 };
+pub use faults::{FileFaultKind, FileFaultPage, FileFaultRecord};
 pub use groups::{
     GroupKind, GroupMemberPage, GroupMemberWrite, GroupPage, GroupWrite, StoredGroup,
     StoredGroupMember,
