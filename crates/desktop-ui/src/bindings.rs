@@ -289,12 +289,17 @@ fn bind_node_config(
 }
 
 fn bind_file_faults(window: &MainWindow, sender: &mpsc::Sender<UiCommand>) {
+    let select_sender = sender.clone();
     let select_window = window.as_weak();
     window.on_select_file_fault_node(move |index| {
         let Some(window) = select_window.upgrade() else {
             return;
         };
         let index = index.max(0);
+        let machine_id = slint::Model::row_data(&window.get_nodes(), index as usize)
+            .map(|node| node.machine_id.to_string())
+            .filter(|machine_id| machine_id != "尚未握手")
+            .unwrap_or_default();
         window.set_file_fault_selected_node(index);
         window.set_file_fault_node_online(selected_node_online(&window, index));
         window.set_file_fault_rows(ModelRc::new(VecModel::from(
@@ -303,6 +308,14 @@ fn bind_file_faults(window: &MainWindow, sender: &mpsc::Sender<UiCommand>) {
         window.set_file_fault_next_cursor(SharedString::default());
         window.set_file_fault_error(SharedString::default());
         window.set_disk_cleanup_summary("尚无磁盘满清理记录".into());
+        send(
+            &select_sender,
+            UiCommand::SelectFileFaultNode {
+                node_index: index as usize,
+                machine_id,
+            },
+            &window.as_weak(),
+        );
     });
 
     let load_sender = sender.clone();
@@ -433,6 +446,21 @@ fn apply_file_fault_state(window: &MainWindow, state: &FileFaultDiagnosticsState
     if let Some(index) = state.selected_node_index {
         window.set_file_fault_selected_node(index as i32);
         window.set_file_fault_node_online(selected_node_online(window, index as i32));
+    }
+    if state.rows.iter().any(|fault| {
+        !matches!(
+            fault.fault_kind.as_str(),
+            "suspected_physical_read" | "worker_crash"
+        )
+    }) {
+        window.set_file_fault_rows(ModelRc::new(VecModel::from(
+            Vec::<UiFileFaultRow>::new(),
+        )));
+        window.set_file_fault_next_cursor(SharedString::default());
+        window.set_file_fault_loading(false);
+        window.set_file_fault_error("未知文件故障类别，响应已拒绝".into());
+        window.set_disk_cleanup_summary("尚无磁盘满清理记录".into());
+        return;
     }
     let rows = state
         .rows

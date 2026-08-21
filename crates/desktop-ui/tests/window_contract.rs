@@ -79,6 +79,8 @@ fn file_faults_diagnostics_show_only_approved_fields_and_disable_offline_actions
     }
 
     window.set_file_fault_node_online(false);
+    window.set_file_fault_selected_node(1);
+    assert_eq!(window.get_file_fault_selected_node(), 1);
     assert_eq!(accessible(&window, "加载文件故障").accessible_enabled(), Some(false));
     assert_eq!(
         accessible(&window, "清除故障：d:\\media\\broken.mp4：疑似物理读取故障")

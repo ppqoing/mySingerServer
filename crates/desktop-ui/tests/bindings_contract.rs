@@ -49,6 +49,13 @@ fn file_faults_callbacks_page_and_clear_the_selected_online_node_only() {
     slint::platform::update_timers_and_animations();
 
     window.invoke_select_file_fault_node(0);
+    assert!(matches!(
+        next(&mut receiver),
+        UiCommand::SelectFileFaultNode {
+            node_index: 0,
+            ref machine_id,
+        } if machine_id == "machine-online"
+    ));
     accessible(&window, "加载文件故障").invoke_accessible_default_action();
     assert!(matches!(
         next(&mut receiver),
@@ -61,6 +68,7 @@ fn file_faults_callbacks_page_and_clear_the_selected_online_node_only() {
         UiEvent::FileFaultsChanged(
             dedup_desktop_core::view_state::FileFaultDiagnosticsState {
                 selected_node_index: Some(0),
+                selected_machine_id: Some("machine-online".into()),
                 rows: vec![dedup_desktop_core::view_state::FileFaultView {
                     machine_id: "machine-online".into(),
                     normalized_path: r"d:\media\broken.mp4".into(),
@@ -107,11 +115,74 @@ fn file_faults_callbacks_page_and_clear_the_selected_online_node_only() {
     ));
 
     window.invoke_select_file_fault_node(1);
+    assert!(matches!(
+        next(&mut receiver),
+        UiCommand::SelectFileFaultNode {
+            node_index: 1,
+            ref machine_id,
+        } if machine_id == "machine-offline"
+    ));
     assert_eq!(slint::Model::row_count(&window.get_file_fault_rows()), 0);
     assert_eq!(window.get_file_fault_next_cursor(), "");
+    let mut periodic = dedup_desktop_core::view_state::DesktopViewState::new(
+        DesktopConfig::default(),
+        dedup_desktop_core::view_state::DesktopPaths {
+            data: std::path::PathBuf::from(r"C:\fixture\desktop"),
+            logs: std::path::PathBuf::from(r"C:\fixture\desktop\logs"),
+            cache: std::path::PathBuf::from(r"C:\fixture\desktop\cache"),
+            config: std::path::PathBuf::from(r"C:\fixture\desktop\config.toml"),
+        },
+    );
+    periodic.set_node_identity(0, "machine-online");
+    periodic.set_node_connection(
+        0,
+        dedup_desktop_core::view_state::NodeConnectionState::Online,
+        None,
+    );
+    let periodic_offline = periodic.add_node("10.0.0.9", 39091).unwrap();
+    periodic.set_node_identity(periodic_offline, "machine-offline");
+    apply_event(&window, &binding, UiEvent::ViewChanged(Box::new(periodic)));
+    assert_eq!(window.get_file_fault_selected_node(), 1);
+    assert_eq!(slint::Model::row_count(&window.get_file_fault_rows()), 0);
     window.invoke_load_file_faults(false);
     window.invoke_clear_file_fault(0);
     assert!(receiver.try_recv().is_err(), "离线节点诊断动作不得发送命令");
+
+    window.invoke_select_file_fault_node(0);
+    let _ = next(&mut receiver);
+    apply_event(
+        &window,
+        &binding,
+        UiEvent::FileFaultsChanged(
+            dedup_desktop_core::view_state::FileFaultDiagnosticsState {
+                selected_node_index: Some(0),
+                selected_machine_id: Some("machine-online".into()),
+                rows: vec![dedup_desktop_core::view_state::FileFaultView {
+                    machine_id: "machine-online".into(),
+                    normalized_path: r"d:\media\unknown.bin".into(),
+                    display_path: r"D:\Media\unknown.bin".into(),
+                    file_size: 1,
+                    fault_kind: "future_unknown_kind".into(),
+                    stage: "read".into(),
+                    error_code: None,
+                    message: "unknown".into(),
+                }],
+                next_cursor: "must-clear".into(),
+                cleanup_summary: None,
+                loading: true,
+                error: None,
+            },
+        ),
+    );
+    assert!(!window.get_file_fault_loading());
+    assert_eq!(slint::Model::row_count(&window.get_file_fault_rows()), 0);
+    assert_eq!(window.get_file_fault_next_cursor(), "");
+    assert!(window.get_file_fault_error().contains("未知文件故障类别"));
+    assert_eq!(
+        accessible(&window, "加载文件故障").accessible_enabled(),
+        Some(true),
+        "unknown 响应失败后必须允许重试"
+    );
 }
 
 #[test]

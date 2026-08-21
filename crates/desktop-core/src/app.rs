@@ -186,6 +186,13 @@ pub enum UiCommand {
         /// 设置页提交的完整 wire 配置值。
         config: proto::NodeConfigValue,
     },
+    /// 由 core 冻结诊断目标身份并立即清除旧页。
+    SelectFileFaultNode {
+        /// 手工节点索引。
+        node_index: usize,
+        /// 当前 UI 行观察到的机器身份。
+        machine_id: String,
+    },
     /// 分页加载指定在线节点的文件故障。
     LoadFileFaults {
         /// 手工节点索引。
@@ -748,10 +755,15 @@ async fn run_controller(
                 }
             }
             UiCommand::LoadFileFaults { node_index, cursor } => {
-                if state.file_faults().selected_node_index != Some(node_index) {
-                    state.select_file_fault_node(node_index);
-                }
                 load_file_faults(node_index, &cursor, &mut state, &sessions, &events).await
+            }
+            UiCommand::SelectFileFaultNode {
+                node_index,
+                machine_id,
+            } => {
+                state.select_file_fault_node(node_index, machine_id);
+                publish(&events, &state).await;
+                Ok(())
             }
             UiCommand::ClearFileFault {
                 node_index,
@@ -1265,6 +1277,12 @@ async fn load_file_faults(
     let session = sessions
         .get(&node_index)
         .ok_or_else(|| format!("节点 {node_index} 未连接，无法加载文件故障"))?;
+    if state.file_faults().selected_node_index != Some(node_index)
+        || state.file_faults().selected_machine_id.as_deref()
+            != Some(session.machine_id().as_str())
+    {
+        return Err("文件故障加载目标与 core 冻结节点身份不一致".into());
+    }
     let mut loading = state.file_faults().clone();
     loading.selected_node_index = Some(node_index);
     loading.loading = true;
@@ -1275,11 +1293,7 @@ async fn load_file_faults(
         Ok(page) => page,
         Err(error) => {
             let message = error.to_string();
-            let mut failed = state.file_faults().clone();
-            failed.loading = false;
-            failed.error = Some(message.clone());
-            state.set_file_faults(failed.clone());
-            let _ = events.send(UiEvent::FileFaultsChanged(failed)).await;
+            fail_file_fault_diagnostics(state, events, &message).await;
             return Err(message);
         }
     };
@@ -1289,10 +1303,18 @@ async fn load_file_faults(
         state.file_faults().rows.clone()
     };
     for fault in page.faults {
-        let kind = proto::FileFaultKind::try_from(fault.fault_kind)
-            .map_err(|_| "节点返回未知文件故障类别".to_owned())?;
+        let kind = match proto::FileFaultKind::try_from(fault.fault_kind) {
+            Ok(kind) => kind,
+            Err(_) => {
+                let message = "节点返回未知文件故障类别";
+                fail_file_fault_diagnostics(state, events, message).await;
+                return Err(message.into());
+            }
+        };
         if kind == proto::FileFaultKind::Unspecified {
-            return Err("节点返回空文件故障类别".into());
+            let message = "节点返回空文件故障类别";
+            fail_file_fault_diagnostics(state, events, message).await;
+            return Err(message.into());
         }
         rows.push(FileFaultView {
             machine_id: fault.machine_id,
@@ -1307,6 +1329,7 @@ async fn load_file_faults(
     }
     let diagnostics = FileFaultDiagnosticsState {
         selected_node_index: Some(node_index),
+        selected_machine_id: Some(session.machine_id().as_str().to_owned()),
         rows,
         next_cursor: page.next_cursor,
         cleanup_summary: page.cleanup_summary.map(|summary| DiskFullCleanupSummaryView {
@@ -1337,6 +1360,12 @@ async fn clear_file_fault(
     let session = sessions
         .get(&node_index)
         .ok_or_else(|| format!("节点 {node_index} 未连接，无法清除文件故障"))?;
+    if state.file_faults().selected_node_index != Some(node_index)
+        || state.file_faults().selected_machine_id.as_deref() != Some(machine_id)
+        || session.machine_id().as_str() != machine_id
+    {
+        return Err("文件故障清除目标与 core 冻结节点身份不一致".into());
+    }
     let kind = match fault_kind {
         "suspected_physical_read" => proto::FileFaultKind::SuspectedPhysicalRead,
         "worker_crash" => proto::FileFaultKind::WorkerCrash,
@@ -1346,8 +1375,23 @@ async fn clear_file_fault(
         .clear_file_fault(machine_id, normalized_path, kind)
         .await
         .map_err(|error| error.to_string())?;
-    state.select_file_fault_node(node_index);
+    state.select_file_fault_node(node_index, machine_id.to_owned());
     load_file_faults(node_index, "", state, sessions, events).await
+}
+
+async fn fail_file_fault_diagnostics(
+    state: &mut DesktopViewState,
+    events: &mpsc::Sender<UiEvent>,
+    message: &str,
+) {
+    let mut failed = state.file_faults().clone();
+    failed.rows.clear();
+    failed.next_cursor.clear();
+    failed.cleanup_summary = None;
+    failed.loading = false;
+    failed.error = Some(message.into());
+    state.set_file_faults(failed.clone());
+    let _ = events.send(UiEvent::FileFaultsChanged(failed)).await;
 }
 
 const fn file_fault_kind_name(kind: proto::FileFaultKind) -> &'static str {

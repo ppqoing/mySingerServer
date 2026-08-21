@@ -263,6 +263,8 @@ pub struct DiskFullCleanupSummaryView {
 pub struct FileFaultDiagnosticsState {
     /// 当前选择节点。
     pub selected_node_index: Option<usize>,
+    /// 选择时冻结的机器身份；离线后保留以防跨节点结果混入。
+    pub selected_machine_id: Option<String>,
     /// 当前已加载记录。
     pub rows: Vec<FileFaultView>,
     /// 空字符串表示没有下一页。
@@ -293,6 +295,14 @@ pub enum ViewStateError {
     /// 配置阈值或重连间隔无效。
     #[error(transparent)]
     Core(#[from] CoreError),
+}
+
+fn clear_file_fault_page(state: &mut FileFaultDiagnosticsState) {
+    state.rows.clear();
+    state.next_cursor.clear();
+    state.cleanup_summary = None;
+    state.loading = false;
+    state.error = None;
 }
 
 /// Slint UI 每次整体替换的管理端状态快照。
@@ -357,9 +367,10 @@ impl DesktopViewState {
         &self.file_faults
     }
 
-    pub(crate) fn select_file_fault_node(&mut self, index: usize) {
+    pub(crate) fn select_file_fault_node(&mut self, index: usize, machine_id: String) {
         self.file_faults = FileFaultDiagnosticsState {
             selected_node_index: Some(index),
+            selected_machine_id: Some(machine_id),
             ..FileFaultDiagnosticsState::default()
         };
     }
@@ -480,12 +491,24 @@ impl DesktopViewState {
                 node.error_text = None;
             }
         }
+        if self.file_faults.selected_node_index == Some(index)
+            && connection != NodeConnectionState::Online
+        {
+            clear_file_fault_page(&mut self.file_faults);
+        }
     }
 
     /// 保存握手取得的物理机器 ID；配置文件仍只保存手工 IP:port。
     pub fn set_node_identity(&mut self, index: usize, machine_id: impl Into<String>) {
+        let machine_id = machine_id.into();
         if let Some(node) = self.nodes.get_mut(index) {
-            node.machine_id = Some(machine_id.into());
+            node.machine_id = Some(machine_id.clone());
+        }
+        if self.file_faults.selected_node_index == Some(index)
+            && self.file_faults.selected_machine_id.as_deref() != Some(machine_id.as_str())
+        {
+            self.file_faults.selected_machine_id = Some(machine_id);
+            clear_file_fault_page(&mut self.file_faults);
         }
     }
 
@@ -495,6 +518,9 @@ impl DesktopViewState {
             node.connection = NodeConnectionState::Error;
             node.error_text = Some(message.into());
             node.stats = None;
+        }
+        if self.file_faults.selected_node_index == Some(index) {
+            clear_file_fault_page(&mut self.file_faults);
         }
     }
 
