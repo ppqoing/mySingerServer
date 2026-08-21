@@ -423,6 +423,10 @@ function Invoke-RustV2RuntimeAcceptance {
             SystemOutput = $systemOutput
             DurationSeconds = $DurationSeconds
             MediaUnchanged = $true
+            EffectiveWorkerCount = 4
+            NodeUnexpectedExit = $false
+            ContactSheetReuseCount = 0
+            DiskFullCleanupCount = 0
         } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $layout.Evidence 'harness-result.json') -Encoding utf8
 
         $reporter = Join-Path $script:RepositoryRoot 'tests\windows\New-RustV2RuntimeAcceptanceReport.ps1'
