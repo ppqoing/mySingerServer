@@ -49,6 +49,13 @@ impl PhysicalDiskId {
     pub fn disk_numbers(&self) -> &[u32] {
         &self.disk_numbers
     }
+
+    /// 排序去重后的身份是否包含多个不同物理盘号。
+    ///
+    /// 该值不表示卷的原始 extent 数；同盘多段 `[7, 7]` 仍是单盘身份。
+    pub fn is_composite(&self) -> bool {
+        self.disk_numbers.len() > 1
+    }
 }
 
 /// Windows 能可靠确认的本机磁盘介质类型。

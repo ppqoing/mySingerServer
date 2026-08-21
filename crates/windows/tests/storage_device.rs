@@ -127,6 +127,9 @@ fn physical_disk_identity_is_independent_from_extent_layout() {
 
     assert_eq!(single.physical_disk_id(), repeated.physical_disk_id());
     assert_ne!(single.physical_disk_id(), mixed.physical_disk_id());
+    assert!(!single.physical_disk_id().is_composite());
+    assert!(!repeated.physical_disk_id().is_composite());
+    assert!(mixed.physical_disk_id().is_composite());
     assert_eq!(repeated.disk_kind(), LocalDiskKind::Unknown);
     assert_eq!(mixed.disk_kind(), LocalDiskKind::Unknown);
 
