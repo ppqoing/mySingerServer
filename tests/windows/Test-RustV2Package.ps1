@@ -4,7 +4,8 @@
 
 .DESCRIPTION
 测试只在临时目录创建最小 PE fixture，不启动产品进程，也不读取旧版发布目录。每个失败场景
-从同一完整基线复制，确保错误来自单一缺陷：禁带 FFmpeg EXE、缺 worker、非 x64 或许可证缺失。
+从同一完整基线复制，确保错误来自单一缺陷：禁带 FFmpeg EXE、缺 Everything/worker、非 x64
+或许可证缺失。
 #>
 [CmdletBinding()]
 param()
@@ -57,13 +58,14 @@ function New-GoodFixture {
     param([string] $Path)
 
     New-Item -ItemType Directory -Path $Path -Force | Out-Null
-    foreach ($name in @('desktop.exe', 'node.exe', 'worker.exe')) {
+    foreach ($name in @('desktop.exe', 'node.exe', 'worker.exe', 'Everything.exe')) {
         Write-MinimalPe -Path (Join-Path $Path $name) -Machine 0x8664
     }
     $runtime = Join-Path $Path 'runtime\ffmpeg'
     $licenses = Join-Path $Path 'licenses'
     $schema = Join-Path $Path 'schema'
-    New-Item -ItemType Directory -Path $runtime, $licenses, $schema -Force | Out-Null
+    $config = Join-Path $Path 'config'
+    New-Item -ItemType Directory -Path $runtime, $licenses, $schema, $config -Force | Out-Null
     foreach ($name in @('avutil-60.dll', 'swresample-6.dll', 'swscale-9.dll', 'avcodec-62.dll', 'avformat-62.dll')) {
         Write-Utf8 -Path (Join-Path $runtime $name) -Text "fixture $name"
     }
@@ -72,10 +74,39 @@ function New-GoodFixture {
         'Rust-Third-Party-Licenses.html',
         'Slint-Royalty-Free-2.0.txt',
         'PDQ-BSD-3-Clause.txt',
-        'FFmpeg-LGPL-3.0.txt'
+        'FFmpeg-LGPL-3.0.txt',
+        'Everything-License.txt',
+        'Everything-NOTICE.md'
     )) {
         Write-Utf8 -Path (Join-Path $licenses $name) -Text "fixture $name"
     }
+    Write-Utf8 -Path (Join-Path $Path 'bootstrap.toml') -Text "config_path = 'config/node.toml'`n"
+    Write-Utf8 -Path (Join-Path $config 'node.toml') -Text @'
+listen_ip = "127.0.0.1"
+port = 39091
+worker_count = 4
+enumerator = "everything"
+
+[paths]
+data_path = "data/node"
+config_path = "config/node.toml"
+log_path = "data/node/logs"
+cache_path = "data/node/cache"
+
+[read]
+hdd_threads_per_disk = 1
+ssd_threads_per_disk = 2
+unknown_threads_per_disk = 1
+total_threads = 4
+block_size_bytes = 4194304
+block_timeout_seconds = 3
+block_retries = 2
+
+[worker]
+mode = "automatic"
+reserved_cores = 1
+manual_worker_count = 4
+'@
     Write-Utf8 -Path (Join-Path $schema 'central-v2.sql') -Text '-- fixture schema'
     Write-FileManifest -Root $Path
 }
@@ -130,6 +161,23 @@ try {
     Copy-Item -LiteralPath $good -Destination $missingWorker -Recurse
     Remove-Item -LiteralPath (Join-Path $missingWorker 'worker.exe')
     Assert-FailsWith -Package $missingWorker -Code 'MISSING_REQUIRED_EXE'
+
+    $missingEverything = Join-Path $fixtureRoot 'missing-everything'
+    Copy-Item -LiteralPath $good -Destination $missingEverything -Recurse
+    Remove-Item -LiteralPath (Join-Path $missingEverything 'Everything.exe')
+    Assert-FailsWith -Package $missingEverything -Code 'MISSING_REQUIRED_EXE'
+
+    $missingBootstrap = Join-Path $fixtureRoot 'missing-bootstrap'
+    Copy-Item -LiteralPath $good -Destination $missingBootstrap -Recurse
+    Remove-Item -LiteralPath (Join-Path $missingBootstrap 'bootstrap.toml')
+    Assert-FailsWith -Package $missingBootstrap -Code 'MISSING_DEFAULT_CONFIG'
+
+    $invalidDefaults = Join-Path $fixtureRoot 'invalid-defaults'
+    Copy-Item -LiteralPath $good -Destination $invalidDefaults -Recurse
+    (Get-Content -LiteralPath (Join-Path $invalidDefaults 'config\node.toml') -Raw).Replace(
+        'enumerator = "everything"', 'enumerator = "windows_walker"') |
+        Set-Content -LiteralPath (Join-Path $invalidDefaults 'config\node.toml') -Encoding utf8
+    Assert-FailsWith -Package $invalidDefaults -Code 'DEFAULT_CONFIG_INVALID'
 
     $wrongMachine = Join-Path $fixtureRoot 'wrong-machine'
     Copy-Item -LiteralPath $good -Destination $wrongMachine -Recurse

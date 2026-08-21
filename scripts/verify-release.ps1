@@ -3,7 +3,7 @@
 验证 Rust V2 Windows x64 便携目录或 ZIP 的内容、架构、许可证和文件哈希。
 
 .DESCRIPTION
-验证器只接受三个顶层 x64 EXE、固定五个 FFmpeg DLL、中心建库脚本、五类许可证和完整
+验证器只接受四个顶层 x64 EXE、固定五个 FFmpeg DLL、中心建库脚本、Everything 许可证和完整
 files.sha256。它不启动程序；运行时冒烟和 GUI 验收由最终验收阶段单独完成。
 #>
 [CmdletBinding()]
@@ -13,14 +13,16 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$requiredExecutables = @('desktop.exe', 'node.exe', 'worker.exe')
+$requiredExecutables = @('desktop.exe', 'node.exe', 'worker.exe', 'Everything.exe')
 $requiredFfmpeg = @('avutil-60.dll', 'swresample-6.dll', 'swscale-9.dll', 'avcodec-62.dll', 'avformat-62.dll')
 $requiredLicenses = @(
     'Project-MIT.txt',
     'Rust-Third-Party-Licenses.html',
     'Slint-Royalty-Free-2.0.txt',
     'PDQ-BSD-3-Clause.txt',
-    'FFmpeg-LGPL-3.0.txt'
+    'FFmpeg-LGPL-3.0.txt',
+    'Everything-License.txt',
+    'Everything-NOTICE.md'
 )
 $temporaryRoot = $null
 
@@ -144,6 +146,27 @@ function Assert-PackageRoot {
     $schema = Join-Path $Root 'schema\central-v2.sql'
     if (-not (Test-Path -LiteralPath $schema -PathType Leaf)) {
         Stop-PackageValidation -Code 'MISSING_SCHEMA' -Message 'schema/central-v2.sql'
+    }
+
+    $bootstrap = Join-Path $Root 'bootstrap.toml'
+    $nodeConfig = Join-Path $Root 'config\node.toml'
+    if (-not (Test-Path -LiteralPath $bootstrap -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $nodeConfig -PathType Leaf)) {
+        Stop-PackageValidation -Code 'MISSING_DEFAULT_CONFIG' -Message 'bootstrap.toml / config/node.toml'
+    }
+    $bootstrapText = Get-Content -LiteralPath $bootstrap -Raw
+    $configText = Get-Content -LiteralPath $nodeConfig -Raw
+    $requiredDefaults = @(
+        'enumerator\s*=\s*"everything"',
+        'config_path\s*=\s*"config/node\.toml"',
+        'cache_path\s*=\s*"data/node/cache"',
+        'block_size_bytes\s*=\s*4194304',
+        'block_timeout_seconds\s*=\s*3',
+        'block_retries\s*=\s*2'
+    )
+    if ($bootstrapText -notmatch "config_path\s*=\s*['`"]config/node\.toml['`"]" -or
+        @($requiredDefaults | Where-Object { $configText -notmatch $_ }).Count -gt 0) {
+        Stop-PackageValidation -Code 'DEFAULT_CONFIG_INVALID' -Message 'Everything/read/cache defaults'
     }
 
     $forbiddenData = @(Get-ChildItem -LiteralPath $Root -Recurse -File |
