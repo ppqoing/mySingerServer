@@ -292,6 +292,24 @@ pub struct RuntimeTaskControllerState {
 }
 
 impl RuntimeTaskControllerState {
+    /// 为 UI 契约测试装配一个完整不可变快照；生产状态仍只由控制循环更新。
+    #[doc(hidden)]
+    pub fn from_parts_for_test(
+        summaries: Vec<RuntimeTaskSnapshot>,
+        selected: Option<RuntimeTaskKey>,
+        details: Option<RuntimeTaskDetailsView>,
+        stale: bool,
+        error: Option<String>,
+    ) -> Self {
+        Self {
+            summaries,
+            selected,
+            details,
+            stale,
+            error,
+        }
+    }
+
     /// 返回 Node/Desktop 合并后的运行任务摘要。
     pub fn summaries(&self) -> &[RuntimeTaskSnapshot] {
         &self.summaries

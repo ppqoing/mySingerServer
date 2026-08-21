@@ -745,3 +745,172 @@ fn remote_node_config_view_and_phase_events_preserve_dirty_fields() {
     assert_eq!(window.get_node_config_data_path(), "edited-data");
     assert_eq!(window.get_node_config_retries(), 9);
 }
+
+#[test]
+fn runtime_task_details_map_unknown_totals_workers_failures_and_selection_once() {
+    i_slint_backend_testing::init_no_event_loop();
+
+    let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    let (sender, mut receiver) = mpsc::channel(8);
+    let binding = bind_commands(&window, sender, DesktopConfig::default());
+    let node_key = dedup_desktop_core::runtime_tasks::RuntimeTaskKey {
+        owner: dedup_desktop_core::runtime_tasks::RuntimeTaskOwner::Node { node_index: 3 },
+        id: "runtime-node".into(),
+    };
+    let desktop_key = dedup_desktop_core::runtime_tasks::RuntimeTaskKey {
+        owner: dedup_desktop_core::runtime_tasks::RuntimeTaskOwner::Desktop,
+        id: "runtime-desktop".into(),
+    };
+    let summaries = vec![
+        dedup_desktop_core::runtime_tasks::RuntimeTaskSnapshot {
+            key: node_key.clone(),
+            machine_ids: vec!["machine-unique-7".into()],
+            kind: dedup_desktop_core::runtime_tasks::DesktopRuntimeTaskKind::Node,
+            title: "节点扫描".into(),
+            state: dedup_desktop_core::runtime_tasks::DesktopRuntimeTaskState::Running,
+            overall_completed: 7,
+            overall_total: None,
+            overall_failed: 2,
+            overall_skipped: 1,
+            stages: Vec::new(),
+            failures: Vec::new(),
+        },
+        dedup_desktop_core::runtime_tasks::RuntimeTaskSnapshot {
+            key: desktop_key.clone(),
+            machine_ids: vec!["machine-a".into(), "machine-b".into()],
+            kind: dedup_desktop_core::runtime_tasks::DesktopRuntimeTaskKind::CrossAnalysis,
+            title: "跨机器分析".into(),
+            state: dedup_desktop_core::runtime_tasks::DesktopRuntimeTaskState::Completed,
+            overall_completed: 12,
+            overall_total: Some(12),
+            overall_failed: 0,
+            overall_skipped: 0,
+            stages: Vec::new(),
+            failures: Vec::new(),
+        },
+    ];
+    let failures = (0..25)
+        .map(|index| dedup_protocol::proto::RuntimeFailureDetails {
+            stage_id: "read_md5".into(),
+            display_path: format!(r"D:\Media\broken-{index}.mp4"),
+            message: format!("读取失败 {index}"),
+        })
+        .collect();
+    let details = dedup_desktop_core::view_state::RuntimeTaskDetailsView::Node {
+        node_index: 3,
+        machine_id: "machine-unique-7".into(),
+        details: dedup_protocol::proto::RuntimeTaskDetails {
+            summary: Some(dedup_protocol::proto::RuntimeTaskSummary {
+                runtime_task_id: "runtime-node".into(),
+                machine_id: "machine-unique-7".into(),
+                task_kind: "scan".into(),
+                title: "节点扫描".into(),
+                state: "running".into(),
+                stage_summary: "读取与 MD5".into(),
+                overall_completed: 7,
+                overall_total: 0,
+                overall_total_known: false,
+                overall_failed: 2,
+                overall_skipped: 1,
+            }),
+            stages: vec![dedup_protocol::proto::RuntimeStageDetails {
+                stage_id: "read_md5".into(),
+                display_name: "读取与 MD5".into(),
+                state: dedup_protocol::proto::RuntimeStageState::RuntimeStageRunning as i32,
+                unit: "bytes".into(),
+                completed: 7,
+                total: 0,
+                total_known: false,
+                failed: 2,
+                skipped: 1,
+                speed_per_second: 2048.0,
+                elapsed_ms: 2500,
+                eta_ms: None,
+            }],
+            workers: vec![dedup_protocol::proto::RuntimeWorkerDetails {
+                slot: 2,
+                process_id: None,
+                stage_id: "probe_stage1".into(),
+                display_path: r"D:\Media\clip.mp4".into(),
+                physical_disk_id: "PhysicalDisk7".into(),
+                completed_files: 18,
+                speed_per_second: 3.5,
+            }],
+            failures,
+        },
+    };
+    let state = dedup_desktop_core::view_state::RuntimeTaskControllerState::from_parts_for_test(
+        summaries,
+        Some(node_key),
+        Some(details),
+        true,
+        Some("节点连接已断开".into()),
+    );
+
+    apply_event(&window, &binding, UiEvent::RuntimeTasksChanged(state));
+
+    let node = window.get_tasks().row_data(0).expect("应映射节点任务");
+    assert_eq!(node.runtime_id, "runtime-node");
+    assert_eq!(node.owner_kind, "node");
+    assert_eq!(node.node_index, 3);
+    assert_eq!(node.machine_id, "machine-unique-7");
+    assert!(node.stale);
+    let desktop = window.get_tasks().row_data(1).expect("应映射 Desktop 任务");
+    assert_eq!(desktop.runtime_id, "runtime-desktop");
+    assert_eq!(desktop.owner_kind, "desktop");
+    assert_eq!(desktop.machine_id, "machine-a、machine-b");
+    assert!(!desktop.stale);
+
+    let stage = window
+        .get_runtime_stages()
+        .row_data(0)
+        .expect("应映射运行阶段");
+    assert_eq!(stage.counts, "7 / —");
+    assert_eq!(stage.speed, "2.0 KiB/s");
+    assert_eq!(stage.eta, "—");
+    assert_eq!(stage.elapsed, "2.5 秒");
+    let worker = window
+        .get_runtime_workers()
+        .row_data(0)
+        .expect("应映射 Worker");
+    assert_eq!(worker.identity, "槽位 2");
+    assert_eq!(worker.path, r"D:\Media\clip.mp4");
+    assert_eq!(worker.disk, "PhysicalDisk7");
+    assert_eq!(worker.speed, "3.5 文件/秒");
+    assert_eq!(window.get_runtime_failures().row_count(), 20);
+    assert_eq!(
+        window.get_runtime_failures().row_data(0).unwrap().message,
+        "读取失败 5"
+    );
+    assert_eq!(
+        window.get_runtime_failures().row_data(19).unwrap().message,
+        "读取失败 24"
+    );
+    assert_eq!(window.get_runtime_detail_machine_id(), "machine-unique-7");
+    assert!(window.get_runtime_detail_stale());
+    assert_eq!(window.get_runtime_detail_error(), "节点连接已断开");
+
+    window.invoke_select_runtime_task("node".into(), 3, "runtime-node".into());
+    assert!(matches!(
+        next(&mut receiver),
+        UiCommand::SelectRuntimeTask {
+            key: dedup_desktop_core::runtime_tasks::RuntimeTaskKey {
+                owner: dedup_desktop_core::runtime_tasks::RuntimeTaskOwner::Node { node_index: 3 },
+                ref id,
+            }
+        } if id == "runtime-node"
+    ));
+    assert!(receiver.try_recv().is_err(), "选择回调只能转发一次");
+
+    window.invoke_select_runtime_task("desktop".into(), 99, "runtime-desktop".into());
+    assert!(matches!(
+        next(&mut receiver),
+        UiCommand::SelectRuntimeTask {
+            key: dedup_desktop_core::runtime_tasks::RuntimeTaskKey {
+                owner: dedup_desktop_core::runtime_tasks::RuntimeTaskOwner::Desktop,
+                ref id,
+            }
+        } if id == "runtime-desktop"
+    ));
+    assert!(receiver.try_recv().is_err(), "Desktop 选择也只能转发一次");
+}

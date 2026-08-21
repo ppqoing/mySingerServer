@@ -15,13 +15,50 @@ export struct UiNodeRow {
 
 export struct UiTaskRow {
     id: string,
+    runtime-id: string,
+    owner-kind: string,
     node-index: int,
+    machine-id: string,
     title: string,
     stage: string,
     status: string,
     status-color: color,
     progress: int,
     counts: string,
+    stale: bool,
+}
+
+// 运行任务阶段行保存完整计数和格式化后的实时指标，页面不重复解释单位。
+export struct UiRuntimeStageRow {
+    stage-id: string,
+    name: string,
+    state: string,
+    state-color: color,
+    unit: string,
+    progress: int,
+    counts: string,
+    speed: string,
+    elapsed: string,
+    eta: string,
+    failures: string,
+}
+
+// Worker 行使用真实槽位、可选 PID、当前路径和物理磁盘身份。
+export struct UiRuntimeWorkerRow {
+    slot: int,
+    identity: string,
+    stage-id: string,
+    path: string,
+    disk: string,
+    completed: string,
+    speed: string,
+}
+
+// 最近失败行只承载后端已经提供的阶段、路径和错误消息。
+export struct UiRuntimeFailureRow {
+    stage-id: string,
+    path: string,
+    message: string,
 }
 
 export struct UiFileFaultRow {

@@ -10,6 +10,7 @@ use dedup_desktop_core::{
     app::{UiCommand, UiEvent},
     results::GroupKind,
     review::{QuickReviewRule, ReviewDecision},
+    runtime_tasks::{RuntimeTaskKey, RuntimeTaskOwner},
     view_state::{FileFaultDiagnosticsState, NodeConnectionState, ViewTaskState},
 };
 use slint::{
@@ -148,6 +149,32 @@ pub fn bind_commands(
                 task_id: task_id.to_string(),
             },
             &cancel_window,
+        );
+    });
+    let runtime_sender = sender.clone();
+    let runtime_window = window.as_weak();
+    window.on_select_runtime_task(move |owner_kind, node_index, runtime_id| {
+        let owner = match owner_kind.as_str() {
+            "desktop" => RuntimeTaskOwner::Desktop,
+            "node" => RuntimeTaskOwner::Node {
+                node_index: node_index.max(0) as usize,
+            },
+            _ => {
+                if let Some(window) = runtime_window.upgrade() {
+                    window.set_last_error("运行任务归属无效".into());
+                }
+                return;
+            }
+        };
+        send(
+            &runtime_sender,
+            UiCommand::SelectRuntimeTask {
+                key: RuntimeTaskKey {
+                    owner,
+                    id: runtime_id.to_string(),
+                },
+            },
+            &runtime_window,
         );
     });
 
@@ -681,6 +708,19 @@ pub fn apply_event(window: &MainWindow, binding: &UiBinding, event: UiEvent) {
             );
         }
         UiEvent::FileFaultsChanged(state) => apply_file_fault_state(window, &state),
+        UiEvent::RuntimeTasksChanged(state) => {
+            let runtime = models::runtime_tasks(&state);
+            window.set_tasks(runtime.tasks);
+            window.set_runtime_stages(runtime.stages);
+            window.set_runtime_workers(runtime.workers);
+            window.set_runtime_failures(runtime.failures);
+            window.set_runtime_detail_title(runtime.title);
+            window.set_runtime_detail_machine_id(runtime.machine_id);
+            window.set_runtime_detail_state(runtime.state);
+            window.set_runtime_detail_counts(runtime.counts);
+            window.set_runtime_detail_stale(runtime.stale);
+            window.set_runtime_detail_error(runtime.error);
+        }
         UiEvent::AnalysisStarted {
             central,
             run_id,

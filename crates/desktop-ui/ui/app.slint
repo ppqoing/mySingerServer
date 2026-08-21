@@ -1,6 +1,6 @@
 // desktop.exe 唯一主窗口；页面只通过属性与回调接触 Rust。
 
-import { Theme, UiFileFaultRow, UiGroupRow, UiMemberRow, UiNodeRow, UiTaskRow } from "theme.slint";
+import { Theme, UiFileFaultRow, UiGroupRow, UiMemberRow, UiNodeRow, UiRuntimeFailureRow, UiRuntimeStageRow, UiRuntimeWorkerRow, UiTaskRow } from "theme.slint";
 import { DeleteDialog } from "components/delete-dialog.slint";
 import { AppShell } from "layout/app-shell.slint";
 import { OverviewDashboard } from "pages/overview-dashboard.slint";
@@ -22,6 +22,16 @@ export component MainWindow inherits Window {
 
     in property <[UiNodeRow]> nodes;
     in property <[UiTaskRow]> tasks;
+    // 运行详情由 Rust 在收到 core 快照时整体替换，Slint 不自行轮询后端。
+    in property <[UiRuntimeStageRow]> runtime-stages;
+    in property <[UiRuntimeWorkerRow]> runtime-workers;
+    in property <[UiRuntimeFailureRow]> runtime-failures;
+    in property <string> runtime-detail-title;
+    in property <string> runtime-detail-machine-id;
+    in property <string> runtime-detail-state;
+    in property <string> runtime-detail-counts;
+    in property <bool> runtime-detail-stale;
+    in property <string> runtime-detail-error;
     in property <[UiGroupRow]> groups;
     in property <[UiMemberRow]> members;
     in property <int> online-count;
@@ -155,6 +165,7 @@ export component MainWindow inherits Window {
     callback prepare-delete();
     callback confirm-delete();
     callback cancel-task(int, string);
+    callback select-runtime-task(string, int, string);
     callback save-settings();
     callback select-node-config(int);
     callback load-node-config();

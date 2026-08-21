@@ -11,6 +11,7 @@ path = "src/lib.rs"
 [dependencies]
 dedup-core = { path = "../core" }
 dedup-desktop-core = { path = "../desktop-core" }
+dedup-protocol = { path = "../protocol" }
 image = { workspace = true, features = ["png", "ico"] }
 slint.workspace = true
 tokio.workspace = true
