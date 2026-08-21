@@ -14,6 +14,8 @@ use tokio::{
     task::JoinSet,
 };
 
+const RESPONSE_FLUSH_ATTEMPTS: usize = 2;
+
 /// 节点 TCP 监听循环的启动或协议错误。
 #[derive(Debug, Error)]
 pub enum ServerError {
@@ -84,13 +86,13 @@ impl NodeServer {
 
     /// 通过与真实 TCP 连接相同的握手、并发请求和写出路径运行测试流。
     #[doc(hidden)]
-    pub async fn serve_stream_for_test<S, H>(stream: S, handler: H)
+    pub async fn serve_stream_for_test<S, H>(stream: S, handler: H) -> Result<(), String>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
         H: NodeRequestHandler,
     {
         let (read, write) = tokio::io::split(stream);
-        serve_connection_io(read, write, handler).await;
+        serve_connection_io(read, write, handler).await
     }
 }
 
@@ -106,10 +108,12 @@ where
     H: NodeRequestHandler,
 {
     let (read, write) = stream.into_split();
-    serve_connection_io(read, write, handler).await;
+    if let Err(error) = serve_connection_io(read, write, handler).await {
+        eprintln!("节点连接在响应刷出后提交重启失败，连接已关闭: {error}");
+    }
 }
 
-async fn serve_connection_io<R, W, H>(read: R, write: W, handler: H)
+async fn serve_connection_io<R, W, H>(read: R, write: W, handler: H) -> Result<(), String>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -118,7 +122,7 @@ where
     let mut reader = FrameReader::new(read);
     let mut writer = FrameWriter::new(write);
     let Ok(first) = read_envelope(&mut reader).await else {
-        return;
+        return Ok(());
     };
     let request_id = first.request_id;
     let Some(proto::envelope::Payload::Hello(hello)) = first.payload else {
@@ -131,7 +135,7 @@ where
             ),
         )
         .await;
-        return;
+        return Ok(());
     };
     if hello.protocol_version != PROTOCOL_VERSION || hello.product_id != product_id() {
         let _ = write_envelope(
@@ -143,7 +147,7 @@ where
             ),
         )
         .await;
-        return;
+        return Ok(());
     }
     let welcome = proto::Envelope {
         request_id,
@@ -154,7 +158,7 @@ where
         })),
     };
     if write_envelope(&mut writer, &welcome).await.is_err() {
-        return;
+        return Ok(());
     }
 
     let (responses, mut response_reader) = mpsc::channel::<proto::Envelope>(64);
@@ -162,10 +166,11 @@ where
     let writer_task = tokio::spawn(async move {
         while let Some(response) = response_reader.recv().await {
             if write_envelope(&mut writer, &response).await.is_err() {
-                break;
+                return Ok(());
             }
-            let _ = writer_handler.response_flushed(response.request_id).await;
+            retry_response_flushed(&writer_handler, response.request_id).await?;
         }
+        Ok::<(), String>(())
     });
     while let Ok(request) = read_envelope(&mut reader).await {
         let request_handler = handler.clone();
@@ -176,8 +181,28 @@ where
         });
     }
     drop(responses);
-    let _ = writer_task.await;
+    let writer_result = writer_task
+        .await
+        .map_err(|error| format!("节点响应写任务异常终止: {error}"))?;
     handler.connection_closed().await;
+    writer_result
+}
+
+async fn retry_response_flushed<H>(handler: &H, request_id: u64) -> Result<(), String>
+where
+    H: NodeRequestHandler,
+{
+    let mut last_error = None;
+    for _ in 0..RESPONSE_FLUSH_ATTEMPTS {
+        match handler.response_flushed(request_id).await {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(format!(
+        "request_id {request_id} 响应刷出后的宿主提交连续失败 {RESPONSE_FLUSH_ATTEMPTS} 次: {}",
+        last_error.unwrap_or_else(|| "未知错误".to_owned())
+    ))
 }
 
 async fn read_envelope<R>(reader: &mut FrameReader<R>) -> Result<proto::Envelope, ConnectionError>

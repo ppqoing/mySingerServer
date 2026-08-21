@@ -479,7 +479,7 @@ async fn remote_config_commit_failure_keeps_pending_for_same_request_retry() {
         Arc::clone(&events),
     );
     let repository_state = Arc::clone(&repository.state);
-    let host = FakeHostControl::with_control(false, 1, Arc::clone(&events));
+    let host = FakeHostControl::with_control(false, 2, Arc::clone(&events));
     let host_state = Arc::clone(&host.state);
     let (handle, actor) = spawn_remote_config_actor(repository, Some(host));
 
@@ -506,13 +506,20 @@ async fn remote_config_commit_failure_keeps_pending_for_same_request_retry() {
     assert_error_code(still_busy, proto::ErrorCode::Conflict);
     assert_eq!(repository_state.lock().unwrap().save_calls, 1);
     assert_eq!(host_state.lock().unwrap().prepared_versions.len(), 1);
-    handle.response_flushed(41).await.unwrap();
+    let second_commit = handle.response_flushed(41).await.unwrap_err();
+    assert!(second_commit.contains("fixture commit failure"));
     assert_eq!(host_state.lock().unwrap().commit_calls, 2);
+    let still_busy_after_retry = handle.handle(save_request(44, "saved-sha")).await;
+    assert_error_code(still_busy_after_retry, proto::ErrorCode::Conflict);
     handle.response_flushed(41).await.unwrap();
-    assert_eq!(host_state.lock().unwrap().commit_calls, 2);
+    assert_eq!(host_state.lock().unwrap().commit_calls, 3);
+    handle.response_flushed(41).await.unwrap();
+    assert_eq!(host_state.lock().unwrap().commit_calls, 3);
     assert_eq!(
         events.lock().unwrap().as_slice(),
-        ["snapshot", "save", "prepare", "commit", "commit"]
+        [
+            "snapshot", "save", "prepare", "commit", "commit", "commit"
+        ]
     );
 
     handle.shutdown().await.unwrap();

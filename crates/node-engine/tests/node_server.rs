@@ -94,7 +94,7 @@ async fn single_manager_is_exclusive_but_one_connection_handles_concurrent_reque
 #[tokio::test]
 async fn restart_response_notifies_handler_only_after_full_frame_write() {
     let (client, server_stream) = tokio::io::duplex(64);
-    let handler = RecordingHandler::new(4096, None, false);
+    let handler = RecordingHandler::new(4096, None, 0);
     let state = Arc::clone(&handler.state);
     let started = handler.started.clone();
     let flushed = handler.flushed.clone();
@@ -131,6 +131,7 @@ async fn restart_response_notifies_handler_only_after_full_frame_write() {
     tokio::time::timeout(Duration::from_secs(1), server)
         .await
         .unwrap()
+        .unwrap()
         .unwrap();
 }
 
@@ -138,7 +139,7 @@ async fn restart_response_notifies_handler_only_after_full_frame_write() {
 async fn restart_response_write_failure_does_not_notify_handler() {
     let (client, server_stream) = tokio::io::duplex(64);
     let release = Arc::new(Notify::new());
-    let handler = RecordingHandler::new(4096, Some(Arc::clone(&release)), false);
+    let handler = RecordingHandler::new(4096, Some(Arc::clone(&release)), 0);
     let state = Arc::clone(&handler.state);
     let started = handler.started.clone();
     let server = tokio::spawn(NodeServer::serve_stream_for_test(server_stream, handler));
@@ -164,14 +165,15 @@ async fn restart_response_write_failure_does_not_notify_handler() {
     tokio::time::timeout(Duration::from_secs(1), server)
         .await
         .unwrap()
+        .unwrap()
         .unwrap();
     assert!(state.lock().unwrap().flushed_ids.is_empty());
 }
 
 #[tokio::test]
-async fn restart_response_flush_error_does_not_duplicate_response_write() {
+async fn restart_response_retries_flush_without_rewriting_or_rehandling() {
     let (client, server_stream) = tokio::io::duplex(64);
-    let handler = RecordingHandler::new(256, None, true);
+    let handler = RecordingHandler::restart_accepted(1);
     let state = Arc::clone(&handler.state);
     let flushed = handler.flushed.clone();
     let server = tokio::spawn(NodeServer::serve_stream_for_test(server_stream, handler));
@@ -182,77 +184,183 @@ async fn restart_response_flush_error_does_not_duplicate_response_write() {
     write_hello(&mut writer, 90).await;
     read_envelope(&mut reader).await;
 
-    let first_flushed = flushed.notified();
     write_envelope(&mut writer, ping(91, 11)).await;
-    assert_eq!(read_envelope(&mut reader).await.request_id, 91);
-    first_flushed.await;
-
-    let second_flushed = flushed.notified();
-    write_envelope(&mut writer, ping(92, 12)).await;
-    assert_eq!(read_envelope(&mut reader).await.request_id, 92);
-    second_flushed.await;
-    assert_eq!(state.lock().unwrap().flushed_ids, [91, 92]);
+    assert_eq!(
+        read_envelope(&mut reader).await,
+        proto::Envelope {
+            request_id: 91,
+            payload: Some(proto::envelope::Payload::NodeRestartAccepted(
+                proto::NodeRestartAccepted {
+                    machine_id: "machine-fixture".into(),
+                    saved_version_sha256: "saved-sha".into(),
+                },
+            )),
+        }
+    );
+    wait_for_flush_count(&state, &flushed, 2).await;
+    let state_guard = state.lock().unwrap();
+    assert_eq!(state_guard.handled_ids, [91]);
+    assert_eq!(state_guard.flushed_ids, [91, 91]);
+    drop(state_guard);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), reader.read_frame())
+            .await
+            .is_err(),
+        "commit retry must not write a second response frame"
+    );
 
     drop(reader);
     drop(writer);
     tokio::time::timeout(Duration::from_secs(1), server)
         .await
         .unwrap()
+        .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn restart_response_exhausted_flush_retries_return_observable_error() {
+    let (client, server_stream) = tokio::io::duplex(64);
+    let handler = RecordingHandler::restart_accepted(usize::MAX);
+    let state = Arc::clone(&handler.state);
+    let flushed = handler.flushed.clone();
+    let server = tokio::spawn(NodeServer::serve_stream_for_test(server_stream, handler));
+    let (client_read, client_write) = tokio::io::split(client);
+    let mut reader = FrameReader::new(client_read);
+    let mut writer = FrameWriter::new(client_write);
+
+    write_hello(&mut writer, 93).await;
+    read_envelope(&mut reader).await;
+    write_envelope(&mut writer, ping(94, 13)).await;
+    assert_eq!(read_envelope(&mut reader).await.request_id, 94);
+    wait_for_flush_count(&state, &flushed, 2).await;
+    let state_guard = state.lock().unwrap();
+    assert_eq!(state_guard.handled_ids, [94]);
+    assert_eq!(state_guard.flushed_ids, [94, 94]);
+    drop(state_guard);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), reader.read_frame())
+            .await
+            .is_err(),
+        "failed commit attempts must not write another response frame"
+    );
+
+    drop(reader);
+    drop(writer);
+    let error = tokio::time::timeout(Duration::from_secs(1), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .expect_err("exhausted commit retries must remain observable");
+    assert!(error.contains("request_id 94"));
+    assert!(error.contains("2 次"));
+    assert!(error.contains("fixture flush failure"));
 }
 
 #[derive(Default)]
 struct RecordingState {
+    handled_ids: Vec<u64>,
     flushed_ids: Vec<u64>,
+    flush_failures_remaining: usize,
 }
 
 #[derive(Clone)]
 struct RecordingHandler {
     state: Arc<Mutex<RecordingState>>,
-    response_bytes: usize,
     started: Arc<Notify>,
     flushed: Arc<Notify>,
     release: Option<Arc<Notify>>,
-    fail_flush: bool,
+    response_bytes: Option<usize>,
 }
 
 impl RecordingHandler {
-    fn new(response_bytes: usize, release: Option<Arc<Notify>>, fail_flush: bool) -> Self {
+    fn new(
+        response_bytes: usize,
+        release: Option<Arc<Notify>>,
+        flush_failures_remaining: usize,
+    ) -> Self {
         Self {
-            state: Arc::new(Mutex::new(RecordingState::default())),
-            response_bytes,
+            state: Arc::new(Mutex::new(RecordingState {
+                handled_ids: Vec::new(),
+                flushed_ids: Vec::new(),
+                flush_failures_remaining,
+            })),
+            response_bytes: Some(response_bytes),
             started: Arc::new(Notify::new()),
             flushed: Arc::new(Notify::new()),
             release,
-            fail_flush,
+        }
+    }
+
+    fn restart_accepted(flush_failures_remaining: usize) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(RecordingState {
+                handled_ids: Vec::new(),
+                flushed_ids: Vec::new(),
+                flush_failures_remaining,
+            })),
+            response_bytes: None,
+            started: Arc::new(Notify::new()),
+            flushed: Arc::new(Notify::new()),
+            release: None,
         }
     }
 }
 
 impl NodeRequestHandler for RecordingHandler {
     async fn handle(&self, request: proto::Envelope) -> proto::Envelope {
+        self.state.lock().unwrap().handled_ids.push(request.request_id);
         self.started.notify_one();
         if let Some(release) = &self.release {
             release.notified().await;
         }
+        let payload = match self.response_bytes {
+            Some(response_bytes) => proto::envelope::Payload::Error(proto::Error {
+                code: proto::ErrorCode::Internal as i32,
+                message: "x".repeat(response_bytes),
+            }),
+            None => proto::envelope::Payload::NodeRestartAccepted(proto::NodeRestartAccepted {
+                machine_id: "machine-fixture".into(),
+                saved_version_sha256: "saved-sha".into(),
+            }),
+        };
         proto::Envelope {
             request_id: request.request_id,
-            payload: Some(proto::envelope::Payload::Error(proto::Error {
-                code: proto::ErrorCode::Internal as i32,
-                message: "x".repeat(self.response_bytes),
-            })),
+            payload: Some(payload),
         }
     }
 
     async fn response_flushed(&self, request_id: u64) -> Result<(), String> {
-        self.state.lock().unwrap().flushed_ids.push(request_id);
+        let mut state = self.state.lock().unwrap();
+        state.flushed_ids.push(request_id);
+        let fail = state.flush_failures_remaining > 0;
+        state.flush_failures_remaining = state.flush_failures_remaining.saturating_sub(1);
+        drop(state);
         self.flushed.notify_one();
-        if self.fail_flush {
+        if fail {
             Err("fixture flush failure".into())
         } else {
             Ok(())
         }
     }
+}
+
+async fn wait_for_flush_count(
+    state: &Arc<Mutex<RecordingState>>,
+    flushed: &Arc<Notify>,
+    expected: usize,
+) {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let notified = flushed.notified();
+            if state.lock().unwrap().flushed_ids.len() >= expected {
+                break;
+            }
+            notified.await;
+        }
+    })
+    .await
+    .unwrap();
 }
 
 async fn try_connect_and_hello(
