@@ -29,7 +29,7 @@ fn node_config_value_round_trips_every_approved_field() {
     config.worker.reserved_cores = 11;
     config.worker.manual_worker_count = 12;
 
-    let wire = proto::NodeConfigValue::from(&config);
+    let wire = proto::NodeConfigValue::try_from(&config).unwrap();
     let decoded = NodeConfig::try_from(wire.clone()).unwrap();
 
     assert_eq!(decoded, config);
@@ -39,7 +39,7 @@ fn node_config_value_round_trips_every_approved_field() {
 
 #[test]
 fn unknown_config_enum_is_rejected_instead_of_silently_defaulting() {
-    let mut wire = proto::NodeConfigValue::from(&NodeConfig::default());
+    let mut wire = proto::NodeConfigValue::try_from(&NodeConfig::default()).unwrap();
     wire.enumerator = 99;
 
     assert!(matches!(
@@ -53,7 +53,7 @@ fn unknown_config_enum_is_rejected_instead_of_silently_defaulting() {
 
 #[test]
 fn config_messages_round_trip_snapshot_and_restart_values() {
-    let config = proto::NodeConfigValue::from(&NodeConfig::default());
+    let config = proto::NodeConfigValue::try_from(&NodeConfig::default()).unwrap();
     let snapshot = proto::NodeConfigSnapshot {
         machine_id: "73bdb7a3377f81376a84f316b3ee1555e345afbfa87aa99c77b1bfcc364c4cae".into(),
         version_sha256: "a".repeat(64),
@@ -75,6 +75,43 @@ fn config_messages_round_trip_snapshot_and_restart_values() {
     };
     assert_eq!(proto::SaveNodeConfigAndRestart::decode(save.encode_to_vec().as_slice()).unwrap(), save);
     assert_eq!(proto::NodeRestartAccepted::decode(accepted.encode_to_vec().as_slice()).unwrap(), accepted);
+}
+
+#[test]
+fn invalid_node_config_is_rejected_before_encoding() {
+    let mut config = NodeConfig::default();
+    config.worker_count = usize::MAX;
+
+    assert!(matches!(
+        proto::NodeConfigValue::try_from(&config),
+        Err(ProtocolError::InvalidDomain(dedup_core::CoreError::InvalidConfig {
+            field: "worker_count",
+            ..
+        }))
+    ));
+}
+
+#[test]
+fn invalid_worker_enum_and_oversized_block_size_are_rejected_while_decoding() {
+    let mut unknown_worker = proto::NodeConfigValue::try_from(&NodeConfig::default()).unwrap();
+    unknown_worker.worker_mode = 99;
+    assert!(matches!(
+        NodeConfig::try_from(unknown_worker),
+        Err(ProtocolError::InvalidDomain(dedup_core::CoreError::InvalidConfig {
+            field: "worker.mode",
+            ..
+        }))
+    ));
+
+    let mut oversized_block = proto::NodeConfigValue::try_from(&NodeConfig::default()).unwrap();
+    oversized_block.block_size_bytes = u64::MAX;
+    assert!(matches!(
+        NodeConfig::try_from(oversized_block),
+        Err(ProtocolError::InvalidDomain(dedup_core::CoreError::InvalidConfig {
+            field: "read.block_size_bytes",
+            ..
+        }))
+    ));
 }
 
 #[test]

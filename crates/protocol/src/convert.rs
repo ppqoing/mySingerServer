@@ -12,9 +12,12 @@ use crate::{ProtocolError, proto};
 /// 单个 `FileChunk.data` 允许的最大字节数。
 pub const MAX_FILE_CHUNK_DATA: usize = 1_048_576;
 
-impl From<&NodeConfig> for proto::NodeConfigValue {
-    fn from(value: &NodeConfig) -> Self {
-        Self {
+impl TryFrom<&NodeConfig> for proto::NodeConfigValue {
+    type Error = ProtocolError;
+
+    fn try_from(value: &NodeConfig) -> Result<Self, Self::Error> {
+        value.validate()?;
+        Ok(Self {
             listen_ip: value.listen_ip.to_string(),
             port: u32::from(value.port),
             enumerator: match value.enumerator {
@@ -25,21 +28,21 @@ impl From<&NodeConfig> for proto::NodeConfigValue {
             config_path: value.paths.config_path.clone(),
             log_path: value.paths.log_path.clone(),
             cache_path: value.paths.cache_path.clone(),
-            hdd_threads_per_disk: value.read.hdd_threads_per_disk as u32,
-            ssd_threads_per_disk: value.read.ssd_threads_per_disk as u32,
-            unknown_threads_per_disk: value.read.unknown_threads_per_disk as u32,
-            total_threads: value.read.total_threads as u32,
-            block_size_bytes: value.read.block_size_bytes as u64,
+            hdd_threads_per_disk: encode_u32(value.read.hdd_threads_per_disk, "read.hdd_threads_per_disk")?,
+            ssd_threads_per_disk: encode_u32(value.read.ssd_threads_per_disk, "read.ssd_threads_per_disk")?,
+            unknown_threads_per_disk: encode_u32(value.read.unknown_threads_per_disk, "read.unknown_threads_per_disk")?,
+            total_threads: encode_u32(value.read.total_threads, "read.total_threads")?,
+            block_size_bytes: encode_u64(value.read.block_size_bytes, "read.block_size_bytes")?,
             block_timeout_seconds: value.read.block_timeout_seconds,
             block_retries: value.read.block_retries,
-            legacy_worker_count: value.worker_count as u32,
+            legacy_worker_count: encode_u32(value.worker_count, "worker_count")?,
             worker_mode: match value.worker.mode {
                 WorkerMode::Automatic => proto::NodeWorkerMode::NodeWorkerAutomatic as i32,
                 WorkerMode::Manual => proto::NodeWorkerMode::NodeWorkerManual as i32,
             },
-            reserved_cores: value.worker.reserved_cores as u32,
-            manual_worker_count: value.worker.manual_worker_count as u32,
-        }
+            reserved_cores: encode_u32(value.worker.reserved_cores, "worker.reserved_cores")?,
+            manual_worker_count: encode_u32(value.worker.manual_worker_count, "worker.manual_worker_count")?,
+        })
     }
 }
 
@@ -203,6 +206,18 @@ fn narrow_usize(value: u32, field: &'static str) -> Result<usize, ProtocolError>
     value
         .try_into()
         .map_err(|_| invalid_config(field, "超出 usize"))
+}
+
+fn encode_u32(value: usize, field: &'static str) -> Result<u32, ProtocolError> {
+    value
+        .try_into()
+        .map_err(|_| invalid_config(field, "超出 u32"))
+}
+
+fn encode_u64(value: usize, field: &'static str) -> Result<u64, ProtocolError> {
+    value
+        .try_into()
+        .map_err(|_| invalid_config(field, "超出 u64"))
 }
 
 fn invalid_config(field: &'static str, reason: &'static str) -> ProtocolError {
