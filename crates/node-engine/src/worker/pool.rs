@@ -2,7 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex},
     time::Duration,
 };
 
@@ -98,14 +98,117 @@ pub struct WorkerPoolHandle {
     state: Arc<Mutex<PoolState>>,
 }
 
-impl WorkerPoolHandle {
-    /// 在持久取消提交后同步标记任务，使 slot send 临界区拒绝后续请求。
-    pub fn mark_task_cancelled(&self, task_id: &str) {
+/// 持久取消前占用的任务发送门禁；未 commit 即 Drop 会回滚 cancelling 标记。
+pub struct TaskCancelGate {
+    state: Arc<Mutex<PoolState>>,
+    commands: mpsc::Sender<PoolCommand>,
+    task_id: String,
+    finished: bool,
+}
+
+impl TaskCancelGate {
+    /// 持久取消成功后提交门禁，使后续调度永久拒绝该任务。
+    pub fn commit(mut self) {
+        let mut state = self.state.lock().unwrap();
+        state.cancelling_tasks.remove(&self.task_id);
+        state.cancelled_tasks.insert(self.task_id.clone());
+        self.finished = true;
+    }
+
+    /// 持久取消失败时回滚门禁并唤醒 pool actor 重新调度等待项。
+    pub fn rollback(mut self) {
         self.state
             .lock()
             .unwrap()
-            .cancelled_tasks
+            .cancelling_tasks
+            .remove(&self.task_id);
+        let _ = self
+            .commands
+            .try_send(PoolCommand::CancelRollback(self.task_id.clone()));
+        self.finished = true;
+    }
+}
+
+impl Drop for TaskCancelGate {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.state
+                .lock()
+                .unwrap()
+                .cancelling_tasks
+                .remove(&self.task_id);
+            let _ = self
+                .commands
+                .try_send(PoolCommand::CancelRollback(self.task_id.clone()));
+        }
+    }
+}
+
+/// 只供直接竞态测试把调度卡在门禁检查后、slot send 前。
+#[doc(hidden)]
+#[derive(Clone, Default)]
+pub struct WorkerDispatchBarrier {
+    state: Arc<(Mutex<(bool, bool)>, Condvar, Condvar)>,
+}
+
+impl WorkerDispatchBarrier {
+    /// 阻塞等待调度抵达 send 前边界。
+    pub fn wait_until_entered(&self) {
+        let (state, entered, _) = &*self.state;
+        let mut state = state.lock().unwrap();
+        while !state.0 {
+            state = entered.wait(state).unwrap();
+        }
+    }
+
+    /// 允许被卡住的调度继续发送。
+    pub fn release(&self) {
+        let (state, _, released) = &*self.state;
+        let mut state = state.lock().unwrap();
+        state.1 = true;
+        released.notify_all();
+    }
+
+    fn block_before_send(&self) {
+        let (state, entered, released) = &*self.state;
+        let mut state = state.lock().unwrap();
+        state.0 = true;
+        entered.notify_all();
+        while !state.1 {
+            state = released.wait(state).unwrap();
+        }
+    }
+}
+
+impl WorkerPoolHandle {
+    /// 在持久取消事务前同步关闭新 slot send，并等待已进入临界区的 send 登记完成。
+    pub fn begin_task_cancel(&self, task_id: &str) -> TaskCancelGate {
+        self.state
+            .lock()
+            .unwrap()
+            .cancelling_tasks
             .insert(task_id.to_owned());
+        TaskCancelGate {
+            state: self.state.clone(),
+            commands: self.commands.clone(),
+            task_id: task_id.to_owned(),
+            finished: false,
+        }
+    }
+
+    /// 在持久取消提交后同步标记任务，使 slot send 临界区拒绝后续请求。
+    pub fn mark_task_cancelled(&self, task_id: &str) {
+        self.begin_task_cancel(task_id).commit();
+    }
+
+    /// 尝试在不等待的情况下标记取消，只供 send 临界区竞态测试。
+    #[doc(hidden)]
+    pub fn try_mark_task_cancelled_for_test(&self, task_id: &str) -> bool {
+        let Ok(mut state) = self.state.try_lock() else {
+            return false;
+        };
+        state.cancelled_tasks.insert(task_id.to_owned());
+        true
     }
 
     /// 取消任务：删除等待项，终止并替换正在执行该任务的 Worker。
@@ -314,6 +417,24 @@ impl WorkerPool {
     /// 创建不启动进程的可控池，只供直接集成测试验证发送/取消边界。
     #[doc(hidden)]
     pub fn controlled_for_test() -> (Self, mpsc::Receiver<(String, String)>) {
+        Self::controlled_inner(None)
+    }
+
+    /// 创建在门禁检查后、send 前暂停的可控池，只供竞态集成测试。
+    #[doc(hidden)]
+    pub fn controlled_with_dispatch_barrier_for_test() -> (
+        Self,
+        mpsc::Receiver<(String, String)>,
+        WorkerDispatchBarrier,
+    ) {
+        let barrier = WorkerDispatchBarrier::default();
+        let (pool, started) = Self::controlled_inner(Some(barrier.clone()));
+        (pool, started, barrier)
+    }
+
+    fn controlled_inner(
+        dispatch_barrier: Option<WorkerDispatchBarrier>,
+    ) -> (Self, mpsc::Receiver<(String, String)>) {
         let state = Arc::new(Mutex::new(PoolState::default()));
         let actor_state = Arc::clone(&state);
         let (commands, mut command_rx) = mpsc::channel(64);
@@ -326,24 +447,23 @@ impl WorkerPool {
                     PoolCommand::Dispatch(envelope, guard, reply) => {
                         let result = WorkItem::try_from(envelope).map(|mut work| {
                             work.scan_guard = guard;
-                            let registry_cancelled = actor_state
-                                .lock()
-                                .unwrap()
-                                .cancelled_tasks
-                                .contains(&work.identity.task_id);
-                            if registry_cancelled || !work.dispatch_allowed() {
+                            let mut locked = actor_state.lock().unwrap();
+                            let registry_blocked =
+                                locked.cancelled_tasks.contains(&work.identity.task_id)
+                                    || locked.cancelling_tasks.contains(&work.identity.task_id);
+                            if registry_blocked || !work.dispatch_allowed() {
+                                drop(locked);
                                 let _ = events.try_send(WorkerEvent::Cancelled {
                                     task_id: work.identity.task_id,
                                     item_id: work.identity.item_id,
                                 });
                                 return;
                             }
+                            if let Some(barrier) = &dispatch_barrier {
+                                barrier.block_before_send();
+                            }
                             active = Some(work.identity.clone());
-                            actor_state
-                                .lock()
-                                .unwrap()
-                                .running
-                                .insert(0, work.identity.clone());
+                            locked.running.insert(0, work.identity.clone());
                             let _ = started.try_send((
                                 work.identity.task_id.clone(),
                                 work.identity.item_id.clone(),
@@ -352,11 +472,11 @@ impl WorkerPool {
                         let _ = reply.send(result);
                     }
                     PoolCommand::Cancel(task_id, reply) => {
-                        actor_state
-                            .lock()
-                            .unwrap()
-                            .cancelled_tasks
-                            .insert(task_id.clone());
+                        {
+                            let mut state = actor_state.lock().unwrap();
+                            state.cancelling_tasks.remove(&task_id);
+                            state.cancelled_tasks.insert(task_id.clone());
+                        }
                         if active.as_ref().is_some_and(|work| work.task_id == task_id) {
                             let work = active.take().expect("活动测试项已经确认存在");
                             actor_state.lock().unwrap().running.clear();
@@ -368,6 +488,13 @@ impl WorkerPool {
                                 .await;
                         }
                         let _ = reply.send(Ok(()));
+                    }
+                    PoolCommand::CancelRollback(task_id) => {
+                        actor_state
+                            .lock()
+                            .unwrap()
+                            .cancelling_tasks
+                            .remove(&task_id);
                     }
                     PoolCommand::PrepareRestart(reply) => {
                         let items = active
@@ -434,6 +561,7 @@ struct PoolState {
     failure_count: u64,
     restarting: bool,
     cancelled_tasks: HashSet<String>,
+    cancelling_tasks: HashSet<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -471,6 +599,7 @@ enum PoolCommand {
         oneshot::Sender<Result<(), WorkerPoolError>>,
     ),
     Cancel(String, oneshot::Sender<Result<(), WorkerPoolError>>),
+    CancelRollback(String),
     PrepareRestart(oneshot::Sender<Result<Vec<String>, WorkerPoolError>>),
     Restart(Vec<String>, oneshot::Sender<Result<(), WorkerPoolError>>),
     TerminateUnexpected(u32, oneshot::Sender<Result<(), WorkerPoolError>>),
@@ -579,11 +708,11 @@ async fn run_pool(
                         let _ = reply.send(result);
                     }
                     PoolCommand::Cancel(task_id, reply) => {
-                        state
-                            .lock()
-                            .unwrap()
-                            .cancelled_tasks
-                            .insert(task_id.clone());
+                        {
+                            let mut locked = state.lock().unwrap();
+                            locked.cancelling_tasks.remove(&task_id);
+                            locked.cancelled_tasks.insert(task_id.clone());
+                        }
                         let result = cancel_task_items(
                             &task_id,
                             &config,
@@ -598,6 +727,14 @@ async fn run_pool(
                         ).await;
                         schedule(&mut queue, &mut idle, &slots, &events, &state).await;
                         let _ = reply.send(result);
+                    }
+                    PoolCommand::CancelRollback(task_id) => {
+                        state
+                            .lock()
+                            .unwrap()
+                            .cancelling_tasks
+                            .remove(&task_id);
+                        schedule(&mut queue, &mut idle, &slots, &events, &state).await;
                     }
                     PoolCommand::TerminateUnexpected(process_id, reply) => {
                         let result = slots
@@ -639,39 +776,72 @@ async fn schedule(
     events: &mpsc::Sender<WorkerEvent>,
     state: &Arc<Mutex<PoolState>>,
 ) {
+    enum DispatchDecision {
+        Sent,
+        Rejected(WorkIdentity),
+        Retry(WorkItem),
+        Restarting(WorkItem),
+        Cancelling(WorkItem),
+    }
     if state.lock().unwrap().restarting {
         return;
     }
     while !idle.is_empty() && !queue.is_empty() {
         let work = queue.pop_front().expect("队列已判定非空");
-        let registry_cancelled = state
-            .lock()
-            .unwrap()
-            .cancelled_tasks
-            .contains(&work.identity.task_id);
-        if registry_cancelled || !work.dispatch_allowed() {
-            let _ = events
-                .send(WorkerEvent::Cancelled {
-                    task_id: work.identity.task_id,
-                    item_id: work.identity.item_id,
-                })
-                .await;
-            continue;
-        }
         let slot_id = idle.pop_first().expect("集合已判定非空");
         let identity = work.identity.clone();
         let Some(slot) = slots.get(&slot_id) else {
             queue.push_front(work);
             continue;
         };
-        if let Err(error) = slot.commands.send(SlotCommand::Run(work)) {
-            let SlotCommand::Run(work) = error.0 else {
-                unreachable!("schedule only sends Run")
-            };
-            queue.push_front(work);
-            continue;
+        let decision = {
+            let mut locked = state.lock().unwrap();
+            if locked.restarting {
+                DispatchDecision::Restarting(work)
+            } else {
+                if locked.cancelling_tasks.contains(&identity.task_id) {
+                    DispatchDecision::Cancelling(work)
+                } else if locked.cancelled_tasks.contains(&identity.task_id)
+                    || !work.dispatch_allowed()
+                {
+                    DispatchDecision::Rejected(identity)
+                } else if let Err(error) = slot.commands.send(SlotCommand::Run(work)) {
+                    let SlotCommand::Run(work) = error.0 else {
+                        unreachable!("schedule only sends Run")
+                    };
+                    DispatchDecision::Retry(work)
+                } else {
+                    locked.running.insert(slot_id, identity);
+                    DispatchDecision::Sent
+                }
+            }
+        };
+        match decision {
+            DispatchDecision::Sent => {}
+            DispatchDecision::Rejected(identity) => {
+                idle.insert(slot_id);
+                let _ = events
+                    .send(WorkerEvent::Cancelled {
+                        task_id: identity.task_id,
+                        item_id: identity.item_id,
+                    })
+                    .await;
+            }
+            DispatchDecision::Retry(work) => {
+                idle.insert(slot_id);
+                queue.push_front(work);
+            }
+            DispatchDecision::Restarting(work) => {
+                idle.insert(slot_id);
+                queue.push_front(work);
+                return;
+            }
+            DispatchDecision::Cancelling(work) => {
+                idle.insert(slot_id);
+                queue.push_front(work);
+                return;
+            }
         }
-        state.lock().unwrap().running.insert(slot_id, identity);
     }
 }
 

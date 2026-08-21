@@ -157,6 +157,73 @@ async fn cancelled_scan_is_rejected_at_the_worker_pool_send_boundary() {
     ));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_gate_cannot_cross_the_registry_check_to_slot_send_window() {
+    let (pool, mut started, barrier) = WorkerPool::controlled_with_dispatch_barrier_for_test();
+    let control = pool.handle();
+    let first = proto::WorkerEnvelope {
+        payload: Some(worker_envelope::Payload::ProbeAndStage1(
+            proto::ProbeAndStage1 {
+                task_id: "race-task".into(),
+                item_id: "before-cancel".into(),
+                display_path: r"D:\before.bin".into(),
+                media_kind: proto::MediaKind::MediaOther as i32,
+            },
+        )),
+    };
+    let dispatch = tokio::spawn(async move {
+        let result = pool
+            .dispatch_scan(first, ReadCancellationToken::new(), true)
+            .await;
+        (pool, result)
+    });
+    let wait_barrier = barrier.clone();
+    tokio::task::spawn_blocking(move || wait_barrier.wait_until_entered())
+        .await
+        .unwrap();
+    let crossed_send_window = control.try_mark_task_cancelled_for_test("race-task");
+    barrier.release();
+    let (mut pool, result) = dispatch.await.unwrap();
+    result.unwrap();
+    if !crossed_send_window {
+        control.mark_task_cancelled("race-task");
+    }
+
+    assert!(
+        !crossed_send_window,
+        "cancel gate 必须等待已进入的 check+send 临界区收束"
+    );
+    assert_eq!(
+        started.recv().await,
+        Some(("race-task".into(), "before-cancel".into()))
+    );
+
+    pool.dispatch_scan(
+        proto::WorkerEnvelope {
+            payload: Some(worker_envelope::Payload::ProbeAndStage1(
+                proto::ProbeAndStage1 {
+                    task_id: "race-task".into(),
+                    item_id: "after-cancel".into(),
+                    display_path: r"D:\after.bin".into(),
+                    media_kind: proto::MediaKind::MediaOther as i32,
+                },
+            )),
+        },
+        ReadCancellationToken::new(),
+        true,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        started.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    assert!(matches!(
+        pool.next_event().await,
+        Some(WorkerEvent::Cancelled { item_id, .. }) if item_id == "after-cancel"
+    ));
+}
+
 /// 把媒体层 Duration 采样定义转换为测试解码器记录的归一化值。
 fn normalized_positions() -> [f64; 6] {
     sample_positions(Duration::from_secs(12)).map(|value| value.as_secs_f64() / 12.0)

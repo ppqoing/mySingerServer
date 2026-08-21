@@ -9,5 +9,8 @@ pub use pipeline::{
     WorkerPipeline, WorkerPipelineError, decode_stage1_payload, decode_stage2_payload,
     encode_stage1_payload, encode_stage2_payload, handle_worker_request,
 };
-pub use pool::{WorkerEvent, WorkerPool, WorkerPoolConfig, WorkerPoolError, WorkerPoolHandle};
+pub use pool::{
+    WorkerDispatchBarrier, WorkerEvent, WorkerPool, WorkerPoolConfig, WorkerPoolError,
+    WorkerPoolHandle,
+};
 pub use process::WorkerLaunch;

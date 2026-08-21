@@ -899,11 +899,18 @@ impl EngineState {
 
     async fn cancel_task(&mut self, request: proto::CancelTask) -> ProtocolResult {
         let task_id = parse_task_id(&request.task_id)?;
-        self.store
-            .cancel_task(task_id, now_ms())
-            .map_err(store_error)?;
-        if let Some(pool) = &self.worker_control {
-            pool.mark_task_cancelled(&request.task_id);
+        let cancel_gate = self
+            .worker_control
+            .as_ref()
+            .map(|pool| pool.begin_task_cancel(&request.task_id));
+        if let Err(error) = self.store.cancel_task(task_id, now_ms()) {
+            if let Some(cancel_gate) = cancel_gate {
+                cancel_gate.rollback();
+            }
+            return Err(store_error(error));
+        }
+        if let Some(cancel_gate) = cancel_gate {
+            cancel_gate.commit();
         }
         if let Some(active) = &self.active_job
             && active.identity == JobIdentity::Task(task_id)
