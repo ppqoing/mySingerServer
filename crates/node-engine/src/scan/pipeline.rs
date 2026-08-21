@@ -60,7 +60,7 @@ pub trait PipelineFileReader: Clone + Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = Result<ReadProduct<Self::Lease>, ReadFailure>> + Send + 'static>>;
 
     /// 返回最近一次为路径解析的物理盘显示身份。
-    fn physical_disk_id(&self, _path: &Path) -> String {
+    fn take_physical_disk_id(&self, _path: &Path) -> String {
         String::new()
     }
 }
@@ -186,12 +186,11 @@ impl PipelineFileReader for ScheduledFileReader {
         })
     }
 
-    fn physical_disk_id(&self, path: &Path) -> String {
+    fn take_physical_disk_id(&self, path: &Path) -> String {
         self.locations
             .lock()
             .unwrap()
-            .get(path)
-            .cloned()
+            .remove(path)
             .unwrap_or_default()
     }
 }

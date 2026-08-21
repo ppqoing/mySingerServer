@@ -289,6 +289,30 @@ impl WorkerDispatchBarrier {
 }
 
 impl WorkerPoolHandle {
+    /// 从可克隆控制面并发派发扫描请求，事件仍由唯一 WorkerPool owner 消费。
+    pub async fn dispatch_scan(
+        &self,
+        envelope: proto::WorkerEnvelope,
+        cancellation: ReadCancellationToken,
+        persisted_active: bool,
+        file_identity: WorkerFileIdentity,
+    ) -> Result<(), WorkerPoolError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.commands
+            .send(PoolCommand::Dispatch(
+                envelope,
+                Some(ScanDispatchGuard {
+                    cancellation,
+                    persisted_active,
+                    file_identity,
+                }),
+                reply_tx,
+            ))
+            .await
+            .map_err(|_| WorkerPoolError::Closed)?;
+        reply_rx.await.map_err(|_| WorkerPoolError::Closed)?
+    }
+
     /// 在持久取消事务前同步关闭新 slot send，并等待已进入临界区的 send 登记完成。
     pub fn begin_task_cancel(&self, task_id: &str) -> TaskCancelGate {
         self.state

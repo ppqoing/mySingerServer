@@ -389,6 +389,41 @@ impl RuntimeTaskReporter {
         Ok(())
     }
 
+    /// 枚举 channel 关闭时立即冻结扫描文件/字节总量，不等待读取或 Worker。
+    pub fn freeze_scan_totals_nowait(
+        &self,
+        files: u64,
+        bytes: u64,
+    ) -> Result<(), RuntimeTaskError> {
+        let now = self.registry.inner.clock.now();
+        let mut tasks = self.registry.inner.tasks.write().expect("runtime registry lock poisoned");
+        let task = active_task(&mut tasks, &self.task_id)?;
+        task.overall_total = Some(files);
+        for (kind, total) in [
+            (RuntimeStage::Enumerate, files),
+            (RuntimeStage::CacheLookup, files),
+            (RuntimeStage::ReadMd5, bytes),
+            (RuntimeStage::ProbeStage1, files),
+            (RuntimeStage::PersistFinalize, files),
+        ] {
+            let stage = task.stages.entry(kind).or_default();
+            stage.total = Some(total);
+        }
+        let stage = task.stages.entry(RuntimeStage::Enumerate).or_default();
+        let completed = stage.completed.max(files);
+        let failed = stage.failed;
+        let skipped = stage.skipped;
+        task.update_stage(RuntimeStageUpdate {
+            stage: RuntimeStage::Enumerate,
+            state: proto::RuntimeStageState::RuntimeStageCompleted,
+            unit: RuntimeProgressUnit::Files,
+            completed,
+            total: Some(files),
+            failed,
+            skipped,
+        }, now)
+    }
+
     /// 更新一个固定阶段。
     pub async fn update_stage(&self, update: RuntimeStageUpdate) -> Result<(), RuntimeTaskError> {
         let now = self.registry.inner.clock.now();
@@ -477,9 +512,24 @@ impl RuntimeTaskReporter {
 
     /// UPSERT 一个 Worker slot。
     pub async fn update_worker(&self, worker: RuntimeWorkerUpdate) -> Result<(), RuntimeTaskError> {
+        self.worker_started(worker).await
+    }
+
+    /// 在真实 Pool Started 边界更新 slot，不重置累计完成数/速度样本。
+    pub async fn worker_started(&self, worker: RuntimeWorkerUpdate) -> Result<(), RuntimeTaskError> {
+        let now = self.registry.inner.clock.now();
         let mut tasks = self.registry.inner.tasks.write().expect("runtime registry lock poisoned");
         let task = active_task(&mut tasks, &self.task_id)?;
-        task.workers.insert(worker.slot, worker);
+        task.workers.entry(worker.slot).or_default().started(worker, now);
+        Ok(())
+    }
+
+    /// 在真实 Pool terminal event 边界给 slot 完成文件数加一并更新 10 秒速度。
+    pub async fn worker_completed(&self, slot: u32) -> Result<(), RuntimeTaskError> {
+        let now = self.registry.inner.clock.now();
+        let mut tasks = self.registry.inner.tasks.write().expect("runtime registry lock poisoned");
+        let task = active_task(&mut tasks, &self.task_id)?;
+        task.workers.entry(slot).or_default().completed(now);
         Ok(())
     }
 
@@ -553,7 +603,7 @@ struct TaskEntry {
     overall_failed: u64,
     overall_skipped: u64,
     stages: BTreeMap<RuntimeStage, StageEntry>,
-    workers: BTreeMap<u32, RuntimeWorkerUpdate>,
+    workers: BTreeMap<u32, WorkerEntry>,
     failures: VecDeque<RuntimeFailureUpdate>,
 }
 
@@ -633,15 +683,7 @@ impl TaskEntry {
             workers: self
                 .workers
                 .values()
-                .map(|worker| proto::RuntimeWorkerDetails {
-                    slot: worker.slot,
-                    process_id: worker.process_id,
-                    stage_id: worker.stage.id().into(),
-                    display_path: worker.display_path.clone(),
-                    physical_disk_id: worker.physical_disk_id.clone(),
-                    completed_files: worker.completed_files,
-                    speed_per_second: finite_nonnegative(worker.speed_per_second),
-                })
+                .map(WorkerEntry::snapshot)
                 .collect(),
             failures: self
                 .failures
@@ -652,6 +694,56 @@ impl TaskEntry {
                     message: failure.message.clone(),
                 })
                 .collect(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct WorkerEntry {
+    slot: u32,
+    process_id: Option<u32>,
+    stage: Option<RuntimeStage>,
+    display_path: String,
+    physical_disk_id: String,
+    completed_files: u64,
+    speed_per_second: f64,
+    samples: VecDeque<(Duration, u64)>,
+}
+
+impl WorkerEntry {
+    fn started(&mut self, update: RuntimeWorkerUpdate, now: Duration) {
+        self.slot = update.slot;
+        self.process_id = update.process_id;
+        self.stage = Some(update.stage);
+        self.display_path = update.display_path;
+        self.physical_disk_id = update.physical_disk_id;
+        if self.samples.is_empty() {
+            self.samples.push_back((now, self.completed_files));
+        }
+    }
+
+    fn completed(&mut self, now: Duration) {
+        self.completed_files = self.completed_files.saturating_add(1);
+        self.samples.push_back((now, self.completed_files));
+        while self
+            .samples
+            .front()
+            .is_some_and(|(time, _)| now.saturating_sub(*time) > SPEED_WINDOW)
+        {
+            self.samples.pop_front();
+        }
+        self.speed_per_second = sample_speed(&self.samples);
+    }
+
+    fn snapshot(&self) -> proto::RuntimeWorkerDetails {
+        proto::RuntimeWorkerDetails {
+            slot: self.slot,
+            process_id: self.process_id,
+            stage_id: self.stage.map_or_else(|| "idle".into(), |stage| stage.id().into()),
+            display_path: self.display_path.clone(),
+            physical_disk_id: self.physical_disk_id.clone(),
+            completed_files: self.completed_files,
+            speed_per_second: self.speed_per_second,
         }
     }
 }
@@ -750,5 +842,18 @@ fn finite_nonnegative(value: f64) -> f64 {
         value
     } else {
         0.0
+    }
+}
+
+fn sample_speed(samples: &VecDeque<(Duration, u64)>) -> f64 {
+    let (Some((first_time, first)), Some((last_time, last))) = (samples.front(), samples.back())
+    else {
+        return 0.0;
+    };
+    let seconds = last_time.saturating_sub(*first_time).as_secs_f64();
+    if seconds <= 0.0 || last < first {
+        0.0
+    } else {
+        finite_nonnegative((*last - *first) as f64 / seconds)
     }
 }

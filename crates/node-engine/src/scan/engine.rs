@@ -276,12 +276,13 @@ impl Stage1Processor for WorkerPoolStage1Processor<'_> {
             )
             .await
             .map_err(|error| error.to_string())?;
-        match self.pool.next_event().await {
+        loop {
+            match self.pool.next_event().await {
             Some(WorkerEvent::Completed {
                 task_id: event_task,
                 item_id: event_item,
                 response,
-            }) if event_task == task_id && event_item == item_id => match response.payload {
+            }) if event_task == task_id && event_item == item_id => return match response.payload {
                 Some(worker_envelope::Payload::Stage1Result(result)) => {
                     decode_stage1_payload(&result.payload).map_err(|error| error.to_string())
                 }
@@ -293,15 +294,30 @@ impl Stage1Processor for WorkerPoolStage1Processor<'_> {
                 item_id: event_item,
                 message,
                 ..
-            }) if event_task == task_id && event_item == item_id => Err(message),
+            }) if event_task == task_id && event_item == item_id => return Err(message),
             Some(WorkerEvent::Cancelled {
                 task_id: event_task,
                 item_id: event_item,
-            }) if event_task == task_id && event_item == item_id => Err("一筛已取消".into()),
-            Some(WorkerEvent::InfrastructureFailure { message }) => Err(message),
-            Some(WorkerEvent::Started { .. }) => Err("Worker 尚未返回一筛结果".into()),
-            Some(_) => Err("WorkerPool 在串行扫描中返回了其他任务事件".into()),
-            None => Err("WorkerPool 已关闭".into()),
+            }) if event_task == task_id && event_item == item_id => return Err("一筛已取消".into()),
+            Some(WorkerEvent::InfrastructureFailure { message }) => return Err(message),
+            Some(WorkerEvent::Started { task_id: event_task, item_id: event_item, slot, process_id, identity })
+                if event_task == task_id && event_item == item_id => {
+                    if let Some(reporter) = &self.runtime_reporter {
+                        let _ = reporter.worker_started(crate::runtime_tasks::RuntimeWorkerUpdate {
+                            slot,
+                            process_id,
+                            stage: RuntimeStage::ProbeStage1,
+                            display_path: identity.display_path.as_path().to_string_lossy().into_owned(),
+                            physical_disk_id: identity.physical_disk_id,
+                            completed_files: 0,
+                            speed_per_second: 0.0,
+                        }).await;
+                    }
+                    continue;
+                }
+            Some(_) => return Err("WorkerPool 在串行扫描中返回了其他任务事件".into()),
+            None => return Err("WorkerPool 已关闭".into()),
+            }
         }
     }
 
@@ -312,6 +328,8 @@ impl Stage1Processor for WorkerPoolStage1Processor<'_> {
     async fn process_batch(&mut self, requests: Vec<Stage1Request>) -> Vec<Stage1BatchResult> {
         let mut pending = BTreeMap::new();
         let mut results = Vec::with_capacity(requests.len());
+        let mut dispatches = JoinSet::new();
+        let pool_handle = self.pool.handle();
         for request in requests {
             let task_id = request.task_id.as_uuid().to_string();
             let item_id = request.item_id.clone();
@@ -331,23 +349,32 @@ impl Stage1Processor for WorkerPoolStage1Processor<'_> {
                     },
                 )),
             };
-            match self
-                .pool
-                .dispatch_scan(envelope, self.cancellation.clone(), true, file_identity)
-                .await
-            {
-                Ok(()) => {
-                    pending.insert(item_id, task_id);
-                }
-                Err(error) => results.push(Stage1BatchResult {
-                    item_id,
-                    output: Err(Stage1ProcessError::Infrastructure(error.to_string())),
-                }),
-            }
+            pending.insert(item_id.clone(), task_id);
+            let handle = pool_handle.clone();
+            let cancellation = self.cancellation.clone();
+            dispatches.spawn(async move {
+                let result = handle
+                    .dispatch_scan(envelope, cancellation, true, file_identity)
+                    .await;
+                (item_id, result)
+            });
         }
         let mut started_workers = BTreeMap::new();
-        while !pending.is_empty() {
-            let Some(event) = self.pool.next_event().await else {
+        while !pending.is_empty() || !dispatches.is_empty() {
+            let event = tokio::select! {
+                joined = dispatches.join_next(), if !dispatches.is_empty() => {
+                    if let Some(Ok((item_id, Err(error)))) = joined {
+                        pending.remove(&item_id);
+                        results.push(Stage1BatchResult {
+                            item_id,
+                            output: Err(Stage1ProcessError::Infrastructure(error.to_string())),
+                        });
+                    }
+                    continue;
+                }
+                event = self.pool.next_event(), if !pending.is_empty() => event,
+            };
+            let Some(event) = event else {
                 for item_id in pending.into_keys() {
                     results.push(Stage1BatchResult {
                         item_id,
@@ -368,7 +395,7 @@ impl Stage1Processor for WorkerPoolStage1Processor<'_> {
                 } if pending.get(&item_id) == Some(&task_id) => {
                     if let Some(reporter) = &self.runtime_reporter {
                         let _ = reporter
-                            .update_worker(crate::runtime_tasks::RuntimeWorkerUpdate {
+                            .worker_started(crate::runtime_tasks::RuntimeWorkerUpdate {
                                 slot,
                                 process_id,
                                 stage: RuntimeStage::ProbeStage1,
@@ -383,7 +410,7 @@ impl Stage1Processor for WorkerPoolStage1Processor<'_> {
                             })
                             .await;
                     }
-                    started_workers.insert(item_id, (slot, process_id, identity));
+                    started_workers.insert(item_id, slot);
                 }
                 WorkerEvent::Completed {
                     task_id,
@@ -391,20 +418,10 @@ impl Stage1Processor for WorkerPoolStage1Processor<'_> {
                     response,
                 } if pending.get(&item_id) == Some(&task_id) => {
                     pending.remove(&item_id);
-                    if let Some((slot, process_id, identity)) = started_workers.remove(&item_id)
+                    if let Some(slot) = started_workers.remove(&item_id)
                         && let Some(reporter) = &self.runtime_reporter
                     {
-                        let _ = reporter
-                            .update_worker(crate::runtime_tasks::RuntimeWorkerUpdate {
-                                slot,
-                                process_id,
-                                stage: RuntimeStage::ProbeStage1,
-                                display_path: identity.display_path.as_path().to_string_lossy().into_owned(),
-                                physical_disk_id: identity.physical_disk_id,
-                                completed_files: 1,
-                                speed_per_second: 0.0,
-                            })
-                            .await;
+                        let _ = reporter.worker_completed(slot).await;
                     }
                     let output = match response.payload {
                         Some(worker_envelope::Payload::Stage1Result(result)) => {
@@ -621,6 +638,7 @@ where
         );
         let mut reads = JoinSet::new();
         let mut enumeration_closed = false;
+        let mut enumeration_totals_frozen = false;
         let mut pending_stage1 = Vec::new();
         let mut summary = ScanSummary {
             task_id,
@@ -660,6 +678,17 @@ where
                         break;
                     }
                 }
+            }
+            if enumeration_closed && !enumeration_totals_frozen {
+                if let Some(reporter) = &self.runtime_reporter {
+                    reporter
+                        .freeze_scan_totals_nowait(
+                            summary.total_files as u64,
+                            summary.total_bytes,
+                        )
+                        .map_err(|error| ScanError::Stage1(error.to_string()))?;
+                }
+                enumeration_totals_frozen = true;
             }
             if pending_stage1.len() >= processor.max_in_flight().max(1) {
                 let result = flush_stage1_batch(
@@ -982,6 +1011,7 @@ where
         R: PipelineFileReader,
     {
         let ReservedScan { scanned, item_id } = reserved;
+        let physical_disk_id = reader.take_physical_disk_id(scanned.display_path.as_path());
         let ReadProduct { md5, lease } = match result {
             Ok(value) => value,
             Err(ReadFailure::Cancelled) => return Err(ScanError::Cancelled),
@@ -1039,7 +1069,7 @@ where
                 file_size,
                 stage: "probe_stage1".into(),
                 content_id: content.id,
-                physical_disk_id: reader.physical_disk_id(scanned.display_path.as_path()),
+                physical_disk_id,
                 generate_contact_sheet: !contact_sheet.exists(),
             },
             lease,
