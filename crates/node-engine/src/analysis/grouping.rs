@@ -8,7 +8,11 @@ use dedup_node_store::{
     PairKind,
 };
 
-use super::exact::exact_groups;
+use crate::runtime_tasks::{
+    RuntimeProgressUnit, RuntimeStage, RuntimeStageUpdate, RuntimeTaskReporter,
+};
+
+use super::exact::{exact_groups, exact_groups_with_runtime};
 
 /// 最终三类分组数量。
 pub(crate) struct GroupCounts {
@@ -17,10 +21,19 @@ pub(crate) struct GroupCounts {
     pub(crate) video: usize,
 }
 
-/// 组合精确组与两种相似组；相似内容只加入与代表直接通过的成员。
-pub(crate) fn final_groups(
+/// 分别在精确、图片和视频聚类真实子边界推进运行时候选对计数。
+pub(crate) fn final_groups_with_runtime(
     inputs: &[AnalysisInput],
     candidates: &[CandidateWrite],
+    reporter: Option<&RuntimeTaskReporter>,
+) -> (Vec<GroupWrite>, GroupCounts) {
+    final_groups_internal(inputs, candidates, reporter)
+}
+
+fn final_groups_internal(
+    inputs: &[AnalysisInput],
+    candidates: &[CandidateWrite],
+    reporter: Option<&RuntimeTaskReporter>,
 ) -> (Vec<GroupWrite>, GroupCounts) {
     let mut locations = BTreeMap::<ContentKey, Vec<LocationKey>>::new();
     for input in inputs {
@@ -34,14 +47,27 @@ pub(crate) fn final_groups(
         values.dedup();
     }
 
-    let mut groups = exact_groups(inputs);
+    let mut groups = if reporter.is_some() {
+        exact_groups_with_runtime(inputs, reporter, candidates.len() as u64)
+    } else {
+        exact_groups(inputs)
+    };
     let exact = groups.len();
     let image_groups = similar_groups(PairKind::Image, GroupKind::Image, candidates, &locations);
     let image = image_groups.len();
     groups.extend(image_groups);
+    report_cluster_progress(
+        reporter,
+        candidates
+            .iter()
+            .filter(|candidate| candidate.kind == PairKind::Image)
+            .count() as u64,
+        candidates.len() as u64,
+    );
     let video_groups = similar_groups(PairKind::Video, GroupKind::Video, candidates, &locations);
     let video = video_groups.len();
     groups.extend(video_groups);
+    report_cluster_progress(reporter, candidates.len() as u64, candidates.len() as u64);
     (
         groups,
         GroupCounts {
@@ -50,6 +76,20 @@ pub(crate) fn final_groups(
             video,
         },
     )
+}
+
+fn report_cluster_progress(reporter: Option<&RuntimeTaskReporter>, completed: u64, total: u64) {
+    if let Some(reporter) = reporter {
+        let _ = reporter.update_stage_nowait(RuntimeStageUpdate {
+            stage: RuntimeStage::Cluster,
+            state: dedup_protocol::proto::RuntimeStageState::RuntimeStageRunning,
+            unit: RuntimeProgressUnit::CandidatePairs,
+            completed,
+            total: Some(total),
+            failed: 0,
+            skipped: 0,
+        });
+    }
 }
 
 fn similar_groups(

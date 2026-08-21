@@ -33,7 +33,7 @@ use dedup_windows::{
 use crate::{
     analysis::{
         LocalAnalysisEngine, Stage2BatchItem, Stage2BatchPlan, WorkerPoolStage2Processor,
-        begin_stage2_batch, run_stage2_batch,
+        begin_stage2_batch, run_stage2_batch_with_runtime,
     },
     artifact_registry::RegenerableArtifactRegistry,
     config_repository::{
@@ -631,9 +631,11 @@ enum BackgroundJob {
     },
     LocalAnalysis {
         run_id: AnalysisRunId,
+        runtime_reporter: RuntimeTaskReporter,
     },
     Stage2 {
         plan: Stage2BatchPlan,
+        runtime_reporter: RuntimeTaskReporter,
     },
 }
 
@@ -641,8 +643,8 @@ impl BackgroundJob {
     const fn identity(&self) -> JobIdentity {
         match self {
             Self::Scan { task_id, .. } => JobIdentity::Task(*task_id),
-            Self::LocalAnalysis { run_id } => JobIdentity::Analysis(*run_id),
-            Self::Stage2 { plan } => JobIdentity::Task(plan.task_id),
+            Self::LocalAnalysis { run_id, .. } => JobIdentity::Analysis(*run_id),
+            Self::Stage2 { plan, .. } => JobIdentity::Task(plan.task_id),
         }
     }
 }
@@ -686,7 +688,7 @@ impl EngineState {
             Some(proto::envelope::Payload::ListTasks(query)) => self.list_tasks(query),
             Some(proto::envelope::Payload::BrowsePaths(query)) => browse_paths(query),
             Some(proto::envelope::Payload::CreateLocalAnalysis(create)) => {
-                self.create_local_analysis(create)
+                self.create_local_analysis(create).await
             }
             Some(proto::envelope::Payload::QueryAnalysisRun(query)) => {
                 self.query_analysis_run(query)
@@ -700,7 +702,7 @@ impl EngineState {
                 self.prepare_analysis_input(query)
             }
             Some(proto::envelope::Payload::DispatchStage2(dispatch)) => {
-                self.dispatch_stage2(dispatch)
+                self.dispatch_stage2(dispatch).await
             }
             Some(proto::envelope::Payload::PullChanges(pull)) => self.pull_changes(pull),
             Some(proto::envelope::Payload::SyncAck(ack)) => self.sync_ack(ack),
@@ -718,7 +720,7 @@ impl EngineState {
                 self.clear_file_fault(clear)
             }
             Some(proto::envelope::Payload::CreateDeleteBatch(create)) => {
-                self.create_delete_batch(create)
+                self.create_delete_batch(create).await
             }
             Some(_) => Err((
                 proto::ErrorCode::InvalidRequest,
@@ -1086,7 +1088,10 @@ impl EngineState {
         }))
     }
 
-    fn create_local_analysis(&mut self, request: proto::CreateLocalAnalysis) -> ProtocolResult {
+    async fn create_local_analysis(
+        &mut self,
+        request: proto::CreateLocalAnalysis,
+    ) -> ProtocolResult {
         self.ensure_job_idle()?;
         if request.group_kind == proto::GroupKind::Unspecified as i32 {
             return Err(invalid("必须选择分析结果类型"));
@@ -1104,10 +1109,23 @@ impl EngineState {
             .unwrap_or_default();
         let run_id = LocalAnalysisEngine::begin(&mut self.store, &tasks, thresholds, now_ms())
             .map_err(internal)?;
-        if let Err(error) = self.start_background(BackgroundJob::LocalAnalysis { run_id }) {
+        let runtime_reporter = self
+            .runtime_tasks
+            .begin(
+                RuntimeTaskKind::LocalAnalysis,
+                self.store.machine_id().clone(),
+                "本地分析",
+            )
+            .await;
+        let runtime_failure = runtime_reporter.clone();
+        if let Err(error) = self.start_background(BackgroundJob::LocalAnalysis {
+            run_id,
+            runtime_reporter,
+        }) {
             let _ = self
                 .store
                 .transition_analysis_run(run_id, AnalysisStatus::Partial, now_ms());
+            let _ = runtime_failure.finish(RuntimeTaskState::Failed).await;
             return Err(internal(error));
         }
         Ok(proto::envelope::Payload::QueryAnalysisRun(
@@ -1319,7 +1337,7 @@ impl EngineState {
         ))
     }
 
-    fn dispatch_stage2(&mut self, request: proto::DispatchStage2) -> ProtocolResult {
+    async fn dispatch_stage2(&mut self, request: proto::DispatchStage2) -> ProtocolResult {
         self.ensure_job_idle()?;
         parse_analysis_id(&request.analysis_run_id)?;
         let items = request
@@ -1350,8 +1368,21 @@ impl EngineState {
             .collect::<Result<Vec<_>, (proto::ErrorCode, String)>>()?;
         let plan = begin_stage2_batch(&mut self.store, &items, now_ms()).map_err(internal)?;
         let task_id = plan.task_id;
-        if let Err(error) = self.start_background(BackgroundJob::Stage2 { plan }) {
+        let runtime_reporter = self
+            .runtime_tasks
+            .begin(
+                RuntimeTaskKind::Stage2,
+                self.store.machine_id().clone(),
+                "二筛计算",
+            )
+            .await;
+        let runtime_failure = runtime_reporter.clone();
+        if let Err(error) = self.start_background(BackgroundJob::Stage2 {
+            plan,
+            runtime_reporter,
+        }) {
             let _ = self.store.fail_task(task_id, now_ms());
+            let _ = runtime_failure.finish(RuntimeTaskState::Failed).await;
             return Err(internal(error));
         }
         Ok(proto::envelope::Payload::TaskAccepted(
@@ -1388,7 +1419,10 @@ impl EngineState {
         }))
     }
 
-    fn create_delete_batch(&mut self, request: proto::CreateDeleteBatch) -> ProtocolResult {
+    async fn create_delete_batch(
+        &mut self,
+        request: proto::CreateDeleteBatch,
+    ) -> ProtocolResult {
         let mode = match proto::DeleteMode::try_from(request.mode) {
             Ok(proto::DeleteMode::DeleteRecycleBin) => DeleteMode::RecycleBin,
             Ok(proto::DeleteMode::DeletePermanent) => DeleteMode::Permanent,
@@ -1462,12 +1496,38 @@ impl EngineState {
                 items,
             }
         };
+        let runtime_reporter = self
+            .runtime_tasks
+            .begin(
+                RuntimeTaskKind::Delete,
+                self.store.machine_id().clone(),
+                "删除",
+            )
+            .await;
         let results = if external {
-            DeleteEngine::execute_external(&mut self.store, &plan)
+            DeleteEngine::execute_external_with_runtime(&mut self.store, &plan, &runtime_reporter)
         } else {
-            DeleteEngine::execute_batch(&mut self.store, &plan)
-        }
-        .map_err(internal)?;
+            DeleteEngine::execute_batch_with_runtime(&mut self.store, &plan, &runtime_reporter)
+        };
+        let results = match results {
+            Ok(results) => {
+                let has_failure = results
+                    .iter()
+                    .any(|result| result.outcome == DeleteOutcome::Failed);
+                let _ = runtime_reporter
+                    .finish(if has_failure {
+                        RuntimeTaskState::Failed
+                    } else {
+                        RuntimeTaskState::Completed
+                    })
+                    .await;
+                results
+            }
+            Err(error) => {
+                let _ = runtime_reporter.finish(RuntimeTaskState::Failed).await;
+                return Err(internal(error));
+            }
+        };
         let items = plan
             .items
             .iter()
@@ -1524,7 +1584,10 @@ impl EngineState {
         };
         let runtime_reporter = match &job {
             BackgroundJob::Scan { runtime_reporter, .. } => Some(runtime_reporter.clone()),
-            _ => None,
+            BackgroundJob::LocalAnalysis { runtime_reporter, .. }
+            | BackgroundJob::Stage2 { runtime_reporter, .. } => {
+                Some(runtime_reporter.clone())
+            }
         };
         let commands = self
             .commands
@@ -1563,6 +1626,9 @@ impl EngineState {
         let Some(active) = self.active_job.take() else {
             return;
         };
+        if let Some(reporter) = &active.runtime_reporter {
+            let _ = reporter.finish(RuntimeTaskState::Cancelled).await;
+        }
         match active.identity {
             JobIdentity::Task(task_id) => {
                 let _ = self.store.cancel_task(task_id, now_ms());
@@ -1679,22 +1745,64 @@ async fn run_background_job(
                 let _ = store.fail_task(task_id, now_ms());
             }
         }
-        BackgroundJob::LocalAnalysis { run_id } => {
-            let mut processor = WorkerPoolStage2Processor::new(worker_pool);
-            if LocalAnalysisEngine::run_existing(store, run_id, &mut processor, now_ms())
-                .await
-                .is_err()
-            {
+        BackgroundJob::LocalAnalysis {
+            run_id,
+            runtime_reporter,
+        } => {
+            let mut processor = WorkerPoolStage2Processor::new(worker_pool).with_runtime_reporter(
+                runtime_reporter.clone(),
+                store.machine_id().clone(),
+            );
+            let result = LocalAnalysisEngine::run_existing_with_runtime(
+                store,
+                run_id,
+                &mut processor,
+                &runtime_reporter,
+                now_ms(),
+            )
+            .await;
+            let state = match &result {
+                Ok(report) if report.status == AnalysisStatus::Completed => {
+                    RuntimeTaskState::Completed
+                }
+                _ => RuntimeTaskState::Failed,
+            };
+            let _ = runtime_reporter.finish(state).await;
+            if result.is_err() {
                 let _ = store.transition_analysis_run(run_id, AnalysisStatus::Partial, now_ms());
             }
         }
-        BackgroundJob::Stage2 { plan } => {
+        BackgroundJob::Stage2 {
+            plan,
+            runtime_reporter,
+        } => {
             let task_id = plan.task_id;
-            let mut processor = WorkerPoolStage2Processor::new(worker_pool);
-            if run_stage2_batch(store, plan, &mut processor, now_ms())
-                .await
-                .is_err()
-            {
+            let mut processor = WorkerPoolStage2Processor::new(worker_pool).with_runtime_reporter(
+                runtime_reporter.clone(),
+                store.machine_id().clone(),
+            );
+            let result = run_stage2_batch_with_runtime(
+                store,
+                plan,
+                &mut processor,
+                &runtime_reporter,
+                now_ms(),
+            )
+            .await;
+            let completed = result.is_ok()
+                && store
+                    .task_snapshot(task_id)
+                    .is_ok_and(|snapshot| {
+                        snapshot.status == TaskStatus::Completed && snapshot.failed == 0
+                    });
+            let _ = runtime_reporter
+                .finish(if completed {
+                    RuntimeTaskState::Completed
+                } else {
+                    RuntimeTaskState::Failed
+                })
+                .await;
+            if result.is_err() {
                 let _ = store.fail_task(task_id, now_ms());
             }
         }

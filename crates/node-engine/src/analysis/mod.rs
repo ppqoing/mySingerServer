@@ -15,16 +15,23 @@ use dedup_node_store::{
 };
 use thiserror::Error;
 
+use crate::runtime_tasks::{
+    RuntimeProgressUnit, RuntimeStage, RuntimeStageUpdate, RuntimeTaskReporter,
+};
+
 pub use phase2::{
     Stage2BatchItem, Stage2Processor, Stage2Request, WorkerPoolStage2Processor,
     dispatch_stage2_batch,
 };
 
-use grouping::final_groups;
-use image::image_candidates;
-pub(crate) use phase2::{Stage2BatchPlan, begin_stage2_batch, run_stage2_batch};
+use grouping::final_groups_with_runtime;
+use image::image_candidates_with_runtime;
+#[allow(unused_imports)]
+pub(crate) use phase2::{
+    Stage2BatchPlan, begin_stage2_batch, run_stage2_batch, run_stage2_batch_with_runtime,
+};
 use phase2::{dispatch_missing, evaluate_candidates};
-use video::video_candidates;
+use video::video_candidates_with_runtime;
 
 /// 节点当前状态不允许开始或继续筛选。
 #[derive(Debug, Error)]
@@ -105,20 +112,68 @@ impl LocalAnalysisEngine {
         processor: &mut P,
         now_ms: i64,
     ) -> Result<LocalAnalysisReport, AnalysisBlocked> {
+        Self::run_existing_internal(store, run_id, processor, None, now_ms).await
+    }
+
+    /// 从已冻结输入继续分析，并把真实 SQLite/Worker 边界发布到进程内任务详情。
+    pub async fn run_existing_with_runtime<P: Stage2Processor>(
+        store: &mut NodeStore,
+        run_id: AnalysisRunId,
+        processor: &mut P,
+        reporter: &RuntimeTaskReporter,
+        now_ms: i64,
+    ) -> Result<LocalAnalysisReport, AnalysisBlocked> {
+        Self::run_existing_internal(store, run_id, processor, Some(reporter), now_ms).await
+    }
+
+    async fn run_existing_internal<P: Stage2Processor>(
+        store: &mut NodeStore,
+        run_id: AnalysisRunId,
+        processor: &mut P,
+        reporter: Option<&RuntimeTaskReporter>,
+        now_ms: i64,
+    ) -> Result<LocalAnalysisReport, AnalysisBlocked> {
+        initialize_runtime_stages(reporter);
         store.transition_analysis_run(run_id, AnalysisStatus::Stage1Synced, now_ms)?;
         store.transition_analysis_run(run_id, AnalysisStatus::Screening, now_ms)?;
 
         let thresholds = store.analysis_thresholds(run_id)?;
         let inputs = store.analysis_inputs(run_id)?;
+        if let Some(reporter) = reporter {
+            let _ = reporter.update_overall_nowait(0, Some(inputs.len() as u64), 0, 0);
+        }
+        report_stage(
+            reporter,
+            RuntimeStage::FreezeInputs,
+            dedup_protocol::proto::RuntimeStageState::RuntimeStageCompleted,
+            RuntimeProgressUnit::Files,
+            inputs.len() as u64,
+            Some(inputs.len() as u64),
+            0,
+            0,
+        );
         let mut images = BTreeMap::<ContentKey, ImageStage1>::new();
         let mut videos = BTreeMap::<ContentKey, Box<[Option<ImageStage1>; 6]>>::new();
         let mut skipped_incomplete = 0;
         let mut keys = inputs.iter().map(|input| input.content).collect::<Vec<_>>();
         keys.sort();
         keys.dedup();
+        report_stage(
+            reporter,
+            RuntimeStage::LoadFeatures,
+            dedup_protocol::proto::RuntimeStageState::RuntimeStageRunning,
+            RuntimeProgressUnit::Files,
+            0,
+            Some(keys.len() as u64),
+            0,
+            0,
+        );
+        let mut loaded = 0_u64;
         for key in keys {
             let Some(content_id) = store.content_id_by_key(key)? else {
                 skipped_incomplete += 1;
+                loaded += 1;
+                report_load_progress(reporter, loaded, skipped_incomplete);
                 continue;
             };
             match store.content_media_kind(content_id)? {
@@ -136,14 +191,85 @@ impl LocalAnalysisEngine {
                 },
                 MediaKind::Other => {}
             }
+            loaded += 1;
+            report_load_progress(reporter, loaded, skipped_incomplete);
         }
         store.set_analysis_skipped_incomplete(run_id, skipped_incomplete, now_ms)?;
-        let mut candidates = image_candidates(&images, &thresholds);
-        candidates.extend(video_candidates(&videos, &thresholds));
+        report_stage(
+            reporter,
+            RuntimeStage::LoadFeatures,
+            dedup_protocol::proto::RuntimeStageState::RuntimeStageCompleted,
+            RuntimeProgressUnit::Files,
+            loaded,
+            Some(loaded),
+            0,
+            skipped_incomplete as u64,
+        );
+        report_stage(
+            reporter,
+            RuntimeStage::Stage1Candidates,
+            dedup_protocol::proto::RuntimeStageState::RuntimeStageRunning,
+            RuntimeProgressUnit::CandidatePairs,
+            0,
+            None,
+            0,
+            0,
+        );
+        let mut candidates = image_candidates_with_runtime(&images, &thresholds, reporter);
+        let image_candidate_count = candidates.len() as u64;
+        candidates.extend(video_candidates_with_runtime(
+            &videos,
+            &thresholds,
+            reporter,
+            image_candidate_count,
+        ));
         store.replace_candidates(run_id, &candidates)?;
+        report_stage(
+            reporter,
+            RuntimeStage::Stage1Candidates,
+            dedup_protocol::proto::RuntimeStageState::RuntimeStageCompleted,
+            RuntimeProgressUnit::CandidatePairs,
+            candidates.len() as u64,
+            Some(candidates.len() as u64),
+            0,
+            0,
+        );
         store.transition_analysis_run(run_id, AnalysisStatus::Phase2Dispatched, now_ms)?;
-        let dispatched = dispatch_missing(store, &candidates, processor, now_ms).await?;
-        finish_run(store, run_id, dispatched, skipped_incomplete, now_ms)
+        report_stage(
+            reporter,
+            RuntimeStage::FillStage2,
+            dedup_protocol::proto::RuntimeStageState::RuntimeStageRunning,
+            RuntimeProgressUnit::CandidatePairs,
+            0,
+            Some(candidates.len() as u64),
+            0,
+            0,
+        );
+        let dispatched =
+            match dispatch_missing(store, &candidates, processor, reporter, now_ms).await {
+                Ok(dispatched) => dispatched,
+                Err(error) => {
+                    report_stage(
+                        reporter,
+                        RuntimeStage::FillStage2,
+                        dedup_protocol::proto::RuntimeStageState::RuntimeStageFailed,
+                        RuntimeProgressUnit::CandidatePairs,
+                        0,
+                        Some(candidates.len() as u64),
+                        1,
+                        0,
+                    );
+                    return Err(error);
+                }
+            };
+        finish_run(
+            store,
+            run_id,
+            dispatched,
+            skipped_incomplete,
+            reporter,
+            now_ms,
+        )
     }
 
     /// 从 partial 只收集未解决候选仍缺失的 ContentKey 并再次完成同一运行。
@@ -164,12 +290,13 @@ impl LocalAnalysisEngine {
         }
         store.transition_analysis_run(run_id, AnalysisStatus::Phase2Dispatched, now_ms)?;
         let candidates = store.analysis_candidates(run_id)?;
-        let dispatched = dispatch_missing(store, &candidates, processor, now_ms).await?;
+        let dispatched = dispatch_missing(store, &candidates, processor, None, now_ms).await?;
         finish_run(
             store,
             run_id,
             dispatched,
             snapshot.skipped_incomplete as usize,
+            None,
             now_ms,
         )
     }
@@ -196,6 +323,7 @@ fn finish_run(
     run_id: AnalysisRunId,
     dispatched: usize,
     skipped_incomplete: usize,
+    reporter: Option<&RuntimeTaskReporter>,
     now_ms: i64,
 ) -> Result<LocalAnalysisReport, AnalysisBlocked> {
     let thresholds = store.analysis_thresholds(run_id)?;
@@ -204,6 +332,25 @@ fn finish_run(
     store.replace_candidates(run_id, &candidates)?;
     if unresolved > 0 {
         store.transition_analysis_run(run_id, AnalysisStatus::Partial, now_ms)?;
+        report_stage(
+            reporter,
+            RuntimeStage::FillStage2,
+            dedup_protocol::proto::RuntimeStageState::RuntimeStageFailed,
+            RuntimeProgressUnit::CandidatePairs,
+            candidates.len().saturating_sub(unresolved) as u64,
+            Some(candidates.len() as u64),
+            unresolved as u64,
+            0,
+        );
+        skip_analysis_tail(reporter);
+        if let Some(reporter) = reporter {
+            let _ = reporter.update_overall_nowait(
+                0,
+                Some(store.analysis_inputs(run_id)?.len() as u64),
+                unresolved as u64,
+                skipped_incomplete as u64,
+            );
+        }
         return Ok(LocalAnalysisReport {
             run_id,
             status: AnalysisStatus::Partial,
@@ -216,12 +363,70 @@ fn finish_run(
         });
     }
 
+    report_stage(
+        reporter,
+        RuntimeStage::FillStage2,
+        dedup_protocol::proto::RuntimeStageState::RuntimeStageCompleted,
+        RuntimeProgressUnit::CandidatePairs,
+        candidates.len() as u64,
+        Some(candidates.len() as u64),
+        0,
+        0,
+    );
     store.transition_analysis_run(run_id, AnalysisStatus::Phase2Synced, now_ms)?;
     store.transition_analysis_run(run_id, AnalysisStatus::Finalizing, now_ms)?;
     let inputs = store.analysis_inputs(run_id)?;
-    let (groups, counts) = final_groups(&inputs, &candidates);
+    report_stage(
+        reporter,
+        RuntimeStage::Cluster,
+        dedup_protocol::proto::RuntimeStageState::RuntimeStageRunning,
+        RuntimeProgressUnit::CandidatePairs,
+        0,
+        Some(candidates.len() as u64),
+        0,
+        0,
+    );
+    let (groups, counts) = final_groups_with_runtime(&inputs, &candidates, reporter);
+    report_stage(
+        reporter,
+        RuntimeStage::Cluster,
+        dedup_protocol::proto::RuntimeStageState::RuntimeStageCompleted,
+        RuntimeProgressUnit::CandidatePairs,
+        candidates.len() as u64,
+        Some(candidates.len() as u64),
+        0,
+        0,
+    );
+    report_stage(
+        reporter,
+        RuntimeStage::SaveResults,
+        dedup_protocol::proto::RuntimeStageState::RuntimeStageRunning,
+        RuntimeProgressUnit::Files,
+        0,
+        Some(inputs.len() as u64),
+        0,
+        0,
+    );
     store.replace_groups(run_id, &groups)?;
     store.transition_analysis_run(run_id, AnalysisStatus::Completed, now_ms)?;
+    if let Some(reporter) = reporter {
+        let _ = reporter.update_overall_nowait(
+            inputs.len().saturating_sub(skipped_incomplete) as u64,
+            Some(inputs.len() as u64),
+            0,
+            skipped_incomplete as u64,
+        );
+    }
+    report_stage(
+        reporter,
+        RuntimeStage::SaveResults,
+        dedup_protocol::proto::RuntimeStageState::RuntimeStageCompleted,
+        RuntimeProgressUnit::Files,
+        inputs.len() as u64,
+        Some(inputs.len() as u64),
+        0,
+        0,
+    );
     Ok(LocalAnalysisReport {
         run_id,
         status: AnalysisStatus::Completed,
@@ -232,4 +437,87 @@ fn finish_run(
         phase2_dispatched: dispatched,
         unresolved_candidates: 0,
     })
+}
+
+fn initialize_runtime_stages(reporter: Option<&RuntimeTaskReporter>) {
+    for (stage, unit) in [
+        (RuntimeStage::FreezeInputs, RuntimeProgressUnit::Files),
+        (RuntimeStage::LoadFeatures, RuntimeProgressUnit::Files),
+        (
+            RuntimeStage::Stage1Candidates,
+            RuntimeProgressUnit::CandidatePairs,
+        ),
+        (
+            RuntimeStage::FillStage2,
+            RuntimeProgressUnit::CandidatePairs,
+        ),
+        (RuntimeStage::Cluster, RuntimeProgressUnit::CandidatePairs),
+        (RuntimeStage::SaveResults, RuntimeProgressUnit::Files),
+    ] {
+        report_stage(
+            reporter,
+            stage,
+            dedup_protocol::proto::RuntimeStageState::RuntimeStageWaiting,
+            unit,
+            0,
+            None,
+            0,
+            0,
+        );
+    }
+}
+
+fn report_load_progress(reporter: Option<&RuntimeTaskReporter>, completed: u64, skipped: usize) {
+    report_stage(
+        reporter,
+        RuntimeStage::LoadFeatures,
+        dedup_protocol::proto::RuntimeStageState::RuntimeStageRunning,
+        RuntimeProgressUnit::Files,
+        completed,
+        None,
+        0,
+        skipped as u64,
+    );
+}
+
+fn skip_analysis_tail(reporter: Option<&RuntimeTaskReporter>) {
+    for (stage, unit) in [
+        (RuntimeStage::Cluster, RuntimeProgressUnit::CandidatePairs),
+        (RuntimeStage::SaveResults, RuntimeProgressUnit::Files),
+    ] {
+        report_stage(
+            reporter,
+            stage,
+            dedup_protocol::proto::RuntimeStageState::RuntimeStageSkipped,
+            unit,
+            0,
+            Some(0),
+            0,
+            0,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn report_stage(
+    reporter: Option<&RuntimeTaskReporter>,
+    stage: RuntimeStage,
+    state: dedup_protocol::proto::RuntimeStageState,
+    unit: RuntimeProgressUnit,
+    completed: u64,
+    total: Option<u64>,
+    failed: u64,
+    skipped: u64,
+) {
+    if let Some(reporter) = reporter {
+        let _ = reporter.update_stage_nowait(RuntimeStageUpdate {
+            stage,
+            state,
+            unit,
+            completed,
+            total,
+            failed,
+            skipped,
+        });
+    }
 }

@@ -10,6 +10,11 @@ use dedup_node_store::{
 };
 use dedup_protocol::proto::{self, worker_envelope};
 
+use crate::runtime_tasks::{
+    RuntimeFailureUpdate, RuntimeProgressUnit, RuntimeStage, RuntimeStageUpdate,
+    RuntimeTaskReporter, RuntimeWorkerUpdate,
+};
+use crate::worker::WorkerFileIdentity;
 use crate::worker::{Stage2Output, WorkerEvent, WorkerPool, decode_stage2_payload};
 
 use super::AnalysisBlocked;
@@ -43,12 +48,26 @@ pub trait Stage2Processor {
 /// 串行借用 NodeEngine 所属 WorkerPool 的二筛适配器。
 pub struct WorkerPoolStage2Processor<'a> {
     pool: &'a mut WorkerPool,
+    runtime: Option<(RuntimeTaskReporter, dedup_core::MachineId)>,
 }
 
 impl<'a> WorkerPoolStage2Processor<'a> {
     /// 借用当前节点唯一 WorkerPool。
     pub const fn new(pool: &'a mut WorkerPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            runtime: None,
+        }
+    }
+
+    /// 冻结本机身份并把真实 Worker slot/PID/path/disk 发布给运行时详情。
+    pub fn with_runtime_reporter(
+        mut self,
+        reporter: RuntimeTaskReporter,
+        machine_id: dedup_core::MachineId,
+    ) -> Self {
+        self.runtime = Some((reporter, machine_id));
+        self
     }
 }
 
@@ -56,55 +75,134 @@ impl Stage2Processor for WorkerPoolStage2Processor<'_> {
     async fn process(&mut self, request: Stage2Request) -> Result<Stage2Output, String> {
         let task_id = request.task_id.as_uuid().to_string();
         let item_id = request.item_id.clone();
-        self.pool
-            .dispatch(proto::WorkerEnvelope {
-                payload: Some(worker_envelope::Payload::ComputeStage2(
-                    proto::ComputeStage2 {
-                        task_id: task_id.clone(),
-                        item_id: item_id.clone(),
-                        display_path: request
-                            .display_path
-                            .as_path()
-                            .to_string_lossy()
-                            .into_owned(),
-                        frame_slots: request
-                            .frame_slots
-                            .iter()
-                            .map(|slot| u32::from(*slot))
-                            .collect(),
+        let envelope = proto::WorkerEnvelope {
+            payload: Some(worker_envelope::Payload::ComputeStage2(
+                proto::ComputeStage2 {
+                    task_id: task_id.clone(),
+                    item_id: item_id.clone(),
+                    display_path: request
+                        .display_path
+                        .as_path()
+                        .to_string_lossy()
+                        .into_owned(),
+                    frame_slots: request
+                        .frame_slots
+                        .iter()
+                        .map(|slot| u32::from(*slot))
+                        .collect(),
+                },
+            )),
+        };
+        if let Some((_, machine_id)) = &self.runtime {
+            let physical_disk_id = physical_disk_id(&request.display_path);
+            let normalized_path = dedup_core::NormalizedPath::new(request.display_path.as_path())
+                .map_err(|error| error.to_string())?;
+            self.pool
+                .dispatch_runtime(
+                    envelope,
+                    WorkerFileIdentity {
+                        machine_id: machine_id.clone(),
+                        normalized_path,
+                        display_path: request.display_path.clone(),
+                        file_size: request.content.file_size(),
+                        stage: RuntimeStage::FillStage2.id().into(),
+                        physical_disk_id,
                     },
-                )),
-            })
-            .await
-            .map_err(|error| error.to_string())?;
-        match self.pool.next_event().await {
-            Some(WorkerEvent::Completed {
-                task_id: event_task,
-                item_id: event_item,
-                response,
-            }) if event_task == task_id && event_item == item_id => match response.payload {
-                Some(worker_envelope::Payload::Stage2Result(result)) => {
-                    decode_stage2_payload(&result.payload).map_err(|error| error.to_string())
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+        } else {
+            self.pool
+                .dispatch(envelope)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        let mut started_slot = None;
+        loop {
+            match self.pool.next_event().await {
+                Some(WorkerEvent::Started {
+                    task_id: event_task,
+                    item_id: event_item,
+                    slot,
+                    process_id,
+                    identity,
+                }) if event_task == task_id && event_item == item_id => {
+                    started_slot = Some(slot);
+                    if let Some((reporter, _)) = &self.runtime {
+                        let _ = reporter
+                            .worker_started(RuntimeWorkerUpdate {
+                                slot,
+                                process_id,
+                                stage: RuntimeStage::FillStage2,
+                                display_path: identity
+                                    .display_path
+                                    .as_path()
+                                    .to_string_lossy()
+                                    .into_owned(),
+                                physical_disk_id: identity.physical_disk_id,
+                                completed_files: 0,
+                                speed_per_second: 0.0,
+                            })
+                            .await;
+                    }
                 }
-                Some(worker_envelope::Payload::WorkerFailure(failure)) => Err(failure.message),
-                _ => Err("Worker 返回了非二筛响应".into()),
-            },
-            Some(WorkerEvent::Crashed {
-                task_id: event_task,
-                item_id: event_item,
-                message,
-                ..
-            }) if event_task == task_id && event_item == item_id => Err(message),
-            Some(WorkerEvent::Cancelled {
-                task_id: event_task,
-                item_id: event_item,
-            }) if event_task == task_id && event_item == item_id => Err("二筛已取消".into()),
-            Some(WorkerEvent::InfrastructureFailure { message }) => Err(message),
-            Some(WorkerEvent::Started { .. }) => Err("Worker 尚未返回二筛结果".into()),
-            Some(_) => Err("WorkerPool 在串行二筛中返回了其他任务事件".into()),
-            None => Err("WorkerPool 已关闭".into()),
+                Some(WorkerEvent::Completed {
+                    task_id: event_task,
+                    item_id: event_item,
+                    response,
+                }) if event_task == task_id && event_item == item_id => {
+                    if let (Some(slot), Some((reporter, _))) = (started_slot, &self.runtime) {
+                        let _ = reporter.worker_completed(slot).await;
+                    }
+                    return match response.payload {
+                        Some(worker_envelope::Payload::Stage2Result(result)) => {
+                            decode_stage2_payload(&result.payload)
+                                .map_err(|error| error.to_string())
+                        }
+                        Some(worker_envelope::Payload::WorkerFailure(failure)) => {
+                            Err(failure.message)
+                        }
+                        _ => Err("Worker 返回了非二筛响应".into()),
+                    };
+                }
+                Some(WorkerEvent::Crashed {
+                    task_id: event_task,
+                    item_id: event_item,
+                    message,
+                    ..
+                }) if event_task == task_id && event_item == item_id => {
+                    return Err(message);
+                }
+                Some(WorkerEvent::Cancelled {
+                    task_id: event_task,
+                    item_id: event_item,
+                }) if event_task == task_id && event_item == item_id => {
+                    return Err("二筛已取消".into());
+                }
+                Some(WorkerEvent::InfrastructureFailure { message }) => return Err(message),
+                Some(_) => return Err("WorkerPool 在串行二筛中返回了其他任务事件".into()),
+                None => return Err("WorkerPool 已关闭".into()),
+            }
         }
     }
+}
+
+fn physical_disk_id(path: &DisplayPath) -> String {
+    dedup_windows::resolve_storage_location(path.as_path()).map_or_else(
+        |_| "Unknown".into(),
+        |location| {
+            format!(
+                "PhysicalDisk{}",
+                location
+                    .physical_disk_id()
+                    .disk_numbers()
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join("+")
+            )
+        },
+    )
 }
 
 struct MissingWork {
@@ -216,7 +314,40 @@ pub(crate) async fn run_stage2_batch<P: Stage2Processor>(
     processor: &mut P,
     now_ms: i64,
 ) -> Result<TaskId, AnalysisBlocked> {
+    run_stage2_batch_internal(store, plan, processor, None, now_ms).await
+}
+
+/// 从已持久批次继续二筛，并按真实任务项终态推进运行时详情。
+pub(crate) async fn run_stage2_batch_with_runtime<P: Stage2Processor>(
+    store: &mut NodeStore,
+    plan: Stage2BatchPlan,
+    processor: &mut P,
+    reporter: &RuntimeTaskReporter,
+    now_ms: i64,
+) -> Result<TaskId, AnalysisBlocked> {
+    run_stage2_batch_internal(store, plan, processor, Some(reporter), now_ms).await
+}
+
+async fn run_stage2_batch_internal<P: Stage2Processor>(
+    store: &mut NodeStore,
+    plan: Stage2BatchPlan,
+    processor: &mut P,
+    reporter: Option<&RuntimeTaskReporter>,
+    now_ms: i64,
+) -> Result<TaskId, AnalysisBlocked> {
     let Stage2BatchPlan { task_id, work } = plan;
+    if let Some(reporter) = reporter {
+        let _ = reporter.update_overall_nowait(0, Some(work.len() as u64), 0, 0);
+    }
+    report_batch_stage(
+        reporter,
+        proto::RuntimeStageState::RuntimeStageRunning,
+        0,
+        work.len() as u64,
+        0,
+    );
+    let mut completed = 0_u64;
+    let mut failed = 0_u64;
     for _ in 0..work.len() {
         let item = store
             .claim_next_item(task_id, now_ms)?
@@ -228,6 +359,7 @@ pub(crate) async fn run_stage2_batch<P: Stage2Processor>(
             .iter()
             .find(|candidate| candidate.content_id == item_content)
             .ok_or_else(|| AnalysisBlocked::InvalidState("二筛任务项不属于当前批次".into()))?;
+        let mut runtime_failure = None;
         let completion = if store.republish_complete_stage2(expected.content_id)? {
             TaskItemCompletion::Succeeded {
                 content_id: Some(expected.content_id),
@@ -249,15 +381,79 @@ pub(crate) async fn run_stage2_batch<P: Stage2Processor>(
                             content_id: Some(expected.content_id),
                         }
                     } else {
+                        failed += 1;
+                        runtime_failure = Some("二筛结果不完整".into());
                         TaskItemCompletion::Failed("二筛结果不完整".into())
                     }
                 }
-                Err(error) => TaskItemCompletion::Failed(error),
+                Err(error) => {
+                    failed += 1;
+                    runtime_failure = Some(error.clone());
+                    TaskItemCompletion::Failed(error)
+                }
             }
         };
         store.complete_item(&item.item_id, completion, now_ms)?;
+        if let (Some(reporter), Some(message)) = (reporter, runtime_failure) {
+            let _ = reporter.record_failure_nowait(RuntimeFailureUpdate {
+                stage: RuntimeStage::FillStage2,
+                display_path: expected
+                    .display_path
+                    .as_path()
+                    .to_string_lossy()
+                    .into_owned(),
+                message,
+            });
+        }
+        completed += 1;
+        if let Some(reporter) = reporter {
+            let _ = reporter.update_overall_nowait(
+                completed.saturating_sub(failed),
+                Some(work.len() as u64),
+                failed,
+                0,
+            );
+        }
+        report_batch_stage(
+            reporter,
+            proto::RuntimeStageState::RuntimeStageRunning,
+            completed,
+            work.len() as u64,
+            failed,
+        );
     }
+    report_batch_stage(
+        reporter,
+        if failed == 0 {
+            proto::RuntimeStageState::RuntimeStageCompleted
+        } else {
+            proto::RuntimeStageState::RuntimeStageFailed
+        },
+        completed,
+        work.len() as u64,
+        failed,
+    );
     Ok(task_id)
+}
+
+fn report_batch_stage(
+    reporter: Option<&RuntimeTaskReporter>,
+    state: proto::RuntimeStageState,
+    completed: u64,
+    total: u64,
+    failed: u64,
+) {
+    if let Some(reporter) = reporter {
+        let _ = reporter.update_stage_nowait(RuntimeStageUpdate {
+            stage: RuntimeStage::FillStage2,
+            state,
+            unit: RuntimeProgressUnit::Files,
+            completed,
+            total: Some(total),
+            failed,
+            skipped: 0,
+        });
+    }
 }
 
 /// 对未解决候选收集缺失 ContentKey，一次创建完整批次后逐项等待终态。
@@ -265,6 +461,7 @@ pub(crate) async fn dispatch_missing<P: Stage2Processor>(
     store: &mut NodeStore,
     candidates: &[CandidateWrite],
     processor: &mut P,
+    reporter: Option<&RuntimeTaskReporter>,
     now_ms: i64,
 ) -> Result<usize, AnalysisBlocked> {
     let mut keys = candidates
@@ -345,6 +542,7 @@ pub(crate) async fn dispatch_missing<P: Stage2Processor>(
             media_kind: expected.media_kind,
             frame_slots: expected.frame_slots.clone(),
         };
+        let mut runtime_failure = None;
         let completion = match processor.process(request).await {
             Ok(output) => {
                 if persist_stage2(store, expected, output)? {
@@ -352,12 +550,27 @@ pub(crate) async fn dispatch_missing<P: Stage2Processor>(
                         content_id: Some(expected.content_id),
                     }
                 } else {
+                    runtime_failure = Some("二筛结果不完整".into());
                     TaskItemCompletion::Failed("二筛结果不完整".into())
                 }
             }
-            Err(error) => TaskItemCompletion::Failed(error),
+            Err(error) => {
+                runtime_failure = Some(error.clone());
+                TaskItemCompletion::Failed(error)
+            }
         };
         store.complete_item(&item.item_id, completion, now_ms)?;
+        if let (Some(reporter), Some(message)) = (reporter, runtime_failure) {
+            let _ = reporter.record_failure_nowait(RuntimeFailureUpdate {
+                stage: RuntimeStage::FillStage2,
+                display_path: expected
+                    .display_path
+                    .as_path()
+                    .to_string_lossy()
+                    .into_owned(),
+                message,
+            });
+        }
     }
     Ok(work.len())
 }

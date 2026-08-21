@@ -76,6 +76,26 @@ pub enum RuntimeStage {
     ShrinkDatabase,
     /// 发布结果。
     PublishResults,
+    /// 冻结分析输入。
+    FreezeInputs,
+    /// 加载特征。
+    LoadFeatures,
+    /// 生成一筛候选。
+    Stage1Candidates,
+    /// 补齐二筛。
+    FillStage2,
+    /// 聚类。
+    Cluster,
+    /// 保存结果。
+    SaveResults,
+    /// 重新验证删除选择。
+    RevalidateSelection,
+    /// 派发删除节点。
+    DispatchNodes,
+    /// 删除项目。
+    DeleteItems,
+    /// 汇总删除。
+    Summarize,
 }
 
 impl RuntimeStage {
@@ -92,6 +112,16 @@ impl RuntimeStage {
             Self::DeleteFiles => "delete_files",
             Self::ShrinkDatabase => "shrink_database",
             Self::PublishResults => "publish_results",
+            Self::FreezeInputs => "freeze_inputs",
+            Self::LoadFeatures => "load_features",
+            Self::Stage1Candidates => "stage1_candidates",
+            Self::FillStage2 => "fill_stage2",
+            Self::Cluster => "cluster",
+            Self::SaveResults => "save_results",
+            Self::RevalidateSelection => "revalidate_selection",
+            Self::DispatchNodes => "dispatch_nodes",
+            Self::DeleteItems => "delete_items",
+            Self::Summarize => "summarize",
         }
     }
 
@@ -108,6 +138,16 @@ impl RuntimeStage {
             Self::DeleteFiles => "删除文件",
             Self::ShrinkDatabase => "收缩数据库",
             Self::PublishResults => "发布结果",
+            Self::FreezeInputs => "冻结输入",
+            Self::LoadFeatures => "加载特征",
+            Self::Stage1Candidates => "一筛候选",
+            Self::FillStage2 => "补齐二筛",
+            Self::Cluster => "聚类",
+            Self::SaveResults => "保存结果",
+            Self::RevalidateSelection => "重新验证选择",
+            Self::DispatchNodes => "派发节点",
+            Self::DeleteItems => "删除项目",
+            Self::Summarize => "汇总",
         }
     }
 }
@@ -121,6 +161,10 @@ pub enum RuntimeProgressUnit {
     Bytes,
     /// 普通项目数。
     Items,
+    /// 候选对。
+    CandidatePairs,
+    /// 删除项。
+    DeleteItems,
 }
 
 impl RuntimeProgressUnit {
@@ -129,6 +173,8 @@ impl RuntimeProgressUnit {
             Self::Files => "files",
             Self::Bytes => "bytes",
             Self::Items => "items",
+            Self::CandidatePairs => "candidate_pairs",
+            Self::DeleteItems => "delete_items",
         }
     }
 }
@@ -359,6 +405,23 @@ impl RuntimeTaskReporter {
 
     /// 更新总体计数。
     pub async fn update_overall(
+        &self,
+        completed: u64,
+        total: Option<u64>,
+        failed: u64,
+        skipped: u64,
+    ) -> Result<(), RuntimeTaskError> {
+        let mut tasks = self.registry.inner.tasks.write().expect("runtime registry lock poisoned");
+        let task = active_task(&mut tasks, &self.task_id)?;
+        task.overall_completed = completed;
+        task.overall_total = total;
+        task.overall_failed = failed;
+        task.overall_skipped = skipped;
+        Ok(())
+    }
+
+    /// 在同步分析/删除边界设置总体计数和已知总数。
+    pub fn update_overall_nowait(
         &self,
         completed: u64,
         total: Option<u64>,

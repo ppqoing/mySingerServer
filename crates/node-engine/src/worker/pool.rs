@@ -16,7 +16,7 @@ use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
 use super::process::{WorkerLaunch, WorkerProcess};
-use super::{Stage1Output, encode_stage1_payload};
+use super::{Stage1Output, Stage2Output, encode_stage1_payload, encode_stage2_payload};
 
 const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -222,6 +222,19 @@ impl ControlledWorkerPool {
             .await;
     }
 
+    /// 让指定运行项返回正常二筛结果。
+    #[doc(hidden)]
+    pub async fn complete_stage2(&self, task_id: String, item_id: String, output: Stage2Output) {
+        let _ = self
+            .commands
+            .send(ControlledWorkerCommand::CompleteStage2 {
+                task_id,
+                item_id,
+                output,
+            })
+            .await;
+    }
+
     /// 返回当前未被运行项占用的逻辑槽位数。
     pub fn available_slots(&self) -> usize {
         self.available_slots.load(Ordering::Acquire)
@@ -256,6 +269,11 @@ enum ControlledWorkerCommand {
         task_id: String,
         item_id: String,
         output: Stage1Output,
+    },
+    CompleteStage2 {
+        task_id: String,
+        item_id: String,
+        output: Stage2Output,
     },
 }
 
@@ -302,7 +320,7 @@ impl WorkerPoolHandle {
             .send(PoolCommand::Dispatch(
                 envelope,
                 Some(ScanDispatchGuard {
-                    cancellation,
+                    cancellation: Some(cancellation),
                     persisted_active,
                     file_identity,
                 }),
@@ -454,6 +472,28 @@ impl WorkerPool {
         reply_rx.await.map_err(|_| WorkerPoolError::Closed)?
     }
 
+    /// 普通二筛请求冻结运行时文件/物理盘身份，使真实 slot send 发布 Started。
+    pub async fn dispatch_runtime(
+        &self,
+        envelope: proto::WorkerEnvelope,
+        file_identity: WorkerFileIdentity,
+    ) -> Result<(), WorkerPoolError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.commands
+            .send(PoolCommand::Dispatch(
+                envelope,
+                Some(ScanDispatchGuard {
+                    cancellation: None,
+                    persisted_active: true,
+                    file_identity,
+                }),
+                reply_tx,
+            ))
+            .await
+            .map_err(|_| WorkerPoolError::Closed)?;
+        reply_rx.await.map_err(|_| WorkerPoolError::Closed)?
+    }
+
     /// 扫描请求在实际槽位发送前同时检查持久门禁结果和取消标记。
     pub async fn dispatch_scan(
         &self,
@@ -467,7 +507,7 @@ impl WorkerPool {
             .send(PoolCommand::Dispatch(
                 envelope,
                 Some(ScanDispatchGuard {
-                    cancellation,
+                    cancellation: Some(cancellation),
                     persisted_active,
                     file_identity,
                 }),
@@ -614,7 +654,8 @@ impl WorkerPool {
                         let Some(control) = control else { break };
                         let (task_id, item_id) = match &control {
                             ControlledWorkerCommand::Crash { task_id, item_id, .. }
-                            | ControlledWorkerCommand::Complete { task_id, item_id, .. } => {
+                            | ControlledWorkerCommand::Complete { task_id, item_id, .. }
+                            | ControlledWorkerCommand::CompleteStage2 { task_id, item_id, .. } => {
                                 (task_id.clone(), item_id.clone())
                             }
                         };
@@ -644,6 +685,21 @@ impl WorkerPool {
                                                 task_id: task_id.clone(),
                                                 item_id: item_id.clone(),
                                                 payload: encode_stage1_payload(&output),
+                                            },
+                                        )),
+                                    },
+                                }
+                            }
+                            ControlledWorkerCommand::CompleteStage2 { output, .. } => {
+                                WorkerEvent::Completed {
+                                    task_id: task_id.clone(),
+                                    item_id: item_id.clone(),
+                                    response: proto::WorkerEnvelope {
+                                        payload: Some(worker_envelope::Payload::Stage2Result(
+                                            proto::Stage2Result {
+                                                task_id: task_id.clone(),
+                                                item_id: item_id.clone(),
+                                                payload: encode_stage2_payload(&output),
                                             },
                                         )),
                                     },
@@ -887,7 +943,7 @@ struct WorkItem {
 }
 
 struct ScanDispatchGuard {
-    cancellation: ReadCancellationToken,
+    cancellation: Option<ReadCancellationToken>,
     persisted_active: bool,
     file_identity: WorkerFileIdentity,
 }
@@ -901,9 +957,13 @@ impl WorkItem {
     }
 
     fn dispatch_allowed(&self) -> bool {
-        self.scan_guard
-            .as_ref()
-            .is_none_or(|guard| guard.persisted_active && !guard.cancellation.is_cancelled())
+        self.scan_guard.as_ref().is_none_or(|guard| {
+            guard.persisted_active
+                && guard
+                    .cancellation
+                    .as_ref()
+                    .is_none_or(|cancellation| !cancellation.is_cancelled())
+        })
     }
 }
 

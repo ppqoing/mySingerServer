@@ -6,6 +6,10 @@ use dedup_core::{ContentKey, ScreeningOutcome, Thresholds};
 use dedup_media::{ImageStage1, VideoFrameFeatures, pdq_bands, score_video_stage1};
 use dedup_node_store::{CandidateStatus, CandidateWrite, PairKind};
 
+use crate::runtime_tasks::{
+    RuntimeProgressUnit, RuntimeStage, RuntimeStageUpdate, RuntimeTaskReporter,
+};
+
 /// 任一对齐槽位共享 PDQ band 即进入完整六槽一筛，最后按有效帧平均阈值判断。
 pub(crate) fn video_candidates(
     features: &BTreeMap<ContentKey, Box<[Option<ImageStage1>; 6]>>,
@@ -51,6 +55,28 @@ pub(crate) fn video_candidates(
             })
         })
         .collect()
+}
+
+/// 生成视频候选并在完整六槽一筛返回后累计真实候选对计数。
+pub(crate) fn video_candidates_with_runtime(
+    features: &BTreeMap<ContentKey, Box<[Option<ImageStage1>; 6]>>,
+    thresholds: &Thresholds,
+    reporter: Option<&RuntimeTaskReporter>,
+    completed_before: u64,
+) -> Vec<CandidateWrite> {
+    let candidates = video_candidates(features, thresholds);
+    if let Some(reporter) = reporter {
+        let _ = reporter.update_stage_nowait(RuntimeStageUpdate {
+            stage: RuntimeStage::Stage1Candidates,
+            state: dedup_protocol::proto::RuntimeStageState::RuntimeStageRunning,
+            unit: RuntimeProgressUnit::CandidatePairs,
+            completed: completed_before.saturating_add(candidates.len() as u64),
+            total: None,
+            failed: 0,
+            skipped: 0,
+        });
+    }
+    candidates
 }
 
 pub(crate) fn frames_for_stage1(frames: &[Option<ImageStage1>; 6]) -> [VideoFrameFeatures; 6] {
