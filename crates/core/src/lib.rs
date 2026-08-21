@@ -10,7 +10,10 @@ mod model;
 mod path;
 mod thresholds;
 
-pub use config::{DesktopConfig, NodeConfig, NodeEndpoint};
+pub use config::{
+    DesktopConfig, DiskReadConfig, NodeConfig, NodeEndpoint, NodePathsConfig, WorkerConfig,
+    WorkerMode,
+};
 pub use error::CoreError;
 pub use grouping::{
     RepresentativeGroup, RepresentativeMember, SimilarityEdge, group_by_representative,

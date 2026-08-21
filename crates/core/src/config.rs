@@ -6,6 +6,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::{CoreError, DeleteMode, EnumeratorKind, Thresholds};
 
+/// 单块 HDD、SSD 或未知本地盘允许的最大读取线程数。
+pub const MAX_READ_THREADS_PER_DISK: usize = 64;
+/// 全部本地物理磁盘合计允许的最大读取线程数。
+pub const MAX_TOTAL_READ_THREADS: usize = 256;
+/// 手动模式允许的最大 Worker 进程数。
+pub const MAX_MANUAL_WORKER_COUNT: usize = 256;
+/// 自动模式允许保留的最大逻辑核心数。
+pub const MAX_RESERVED_CORES: usize = 255;
+
 /// 管理工具手工维护的节点 IP 和端口。
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
@@ -97,9 +106,17 @@ pub struct NodeConfig {
     /// 节点 TCP 监听端口。
     pub port: u16,
     /// 同时运行的媒体 Worker 数量。
+    ///
+    /// 此字段保留到 Node 启动路径切换为 `worker` 配置为止，避免本任务提前修改运行时装配。
     pub worker_count: usize,
     /// 扫描目录时选择的文件枚举方式。
     pub enumerator: EnumeratorKind,
+    /// 节点运行数据、配置、日志和缓存的原始路径字符串。
+    pub paths: NodePathsConfig,
+    /// Node 控制的磁盘读取并发和块读取参数。
+    pub read: DiskReadConfig,
+    /// Worker 自动或手动模式参数。
+    pub worker: WorkerConfig,
 }
 
 impl Default for NodeConfig {
@@ -110,7 +127,10 @@ impl Default for NodeConfig {
             worker_count: std::thread::available_parallelism()
                 .map(usize::from)
                 .unwrap_or(1),
-            enumerator: EnumeratorKind::default(),
+            enumerator: EnumeratorKind::Everything,
+            paths: NodePathsConfig::default(),
+            read: DiskReadConfig::default(),
+            worker: WorkerConfig::default(),
         }
     }
 }
@@ -123,7 +143,7 @@ impl NodeConfig {
         Ok(config)
     }
 
-    /// 验证节点启动必需的端口和 Worker 数量。
+    /// 验证节点启动必需的端口、读取和 Worker 参数。
     pub fn validate(&self) -> Result<(), CoreError> {
         if self.port == 0 {
             return Err(invalid_config("port", "端口不能为 0"));
@@ -131,6 +151,14 @@ impl NodeConfig {
         if self.worker_count == 0 {
             return Err(invalid_config("worker_count", "Worker 数量必须大于 0"));
         }
+        if self.worker_count > MAX_MANUAL_WORKER_COUNT {
+            return Err(invalid_config(
+                "worker_count",
+                "Worker 数量不能超过 256",
+            ));
+        }
+        self.read.validate()?;
+        self.worker.validate()?;
         Ok(())
     }
 
@@ -141,6 +169,216 @@ impl NodeConfig {
     }
 }
 
+/// Node 本地运行目录的原始路径配置。
+///
+/// 相对路径和绝对路径都按原样保留；路径解析和本地磁盘验证由后续 Windows 边界负责。
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct NodePathsConfig {
+    /// Node 数据目录的原始配置字符串。
+    pub data_path: String,
+    /// Node 配置文件的原始配置字符串。
+    pub config_path: String,
+    /// Node 日志目录的原始配置字符串。
+    pub log_path: String,
+    /// Node 缓存目录的原始配置字符串。
+    pub cache_path: String,
+}
+
+impl Default for NodePathsConfig {
+    fn default() -> Self {
+        Self {
+            data_path: "data/node".to_owned(),
+            config_path: "data/node/config.toml".to_owned(),
+            log_path: "data/node/logs".to_owned(),
+            cache_path: "data/node/cache".to_owned(),
+        }
+    }
+}
+
+/// 按物理磁盘类别限制的 Node 文件读取参数。
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
+pub struct DiskReadConfig {
+    /// 每块 HDD 同时允许的文件级读取数。
+    pub hdd_threads_per_disk: usize,
+    /// 每块 SSD 同时允许的文件级读取数。
+    pub ssd_threads_per_disk: usize,
+    /// 每块未知本地物理盘同时允许的文件级读取数。
+    pub unknown_threads_per_disk: usize,
+    /// 所有物理磁盘合计允许的读取数。
+    pub total_threads: usize,
+    /// 一次流式读取使用的块大小（字节）。
+    pub block_size_bytes: usize,
+    /// 单个读取块的超时秒数。
+    pub block_timeout_seconds: u64,
+    /// 单个读取块超时后的重试次数。
+    pub block_retries: u32,
+}
+
+impl Default for DiskReadConfig {
+    fn default() -> Self {
+        Self {
+            hdd_threads_per_disk: 1,
+            ssd_threads_per_disk: 2,
+            unknown_threads_per_disk: 1,
+            total_threads: 4,
+            block_size_bytes: 4 * 1024 * 1024,
+            block_timeout_seconds: 3,
+            block_retries: 2,
+        }
+    }
+}
+
+impl DiskReadConfig {
+    fn validate(&self) -> Result<(), CoreError> {
+        if self.hdd_threads_per_disk == 0 {
+            return Err(invalid_config(
+                "read.hdd_threads_per_disk",
+                "每块 HDD 的读取线程数必须大于 0",
+            ));
+        }
+        if self.hdd_threads_per_disk > MAX_READ_THREADS_PER_DISK {
+            return Err(invalid_config(
+                "read.hdd_threads_per_disk",
+                "每块 HDD 的读取线程数不能超过 64",
+            ));
+        }
+        if self.ssd_threads_per_disk == 0 {
+            return Err(invalid_config(
+                "read.ssd_threads_per_disk",
+                "每块 SSD 的读取线程数必须大于 0",
+            ));
+        }
+        if self.ssd_threads_per_disk > MAX_READ_THREADS_PER_DISK {
+            return Err(invalid_config(
+                "read.ssd_threads_per_disk",
+                "每块 SSD 的读取线程数不能超过 64",
+            ));
+        }
+        if self.unknown_threads_per_disk == 0 {
+            return Err(invalid_config(
+                "read.unknown_threads_per_disk",
+                "未知盘的读取线程数必须大于 0",
+            ));
+        }
+        if self.unknown_threads_per_disk > MAX_READ_THREADS_PER_DISK {
+            return Err(invalid_config(
+                "read.unknown_threads_per_disk",
+                "未知盘的读取线程数不能超过 64",
+            ));
+        }
+        if self.total_threads == 0 {
+            return Err(invalid_config(
+                "read.total_threads",
+                "总读取线程数必须大于 0",
+            ));
+        }
+        if self.total_threads > MAX_TOTAL_READ_THREADS {
+            return Err(invalid_config(
+                "read.total_threads",
+                "总读取线程数不能超过 256",
+            ));
+        }
+        if !(64 * 1024..=64 * 1024 * 1024).contains(&self.block_size_bytes) {
+            return Err(invalid_config(
+                "read.block_size_bytes",
+                "读取块大小必须在 64 KiB 到 64 MiB 之间",
+            ));
+        }
+        if !(1..=60).contains(&self.block_timeout_seconds) {
+            return Err(invalid_config(
+                "read.block_timeout_seconds",
+                "读取块超时必须在 1 到 60 秒之间",
+            ));
+        }
+        if self.block_retries > 10 {
+            return Err(invalid_config(
+                "read.block_retries",
+                "读取块重试次数不能超过 10",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Worker 进程数量的计算方式。
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerMode {
+    /// 按逻辑 CPU 数扣除保留核心后自动计算。
+    Automatic,
+    /// 使用用户明确提供的 Worker 数量。
+    Manual,
+}
+
+/// Node Worker 的自动或手动数量配置。
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
+pub struct WorkerConfig {
+    /// Worker 数量的计算方式。
+    pub mode: WorkerMode,
+    /// 自动模式下不用于 Worker 的逻辑核心数。
+    pub reserved_cores: usize,
+    /// 手动模式下明确启动的 Worker 数量。
+    pub manual_worker_count: usize,
+}
+
+impl Default for WorkerConfig {
+    fn default() -> Self {
+        Self {
+            mode: WorkerMode::Automatic,
+            reserved_cores: 1,
+            manual_worker_count: 1,
+        }
+    }
+}
+
+impl WorkerConfig {
+    /// 根据模式和检测到的逻辑 CPU 数返回至少为一的有效 Worker 数。
+    pub fn effective_worker_count(&self, logical_cpus: usize) -> usize {
+        match self.mode {
+            WorkerMode::Automatic => logical_cpus.saturating_sub(self.reserved_cores).max(1),
+            WorkerMode::Manual => self.manual_worker_count,
+        }
+    }
+
+    fn validate(&self) -> Result<(), CoreError> {
+        match self.mode {
+            WorkerMode::Automatic if self.reserved_cores > MAX_RESERVED_CORES => {
+                return Err(invalid_config(
+                    "worker.reserved_cores",
+                    "自动模式保留核心数不能超过 255",
+                ));
+            }
+            WorkerMode::Manual if self.manual_worker_count == 0 => {
+                return Err(invalid_config(
+                    "worker.manual_worker_count",
+                    "手动 Worker 数量必须大于 0",
+                ));
+            }
+            WorkerMode::Manual if self.manual_worker_count > MAX_MANUAL_WORKER_COUNT => {
+                return Err(invalid_config(
+                    "worker.manual_worker_count",
+                    "手动 Worker 数量不能超过 256",
+                ));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
 const fn invalid_config(field: &'static str, reason: &'static str) -> CoreError {
     CoreError::InvalidConfig { field, reason }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{EnumeratorKind, NodeConfig};
+
+    #[test]
+    fn new_node_config_defaults_to_everything() {
+        assert_eq!(NodeConfig::default().enumerator, EnumeratorKind::Everything,);
+    }
 }
