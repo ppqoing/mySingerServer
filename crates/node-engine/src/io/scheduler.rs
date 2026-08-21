@@ -38,7 +38,9 @@ impl Drop for DiskReadPermit {
         let Some(counters) = self.counters.take() else {
             return;
         };
-        counters.disk_active.fetch_sub(1, Ordering::AcqRel);
+        for active in counters.disk_actives {
+            active.fetch_sub(1, Ordering::AcqRel);
+        }
         counters.global_active.fetch_sub(1, Ordering::AcqRel);
         counters.notify.notify_one();
     }
@@ -46,7 +48,7 @@ impl Drop for DiskReadPermit {
 
 struct PermitCounters {
     global_active: Arc<AtomicUsize>,
-    disk_active: Arc<AtomicUsize>,
+    disk_actives: Vec<Arc<AtomicUsize>>,
     notify: Arc<Notify>,
 }
 
@@ -188,18 +190,14 @@ struct Waiter {
     _queue_slot: OwnedSemaphorePermit,
 }
 
-struct DiskState {
-    active: Arc<AtomicUsize>,
+#[derive(Default)]
+struct LocationQueue {
     waiting: VecDeque<Waiter>,
 }
 
-impl Default for DiskState {
-    fn default() -> Self {
-        Self {
-            active: Arc::new(AtomicUsize::new(0)),
-            waiting: VecDeque::new(),
-        }
-    }
+struct UnderlyingDiskState {
+    active: Arc<AtomicUsize>,
+    limit: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -235,7 +233,8 @@ struct ActorState {
     config: ActorConfig,
     notify: Arc<Notify>,
     global_active: Arc<AtomicUsize>,
-    disks: BTreeMap<DiskKey, DiskState>,
+    queues: BTreeMap<DiskKey, LocationQueue>,
+    underlying_disks: BTreeMap<u32, UnderlyingDiskState>,
     rotation: VecDeque<DiskKey>,
     in_rotation: BTreeSet<DiskKey>,
 }
@@ -246,7 +245,8 @@ impl ActorState {
             config,
             notify,
             global_active: Arc::new(AtomicUsize::new(0)),
-            disks: BTreeMap::new(),
+            queues: BTreeMap::new(),
+            underlying_disks: BTreeMap::new(),
             rotation: VecDeque::new(),
             in_rotation: BTreeSet::new(),
         }
@@ -254,7 +254,17 @@ impl ActorState {
 
     fn enqueue(&mut self, waiter: Waiter) {
         let key = waiter.key.clone();
-        self.disks
+        let observed_limit = self.config.disk_limit(waiter.kind);
+        for disk_number in &key.0 {
+            self.underlying_disks
+                .entry(*disk_number)
+                .and_modify(|disk| disk.limit = disk.limit.min(observed_limit))
+                .or_insert_with(|| UnderlyingDiskState {
+                    active: Arc::new(AtomicUsize::new(0)),
+                    limit: observed_limit,
+                });
+        }
+        self.queues
             .entry(key.clone())
             .or_default()
             .waiting
@@ -283,23 +293,29 @@ impl ActorState {
                 }
                 let key = self.rotation.pop_front().expect("round_len 已冻结");
                 self.in_rotation.remove(&key);
-                let (waiter, active, still_waiting) = {
-                    let disk = self.disks.get_mut(&key).expect("rotation 只保存已知磁盘");
-                    while disk
+                let has_waiter = {
+                    let queue = self
+                        .queues
+                        .get_mut(&key)
+                        .expect("rotation 只保存已知位置队列");
+                    while queue
                         .waiting
                         .front()
                         .is_some_and(|item| item.reply.is_closed())
                     {
-                        disk.waiting.pop_front();
+                        queue.waiting.pop_front();
                     }
-                    let can_grant = disk.waiting.front().is_some_and(|item| {
-                        disk.active.load(Ordering::Acquire) < self.config.disk_limit(item.kind)
-                    });
+                    !queue.waiting.is_empty()
+                };
+                let can_grant = has_waiter && self.can_reserve_all(&key);
+                let (waiter, still_waiting) = {
+                    let queue = self
+                        .queues
+                        .get_mut(&key)
+                        .expect("rotation 只保存已知位置队列");
                     let waiter =
-                        can_grant.then(|| disk.waiting.pop_front().expect("front 刚刚存在"));
-                    let active = disk.active.clone();
-                    let still_waiting = !disk.waiting.is_empty();
-                    (waiter, active, still_waiting)
+                        can_grant.then(|| queue.waiting.pop_front().expect("front 刚刚存在"));
+                    (waiter, !queue.waiting.is_empty())
                 };
                 if still_waiting {
                     self.rotate(key.clone());
@@ -307,12 +323,12 @@ impl ActorState {
                 let Some(waiter) = waiter else {
                     continue;
                 };
-                active.fetch_add(1, Ordering::AcqRel);
+                let disk_actives = self.reserve_all(&key);
                 self.global_active.fetch_add(1, Ordering::AcqRel);
                 let permit = DiskReadPermit {
                     counters: Some(PermitCounters {
                         global_active: self.global_active.clone(),
-                        disk_active: active,
+                        disk_actives,
                         notify: self.notify.clone(),
                     }),
                 };
@@ -323,6 +339,33 @@ impl ActorState {
                 return;
             }
         }
+    }
+
+    fn can_reserve_all(&self, key: &DiskKey) -> bool {
+        key.0.iter().all(|disk_number| {
+            let disk = self
+                .underlying_disks
+                .get(disk_number)
+                .expect("enqueue 已注册每个底层物理盘");
+            disk.active.load(Ordering::Acquire) < disk.limit
+        })
+    }
+
+    fn reserve_all(&self, key: &DiskKey) -> Vec<Arc<AtomicUsize>> {
+        debug_assert!(self.can_reserve_all(key));
+        key.0
+            .iter()
+            .map(|disk_number| {
+                let active = self
+                    .underlying_disks
+                    .get(disk_number)
+                    .expect("enqueue 已注册每个底层物理盘")
+                    .active
+                    .clone();
+                active.fetch_add(1, Ordering::AcqRel);
+                active
+            })
+            .collect()
     }
 }
 

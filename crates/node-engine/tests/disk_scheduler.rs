@@ -153,3 +153,74 @@ async fn capacity_uses_total_or_workers_and_shutdown_fails_pending_and_new_reque
     ));
     drop(active);
 }
+
+#[tokio::test]
+async fn composite_and_single_locations_share_every_underlying_disk_limit() {
+    let config = DiskReadConfig::default();
+    let scheduler = DiskReadScheduler::new(&config, 4).unwrap();
+    let composite = scheduler
+        .acquire_for_test(&[5, 12], LocalDiskKind::Unknown)
+        .await
+        .unwrap();
+    let mut single_five = Box::pin(scheduler.acquire_for_test(&[5], LocalDiskKind::Ssd));
+    let mut single_twelve = Box::pin(scheduler.acquire_for_test(&[12], LocalDiskKind::Ssd));
+    assert!(poll_once(single_five.as_mut()).is_pending());
+    assert!(poll_once(single_twelve.as_mut()).is_pending());
+    scheduler.barrier_for_test().await.unwrap();
+    assert!(poll_once(single_five.as_mut()).is_pending());
+    assert!(poll_once(single_twelve.as_mut()).is_pending());
+
+    drop(composite);
+    let single_five = single_five.await.unwrap();
+    let single_twelve = single_twelve.await.unwrap();
+    let mut composite_again =
+        Box::pin(scheduler.acquire_for_test(&[5, 12], LocalDiskKind::Unknown));
+    assert!(poll_once(composite_again.as_mut()).is_pending());
+    scheduler.barrier_for_test().await.unwrap();
+    assert!(poll_once(composite_again.as_mut()).is_pending());
+
+    drop(single_five);
+    scheduler.barrier_for_test().await.unwrap();
+    assert!(poll_once(composite_again.as_mut()).is_pending());
+    drop(single_twelve);
+    let composite_again = composite_again.await.unwrap();
+    drop(composite_again);
+}
+
+#[tokio::test]
+async fn overlapping_composites_check_all_disks_atomically_without_partial_reservation() {
+    let config = DiskReadConfig::default();
+    let scheduler = DiskReadScheduler::new(&config, 4).unwrap();
+    let twelve = scheduler
+        .acquire_for_test(&[12], LocalDiskKind::Unknown)
+        .await
+        .unwrap();
+    let mut five_twelve = Box::pin(scheduler.acquire_for_test(&[5, 12], LocalDiskKind::Unknown));
+    let mut twelve_twenty = Box::pin(scheduler.acquire_for_test(&[12, 20], LocalDiskKind::Unknown));
+    assert!(poll_once(five_twelve.as_mut()).is_pending());
+    assert!(poll_once(twelve_twenty.as_mut()).is_pending());
+    scheduler.barrier_for_test().await.unwrap();
+    assert!(poll_once(five_twelve.as_mut()).is_pending());
+    assert!(poll_once(twelve_twenty.as_mut()).is_pending());
+
+    let five = scheduler
+        .acquire_for_test(&[5], LocalDiskKind::Unknown)
+        .await
+        .unwrap();
+    let twenty = scheduler
+        .acquire_for_test(&[20], LocalDiskKind::Unknown)
+        .await
+        .unwrap();
+    drop(twelve);
+    scheduler.barrier_for_test().await.unwrap();
+    assert!(poll_once(five_twelve.as_mut()).is_pending());
+    assert!(poll_once(twelve_twenty.as_mut()).is_pending());
+
+    drop(five);
+    let five_twelve = five_twelve.await.unwrap();
+    drop(twenty);
+    assert!(poll_once(twelve_twenty.as_mut()).is_pending());
+    drop(five_twelve);
+    let twelve_twenty = twelve_twenty.await.unwrap();
+    drop(twelve_twenty);
+}
