@@ -5,6 +5,7 @@ use std::{
     fs,
     net::SocketAddr,
     path::{Path, PathBuf},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -33,10 +34,12 @@ use crate::{
         LocalAnalysisEngine, Stage2BatchItem, Stage2BatchPlan, WorkerPoolStage2Processor,
         begin_stage2_batch, run_stage2_batch,
     },
+    artifact_registry::RegenerableArtifactRegistry,
     config_repository::{
         ConfigRepositoryError, LoadedNodeConfig, NodeConfigRepository, ResolvedNodePaths,
     },
     delete::DeleteEngine,
+    disk_full_cleanup::{DiskFullCleaner, SystemArtifactDiskResolver},
     host_control::NodeHostControl,
     preview::{PreviewKind, PreviewService},
     scan::{
@@ -498,6 +501,16 @@ fn spawn_actor(
     config_repository: Option<Box<dyn NodeConfigRepositoryAccess>>,
     host_control: Option<Box<dyn NodeHostControl>>,
 ) -> (NodeEngineHandle, JoinHandle<()>) {
+    fs::create_dir_all(cache_root).expect("Node cache root must be creatable");
+    let install_root = artifact_install_root(cache_root);
+    let artifact_registry = Arc::new(
+        RegenerableArtifactRegistry::new(&install_root)
+            .expect("Node artifact registry root must be an existing absolute path"),
+    );
+    let disk_full_cleaner = DiskFullCleaner::new(
+        Arc::clone(&artifact_registry),
+        SystemArtifactDiskResolver,
+    );
     let (commands, receiver) = mpsc::channel(64);
     let handle = NodeEngineHandle {
         commands: commands.clone(),
@@ -520,10 +533,32 @@ fn spawn_actor(
             config_repository,
             host_control,
             pending_restart_request_id: None,
+            artifact_registry,
+            disk_full_cleaner,
         },
         receiver,
     ));
     (handle, actor)
+}
+
+fn artifact_install_root(cache_root: &Path) -> PathBuf {
+    let Some(node_root) = cache_root.parent() else {
+        return cache_root.to_path_buf();
+    };
+    let Some(data_root) = node_root.parent() else {
+        return cache_root.to_path_buf();
+    };
+    let production_layout = cache_root.file_name().is_some_and(|name| name == "cache")
+        && node_root.file_name().is_some_and(|name| name == "node")
+        && data_root.file_name().is_some_and(|name| name == "data");
+    if production_layout {
+        data_root
+            .parent()
+            .unwrap_or(cache_root)
+            .to_path_buf()
+    } else {
+        cache_root.to_path_buf()
+    }
 }
 
 struct EngineState {
@@ -542,6 +577,8 @@ struct EngineState {
     config_repository: Option<Box<dyn NodeConfigRepositoryAccess>>,
     host_control: Option<Box<dyn NodeHostControl>>,
     pending_restart_request_id: Option<u64>,
+    artifact_registry: Arc<RegenerableArtifactRegistry>,
+    disk_full_cleaner: DiskFullCleaner,
 }
 
 enum EngineCommand {
@@ -577,6 +614,8 @@ enum BackgroundJob {
         read_config: DiskReadConfig,
         effective_worker_count: usize,
         cancellation: ReadCancellationToken,
+        artifact_registry: Arc<RegenerableArtifactRegistry>,
+        disk_full_cleaner: DiskFullCleaner,
     },
     LocalAnalysis {
         run_id: AnalysisRunId,
@@ -886,6 +925,8 @@ impl EngineState {
             read_config: self.read_config.clone(),
             effective_worker_count: self.effective_worker_count,
             cancellation,
+            artifact_registry: Arc::clone(&self.artifact_registry),
+            disk_full_cleaner: self.disk_full_cleaner.clone(),
         }) {
             let _ = self.store.fail_task(task_id, now_ms());
             return Err(internal(error));
@@ -1474,6 +1515,8 @@ async fn run_background_job(
             read_config,
             effective_worker_count,
             cancellation,
+            artifact_registry,
+            disk_full_cleaner,
         } => {
             let mut processor =
                 WorkerPoolStage1Processor::new(worker_pool, cancellation.clone());
@@ -1484,6 +1527,10 @@ async fn run_background_job(
                 Ok((reader, limits)) => match enumerator {
                     EnumeratorKind::WindowsWalker => {
                         ScanEngine::new(WindowsWalker, SystemMd5, contact_sheets)
+                            .with_disk_full_cleanup(
+                                Arc::clone(&artifact_registry),
+                                disk_full_cleaner.clone(),
+                            )
                             .run_existing_parallel_with(
                                 store,
                                 task_id,
@@ -1498,6 +1545,7 @@ async fn run_background_job(
                     }
                     EnumeratorKind::Everything => {
                         ScanEngine::new(PreferredEverythingEnumerator, SystemMd5, contact_sheets)
+                            .with_disk_full_cleanup(artifact_registry, disk_full_cleaner)
                             .run_existing_parallel_with(
                                 store,
                                 task_id,

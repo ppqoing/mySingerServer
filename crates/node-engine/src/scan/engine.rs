@@ -4,6 +4,7 @@ use std::{
     collections::{BTreeMap, VecDeque},
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -20,7 +21,9 @@ use thiserror::Error;
 use tokio::task::JoinSet;
 
 use crate::{
+    artifact_registry::{ArtifactKind, ArtifactLease, RegenerableArtifactRegistry},
     contact_sheet_cache::ContactSheetCacheEntry,
+    disk_full_cleanup::DiskFullCleaner,
     io::ReadFailure,
     worker::{WorkerEvent, WorkerPool, decode_stage1_payload},
 };
@@ -392,6 +395,8 @@ pub struct ScanEngine<E, H> {
     enumerator: E,
     hasher: H,
     contact_sheet_root: PathBuf,
+    artifact_registry: Option<Arc<RegenerableArtifactRegistry>>,
+    disk_full_cleaner: Option<DiskFullCleaner>,
 }
 
 impl<E, H> ScanEngine<E, H>
@@ -405,7 +410,20 @@ where
             enumerator,
             hasher,
             contact_sheet_root: contact_sheet_root.into(),
+            artifact_registry: None,
+            disk_full_cleaner: None,
         }
+    }
+
+    /// 为真实联系表写入接入进程级显式 registry 和磁盘满清理器。
+    pub fn with_disk_full_cleanup(
+        mut self,
+        registry: Arc<RegenerableArtifactRegistry>,
+        cleaner: DiskFullCleaner,
+    ) -> Self {
+        self.artifact_registry = Some(registry);
+        self.disk_full_cleaner = Some(cleaner);
+        self
     }
 
     /// 返回哈希实现，主要用于确认缓存路径没有发生文件读取。
@@ -531,6 +549,8 @@ where
                 let result = flush_stage1_batch(
                     store,
                     processor,
+                    self.artifact_registry.as_ref(),
+                    self.disk_full_cleaner.as_ref(),
                     &cancellation,
                     &mut pending_stage1,
                     &mut summary,
@@ -603,6 +623,8 @@ where
         flush_stage1_batch(
             store,
             processor,
+            self.artifact_registry.as_ref(),
+            self.disk_full_cleaner.as_ref(),
             &cancellation,
             &mut pending_stage1,
             &mut summary,
@@ -901,7 +923,14 @@ where
         };
         match processor.process(request).await {
             Ok(output) => {
-                persist_stage1(store, content_id, contact_sheet, output)?;
+                persist_stage1(
+                    store,
+                    content_id,
+                    contact_sheet,
+                    self.artifact_registry.as_ref(),
+                    self.disk_full_cleaner.as_ref(),
+                    output,
+                )?;
                 store.complete_item(
                     &item_id,
                     TaskItemCompletion::Succeeded {
@@ -947,6 +976,8 @@ struct ContactSheetBatchGroup<L> {
 async fn flush_stage1_batch<P, L>(
     store: &mut NodeStore,
     processor: &mut P,
+    artifact_registry: Option<&Arc<RegenerableArtifactRegistry>>,
+    disk_full_cleaner: Option<&DiskFullCleaner>,
     cancellation: &ReadCancellationToken,
     pending: &mut Vec<PendingStage1<L>>,
     summary: &mut ScanSummary,
@@ -1062,9 +1093,12 @@ where
                 Ok(output) => {
                     let media_kind = output.media_kind;
                     let prepared = prepare_stage1_writes(
+                        store,
                         &request.item_id,
                         &contact_sheet,
                         request.generate_contact_sheet,
+                        artifact_registry,
+                        disk_full_cleaner,
                         output,
                     )?;
                     let committed = match store.commit_scan_stage1_if_running(
@@ -1215,12 +1249,17 @@ fn persist_stage1(
     store: &mut NodeStore,
     content_id: ContentId,
     contact_sheet: ContactSheetCacheEntry,
+    artifact_registry: Option<&Arc<RegenerableArtifactRegistry>>,
+    disk_full_cleaner: Option<&DiskFullCleaner>,
     output: crate::worker::Stage1Output,
 ) -> Result<(), ScanError> {
     let prepared = prepare_stage1_writes(
+        store,
         &format!("legacy-{}", content_id.as_i64()),
         &contact_sheet,
         !contact_sheet.exists(),
+        artifact_registry,
+        disk_full_cleaner,
         output,
     )?;
     store.set_content_media_kind(content_id, prepared.media_kind)?;
@@ -1243,20 +1282,29 @@ struct PendingContactSheet {
     temp_path: Option<PathBuf>,
     final_path: PathBuf,
     relative_path: String,
+    registry: Option<Arc<RegenerableArtifactRegistry>>,
+    artifact_lease: Option<ArtifactLease>,
 }
 
 impl PendingContactSheet {
     fn remove_partial(self) {
+        drop(self.artifact_lease);
         if let Some(temp_path) = self.temp_path {
-            let _ = fs::remove_file(temp_path);
+            let _ = fs::remove_file(&temp_path);
+            if let Some(registry) = self.registry {
+                let _ = registry.unregister(&temp_path);
+            }
         }
     }
 }
 
 fn prepare_stage1_writes(
+    store: &mut NodeStore,
     item_id: &str,
     contact_sheet: &ContactSheetCacheEntry,
     generate_contact_sheet: bool,
+    artifact_registry: Option<&Arc<RegenerableArtifactRegistry>>,
+    disk_full_cleaner: Option<&DiskFullCleaner>,
     output: crate::worker::Stage1Output,
 ) -> Result<PreparedStage1, ScanError> {
     let media_kind = output.media_kind;
@@ -1295,16 +1343,42 @@ fn prepare_stage1_writes(
                 }));
             }
             if let Some(jpeg) = output.contact_sheet_jpeg {
+                let (temp_path, registry, artifact_lease) = match (
+                    artifact_registry,
+                    disk_full_cleaner,
+                ) {
+                    (Some(registry), Some(cleaner)) => {
+                        let (path, lease) = contact_sheet
+                            .write_partial_with_disk_full_cleanup(
+                                item_id, &jpeg, registry, cleaner, store,
+                            )?;
+                        (path, Some(Arc::clone(registry)), Some(lease))
+                    }
+                    _ => (
+                        contact_sheet.write_partial(item_id, &jpeg)?,
+                        None,
+                        None,
+                    ),
+                };
                 contact = Some(PendingContactSheet {
-                    temp_path: Some(contact_sheet.write_partial(item_id, &jpeg)?),
+                    temp_path: Some(temp_path),
                     final_path: contact_sheet.final_path().to_path_buf(),
                     relative_path: contact_sheet.relative_path().to_owned(),
+                    registry,
+                    artifact_lease,
                 });
             } else if !generate_contact_sheet {
+                let (registry, artifact_lease) = register_and_lease(
+                    artifact_registry,
+                    contact_sheet.final_path(),
+                    ArtifactKind::ContactSheet,
+                )?;
                 contact = Some(PendingContactSheet {
                     temp_path: None,
                     final_path: contact_sheet.final_path().to_path_buf(),
                     relative_path: contact_sheet.relative_path().to_owned(),
+                    registry,
+                    artifact_lease,
                 });
             }
         }
@@ -1325,17 +1399,50 @@ fn commit_contact_sheet(
         temp_path,
         final_path,
         relative_path,
+        registry,
+        mut artifact_lease,
     } = contact;
-    let commit_reference = || {
-        store
+    if let Some(temp_path) = temp_path {
+        publish_contact_sheet(&temp_path, &final_path, |owned_final| {
+            drop(artifact_lease.take());
+            let mut final_lease = None;
+            if let Some(registry) = &registry {
+                registry.unregister(&temp_path)?;
+                registry.register(&final_path, ArtifactKind::ContactSheet)?;
+                match registry.lease(&final_path) {
+                    Ok(lease) => final_lease = Some(lease),
+                    Err(error) => {
+                        if owned_final {
+                            let _ = registry.unregister(&final_path);
+                        }
+                        return Err(error.into());
+                    }
+                }
+            }
+            let result = store
+                .commit_feature_result(
+                    content_id,
+                    None,
+                    FeatureWrite::ContactSheet(relative_path),
+                )
+                .map(|_| ())
+                .map_err(ScanError::from);
+            drop(final_lease);
+            if result.is_err()
+                && owned_final
+                && let Some(registry) = &registry
+            {
+                let _ = registry.unregister(&final_path);
+            }
+            result
+        })
+    } else if final_path.is_file() {
+        let result = store
             .commit_feature_result(content_id, None, FeatureWrite::ContactSheet(relative_path))
             .map(|_| ())
-            .map_err(ScanError::from)
-    };
-    if let Some(temp_path) = temp_path {
-        publish_contact_sheet(&temp_path, &final_path, commit_reference)
-    } else if final_path.is_file() {
-        commit_reference()
+            .map_err(ScanError::from);
+        drop(artifact_lease);
+        result
     } else {
         Err(ScanError::Stage1(format!(
             "复用的视频联系表在写回引用前已不存在: {}",
@@ -1347,7 +1454,7 @@ fn commit_contact_sheet(
 fn publish_contact_sheet(
     temp_path: &Path,
     final_path: &Path,
-    commit_reference: impl FnOnce() -> Result<(), ScanError>,
+    commit_reference: impl FnOnce(bool) -> Result<(), ScanError>,
 ) -> Result<(), ScanError> {
     let owned_final = if final_path.exists() {
         fs::remove_file(temp_path)?;
@@ -1359,7 +1466,7 @@ fn publish_contact_sheet(
         }
         true
     };
-    if let Err(error) = commit_reference() {
+    if let Err(error) = commit_reference(owned_final) {
         if owned_final {
             if let Err(cleanup) = fs::remove_file(final_path) {
                 return Err(ScanError::Stage1(format!(
@@ -1379,5 +1486,24 @@ pub fn publish_contact_sheet_for_test(
     final_path: &Path,
     commit_reference: impl FnOnce() -> Result<(), ScanError>,
 ) -> Result<(), ScanError> {
-    publish_contact_sheet(temp_path, final_path, commit_reference)
+    publish_contact_sheet(temp_path, final_path, |_| commit_reference())
+}
+
+fn register_and_lease(
+    registry: Option<&Arc<RegenerableArtifactRegistry>>,
+    path: &Path,
+    kind: ArtifactKind,
+) -> Result<
+    (
+        Option<Arc<RegenerableArtifactRegistry>>,
+        Option<ArtifactLease>,
+    ),
+    ScanError,
+> {
+    let Some(registry) = registry else {
+        return Ok((None, None));
+    };
+    registry.register(path, kind)?;
+    let lease = registry.lease(path)?;
+    Ok((Some(Arc::clone(registry)), Some(lease)))
 }

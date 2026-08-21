@@ -86,6 +86,17 @@ impl StorageLocation {
     pub const fn disk_kind(&self) -> LocalDiskKind {
         self.disk_kind
     }
+
+    /// 两个位置是否至少共享一个底层物理盘。
+    pub fn shares_physical_disk(&self, other: &Self) -> bool {
+        self.physical_disk_id.disk_numbers.iter().any(|disk| {
+            other
+                .physical_disk_id
+                .disk_numbers
+                .binary_search(disk)
+                .is_ok()
+        })
+    }
 }
 
 /// 把已解析的本机绝对路径映射到物理磁盘；相对或网络路径直接拒绝。

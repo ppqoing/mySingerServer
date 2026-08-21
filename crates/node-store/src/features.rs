@@ -16,6 +16,23 @@ use crate::{
 };
 
 impl NodeStore {
+    /// 删除已经被磁盘满清理器移除的联系表本地引用。
+    pub fn clear_contact_sheet_references(
+        &mut self,
+        relative_paths: &[String],
+    ) -> Result<usize, StoreError> {
+        let transaction = self.connection.transaction()?;
+        let mut removed = 0;
+        for relative_path in relative_paths {
+            removed += transaction.execute(
+                "DELETE FROM contact_sheets WHERE relative_path=?1",
+                [relative_path],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(removed)
+    }
+
     /// 在同一事务写特征、可选任务项成功状态和对应 outbox，返回新 outbox 序号。
     pub fn commit_feature_result(
         &mut self,

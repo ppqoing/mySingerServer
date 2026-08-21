@@ -7,6 +7,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use dedup_node_store::NodeStore;
+
+use crate::{
+    artifact_registry::{ArtifactKind, ArtifactLease, RegenerableArtifactRegistry},
+    disk_full_cleanup::{DiskFullCleaner, write_with_disk_full_cleanup},
+};
+
 /// 一份由固定 16 字节 MD5 唯一确定的联系表缓存目标。
 #[derive(Clone, Debug)]
 pub(crate) struct ContactSheetCacheEntry {
@@ -46,6 +53,30 @@ impl ContactSheetCacheEntry {
     }
 
     pub(crate) fn write_partial(&self, item_id: &str, jpeg: &[u8]) -> io::Result<PathBuf> {
+        let partial_path = self.partial_path(item_id)?;
+        write_jpeg(&partial_path, jpeg)?;
+        Ok(partial_path)
+    }
+
+    pub(crate) fn write_partial_with_disk_full_cleanup(
+        &self,
+        item_id: &str,
+        jpeg: &[u8],
+        registry: &RegenerableArtifactRegistry,
+        cleaner: &DiskFullCleaner,
+        store: &mut NodeStore,
+    ) -> io::Result<(PathBuf, ArtifactLease)> {
+        let partial_path = self.partial_path(item_id)?;
+        registry.register(&partial_path, ArtifactKind::OrphanTemporary)?;
+        write_with_disk_full_cleanup(cleaner, store, &partial_path, || {
+            write_jpeg(&partial_path, jpeg)
+        })?;
+        registry.register(&partial_path, ArtifactKind::OrphanTemporary)?;
+        let lease = registry.lease(&partial_path)?;
+        Ok((partial_path, lease))
+    }
+
+    fn partial_path(&self, item_id: &str) -> io::Result<PathBuf> {
         let parent = self
             .final_path
             .parent()
@@ -66,11 +97,13 @@ impl ContactSheetCacheEntry {
             .file_name()
             .expect("MD5 contact sheet target always has a file name")
             .to_string_lossy();
-        let partial_path = parent.join(format!(".{file_name}.{safe_item}.partial"));
-        let mut partial = File::create(&partial_path)?;
-        partial.write_all(jpeg)?;
-        partial.flush()?;
-        partial.sync_all()?;
-        Ok(partial_path)
+        Ok(parent.join(format!(".{file_name}.{safe_item}.partial")))
     }
+}
+
+fn write_jpeg(path: &Path, jpeg: &[u8]) -> io::Result<()> {
+    let mut partial = File::create(path)?;
+    partial.write_all(jpeg)?;
+    partial.flush()?;
+    partial.sync_all()
 }

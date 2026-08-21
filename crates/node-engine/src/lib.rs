@@ -3,6 +3,11 @@
 
 mod contact_sheet_cache;
 
+/// 显式可再生产物登记与活动租约。
+pub mod artifact_registry;
+/// Windows 磁盘满触发的同盘全量派生产物清理。
+pub mod disk_full_cleanup;
+
 /// 串行独占 NodeStore 与 WorkerPool 的节点业务 actor。
 pub mod actor;
 /// 固定 bootstrap 与完整 Node 配置的本机原子持久化边界。
