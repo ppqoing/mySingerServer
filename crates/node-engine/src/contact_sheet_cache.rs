@@ -33,6 +33,10 @@ impl ContactSheetCacheEntry {
         self.final_path.is_file()
     }
 
+    pub(crate) fn same_target(&self, other: &Self) -> bool {
+        self.final_path == other.final_path
+    }
+
     pub(crate) fn final_path(&self) -> &Path {
         &self.final_path
     }

@@ -1,7 +1,7 @@
 //! 扫描缓存短路径、内容复用、一筛提交和成功收尾事务。
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     fs,
     path::{Path, PathBuf},
     time::Duration,
@@ -938,6 +938,12 @@ struct PendingStage1<L> {
     contact_sheet: ContactSheetCacheEntry,
 }
 
+struct ContactSheetBatchGroup<L> {
+    target: ContactSheetCacheEntry,
+    ready: bool,
+    pending: VecDeque<PendingStage1<L>>,
+}
+
 async fn flush_stage1_batch<P, L>(
     store: &mut NodeStore,
     processor: &mut P,
@@ -968,104 +974,163 @@ where
         }
         dispatchable.push(work);
     }
-    let works = dispatchable;
-    if works.is_empty() {
+    if dispatchable.is_empty() {
         return Ok(());
     }
-    let requests = works
-        .iter()
-        .map(|work| work.request.clone())
-        .collect::<Vec<_>>();
-    let mut results = processor
-        .process_batch(requests)
-        .await
-        .into_iter()
-        .map(|result| (result.item_id, result.output))
-        .collect::<BTreeMap<_, _>>();
-    for PendingStage1 {
-        request,
-        lease,
-        contact_sheet,
-    } in works
-    {
-        if cancellation.is_cancelled()
-            || store.task_snapshot(request.task_id)?.status == TaskStatus::Cancelled
+    // 分组只存活于当前有界 Worker batch，容量不会随整次扫描累计。
+    let mut groups: Vec<ContactSheetBatchGroup<L>> = Vec::new();
+    for work in dispatchable {
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|group| group.target.same_target(&work.contact_sheet))
         {
-            drop(lease);
-            continue;
+            group.pending.push_back(work);
+        } else {
+            let target = work.contact_sheet.clone();
+            groups.push(ContactSheetBatchGroup {
+                ready: target.exists(),
+                target,
+                pending: VecDeque::from([work]),
+            });
         }
-        let output = results.remove(&request.item_id).unwrap_or_else(|| {
-            Err(Stage1ProcessError::Infrastructure(
-                "Worker 批次缺少对应 item 结果".into(),
-            ))
-        });
-        match output {
-            Ok(output) => {
-                let prepared = prepare_stage1_writes(
-                    &request.item_id,
-                    &contact_sheet,
-                    request.generate_contact_sheet,
-                    output,
-                )?;
-                let committed = match store.commit_scan_stage1_if_running(
-                    &request.item_id,
-                    request.content_id,
-                    prepared.media_kind,
-                    prepared.writes,
-                    now_ms,
+    }
+
+    while groups.iter().any(|group| !group.pending.is_empty()) {
+        if cancellation.is_cancelled() {
+            return Err(ScanError::Cancelled);
+        }
+        let mut wave = Vec::new();
+        for (group_index, group) in groups.iter_mut().enumerate() {
+            let take_count = if group.ready {
+                group.pending.len()
+            } else {
+                usize::from(!group.pending.is_empty())
+            };
+            for _ in 0..take_count {
+                let Some(mut work) = group.pending.pop_front() else {
+                    break;
+                };
+                if !matches!(
+                    store.task_snapshot(work.request.task_id)?.status,
+                    TaskStatus::Queued | TaskStatus::Running
                 ) {
-                    Ok(committed) => committed,
-                    Err(error) => {
+                    drop(work);
+                    continue;
+                }
+                work.request.generate_contact_sheet = !group.ready;
+                wave.push((group_index, work));
+                if !group.ready {
+                    break;
+                }
+            }
+        }
+        if wave.is_empty() {
+            break;
+        }
+        let requests = wave
+            .iter()
+            .map(|(_, work)| work.request.clone())
+            .collect::<Vec<_>>();
+        let mut results = processor
+            .process_batch(requests)
+            .await
+            .into_iter()
+            .map(|result| (result.item_id, result.output))
+            .collect::<BTreeMap<_, _>>();
+        for (
+            group_index,
+            PendingStage1 {
+                request,
+                lease,
+                contact_sheet,
+            },
+        ) in wave
+        {
+            if cancellation.is_cancelled()
+                || store.task_snapshot(request.task_id)?.status == TaskStatus::Cancelled
+            {
+                drop(lease);
+                continue;
+            }
+            let output = results.remove(&request.item_id).unwrap_or_else(|| {
+                Err(Stage1ProcessError::Infrastructure(
+                    "Worker 批次缺少对应 item 结果".into(),
+                ))
+            });
+            let mut contact_ready = false;
+            match output {
+                Ok(output) => {
+                    let media_kind = output.media_kind;
+                    let prepared = prepare_stage1_writes(
+                        &request.item_id,
+                        &contact_sheet,
+                        request.generate_contact_sheet,
+                        output,
+                    )?;
+                    let committed = match store.commit_scan_stage1_if_running(
+                        &request.item_id,
+                        request.content_id,
+                        prepared.media_kind,
+                        prepared.writes,
+                        now_ms,
+                    ) {
+                        Ok(committed) => committed,
+                        Err(error) => {
+                            if let Some(contact) = prepared.contact {
+                                contact.remove_partial();
+                            }
+                            return Err(error.into());
+                        }
+                    };
+                    if !committed {
                         if let Some(contact) = prepared.contact {
                             contact.remove_partial();
                         }
-                        return Err(error.into());
+                        drop(lease);
+                        continue;
                     }
-                };
-                if !committed {
                     if let Some(contact) = prepared.contact {
-                        contact.remove_partial();
+                        commit_contact_sheet(store, request.content_id, contact)?;
                     }
-                    drop(lease);
-                    continue;
+                    contact_ready = media_kind != MediaKind::Video || contact_sheet.exists();
                 }
-                if let Some(contact) = prepared.contact {
-                    commit_contact_sheet(store, request.content_id, contact)?;
+                Err(Stage1ProcessError::WorkerCrash { identity, message }) => {
+                    if store.task_snapshot(request.task_id)?.status != TaskStatus::Cancelled {
+                        let fault = FileFaultRecord {
+                            machine_id: identity.machine_id,
+                            normalized_path: identity.normalized_path,
+                            display_path: identity.display_path,
+                            file_size: identity.file_size,
+                            kind: FileFaultKind::WorkerCrash,
+                            stage: identity.stage,
+                            windows_error_code: None,
+                            message: message.clone(),
+                        };
+                        store.fail_running_item_with_file_fault(
+                            &request.item_id,
+                            &fault,
+                            &message,
+                            now_ms,
+                        )?;
+                        summary.file_failures += 1;
+                    }
                 }
-            }
-            Err(Stage1ProcessError::WorkerCrash { identity, message }) => {
-                if store.task_snapshot(request.task_id)?.status != TaskStatus::Cancelled {
-                    let fault = FileFaultRecord {
-                        machine_id: identity.machine_id,
-                        normalized_path: identity.normalized_path,
-                        display_path: identity.display_path,
-                        file_size: identity.file_size,
-                        kind: FileFaultKind::WorkerCrash,
-                        stage: identity.stage,
-                        windows_error_code: None,
-                        message: message.clone(),
-                    };
-                    store.fail_running_item_with_file_fault(
-                        &request.item_id,
-                        &fault,
-                        &message,
-                        now_ms,
-                    )?;
-                    summary.file_failures += 1;
-                }
-            }
-            Err(error) => {
-                if store.task_snapshot(request.task_id)?.status != TaskStatus::Cancelled {
-                    store.complete_item(
-                        &request.item_id,
-                        TaskItemCompletion::Failed(error.to_string()),
-                        now_ms,
-                    )?;
-                    summary.file_failures += 1;
+                Err(error) => {
+                    if store.task_snapshot(request.task_id)?.status != TaskStatus::Cancelled {
+                        store.complete_item(
+                            &request.item_id,
+                            TaskItemCompletion::Failed(error.to_string()),
+                            now_ms,
+                        )?;
+                        summary.file_failures += 1;
+                    }
                 }
             }
+            if contact_ready {
+                groups[group_index].ready = true;
+            }
+            drop(lease);
         }
-        drop(lease);
     }
     Ok(())
 }

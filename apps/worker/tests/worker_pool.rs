@@ -111,6 +111,7 @@ fn stage1_request(task_id: &str, item_id: &str) -> proto::WorkerEnvelope {
                 item_id: item_id.into(),
                 display_path: media_fixture("image.jpg").to_string_lossy().into_owned(),
                 media_kind: proto::MediaKind::MediaImage as i32,
+                generate_contact_sheet: true,
             },
         )),
     }

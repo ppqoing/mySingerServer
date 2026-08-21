@@ -4,11 +4,12 @@ use dedup_core::{DisplayPath, MachineId, MediaKind, NormalizedPath};
 use dedup_node_engine::{
     scan::{
         FileEnumerator, FileHasher, PipelineFileReader, PipelineLimits, ReadProduct, ScanEngine,
-        ScanError, ScanOptions, Stage1Processor, Stage1Request, md5_bytes,
+        ScanError, ScanOptions, Stage1BatchResult, Stage1ProcessError, Stage1Processor,
+        Stage1Request, md5_bytes,
     },
     worker::{Stage1Frame, Stage1Output},
 };
-use dedup_node_store::{NodeStore, ScannedPath};
+use dedup_node_store::{NodeStore, ScannedPath, TaskItemStatus};
 use dedup_windows::ReadCancellationToken;
 use tempfile::tempdir;
 
@@ -31,6 +32,17 @@ impl FileEnumerator for FixedEnumerator {
     fn enumerate(&self, roots: &[DisplayPath]) -> Result<Vec<ScannedPath>, ScanError> {
         let path = roots[0].as_path().join("sample.bin");
         Ok(vec![scanned(&path)])
+    }
+}
+
+#[derive(Clone)]
+struct RowsEnumerator {
+    rows: Vec<ScannedPath>,
+}
+
+impl FileEnumerator for RowsEnumerator {
+    fn enumerate(&self, _roots: &[DisplayPath]) -> Result<Vec<ScannedPath>, ScanError> {
+        Ok(self.rows.clone())
     }
 }
 
@@ -94,6 +106,9 @@ struct VideoContactSheetProcessor {
     calls: usize,
     encodes: usize,
     generation_requests: Vec<bool>,
+    batch_generation_requests: Vec<Vec<bool>>,
+    fail_first_generation: bool,
+    failed_generations: usize,
 }
 
 impl Stage1Processor for VideoContactSheetProcessor {
@@ -101,6 +116,13 @@ impl Stage1Processor for VideoContactSheetProcessor {
         self.calls += 1;
         self.generation_requests
             .push(request.generate_contact_sheet);
+        if request.generate_contact_sheet
+            && self.fail_first_generation
+            && self.failed_generations == 0
+        {
+            self.failed_generations += 1;
+            return Err("controlled leader failure".into());
+        }
         let contact_sheet_jpeg = request.generate_contact_sheet.then(|| {
             self.encodes += 1;
             b"generated-jpeg".to_vec()
@@ -120,6 +142,158 @@ impl Stage1Processor for VideoContactSheetProcessor {
             contact_sheet_jpeg,
         })
     }
+
+    async fn process_batch(&mut self, requests: Vec<Stage1Request>) -> Vec<Stage1BatchResult> {
+        self.batch_generation_requests.push(
+            requests
+                .iter()
+                .map(|request| request.generate_contact_sheet)
+                .collect(),
+        );
+        let mut results = Vec::with_capacity(requests.len());
+        for request in requests {
+            let item_id = request.item_id.clone();
+            results.push(Stage1BatchResult {
+                item_id,
+                output: self
+                    .process(request)
+                    .await
+                    .map_err(Stage1ProcessError::Processing),
+            });
+        }
+        results
+    }
+
+    fn max_in_flight(&self) -> usize {
+        4
+    }
+}
+
+#[tokio::test]
+async fn contact_sheet_md5_coalesces_same_digest_to_one_batch_leader() {
+    let directory = tempdir().unwrap();
+    let path_a = directory.path().join("same-a.bin");
+    let path_b = directory.path().join("same-b.bin");
+    fs::write(&path_a, b"same-video-content").unwrap();
+    fs::write(&path_b, b"same-video-content").unwrap();
+    let rows = vec![scanned(&path_a), scanned(&path_b)];
+    let root = DisplayPath::new(directory.path()).unwrap();
+    let machine = MachineId::parse(&"44".repeat(32)).unwrap();
+    let mut store = NodeStore::open_in_memory(machine).unwrap();
+    let contact_root = directory.path().join("contact-sheets");
+    let md5 = dedup_node_engine::scan::md5_file(&path_a).unwrap();
+    let digest = hex_md5(md5);
+    let target = contact_root
+        .join(&digest[..2])
+        .join(format!("{digest}.jpg"));
+    let mut engine = ScanEngine::new(
+        RowsEnumerator { rows: rows.clone() },
+        CountingHasher::default(),
+        &contact_root,
+    );
+    let mut processor = VideoContactSheetProcessor::default();
+
+    let summary = engine
+        .run_parallel_with(
+            &mut store,
+            ScanOptions::new(vec![root]).force_recompute(),
+            ImmediateReader,
+            &mut processor,
+            PipelineLimits::new(4, 4),
+            ReadCancellationToken::new(),
+            30,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(processor.encodes, 1, "同批相同 MD5 只能有一个编码 leader");
+    assert_eq!(
+        processor.batch_generation_requests,
+        vec![vec![true], vec![false]],
+        "follower 必须等 leader 发布后才以不编码请求进入下一波"
+    );
+    assert_eq!(fs::read(&target).unwrap(), b"generated-jpeg");
+    let items = store.task_items(summary.task_id).unwrap();
+    assert_eq!(items.len(), 2);
+    assert!(
+        items
+            .iter()
+            .all(|item| item.status == TaskItemStatus::Succeeded)
+    );
+    let lookups = store.lookup_scanned_paths(&rows).unwrap();
+    assert_eq!(lookups[0].content_id, lookups[1].content_id);
+    let content_id = lookups[0].content_id.unwrap();
+    let relative_path = format!("contact-sheets/{}/{}.jpg", &digest[..2], digest);
+    assert_eq!(
+        store.contact_sheet_path(content_id).unwrap().as_deref(),
+        Some(relative_path.as_str())
+    );
+}
+
+#[tokio::test]
+async fn contact_sheet_md5_promotes_follower_after_leader_failure() {
+    let directory = tempdir().unwrap();
+    let path_a = directory.path().join("failure-a.bin");
+    let path_b = directory.path().join("failure-b.bin");
+    fs::write(&path_a, b"retry-same-video").unwrap();
+    fs::write(&path_b, b"retry-same-video").unwrap();
+    let rows = vec![scanned(&path_a), scanned(&path_b)];
+    let root = DisplayPath::new(directory.path()).unwrap();
+    let machine = MachineId::parse(&"55".repeat(32)).unwrap();
+    let mut store = NodeStore::open_in_memory(machine).unwrap();
+    let contact_root = directory.path().join("contact-sheets");
+    let md5 = dedup_node_engine::scan::md5_file(&path_a).unwrap();
+    let digest = hex_md5(md5);
+    let target = contact_root
+        .join(&digest[..2])
+        .join(format!("{digest}.jpg"));
+    let mut engine = ScanEngine::new(
+        RowsEnumerator { rows },
+        CountingHasher::default(),
+        &contact_root,
+    );
+    let mut processor = VideoContactSheetProcessor {
+        fail_first_generation: true,
+        ..VideoContactSheetProcessor::default()
+    };
+
+    let summary = engine
+        .run_parallel_with(
+            &mut store,
+            ScanOptions::new(vec![root]).force_recompute(),
+            ImmediateReader,
+            &mut processor,
+            PipelineLimits::new(4, 4),
+            ReadCancellationToken::new(),
+            31,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(processor.failed_generations, 1);
+    assert_eq!(processor.encodes, 1, "提升后的 follower 只编码一次");
+    assert_eq!(
+        processor.batch_generation_requests,
+        vec![vec![true], vec![true]],
+        "失败 leader 收尾后才能提升下一 follower"
+    );
+    assert_eq!(summary.file_failures, 1);
+    let items = store.task_items(summary.task_id).unwrap();
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| item.status == TaskItemStatus::Failed)
+            .count(),
+        1
+    );
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| item.status == TaskItemStatus::Succeeded)
+            .count(),
+        1
+    );
+    assert_eq!(fs::read(&target).unwrap(), b"generated-jpeg");
 }
 
 #[tokio::test]
