@@ -348,6 +348,7 @@ async fn accepted_save_without_reconnect_ends_in_explicit_timeout_failure() {
 async fn pending_save_rejects_load_edit_and_remove_without_losing_target() {
     let machine = "b6".repeat(32);
     let handler = ConfigHandler::new(&machine, &machine, "saved-sha");
+    let handler_state = Arc::clone(&handler.state);
     let (address, shutdown, server) = start_server(handler).await;
     let unused = unused_endpoint().await;
     let temp = TempDir::new().unwrap();
@@ -380,6 +381,16 @@ async fn pending_save_rejects_load_edit_and_remove_without_losing_target() {
     .await;
     let target_machine = waiting.target_machine_id().unwrap().to_owned();
     let target_endpoint = waiting.target_endpoint().unwrap().clone();
+
+    app.send(UiCommand::SaveNodeConfigAndRestart {
+        node_index: 0,
+        config: config_value(39206),
+    })
+    .await
+    .unwrap();
+    assert!(wait_for_error(&mut events).await.contains("重启验证进行中"));
+    assert_pending_target_unchanged(&mut events, &target_machine, &target_endpoint).await;
+    assert_eq!(handler_state.lock().unwrap().saves.len(), 1);
 
     app.send(UiCommand::LoadNodeConfig { node_index: 1 })
         .await

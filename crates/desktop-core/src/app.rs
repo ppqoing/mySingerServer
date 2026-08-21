@@ -701,24 +701,28 @@ async fn run_controller(
                 }
             }
             UiCommand::SaveNodeConfigAndRestart { node_index, config } => {
-                let result = save_node_config_and_restart(
-                    node_index,
-                    config,
-                    &mut state,
-                    &mut sessions,
-                    &mut sync_workers,
-                    &events,
-                )
-                .await;
-                match result {
-                    Ok(pending) => {
-                        pending_node_config = Some(pending);
-                        Ok(())
-                    }
-                    Err(error) => {
-                        state.fail_node_config(error.clone());
-                        publish_node_config(&events, &state).await;
-                        Err(error)
+                if state.node_config().is_in_progress() {
+                    Err(node_config_target_change_error())
+                } else {
+                    let result = save_node_config_and_restart(
+                        node_index,
+                        config,
+                        &mut state,
+                        &mut sessions,
+                        &mut sync_workers,
+                        &events,
+                    )
+                    .await;
+                    match result {
+                        Ok(pending) => {
+                            pending_node_config = Some(pending);
+                            Ok(())
+                        }
+                        Err(error) => {
+                            state.fail_node_config(error.clone());
+                            publish_node_config(&events, &state).await;
+                            Err(error)
+                        }
                     }
                 }
             }
