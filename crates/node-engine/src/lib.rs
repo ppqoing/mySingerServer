@@ -11,6 +11,8 @@ pub mod analysis;
 pub mod delete;
 /// Node 替代进程与响应刷出后的退出通知边界。
 pub mod host_control;
+/// 可取消分块读取、超时重试和流式 MD5 边界。
+pub mod io;
 /// 图片原文件和视频 JPEG 联系表的有界分块预览。
 pub mod preview;
 /// 文件枚举、缓存复用、MD5 与一筛任务编排。
