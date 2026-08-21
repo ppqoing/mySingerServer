@@ -1,6 +1,8 @@
 //! 扫描、持久任务、Worker 池、本地分析、预览和安全删除编排。
 #![warn(missing_docs)]
 
+mod contact_sheet_cache;
+
 /// 串行独占 NodeStore 与 WorkerPool 的节点业务 actor。
 pub mod actor;
 /// 固定 bootstrap 与完整 Node 配置的本机原子持久化边界。

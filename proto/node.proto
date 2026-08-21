@@ -411,6 +411,7 @@ message ProbeAndStage1 {
   string item_id = 2;
   string display_path = 3;
   MediaKind media_kind = 4;
+  bool generate_contact_sheet = 5;
 }
 
 message ComputeStage2 {

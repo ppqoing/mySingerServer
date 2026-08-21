@@ -20,6 +20,7 @@ use thiserror::Error;
 use tokio::task::JoinSet;
 
 use crate::{
+    contact_sheet_cache::ContactSheetCacheEntry,
     io::ReadFailure,
     worker::{WorkerEvent, WorkerPool, decode_stage1_payload},
 };
@@ -98,6 +99,8 @@ pub struct Stage1Request {
     pub stage: String,
     /// 本机内容行。
     pub content_id: ContentId,
+    /// 当前 MD5 目标不存在时要求 Worker 生成联系表。
+    pub generate_contact_sheet: bool,
 }
 
 impl Stage1Request {
@@ -228,6 +231,7 @@ impl Stage1Processor for WorkerPoolStage1Processor<'_> {
                                 .to_string_lossy()
                                 .into_owned(),
                             media_kind: proto::MediaKind::MediaOther as i32,
+                            generate_contact_sheet: request.generate_contact_sheet,
                         },
                     )),
                 },
@@ -287,6 +291,7 @@ impl Stage1Processor for WorkerPoolStage1Processor<'_> {
                             .to_string_lossy()
                             .into_owned(),
                         media_kind: proto::MediaKind::MediaOther as i32,
+                        generate_contact_sheet: request.generate_contact_sheet,
                     },
                 )),
             };
@@ -526,7 +531,6 @@ where
                 let result = flush_stage1_batch(
                     store,
                     processor,
-                    &self.contact_sheet_root,
                     &cancellation,
                     &mut pending_stage1,
                     &mut summary,
@@ -599,7 +603,6 @@ where
         flush_stage1_batch(
             store,
             processor,
-            &self.contact_sheet_root,
             &cancellation,
             &mut pending_stage1,
             &mut summary,
@@ -703,8 +706,18 @@ where
                     continue;
                 }
                 summary.scheduled_stage1 += 1;
+                let contact_sheet =
+                    ContactSheetCacheEntry::from_md5(&self.contact_sheet_root, md5);
                 let succeeded = self
-                    .process_stage1(store, task_id, scanned, content.id, processor, now_ms)
+                    .process_stage1(
+                        store,
+                        task_id,
+                        scanned,
+                        content.id,
+                        contact_sheet,
+                        processor,
+                        now_ms,
+                    )
                     .await?;
                 if !succeeded {
                     summary.file_failures += 1;
@@ -799,6 +812,7 @@ where
             return Ok(());
         }
         summary.scheduled_stage1 += 1;
+        let contact_sheet = ContactSheetCacheEntry::from_md5(&self.contact_sheet_root, md5);
         store.set_running_item_content_and_stage(&item_id, content.id, "probe_stage1")?;
         let machine_id = store.machine_id().clone();
         let normalized_path = scanned.normalized_path.clone();
@@ -814,8 +828,10 @@ where
                 file_size,
                 stage: "probe_stage1".into(),
                 content_id: content.id,
+                generate_contact_sheet: !contact_sheet.exists(),
             },
             lease,
+            contact_sheet,
         });
         Ok(())
     }
@@ -866,6 +882,7 @@ where
         task_id: TaskId,
         scanned: &ScannedPath,
         content_id: ContentId,
+        contact_sheet: ContactSheetCacheEntry,
         processor: &mut P,
         now_ms: i64,
     ) -> Result<bool, ScanError> {
@@ -880,10 +897,11 @@ where
             file_size: scanned.file_size,
             stage: "probe_stage1".into(),
             content_id,
+            generate_contact_sheet: !contact_sheet.exists(),
         };
         match processor.process(request).await {
             Ok(output) => {
-                persist_stage1(store, content_id, &self.contact_sheet_root, output)?;
+                persist_stage1(store, content_id, contact_sheet, output)?;
                 store.complete_item(
                     &item_id,
                     TaskItemCompletion::Succeeded {
@@ -917,12 +935,12 @@ async fn drain_parallel_reads<L>(
 struct PendingStage1<L> {
     request: Stage1Request,
     lease: L,
+    contact_sheet: ContactSheetCacheEntry,
 }
 
 async fn flush_stage1_batch<P, L>(
     store: &mut NodeStore,
     processor: &mut P,
-    contact_sheet_root: &PathBuf,
     cancellation: &ReadCancellationToken,
     pending: &mut Vec<PendingStage1<L>>,
     summary: &mut ScanSummary,
@@ -964,7 +982,12 @@ where
         .into_iter()
         .map(|result| (result.item_id, result.output))
         .collect::<BTreeMap<_, _>>();
-    for PendingStage1 { request, lease } in works {
+    for PendingStage1 {
+        request,
+        lease,
+        contact_sheet,
+    } in works
+    {
         if cancellation.is_cancelled()
             || store.task_snapshot(request.task_id)?.status == TaskStatus::Cancelled
         {
@@ -980,8 +1003,8 @@ where
             Ok(output) => {
                 let prepared = prepare_stage1_writes(
                     &request.item_id,
-                    request.content_id,
-                    contact_sheet_root,
+                    &contact_sheet,
+                    request.generate_contact_sheet,
                     output,
                 )?;
                 let committed = match store.commit_scan_stage1_if_running(
@@ -994,30 +1017,20 @@ where
                     Ok(committed) => committed,
                     Err(error) => {
                         if let Some(contact) = prepared.contact {
-                            let _ = fs::remove_file(contact.temp_path);
+                            contact.remove_partial();
                         }
                         return Err(error.into());
                     }
                 };
                 if !committed {
                     if let Some(contact) = prepared.contact {
-                        let _ = fs::remove_file(contact.temp_path);
+                        contact.remove_partial();
                     }
                     drop(lease);
                     continue;
                 }
                 if let Some(contact) = prepared.contact {
-                    let relative_path = contact.relative_path.clone();
-                    publish_contact_sheet(&contact.temp_path, &contact.final_path, || {
-                        store
-                            .commit_feature_result(
-                                request.content_id,
-                                None,
-                                FeatureWrite::ContactSheet(relative_path),
-                            )
-                            .map(|_| ())
-                            .map_err(ScanError::from)
-                    })?;
+                    commit_contact_sheet(store, request.content_id, contact)?;
                 }
             }
             Err(Stage1ProcessError::WorkerCrash { identity, message }) => {
@@ -1136,13 +1149,13 @@ fn complete_file_failure(
 fn persist_stage1(
     store: &mut NodeStore,
     content_id: ContentId,
-    contact_sheet_root: &PathBuf,
+    contact_sheet: ContactSheetCacheEntry,
     output: crate::worker::Stage1Output,
 ) -> Result<(), ScanError> {
     let prepared = prepare_stage1_writes(
         &format!("legacy-{}", content_id.as_i64()),
-        content_id,
-        contact_sheet_root,
+        &contact_sheet,
+        !contact_sheet.exists(),
         output,
     )?;
     store.set_content_media_kind(content_id, prepared.media_kind)?;
@@ -1150,13 +1163,7 @@ fn persist_stage1(
         store.commit_feature_result(content_id, None, write)?;
     }
     if let Some(contact) = prepared.contact {
-        let relative_path = contact.relative_path.clone();
-        publish_contact_sheet(&contact.temp_path, &contact.final_path, || {
-            store
-                .commit_feature_result(content_id, None, FeatureWrite::ContactSheet(relative_path))
-                .map(|_| ())
-                .map_err(ScanError::from)
-        })?;
+        commit_contact_sheet(store, content_id, contact)?;
     }
     Ok(())
 }
@@ -1168,15 +1175,23 @@ struct PreparedStage1 {
 }
 
 struct PendingContactSheet {
-    temp_path: PathBuf,
+    temp_path: Option<PathBuf>,
     final_path: PathBuf,
     relative_path: String,
 }
 
+impl PendingContactSheet {
+    fn remove_partial(self) {
+        if let Some(temp_path) = self.temp_path {
+            let _ = fs::remove_file(temp_path);
+        }
+    }
+}
+
 fn prepare_stage1_writes(
     item_id: &str,
-    content_id: ContentId,
-    contact_sheet_root: &PathBuf,
+    contact_sheet: &ContactSheetCacheEntry,
+    generate_contact_sheet: bool,
     output: crate::worker::Stage1Output,
 ) -> Result<PreparedStage1, ScanError> {
     let media_kind = output.media_kind;
@@ -1215,15 +1230,16 @@ fn prepare_stage1_writes(
                 }));
             }
             if let Some(jpeg) = output.contact_sheet_jpeg {
-                let temporary_root = contact_sheet_root.join(".partial");
-                fs::create_dir_all(&temporary_root)?;
-                let file_name = format!("{}.jpg", content_id.as_i64());
-                let temp_path = temporary_root.join(format!("{item_id}.jpg.partial"));
-                fs::write(&temp_path, jpeg)?;
                 contact = Some(PendingContactSheet {
-                    temp_path,
-                    final_path: contact_sheet_root.join(&file_name),
-                    relative_path: format!("contact-sheets/{file_name}"),
+                    temp_path: Some(contact_sheet.write_partial(item_id, &jpeg)?),
+                    final_path: contact_sheet.final_path().to_path_buf(),
+                    relative_path: contact_sheet.relative_path().to_owned(),
+                });
+            } else if !generate_contact_sheet {
+                contact = Some(PendingContactSheet {
+                    temp_path: None,
+                    final_path: contact_sheet.final_path().to_path_buf(),
+                    relative_path: contact_sheet.relative_path().to_owned(),
                 });
             }
         }
@@ -1233,6 +1249,34 @@ fn prepare_stage1_writes(
         writes,
         contact,
     })
+}
+
+fn commit_contact_sheet(
+    store: &mut NodeStore,
+    content_id: ContentId,
+    contact: PendingContactSheet,
+) -> Result<(), ScanError> {
+    let PendingContactSheet {
+        temp_path,
+        final_path,
+        relative_path,
+    } = contact;
+    let commit_reference = || {
+        store
+            .commit_feature_result(content_id, None, FeatureWrite::ContactSheet(relative_path))
+            .map(|_| ())
+            .map_err(ScanError::from)
+    };
+    if let Some(temp_path) = temp_path {
+        publish_contact_sheet(&temp_path, &final_path, commit_reference)
+    } else if final_path.is_file() {
+        commit_reference()
+    } else {
+        Err(ScanError::Stage1(format!(
+            "复用的视频联系表在写回引用前已不存在: {}",
+            final_path.display()
+        )))
+    }
 }
 
 fn publish_contact_sheet(

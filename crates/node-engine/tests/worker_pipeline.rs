@@ -34,7 +34,7 @@ fn image_stage_one_decodes_once_and_has_no_thumbnail() {
     let pipeline = WorkerPipeline::new(decoder);
 
     let output = pipeline
-        .probe_and_stage1(Path::new(r"D:\photo.jpg"), MediaKind::Image)
+        .probe_and_stage1(Path::new(r"D:\photo.jpg"), MediaKind::Image, true)
         .unwrap();
 
     assert_eq!(*calls.lock().unwrap(), vec![0.0]);
@@ -51,7 +51,7 @@ fn video_stage_one_reuses_exactly_six_decoded_frames_for_contact_sheet() {
     let pipeline = WorkerPipeline::new(decoder);
 
     let output = pipeline
-        .probe_and_stage1(Path::new(r"D:\clip.mp4"), MediaKind::Video)
+        .probe_and_stage1(Path::new(r"D:\clip.mp4"), MediaKind::Video, true)
         .unwrap();
 
     assert_eq!(*calls.lock().unwrap(), normalized_positions().to_vec());
@@ -87,7 +87,7 @@ fn stage_two_computes_phash_and_sobel_from_each_single_decode() {
 fn worker_payloads_round_trip_all_persisted_features() {
     let pipeline = WorkerPipeline::new(FakeDecoder::video());
     let stage1 = pipeline
-        .probe_and_stage1(Path::new(r"D:\clip.mp4"), MediaKind::Video)
+        .probe_and_stage1(Path::new(r"D:\clip.mp4"), MediaKind::Video, true)
         .unwrap();
     let stage2 = pipeline
         .compute_stage2(Path::new(r"D:\clip.mp4"), MediaKind::Video, &[0, 5])
@@ -117,6 +117,7 @@ fn worker_envelope_maps_probe_command_to_stage_one_result() {
                     display_path: r"D:\photo.jpg".into(),
                     // 扩展名或调用方只能提供候选提示；最终类型必须来自 FFmpeg probe。
                     media_kind: proto::MediaKind::MediaOther as i32,
+                    generate_contact_sheet: true,
                 },
             )),
         },
@@ -133,6 +134,34 @@ fn worker_envelope_maps_probe_command_to_stage_one_result() {
     );
 }
 
+#[test]
+fn skips_contact_sheet_encoding_when_probe_request_disables_it() {
+    let decoder = FakeDecoder::video();
+    let calls = Arc::clone(&decoder.calls);
+    let response = handle_worker_request(
+        &WorkerPipeline::new(decoder),
+        proto::WorkerEnvelope {
+            payload: Some(worker_envelope::Payload::ProbeAndStage1(
+                proto::ProbeAndStage1 {
+                    task_id: "task-no-sheet".into(),
+                    item_id: "item-no-sheet".into(),
+                    display_path: r"D:\clip.mp4".into(),
+                    media_kind: proto::MediaKind::MediaOther as i32,
+                    generate_contact_sheet: false,
+                },
+            )),
+        },
+    );
+
+    let Some(worker_envelope::Payload::Stage1Result(result)) = response.payload else {
+        panic!("expected Stage1Result");
+    };
+    let output = decode_stage1_payload(&result.payload).unwrap();
+    assert_eq!(*calls.lock().unwrap(), normalized_positions().to_vec());
+    assert_eq!(output.frames.len(), 6);
+    assert!(output.contact_sheet_jpeg.is_none());
+}
+
 #[tokio::test]
 async fn cancelled_scan_is_rejected_at_the_worker_pool_send_boundary() {
     let (mut pool, mut started) = WorkerPool::controlled_for_test();
@@ -146,6 +175,7 @@ async fn cancelled_scan_is_rejected_at_the_worker_pool_send_boundary() {
                     item_id: "cancelled-item".into(),
                     display_path: r"D:\cancelled.bin".into(),
                     media_kind: proto::MediaKind::MediaOther as i32,
+                    generate_contact_sheet: true,
                 },
             )),
         },
@@ -178,6 +208,7 @@ async fn cancel_gate_cannot_cross_the_registry_check_to_slot_send_window() {
                 item_id: "before-cancel".into(),
                 display_path: r"D:\before.bin".into(),
                 media_kind: proto::MediaKind::MediaOther as i32,
+                generate_contact_sheet: true,
             },
         )),
     };
@@ -221,6 +252,7 @@ async fn cancel_gate_cannot_cross_the_registry_check_to_slot_send_window() {
                     item_id: "after-cancel".into(),
                     display_path: r"D:\after.bin".into(),
                     media_kind: proto::MediaKind::MediaOther as i32,
+                    generate_contact_sheet: true,
                 },
             )),
         },

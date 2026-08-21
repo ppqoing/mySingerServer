@@ -143,6 +143,7 @@ where
         &self,
         path: &Path,
         _requested_media_kind: MediaKind,
+        generate_contact_sheet: bool,
     ) -> Result<Stage1Output, WorkerPipelineError> {
         let probe = self
             .decoder
@@ -168,7 +169,7 @@ where
                     contact_sheet_jpeg: None,
                 })
             }
-            MediaKind::Video => self.video_stage1(path, probe),
+            MediaKind::Video => self.video_stage1(path, probe, generate_contact_sheet),
             MediaKind::Other => Ok(Stage1Output {
                 media_kind: MediaKind::Other,
                 width: probe.width,
@@ -253,6 +254,7 @@ where
         &self,
         path: &Path,
         probe: MediaProbe,
+        generate_contact_sheet: bool,
     ) -> Result<Stage1Output, WorkerPipelineError> {
         let mut contact_frames: [Option<Rgb24Image>; 6] = std::array::from_fn(|_| None);
         let mut frames = Vec::with_capacity(6);
@@ -274,15 +276,19 @@ where
                 }),
             }
         }
-        let jpeg = encode_contact_sheet(&contact_frames, CONTACT_CELL_WIDTH, CONTACT_CELL_HEIGHT)
-            .map_err(|error| WorkerPipelineError::ContactSheet(error.to_string()))?;
+        let contact_sheet_jpeg = generate_contact_sheet
+            .then(|| {
+                encode_contact_sheet(&contact_frames, CONTACT_CELL_WIDTH, CONTACT_CELL_HEIGHT)
+                    .map_err(|error| WorkerPipelineError::ContactSheet(error.to_string()))
+            })
+            .transpose()?;
         Ok(Stage1Output {
             media_kind: MediaKind::Video,
             width: probe.width,
             height: probe.height,
             duration_ms: probe.duration_ms,
             frames,
-            contact_sheet_jpeg: Some(jpeg),
+            contact_sheet_jpeg,
         })
     }
 }
@@ -301,7 +307,11 @@ where
     match envelope.payload {
         Some(worker_envelope::Payload::ProbeAndStage1(command)) => {
             let result = parse_media_kind(command.media_kind).and_then(|media_kind| {
-                pipeline.probe_and_stage1(Path::new(&command.display_path), media_kind)
+                pipeline.probe_and_stage1(
+                    Path::new(&command.display_path),
+                    media_kind,
+                    command.generate_contact_sheet,
+                )
             });
             match result {
                 Ok(output) => response(worker_envelope::Payload::Stage1Result(
