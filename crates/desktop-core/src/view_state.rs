@@ -220,6 +220,61 @@ impl NodeConfigControllerState {
     }
 }
 
+/// 设置诊断页展示的一条已批准文件故障投影。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileFaultView {
+    /// 物理机器 ID。
+    pub machine_id: String,
+    /// 规范路径。
+    pub normalized_path: String,
+    /// 实际显示路径。
+    pub display_path: String,
+    /// 文件大小。
+    pub file_size: u64,
+    /// `suspected_physical_read` 或 `worker_crash`。
+    pub fault_kind: String,
+    /// 故障阶段。
+    pub stage: String,
+    /// 可选 Windows 错误码。
+    pub error_code: Option<i32>,
+    /// 最近诊断文案。
+    pub message: String,
+}
+
+/// Node 进程内最近一次磁盘满清理摘要。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiskFullCleanupSummaryView {
+    /// 触发 Unix 毫秒。
+    pub triggered_at_unix_ms: u64,
+    /// 删除文件数。
+    pub deleted_files: u64,
+    /// 删除字节数。
+    pub deleted_bytes: u64,
+    /// 活动租约跳过数。
+    pub skipped_active: u64,
+    /// 异盘跳过数。
+    pub skipped_other_disk: u64,
+    /// 失败文件数。
+    pub failed_files: u64,
+}
+
+/// 设置诊断页当前节点、分页结果和内存清理摘要。
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct FileFaultDiagnosticsState {
+    /// 当前选择节点。
+    pub selected_node_index: Option<usize>,
+    /// 当前已加载记录。
+    pub rows: Vec<FileFaultView>,
+    /// 空字符串表示没有下一页。
+    pub next_cursor: String,
+    /// Node 最近磁盘满清理摘要。
+    pub cleanup_summary: Option<DiskFullCleanupSummaryView>,
+    /// 是否正在加载或清除。
+    pub loading: bool,
+    /// 最近诊断命令错误。
+    pub error: Option<String>,
+}
+
 /// 手工编辑节点或保存设置时的唯一边界错误。
 #[derive(Debug, Error)]
 pub enum ViewStateError {
@@ -249,6 +304,7 @@ pub struct DesktopViewState {
     tasks: Vec<TaskView>,
     postgres: PostgresHealth,
     node_config: NodeConfigControllerState,
+    file_faults: FileFaultDiagnosticsState,
 }
 
 impl DesktopViewState {
@@ -267,6 +323,7 @@ impl DesktopViewState {
             tasks: Vec::new(),
             postgres,
             node_config: NodeConfigControllerState::default(),
+            file_faults: FileFaultDiagnosticsState::default(),
         }
     }
 
@@ -293,6 +350,22 @@ impl DesktopViewState {
     /// 返回远程 Node 配置加载与保存状态。
     pub const fn node_config(&self) -> &NodeConfigControllerState {
         &self.node_config
+    }
+
+    /// 返回设置页文件故障诊断状态。
+    pub const fn file_faults(&self) -> &FileFaultDiagnosticsState {
+        &self.file_faults
+    }
+
+    pub(crate) fn select_file_fault_node(&mut self, index: usize) {
+        self.file_faults = FileFaultDiagnosticsState {
+            selected_node_index: Some(index),
+            ..FileFaultDiagnosticsState::default()
+        };
+    }
+
+    pub(crate) fn set_file_faults(&mut self, state: FileFaultDiagnosticsState) {
+        self.file_faults = state;
     }
 
     /// 切换设置页节点时立即清除旧表单、摘要和保存状态。

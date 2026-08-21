@@ -1,6 +1,6 @@
 // desktop.exe 唯一主窗口；页面只通过属性与回调接触 Rust。
 
-import { Theme, UiGroupRow, UiMemberRow, UiNodeRow, UiTaskRow } from "theme.slint";
+import { Theme, UiFileFaultRow, UiGroupRow, UiMemberRow, UiNodeRow, UiTaskRow } from "theme.slint";
 import { DeleteDialog } from "components/delete-dialog.slint";
 import { AppShell } from "layout/app-shell.slint";
 import { OverviewDashboard } from "pages/overview-dashboard.slint";
@@ -127,6 +127,14 @@ export component MainWindow inherits Window {
     in-out property <int> node-config-logical-cpus;
     in-out property <int> node-config-effective-workers;
 
+    in-out property <int> file-fault-selected-node: 0;
+    in-out property <bool> file-fault-node-online: false;
+    in-out property <bool> file-fault-loading: false;
+    in-out property <[UiFileFaultRow]> file-fault-rows;
+    in-out property <string> file-fault-next-cursor;
+    in-out property <string> file-fault-error;
+    in-out property <string> disk-cleanup-summary: "尚无磁盘满清理记录";
+
     callback add-node(string, int);
     callback edit-node(int, string, int);
     callback remove-node(int);
@@ -152,6 +160,9 @@ export component MainWindow inherits Window {
     callback load-node-config();
     callback save-node-config-and-restart();
     callback node-config-edited();
+    callback select-file-fault-node(int);
+    callback load-file-faults(bool);
+    callback clear-file-fault(int);
     callback navigate-to(int);
 
     navigate-to(index) => {
@@ -270,10 +281,20 @@ export component MainWindow inherits Window {
                     node-worker-mode-index <=> root.node-config-worker-mode-index;
                     node-reserved-cores <=> root.node-config-reserved-cores; node-manual-workers <=> root.node-config-manual-workers;
                     node-logical-cpus: root.node-config-logical-cpus; node-effective-workers: root.node-config-effective-workers;
+                    file-fault-selected-node <=> root.file-fault-selected-node;
+                    file-fault-node-online: root.file-fault-node-online;
+                    file-fault-loading: root.file-fault-loading;
+                    file-fault-rows: root.file-fault-rows;
+                    file-fault-next-cursor: root.file-fault-next-cursor;
+                    file-fault-error: root.file-fault-error;
+                    disk-cleanup-summary: root.disk-cleanup-summary;
                     select-node(index) => { root.select-node-config(index); }
                     load-node => { root.load-node-config(); }
                     save-node => { root.save-node-config-and-restart(); }
                     node-edited => { root.node-config-edited(); }
+                    select-file-fault-node(index) => { root.select-file-fault-node(index); }
+                    load-file-faults(next-page) => { root.load-file-faults(next-page); }
+                    clear-file-fault(index) => { root.clear-file-fault(index); }
                     save-settings => { root.save-settings(); }
                 }
     }

@@ -1,7 +1,7 @@
 // 设置工作区仅消费 MainWindow 已有属性；未实现能力保持禁用且说明原因。
 
 import { AboutSlint, ComboBox, LineEdit, ScrollView, SpinBox } from "std-widgets.slint";
-import { Theme } from "../theme.slint";
+import { Theme, UiFileFaultRow } from "../theme.slint";
 import { ActionButton } from "../components/action-button.slint";
 import { SectionHeader } from "../components/section-header.slint";
 
@@ -156,10 +156,20 @@ export component SettingsWorkspace inherits Rectangle {
     in-out property <int> node-manual-workers;
     in property <int> node-logical-cpus;
     in property <int> node-effective-workers;
+    in-out property <int> file-fault-selected-node: 0;
+    in property <bool> file-fault-node-online;
+    in property <bool> file-fault-loading;
+    in property <[UiFileFaultRow]> file-fault-rows;
+    in property <string> file-fault-next-cursor;
+    in property <string> file-fault-error;
+    in property <string> disk-cleanup-summary;
     callback select-node(int);
     callback load-node();
     callback save-node();
     callback node-edited();
+    callback select-file-fault-node(int);
+    callback load-file-faults(bool);
+    callback clear-file-fault(int);
     callback save-settings();
     property <bool> node-form-enabled: root.node-online && root.node-loaded && !root.node-saving;
     background: transparent;
@@ -503,14 +513,54 @@ export component SettingsWorkspace inherits Rectangle {
                             }
                         }
                         ValueRow { label: "最后错误"; value: root.last-error; }
+                        ComboBox {
+                            height: Theme.control-height;
+                            vertical-stretch: 0;
+                            model: root.node-options;
+                            current-index <=> root.file-fault-selected-node;
+                            accessible-label: "故障节点选择";
+                            selected(_) => { root.select-file-fault-node(self.current-index); }
+                        }
                         Rectangle {
                             height: Theme.control-height; vertical-stretch: 0;
                             accessible-role: AccessibleRole.groupbox; accessible-label: "诊断动作栏";
                             HorizontalLayout { spacing: 8px;
-                                ActionButton { horizontal-stretch: 1; label: "日志筛选（当前版本未提供）"; icon: @image-url("../assets/icons/settings.png"); action-enabled: false; }
-                                ActionButton { horizontal-stretch: 1; label: "日志导出（当前版本未提供）"; icon: @image-url("../assets/icons/save.png"); action-enabled: false; }
-                                ActionButton { horizontal-stretch: 1; label: "日志清空（当前版本未提供）"; icon: @image-url("../assets/icons/settings.png"); action-enabled: false; }
-                                ActionButton { horizontal-stretch: 1; label: "环境版本（当前版本未提供）"; icon: @image-url("../assets/icons/info.png"); action-enabled: false; }
+                                ActionButton { horizontal-stretch: 1; label: "加载文件故障"; icon: @image-url("../assets/icons/refresh.png"); action-enabled: root.file-fault-node-online && !root.file-fault-loading; clicked => { root.load-file-faults(false); } }
+                                ActionButton { horizontal-stretch: 1; label: "加载下一页"; icon: @image-url("../assets/icons/refresh.png"); action-enabled: root.file-fault-node-online && !root.file-fault-loading && root.file-fault-next-cursor != ""; clicked => { root.load-file-faults(true); } }
+                            }
+                        }
+                        Text {
+                            text: root.disk-cleanup-summary;
+                            height: 20px; vertical-stretch: 0; color: Theme.muted; font-size: 11px; overflow: elide;
+                            accessible-label: root.disk-cleanup-summary;
+                        }
+                        Text {
+                            visible: root.file-fault-error != "";
+                            text: root.file-fault-error;
+                            height: 20px; vertical-stretch: 0; color: Theme.danger; font-size: 11px; overflow: elide;
+                            accessible-label: "文件故障错误：" + root.file-fault-error;
+                        }
+                        for fault[index] in root.file-fault-rows : fault-row := Rectangle {
+                            height: 118px; vertical-stretch: 0; border-radius: 6px; border-width: 1px; border-color: Theme.border; background: Theme.window;
+                            accessible-role: AccessibleRole.groupbox;
+                            accessible-label: "故障：" + fault.fault-kind-text + "：" + fault.display-path;
+                            VerticalLayout {
+                                padding: 10px; spacing: 3px;
+                                HorizontalLayout {
+                                    height: 30px; vertical-stretch: 0; spacing: 8px;
+                                    Text { text: fault.fault-kind-text; color: fault.fault-kind == 1 ? Theme.warning : Theme.danger; font-size: 12px; font-weight: 650; vertical-alignment: center; }
+                                    Text { horizontal-stretch: 1; text: fault.display-path; color: Theme.text; font-size: 12px; overflow: elide; vertical-alignment: center; }
+                                    ActionButton {
+                                        min-width: 260px;
+                                        label: "清除故障：" + fault.normalized-path + "：" + fault.fault-kind-text;
+                                        icon: @image-url("../assets/icons/settings.png");
+                                        action-enabled: root.file-fault-node-online && !root.file-fault-loading;
+                                        clicked => { root.clear-file-fault(index); }
+                                    }
+                                }
+                                Text { text: "机器 " + fault.machine-id + " · 大小 " + fault.file-size + " · 阶段 " + fault.stage + " · 错误码 " + fault.error-code; color: Theme.muted; font-size: 11px; overflow: elide; }
+                                Text { text: "规范路径 " + fault.normalized-path; color: Theme.muted; font-size: 11px; overflow: elide; }
+                                Text { text: fault.message; color: Theme.text; font-size: 11px; overflow: elide; }
                             }
                         }
                     }

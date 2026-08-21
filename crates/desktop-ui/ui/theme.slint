@@ -24,6 +24,18 @@ export struct UiTaskRow {
     counts: string,
 }
 
+export struct UiFileFaultRow {
+    machine-id: string,
+    normalized-path: string,
+    display-path: string,
+    file-size: string,
+    fault-kind: int,
+    fault-kind-text: string,
+    stage: string,
+    error-code: string,
+    message: string,
+}
+
 export struct UiGroupRow {
     id: string,
     kind: string,

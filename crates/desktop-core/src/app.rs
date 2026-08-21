@@ -38,8 +38,9 @@ use crate::{
         SyncTriggerSender, sync_trigger_channel,
     },
     view_state::{
-        DesktopPaths, DesktopViewState, NodeConfigControllerState, NodeConfigSavePhase,
-        NodeConnectionState, NodeRuntimeStats, PostgresHealth, TaskView, ViewTaskState,
+        DesktopPaths, DesktopViewState, DiskFullCleanupSummaryView, FileFaultDiagnosticsState,
+        FileFaultView, NodeConfigControllerState, NodeConfigSavePhase, NodeConnectionState,
+        NodeRuntimeStats, PostgresHealth, TaskView, ViewTaskState,
     },
 };
 
@@ -185,6 +186,24 @@ pub enum UiCommand {
         /// 设置页提交的完整 wire 配置值。
         config: proto::NodeConfigValue,
     },
+    /// 分页加载指定在线节点的文件故障。
+    LoadFileFaults {
+        /// 手工节点索引。
+        node_index: usize,
+        /// 空字符串表示第一页。
+        cursor: String,
+    },
+    /// 精确清除一条 `(机器,规范路径,类别)` 文件故障。
+    ClearFileFault {
+        /// 手工节点索引。
+        node_index: usize,
+        /// 物理机器 ID。
+        machine_id: String,
+        /// 规范路径。
+        normalized_path: String,
+        /// 稳定小写故障类别。
+        fault_kind: String,
+    },
     /// 保存完整配置；校验失败保持旧配置。
     SaveSettings(DesktopConfig),
     /// 有序结束后台控制循环。
@@ -207,6 +226,8 @@ pub enum UiEvent {
     ViewChanged(Box<DesktopViewState>),
     /// 远程 Node 配置表单或保存阶段已经改变。
     NodeConfigChanged(NodeConfigControllerState),
+    /// 文件故障分页、选择和最近清理摘要已改变。
+    FileFaultsChanged(FileFaultDiagnosticsState),
     /// 返回一页路径浏览结果。
     PathsChanged {
         /// 结果所属节点。
@@ -726,6 +747,29 @@ async fn run_controller(
                     }
                 }
             }
+            UiCommand::LoadFileFaults { node_index, cursor } => {
+                if state.file_faults().selected_node_index != Some(node_index) {
+                    state.select_file_fault_node(node_index);
+                }
+                load_file_faults(node_index, &cursor, &mut state, &sessions, &events).await
+            }
+            UiCommand::ClearFileFault {
+                node_index,
+                machine_id,
+                normalized_path,
+                fault_kind,
+            } => {
+                clear_file_fault(
+                    node_index,
+                    &machine_id,
+                    &normalized_path,
+                    &fault_kind,
+                    &mut state,
+                    &sessions,
+                    &events,
+                )
+                .await
+            }
             UiCommand::SaveSettings(config) => {
                 let result = if state.node_config().is_in_progress() {
                     Err(node_config_target_change_error())
@@ -1209,6 +1253,109 @@ async fn load_node_config(
     state.set_node_config_snapshot(node_index, endpoint, machine_id, snapshot);
     publish_node_config(events, state).await;
     Ok(())
+}
+
+async fn load_file_faults(
+    node_index: usize,
+    cursor: &str,
+    state: &mut DesktopViewState,
+    sessions: &BTreeMap<usize, Arc<NodeSession>>,
+    events: &mpsc::Sender<UiEvent>,
+) -> Result<(), String> {
+    let session = sessions
+        .get(&node_index)
+        .ok_or_else(|| format!("节点 {node_index} 未连接，无法加载文件故障"))?;
+    let mut loading = state.file_faults().clone();
+    loading.selected_node_index = Some(node_index);
+    loading.loading = true;
+    loading.error = None;
+    state.set_file_faults(loading.clone());
+    let _ = events.send(UiEvent::FileFaultsChanged(loading)).await;
+    let page = match session.list_file_faults(cursor, 100).await {
+        Ok(page) => page,
+        Err(error) => {
+            let message = error.to_string();
+            let mut failed = state.file_faults().clone();
+            failed.loading = false;
+            failed.error = Some(message.clone());
+            state.set_file_faults(failed.clone());
+            let _ = events.send(UiEvent::FileFaultsChanged(failed)).await;
+            return Err(message);
+        }
+    };
+    let mut rows = if cursor.is_empty() {
+        Vec::new()
+    } else {
+        state.file_faults().rows.clone()
+    };
+    for fault in page.faults {
+        let kind = proto::FileFaultKind::try_from(fault.fault_kind)
+            .map_err(|_| "节点返回未知文件故障类别".to_owned())?;
+        if kind == proto::FileFaultKind::Unspecified {
+            return Err("节点返回空文件故障类别".into());
+        }
+        rows.push(FileFaultView {
+            machine_id: fault.machine_id,
+            normalized_path: fault.normalized_path,
+            display_path: fault.display_path,
+            file_size: fault.file_size,
+            fault_kind: file_fault_kind_name(kind).into(),
+            stage: fault.stage,
+            error_code: fault.error_code,
+            message: fault.message,
+        });
+    }
+    let diagnostics = FileFaultDiagnosticsState {
+        selected_node_index: Some(node_index),
+        rows,
+        next_cursor: page.next_cursor,
+        cleanup_summary: page.cleanup_summary.map(|summary| DiskFullCleanupSummaryView {
+            triggered_at_unix_ms: summary.triggered_at_unix_ms,
+            deleted_files: summary.deleted_files,
+            deleted_bytes: summary.deleted_bytes,
+            skipped_active: summary.skipped_active,
+            skipped_other_disk: summary.skipped_other_disk,
+            failed_files: summary.failed_files,
+        }),
+        loading: false,
+        error: None,
+    };
+    state.set_file_faults(diagnostics.clone());
+    let _ = events.send(UiEvent::FileFaultsChanged(diagnostics)).await;
+    Ok(())
+}
+
+async fn clear_file_fault(
+    node_index: usize,
+    machine_id: &str,
+    normalized_path: &str,
+    fault_kind: &str,
+    state: &mut DesktopViewState,
+    sessions: &BTreeMap<usize, Arc<NodeSession>>,
+    events: &mpsc::Sender<UiEvent>,
+) -> Result<(), String> {
+    let session = sessions
+        .get(&node_index)
+        .ok_or_else(|| format!("节点 {node_index} 未连接，无法清除文件故障"))?;
+    let kind = match fault_kind {
+        "suspected_physical_read" => proto::FileFaultKind::SuspectedPhysicalRead,
+        "worker_crash" => proto::FileFaultKind::WorkerCrash,
+        _ => return Err("文件故障类别无效".into()),
+    };
+    session
+        .clear_file_fault(machine_id, normalized_path, kind)
+        .await
+        .map_err(|error| error.to_string())?;
+    state.select_file_fault_node(node_index);
+    load_file_faults(node_index, "", state, sessions, events).await
+}
+
+const fn file_fault_kind_name(kind: proto::FileFaultKind) -> &'static str {
+    match kind {
+        proto::FileFaultKind::SuspectedPhysicalRead => "suspected_physical_read",
+        proto::FileFaultKind::WorkerCrash => "worker_crash",
+        proto::FileFaultKind::Unspecified => "",
+    }
 }
 
 async fn save_node_config_and_restart(

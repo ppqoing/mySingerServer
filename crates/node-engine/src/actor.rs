@@ -11,11 +11,12 @@ use std::{
 
 use dedup_core::{
     AnalysisRunId, ContentKey, CoreError, DeleteMode, DiskReadConfig, DisplayPath, EnumeratorKind,
-    LocationKey, MachineId, NodeConfig, TaskId, Thresholds,
+    LocationKey, MachineId, NodeConfig, NormalizedPath, TaskId, Thresholds,
 };
 use dedup_node_store::{
-    AnalysisStatus, ConfirmedDeleteItem, DeleteBatchPlan, DeleteOutcome, GroupKind, NodeStore,
-    OwnedSnapshot, PlannedDeleteItem, ReviewDecision, StoreError, TaskSnapshot, TaskStatus,
+    AnalysisStatus, ConfirmedDeleteItem, DeleteBatchPlan, DeleteOutcome, FileFaultKind, GroupKind,
+    NodeStore, OwnedSnapshot, PlannedDeleteItem, ReviewDecision, StoreError, TaskSnapshot,
+    TaskStatus,
 };
 use dedup_protocol::proto;
 use thiserror::Error;
@@ -705,6 +706,12 @@ impl EngineState {
             Some(proto::envelope::Payload::SaveNodeConfigAndRestart(save)) => {
                 self.save_node_config_and_restart(request_id, save)
             }
+            Some(proto::envelope::Payload::ListFileFaults(query)) => {
+                self.list_file_faults(query)
+            }
+            Some(proto::envelope::Payload::ClearFileFault(clear)) => {
+                self.clear_file_fault(clear)
+            }
             Some(proto::envelope::Payload::CreateDeleteBatch(create)) => {
                 self.create_delete_batch(create)
             }
@@ -747,6 +754,70 @@ impl EngineState {
                 config: Some(config),
                 logical_cpu_count: u32::try_from(logical_cpu_count).unwrap_or(u32::MAX),
                 effective_worker_count: u32::try_from(effective_worker_count).unwrap_or(u32::MAX),
+            },
+        ))
+    }
+
+    fn list_file_faults(&self, query: proto::ListFileFaults) -> ProtocolResult {
+        let limit = usize::try_from(query.limit).map_err(invalid)?;
+        let page = self
+            .store
+            .page_file_faults((!query.cursor.is_empty()).then_some(query.cursor.as_str()), limit)
+            .map_err(store_error)?;
+        let faults = page
+            .items
+            .into_iter()
+            .map(|fault| proto::FileFault {
+                machine_id: fault.machine_id.as_str().to_owned(),
+                normalized_path: fault.normalized_path.as_str().to_owned(),
+                display_path: fault.display_path.as_path().to_string_lossy().into_owned(),
+                file_size: fault.file_size,
+                fault_kind: wire_file_fault_kind(fault.kind) as i32,
+                stage: fault.stage,
+                error_code: fault.windows_error_code,
+                message: fault.message,
+            })
+            .collect();
+        let cleanup_summary = self.disk_full_cleaner.recent_summary().map(|summary| {
+            proto::DiskFullCleanupSummary {
+                triggered_at_unix_ms: summary.triggered_at_unix_ms,
+                deleted_files: summary.deleted_files.try_into().unwrap_or(u64::MAX),
+                deleted_bytes: summary.deleted_bytes,
+                skipped_active: summary.skipped_active.try_into().unwrap_or(u64::MAX),
+                skipped_other_disk: summary
+                    .skipped_other_disk
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+                failed_files: summary.failed_files.try_into().unwrap_or(u64::MAX),
+            }
+        });
+        Ok(proto::envelope::Payload::ListFileFaults(
+            proto::ListFileFaults {
+                cursor: query.cursor,
+                limit: query.limit,
+                faults,
+                next_cursor: page.next_cursor.unwrap_or_default(),
+                cleanup_summary,
+            },
+        ))
+    }
+
+    fn clear_file_fault(&mut self, request: proto::ClearFileFault) -> ProtocolResult {
+        let machine_id = MachineId::parse(&request.machine_id).map_err(invalid)?;
+        let normalized_path = NormalizedPath::new(&request.normalized_path).map_err(invalid)?;
+        let wire_kind = proto::FileFaultKind::try_from(request.fault_kind)
+            .map_err(|_| invalid("未知文件故障类别"))?;
+        let kind = store_file_fault_kind(wire_kind)?;
+        let cleared = self
+            .store
+            .clear_file_fault_kind(&machine_id, &normalized_path, kind)
+            .map_err(store_error)?;
+        Ok(proto::envelope::Payload::ClearFileFault(
+            proto::ClearFileFault {
+                machine_id: request.machine_id,
+                normalized_path: request.normalized_path,
+                fault_kind: request.fault_kind,
+                cleared: cleared.try_into().unwrap_or(u32::MAX),
             },
         ))
     }
@@ -1721,6 +1792,23 @@ const fn wire_media_kind(kind: dedup_core::MediaKind) -> proto::MediaKind {
         dedup_core::MediaKind::Image => proto::MediaKind::MediaImage,
         dedup_core::MediaKind::Video => proto::MediaKind::MediaVideo,
         dedup_core::MediaKind::Other => proto::MediaKind::MediaOther,
+    }
+}
+
+const fn wire_file_fault_kind(kind: FileFaultKind) -> proto::FileFaultKind {
+    match kind {
+        FileFaultKind::SuspectedPhysicalRead => proto::FileFaultKind::SuspectedPhysicalRead,
+        FileFaultKind::WorkerCrash => proto::FileFaultKind::WorkerCrash,
+    }
+}
+
+fn store_file_fault_kind(
+    kind: proto::FileFaultKind,
+) -> Result<FileFaultKind, (proto::ErrorCode, String)> {
+    match kind {
+        proto::FileFaultKind::SuspectedPhysicalRead => Ok(FileFaultKind::SuspectedPhysicalRead),
+        proto::FileFaultKind::WorkerCrash => Ok(FileFaultKind::WorkerCrash),
+        proto::FileFaultKind::Unspecified => Err(invalid("文件故障类别不能为空")),
     }
 }
 

@@ -369,6 +369,47 @@ message NodeRestartAccepted {
   string saved_version_sha256 = 2;
 }
 
+enum FileFaultKind {
+  FILE_FAULT_KIND_UNSPECIFIED = 0;
+  FILE_FAULT_KIND_SUSPECTED_PHYSICAL_READ = 1;
+  FILE_FAULT_KIND_WORKER_CRASH = 2;
+}
+
+message FileFault {
+  string machine_id = 1;
+  string normalized_path = 2;
+  string display_path = 3;
+  uint64 file_size = 4;
+  FileFaultKind fault_kind = 5;
+  string stage = 6;
+  optional int32 error_code = 7;
+  string message = 8;
+}
+
+message DiskFullCleanupSummary {
+  uint64 triggered_at_unix_ms = 1;
+  uint64 deleted_files = 2;
+  uint64 deleted_bytes = 3;
+  uint64 skipped_active = 4;
+  uint64 skipped_other_disk = 5;
+  uint64 failed_files = 6;
+}
+
+message ListFileFaults {
+  string cursor = 1;
+  uint32 limit = 2;
+  repeated FileFault faults = 3;
+  string next_cursor = 4;
+  DiskFullCleanupSummary cleanup_summary = 5;
+}
+
+message ClearFileFault {
+  string machine_id = 1;
+  string normalized_path = 2;
+  FileFaultKind fault_kind = 3;
+  uint32 cleared = 4;
+}
+
 message Envelope {
   uint64 request_id = 1;
   oneof payload {
@@ -403,6 +444,8 @@ message Envelope {
     NodeConfigSnapshot node_config_snapshot = 38;
     SaveNodeConfigAndRestart save_node_config_and_restart = 39;
     NodeRestartAccepted node_restart_accepted = 40;
+    ListFileFaults list_file_faults = 41;
+    ClearFileFault clear_file_fault = 42;
   }
 }
 

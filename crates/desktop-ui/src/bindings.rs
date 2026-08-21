@@ -10,12 +10,14 @@ use dedup_desktop_core::{
     app::{UiCommand, UiEvent},
     results::GroupKind,
     review::{QuickReviewRule, ReviewDecision},
-    view_state::{NodeConnectionState, ViewTaskState},
+    view_state::{FileFaultDiagnosticsState, NodeConnectionState, ViewTaskState},
 };
-use slint::{ComponentHandle, Image, Rgba8Pixel, SharedPixelBuffer, SharedString};
+use slint::{
+    ComponentHandle, Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, VecModel,
+};
 use tokio::sync::mpsc;
 
-use crate::{MainWindow, models};
+use crate::{MainWindow, UiFileFaultRow, models};
 
 /// GUI 回调与事件应用共享的最新已验证配置。
 ///
@@ -155,6 +157,7 @@ pub fn bind_commands(
         &binding.node_config,
         &binding.selected_node,
     );
+    bind_file_faults(window, &sender);
 
     let save_sender = sender;
     let save_window = window.as_weak();
@@ -285,6 +288,79 @@ fn bind_node_config(
     });
 }
 
+fn bind_file_faults(window: &MainWindow, sender: &mpsc::Sender<UiCommand>) {
+    let select_window = window.as_weak();
+    window.on_select_file_fault_node(move |index| {
+        let Some(window) = select_window.upgrade() else {
+            return;
+        };
+        let index = index.max(0);
+        window.set_file_fault_selected_node(index);
+        window.set_file_fault_node_online(selected_node_online(&window, index));
+        window.set_file_fault_rows(ModelRc::new(VecModel::from(
+            Vec::<UiFileFaultRow>::new(),
+        )));
+        window.set_file_fault_next_cursor(SharedString::default());
+        window.set_file_fault_error(SharedString::default());
+        window.set_disk_cleanup_summary("尚无磁盘满清理记录".into());
+    });
+
+    let load_sender = sender.clone();
+    let load_window = window.as_weak();
+    window.on_load_file_faults(move |next_page| {
+        let Some(window) = load_window.upgrade() else {
+            return;
+        };
+        if !window.get_file_fault_node_online() || window.get_file_fault_loading() {
+            return;
+        }
+        send(
+            &load_sender,
+            UiCommand::LoadFileFaults {
+                node_index: window.get_file_fault_selected_node().max(0) as usize,
+                cursor: if next_page {
+                    window.get_file_fault_next_cursor().to_string()
+                } else {
+                    String::new()
+                },
+            },
+            &window.as_weak(),
+        );
+    });
+
+    let clear_sender = sender.clone();
+    let clear_window = window.as_weak();
+    window.on_clear_file_fault(move |index| {
+        let Some(window) = clear_window.upgrade() else {
+            return;
+        };
+        if !window.get_file_fault_node_online() || window.get_file_fault_loading() {
+            return;
+        }
+        let Some(row) = window
+            .get_file_fault_rows()
+            .row_data(index.max(0) as usize)
+        else {
+            return;
+        };
+        let fault_kind = match row.fault_kind {
+            1 => "suspected_physical_read",
+            2 => "worker_crash",
+            _ => return,
+        };
+        send(
+            &clear_sender,
+            UiCommand::ClearFileFault {
+                node_index: window.get_file_fault_selected_node().max(0) as usize,
+                machine_id: row.machine_id.to_string(),
+                normalized_path: row.normalized_path.to_string(),
+                fault_kind: fault_kind.into(),
+            },
+            &window.as_weak(),
+        );
+    });
+}
+
 fn update_node_config_selection(
     window: &MainWindow,
     index: i32,
@@ -351,6 +427,58 @@ fn clear_node_config_form(window: &MainWindow) {
 fn clear_node_config_context(window: &MainWindow, loaded: &Arc<Mutex<Option<LoadedNodeConfig>>>) {
     clear_node_config_form(window);
     *loaded.lock().expect("Node 配置锁未中毒") = None;
+}
+
+fn apply_file_fault_state(window: &MainWindow, state: &FileFaultDiagnosticsState) {
+    if let Some(index) = state.selected_node_index {
+        window.set_file_fault_selected_node(index as i32);
+        window.set_file_fault_node_online(selected_node_online(window, index as i32));
+    }
+    let rows = state
+        .rows
+        .iter()
+        .filter_map(|fault| {
+            let (fault_kind, fault_kind_text) = match fault.fault_kind.as_str() {
+                "suspected_physical_read" => (1, "疑似物理读取故障"),
+                "worker_crash" => (2, "Worker 崩溃"),
+                _ => return None,
+            };
+            Some(UiFileFaultRow {
+                machine_id: fault.machine_id.clone().into(),
+                normalized_path: fault.normalized_path.clone().into(),
+                display_path: fault.display_path.clone().into(),
+                file_size: models::bytes(fault.file_size).into(),
+                fault_kind,
+                fault_kind_text: fault_kind_text.into(),
+                stage: fault.stage.clone().into(),
+                error_code: fault
+                    .error_code
+                    .map_or_else(|| "—".into(), |code| code.to_string().into()),
+                message: fault.message.clone().into(),
+            })
+        })
+        .collect::<Vec<_>>();
+    window.set_file_fault_rows(ModelRc::new(VecModel::from(rows)));
+    window.set_file_fault_next_cursor(state.next_cursor.clone().into());
+    window.set_file_fault_loading(state.loading);
+    window.set_file_fault_error(state.error.clone().unwrap_or_default().into());
+    window.set_disk_cleanup_summary(
+        state.cleanup_summary.as_ref().map_or_else(
+            || "尚无磁盘满清理记录".to_owned(),
+            |summary| {
+                format!(
+                    "最近磁盘满清理：触发 {} ms · 删除 {} 个 / {} · 活动跳过 {} · 异盘跳过 {} · 失败 {}",
+                    summary.triggered_at_unix_ms,
+                    summary.deleted_files,
+                    models::bytes(summary.deleted_bytes),
+                    summary.skipped_active,
+                    summary.skipped_other_disk,
+                    summary.failed_files,
+                )
+            },
+        )
+        .into(),
+    );
 }
 
 fn node_config_from_window(window: &MainWindow) -> Result<NodeConfig, String> {
@@ -461,6 +589,21 @@ pub fn apply_event(window: &MainWindow, binding: &UiBinding, event: UiEvent) {
             if update_node_config_selection(window, selected as i32, &binding.selected_node) {
                 clear_node_config_context(window, &binding.node_config);
             }
+            let file_fault_selected = state
+                .file_faults()
+                .selected_node_index
+                .unwrap_or_else(|| window.get_file_fault_selected_node().max(0) as usize);
+            window.set_file_fault_selected_node(file_fault_selected as i32);
+            window.set_file_fault_node_online(
+                state
+                    .nodes()
+                    .get(file_fault_selected)
+                    .is_some_and(|node| {
+                        node.connection == NodeConnectionState::Online
+                            && node.machine_id.is_some()
+                    }),
+            );
+            apply_file_fault_state(window, state.file_faults());
             let sync = state
                 .nodes()
                 .iter()
@@ -509,6 +652,7 @@ pub fn apply_event(window: &MainWindow, binding: &UiBinding, event: UiEvent) {
                 .into(),
             );
         }
+        UiEvent::FileFaultsChanged(state) => apply_file_fault_state(window, &state),
         UiEvent::AnalysisStarted {
             central,
             run_id,

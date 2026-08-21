@@ -176,6 +176,54 @@ impl NodeSession {
         }
     }
 
+    /// 分页读取节点持久文件故障和进程内最近磁盘满清理摘要。
+    pub async fn list_file_faults(
+        &self,
+        cursor: &str,
+        limit: u32,
+    ) -> Result<proto::ListFileFaults, SessionError> {
+        let response = self
+            .connection
+            .request(proto::envelope::Payload::ListFileFaults(
+                proto::ListFileFaults {
+                    cursor: cursor.into(),
+                    limit,
+                    faults: Vec::new(),
+                    next_cursor: String::new(),
+                    cleanup_summary: None,
+                },
+            ))
+            .await?;
+        match payload_or_error(response)? {
+            proto::envelope::Payload::ListFileFaults(page) => Ok(page),
+            _ => Err(SessionError::UnexpectedResponse("ListFileFaults")),
+        }
+    }
+
+    /// 按机器、规范路径和类别精确清除一条文件故障。
+    pub async fn clear_file_fault(
+        &self,
+        machine_id: &str,
+        normalized_path: &str,
+        fault_kind: proto::FileFaultKind,
+    ) -> Result<u32, SessionError> {
+        let response = self
+            .connection
+            .request(proto::envelope::Payload::ClearFileFault(
+                proto::ClearFileFault {
+                    machine_id: machine_id.into(),
+                    normalized_path: normalized_path.into(),
+                    fault_kind: fault_kind as i32,
+                    cleared: 0,
+                },
+            ))
+            .await?;
+        match payload_or_error(response)? {
+            proto::envelope::Payload::ClearFileFault(result) => Ok(result.cleared),
+            _ => Err(SessionError::UnexpectedResponse("ClearFileFault")),
+        }
+    }
+
     /// 在节点创建一个持久扫描任务；媒体计算由节点唯一 WorkerPool 执行。
     pub async fn create_scan(
         &self,

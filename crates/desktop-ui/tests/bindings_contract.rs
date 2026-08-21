@@ -14,6 +14,107 @@ fn next(receiver: &mut mpsc::Receiver<UiCommand>) -> UiCommand {
 }
 
 #[test]
+fn file_faults_callbacks_page_and_clear_the_selected_online_node_only() {
+    i_slint_backend_testing::init_no_event_loop();
+    let accessible = |window: &MainWindow, label: &str| {
+        i_slint_backend_testing::ElementHandle::find_by_accessible_label(window, label)
+            .next()
+            .unwrap_or_else(|| panic!("应找到可访问元素：{label}"))
+    };
+
+    let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    let (sender, mut receiver) = mpsc::channel(16);
+    let binding = bind_commands(&window, sender, DesktopConfig::default());
+    let mut state = dedup_desktop_core::view_state::DesktopViewState::new(
+        DesktopConfig::default(),
+        dedup_desktop_core::view_state::DesktopPaths {
+            data: std::path::PathBuf::from(r"C:\fixture\desktop"),
+            logs: std::path::PathBuf::from(r"C:\fixture\desktop\logs"),
+            cache: std::path::PathBuf::from(r"C:\fixture\desktop\cache"),
+            config: std::path::PathBuf::from(r"C:\fixture\desktop\config.toml"),
+        },
+    );
+    state.set_node_identity(0, "machine-online");
+    state.set_node_connection(
+        0,
+        dedup_desktop_core::view_state::NodeConnectionState::Online,
+        None,
+    );
+    let offline = state.add_node("10.0.0.9", 39091).unwrap();
+    state.set_node_identity(offline, "machine-offline");
+    apply_event(&window, &binding, UiEvent::ViewChanged(Box::new(state)));
+    window.invoke_navigate_to(6);
+    accessible(&window, "日志与诊断").invoke_accessible_default_action();
+    accessible(&window, "诊断内容滚动区").scroll(0.0, -10000.0);
+    slint::platform::update_timers_and_animations();
+
+    window.invoke_select_file_fault_node(0);
+    accessible(&window, "加载文件故障").invoke_accessible_default_action();
+    assert!(matches!(
+        next(&mut receiver),
+        UiCommand::LoadFileFaults { node_index: 0, ref cursor } if cursor.is_empty()
+    ));
+
+    apply_event(
+        &window,
+        &binding,
+        UiEvent::FileFaultsChanged(
+            dedup_desktop_core::view_state::FileFaultDiagnosticsState {
+                selected_node_index: Some(0),
+                rows: vec![dedup_desktop_core::view_state::FileFaultView {
+                    machine_id: "machine-online".into(),
+                    normalized_path: r"d:\media\broken.mp4".into(),
+                    display_path: r"D:\Media\broken.mp4".into(),
+                    file_size: 4096,
+                    fault_kind: "suspected_physical_read".into(),
+                    stage: "read".into(),
+                    error_code: Some(23),
+                    message: "读取块重试耗尽".into(),
+                }],
+                next_cursor: "next-page".into(),
+                cleanup_summary: Some(
+                    dedup_desktop_core::view_state::DiskFullCleanupSummaryView {
+                        triggered_at_unix_ms: 1234,
+                        deleted_files: 3,
+                        deleted_bytes: 8192,
+                        skipped_active: 1,
+                        skipped_other_disk: 2,
+                        failed_files: 0,
+                    },
+                ),
+                loading: false,
+                error: None,
+            },
+        ),
+    );
+    assert_eq!(slint::Model::row_count(&window.get_file_fault_rows()), 1);
+    accessible(&window, "加载下一页").invoke_accessible_default_action();
+    assert!(matches!(
+        next(&mut receiver),
+        UiCommand::LoadFileFaults { node_index: 0, ref cursor } if cursor == "next-page"
+    ));
+    window.invoke_clear_file_fault(0);
+    assert!(matches!(
+        next(&mut receiver),
+        UiCommand::ClearFileFault {
+            node_index: 0,
+            ref machine_id,
+            ref normalized_path,
+            ref fault_kind,
+        } if machine_id == "machine-online"
+            && normalized_path == r"d:\media\broken.mp4"
+            && fault_kind == "suspected_physical_read"
+    ));
+
+    window.invoke_select_file_fault_node(1);
+    assert_eq!(slint::Model::row_count(&window.get_file_fault_rows()), 0);
+    assert_eq!(window.get_file_fault_next_cursor(), "");
+    window.invoke_load_file_faults(false);
+    window.invoke_clear_file_fault(0);
+    assert!(receiver.try_recv().is_err(), "离线节点诊断动作不得发送命令");
+}
+
+#[test]
 fn root_callbacks_emit_their_ui_commands_and_reject_invalid_settings() {
     i_slint_backend_testing::init_no_event_loop();
 

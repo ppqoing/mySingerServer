@@ -101,6 +101,23 @@ impl NodeStore {
         )?)
     }
 
+    /// 在一个事务内按机器、规范路径和类别精确清除一条故障身份。
+    pub fn clear_file_fault_kind(
+        &mut self,
+        machine_id: &MachineId,
+        normalized_path: &NormalizedPath,
+        kind: FileFaultKind,
+    ) -> Result<usize, StoreError> {
+        let transaction = self.connection.transaction()?;
+        let cleared = transaction.execute(
+            "DELETE FROM file_faults
+             WHERE machine_id=?1 AND normalized_path=?2 AND fault_kind=?3",
+            params![machine_id.as_str(), normalized_path.as_str(), kind.as_str()],
+        )?;
+        transaction.commit()?;
+        Ok(cleared)
+    }
+
     /// 按机器、规范路径和故障类别稳定分页。
     pub fn page_file_faults(
         &self,
