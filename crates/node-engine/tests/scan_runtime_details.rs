@@ -9,12 +9,12 @@ use dedup_node_engine::{
     },
     scan::{
         FileEnumerator, PipelineFileReader, PipelineLimits, ReadProduct, ScanEngine, ScanError,
-        ScanOptions, ScheduledFileReader, Stage1Processor, Stage1Request, SystemMd5,
+        ScanOptions, ScheduledFileReader, Stage1Processor, Stage1Request, SystemMd5, begin_scan_task,
         WorkerPoolStage1Processor, md5_bytes,
     },
     worker::{Stage1Output, WorkerPool},
 };
-use dedup_node_store::{NodeStore, ScannedPath};
+use dedup_node_store::{NodeStore, ScannedPath, TaskStatus};
 use dedup_windows::{LocalDiskKind, ReadCancellationToken};
 
 #[derive(Clone, Default)]
@@ -65,6 +65,34 @@ struct FailingRows;
 impl FileEnumerator for FailingRows {
     fn enumerate(&self, _: &[DisplayPath]) -> Result<Vec<ScannedPath>, ScanError> {
         Err(ScanError::Stage1("controlled enumeration failure".into()))
+    }
+}
+
+#[derive(Clone)]
+struct CancelAfterTopCheck {
+    state: Arc<(Mutex<(bool, bool)>, Condvar)>,
+    cancellation: ReadCancellationToken,
+}
+impl CancelAfterTopCheck {
+    fn wait_entered(&self) {
+        let (lock, cv) = &*self.state;
+        let mut state = lock.lock().unwrap();
+        while !state.0 { state = cv.wait(state).unwrap(); }
+    }
+    fn release(&self) {
+        let (lock, cv) = &*self.state;
+        lock.lock().unwrap().1 = true;
+        cv.notify_all();
+    }
+}
+impl FileEnumerator for CancelAfterTopCheck {
+    fn enumerate(&self, _: &[DisplayPath]) -> Result<Vec<ScannedPath>, ScanError> {
+        let (lock, cv) = &*self.state;
+        let mut state = lock.lock().unwrap();
+        state.0 = true;
+        cv.notify_all();
+        while !state.1 { state = cv.wait(state).unwrap(); }
+        if self.cancellation.is_cancelled() { Err(ScanError::Cancelled) } else { Ok(Vec::new()) }
     }
 }
 
@@ -425,4 +453,44 @@ async fn serial_processor_consumes_started_and_counts_only_matching_completions(
     let worker = registry.details(reporter.id()).await.unwrap().workers.remove(0);
     assert_eq!(worker.completed_files, 2);
     assert!(worker.speed_per_second > 0.0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn producer_cancel_after_main_top_check_never_turns_cancelled_task_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("node.db");
+    let machine = MachineId::from_sha256([0xa7; 32]);
+    let mut store = NodeStore::open(&database, machine.clone()).unwrap();
+    let root = DisplayPath::new(dir.path()).unwrap();
+    let options = ScanOptions::new(vec![root]);
+    let task_id = begin_scan_task(&mut store, &options, 1).unwrap();
+    let cancellation = ReadCancellationToken::new();
+    let enumerator = CancelAfterTopCheck {
+        state: Arc::new((Mutex::new((false, false)), Condvar::new())),
+        cancellation: cancellation.clone(),
+    };
+    let barrier = enumerator.clone();
+    let registry = RuntimeTaskRegistry::new();
+    let reporter = registry.begin(RuntimeTaskKind::Scan, machine.clone(), "取消竞态").await;
+    let run_reporter = reporter.clone();
+    let run_cancel = cancellation.clone();
+    let run = tokio::spawn(async move {
+        let mut engine = ScanEngine::new(enumerator, SystemMd5, dir.path().join("sheets"))
+            .with_runtime_reporter(run_reporter.clone());
+        let result = engine.run_existing_parallel_with(
+            &mut store, task_id, options, Reader(run_reporter.clone()),
+            &mut Processor(run_reporter), PipelineLimits::new(1, 1), run_cancel, 2,
+        ).await;
+        (store, result)
+    });
+    let wait = barrier.clone();
+    tokio::task::spawn_blocking(move || wait.wait_entered()).await.unwrap();
+    let mut control_store = NodeStore::open(&database, machine).unwrap();
+    control_store.cancel_task(task_id, 3).unwrap();
+    cancellation.cancel();
+    barrier.release();
+    let (store, result) = run.await.unwrap();
+    assert!(matches!(result, Err(ScanError::Cancelled)));
+    assert_eq!(store.task_snapshot(task_id).unwrap().status, TaskStatus::Cancelled);
+    assert_eq!(registry.details(reporter.id()).await.unwrap().summary.unwrap().state, "cancelled");
 }

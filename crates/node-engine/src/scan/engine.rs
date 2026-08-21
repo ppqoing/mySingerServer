@@ -667,6 +667,9 @@ where
                 drop(enumerated);
                 drain_parallel_reads(&mut reads).await;
                 let _ = join_enumeration(&mut enumeration_task).await;
+                if let Some(reporter) = &self.runtime_reporter {
+                    let _ = reporter.finish(crate::runtime_tasks::RuntimeTaskState::Cancelled).await;
+                }
                 return Err(ScanError::Cancelled);
             }
             while reads.len() < limits.max_read_tasks() {
@@ -698,6 +701,12 @@ where
                     Err(error) => {
                         cancellation.cancel();
                         drain_parallel_reads(&mut reads).await;
+                        if matches!(&error, ScanError::Cancelled) {
+                            if let Some(reporter) = &self.runtime_reporter {
+                                let _ = reporter.finish(crate::runtime_tasks::RuntimeTaskState::Cancelled).await;
+                            }
+                            return Err(ScanError::Cancelled);
+                        }
                         if let Some(reporter) = &self.runtime_reporter {
                             let _ = reporter.finish(crate::runtime_tasks::RuntimeTaskState::Failed).await;
                         }
@@ -732,6 +741,9 @@ where
                     drop(enumerated);
                     drain_parallel_reads(&mut reads).await;
                     let _ = join_enumeration(&mut enumeration_task).await;
+                    if let Some(reporter) = &self.runtime_reporter {
+                        let _ = reporter.finish(crate::runtime_tasks::RuntimeTaskState::Cancelled).await;
+                    }
                     return Err(ScanError::Cancelled);
                 }
                 result?;
@@ -758,6 +770,9 @@ where
                     drop(enumerated);
                     drain_parallel_reads(&mut reads).await;
                     let _ = join_enumeration(&mut enumeration_task).await;
+                    if let Some(reporter) = &self.runtime_reporter {
+                        let _ = reporter.finish(crate::runtime_tasks::RuntimeTaskState::Cancelled).await;
+                    }
                     return Err(ScanError::Cancelled);
                 }
                 result?;
@@ -788,6 +803,9 @@ where
                 drop(enumerated);
                 drain_parallel_reads(&mut reads).await;
                 let _ = join_enumeration(&mut enumeration_task).await;
+                if let Some(reporter) = &self.runtime_reporter {
+                    let _ = reporter.finish(crate::runtime_tasks::RuntimeTaskState::Cancelled).await;
+                }
                 return Err(ScanError::Cancelled);
             }
             step?;
@@ -804,10 +822,21 @@ where
             now_ms,
         )
         .await?;
-        join_enumeration(&mut enumeration_task).await?;
+        if let Err(error) = join_enumeration(&mut enumeration_task).await {
+            if matches!(&error, ScanError::Cancelled) {
+                if let Some(reporter) = &self.runtime_reporter {
+                    let _ = reporter.finish(crate::runtime_tasks::RuntimeTaskState::Cancelled).await;
+                }
+                return Err(ScanError::Cancelled);
+            }
+            return Err(error);
+        }
         if cancellation.is_cancelled()
             || store.task_snapshot(task_id)?.status == TaskStatus::Cancelled
         {
+            if let Some(reporter) = &self.runtime_reporter {
+                let _ = reporter.finish(crate::runtime_tasks::RuntimeTaskState::Cancelled).await;
+            }
             return Err(ScanError::Cancelled);
         }
         summary.outbox_high_seq = store.finalize_scan_task_from_items(task_id, now_ms)?;
