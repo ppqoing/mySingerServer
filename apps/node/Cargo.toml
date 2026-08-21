@@ -16,3 +16,4 @@ tracing-subscriber.workspace = true
 
 [build-dependencies]
 slint-build.workspace = true
+winresource = "=0.1.31"

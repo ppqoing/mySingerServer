@@ -31,7 +31,9 @@ use crate::{
         LocalAnalysisEngine, Stage2BatchItem, Stage2BatchPlan, WorkerPoolStage2Processor,
         begin_stage2_batch, run_stage2_batch,
     },
-    config_repository::{ConfigRepositoryError, LoadedNodeConfig, NodeConfigRepository},
+    config_repository::{
+        ConfigRepositoryError, LoadedNodeConfig, NodeConfigRepository, ResolvedNodePaths,
+    },
     delete::DeleteEngine,
     host_control::NodeHostControl,
     preview::{PreviewKind, PreviewService},
@@ -283,16 +285,60 @@ impl NodeRuntime {
     where
         I: IdentityProvider,
     {
+        let paths = ResolvedNodePaths {
+            data_path: layout.node_root().to_path_buf(),
+            config_path: layout.node_config(),
+            log_path: layout.node_logs(),
+            cache_path: layout.node_cache(),
+        };
+        Self::start_inner(layout, config, &paths, identity, None).await
+    }
+
+    /// 从仓库解析路径启动运行时，并注入应用入口拥有的替代进程宿主。
+    pub async fn start_with_host<I, H>(
+        layout: &AppLayout,
+        config: &NodeConfig,
+        paths: &ResolvedNodePaths,
+        identity: &I,
+        host_control: H,
+    ) -> Result<Self, RuntimeError>
+    where
+        I: IdentityProvider,
+        H: NodeHostControl + 'static,
+    {
+        Self::start_inner(
+            layout,
+            config,
+            paths,
+            identity,
+            Some(Box::new(host_control)),
+        )
+        .await
+    }
+
+    async fn start_inner<I>(
+        layout: &AppLayout,
+        config: &NodeConfig,
+        paths: &ResolvedNodePaths,
+        identity: &I,
+        host_control: Option<Box<dyn NodeHostControl>>,
+    ) -> Result<Self, RuntimeError>
+    where
+        I: IdentityProvider,
+    {
         config.validate()?;
-        fs::create_dir_all(layout.node_root())?;
-        fs::create_dir_all(layout.node_cache())?;
-        fs::create_dir_all(layout.node_logs())?;
+        fs::create_dir_all(&paths.data_path)?;
+        fs::create_dir_all(&paths.cache_path)?;
+        fs::create_dir_all(&paths.log_path)?;
         let machine_id = identity.machine_id()?;
-        let mut store = NodeStore::open(&layout.node_database(), machine_id)?;
+        let mut store = NodeStore::open(&paths.data_path.join("node.db"), machine_id)?;
         store.recover_running_items(now_ms())?;
+        let logical_cpu_count = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1);
         let worker_pool = WorkerPool::start(WorkerPoolConfig::new(
             WorkerLaunch::new(layout.executable_dir().join("worker.exe")),
-            config.worker_count,
+            config.worker.effective_worker_count(logical_cpu_count),
         ))
         .await?;
         let listener = tokio::net::TcpListener::bind((config.listen_ip, config.port)).await?;
@@ -302,10 +348,10 @@ impl NodeRuntime {
             store,
             Some(worker_pool),
             listen_address,
-            &layout.node_cache(),
+            &paths.cache_path,
             config.enumerator,
             Some(Box::new(repository)),
-            None,
+            host_control,
         );
         let (server_shutdown, shutdown) = oneshot::channel();
         let server_task = tokio::spawn(NodeServer::serve_until(listener, handle.clone(), shutdown));
