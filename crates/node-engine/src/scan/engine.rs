@@ -10,11 +10,13 @@ use std::{
 use dedup_core::{DisplayPath, LocationKey, MediaKind, NormalizedPath, TaskId};
 use dedup_media::sample_positions;
 use dedup_node_store::{
-    ContentId, FeatureWrite, ImageStage1Fields, NewTaskItem, NodeStore, ScannedPath,
-    TaskItemCompletion, TaskStatus, VideoFrameStage1Fields, VideoMetadataFields,
+    ContentId, FeatureWrite, FileFaultKind, FileFaultRecord, ImageStage1Fields, NewTaskItem,
+    NodeStore, ScannedPath, TaskItemCompletion, TaskStatus, VideoFrameStage1Fields,
+    VideoMetadataFields,
 };
 use dedup_protocol::proto::{self, worker_envelope};
 use dedup_windows::ReadCancellationToken;
+use thiserror::Error;
 use tokio::task::JoinSet;
 
 use crate::{
@@ -95,7 +97,24 @@ pub struct Stage1BatchResult {
     /// 原持久任务项 ID。
     pub item_id: String,
     /// 该项的 Worker 输出或文件级错误。
-    pub output: Result<crate::worker::Stage1Output, String>,
+    pub output: Result<crate::worker::Stage1Output, Stage1ProcessError>,
+}
+
+/// 一筛批次保留 Worker 崩溃、取消、基础设施和普通处理错误的不同终态。
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum Stage1ProcessError {
+    /// 文件被 Worker 正常处理但返回业务失败。
+    #[error("{0}")]
+    Processing(String),
+    /// Worker 进程在当前文件运行期间意外退出。
+    #[error("{0}")]
+    WorkerCrash(String),
+    /// 当前任务或任务项已取消。
+    #[error("一筛已取消")]
+    Cancelled,
+    /// WorkerPool 或进程补建等基础设施失败。
+    #[error("{0}")]
+    Infrastructure(String),
 }
 
 /// 扫描引擎调用的媒体探测与一筛计算边界。
@@ -119,7 +138,10 @@ pub trait Stage1Processor {
             let item_id = request.item_id.clone();
             results.push(Stage1BatchResult {
                 item_id,
-                output: self.process(request).await,
+                output: self
+                    .process(request)
+                    .await
+                    .map_err(Stage1ProcessError::Processing),
             });
         }
         results
@@ -249,7 +271,7 @@ impl Stage1Processor for WorkerPoolStage1Processor<'_> {
                 }
                 Err(error) => results.push(Stage1BatchResult {
                     item_id,
-                    output: Err(error.to_string()),
+                    output: Err(Stage1ProcessError::Infrastructure(error.to_string())),
                 }),
             }
         }
@@ -258,7 +280,9 @@ impl Stage1Processor for WorkerPoolStage1Processor<'_> {
                 for item_id in pending.into_keys() {
                     results.push(Stage1BatchResult {
                         item_id,
-                        output: Err("WorkerPool 已关闭".into()),
+                        output: Err(Stage1ProcessError::Infrastructure(
+                            "WorkerPool 已关闭".into(),
+                        )),
                     });
                 }
                 break;
@@ -273,12 +297,14 @@ impl Stage1Processor for WorkerPoolStage1Processor<'_> {
                     let output = match response.payload {
                         Some(worker_envelope::Payload::Stage1Result(result)) => {
                             decode_stage1_payload(&result.payload)
-                                .map_err(|error| error.to_string())
+                                .map_err(|error| Stage1ProcessError::Processing(error.to_string()))
                         }
                         Some(worker_envelope::Payload::WorkerFailure(failure)) => {
-                            Err(failure.message)
+                            Err(Stage1ProcessError::Processing(failure.message))
                         }
-                        _ => Err("Worker 返回了非一筛响应".into()),
+                        _ => Err(Stage1ProcessError::Infrastructure(
+                            "Worker 返回了非一筛响应".into(),
+                        )),
                     };
                     results.push(Stage1BatchResult { item_id, output });
                 }
@@ -290,7 +316,7 @@ impl Stage1Processor for WorkerPoolStage1Processor<'_> {
                     pending.remove(&item_id);
                     results.push(Stage1BatchResult {
                         item_id,
-                        output: Err(message),
+                        output: Err(Stage1ProcessError::WorkerCrash(message)),
                     });
                 }
                 WorkerEvent::Cancelled { task_id, item_id }
@@ -299,14 +325,14 @@ impl Stage1Processor for WorkerPoolStage1Processor<'_> {
                     pending.remove(&item_id);
                     results.push(Stage1BatchResult {
                         item_id,
-                        output: Err("一筛已取消".into()),
+                        output: Err(Stage1ProcessError::Cancelled),
                     });
                 }
                 WorkerEvent::InfrastructureFailure { message } => {
                     for item_id in std::mem::take(&mut pending).into_keys() {
                         results.push(Stage1BatchResult {
                             item_id,
-                            output: Err(message.clone()),
+                            output: Err(Stage1ProcessError::Infrastructure(message.clone())),
                         });
                     }
                 }
@@ -314,7 +340,9 @@ impl Stage1Processor for WorkerPoolStage1Processor<'_> {
                     for item_id in std::mem::take(&mut pending).into_keys() {
                         results.push(Stage1BatchResult {
                             item_id,
-                            output: Err("WorkerPool 返回了不属于当前扫描批次的事件".into()),
+                            output: Err(Stage1ProcessError::Infrastructure(
+                                "WorkerPool 返回了不属于当前扫描批次的事件".into(),
+                            )),
                         });
                     }
                 }
@@ -741,11 +769,13 @@ where
             return Ok(());
         }
         summary.scheduled_stage1 += 1;
+        let display_path = scanned.display_path.clone();
         pending_stage1.push(PendingStage1 {
+            scanned,
             request: Stage1Request {
                 task_id,
                 item_id,
-                display_path: scanned.display_path.clone(),
+                display_path,
                 content_id: content.id,
             },
             lease,
@@ -844,6 +874,7 @@ async fn drain_parallel_reads<L>(
 }
 
 struct PendingStage1<L> {
+    scanned: ScannedPath,
     request: Stage1Request,
     lease: L,
 }
@@ -893,16 +924,23 @@ where
         .into_iter()
         .map(|result| (result.item_id, result.output))
         .collect::<BTreeMap<_, _>>();
-    for PendingStage1 { request, lease } in works {
+    for PendingStage1 {
+        scanned,
+        request,
+        lease,
+    } in works
+    {
         if cancellation.is_cancelled()
             || store.task_snapshot(request.task_id)?.status == TaskStatus::Cancelled
         {
             drop(lease);
             continue;
         }
-        let output = results
-            .remove(&request.item_id)
-            .unwrap_or_else(|| Err("Worker 批次缺少对应 item 结果".into()));
+        let output = results.remove(&request.item_id).unwrap_or_else(|| {
+            Err(Stage1ProcessError::Infrastructure(
+                "Worker 批次缺少对应 item 结果".into(),
+            ))
+        });
         match output {
             Ok(output) => {
                 let prepared = prepare_stage1_writes(
@@ -947,11 +985,32 @@ where
                     })?;
                 }
             }
+            Err(Stage1ProcessError::WorkerCrash(message)) => {
+                if store.task_snapshot(request.task_id)?.status != TaskStatus::Cancelled {
+                    let fault = FileFaultRecord {
+                        machine_id: store.machine_id().clone(),
+                        normalized_path: scanned.normalized_path.clone(),
+                        display_path: scanned.display_path.clone(),
+                        file_size: scanned.file_size,
+                        kind: FileFaultKind::WorkerCrash,
+                        stage: "probe_stage1".into(),
+                        windows_error_code: None,
+                        message: message.clone(),
+                    };
+                    store.fail_running_item_with_file_fault(
+                        &request.item_id,
+                        &fault,
+                        &message,
+                        now_ms,
+                    )?;
+                    summary.file_failures += 1;
+                }
+            }
             Err(error) => {
                 if store.task_snapshot(request.task_id)?.status != TaskStatus::Cancelled {
                     store.complete_item(
                         &request.item_id,
-                        TaskItemCompletion::Failed(error),
+                        TaskItemCompletion::Failed(error.to_string()),
                         now_ms,
                     )?;
                     summary.file_failures += 1;

@@ -1,7 +1,10 @@
 //! 可恢复任务的状态、计数和持久化事件序号契约。
 
-use dedup_core::MachineId;
-use dedup_node_store::{NewTaskItem, NodeStore, TaskItemCompletion, TaskItemStatus, TaskStatus};
+use dedup_core::{DisplayPath, MachineId, NormalizedPath};
+use dedup_node_store::{
+    FileFaultKind, FileFaultRecord, NewTaskItem, NodeStore, ScannedPath, TaskItemCompletion,
+    TaskItemStatus, TaskStatus,
+};
 
 fn machine() -> MachineId {
     MachineId::from_sha256([0x71; 32])
@@ -116,4 +119,67 @@ fn item_failure_still_allows_task_to_complete() {
     let snapshot = store.task_snapshot(task_id).unwrap();
     assert_eq!(snapshot.status, TaskStatus::Completed);
     assert_eq!((snapshot.succeeded, snapshot.failed), (1, 1));
+}
+
+#[test]
+fn crashed_item_is_failed_with_fault_and_never_requeued_after_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("crashed.db");
+    let task_id;
+    let item_id;
+    let path = NormalizedPath::new(r"D:\Crash\file-a.mp4").unwrap();
+    {
+        let mut store = NodeStore::open(&database, machine()).unwrap();
+        task_id = store
+            .create_scan_task(&[NormalizedPath::new(r"D:\Crash").unwrap()], 1)
+            .unwrap();
+        item_id = store
+            .reserve_scan_path(
+                task_id,
+                &ScannedPath::new(
+                    path.clone(),
+                    DisplayPath::new(r"D:\Crash\file-a.mp4").unwrap(),
+                    1234,
+                ),
+                2,
+            )
+            .unwrap()
+            .unwrap();
+        store
+            .fail_running_item_with_file_fault(
+                &item_id,
+                &FileFaultRecord {
+                    machine_id: machine(),
+                    normalized_path: path.clone(),
+                    display_path: DisplayPath::new(r"D:\Crash\file-a.mp4").unwrap(),
+                    file_size: 1234,
+                    kind: FileFaultKind::WorkerCrash,
+                    stage: "probe_stage1".into(),
+                    windows_error_code: None,
+                    message: "Worker 处理文件时崩溃".into(),
+                },
+                "Worker 处理文件时崩溃",
+                3,
+            )
+            .unwrap();
+    }
+
+    let mut store = NodeStore::open(&database, machine()).unwrap();
+    assert_eq!(store.recover_running_items(4).unwrap(), 0);
+    let item = store
+        .task_items(task_id)
+        .unwrap()
+        .into_iter()
+        .find(|item| item.item_id == item_id)
+        .unwrap();
+    assert_eq!(item.status, TaskItemStatus::Failed);
+    assert_eq!(store.task_snapshot(task_id).unwrap().failed, 1);
+    let faults = store.page_file_faults(None, 10).unwrap();
+    assert_eq!(faults.items.len(), 1);
+    assert_eq!(faults.items[0].machine_id, machine());
+    assert_eq!(faults.items[0].normalized_path, path);
+    assert_eq!(faults.items[0].file_size, 1234);
+    assert_eq!(faults.items[0].kind, FileFaultKind::WorkerCrash);
+    assert_eq!(faults.items[0].stage, "probe_stage1");
+    assert_eq!(faults.items[0].windows_error_code, None);
 }

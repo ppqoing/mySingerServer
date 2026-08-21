@@ -8,8 +8,8 @@ mod pipeline;
 
 pub use dedup_windows::WindowsWalker;
 pub use engine::{
-    ScanEngine, ScanOptions, ScanSummary, Stage1BatchResult, Stage1Processor, Stage1Request,
-    WorkerPoolStage1Processor, begin_scan_task, publish_contact_sheet_for_test,
+    ScanEngine, ScanOptions, ScanSummary, Stage1BatchResult, Stage1ProcessError, Stage1Processor,
+    Stage1Request, WorkerPoolStage1Processor, begin_scan_task, publish_contact_sheet_for_test,
 };
 pub use enumerator::FileEnumerator;
 pub use everything::EverythingEnumerator;

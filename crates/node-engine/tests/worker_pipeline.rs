@@ -6,14 +6,18 @@ use std::{
     time::Duration,
 };
 
-use dedup_core::MediaKind;
+use dedup_core::{DisplayPath, MachineId, MediaKind, TaskId};
 use dedup_media::sample_positions;
 use dedup_media_ffmpeg::{DecodedFrame, MediaProbe};
+use dedup_node_engine::scan::{
+    Stage1ProcessError, Stage1Processor, Stage1Request, WorkerPoolStage1Processor,
+};
 use dedup_node_engine::worker::WorkerPool;
 use dedup_node_engine::worker::{
-    MediaDecoder, WorkerEvent, WorkerPipeline, decode_stage1_payload, decode_stage2_payload,
-    encode_stage1_payload, encode_stage2_payload, handle_worker_request,
+    MediaDecoder, Stage1Output, WorkerEvent, WorkerPipeline, decode_stage1_payload,
+    decode_stage2_payload, encode_stage1_payload, encode_stage2_payload, handle_worker_request,
 };
+use dedup_node_store::{NodeStore, ScannedPath};
 use dedup_protocol::proto::{self, worker_envelope};
 use dedup_windows::ReadCancellationToken;
 
@@ -222,6 +226,104 @@ async fn cancel_gate_cannot_cross_the_registry_check_to_slot_send_window() {
         pool.next_event().await,
         Some(WorkerEvent::Cancelled { item_id, .. }) if item_id == "after-cancel"
     ));
+}
+
+#[tokio::test]
+async fn crash_fault_fails_file_a_once_while_file_b_completes_and_slot_is_replaced() {
+    let (pool, mut started, control) = WorkerPool::controlled_batch_for_test(2);
+    let machine = MachineId::from_sha256([0x61; 32]);
+    let mut store = NodeStore::open_in_memory(machine).unwrap();
+    let task_id = TaskId::new();
+    let a = store
+        .upsert_content_and_location(
+            &ScannedPath::new(
+                dedup_core::NormalizedPath::new(r"D:\Crash\a.bin").unwrap(),
+                DisplayPath::new(r"D:\Crash\a.bin").unwrap(),
+                1,
+            ),
+            [1; 16],
+            MediaKind::Other,
+        )
+        .unwrap();
+    let b = store
+        .upsert_content_and_location(
+            &ScannedPath::new(
+                dedup_core::NormalizedPath::new(r"D:\Crash\b.bin").unwrap(),
+                DisplayPath::new(r"D:\Crash\b.bin").unwrap(),
+                1,
+            ),
+            [2; 16],
+            MediaKind::Other,
+        )
+        .unwrap();
+    let requests = vec![
+        Stage1Request {
+            task_id,
+            item_id: "file-a".into(),
+            display_path: DisplayPath::new(r"D:\Crash\a.bin").unwrap(),
+            content_id: a.id,
+        },
+        Stage1Request {
+            task_id,
+            item_id: "file-b".into(),
+            display_path: DisplayPath::new(r"D:\Crash\b.bin").unwrap(),
+            content_id: b.id,
+        },
+    ];
+    let task = tokio::spawn(async move {
+        let mut pool = pool;
+        let mut processor = WorkerPoolStage1Processor::new(&mut pool, ReadCancellationToken::new());
+        processor.process_batch(requests).await
+    });
+    let mut dispatched = vec![started.recv().await.unwrap(), started.recv().await.unwrap()];
+    dispatched.sort();
+    assert_eq!(
+        dispatched,
+        vec![
+            (task_id.as_uuid().to_string(), "file-a".into()),
+            (task_id.as_uuid().to_string(), "file-b".into())
+        ]
+    );
+    control
+        .crash(
+            task_id.as_uuid().to_string(),
+            "file-a".into(),
+            "worker crashed".into(),
+        )
+        .await;
+    control
+        .complete(
+            task_id.as_uuid().to_string(),
+            "file-b".into(),
+            Stage1Output {
+                media_kind: MediaKind::Other,
+                width: 0,
+                height: 0,
+                duration_ms: None,
+                frames: Vec::new(),
+                contact_sheet_jpeg: None,
+            },
+        )
+        .await;
+    let results = task.await.unwrap();
+    let crash = results
+        .iter()
+        .find(|result| result.item_id == "file-a")
+        .unwrap();
+    assert!(matches!(
+        &crash.output,
+        Err(Stage1ProcessError::WorkerCrash(message)) if message == "worker crashed"
+    ));
+    assert!(
+        results
+            .iter()
+            .find(|result| result.item_id == "file-b")
+            .unwrap()
+            .output
+            .is_ok()
+    );
+    assert_eq!(control.available_slots(), 2);
+    assert!(started.try_recv().is_err(), "崩溃项不得重新派发");
 }
 
 /// 把媒体层 Duration 采样定义转换为测试解码器记录的归一化值。

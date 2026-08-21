@@ -7,7 +7,7 @@ use rusqlite::{OptionalExtension, Transaction, params};
 use uuid::Uuid;
 
 use crate::{
-    ContentId, NodeStore, ScannedPath, StoreError,
+    ContentId, FileFaultKind, FileFaultRecord, NodeStore, ScannedPath, StoreError,
     content::{content_key_in_transaction, encode_file},
     open::sqlite_integer,
     outbox::append_sync_change,
@@ -381,6 +381,50 @@ impl NodeStore {
     ) -> Result<TaskEvent, StoreError> {
         let transaction = self.connection.transaction()?;
         let event = complete_item_in_transaction(&transaction, item_id, completion, now_ms)?;
+        transaction.commit()?;
+        Ok(event)
+    }
+
+    /// 在一个事务中先把 running 项置为 Failed，再 UPSERT 对应 worker_crash 文件故障。
+    pub fn fail_running_item_with_file_fault(
+        &mut self,
+        item_id: &str,
+        fault: &FileFaultRecord,
+        error: &str,
+        now_ms: i64,
+    ) -> Result<TaskEvent, StoreError> {
+        if fault.kind != FileFaultKind::WorkerCrash {
+            return Err(StoreError::InvalidState(
+                "Worker 崩溃终态只能写 worker_crash 故障".into(),
+            ));
+        }
+        let transaction = self.connection.transaction()?;
+        let event = complete_item_in_transaction(
+            &transaction,
+            item_id,
+            TaskItemCompletion::Failed(error.to_owned()),
+            now_ms,
+        )?;
+        transaction.execute(
+            "INSERT INTO file_faults(
+                machine_id,normalized_path,display_path,file_size,fault_kind,stage,
+                windows_error_code,message
+             ) VALUES(?1,?2,?3,?4,?5,?6,NULL,?7)
+             ON CONFLICT(machine_id,normalized_path,fault_kind) DO UPDATE SET
+                file_size=excluded.file_size,
+                stage=excluded.stage,
+                windows_error_code=NULL,
+                message=excluded.message",
+            params![
+                fault.machine_id.as_str(),
+                fault.normalized_path.as_str(),
+                fault.display_path.as_path().to_string_lossy().as_ref(),
+                sqlite_integer(fault.file_size)?,
+                fault.kind.as_str(),
+                fault.stage,
+                fault.message,
+            ],
+        )?;
         transaction.commit()?;
         Ok(event)
     }

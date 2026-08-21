@@ -2,7 +2,10 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
-    sync::{Arc, Condvar, Mutex},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -12,6 +15,7 @@ use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
 use super::process::{WorkerLaunch, WorkerProcess};
+use super::{Stage1Output, encode_stage1_payload};
 
 const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -149,6 +153,58 @@ impl Drop for TaskCancelGate {
 #[derive(Clone, Default)]
 pub struct WorkerDispatchBarrier {
     state: Arc<(Mutex<(bool, bool)>, Condvar, Condvar)>,
+}
+
+/// 可控多槽池的完成/崩溃驱动，只供直接集成测试。
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct ControlledWorkerPool {
+    commands: mpsc::Sender<ControlledWorkerCommand>,
+    available_slots: Arc<AtomicUsize>,
+}
+
+impl ControlledWorkerPool {
+    /// 让指定运行项按 Worker 崩溃返回并立即补回逻辑槽位。
+    pub async fn crash(&self, task_id: String, item_id: String, message: String) {
+        let _ = self
+            .commands
+            .send(ControlledWorkerCommand::Crash {
+                task_id,
+                item_id,
+                message,
+            })
+            .await;
+    }
+
+    /// 让指定运行项返回正常一筛结果。
+    pub async fn complete(&self, task_id: String, item_id: String, output: Stage1Output) {
+        let _ = self
+            .commands
+            .send(ControlledWorkerCommand::Complete {
+                task_id,
+                item_id,
+                output,
+            })
+            .await;
+    }
+
+    /// 返回当前未被运行项占用的逻辑槽位数。
+    pub fn available_slots(&self) -> usize {
+        self.available_slots.load(Ordering::Acquire)
+    }
+}
+
+enum ControlledWorkerCommand {
+    Crash {
+        task_id: String,
+        item_id: String,
+        message: String,
+    },
+    Complete {
+        task_id: String,
+        item_id: String,
+        output: Stage1Output,
+    },
 }
 
 impl WorkerDispatchBarrier {
@@ -414,6 +470,123 @@ impl WorkerPool {
         reply_rx.await.map_err(|_| WorkerPoolError::Closed)?
     }
 
+    /// 创建可控多槽池，直接驱动乱序完成与崩溃补槽行为。
+    #[doc(hidden)]
+    pub fn controlled_batch_for_test(
+        worker_count: usize,
+    ) -> (Self, mpsc::Receiver<(String, String)>, ControlledWorkerPool) {
+        assert!(worker_count > 0);
+        let state = Arc::new(Mutex::new(PoolState::default()));
+        for slot in 0..worker_count {
+            state
+                .lock()
+                .unwrap()
+                .process_ids
+                .insert(slot, slot as u32 + 1);
+        }
+        let actor_state = state.clone();
+        let (commands, mut command_rx) = mpsc::channel(64);
+        let (events, event_rx) = mpsc::channel(256);
+        let (started, started_rx) = mpsc::channel(16);
+        let (control_tx, mut control_rx) = mpsc::channel(16);
+        let available_slots = Arc::new(AtomicUsize::new(worker_count));
+        let actor_available = available_slots.clone();
+        tokio::spawn(async move {
+            let mut queue = VecDeque::new();
+            let mut idle = (0..worker_count).collect::<VecDeque<_>>();
+            let mut active = HashMap::<String, (usize, WorkIdentity)>::new();
+            loop {
+                tokio::select! {
+                    command = command_rx.recv() => {
+                        let Some(command) = command else { break };
+                        match command {
+                            PoolCommand::Dispatch(envelope, guard, reply) => {
+                                let result = WorkItem::try_from(envelope).map(|mut work| {
+                                    work.scan_guard = guard;
+                                    queue.push_back(work);
+                                    controlled_schedule(
+                                        &mut queue, &mut idle, &mut active, &started,
+                                        &events, &actor_state, &actor_available,
+                                    );
+                                });
+                                let _ = reply.send(result);
+                            }
+                            PoolCommand::Cancel(task_id, reply) => {
+                                actor_state
+                                    .lock()
+                                    .unwrap()
+                                    .cancelled_tasks
+                                    .insert(task_id);
+                                let _ = reply.send(Ok(()));
+                            }
+                            PoolCommand::CancelRollback(task_id) => {
+                                actor_state
+                                    .lock()
+                                    .unwrap()
+                                    .cancelling_tasks
+                                    .remove(&task_id);
+                            }
+                            PoolCommand::PrepareRestart(reply) => { let _ = reply.send(Ok(Vec::new())); }
+                            PoolCommand::Restart(_, reply) => { let _ = reply.send(Ok(())); }
+                            PoolCommand::TerminateUnexpected(_, reply) => { let _ = reply.send(Ok(())); }
+                        }
+                    }
+                    control = control_rx.recv() => {
+                        let Some(control) = control else { break };
+                        let (task_id, item_id, event) = match control {
+                            ControlledWorkerCommand::Crash { task_id, item_id, message } => {
+                                let event = WorkerEvent::Crashed {
+                                    task_id: task_id.clone(),
+                                    item_id: item_id.clone(),
+                                    message,
+                                };
+                                (task_id, item_id, event)
+                            }
+                            ControlledWorkerCommand::Complete { task_id, item_id, output } => {
+                                let event = WorkerEvent::Completed {
+                                    task_id: task_id.clone(),
+                                    item_id: item_id.clone(),
+                                    response: proto::WorkerEnvelope {
+                                        payload: Some(worker_envelope::Payload::Stage1Result(
+                                            proto::Stage1Result {
+                                                task_id: task_id.clone(),
+                                                item_id: item_id.clone(),
+                                                payload: encode_stage1_payload(&output),
+                                            },
+                                        )),
+                                    },
+                                };
+                                (task_id, item_id, event)
+                            }
+                        };
+                        let Some((slot, identity)) = active.remove(&item_id) else { continue };
+                        if identity.task_id != task_id { continue; }
+                        actor_state.lock().unwrap().running.remove(&slot);
+                        idle.push_back(slot);
+                        actor_available.store(idle.len(), Ordering::Release);
+                        let _ = events.send(event).await;
+                        controlled_schedule(
+                            &mut queue, &mut idle, &mut active, &started,
+                            &events, &actor_state, &actor_available,
+                        );
+                    }
+                }
+            }
+        });
+        (
+            Self {
+                commands,
+                events: event_rx,
+                state,
+            },
+            started_rx,
+            ControlledWorkerPool {
+                commands: control_tx,
+                available_slots,
+            },
+        )
+    }
+
     /// 创建不启动进程的可控池，只供直接集成测试验证发送/取消边界。
     #[doc(hidden)]
     pub fn controlled_for_test() -> (Self, mpsc::Receiver<(String, String)>) {
@@ -520,6 +693,40 @@ impl WorkerPool {
             },
             started_rx,
         )
+    }
+}
+
+fn controlled_schedule(
+    queue: &mut VecDeque<WorkItem>,
+    idle: &mut VecDeque<usize>,
+    active: &mut HashMap<String, (usize, WorkIdentity)>,
+    started: &mpsc::Sender<(String, String)>,
+    events: &mpsc::Sender<WorkerEvent>,
+    state: &Arc<Mutex<PoolState>>,
+    available_slots: &Arc<AtomicUsize>,
+) {
+    while !idle.is_empty() && !queue.is_empty() {
+        let slot = idle.pop_front().expect("空闲槽已确认存在");
+        let work = queue.pop_front().expect("等待项已确认存在");
+        let blocked = {
+            let state = state.lock().unwrap();
+            state.cancelled_tasks.contains(&work.identity.task_id)
+                || state.cancelling_tasks.contains(&work.identity.task_id)
+                || !work.dispatch_allowed()
+        };
+        if blocked {
+            idle.push_front(slot);
+            let _ = events.try_send(WorkerEvent::Cancelled {
+                task_id: work.identity.task_id,
+                item_id: work.identity.item_id,
+            });
+            continue;
+        }
+        let identity = work.identity;
+        state.lock().unwrap().running.insert(slot, identity.clone());
+        active.insert(identity.item_id.clone(), (slot, identity.clone()));
+        let _ = started.try_send((identity.task_id, identity.item_id));
+        available_slots.store(idle.len(), Ordering::Release);
     }
 }
 
