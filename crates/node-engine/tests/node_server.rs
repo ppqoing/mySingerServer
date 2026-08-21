@@ -238,23 +238,20 @@ async fn restart_response_exhausted_flush_retries_return_observable_error() {
     assert_eq!(state_guard.handled_ids, [94]);
     assert_eq!(state_guard.flushed_ids, [94, 94]);
     drop(state_guard);
-    assert!(
-        tokio::time::timeout(Duration::from_millis(50), reader.read_frame())
-            .await
-            .is_err(),
-        "failed commit attempts must not write another response frame"
-    );
-
-    drop(reader);
-    drop(writer);
     let error = tokio::time::timeout(Duration::from_secs(1), server)
         .await
-        .unwrap()
+        .expect("server must stop without waiting for the client to disconnect")
         .unwrap()
         .expect_err("exhausted commit retries must remain observable");
     assert!(error.contains("request_id 94"));
     assert!(error.contains("2 次"));
     assert!(error.contains("fixture flush failure"));
+    let eof = tokio::time::timeout(Duration::from_secs(1), reader.read_frame())
+        .await
+        .expect("server must close the client read side");
+    assert!(eof.is_err(), "client must observe EOF instead of another frame");
+    drop(reader);
+    drop(writer);
 }
 
 #[derive(Default)]

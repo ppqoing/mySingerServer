@@ -162,8 +162,9 @@ where
     }
 
     let (responses, mut response_reader) = mpsc::channel::<proto::Envelope>(64);
+    let mut responses = Some(responses);
     let writer_handler = handler.clone();
-    let writer_task = tokio::spawn(async move {
+    let mut writer_task = tokio::spawn(async move {
         while let Some(response) = response_reader.recv().await {
             if write_envelope(&mut writer, &response).await.is_err() {
                 return Ok(());
@@ -172,20 +173,47 @@ where
         }
         Ok::<(), String>(())
     });
-    while let Ok(request) = read_envelope(&mut reader).await {
-        let request_handler = handler.clone();
-        let response_sender = responses.clone();
-        tokio::spawn(async move {
-            let response = request_handler.handle(request).await;
-            let _ = response_sender.send(response).await;
-        });
-    }
-    drop(responses);
-    let writer_result = writer_task
-        .await
-        .map_err(|error| format!("节点响应写任务异常终止: {error}"))?;
+    let mut request_tasks = JoinSet::new();
+    let writer_completion = loop {
+        tokio::select! {
+            completed = &mut writer_task => break Some(completed),
+            request = read_envelope(&mut reader) => {
+                let Ok(request) = request else {
+                    break None;
+                };
+                let request_handler = handler.clone();
+                let response_sender = responses
+                    .as_ref()
+                    .expect("连接读循环期间响应通道必须存在")
+                    .clone();
+                request_tasks.spawn(async move {
+                    let response = request_handler.handle(request).await;
+                    let _ = response_sender.send(response).await;
+                });
+            }
+            Some(_) = request_tasks.join_next(), if !request_tasks.is_empty() => {}
+        }
+    };
+    drop(responses.take());
+    let writer_result = match writer_completion {
+        Some(completed) => {
+            request_tasks.abort_all();
+            while request_tasks.join_next().await.is_some() {}
+            flatten_writer_result(completed)
+        }
+        None => {
+            while request_tasks.join_next().await.is_some() {}
+            flatten_writer_result(writer_task.await)
+        }
+    };
     handler.connection_closed().await;
     writer_result
+}
+
+fn flatten_writer_result(
+    result: Result<Result<(), String>, tokio::task::JoinError>,
+) -> Result<(), String> {
+    result.map_err(|error| format!("节点响应写任务异常终止: {error}"))?
 }
 
 async fn retry_response_flushed<H>(handler: &H, request_id: u64) -> Result<(), String>

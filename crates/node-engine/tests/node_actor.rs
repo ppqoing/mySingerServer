@@ -501,20 +501,34 @@ async fn remote_config_commit_failure_keeps_pending_for_same_request_retry() {
     assert_eq!(host_state.lock().unwrap().commit_calls, 0);
     let first_commit = handle.response_flushed(41).await.unwrap_err();
     assert!(first_commit.contains("fixture commit failure"));
-    assert_eq!(host_state.lock().unwrap().commit_calls, 1);
+    let host_after_first_error = host_state.lock().unwrap();
+    assert_eq!(host_after_first_error.commit_calls, 1);
+    assert!(host_after_first_error.exit_committed);
+    assert_eq!(host_after_first_error.exit_side_effects, 1);
+    drop(host_after_first_error);
     let still_busy = handle.handle(save_request(43, "saved-sha")).await;
     assert_error_code(still_busy, proto::ErrorCode::Conflict);
     assert_eq!(repository_state.lock().unwrap().save_calls, 1);
     assert_eq!(host_state.lock().unwrap().prepared_versions.len(), 1);
     let second_commit = handle.response_flushed(41).await.unwrap_err();
     assert!(second_commit.contains("fixture commit failure"));
-    assert_eq!(host_state.lock().unwrap().commit_calls, 2);
+    let host_after_second_error = host_state.lock().unwrap();
+    assert_eq!(host_after_second_error.commit_calls, 2);
+    assert!(host_after_second_error.exit_committed);
+    assert_eq!(host_after_second_error.exit_side_effects, 1);
+    drop(host_after_second_error);
     let still_busy_after_retry = handle.handle(save_request(44, "saved-sha")).await;
     assert_error_code(still_busy_after_retry, proto::ErrorCode::Conflict);
     handle.response_flushed(41).await.unwrap();
-    assert_eq!(host_state.lock().unwrap().commit_calls, 3);
+    let host_after_success = host_state.lock().unwrap();
+    assert_eq!(host_after_success.commit_calls, 3);
+    assert_eq!(host_after_success.exit_side_effects, 1);
+    drop(host_after_success);
     handle.response_flushed(41).await.unwrap();
-    assert_eq!(host_state.lock().unwrap().commit_calls, 3);
+    let host_after_duplicate = host_state.lock().unwrap();
+    assert_eq!(host_after_duplicate.commit_calls, 3);
+    assert_eq!(host_after_duplicate.exit_side_effects, 1);
+    drop(host_after_duplicate);
     assert_eq!(
         events.lock().unwrap().as_slice(),
         [
@@ -631,6 +645,8 @@ struct FakeHostState {
     prepared_versions: Vec<String>,
     commit_calls: usize,
     commit_failures_remaining: usize,
+    exit_committed: bool,
+    exit_side_effects: usize,
 }
 
 struct FakeHostControl {
@@ -654,6 +670,8 @@ impl FakeHostControl {
                 prepared_versions: Vec::new(),
                 commit_calls: 0,
                 commit_failures_remaining,
+                exit_committed: false,
+                exit_side_effects: 0,
             })),
             fail_prepare,
             events,
@@ -682,6 +700,10 @@ impl NodeHostControl for FakeHostControl {
         self.events.lock().unwrap().push("commit");
         let mut state = self.state.lock().unwrap();
         state.commit_calls += 1;
+        if !state.exit_committed {
+            state.exit_committed = true;
+            state.exit_side_effects += 1;
+        }
         if state.commit_failures_remaining > 0 {
             state.commit_failures_remaining -= 1;
             Err(NodeHostControlError::Failed(
