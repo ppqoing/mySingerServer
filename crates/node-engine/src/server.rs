@@ -27,9 +27,12 @@ pub trait NodeRequestHandler: Clone + Send + Sync + 'static {
     /// 处理一个已握手连接上的请求，并保留原 request_id 返回响应。
     fn handle(&self, request: proto::Envelope) -> impl Future<Output = proto::Envelope> + Send;
 
-    /// 指定 request 的响应完整写入客户端后通知业务层。
-    fn response_flushed(&self, _request_id: u64) -> impl Future<Output = ()> + Send {
-        async {}
+    /// 指定 request 的响应完整写入客户端后通知业务层；业务提交失败不重写响应。
+    fn response_flushed(
+        &self,
+        _request_id: u64,
+    ) -> impl Future<Output = Result<(), String>> + Send {
+        async { Ok(()) }
     }
 
     /// 管理连接结束后释放该连接持有的快照等短生命周期资源。
@@ -161,7 +164,7 @@ where
             if write_envelope(&mut writer, &response).await.is_err() {
                 break;
             }
-            writer_handler.response_flushed(response.request_id).await;
+            let _ = writer_handler.response_flushed(response.request_id).await;
         }
     });
     while let Ok(request) = read_envelope(&mut reader).await {

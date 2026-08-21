@@ -58,6 +58,62 @@ fn save_to_a_new_config_path_keeps_the_old_config_file() {
 }
 
 #[test]
+fn restore_if_version_uses_cas_and_restores_exact_original_text_and_sha() {
+    let fixture = RepositoryFixture::new();
+    let initial = fixture.initial_config();
+    let original_config = format!(
+        "# preserve original bytes\r\n{}",
+        initial
+            .to_toml()
+            .unwrap()
+            .replace("port = 39091", "port=39091 # original spacing")
+    );
+    let original_bootstrap = "config_path='data\\node\\config.toml' # original spacing\r\n";
+    fs::create_dir_all(fixture.initial_config_path().parent().unwrap()).unwrap();
+    fs::write(fixture.initial_config_path(), &original_config).unwrap();
+    fs::write(fixture.bootstrap_path(), original_bootstrap).unwrap();
+    let repository = fixture.repository();
+    let previous = repository.snapshot().unwrap();
+    let mut changed = initial.clone();
+    changed.port = 39092;
+
+    let saved = repository
+        .save_if_version(&previous.version_sha256, &changed)
+        .unwrap();
+    assert_ne!(saved.version_sha256, previous.version_sha256);
+    assert_ne!(
+        fs::read_to_string(fixture.initial_config_path()).unwrap(),
+        original_config
+    );
+
+    let conflict = repository
+        .restore_if_version("wrong-new-version", &previous)
+        .unwrap_err();
+    assert!(matches!(
+        conflict,
+        ConfigRepositoryError::VersionConflict { .. }
+    ));
+    assert_eq!(
+        repository.snapshot().unwrap().version_sha256,
+        saved.version_sha256
+    );
+
+    let restored = repository
+        .restore_if_version(&saved.version_sha256, &previous)
+        .unwrap();
+    assert_eq!(restored.version_sha256, previous.version_sha256);
+    assert_eq!(restored.config, initial);
+    assert_eq!(
+        fs::read_to_string(fixture.initial_config_path()).unwrap(),
+        original_config
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.bootstrap_path()).unwrap(),
+        original_bootstrap
+    );
+}
+
+#[test]
 fn stale_version_refuses_to_write_either_current_file() {
     let fixture = RepositoryFixture::new();
     let initial = fixture.initial_config();

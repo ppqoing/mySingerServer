@@ -194,25 +194,72 @@ impl NodeConfigRepository {
 
         let config_toml = config.to_toml()?;
         let bootstrap_toml = bootstrap_toml(&config.paths.config_path)?;
-        let config_temp = write_synced_temp(&resolved.config_path, config_toml.as_bytes())?;
-        let bootstrap_temp = match write_synced_temp(&self.bootstrap_path(), bootstrap_toml.as_bytes()) {
+        self.replace_state_locked(
+            &current,
+            &resolved.config_path,
+            &config.paths.config_path,
+            &config_toml,
+            &bootstrap_toml,
+        )
+    }
+
+    /// 仅在当前版本仍为刚保存摘要时，用先前快照的原始字节精确补偿恢复。
+    pub fn restore_if_version(
+        &self,
+        expected_new_version_sha256: &str,
+        previous: &LoadedNodeConfig,
+    ) -> Result<LoadedNodeConfig, ConfigRepositoryError> {
+        let _transaction = self.lock_transaction();
+        self.recover_locked()?;
+        let current = self.load_locked()?;
+        if expected_new_version_sha256 != current.version_sha256 {
+            return Err(ConfigRepositoryError::VersionConflict {
+                expected: expected_new_version_sha256.to_owned(),
+                actual: current.version_sha256,
+            });
+        }
+        let previous_path =
+            LocalNodePath::validate(&self.executable_dir, &previous.bootstrap_config_path)?;
+        self.reject_control_path(previous_path.resolved())?;
+        self.replace_state_locked(
+            &current,
+            previous_path.resolved(),
+            &previous.bootstrap_config_path,
+            &previous.config_toml,
+            &previous.bootstrap_toml,
+        )
+    }
+
+    fn replace_state_locked(
+        &self,
+        current: &LoadedNodeConfig,
+        target_config_path: &Path,
+        target_config_path_raw: &str,
+        target_config_toml: &str,
+        target_bootstrap_toml: &str,
+    ) -> Result<LoadedNodeConfig, ConfigRepositoryError> {
+        let config_temp = write_synced_temp(target_config_path, target_config_toml.as_bytes())?;
+        let bootstrap_temp = match write_synced_temp(
+            &self.bootstrap_path(),
+            target_bootstrap_toml.as_bytes(),
+        ) {
             Ok(path) => path,
             Err(error) => {
                 discard_repository_temp(&config_temp);
                 return Err(error);
             }
         };
-        let journal = ConfigTransactionJournal::from_loaded(&current, &config.paths.config_path);
+        let journal = ConfigTransactionJournal::from_loaded(current, target_config_path_raw);
         if let Err(error) = self.write_journal(&journal) {
             discard_repository_temp(&config_temp);
             discard_repository_temp(&bootstrap_temp);
             return Err(error);
         }
 
-        if let Err(error) = replace_file(&config_temp, &resolved.config_path) {
+        if let Err(error) = replace_file(&config_temp, target_config_path) {
             discard_repository_temp(&config_temp);
             discard_repository_temp(&bootstrap_temp);
-            return self.recover_after_error(self.io_error(&resolved.config_path, error));
+            return self.recover_after_error(self.io_error(target_config_path, error));
         }
         if self.consume_failpoint(ConfigSaveFailpoint::AfterConfigReplace) {
             return Err(ConfigRepositoryError::SimulatedInterruption("config rename 后"));

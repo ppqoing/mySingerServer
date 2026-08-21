@@ -395,17 +395,31 @@ async fn remote_config_version_conflict_and_path_failure_do_not_prepare_replacem
 
 #[tokio::test]
 async fn remote_config_prepare_failure_keeps_old_node_running() {
-    let repository = FakeConfigRepository::new(SaveBehavior::Success);
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let repository = FakeConfigRepository::with_control(
+        SaveBehavior::Success,
+        false,
+        Arc::clone(&events),
+    );
     let repository_state = Arc::clone(&repository.state);
-    let host = FakeHostControl::new(true);
+    let host = FakeHostControl::with_control(true, 0, Arc::clone(&events));
     let host_state = Arc::clone(&host.state);
     let (handle, actor) = spawn_remote_config_actor(repository, Some(host));
 
     let response = handle.handle(save_request(35, "current-sha")).await;
     assert_error_code(response, proto::ErrorCode::Internal);
-    assert_eq!(repository_state.lock().unwrap().save_calls, 1);
+    let repository_state = repository_state.lock().unwrap();
+    assert_eq!(repository_state.save_calls, 1);
+    assert_eq!(repository_state.restore_calls, 1);
+    assert_eq!(repository_state.current.version_sha256, "current-sha");
+    assert_eq!(repository_state.current.config, remote_config_fixture());
+    drop(repository_state);
     assert_eq!(host_state.lock().unwrap().prepared_versions, ["saved-sha"]);
-    handle.response_flushed(35).await;
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        ["snapshot", "save", "prepare", "restore"]
+    );
+    handle.response_flushed(35).await.unwrap();
     assert_eq!(host_state.lock().unwrap().commit_calls, 0);
     let ping = handle
         .handle(envelope(
@@ -423,10 +437,49 @@ async fn remote_config_prepare_failure_keeps_old_node_running() {
 }
 
 #[tokio::test]
-async fn remote_config_success_prepares_once_and_commits_only_matching_flush_once() {
-    let repository = FakeConfigRepository::new(SaveBehavior::Success);
+async fn remote_config_prepare_and_restore_failure_reports_partial_save() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let repository = FakeConfigRepository::with_control(
+        SaveBehavior::Success,
+        true,
+        Arc::clone(&events),
+    );
     let repository_state = Arc::clone(&repository.state);
-    let host = FakeHostControl::new(false);
+    let host = FakeHostControl::with_control(true, 0, Arc::clone(&events));
+    let (handle, actor) = spawn_remote_config_actor(repository, Some(host));
+
+    let response = handle.handle(save_request(37, "current-sha")).await;
+    let Some(proto::envelope::Payload::Error(error)) = response.payload else {
+        panic!("expected combined internal error");
+    };
+    assert_eq!(error.code, proto::ErrorCode::Internal as i32);
+    assert!(error.message.contains("fixture prepare failure"));
+    assert!(error.message.contains("fixture restore failure"));
+    assert!(error.message.contains("已保存"));
+    let repository_state = repository_state.lock().unwrap();
+    assert_eq!(repository_state.save_calls, 1);
+    assert_eq!(repository_state.restore_calls, 1);
+    assert_eq!(repository_state.current.version_sha256, "saved-sha");
+    drop(repository_state);
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        ["snapshot", "save", "prepare", "restore"]
+    );
+
+    handle.shutdown().await.unwrap();
+    actor.await.unwrap();
+}
+
+#[tokio::test]
+async fn remote_config_commit_failure_keeps_pending_for_same_request_retry() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let repository = FakeConfigRepository::with_control(
+        SaveBehavior::Success,
+        false,
+        Arc::clone(&events),
+    );
+    let repository_state = Arc::clone(&repository.state);
+    let host = FakeHostControl::with_control(false, 1, Arc::clone(&events));
     let host_state = Arc::clone(&host.state);
     let (handle, actor) = spawn_remote_config_actor(repository, Some(host));
 
@@ -444,12 +497,23 @@ async fn remote_config_success_prepares_once_and_commits_only_matching_flush_onc
     assert_eq!(repository_state.lock().unwrap().save_calls, 1);
     assert_eq!(host_state.lock().unwrap().prepared_versions.len(), 1);
 
-    handle.response_flushed(999).await;
+    handle.response_flushed(999).await.unwrap();
     assert_eq!(host_state.lock().unwrap().commit_calls, 0);
-    handle.response_flushed(41).await;
+    let first_commit = handle.response_flushed(41).await.unwrap_err();
+    assert!(first_commit.contains("fixture commit failure"));
     assert_eq!(host_state.lock().unwrap().commit_calls, 1);
-    handle.response_flushed(41).await;
-    assert_eq!(host_state.lock().unwrap().commit_calls, 1);
+    let still_busy = handle.handle(save_request(43, "saved-sha")).await;
+    assert_error_code(still_busy, proto::ErrorCode::Conflict);
+    assert_eq!(repository_state.lock().unwrap().save_calls, 1);
+    assert_eq!(host_state.lock().unwrap().prepared_versions.len(), 1);
+    handle.response_flushed(41).await.unwrap();
+    assert_eq!(host_state.lock().unwrap().commit_calls, 2);
+    handle.response_flushed(41).await.unwrap();
+    assert_eq!(host_state.lock().unwrap().commit_calls, 2);
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        ["snapshot", "save", "prepare", "commit", "commit"]
+    );
 
     handle.shutdown().await.unwrap();
     actor.await.unwrap();
@@ -467,30 +531,42 @@ struct FakeRepositoryState {
     behavior: SaveBehavior,
     load_calls: usize,
     save_calls: usize,
+    restore_calls: usize,
+    fail_restore: bool,
 }
 
 struct FakeConfigRepository {
     state: Arc<Mutex<FakeRepositoryState>>,
+    events: Arc<Mutex<Vec<&'static str>>>,
 }
 
 impl FakeConfigRepository {
     fn new(behavior: SaveBehavior) -> Self {
+        Self::with_control(behavior, false, Arc::new(Mutex::new(Vec::new())))
+    }
+
+    fn with_control(
+        behavior: SaveBehavior,
+        fail_restore: bool,
+        events: Arc<Mutex<Vec<&'static str>>>,
+    ) -> Self {
         Self {
             state: Arc::new(Mutex::new(FakeRepositoryState {
-                current: NodeConfigState {
-                    config: remote_config_fixture(),
-                    version_sha256: "current-sha".into(),
-                },
+                current: NodeConfigState::for_test(remote_config_fixture(), "current-sha"),
                 behavior,
                 load_calls: 0,
                 save_calls: 0,
+                restore_calls: 0,
+                fail_restore,
             })),
+            events,
         }
     }
 }
 
 impl NodeConfigRepositoryAccess for FakeConfigRepository {
     fn snapshot(&self) -> Result<NodeConfigState, ConfigRepositoryError> {
+        self.events.lock().unwrap().push("snapshot");
         let mut state = self.state.lock().unwrap();
         state.load_calls += 1;
         Ok(state.current.clone())
@@ -501,14 +577,12 @@ impl NodeConfigRepositoryAccess for FakeConfigRepository {
         expected_version_sha256: &str,
         config: &NodeConfig,
     ) -> Result<NodeConfigState, ConfigRepositoryError> {
+        self.events.lock().unwrap().push("save");
         let mut state = self.state.lock().unwrap();
         state.save_calls += 1;
         match state.behavior {
             SaveBehavior::Success => {
-                state.current = NodeConfigState {
-                    config: config.clone(),
-                    version_sha256: "saved-sha".into(),
-                };
+                state.current = NodeConfigState::for_test(config.clone(), "saved-sha");
                 Ok(state.current.clone())
             }
             SaveBehavior::Conflict => Err(ConfigRepositoryError::VersionConflict {
@@ -520,30 +594,69 @@ impl NodeConfigRepositoryAccess for FakeConfigRepository {
             }),
         }
     }
+
+    fn restore_if_version(
+        &self,
+        expected_new_version_sha256: &str,
+        previous: &NodeConfigState,
+    ) -> Result<NodeConfigState, ConfigRepositoryError> {
+        self.events.lock().unwrap().push("restore");
+        let mut state = self.state.lock().unwrap();
+        state.restore_calls += 1;
+        if state.fail_restore {
+            return Err(ConfigRepositoryError::InvalidJournal(
+                "fixture restore failure",
+            ));
+        }
+        if state.current.version_sha256 != expected_new_version_sha256 {
+            return Err(ConfigRepositoryError::VersionConflict {
+                expected: expected_new_version_sha256.into(),
+                actual: state.current.version_sha256.clone(),
+            });
+        }
+        state.current = previous.clone();
+        Ok(state.current.clone())
+    }
 }
 
 #[derive(Default)]
 struct FakeHostState {
     prepared_versions: Vec<String>,
     commit_calls: usize,
+    commit_failures_remaining: usize,
 }
 
 struct FakeHostControl {
     state: Arc<Mutex<FakeHostState>>,
     fail_prepare: bool,
+    events: Arc<Mutex<Vec<&'static str>>>,
 }
 
 impl FakeHostControl {
     fn new(fail_prepare: bool) -> Self {
+        Self::with_control(fail_prepare, 0, Arc::new(Mutex::new(Vec::new())))
+    }
+
+    fn with_control(
+        fail_prepare: bool,
+        commit_failures_remaining: usize,
+        events: Arc<Mutex<Vec<&'static str>>>,
+    ) -> Self {
         Self {
-            state: Arc::new(Mutex::new(FakeHostState::default())),
+            state: Arc::new(Mutex::new(FakeHostState {
+                prepared_versions: Vec::new(),
+                commit_calls: 0,
+                commit_failures_remaining,
+            })),
             fail_prepare,
+            events,
         }
     }
 }
 
 impl NodeHostControl for FakeHostControl {
     fn prepare_replacement(&self, saved_version: &str) -> Result<(), NodeHostControlError> {
+        self.events.lock().unwrap().push("prepare");
         self.state
             .lock()
             .unwrap()
@@ -559,8 +672,17 @@ impl NodeHostControl for FakeHostControl {
     }
 
     fn commit_exit_after_response(&self) -> Result<(), NodeHostControlError> {
-        self.state.lock().unwrap().commit_calls += 1;
-        Ok(())
+        self.events.lock().unwrap().push("commit");
+        let mut state = self.state.lock().unwrap();
+        state.commit_calls += 1;
+        if state.commit_failures_remaining > 0 {
+            state.commit_failures_remaining -= 1;
+            Err(NodeHostControlError::Failed(
+                "fixture commit failure".into(),
+            ))
+        } else {
+            Ok(())
+        }
     }
 }
 

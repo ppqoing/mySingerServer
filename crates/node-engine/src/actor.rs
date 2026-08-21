@@ -31,7 +31,7 @@ use crate::{
         LocalAnalysisEngine, Stage2BatchItem, Stage2BatchPlan, WorkerPoolStage2Processor,
         begin_stage2_batch, run_stage2_batch,
     },
-    config_repository::{ConfigRepositoryError, NodeConfigRepository},
+    config_repository::{ConfigRepositoryError, LoadedNodeConfig, NodeConfigRepository},
     delete::DeleteEngine,
     host_control::NodeHostControl,
     preview::{PreviewKind, PreviewService},
@@ -112,16 +112,15 @@ impl NodeEngineHandle {
         let _ = self.commands.send(EngineCommand::ConnectionClosed).await;
     }
 
-    async fn response_flushed(&self, request_id: u64) {
+    async fn response_flushed(&self, request_id: u64) -> Result<(), String> {
         let (reply, response) = oneshot::channel();
-        if self
-            .commands
+        self.commands
             .send(EngineCommand::ResponseFlushed(request_id, reply))
             .await
-            .is_ok()
-        {
-            let _ = response.await;
-        }
+            .map_err(|_| "节点计算引擎已经关闭".to_owned())?;
+        response
+            .await
+            .map_err(|_| "节点计算引擎没有返回刷出确认".to_owned())?
     }
 }
 
@@ -133,6 +132,27 @@ pub struct NodeConfigState {
     pub config: NodeConfig,
     /// 当前完整配置文件的 SHA-256 摘要。
     pub version_sha256: String,
+    repository_snapshot: Option<LoadedNodeConfig>,
+}
+
+impl NodeConfigState {
+    /// 构造不携带真实仓库恢复点的测试状态。
+    #[doc(hidden)]
+    pub fn for_test(config: NodeConfig, version_sha256: impl Into<String>) -> Self {
+        Self {
+            config,
+            version_sha256: version_sha256.into(),
+            repository_snapshot: None,
+        }
+    }
+
+    fn from_loaded(loaded: LoadedNodeConfig) -> Self {
+        Self {
+            config: loaded.config.clone(),
+            version_sha256: loaded.version_sha256.clone(),
+            repository_snapshot: Some(loaded),
+        }
+    }
 }
 
 /// actor 配置协议对原子仓库使用的最小可替换边界。
@@ -147,15 +167,18 @@ pub trait NodeConfigRepositoryAccess: Send + Sync {
         expected_version_sha256: &str,
         config: &NodeConfig,
     ) -> Result<NodeConfigState, ConfigRepositoryError>;
+
+    /// 仅在当前仍为新摘要时恢复保存前冻结的完整状态。
+    fn restore_if_version(
+        &self,
+        expected_new_version_sha256: &str,
+        previous: &NodeConfigState,
+    ) -> Result<NodeConfigState, ConfigRepositoryError>;
 }
 
 impl NodeConfigRepositoryAccess for NodeConfigRepository {
     fn snapshot(&self) -> Result<NodeConfigState, ConfigRepositoryError> {
-        let loaded = NodeConfigRepository::snapshot(self)?;
-        Ok(NodeConfigState {
-            config: loaded.config,
-            version_sha256: loaded.version_sha256,
-        })
+        NodeConfigRepository::snapshot(self).map(NodeConfigState::from_loaded)
     }
 
     fn save_if_version(
@@ -163,11 +186,20 @@ impl NodeConfigRepositoryAccess for NodeConfigRepository {
         expected_version_sha256: &str,
         config: &NodeConfig,
     ) -> Result<NodeConfigState, ConfigRepositoryError> {
-        let loaded = NodeConfigRepository::save_if_version(self, expected_version_sha256, config)?;
-        Ok(NodeConfigState {
-            config: loaded.config,
-            version_sha256: loaded.version_sha256,
-        })
+        NodeConfigRepository::save_if_version(self, expected_version_sha256, config)
+            .map(NodeConfigState::from_loaded)
+    }
+
+    fn restore_if_version(
+        &self,
+        expected_new_version_sha256: &str,
+        previous: &NodeConfigState,
+    ) -> Result<NodeConfigState, ConfigRepositoryError> {
+        let snapshot = previous.repository_snapshot.as_ref().ok_or(
+            ConfigRepositoryError::InvalidJournal("配置快照缺少仓库恢复数据"),
+        )?;
+        NodeConfigRepository::restore_if_version(self, expected_new_version_sha256, snapshot)
+            .map(NodeConfigState::from_loaded)
     }
 }
 
@@ -326,7 +358,10 @@ impl NodeRequestHandler for NodeEngineHandle {
         async move { handle.connection_closed().await }
     }
 
-    fn response_flushed(&self, request_id: u64) -> impl std::future::Future<Output = ()> + Send {
+    fn response_flushed(
+        &self,
+        request_id: u64,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
         let handle = self.clone();
         async move { handle.response_flushed(request_id).await }
     }
@@ -448,7 +483,7 @@ struct EngineState {
 enum EngineCommand {
     Protocol(proto::Envelope, oneshot::Sender<proto::Envelope>),
     ConnectionClosed,
-    ResponseFlushed(u64, oneshot::Sender<()>),
+    ResponseFlushed(u64, oneshot::Sender<Result<(), String>>),
     Restart(oneshot::Sender<Result<(), String>>),
     Shutdown(oneshot::Sender<()>),
     BackgroundFinished {
@@ -501,8 +536,8 @@ async fn run_actor(mut state: EngineState, mut commands: mpsc::Receiver<EngineCo
             }
             EngineCommand::ConnectionClosed => state.snapshots.clear(),
             EngineCommand::ResponseFlushed(request_id, reply) => {
-                state.response_flushed(request_id);
-                let _ = reply.send(());
+                let result = state.response_flushed(request_id);
+                let _ = reply.send(result);
             }
             EngineCommand::Restart(reply) => {
                 let _ = reply.send(state.restart_engine().await);
@@ -629,12 +664,21 @@ impl EngineState {
             .ok_or_else(|| invalid("保存请求缺少 config"))?
             .try_into()
             .map_err(invalid)?;
+        let previous = repository.snapshot().map_err(config_repository_error)?;
         let saved = repository
             .save_if_version(&save.expected_version_sha256, &config)
             .map_err(config_repository_error)?;
-        host_control
-            .prepare_replacement(&saved.version_sha256)
-            .map_err(internal)?;
+        if let Err(prepare_error) = host_control.prepare_replacement(&saved.version_sha256) {
+            return match repository.restore_if_version(&saved.version_sha256, &previous) {
+                Ok(_) => Err(internal(prepare_error)),
+                Err(restore_error) => Err((
+                    proto::ErrorCode::Internal,
+                    format!(
+                        "{prepare_error}; 配置回滚失败: {restore_error}; 已保存配置可能仍生效"
+                    ),
+                )),
+            };
+        }
         self.pending_restart_request_id = Some(request_id);
         Ok(proto::envelope::Payload::NodeRestartAccepted(
             proto::NodeRestartAccepted {
@@ -644,14 +688,19 @@ impl EngineState {
         ))
     }
 
-    fn response_flushed(&mut self, request_id: u64) {
+    fn response_flushed(&mut self, request_id: u64) -> Result<(), String> {
         if self.pending_restart_request_id != Some(request_id) {
-            return;
+            return Ok(());
         }
+        let host_control = self
+            .host_control
+            .as_ref()
+            .ok_or_else(|| "节点宿主控制器已经不可用".to_owned())?;
+        host_control
+            .commit_exit_after_response()
+            .map_err(|error| error.to_string())?;
         self.pending_restart_request_id = None;
-        if let Some(host_control) = &self.host_control {
-            let _ = host_control.commit_exit_after_response();
-        }
+        Ok(())
     }
 
     fn node_status(&self) -> ProtocolResult {
