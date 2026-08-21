@@ -350,6 +350,14 @@ impl NodeRuntime {
         let listener = tokio::net::TcpListener::bind((config.listen_ip, config.port)).await?;
         let listen_address = listener.local_addr()?;
         let repository = NodeConfigRepository::from_layout(layout);
+        let artifact_registry = Arc::new(RegenerableArtifactRegistry::new(
+            layout.executable_dir(),
+            &paths.cache_path,
+        )?);
+        let disk_full_cleaner = DiskFullCleaner::new(
+            Arc::clone(&artifact_registry),
+            SystemArtifactDiskResolver,
+        );
         let (handle, actor_task) = spawn_actor(
             store,
             Some(worker_pool),
@@ -360,6 +368,8 @@ impl NodeRuntime {
             effective_worker_count,
             Some(Box::new(repository)),
             host_control,
+            artifact_registry,
+            disk_full_cleaner,
         );
         let (server_shutdown, shutdown) = oneshot::channel();
         let server_task = tokio::spawn(NodeServer::serve_until(listener, handle.clone(), shutdown));
@@ -432,6 +442,7 @@ impl NodeEngine {
         listen_address: SocketAddr,
         cache_root: &Path,
     ) -> (NodeEngineHandle, JoinHandle<()>) {
+        let (artifact_registry, disk_full_cleaner) = test_artifact_cleanup(cache_root);
         spawn_actor(
             store,
             None,
@@ -442,6 +453,8 @@ impl NodeEngine {
             1,
             None,
             None,
+            artifact_registry,
+            disk_full_cleaner,
         )
     }
 
@@ -454,6 +467,7 @@ impl NodeEngine {
         repository: Box<dyn NodeConfigRepositoryAccess>,
         host_control: Option<Box<dyn NodeHostControl>>,
     ) -> (NodeEngineHandle, JoinHandle<()>) {
+        let (artifact_registry, disk_full_cleaner) = test_artifact_cleanup(cache_root);
         spawn_actor(
             store,
             None,
@@ -464,6 +478,8 @@ impl NodeEngine {
             1,
             Some(repository),
             host_control,
+            artifact_registry,
+            disk_full_cleaner,
         )
     }
 
@@ -476,6 +492,7 @@ impl NodeEngine {
         enumerator: EnumeratorKind,
     ) -> (NodeEngineHandle, JoinHandle<()>) {
         let effective_worker_count = worker_pool.worker_process_ids().len().max(1);
+        let (artifact_registry, disk_full_cleaner) = test_artifact_cleanup(cache_root);
         spawn_actor(
             store,
             Some(worker_pool),
@@ -486,6 +503,8 @@ impl NodeEngine {
             effective_worker_count,
             None,
             None,
+            artifact_registry,
+            disk_full_cleaner,
         )
     }
 }
@@ -500,17 +519,9 @@ fn spawn_actor(
     effective_worker_count: usize,
     config_repository: Option<Box<dyn NodeConfigRepositoryAccess>>,
     host_control: Option<Box<dyn NodeHostControl>>,
+    artifact_registry: Arc<RegenerableArtifactRegistry>,
+    disk_full_cleaner: DiskFullCleaner,
 ) -> (NodeEngineHandle, JoinHandle<()>) {
-    fs::create_dir_all(cache_root).expect("Node cache root must be creatable");
-    let install_root = artifact_install_root(cache_root);
-    let artifact_registry = Arc::new(
-        RegenerableArtifactRegistry::new(&install_root)
-            .expect("Node artifact registry root must be an existing absolute path"),
-    );
-    let disk_full_cleaner = DiskFullCleaner::new(
-        Arc::clone(&artifact_registry),
-        SystemArtifactDiskResolver,
-    );
     let (commands, receiver) = mpsc::channel(64);
     let handle = NodeEngineHandle {
         commands: commands.clone(),
@@ -541,24 +552,19 @@ fn spawn_actor(
     (handle, actor)
 }
 
-fn artifact_install_root(cache_root: &Path) -> PathBuf {
-    let Some(node_root) = cache_root.parent() else {
-        return cache_root.to_path_buf();
-    };
-    let Some(data_root) = node_root.parent() else {
-        return cache_root.to_path_buf();
-    };
-    let production_layout = cache_root.file_name().is_some_and(|name| name == "cache")
-        && node_root.file_name().is_some_and(|name| name == "node")
-        && data_root.file_name().is_some_and(|name| name == "data");
-    if production_layout {
-        data_root
-            .parent()
-            .unwrap_or(cache_root)
-            .to_path_buf()
-    } else {
-        cache_root.to_path_buf()
-    }
+fn test_artifact_cleanup(
+    cache_root: &Path,
+) -> (Arc<RegenerableArtifactRegistry>, DiskFullCleaner) {
+    fs::create_dir_all(cache_root).expect("Node test cache root must be creatable");
+    let install_root = cache_root
+        .parent()
+        .expect("Node test cache root must have a distinct install parent");
+    let registry = Arc::new(
+        RegenerableArtifactRegistry::new(install_root, cache_root)
+            .expect("Node test artifact roots must be absolute and nested"),
+    );
+    let cleaner = DiskFullCleaner::new(Arc::clone(&registry), SystemArtifactDiskResolver);
+    (registry, cleaner)
 }
 
 struct EngineState {

@@ -11,7 +11,9 @@ use dedup_node_store::NodeStore;
 
 use crate::{
     artifact_registry::{ArtifactKind, ArtifactLease, RegenerableArtifactRegistry},
-    disk_full_cleanup::{DiskFullCleaner, write_with_disk_full_cleanup},
+    disk_full_cleanup::{
+        DiskFullCleaner, write_planned_artifact_with_disk_full_cleanup,
+    },
 };
 
 /// 一份由固定 16 字节 MD5 唯一确定的联系表缓存目标。
@@ -67,12 +69,14 @@ impl ContactSheetCacheEntry {
         store: &mut NodeStore,
     ) -> io::Result<(PathBuf, ArtifactLease)> {
         let partial_path = self.partial_path(item_id)?;
-        registry.register(&partial_path, ArtifactKind::OrphanTemporary)?;
-        write_with_disk_full_cleanup(cleaner, store, &partial_path, || {
-            write_jpeg(&partial_path, jpeg)
-        })?;
-        registry.register(&partial_path, ArtifactKind::OrphanTemporary)?;
-        let lease = registry.lease(&partial_path)?;
+        let (_, lease) = write_planned_artifact_with_disk_full_cleanup(
+            cleaner,
+            store,
+            registry,
+            &partial_path,
+            ArtifactKind::OrphanTemporary,
+            || write_jpeg(&partial_path, jpeg),
+        )?;
         Ok((partial_path, lease))
     }
 

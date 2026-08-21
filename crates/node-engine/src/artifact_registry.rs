@@ -32,6 +32,7 @@ struct ArtifactState {
 #[derive(Debug)]
 struct RegistryInner {
     install_root: PathBuf,
+    cache_root: PathBuf,
     entries: Mutex<BTreeMap<PathBuf, ArtifactState>>,
 }
 
@@ -42,15 +43,20 @@ pub struct RegenerableArtifactRegistry {
 }
 
 impl RegenerableArtifactRegistry {
-    /// 从已经存在的绝对安装根创建空 registry。
-    pub fn new(install_root: &Path) -> io::Result<Self> {
-        if !install_root.is_absolute() {
-            return Err(invalid_input("安装根必须是绝对路径"));
+    /// 从已经存在的绝对安装根和其中唯一允许清理的 cache 根创建空 registry。
+    pub fn new(install_root: &Path, cache_root: &Path) -> io::Result<Self> {
+        if !install_root.is_absolute() || !cache_root.is_absolute() {
+            return Err(invalid_input("安装根和 cache 根必须是绝对路径"));
         }
         let install_root = fs::canonicalize(install_root)?;
+        let cache_root = fs::canonicalize(cache_root)?;
+        if cache_root == install_root || !cache_root.starts_with(&install_root) {
+            return Err(invalid_input("cache 根必须位于安装根内部且不能等于安装根"));
+        }
         Ok(Self {
             inner: Arc::new(RegistryInner {
                 install_root,
+                cache_root,
                 entries: Mutex::new(BTreeMap::new()),
             }),
         })
@@ -62,7 +68,7 @@ impl RegenerableArtifactRegistry {
         if path.exists() && !path.is_file() {
             return Err(invalid_input("registry 只接受文件"));
         }
-        validate_kind_path(&self.inner.install_root, &path, kind)?;
+        validate_kind_path(&self.inner.cache_root, &path, kind)?;
         let reference = match kind {
             ArtifactKind::ContactSheet => Some(contact_sheet_reference(&path)?),
             _ => None,
@@ -85,6 +91,48 @@ impl RegenerableArtifactRegistry {
             },
         );
         Ok(())
+    }
+
+    /// 原子登记一个计划文件并在首次 write 前取得活动租约。
+    pub fn lease_planned(&self, path: &Path, kind: ArtifactKind) -> io::Result<ArtifactLease> {
+        let path = self.normalize_path_even_if_missing(path)?;
+        if path.exists() && !path.is_file() {
+            return Err(invalid_input("registry 只接受文件"));
+        }
+        validate_kind_path(&self.inner.cache_root, &path, kind)?;
+        let reference = match kind {
+            ArtifactKind::ContactSheet => Some(contact_sheet_reference(&path)?),
+            _ => None,
+        };
+        let mut entries = self.entries()?;
+        let state = match entries.entry(path.clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => entry.insert(ArtifactState {
+                kind,
+                contact_sheet_reference: reference,
+                active_leases: 0,
+                cleaning: false,
+            }),
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                if entry.get().kind != kind {
+                    return Err(invalid_input("同一路径不能登记为不同产物类型"));
+                }
+                entry.into_mut()
+            }
+        };
+        if state.cleaning {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "产物已冻结等待清理",
+            ));
+        }
+        state.active_leases = state
+            .active_leases
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("产物租约计数溢出"))?;
+        Ok(ArtifactLease {
+            inner: Arc::clone(&self.inner),
+            path: Some(path),
+        })
     }
 
     /// 为已经登记且尚未冻结清理的产物取得活动租约。
@@ -278,10 +326,10 @@ fn contact_sheet_reference(path: &Path) -> io::Result<String> {
         .join("/"))
 }
 
-fn validate_kind_path(install_root: &Path, path: &Path, kind: ArtifactKind) -> io::Result<()> {
+fn validate_kind_path(cache_root: &Path, path: &Path, kind: ArtifactKind) -> io::Result<()> {
     let relative = path
-        .strip_prefix(install_root)
-        .map_err(|_| invalid_input("产物路径必须位于安装根内"))?;
+        .strip_prefix(cache_root)
+        .map_err(|_| invalid_input("产物路径必须位于配置的 exact cache 根内"))?;
     let components = relative
         .components()
         .map(|component| component.as_os_str().to_string_lossy().to_ascii_lowercase())
@@ -294,28 +342,35 @@ fn validate_kind_path(install_root: &Path, path: &Path, kind: ArtifactKind) -> i
     }) {
         return Err(invalid_input("源码、构建、日志和扫描媒体目录禁止登记"));
     }
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     let extension = path
         .extension()
         .and_then(|extension| extension.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if matches!(extension.as_str(), "db" | "toml" | "log" | "exe" | "zip") {
+    let database_sidecar = file_name.contains(".db-")
+        || file_name.contains(".sqlite-")
+        || file_name.contains(".sqlite3-");
+    if database_sidecar
+        || matches!(
+            extension.as_str(),
+            "db" | "sqlite" | "sqlite3" | "toml" | "log" | "exe" | "zip"
+        )
+    {
         return Err(invalid_input("数据库、配置、日志、程序和压缩包禁止登记"));
     }
-    let has_cache = components.iter().any(|component| component == "cache");
     let accepted = match kind {
-        ArtifactKind::ContactSheet => {
-            has_cache
-                && components
-                    .iter()
-                    .any(|component| component == "contact-sheets")
-        }
-        ArtifactKind::Preview => {
-            has_cache && components.iter().any(|component| component == "previews")
-        }
-        ArtifactKind::OrphanTemporary => has_cache && extension == "partial",
+        ArtifactKind::ContactSheet => components
+            .first()
+            .is_some_and(|value| value == "contact-sheets"),
+        ArtifactKind::Preview => components.first().is_some_and(|value| value == "previews"),
+        ArtifactKind::OrphanTemporary => extension == "partial",
         ArtifactKind::RegisteredDerivation => {
-            has_cache && components.iter().any(|component| component == "derived")
+            components.first().is_some_and(|value| value == "derived")
         }
     };
     if !accepted {

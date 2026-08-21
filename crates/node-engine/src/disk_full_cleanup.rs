@@ -10,7 +10,9 @@ use std::{
 use dedup_node_store::NodeStore;
 use dedup_windows::resolve_storage_location;
 
-use crate::artifact_registry::{ArtifactKind, RegenerableArtifactRegistry};
+use crate::artifact_registry::{
+    ArtifactKind, ArtifactLease, RegenerableArtifactRegistry,
+};
 
 const ERROR_HANDLE_DISK_FULL: i32 = 39;
 const ERROR_DISK_FULL: i32 = 112;
@@ -164,6 +166,28 @@ pub fn write_with_disk_full_cleanup<T>(
         Err(error) if is_disk_full(&error) => {
             cleaner.cleanup(store, write_target)?;
             write()
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// 在首次写前原子登记 planned artifact 并持有 lease；自身磁盘满时才释放并清理重试。
+pub fn write_planned_artifact_with_disk_full_cleanup<T>(
+    cleaner: &DiskFullCleaner,
+    store: &mut NodeStore,
+    registry: &RegenerableArtifactRegistry,
+    write_target: &Path,
+    kind: ArtifactKind,
+    mut write: impl FnMut() -> io::Result<T>,
+) -> io::Result<(T, ArtifactLease)> {
+    let mut lease = Some(registry.lease_planned(write_target, kind)?);
+    match write() {
+        Ok(value) => Ok((value, lease.take().expect("planned write lease exists"))),
+        Err(error) if is_disk_full(&error) => {
+            drop(lease.take());
+            cleaner.cleanup(store, write_target)?;
+            let retry_lease = registry.lease_planned(write_target, kind)?;
+            write().map(|value| (value, retry_lease))
         }
         Err(error) => Err(error),
     }
