@@ -9,11 +9,13 @@ use std::{
 use dedup_core::MediaKind;
 use dedup_media::sample_positions;
 use dedup_media_ffmpeg::{DecodedFrame, MediaProbe};
+use dedup_node_engine::worker::WorkerPool;
 use dedup_node_engine::worker::{
-    MediaDecoder, WorkerPipeline, decode_stage1_payload, decode_stage2_payload,
+    MediaDecoder, WorkerEvent, WorkerPipeline, decode_stage1_payload, decode_stage2_payload,
     encode_stage1_payload, encode_stage2_payload, handle_worker_request,
 };
 use dedup_protocol::proto::{self, worker_envelope};
+use dedup_windows::ReadCancellationToken;
 
 #[test]
 /// 图片一筛不得为了预览或特征重复解码。
@@ -120,6 +122,39 @@ fn worker_envelope_maps_probe_command_to_stage_one_result() {
         decode_stage1_payload(&result.payload).unwrap().media_kind,
         MediaKind::Image
     );
+}
+
+#[tokio::test]
+async fn cancelled_scan_is_rejected_at_the_worker_pool_send_boundary() {
+    let (mut pool, mut started) = WorkerPool::controlled_for_test();
+    let cancellation = ReadCancellationToken::new();
+    pool.handle().mark_task_cancelled("cancelled-task");
+    pool.dispatch_scan(
+        proto::WorkerEnvelope {
+            payload: Some(worker_envelope::Payload::ProbeAndStage1(
+                proto::ProbeAndStage1 {
+                    task_id: "cancelled-task".into(),
+                    item_id: "cancelled-item".into(),
+                    display_path: r"D:\cancelled.bin".into(),
+                    media_kind: proto::MediaKind::MediaOther as i32,
+                },
+            )),
+        },
+        cancellation,
+        true,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        started.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    assert!(matches!(
+        pool.next_event().await,
+        Some(WorkerEvent::Cancelled { task_id, item_id })
+            if task_id == "cancelled-task" && item_id == "cancelled-item"
+    ));
 }
 
 /// 把媒体层 Duration 采样定义转换为测试解码器记录的归一化值。

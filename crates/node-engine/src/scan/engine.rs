@@ -1,6 +1,11 @@
 //! 扫描缓存短路径、内容复用、一筛提交和成功收尾事务。
 
-use std::{collections::BTreeMap, fs, path::PathBuf, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use dedup_core::{DisplayPath, LocationKey, MediaKind, NormalizedPath, TaskId};
 use dedup_media::sample_positions;
@@ -140,13 +145,18 @@ pub fn begin_scan_task(
 pub struct WorkerPoolStage1Processor<'a> {
     pool: &'a mut WorkerPool,
     capacity: usize,
+    cancellation: ReadCancellationToken,
 }
 
 impl<'a> WorkerPoolStage1Processor<'a> {
     /// 借用由 NodeEngine actor 独占的 WorkerPool。
-    pub fn new(pool: &'a mut WorkerPool) -> Self {
+    pub fn new(pool: &'a mut WorkerPool, cancellation: ReadCancellationToken) -> Self {
         let capacity = pool.worker_process_ids().len().max(1);
-        Self { pool, capacity }
+        Self {
+            pool,
+            capacity,
+            cancellation,
+        }
     }
 }
 
@@ -158,20 +168,24 @@ impl Stage1Processor for WorkerPoolStage1Processor<'_> {
         let task_id = request.task_id.as_uuid().to_string();
         let item_id = request.item_id.clone();
         self.pool
-            .dispatch(proto::WorkerEnvelope {
-                payload: Some(worker_envelope::Payload::ProbeAndStage1(
-                    proto::ProbeAndStage1 {
-                        task_id: task_id.clone(),
-                        item_id: item_id.clone(),
-                        display_path: request
-                            .display_path
-                            .as_path()
-                            .to_string_lossy()
-                            .into_owned(),
-                        media_kind: proto::MediaKind::MediaOther as i32,
-                    },
-                )),
-            })
+            .dispatch_scan(
+                proto::WorkerEnvelope {
+                    payload: Some(worker_envelope::Payload::ProbeAndStage1(
+                        proto::ProbeAndStage1 {
+                            task_id: task_id.clone(),
+                            item_id: item_id.clone(),
+                            display_path: request
+                                .display_path
+                                .as_path()
+                                .to_string_lossy()
+                                .into_owned(),
+                            media_kind: proto::MediaKind::MediaOther as i32,
+                        },
+                    )),
+                },
+                self.cancellation.clone(),
+                true,
+            )
             .await
             .map_err(|error| error.to_string())?;
         match self.pool.next_event().await {
@@ -225,7 +239,11 @@ impl Stage1Processor for WorkerPoolStage1Processor<'_> {
                     },
                 )),
             };
-            match self.pool.dispatch(envelope).await {
+            match self
+                .pool
+                .dispatch_scan(envelope, self.cancellation.clone(), true)
+                .await
+            {
                 Ok(()) => {
                     pending.insert(item_id, task_id);
                 }
@@ -407,7 +425,6 @@ where
         );
         let mut reads = JoinSet::new();
         let mut enumeration_closed = false;
-        let mut seen = Vec::new();
         let mut pending_stage1 = Vec::new();
         let mut summary = ScanSummary {
             task_id,
@@ -423,8 +440,7 @@ where
         loop {
             if cancellation.is_cancelled() {
                 drop(enumerated);
-                reads.abort_all();
-                while reads.join_next().await.is_some() {}
+                drain_parallel_reads(&mut reads).await;
                 let _ = enumeration_task.await;
                 return Err(ScanError::Cancelled);
             }
@@ -437,7 +453,6 @@ where
                         &reader,
                         &cancellation,
                         &mut reads,
-                        &mut seen,
                         &mut summary,
                         scanned,
                         now_ms,
@@ -450,7 +465,7 @@ where
                 }
             }
             if pending_stage1.len() >= processor.max_in_flight().max(1) {
-                flush_stage1_batch(
+                let result = flush_stage1_batch(
                     store,
                     processor,
                     &self.contact_sheet_root,
@@ -459,7 +474,14 @@ where
                     &mut summary,
                     now_ms,
                 )
-                .await?;
+                .await;
+                if matches!(result, Err(ScanError::Cancelled)) {
+                    drop(enumerated);
+                    drain_parallel_reads(&mut reads).await;
+                    let _ = enumeration_task.await;
+                    return Err(ScanError::Cancelled);
+                }
+                result?;
             }
             if enumeration_closed && reads.is_empty() {
                 break;
@@ -469,7 +491,7 @@ where
                     .join_next()
                     .await
                     .ok_or_else(|| ScanError::Stage1("读取任务意外为空".into()))?;
-                self.accept_parallel_read(
+                let result = self.accept_parallel_read(
                     store,
                     task_id,
                     &options,
@@ -477,25 +499,44 @@ where
                     &mut summary,
                     joined.map_err(|error| ScanError::Stage1(error.to_string()))?,
                     now_ms,
-                )?;
+                );
+                if matches!(result, Err(ScanError::Cancelled)) {
+                    drop(enumerated);
+                    drain_parallel_reads(&mut reads).await;
+                    let _ = enumeration_task.await;
+                    return Err(ScanError::Cancelled);
+                }
+                result?;
                 continue;
             }
-            tokio::select! {
+            let step = tokio::select! {
                 row = enumerated.recv() => match row {
                     Some(scanned) => self.accept_parallel_row(
                         store, task_id, &options, &reader, &cancellation, &mut reads,
-                        &mut seen, &mut summary, scanned, now_ms,
-                    )?,
-                    None => enumeration_closed = true,
+                        &mut summary, scanned, now_ms,
+                    ),
+                    None => {
+                        enumeration_closed = true;
+                        Ok(())
+                    },
                 },
                 joined = reads.join_next(), if !reads.is_empty() => {
-                    self.accept_parallel_read(
-                        store, task_id, &options, &mut pending_stage1, &mut summary,
-                        joined.expect("分支保证存在").map_err(|error| ScanError::Stage1(error.to_string()))?,
-                        now_ms,
-                    )?;
+                    match joined.expect("分支保证存在") {
+                        Ok(value) => self.accept_parallel_read(
+                            store, task_id, &options, &mut pending_stage1, &mut summary,
+                            value, now_ms,
+                        ),
+                        Err(error) => Err(ScanError::Stage1(error.to_string())),
+                    }
                 }
+            };
+            if matches!(step, Err(ScanError::Cancelled)) {
+                drop(enumerated);
+                drain_parallel_reads(&mut reads).await;
+                let _ = enumeration_task.await;
+                return Err(ScanError::Cancelled);
             }
+            step?;
         }
         flush_stage1_batch(
             store,
@@ -524,7 +565,7 @@ where
         {
             return Err(ScanError::Cancelled);
         }
-        summary.outbox_high_seq = store.finalize_scan_task(task_id, &seen, now_ms)?;
+        summary.outbox_high_seq = store.finalize_scan_task_from_items(task_id, now_ms)?;
         Ok(summary)
     }
 
@@ -628,8 +669,7 @@ where
         options: &ScanOptions,
         reader: &R,
         cancellation: &ReadCancellationToken,
-        reads: &mut JoinSet<(ScannedPath, Result<ReadProduct<R::Lease>, ReadFailure>)>,
-        seen: &mut Vec<NormalizedPath>,
+        reads: &mut JoinSet<(ReservedScan, Result<ReadProduct<R::Lease>, ReadFailure>)>,
         summary: &mut ScanSummary,
         scanned: ScannedPath,
         now_ms: i64,
@@ -637,8 +677,10 @@ where
     where
         R: PipelineFileReader,
     {
+        let Some(item_id) = store.reserve_scan_path(task_id, &scanned, now_ms)? else {
+            return Ok(());
+        };
         summary.total_files += 1;
-        seen.push(scanned.normalized_path.clone());
         let cached_content = if options.force_recompute {
             None
         } else {
@@ -646,19 +688,18 @@ where
         };
         if let Some(content_id) = cached_content {
             summary.cache_hits += 1;
-            if self.complete_reused_item(store, task_id, &scanned, content_id, now_ms)? {
+            if self.complete_reserved_reused_item(store, &item_id, content_id, now_ms)? {
                 summary.skipped_incomplete += 1;
             }
             return Ok(());
         }
         let task_reader = reader.clone();
-        let task_scanned = scanned.clone();
+        let reserved = ReservedScan { scanned, item_id };
+        let task_scanned = reserved.scanned.clone();
         let task_cancellation = cancellation.clone();
         reads.spawn(async move {
-            let result = task_reader
-                .read(task_scanned.clone(), task_cancellation)
-                .await;
-            (task_scanned, result)
+            let result = task_reader.read(task_scanned, task_cancellation).await;
+            (reserved, result)
         });
         Ok(())
     }
@@ -670,22 +711,19 @@ where
         options: &ScanOptions,
         pending_stage1: &mut Vec<PendingStage1<L>>,
         summary: &mut ScanSummary,
-        (scanned, result): (ScannedPath, Result<ReadProduct<L>, ReadFailure>),
+        (reserved, result): (ReservedScan, Result<ReadProduct<L>, ReadFailure>),
         now_ms: i64,
     ) -> Result<(), ScanError> {
+        let ReservedScan { scanned, item_id } = reserved;
         let ReadProduct { md5, lease } = match result {
             Ok(value) => value,
             Err(ReadFailure::Cancelled) => return Err(ScanError::Cancelled),
             Err(error) => {
                 summary.file_failures += 1;
                 if store.task_snapshot(task_id)?.status != TaskStatus::Cancelled {
-                    complete_file_failure(
-                        store,
-                        task_id,
-                        &scanned,
-                        None,
-                        "md5",
-                        error.to_string(),
+                    store.complete_item(
+                        &item_id,
+                        TaskItemCompletion::Failed(error.to_string()),
                         now_ms,
                     )?;
                 }
@@ -696,15 +734,13 @@ where
         let content = store.upsert_content_and_location(&scanned, md5, MediaKind::Other)?;
         if content.reused && !options.force_recompute {
             summary.reused_contents += 1;
-            if self.complete_reused_item(store, task_id, &scanned, content.id, now_ms)? {
+            if self.complete_reserved_reused_item(store, &item_id, content.id, now_ms)? {
                 summary.skipped_incomplete += 1;
             }
             drop(lease);
             return Ok(());
         }
         summary.scheduled_stage1 += 1;
-        let item_id =
-            append_and_claim(store, task_id, &scanned, content.id, "probe_stage1", now_ms)?;
         pending_stage1.push(PendingStage1 {
             request: Stage1Request {
                 task_id,
@@ -715,6 +751,26 @@ where
             lease,
         });
         Ok(())
+    }
+
+    fn complete_reserved_reused_item(
+        &self,
+        store: &mut NodeStore,
+        item_id: &str,
+        content_id: ContentId,
+        now_ms: i64,
+    ) -> Result<bool, ScanError> {
+        let kind = store.content_media_kind(content_id)?;
+        let incomplete =
+            kind != MediaKind::Other && store.load_complete_stage1(content_id)?.is_none();
+        store.complete_item(
+            item_id,
+            TaskItemCompletion::Succeeded {
+                content_id: Some(content_id),
+            },
+            now_ms,
+        )?;
+        Ok(incomplete)
     }
 
     fn complete_reused_item(
@@ -774,6 +830,19 @@ where
     }
 }
 
+struct ReservedScan {
+    scanned: ScannedPath,
+    item_id: String,
+}
+
+async fn drain_parallel_reads<L>(
+    reads: &mut JoinSet<(ReservedScan, Result<ReadProduct<L>, ReadFailure>)>,
+) where
+    L: Send + 'static,
+{
+    while reads.join_next().await.is_some() {}
+}
+
 struct PendingStage1<L> {
     request: Stage1Request,
     lease: L,
@@ -795,6 +864,25 @@ where
         return Ok(());
     }
     let works = std::mem::take(pending);
+    let mut dispatchable = Vec::with_capacity(works.len());
+    for work in works {
+        if cancellation.is_cancelled() {
+            drop(work);
+            return Err(ScanError::Cancelled);
+        }
+        if !matches!(
+            store.task_snapshot(work.request.task_id)?.status,
+            TaskStatus::Queued | TaskStatus::Running
+        ) {
+            drop(work);
+            continue;
+        }
+        dispatchable.push(work);
+    }
+    let works = dispatchable;
+    if works.is_empty() {
+        return Ok(());
+    }
     let requests = works
         .iter()
         .map(|work| work.request.clone())
@@ -817,15 +905,47 @@ where
             .unwrap_or_else(|| Err("Worker 批次缺少对应 item 结果".into()));
         match output {
             Ok(output) => {
-                let (media_kind, writes) =
-                    prepare_stage1_writes(request.content_id, contact_sheet_root, output)?;
-                let _ = store.commit_scan_stage1_if_running(
+                let prepared = prepare_stage1_writes(
                     &request.item_id,
                     request.content_id,
-                    media_kind,
-                    writes,
-                    now_ms,
+                    contact_sheet_root,
+                    output,
                 )?;
+                let committed = match store.commit_scan_stage1_if_running(
+                    &request.item_id,
+                    request.content_id,
+                    prepared.media_kind,
+                    prepared.writes,
+                    now_ms,
+                ) {
+                    Ok(committed) => committed,
+                    Err(error) => {
+                        if let Some(contact) = prepared.contact {
+                            let _ = fs::remove_file(contact.temp_path);
+                        }
+                        return Err(error.into());
+                    }
+                };
+                if !committed {
+                    if let Some(contact) = prepared.contact {
+                        let _ = fs::remove_file(contact.temp_path);
+                    }
+                    drop(lease);
+                    continue;
+                }
+                if let Some(contact) = prepared.contact {
+                    let relative_path = contact.relative_path.clone();
+                    publish_contact_sheet(&contact.temp_path, &contact.final_path, || {
+                        store
+                            .commit_feature_result(
+                                request.content_id,
+                                None,
+                                FeatureWrite::ContactSheet(relative_path),
+                            )
+                            .map(|_| ())
+                            .map_err(ScanError::from)
+                    })?;
+                }
             }
             Err(error) => {
                 if store.task_snapshot(request.task_id)?.status != TaskStatus::Cancelled {
@@ -925,21 +1045,49 @@ fn persist_stage1(
     contact_sheet_root: &PathBuf,
     output: crate::worker::Stage1Output,
 ) -> Result<(), ScanError> {
-    let (media_kind, writes) = prepare_stage1_writes(content_id, contact_sheet_root, output)?;
-    store.set_content_media_kind(content_id, media_kind)?;
-    for write in writes {
+    let prepared = prepare_stage1_writes(
+        &format!("legacy-{}", content_id.as_i64()),
+        content_id,
+        contact_sheet_root,
+        output,
+    )?;
+    store.set_content_media_kind(content_id, prepared.media_kind)?;
+    for write in prepared.writes {
         store.commit_feature_result(content_id, None, write)?;
+    }
+    if let Some(contact) = prepared.contact {
+        let relative_path = contact.relative_path.clone();
+        publish_contact_sheet(&contact.temp_path, &contact.final_path, || {
+            store
+                .commit_feature_result(content_id, None, FeatureWrite::ContactSheet(relative_path))
+                .map(|_| ())
+                .map_err(ScanError::from)
+        })?;
     }
     Ok(())
 }
 
+struct PreparedStage1 {
+    media_kind: MediaKind,
+    writes: Vec<FeatureWrite>,
+    contact: Option<PendingContactSheet>,
+}
+
+struct PendingContactSheet {
+    temp_path: PathBuf,
+    final_path: PathBuf,
+    relative_path: String,
+}
+
 fn prepare_stage1_writes(
+    item_id: &str,
     content_id: ContentId,
     contact_sheet_root: &PathBuf,
     output: crate::worker::Stage1Output,
-) -> Result<(MediaKind, Vec<FeatureWrite>), ScanError> {
+) -> Result<PreparedStage1, ScanError> {
     let media_kind = output.media_kind;
     let mut writes = Vec::new();
+    let mut contact = None;
     match media_kind {
         MediaKind::Other => {}
         MediaKind::Image => {
@@ -973,14 +1121,60 @@ fn prepare_stage1_writes(
                 }));
             }
             if let Some(jpeg) = output.contact_sheet_jpeg {
-                fs::create_dir_all(contact_sheet_root)?;
+                let temporary_root = contact_sheet_root.join(".partial");
+                fs::create_dir_all(&temporary_root)?;
                 let file_name = format!("{}.jpg", content_id.as_i64());
-                fs::write(contact_sheet_root.join(&file_name), jpeg)?;
-                writes.push(FeatureWrite::ContactSheet(format!(
-                    "contact-sheets/{file_name}"
-                )));
+                let temp_path = temporary_root.join(format!("{item_id}.jpg.partial"));
+                fs::write(&temp_path, jpeg)?;
+                contact = Some(PendingContactSheet {
+                    temp_path,
+                    final_path: contact_sheet_root.join(&file_name),
+                    relative_path: format!("contact-sheets/{file_name}"),
+                });
             }
         }
     }
-    Ok((media_kind, writes))
+    Ok(PreparedStage1 {
+        media_kind,
+        writes,
+        contact,
+    })
+}
+
+fn publish_contact_sheet(
+    temp_path: &Path,
+    final_path: &Path,
+    commit_reference: impl FnOnce() -> Result<(), ScanError>,
+) -> Result<(), ScanError> {
+    let owned_final = if final_path.exists() {
+        fs::remove_file(temp_path)?;
+        false
+    } else {
+        if let Err(error) = fs::rename(temp_path, final_path) {
+            let _ = fs::remove_file(temp_path);
+            return Err(error.into());
+        }
+        true
+    };
+    if let Err(error) = commit_reference() {
+        if owned_final {
+            if let Err(cleanup) = fs::remove_file(final_path) {
+                return Err(ScanError::Stage1(format!(
+                    "{error}; 联系表引用失败后的本轮文件补偿也失败: {cleanup}"
+                )));
+            }
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// 只供直接行为测试验证联系表发布与引用失败补偿。
+#[doc(hidden)]
+pub fn publish_contact_sheet_for_test(
+    temp_path: &Path,
+    final_path: &Path,
+    commit_reference: impl FnOnce() -> Result<(), ScanError>,
+) -> Result<(), ScanError> {
+    publish_contact_sheet(temp_path, final_path, commit_reference)
 }

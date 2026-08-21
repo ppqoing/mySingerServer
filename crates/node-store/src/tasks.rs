@@ -256,6 +256,69 @@ impl NodeStore {
         Ok(item_id)
     }
 
+    /// 在唯一 SQLite writer 中按任务和规范路径去重，并立即保留一个 running 扫描项。
+    pub fn reserve_scan_path(
+        &mut self,
+        task_id: TaskId,
+        scanned: &ScannedPath,
+        now_ms: i64,
+    ) -> Result<Option<String>, StoreError> {
+        let machine_id = self.machine_id().clone();
+        let transaction = self.connection.transaction()?;
+        let status: String = transaction.query_row(
+            "SELECT status FROM tasks WHERE task_id=?1",
+            [task_id.as_uuid().to_string()],
+            |row| row.get(0),
+        )?;
+        if !matches!(status.as_str(), "queued" | "running") {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM task_items
+               WHERE task_id=?1 AND machine_id=?2 AND normalized_path=?3
+             )",
+            params![
+                task_id.as_uuid().to_string(),
+                machine_id.as_str(),
+                scanned.normalized_path.as_str()
+            ],
+            |row| row.get(0),
+        )?;
+        if exists {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        let item_id = Uuid::now_v7().to_string();
+        insert_task_item(
+            &transaction,
+            task_id,
+            &item_id,
+            &NewTaskItem {
+                location: Some(LocationKey::new(
+                    machine_id,
+                    scanned.normalized_path.clone(),
+                )),
+                display_path: Some(scanned.display_path.clone()),
+                file_size: Some(scanned.file_size),
+                content_id: None,
+                stage: "enumerated".into(),
+            },
+        )?;
+        transaction.execute(
+            "UPDATE task_items SET status='running' WHERE item_id=?1",
+            [&item_id],
+        )?;
+        transaction.execute(
+            "UPDATE tasks SET status='running',total_items=total_items+1,updated_at_ms=?2
+             WHERE task_id=?1",
+            params![task_id.as_uuid().to_string(), now_ms],
+        )?;
+        transaction.commit()?;
+        Ok(Some(item_id))
+    }
+
     /// 在一个事务中创建任务及全部初始 queued 项。
     pub fn create_task(
         &mut self,
@@ -497,6 +560,104 @@ impl NodeStore {
                  (SELECT seq FROM sqlite_sequence WHERE name='sync_outbox'),0)
              WHERE task_id=?1",
             params![task_id.as_uuid().to_string(), now_ms],
+        )?;
+        transaction.commit()?;
+        self.outbox_high_seq()
+    }
+
+    /// 由本任务已经持久化的扫描项判断 seen 路径，以常量内存完成失效和收尾。
+    pub fn finalize_scan_task_from_items(
+        &mut self,
+        task_id: TaskId,
+        now_ms: i64,
+    ) -> Result<u64, StoreError> {
+        let machine_id = self.machine_id().clone();
+        let task_id_text = task_id.as_uuid().to_string();
+        let transaction = self.connection.transaction()?;
+        let (kind, status): (String, String) = transaction.query_row(
+            "SELECT kind,status FROM tasks WHERE task_id=?1",
+            [&task_id_text],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if kind != "scan" || !matches!(status.as_str(), "queued" | "running") {
+            return Err(StoreError::InvalidState("扫描任务不处于可完成状态".into()));
+        }
+        let pending: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM task_items
+             WHERE task_id=?1 AND status IN ('queued','running')",
+            [&task_id_text],
+            |row| row.get(0),
+        )?;
+        if pending != 0 {
+            return Err(StoreError::InvalidState("扫描仍有未完成任务项".into()));
+        }
+        let roots = {
+            let mut statement = transaction.prepare(
+                "SELECT normalized_root FROM task_scan_roots WHERE task_id=?1 ORDER BY normalized_root",
+            )?;
+            statement
+                .query_map([&task_id_text], |row| row.get::<_, String>(0))?
+                .map(|row| NormalizedPath::new(row?).map_err(StoreError::from))
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut last_rowid = 0i64;
+        loop {
+            let row: Option<(i64, String, String, i64, i64)> = transaction
+                .query_row(
+                    "SELECT rowid,normalized_path,display_path,file_size,content_id
+                     FROM files
+                     WHERE machine_id=?1 AND active=1 AND rowid>?2
+                     ORDER BY rowid LIMIT 1",
+                    params![machine_id.as_str(), last_rowid],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((rowid, normalized, display, file_size, content_id)) = row else {
+                break;
+            };
+            last_rowid = rowid;
+            let normalized_path = NormalizedPath::new(&normalized)?;
+            if !roots.iter().any(|root| normalized_path.is_within(root)) {
+                continue;
+            }
+            let seen: bool = transaction.query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM task_items
+                   WHERE task_id=?1 AND machine_id=?2 AND normalized_path=?3
+                 )",
+                params![&task_id_text, machine_id.as_str(), &normalized],
+                |row| row.get(0),
+            )?;
+            if seen {
+                continue;
+            }
+            transaction.execute("UPDATE files SET active=0 WHERE rowid=?1", [rowid])?;
+            let scanned = ScannedPath::new(
+                normalized_path,
+                DisplayPath::new(display)?,
+                file_size as u64,
+            );
+            let key = content_key_in_transaction(&transaction, ContentId::from_i64(content_id))?;
+            append_sync_change(
+                &transaction,
+                "file",
+                encode_file(machine_id.as_str(), &scanned, key, false),
+            )?;
+        }
+        transaction.execute(
+            "UPDATE tasks SET status='completed',event_seq=event_seq+1,updated_at_ms=?2,
+               outbox_high_seq=COALESCE(
+                 (SELECT seq FROM sqlite_sequence WHERE name='sync_outbox'),0)
+             WHERE task_id=?1",
+            params![&task_id_text, now_ms],
         )?;
         transaction.commit()?;
         self.outbox_high_seq()

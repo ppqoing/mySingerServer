@@ -902,6 +902,9 @@ impl EngineState {
         self.store
             .cancel_task(task_id, now_ms())
             .map_err(store_error)?;
+        if let Some(pool) = &self.worker_control {
+            pool.mark_task_cancelled(&request.task_id);
+        }
         if let Some(active) = &self.active_job
             && active.identity == JobIdentity::Task(task_id)
             && let Some(cancellation) = &active.cancellation
@@ -1465,7 +1468,8 @@ async fn run_background_job(
             effective_worker_count,
             cancellation,
         } => {
-            let mut processor = WorkerPoolStage1Processor::new(worker_pool);
+            let mut processor =
+                WorkerPoolStage1Processor::new(worker_pool, cancellation.clone());
             let enumerator =
                 resolve_scan_enumerator_with(enumerator, ensure_everything_ready).await;
             let result = match ScheduledFileReader::new(&read_config, effective_worker_count) {

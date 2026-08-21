@@ -7,7 +7,7 @@ use std::{
 };
 
 use dedup_protocol::proto::{self, worker_envelope};
-use dedup_windows::WorkerJob;
+use dedup_windows::{ReadCancellationToken, WorkerJob};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
@@ -99,6 +99,15 @@ pub struct WorkerPoolHandle {
 }
 
 impl WorkerPoolHandle {
+    /// 在持久取消提交后同步标记任务，使 slot send 临界区拒绝后续请求。
+    pub fn mark_task_cancelled(&self, task_id: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .cancelled_tasks
+            .insert(task_id.to_owned());
+    }
+
     /// 取消任务：删除等待项，终止并替换正在执行该任务的 Worker。
     pub async fn cancel_task(&self, task_id: &str) -> Result<(), WorkerPoolError> {
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -204,7 +213,29 @@ impl WorkerPool {
     pub async fn dispatch(&self, envelope: proto::WorkerEnvelope) -> Result<(), WorkerPoolError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.commands
-            .send(PoolCommand::Dispatch(envelope, reply_tx))
+            .send(PoolCommand::Dispatch(envelope, None, reply_tx))
+            .await
+            .map_err(|_| WorkerPoolError::Closed)?;
+        reply_rx.await.map_err(|_| WorkerPoolError::Closed)?
+    }
+
+    /// 扫描请求在实际槽位发送前同时检查持久门禁结果和取消标记。
+    pub async fn dispatch_scan(
+        &self,
+        envelope: proto::WorkerEnvelope,
+        cancellation: ReadCancellationToken,
+        persisted_active: bool,
+    ) -> Result<(), WorkerPoolError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.commands
+            .send(PoolCommand::Dispatch(
+                envelope,
+                Some(ScanDispatchGuard {
+                    cancellation,
+                    persisted_active,
+                }),
+                reply_tx,
+            ))
             .await
             .map_err(|_| WorkerPoolError::Closed)?;
         reply_rx.await.map_err(|_| WorkerPoolError::Closed)?
@@ -280,8 +311,9 @@ impl WorkerPool {
         reply_rx.await.map_err(|_| WorkerPoolError::Closed)?
     }
 
-    #[cfg(test)]
-    pub(crate) fn controlled_for_test() -> (Self, mpsc::Receiver<(String, String)>) {
+    /// 创建不启动进程的可控池，只供直接集成测试验证发送/取消边界。
+    #[doc(hidden)]
+    pub fn controlled_for_test() -> (Self, mpsc::Receiver<(String, String)>) {
         let state = Arc::new(Mutex::new(PoolState::default()));
         let actor_state = Arc::clone(&state);
         let (commands, mut command_rx) = mpsc::channel(64);
@@ -291,8 +323,21 @@ impl WorkerPool {
             let mut active = None::<WorkIdentity>;
             while let Some(command) = command_rx.recv().await {
                 match command {
-                    PoolCommand::Dispatch(envelope, reply) => {
-                        let result = WorkItem::try_from(envelope).map(|work| {
+                    PoolCommand::Dispatch(envelope, guard, reply) => {
+                        let result = WorkItem::try_from(envelope).map(|mut work| {
+                            work.scan_guard = guard;
+                            let registry_cancelled = actor_state
+                                .lock()
+                                .unwrap()
+                                .cancelled_tasks
+                                .contains(&work.identity.task_id);
+                            if registry_cancelled || !work.dispatch_allowed() {
+                                let _ = events.try_send(WorkerEvent::Cancelled {
+                                    task_id: work.identity.task_id,
+                                    item_id: work.identity.item_id,
+                                });
+                                return;
+                            }
                             active = Some(work.identity.clone());
                             actor_state
                                 .lock()
@@ -307,6 +352,11 @@ impl WorkerPool {
                         let _ = reply.send(result);
                     }
                     PoolCommand::Cancel(task_id, reply) => {
+                        actor_state
+                            .lock()
+                            .unwrap()
+                            .cancelled_tasks
+                            .insert(task_id.clone());
                         if active.as_ref().is_some_and(|work| work.task_id == task_id) {
                             let work = active.take().expect("活动测试项已经确认存在");
                             actor_state.lock().unwrap().running.clear();
@@ -383,6 +433,7 @@ struct PoolState {
     restart_items: HashSet<String>,
     failure_count: u64,
     restarting: bool,
+    cancelled_tasks: HashSet<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -396,12 +447,27 @@ struct WorkIdentity {
 struct WorkItem {
     identity: WorkIdentity,
     envelope: proto::WorkerEnvelope,
+    scan_guard: Option<ScanDispatchGuard>,
+}
+
+struct ScanDispatchGuard {
+    cancellation: ReadCancellationToken,
+    persisted_active: bool,
+}
+
+impl WorkItem {
+    fn dispatch_allowed(&self) -> bool {
+        self.scan_guard
+            .as_ref()
+            .is_none_or(|guard| guard.persisted_active && !guard.cancellation.is_cancelled())
+    }
 }
 
 /// 客户端 API 向单 actor 发送的控制命令。
 enum PoolCommand {
     Dispatch(
         proto::WorkerEnvelope,
+        Option<ScanDispatchGuard>,
         oneshot::Sender<Result<(), WorkerPoolError>>,
     ),
     Cancel(String, oneshot::Sender<Result<(), WorkerPoolError>>),
@@ -455,14 +521,15 @@ async fn run_pool(
             command = commands.recv() => {
                 let Some(command) = command else { break };
                 match command {
-                    PoolCommand::Dispatch(envelope, reply) => {
+                    PoolCommand::Dispatch(envelope, guard, reply) => {
                         let result = if state.lock().unwrap().restarting {
                             Err(WorkerPoolError::Restarting)
                         } else {
                             match WorkItem::try_from(envelope) {
-                                Ok(work) => {
+                                Ok(mut work) => {
+                                    work.scan_guard = guard;
                                     queue.push_back(work);
-                                    schedule(&mut queue, &mut idle, &slots, &state);
+                                    schedule(&mut queue, &mut idle, &slots, &events, &state).await;
                                     Ok(())
                                 }
                                 Err(error) => Err(error),
@@ -502,15 +569,21 @@ async fn run_pool(
                             &state,
                         ).await;
                         if result.is_ok() {
-                            let mut locked = state.lock().unwrap();
-                            locked.restarting = false;
-                            locked.restart_items.clear();
-                            drop(locked);
-                            schedule(&mut queue, &mut idle, &slots, &state);
+                            {
+                                let mut locked = state.lock().unwrap();
+                                locked.restarting = false;
+                                locked.restart_items.clear();
+                            }
+                            schedule(&mut queue, &mut idle, &slots, &events, &state).await;
                         }
                         let _ = reply.send(result);
                     }
                     PoolCommand::Cancel(task_id, reply) => {
+                        state
+                            .lock()
+                            .unwrap()
+                            .cancelled_tasks
+                            .insert(task_id.clone());
                         let result = cancel_task_items(
                             &task_id,
                             &config,
@@ -523,7 +596,7 @@ async fn run_pool(
                             &events,
                             &state,
                         ).await;
-                        schedule(&mut queue, &mut idle, &slots, &state);
+                        schedule(&mut queue, &mut idle, &slots, &events, &state).await;
                         let _ = reply.send(result);
                     }
                     PoolCommand::TerminateUnexpected(process_id, reply) => {
@@ -552,25 +625,40 @@ async fn run_pool(
                     &events,
                     &state,
                 ).await;
-                schedule(&mut queue, &mut idle, &slots, &state);
+                schedule(&mut queue, &mut idle, &slots, &events, &state).await;
             }
         }
     }
 }
 
 /// 按最小槽位号把等待项发送给空闲 Worker，并原子更新共享运行快照。
-fn schedule(
+async fn schedule(
     queue: &mut VecDeque<WorkItem>,
     idle: &mut BTreeSet<usize>,
     slots: &BTreeMap<usize, SlotHandle>,
+    events: &mpsc::Sender<WorkerEvent>,
     state: &Arc<Mutex<PoolState>>,
 ) {
     if state.lock().unwrap().restarting {
         return;
     }
     while !idle.is_empty() && !queue.is_empty() {
-        let slot_id = idle.pop_first().expect("集合已判定非空");
         let work = queue.pop_front().expect("队列已判定非空");
+        let registry_cancelled = state
+            .lock()
+            .unwrap()
+            .cancelled_tasks
+            .contains(&work.identity.task_id);
+        if registry_cancelled || !work.dispatch_allowed() {
+            let _ = events
+                .send(WorkerEvent::Cancelled {
+                    task_id: work.identity.task_id,
+                    item_id: work.identity.item_id,
+                })
+                .await;
+            continue;
+        }
+        let slot_id = idle.pop_first().expect("集合已判定非空");
         let identity = work.identity.clone();
         let Some(slot) = slots.get(&slot_id) else {
             queue.push_front(work);
@@ -959,6 +1047,10 @@ impl TryFrom<proto::WorkerEnvelope> for WorkItem {
             },
             _ => return Err(WorkerPoolError::InvalidRequest),
         };
-        Ok(Self { identity, envelope })
+        Ok(Self {
+            identity,
+            envelope,
+            scan_guard: None,
+        })
     }
 }

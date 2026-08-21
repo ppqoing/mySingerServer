@@ -1,6 +1,6 @@
 //! 两种枚举器必须遵守的稳定输出契约。
 
-use std::{collections::BTreeSet, io};
+use std::io;
 
 use dedup_core::{DisplayPath, NormalizedPath};
 use dedup_node_store::ScannedPath;
@@ -54,7 +54,6 @@ impl FileEnumerator for dedup_windows::WindowsWalker {
         emit: &mut dyn FnMut(ScannedPath) -> Result<(), ScanError>,
     ) -> Result<(), ScanError> {
         let mut emitted_error = None;
-        let mut seen = BTreeSet::new();
         let result = self.walk_into(roots, |file| {
             let row = NormalizedPath::new(&file.path)
                 .map_err(|error| ScanError::InvalidResult(error.to_string()))
@@ -66,13 +65,7 @@ impl FileEnumerator for dedup_windows::WindowsWalker {
                         file.file_size,
                     ))
                 })
-                .and_then(|row| {
-                    if seen.insert(row.normalized_path.clone()) {
-                        emit(row)
-                    } else {
-                        Ok(())
-                    }
-                });
+                .and_then(|row| emit(row));
             match row {
                 Ok(()) => Ok(()),
                 Err(error) => {

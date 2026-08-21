@@ -1,6 +1,6 @@
 //! 不依赖索引服务的 Windows 文件系统递归枚举。
 
-use std::{fs, io, path::PathBuf};
+use std::{collections::VecDeque, fs, io, path::PathBuf};
 
 use dedup_core::DisplayPath;
 
@@ -34,40 +34,34 @@ impl WindowsWalker {
         roots: &[DisplayPath],
         mut emit: impl FnMut(WalkedFile) -> io::Result<()>,
     ) -> io::Result<()> {
-        enum Pending {
-            Directory(PathBuf),
-            File(WalkedFile),
-        }
         let mut root_paths = roots
             .iter()
             .map(|root| root.as_path().to_path_buf())
             .collect::<Vec<_>>();
         root_paths.sort_by_key(|path| path.to_string_lossy().to_uppercase());
-        let mut pending = root_paths
-            .into_iter()
-            .rev()
-            .map(Pending::Directory)
-            .collect::<Vec<_>>();
-        while let Some(next) = pending.pop() {
-            let directory = match next {
-                Pending::Directory(directory) => directory,
-                Pending::File(file) => {
-                    emit(file)?;
-                    continue;
-                }
+        let mut pending_roots = VecDeque::from(root_paths);
+        let mut stack = Vec::new();
+        loop {
+            if stack.is_empty() {
+                let Some(root) = pending_roots.pop_front() else {
+                    break;
+                };
+                stack.push(fs::read_dir(root)?);
+            }
+            let next = stack.last_mut().expect("非空目录迭代器栈").next();
+            let Some(entry) = next else {
+                stack.pop();
+                continue;
             };
-            let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
-            entries.sort_by_key(|entry| entry.path().to_string_lossy().to_uppercase());
-            for entry in entries.into_iter().rev() {
-                let file_type = entry.file_type()?;
-                if file_type.is_dir() && !file_type.is_symlink() {
-                    pending.push(Pending::Directory(entry.path()));
-                } else if file_type.is_file() {
-                    pending.push(Pending::File(WalkedFile {
-                        path: entry.path(),
-                        file_size: entry.metadata()?.len(),
-                    }));
-                }
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() && !file_type.is_symlink() {
+                stack.push(fs::read_dir(entry.path())?);
+            } else if file_type.is_file() {
+                emit(WalkedFile {
+                    path: entry.path(),
+                    file_size: entry.metadata()?.len(),
+                })?;
             }
         }
         Ok(())

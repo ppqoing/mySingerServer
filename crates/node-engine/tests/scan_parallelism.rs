@@ -18,6 +18,7 @@ use dedup_node_engine::{
     scan::{
         FileEnumerator, PipelineFileReader, PipelineLimits, ReadProduct, ScanEngine, ScanError,
         ScanOptions, Stage1BatchResult, Stage1Processor, Stage1Request, SystemMd5, md5_bytes,
+        publish_contact_sheet_for_test,
     },
     worker::{Stage1Frame, Stage1Output},
 };
@@ -71,6 +72,49 @@ impl Drop for TestLease {
     }
 }
 
+#[derive(Clone)]
+struct HoldingPipelineReader {
+    data: Arc<BTreeMap<PathBuf, Vec<u8>>>,
+    gates: Arc<BTreeMap<PathBuf, Arc<Semaphore>>>,
+    started: mpsc::UnboundedSender<PathBuf>,
+    completed: mpsc::UnboundedSender<PathBuf>,
+    active_leases: Arc<AtomicUsize>,
+}
+
+impl PipelineFileReader for HoldingPipelineReader {
+    type Lease = TestLease;
+
+    fn read(
+        &self,
+        scanned: ScannedPath,
+        cancellation: ReadCancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<ReadProduct<Self::Lease>, ReadFailure>> + Send + 'static>>
+    {
+        let path = scanned.display_path.as_path().to_path_buf();
+        let data = self.data.get(&path).unwrap().clone();
+        let gate = self.gates.get(&path).unwrap().clone();
+        let started = self.started.clone();
+        let completed = self.completed.clone();
+        let active_leases = self.active_leases.clone();
+        Box::pin(async move {
+            active_leases.fetch_add(1, Ordering::AcqRel);
+            let lease = TestLease(active_leases);
+            let _ = started.send(path.clone());
+            gate.acquire().await.unwrap().forget();
+            let _ = completed.send(path);
+            if cancellation.is_cancelled() {
+                drop(lease);
+                Err(ReadFailure::Cancelled)
+            } else {
+                Ok(ReadProduct {
+                    md5: md5_bytes(&data),
+                    lease,
+                })
+            }
+        })
+    }
+}
+
 impl PipelineFileReader for FakePipelineReader {
     type Lease = TestLease;
 
@@ -108,6 +152,21 @@ impl PipelineFileReader for FakePipelineReader {
 struct ReversedBatchProcessor {
     batch_sizes: Arc<Mutex<Vec<usize>>>,
     active_leases: Arc<AtomicUsize>,
+}
+
+struct InvalidVideoProcessor;
+
+impl Stage1Processor for InvalidVideoProcessor {
+    async fn process(&mut self, _request: Stage1Request) -> Result<Stage1Output, String> {
+        Ok(Stage1Output {
+            media_kind: MediaKind::Video,
+            width: 1,
+            height: 1,
+            duration_ms: Some(u64::MAX),
+            frames: Vec::new(),
+            contact_sheet_jpeg: Some(vec![1, 2, 3]),
+        })
+    }
 }
 
 impl Stage1Processor for ReversedBatchProcessor {
@@ -275,6 +334,196 @@ async fn bounded_enumerator_stops_emitting_when_downstream_capacity_is_full() {
     assert!(matches!(task.await.unwrap(), Err(ScanError::Cancelled)));
 }
 
+#[tokio::test]
+async fn duplicate_enumeration_is_deduplicated_by_the_single_sqlite_writer() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("duplicate.bin");
+    let data = b"duplicate".repeat(31);
+    std::fs::write(&path, &data).unwrap();
+    let row = scanned(&path);
+    let enumerator = StreamingEnumerator {
+        rows: Arc::new(vec![row.clone(), row.clone()]),
+        attempted: None,
+        emitted: Arc::new(AtomicUsize::new(0)),
+    };
+    let (completed, _completed_rx) = mpsc::unbounded_channel();
+    let active_leases = Arc::new(AtomicUsize::new(0));
+    let reader = FakePipelineReader {
+        data: Arc::new(BTreeMap::from([(path.clone(), data)])),
+        gates: Arc::new(BTreeMap::new()),
+        completed,
+        active_leases: active_leases.clone(),
+    };
+    let mut processor = ReversedBatchProcessor {
+        batch_sizes: Arc::new(Mutex::new(Vec::new())),
+        active_leases,
+    };
+    let root = DisplayPath::new(directory.path()).unwrap();
+    let machine = MachineId::parse(&"44".repeat(32)).unwrap();
+    let mut store = NodeStore::open_in_memory(machine).unwrap();
+    let mut engine = ScanEngine::new(enumerator, SystemMd5, directory.path().join("sheets"));
+
+    let summary = engine
+        .run_parallel_with(
+            &mut store,
+            ScanOptions::new(vec![root]),
+            reader,
+            &mut processor,
+            PipelineLimits::new(2, 2),
+            ReadCancellationToken::new(),
+            4,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(summary.total_files, 1);
+    assert_eq!(summary.hashed, 1);
+    assert_eq!(summary.scheduled_stage1, 1);
+    assert_eq!(store.task_snapshot(summary.task_id).unwrap().total_items, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancellation_drains_blocking_reads_before_their_leases_are_dropped() {
+    let directory = tempfile::tempdir().unwrap();
+    let path_a = directory.path().join("holding-a.bin");
+    let path_b = directory.path().join("holding-b.bin");
+    std::fs::write(&path_a, b"a").unwrap();
+    std::fs::write(&path_b, b"b").unwrap();
+    let rows = vec![scanned(&path_a), scanned(&path_b)];
+    let enumerator = StreamingEnumerator {
+        rows: Arc::new(rows),
+        attempted: None,
+        emitted: Arc::new(AtomicUsize::new(0)),
+    };
+    let gate_a = Arc::new(Semaphore::new(0));
+    let gate_b = Arc::new(Semaphore::new(0));
+    let (started, mut started_rx) = mpsc::unbounded_channel();
+    let (completed, mut completed_rx) = mpsc::unbounded_channel();
+    let active_leases = Arc::new(AtomicUsize::new(0));
+    let reader = HoldingPipelineReader {
+        data: Arc::new(BTreeMap::from([
+            (path_a.clone(), vec![b'a']),
+            (path_b.clone(), vec![b'b']),
+        ])),
+        gates: Arc::new(BTreeMap::from([
+            (path_a.clone(), gate_a.clone()),
+            (path_b.clone(), gate_b.clone()),
+        ])),
+        started,
+        completed,
+        active_leases: active_leases.clone(),
+    };
+    let machine = MachineId::parse(&"45".repeat(32)).unwrap();
+    let store = NodeStore::open_in_memory(machine).unwrap();
+    let root = DisplayPath::new(directory.path()).unwrap();
+    let cancellation = ReadCancellationToken::new();
+    let task_cancellation = cancellation.clone();
+    let task = tokio::spawn(async move {
+        let mut store = store;
+        let mut engine = ScanEngine::new(enumerator, SystemMd5, directory.path().join("sheets"));
+        let mut processor = ReversedBatchProcessor {
+            batch_sizes: Arc::new(Mutex::new(Vec::new())),
+            active_leases: Arc::new(AtomicUsize::new(0)),
+        };
+        engine
+            .run_parallel_with(
+                &mut store,
+                ScanOptions::new(vec![root]),
+                reader,
+                &mut processor,
+                PipelineLimits::new(2, 2),
+                task_cancellation,
+                5,
+            )
+            .await
+    });
+    let mut started_paths = vec![
+        started_rx.recv().await.unwrap(),
+        started_rx.recv().await.unwrap(),
+    ];
+    started_paths.sort();
+    assert_eq!(started_paths, vec![path_a.clone(), path_b.clone()]);
+    assert_eq!(active_leases.load(Ordering::Acquire), 2);
+
+    cancellation.cancel();
+    gate_b.add_permits(1);
+    assert_eq!(completed_rx.recv().await.unwrap(), path_b);
+    tokio::task::yield_now().await;
+    assert!(!task.is_finished(), "另一个 blocking read 尚未 drain");
+    assert_eq!(active_leases.load(Ordering::Acquire), 1);
+
+    gate_a.add_permits(1);
+    assert_eq!(completed_rx.recv().await.unwrap(), path_a);
+    assert!(matches!(task.await.unwrap(), Err(ScanError::Cancelled)));
+    assert_eq!(active_leases.load(Ordering::Acquire), 0);
+}
+
+#[tokio::test]
+async fn rejected_main_stage1_transaction_never_publishes_a_final_contact_sheet() {
+    let directory = tempfile::tempdir().unwrap();
+    let media = directory.path().join("video.bin");
+    std::fs::write(&media, b"video").unwrap();
+    let row = scanned(&media);
+    let enumerator = StreamingEnumerator {
+        rows: Arc::new(vec![row]),
+        attempted: None,
+        emitted: Arc::new(AtomicUsize::new(0)),
+    };
+    let (completed, _completed_rx) = mpsc::unbounded_channel();
+    let reader = FakePipelineReader {
+        data: Arc::new(BTreeMap::from([(media, b"video".to_vec())])),
+        gates: Arc::new(BTreeMap::new()),
+        completed,
+        active_leases: Arc::new(AtomicUsize::new(0)),
+    };
+    let sheets = directory.path().join("sheets");
+    let machine = MachineId::parse(&"46".repeat(32)).unwrap();
+    let mut store = NodeStore::open_in_memory(machine).unwrap();
+    let mut engine = ScanEngine::new(enumerator, SystemMd5, sheets.clone());
+    let root = DisplayPath::new(directory.path()).unwrap();
+
+    let result = engine
+        .run_parallel_with(
+            &mut store,
+            ScanOptions::new(vec![root]),
+            reader,
+            &mut InvalidVideoProcessor,
+            PipelineLimits::new(1, 1),
+            ReadCancellationToken::new(),
+            6,
+        )
+        .await;
+
+    assert!(result.is_err());
+    assert!(!contains_jpg(&sheets));
+}
+
+#[test]
+fn contact_reference_failure_removes_only_a_final_owned_by_this_publish_attempt() {
+    let directory = tempfile::tempdir().unwrap();
+    let temp = directory.path().join("item.partial");
+    let final_path = directory.path().join("content.jpg");
+    std::fs::write(&temp, b"new").unwrap();
+    let error = publish_contact_sheet_for_test(&temp, &final_path, || {
+        Err(ScanError::Stage1("ref failed".into()))
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("ref failed"));
+    assert!(!temp.exists());
+    assert!(!final_path.exists());
+
+    std::fs::write(&final_path, b"existing").unwrap();
+    std::fs::write(&temp, b"newer").unwrap();
+    assert!(
+        publish_contact_sheet_for_test(&temp, &final_path, || {
+            Err(ScanError::Stage1("ref failed again".into()))
+        })
+        .is_err()
+    );
+    assert_eq!(std::fs::read(&final_path).unwrap(), b"existing");
+    assert!(!temp.exists());
+}
+
 #[test]
 fn cancelled_item_rejects_late_stage1_without_feature_side_effects() {
     let machine = MachineId::parse(&"43".repeat(32)).unwrap();
@@ -359,4 +608,22 @@ fn scanned(path: &Path) -> ScannedPath {
         DisplayPath::new(path).unwrap(),
         std::fs::metadata(path).unwrap().len(),
     )
+}
+
+fn contains_jpg(root: &Path) -> bool {
+    if !root.exists() {
+        return false;
+    }
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|extension| extension == "jpg") {
+                return true;
+            }
+        }
+    }
+    false
 }

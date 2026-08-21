@@ -131,11 +131,13 @@ impl PipelineFileReader for ScheduledFileReader {
                 })?;
             let read_path = path.clone();
             let read_cancellation = cancellation.clone();
-            let md5 = tokio::task::spawn_blocking(move || {
-                reader.read_file_md5(&read_path, &read_cancellation)
+            let (md5, lease) = tokio::task::spawn_blocking(move || {
+                let result = reader.read_file_md5(&read_path, &read_cancellation);
+                (result, lease)
             })
             .await
-            .map_err(|error| join_failure(&path, error.to_string()))??;
+            .map_err(|error| join_failure(&path, error.to_string()))?;
+            let md5 = md5?;
             Ok(ReadProduct { md5, lease })
         })
     }
