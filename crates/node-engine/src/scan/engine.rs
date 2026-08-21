@@ -276,19 +276,27 @@ impl Stage1Processor for WorkerPoolStage1Processor<'_> {
             )
             .await
             .map_err(|error| error.to_string())?;
+        let mut started_slot = None;
         loop {
             match self.pool.next_event().await {
             Some(WorkerEvent::Completed {
                 task_id: event_task,
                 item_id: event_item,
                 response,
-            }) if event_task == task_id && event_item == item_id => return match response.payload {
+            }) if event_task == task_id && event_item == item_id => {
+                if let Some(slot) = started_slot
+                    && let Some(reporter) = &self.runtime_reporter
+                {
+                    let _ = reporter.worker_completed(slot).await;
+                }
+                return match response.payload {
                 Some(worker_envelope::Payload::Stage1Result(result)) => {
                     decode_stage1_payload(&result.payload).map_err(|error| error.to_string())
                 }
                 Some(worker_envelope::Payload::WorkerFailure(failure)) => Err(failure.message),
                 _ => Err("Worker 返回了非一筛响应".into()),
-            },
+                };
+            }
             Some(WorkerEvent::Crashed {
                 task_id: event_task,
                 item_id: event_item,
@@ -313,6 +321,7 @@ impl Stage1Processor for WorkerPoolStage1Processor<'_> {
                             speed_per_second: 0.0,
                         }).await;
                     }
+                    started_slot = Some(slot);
                     continue;
                 }
             Some(_) => return Err("WorkerPool 在串行扫描中返回了其他任务事件".into()),
@@ -630,16 +639,16 @@ where
                     .map_err(|error| ScanError::Stage1(error.to_string()))?;
             }
         }
-        let (mut enumerated, mut enumeration_task) = spawn_bounded_enumeration(
+        let (mut enumerated, enumeration_task) = spawn_bounded_enumeration(
             self.enumerator.clone(),
             options.roots.clone(),
             limits.channel_capacity(),
             cancellation.clone(),
         );
+        let mut enumeration_task = Some(enumeration_task);
         let mut reads = JoinSet::new();
         let mut enumeration_closed = false;
         let mut enumeration_totals_frozen = false;
-        let mut enumeration_joined = false;
         let mut pending_stage1 = Vec::new();
         let mut summary = ScanSummary {
             task_id,
@@ -657,7 +666,7 @@ where
             if cancellation.is_cancelled() {
                 drop(enumerated);
                 drain_parallel_reads(&mut reads).await;
-                let _ = enumeration_task.await;
+                let _ = join_enumeration(&mut enumeration_task).await;
                 return Err(ScanError::Cancelled);
             }
             while reads.len() < limits.max_read_tasks() {
@@ -684,17 +693,8 @@ where
                 enumeration_closed = true;
             }
             if enumeration_closed && !enumeration_totals_frozen {
-                match (&mut enumeration_task).await {
-                    Ok(Ok(())) => enumeration_joined = true,
-                    Ok(Err(error)) => {
-                        cancellation.cancel();
-                        drain_parallel_reads(&mut reads).await;
-                        if let Some(reporter) = &self.runtime_reporter {
-                            let _ = reporter.finish(crate::runtime_tasks::RuntimeTaskState::Failed).await;
-                        }
-                        store.fail_task(task_id, now_ms)?;
-                        return Err(error);
-                    }
+                match join_enumeration(&mut enumeration_task).await {
+                    Ok(()) => {}
                     Err(error) => {
                         cancellation.cancel();
                         drain_parallel_reads(&mut reads).await;
@@ -702,7 +702,7 @@ where
                             let _ = reporter.finish(crate::runtime_tasks::RuntimeTaskState::Failed).await;
                         }
                         store.fail_task(task_id, now_ms)?;
-                        return Err(ScanError::Stage1(error.to_string()));
+                        return Err(error);
                     }
                 }
                 if let Some(reporter) = &self.runtime_reporter {
@@ -731,7 +731,7 @@ where
                 if matches!(result, Err(ScanError::Cancelled)) {
                     drop(enumerated);
                     drain_parallel_reads(&mut reads).await;
-                    let _ = enumeration_task.await;
+                    let _ = join_enumeration(&mut enumeration_task).await;
                     return Err(ScanError::Cancelled);
                 }
                 result?;
@@ -757,7 +757,7 @@ where
                 if matches!(result, Err(ScanError::Cancelled)) {
                     drop(enumerated);
                     drain_parallel_reads(&mut reads).await;
-                    let _ = enumeration_task.await;
+                    let _ = join_enumeration(&mut enumeration_task).await;
                     return Err(ScanError::Cancelled);
                 }
                 result?;
@@ -787,7 +787,7 @@ where
             if matches!(step, Err(ScanError::Cancelled)) {
                 drop(enumerated);
                 drain_parallel_reads(&mut reads).await;
-                let _ = enumeration_task.await;
+                let _ = join_enumeration(&mut enumeration_task).await;
                 return Err(ScanError::Cancelled);
             }
             step?;
@@ -804,24 +804,7 @@ where
             now_ms,
         )
         .await?;
-        if !enumeration_joined { match enumeration_task.await {
-            Ok(Ok(())) => {}
-            Ok(Err(ScanError::Cancelled)) => return Err(ScanError::Cancelled),
-            Ok(Err(error)) => {
-                if let Some(reporter) = &self.runtime_reporter {
-                    let _ = reporter.finish(crate::runtime_tasks::RuntimeTaskState::Failed).await;
-                }
-                store.fail_task(task_id, now_ms)?;
-                return Err(error);
-            }
-            Err(error) => {
-                if let Some(reporter) = &self.runtime_reporter {
-                    let _ = reporter.finish(crate::runtime_tasks::RuntimeTaskState::Failed).await;
-                }
-                store.fail_task(task_id, now_ms)?;
-                return Err(ScanError::Stage1(error.to_string()));
-            }
-        } }
+        join_enumeration(&mut enumeration_task).await?;
         if cancellation.is_cancelled()
             || store.task_snapshot(task_id)?.status == TaskStatus::Cancelled
         {
@@ -1211,6 +1194,16 @@ async fn drain_parallel_reads<L>(
     L: Send + 'static,
 {
     while reads.join_next().await.is_some() {}
+}
+
+async fn join_enumeration(
+    task: &mut Option<tokio::task::JoinHandle<Result<(), ScanError>>>,
+) -> Result<(), ScanError> {
+    let Some(task) = task.take() else {
+        return Ok(());
+    };
+    task.await
+        .map_err(|error| ScanError::Stage1(error.to_string()))?
 }
 
 struct PendingStage1<L> {

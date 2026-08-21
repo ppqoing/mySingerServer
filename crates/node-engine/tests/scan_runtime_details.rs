@@ -209,9 +209,6 @@ async fn controlled_two_disks_and_actual_two_worker_slots_expose_live_known_tota
         NormalizedPath::new(path).unwrap(), DisplayPath::new(path).unwrap(), 16,
     )).collect::<Vec<_>>();
     let gate = ReadGate::default();
-    struct ReleaseAll(ReadGate);
-    impl Drop for ReleaseAll { fn drop(&mut self) { self.0.release_all(); } }
-    let _release_all = ReleaseAll(gate.clone());
     let mut config = dedup_core::DiskReadConfig::default();
     config.hdd_threads_per_disk = 2;
     config.total_threads = 4;
@@ -223,6 +220,7 @@ async fn controlled_two_disks_and_actual_two_worker_slots_expose_live_known_tota
     ).unwrap();
     let registry = RuntimeTaskRegistry::new();
     let reporter = registry.begin(RuntimeTaskKind::Scan, MachineId::from_sha256([0xa3; 32]), "双盘").await;
+    let reader = reader.with_runtime_reporter(reporter.clone());
     let (pool, mut started, control) = WorkerPool::controlled_batch_for_test(2);
     let (first_started_tx, first_started_rx) = tokio::sync::oneshot::channel();
     let release_workers = Arc::new(tokio::sync::Notify::new());
@@ -245,6 +243,15 @@ async fn controlled_two_disks_and_actual_two_worker_slots_expose_live_known_tota
     let sheets = dir.path().join("sheets");
     let run_reporter = reporter.clone();
     let cancellation = ReadCancellationToken::new();
+    struct ScenarioGuard { gate: ReadGate, workers: Arc<tokio::sync::Notify>, cancellation: ReadCancellationToken }
+    impl Drop for ScenarioGuard {
+        fn drop(&mut self) {
+            self.cancellation.cancel();
+            self.gate.release_all();
+            self.workers.notify_waiters();
+        }
+    }
+    let _scenario_guard = ScenarioGuard { gate: gate.clone(), workers: release_workers.clone(), cancellation: cancellation.clone() };
     let run_cancellation = cancellation.clone();
     let run = tokio::spawn(async move {
         let mut pool = pool;
@@ -269,6 +276,9 @@ async fn controlled_two_disks_and_actual_two_worker_slots_expose_live_known_tota
         let _ = tokio::time::timeout(Duration::from_secs(3), run).await;
         panic!("两盘首批读取必须进入两个真实Worker slot");
     }
+    let released_bytes = registry.details(reporter.id()).await.unwrap();
+    let read_after_release = released_bytes.stages.iter().find(|stage| stage.stage_id == "read_md5").unwrap();
+    assert_eq!(read_after_release.completed, 32, "首批两个真实block只能推进32字节");
     tokio::time::timeout(Duration::from_secs(3), async {
         while registry.details(reporter.id()).await.unwrap().workers.len() != 2 {
             tokio::task::yield_now().await;
@@ -327,4 +337,92 @@ async fn enumeration_error_marks_runtime_task_and_all_started_stages_failed() {
     }));
     let enumerate = details.stages.iter().find(|stage| stage.stage_id == "enumerate").unwrap();
     assert_eq!(enumerate.state, dedup_protocol::proto::RuntimeStageState::RuntimeStageFailed as i32);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_after_successful_enumerator_join_during_read_barrier_returns_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = [dir.path().join("c2.bin"), dir.path().join("d2.bin")];
+    for path in &paths { fs::write(path, b"blocked-read").unwrap(); }
+    let rows = paths.iter().map(|path| ScannedPath::new(
+        NormalizedPath::new(path).unwrap(), DisplayPath::new(path).unwrap(), 12,
+    )).collect();
+    let gate = ReadGate::default();
+    struct Guard(ReadGate);
+    impl Drop for Guard { fn drop(&mut self) { self.0.release_all(); } }
+    let _guard = Guard(gate.clone());
+    let config = dedup_core::DiskReadConfig::default();
+    let (reader, limits) = ScheduledFileReader::controlled_for_test(
+        &config, 1, gate.clone(), |_| (vec![20], LocalDiskKind::Unknown),
+    ).unwrap();
+    let registry = RuntimeTaskRegistry::new();
+    let reporter = registry.begin(RuntimeTaskKind::Scan, MachineId::from_sha256([0xa5; 32]), "取消").await;
+    let reader = reader.with_runtime_reporter(reporter.clone());
+    let cancellation = ReadCancellationToken::new();
+    let run_cancel = cancellation.clone();
+    let root = DisplayPath::new(dir.path()).unwrap();
+    let run_reporter = reporter.clone();
+    let run = tokio::spawn(async move {
+        let mut engine = ScanEngine::new(Rows(rows), SystemMd5, dir.path().join("sheets"))
+            .with_runtime_reporter(run_reporter.clone());
+        let mut store = NodeStore::open_in_memory(MachineId::from_sha256([0xa5; 32])).unwrap();
+        engine.run_parallel_with(
+            &mut store, ScanOptions::new(vec![root]), reader,
+            &mut Processor(run_reporter), limits, run_cancel, 1,
+        ).await
+    });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !registry.list().await[0].overall_total_known { tokio::task::yield_now().await; }
+    }).await.expect("producer Ok join后必须立即freeze totals");
+    cancellation.cancel();
+    gate.release_all();
+    let result = tokio::time::timeout(Duration::from_secs(3), run).await
+        .expect("取消后background owner必须归还").unwrap();
+    assert!(matches!(result, Err(ScanError::Cancelled)));
+}
+
+#[tokio::test]
+async fn serial_processor_consumes_started_and_counts_only_matching_completions() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("serial.bin");
+    fs::write(&path, b"serial").unwrap();
+    let machine = MachineId::from_sha256([0xa6; 32]);
+    let mut store = NodeStore::open_in_memory(machine.clone()).unwrap();
+    let scanned = ScannedPath::new(
+        NormalizedPath::new(&path).unwrap(), DisplayPath::new(&path).unwrap(), 6,
+    );
+    let content = store.upsert_content_and_location(&scanned, [0x33; 16], MediaKind::Other).unwrap();
+    let registry = RuntimeTaskRegistry::new();
+    let reporter = registry.begin(RuntimeTaskKind::Scan, machine.clone(), "串行").await;
+    let (mut pool, mut started, control) = WorkerPool::controlled_batch_for_test(1);
+    let controller = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (task_id, item_id) = started.recv().await.unwrap();
+            control.complete(task_id, item_id, Stage1Output { media_kind: MediaKind::Other, width: 0, height: 0, duration_ms: None, frames: Vec::new(), contact_sheet_jpeg: None }).await;
+        }
+        let (task_id, item_id) = started.recv().await.unwrap();
+        control.crash(task_id, item_id, "serial crash".into()).await;
+    });
+    let mut processor = WorkerPoolStage1Processor::new(&mut pool, ReadCancellationToken::new())
+        .with_runtime_reporter(reporter.clone());
+    let task_id = dedup_core::TaskId::from_uuid(uuid::Uuid::new_v4());
+    for index in 0..3 {
+        let result = processor.process(Stage1Request {
+            task_id,
+            item_id: format!("serial-{index}"),
+            machine_id: machine.clone(),
+            normalized_path: scanned.normalized_path.clone(),
+            display_path: scanned.display_path.clone(),
+            file_size: 6,
+            stage: "probe_stage1".into(),
+            content_id: content.id,
+            physical_disk_id: "PhysicalDisk9".into(),
+            generate_contact_sheet: false,
+        }).await;
+        assert_eq!(result.is_ok(), index < 2);
+    }
+    controller.await.unwrap();
+    let worker = registry.details(reporter.id()).await.unwrap().workers.remove(0);
+    assert_eq!(worker.completed_files, 2);
+    assert!(worker.speed_per_second > 0.0);
 }
