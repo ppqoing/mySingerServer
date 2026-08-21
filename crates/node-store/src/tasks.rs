@@ -497,27 +497,72 @@ impl NodeStore {
 
     /// 把上次进程遗留的 running 项重新排队，其他四种项状态保持不变。
     pub fn recover_running_items(&mut self, now_ms: i64) -> Result<usize, StoreError> {
+        self.recover_active_task_state(now_ms)
+            .map(|(_, changed)| changed)
+    }
+
+    /// 原子恢复 running 项，并返回所有 queued/running 持久任务的最新快照。
+    pub fn recover_active_computation_tasks(
+        &mut self,
+        now_ms: i64,
+    ) -> Result<Vec<TaskSnapshot>, StoreError> {
+        self.recover_active_task_state(now_ms)
+            .map(|(tasks, _)| tasks)
+    }
+
+    /// 在同一事务中冻结活动任务集合并完成 running 到 queued 的恢复。
+    fn recover_active_task_state(
+        &mut self,
+        now_ms: i64,
+    ) -> Result<(Vec<TaskSnapshot>, usize), StoreError> {
         let transaction = self.connection.transaction()?;
-        let task_ids = {
-            let mut statement = transaction
-                .prepare("SELECT DISTINCT task_id FROM task_items WHERE status='running'")?;
+        let active = {
+            let mut statement = transaction.prepare(
+                "SELECT task_id,kind,event_seq,total_items,succeeded,failed_items,cancelled,
+                        outbox_high_seq
+                 FROM tasks WHERE status IN ('queued','running') ORDER BY task_id",
+            )?;
             statement
-                .query_map([], |row| row.get::<_, String>(0))?
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                    ))
+                })?
                 .collect::<Result<Vec<_>, _>>()?
         };
+        let tasks = active
+            .into_iter()
+            .map(|row| {
+                Ok(TaskSnapshot {
+                    task_id: parse_task_id(&row.0)?,
+                    kind: row.1,
+                    status: TaskStatus::Queued,
+                    event_seq: row.2 as u64,
+                    total_items: row.3 as u64,
+                    succeeded: row.4 as u64,
+                    failed: row.5 as u64,
+                    cancelled: row.6 as u64,
+                    outbox_high_seq: row.7 as u64,
+                })
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?;
         let changed = transaction.execute(
             "UPDATE task_items SET status='queued' WHERE status='running'",
             [],
         )?;
-        for task_id in task_ids {
-            transaction.execute(
-                "UPDATE tasks SET status='queued',updated_at_ms=?2
-                 WHERE task_id=?1 AND status='running'",
-                params![task_id, now_ms],
-            )?;
-        }
+        transaction.execute(
+            "UPDATE tasks SET status='queued',updated_at_ms=?1 WHERE status='running'",
+            [now_ms],
+        )?;
         transaction.commit()?;
-        Ok(changed)
+        Ok((tasks, changed))
     }
 
     /// 在 Worker 计划重启的 prepare 与 restart 之间原子重排指定 running 项。

@@ -345,7 +345,7 @@ impl NodeRuntime {
         fs::create_dir_all(&paths.log_path)?;
         let machine_id = identity.machine_id()?;
         let mut store = NodeStore::open(&paths.data_path.join("node.db"), machine_id)?;
-        store.recover_running_items(now_ms())?;
+        let recovered_tasks = store.recover_active_computation_tasks(now_ms())?;
         let logical_cpu_count = std::thread::available_parallelism()
             .map(usize::from)
             .unwrap_or(1);
@@ -378,6 +378,7 @@ impl NodeRuntime {
             host_control,
             artifact_registry,
             disk_full_cleaner,
+            recovered_tasks,
         );
         let (server_shutdown, shutdown) = oneshot::channel();
         let server_task = tokio::spawn(NodeServer::serve_until(listener, handle.clone(), shutdown));
@@ -452,11 +453,12 @@ impl NodeEngine {
     /// 创建不启动 Worker 的测试 actor；协议、SQLite 和关闭路径与生产相同。
     #[doc(hidden)]
     pub fn spawn_for_test(
-        store: NodeStore,
+        mut store: NodeStore,
         listen_address: SocketAddr,
         cache_root: &Path,
     ) -> (NodeEngineHandle, JoinHandle<()>) {
         let (artifact_registry, disk_full_cleaner) = test_artifact_cleanup(cache_root);
+        let recovered_tasks = recover_for_actor(&mut store);
         spawn_actor(
             store,
             None,
@@ -469,19 +471,21 @@ impl NodeEngine {
             None,
             artifact_registry,
             disk_full_cleaner,
+            recovered_tasks,
         )
     }
 
     /// 创建注入配置仓库和可选宿主控制器的测试 actor。
     #[doc(hidden)]
     pub fn spawn_with_remote_config_for_test(
-        store: NodeStore,
+        mut store: NodeStore,
         listen_address: SocketAddr,
         cache_root: &Path,
         repository: Box<dyn NodeConfigRepositoryAccess>,
         host_control: Option<Box<dyn NodeHostControl>>,
     ) -> (NodeEngineHandle, JoinHandle<()>) {
         let (artifact_registry, disk_full_cleaner) = test_artifact_cleanup(cache_root);
+        let recovered_tasks = recover_for_actor(&mut store);
         spawn_actor(
             store,
             None,
@@ -494,12 +498,13 @@ impl NodeEngine {
             host_control,
             artifact_registry,
             disk_full_cleaner,
+            recovered_tasks,
         )
     }
 
     /// 创建持有真实 WorkerPool 的生产 actor。
     pub fn spawn(
-        store: NodeStore,
+        mut store: NodeStore,
         worker_pool: WorkerPool,
         listen_address: SocketAddr,
         cache_root: &Path,
@@ -507,6 +512,7 @@ impl NodeEngine {
     ) -> (NodeEngineHandle, JoinHandle<()>) {
         let effective_worker_count = worker_pool.worker_process_ids().len().max(1);
         let (artifact_registry, disk_full_cleaner) = test_artifact_cleanup(cache_root);
+        let recovered_tasks = recover_for_actor(&mut store);
         spawn_actor(
             store,
             Some(worker_pool),
@@ -519,6 +525,7 @@ impl NodeEngine {
             None,
             artifact_registry,
             disk_full_cleaner,
+            recovered_tasks,
         )
     }
 }
@@ -535,6 +542,7 @@ fn spawn_actor(
     host_control: Option<Box<dyn NodeHostControl>>,
     artifact_registry: Arc<RegenerableArtifactRegistry>,
     disk_full_cleaner: DiskFullCleaner,
+    recovered_tasks: Vec<TaskSnapshot>,
 ) -> (NodeEngineHandle, JoinHandle<()>) {
     let (commands, receiver) = mpsc::channel(64);
     let runtime_tasks = RuntimeTaskRegistry::new();
@@ -565,8 +573,16 @@ fn spawn_actor(
             runtime_tasks,
         },
         receiver,
+        recovered_tasks,
     ));
     (handle, actor)
+}
+
+/// 兼容不返回 `Result` 的旧工厂 API，并在 actor 启动前完成持久任务恢复。
+fn recover_for_actor(store: &mut NodeStore) -> Vec<TaskSnapshot> {
+    store
+        .recover_active_computation_tasks(now_ms())
+        .expect("Node actor 启动前必须能够恢复持久任务")
 }
 
 fn test_artifact_cleanup(
@@ -663,7 +679,17 @@ impl BackgroundJob {
     }
 }
 
-async fn run_actor(mut state: EngineState, mut commands: mpsc::Receiver<EngineCommand>) {
+async fn run_actor(
+    mut state: EngineState,
+    mut commands: mpsc::Receiver<EngineCommand>,
+    recovered_tasks: Vec<TaskSnapshot>,
+) {
+    publish_recovery_runtime_tasks(
+        &state.runtime_tasks,
+        state.store.machine_id().clone(),
+        recovered_tasks,
+    )
+    .await;
     while let Some(command) = commands.recv().await {
         match command {
             EngineCommand::Protocol(request, reply) => {
@@ -687,6 +713,28 @@ async fn run_actor(mut state: EngineState, mut commands: mpsc::Receiver<EngineCo
                 worker_pool,
             } => state.finish_background(identity, worker_pool),
         }
+    }
+}
+
+/// 把每个活动持久任务包装为全新临时恢复任务，不暴露原 SQLite 任务 ID。
+async fn publish_recovery_runtime_tasks(
+    registry: &RuntimeTaskRegistry,
+    machine_id: MachineId,
+    recovered_tasks: Vec<TaskSnapshot>,
+) {
+    for task in recovered_tasks {
+        let pending_items = task
+            .total_items
+            .saturating_sub(task.succeeded)
+            .saturating_sub(task.failed)
+            .saturating_sub(task.cancelled);
+        registry
+            .begin_recovery(
+                machine_id.clone(),
+                format!("恢复任务（{}）", task.kind),
+                pending_items,
+            )
+            .await;
     }
 }
 

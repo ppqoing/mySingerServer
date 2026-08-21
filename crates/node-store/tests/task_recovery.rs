@@ -230,3 +230,57 @@ fn crashed_item_rejects_mismatched_fault_identity_without_side_effects() {
     assert_eq!(store.task_snapshot(task).unwrap().failed, 0);
     assert!(store.page_file_faults(None, 10).unwrap().items.is_empty());
 }
+
+/// 启动恢复只返回 queued/running 任务，并把 running 项重新排队而不复活终态任务。
+#[test]
+fn active_recovery_snapshots_exclude_terminal_tasks() {
+    let mut store = NodeStore::open_in_memory(machine()).unwrap();
+    let queued = store
+        .create_task("scan", &[NewTaskItem::detached("queued")], 1)
+        .unwrap();
+    let running = store
+        .create_task("scan", &[NewTaskItem::detached("running")], 2)
+        .unwrap();
+    store.claim_next_item(running, 3).unwrap().unwrap();
+    let completed = store
+        .create_task("scan", &[NewTaskItem::detached("completed")], 4)
+        .unwrap();
+    let completed_item = store.claim_next_item(completed, 5).unwrap().unwrap();
+    store
+        .complete_item(
+            &completed_item.item_id,
+            TaskItemCompletion::Succeeded { content_id: None },
+            6,
+        )
+        .unwrap();
+    let failed = store
+        .create_task("scan", &[NewTaskItem::detached("failed")], 7)
+        .unwrap();
+    store.fail_task(failed, 8).unwrap();
+
+    let recovered = store.recover_active_computation_tasks(9).unwrap();
+    assert_eq!(
+        recovered
+            .iter()
+            .map(|task| task.task_id)
+            .collect::<Vec<_>>(),
+        vec![queued, running]
+    );
+    assert!(
+        recovered
+            .iter()
+            .all(|task| task.status == TaskStatus::Queued)
+    );
+    assert_eq!(
+        store.task_items(running).unwrap()[0].status,
+        TaskItemStatus::Queued
+    );
+    assert_eq!(
+        store.task_snapshot(completed).unwrap().status,
+        TaskStatus::Completed
+    );
+    assert_eq!(
+        store.task_snapshot(failed).unwrap().status,
+        TaskStatus::Failed
+    );
+}

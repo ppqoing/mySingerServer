@@ -32,6 +32,8 @@ impl RuntimeTaskClock for SystemClock {
 /// Node 运行任务类别。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeTaskKind {
+    /// Node 重启后为未完成持久任务创建的临时恢复包装。
+    Recovery,
     /// 扫描与一筛。
     Scan,
     /// 本地分析。
@@ -45,6 +47,7 @@ pub enum RuntimeTaskKind {
 impl RuntimeTaskKind {
     const fn as_str(self) -> &'static str {
         match self {
+            Self::Recovery => "recovery",
             Self::Scan => "scan",
             Self::LocalAnalysis => "local_analysis",
             Self::Stage2 => "stage2",
@@ -56,6 +59,8 @@ impl RuntimeTaskKind {
 /// 固定英文 ID 与中文显示名的运行阶段。
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum RuntimeStage {
+    /// 重启后校验并重新排队未完成持久任务。
+    RecoveryValidate,
     /// 准备。
     Prepare,
     /// 枚举。
@@ -102,6 +107,7 @@ impl RuntimeStage {
     /// 稳定英文阶段 ID。
     pub const fn id(self) -> &'static str {
         match self {
+            Self::RecoveryValidate => "recovery_validate",
             Self::Prepare => "prepare",
             Self::Enumerate => "enumerate",
             Self::CacheLookup => "cache_lookup",
@@ -128,6 +134,7 @@ impl RuntimeStage {
     /// 固定中文阶段名。
     pub const fn display_name(self) -> &'static str {
         match self {
+            Self::RecoveryValidate => "恢复与校验",
             Self::Prepare => "准备",
             Self::Enumerate => "枚举文件",
             Self::CacheLookup => "缓存查询",
@@ -354,6 +361,28 @@ impl RuntimeTaskRegistry {
             registry: self.clone(),
             task_id,
         }
+    }
+
+    /// 为一个未完成持久任务创建全新恢复详情，不复用 SQLite 任务 ID 或旧历史。
+    pub async fn begin_recovery(
+        &self,
+        machine_id: MachineId,
+        title: impl Into<String>,
+        pending_items: u64,
+    ) -> RuntimeTaskReporter {
+        let reporter = self
+            .begin(RuntimeTaskKind::Recovery, machine_id, title)
+            .await;
+        let _ = reporter.update_overall(0, Some(pending_items), 0, 0).await;
+        let _ = reporter
+            .update_stage(RuntimeStageUpdate::running(
+                RuntimeStage::RecoveryValidate,
+                RuntimeProgressUnit::Items,
+                0,
+                Some(pending_items),
+            ))
+            .await;
+        reporter
     }
 
     /// 返回按 ID 稳定排列的摘要。
