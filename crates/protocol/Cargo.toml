@@ -16,3 +16,6 @@ thiserror.workspace = true
 [build-dependencies]
 prost-build.workspace = true
 protoc-bin-vendored.workspace = true
+
+[dev-dependencies]
+prost-types = "=0.14.4"

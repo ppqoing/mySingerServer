@@ -69,6 +69,18 @@ enum MediaKind {
   MEDIA_OTHER = 3;
 }
 
+enum NodeEnumerator {
+  NODE_ENUMERATOR_UNSPECIFIED = 0;
+  NODE_WINDOWS_WALKER = 1;
+  NODE_EVERYTHING = 2;
+}
+
+enum NodeWorkerMode {
+  NODE_WORKER_MODE_UNSPECIFIED = 0;
+  NODE_WORKER_AUTOMATIC = 1;
+  NODE_WORKER_MANUAL = 2;
+}
+
 message Hello {
   uint32 protocol_version = 1;
   string product_id = 2;
@@ -316,6 +328,47 @@ message RetryDeleteItems {
   repeated string delete_item_ids = 2;
 }
 
+message GetNodeConfig {}
+
+message NodeConfigValue {
+  string listen_ip = 1;
+  uint32 port = 2;
+  NodeEnumerator enumerator = 3;
+  string data_path = 4;
+  string config_path = 5;
+  string log_path = 6;
+  string cache_path = 7;
+  uint32 hdd_threads_per_disk = 8;
+  uint32 ssd_threads_per_disk = 9;
+  uint32 unknown_threads_per_disk = 10;
+  uint32 total_threads = 11;
+  uint64 block_size_bytes = 12;
+  uint64 block_timeout_seconds = 13;
+  uint32 block_retries = 14;
+  uint32 legacy_worker_count = 15;
+  NodeWorkerMode worker_mode = 16;
+  uint32 reserved_cores = 17;
+  uint32 manual_worker_count = 18;
+}
+
+message NodeConfigSnapshot {
+  string machine_id = 1;
+  string version_sha256 = 2;
+  NodeConfigValue config = 3;
+  uint32 logical_cpu_count = 4;
+  uint32 effective_worker_count = 5;
+}
+
+message SaveNodeConfigAndRestart {
+  string expected_version_sha256 = 1;
+  NodeConfigValue config = 2;
+}
+
+message NodeRestartAccepted {
+  string machine_id = 1;
+  string saved_version_sha256 = 2;
+}
+
 message Envelope {
   uint64 request_id = 1;
   oneof payload {
@@ -346,6 +399,10 @@ message Envelope {
     FileChunk file_chunk = 34;
     CreateDeleteBatch create_delete_batch = 35;
     RetryDeleteItems retry_delete_items = 36;
+    GetNodeConfig get_node_config = 37;
+    NodeConfigSnapshot node_config_snapshot = 38;
+    SaveNodeConfigAndRestart save_node_config_and_restart = 39;
+    NodeRestartAccepted node_restart_accepted = 40;
   }
 }
 

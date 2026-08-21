@@ -1232,6 +1232,7 @@ dependencies = [
  "dedup-core",
  "prost",
  "prost-build",
+ "prost-types",
  "protoc-bin-vendored",
  "thiserror 2.0.20",
 ]

@@ -10,7 +10,7 @@ pub use error::ProtocolError;
 pub use generated::{FILE_DESCRIPTOR_SET, proto};
 
 /// 当前 Rust V2 节点与管理端握手使用的固定协议版本。
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 #[cfg(test)]
 mod tests {

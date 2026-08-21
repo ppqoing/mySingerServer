@@ -1,11 +1,101 @@
 //! Protobuf 外部键与共享领域值对象之间的显式转换。
 
-use dedup_core::{ContentKey, LocationKey, MachineId, NormalizedPath, Thresholds};
+use std::net::IpAddr;
+
+use dedup_core::{
+    ContentKey, DiskReadConfig, EnumeratorKind, LocationKey, MachineId, NodeConfig,
+    NodePathsConfig, NormalizedPath, Thresholds, WorkerConfig, WorkerMode,
+};
 
 use crate::{ProtocolError, proto};
 
 /// 单个 `FileChunk.data` 允许的最大字节数。
 pub const MAX_FILE_CHUNK_DATA: usize = 1_048_576;
+
+impl From<&NodeConfig> for proto::NodeConfigValue {
+    fn from(value: &NodeConfig) -> Self {
+        Self {
+            listen_ip: value.listen_ip.to_string(),
+            port: u32::from(value.port),
+            enumerator: match value.enumerator {
+                EnumeratorKind::WindowsWalker => proto::NodeEnumerator::NodeWindowsWalker as i32,
+                EnumeratorKind::Everything => proto::NodeEnumerator::NodeEverything as i32,
+            },
+            data_path: value.paths.data_path.clone(),
+            config_path: value.paths.config_path.clone(),
+            log_path: value.paths.log_path.clone(),
+            cache_path: value.paths.cache_path.clone(),
+            hdd_threads_per_disk: value.read.hdd_threads_per_disk as u32,
+            ssd_threads_per_disk: value.read.ssd_threads_per_disk as u32,
+            unknown_threads_per_disk: value.read.unknown_threads_per_disk as u32,
+            total_threads: value.read.total_threads as u32,
+            block_size_bytes: value.read.block_size_bytes as u64,
+            block_timeout_seconds: value.read.block_timeout_seconds,
+            block_retries: value.read.block_retries,
+            legacy_worker_count: value.worker_count as u32,
+            worker_mode: match value.worker.mode {
+                WorkerMode::Automatic => proto::NodeWorkerMode::NodeWorkerAutomatic as i32,
+                WorkerMode::Manual => proto::NodeWorkerMode::NodeWorkerManual as i32,
+            },
+            reserved_cores: value.worker.reserved_cores as u32,
+            manual_worker_count: value.worker.manual_worker_count as u32,
+        }
+    }
+}
+
+impl TryFrom<proto::NodeConfigValue> for NodeConfig {
+    type Error = ProtocolError;
+
+    fn try_from(value: proto::NodeConfigValue) -> Result<Self, Self::Error> {
+        let listen_ip = value.listen_ip.parse::<IpAddr>().map_err(|_| invalid_config(
+            "listen_ip",
+            "不是有效 IP 地址",
+        ))?;
+        let enumerator = match proto::NodeEnumerator::try_from(value.enumerator) {
+            Ok(proto::NodeEnumerator::NodeWindowsWalker) => EnumeratorKind::WindowsWalker,
+            Ok(proto::NodeEnumerator::NodeEverything) => EnumeratorKind::Everything,
+            Ok(proto::NodeEnumerator::Unspecified) | Err(_) => {
+                return Err(invalid_config("enumerator", "未知枚举值"));
+            }
+        };
+        let mode = match proto::NodeWorkerMode::try_from(value.worker_mode) {
+            Ok(proto::NodeWorkerMode::NodeWorkerAutomatic) => WorkerMode::Automatic,
+            Ok(proto::NodeWorkerMode::NodeWorkerManual) => WorkerMode::Manual,
+            Ok(proto::NodeWorkerMode::Unspecified) | Err(_) => {
+                return Err(invalid_config("worker.mode", "未知枚举值"));
+            }
+        };
+        let config = Self {
+            listen_ip,
+            port: value.port.try_into().map_err(|_| invalid_config("port", "超出 u16"))?,
+            worker_count: narrow_usize(value.legacy_worker_count, "worker_count")?,
+            enumerator,
+            paths: NodePathsConfig {
+                data_path: value.data_path,
+                config_path: value.config_path,
+                log_path: value.log_path,
+                cache_path: value.cache_path,
+            },
+            read: DiskReadConfig {
+                hdd_threads_per_disk: narrow_usize(value.hdd_threads_per_disk, "read.hdd_threads_per_disk")?,
+                ssd_threads_per_disk: narrow_usize(value.ssd_threads_per_disk, "read.ssd_threads_per_disk")?,
+                unknown_threads_per_disk: narrow_usize(value.unknown_threads_per_disk, "read.unknown_threads_per_disk")?,
+                total_threads: narrow_usize(value.total_threads, "read.total_threads")?,
+                block_size_bytes: usize::try_from(value.block_size_bytes)
+                    .map_err(|_| invalid_config("read.block_size_bytes", "超出 usize"))?,
+                block_timeout_seconds: value.block_timeout_seconds,
+                block_retries: value.block_retries,
+            },
+            worker: WorkerConfig {
+                mode,
+                reserved_cores: narrow_usize(value.reserved_cores, "worker.reserved_cores")?,
+                manual_worker_count: narrow_usize(value.manual_worker_count, "worker.manual_worker_count")?,
+            },
+        };
+        config.validate()?;
+        Ok(config)
+    }
+}
 
 impl From<&ContentKey> for proto::ContentKey {
     fn from(value: &ContentKey) -> Self {
@@ -107,4 +197,14 @@ fn narrow(value: u32, field: &'static str) -> Result<u8, dedup_core::CoreError> 
             field,
             reason: "整数超出 u8",
         })
+}
+
+fn narrow_usize(value: u32, field: &'static str) -> Result<usize, ProtocolError> {
+    value
+        .try_into()
+        .map_err(|_| invalid_config(field, "超出 usize"))
+}
+
+fn invalid_config(field: &'static str, reason: &'static str) -> ProtocolError {
+    dedup_core::CoreError::InvalidConfig { field, reason }.into()
 }
