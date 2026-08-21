@@ -35,6 +35,7 @@ use crate::{
     review::{QuickReviewRule, ReviewBoard, ReviewDecision},
     runtime_tasks::{
         DesktopRuntimeTaskRegistry, DesktopRuntimeTaskReporter, DesktopRuntimeTaskState,
+        RuntimeTaskKey, RuntimeTaskOwner,
     },
     sync::{
         AUTO_CATCH_UP_INTERVAL_SECONDS, SyncEngine, SyncError, SyncTriggerReceiver,
@@ -43,11 +44,13 @@ use crate::{
     view_state::{
         DesktopPaths, DesktopViewState, DiskFullCleanupSummaryView, FileFaultDiagnosticsState,
         FileFaultView, NodeConfigControllerState, NodeConfigSavePhase, NodeConnectionState,
-        NodeRuntimeStats, PostgresHealth, TaskView, ViewTaskState,
+        NodeRuntimeStats, PostgresHealth, RuntimeTaskControllerState, RuntimeTaskDetailsView,
+        TaskView, ViewTaskState,
     },
 };
 
 const NODE_CONFIG_RECONNECT_ATTEMPTS: u64 = 3;
+const RUNTIME_TASK_REFRESH_SECONDS: u64 = 2;
 
 /// Slint 回调允许发送的管理命令；回调自身不执行网络或文件 IO。
 #[derive(Clone, Debug)]
@@ -214,6 +217,11 @@ pub enum UiCommand {
         /// 稳定小写故障类别。
         fault_kind: String,
     },
+    /// 切换任务中心选中项并立即拉取其详情。
+    SelectRuntimeTask {
+        /// Node/Desktop 共用的稳定运行任务键。
+        key: RuntimeTaskKey,
+    },
     /// 保存完整配置；校验失败保持旧配置。
     SaveSettings(DesktopConfig),
     /// 有序结束后台控制循环。
@@ -238,6 +246,8 @@ pub enum UiEvent {
     NodeConfigChanged(NodeConfigControllerState),
     /// 文件故障分页、选择和最近清理摘要已改变。
     FileFaultsChanged(FileFaultDiagnosticsState),
+    /// 运行任务摘要、选择、详情或 stale 状态已经改变。
+    RuntimeTasksChanged(RuntimeTaskControllerState),
     /// 返回一页路径浏览结果。
     PathsChanged {
         /// 结果所属节点。
@@ -420,6 +430,44 @@ enum NodeSyncOutcome {
     },
 }
 
+/// 一个 Node 管理会话对应的唯一运行任务事件监督器。
+struct NodeRuntimeWatcher {
+    /// 每次新会话生成的代次，阻止旧连接事件覆盖新机器。
+    generation: Uuid,
+    /// 启动监督器时冻结的握手机器 ID。
+    machine_id: String,
+    /// 用于确认当前 sessions 仍是同一个连接对象。
+    session: Arc<NodeSession>,
+    /// 持续等待该连接主动事件的后台任务。
+    task: JoinHandle<()>,
+}
+
+impl Drop for NodeRuntimeWatcher {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Node 运行任务监督器返回给唯一控制循环的带归属结果。
+struct NodeRuntimeEvent {
+    /// 当前 Desktop 配置中的节点索引。
+    node_index: usize,
+    /// 监督器代次。
+    generation: Uuid,
+    /// 监督器启动时冻结的机器 ID。
+    machine_id: String,
+    /// 主动终态或连接错误。
+    outcome: NodeRuntimeEventOutcome,
+}
+
+/// Node 主动运行任务事件或事件流终止原因。
+enum NodeRuntimeEventOutcome {
+    /// Node 推送的终态变化。
+    Changed(proto::RuntimeTaskChanged),
+    /// 当前管理连接已断开，旧详情必须标记 stale。
+    Disconnected(String),
+}
+
 async fn run_controller(
     mut state: DesktopViewState,
     config_path: PathBuf,
@@ -431,13 +479,18 @@ async fn run_controller(
     let mut central = connect_central(&mut state).await;
     let mut sync_workers = BTreeMap::<usize, NodeSyncWorker>::new();
     let (sync_result_sender, mut sync_results) = mpsc::unbounded_channel();
+    let mut runtime_view = RuntimeTaskControllerState::default();
+    let mut runtime_watchers = BTreeMap::<usize, NodeRuntimeWatcher>::new();
+    let (runtime_event_sender, mut runtime_events) = mpsc::unbounded_channel();
     let mut cross_analysis: Option<ActiveCrossAnalysis> = None;
     let mut loaded_members: Option<LoadedMembersContext> = None;
     let mut prepared_delete: Option<PreparedDeleteContext> = None;
     let mut pending_node_config: Option<PendingNodeConfigSave> = None;
     let mut reconnect_ticks = repeating_interval(state.config().reconnect_interval_seconds);
     let mut catch_up_ticks = repeating_interval(AUTO_CATCH_UP_INTERVAL_SECONDS);
+    let mut runtime_ticks = runtime_task_interval();
     catch_up_ticks.tick().await;
+    runtime_ticks.tick().await;
     publish(&events, &state).await;
     loop {
         let command = tokio::select! {
@@ -467,6 +520,14 @@ async fn run_controller(
                     &sync_result_sender,
                     &runtime_tasks,
                 ).await;
+                reconcile_and_publish_runtime_tasks(
+                    &sessions,
+                    &mut runtime_watchers,
+                    &runtime_event_sender,
+                    &mut runtime_view,
+                    &runtime_tasks,
+                    &events,
+                ).await;
                 publish(&events, &state).await;
                 continue;
             }
@@ -479,6 +540,14 @@ async fn run_controller(
                     &sync_result_sender,
                     &runtime_tasks,
                 ).await;
+                reconcile_and_publish_runtime_tasks(
+                    &sessions,
+                    &mut runtime_watchers,
+                    &runtime_event_sender,
+                    &mut runtime_view,
+                    &runtime_tasks,
+                    &events,
+                ).await;
                 publish(&events, &state).await;
                 continue;
             }
@@ -489,6 +558,39 @@ async fn run_controller(
                     &mut sessions,
                     &mut central,
                     &mut sync_workers,
+                    &events,
+                ).await;
+                reconcile_and_publish_runtime_tasks(
+                    &sessions,
+                    &mut runtime_watchers,
+                    &runtime_event_sender,
+                    &mut runtime_view,
+                    &runtime_tasks,
+                    &events,
+                ).await;
+                publish(&events, &state).await;
+                continue;
+            }
+            _ = runtime_ticks.tick() => {
+                reconcile_runtime_watchers(
+                    &sessions,
+                    &mut runtime_watchers,
+                    &runtime_event_sender,
+                    &mut runtime_view,
+                );
+                refresh_runtime_tasks(&mut runtime_view, &sessions, &runtime_tasks).await;
+                publish_runtime_tasks(&events, &runtime_view).await;
+                continue;
+            }
+            Some(runtime_event) = runtime_events.recv() => {
+                apply_runtime_event(
+                    runtime_event,
+                    &mut state,
+                    &mut sessions,
+                    &mut sync_workers,
+                    &mut runtime_watchers,
+                    &mut runtime_view,
+                    &runtime_tasks,
                     &events,
                 ).await;
                 publish(&events, &state).await;
@@ -824,6 +926,12 @@ async fn run_controller(
                 )
                 .await
             }
+            UiCommand::SelectRuntimeTask { key } => {
+                runtime_view.select(key);
+                refresh_runtime_tasks(&mut runtime_view, &sessions, &runtime_tasks).await;
+                publish_runtime_tasks(&events, &runtime_view).await;
+                Ok(())
+            }
             UiCommand::SaveSettings(config) => {
                 let result = if state.node_config().is_in_progress() {
                     Err(node_config_target_change_error())
@@ -850,8 +958,281 @@ async fn run_controller(
         if let Err(error) = result {
             let _ = events.send(UiEvent::Error(error)).await;
         }
+        reconcile_and_publish_runtime_tasks(
+            &sessions,
+            &mut runtime_watchers,
+            &runtime_event_sender,
+            &mut runtime_view,
+            &runtime_tasks,
+            &events,
+        )
+        .await;
         publish(&events, &state).await;
     }
+}
+
+/// 创建固定两秒、错过后不补跑的运行任务刷新时钟。
+fn runtime_task_interval() -> Interval {
+    let mut ticks = interval(Duration::from_secs(RUNTIME_TASK_REFRESH_SECONDS));
+    ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    ticks
+}
+
+/// 会话集合变化时立即建立监督器并发布一次列表/选中详情。
+async fn reconcile_and_publish_runtime_tasks(
+    sessions: &BTreeMap<usize, Arc<NodeSession>>,
+    watchers: &mut BTreeMap<usize, NodeRuntimeWatcher>,
+    runtime_events: &mpsc::UnboundedSender<NodeRuntimeEvent>,
+    view: &mut RuntimeTaskControllerState,
+    registry: &DesktopRuntimeTaskRegistry,
+    ui_events: &mpsc::Sender<UiEvent>,
+) {
+    if reconcile_runtime_watchers(sessions, watchers, runtime_events, view) {
+        refresh_runtime_tasks(view, sessions, registry).await;
+        publish_runtime_tasks(ui_events, view).await;
+    }
+}
+
+/// 让监督器集合与当前活动会话严格一一对应，并返回集合是否发生变化。
+fn reconcile_runtime_watchers(
+    sessions: &BTreeMap<usize, Arc<NodeSession>>,
+    watchers: &mut BTreeMap<usize, NodeRuntimeWatcher>,
+    events: &mpsc::UnboundedSender<NodeRuntimeEvent>,
+    view: &mut RuntimeTaskControllerState,
+) -> bool {
+    let obsolete = watchers
+        .iter()
+        .filter_map(|(index, watcher)| {
+            let current = sessions.get(index);
+            let matches = current.is_some_and(|session| {
+                Arc::ptr_eq(session, &watcher.session)
+                    && session.machine_id().as_str() == watcher.machine_id
+            });
+            (!matches).then_some(*index)
+        })
+        .collect::<Vec<_>>();
+    let mut changed = !obsolete.is_empty();
+    for index in obsolete {
+        watchers.remove(&index);
+        if selected_node_index(view) == Some(index) {
+            view.mark_stale(format!("节点 {index} 运行任务连接已失效"));
+        }
+    }
+
+    for (index, session) in sessions {
+        if watchers.contains_key(index) {
+            continue;
+        }
+        changed = true;
+        let generation = Uuid::now_v7();
+        let machine_id = session.machine_id().as_str().to_owned();
+        let event_session = Arc::clone(session);
+        let event_sender = events.clone();
+        let event_machine = machine_id.clone();
+        let event_index = *index;
+        let task = tokio::spawn(async move {
+            loop {
+                let outcome = match event_session.next_runtime_event().await {
+                    Ok(event) => NodeRuntimeEventOutcome::Changed(event),
+                    Err(error) => NodeRuntimeEventOutcome::Disconnected(error.to_string()),
+                };
+                let disconnected = matches!(outcome, NodeRuntimeEventOutcome::Disconnected(_));
+                if event_sender
+                    .send(NodeRuntimeEvent {
+                        node_index: event_index,
+                        generation,
+                        machine_id: event_machine.clone(),
+                        outcome,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                if disconnected {
+                    break;
+                }
+            }
+        });
+        watchers.insert(
+            *index,
+            NodeRuntimeWatcher {
+                generation,
+                machine_id,
+                session: Arc::clone(session),
+                task,
+            },
+        );
+    }
+    changed
+}
+
+/// 只应用当前代次和机器的主动事件；旧会话结果直接丢弃。
+async fn apply_runtime_event(
+    event: NodeRuntimeEvent,
+    state: &mut DesktopViewState,
+    sessions: &mut BTreeMap<usize, Arc<NodeSession>>,
+    sync_workers: &mut BTreeMap<usize, NodeSyncWorker>,
+    watchers: &mut BTreeMap<usize, NodeRuntimeWatcher>,
+    view: &mut RuntimeTaskControllerState,
+    registry: &DesktopRuntimeTaskRegistry,
+    ui_events: &mpsc::Sender<UiEvent>,
+) {
+    let valid = watchers.get(&event.node_index).is_some_and(|watcher| {
+        runtime_event_identity_matches(
+            watcher.generation,
+            &watcher.machine_id,
+            event.generation,
+            &event.machine_id,
+        ) && sessions.get(&event.node_index).is_some_and(|session| {
+            Arc::ptr_eq(session, &watcher.session)
+                && session.machine_id().as_str() == event.machine_id
+        })
+    });
+    if !valid {
+        return;
+    }
+
+    match event.outcome {
+        NodeRuntimeEventOutcome::Changed(_changed) => {
+            refresh_runtime_tasks(view, sessions, registry).await;
+        }
+        NodeRuntimeEventOutcome::Disconnected(message) => {
+            sessions.remove(&event.node_index);
+            sync_workers.remove(&event.node_index);
+            watchers.remove(&event.node_index);
+            state.set_node_error(event.node_index, message.clone());
+            if selected_node_index(view) == Some(event.node_index) {
+                view.mark_stale(message);
+            }
+        }
+    }
+    publish_runtime_tasks(ui_events, view).await;
+}
+
+/// 比较监督器与事件的冻结代次和机器身份；测试用公开边界验证旧事件必被拒绝。
+#[doc(hidden)]
+pub fn runtime_event_identity_matches(
+    current_generation: Uuid,
+    current_machine_id: &str,
+    event_generation: Uuid,
+    event_machine_id: &str,
+) -> bool {
+    current_generation == event_generation && current_machine_id == event_machine_id
+}
+
+/// 合并 Desktop registry 与全部在线 Node 摘要，并只刷新当前选中详情。
+async fn refresh_runtime_tasks(
+    view: &mut RuntimeTaskControllerState,
+    sessions: &BTreeMap<usize, Arc<NodeSession>>,
+    registry: &DesktopRuntimeTaskRegistry,
+) {
+    let previous = view.summaries().to_vec();
+    let mut summaries = registry.list();
+    let mut errors = Vec::new();
+    for (node_index, session) in sessions {
+        match list_node_runtime_tasks(*node_index, session).await {
+            Ok(mut tasks) => summaries.append(&mut tasks),
+            Err(error) => {
+                errors.push(format!("节点 {node_index} 运行任务列表失败: {error}"));
+                summaries.extend(previous.iter().filter(|task| {
+                    matches!(
+                        task.key.owner,
+                        RuntimeTaskOwner::Node { node_index: current } if current == *node_index
+                    )
+                }).cloned());
+            }
+        }
+    }
+    summaries.sort_by(|left, right| left.key.cmp(&right.key));
+    summaries.dedup_by(|left, right| left.key == right.key);
+    view.replace_summaries(summaries, (!errors.is_empty()).then(|| errors.join("；")));
+    refresh_selected_runtime_details(view, sessions, registry).await;
+}
+
+/// 读取单个 Node 的全部稳定游标页，并用真实握手机器 ID 建立统一摘要。
+async fn list_node_runtime_tasks(
+    node_index: usize,
+    session: &Arc<NodeSession>,
+) -> Result<Vec<crate::runtime_tasks::RuntimeTaskSnapshot>, String> {
+    let mut cursor = String::new();
+    let mut tasks = Vec::new();
+    loop {
+        let page = session
+            .list_runtime_tasks(&cursor, 100)
+            .await
+            .map_err(|error| error.to_string())?;
+        tasks.extend(page.tasks.into_iter().map(|summary| {
+            DesktopRuntimeTaskRegistry::node_snapshot(node_index, session.machine_id(), summary)
+        }));
+        if page.next_cursor.is_empty() {
+            break;
+        }
+        if page.next_cursor == cursor {
+            return Err("Node 返回了未推进的运行任务游标".into());
+        }
+        cursor = page.next_cursor;
+    }
+    Ok(tasks)
+}
+
+/// 只刷新当前选中详情；失败时保留最后成功数据并标记 stale。
+async fn refresh_selected_runtime_details(
+    view: &mut RuntimeTaskControllerState,
+    sessions: &BTreeMap<usize, Arc<NodeSession>>,
+    registry: &DesktopRuntimeTaskRegistry,
+) {
+    let Some(selected) = view.selected().cloned() else {
+        return;
+    };
+    match selected.owner {
+        RuntimeTaskOwner::Desktop => match registry.details(&selected) {
+            Some(details) => view.set_details(RuntimeTaskDetailsView::Desktop(details)),
+            None => view.mark_stale("Desktop 运行任务已不存在"),
+        },
+        RuntimeTaskOwner::Node { node_index } => {
+            let Some(session) = sessions.get(&node_index) else {
+                view.mark_stale(format!("节点 {node_index} 未连接，保留最后运行详情"));
+                return;
+            };
+            let machine_id = session.machine_id().as_str().to_owned();
+            match session.runtime_task_details(&selected.id).await {
+                Ok(details) => {
+                    let response_machine = details
+                        .summary
+                        .as_ref()
+                        .map(|summary| summary.machine_id.as_str())
+                        .unwrap_or_default();
+                    if !response_machine.is_empty() && response_machine != machine_id {
+                        view.mark_stale(format!("节点 {node_index} 运行详情机器归属不匹配"));
+                    } else {
+                        view.set_details(RuntimeTaskDetailsView::Node {
+                            node_index,
+                            machine_id,
+                            details,
+                        });
+                    }
+                }
+                Err(error) => {
+                    view.mark_stale(format!("节点 {node_index} 运行任务详情失败: {error}"))
+                }
+            }
+        }
+    }
+}
+
+/// 返回当前选择所属的节点索引；Desktop 任务没有节点索引。
+fn selected_node_index(view: &RuntimeTaskControllerState) -> Option<usize> {
+    match view.selected().map(|key| &key.owner) {
+        Some(RuntimeTaskOwner::Node { node_index }) => Some(*node_index),
+        _ => None,
+    }
+}
+
+/// 向 UI 发布独立运行任务快照，不重放其它配置或表单状态。
+async fn publish_runtime_tasks(events: &mpsc::Sender<UiEvent>, view: &RuntimeTaskControllerState) {
+    let _ = events
+        .send(UiEvent::RuntimeTasksChanged(view.clone()))
+        .await;
 }
 
 async fn connect_all(

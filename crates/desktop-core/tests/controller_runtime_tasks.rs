@@ -1,11 +1,28 @@
-use dedup_core::{AnalysisRunId, MachineId};
+use std::{
+    net::IpAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
+
+use dedup_core::{AnalysisRunId, DesktopConfig, MachineId, NodeEndpoint};
 use dedup_desktop_core::{
     analysis::CrossPollReport,
+    app::{DesktopApp, UiCommand, UiEvent},
     central::CentralAnalysisStatus,
-    runtime_tasks::{DesktopRuntimeTaskRegistry, DesktopRuntimeTaskState, RuntimeStageState},
+    runtime_tasks::{
+        DesktopRuntimeTaskRegistry, DesktopRuntimeTaskState, RuntimeStageState, RuntimeTaskKey,
+        RuntimeTaskOwner,
+    },
     sync::{SyncPhase, SyncProgress, SyncTrigger, sync_trigger_channel},
+    view_state::DesktopPaths,
 };
+use dedup_node_engine::server::{NodeRequestHandler, NodeServer};
 use dedup_protocol::proto;
+use tempfile::TempDir;
+use tokio::sync::{broadcast, oneshot};
 
 #[test]
 fn cross_analysis_real_poll_shape_updates_seven_fixed_stages() {
@@ -173,4 +190,174 @@ async fn queued_sync_triggers_are_drained_into_the_active_runtime_row() {
     sender.manual().await.unwrap();
     sender.catch_up_tick().await.unwrap();
     assert_eq!(receiver.drain_pending(), 2);
+}
+
+/// 可控 Node handler 记录列表与详情请求，并向真实 TCP 会话推送终态事件。
+#[derive(Clone)]
+struct RuntimeTaskHandler {
+    /// 握手后状态接口报告的物理机器身份。
+    machine_id: MachineId,
+    /// 列表请求次数，用于验证固定两秒刷新节奏。
+    list_calls: Arc<AtomicUsize>,
+    /// 详情请求次数，用于验证只拉取当前选中任务。
+    detail_calls: Arc<AtomicUsize>,
+    /// 每条管理连接各自订阅的运行任务终态广播。
+    changes: broadcast::Sender<proto::RuntimeTaskChanged>,
+}
+
+impl NodeRequestHandler for RuntimeTaskHandler {
+    async fn handle(&self, request: proto::Envelope) -> proto::Envelope {
+        let payload = match request.payload {
+            Some(proto::envelope::Payload::NodeStatus(_)) => {
+                proto::envelope::Payload::NodeStatus(proto::NodeStatus {
+                    machine_id: self.machine_id.as_str().into(),
+                    listen_address: "127.0.0.1".into(),
+                    ..Default::default()
+                })
+            }
+            Some(proto::envelope::Payload::ListTasks(mut page)) => {
+                page.tasks.clear();
+                page.next_cursor.clear();
+                proto::envelope::Payload::ListTasks(page)
+            }
+            Some(proto::envelope::Payload::ListRuntimeTasks(mut page)) => {
+                self.list_calls.fetch_add(1, Ordering::SeqCst);
+                page.tasks = vec![runtime_summary(self.machine_id.as_str())];
+                page.next_cursor.clear();
+                proto::envelope::Payload::ListRuntimeTasks(page)
+            }
+            Some(proto::envelope::Payload::GetRuntimeTaskDetails(mut response)) => {
+                self.detail_calls.fetch_add(1, Ordering::SeqCst);
+                response.details = Some(proto::RuntimeTaskDetails {
+                    summary: Some(runtime_summary(self.machine_id.as_str())),
+                    stages: Vec::new(),
+                    workers: Vec::new(),
+                    failures: Vec::new(),
+                });
+                proto::envelope::Payload::GetRuntimeTaskDetails(response)
+            }
+            _ => proto::envelope::Payload::Error(proto::Error {
+                code: proto::ErrorCode::InvalidRequest as i32,
+                message: "测试节点只提供运行任务查询".into(),
+            }),
+        };
+        proto::Envelope {
+            request_id: request.request_id,
+            payload: Some(payload),
+        }
+    }
+
+    fn subscribe_runtime_events(&self) -> Option<broadcast::Receiver<proto::RuntimeTaskChanged>> {
+        Some(self.changes.subscribe())
+    }
+}
+
+/// 暂停时钟精确验证 2 秒 tick、按需详情和终态事件立即刷新。
+#[tokio::test(start_paused = true)]
+async fn controller_refreshes_runtime_tasks_on_two_second_tick_and_terminal_event() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let machine_id = MachineId::from_sha256([0xe1; 32]);
+    let list_calls = Arc::new(AtomicUsize::new(0));
+    let detail_calls = Arc::new(AtomicUsize::new(0));
+    let (changes, _) = broadcast::channel(8);
+    let (shutdown_sender, shutdown) = oneshot::channel();
+    let server = tokio::spawn(NodeServer::serve_until(
+        listener,
+        RuntimeTaskHandler {
+            machine_id: machine_id.clone(),
+            list_calls: Arc::clone(&list_calls),
+            detail_calls: Arc::clone(&detail_calls),
+            changes: changes.clone(),
+        },
+        shutdown,
+    ));
+    let temp = TempDir::new().unwrap();
+    let config = DesktopConfig {
+        nodes: vec![NodeEndpoint {
+            ip: IpAddr::from([127, 0, 0, 1]),
+            port: address.port(),
+        }],
+        reconnect_interval_seconds: 30,
+        ..DesktopConfig::default()
+    };
+    let (app, mut events) = DesktopApp::start(config, desktop_paths(&temp));
+
+    wait_for_count(&list_calls, 1).await;
+    let baseline = list_calls.load(Ordering::SeqCst);
+    assert_eq!(detail_calls.load(Ordering::SeqCst), 0);
+
+    tokio::time::advance(Duration::from_millis(1_999)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(list_calls.load(Ordering::SeqCst), baseline);
+    tokio::time::advance(Duration::from_millis(1)).await;
+    wait_for_count(&list_calls, baseline + 1).await;
+
+    app.send(UiCommand::SelectRuntimeTask {
+        key: RuntimeTaskKey {
+            owner: RuntimeTaskOwner::Node { node_index: 0 },
+            id: "node-runtime".into(),
+        },
+    })
+    .await
+    .unwrap();
+    wait_for_count(&detail_calls, 1).await;
+    let before_event = list_calls.load(Ordering::SeqCst);
+    changes
+        .send(proto::RuntimeTaskChanged {
+            runtime_task_id: "node-runtime".into(),
+            state: "completed".into(),
+        })
+        .unwrap();
+    wait_for_count(&list_calls, before_event + 1).await;
+
+    let mut observed_selected_details = false;
+    while let Ok(event) = events.try_recv() {
+        if let UiEvent::RuntimeTasksChanged(state) = event {
+            observed_selected_details |= state.selected().is_some() && state.details().is_some();
+        }
+    }
+    assert!(observed_selected_details, "选中任务应立即发布详情状态");
+
+    app.send(UiCommand::Shutdown).await.unwrap();
+    shutdown_sender.send(()).unwrap();
+    server.await.unwrap().unwrap();
+}
+
+/// 返回一个稳定 Node 运行任务摘要。
+fn runtime_summary(machine_id: &str) -> proto::RuntimeTaskSummary {
+    proto::RuntimeTaskSummary {
+        runtime_task_id: "node-runtime".into(),
+        machine_id: machine_id.into(),
+        task_kind: "scan".into(),
+        title: "节点扫描".into(),
+        state: "running".into(),
+        stage_summary: "读取与 MD5".into(),
+        overall_completed: 1,
+        overall_total: 2,
+        overall_total_known: true,
+        overall_failed: 0,
+        overall_skipped: 0,
+    }
+}
+
+/// 在暂停时钟下只让出调度权，避免等待逻辑偷偷推进固定 tick。
+async fn wait_for_count(counter: &AtomicUsize, expected: usize) {
+    for _ in 0..1_000 {
+        if counter.load(Ordering::SeqCst) >= expected {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("计数未达到 {expected}");
+}
+
+/// 构造隔离的 Desktop 路径，不读写用户目录。
+fn desktop_paths(temp: &TempDir) -> DesktopPaths {
+    DesktopPaths {
+        data: temp.path().to_path_buf(),
+        logs: temp.path().join("logs"),
+        cache: temp.path().join("cache"),
+        config: temp.path().join("config.toml"),
+    }
 }

@@ -6,6 +6,8 @@ use dedup_core::{CoreError, DesktopConfig, NodeEndpoint};
 use dedup_protocol::proto;
 use thiserror::Error;
 
+use crate::runtime_tasks::{RuntimeTaskKey, RuntimeTaskSnapshot};
+
 /// `data/desktop` 下供设置诊断页展示的绝对路径。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DesktopPaths {
@@ -256,6 +258,100 @@ pub struct DiskFullCleanupSummaryView {
     pub skipped_other_disk: u64,
     /// 失败文件数。
     pub failed_files: u64,
+}
+
+/// 当前选中运行任务的详情来源；Node 保留握手机器身份以隔离过期会话。
+#[derive(Clone, Debug, PartialEq)]
+pub enum RuntimeTaskDetailsView {
+    /// Node 进程通过同一管理会话返回的协议详情。
+    Node {
+        /// 当前 Desktop 配置中的节点索引。
+        node_index: usize,
+        /// 拉取详情时冻结的真实握手机器 ID。
+        machine_id: String,
+        /// Node 返回的阶段、Worker 与最近失败详情。
+        details: proto::RuntimeTaskDetails,
+    },
+    /// Desktop 进程内 registry 的完整临时快照。
+    Desktop(RuntimeTaskSnapshot),
+}
+
+/// UI 任务中心消费的统一 Node/Desktop 运行任务状态。
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RuntimeTaskControllerState {
+    /// 两秒刷新或终态事件归并后的稳定摘要列表。
+    summaries: Vec<RuntimeTaskSnapshot>,
+    /// 用户当前选择的统一任务键。
+    selected: Option<RuntimeTaskKey>,
+    /// 只为当前选中任务保留的详情。
+    details: Option<RuntimeTaskDetailsView>,
+    /// 断线或详情拉取失败时为真，旧详情仍保留供诊断。
+    stale: bool,
+    /// 最近一次列表、详情或事件连接错误。
+    error: Option<String>,
+}
+
+impl RuntimeTaskControllerState {
+    /// 返回 Node/Desktop 合并后的运行任务摘要。
+    pub fn summaries(&self) -> &[RuntimeTaskSnapshot] {
+        &self.summaries
+    }
+
+    /// 返回用户当前选中的统一任务键。
+    pub const fn selected(&self) -> Option<&RuntimeTaskKey> {
+        self.selected.as_ref()
+    }
+
+    /// 返回当前详情；过期时仍可读取最后成功快照。
+    pub const fn details(&self) -> Option<&RuntimeTaskDetailsView> {
+        self.details.as_ref()
+    }
+
+    /// 返回详情是否因断线或请求失败而过期。
+    pub const fn is_stale(&self) -> bool {
+        self.stale
+    }
+
+    /// 返回最近一次运行任务监督错误。
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    /// 切换选择时先清除旧详情，防止旧机器内容短暂归给新任务。
+    pub(crate) fn select(&mut self, key: RuntimeTaskKey) {
+        if self.selected.as_ref() != Some(&key) {
+            self.selected = Some(key);
+            self.details = None;
+            self.stale = false;
+            self.error = None;
+        }
+    }
+
+    /// 原子替换本轮摘要，并记录不影响旧详情展示的列表错误。
+    pub(crate) fn replace_summaries(
+        &mut self,
+        summaries: Vec<RuntimeTaskSnapshot>,
+        error: Option<String>,
+    ) {
+        self.summaries = summaries;
+        if let Some(error) = error {
+            self.stale = true;
+            self.error = Some(error);
+        }
+    }
+
+    /// 保存当前选择对应的最新详情并清除 stale 标记。
+    pub(crate) fn set_details(&mut self, details: RuntimeTaskDetailsView) {
+        self.details = Some(details);
+        self.stale = false;
+        self.error = None;
+    }
+
+    /// 保留最后详情，仅把当前选择标记为过期并公开原因。
+    pub(crate) fn mark_stale(&mut self, error: impl Into<String>) {
+        self.stale = true;
+        self.error = Some(error.into());
+    }
 }
 
 /// 设置诊断页当前节点、分页结果和内存清理摘要。
