@@ -1006,6 +1006,7 @@ impl EngineState {
                 "扫描",
             )
             .await;
+        let runtime_failure = runtime_reporter.clone();
         let cancellation = ReadCancellationToken::new();
         if let Err(error) = self.start_background(BackgroundJob::Scan {
             task_id,
@@ -1020,6 +1021,7 @@ impl EngineState {
             disk_full_cleaner: self.disk_full_cleaner.clone(),
         }) {
             let _ = self.store.fail_task(task_id, now_ms());
+            let _ = runtime_failure.finish(RuntimeTaskState::Failed).await;
             return Err(internal(error));
         }
         Ok(proto::envelope::Payload::TaskAccepted(

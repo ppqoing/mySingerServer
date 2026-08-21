@@ -110,4 +110,45 @@ async fn scan_reports_real_pipeline_stages_bytes_and_worker_identity() {
     assert_eq!(details.summary.unwrap().overall_total, 1);
     assert_eq!(details.workers[0].process_id, Some(7001));
     assert_eq!(details.workers[0].physical_disk_id, "PhysicalDisk7");
+    assert!(details.stages.iter().all(|stage| {
+        stage.state != dedup_protocol::proto::RuntimeStageState::RuntimeStageRunning as i32
+    }));
+    let read = details.stages.iter().find(|stage| stage.stage_id == "read_md5").unwrap();
+    assert!(read.total_known);
+    assert_eq!(read.total, b"real-block-bytes".len() as u64);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_telemetry_updates_are_exact_and_never_become_io_failures() {
+    let registry = RuntimeTaskRegistry::new();
+    let reporter = registry
+        .begin(RuntimeTaskKind::Scan, MachineId::from_sha256([0xa2; 32]), "并发")
+        .await;
+    reporter
+        .update_stage(dedup_node_engine::runtime_tasks::RuntimeStageUpdate::running(
+            RuntimeStage::ReadMd5,
+            RuntimeProgressUnit::Bytes,
+            0,
+            Some(800),
+        ))
+        .await
+        .unwrap();
+    let mut joins = Vec::new();
+    for _ in 0..8 {
+        let reporter = reporter.clone();
+        joins.push(tokio::spawn(async move {
+            for _ in 0..100 {
+                reporter
+                    .advance_stage_nowait(RuntimeStage::ReadMd5, RuntimeProgressUnit::Bytes, 1)
+                    .unwrap();
+            }
+        }));
+    }
+    for join in joins {
+        join.await.unwrap();
+    }
+    assert_eq!(
+        registry.details(reporter.id()).await.unwrap().stages[0].completed,
+        800
+    );
 }

@@ -57,6 +57,19 @@ impl WorkerPoolConfig {
 /// WorkerPool 交给 NodeEngine 的持久化动作或任务结果。
 #[derive(Clone, Debug)]
 pub enum WorkerEvent {
+    /// 请求已经在真实 slot 的 Run 边界发送。
+    Started {
+        /// 所属任务 ID。
+        task_id: String,
+        /// 任务项 ID。
+        item_id: String,
+        /// 实际槽位。
+        slot: u32,
+        /// 当前槽位真实 PID；可控池可使用合成 PID。
+        process_id: Option<u32>,
+        /// dispatch 冻结文件身份。
+        identity: WorkerFileIdentity,
+    },
     /// Worker 正常返回一个协议结果。
     Completed {
         /// 所属任务 ID。
@@ -104,6 +117,8 @@ pub struct WorkerFileIdentity {
     pub file_size: u64,
     /// Worker 正在执行的流水线阶段。
     pub stage: String,
+    /// 读取许可冻结的物理盘显示身份。
+    pub physical_disk_id: String,
 }
 
 /// 拥有 Worker 进程 actor 的客户端句柄。
@@ -775,6 +790,16 @@ fn controlled_schedule(
         let identity = work.identity;
         state.lock().unwrap().running.insert(slot, identity.clone());
         active.insert(identity.item_id.clone(), (slot, identity.clone()));
+        if let Some(file_identity) = identity.file_identity.clone() {
+            let process_id = state.lock().unwrap().process_ids.get(&slot).copied();
+            let _ = events.try_send(WorkerEvent::Started {
+                task_id: identity.task_id.clone(),
+                item_id: identity.item_id.clone(),
+                slot: slot as u32,
+                process_id,
+                identity: file_identity,
+            });
+        }
         let _ = started.try_send((identity.task_id, identity.item_id));
         available_slots.store(idle.len(), Ordering::Release);
     }
@@ -1070,20 +1095,32 @@ async fn schedule(
                 } else if locked.cancelled_tasks.contains(&identity.task_id)
                     || !work.dispatch_allowed()
                 {
-                    DispatchDecision::Rejected(identity)
+                    DispatchDecision::Rejected(identity.clone())
                 } else if let Err(error) = slot.commands.send(SlotCommand::Run(work)) {
                     let SlotCommand::Run(work) = error.0 else {
                         unreachable!("schedule only sends Run")
                     };
                     DispatchDecision::Retry(work)
                 } else {
-                    locked.running.insert(slot_id, identity);
+                    locked.running.insert(slot_id, identity.clone());
                     DispatchDecision::Sent
                 }
             }
         };
         match decision {
-            DispatchDecision::Sent => {}
+            DispatchDecision::Sent => {
+                if let Some(identity_file) = identity.file_identity.clone() {
+                    let _ = events
+                        .send(WorkerEvent::Started {
+                            task_id: identity.task_id,
+                            item_id: identity.item_id,
+                            slot: slot_id as u32,
+                            process_id: Some(slot.process_id),
+                            identity: identity_file,
+                        })
+                        .await;
+                }
+            }
             DispatchDecision::Rejected(identity) => {
                 idle.insert(slot_id);
                 let _ = events

@@ -1,6 +1,6 @@
 //! 有界枚举生产器与按物理盘调度的生产 MD5 读取适配器。
 
-use std::{future::Future, io, path::PathBuf, pin::Pin, sync::Arc};
+use std::{collections::BTreeMap, future::Future, io, path::{Path, PathBuf}, pin::Pin, sync::{Arc, Mutex}};
 
 use dedup_core::{DiskReadConfig, NodeConfig};
 use dedup_node_store::ScannedPath;
@@ -58,6 +58,11 @@ pub trait PipelineFileReader: Clone + Send + Sync + 'static {
         scanned: ScannedPath,
         cancellation: ReadCancellationToken,
     ) -> Pin<Box<dyn Future<Output = Result<ReadProduct<Self::Lease>, ReadFailure>> + Send + 'static>>;
+
+    /// 返回最近一次为路径解析的物理盘显示身份。
+    fn physical_disk_id(&self, _path: &Path) -> String {
+        String::new()
+    }
 }
 
 /// 生产路径使用的物理盘调度、OVERLAPPED 重试 MD5 组合。
@@ -66,6 +71,7 @@ pub struct ScheduledFileReader {
     scheduler: DiskReadScheduler,
     reader: Arc<RetryingFileReader<OverlappedFileReader>>,
     reporter: Option<RuntimeTaskReporter>,
+    locations: Arc<Mutex<BTreeMap<PathBuf, String>>>,
 }
 
 impl ScheduledFileReader {
@@ -94,6 +100,7 @@ impl ScheduledFileReader {
                 scheduler,
                 reader: Arc::new(reader),
                 reporter: None,
+                locations: Arc::new(Mutex::new(BTreeMap::new())),
             },
             PipelineLimits::new(capacity, capacity),
         ))
@@ -118,6 +125,7 @@ impl PipelineFileReader for ScheduledFileReader {
         let scheduler = self.scheduler.clone();
         let reader = self.reader.clone();
         let reporter = self.reporter.clone();
+        let locations = self.locations.clone();
         Box::pin(async move {
             let path = scanned.display_path.as_path().to_path_buf();
             if cancellation.is_cancelled() {
@@ -133,6 +141,17 @@ impl PipelineFileReader for ScheduledFileReader {
                         block_offset: 0,
                         source,
                     })?;
+            let physical_disk_id = format!(
+                "PhysicalDisk{}",
+                storage
+                    .physical_disk_id()
+                    .disk_numbers()
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join("+")
+            );
+            locations.lock().unwrap().insert(path.clone(), physical_disk_id);
             let lease = scheduler
                 .acquire(storage)
                 .await
@@ -149,13 +168,11 @@ impl PipelineFileReader for ScheduledFileReader {
                     &read_cancellation,
                     |bytes| {
                         if let Some(reporter) = &reporter {
-                            reporter
-                                .advance_stage_nowait(
-                                    RuntimeStage::ReadMd5,
-                                    crate::runtime_tasks::RuntimeProgressUnit::Bytes,
-                                    bytes as u64,
-                                )
-                                .map_err(|error| io::Error::other(error.to_string()))?;
+                            let _ = reporter.advance_stage_nowait(
+                                RuntimeStage::ReadMd5,
+                                crate::runtime_tasks::RuntimeProgressUnit::Bytes,
+                                bytes as u64,
+                            );
                         }
                         Ok(())
                     },
@@ -167,6 +184,15 @@ impl PipelineFileReader for ScheduledFileReader {
             let md5 = md5?;
             Ok(ReadProduct { md5, lease })
         })
+    }
+
+    fn physical_disk_id(&self, path: &Path) -> String {
+        self.locations
+            .lock()
+            .unwrap()
+            .get(path)
+            .cloned()
+            .unwrap_or_default()
     }
 }
 

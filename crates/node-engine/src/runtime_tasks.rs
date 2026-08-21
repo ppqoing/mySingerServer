@@ -2,14 +2,14 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
 
 use dedup_core::MachineId;
 use dedup_protocol::{MAX_RUNTIME_FAILURES, proto};
 use thiserror::Error;
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::broadcast;
 use uuid::Uuid;
 
 const SPEED_WINDOW: Duration = Duration::from_secs(10);
@@ -245,9 +245,6 @@ pub enum RuntimeTaskError {
     /// finish 只接受终态。
     #[error("finish 必须使用终态")]
     NotTerminal,
-    /// registry 正由另一更新短暂占用。
-    #[error("运行任务 registry 正忙")]
-    Busy,
 }
 
 /// Node 进程内唯一运行任务 registry。
@@ -291,7 +288,7 @@ impl RuntimeTaskRegistry {
         title: impl Into<String>,
     ) -> RuntimeTaskReporter {
         let task_id = Uuid::new_v4().to_string();
-        self.inner.tasks.write().await.insert(
+        self.inner.tasks.write().expect("runtime registry lock poisoned").insert(
             task_id.clone(),
             TaskEntry {
                 machine_id: machine_id.as_str().into(),
@@ -318,7 +315,7 @@ impl RuntimeTaskRegistry {
         self.inner
             .tasks
             .read()
-            .await
+            .expect("runtime registry lock poisoned")
             .iter()
             .map(|(id, task)| task.summary(id))
             .collect()
@@ -330,7 +327,7 @@ impl RuntimeTaskRegistry {
         self.inner
             .tasks
             .read()
-            .await
+            .expect("runtime registry lock poisoned")
             .get(task_id)
             .map(|task| task.details(task_id, now))
     }
@@ -368,7 +365,7 @@ impl RuntimeTaskReporter {
         failed: u64,
         skipped: u64,
     ) -> Result<(), RuntimeTaskError> {
-        let mut tasks = self.registry.inner.tasks.write().await;
+        let mut tasks = self.registry.inner.tasks.write().expect("runtime registry lock poisoned");
         let task = active_task(&mut tasks, &self.task_id)?;
         task.overall_completed = completed;
         task.overall_total = total;
@@ -377,10 +374,25 @@ impl RuntimeTaskReporter {
         Ok(())
     }
 
+    /// 在单 SQLite writer 成功/失败终态边界实时推进总体计数。
+    pub fn advance_overall_nowait(
+        &self,
+        completed: u64,
+        failed: u64,
+        skipped: u64,
+    ) -> Result<(), RuntimeTaskError> {
+        let mut tasks = self.registry.inner.tasks.write().expect("runtime registry lock poisoned");
+        let task = active_task(&mut tasks, &self.task_id)?;
+        task.overall_completed = task.overall_completed.saturating_add(completed);
+        task.overall_failed = task.overall_failed.saturating_add(failed);
+        task.overall_skipped = task.overall_skipped.saturating_add(skipped);
+        Ok(())
+    }
+
     /// 更新一个固定阶段。
     pub async fn update_stage(&self, update: RuntimeStageUpdate) -> Result<(), RuntimeTaskError> {
         let now = self.registry.inner.clock.now();
-        let mut tasks = self.registry.inner.tasks.write().await;
+        let mut tasks = self.registry.inner.tasks.write().expect("runtime registry lock poisoned");
         let task = active_task(&mut tasks, &self.task_id)?;
         task.update_stage(update, now)
     }
@@ -392,8 +404,8 @@ impl RuntimeTaskReporter {
             .registry
             .inner
             .tasks
-            .try_write()
-            .map_err(|_| RuntimeTaskError::Busy)?;
+            .write()
+            .expect("runtime registry lock poisoned");
         active_task(&mut tasks, &self.task_id)?.update_stage(update, now)
     }
 
@@ -409,8 +421,8 @@ impl RuntimeTaskReporter {
             .registry
             .inner
             .tasks
-            .try_write()
-            .map_err(|_| RuntimeTaskError::Busy)?;
+            .write()
+            .expect("runtime registry lock poisoned");
         let task = active_task(&mut tasks, &self.task_id)?;
         let stage = task.stages.entry(stage_kind).or_default();
         let update = RuntimeStageUpdate {
@@ -425,9 +437,47 @@ impl RuntimeTaskReporter {
         task.update_stage(update, now)
     }
 
+    /// 以当前 completed 冻结阶段总数并进入终态。
+    pub fn finish_stage_nowait(
+        &self,
+        stage_kind: RuntimeStage,
+        state: proto::RuntimeStageState,
+        total: Option<u64>,
+    ) -> Result<(), RuntimeTaskError> {
+        let now = self.registry.inner.clock.now();
+        let mut tasks = self.registry.inner.tasks.write().expect("runtime registry lock poisoned");
+        let task = active_task(&mut tasks, &self.task_id)?;
+        let stage = task.stages.entry(stage_kind).or_default();
+        let (unit, completed, failed, skipped) =
+            (stage.unit, stage.completed, stage.failed, stage.skipped);
+        task.update_stage(RuntimeStageUpdate {
+            stage: stage_kind,
+            state,
+            unit,
+            completed,
+            total,
+            failed,
+            skipped,
+        }, now)
+    }
+
+    /// 在同步 Store 终态边界追加最近失败。
+    pub fn record_failure_nowait(
+        &self,
+        failure: RuntimeFailureUpdate,
+    ) -> Result<(), RuntimeTaskError> {
+        let mut tasks = self.registry.inner.tasks.write().expect("runtime registry lock poisoned");
+        let task = active_task(&mut tasks, &self.task_id)?;
+        task.failures.push_back(failure);
+        while task.failures.len() > MAX_RUNTIME_FAILURES {
+            task.failures.pop_front();
+        }
+        Ok(())
+    }
+
     /// UPSERT 一个 Worker slot。
     pub async fn update_worker(&self, worker: RuntimeWorkerUpdate) -> Result<(), RuntimeTaskError> {
-        let mut tasks = self.registry.inner.tasks.write().await;
+        let mut tasks = self.registry.inner.tasks.write().expect("runtime registry lock poisoned");
         let task = active_task(&mut tasks, &self.task_id)?;
         task.workers.insert(worker.slot, worker);
         Ok(())
@@ -438,7 +488,7 @@ impl RuntimeTaskReporter {
         &self,
         failure: RuntimeFailureUpdate,
     ) -> Result<(), RuntimeTaskError> {
-        let mut tasks = self.registry.inner.tasks.write().await;
+        let mut tasks = self.registry.inner.tasks.write().expect("runtime registry lock poisoned");
         let task = active_task(&mut tasks, &self.task_id)?;
         task.failures.push_back(failure);
         while task.failures.len() > MAX_RUNTIME_FAILURES {
@@ -452,12 +502,25 @@ impl RuntimeTaskReporter {
         if !state.is_terminal() {
             return Err(RuntimeTaskError::NotTerminal);
         }
-        let mut tasks = self.registry.inner.tasks.write().await;
+        let mut tasks = self.registry.inner.tasks.write().expect("runtime registry lock poisoned");
         let task = tasks
             .get_mut(&self.task_id)
             .ok_or(RuntimeTaskError::Missing)?;
         if task.state.is_terminal() {
             return Err(RuntimeTaskError::Terminal);
+        }
+        let now = self.registry.inner.clock.now();
+        let stage_terminal = match state {
+            RuntimeTaskState::Completed => proto::RuntimeStageState::RuntimeStageCompleted,
+            RuntimeTaskState::Failed => proto::RuntimeStageState::RuntimeStageFailed,
+            RuntimeTaskState::Cancelled => proto::RuntimeStageState::RuntimeStageSkipped,
+            RuntimeTaskState::Running => unreachable!(),
+        };
+        for stage in task.stages.values_mut() {
+            if !is_stage_terminal(stage.state) {
+                stage.state = stage_terminal;
+                stage.ended_at = Some(now);
+            }
         }
         task.state = state;
         drop(tasks);

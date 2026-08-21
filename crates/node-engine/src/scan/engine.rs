@@ -25,7 +25,7 @@ use crate::{
     contact_sheet_cache::ContactSheetCacheEntry,
     disk_full_cleanup::DiskFullCleaner,
     io::ReadFailure,
-    runtime_tasks::{RuntimeProgressUnit, RuntimeStage, RuntimeStageUpdate, RuntimeTaskReporter},
+    runtime_tasks::{RuntimeFailureUpdate, RuntimeProgressUnit, RuntimeStage, RuntimeStageUpdate, RuntimeTaskReporter},
     worker::{WorkerEvent, WorkerPool, decode_stage1_payload},
 };
 
@@ -86,6 +86,8 @@ pub struct ScanSummary {
     pub task_id: TaskId,
     /// 枚举得到的文件数量。
     pub total_files: usize,
+    /// 枚举实际累计文件字节总数。
+    pub total_bytes: u64,
     /// 完全跳过文件读取的路径缓存命中数。
     pub cache_hits: usize,
     /// 实际读取并计算 MD5 的文件数。
@@ -121,6 +123,8 @@ pub struct Stage1Request {
     pub stage: String,
     /// 本机内容行。
     pub content_id: ContentId,
+    /// 读取调度冻结的物理盘显示身份。
+    pub physical_disk_id: String,
     /// 当前 MD5 目标不存在时要求 Worker 生成联系表。
     pub generate_contact_sheet: bool,
 }
@@ -133,6 +137,7 @@ impl Stage1Request {
             display_path: self.display_path.clone(),
             file_size: self.file_size,
             stage: self.stage.clone(),
+            physical_disk_id: self.physical_disk_id.clone(),
         }
     }
 }
@@ -294,6 +299,7 @@ impl Stage1Processor for WorkerPoolStage1Processor<'_> {
                 item_id: event_item,
             }) if event_task == task_id && event_item == item_id => Err("一筛已取消".into()),
             Some(WorkerEvent::InfrastructureFailure { message }) => Err(message),
+            Some(WorkerEvent::Started { .. }) => Err("Worker 尚未返回一筛结果".into()),
             Some(_) => Err("WorkerPool 在串行扫描中返回了其他任务事件".into()),
             None => Err("WorkerPool 已关闭".into()),
         }
@@ -306,23 +312,10 @@ impl Stage1Processor for WorkerPoolStage1Processor<'_> {
     async fn process_batch(&mut self, requests: Vec<Stage1Request>) -> Vec<Stage1BatchResult> {
         let mut pending = BTreeMap::new();
         let mut results = Vec::with_capacity(requests.len());
-        for (slot, request) in requests.into_iter().enumerate() {
+        for request in requests {
             let task_id = request.task_id.as_uuid().to_string();
             let item_id = request.item_id.clone();
             let file_identity = request.worker_file_identity();
-            if let Some(reporter) = &self.runtime_reporter {
-                let _ = reporter
-                    .update_worker(crate::runtime_tasks::RuntimeWorkerUpdate {
-                        slot: slot as u32,
-                        process_id: self.pool.worker_process_ids().get(slot).copied(),
-                        stage: RuntimeStage::ProbeStage1,
-                        display_path: request.display_path.as_path().to_string_lossy().into_owned(),
-                        physical_disk_id: String::new(),
-                        completed_files: 0,
-                        speed_per_second: 0.0,
-                    })
-                    .await;
-            }
             let envelope = proto::WorkerEnvelope {
                 payload: Some(worker_envelope::Payload::ProbeAndStage1(
                     proto::ProbeAndStage1 {
@@ -352,6 +345,7 @@ impl Stage1Processor for WorkerPoolStage1Processor<'_> {
                 }),
             }
         }
+        let mut started_workers = BTreeMap::new();
         while !pending.is_empty() {
             let Some(event) = self.pool.next_event().await else {
                 for item_id in pending.into_keys() {
@@ -365,12 +359,53 @@ impl Stage1Processor for WorkerPoolStage1Processor<'_> {
                 break;
             };
             match event {
+                WorkerEvent::Started {
+                    task_id,
+                    item_id,
+                    slot,
+                    process_id,
+                    identity,
+                } if pending.get(&item_id) == Some(&task_id) => {
+                    if let Some(reporter) = &self.runtime_reporter {
+                        let _ = reporter
+                            .update_worker(crate::runtime_tasks::RuntimeWorkerUpdate {
+                                slot,
+                                process_id,
+                                stage: RuntimeStage::ProbeStage1,
+                                display_path: identity
+                                    .display_path
+                                    .as_path()
+                                    .to_string_lossy()
+                                    .into_owned(),
+                                physical_disk_id: identity.physical_disk_id.clone(),
+                                completed_files: 0,
+                                speed_per_second: 0.0,
+                            })
+                            .await;
+                    }
+                    started_workers.insert(item_id, (slot, process_id, identity));
+                }
                 WorkerEvent::Completed {
                     task_id,
                     item_id,
                     response,
                 } if pending.get(&item_id) == Some(&task_id) => {
                     pending.remove(&item_id);
+                    if let Some((slot, process_id, identity)) = started_workers.remove(&item_id)
+                        && let Some(reporter) = &self.runtime_reporter
+                    {
+                        let _ = reporter
+                            .update_worker(crate::runtime_tasks::RuntimeWorkerUpdate {
+                                slot,
+                                process_id,
+                                stage: RuntimeStage::ProbeStage1,
+                                display_path: identity.display_path.as_path().to_string_lossy().into_owned(),
+                                physical_disk_id: identity.physical_disk_id,
+                                completed_files: 1,
+                                speed_per_second: 0.0,
+                            })
+                            .await;
+                    }
                     let output = match response.payload {
                         Some(worker_envelope::Payload::Stage1Result(result)) => {
                             decode_stage1_payload(&result.payload)
@@ -590,6 +625,7 @@ where
         let mut summary = ScanSummary {
             task_id,
             total_files: 0,
+            total_bytes: 0,
             cache_hits: 0,
             hashed: 0,
             reused_contents: 0,
@@ -656,6 +692,7 @@ where
                     .ok_or_else(|| ScanError::Stage1("读取任务意外为空".into()))?;
                 let result = self.accept_parallel_read(
                     store,
+                    &reader,
                     task_id,
                     &options,
                     &mut pending_stage1,
@@ -686,7 +723,7 @@ where
                 joined = reads.join_next(), if !reads.is_empty() => {
                     match joined.expect("分支保证存在") {
                         Ok(value) => self.accept_parallel_read(
-                            store, task_id, &options, &mut pending_stage1, &mut summary,
+                            store, &reader, task_id, &options, &mut pending_stage1, &mut summary,
                             value, now_ms,
                         ),
                         Err(error) => Err(ScanError::Stage1(error.to_string())),
@@ -741,19 +778,27 @@ where
                 )
                 .await
                 .map_err(|error| ScanError::Stage1(error.to_string()))?;
-            for stage in [
+            let _ = reporter.finish_stage_nowait(
                 RuntimeStage::Enumerate,
+                proto::RuntimeStageState::RuntimeStageCompleted,
+                Some(summary.total_files as u64),
+            );
+            let _ = reporter.finish_stage_nowait(
                 RuntimeStage::CacheLookup,
-                RuntimeStage::ProbeStage1,
-                RuntimeStage::PersistFinalize,
-            ] {
-                let _ = reporter.update_stage(stage_update(
+                proto::RuntimeStageState::RuntimeStageCompleted,
+                Some(summary.total_files as u64),
+            );
+            let _ = reporter.finish_stage_nowait(
+                RuntimeStage::ReadMd5,
+                proto::RuntimeStageState::RuntimeStageCompleted,
+                Some(summary.total_bytes),
+            );
+            for stage in [RuntimeStage::ProbeStage1, RuntimeStage::PersistFinalize] {
+                let _ = reporter.finish_stage_nowait(
                     stage,
                     proto::RuntimeStageState::RuntimeStageCompleted,
-                    RuntimeProgressUnit::Files,
-                    summary.total_files as u64,
-                    Some(summary.total_files as u64),
-                )).await;
+                    Some(summary.scheduled_stage1 as u64),
+                );
             }
         }
         Ok(summary)
@@ -781,6 +826,7 @@ where
         let mut summary = ScanSummary {
             task_id,
             total_files: rows.len(),
+            total_bytes: rows.iter().map(|row| row.file_size).sum(),
             cache_hits: 0,
             hashed: 0,
             reused_contents: 0,
@@ -814,6 +860,14 @@ where
                     }
                     Err(error) => {
                         summary.file_failures += 1;
+                        if let Some(reporter) = &self.runtime_reporter {
+                            let _ = reporter.record_failure_nowait(RuntimeFailureUpdate {
+                                stage: RuntimeStage::ReadMd5,
+                                display_path: scanned.display_path.as_path().to_string_lossy().into_owned(),
+                                message: error.to_string(),
+                            });
+                            let _ = reporter.advance_overall_nowait(0, 1, 0);
+                        }
                         complete_file_failure(
                             store,
                             task_id,
@@ -881,6 +935,7 @@ where
             return Ok(());
         };
         summary.total_files += 1;
+        summary.total_bytes = summary.total_bytes.saturating_add(scanned.file_size);
         let cached_content = if options.force_recompute {
             None
         } else {
@@ -894,6 +949,7 @@ where
                     RuntimeProgressUnit::Files,
                     1,
                 );
+                let _ = reporter.advance_overall_nowait(1, 0, 0);
             }
             if self.complete_reserved_reused_item(store, &item_id, content_id, now_ms)? {
                 summary.skipped_incomplete += 1;
@@ -911,16 +967,20 @@ where
         Ok(())
     }
 
-    fn accept_parallel_read<L>(
+    fn accept_parallel_read<R>(
         &self,
         store: &mut NodeStore,
+        reader: &R,
         task_id: TaskId,
         options: &ScanOptions,
-        pending_stage1: &mut Vec<PendingStage1<L>>,
+        pending_stage1: &mut Vec<PendingStage1<R::Lease>>,
         summary: &mut ScanSummary,
-        (reserved, result): (ReservedScan, Result<ReadProduct<L>, ReadFailure>),
+        (reserved, result): (ReservedScan, Result<ReadProduct<R::Lease>, ReadFailure>),
         now_ms: i64,
-    ) -> Result<(), ScanError> {
+    ) -> Result<(), ScanError>
+    where
+        R: PipelineFileReader,
+    {
         let ReservedScan { scanned, item_id } = reserved;
         let ReadProduct { md5, lease } = match result {
             Ok(value) => value,
@@ -933,6 +993,14 @@ where
                         TaskItemCompletion::Failed(error.to_string()),
                         now_ms,
                     )?;
+                    if let Some(reporter) = &self.runtime_reporter {
+                        let _ = reporter.record_failure_nowait(RuntimeFailureUpdate {
+                            stage: RuntimeStage::ReadMd5,
+                            display_path: scanned.display_path.as_path().to_string_lossy().into_owned(),
+                            message: error.to_string(),
+                        });
+                        let _ = reporter.advance_overall_nowait(0, 1, 0);
+                    }
                 }
                 return Ok(());
             }
@@ -971,6 +1039,7 @@ where
                 file_size,
                 stage: "probe_stage1".into(),
                 content_id: content.id,
+                physical_disk_id: reader.physical_disk_id(scanned.display_path.as_path()),
                 generate_contact_sheet: !contact_sheet.exists(),
             },
             lease,
@@ -1040,6 +1109,7 @@ where
             file_size: scanned.file_size,
             stage: "probe_stage1".into(),
             content_id,
+            physical_disk_id: String::new(),
             generate_contact_sheet: !contact_sheet.exists(),
         };
         match processor.process(request).await {
@@ -1254,6 +1324,7 @@ where
                             RuntimeProgressUnit::Files,
                             1,
                         );
+                        let _ = reporter.advance_overall_nowait(1, 0, 0);
                         let _ = reporter.advance_stage_nowait(
                             RuntimeStage::PersistFinalize,
                             RuntimeProgressUnit::Files,
@@ -1281,6 +1352,14 @@ where
                             now_ms,
                         )?;
                         summary.file_failures += 1;
+                        if let Some(reporter) = runtime_reporter {
+                            let _ = reporter.record_failure_nowait(RuntimeFailureUpdate {
+                                stage: RuntimeStage::ProbeStage1,
+                                display_path: request.display_path.as_path().to_string_lossy().into_owned(),
+                                message: message.clone(),
+                            });
+                            let _ = reporter.advance_overall_nowait(0, 1, 0);
+                        }
                     }
                 }
                 Err(error) => {
@@ -1291,6 +1370,14 @@ where
                             now_ms,
                         )?;
                         summary.file_failures += 1;
+                        if let Some(reporter) = runtime_reporter {
+                            let _ = reporter.record_failure_nowait(RuntimeFailureUpdate {
+                                stage: RuntimeStage::ProbeStage1,
+                                display_path: request.display_path.as_path().to_string_lossy().into_owned(),
+                                message: error.to_string(),
+                            });
+                            let _ = reporter.advance_overall_nowait(0, 1, 0);
+                        }
                     }
                 }
             }

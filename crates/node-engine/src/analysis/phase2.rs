@@ -100,6 +100,7 @@ impl Stage2Processor for WorkerPoolStage2Processor<'_> {
                 item_id: event_item,
             }) if event_task == task_id && event_item == item_id => Err("二筛已取消".into()),
             Some(WorkerEvent::InfrastructureFailure { message }) => Err(message),
+            Some(WorkerEvent::Started { .. }) => Err("Worker 尚未返回二筛结果".into()),
             Some(_) => Err("WorkerPool 在串行二筛中返回了其他任务事件".into()),
             None => Err("WorkerPool 已关闭".into()),
         }
