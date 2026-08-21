@@ -7,7 +7,10 @@ use dedup_node_store::ScannedPath;
 use dedup_windows::{OverlappedFileReader, ReadCancellationToken, resolve_storage_location};
 use tokio::{sync::mpsc, task::JoinHandle};
 
-use crate::io::{DiskReadPermit, DiskReadScheduler, ReadFailure, RetryingFileReader};
+use crate::{
+    io::{DiskReadPermit, DiskReadScheduler, ReadFailure, RetryingFileReader},
+    runtime_tasks::{RuntimeStage, RuntimeTaskReporter},
+};
 
 use super::{FileEnumerator, ScanError};
 
@@ -62,6 +65,7 @@ pub trait PipelineFileReader: Clone + Send + Sync + 'static {
 pub struct ScheduledFileReader {
     scheduler: DiskReadScheduler,
     reader: Arc<RetryingFileReader<OverlappedFileReader>>,
+    reporter: Option<RuntimeTaskReporter>,
 }
 
 impl ScheduledFileReader {
@@ -89,9 +93,16 @@ impl ScheduledFileReader {
             Self {
                 scheduler,
                 reader: Arc::new(reader),
+                reporter: None,
             },
             PipelineLimits::new(capacity, capacity),
         ))
+    }
+
+    /// 接入扫描运行时读取字节 reporter。
+    pub fn with_runtime_reporter(mut self, reporter: RuntimeTaskReporter) -> Self {
+        self.reporter = Some(reporter);
+        self
     }
 }
 
@@ -106,6 +117,7 @@ impl PipelineFileReader for ScheduledFileReader {
     {
         let scheduler = self.scheduler.clone();
         let reader = self.reader.clone();
+        let reporter = self.reporter.clone();
         Box::pin(async move {
             let path = scanned.display_path.as_path().to_path_buf();
             if cancellation.is_cancelled() {
@@ -132,7 +144,22 @@ impl PipelineFileReader for ScheduledFileReader {
             let read_path = path.clone();
             let read_cancellation = cancellation.clone();
             let (md5, lease) = tokio::task::spawn_blocking(move || {
-                let result = reader.read_file_md5(&read_path, &read_cancellation);
+                let result = reader.read_file_md5_with_progress(
+                    &read_path,
+                    &read_cancellation,
+                    |bytes| {
+                        if let Some(reporter) = &reporter {
+                            reporter
+                                .advance_stage_nowait(
+                                    RuntimeStage::ReadMd5,
+                                    crate::runtime_tasks::RuntimeProgressUnit::Bytes,
+                                    bytes as u64,
+                                )
+                                .map_err(|error| io::Error::other(error.to_string()))?;
+                        }
+                        Ok(())
+                    },
+                );
                 (result, lease)
             })
             .await

@@ -245,6 +245,9 @@ pub enum RuntimeTaskError {
     /// finish 只接受终态。
     #[error("finish 必须使用终态")]
     NotTerminal,
+    /// registry 正由另一更新短暂占用。
+    #[error("运行任务 registry 正忙")]
+    Busy,
 }
 
 /// Node 进程内唯一运行任务 registry。
@@ -379,6 +382,46 @@ impl RuntimeTaskReporter {
         let now = self.registry.inner.clock.now();
         let mut tasks = self.registry.inner.tasks.write().await;
         let task = active_task(&mut tasks, &self.task_id)?;
+        task.update_stage(update, now)
+    }
+
+    /// 在同步流水线边界无等待更新阶段。
+    pub fn update_stage_nowait(&self, update: RuntimeStageUpdate) -> Result<(), RuntimeTaskError> {
+        let now = self.registry.inner.clock.now();
+        let mut tasks = self
+            .registry
+            .inner
+            .tasks
+            .try_write()
+            .map_err(|_| RuntimeTaskError::Busy)?;
+        active_task(&mut tasks, &self.task_id)?.update_stage(update, now)
+    }
+
+    /// 在真实成功读取块后增加阶段 completed。
+    pub fn advance_stage_nowait(
+        &self,
+        stage_kind: RuntimeStage,
+        unit: RuntimeProgressUnit,
+        amount: u64,
+    ) -> Result<(), RuntimeTaskError> {
+        let now = self.registry.inner.clock.now();
+        let mut tasks = self
+            .registry
+            .inner
+            .tasks
+            .try_write()
+            .map_err(|_| RuntimeTaskError::Busy)?;
+        let task = active_task(&mut tasks, &self.task_id)?;
+        let stage = task.stages.entry(stage_kind).or_default();
+        let update = RuntimeStageUpdate {
+            stage: stage_kind,
+            state: proto::RuntimeStageState::RuntimeStageRunning,
+            unit,
+            completed: stage.completed.saturating_add(amount),
+            total: stage.total,
+            failed: stage.failed,
+            skipped: stage.skipped,
+        };
         task.update_stage(update, now)
     }
 

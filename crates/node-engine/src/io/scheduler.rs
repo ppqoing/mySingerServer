@@ -31,6 +31,14 @@ pub enum SchedulerError {
 #[must_use = "读取许可必须持有到 Worker 不再访问文件"]
 pub struct DiskReadPermit {
     counters: Option<PermitCounters>,
+    physical_disk_id: String,
+}
+
+impl DiskReadPermit {
+    /// 返回当前许可覆盖的稳定物理盘显示身份。
+    pub fn physical_disk_id(&self) -> &str {
+        &self.physical_disk_id
+    }
 }
 
 impl Drop for DiskReadPermit {
@@ -326,6 +334,10 @@ impl ActorState {
                 let disk_actives = self.reserve_all(&key);
                 self.global_active.fetch_add(1, Ordering::AcqRel);
                 let permit = DiskReadPermit {
+                    physical_disk_id: format!(
+                        "PhysicalDisk{}",
+                        key.0.iter().map(u32::to_string).collect::<Vec<_>>().join("+")
+                    ),
                     counters: Some(PermitCounters {
                         global_active: self.global_active.clone(),
                         disk_actives,

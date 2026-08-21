@@ -43,6 +43,7 @@ use crate::{
     disk_full_cleanup::{DiskFullCleaner, SystemArtifactDiskResolver},
     host_control::NodeHostControl,
     preview::{PreviewKind, PreviewService},
+    runtime_tasks::{RuntimeTaskKind, RuntimeTaskRegistry, RuntimeTaskReporter, RuntimeTaskState},
     scan::{
         PreferredEverythingEnumerator, ScanEngine, ScanOptions, ScheduledFileReader, SystemMd5,
         WindowsWalker, WorkerPoolStage1Processor, begin_scan_task, ensure_everything_ready,
@@ -547,6 +548,7 @@ fn spawn_actor(
             pending_restart_request_id: None,
             artifact_registry,
             disk_full_cleaner,
+            runtime_tasks: RuntimeTaskRegistry::new(),
         },
         receiver,
     ));
@@ -586,6 +588,7 @@ struct EngineState {
     pending_restart_request_id: Option<u64>,
     artifact_registry: Arc<RegenerableArtifactRegistry>,
     disk_full_cleaner: DiskFullCleaner,
+    runtime_tasks: RuntimeTaskRegistry,
 }
 
 enum EngineCommand {
@@ -610,6 +613,7 @@ struct ActiveJob {
     identity: JobIdentity,
     abort: tokio::task::AbortHandle,
     cancellation: Option<ReadCancellationToken>,
+    runtime_reporter: Option<RuntimeTaskReporter>,
 }
 
 enum BackgroundJob {
@@ -621,6 +625,7 @@ enum BackgroundJob {
         read_config: DiskReadConfig,
         effective_worker_count: usize,
         cancellation: ReadCancellationToken,
+        runtime_reporter: RuntimeTaskReporter,
         artifact_registry: Arc<RegenerableArtifactRegistry>,
         disk_full_cleaner: DiskFullCleaner,
     },
@@ -675,7 +680,7 @@ impl EngineState {
         let result = match request.payload {
             Some(proto::envelope::Payload::Ping(ping)) => Ok(proto::envelope::Payload::Ping(ping)),
             Some(proto::envelope::Payload::NodeStatus(_)) => self.node_status(),
-            Some(proto::envelope::Payload::CreateScan(scan)) => self.create_scan(scan),
+            Some(proto::envelope::Payload::CreateScan(scan)) => self.create_scan(scan).await,
             Some(proto::envelope::Payload::CancelTask(cancel)) => self.cancel_task(cancel).await,
             Some(proto::envelope::Payload::QueryTask(query)) => self.query_task(query),
             Some(proto::envelope::Payload::ListTasks(query)) => self.list_tasks(query),
@@ -973,7 +978,7 @@ impl EngineState {
         Ok(proto::envelope::Payload::ReadSnapshotPage(response))
     }
 
-    fn create_scan(&mut self, request: proto::CreateScan) -> ProtocolResult {
+    async fn create_scan(&mut self, request: proto::CreateScan) -> ProtocolResult {
         self.ensure_job_idle()?;
         let roots = request
             .roots
@@ -993,6 +998,14 @@ impl EngineState {
         };
         let contact_sheets = self.cache_root.join("contact-sheets");
         let task_id = begin_scan_task(&mut self.store, &options, now_ms()).map_err(internal)?;
+        let runtime_reporter = self
+            .runtime_tasks
+            .begin(
+                RuntimeTaskKind::Scan,
+                self.store.machine_id().clone(),
+                "扫描",
+            )
+            .await;
         let cancellation = ReadCancellationToken::new();
         if let Err(error) = self.start_background(BackgroundJob::Scan {
             task_id,
@@ -1002,6 +1015,7 @@ impl EngineState {
             read_config: self.read_config.clone(),
             effective_worker_count: self.effective_worker_count,
             cancellation,
+            runtime_reporter,
             artifact_registry: Arc::clone(&self.artifact_registry),
             disk_full_cleaner: self.disk_full_cleaner.clone(),
         }) {
@@ -1032,9 +1046,13 @@ impl EngineState {
         }
         if let Some(active) = &self.active_job
             && active.identity == JobIdentity::Task(task_id)
-            && let Some(cancellation) = &active.cancellation
         {
-            cancellation.cancel();
+            if let Some(reporter) = &active.runtime_reporter {
+                let _ = reporter.finish(RuntimeTaskState::Cancelled).await;
+            }
+            if let Some(cancellation) = &active.cancellation {
+                cancellation.cancel();
+            }
         }
         if let Some(pool) = &self.worker_control {
             pool.cancel_task(&request.task_id).await.map_err(internal)?;
@@ -1502,6 +1520,10 @@ impl EngineState {
             BackgroundJob::Scan { cancellation, .. } => Some(cancellation.clone()),
             _ => None,
         };
+        let runtime_reporter = match &job {
+            BackgroundJob::Scan { runtime_reporter, .. } => Some(runtime_reporter.clone()),
+            _ => None,
+        };
         let commands = self
             .commands
             .upgrade()
@@ -1519,6 +1541,7 @@ impl EngineState {
             identity,
             abort: task.abort_handle(),
             cancellation,
+            runtime_reporter,
         });
         Ok(())
     }
@@ -1592,22 +1615,26 @@ async fn run_background_job(
             read_config,
             effective_worker_count,
             cancellation,
+            runtime_reporter,
             artifact_registry,
             disk_full_cleaner,
         } => {
-            let mut processor =
-                WorkerPoolStage1Processor::new(worker_pool, cancellation.clone());
+            let mut processor = WorkerPoolStage1Processor::new(worker_pool, cancellation.clone())
+                .with_runtime_reporter(runtime_reporter.clone());
             let enumerator =
                 resolve_scan_enumerator_with(enumerator, ensure_everything_ready).await;
             let result = match ScheduledFileReader::new(&read_config, effective_worker_count) {
                 Err(error) => Err(error),
-                Ok((reader, limits)) => match enumerator {
+                Ok((reader, limits)) => {
+                    let reader = reader.with_runtime_reporter(runtime_reporter.clone());
+                    match enumerator {
                     EnumeratorKind::WindowsWalker => {
                         ScanEngine::new(WindowsWalker, SystemMd5, contact_sheets)
                             .with_disk_full_cleanup(
                                 Arc::clone(&artifact_registry),
                                 disk_full_cleaner.clone(),
                             )
+                            .with_runtime_reporter(runtime_reporter.clone())
                             .run_existing_parallel_with(
                                 store,
                                 task_id,
@@ -1623,6 +1650,7 @@ async fn run_background_job(
                     EnumeratorKind::Everything => {
                         ScanEngine::new(PreferredEverythingEnumerator, SystemMd5, contact_sheets)
                             .with_disk_full_cleanup(artifact_registry, disk_full_cleaner)
+                            .with_runtime_reporter(runtime_reporter.clone())
                             .run_existing_parallel_with(
                                 store,
                                 task_id,
@@ -1635,8 +1663,16 @@ async fn run_background_job(
                             )
                             .await
                     }
-                },
+                    }
+                }
             };
+            let _ = runtime_reporter
+                .finish(if result.is_ok() {
+                    RuntimeTaskState::Completed
+                } else {
+                    RuntimeTaskState::Failed
+                })
+                .await;
             if result.is_err() {
                 let _ = store.fail_task(task_id, now_ms());
             }

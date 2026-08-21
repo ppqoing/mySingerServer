@@ -25,6 +25,7 @@ use crate::{
     contact_sheet_cache::ContactSheetCacheEntry,
     disk_full_cleanup::DiskFullCleaner,
     io::ReadFailure,
+    runtime_tasks::{RuntimeProgressUnit, RuntimeStage, RuntimeStageUpdate, RuntimeTaskReporter},
     worker::{WorkerEvent, WorkerPool, decode_stage1_payload},
 };
 
@@ -34,6 +35,24 @@ use super::{
 };
 
 const LOOKUP_BATCH_SIZE: usize = 1000;
+
+fn stage_update(
+    stage: RuntimeStage,
+    state: proto::RuntimeStageState,
+    unit: RuntimeProgressUnit,
+    completed: u64,
+    total: Option<u64>,
+) -> RuntimeStageUpdate {
+    RuntimeStageUpdate {
+        stage,
+        state,
+        unit,
+        completed,
+        total,
+        failed: 0,
+        skipped: 0,
+    }
+}
 
 /// 用户创建扫描任务时固定的根和缓存策略。
 #[derive(Clone, Debug)]
@@ -199,6 +218,7 @@ pub struct WorkerPoolStage1Processor<'a> {
     pool: &'a mut WorkerPool,
     capacity: usize,
     cancellation: ReadCancellationToken,
+    runtime_reporter: Option<RuntimeTaskReporter>,
 }
 
 impl<'a> WorkerPoolStage1Processor<'a> {
@@ -209,7 +229,14 @@ impl<'a> WorkerPoolStage1Processor<'a> {
             pool,
             capacity,
             cancellation,
+            runtime_reporter: None,
         }
+    }
+
+    /// 接入真实 Worker slot 运行详情。
+    pub fn with_runtime_reporter(mut self, reporter: RuntimeTaskReporter) -> Self {
+        self.runtime_reporter = Some(reporter);
+        self
     }
 }
 
@@ -279,10 +306,23 @@ impl Stage1Processor for WorkerPoolStage1Processor<'_> {
     async fn process_batch(&mut self, requests: Vec<Stage1Request>) -> Vec<Stage1BatchResult> {
         let mut pending = BTreeMap::new();
         let mut results = Vec::with_capacity(requests.len());
-        for request in requests {
+        for (slot, request) in requests.into_iter().enumerate() {
             let task_id = request.task_id.as_uuid().to_string();
             let item_id = request.item_id.clone();
             let file_identity = request.worker_file_identity();
+            if let Some(reporter) = &self.runtime_reporter {
+                let _ = reporter
+                    .update_worker(crate::runtime_tasks::RuntimeWorkerUpdate {
+                        slot: slot as u32,
+                        process_id: self.pool.worker_process_ids().get(slot).copied(),
+                        stage: RuntimeStage::ProbeStage1,
+                        display_path: request.display_path.as_path().to_string_lossy().into_owned(),
+                        physical_disk_id: String::new(),
+                        completed_files: 0,
+                        speed_per_second: 0.0,
+                    })
+                    .await;
+            }
             let envelope = proto::WorkerEnvelope {
                 payload: Some(worker_envelope::Payload::ProbeAndStage1(
                     proto::ProbeAndStage1 {
@@ -397,6 +437,7 @@ pub struct ScanEngine<E, H> {
     contact_sheet_root: PathBuf,
     artifact_registry: Option<Arc<RegenerableArtifactRegistry>>,
     disk_full_cleaner: Option<DiskFullCleaner>,
+    runtime_reporter: Option<RuntimeTaskReporter>,
 }
 
 impl<E, H> ScanEngine<E, H>
@@ -412,7 +453,14 @@ where
             contact_sheet_root: contact_sheet_root.into(),
             artifact_registry: None,
             disk_full_cleaner: None,
+            runtime_reporter: None,
         }
+    }
+
+    /// 接入当前扫描的进程内运行详情 reporter。
+    pub fn with_runtime_reporter(mut self, reporter: RuntimeTaskReporter) -> Self {
+        self.runtime_reporter = Some(reporter);
+        self
     }
 
     /// 为真实联系表写入接入进程级显式 registry 和磁盘满清理器。
@@ -498,6 +546,38 @@ where
         if limits.channel_capacity() == 0 || limits.max_read_tasks() == 0 {
             return Err(ScanError::Stage1("扫描管道容量必须大于零".into()));
         }
+        if let Some(reporter) = &self.runtime_reporter {
+            reporter
+                .update_stage(stage_update(
+                    RuntimeStage::Prepare,
+                    proto::RuntimeStageState::RuntimeStageCompleted,
+                    RuntimeProgressUnit::Items,
+                    1,
+                    Some(1),
+                ))
+                .await
+                .map_err(|error| ScanError::Stage1(error.to_string()))?;
+            for stage in [
+                RuntimeStage::Enumerate,
+                RuntimeStage::CacheLookup,
+                RuntimeStage::ReadMd5,
+                RuntimeStage::ProbeStage1,
+            ] {
+                reporter
+                    .update_stage(RuntimeStageUpdate::running(
+                        stage,
+                        if stage == RuntimeStage::ReadMd5 {
+                            RuntimeProgressUnit::Bytes
+                        } else {
+                            RuntimeProgressUnit::Files
+                        },
+                        0,
+                        None,
+                    ))
+                    .await
+                    .map_err(|error| ScanError::Stage1(error.to_string()))?;
+            }
+        }
         let (mut enumerated, enumeration_task) = spawn_bounded_enumeration(
             self.enumerator.clone(),
             options.roots.clone(),
@@ -551,6 +631,7 @@ where
                     processor,
                     self.artifact_registry.as_ref(),
                     self.disk_full_cleaner.as_ref(),
+                    self.runtime_reporter.as_ref(),
                     &cancellation,
                     &mut pending_stage1,
                     &mut summary,
@@ -625,6 +706,7 @@ where
             processor,
             self.artifact_registry.as_ref(),
             self.disk_full_cleaner.as_ref(),
+            self.runtime_reporter.as_ref(),
             &cancellation,
             &mut pending_stage1,
             &mut summary,
@@ -649,6 +731,31 @@ where
             return Err(ScanError::Cancelled);
         }
         summary.outbox_high_seq = store.finalize_scan_task_from_items(task_id, now_ms)?;
+        if let Some(reporter) = &self.runtime_reporter {
+            reporter
+                .update_overall(
+                    summary.total_files.saturating_sub(summary.file_failures) as u64,
+                    Some(summary.total_files as u64),
+                    summary.file_failures as u64,
+                    summary.skipped_incomplete as u64,
+                )
+                .await
+                .map_err(|error| ScanError::Stage1(error.to_string()))?;
+            for stage in [
+                RuntimeStage::Enumerate,
+                RuntimeStage::CacheLookup,
+                RuntimeStage::ProbeStage1,
+                RuntimeStage::PersistFinalize,
+            ] {
+                let _ = reporter.update_stage(stage_update(
+                    stage,
+                    proto::RuntimeStageState::RuntimeStageCompleted,
+                    RuntimeProgressUnit::Files,
+                    summary.total_files as u64,
+                    Some(summary.total_files as u64),
+                )).await;
+            }
+        }
         Ok(summary)
     }
 
@@ -781,6 +888,13 @@ where
         };
         if let Some(content_id) = cached_content {
             summary.cache_hits += 1;
+            if let Some(reporter) = &self.runtime_reporter {
+                let _ = reporter.advance_stage_nowait(
+                    RuntimeStage::CacheLookup,
+                    RuntimeProgressUnit::Files,
+                    1,
+                );
+            }
             if self.complete_reserved_reused_item(store, &item_id, content_id, now_ms)? {
                 summary.skipped_incomplete += 1;
             }
@@ -824,6 +938,13 @@ where
             }
         };
         summary.hashed += 1;
+        if let Some(reporter) = &self.runtime_reporter {
+            let _ = reporter.advance_stage_nowait(
+                RuntimeStage::CacheLookup,
+                RuntimeProgressUnit::Files,
+                1,
+            );
+        }
         let content = store.upsert_content_and_location(&scanned, md5, MediaKind::Other)?;
         if content.reused && !options.force_recompute {
             summary.reused_contents += 1;
@@ -978,6 +1099,7 @@ async fn flush_stage1_batch<P, L>(
     processor: &mut P,
     artifact_registry: Option<&Arc<RegenerableArtifactRegistry>>,
     disk_full_cleaner: Option<&DiskFullCleaner>,
+    runtime_reporter: Option<&RuntimeTaskReporter>,
     cancellation: &ReadCancellationToken,
     pending: &mut Vec<PendingStage1<L>>,
     summary: &mut ScanSummary,
@@ -1125,6 +1247,18 @@ where
                     }
                     if let Some(contact) = prepared.contact {
                         commit_contact_sheet(store, request.content_id, contact)?;
+                    }
+                    if let Some(reporter) = runtime_reporter {
+                        let _ = reporter.advance_stage_nowait(
+                            RuntimeStage::ProbeStage1,
+                            RuntimeProgressUnit::Files,
+                            1,
+                        );
+                        let _ = reporter.advance_stage_nowait(
+                            RuntimeStage::PersistFinalize,
+                            RuntimeProgressUnit::Files,
+                            1,
+                        );
                     }
                     contact_ready = media_kind != MediaKind::Video || contact_sheet.exists();
                 }

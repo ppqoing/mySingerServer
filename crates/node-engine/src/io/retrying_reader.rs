@@ -139,6 +139,16 @@ where
         path: &Path,
         cancellation: &ReadCancellationToken,
     ) -> Result<[u8; 16], ReadFailure> {
+        self.read_file_md5_with_progress(path, cancellation, |_| Ok(()))
+    }
+
+    /// 分块读取并只在每个真实成功块写入 MD5 后报告实际字节数。
+    pub fn read_file_md5_with_progress(
+        &self,
+        path: &Path,
+        cancellation: &ReadCancellationToken,
+        mut progress: impl FnMut(usize) -> io::Result<()>,
+    ) -> Result<[u8; 16], ReadFailure> {
         if cancellation.is_cancelled() {
             return Err(ReadFailure::Cancelled);
         }
@@ -217,6 +227,7 @@ where
                 debug_assert!(completed);
             }
             digest.update(&buffer[..block_len]);
+            progress(block_len).map_err(|source| io_failure(path, block_offset, source))?;
             block_offset += block_len as u64;
         }
         Ok(digest.finalize().into())
