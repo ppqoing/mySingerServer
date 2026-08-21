@@ -29,8 +29,7 @@ impl LocalNodePath {
         Self::validate_with_drive_type(executable_dir, raw, system_drive_type)
     }
 
-    /// 使用调用方提供的盘类型探针验证路径；用于隔离真实 Windows API 的行为测试。
-    pub fn validate_with_drive_type<F>(
+    fn validate_with_drive_type<F>(
         executable_dir: &Path,
         raw: &str,
         drive_type: F,
@@ -101,4 +100,16 @@ fn system_drive_type(path: &Path) -> u32 {
 
 fn invalid_local_path(raw: &str, reason: &str) -> CoreError {
     CoreError::InvalidPath(format!("{raw}: {reason}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LocalNodePath;
+
+    #[test]
+    fn remote_drive_probe_is_rejected_without_a_real_mapped_drive() {
+        let directory = tempfile::tempdir().unwrap();
+
+        assert!(LocalNodePath::validate_with_drive_type(directory.path(), "data", |_| 4).is_err());
+    }
 }

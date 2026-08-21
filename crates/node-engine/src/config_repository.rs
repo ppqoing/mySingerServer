@@ -1,10 +1,12 @@
 //! Node 配置的 bootstrap 定位、路径验证、摘要与可恢复双文件事务边界。
 
 use std::{
+    collections::HashMap,
     fs::{self, File, OpenOptions},
     io::{self, Write},
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard},
+    ffi::OsString,
+    path::{Component, Path, PathBuf},
+    sync::{Arc, Mutex, MutexGuard, OnceLock, Weak},
 };
 
 use dedup_core::{CoreError, NodeConfig};
@@ -16,6 +18,8 @@ use uuid::Uuid;
 const BOOTSTRAP_FILE: &str = "bootstrap.toml";
 const JOURNAL_FILE: &str = "config-transaction.toml";
 const LOCK_FILE: &str = "config.lock";
+
+static TRANSACTION_LOCKS: OnceLock<Mutex<HashMap<String, Weak<Mutex<()>>>>> = OnceLock::new();
 
 /// 保存流程中供集成测试模拟进程突然终止的固定阶段。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -123,7 +127,7 @@ pub struct ResolvedNodePaths {
 
 #[derive(Debug)]
 struct RepositoryState {
-    transaction: Mutex<()>,
+    transaction: Arc<Mutex<()>>,
     failpoint: Mutex<Option<ConfigSaveFailpoint>>,
 }
 
@@ -145,7 +149,7 @@ impl NodeConfigRepository {
         Self {
             executable_dir: executable_dir.to_path_buf(),
             state: Arc::new(RepositoryState {
-                transaction: Mutex::new(()),
+                transaction: transaction_lock_for(executable_dir),
                 failpoint: Mutex::new(None),
             }),
         }
@@ -317,9 +321,11 @@ impl NodeConfigRepository {
     }
 
     fn reject_control_path(&self, path: &Path) -> Result<(), ConfigRepositoryError> {
+        let normalized = lexical_windows_path(path);
         if [self.bootstrap_path(), self.journal_path(), self.lock_path()]
             .iter()
-            .any(|control| paths_equal_ignore_ascii_case(path, control))
+            .map(|control| lexical_windows_path(control))
+            .any(|control| paths_equal_ignore_ascii_case(&normalized, &control))
         {
             return Err(ConfigRepositoryError::RepositoryControlPath {
                 path: path.to_path_buf(),
@@ -537,4 +543,54 @@ fn paths_equal_ignore_ascii_case(left: &Path, right: &Path) -> bool {
     left.as_os_str()
         .to_string_lossy()
         .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
+}
+
+fn transaction_lock_for(executable_dir: &Path) -> Arc<Mutex<()>> {
+    let key = lexical_windows_path(executable_dir)
+        .as_os_str()
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    let registry = TRANSACTION_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut registry = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    registry.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = registry.get(&key).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    registry.insert(key, Arc::downgrade(&lock));
+    lock
+}
+
+fn lexical_windows_path(path: &Path) -> PathBuf {
+    let mut prefix = None;
+    let mut rooted = false;
+    let mut segments = Vec::<OsString>::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(value) => prefix = Some(value.as_os_str().to_owned()),
+            Component::RootDir => rooted = true,
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if segments.last().is_some_and(|segment| segment != "..") {
+                    segments.pop();
+                } else if !rooted {
+                    segments.push(OsString::from(".."));
+                }
+            }
+            Component::Normal(value) => segments.push(value.to_owned()),
+        }
+    }
+    let mut normalized = PathBuf::new();
+    if let Some(prefix) = prefix {
+        normalized.push(prefix);
+    }
+    if rooted {
+        normalized.push(Path::new(r"\"));
+    }
+    for segment in segments {
+        normalized.push(segment);
+    }
+    normalized
 }

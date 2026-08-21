@@ -180,6 +180,43 @@ fn clones_with_the_same_old_version_allow_only_one_save() {
 }
 
 #[test]
+fn independent_repositories_with_the_same_old_version_allow_only_one_save() {
+    let fixture = RepositoryFixture::new();
+    let initial = fixture.initial_config();
+    fixture.write_active_config(&initial);
+    let first = fixture.repository();
+    let second = fixture.repository();
+    let version = first.snapshot().unwrap().version_sha256;
+    let barrier = Arc::new(Barrier::new(2));
+    let first_barrier = barrier.clone();
+    let second_barrier = barrier.clone();
+    let first_version = version.clone();
+    let mut first_config = initial.clone();
+    first_config.port = 39092;
+    let mut second_config = initial;
+    second_config.port = 39093;
+
+    let first_result = std::thread::spawn(move || {
+        first_barrier.wait();
+        first.save_if_version(&first_version, &first_config)
+    });
+    let second_result = std::thread::spawn(move || {
+        second_barrier.wait();
+        second.save_if_version(&version, &second_config)
+    });
+    let results = [first_result.join().unwrap(), second_result.join().unwrap()];
+
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Err(ConfigRepositoryError::VersionConflict { .. })))
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn load_recovers_a_persisted_journal_after_config_replace_interruption() {
     let fixture = RepositoryFixture::new();
     let initial = fixture.initial_config();
@@ -271,6 +308,29 @@ fn save_rejects_repository_control_files_as_config_targets() {
         repository.save_if_version(&repository.snapshot().unwrap().version_sha256, &changed),
         Err(ConfigRepositoryError::RepositoryControlPath { .. })
     ));
+}
+
+#[test]
+fn save_rejects_lexical_aliases_of_repository_control_files() {
+    let fixture = RepositoryFixture::new();
+    let initial = fixture.initial_config();
+    fixture.write_active_config(&initial);
+    let repository = fixture.repository();
+    let version = repository.snapshot().unwrap().version_sha256;
+
+    for alias in [
+        r".\bootstrap.toml",
+        r"data\..\bootstrap.toml",
+        r".\config-transaction.toml",
+        r"data\..\config.lock",
+    ] {
+        let mut changed = initial.clone();
+        changed.paths.config_path = alias.into();
+        assert!(matches!(
+            repository.save_if_version(&version, &changed),
+            Err(ConfigRepositoryError::RepositoryControlPath { .. })
+        ));
+    }
 }
 
 struct RepositoryFixture {
