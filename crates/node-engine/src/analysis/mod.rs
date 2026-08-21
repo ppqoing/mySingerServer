@@ -342,11 +342,12 @@ fn finish_run(
             unresolved as u64,
             0,
         );
-        skip_analysis_tail(reporter);
+        let input_total = store.analysis_inputs(run_id)?.len() as u64;
+        skip_analysis_tail(reporter, candidates.len() as u64, input_total);
         if let Some(reporter) = reporter {
             let _ = reporter.update_overall_nowait(
                 0,
-                Some(store.analysis_inputs(run_id)?.len() as u64),
+                Some(input_total),
                 unresolved as u64,
                 skipped_incomplete as u64,
             );
@@ -480,10 +481,22 @@ fn report_load_progress(reporter: Option<&RuntimeTaskReporter>, completed: u64, 
     );
 }
 
-fn skip_analysis_tail(reporter: Option<&RuntimeTaskReporter>) {
-    for (stage, unit) in [
-        (RuntimeStage::Cluster, RuntimeProgressUnit::CandidatePairs),
-        (RuntimeStage::SaveResults, RuntimeProgressUnit::Files),
+fn skip_analysis_tail(
+    reporter: Option<&RuntimeTaskReporter>,
+    candidate_total: u64,
+    input_total: u64,
+) {
+    for (stage, unit, total) in [
+        (
+            RuntimeStage::Cluster,
+            RuntimeProgressUnit::CandidatePairs,
+            candidate_total,
+        ),
+        (
+            RuntimeStage::SaveResults,
+            RuntimeProgressUnit::Files,
+            input_total,
+        ),
     ] {
         report_stage(
             reporter,
@@ -491,9 +504,9 @@ fn skip_analysis_tail(reporter: Option<&RuntimeTaskReporter>) {
             dedup_protocol::proto::RuntimeStageState::RuntimeStageSkipped,
             unit,
             0,
-            Some(0),
+            Some(total),
             0,
-            0,
+            total,
         );
     }
 }

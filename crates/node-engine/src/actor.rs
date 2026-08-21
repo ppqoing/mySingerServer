@@ -1506,28 +1506,12 @@ impl EngineState {
             .await;
         let results = if external {
             DeleteEngine::execute_external_with_runtime(&mut self.store, &plan, &runtime_reporter)
+                .await
         } else {
             DeleteEngine::execute_batch_with_runtime(&mut self.store, &plan, &runtime_reporter)
-        };
-        let results = match results {
-            Ok(results) => {
-                let has_failure = results
-                    .iter()
-                    .any(|result| result.outcome == DeleteOutcome::Failed);
-                let _ = runtime_reporter
-                    .finish(if has_failure {
-                        RuntimeTaskState::Failed
-                    } else {
-                        RuntimeTaskState::Completed
-                    })
-                    .await;
-                results
-            }
-            Err(error) => {
-                let _ = runtime_reporter.finish(RuntimeTaskState::Failed).await;
-                return Err(internal(error));
-            }
-        };
+                .await
+        }
+        .map_err(internal)?;
         let items = plan
             .items
             .iter()

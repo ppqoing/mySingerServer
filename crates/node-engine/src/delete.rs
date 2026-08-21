@@ -1,13 +1,14 @@
 //! 删除批次执行器：每项重新核对活动路径、大小和 MD5，再调用固定文件系统边界。
 
-use std::{fs, io};
+use std::{fs, io, path::Path};
 
 use dedup_core::DeleteMode;
 use dedup_node_store::{DeleteBatchPlan, DeleteOutcome, DeleteResult, NodeStore, StoreError};
 use thiserror::Error;
 
 use crate::runtime_tasks::{
-    RuntimeProgressUnit, RuntimeStage, RuntimeStageUpdate, RuntimeTaskReporter,
+    RuntimeFailureUpdate, RuntimeProgressUnit, RuntimeStage, RuntimeStageUpdate,
+    RuntimeTaskReporter, RuntimeTaskState,
 };
 use crate::scan::md5_file;
 
@@ -19,6 +20,61 @@ pub enum DeleteError {
     Store(#[from] StoreError),
 }
 
+/// 删除文件系统边界；生产默认调用 Windows 回收站或 `remove_file`，测试可精确注入失败。
+#[doc(hidden)]
+pub trait DeleteFilesystem {
+    /// 删除一项已经通过大小和 MD5 重校验的路径。
+    fn delete(&self, mode: DeleteMode, path: &Path) -> io::Result<DeleteOutcome>;
+}
+
+/// 生产文件系统删除边界。
+#[doc(hidden)]
+pub struct SystemDeleteFilesystem;
+
+impl DeleteFilesystem for SystemDeleteFilesystem {
+    fn delete(&self, mode: DeleteMode, path: &Path) -> io::Result<DeleteOutcome> {
+        match mode {
+            DeleteMode::RecycleBin => {
+                dedup_windows::move_to_recycle_bin(path).map(|()| DeleteOutcome::Recycled)
+            }
+            DeleteMode::Permanent => fs::remove_file(path).map(|()| DeleteOutcome::Deleted),
+        }
+    }
+}
+
+/// 删除结果事务边界；测试可在不重复文件删除的前提下注入 summarize 失败。
+#[doc(hidden)]
+pub trait DeleteResultCommitter {
+    /// 原子提交本轮所有结果。
+    fn apply(
+        &self,
+        store: &mut NodeStore,
+        plan: &DeleteBatchPlan,
+        results: &[DeleteResult],
+        external: bool,
+    ) -> Result<(), StoreError>;
+}
+
+/// 生产 NodeStore 结果事务边界。
+#[doc(hidden)]
+pub struct NodeStoreDeleteResultCommitter;
+
+impl DeleteResultCommitter for NodeStoreDeleteResultCommitter {
+    fn apply(
+        &self,
+        store: &mut NodeStore,
+        plan: &DeleteBatchPlan,
+        results: &[DeleteResult],
+        external: bool,
+    ) -> Result<(), StoreError> {
+        if external {
+            store.apply_external_delete_results(plan, results)
+        } else {
+            store.apply_delete_results(&plan.batch_id, results)
+        }
+    }
+}
+
 /// 在 NodeEngine actor 内串行调用的安全删除执行器。
 pub struct DeleteEngine;
 
@@ -28,16 +84,48 @@ impl DeleteEngine {
         store: &mut NodeStore,
         plan: &DeleteBatchPlan,
     ) -> Result<Vec<DeleteResult>, DeleteError> {
-        execute_batch_inner(store, plan, None, false)
+        execute_batch_inner(
+            store,
+            plan,
+            None,
+            false,
+            &SystemDeleteFilesystem,
+            &NodeStoreDeleteResultCommitter,
+        )
     }
 
     /// 执行本机已冻结计划并发布真实重校验、删除和提交阶段。
-    pub fn execute_batch_with_runtime(
+    pub async fn execute_batch_with_runtime(
         store: &mut NodeStore,
         plan: &DeleteBatchPlan,
         reporter: &RuntimeTaskReporter,
     ) -> Result<Vec<DeleteResult>, DeleteError> {
-        execute_batch_inner(store, plan, Some(reporter), false)
+        Self::execute_batch_with_runtime_using(
+            store,
+            plan,
+            reporter,
+            &SystemDeleteFilesystem,
+            &NodeStoreDeleteResultCommitter,
+        )
+        .await
+    }
+
+    /// 使用受控删除和结果事务边界执行本地确认批次；仅供直接行为测试。
+    #[doc(hidden)]
+    pub async fn execute_batch_with_runtime_using<F, C>(
+        store: &mut NodeStore,
+        plan: &DeleteBatchPlan,
+        reporter: &RuntimeTaskReporter,
+        filesystem: &F,
+        committer: &C,
+    ) -> Result<Vec<DeleteResult>, DeleteError>
+    where
+        F: DeleteFilesystem,
+        C: DeleteResultCommitter,
+    {
+        let result = execute_batch_inner(store, plan, Some(reporter), false, filesystem, committer);
+        finish_runtime(reporter, &result).await;
+        result
     }
 
     /// 执行 PostgreSQL 已冻结并按机器派发的计划，不要求节点存在同 ID 本地分析组。
@@ -45,35 +133,73 @@ impl DeleteEngine {
         store: &mut NodeStore,
         plan: &DeleteBatchPlan,
     ) -> Result<Vec<DeleteResult>, DeleteError> {
-        execute_batch_inner(store, plan, None, true)
+        execute_batch_inner(
+            store,
+            plan,
+            None,
+            true,
+            &SystemDeleteFilesystem,
+            &NodeStoreDeleteResultCommitter,
+        )
     }
 
     /// 执行中心已冻结并派发到本机的计划，遥测不重新查询或扩大选择集合。
-    pub fn execute_external_with_runtime(
+    pub async fn execute_external_with_runtime(
         store: &mut NodeStore,
         plan: &DeleteBatchPlan,
         reporter: &RuntimeTaskReporter,
     ) -> Result<Vec<DeleteResult>, DeleteError> {
-        execute_batch_inner(store, plan, Some(reporter), true)
+        let result = execute_batch_inner(
+            store,
+            plan,
+            Some(reporter),
+            true,
+            &SystemDeleteFilesystem,
+            &NodeStoreDeleteResultCommitter,
+        );
+        finish_runtime(reporter, &result).await;
+        result
     }
 }
 
-fn execute_batch_inner(
+async fn finish_runtime(
+    reporter: &RuntimeTaskReporter,
+    result: &Result<Vec<DeleteResult>, DeleteError>,
+) {
+    let state = match result {
+        Ok(results)
+            if results
+                .iter()
+                .all(|row| row.outcome != DeleteOutcome::Failed) =>
+        {
+            RuntimeTaskState::Completed
+        }
+        _ => RuntimeTaskState::Failed,
+    };
+    let _ = reporter.finish(state).await;
+}
+
+fn execute_batch_inner<F, C>(
     store: &mut NodeStore,
     plan: &DeleteBatchPlan,
     reporter: Option<&RuntimeTaskReporter>,
     external: bool,
-) -> Result<Vec<DeleteResult>, DeleteError> {
+    filesystem: &F,
+    committer: &C,
+) -> Result<Vec<DeleteResult>, DeleteError>
+where
+    F: DeleteFilesystem,
+    C: DeleteResultCommitter,
+{
     if let Some(reporter) = reporter {
         let _ = reporter.update_overall_nowait(0, Some(plan.items.len() as u64), 0, 0);
     }
     initialize_delete_stages(reporter, plan.items.len() as u64);
-    let executed = execute_items(store, plan, reporter);
+    let executed = execute_items(store, plan, reporter, filesystem);
     let results = executed
         .iter()
         .map(|item| item.result.clone())
         .collect::<Vec<_>>();
-    report_delete_terminal(reporter, &executed);
     report_delete_stage(
         reporter,
         RuntimeStage::Summarize,
@@ -83,13 +209,11 @@ fn execute_batch_inner(
         0,
         0,
     );
-    let applied = if external {
-        store.apply_external_delete_results(plan, &results)
-    } else {
-        store.apply_delete_results(&plan.batch_id, &results)
-    };
+    let applied = committer.apply(store, plan, &results, external);
     match applied {
         Ok(()) => {
+            report_delete_terminal(reporter, &executed);
+            record_delete_failures(reporter, &executed);
             if let Some(reporter) = reporter {
                 let completed = results
                     .iter()
@@ -139,6 +263,13 @@ fn execute_batch_inner(
                 1,
                 0,
             );
+            if let Some(reporter) = reporter {
+                let _ = reporter.record_failure_nowait(RuntimeFailureUpdate {
+                    stage: RuntimeStage::Summarize,
+                    display_path: String::new(),
+                    message: error.to_string(),
+                });
+            }
             Err(error.into())
         }
     }
@@ -155,13 +286,18 @@ struct ExecutedDeleteItem {
     result: DeleteResult,
     revalidation: RevalidationOutcome,
     delete_failed: bool,
+    display_path: String,
 }
 
-fn execute_items(
+fn execute_items<F>(
     store: &NodeStore,
     plan: &DeleteBatchPlan,
     reporter: Option<&RuntimeTaskReporter>,
-) -> Vec<ExecutedDeleteItem> {
+    filesystem: &F,
+) -> Vec<ExecutedDeleteItem>
+where
+    F: DeleteFilesystem,
+{
     let total = plan.items.len() as u64;
     let mut completed = 0_u64;
     let mut revalidation_failed = 0_u64;
@@ -181,6 +317,7 @@ fn execute_items(
                         ),
                         revalidation: RevalidationOutcome::Skipped,
                         delete_failed: false,
+                        display_path: item.location.normalized_path().as_str().to_owned(),
                     });
                     completed += 1;
                     revalidation_skipped += 1;
@@ -203,6 +340,7 @@ fn execute_items(
                         ),
                         revalidation: RevalidationOutcome::Failed,
                         delete_failed: false,
+                        display_path: item.location.normalized_path().as_str().to_owned(),
                     });
                     completed += 1;
                     revalidation_failed += 1;
@@ -229,6 +367,7 @@ fn execute_items(
                         ),
                         revalidation: RevalidationOutcome::Skipped,
                         delete_failed: false,
+                        display_path: path.to_string_lossy().into_owned(),
                     });
                     completed += 1;
                     revalidation_skipped += 1;
@@ -247,6 +386,7 @@ fn execute_items(
                         result: failed(&item.item_id, error),
                         revalidation: RevalidationOutcome::Failed,
                         delete_failed: false,
+                        display_path: path.to_string_lossy().into_owned(),
                     });
                     completed += 1;
                     revalidation_failed += 1;
@@ -270,6 +410,7 @@ fn execute_items(
                     ),
                     revalidation: RevalidationOutcome::Skipped,
                     delete_failed: false,
+                    display_path: path.to_string_lossy().into_owned(),
                 });
                 completed += 1;
                 revalidation_skipped += 1;
@@ -294,6 +435,7 @@ fn execute_items(
                         ),
                         revalidation: RevalidationOutcome::Skipped,
                         delete_failed: false,
+                        display_path: path.to_string_lossy().into_owned(),
                     });
                     completed += 1;
                     revalidation_skipped += 1;
@@ -312,6 +454,7 @@ fn execute_items(
                         result: failed(&item.item_id, error),
                         revalidation: RevalidationOutcome::Failed,
                         delete_failed: false,
+                        display_path: path.to_string_lossy().into_owned(),
                     });
                     completed += 1;
                     revalidation_failed += 1;
@@ -326,22 +469,19 @@ fn execute_items(
                     continue;
                 }
             }
-            let outcome = match plan.mode {
-                DeleteMode::RecycleBin => {
-                    dedup_windows::move_to_recycle_bin(path).map(|()| DeleteOutcome::Recycled)
-                }
-                DeleteMode::Permanent => fs::remove_file(path).map(|()| DeleteOutcome::Deleted),
-            };
+            let outcome = filesystem.delete(plan.mode, path);
             match outcome {
                 Ok(outcome) => ExecutedDeleteItem {
                     result: DeleteResult::new(item.item_id.clone(), outcome, None),
                     revalidation: RevalidationOutcome::Passed,
                     delete_failed: false,
+                    display_path: path.to_string_lossy().into_owned(),
                 },
                 Err(error) => ExecutedDeleteItem {
                     result: failed(&item.item_id, error),
                     revalidation: RevalidationOutcome::Passed,
                     delete_failed: true,
+                    display_path: path.to_string_lossy().into_owned(),
                 },
             }
         };
@@ -420,7 +560,7 @@ fn report_delete_progress(
         reporter,
         RuntimeStage::DeleteItems,
         dedup_protocol::proto::RuntimeStageState::RuntimeStageRunning,
-        completed.saturating_sub(revalidation_failed + revalidation_skipped),
+        completed.saturating_sub(revalidation_failed + revalidation_skipped + delete_failed),
         total,
         delete_failed,
         revalidation_skipped + revalidation_failed,
@@ -459,11 +599,34 @@ fn report_delete_terminal(reporter: Option<&RuntimeTaskReporter>, executed: &[Ex
         } else {
             dedup_protocol::proto::RuntimeStageState::RuntimeStageFailed
         },
-        total.saturating_sub(revalidation_failed + revalidation_skipped),
+        total.saturating_sub(revalidation_failed + revalidation_skipped + delete_failed),
         total,
         delete_failed,
         revalidation_failed + revalidation_skipped,
     );
+}
+
+fn record_delete_failures(reporter: Option<&RuntimeTaskReporter>, executed: &[ExecutedDeleteItem]) {
+    let Some(reporter) = reporter else { return };
+    for item in executed
+        .iter()
+        .filter(|item| item.result.outcome == DeleteOutcome::Failed)
+    {
+        let stage = if item.delete_failed {
+            RuntimeStage::DeleteItems
+        } else {
+            RuntimeStage::RevalidateSelection
+        };
+        let _ = reporter.record_failure_nowait(RuntimeFailureUpdate {
+            stage,
+            display_path: item.display_path.clone(),
+            message: item
+                .result
+                .message
+                .clone()
+                .unwrap_or_else(|| "删除失败".into()),
+        });
+    }
 }
 
 fn report_delete_stage(

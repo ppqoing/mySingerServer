@@ -123,7 +123,144 @@ async fn unresolved_stage2_marks_fill_failed_and_downstream_skipped() {
             .find(|stage| stage.stage_id == id)
             .unwrap();
         assert_eq!(stage.state, RuntimeStageState::RuntimeStageSkipped as i32);
+        let expected_total = if id == "cluster" { 1 } else { 2 };
+        assert_eq!(stage.total, expected_total);
+        assert_eq!(stage.completed, 0);
+        assert_eq!(stage.skipped, expected_total);
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_analysis_real_pool_crash_is_persisted_before_next_dispatch_and_slot_recovers() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("analysis-crash.db");
+    let machine = MachineId::from_sha256([0x84; 32]);
+    let registry = RuntimeTaskRegistry::new();
+    let reporter = registry
+        .begin(RuntimeTaskKind::LocalAnalysis, machine.clone(), "本地分析")
+        .await;
+    let reporter_id = reporter.id().to_owned();
+    let mut store = NodeStore::open(&database, machine.clone()).unwrap();
+    let a = seed_image(&mut store, r"D:\crash-a.jpg", [8; 16], false);
+    let b = seed_image(&mut store, r"D:\crash-b.jpg", [9; 16], false);
+    let c = seed_image(&mut store, r"D:\crash-c.jpg", [10; 16], false);
+    let task = completed_task(&mut store, &[a, b, c]);
+    let run_id = LocalAnalysisEngine::begin(&mut store, &[task], Thresholds::default(), 6).unwrap();
+    let (mut pool, mut started, control) = WorkerPool::controlled_batch_for_test(2);
+    let controller_registry = registry.clone();
+    let controller_database = database.clone();
+    let controller_reporter_id = reporter_id.clone();
+    let controller = tokio::spawn(async move {
+        let (task_id, first_item) = started.recv().await.unwrap();
+        control
+            .crash(
+                task_id.clone(),
+                first_item,
+                "controlled stage2 crash".into(),
+            )
+            .await;
+
+        let (_, second_item) = started.recv().await.unwrap();
+        let reopened =
+            NodeStore::open(&controller_database, MachineId::from_sha256([0x84; 32])).unwrap();
+        let stage2_task = reopened
+            .page_tasks(None, 20)
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|task| task.task_id.as_uuid().to_string() == task_id)
+            .unwrap();
+        assert_eq!(stage2_task.failed, 1, "A 必须先写 Store Failed 再派发 B");
+        assert_eq!(stage2_task.succeeded, 0);
+        let live = controller_registry
+            .details(&controller_reporter_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            live.failures.len(),
+            1,
+            "Store 终态后 runtime failure 才可见"
+        );
+        assert!(live.failures[0].message.contains("controlled stage2 crash"));
+        control
+            .complete_stage2(
+                task_id.clone(),
+                second_item,
+                Stage2Output {
+                    frames: vec![Stage2Frame {
+                        slot: 0,
+                        feature: Some(stage2()),
+                        error: None,
+                    }],
+                },
+            )
+            .await;
+
+        let (_, third_item) = started.recv().await.unwrap();
+        control
+            .complete_stage2(
+                task_id,
+                third_item,
+                Stage2Output {
+                    frames: vec![Stage2Frame {
+                        slot: 0,
+                        feature: Some(stage2()),
+                        error: None,
+                    }],
+                },
+            )
+            .await;
+        control
+    });
+
+    let run_registry = registry.clone();
+    let run_reporter = reporter.clone();
+    let run = tokio::spawn(async move {
+        let mut processor = WorkerPoolStage2Processor::new(&mut pool)
+            .with_runtime_reporter(run_reporter.clone(), machine);
+        let report = LocalAnalysisEngine::run_existing_with_runtime(
+            &mut store,
+            run_id,
+            &mut processor,
+            &run_reporter,
+            7,
+        )
+        .await;
+        drop(processor);
+        (report, store, pool, run_registry)
+    });
+
+    let control = tokio::time::timeout(std::time::Duration::from_secs(3), controller)
+        .await
+        .expect("crash 后必须补槽并继续 B/C")
+        .unwrap();
+    let (report, store, pool, registry) =
+        tokio::time::timeout(std::time::Duration::from_secs(3), run)
+            .await
+            .expect("真实 LocalAnalysis/WorkerPool 链不得死锁")
+            .unwrap();
+    assert_eq!(report.unwrap().status, AnalysisStatus::Partial);
+    assert_eq!(control.available_slots(), 2);
+    assert_eq!(pool.busy_workers(), 0);
+    let stage2_task = store
+        .page_tasks(None, 20)
+        .unwrap()
+        .items
+        .into_iter()
+        .find(|task| task.kind == "analysis_stage2")
+        .unwrap();
+    assert_eq!(stage2_task.failed, 1);
+    assert_eq!(stage2_task.succeeded, 2);
+    let details = registry.details(&reporter_id).await.unwrap();
+    assert_eq!(
+        details
+            .workers
+            .iter()
+            .map(|worker| worker.completed_files)
+            .sum::<u64>(),
+        2
+    );
+    assert_eq!(details.failures.len(), 1);
 }
 
 #[tokio::test]

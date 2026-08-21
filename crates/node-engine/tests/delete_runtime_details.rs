@@ -1,14 +1,27 @@
-use std::fs;
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use dedup_core::{
     ContentKey, DeleteMode, DisplayPath, LocationKey, MachineId, MediaKind, NormalizedPath,
 };
 use dedup_node_engine::{
-    delete::DeleteEngine,
+    delete::{
+        DeleteEngine, DeleteFilesystem, DeleteResultCommitter, NodeStoreDeleteResultCommitter,
+    },
     runtime_tasks::{RuntimeTaskKind, RuntimeTaskRegistry},
     scan::md5_bytes,
 };
-use dedup_node_store::{DeleteBatchPlan, DeleteOutcome, NodeStore, PlannedDeleteItem, ScannedPath};
+use dedup_node_store::{
+    AnalysisMode, ConfirmedDeleteItem, DeleteBatchPlan, DeleteOutcome, DeleteResult, GroupKind,
+    GroupMemberWrite, GroupWrite, NodeStore, PlannedDeleteItem, ReviewDecision, ScannedPath,
+    StoreError,
+};
 use dedup_protocol::proto::RuntimeStageState;
 
 #[tokio::test]
@@ -44,8 +57,9 @@ async fn delete_reports_frozen_plan_without_expanding_selection() {
         }],
     };
 
-    let results =
-        DeleteEngine::execute_external_with_runtime(&mut store, &plan, &reporter).unwrap();
+    let results = DeleteEngine::execute_external_with_runtime(&mut store, &plan, &reporter)
+        .await
+        .unwrap();
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].outcome, DeleteOutcome::Deleted);
@@ -104,8 +118,9 @@ async fn stale_frozen_item_is_skipped_in_revalidate_without_delete_failure() {
     };
     fs::remove_file(&target).unwrap();
 
-    let results =
-        DeleteEngine::execute_external_with_runtime(&mut store, &plan, &reporter).unwrap();
+    let results = DeleteEngine::execute_external_with_runtime(&mut store, &plan, &reporter)
+        .await
+        .unwrap();
 
     assert_eq!(results[0].outcome, DeleteOutcome::Skipped);
     let details = registry.details(reporter.id()).await.unwrap();
@@ -130,6 +145,240 @@ async fn stale_frozen_item_is_skipped_in_revalidate_without_delete_failure() {
     );
     assert_eq!(delete.failed, 0);
     assert_eq!(delete.skipped, 1);
+}
+
+#[derive(Clone)]
+struct ControlledDeleteFilesystem {
+    fail_path: PathBuf,
+    calls: Arc<AtomicUsize>,
+}
+
+impl DeleteFilesystem for ControlledDeleteFilesystem {
+    fn delete(&self, mode: DeleteMode, path: &Path) -> io::Result<DeleteOutcome> {
+        assert_eq!(mode, DeleteMode::Permanent);
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if path == self.fail_path {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "controlled sharing violation",
+            ));
+        }
+        fs::remove_file(path)?;
+        Ok(DeleteOutcome::Deleted)
+    }
+}
+
+struct FailingCommitter {
+    calls: Arc<AtomicUsize>,
+}
+
+impl DeleteResultCommitter for FailingCommitter {
+    fn apply(
+        &self,
+        _store: &mut NodeStore,
+        _plan: &DeleteBatchPlan,
+        _results: &[DeleteResult],
+        _external: bool,
+    ) -> Result<(), StoreError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(StoreError::InvalidState(
+            "controlled summarize failure".into(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn confirmed_local_batch_reports_partial_delete_after_store_item_terminals() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut store, plan, success, failed, outside) = local_confirmed_fixture(directory.path());
+    let registry = RuntimeTaskRegistry::new();
+    let reporter = registry
+        .begin(
+            RuntimeTaskKind::Delete,
+            store.machine_id().clone(),
+            "本地确认删除",
+        )
+        .await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let filesystem = ControlledDeleteFilesystem {
+        fail_path: failed.clone(),
+        calls: Arc::clone(&calls),
+    };
+
+    let results = DeleteEngine::execute_batch_with_runtime_using(
+        &mut store,
+        &plan,
+        &reporter,
+        &filesystem,
+        &NodeStoreDeleteResultCommitter,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|row| row.outcome == DeleteOutcome::Deleted)
+            .count(),
+        1
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|row| row.outcome == DeleteOutcome::Failed)
+            .count(),
+        1
+    );
+    assert!(!success.exists());
+    assert!(failed.exists());
+    assert!(outside.exists(), "冻结集合外的活动文件不得扩项删除");
+    let details = registry.details(reporter.id()).await.unwrap();
+    assert_eq!(details.summary.as_ref().unwrap().state, "failed");
+    let delete = details
+        .stages
+        .iter()
+        .find(|stage| stage.stage_id == "delete_items")
+        .unwrap();
+    assert_eq!(delete.state, RuntimeStageState::RuntimeStageFailed as i32);
+    assert_eq!(delete.completed, 1);
+    assert_eq!(delete.failed, 1);
+    let summarize = details
+        .stages
+        .iter()
+        .find(|stage| stage.stage_id == "summarize")
+        .unwrap();
+    assert_eq!(
+        summarize.state,
+        RuntimeStageState::RuntimeStageCompleted as i32
+    );
+    assert_eq!(details.failures.len(), 1);
+    assert_eq!(details.failures[0].stage_id, "delete_items");
+    assert!(
+        details.failures[0]
+            .message
+            .contains("controlled sharing violation")
+    );
+}
+
+#[tokio::test]
+async fn summarize_store_failure_is_terminal_and_never_repeats_or_expands_deletes() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut store, plan, _success, failed, outside) = local_confirmed_fixture(directory.path());
+    let registry = RuntimeTaskRegistry::new();
+    let reporter = registry
+        .begin(
+            RuntimeTaskKind::Delete,
+            store.machine_id().clone(),
+            "提交失败",
+        )
+        .await;
+    let delete_calls = Arc::new(AtomicUsize::new(0));
+    let commit_calls = Arc::new(AtomicUsize::new(0));
+    let filesystem = ControlledDeleteFilesystem {
+        fail_path: failed,
+        calls: Arc::clone(&delete_calls),
+    };
+
+    let error = DeleteEngine::execute_batch_with_runtime_using(
+        &mut store,
+        &plan,
+        &reporter,
+        &filesystem,
+        &FailingCommitter {
+            calls: Arc::clone(&commit_calls),
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("controlled summarize failure"));
+    assert_eq!(delete_calls.load(Ordering::SeqCst), plan.items.len());
+    assert_eq!(commit_calls.load(Ordering::SeqCst), 1);
+    assert!(outside.exists());
+    let details = registry.details(reporter.id()).await.unwrap();
+    assert_eq!(details.summary.as_ref().unwrap().state, "failed");
+    let summarize = details
+        .stages
+        .iter()
+        .find(|stage| stage.stage_id == "summarize")
+        .unwrap();
+    assert_eq!(
+        summarize.state,
+        RuntimeStageState::RuntimeStageFailed as i32
+    );
+    assert!(details.summary.as_ref().unwrap().overall_failed > 0);
+    assert_eq!(details.failures.len(), 1);
+    assert_eq!(details.failures[0].stage_id, "summarize");
+    assert!(
+        details.failures[0]
+            .message
+            .contains("controlled summarize failure")
+    );
+}
+
+fn local_confirmed_fixture(
+    directory: &Path,
+) -> (NodeStore, DeleteBatchPlan, PathBuf, PathBuf, PathBuf) {
+    let success = directory.join("delete-success.bin");
+    let failed = directory.join("delete-failed.bin");
+    let outside = directory.join("keep-outside.bin");
+    fs::write(&success, b"same").unwrap();
+    fs::write(&failed, b"same").unwrap();
+    fs::write(&outside, b"same").unwrap();
+    let machine = MachineId::from_sha256([0x93; 32]);
+    let mut store = NodeStore::open_in_memory(machine.clone()).unwrap();
+    let success_scan = scanned(&success);
+    let failed_scan = scanned(&failed);
+    let outside_scan = scanned(&outside);
+    let key = ContentKey::new(md5_bytes(b"same"), 4);
+    for row in [&success_scan, &failed_scan, &outside_scan] {
+        store
+            .upsert_content_and_location(row, key.md5(), MediaKind::Other)
+            .unwrap();
+    }
+    let success_location = LocationKey::new(machine.clone(), success_scan.normalized_path.clone());
+    let failed_location = LocationKey::new(machine.clone(), failed_scan.normalized_path.clone());
+    let outside_location = LocationKey::new(machine, outside_scan.normalized_path.clone());
+    let run = store
+        .create_analysis_run(AnalysisMode::Local, Default::default(), 1)
+        .unwrap();
+    let group_id = uuid::Uuid::new_v4().to_string();
+    store
+        .replace_groups(
+            run,
+            &[GroupWrite {
+                group_id: group_id.clone(),
+                kind: GroupKind::Exact,
+                representative: key,
+                members: vec![
+                    GroupMemberWrite::new(outside_location.clone(), key, true),
+                    GroupMemberWrite::new(success_location.clone(), key, false),
+                    GroupMemberWrite::new(failed_location.clone(), key, false),
+                ],
+            }],
+        )
+        .unwrap();
+    store
+        .save_review_mark(run, &group_id, &outside_location, ReviewDecision::Keep)
+        .unwrap();
+    for location in [&success_location, &failed_location] {
+        store
+            .save_review_mark(run, &group_id, location, ReviewDecision::Delete)
+            .unwrap();
+    }
+    let plan = store
+        .create_delete_batch(
+            run,
+            &[
+                ConfirmedDeleteItem::new(group_id.clone(), success_location, key),
+                ConfirmedDeleteItem::new(group_id, failed_location, key),
+            ],
+            DeleteMode::Permanent,
+            2,
+        )
+        .unwrap();
+    (store, plan, success, failed, outside)
 }
 
 fn scanned(path: &std::path::Path) -> ScannedPath {
