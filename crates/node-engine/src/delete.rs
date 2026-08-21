@@ -44,9 +44,10 @@ impl DeleteFilesystem for SystemDeleteFilesystem {
 
 /// 删除结果事务边界；测试可在不重复文件删除的前提下注入 summarize 失败。
 #[doc(hidden)]
+#[allow(async_fn_in_trait)]
 pub trait DeleteResultCommitter {
     /// 原子提交本轮所有结果。
-    fn apply(
+    async fn apply(
         &self,
         store: &mut NodeStore,
         plan: &DeleteBatchPlan,
@@ -60,7 +61,7 @@ pub trait DeleteResultCommitter {
 pub struct NodeStoreDeleteResultCommitter;
 
 impl DeleteResultCommitter for NodeStoreDeleteResultCommitter {
-    fn apply(
+    async fn apply(
         &self,
         store: &mut NodeStore,
         plan: &DeleteBatchPlan,
@@ -84,14 +85,7 @@ impl DeleteEngine {
         store: &mut NodeStore,
         plan: &DeleteBatchPlan,
     ) -> Result<Vec<DeleteResult>, DeleteError> {
-        execute_batch_inner(
-            store,
-            plan,
-            None,
-            false,
-            &SystemDeleteFilesystem,
-            &NodeStoreDeleteResultCommitter,
-        )
+        execute_without_runtime(store, plan, false)
     }
 
     /// 执行本机已冻结计划并发布真实重校验、删除和提交阶段。
@@ -123,7 +117,8 @@ impl DeleteEngine {
         F: DeleteFilesystem,
         C: DeleteResultCommitter,
     {
-        let result = execute_batch_inner(store, plan, Some(reporter), false, filesystem, committer);
+        let result =
+            execute_batch_inner(store, plan, Some(reporter), false, filesystem, committer).await;
         finish_runtime(reporter, &result).await;
         result
     }
@@ -133,14 +128,7 @@ impl DeleteEngine {
         store: &mut NodeStore,
         plan: &DeleteBatchPlan,
     ) -> Result<Vec<DeleteResult>, DeleteError> {
-        execute_batch_inner(
-            store,
-            plan,
-            None,
-            true,
-            &SystemDeleteFilesystem,
-            &NodeStoreDeleteResultCommitter,
-        )
+        execute_without_runtime(store, plan, true)
     }
 
     /// 执行中心已冻结并派发到本机的计划，遥测不重新查询或扩大选择集合。
@@ -156,7 +144,8 @@ impl DeleteEngine {
             true,
             &SystemDeleteFilesystem,
             &NodeStoreDeleteResultCommitter,
-        );
+        )
+        .await;
         finish_runtime(reporter, &result).await;
         result
     }
@@ -179,7 +168,24 @@ async fn finish_runtime(
     let _ = reporter.finish(state).await;
 }
 
-fn execute_batch_inner<F, C>(
+fn execute_without_runtime(
+    store: &mut NodeStore,
+    plan: &DeleteBatchPlan,
+    external: bool,
+) -> Result<Vec<DeleteResult>, DeleteError> {
+    let results = execute_items(store, plan, &SystemDeleteFilesystem)
+        .into_iter()
+        .map(|item| item.result)
+        .collect::<Vec<_>>();
+    if external {
+        store.apply_external_delete_results(plan, &results)?;
+    } else {
+        store.apply_delete_results(&plan.batch_id, &results)?;
+    }
+    Ok(results)
+}
+
+async fn execute_batch_inner<F, C>(
     store: &mut NodeStore,
     plan: &DeleteBatchPlan,
     reporter: Option<&RuntimeTaskReporter>,
@@ -195,11 +201,12 @@ where
         let _ = reporter.update_overall_nowait(0, Some(plan.items.len() as u64), 0, 0);
     }
     initialize_delete_stages(reporter, plan.items.len() as u64);
-    let executed = execute_items(store, plan, reporter, filesystem);
+    let executed = execute_items(store, plan, filesystem);
     let results = executed
         .iter()
         .map(|item| item.result.clone())
         .collect::<Vec<_>>();
+    report_revalidation_terminal(reporter, &executed);
     report_delete_stage(
         reporter,
         RuntimeStage::Summarize,
@@ -209,10 +216,10 @@ where
         0,
         0,
     );
-    let applied = committer.apply(store, plan, &results, external);
+    let applied = committer.apply(store, plan, &results, external).await;
     match applied {
         Ok(()) => {
-            report_delete_terminal(reporter, &executed);
+            report_delete_terminal(reporter, &executed, true);
             record_delete_failures(reporter, &executed);
             if let Some(reporter) = reporter {
                 let completed = results
@@ -251,6 +258,7 @@ where
             Ok(results)
         }
         Err(error) => {
+            report_delete_terminal(reporter, &executed, false);
             if let Some(reporter) = reporter {
                 let _ = reporter.update_overall_nowait(0, Some(plan.items.len() as u64), 1, 0);
             }
@@ -292,17 +300,11 @@ struct ExecutedDeleteItem {
 fn execute_items<F>(
     store: &NodeStore,
     plan: &DeleteBatchPlan,
-    reporter: Option<&RuntimeTaskReporter>,
     filesystem: &F,
 ) -> Vec<ExecutedDeleteItem>
 where
     F: DeleteFilesystem,
 {
-    let total = plan.items.len() as u64;
-    let mut completed = 0_u64;
-    let mut revalidation_failed = 0_u64;
-    let mut revalidation_skipped = 0_u64;
-    let mut delete_failed = 0_u64;
     let mut output = Vec::with_capacity(plan.items.len());
     for item in &plan.items {
         let executed = {
@@ -319,16 +321,6 @@ where
                         delete_failed: false,
                         display_path: item.location.normalized_path().as_str().to_owned(),
                     });
-                    completed += 1;
-                    revalidation_skipped += 1;
-                    report_delete_progress(
-                        reporter,
-                        total,
-                        completed,
-                        revalidation_failed,
-                        revalidation_skipped,
-                        delete_failed,
-                    );
                     continue;
                 }
                 Err(error) => {
@@ -342,16 +334,6 @@ where
                         delete_failed: false,
                         display_path: item.location.normalized_path().as_str().to_owned(),
                     });
-                    completed += 1;
-                    revalidation_failed += 1;
-                    report_delete_progress(
-                        reporter,
-                        total,
-                        completed,
-                        revalidation_failed,
-                        revalidation_skipped,
-                        delete_failed,
-                    );
                     continue;
                 }
             };
@@ -369,16 +351,6 @@ where
                         delete_failed: false,
                         display_path: path.to_string_lossy().into_owned(),
                     });
-                    completed += 1;
-                    revalidation_skipped += 1;
-                    report_delete_progress(
-                        reporter,
-                        total,
-                        completed,
-                        revalidation_failed,
-                        revalidation_skipped,
-                        delete_failed,
-                    );
                     continue;
                 }
                 Err(error) => {
@@ -388,16 +360,6 @@ where
                         delete_failed: false,
                         display_path: path.to_string_lossy().into_owned(),
                     });
-                    completed += 1;
-                    revalidation_failed += 1;
-                    report_delete_progress(
-                        reporter,
-                        total,
-                        completed,
-                        revalidation_failed,
-                        revalidation_skipped,
-                        delete_failed,
-                    );
                     continue;
                 }
             };
@@ -412,16 +374,6 @@ where
                     delete_failed: false,
                     display_path: path.to_string_lossy().into_owned(),
                 });
-                completed += 1;
-                revalidation_skipped += 1;
-                report_delete_progress(
-                    reporter,
-                    total,
-                    completed,
-                    revalidation_failed,
-                    revalidation_skipped,
-                    delete_failed,
-                );
                 continue;
             }
             match md5_file(path) {
@@ -437,16 +389,6 @@ where
                         delete_failed: false,
                         display_path: path.to_string_lossy().into_owned(),
                     });
-                    completed += 1;
-                    revalidation_skipped += 1;
-                    report_delete_progress(
-                        reporter,
-                        total,
-                        completed,
-                        revalidation_failed,
-                        revalidation_skipped,
-                        delete_failed,
-                    );
                     continue;
                 }
                 Err(error) => {
@@ -456,16 +398,6 @@ where
                         delete_failed: false,
                         display_path: path.to_string_lossy().into_owned(),
                     });
-                    completed += 1;
-                    revalidation_failed += 1;
-                    report_delete_progress(
-                        reporter,
-                        total,
-                        completed,
-                        revalidation_failed,
-                        revalidation_skipped,
-                        delete_failed,
-                    );
                     continue;
                 }
             }
@@ -485,17 +417,7 @@ where
                 },
             }
         };
-        completed += 1;
-        delete_failed += u64::from(executed.delete_failed);
         output.push(executed);
-        report_delete_progress(
-            reporter,
-            total,
-            completed,
-            revalidation_failed,
-            revalidation_skipped,
-            delete_failed,
-        );
     }
     output
 }
@@ -539,35 +461,39 @@ fn initialize_delete_stages(reporter: Option<&RuntimeTaskReporter>, total: u64) 
     }
 }
 
-fn report_delete_progress(
+fn report_revalidation_terminal(
     reporter: Option<&RuntimeTaskReporter>,
-    total: u64,
-    completed: u64,
-    revalidation_failed: u64,
-    revalidation_skipped: u64,
-    delete_failed: u64,
+    executed: &[ExecutedDeleteItem],
 ) {
+    let total = executed.len() as u64;
+    let revalidation_failed = executed
+        .iter()
+        .filter(|item| matches!(item.revalidation, RevalidationOutcome::Failed))
+        .count() as u64;
+    let revalidation_skipped = executed
+        .iter()
+        .filter(|item| matches!(item.revalidation, RevalidationOutcome::Skipped))
+        .count() as u64;
     report_delete_stage(
         reporter,
         RuntimeStage::RevalidateSelection,
-        dedup_protocol::proto::RuntimeStageState::RuntimeStageRunning,
-        completed,
+        if revalidation_failed == 0 {
+            dedup_protocol::proto::RuntimeStageState::RuntimeStageCompleted
+        } else {
+            dedup_protocol::proto::RuntimeStageState::RuntimeStageFailed
+        },
+        total.saturating_sub(revalidation_failed + revalidation_skipped),
         total,
         revalidation_failed,
         revalidation_skipped,
     );
-    report_delete_stage(
-        reporter,
-        RuntimeStage::DeleteItems,
-        dedup_protocol::proto::RuntimeStageState::RuntimeStageRunning,
-        completed.saturating_sub(revalidation_failed + revalidation_skipped + delete_failed),
-        total,
-        delete_failed,
-        revalidation_skipped + revalidation_failed,
-    );
 }
 
-fn report_delete_terminal(reporter: Option<&RuntimeTaskReporter>, executed: &[ExecutedDeleteItem]) {
+fn report_delete_terminal(
+    reporter: Option<&RuntimeTaskReporter>,
+    executed: &[ExecutedDeleteItem],
+    publish_item_failures: bool,
+) {
     let total = executed.len() as u64;
     let revalidation_failed = executed
         .iter()
@@ -578,31 +504,24 @@ fn report_delete_terminal(reporter: Option<&RuntimeTaskReporter>, executed: &[Ex
         .filter(|item| matches!(item.revalidation, RevalidationOutcome::Skipped))
         .count() as u64;
     let delete_failed = executed.iter().filter(|item| item.delete_failed).count() as u64;
-    report_delete_stage(
-        reporter,
-        RuntimeStage::RevalidateSelection,
-        if revalidation_failed == 0 {
-            dedup_protocol::proto::RuntimeStageState::RuntimeStageCompleted
-        } else {
-            dedup_protocol::proto::RuntimeStageState::RuntimeStageFailed
-        },
-        total,
-        total,
-        revalidation_failed,
-        revalidation_skipped,
-    );
+    let published_failed = if publish_item_failures {
+        delete_failed
+    } else {
+        0
+    };
+    let unpublished_failures = delete_failed.saturating_sub(published_failed);
     report_delete_stage(
         reporter,
         RuntimeStage::DeleteItems,
-        if delete_failed == 0 {
+        if published_failed == 0 {
             dedup_protocol::proto::RuntimeStageState::RuntimeStageCompleted
         } else {
             dedup_protocol::proto::RuntimeStageState::RuntimeStageFailed
         },
         total.saturating_sub(revalidation_failed + revalidation_skipped + delete_failed),
         total,
-        delete_failed,
-        revalidation_failed + revalidation_skipped,
+        published_failed,
+        revalidation_failed + revalidation_skipped + unpublished_failures,
     );
 }
 

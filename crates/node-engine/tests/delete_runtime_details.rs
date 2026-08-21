@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -149,7 +149,7 @@ async fn stale_frozen_item_is_skipped_in_revalidate_without_delete_failure() {
 
 #[derive(Clone)]
 struct ControlledDeleteFilesystem {
-    fail_path: PathBuf,
+    fail_path: Option<PathBuf>,
     calls: Arc<AtomicUsize>,
 }
 
@@ -157,7 +157,7 @@ impl DeleteFilesystem for ControlledDeleteFilesystem {
     fn delete(&self, mode: DeleteMode, path: &Path) -> io::Result<DeleteOutcome> {
         assert_eq!(mode, DeleteMode::Permanent);
         self.calls.fetch_add(1, Ordering::SeqCst);
-        if path == self.fail_path {
+        if self.fail_path.as_deref() == Some(path) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "controlled sharing violation",
@@ -170,21 +170,67 @@ impl DeleteFilesystem for ControlledDeleteFilesystem {
 
 struct FailingCommitter {
     calls: Arc<AtomicUsize>,
+    registry: RuntimeTaskRegistry,
+    reporter_id: String,
 }
 
 impl DeleteResultCommitter for FailingCommitter {
-    fn apply(
+    async fn apply(
         &self,
         _store: &mut NodeStore,
         _plan: &DeleteBatchPlan,
         _results: &[DeleteResult],
         _external: bool,
     ) -> Result<(), StoreError> {
+        assert_precommit_clean(&self.registry, &self.reporter_id).await;
         self.calls.fetch_add(1, Ordering::SeqCst);
         Err(StoreError::InvalidState(
             "controlled summarize failure".into(),
         ))
     }
+}
+
+struct ObservingCommitter {
+    registry: RuntimeTaskRegistry,
+    reporter_id: String,
+    observed: Arc<AtomicBool>,
+}
+
+impl DeleteResultCommitter for ObservingCommitter {
+    async fn apply(
+        &self,
+        store: &mut NodeStore,
+        plan: &DeleteBatchPlan,
+        results: &[DeleteResult],
+        external: bool,
+    ) -> Result<(), StoreError> {
+        assert_precommit_clean(&self.registry, &self.reporter_id).await;
+        self.observed.store(true, Ordering::SeqCst);
+        NodeStoreDeleteResultCommitter
+            .apply(store, plan, results, external)
+            .await
+    }
+}
+
+async fn assert_precommit_clean(registry: &RuntimeTaskRegistry, reporter_id: &str) {
+    let details = registry.details(reporter_id).await.unwrap();
+    let revalidate = details
+        .stages
+        .iter()
+        .find(|stage| stage.stage_id == "revalidate_selection")
+        .unwrap();
+    assert_eq!(
+        revalidate.state,
+        RuntimeStageState::RuntimeStageCompleted as i32,
+        "committer 前重校验必须已收束"
+    );
+    let delete = details
+        .stages
+        .iter()
+        .find(|stage| stage.stage_id == "delete_items")
+        .unwrap();
+    assert_eq!(delete.failed, 0, "committer 前不得发布未持久 item failure");
+    assert!(details.failures.is_empty());
 }
 
 #[tokio::test]
@@ -200,8 +246,9 @@ async fn confirmed_local_batch_reports_partial_delete_after_store_item_terminals
         )
         .await;
     let calls = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::new(AtomicBool::new(false));
     let filesystem = ControlledDeleteFilesystem {
-        fail_path: failed.clone(),
+        fail_path: Some(failed.clone()),
         calls: Arc::clone(&calls),
     };
 
@@ -210,12 +257,17 @@ async fn confirmed_local_batch_reports_partial_delete_after_store_item_terminals
         &plan,
         &reporter,
         &filesystem,
-        &NodeStoreDeleteResultCommitter,
+        &ObservingCommitter {
+            registry: registry.clone(),
+            reporter_id: reporter.id().to_owned(),
+            observed: Arc::clone(&observed),
+        },
     )
     .await
     .unwrap();
 
     assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(observed.load(Ordering::SeqCst));
     assert_eq!(
         results
             .iter()
@@ -264,7 +316,7 @@ async fn confirmed_local_batch_reports_partial_delete_after_store_item_terminals
 #[tokio::test]
 async fn summarize_store_failure_is_terminal_and_never_repeats_or_expands_deletes() {
     let directory = tempfile::tempdir().unwrap();
-    let (mut store, plan, _success, failed, outside) = local_confirmed_fixture(directory.path());
+    let (mut store, plan, _success, _failed, outside) = local_confirmed_fixture(directory.path());
     let registry = RuntimeTaskRegistry::new();
     let reporter = registry
         .begin(
@@ -276,7 +328,7 @@ async fn summarize_store_failure_is_terminal_and_never_repeats_or_expands_delete
     let delete_calls = Arc::new(AtomicUsize::new(0));
     let commit_calls = Arc::new(AtomicUsize::new(0));
     let filesystem = ControlledDeleteFilesystem {
-        fail_path: failed,
+        fail_path: None,
         calls: Arc::clone(&delete_calls),
     };
 
@@ -287,6 +339,8 @@ async fn summarize_store_failure_is_terminal_and_never_repeats_or_expands_delete
         &filesystem,
         &FailingCommitter {
             calls: Arc::clone(&commit_calls),
+            registry: registry.clone(),
+            reporter_id: reporter.id().to_owned(),
         },
     )
     .await
@@ -307,6 +361,16 @@ async fn summarize_store_failure_is_terminal_and_never_repeats_or_expands_delete
         summarize.state,
         RuntimeStageState::RuntimeStageFailed as i32
     );
+    for id in ["revalidate_selection", "delete_items"] {
+        let stage = details
+            .stages
+            .iter()
+            .find(|stage| stage.stage_id == id)
+            .unwrap();
+        assert_eq!(stage.state, RuntimeStageState::RuntimeStageCompleted as i32);
+        assert_eq!(stage.completed, plan.items.len() as u64);
+        assert_eq!(stage.failed, 0);
+    }
     assert!(details.summary.as_ref().unwrap().overall_failed > 0);
     assert_eq!(details.failures.len(), 1);
     assert_eq!(details.failures[0].stage_id, "summarize");
@@ -315,6 +379,54 @@ async fn summarize_store_failure_is_terminal_and_never_repeats_or_expands_delete
             .message
             .contains("controlled summarize failure")
     );
+}
+
+#[tokio::test]
+async fn summarize_failure_suppresses_uncommitted_item_failure_telemetry() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut store, plan, _success, failed, _outside) = local_confirmed_fixture(directory.path());
+    let registry = RuntimeTaskRegistry::new();
+    let reporter = registry
+        .begin(
+            RuntimeTaskKind::Delete,
+            store.machine_id().clone(),
+            "提交失败覆盖项目失败",
+        )
+        .await;
+    let filesystem = ControlledDeleteFilesystem {
+        fail_path: Some(failed),
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+
+    DeleteEngine::execute_batch_with_runtime_using(
+        &mut store,
+        &plan,
+        &reporter,
+        &filesystem,
+        &FailingCommitter {
+            calls: Arc::new(AtomicUsize::new(0)),
+            registry: registry.clone(),
+            reporter_id: reporter.id().to_owned(),
+        },
+    )
+    .await
+    .unwrap_err();
+
+    let details = registry.details(reporter.id()).await.unwrap();
+    assert_eq!(details.failures.len(), 1);
+    assert_eq!(details.failures[0].stage_id, "summarize");
+    let delete = details
+        .stages
+        .iter()
+        .find(|stage| stage.stage_id == "delete_items")
+        .unwrap();
+    assert_eq!(
+        delete.state,
+        RuntimeStageState::RuntimeStageCompleted as i32
+    );
+    assert_eq!(delete.failed, 0);
+    assert_eq!(delete.completed, 1);
+    assert_eq!(delete.skipped, 1);
 }
 
 fn local_confirmed_fixture(
