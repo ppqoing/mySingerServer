@@ -38,3 +38,18 @@ fn empty_and_unc_paths_are_rejected_before_node_configuration_is_saved() {
     assert!(LocalNodePath::validate(directory.path(), r"\\server\share\node").is_err());
     assert!(LocalNodePath::validate(directory.path(), r"\\?\UNC\server\share\node").is_err());
 }
+
+#[test]
+fn drive_relative_and_rooted_relative_paths_cannot_bypass_the_executable_directory_base() {
+    let directory = tempfile::tempdir().unwrap();
+
+    assert!(LocalNodePath::validate(directory.path(), r"C:cache").is_err());
+    assert!(LocalNodePath::validate(directory.path(), r"\cache").is_err());
+}
+
+#[test]
+fn injected_remote_drive_type_is_rejected_without_a_real_mapped_drive() {
+    let directory = tempfile::tempdir().unwrap();
+
+    assert!(LocalNodePath::validate_with_drive_type(directory.path(), "data", |_| 4).is_err());
+}
