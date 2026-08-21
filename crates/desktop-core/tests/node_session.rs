@@ -197,12 +197,47 @@ async fn runtime_tasks_share_one_connection_and_demux_terminal_events() {
     assert_eq!(event.runtime_task_id, second.id());
     assert_eq!(event.state, "completed");
 
+    for index in 0..160 {
+        registry
+            .begin(
+                RuntimeTaskKind::Scan,
+                machine_id.clone(),
+                format!("终态洪峰 {index}"),
+            )
+            .await
+            .finish(RuntimeTaskState::Completed)
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+    }
+    let (status, page, details) = tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::join!(
+            session.status(),
+            session.list_runtime_tasks("", 1),
+            session.runtime_task_details(first.id()),
+        )
+    })
+    .await
+    .expect("未消费的有界终态事件不得阻塞普通响应 demux");
+    assert_eq!(status.unwrap().machine_id, machine_id.as_str());
+    assert_eq!(page.unwrap().tasks.len(), 1);
+    assert_eq!(
+        details.unwrap().summary.as_ref().unwrap().runtime_task_id,
+        first.id()
+    );
+
     shutdown_sender.send(()).unwrap();
     server.await.unwrap().unwrap();
-    let disconnected = tokio::time::timeout(Duration::from_secs(1), session.next_runtime_event())
-        .await
-        .expect("server disconnect must terminate the event reader")
-        .unwrap_err();
+    let disconnected = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match session.next_runtime_event().await {
+                Ok(_) => continue,
+                Err(error) => break error,
+            }
+        }
+    })
+    .await
+    .expect("server disconnect must terminate the event reader");
     assert!(matches!(disconnected, SessionError::Transport(_)));
     handle.shutdown().await.unwrap();
     actor.await.unwrap();

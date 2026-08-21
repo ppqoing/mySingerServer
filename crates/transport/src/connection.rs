@@ -133,8 +133,11 @@ async fn read_loop(
             break;
         };
         if envelope.request_id == 0 {
-            if events.send(envelope).await.is_err() {
-                break;
+            match events.try_send(envelope) {
+                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    // 事件消费者关闭不应阻塞同一连接上的普通响应 demux。
+                }
             }
         } else {
             pending.resolve(envelope);
