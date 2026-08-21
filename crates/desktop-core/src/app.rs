@@ -9,14 +9,14 @@ use std::{
 };
 
 use dedup_core::{
-    AnalysisRunId, DeleteMode, DesktopConfig, EnumeratorKind, LocationKey, MachineId,
-    NormalizedPath, TaskId,
+    AnalysisRunId, DeleteMode, DesktopConfig, EnumeratorKind, LocationKey, MachineId, NodeConfig,
+    NodeEndpoint, NormalizedPath, TaskId,
 };
 use dedup_protocol::proto;
 use tokio::{
     sync::mpsc,
     task::JoinHandle,
-    time::{Interval, MissedTickBehavior, interval},
+    time::{Instant, Interval, MissedTickBehavior, interval},
 };
 use uuid::Uuid;
 
@@ -38,10 +38,12 @@ use crate::{
         SyncTriggerSender, sync_trigger_channel,
     },
     view_state::{
-        DesktopPaths, DesktopViewState, NodeConnectionState, NodeRuntimeStats, PostgresHealth,
-        TaskView, ViewTaskState,
+        DesktopPaths, DesktopViewState, NodeConfigControllerState, NodeConfigSavePhase,
+        NodeConnectionState, NodeRuntimeStats, PostgresHealth, TaskView, ViewTaskState,
     },
 };
+
+const NODE_CONFIG_RECONNECT_ATTEMPTS: u64 = 3;
 
 /// Slint 回调允许发送的管理命令；回调自身不执行网络或文件 IO。
 #[derive(Clone, Debug)]
@@ -171,6 +173,18 @@ pub enum UiCommand {
     PrepareDelete,
     /// 执行最近一次仍有效且通过门禁的删除确认。
     ConfirmDelete,
+    /// 按手工节点索引加载当前远程 Node 配置。
+    LoadNodeConfig {
+        /// 用户当前选择的节点列表索引。
+        node_index: usize,
+    },
+    /// 使用已加载摘要保存远程配置并等待同一机器重连验证。
+    SaveNodeConfigAndRestart {
+        /// 用户发起操作时的节点列表索引。
+        node_index: usize,
+        /// 设置页提交的完整 wire 配置值。
+        config: proto::NodeConfigValue,
+    },
     /// 保存完整配置；校验失败保持旧配置。
     SaveSettings(DesktopConfig),
     /// 有序结束后台控制循环。
@@ -191,6 +205,8 @@ pub struct PathEntryView {
 pub enum UiEvent {
     /// 整体替换节点、任务、设置和诊断状态。
     ViewChanged(Box<DesktopViewState>),
+    /// 远程 Node 配置表单或保存阶段已经改变。
+    NodeConfigChanged(NodeConfigControllerState),
     /// 返回一页路径浏览结果。
     PathsChanged {
         /// 结果所属节点。
@@ -299,6 +315,13 @@ struct PreparedDeleteContext {
     items: Vec<MemberView>,
 }
 
+struct PendingNodeConfigSave {
+    machine_id: String,
+    endpoint: NodeEndpoint,
+    saved_version_sha256: String,
+    deadline: Instant,
+}
+
 /// 一个节点独占的同步触发端和后台任务；丢弃时立即结束其 PG 连接与同步请求。
 struct NodeSyncWorker {
     id: Uuid,
@@ -346,6 +369,7 @@ async fn run_controller(
     let mut cross_analysis: Option<CrossAnalysisCoordinator> = None;
     let mut loaded_members: Option<LoadedMembersContext> = None;
     let mut prepared_delete: Option<PreparedDeleteContext> = None;
+    let mut pending_node_config: Option<PendingNodeConfigSave> = None;
     let mut reconnect_ticks = repeating_interval(state.config().reconnect_interval_seconds);
     let mut catch_up_ticks = repeating_interval(AUTO_CATCH_UP_INTERVAL_SECONDS);
     catch_up_ticks.tick().await;
@@ -363,6 +387,13 @@ async fn run_controller(
                     &mut central,
                     &mut sync_workers,
                     &sync_result_sender,
+                ).await;
+                verify_reconnected_node_config(
+                    &mut state,
+                    &mut sessions,
+                    &mut sync_workers,
+                    &mut pending_node_config,
+                    &events,
                 ).await;
                 publish(&events, &state).await;
                 continue;
@@ -637,12 +668,41 @@ async fn run_controller(
                 }
                 result
             }
+            UiCommand::LoadNodeConfig { node_index } => {
+                pending_node_config = None;
+                state.select_node_config(node_index);
+                publish_node_config(&events, &state).await;
+                load_node_config(node_index, &mut state, &sessions, &events).await
+            }
+            UiCommand::SaveNodeConfigAndRestart { node_index, config } => {
+                let result = save_node_config_and_restart(
+                    node_index,
+                    config,
+                    &mut state,
+                    &mut sessions,
+                    &mut sync_workers,
+                    &events,
+                )
+                .await;
+                match result {
+                    Ok(pending) => {
+                        pending_node_config = Some(pending);
+                        Ok(())
+                    }
+                    Err(error) => {
+                        state.fail_node_config(error.clone());
+                        publish_node_config(&events, &state).await;
+                        Err(error)
+                    }
+                }
+            }
             UiCommand::SaveSettings(config) => {
                 let result = state
                     .apply_settings(config)
                     .map_err(|error| error.to_string())
                     .and_then(|_| persist(&config_path, state.config()));
                 if result.is_ok() {
+                    pending_node_config = None;
                     sessions.clear();
                     sync_workers.clear();
                     central = connect_central(&mut state).await;
@@ -1078,6 +1138,193 @@ fn repeating_interval(seconds: u64) -> Interval {
     let mut ticks = interval(Duration::from_secs(seconds));
     ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
     ticks
+}
+
+async fn load_node_config(
+    node_index: usize,
+    state: &mut DesktopViewState,
+    sessions: &BTreeMap<usize, Arc<NodeSession>>,
+    events: &mpsc::Sender<UiEvent>,
+) -> Result<(), String> {
+    let session = sessions
+        .get(&node_index)
+        .ok_or_else(|| format!("节点 {node_index} 未连接，无法加载远程配置"))?;
+    let machine_id = session.machine_id().as_str().to_owned();
+    let endpoint = session.endpoint().clone();
+    let snapshot = session
+        .get_node_config()
+        .await
+        .map_err(|error| error.to_string())?;
+    if snapshot.machine_id != machine_id {
+        return Err(format!(
+            "远程配置归属机器不匹配：握手 {machine_id}，快照 {}",
+            snapshot.machine_id
+        ));
+    }
+    state.set_node_config_snapshot(node_index, endpoint, machine_id, snapshot);
+    publish_node_config(events, state).await;
+    Ok(())
+}
+
+async fn save_node_config_and_restart(
+    node_index: usize,
+    config: proto::NodeConfigValue,
+    state: &mut DesktopViewState,
+    sessions: &mut BTreeMap<usize, Arc<NodeSession>>,
+    sync_workers: &mut BTreeMap<usize, NodeSyncWorker>,
+    events: &mpsc::Sender<UiEvent>,
+) -> Result<PendingNodeConfigSave, String> {
+    let loaded = state.node_config();
+    if loaded.selected_node_index() != Some(node_index) {
+        return Err("保存目标与已加载远程配置不是同一节点".into());
+    }
+    let expected_version_sha256 = loaded
+        .snapshot()
+        .ok_or_else(|| "请先加载远程 Node 配置".to_owned())?
+        .version_sha256
+        .clone();
+    let loaded_machine_id = loaded
+        .target_machine_id()
+        .ok_or_else(|| "已加载配置缺少目标机器 ID".to_owned())?
+        .to_owned();
+    let loaded_endpoint = loaded
+        .target_endpoint()
+        .ok_or_else(|| "已加载配置缺少目标 endpoint".to_owned())?
+        .clone();
+    let session = sessions
+        .get(&node_index)
+        .cloned()
+        .ok_or_else(|| format!("节点 {node_index} 未连接，无法保存远程配置"))?;
+    if session.machine_id().as_str() != loaded_machine_id || session.endpoint() != &loaded_endpoint
+    {
+        return Err(format!(
+            "节点会话已变化：加载目标 {} / {}:{}，当前会话 {} / {}:{}",
+            loaded_machine_id,
+            loaded_endpoint.ip,
+            loaded_endpoint.port,
+            session.machine_id().as_str(),
+            session.endpoint().ip,
+            session.endpoint().port
+        ));
+    }
+    let machine_id = loaded_machine_id;
+    let endpoint = loaded_endpoint;
+
+    state.set_node_config_phase(NodeConfigSavePhase::Validating);
+    publish_node_config(events, state).await;
+    NodeConfig::try_from(config.clone()).map_err(|error| error.to_string())?;
+
+    state.set_node_config_phase(NodeConfigSavePhase::Saving);
+    publish_node_config(events, state).await;
+    let accepted = session
+        .save_node_config_and_restart(&expected_version_sha256, config)
+        .await
+        .map_err(|error| error.to_string())?;
+    if accepted.machine_id != machine_id {
+        return Err(format!(
+            "保存响应机器不匹配：目标 {machine_id}，响应 {}",
+            accepted.machine_id
+        ));
+    }
+    if accepted.saved_version_sha256.is_empty() {
+        return Err("保存响应缺少新配置摘要".into());
+    }
+
+    state.set_node_config_save_target(
+        machine_id.clone(),
+        endpoint.clone(),
+        accepted.saved_version_sha256.clone(),
+    );
+    state.set_node_config_phase(NodeConfigSavePhase::Restarting);
+    publish_node_config(events, state).await;
+
+    sessions.remove(&node_index);
+    sync_workers.remove(&node_index);
+    state.set_node_connection(node_index, NodeConnectionState::Offline, None);
+    state.set_node_config_phase(NodeConfigSavePhase::WaitingForReconnect);
+    publish_node_config(events, state).await;
+
+    let timeout_seconds = state
+        .config()
+        .reconnect_interval_seconds
+        .saturating_mul(NODE_CONFIG_RECONNECT_ATTEMPTS)
+        .max(1);
+    Ok(PendingNodeConfigSave {
+        machine_id,
+        endpoint,
+        saved_version_sha256: accepted.saved_version_sha256,
+        deadline: Instant::now() + Duration::from_secs(timeout_seconds),
+    })
+}
+
+async fn verify_reconnected_node_config(
+    state: &mut DesktopViewState,
+    sessions: &mut BTreeMap<usize, Arc<NodeSession>>,
+    sync_workers: &mut BTreeMap<usize, NodeSyncWorker>,
+    pending: &mut Option<PendingNodeConfigSave>,
+    events: &mpsc::Sender<UiEvent>,
+) {
+    let Some(target) = pending.as_ref() else {
+        return;
+    };
+    let candidate = sessions
+        .iter()
+        .find(|(_, session)| session.endpoint() == &target.endpoint)
+        .map(|(index, session)| (*index, Arc::clone(session)));
+    let Some((index, session)) = candidate else {
+        if Instant::now() >= target.deadline {
+            state.fail_node_config(format!(
+                "等待机器 {} 在 {}:{} 重连超时",
+                target.machine_id, target.endpoint.ip, target.endpoint.port
+            ));
+            pending.take();
+            publish_node_config(events, state).await;
+        }
+        return;
+    };
+
+    if session.machine_id().as_str() != target.machine_id {
+        let message = format!(
+            "重连机器不匹配：目标 {}，实际 {}",
+            target.machine_id,
+            session.machine_id().as_str()
+        );
+        sessions.remove(&index);
+        sync_workers.remove(&index);
+        state.set_node_error(index, message.clone());
+        state.fail_node_config(message);
+        pending.take();
+        publish_node_config(events, state).await;
+        return;
+    }
+
+    state.set_node_config_phase(NodeConfigSavePhase::Verifying);
+    publish_node_config(events, state).await;
+    let result = session.get_node_config().await;
+    match result {
+        Ok(snapshot)
+            if snapshot.machine_id == target.machine_id
+                && snapshot.version_sha256 == target.saved_version_sha256 =>
+        {
+            state.complete_node_config(snapshot);
+        }
+        Ok(snapshot) => state.fail_node_config(format!(
+            "重连配置验证失败：目标机器 {} / 摘要 {}，实际机器 {} / 摘要 {}",
+            target.machine_id,
+            target.saved_version_sha256,
+            snapshot.machine_id,
+            snapshot.version_sha256
+        )),
+        Err(error) => state.fail_node_config(format!("重连后加载 Node 配置失败：{error}")),
+    }
+    pending.take();
+    publish_node_config(events, state).await;
+}
+
+async fn publish_node_config(events: &mpsc::Sender<UiEvent>, state: &DesktopViewState) {
+    let _ = events
+        .send(UiEvent::NodeConfigChanged(state.node_config().clone()))
+        .await;
 }
 
 async fn create_scan(

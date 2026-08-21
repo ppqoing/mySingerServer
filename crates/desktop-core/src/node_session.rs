@@ -141,6 +141,41 @@ impl NodeSession {
         }
     }
 
+    /// 读取节点当前原始配置、版本摘要与有效 Worker 快照。
+    pub async fn get_node_config(&self) -> Result<proto::NodeConfigSnapshot, SessionError> {
+        let response = self
+            .connection
+            .request(proto::envelope::Payload::GetNodeConfig(
+                proto::GetNodeConfig {},
+            ))
+            .await?;
+        match payload_or_error(response)? {
+            proto::envelope::Payload::NodeConfigSnapshot(snapshot) => Ok(snapshot),
+            _ => Err(SessionError::UnexpectedResponse("NodeConfigSnapshot")),
+        }
+    }
+
+    /// 携带加载时摘要请求节点原子保存配置并准备自重启。
+    pub async fn save_node_config_and_restart(
+        &self,
+        expected_version_sha256: &str,
+        config: proto::NodeConfigValue,
+    ) -> Result<proto::NodeRestartAccepted, SessionError> {
+        let response = self
+            .connection
+            .request(proto::envelope::Payload::SaveNodeConfigAndRestart(
+                proto::SaveNodeConfigAndRestart {
+                    expected_version_sha256: expected_version_sha256.into(),
+                    config: Some(config),
+                },
+            ))
+            .await?;
+        match payload_or_error(response)? {
+            proto::envelope::Payload::NodeRestartAccepted(accepted) => Ok(accepted),
+            _ => Err(SessionError::UnexpectedResponse("NodeRestartAccepted")),
+        }
+    }
+
     /// 在节点创建一个持久扫描任务；媒体计算由节点唯一 WorkerPool 执行。
     pub async fn create_scan(
         &self,

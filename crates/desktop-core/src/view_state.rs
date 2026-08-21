@@ -3,6 +3,7 @@
 use std::{net::IpAddr, path::PathBuf, str::FromStr};
 
 use dedup_core::{CoreError, DesktopConfig, NodeEndpoint};
+use dedup_protocol::proto;
 use thiserror::Error;
 
 /// `data/desktop` 下供设置诊断页展示的绝对路径。
@@ -136,6 +137,77 @@ pub struct ActionAvailability {
     pub reason: String,
 }
 
+/// 远程 Node 配置保存与重连验证的严格阶段。
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum NodeConfigSavePhase {
+    /// 尚未保存或只完成了配置加载。
+    #[default]
+    Idle,
+    /// 正在 Desktop 边界验证待保存字段。
+    Validating,
+    /// 正在向冻结的旧会话发送版本化保存请求。
+    Saving,
+    /// Node 已接受保存并准备替代进程。
+    Restarting,
+    /// 旧会话已失效，按机器 ID 和原 endpoint 等待重连。
+    WaitingForReconnect,
+    /// 已重连同一机器，正在重新加载并核对新摘要。
+    Verifying,
+    /// 机器 ID 与保存摘要均验证一致。
+    Completed,
+    /// 校验、保存、重连或验证失败，错误文本保留。
+    Failed,
+}
+
+/// 设置页消费的远程 Node 配置快照和保存生命周期。
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct NodeConfigControllerState {
+    selected_node_index: Option<usize>,
+    target_machine_id: Option<String>,
+    target_endpoint: Option<NodeEndpoint>,
+    snapshot: Option<proto::NodeConfigSnapshot>,
+    phase: NodeConfigSavePhase,
+    saved_version_sha256: Option<String>,
+    error: Option<String>,
+}
+
+impl NodeConfigControllerState {
+    /// 返回设置页当前选择的手工节点索引。
+    pub const fn selected_node_index(&self) -> Option<usize> {
+        self.selected_node_index
+    }
+
+    /// 返回加载或完成验证后的远程原始配置快照。
+    pub const fn snapshot(&self) -> Option<&proto::NodeConfigSnapshot> {
+        self.snapshot.as_ref()
+    }
+
+    /// 返回当前保存/重连阶段。
+    pub const fn phase(&self) -> NodeConfigSavePhase {
+        self.phase
+    }
+
+    /// 返回冻结的目标物理机器 ID。
+    pub fn target_machine_id(&self) -> Option<&str> {
+        self.target_machine_id.as_deref()
+    }
+
+    /// 返回冻结的手工 endpoint。
+    pub const fn target_endpoint(&self) -> Option<&NodeEndpoint> {
+        self.target_endpoint.as_ref()
+    }
+
+    /// 返回 Node 接受保存后报告的新版本摘要。
+    pub fn saved_version_sha256(&self) -> Option<&str> {
+        self.saved_version_sha256.as_deref()
+    }
+
+    /// 返回终态失败原因。
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+}
+
 /// 手工编辑节点或保存设置时的唯一边界错误。
 #[derive(Debug, Error)]
 pub enum ViewStateError {
@@ -164,6 +236,7 @@ pub struct DesktopViewState {
     nodes: Vec<NodeView>,
     tasks: Vec<TaskView>,
     postgres: PostgresHealth,
+    node_config: NodeConfigControllerState,
 }
 
 impl DesktopViewState {
@@ -181,6 +254,7 @@ impl DesktopViewState {
             nodes,
             tasks: Vec::new(),
             postgres,
+            node_config: NodeConfigControllerState::default(),
         }
     }
 
@@ -202,6 +276,71 @@ impl DesktopViewState {
     /// 返回按最近事件更新的任务列表。
     pub fn tasks(&self) -> &[TaskView] {
         &self.tasks
+    }
+
+    /// 返回远程 Node 配置加载与保存状态。
+    pub const fn node_config(&self) -> &NodeConfigControllerState {
+        &self.node_config
+    }
+
+    /// 切换设置页节点时立即清除旧表单、摘要和保存状态。
+    pub(crate) fn select_node_config(&mut self, index: usize) {
+        self.node_config = NodeConfigControllerState {
+            selected_node_index: Some(index),
+            ..NodeConfigControllerState::default()
+        };
+    }
+
+    /// 保存一次已验证归属的远程配置快照。
+    pub(crate) fn set_node_config_snapshot(
+        &mut self,
+        index: usize,
+        endpoint: NodeEndpoint,
+        machine_id: String,
+        snapshot: proto::NodeConfigSnapshot,
+    ) {
+        self.node_config = NodeConfigControllerState {
+            selected_node_index: Some(index),
+            target_machine_id: Some(machine_id),
+            target_endpoint: Some(endpoint),
+            snapshot: Some(snapshot),
+            phase: NodeConfigSavePhase::Idle,
+            saved_version_sha256: None,
+            error: None,
+        };
+    }
+
+    /// 更新保存阶段并在非失败阶段清除旧错误。
+    pub(crate) fn set_node_config_phase(&mut self, phase: NodeConfigSavePhase) {
+        self.node_config.phase = phase;
+        if phase != NodeConfigSavePhase::Failed {
+            self.node_config.error = None;
+        }
+    }
+
+    /// 冻结保存目标及 Node 接受的新摘要。
+    pub(crate) fn set_node_config_save_target(
+        &mut self,
+        machine_id: String,
+        endpoint: NodeEndpoint,
+        saved_version_sha256: String,
+    ) {
+        self.node_config.target_machine_id = Some(machine_id);
+        self.node_config.target_endpoint = Some(endpoint);
+        self.node_config.saved_version_sha256 = Some(saved_version_sha256);
+    }
+
+    /// 用重连验证得到的新快照完成状态机。
+    pub(crate) fn complete_node_config(&mut self, snapshot: proto::NodeConfigSnapshot) {
+        self.node_config.snapshot = Some(snapshot);
+        self.node_config.phase = NodeConfigSavePhase::Completed;
+        self.node_config.error = None;
+    }
+
+    /// 保留明确错误并进入 Failed。
+    pub(crate) fn fail_node_config(&mut self, message: impl Into<String>) {
+        self.node_config.phase = NodeConfigSavePhase::Failed;
+        self.node_config.error = Some(message.into());
     }
 
     /// 仅供单向事件归并器更新已有任务；UI 只能读取克隆快照。
@@ -227,6 +366,7 @@ impl DesktopViewState {
         self.ensure_unique(&endpoint, Some(index))?;
         self.config.nodes[index] = endpoint.clone();
         self.nodes[index] = offline_node(endpoint);
+        self.node_config = NodeConfigControllerState::default();
         Ok(())
     }
 
@@ -237,6 +377,7 @@ impl DesktopViewState {
         }
         self.config.nodes.remove(index);
         self.nodes.remove(index);
+        self.node_config = NodeConfigControllerState::default();
         Ok(())
     }
 
@@ -352,6 +493,7 @@ impl DesktopViewState {
         } else {
             PostgresHealth::Disabled
         };
+        self.node_config = NodeConfigControllerState::default();
         Ok(())
     }
 
