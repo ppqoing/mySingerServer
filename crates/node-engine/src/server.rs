@@ -10,7 +10,7 @@ use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::{TcpListener, TcpStream},
-    sync::{Semaphore, mpsc, oneshot},
+    sync::{Semaphore, broadcast, mpsc, oneshot},
     task::JoinSet,
 };
 
@@ -40,6 +40,11 @@ pub trait NodeRequestHandler: Clone + Send + Sync + 'static {
     /// 管理连接结束后释放该连接持有的快照等短生命周期资源。
     fn connection_closed(&self) -> impl Future<Output = ()> + Send {
         async {}
+    }
+
+    /// 为每条已握手连接创建独立的运行任务终态订阅；不支持时保持无事件。
+    fn subscribe_runtime_events(&self) -> Option<broadcast::Receiver<proto::RuntimeTaskChanged>> {
+        None
     }
 }
 
@@ -164,12 +169,34 @@ where
     let (responses, mut response_reader) = mpsc::channel::<proto::Envelope>(64);
     let mut responses = Some(responses);
     let writer_handler = handler.clone();
+    let mut runtime_events = handler.subscribe_runtime_events();
     let mut writer_task = tokio::spawn(async move {
-        while let Some(response) = response_reader.recv().await {
-            if write_envelope(&mut writer, &response).await.is_err() {
-                return Ok(());
+        loop {
+            tokio::select! {
+                biased;
+                response = response_reader.recv() => {
+                    let Some(response) = response else { break };
+                    if write_envelope(&mut writer, &response).await.is_err() {
+                        return Ok(());
+                    }
+                    retry_response_flushed(&writer_handler, response.request_id).await?;
+                }
+                event = receive_runtime_event(&mut runtime_events) => {
+                    match event {
+                        RuntimeEventReceive::Event(event) => {
+                            let envelope = proto::Envelope {
+                                request_id: 0,
+                                payload: Some(proto::envelope::Payload::RuntimeTaskChanged(event)),
+                            };
+                            if write_envelope(&mut writer, &envelope).await.is_err() {
+                                return Ok(());
+                            }
+                        }
+                        RuntimeEventReceive::Lagged => continue,
+                        RuntimeEventReceive::Closed => runtime_events = None,
+                    }
+                }
             }
-            retry_response_flushed(&writer_handler, response.request_id).await?;
         }
         Ok::<(), String>(())
     });
@@ -208,6 +235,25 @@ where
     };
     handler.connection_closed().await;
     writer_result
+}
+
+enum RuntimeEventReceive {
+    Event(proto::RuntimeTaskChanged),
+    Lagged,
+    Closed,
+}
+
+async fn receive_runtime_event(
+    events: &mut Option<broadcast::Receiver<proto::RuntimeTaskChanged>>,
+) -> RuntimeEventReceive {
+    let Some(events) = events else {
+        return std::future::pending().await;
+    };
+    match events.recv().await {
+        Ok(event) => RuntimeEventReceive::Event(event),
+        Err(broadcast::error::RecvError::Lagged(_)) => RuntimeEventReceive::Lagged,
+        Err(broadcast::error::RecvError::Closed) => RuntimeEventReceive::Closed,
+    }
 }
 
 fn flatten_writer_result(

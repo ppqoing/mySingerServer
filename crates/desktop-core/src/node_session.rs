@@ -641,6 +641,65 @@ impl NodeSession {
             .map_err(|_| SessionError::InvalidTaskId(accepted.task_id))
     }
 
+    /// 分页读取当前 Node 进程内运行任务摘要；节点重启后该列表重新为空。
+    pub async fn list_runtime_tasks(
+        &self,
+        cursor: &str,
+        limit: u32,
+    ) -> Result<proto::ListRuntimeTasks, SessionError> {
+        let response = self
+            .connection
+            .request(proto::envelope::Payload::ListRuntimeTasks(
+                proto::ListRuntimeTasks {
+                    cursor: cursor.into(),
+                    limit,
+                    tasks: Vec::new(),
+                    next_cursor: String::new(),
+                },
+            ))
+            .await?;
+        match payload_or_error(response)? {
+            proto::envelope::Payload::ListRuntimeTasks(page) => Ok(page),
+            _ => Err(SessionError::UnexpectedResponse("ListRuntimeTasks")),
+        }
+    }
+
+    /// 按进程内运行任务 ID 读取完整阶段、Worker 与最近失败详情。
+    pub async fn runtime_task_details(
+        &self,
+        runtime_task_id: &str,
+    ) -> Result<proto::RuntimeTaskDetails, SessionError> {
+        let response = self
+            .connection
+            .request(proto::envelope::Payload::GetRuntimeTaskDetails(
+                proto::GetRuntimeTaskDetails {
+                    runtime_task_id: runtime_task_id.into(),
+                    details: None,
+                },
+            ))
+            .await?;
+        match payload_or_error(response)? {
+            proto::envelope::Payload::GetRuntimeTaskDetails(response) => response
+                .details
+                .ok_or_else(|| SessionError::InvalidResponse("运行任务详情为空".into())),
+            _ => Err(SessionError::UnexpectedResponse("GetRuntimeTaskDetails")),
+        }
+    }
+
+    /// 在当前同一 TCP 会话等待一个 `request_id=0` 运行任务终态事件。
+    pub async fn next_runtime_event(&self) -> Result<proto::RuntimeTaskChanged, SessionError> {
+        let envelope = self.connection.next_event().await?;
+        if envelope.request_id != 0 {
+            return Err(SessionError::InvalidResponse(
+                "运行任务事件 request_id 必须为 0".into(),
+            ));
+        }
+        match payload_or_error(envelope)? {
+            proto::envelope::Payload::RuntimeTaskChanged(event) => Ok(event),
+            _ => Err(SessionError::UnexpectedResponse("RuntimeTaskChanged")),
+        }
+    }
+
     /// 等待节点主动推送的任务事件；断线时返回当前会话错误，由上层重新连接。
     pub async fn next_event(&self) -> Result<proto::Envelope, SessionError> {
         Ok(self.connection.next_event().await?)

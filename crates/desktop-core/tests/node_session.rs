@@ -7,8 +7,13 @@ use std::{
 };
 
 use dedup_core::{MachineId, NodeEndpoint};
-use dedup_desktop_core::node_session::NodeSession;
-use dedup_node_engine::server::{NodeRequestHandler, NodeServer};
+use dedup_desktop_core::node_session::{NodeSession, SessionError};
+use dedup_node_engine::{
+    actor::NodeEngine,
+    runtime_tasks::{RuntimeTaskKind, RuntimeTaskState},
+    server::{NodeRequestHandler, NodeServer},
+};
+use dedup_node_store::NodeStore;
 use dedup_protocol::proto;
 use tokio::sync::{oneshot, watch};
 
@@ -129,4 +134,76 @@ async fn fixed_interval_retry_connects_when_the_same_manual_endpoint_comes_onlin
     drop(session);
     shutdown_sender.send(()).unwrap();
     server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn runtime_tasks_share_one_connection_and_demux_terminal_events() {
+    let directory = tempfile::tempdir().unwrap();
+    let machine_id = MachineId::parse(&"ad".repeat(32)).unwrap();
+    let store = NodeStore::open_in_memory(machine_id.clone()).unwrap();
+    let (handle, actor) =
+        NodeEngine::spawn_for_test(store, "127.0.0.1:39091".parse().unwrap(), directory.path());
+    let registry = handle.runtime_tasks_for_test();
+    let first = registry
+        .begin(RuntimeTaskKind::Scan, machine_id.clone(), "扫描")
+        .await;
+    let second = registry
+        .begin(RuntimeTaskKind::Delete, machine_id.clone(), "删除")
+        .await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (shutdown_sender, shutdown) = oneshot::channel();
+    let server = tokio::spawn(NodeServer::serve_until(listener, handle.clone(), shutdown));
+    let session = NodeSession::connect(NodeEndpoint {
+        ip: address.ip(),
+        port: address.port(),
+    })
+    .await
+    .unwrap();
+
+    let first_page = session.list_runtime_tasks("", 1).await.unwrap();
+    assert_eq!(first_page.tasks.len(), 1);
+    assert!(!first_page.next_cursor.is_empty());
+    let second_page = session
+        .list_runtime_tasks(&first_page.next_cursor, 1)
+        .await
+        .unwrap();
+    assert_eq!(second_page.tasks.len(), 1);
+    assert!(second_page.next_cursor.is_empty());
+    let details = session.runtime_task_details(first.id()).await.unwrap();
+    assert_eq!(
+        details.summary.as_ref().unwrap().runtime_task_id,
+        first.id()
+    );
+    let missing = session
+        .runtime_task_details("missing-runtime-task")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        missing,
+        SessionError::Protocol { code, .. } if code == proto::ErrorCode::NotFound as i32
+    ));
+
+    second.update_overall(1, Some(2), 0, 0).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), session.next_runtime_event())
+            .await
+            .is_err()
+    );
+    second.finish(RuntimeTaskState::Completed).await.unwrap();
+    let (status, event) = tokio::join!(session.status(), session.next_runtime_event());
+    assert_eq!(status.unwrap().machine_id, machine_id.as_str());
+    let event = event.unwrap();
+    assert_eq!(event.runtime_task_id, second.id());
+    assert_eq!(event.state, "completed");
+
+    shutdown_sender.send(()).unwrap();
+    server.await.unwrap().unwrap();
+    let disconnected = tokio::time::timeout(Duration::from_secs(1), session.next_runtime_event())
+        .await
+        .expect("server disconnect must terminate the event reader")
+        .unwrap_err();
+    assert!(matches!(disconnected, SessionError::Transport(_)));
+    handle.shutdown().await.unwrap();
+    actor.await.unwrap();
 }

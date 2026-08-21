@@ -67,9 +67,15 @@ pub enum EngineError {
 #[derive(Clone)]
 pub struct NodeEngineHandle {
     commands: mpsc::Sender<EngineCommand>,
+    runtime_tasks: RuntimeTaskRegistry,
 }
 
 impl NodeEngineHandle {
+    /// 返回与 actor/服务共享的进程内 registry，仅供直接协议测试驱动任务终态。
+    #[doc(hidden)]
+    pub fn runtime_tasks_for_test(&self) -> RuntimeTaskRegistry {
+        self.runtime_tasks.clone()
+    }
     /// 严格执行 WorkerPool prepare、SQLite requeue、WorkerPool restart 三阶段重启。
     pub async fn restart_engine(&self) -> Result<(), EngineError> {
         let (reply, response) = oneshot::channel();
@@ -431,6 +437,12 @@ impl NodeRequestHandler for NodeEngineHandle {
         let handle = self.clone();
         async move { handle.response_flushed(request_id).await }
     }
+
+    fn subscribe_runtime_events(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<proto::RuntimeTaskChanged>> {
+        Some(self.runtime_tasks.subscribe())
+    }
 }
 
 /// 创建并运行单一 NodeEngine actor 的工厂。
@@ -525,8 +537,10 @@ fn spawn_actor(
     disk_full_cleaner: DiskFullCleaner,
 ) -> (NodeEngineHandle, JoinHandle<()>) {
     let (commands, receiver) = mpsc::channel(64);
+    let runtime_tasks = RuntimeTaskRegistry::new();
     let handle = NodeEngineHandle {
         commands: commands.clone(),
+        runtime_tasks: runtime_tasks.clone(),
     };
     let worker_control = worker_pool.as_ref().map(WorkerPool::handle);
     let actor = tokio::spawn(run_actor(
@@ -548,7 +562,7 @@ fn spawn_actor(
             pending_restart_request_id: None,
             artifact_registry,
             disk_full_cleaner,
-            runtime_tasks: RuntimeTaskRegistry::new(),
+            runtime_tasks,
         },
         receiver,
     ));
@@ -718,6 +732,12 @@ impl EngineState {
             }
             Some(proto::envelope::Payload::ClearFileFault(clear)) => {
                 self.clear_file_fault(clear)
+            }
+            Some(proto::envelope::Payload::ListRuntimeTasks(query)) => {
+                self.list_runtime_tasks(query).await
+            }
+            Some(proto::envelope::Payload::GetRuntimeTaskDetails(query)) => {
+                self.get_runtime_task_details(query).await
             }
             Some(proto::envelope::Payload::CreateDeleteBatch(create)) => {
                 self.create_delete_batch(create).await
@@ -1086,6 +1106,63 @@ impl EngineState {
             tasks: page.items.into_iter().map(task_summary).collect(),
             next_cursor: page.next_cursor.unwrap_or_default(),
         }))
+    }
+
+    async fn list_runtime_tasks(&mut self, request: proto::ListRuntimeTasks) -> ProtocolResult {
+        let tasks = self.runtime_tasks.list().await;
+        let start = if request.cursor.is_empty() {
+            0
+        } else {
+            tasks
+                .iter()
+                .position(|task| task.runtime_task_id == request.cursor)
+                .map(|index| index + 1)
+                .ok_or_else(|| invalid("运行任务分页游标不存在"))?
+        };
+        let limit = if request.limit == 0 {
+            100
+        } else {
+            request.limit.min(1_000) as usize
+        };
+        let end = start.saturating_add(limit).min(tasks.len());
+        let page = tasks[start..end].to_vec();
+        let next_cursor = if end < tasks.len() {
+            page.last()
+                .map(|task| task.runtime_task_id.clone())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        Ok(proto::envelope::Payload::ListRuntimeTasks(
+            proto::ListRuntimeTasks {
+                cursor: request.cursor,
+                limit: request.limit,
+                tasks: page,
+                next_cursor,
+            },
+        ))
+    }
+
+    async fn get_runtime_task_details(
+        &mut self,
+        request: proto::GetRuntimeTaskDetails,
+    ) -> ProtocolResult {
+        let details = self
+            .runtime_tasks
+            .details(&request.runtime_task_id)
+            .await
+            .ok_or_else(|| {
+                (
+                    proto::ErrorCode::NotFound,
+                    format!("运行任务不存在: {}", request.runtime_task_id),
+                )
+            })?;
+        Ok(proto::envelope::Payload::GetRuntimeTaskDetails(
+            proto::GetRuntimeTaskDetails {
+                runtime_task_id: request.runtime_task_id,
+                details: Some(details),
+            },
+        ))
     }
 
     async fn create_local_analysis(
