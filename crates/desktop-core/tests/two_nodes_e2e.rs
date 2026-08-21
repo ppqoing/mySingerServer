@@ -259,6 +259,7 @@ async fn start_test_node(
         port,
         worker_count: 1,
         enumerator: EnumeratorKind::WindowsWalker,
+        ..NodeConfig::default()
     };
     let identity = FixedIdentityProvider::new(machine_id);
     let runtime = NodeRuntime::start(&layout, &config, &identity)

@@ -85,6 +85,46 @@ fn validate_rejects_each_node_runtime_boundary() {
 }
 
 #[test]
+fn automatic_mode_rejects_an_out_of_range_manual_worker_count() {
+    let error = NodeConfig::from_toml(
+        r#"
+[worker]
+mode = "automatic"
+manual_worker_count = 257
+"#,
+    )
+    .expect_err("未生效的手动 Worker 字段也必须通过配置边界验证");
+
+    assert!(matches!(
+        error,
+        CoreError::InvalidConfig {
+            field: "worker.manual_worker_count",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn manual_mode_rejects_an_out_of_range_reserved_core_count() {
+    let error = NodeConfig::from_toml(
+        r#"
+[worker]
+mode = "manual"
+reserved_cores = 256
+"#,
+    )
+    .expect_err("未生效的保留核心字段也必须通过配置边界验证");
+
+    assert!(matches!(
+        error,
+        CoreError::InvalidConfig {
+            field: "worker.reserved_cores",
+            ..
+        }
+    ));
+}
+
+#[test]
 fn automatic_worker_count_reserves_cores_without_falling_below_one() {
     let config = NodeConfig::default();
 

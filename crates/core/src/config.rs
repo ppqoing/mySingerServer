@@ -344,26 +344,23 @@ impl WorkerConfig {
     }
 
     fn validate(&self) -> Result<(), CoreError> {
-        match self.mode {
-            WorkerMode::Automatic if self.reserved_cores > MAX_RESERVED_CORES => {
-                return Err(invalid_config(
-                    "worker.reserved_cores",
-                    "自动模式保留核心数不能超过 255",
-                ));
-            }
-            WorkerMode::Manual if self.manual_worker_count == 0 => {
-                return Err(invalid_config(
-                    "worker.manual_worker_count",
-                    "手动 Worker 数量必须大于 0",
-                ));
-            }
-            WorkerMode::Manual if self.manual_worker_count > MAX_MANUAL_WORKER_COUNT => {
-                return Err(invalid_config(
-                    "worker.manual_worker_count",
-                    "手动 Worker 数量不能超过 256",
-                ));
-            }
-            _ => {}
+        if self.reserved_cores > MAX_RESERVED_CORES {
+            return Err(invalid_config(
+                "worker.reserved_cores",
+                "自动模式保留核心数不能超过 255",
+            ));
+        }
+        if self.manual_worker_count > MAX_MANUAL_WORKER_COUNT {
+            return Err(invalid_config(
+                "worker.manual_worker_count",
+                "手动 Worker 数量不能超过 256",
+            ));
+        }
+        if self.mode == WorkerMode::Manual && self.manual_worker_count == 0 {
+            return Err(invalid_config(
+                "worker.manual_worker_count",
+                "手动 Worker 数量必须大于 0",
+            ));
         }
         Ok(())
     }

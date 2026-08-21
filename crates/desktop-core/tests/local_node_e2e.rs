@@ -354,6 +354,7 @@ fn node_config() -> NodeConfig {
         port: 0,
         worker_count: 1,
         enumerator: EnumeratorKind::WindowsWalker,
+        ..NodeConfig::default()
     };
     if config.validate().is_err() {
         config.port = reusable_runtime_port();
