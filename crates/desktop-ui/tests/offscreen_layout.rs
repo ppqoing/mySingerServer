@@ -1,4 +1,7 @@
-use dedup_desktop_ui::{MainWindow, UiGroupRow, UiMemberRow, UiNodeRow, UiTaskRow};
+use dedup_desktop_ui::{
+    MainWindow, UiGroupRow, UiMemberRow, UiNodeRow, UiRuntimeFailureRow, UiRuntimeStageRow,
+    UiRuntimeWorkerRow, UiTaskRow,
+};
 use i_slint_backend_testing::{ElementHandle, TestingBackend, TestingBackendOptions};
 use slint::{Color, ComponentHandle, ModelRc, VecModel};
 
@@ -149,33 +152,45 @@ fn install_overview_and_nodes_fixture(window: &MainWindow) {
     window.set_tasks(ModelRc::new(VecModel::from(vec![
         UiTaskRow {
             id: "task-media-scan".into(),
+            runtime_id: "task-media-scan".into(),
+            owner_kind: "node".into(),
             node_index: 0,
+            machine_id: "machine-local".into(),
             title: "媒体扫描".into(),
             stage: "枚举文件".into(),
             status: "运行中".into(),
             status_color: Color::from_rgb_u8(59, 130, 246),
             progress: 35,
             counts: "7 / 20 · 失败 0 · 跳过 1".into(),
+            stale: false,
         },
         UiTaskRow {
             id: "task-image-analysis".into(),
+            runtime_id: "task-image-analysis".into(),
+            owner_kind: "desktop".into(),
             node_index: 1,
+            machine_id: "machine-image".into(),
             title: "图片分析".into(),
             stage: "完成".into(),
             status: "已完成".into(),
             status_color: Color::from_rgb_u8(22, 163, 74),
             progress: 100,
             counts: "18 / 18 · 失败 0 · 跳过 0".into(),
+            stale: false,
         },
         UiTaskRow {
             id: "task-video-analysis".into(),
+            runtime_id: "task-video-analysis".into(),
+            owner_kind: "node".into(),
             node_index: 2,
+            machine_id: "machine-video".into(),
             title: "视频分析".into(),
             stage: "提取特征".into(),
             status: "失败".into(),
             status_color: Color::from_rgb_u8(239, 68, 68),
             progress: 60,
             counts: "6 / 10 · 失败 1 · 跳过 0".into(),
+            stale: false,
         },
     ])));
 }
@@ -189,13 +204,64 @@ fn install_scan_and_task_fixture(window: &MainWindow) {
     window.set_analysis_task_ids("task-running".into());
     window.set_tasks(ModelRc::new(VecModel::from(vec![UiTaskRow {
         id: "task-running".into(),
+        runtime_id: "task-running".into(),
+        owner_kind: "node".into(),
         node_index: 7,
+        machine_id: "machine-runtime-very-long-001".into(),
         title: "媒体扫描".into(),
         stage: "枚举文件".into(),
         status: "运行中".into(),
         status_color: Color::from_rgb_u8(59, 130, 246),
         progress: 35,
         counts: "7 / 20 · 失败 0 · 跳过 1".into(),
+        stale: true,
+    }])));
+    window.set_runtime_detail_title("媒体扫描".into());
+    window.set_runtime_detail_machine_id("machine-runtime-very-long-001".into());
+    window.set_runtime_detail_state("运行中".into());
+    window.set_runtime_detail_counts("7 / 20 · 失败 0 · 跳过 1".into());
+    window.set_runtime_detail_stale(true);
+    window.set_runtime_stages(ModelRc::new(VecModel::from(vec![
+        UiRuntimeStageRow {
+            stage_id: "read".into(),
+            name: "读取文件".into(),
+            state: "运行中".into(),
+            state_color: Color::from_rgb_u8(59, 130, 246),
+            unit: "字节".into(),
+            progress: 35,
+            counts: "7 / 20".into(),
+            speed: "2.0 KiB/s".into(),
+            elapsed: "2.5 秒".into(),
+            eta: "—".into(),
+            failures: "失败 0 · 跳过 0".into(),
+        },
+        UiRuntimeStageRow {
+            stage_id: "probe_stage1".into(),
+            name: "媒体探测与一筛".into(),
+            state: "运行中".into(),
+            state_color: Color::from_rgb_u8(59, 130, 246),
+            unit: "文件".into(),
+            progress: 25,
+            counts: "5 / 20".into(),
+            speed: "3.5 文件/秒".into(),
+            elapsed: "1.8 秒".into(),
+            eta: "4.2 秒".into(),
+            failures: "失败 1 · 跳过 0".into(),
+        },
+    ])));
+    window.set_runtime_workers(ModelRc::new(VecModel::from(vec![UiRuntimeWorkerRow {
+        slot: 2,
+        identity: "PID 4812 · 槽位 2".into(),
+        stage_id: "probe_stage1".into(),
+        path: r"D:\Media\very-long-directory\nested\clip-001.mp4".into(),
+        disk: "PhysicalDisk 1".into(),
+        completed: "12 个文件".into(),
+        speed: "3.5 文件/秒".into(),
+    }])));
+    window.set_runtime_failures(ModelRc::new(VecModel::from(vec![UiRuntimeFailureRow {
+        stage_id: "probe_stage1".into(),
+        path: r"D:\Media\very-long-directory\nested\broken-001.mp4".into(),
+        message: "Worker 意外退出".into(),
     }])));
 }
 
@@ -329,6 +395,61 @@ fn scan_and_task_primary_actions_stay_above_the_fold() {
         assert!(
             cancel_inside_window || cancel_reachable_in_table,
             "取消动作必须直接可见或位于任务表自己的滚动区域，动作={cancel_position:?}/{cancel_size:?}，滚动区={scroll_position:?}/{scroll_size:?}",
+        );
+    }
+}
+
+#[test]
+fn runtime_task_details_keep_thirty_five_sixty_five_columns_at_both_sizes() {
+    install_testing_backend();
+
+    let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    install_scan_and_task_fixture(&window);
+    window.show().expect("应能显示运行任务详情工作区");
+    window.invoke_navigate_to(3);
+
+    for (width, height) in [(1440.0, 900.0), (1080.0, 700.0)] {
+        window
+            .window()
+            .set_size(slint::PhysicalSize::new(width as u32, height as u32));
+        window
+            .window()
+            .take_snapshot()
+            .expect("空任务工作区应能完成软件渲染");
+
+        let table = accessible(&window, "任务列表区域");
+        let detail = accessible(&window, "运行详情区域");
+        for (element, label) in [(&table, "任务列表区域"), (&detail, "运行详情区域")] {
+            assert_element_has_positive_size(element, label);
+            assert_element_inside_window(element, label, width, height);
+        }
+
+        let table_position = table.absolute_position();
+        let table_size = table.size();
+        let detail_position = detail.absolute_position();
+        let detail_size = detail.size();
+        let columns_width = table_size.width + detail_size.width;
+        let left_ratio = table_size.width / columns_width;
+        let right_ratio = detail_size.width / columns_width;
+        assert!(
+            (0.32..=0.38).contains(&left_ratio)
+                && (0.62..=0.68).contains(&right_ratio)
+                && table_position.x + table_size.width <= detail_position.x,
+            "任务列表/详情应为35%/65%且不重叠，窗口={width}×{height}，比例={left_ratio:.3}/{right_ratio:.3}，列表={table_position:?}/{table_size:?}，详情={detail_position:?}/{detail_size:?}",
+        );
+
+        for label in ["任务列表滚动区", "运行详情滚动区"] {
+            let scroll = accessible(&window, label);
+            assert_element_has_positive_size(&scroll, label);
+            assert_element_inside_window(&scroll, label, width, height);
+        }
+        for label in ["全部阶段", "当前 Worker", "最近失败", "数据已过期"] {
+            assert_element_has_positive_size(&accessible(&window, label), label);
+        }
+        accessible(&window, "任务机器：machine-runtime-very-long-001");
+        accessible(
+            &window,
+            r"Worker：PID 4812 · 槽位 2；阶段 probe_stage1；路径 D:\Media\very-long-directory\nested\clip-001.mp4；磁盘 PhysicalDisk 1；12 个文件；3.5 文件/秒",
         );
     }
 }

@@ -1,9 +1,8 @@
-// 任务中心只筛选当前已加载行模型，并原样转发现有取消命令。
+// 任务中心以35%列表和65%详情展示统一运行任务，并原样转发选择与取消命令。
 
 import { ScrollView } from "std-widgets.slint";
-import { Theme, UiTaskRow } from "../theme.slint";
+import { Theme, UiRuntimeFailureRow, UiRuntimeStageRow, UiRuntimeWorkerRow, UiTaskRow } from "../theme.slint";
 import { ActionButton } from "../components/action-button.slint";
-import { DetailPanel } from "../components/detail-panel.slint";
 import { EmptyState } from "../components/empty-state.slint";
 import { FluentCard } from "../components/fluent-card.slint";
 import { ProgressBar } from "../components/progress-bar.slint";
@@ -12,8 +11,18 @@ import { TabStrip } from "../components/tab-strip.slint";
 
 export component TaskCenterPage inherits Rectangle {
     in property <[UiTaskRow]> tasks;
+    in property <[UiRuntimeStageRow]> runtime-stages;
+    in property <[UiRuntimeWorkerRow]> runtime-workers;
+    in property <[UiRuntimeFailureRow]> runtime-failures;
+    in property <string> runtime-detail-title;
+    in property <string> runtime-detail-machine-id;
+    in property <string> runtime-detail-state;
+    in property <string> runtime-detail-counts;
+    in property <bool> runtime-detail-stale;
+    in property <string> runtime-detail-error;
     in-out property <int> task-tab: 0;
     in-out property <int> selected-task-index: 0;
+    callback select-runtime-task(string, int, string);
     callback cancel-task(int, string);
 
     pure function status-matches-tab(status: string) -> bool {
@@ -28,137 +37,137 @@ export component TaskCenterPage inherits Rectangle {
         padding: 20px;
         spacing: 16px;
 
-        VerticalLayout {
-            spacing: 12px;
-            horizontal-stretch: 1;
+        // 左栏固定占可用双栏宽度的35%，最小窗口内由自身ScrollView承接横向内容。
+        task-region := Rectangle {
+            width: (root.width - 56px) * 35 / 100;
+            background: transparent;
+            accessible-role: AccessibleRole.groupbox;
+            accessible-label: "任务列表区域";
 
-            Text {
-                text: "任务中心";
-                height: 30px;
-                vertical-stretch: 0;
-                color: Theme.text;
-                font-size: 24px;
-                font-weight: 750;
-                accessible-role: AccessibleRole.groupbox;
-                accessible-label: "任务中心标题";
-            }
-            TabStrip {
-                labels: ["运行中", "已完成", "失败"];
-                active-index <=> root.task-tab;
-                accessible-role: AccessibleRole.tab-list;
-                accessible-label: "任务标签栏";
-            }
+            VerticalLayout {
+                spacing: 12px;
 
-            // 表头、双行任务和取消动作共用自己的双向滚动视口，300px 详情始终保留。
-            FluentCard {
-                vertical-stretch: 1;
-                accessible-role: AccessibleRole.groupbox;
-                accessible-label: "任务主表";
-                VerticalLayout {
-                    padding: 10px;
-                    spacing: 0px;
+                Text {
+                    text: "任务中心";
+                    height: 30px;
+                    vertical-stretch: 0;
+                    color: Theme.text;
+                    font-size: 24px;
+                    font-weight: 750;
+                    accessible-role: AccessibleRole.groupbox;
+                    accessible-label: "任务中心标题";
+                }
+                TabStrip {
+                    labels: ["运行中", "已完成", "失败"];
+                    active-index <=> root.task-tab;
+                    accessible-role: AccessibleRole.tab-list;
+                    accessible-label: "任务标签栏";
+                }
+                FluentCard {
+                    vertical-stretch: 1;
+                    accessible-role: AccessibleRole.groupbox;
+                    accessible-label: "任务主表";
+
                     if root.tasks.length == 0 : EmptyState {
-                        vertical-stretch: 1;
                         icon: @image-url("../assets/icons/tasks.png");
                         title: "暂无任务";
-                        detail: "任务标签只筛选当前已加载模型。";
+                        detail: "节点和管理端当前没有运行任务摘要。";
                         accessible-role: AccessibleRole.groupbox;
                         accessible-label: "任务表空态：" + (root.task-tab == 0 ? "运行中" : root.task-tab == 1 ? "已完成" : "失败");
                     }
                     if root.tasks.length > 0 : task-scroll := ScrollView {
-                        vertical-stretch: 1;
+                        accessible-role: AccessibleRole.groupbox;
+                        accessible-label: "任务列表滚动区";
                         VerticalLayout {
-                            min-width: 720px;
+                            min-width: max(300px, task-scroll.visible-width);
                             spacing: 0px;
+
                             Rectangle {
-                                height: 34px;
+                                height: 32px;
                                 background: Theme.panel-hover;
                                 HorizontalLayout {
-                                    padding-left: 8px;
-                                    padding-right: 8px;
-                                    spacing: 8px;
-                                    alignment: center;
-                                    Text { text: "任务 / 节点 / 阶段"; color: Theme.muted; font-size: 10px; horizontal-stretch: 1; }
-                                    Text { text: "进度与计数"; color: Theme.muted; font-size: 10px; width: 278px; }
-                                    Text { text: "状态"; color: Theme.muted; font-size: 10px; width: 82px; horizontal-alignment: center; }
-                                    Text { text: "动作"; color: Theme.muted; font-size: 10px; width: 82px; horizontal-alignment: center; }
+                                    padding-left: 10px;
+                                    padding-right: 10px;
+                                    Text { text: "任务 / 阶段 / 机器"; color: Theme.muted; font-size: 10px; horizontal-stretch: 1; }
+                                    Text { text: "进度 / 状态 / 动作"; color: Theme.muted; font-size: 10px; width: 180px; horizontal-alignment: right; }
                                 }
                             }
                             Rectangle { height: 1px; background: Theme.border; }
 
-                            // 行布局的 preferred-height 直接反映当前页签是否存在匹配项。
                             task-rows := VerticalLayout {
                                 spacing: 0px;
                                 for task[index] in root.tasks : task-row := Rectangle {
-                                property <bool> matches-current-tab: root.status-matches-tab(task.status);
-                                visible: task-row.matches-current-tab;
-                                height: task-row.matches-current-tab ? 58px : 0px;
-                                background: root.selected-task-index == index ? Theme.accent-soft : task-touch.has-hover ? Theme.panel-hover : Theme.panel;
-                                accessible-role: AccessibleRole.list-item;
-                                accessible-label: "任务项：" + task.title + "；节点 " + task.node-index + "；" + task.stage
-                                    + "；" + task.progress + "%；" + task.counts + "；" + task.status;
-                                accessible-item-selectable: true;
-                                accessible-item-selected: root.selected-task-index == index;
-                                accessible-action-default => { root.selected-task-index = index; }
+                                    property <bool> matches-current-tab: root.status-matches-tab(task.status);
+                                    property <bool> can-cancel: task.status == "运行中" && task.owner-kind == "node";
+                                    visible: task-row.matches-current-tab;
+                                    height: task-row.matches-current-tab ? 64px : 0px;
+                                    background: root.selected-task-index == index ? Theme.accent-soft : task-touch.has-hover ? Theme.panel-hover : Theme.panel;
+                                    accessible-role: AccessibleRole.list-item;
+                                    accessible-label: "任务项：" + task.title + "；节点 " + task.node-index + "；" + task.stage
+                                        + "；" + task.progress + "%；" + task.counts + "；" + task.status;
+                                    accessible-item-selectable: true;
+                                    accessible-item-selected: root.selected-task-index == index;
+                                    accessible-action-default => {
+                                        root.selected-task-index = index;
+                                        root.select-runtime-task(task.owner-kind, task.node-index, task.runtime-id);
+                                    }
 
-                                VerticalLayout {
-                                    padding-left: 8px;
-                                    padding-right: 8px;
-                                    padding-top: 5px;
-                                    padding-bottom: 5px;
-                                    spacing: 3px;
-                                    HorizontalLayout {
-                                        height: 18px;
-                                        spacing: 8px;
-                                        Text { text: task.title; color: Theme.text; font-size: 12px; font-weight: 650; horizontal-stretch: 1; overflow: elide; }
-                                        Text { text: "节点 " + task.node-index; color: Theme.text; font-size: 11px; width: 64px; overflow: elide; }
-                                        Text { text: task.stage; color: Theme.muted; font-size: 11px; width: 108px; overflow: elide; }
-                                        Rectangle { width: 442px; background: transparent; }
-                                    }
-                                    HorizontalLayout {
-                                        height: 26px;
-                                        spacing: 8px;
-                                        ProgressBar {
-                                            width: 160px;
-                                            value: task.progress;
-                                            tone: task.status-color;
-                                            accessible-name: "任务进度";
+                                    VerticalLayout {
+                                        padding-left: 10px;
+                                        padding-right: 92px;
+                                        padding-top: 6px;
+                                        padding-bottom: 6px;
+                                        spacing: 3px;
+                                        HorizontalLayout {
+                                            height: 18px;
+                                            spacing: 8px;
+                                            Text { text: task.title; color: Theme.text; font-size: 12px; font-weight: 650; horizontal-stretch: 1; overflow: elide; }
+                                            StatusPill { label: task.status; tone: task.status-color; width: 76px; }
                                         }
-                                        Text { text: task.progress + "%"; color: Theme.text; font-size: 11px; width: 34px; vertical-alignment: center; }
-                                        Text { text: task.counts; color: Theme.muted; font-size: 10px; width: 208px; overflow: elide; vertical-alignment: center; }
-                                        Rectangle { horizontal-stretch: 1; background: transparent; }
-                                        StatusPill { label: task.status; tone: task.status-color; width: 82px; }
-                                        Rectangle {
-                                            width: 82px;
-                                            background: transparent;
+                                        HorizontalLayout {
+                                            height: 18px;
+                                            spacing: 8px;
+                                            Text { text: task.stage; color: Theme.muted; font-size: 10px; width: 108px; overflow: elide; }
+                                            ProgressBar { value: task.progress; tone: task.status-color; horizontal-stretch: 1; accessible-name: "任务进度"; }
+                                            Text { text: task.progress + "%"; color: Theme.text; font-size: 10px; width: 34px; }
+                                        }
+                                        Text {
+                                            text: task.machine-id + " · " + task.counts;
+                                            height: 16px;
+                                            color: Theme.muted;
+                                            font-size: 10px;
+                                            overflow: elide;
+                                            accessible-role: AccessibleRole.text;
+                                            accessible-label: "任务机器：" + task.machine-id;
                                         }
                                     }
+                                    task-touch := TouchArea {
+                                        x: 0px;
+                                        y: 0px;
+                                        width: parent.width - (task-row.can-cancel ? 88px : 0px);
+                                        height: parent.height;
+                                        clicked => {
+                                            root.selected-task-index = index;
+                                            root.select-runtime-task(task.owner-kind, task.node-index, task.runtime-id);
+                                        }
+                                    }
+                                    if task-row.can-cancel : ActionButton {
+                                        x: parent.width - 84px;
+                                        y: 18px;
+                                        width: 76px;
+                                        height: 28px;
+                                        label: "取消";
+                                        icon: @image-url("../assets/icons/cancel.png");
+                                        accessible-label: "取消任务：" + task.id;
+                                        clicked => { root.cancel-task(task.node-index, task.id); }
+                                    }
                                 }
-                                // 行命中层排除最右动作列；取消按钮最后声明，二者不会互相吞掉指针。
-                                task-touch := TouchArea {
-                                    x: 0px;
-                                    y: 0px;
-                                    width: parent.width - 90px;
-                                    height: parent.height;
-                                    clicked => { root.selected-task-index = index; }
-                                }
-                                if task.status == "运行中" : ActionButton {
-                                    x: parent.width - 90px;
-                                    y: 28px;
-                                    width: 82px;
-                                    height: 26px;
-                                    label: "取消";
-                                    icon: @image-url("../assets/icons/cancel.png");
-                                    accessible-label: "取消任务：" + task.id;
-                                    clicked => { root.cancel-task(task.node-index, task.id); }
-                                }
-                            }
                             }
                             if task-rows.preferred-height == 0px : EmptyState {
-                                min-height: max(180px, task-scroll.visible-height - 35px);
+                                min-height: max(180px, task-scroll.visible-height - 33px);
                                 icon: @image-url("../assets/icons/tasks.png");
                                 title: "当前页没有匹配任务";
-                                detail: "任务标签只筛选当前已加载模型。";
+                                detail: "切换标签查看其他运行终态。";
                                 accessible-role: AccessibleRole.groupbox;
                                 accessible-label: "任务表空态：" + (root.task-tab == 0 ? "运行中" : root.task-tab == 1 ? "已完成" : "失败");
                             }
@@ -168,50 +177,195 @@ export component TaskCenterPage inherits Rectangle {
             }
         }
 
-        // 详情只读取选中 UiTaskRow；速度、ETA、当前文件和日志没有模型字段。
-        DetailPanel {
-            accessible-label: "任务详情";
-            if root.tasks.length > 0
-                && root.selected-task-index >= 0
-                && root.selected-task-index < root.tasks.length
-                && ((root.task-tab == 0 && (root.tasks[root.selected-task-index].status == "排队中" || root.tasks[root.selected-task-index].status == "运行中"))
-                    || (root.task-tab == 1 && root.tasks[root.selected-task-index].status == "已完成")
-                    || (root.task-tab == 2 && root.tasks[root.selected-task-index].status == "失败"))
-            : VerticalLayout {
-                padding: 18px;
-                spacing: 10px;
-                Text { text: root.tasks[root.selected-task-index].title; height: 28px; vertical-stretch: 0; color: Theme.text; font-size: 20px; font-weight: 720; }
-                Text { text: "任务 ID  " + root.tasks[root.selected-task-index].id; min-height: 20px; vertical-stretch: 0; color: Theme.muted; font-size: 11px; wrap: word-wrap; }
-                Text { text: "阶段  " + root.tasks[root.selected-task-index].stage; height: 20px; vertical-stretch: 0; color: Theme.text; font-size: 12px; }
-                Text { text: "状态  " + root.tasks[root.selected-task-index].status; height: 20px; vertical-stretch: 0; color: Theme.text; font-size: 12px; }
-                ProgressBar {
-                    width: 220px;
-                    value: root.tasks[root.selected-task-index].progress;
-                    tone: root.tasks[root.selected-task-index].status-color;
-                    accessible-name: "详情进度";
+        // 右栏使用单一纵向ScrollView，顺序固定为摘要、阶段、Worker、失败。
+        detail-region := FluentCard {
+            horizontal-stretch: 1;
+            accessible-role: AccessibleRole.groupbox;
+            accessible-label: "运行详情区域";
+
+            Rectangle {
+                accessible-role: AccessibleRole.groupbox;
+                accessible-label: "任务详情";
+                detail-scroll := ScrollView {
+                    accessible-role: AccessibleRole.groupbox;
+                    accessible-label: "运行详情滚动区";
+
+                    if root.runtime-detail-title == "" : EmptyState {
+                        min-height: detail-scroll.visible-height;
+                        icon: @image-url("../assets/icons/tasks.png");
+                        title: "请选择任务";
+                        detail: "选择左侧任务后显示实时阶段、Worker 和最近失败。";
+                    }
+                    if root.runtime-detail-title != "" : VerticalLayout {
+                        min-width: max(520px, detail-scroll.visible-width);
+                        padding: 16px;
+                        spacing: 12px;
+
+                        Rectangle {
+                            height: 104px;
+                            background: Theme.panel-hover;
+                            border-radius: 7px;
+                            accessible-role: AccessibleRole.groupbox;
+                            accessible-label: "运行摘要：" + root.runtime-detail-title + "；" + root.runtime-detail-state + "；" + root.runtime-detail-counts;
+                            VerticalLayout {
+                                padding: 12px;
+                                spacing: 5px;
+                                HorizontalLayout {
+                                    Text { text: root.runtime-detail-title; color: Theme.text; font-size: 18px; font-weight: 720; horizontal-stretch: 1; overflow: elide; }
+                                    StatusPill { label: root.runtime-detail-state; tone: Theme.accent; width: 84px; }
+                                }
+                                Text {
+                                    text: "机器  " + root.runtime-detail-machine-id;
+                                    color: Theme.muted;
+                                    font-size: 11px;
+                                    overflow: elide;
+                                    accessible-role: AccessibleRole.text;
+                                    accessible-label: "任务机器：" + root.runtime-detail-machine-id;
+                                }
+                                Text { text: root.runtime-detail-counts; color: Theme.text; font-size: 12px; overflow: elide; }
+                            }
+                        }
+
+                        if root.runtime-detail-stale : Rectangle {
+                            height: 34px;
+                            background: #fff7ed;
+                            border-radius: 6px;
+                            accessible-role: AccessibleRole.groupbox;
+                            accessible-label: "数据已过期";
+                            Text { text: "数据已过期 · 正在等待最新运行快照"; color: Theme.warning; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                        if root.runtime-detail-error != "" : Rectangle {
+                            height: 42px;
+                            background: Theme.danger-soft;
+                            border-radius: 6px;
+                            accessible-role: AccessibleRole.groupbox;
+                            accessible-label: "运行详情错误：" + root.runtime-detail-error;
+                            Text { text: root.runtime-detail-error; color: Theme.danger; font-size: 11px; overflow: elide; vertical-alignment: center; }
+                        }
+
+                        Rectangle {
+                            height: 30px + (root.runtime-stages.length == 0 ? 44px : root.runtime-stages.length * 82px);
+                            vertical-stretch: 0;
+                            background: transparent;
+                            accessible-role: AccessibleRole.groupbox;
+                            accessible-label: "全部阶段";
+                            VerticalLayout {
+                                spacing: 6px;
+                                Text { text: "全部阶段"; height: 24px; color: Theme.text; font-size: 15px; font-weight: 700; }
+                                if root.runtime-stages.length == 0 : Rectangle {
+                                    height: 44px;
+                                    background: Theme.panel-hover;
+                                    border-radius: 6px;
+                                    Text { text: "暂无阶段详情"; color: Theme.muted; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
+                                }
+                                for stage in root.runtime-stages : Rectangle {
+                                    height: 76px;
+                                    background: Theme.panel-hover;
+                                    border-radius: 6px;
+                                    accessible-role: AccessibleRole.list-item;
+                                    accessible-label: "阶段：" + stage.name + "；" + stage.state + "；" + stage.counts + "；" + stage.speed
+                                        + "；耗时 " + stage.elapsed + "；ETA " + stage.eta + "；" + stage.failures;
+                                    VerticalLayout {
+                                        padding: 9px;
+                                        spacing: 4px;
+                                        HorizontalLayout {
+                                            Text { text: stage.name; color: Theme.text; font-size: 12px; font-weight: 650; horizontal-stretch: 1; overflow: elide; }
+                                            StatusPill { label: stage.state; tone: stage.state-color; width: 76px; }
+                                        }
+                                        HorizontalLayout {
+                                            spacing: 8px;
+                                            ProgressBar { value: stage.progress; tone: stage.state-color; horizontal-stretch: 1; accessible-name: "阶段进度：" + stage.name; }
+                                            Text { text: stage.counts; color: Theme.text; font-size: 10px; width: 76px; horizontal-alignment: right; }
+                                        }
+                                        Text { text: stage.speed + " · 耗时 " + stage.elapsed + " · ETA " + stage.eta + " · " + stage.failures; color: Theme.muted; font-size: 10px; overflow: elide; }
+                                    }
+                                }
+                            }
+                        }
+
+                        Rectangle {
+                            height: 30px + (root.runtime-workers.length == 0 ? 44px : root.runtime-workers.length * 72px);
+                            vertical-stretch: 0;
+                            background: transparent;
+                            accessible-role: AccessibleRole.groupbox;
+                            accessible-label: "当前 Worker";
+                            VerticalLayout {
+                                spacing: 6px;
+                                Text { text: "当前 Worker"; height: 24px; color: Theme.text; font-size: 15px; font-weight: 700; }
+                                if root.runtime-workers.length == 0 : Rectangle {
+                                    height: 44px;
+                                    background: Theme.panel-hover;
+                                    border-radius: 6px;
+                                    accessible-role: AccessibleRole.groupbox;
+                                    accessible-label: "当前 Worker 空态";
+                                    Text { text: "当前没有占用 Worker 的阶段"; color: Theme.muted; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
+                                }
+                                for worker in root.runtime-workers : Rectangle {
+                                    height: 66px;
+                                    background: Theme.panel-hover;
+                                    border-radius: 6px;
+                                    accessible-role: AccessibleRole.list-item;
+                                    accessible-label: "Worker：" + worker.identity + "；阶段 " + worker.stage-id + "；路径 " + worker.path
+                                        + "；磁盘 " + worker.disk + "；" + worker.completed + "；" + worker.speed;
+                                    VerticalLayout {
+                                        padding: 9px;
+                                        spacing: 4px;
+                                        HorizontalLayout {
+                                            Text { text: worker.identity; color: Theme.text; font-size: 12px; font-weight: 650; horizontal-stretch: 1; overflow: elide; }
+                                            Text { text: worker.disk; color: Theme.muted; font-size: 10px; width: 110px; overflow: elide; horizontal-alignment: right; }
+                                        }
+                                        Text { text: worker.path; color: Theme.text; font-size: 10px; overflow: elide; }
+                                        Text { text: worker.stage-id + " · " + worker.completed + " · " + worker.speed; color: Theme.muted; font-size: 10px; overflow: elide; }
+                                    }
+                                }
+                            }
+                        }
+
+                        Rectangle {
+                            property <int> recent-failure-count: root.runtime-failures.length > 20 ? 20 : root.runtime-failures.length;
+                            height: 30px + (recent-failure-count == 0 ? 44px : recent-failure-count * 64px);
+                            vertical-stretch: 0;
+                            background: transparent;
+                            accessible-role: AccessibleRole.groupbox;
+                            accessible-label: "最近失败";
+                            VerticalLayout {
+                                spacing: 6px;
+                                Text {
+                                    text: "最近失败";
+                                    height: 24px;
+                                    color: Theme.text;
+                                    font-size: 15px;
+                                    font-weight: 700;
+                                    accessible-role: AccessibleRole.text;
+                                    accessible-label: "最近失败：" + recent-failure-count + " 条";
+                                }
+                                if root.runtime-failures.length == 0 : Rectangle {
+                                    height: 44px;
+                                    background: Theme.panel-hover;
+                                    border-radius: 6px;
+                                    accessible-role: AccessibleRole.groupbox;
+                                    accessible-label: "最近失败空态";
+                                    Text { text: "当前任务没有最近失败记录"; color: Theme.muted; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
+                                }
+                                for failure[index] in root.runtime-failures : Rectangle {
+                                    property <bool> is-recent: index >= root.runtime-failures.length - 20;
+                                    visible: is-recent;
+                                    height: is-recent ? 58px : 0px;
+                                    background: Theme.danger-soft;
+                                    border-radius: 6px;
+                                    accessible-role: AccessibleRole.list-item;
+                                    accessible-label: "失败：" + failure.stage-id + "；" + failure.path + "；" + failure.message;
+                                    VerticalLayout {
+                                        padding: 8px;
+                                        spacing: 3px;
+                                        Text { text: failure.stage-id + " · " + failure.message; color: Theme.danger; font-size: 11px; font-weight: 650; overflow: elide; }
+                                        Text { text: failure.path; color: Theme.muted; font-size: 10px; overflow: elide; }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
-                Text { text: "进度  " + root.tasks[root.selected-task-index].progress + "%"; height: 20px; vertical-stretch: 0; color: Theme.text; font-size: 12px; }
-                Text { text: root.tasks[root.selected-task-index].counts; min-height: 20px; vertical-stretch: 0; color: Theme.muted; font-size: 11px; wrap: word-wrap; }
-                Rectangle { height: 1px; vertical-stretch: 0; background: Theme.border; }
-                Rectangle { vertical-stretch: 1; background: transparent; }
-                EmptyState {
-                    density: 0;
-                    icon: @image-url("../assets/icons/info.png");
-                    title: "运行明细未接入";
-                    detail: "速度、剩余时间、当前文件和事件日志没有现有模型字段。";
-                    disabled-feature: true;
-                }
-            }
-            if root.tasks.length == 0
-                || root.selected-task-index < 0
-                || root.selected-task-index >= root.tasks.length
-                || !((root.task-tab == 0 && (root.tasks[root.selected-task-index].status == "排队中" || root.tasks[root.selected-task-index].status == "运行中"))
-                    || (root.task-tab == 1 && root.tasks[root.selected-task-index].status == "已完成")
-                    || (root.task-tab == 2 && root.tasks[root.selected-task-index].status == "失败"))
-            : EmptyState {
-                icon: @image-url("../assets/icons/tasks.png");
-                title: root.tasks.length == 0 ? "暂无任务" : "请选择当前页签中的任务";
-                detail: "任务标签只筛选当前已加载模型。";
             }
         }
     }

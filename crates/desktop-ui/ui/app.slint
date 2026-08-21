@@ -234,7 +234,19 @@ export component MainWindow inherits Window {
                 }
                 if root.current-page == 1 && root.task-mode == 1 : TaskCenterPage {
                     tasks: root.tasks;
+                    runtime-stages: root.runtime-stages;
+                    runtime-workers: root.runtime-workers;
+                    runtime-failures: root.runtime-failures;
+                    runtime-detail-title: root.runtime-detail-title;
+                    runtime-detail-machine-id: root.runtime-detail-machine-id;
+                    runtime-detail-state: root.runtime-detail-state;
+                    runtime-detail-counts: root.runtime-detail-counts;
+                    runtime-detail-stale: root.runtime-detail-stale;
+                    runtime-detail-error: root.runtime-detail-error;
                     task-tab <=> root.task-tab;
+                    select-runtime-task(owner, node-index, runtime-id) => {
+                        root.select-runtime-task(owner, node-index, runtime-id);
+                    }
                     cancel-task(index, id) => { root.cancel-task(index, id); }
                 }
                 if root.current-page >= 2 && root.current-page <= 5 : DuplicateWorkspace {

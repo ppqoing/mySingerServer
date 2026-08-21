@@ -1,4 +1,7 @@
-use dedup_desktop_ui::{MainWindow, UiGroupRow, UiMemberRow, UiNodeRow, UiTaskRow};
+use dedup_desktop_ui::{
+    MainWindow, UiGroupRow, UiMemberRow, UiNodeRow, UiRuntimeFailureRow, UiRuntimeStageRow,
+    UiRuntimeWorkerRow, UiTaskRow,
+};
 use i_slint_backend_testing::{ElementHandle, TestingBackend, TestingBackendOptions};
 use slint::{Color, ComponentHandle, ModelRc, VecModel};
 use std::path::{Path, PathBuf};
@@ -73,33 +76,45 @@ impl VisualFixture {
             tasks: vec![
                 UiTaskRow {
                     id: "task-media-scan".into(),
+                    runtime_id: "task-media-scan".into(),
+                    owner_kind: "node".into(),
                     node_index: 0,
+                    machine_id: "machine-local".into(),
                     title: "媒体扫描".into(),
                     stage: "枚举文件".into(),
                     status: "运行中".into(),
                     status_color: Color::from_rgb_u8(59, 130, 246),
                     progress: 35,
                     counts: "7 / 20 · 失败 0 · 跳过 1".into(),
+                    stale: false,
                 },
                 UiTaskRow {
                     id: "task-image-analysis".into(),
+                    runtime_id: "task-image-analysis".into(),
+                    owner_kind: "desktop".into(),
                     node_index: 1,
+                    machine_id: "machine-image".into(),
                     title: "图片分析".into(),
                     stage: "完成".into(),
                     status: "已完成".into(),
                     status_color: Color::from_rgb_u8(22, 163, 74),
                     progress: 100,
                     counts: "18 / 18 · 失败 0 · 跳过 0".into(),
+                    stale: false,
                 },
                 UiTaskRow {
                     id: "task-video-analysis".into(),
+                    runtime_id: "task-video-analysis".into(),
+                    owner_kind: "node".into(),
                     node_index: 2,
+                    machine_id: "machine-video".into(),
                     title: "视频分析".into(),
                     stage: "提取特征".into(),
                     status: "失败".into(),
                     status_color: Color::from_rgb_u8(239, 68, 68),
                     progress: 60,
                     counts: "6 / 10 · 失败 1 · 跳过 0".into(),
+                    stale: false,
                 },
             ],
             groups: vec![
@@ -190,6 +205,77 @@ impl VisualFixture {
     fn install(&self, window: &MainWindow) {
         window.set_nodes(ModelRc::new(VecModel::from(self.nodes.clone())));
         window.set_tasks(ModelRc::new(VecModel::from(self.tasks.clone())));
+        window.set_runtime_detail_title("媒体扫描".into());
+        window.set_runtime_detail_machine_id("machine-local".into());
+        window.set_runtime_detail_state("运行中".into());
+        window.set_runtime_detail_counts("7 / 20 · 失败 0 · 跳过 1".into());
+        window.set_runtime_detail_stale(false);
+        window.set_runtime_stages(ModelRc::new(VecModel::from(vec![
+            UiRuntimeStageRow {
+                stage_id: "enumerate".into(),
+                name: "枚举文件".into(),
+                state: "已完成".into(),
+                state_color: Color::from_rgb_u8(22, 163, 74),
+                unit: "文件".into(),
+                progress: 100,
+                counts: "20 / 20".into(),
+                speed: "18.4 文件/秒".into(),
+                elapsed: "1.1 秒".into(),
+                eta: "—".into(),
+                failures: "失败 0 · 跳过 0".into(),
+            },
+            UiRuntimeStageRow {
+                stage_id: "read".into(),
+                name: "读取文件".into(),
+                state: "运行中".into(),
+                state_color: Color::from_rgb_u8(59, 130, 246),
+                unit: "字节".into(),
+                progress: 35,
+                counts: "7 / 20".into(),
+                speed: "128.0 MiB/s".into(),
+                elapsed: "8.4 秒".into(),
+                eta: "15.6 秒".into(),
+                failures: "失败 0 · 跳过 1".into(),
+            },
+            UiRuntimeStageRow {
+                stage_id: "probe_stage1".into(),
+                name: "媒体探测与一筛".into(),
+                state: "运行中".into(),
+                state_color: Color::from_rgb_u8(59, 130, 246),
+                unit: "文件".into(),
+                progress: 25,
+                counts: "5 / 20".into(),
+                speed: "3.5 文件/秒".into(),
+                elapsed: "6.2 秒".into(),
+                eta: "21.0 秒".into(),
+                failures: "失败 1 · 跳过 0".into(),
+            },
+        ])));
+        window.set_runtime_workers(ModelRc::new(VecModel::from(vec![
+            UiRuntimeWorkerRow {
+                slot: 0,
+                identity: "PID 4812 · 槽位 0".into(),
+                stage_id: "probe_stage1".into(),
+                path: r"D:\Media\Series\Episode-001.mkv".into(),
+                disk: "PhysicalDisk 0".into(),
+                completed: "12 个文件".into(),
+                speed: "3.5 文件/秒".into(),
+            },
+            UiRuntimeWorkerRow {
+                slot: 1,
+                identity: "PID 4920 · 槽位 1".into(),
+                stage_id: "probe_stage1".into(),
+                path: r"E:\Archive\Movie-002.mp4".into(),
+                disk: "PhysicalDisk 1".into(),
+                completed: "9 个文件".into(),
+                speed: "2.8 文件/秒".into(),
+            },
+        ])));
+        window.set_runtime_failures(ModelRc::new(VecModel::from(vec![UiRuntimeFailureRow {
+            stage_id: "probe_stage1".into(),
+            path: r"D:\Media\Damaged\broken-clip.mp4".into(),
+            message: "Worker 意外退出，已跳过文件".into(),
+        }])));
         window.set_groups(ModelRc::new(VecModel::from(self.groups.clone())));
         window.set_members(ModelRc::new(VecModel::from(self.members.clone())));
         window.set_online_count(1);
@@ -269,8 +355,22 @@ fn install_testing_backend() {
 
 fn render_all_views(fixture: &VisualFixture, destination: PreviewDestination) {
     install_testing_backend();
+    let requested_views = std::env::var("RUST_V2_PREVIEW_VIEWS")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|view| !view.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     for (size_name, width, height) in [("1440x900", 1440, 900), ("1080x700", 1080, 700)] {
         for (view, current_page, overview_mode, task_mode, review_tab, settings_section) in VIEWS {
+            if !requested_views.is_empty() && !requested_views.iter().any(|item| item == view) {
+                continue;
+            }
             let window = MainWindow::new().expect("应能构造真实 MainWindow");
             fixture.install(&window);
             window.set_current_page(current_page);
@@ -340,7 +440,7 @@ fn save_snapshot(snapshot: &slint::SharedPixelBuffer<slint::Rgba8Pixel>, path: &
 }
 
 #[test]
-fn visual_fixture_covers_every_real_row_state() {
+fn render_all_views_with_real_row_states() {
     let fixture = VisualFixture::full();
     assert_eq!(fixture.nodes.len(), 3);
     assert_eq!(fixture.tasks.len(), 3);
