@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
 在隔离 Node 状态下连续运行半小时真实媒体计算并每两秒采样。
 
@@ -145,21 +145,28 @@ function Get-RuntimeMediaManifest {
     param([Parameter(Mandatory)] [string] $MediaRoot)
 
     $root = (Get-Item -LiteralPath $MediaRoot -ErrorAction Stop).FullName
+    $rootPrefixLength = $root.TrimEnd('\').Length
     $files = @(
         Get-ChildItem -LiteralPath $root -Recurse -File -Force -ErrorAction Stop |
             ForEach-Object {
+                # PowerShell 5.1 没有 Path.GetRelativePath；媒体项已确认位于根目录内，直接截取相对部分。
+                $relativePath = $_.FullName.Substring($rootPrefixLength).TrimStart('\').Replace('\', '/')
                 [pscustomobject]@{
-                    Path = [IO.Path]::GetRelativePath($root, $_.FullName).Replace('\', '/')
+                    Path = $relativePath
                     Length = [long]$_.Length
                     LastWriteTimeUtc = $_.LastWriteTimeUtc.ToString('O')
                 }
             } |
             Sort-Object -Property Path
     )
+    $totalBytes = ($files | Measure-Object -Property Length -Sum).Sum
+    if ($null -eq $totalBytes) {
+        $totalBytes = 0
+    }
     [pscustomobject]@{
         Root = $root
         FileCount = $files.Count
-        TotalBytes = [long](($files | Measure-Object -Property Length -Sum).Sum ?? 0)
+        TotalBytes = [long]$totalBytes
         Files = $files
     }
 }

@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
 把半小时真实媒体运行原始证据汇总为中文可审计报告。
 #>
@@ -26,8 +26,18 @@ function Read-Ndjson {
     @(
         Get-Content -LiteralPath $Path |
             Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
-            ForEach-Object { $_ | ConvertFrom-Json -Depth 30 }
+            ForEach-Object { $_ | ConvertFrom-Json }
     )
+}
+
+function Get-NumberOrZero {
+    <# 把空聚合值转换为零，兼容没有空合并运算符的 Windows PowerShell 5.1。 #>
+    param($Value)
+
+    if ($null -eq $Value) {
+        return 0
+    }
+    $Value
 }
 
 function Get-MaxGapSeconds {
@@ -67,9 +77,9 @@ $runtimeResult = @($runtimeRecords | Where-Object record_type -eq 'runtime_resul
 if (-not $runtimeResult -or $runtimeSamples.Count -eq 0 -or $systemSamples.Count -eq 0) {
     throw 'RUST_V2_RUNTIME_EVIDENCE_INCOMPLETE'
 }
-$before = Get-Content -LiteralPath $beforePath -Raw | ConvertFrom-Json -Depth 30
-$after = Get-Content -LiteralPath $afterPath -Raw | ConvertFrom-Json -Depth 30
-$harness = Get-Content -LiteralPath $harnessPath -Raw | ConvertFrom-Json -Depth 20
+$before = Get-Content -LiteralPath $beforePath -Raw | ConvertFrom-Json
+$after = Get-Content -LiteralPath $afterPath -Raw | ConvertFrom-Json
+$harness = Get-Content -LiteralPath $harnessPath -Raw | ConvertFrom-Json
 
 $duration = [int64]$runtimeResult.duration_seconds
 $maxGap = Get-MaxGapSeconds -Samples $runtimeSamples
@@ -125,25 +135,25 @@ $stageLines = [Collections.Generic.List[string]]::new()
 $stageRows = @($runtimeSamples | ForEach-Object { @($_.stages) })
 foreach ($group in $stageRows | Group-Object stage_id | Sort-Object Name) {
     $last = $group.Group | Sort-Object elapsed_ms | Select-Object -Last 1
-    $maxSpeed = [double](($group.Group.speed_per_second | Measure-Object -Maximum).Maximum ?? 0)
+    $maxSpeed = [double](Get-NumberOrZero (($group.Group.speed_per_second | Measure-Object -Maximum).Maximum))
     $stageLines.Add("| $($last.display_name) ($($last.stage_id)) | $($last.completed) / $($last.total) | $($last.elapsed_ms) | $('{0:N2}' -f $maxSpeed) | $($last.failed) |")
 }
 
 $processLines = [Collections.Generic.List[string]]::new()
 $processRows = @($systemSamples | ForEach-Object { @($_.processes) })
 foreach ($group in $processRows | Group-Object Name | Sort-Object Name) {
-    $cpuAverage = [double](($group.Group.CpuDeltaMs | Measure-Object -Average).Average ?? 0)
-    $workingPeak = [double](($group.Group.WorkingSetBytes | Measure-Object -Maximum).Maximum ?? 0)
-    $privatePeak = [double](($group.Group.PrivateMemoryBytes | Measure-Object -Maximum).Maximum ?? 0)
+    $cpuAverage = [double](Get-NumberOrZero (($group.Group.CpuDeltaMs | Measure-Object -Average).Average))
+    $workingPeak = [double](Get-NumberOrZero (($group.Group.WorkingSetBytes | Measure-Object -Maximum).Maximum))
+    $privatePeak = [double](Get-NumberOrZero (($group.Group.PrivateMemoryBytes | Measure-Object -Maximum).Maximum))
     $processLines.Add("| $($group.Name) | $('{0:N2}' -f $cpuAverage) | $(Format-Bytes $workingPeak) | $(Format-Bytes $privatePeak) |")
 }
 
 $diskLines = [Collections.Generic.List[string]]::new()
 $diskRows = @($systemSamples | ForEach-Object { @($_.disks) })
 foreach ($group in $diskRows | Group-Object Name | Sort-Object Name) {
-    $readAverage = [double](($group.Group.DiskReadBytesPerSec | Measure-Object -Average).Average ?? 0)
-    $readPeak = [double](($group.Group.DiskReadBytesPerSec | Measure-Object -Maximum).Maximum ?? 0)
-    $queuePeak = [double](($group.Group.AvgDiskQueueLength | Measure-Object -Maximum).Maximum ?? 0)
+    $readAverage = [double](Get-NumberOrZero (($group.Group.DiskReadBytesPerSec | Measure-Object -Average).Average))
+    $readPeak = [double](Get-NumberOrZero (($group.Group.DiskReadBytesPerSec | Measure-Object -Maximum).Maximum))
+    $queuePeak = [double](Get-NumberOrZero (($group.Group.AvgDiskQueueLength | Measure-Object -Maximum).Maximum))
     $diskLines.Add("| $($group.Name) | $(Format-Bytes $readAverage)/s | $(Format-Bytes $readPeak)/s | $('{0:N2}' -f $queuePeak) |")
 }
 
@@ -255,6 +265,7 @@ $recentFailureLines
 
 $parent = Split-Path -Parent $OutputPath
 if ($parent) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
-[IO.File]::WriteAllText($OutputPath, $report, [Text.UTF8Encoding]::new($false))
+# 写入 BOM，让远端 Windows PowerShell 5.1 也能按 UTF-8 正确读取中文报告。
+[IO.File]::WriteAllText($OutputPath, $report, [Text.UTF8Encoding]::new($true))
 Write-Output "RUST_V2_RUNTIME_ACCEPTANCE_REPORT_$verdict"
 Write-Output "REPORT_PATH=$OutputPath"

@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
 使用901个两秒合成样本验证半小时中文报告和失败条件。
 #>
@@ -77,7 +77,7 @@ function Write-Fixture {
             [ordered]@{ Path = 'b.mp4'; Length = 200; LastWriteTimeUtc = '2026-08-22T00:00:00.0000000Z' }
         )
     }
-    $after = $before | ConvertTo-Json -Depth 8 | ConvertFrom-Json -Depth 8
+    $after = $before | ConvertTo-Json -Depth 8 | ConvertFrom-Json
     if ($MediaChanged) {
         $after.TotalBytes = 301
         $after.Files = @(
