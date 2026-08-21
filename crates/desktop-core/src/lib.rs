@@ -15,6 +15,8 @@ pub mod node_session;
 pub mod results;
 /// 持久复核标记与只更新标记的快捷规则。
 pub mod review;
+/// Desktop 进程内跨机器分析、同步和删除运行详情。
+pub mod runtime_tasks;
 /// 增量、ACK、快照与自动/手动触发共用的同步状态机。
 pub mod sync;
 /// Slint 只读消费的节点、任务、设置和诊断状态快照。

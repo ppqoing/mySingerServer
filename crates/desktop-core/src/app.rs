@@ -23,8 +23,8 @@ use uuid::Uuid;
 use crate::{
     analysis::{CrossAnalysisCoordinator, CrossNodeSelection, CrossPollReport},
     central::{
-        CentralDeleteOutcome, CentralDeleteResult, CentralDeleteSelection, CentralError,
-        CentralReviewDecision, CentralStore,
+        CentralAnalysisStatus, CentralDeleteOutcome, CentralDeleteResult, CentralDeleteSelection,
+        CentralError, CentralReviewDecision, CentralStore,
     },
     delete::{DeleteConfirmation, ReviewGroup},
     node_session::NodeSession,
@@ -33,6 +33,9 @@ use crate::{
         group_page_from_node, load_preview, member_page_from_central, member_page_from_node,
     },
     review::{QuickReviewRule, ReviewBoard, ReviewDecision},
+    runtime_tasks::{
+        DesktopRuntimeTaskRegistry, DesktopRuntimeTaskReporter, DesktopRuntimeTaskState,
+    },
     sync::{
         AUTO_CATCH_UP_INTERVAL_SECONDS, SyncEngine, SyncError, SyncTriggerReceiver,
         SyncTriggerSender, sync_trigger_channel,
@@ -303,6 +306,8 @@ pub enum UiEvent {
 /// GUI 线程持有的可克隆命令发送端。
 #[derive(Clone)]
 pub struct DesktopApp {
+    /// 当前 desktop.exe 进程内唯一的运行任务 registry。
+    runtime_tasks: DesktopRuntimeTaskRegistry,
     commands: mpsc::Sender<UiCommand>,
 }
 
@@ -311,10 +316,28 @@ impl DesktopApp {
     pub fn start(config: DesktopConfig, paths: DesktopPaths) -> (Self, mpsc::Receiver<UiEvent>) {
         let config_path = paths.config.clone();
         let state = DesktopViewState::new(config, paths);
+        let runtime_tasks = DesktopRuntimeTaskRegistry::new();
         let (commands, command_receiver) = mpsc::channel(64);
         let (events, event_receiver) = mpsc::channel(64);
-        tokio::spawn(run_controller(state, config_path, command_receiver, events));
-        (Self { commands }, event_receiver)
+        tokio::spawn(run_controller(
+            state,
+            config_path,
+            command_receiver,
+            events,
+            runtime_tasks.clone(),
+        ));
+        (
+            Self {
+                runtime_tasks,
+                commands,
+            },
+            event_receiver,
+        )
+    }
+
+    /// 返回当前 Desktop 进程共享的临时运行任务 registry。
+    pub fn runtime_tasks(&self) -> DesktopRuntimeTaskRegistry {
+        self.runtime_tasks.clone()
     }
 
     /// 返回 Slint 回调可复制进闭包的有界发送端。
@@ -341,6 +364,18 @@ struct PreparedDeleteContext {
     group_id: String,
     confirmation: DeleteConfirmation,
     items: Vec<MemberView>,
+    /// 冻结确认集合对应的唯一删除运行详情。
+    runtime: DesktopRuntimeTaskReporter,
+}
+
+/// 当前进程正在推进的唯一跨机器分析及其运行详情。
+struct ActiveCrossAnalysis {
+    /// 既有 PostgreSQL 协调器。
+    coordinator: CrossAnalysisCoordinator,
+    /// Desktop 临时运行详情句柄。
+    runtime: DesktopRuntimeTaskReporter,
+    /// 冻结输入涉及的唯一物理节点数。
+    node_count: usize,
 }
 
 #[derive(Clone)]
@@ -390,12 +425,13 @@ async fn run_controller(
     config_path: PathBuf,
     mut commands: mpsc::Receiver<UiCommand>,
     events: mpsc::Sender<UiEvent>,
+    runtime_tasks: DesktopRuntimeTaskRegistry,
 ) {
     let mut sessions = BTreeMap::<usize, Arc<NodeSession>>::new();
     let mut central = connect_central(&mut state).await;
     let mut sync_workers = BTreeMap::<usize, NodeSyncWorker>::new();
     let (sync_result_sender, mut sync_results) = mpsc::unbounded_channel();
-    let mut cross_analysis: Option<CrossAnalysisCoordinator> = None;
+    let mut cross_analysis: Option<ActiveCrossAnalysis> = None;
     let mut loaded_members: Option<LoadedMembersContext> = None;
     let mut prepared_delete: Option<PreparedDeleteContext> = None;
     let mut pending_node_config: Option<PendingNodeConfigSave> = None;
@@ -420,6 +456,7 @@ async fn run_controller(
                     &mut sync_workers,
                     &sync_result_sender,
                     pending_endpoint.as_ref(),
+                    &runtime_tasks,
                 ).await;
                 verify_reconnected_node_config(
                     &mut state,
@@ -428,6 +465,7 @@ async fn run_controller(
                     &mut pending_node_config,
                     &events,
                     &sync_result_sender,
+                    &runtime_tasks,
                 ).await;
                 publish(&events, &state).await;
                 continue;
@@ -439,6 +477,7 @@ async fn run_controller(
                     &mut central,
                     &mut sync_workers,
                     &sync_result_sender,
+                    &runtime_tasks,
                 ).await;
                 publish(&events, &state).await;
                 continue;
@@ -506,6 +545,7 @@ async fn run_controller(
                         state.config().postgres_url.as_deref(),
                         &mut sync_workers,
                         &sync_result_sender,
+                        &runtime_tasks,
                     );
                     queue_automatic(&indexes, &sync_workers, AutomaticSyncCause::Connected).await;
                     Ok(())
@@ -571,6 +611,7 @@ async fn run_controller(
                     central.as_mut(),
                     &mut cross_analysis,
                     &events,
+                    &runtime_tasks,
                 )
                 .await
             }
@@ -701,6 +742,7 @@ async fn run_controller(
                     central.as_ref(),
                     &mut prepared_delete,
                     &events,
+                    &runtime_tasks,
                 )
                 .await
             }
@@ -956,6 +998,7 @@ fn ensure_sync_workers(
     postgres_url: Option<&str>,
     workers: &mut BTreeMap<usize, NodeSyncWorker>,
     results: &mpsc::UnboundedSender<NodeSyncEvent>,
+    runtime_tasks: &DesktopRuntimeTaskRegistry,
 ) {
     let Some(postgres_url) = postgres_url else {
         return;
@@ -976,6 +1019,7 @@ fn ensure_sync_workers(
             postgres_url.to_owned(),
             receiver,
             results.clone(),
+            runtime_tasks.clone(),
         ));
         workers.insert(
             *index,
@@ -996,15 +1040,20 @@ async fn run_node_sync_worker(
     postgres_url: String,
     mut triggers: SyncTriggerReceiver,
     results: mpsc::UnboundedSender<NodeSyncEvent>,
+    runtime_tasks: DesktopRuntimeTaskRegistry,
 ) {
     let engine = SyncEngine::new();
     let machine_id = session.machine_id().as_str().to_owned();
     let mut central = None;
     while let Some(trigger) = triggers.next().await {
+        let runtime = runtime_tasks
+            .begin_or_merge_sync(session.machine_id(), format!("同步节点 {machine_id}"));
         if central.is_none() {
             match CentralStore::connect(&postgres_url).await {
                 Ok(store) => central = Some(store),
                 Err(error) => {
+                    runtime.record_failure("acknowledging", "", error.to_string());
+                    let _ = runtime.finish(DesktopRuntimeTaskState::Failed);
                     let _ = results.send(NodeSyncEvent {
                         index,
                         worker_id,
@@ -1020,15 +1069,19 @@ async fn run_node_sync_worker(
             }
         }
         let outcome = engine
-            .sync_node(
+            .sync_node_with_progress(
                 session.as_ref(),
                 central.as_mut().expect("PG 连接已经建立"),
                 trigger,
+                |progress| runtime.update_sync_progress(progress),
             )
             .await;
+        // 当前同步运行期间进入队列的触发已经由同一任务覆盖，避免完成后重复显示新行。
+        triggers.drain_pending();
         match outcome {
             Ok(report) => match session.status().await {
                 Ok(status) => {
+                    let _ = runtime.finish(DesktopRuntimeTaskState::Completed);
                     let _ = results.send(NodeSyncEvent {
                         index,
                         worker_id,
@@ -1040,6 +1093,8 @@ async fn run_node_sync_worker(
                     });
                 }
                 Err(error) => {
+                    runtime.record_failure("caught_up", "", error.to_string());
+                    let _ = runtime.finish(DesktopRuntimeTaskState::Failed);
                     let _ = results.send(NodeSyncEvent {
                         index,
                         worker_id,
@@ -1054,6 +1109,8 @@ async fn run_node_sync_worker(
                 }
             },
             Err(error) => {
+                runtime.record_failure("incremental", "", error.to_string());
+                let _ = runtime.finish(DesktopRuntimeTaskState::Failed);
                 let session_failed = matches!(&error, SyncError::Session(_));
                 let central_failed = matches!(&error, SyncError::Central(_));
                 let _ = results.send(NodeSyncEvent {
@@ -1186,6 +1243,7 @@ async fn reconnect_and_sync(
     workers: &mut BTreeMap<usize, NodeSyncWorker>,
     results: &mpsc::UnboundedSender<NodeSyncEvent>,
     excluded_endpoint: Option<&NodeEndpoint>,
+    runtime_tasks: &DesktopRuntimeTaskRegistry,
 ) {
     let report = refresh_nodes(state, sessions, central.as_ref()).await;
     let completed_nodes = report.completed_nodes.clone();
@@ -1202,6 +1260,7 @@ async fn reconnect_and_sync(
         state.config().postgres_url.as_deref(),
         workers,
         results,
+        runtime_tasks,
     );
     queue_automatic(&connected_nodes, workers, AutomaticSyncCause::Connected).await;
     queue_automatic(&completed_nodes, workers, AutomaticSyncCause::TaskCompleted).await;
@@ -1214,6 +1273,7 @@ async fn catch_up_and_refresh(
     central: &mut Option<CentralStore>,
     workers: &mut BTreeMap<usize, NodeSyncWorker>,
     results: &mpsc::UnboundedSender<NodeSyncEvent>,
+    runtime_tasks: &DesktopRuntimeTaskRegistry,
 ) {
     let report = refresh_nodes(state, sessions, central.as_ref()).await;
     let completed_nodes = report.completed_nodes.clone();
@@ -1225,6 +1285,7 @@ async fn catch_up_and_refresh(
         state.config().postgres_url.as_deref(),
         workers,
         results,
+        runtime_tasks,
     );
     queue_automatic(&completed_nodes, workers, AutomaticSyncCause::TaskCompleted).await;
     let catch_up_nodes = indexes
@@ -1500,6 +1561,7 @@ async fn verify_reconnected_node_config(
     pending: &mut Option<PendingNodeConfigSave>,
     events: &mpsc::Sender<UiEvent>,
     sync_results: &mpsc::UnboundedSender<NodeSyncEvent>,
+    runtime_tasks: &DesktopRuntimeTaskRegistry,
 ) {
     let Some(target) = pending.clone() else {
         return;
@@ -1581,6 +1643,7 @@ async fn verify_reconnected_node_config(
                 state.config().postgres_url.as_deref(),
                 sync_workers,
                 sync_results,
+                runtime_tasks,
             );
             queue_automatic(&[index], sync_workers, AutomaticSyncCause::Connected).await;
         }
@@ -1734,8 +1797,9 @@ async fn start_cross_analysis(
     config: &DesktopConfig,
     sessions: &BTreeMap<usize, Arc<NodeSession>>,
     central: Option<&mut CentralStore>,
-    current: &mut Option<CrossAnalysisCoordinator>,
+    current: &mut Option<ActiveCrossAnalysis>,
     events: &mpsc::Sender<UiEvent>,
+    runtime_tasks: &DesktopRuntimeTaskRegistry,
 ) -> Result<(), String> {
     let parsed = parse_cross_selections(text)?;
     let mut selected = Vec::with_capacity(parsed.len());
@@ -1750,7 +1814,17 @@ async fn start_cross_analysis(
         .await
         .map_err(|error| error.to_string())?;
     let run_id = coordinator.run_id();
-    *current = Some(coordinator);
+    let machines = selected
+        .iter()
+        .map(|selection| selection.session.machine_id().clone())
+        .collect::<Vec<_>>();
+    let runtime =
+        runtime_tasks.begin_cross_analysis(run_id.as_uuid().to_string(), &machines, "跨机器分析");
+    *current = Some(ActiveCrossAnalysis {
+        coordinator,
+        runtime,
+        node_count: machines.len(),
+    });
     send_event(
         events,
         UiEvent::AnalysisStarted {
@@ -1766,21 +1840,37 @@ async fn poll_cross_analysis(
     retry: bool,
     sessions: &BTreeMap<usize, Arc<NodeSession>>,
     central: Option<&mut CentralStore>,
-    current: Option<&mut CrossAnalysisCoordinator>,
+    current: Option<&mut ActiveCrossAnalysis>,
     events: &mpsc::Sender<UiEvent>,
 ) -> Result<(), String> {
-    let coordinator = current.ok_or_else(|| "当前进程尚未创建跨机器分析".to_owned())?;
+    let active = current.ok_or_else(|| "当前进程尚未创建跨机器分析".to_owned())?;
     let central = central.ok_or_else(|| "PostgreSQL 中心模式未启用".to_owned())?;
     let online = sessions
         .values()
         .map(Arc::as_ref)
         .collect::<Vec<&NodeSession>>();
-    let report = if retry {
-        coordinator.retry_unresolved(central, &online).await
+    let polled = if retry {
+        active.coordinator.retry_unresolved(central, &online).await
     } else {
-        coordinator.poll(central, &online).await
+        active.coordinator.poll(central, &online).await
+    };
+    let report = match polled {
+        Ok(report) => report,
+        Err(error) => {
+            let _ = active.runtime.finish(DesktopRuntimeTaskState::Failed);
+            return Err(error.to_string());
+        }
+    };
+    active.runtime.update_cross_poll(&report, active.node_count);
+    let terminal = match report.status {
+        CentralAnalysisStatus::Completed => Some(DesktopRuntimeTaskState::Completed),
+        CentralAnalysisStatus::Partial => Some(DesktopRuntimeTaskState::Failed),
+        CentralAnalysisStatus::Cancelled => Some(DesktopRuntimeTaskState::Cancelled),
+        _ => None,
+    };
+    if let Some(state) = terminal {
+        let _ = active.runtime.finish(state);
     }
-    .map_err(|error| error.to_string())?;
     send_event(events, UiEvent::CrossAnalysisChanged(report)).await
 }
 
@@ -2006,6 +2096,7 @@ async fn prepare_delete(
     central: Option<&CentralStore>,
     prepared: &mut Option<PreparedDeleteContext>,
     events: &mpsc::Sender<UiEvent>,
+    runtime_tasks: &DesktopRuntimeTaskRegistry,
 ) -> Result<(), String> {
     let context = context.ok_or_else(|| "尚未载入重复组成员".to_owned())?;
     let group = load_complete_review_group(context, sessions, central).await?;
@@ -2014,12 +2105,24 @@ async fn prepare_delete(
         .members
         .into_iter()
         .filter(|member| member.active && member.review == ReviewDecision::Delete)
-        .collect();
+        .collect::<Vec<_>>();
+    let machines = items
+        .iter()
+        .map(|member| member.location.machine_id().clone())
+        .collect::<Vec<_>>();
+    let runtime = runtime_tasks.begin_delete(
+        Uuid::now_v7().to_string(),
+        &machines,
+        format!("删除组 {}", context.group_id),
+        items.len() as u64,
+    );
+    runtime.mark_delete_prepared();
     *prepared = Some(PreparedDeleteContext {
         scope: context.scope,
         group_id: context.group_id.clone(),
         confirmation: confirmation.clone(),
         items,
+        runtime,
     });
     send_event(events, UiEvent::DeleteConfirmationChanged(confirmation)).await
 }
@@ -2089,41 +2192,66 @@ async fn confirm_delete(
     if !prepared.confirmation.can_execute {
         return Err("删除确认门禁未通过".into());
     }
-    let summary = match prepared.scope {
-        ResultScope::Local { node_index, run_id } => {
-            let items = prepared
-                .items
-                .iter()
-                .map(|member| proto::DeleteItem {
-                    delete_item_id: String::new(),
-                    group_id: prepared.group_id.clone(),
-                    location: Some((&member.location).into()),
-                    expected_content: Some((&member.content).into()),
-                    outcome: String::new(),
-                    message: String::new(),
-                })
-                .collect();
-            let batch = sessions
-                .get(&node_index)
-                .ok_or_else(|| "节点当前未连接".to_owned())?
-                .create_delete_batch(run_id, items, prepared.confirmation.mode)
+    let executed: Result<Vec<proto::DeleteItem>, String> = async {
+        match prepared.scope {
+            ResultScope::Local { node_index, run_id } => {
+                let items = prepared
+                    .items
+                    .iter()
+                    .map(|member| proto::DeleteItem {
+                        delete_item_id: String::new(),
+                        group_id: prepared.group_id.clone(),
+                        location: Some((&member.location).into()),
+                        expected_content: Some((&member.content).into()),
+                        outcome: String::new(),
+                        message: String::new(),
+                    })
+                    .collect();
+                sessions
+                    .get(&node_index)
+                    .ok_or_else(|| "节点当前未连接".to_owned())?
+                    .create_delete_batch(run_id, items, prepared.confirmation.mode)
+                    .await
+                    .map(|batch| batch.items)
+                    .map_err(|error| error.to_string())
+            }
+            ResultScope::Central { run_id } => {
+                execute_central_delete(
+                    run_id,
+                    &prepared.group_id,
+                    &prepared.items,
+                    prepared.confirmation.mode,
+                    sessions,
+                    central.ok_or_else(|| "PostgreSQL 中心模式未启用".to_owned())?,
+                )
                 .await
-                .map_err(|error| error.to_string())?;
-            summarize_delete_items(&batch.items)
+            }
         }
-        ResultScope::Central { run_id } => {
-            execute_central_delete(
-                run_id,
-                &prepared.group_id,
-                &prepared.items,
-                prepared.confirmation.mode,
-                sessions,
-                central.ok_or_else(|| "PostgreSQL 中心模式未启用".to_owned())?,
+    }
+    .await;
+    match executed {
+        Ok(items) => {
+            prepared.runtime.finish_delete_results(&items);
+            let state = if items.iter().any(|item| item.outcome == "failed") {
+                DesktopRuntimeTaskState::Failed
+            } else {
+                DesktopRuntimeTaskState::Completed
+            };
+            let _ = prepared.runtime.finish(state);
+            send_event(
+                events,
+                UiEvent::DeleteFinished(summarize_delete_items(&items)),
             )
-            .await?
+            .await
         }
-    };
-    send_event(events, UiEvent::DeleteFinished(summary)).await
+        Err(error) => {
+            prepared
+                .runtime
+                .record_failure("delete_items", "", error.clone());
+            let _ = prepared.runtime.finish(DesktopRuntimeTaskState::Failed);
+            Err(error)
+        }
+    }
 }
 
 async fn execute_central_delete(
@@ -2133,7 +2261,7 @@ async fn execute_central_delete(
     mode: DeleteMode,
     sessions: &BTreeMap<usize, Arc<NodeSession>>,
     central: &mut CentralStore,
-) -> Result<String, String> {
+) -> Result<Vec<proto::DeleteItem>, String> {
     let selected = confirmed
         .iter()
         .map(|member| {
@@ -2185,7 +2313,7 @@ async fn execute_central_delete(
             .map_err(|error| error.to_string())?;
         all_items.extend(response.items);
     }
-    Ok(summarize_delete_items(&all_items))
+    Ok(all_items)
 }
 
 fn central_delete_result(item: &proto::DeleteItem) -> Result<CentralDeleteResult, String> {

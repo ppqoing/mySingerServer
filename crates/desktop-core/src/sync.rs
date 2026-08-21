@@ -107,6 +107,15 @@ impl SyncTriggerReceiver {
     pub async fn next(&mut self) -> Option<SyncTrigger> {
         self.receiver.recv().await
     }
+
+    /// 丢弃当前同步运行期间已经排队的重复触发，并返回合并数量。
+    pub fn drain_pending(&mut self) -> usize {
+        let mut drained = 0;
+        while self.receiver.try_recv().is_ok() {
+            drained += 1;
+        }
+        drained
+    }
 }
 
 /// 管理界面显示的同步阶段。
