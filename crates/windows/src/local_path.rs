@@ -77,6 +77,11 @@ impl LocalNodePath {
     pub fn resolved(&self) -> &Path {
         &self.resolved
     }
+
+    /// 把已经按 `node.exe` 目录解析的绝对路径映射到本机物理磁盘。
+    pub fn storage_location(&self) -> std::io::Result<crate::StorageLocation> {
+        crate::resolve_storage_location(&self.resolved)
+    }
 }
 
 fn is_unc_path(raw: &str) -> bool {

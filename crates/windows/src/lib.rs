@@ -8,6 +8,7 @@ mod machine_id;
 mod process_lifecycle;
 mod shell;
 mod smbios;
+mod storage_device;
 mod walker;
 
 pub use app_layout::AppLayout;
@@ -17,6 +18,9 @@ pub use machine_id::{PhysicalMachineFields, machine_id_from_fields};
 pub use process_lifecycle::{spawn_replacement_node, wait_for_process_exit};
 pub use shell::{move_to_recycle_bin, open_folder};
 pub use smbios::read_physical_machine_fields;
+pub use storage_device::{
+    LocalDiskKind, PhysicalDiskId, StorageLocation, resolve_storage_location,
+};
 pub use walker::{WalkedFile, WindowsWalker};
 
 #[cfg(test)]
