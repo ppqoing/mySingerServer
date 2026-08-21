@@ -1,7 +1,9 @@
 //! Worker 媒体流水线的解码次数、六槽位和联合特征契约。
 
 use std::{
+    future::Future,
     path::Path,
+    pin::Pin,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -9,8 +11,10 @@ use std::{
 use dedup_core::{DisplayPath, MachineId, MediaKind};
 use dedup_media::sample_positions;
 use dedup_media_ffmpeg::{DecodedFrame, MediaProbe};
+use dedup_node_engine::io::ReadFailure;
 use dedup_node_engine::scan::{
-    Stage1ProcessError, Stage1Processor, Stage1Request, WorkerPoolStage1Processor,
+    FileEnumerator, PipelineFileReader, PipelineLimits, ReadProduct, ScanEngine, ScanError,
+    ScanOptions, SystemMd5, WorkerPoolStage1Processor, md5_bytes,
 };
 use dedup_node_engine::worker::WorkerPool;
 use dedup_node_engine::worker::{
@@ -18,9 +22,7 @@ use dedup_node_engine::worker::{
     decode_stage1_payload, decode_stage2_payload, encode_stage1_payload, encode_stage2_payload,
     handle_worker_request,
 };
-use dedup_node_store::{
-    FileFaultKind, FileFaultRecord, NodeStore, ScannedPath, TaskItemCompletion,
-};
+use dedup_node_store::{NodeStore, ScannedPath, TaskItemStatus};
 use dedup_protocol::proto::{self, worker_envelope};
 use dedup_windows::ReadCancellationToken;
 
@@ -241,88 +243,56 @@ async fn cancel_gate_cannot_cross_the_registry_check_to_slot_send_window() {
 #[tokio::test]
 async fn crash_fault_fails_file_a_once_while_file_b_completes_and_slot_is_replaced() {
     let (pool, mut started, control) = WorkerPool::controlled_batch_for_test(2);
+    let directory = tempfile::tempdir().unwrap();
+    let path_a = directory.path().join("a.bin");
+    let path_b = directory.path().join("b.bin");
+    std::fs::write(&path_a, b"a").unwrap();
+    std::fs::write(&path_b, b"b").unwrap();
+    let rows = vec![scanned(&path_a), scanned(&path_b)];
+    let enumerator = CrashEnumerator { rows };
     let machine = MachineId::from_sha256([0x61; 32]);
-    let mut store = NodeStore::open_in_memory(machine.clone()).unwrap();
-    let task_id = store
-        .create_scan_task(&[dedup_core::NormalizedPath::new(r"D:\Crash").unwrap()], 1)
-        .unwrap();
-    let scanned_a = ScannedPath::new(
-        dedup_core::NormalizedPath::new(r"D:\Crash\a.bin").unwrap(),
-        DisplayPath::new(r"D:\Crash\a.bin").unwrap(),
-        1,
-    );
-    let scanned_b = ScannedPath::new(
-        dedup_core::NormalizedPath::new(r"D:\Crash\b.bin").unwrap(),
-        DisplayPath::new(r"D:\Crash\b.bin").unwrap(),
-        1,
-    );
-    let a = store
-        .upsert_content_and_location(&scanned_a, [1; 16], MediaKind::Other)
-        .unwrap();
-    let b = store
-        .upsert_content_and_location(&scanned_b, [2; 16], MediaKind::Other)
-        .unwrap();
-    let item_a = store
-        .reserve_scan_path(task_id, &scanned_a, 2)
-        .unwrap()
-        .unwrap();
-    let item_b = store
-        .reserve_scan_path(task_id, &scanned_b, 2)
-        .unwrap()
-        .unwrap();
-    store
-        .set_running_item_content_and_stage(&item_a, a.id, "probe_stage1")
-        .unwrap();
-    store
-        .set_running_item_content_and_stage(&item_b, b.id, "probe_stage1")
-        .unwrap();
-    let requests = vec![
-        Stage1Request {
-            task_id,
-            item_id: item_a.clone(),
-            machine_id: machine.clone(),
-            normalized_path: scanned_a.normalized_path.clone(),
-            display_path: scanned_a.display_path.clone(),
-            file_size: scanned_a.file_size,
-            stage: "probe_stage1".into(),
-            content_id: a.id,
-        },
-        Stage1Request {
-            task_id,
-            item_id: item_b.clone(),
-            machine_id: machine.clone(),
-            normalized_path: scanned_b.normalized_path.clone(),
-            display_path: scanned_b.display_path.clone(),
-            file_size: scanned_b.file_size,
-            stage: "probe_stage1".into(),
-            content_id: b.id,
-        },
-    ];
+    let store = NodeStore::open_in_memory(machine.clone()).unwrap();
+    let root = DisplayPath::new(directory.path()).unwrap();
+    let sheets = directory.path().join("sheets");
     let task = tokio::spawn(async move {
+        let mut store = store;
         let mut pool = pool;
         let mut processor = WorkerPoolStage1Processor::new(&mut pool, ReadCancellationToken::new());
-        processor.process_batch(requests).await
+        let mut engine = ScanEngine::new(enumerator, SystemMd5, sheets);
+        let result = engine
+            .run_parallel_with(
+                &mut store,
+                ScanOptions::new(vec![root]),
+                ImmediatePipelineReader,
+                &mut processor,
+                PipelineLimits::new(2, 2),
+                ReadCancellationToken::new(),
+                10,
+            )
+            .await;
+        (store, result)
     });
-    let mut dispatched = vec![started.recv().await.unwrap(), started.recv().await.unwrap()];
-    dispatched.sort();
-    assert_eq!(
-        dispatched,
-        vec![
-            (task_id.as_uuid().to_string(), item_a.clone()),
-            (task_id.as_uuid().to_string(), item_b.clone())
-        ]
-    );
+    let _ = started.recv().await.unwrap();
+    let _ = started.recv().await.unwrap();
+    let running = control.running_files();
+    assert_eq!(running.len(), 2);
+    let a = running
+        .iter()
+        .find(|(_, _, identity)| identity.display_path.as_path() == path_a)
+        .unwrap()
+        .clone();
+    let b = running
+        .iter()
+        .find(|(_, _, identity)| identity.display_path.as_path() == path_b)
+        .unwrap()
+        .clone();
     control
-        .crash(
-            task_id.as_uuid().to_string(),
-            item_a.clone(),
-            "worker crashed".into(),
-        )
+        .crash(a.0.clone(), a.1.clone(), "worker crashed".into())
         .await;
     control
         .complete(
-            task_id.as_uuid().to_string(),
-            item_b.clone(),
+            b.0.clone(),
+            b.1.clone(),
             Stage1Output {
                 media_kind: MediaKind::Other,
                 width: 0,
@@ -333,61 +303,84 @@ async fn crash_fault_fails_file_a_once_while_file_b_completes_and_slot_is_replac
             },
         )
         .await;
-    let results = task.await.unwrap();
-    let crash = results
-        .iter()
-        .find(|result| result.item_id == item_a)
-        .unwrap();
-    let (identity, message) = match &crash.output {
-        Err(Stage1ProcessError::WorkerCrash { identity, message }) => (identity, message),
-        other => panic!("expected WorkerCrash, got {other:?}"),
-    };
-    let identity: &WorkerFileIdentity = identity;
-    assert_eq!(message, "worker crashed");
-    assert_eq!(identity.machine_id, machine);
-    assert_eq!(identity.normalized_path, scanned_a.normalized_path);
-    assert_eq!(identity.display_path, scanned_a.display_path);
-    assert_eq!(identity.file_size, 1);
-    assert_eq!(identity.stage, "probe_stage1");
-    store
-        .fail_running_item_with_file_fault(
-            &item_a,
-            &FileFaultRecord {
-                machine_id: identity.machine_id.clone(),
-                normalized_path: identity.normalized_path.clone(),
-                display_path: identity.display_path.clone(),
-                file_size: identity.file_size,
-                kind: FileFaultKind::WorkerCrash,
-                stage: identity.stage.clone(),
-                windows_error_code: None,
-                message: message.clone(),
-            },
-            message,
-            3,
-        )
-        .unwrap();
-    store
-        .complete_item(
-            &item_b,
-            TaskItemCompletion::Succeeded {
-                content_id: Some(b.id),
-            },
-            3,
-        )
-        .unwrap();
-    assert!(
-        results
+    let (store, summary) = task.await.unwrap();
+    let summary = summary.unwrap();
+    let items = store.task_items(summary.task_id).unwrap();
+    assert_eq!(
+        items
             .iter()
-            .find(|result| result.item_id == item_b)
+            .find(|item| item.item_id == a.1)
             .unwrap()
-            .output
-            .is_ok()
+            .status,
+        TaskItemStatus::Failed
+    );
+    assert_eq!(
+        items
+            .iter()
+            .find(|item| item.item_id == b.1)
+            .unwrap()
+            .status,
+        TaskItemStatus::Succeeded
     );
     let faults = store.page_file_faults(None, 10).unwrap();
     assert_eq!(faults.items.len(), 1);
-    assert_eq!(faults.items[0].normalized_path, identity.normalized_path);
+    assert_eq!(faults.items[0].machine_id, machine);
+    assert_eq!(faults.items[0].normalized_path, a.2.normalized_path);
+    assert_eq!(faults.items[0].display_path, a.2.display_path);
+    assert_eq!(faults.items[0].file_size, a.2.file_size);
+    assert_eq!(faults.items[0].stage, a.2.stage);
     assert_eq!(control.available_slots(), 2);
     assert!(started.try_recv().is_err(), "崩溃项不得重新派发");
+}
+
+#[derive(Clone)]
+struct CrashEnumerator {
+    rows: Vec<ScannedPath>,
+}
+
+impl FileEnumerator for CrashEnumerator {
+    fn enumerate(&self, _roots: &[DisplayPath]) -> Result<Vec<ScannedPath>, ScanError> {
+        Ok(self.rows.clone())
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ImmediatePipelineReader;
+
+impl PipelineFileReader for ImmediatePipelineReader {
+    type Lease = ();
+
+    fn read(
+        &self,
+        scanned: ScannedPath,
+        cancellation: ReadCancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<ReadProduct<Self::Lease>, ReadFailure>> + Send + 'static>>
+    {
+        Box::pin(async move {
+            if cancellation.is_cancelled() {
+                return Err(ReadFailure::Cancelled);
+            }
+            let data = std::fs::read(scanned.display_path.as_path()).map_err(|source| {
+                ReadFailure::Io {
+                    path: scanned.display_path.as_path().to_path_buf(),
+                    block_offset: 0,
+                    source,
+                }
+            })?;
+            Ok(ReadProduct {
+                md5: md5_bytes(&data),
+                lease: (),
+            })
+        })
+    }
+}
+
+fn scanned(path: &Path) -> ScannedPath {
+    ScannedPath::new(
+        dedup_core::NormalizedPath::new(path).unwrap(),
+        DisplayPath::new(path).unwrap(),
+        std::fs::metadata(path).unwrap().len(),
+    )
 }
 
 /// 把媒体层 Duration 采样定义转换为测试解码器记录的归一化值。

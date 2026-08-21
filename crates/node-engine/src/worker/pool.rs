@@ -179,6 +179,7 @@ pub struct WorkerDispatchBarrier {
 pub struct ControlledWorkerPool {
     commands: mpsc::Sender<ControlledWorkerCommand>,
     available_slots: Arc<AtomicUsize>,
+    state: Arc<Mutex<PoolState>>,
 }
 
 impl ControlledWorkerPool {
@@ -209,6 +210,24 @@ impl ControlledWorkerPool {
     /// 返回当前未被运行项占用的逻辑槽位数。
     pub fn available_slots(&self) -> usize {
         self.available_slots.load(Ordering::Acquire)
+    }
+
+    /// 返回当前真实 running map 中携带冻结文件身份的项。
+    pub fn running_files(&self) -> Vec<(String, String, WorkerFileIdentity)> {
+        let mut rows = self
+            .state
+            .lock()
+            .unwrap()
+            .running
+            .values()
+            .filter_map(|work| {
+                work.file_identity
+                    .clone()
+                    .map(|identity| (work.task_id.clone(), work.item_id.clone(), identity))
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by(|left, right| left.1.cmp(&right.1));
+        rows
     }
 }
 
@@ -607,12 +626,13 @@ impl WorkerPool {
             Self {
                 commands,
                 events: event_rx,
-                state,
+                state: state.clone(),
             },
             started_rx,
             ControlledWorkerPool {
                 commands: control_tx,
                 available_slots,
+                state,
             },
         )
     }
