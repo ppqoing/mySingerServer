@@ -6,6 +6,123 @@ use slint::{
 };
 use std::{cell::Cell, cell::RefCell, rc::Rc};
 
+#[test]
+fn remote_node_config_form_exposes_identity_actions_and_mode_gates() {
+    i_slint_backend_testing::init_no_event_loop();
+
+    let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    window
+        .window()
+        .set_size(slint::PhysicalSize::new(1080, 700));
+    window.set_node_config_options(ModelRc::new(VecModel::from(vec![
+        "本机节点 · machine-local · 127.0.0.1:39091 · 在线".into(),
+        "计算节点 2 · machine-offline · 10.0.0.8:39091 · 离线".into(),
+    ])));
+    window.set_node_config_node_online(true);
+    window.invoke_navigate_to(6);
+    accessible(&window, "节点服务").invoke_accessible_default_action();
+
+    assert_eq!(
+        accessible(&window, "远程节点选择")
+            .accessible_value()
+            .as_deref(),
+        Some("本机节点 · machine-local · 127.0.0.1:39091 · 在线"),
+        "节点选项必须完整显示名称、机器唯一 ID、地址和在线状态",
+    );
+    assert_eq!(
+        accessible(&window, "加载配置").accessible_enabled(),
+        Some(true)
+    );
+    assert_eq!(
+        accessible(&window, "保存并重启").accessible_enabled(),
+        Some(false),
+        "加载前不得保存",
+    );
+    assert_eq!(
+        ElementHandle::find_by_accessible_label(&window, "保存并重启")
+            .filter(|element| element.accessible_enabled().is_some())
+            .count(),
+        1,
+        "Node 配置只能有一个保存并重启动作",
+    );
+    assert!(
+        ElementHandle::find_by_accessible_label(&window, "节点服务配置（当前版本未提供）")
+            .next()
+            .is_none(),
+        "真实远程配置区不得继续显示未实现占位",
+    );
+    let required = [
+        "路径语义：相对路径按 node.exe 所在目录解析；旧数据不迁移；不支持网络盘",
+        "Node 数据路径",
+        "Node 配置路径",
+        "Node 日志路径",
+        "Node 缓存路径",
+        "机械硬盘每盘读取线程",
+        "固态硬盘每盘读取线程",
+        "未知磁盘每盘读取线程",
+        "总读取线程",
+        "读取块大小（字节）",
+        "单块读取超时（秒）",
+        "读取重试次数",
+        "Worker 模式",
+        "兼容 Worker 数量",
+        "自动模式保留核心",
+        "手动 Worker 数量",
+    ];
+    let scroll = accessible(&window, "节点服务内容滚动区");
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..20 {
+        for label in required {
+            if ElementHandle::find_by_accessible_label(&window, label)
+                .next()
+                .is_some()
+            {
+                seen.insert(label);
+            }
+        }
+        scroll.scroll(0.0, -120.0);
+        slint::platform::update_timers_and_animations();
+    }
+    for label in required {
+        assert!(
+            seen.contains(label),
+            "Node 服务配置区必须可滚动到达 {label}"
+        );
+    }
+
+    window.set_node_config_loaded(true);
+    window.set_node_config_dirty(true);
+    window.set_node_config_worker_mode_index(0);
+    scroll.scroll(0.0, -10000.0);
+    slint::platform::update_timers_and_animations();
+    assert_eq!(
+        accessible(&window, "自动模式保留核心").accessible_enabled(),
+        Some(true),
+    );
+    assert_eq!(
+        accessible(&window, "手动 Worker 数量").accessible_enabled(),
+        Some(false),
+        "自动模式必须禁用手动 Worker 数量",
+    );
+    window.set_node_config_worker_mode_index(1);
+    assert_eq!(
+        accessible(&window, "自动模式保留核心").accessible_enabled(),
+        Some(false),
+        "手动模式必须禁用保留核心",
+    );
+    assert_eq!(
+        accessible(&window, "手动 Worker 数量").accessible_enabled(),
+        Some(true),
+    );
+
+    assert!(
+        ElementHandle::find_by_accessible_label(&window, "保存设置")
+            .next()
+            .is_some(),
+        "Desktop 保存设置动作必须保留",
+    );
+}
+
 // 使用完整字面行模型驱动真实 MainWindow，避免从生产映射反推预期结果。
 fn install_overview_fixture(window: &MainWindow) {
     window.set_nodes(ModelRc::new(VecModel::from(vec![

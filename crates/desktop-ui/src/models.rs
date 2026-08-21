@@ -200,3 +200,33 @@ pub(crate) fn postgres_health(state: &DesktopViewState) -> (SharedString, Color)
 fn rgb(red: u8, green: u8, blue: u8) -> Color {
     Color::from_rgb_u8(red, green, blue)
 }
+
+/// 设置页节点选择完整展示名称、机器唯一 ID、地址和连接状态。
+pub(crate) fn node_config_options(state: &DesktopViewState) -> ModelRc<SharedString> {
+    let rows = state
+        .nodes()
+        .iter()
+        .enumerate()
+        .map(|(index, node)| {
+            let name = if index == 0 {
+                "本机节点".to_owned()
+            } else {
+                format!("计算节点 {}", index + 1)
+            };
+            let status = match node.connection {
+                NodeConnectionState::Offline => "离线",
+                NodeConnectionState::Connecting => "连接中",
+                NodeConnectionState::Online => "在线",
+                NodeConnectionState::Error => "错误",
+            };
+            format!(
+                "{} · {} · {} · {status}",
+                name,
+                node.machine_id.as_deref().unwrap_or("尚未握手"),
+                node.endpoint,
+            )
+            .into()
+        })
+        .collect::<Vec<_>>();
+    ModelRc::new(VecModel::from(rows))
+}

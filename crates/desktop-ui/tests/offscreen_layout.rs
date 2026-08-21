@@ -992,6 +992,100 @@ fn settings_workspace_stays_reachable_at_minimum_size() {
 }
 
 #[test]
+fn remote_node_config_scroll_reaches_all_fields_without_covering_settings_menu() {
+    install_testing_backend();
+
+    let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    window
+        .window()
+        .set_size(slint::PhysicalSize::new(1080, 700));
+    window.set_node_config_options(ModelRc::new(VecModel::from(vec![
+        "本机节点 · machine-local · 127.0.0.1:39091 · 在线".into(),
+    ])));
+    window.set_node_config_node_online(true);
+    window.set_node_config_loaded(true);
+    window.invoke_navigate_to(6);
+    window.show().expect("应能显示真实设置工作区");
+    accessible(&window, "节点服务").invoke_accessible_default_action();
+    window
+        .window()
+        .take_snapshot()
+        .expect("Node 服务配置首屏应能渲染");
+
+    let menu = accessible(&window, "设置二级菜单");
+    let scroll = accessible(&window, "节点服务内容滚动区");
+    assert_element_has_positive_size(&scroll, "节点服务内容滚动区");
+    assert!(
+        menu.absolute_position().x + menu.size().width <= scroll.absolute_position().x,
+        "Node 服务自己的 ScrollView 不得覆盖 190px 二级菜单",
+    );
+    for label in ["远程节点选择", "加载配置", "保存并重启"] {
+        let element = accessible(&window, label);
+        assert!(
+            element.absolute_position().y >= scroll.absolute_position().y
+                && element.absolute_position().y + element.size().height
+                    <= scroll.absolute_position().y + scroll.size().height,
+            "{label} 必须位于 Node 服务首屏滚动视口内",
+        );
+    }
+
+    let required = [
+        "Node 数据路径",
+        "Node 配置路径",
+        "Node 日志路径",
+        "Node 缓存路径",
+        "机械硬盘每盘读取线程",
+        "固态硬盘每盘读取线程",
+        "未知磁盘每盘读取线程",
+        "总读取线程",
+        "读取块大小（字节）",
+        "单块读取超时（秒）",
+        "读取重试次数",
+        "Worker 模式",
+        "兼容 Worker 数量",
+        "自动模式保留核心",
+        "手动 Worker 数量",
+    ];
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..20 {
+        window
+            .window()
+            .take_snapshot()
+            .expect("Node 服务配置滚动过程应能渲染");
+        for label in required {
+            if let Some(element) = ElementHandle::find_by_accessible_label(&window, label).next() {
+                assert!(
+                    element.absolute_position().x >= scroll.absolute_position().x
+                        && element.absolute_position().x + element.size().width
+                            <= scroll.absolute_position().x + scroll.size().width,
+                    "{label} 必须水平位于 Node 服务 ScrollView 内",
+                );
+                seen.insert(label);
+            }
+        }
+        scroll.scroll(0.0, -120.0);
+    }
+    for label in required {
+        assert!(
+            seen.contains(label),
+            "Node 服务 ScrollView 必须可到达 {label}"
+        );
+    }
+    scroll.scroll(0.0, -10000.0);
+    window
+        .window()
+        .take_snapshot()
+        .expect("Node 服务配置滚动到底部后应能渲染");
+    let manual = accessible(&window, "手动 Worker 数量");
+    assert!(
+        manual.absolute_position().y >= scroll.absolute_position().y
+            && manual.absolute_position().y + manual.size().height
+                <= scroll.absolute_position().y + scroll.size().height,
+        "滚到底部后必须可达最后一个 Worker 字段",
+    );
+}
+
+#[test]
 fn delete_confirmation_is_a_centered_root_level_light_overlay() {
     install_testing_backend();
 

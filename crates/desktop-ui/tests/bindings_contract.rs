@@ -321,3 +321,104 @@ fn preview_completions_preserve_identity_and_increment_sequence() {
     assert_eq!(window.get_last_error(), "");
     assert!(window.get_preview_info().contains("D:\\Display\\ready.jpg"));
 }
+
+#[test]
+fn remote_node_config_callbacks_map_identity_and_send_only_task6_commands() {
+    i_slint_backend_testing::init_no_event_loop();
+
+    let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    let find = |label: &str| {
+        i_slint_backend_testing::ElementHandle::find_by_accessible_label(&window, label)
+            .next()
+            .unwrap_or_else(|| panic!("应找到可访问元素：{label}"))
+    };
+    let (sender, mut receiver) = mpsc::channel(16);
+    let binding = bind_commands(&window, sender, DesktopConfig::default());
+    let mut state = dedup_desktop_core::view_state::DesktopViewState::new(
+        DesktopConfig::default(),
+        dedup_desktop_core::view_state::DesktopPaths {
+            data: std::path::PathBuf::from(r"C:\fixture\desktop"),
+            logs: std::path::PathBuf::from(r"C:\fixture\desktop\logs"),
+            cache: std::path::PathBuf::from(r"C:\fixture\desktop\cache"),
+            config: std::path::PathBuf::from(r"C:\fixture\desktop\config.toml"),
+        },
+    );
+    state.set_node_identity(0, "machine-local");
+    state.set_node_connection(
+        0,
+        dedup_desktop_core::view_state::NodeConnectionState::Online,
+        None,
+    );
+    let offline = state.add_node("10.0.0.8", 39091).expect("离线节点 fixture");
+    state.set_node_identity(offline, "machine-offline");
+    apply_event(&window, &binding, UiEvent::ViewChanged(Box::new(state)));
+    let options = window.get_node_config_options();
+    assert_eq!(
+        slint::Model::row_data(&options, 0).as_deref(),
+        Some("本机节点 · machine-local · 127.0.0.1:39091 · 在线"),
+    );
+    assert_eq!(
+        slint::Model::row_data(&options, 1).as_deref(),
+        Some("计算节点 2 · machine-offline · 10.0.0.8:39091 · 离线"),
+    );
+    window.invoke_navigate_to(6);
+    find("节点服务").invoke_accessible_default_action();
+
+    window.invoke_select_node_config(0);
+    find("加载配置").invoke_accessible_default_action();
+    match next(&mut receiver) {
+        UiCommand::LoadNodeConfig { node_index } => assert_eq!(node_index, 0),
+        command => panic!("加载远程配置命令错误：{command:?}"),
+    }
+    assert!(receiver.try_recv().is_err(), "一次加载动作只能发送一条命令");
+
+    window.set_node_config_loaded(true);
+    window.set_node_config_dirty(true);
+    window.set_node_config_listen_ip("0.0.0.0".into());
+    window.set_node_config_port(39100);
+    window.set_node_config_enumerator_index(1);
+    window.set_node_config_data_path("data\\node".into());
+    window.set_node_config_config_path("data\\node\\config.toml".into());
+    window.set_node_config_log_path("data\\node\\logs".into());
+    window.set_node_config_cache_path("data\\node\\cache".into());
+    window.set_node_config_hdd_threads(1);
+    window.set_node_config_ssd_threads(2);
+    window.set_node_config_unknown_threads(1);
+    window.set_node_config_total_threads(4);
+    window.set_node_config_block_size(4 * 1024 * 1024);
+    window.set_node_config_timeout_seconds(3);
+    window.set_node_config_retries(2);
+    window.set_node_config_legacy_workers(4);
+    window.set_node_config_worker_mode_index(0);
+    window.set_node_config_reserved_cores(1);
+    window.set_node_config_manual_workers(2);
+    find("保存并重启").invoke_accessible_default_action();
+    match next(&mut receiver) {
+        UiCommand::SaveNodeConfigAndRestart { node_index, config } => {
+            assert_eq!(node_index, 0);
+            assert_eq!(config.listen_ip, "0.0.0.0");
+            assert_eq!(config.port, 39100);
+            assert_eq!(config.data_path, "data\\node");
+            assert_eq!(config.block_timeout_seconds, 3);
+            assert_eq!(config.block_retries, 2);
+        }
+        command => panic!("保存远程配置命令错误：{command:?}"),
+    }
+    assert!(receiver.try_recv().is_err(), "一次保存动作只能发送一条命令");
+
+    window.set_scan_root("D:\\Media".into());
+    window.invoke_select_node_config(1);
+    assert_eq!(window.get_node_config_selected_index(), 1);
+    assert!(!window.get_node_config_loaded(), "切换节点必须清除远程快照");
+    assert!(!window.get_node_config_dirty());
+    assert_eq!(window.get_scan_root(), "", "切换节点必须清除旧扫描路径");
+    assert_eq!(find("加载配置").accessible_enabled(), Some(false));
+    assert_eq!(find("保存并重启").accessible_enabled(), Some(false));
+    find("加载配置").invoke_accessible_default_action();
+    find("保存并重启").invoke_accessible_default_action();
+    assert!(receiver.try_recv().is_err(), "离线动作不得发送命令");
+
+    window.invoke_save_settings();
+    assert!(matches!(next(&mut receiver), UiCommand::SaveSettings(_)));
+    assert!(receiver.try_recv().is_err(), "旧保存设置不得冒充 Node 保存");
+}

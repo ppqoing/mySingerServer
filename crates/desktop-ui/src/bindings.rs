@@ -2,7 +2,10 @@
 
 use std::sync::{Arc, Mutex};
 
-use dedup_core::{DeleteMode, DesktopConfig, EnumeratorKind, Thresholds};
+use dedup_core::{
+    DeleteMode, DesktopConfig, DiskReadConfig, EnumeratorKind, NodeConfig, NodePathsConfig,
+    Thresholds, WorkerConfig, WorkerMode,
+};
 use dedup_desktop_core::{
     app::{UiCommand, UiEvent},
     results::GroupKind,
@@ -21,6 +24,7 @@ use crate::{MainWindow, models};
 #[derive(Clone)]
 pub struct UiBinding {
     config: Arc<Mutex<DesktopConfig>>,
+    node_config: Arc<Mutex<Option<NodeConfig>>>,
 }
 
 /// 绑定主窗口全部任务 21 回调，并返回事件应用所需的共享配置快照。
@@ -31,6 +35,7 @@ pub fn bind_commands(
 ) -> UiBinding {
     let binding = UiBinding {
         config: Arc::new(Mutex::new(initial)),
+        node_config: Arc::new(Mutex::new(None)),
     };
 
     bind_simple(window, &sender);
@@ -126,6 +131,8 @@ pub fn bind_commands(
         );
     });
 
+    bind_node_config(window, &sender, &binding.node_config);
+
     let save_sender = sender;
     let save_window = window.as_weak();
     let save_config = Arc::clone(&binding.config);
@@ -143,6 +150,201 @@ pub fn bind_commands(
         }
     });
     binding
+}
+
+fn bind_node_config(
+    window: &MainWindow,
+    sender: &mpsc::Sender<UiCommand>,
+    loaded: &Arc<Mutex<Option<NodeConfig>>>,
+) {
+    let select_window = window.as_weak();
+    let select_loaded = Arc::clone(loaded);
+    window.on_select_node_config(move |index| {
+        let Some(window) = select_window.upgrade() else {
+            return;
+        };
+        let index = index.max(0);
+        let changed = window.get_node_config_selected_index() != index;
+        window.set_node_config_selected_index(index);
+        window.set_node_config_node_online(selected_node_online(&window, index));
+        if changed {
+            clear_node_config_form(&window);
+            *select_loaded.lock().expect("Node 配置锁未中毒") = None;
+            window.set_scan_root(SharedString::default());
+        }
+    });
+
+    let load_sender = sender.clone();
+    let load_window = window.as_weak();
+    let load_loaded = Arc::clone(loaded);
+    window.on_load_node_config(move || {
+        let Some(window) = load_window.upgrade() else {
+            return;
+        };
+        if !window.get_node_config_node_online() || window.get_node_config_saving() {
+            return;
+        }
+        clear_node_config_form(&window);
+        *load_loaded.lock().expect("Node 配置锁未中毒") = None;
+        send(
+            &load_sender,
+            UiCommand::LoadNodeConfig {
+                node_index: window.get_node_config_selected_index().max(0) as usize,
+            },
+            &window.as_weak(),
+        );
+    });
+
+    let edit_window = window.as_weak();
+    let edit_loaded = Arc::clone(loaded);
+    window.on_node_config_edited(move || {
+        let Some(window) = edit_window.upgrade() else {
+            return;
+        };
+        let is_dirty = match node_config_from_window(&window) {
+            Ok(current) => {
+                edit_loaded.lock().expect("Node 配置锁未中毒").as_ref() != Some(&current)
+            }
+            Err(_) => true,
+        };
+        window.set_node_config_dirty(is_dirty);
+    });
+
+    let save_sender = sender.clone();
+    let save_window = window.as_weak();
+    let save_loaded = Arc::clone(loaded);
+    window.on_save_node_config_and_restart(move || {
+        let Some(window) = save_window.upgrade() else {
+            return;
+        };
+        if !window.get_node_config_node_online()
+            || !window.get_node_config_loaded()
+            || window.get_node_config_saving()
+        {
+            return;
+        }
+        let config = match node_config_from_window(&window) {
+            Ok(config) => config,
+            Err(error) => {
+                window.set_last_error(error.into());
+                return;
+            }
+        };
+        if save_loaded.lock().expect("Node 配置锁未中毒").as_ref() == Some(&config) {
+            window.set_node_config_dirty(false);
+            return;
+        }
+        let wire = match (&config).try_into() {
+            Ok(wire) => wire,
+            Err(error) => {
+                window.set_last_error(format!("Node 配置无效：{error}").into());
+                return;
+            }
+        };
+        send(
+            &save_sender,
+            UiCommand::SaveNodeConfigAndRestart {
+                node_index: window.get_node_config_selected_index().max(0) as usize,
+                config: wire,
+            },
+            &window.as_weak(),
+        );
+    });
+}
+
+fn selected_node_online(window: &MainWindow, index: i32) -> bool {
+    slint::Model::row_data(&window.get_nodes(), index.max(0) as usize)
+        .is_some_and(|node| node.status == "在线" && node.machine_id != "尚未握手")
+}
+
+fn clear_node_config_form(window: &MainWindow) {
+    window.set_node_config_loaded(false);
+    window.set_node_config_dirty(false);
+    window.set_node_config_saving(false);
+    window.set_node_config_machine_id(SharedString::default());
+    window.set_node_config_version(SharedString::default());
+    window.set_node_config_phase("未加载".into());
+    window.set_node_config_error(SharedString::default());
+    window.set_node_config_listen_ip(SharedString::default());
+    window.set_node_config_data_path(SharedString::default());
+    window.set_node_config_config_path(SharedString::default());
+    window.set_node_config_log_path(SharedString::default());
+    window.set_node_config_cache_path(SharedString::default());
+    window.set_node_config_logical_cpus(0);
+    window.set_node_config_effective_workers(0);
+}
+
+fn node_config_from_window(window: &MainWindow) -> Result<NodeConfig, String> {
+    let listen_ip = window
+        .get_node_config_listen_ip()
+        .trim()
+        .parse()
+        .map_err(|_| "Node 监听 IP 无效".to_owned())?;
+    let port = window
+        .get_node_config_port()
+        .try_into()
+        .map_err(|_| "Node 监听端口无效".to_owned())?;
+    let config = NodeConfig {
+        listen_ip,
+        port,
+        worker_count: positive_usize(window.get_node_config_legacy_workers(), "兼容 Worker 数量")?,
+        enumerator: if window.get_node_config_enumerator_index() == 0 {
+            EnumeratorKind::WindowsWalker
+        } else {
+            EnumeratorKind::Everything
+        },
+        paths: NodePathsConfig {
+            data_path: window.get_node_config_data_path().to_string(),
+            config_path: window.get_node_config_config_path().to_string(),
+            log_path: window.get_node_config_log_path().to_string(),
+            cache_path: window.get_node_config_cache_path().to_string(),
+        },
+        read: DiskReadConfig {
+            hdd_threads_per_disk: positive_usize(
+                window.get_node_config_hdd_threads(),
+                "机械硬盘每盘读取线程",
+            )?,
+            ssd_threads_per_disk: positive_usize(
+                window.get_node_config_ssd_threads(),
+                "固态硬盘每盘读取线程",
+            )?,
+            unknown_threads_per_disk: positive_usize(
+                window.get_node_config_unknown_threads(),
+                "未知磁盘每盘读取线程",
+            )?,
+            total_threads: positive_usize(window.get_node_config_total_threads(), "总读取线程")?,
+            block_size_bytes: positive_usize(window.get_node_config_block_size(), "读取块大小")?,
+            block_timeout_seconds: window
+                .get_node_config_timeout_seconds()
+                .try_into()
+                .map_err(|_| "单块读取超时无效".to_owned())?,
+            block_retries: window
+                .get_node_config_retries()
+                .try_into()
+                .map_err(|_| "读取重试次数无效".to_owned())?,
+        },
+        worker: WorkerConfig {
+            mode: if window.get_node_config_worker_mode_index() == 0 {
+                WorkerMode::Automatic
+            } else {
+                WorkerMode::Manual
+            },
+            reserved_cores: window
+                .get_node_config_reserved_cores()
+                .try_into()
+                .map_err(|_| "自动模式保留核心无效".to_owned())?,
+            manual_worker_count: positive_usize(
+                window.get_node_config_manual_workers(),
+                "手动 Worker 数量",
+            )?,
+        },
+    };
+    config.validate().map_err(|error| error.to_string())?;
+    Ok(config)
+}
+
+fn positive_usize(value: i32, field: &str) -> Result<usize, String> {
+    value.try_into().map_err(|_| format!("{field} 无效"))
 }
 
 /// 在 Slint 线程整体应用一个不可变 core 事件。
@@ -168,6 +370,15 @@ pub fn apply_event(window: &MainWindow, binding: &UiBinding, event: UiEvent) {
                     })
                     .count() as i32,
             );
+            window.set_node_config_options(models::node_config_options(&state));
+            let selected = state
+                .node_config()
+                .selected_node_index()
+                .unwrap_or_else(|| window.get_node_config_selected_index().max(0) as usize);
+            window.set_node_config_selected_index(selected as i32);
+            window.set_node_config_node_online(state.nodes().get(selected).is_some_and(|node| {
+                node.connection == NodeConnectionState::Online && node.machine_id.is_some()
+            }));
             let sync = state
                 .nodes()
                 .iter()
@@ -191,6 +402,7 @@ pub fn apply_event(window: &MainWindow, binding: &UiBinding, event: UiEvent) {
             window.set_config_path(path(&state.paths().config));
             apply_settings(window, state.config());
             window.set_last_error(SharedString::default());
+            apply_node_config_state(window, binding, state.node_config());
         }
         UiEvent::PathsChanged {
             parent_path,
@@ -326,10 +538,109 @@ pub fn apply_event(window: &MainWindow, binding: &UiBinding, event: UiEvent) {
             window.set_member_next_cursor(SharedString::default());
             window.set_last_error(summary.into());
         }
+        UiEvent::NodeConfigChanged(state) => apply_node_config_state(window, binding, &state),
         UiEvent::Error(error) => window.set_last_error(error.into()),
         UiEvent::ShutdownComplete => {
             let _ = window.hide();
         }
+    }
+}
+
+fn apply_node_config_state(
+    window: &MainWindow,
+    binding: &UiBinding,
+    state: &dedup_desktop_core::view_state::NodeConfigControllerState,
+) {
+    if let Some(index) = state.selected_node_index() {
+        window.set_node_config_selected_index(index as i32);
+        window.set_node_config_node_online(selected_node_online(window, index as i32));
+    }
+    window.set_node_config_saving(state.is_in_progress());
+    window.set_node_config_phase(node_config_phase(state.phase()).into());
+    window.set_node_config_error(state.error().unwrap_or_default().into());
+    if let Some(error) = state.error() {
+        window.set_last_error(error.into());
+    }
+
+    let Some(snapshot) = state.snapshot() else {
+        clear_node_config_form(window);
+        window.set_node_config_phase(
+            if state.phase() == dedup_desktop_core::view_state::NodeConfigSavePhase::Idle {
+                "未加载"
+            } else {
+                node_config_phase(state.phase())
+            }
+            .into(),
+        );
+        window.set_node_config_error(state.error().unwrap_or_default().into());
+        *binding.node_config.lock().expect("Node 配置锁未中毒") = None;
+        return;
+    };
+    let Some(wire) = snapshot.config.as_ref() else {
+        clear_node_config_form(window);
+        window.set_node_config_error("Node 配置响应缺少 config".into());
+        window.set_last_error("Node 配置响应缺少 config".into());
+        *binding.node_config.lock().expect("Node 配置锁未中毒") = None;
+        return;
+    };
+    let config = match NodeConfig::try_from(wire.clone()) {
+        Ok(config) => config,
+        Err(error) => {
+            clear_node_config_form(window);
+            window.set_node_config_error(format!("Node 配置无效：{error}").into());
+            window.set_last_error(format!("Node 配置无效：{error}").into());
+            *binding.node_config.lock().expect("Node 配置锁未中毒") = None;
+            return;
+        }
+    };
+    apply_node_config(window, &config);
+    window.set_node_config_loaded(true);
+    window.set_node_config_dirty(false);
+    window.set_node_config_saving(state.is_in_progress());
+    window.set_node_config_machine_id(snapshot.machine_id.clone().into());
+    window.set_node_config_version(snapshot.version_sha256.clone().into());
+    window.set_node_config_logical_cpus(snapshot.logical_cpu_count as i32);
+    window.set_node_config_effective_workers(snapshot.effective_worker_count as i32);
+    window.set_node_config_phase(node_config_phase(state.phase()).into());
+    window.set_node_config_error(state.error().unwrap_or_default().into());
+    *binding.node_config.lock().expect("Node 配置锁未中毒") = Some(config);
+}
+
+fn apply_node_config(window: &MainWindow, config: &NodeConfig) {
+    window.set_node_config_listen_ip(config.listen_ip.to_string().into());
+    window.set_node_config_port(i32::from(config.port));
+    window.set_node_config_enumerator_index(i32::from(
+        config.enumerator == EnumeratorKind::Everything,
+    ));
+    window.set_node_config_data_path(config.paths.data_path.clone().into());
+    window.set_node_config_config_path(config.paths.config_path.clone().into());
+    window.set_node_config_log_path(config.paths.log_path.clone().into());
+    window.set_node_config_cache_path(config.paths.cache_path.clone().into());
+    window.set_node_config_hdd_threads(config.read.hdd_threads_per_disk as i32);
+    window.set_node_config_ssd_threads(config.read.ssd_threads_per_disk as i32);
+    window.set_node_config_unknown_threads(config.read.unknown_threads_per_disk as i32);
+    window.set_node_config_total_threads(config.read.total_threads as i32);
+    window.set_node_config_block_size(config.read.block_size_bytes as i32);
+    window.set_node_config_timeout_seconds(config.read.block_timeout_seconds as i32);
+    window.set_node_config_retries(config.read.block_retries as i32);
+    window.set_node_config_legacy_workers(config.worker_count as i32);
+    window.set_node_config_worker_mode_index(i32::from(config.worker.mode == WorkerMode::Manual));
+    window.set_node_config_reserved_cores(config.worker.reserved_cores as i32);
+    window.set_node_config_manual_workers(config.worker.manual_worker_count as i32);
+}
+
+fn node_config_phase(phase: dedup_desktop_core::view_state::NodeConfigSavePhase) -> &'static str {
+    match phase {
+        dedup_desktop_core::view_state::NodeConfigSavePhase::Idle => "已加载",
+        dedup_desktop_core::view_state::NodeConfigSavePhase::Validating => "正在校验",
+        dedup_desktop_core::view_state::NodeConfigSavePhase::Saving => "正在保存",
+        dedup_desktop_core::view_state::NodeConfigSavePhase::Restarting => "Node 正在重启",
+        dedup_desktop_core::view_state::NodeConfigSavePhase::WaitingForReconnect => {
+            "等待同一机器重连"
+        }
+        dedup_desktop_core::view_state::NodeConfigSavePhase::Verifying => "正在验证新配置",
+        dedup_desktop_core::view_state::NodeConfigSavePhase::Completed => "保存并重启完成",
+        dedup_desktop_core::view_state::NodeConfigSavePhase::Failed => "保存失败",
     }
 }
 

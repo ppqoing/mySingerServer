@@ -60,6 +60,50 @@ component DisabledFeatureRow inherits Rectangle {
     }
 }
 
+component NodeTextField inherits Rectangle {
+    in property <string> label;
+    in-out property <string> value;
+    in property <bool> field-enabled;
+    callback edited();
+    height: Theme.form-row-height;
+    vertical-stretch: 0;
+    VerticalLayout {
+        spacing: 4px;
+        FormLabel { height: 18px; accessible-name: root.label + " 标签"; text: root.label; }
+        LineEdit {
+            height: Theme.control-height;
+            text <=> root.value;
+            enabled: root.field-enabled;
+            accessible-label: root.label;
+            edited(_) => { root.edited(); }
+        }
+    }
+}
+
+component NodeNumberField inherits Rectangle {
+    in property <string> label;
+    in-out property <int> value;
+    in property <int> minimum: 0;
+    in property <int> maximum: 2147483647;
+    in property <bool> field-enabled;
+    callback edited();
+    height: Theme.form-row-height;
+    vertical-stretch: 0;
+    VerticalLayout {
+        spacing: 4px;
+        FormLabel { height: 18px; accessible-name: root.label + " 标签"; text: root.label; }
+        SpinBox {
+            height: Theme.control-height;
+            value <=> root.value;
+            minimum: root.minimum;
+            maximum: root.maximum;
+            enabled: root.field-enabled;
+            accessible-label: root.label;
+            edited(_) => { root.edited(); }
+        }
+    }
+}
+
 export component SettingsWorkspace inherits Rectangle {
     in-out property <int> active-section: 0;
     in-out property <bool> about-open: false;
@@ -82,7 +126,42 @@ export component SettingsWorkspace inherits Rectangle {
     in-out property <string> video-valid;
     in-out property <string> video-stage1;
     in-out property <string> video-stage2;
+    in property <[string]> node-options;
+    in-out property <int> selected-node: 0;
+    in property <bool> node-online;
+    in property <bool> node-loaded;
+    in property <bool> node-dirty;
+    in property <bool> node-saving;
+    in property <string> node-machine-id;
+    in property <string> node-version;
+    in property <string> node-phase;
+    in property <string> node-error;
+    in-out property <string> node-listen-ip;
+    in-out property <int> node-port;
+    in-out property <int> node-enumerator-index;
+    in-out property <string> node-data-path;
+    in-out property <string> node-config-path;
+    in-out property <string> node-log-path;
+    in-out property <string> node-cache-path;
+    in-out property <int> node-hdd-threads;
+    in-out property <int> node-ssd-threads;
+    in-out property <int> node-unknown-threads;
+    in-out property <int> node-total-threads;
+    in-out property <int> node-block-size;
+    in-out property <int> node-timeout-seconds;
+    in-out property <int> node-retries;
+    in-out property <int> node-legacy-workers;
+    in-out property <int> node-worker-mode-index;
+    in-out property <int> node-reserved-cores;
+    in-out property <int> node-manual-workers;
+    in property <int> node-logical-cpus;
+    in property <int> node-effective-workers;
+    callback select-node(int);
+    callback load-node();
+    callback save-node();
+    callback node-edited();
     callback save-settings();
+    property <bool> node-form-enabled: root.node-online && root.node-loaded && !root.node-saving;
     background: transparent;
 
     VerticalLayout {
@@ -235,10 +314,147 @@ export component SettingsWorkspace inherits Rectangle {
                 }
 
                 if !root.about-open && root.active-section == 3 : ScrollView {
-                    horizontal-stretch: 1; vertical-stretch: 1;
-                    VerticalLayout { min-width: 600px; padding: 20px; spacing: 12px;
+                    horizontal-stretch: 1;
+                    vertical-stretch: 1;
+                    accessible-role: AccessibleRole.groupbox;
+                    accessible-label: "节点服务内容滚动区";
+                    VerticalLayout {
+                        min-width: 600px;
+                        padding: 20px;
+                        spacing: 12px;
                         Text { text: "节点服务"; height: 26px; vertical-stretch: 0; color: Theme.text; font-size: 18px; font-weight: 700; }
-                        DisabledFeatureRow { action-label: "节点服务配置（当前版本未提供）"; reason: "监听、Worker 数量与连接策略尚无可配置字段。"; }
+                        Text { text: "配置由所选 Node 本地持久化；Desktop 只下发命令并验证同一机器重连。"; height: 18px; vertical-stretch: 0; color: Theme.muted; font-size: 12px; }
+                        ComboBox {
+                            height: Theme.control-height;
+                            vertical-stretch: 0;
+                            model: root.node-options;
+                            current-index <=> root.selected-node;
+                            accessible-label: "远程节点选择";
+                            selected(_) => { root.select-node(self.current-index); }
+                        }
+                        Rectangle {
+                            height: Theme.control-height;
+                            vertical-stretch: 0;
+                            HorizontalLayout {
+                                spacing: 8px;
+                                ActionButton {
+                                    label: "加载配置";
+                                    icon: @image-url("../assets/icons/refresh.png");
+                                    action-enabled: root.node-online && !root.node-saving;
+                                    clicked => { root.load-node(); }
+                                }
+                                ActionButton {
+                                    label: "保存并重启";
+                                    icon: @image-url("../assets/icons/save.png");
+                                    tone: 1;
+                                    action-enabled: root.node-form-enabled && root.node-dirty;
+                                    clicked => { root.save-node(); }
+                                }
+                                Text {
+                                    horizontal-stretch: 1;
+                                    text: root.node-phase;
+                                    color: root.node-error == "" ? Theme.muted : Theme.danger;
+                                    font-size: 12px;
+                                    overflow: elide;
+                                    vertical-alignment: center;
+                                    accessible-label: "Node 配置阶段：" + root.node-phase;
+                                }
+                            }
+                        }
+                        Text {
+                            text: "机器 ID：" + (root.node-machine-id == "" ? "—" : root.node-machine-id)
+                                + " · 版本：" + (root.node-version == "" ? "—" : root.node-version);
+                            height: 18px;
+                            vertical-stretch: 0;
+                            color: Theme.muted;
+                            font-size: 11px;
+                            overflow: elide;
+                            accessible-label: "Node 配置身份：" + root.node-machine-id + " · " + root.node-version;
+                        }
+                        Rectangle {
+                            height: 40px;
+                            vertical-stretch: 0;
+                            border-radius: 6px;
+                            background: Theme.warning.with-alpha(0.10);
+                            accessible-role: AccessibleRole.groupbox;
+                            accessible-label: "路径语义：相对路径按 node.exe 所在目录解析；旧数据不迁移；不支持网络盘";
+                            HorizontalLayout {
+                                padding-left: 12px;
+                                padding-right: 12px;
+                                Text {
+                                    text: "路径语义：相对路径按 node.exe 所在目录解析；旧数据不迁移；不支持网络盘。";
+                                    color: Theme.warning;
+                                    font-size: 12px;
+                                    overflow: elide;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                        Text { text: "监听与枚举"; height: 22px; vertical-stretch: 0; color: Theme.text; font-size: 14px; font-weight: 650; }
+                        GridLayout {
+                            vertical-stretch: 0;
+                            spacing: 12px;
+                            Row {
+                                NodeTextField { label: "监听 IP"; value <=> root.node-listen-ip; field-enabled: root.node-form-enabled; edited => { root.node-edited(); } }
+                                NodeNumberField { label: "监听端口"; value <=> root.node-port; minimum: 1; maximum: 65535; field-enabled: root.node-form-enabled; edited => { root.node-edited(); } }
+                            }
+                            Row {
+                                VerticalLayout {
+                                    height: Theme.form-row-height; vertical-stretch: 0; spacing: 4px;
+                                    FormLabel { height: 18px; accessible-name: "文件枚举器 标签"; text: "文件枚举器"; }
+                                    ComboBox { height: Theme.control-height; model: ["Windows Walker", "Everything"]; current-index <=> root.node-enumerator-index; enabled: root.node-form-enabled; accessible-label: "文件枚举器"; selected(_) => { root.node-edited(); } }
+                                }
+                                Rectangle { background: transparent; }
+                            }
+                        }
+                        Text { text: "Node 本地路径"; height: 22px; vertical-stretch: 0; color: Theme.text; font-size: 14px; font-weight: 650; }
+                        NodeTextField { label: "Node 数据路径"; value <=> root.node-data-path; field-enabled: root.node-form-enabled; edited => { root.node-edited(); } }
+                        NodeTextField { label: "Node 配置路径"; value <=> root.node-config-path; field-enabled: root.node-form-enabled; edited => { root.node-edited(); } }
+                        NodeTextField { label: "Node 日志路径"; value <=> root.node-log-path; field-enabled: root.node-form-enabled; edited => { root.node-edited(); } }
+                        NodeTextField { label: "Node 缓存路径"; value <=> root.node-cache-path; field-enabled: root.node-form-enabled; edited => { root.node-edited(); } }
+                        Text { text: "磁盘读取"; height: 22px; vertical-stretch: 0; color: Theme.text; font-size: 14px; font-weight: 650; }
+                        GridLayout {
+                            vertical-stretch: 0;
+                            spacing: 12px;
+                            Row {
+                                NodeNumberField { label: "机械硬盘每盘读取线程"; value <=> root.node-hdd-threads; minimum: 1; maximum: 64; field-enabled: root.node-form-enabled; edited => { root.node-edited(); } }
+                                NodeNumberField { label: "固态硬盘每盘读取线程"; value <=> root.node-ssd-threads; minimum: 1; maximum: 64; field-enabled: root.node-form-enabled; edited => { root.node-edited(); } }
+                            }
+                            Row {
+                                NodeNumberField { label: "未知磁盘每盘读取线程"; value <=> root.node-unknown-threads; minimum: 1; maximum: 64; field-enabled: root.node-form-enabled; edited => { root.node-edited(); } }
+                                NodeNumberField { label: "总读取线程"; value <=> root.node-total-threads; minimum: 1; maximum: 256; field-enabled: root.node-form-enabled; edited => { root.node-edited(); } }
+                            }
+                            Row {
+                                NodeNumberField { label: "读取块大小（字节）"; value <=> root.node-block-size; minimum: 65536; maximum: 67108864; field-enabled: root.node-form-enabled; edited => { root.node-edited(); } }
+                                NodeNumberField { label: "单块读取超时（秒）"; value <=> root.node-timeout-seconds; minimum: 1; maximum: 60; field-enabled: root.node-form-enabled; edited => { root.node-edited(); } }
+                            }
+                            Row {
+                                NodeNumberField { label: "读取重试次数"; value <=> root.node-retries; minimum: 0; maximum: 10; field-enabled: root.node-form-enabled; edited => { root.node-edited(); } }
+                                Rectangle { background: transparent; }
+                            }
+                        }
+                        Text { text: "Worker 调度"; height: 22px; vertical-stretch: 0; color: Theme.text; font-size: 14px; font-weight: 650; }
+                        GridLayout {
+                            vertical-stretch: 0;
+                            spacing: 12px;
+                            Row {
+                                VerticalLayout {
+                                    height: Theme.form-row-height; vertical-stretch: 0; spacing: 4px;
+                                    FormLabel { height: 18px; accessible-name: "Worker 模式 标签"; text: "Worker 模式"; }
+                                    ComboBox { height: Theme.control-height; model: ["自动", "手动"]; current-index <=> root.node-worker-mode-index; enabled: root.node-form-enabled; accessible-label: "Worker 模式"; selected(_) => { root.node-edited(); } }
+                                }
+                                NodeNumberField { label: "兼容 Worker 数量"; value <=> root.node-legacy-workers; minimum: 1; maximum: 256; field-enabled: root.node-form-enabled; edited => { root.node-edited(); } }
+                            }
+                            Row {
+                                NodeNumberField { label: "自动模式保留核心"; value <=> root.node-reserved-cores; minimum: 0; maximum: 255; field-enabled: root.node-form-enabled && root.node-worker-mode-index == 0; edited => { root.node-edited(); } }
+                                NodeNumberField { label: "手动 Worker 数量"; value <=> root.node-manual-workers; minimum: 1; maximum: 256; field-enabled: root.node-form-enabled && root.node-worker-mode-index == 1; edited => { root.node-edited(); } }
+                            }
+                        }
+                        Text {
+                            text: "逻辑 CPU " + root.node-logical-cpus + " · 当前有效 Worker " + root.node-effective-workers;
+                            height: 18px; vertical-stretch: 0; color: Theme.muted; font-size: 11px;
+                            accessible-label: "Worker 计算摘要：逻辑 CPU " + root.node-logical-cpus + "，有效 Worker " + root.node-effective-workers;
+                        }
                     }
                 }
                 if !root.about-open && root.active-section == 4 : ScrollView {
