@@ -4,7 +4,7 @@
 
 - 方案规格：`docs/superpowers/specs/2026-08-24-cpu-io-active-seat-smoothing-design.md`
 - 方案规格 SHA-256：`d0ae79a5a3cc8a9177ed12e51d83965988b8ca4c21de068cb28df078c125c67e`
-- pre-plan HEAD（仅用于计划出处，不作为执行基线）：`0e796fca`
+- pre-plan HEAD（仅用于计划出处，不作为执行基线）：`0e796fcabbd5899678ab12e5ffad8bb94d1214f4`
 - 执行 HEAD：`0db47462f9bd80352dc2a05fbb85ce84a0b4ed29`
 - 执行基线 dirty / untracked：165 项，完整状态保存在 `C:\tmp\rust-v2-cpu-io-ab\benchmark\A0\baseline-status.txt`。
 - `Cargo.lock` SHA-256：`57203a0c18d69b3e24c15df9de54e2b7eac06992025d5722072185201a59ea3b`
@@ -16,9 +16,9 @@
 
 证据根：`C:\tmp\rust-v2-cpu-io-ab\benchmark\A0`
 
-- `baseline-head.txt`：执行 HEAD。
-- `baseline-status.txt`：165 项 dirty / untracked 状态。
-- `baseline.patch`：基线工作树二进制 diff。
+- `baseline-head.txt`：`C:\tmp\rust-v2-cpu-io-ab\benchmark\A0\baseline-head.txt`，内容绑定为执行 HEAD `0db47462f9bd80352dc2a05fbb85ce84a0b4ed29`。
+- `baseline-status.txt`：`C:\tmp\rust-v2-cpu-io-ab\benchmark\A0\baseline-status.txt`，165 项 dirty / untracked 状态，SHA-256 `597f81d19aa7ac55dbe46b33349e4859706c6fe1ae51f8ddba30b50db6addd2a`。
+- `baseline.patch`：`C:\tmp\rust-v2-cpu-io-ab\benchmark\A0\baseline.patch`，基线工作树二进制 diff，SHA-256 `973c8cd0e6623f907fc699b8560b9dcf80cd0b285bdbb5c0e2f662241f57eed3`。
 - `baseline-files.sha256`：Git 可见 tracked + untracked、非 ignored 文件的有序内容清单。
 - `source_tree_fingerprint`：`81a858f21946d63433d5382517ffa4c9e52a808704b3b3ae7804249019f3122b`。
 
@@ -30,7 +30,7 @@
 - `crates/desktop-core/src/central/delete.rs`
 - `crates/desktop-core/src/central/schema.rs`
 
-环境记录在 `a0-environment.json`：Rust `1.97.1`、Cargo `1.97.1`、PowerShell `7.6.4`、Windows 10 专业版 `10.0.19045 build 19045`。
+环境记录在 `C:\tmp\rust-v2-cpu-io-ab\benchmark\A0\a0-environment.json`（SHA-256 `ee79a0e4effe6d4435bf676d8234efd01d3175c2b7299be422bca6100bc8079a`）：Rust `1.97.1`、Cargo `1.97.1`、PowerShell `7.6.4`、Windows 10 专业版 `10.0.19045 build 19045`。JSON 中独立包含 `baseline_head_path`/`head`、`baseline_status_path`/`status_sha256`、`baseline_patch_path`/`patch_sha256`；原始 status 与 patch 未被覆盖或重造。
 
 ## A0 定向正确性
 
