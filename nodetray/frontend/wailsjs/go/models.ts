@@ -1008,6 +1008,26 @@ export namespace traymodel {
 	        this.limit = source["limit"];
 	    }
 	}
+	export class PathSelectionResult {
+	    ok: boolean;
+	    path: string;
+	    cancelled: boolean;
+	    errorCode: string;
+	    errorSummary: string;
+
+	    static createFrom(source: any = {}) {
+	        return new PathSelectionResult(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.ok = source["ok"];
+	        this.path = source["path"];
+	        this.cancelled = source["cancelled"];
+	        this.errorCode = source["errorCode"];
+	        this.errorSummary = source["errorSummary"];
+	    }
+	}
 	export class TraySettings {
 	    loginStartTray: boolean;
 	    agentStartMode: string;

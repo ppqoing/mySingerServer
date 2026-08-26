@@ -117,31 +117,28 @@
   border-radius: var(--radius-control);
 }
 
-.remote-path-browser__backdrop {
-  position: fixed;
-  z-index: 10;
-  inset: 0;
-  display: grid;
-  place-items: center;
-  padding: var(--space-4);
-  background: color-mix(in srgb, black 45%, transparent);
-}
-
+/* 外层面板由 Modal 提供（含 Esc 关闭/焦点圈定），这里只保留内容栅格。 */
 .remote-path-browser {
   display: grid;
-  width: min(42rem, 100%);
-  max-height: min(42rem, 100%);
+  min-width: 0;
   gap: var(--space-3);
-  padding: var(--space-4);
-  overflow: auto;
-  color: var(--color-ink);
-  background: var(--color-surface);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-panel);
-  box-shadow: var(--shadow-panel);
 }
 
-.remote-path-browser__header,
+/* Modal 经 portal 渲染，脱离 .operational-page 作用域，按钮样式需在此补齐。 */
+.remote-path-browser button {
+  min-height: 2.25rem;
+  padding: var(--space-2) var(--space-3);
+  color: white;
+  background: var(--color-primary);
+  border: 1px solid var(--color-primary-strong);
+  border-radius: var(--radius-control);
+}
+
+.remote-path-browser button:disabled {
+  cursor: wait;
+  opacity: 0.62;
+}
+
 .remote-path-browser__actions,
 .remote-path-browser__breadcrumbs,
 .remote-path-browser__toggle {
@@ -151,11 +148,6 @@
   gap: var(--space-2);
 }
 
-.remote-path-browser__header {
-  justify-content: space-between;
-}
-
-.remote-path-browser__header h2,
 .remote-path-browser__selection {
   margin: 0;
 }
@@ -238,6 +230,54 @@
 
 .operational-table-scroll:focus-visible {
   box-shadow: var(--focus-ring);
+}
+
+.scan-tasks-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0 0 var(--space-3);
+}
+
+.scan-tasks-toolbar select {
+  padding: var(--space-2) var(--space-3);
+  color: var(--color-ink);
+  background: var(--color-surface-raised);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-control);
+}
+
+.scan-tasks-history > summary {
+  cursor: pointer;
+  margin: var(--space-2) 0;
+  color: var(--color-muted);
+}
+
+.scan-task-row--stalled td {
+  background: var(--color-warning-soft);
+}
+
+.scan-task-errors {
+  color: var(--color-danger);
+  font-weight: 700;
+}
+
+.scan-task-next {
+  display: block;
+  margin-top: var(--space-1);
+  font-size: var(--font-size-xs);
+  white-space: normal;
+}
+
+.scan-task-recent summary {
+  cursor: pointer;
+}
+
+.scan-task-recent ul {
+  margin: var(--space-2) 0 0;
+  padding-left: var(--space-4);
+  white-space: normal;
 }
 
 @media (max-width: 42rem) {

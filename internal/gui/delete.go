@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -14,6 +15,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"dedup/internal/proto"
 )
@@ -53,7 +56,7 @@ type ConfirmStore struct {
 	ttl            time.Duration
 	now            func() time.Time
 	records        map[string]confirmationRecord
-	used           map[string]struct{}
+	used           map[string]string
 	expired        map[string]struct{}
 	tombstoneOrder []string
 }
@@ -63,7 +66,7 @@ func NewConfirmStore(ttl time.Duration, now func() time.Time) *ConfirmStore {
 		ttl:     ttl,
 		now:     now,
 		records: make(map[string]confirmationRecord),
-		used:    make(map[string]struct{}),
+		used:    make(map[string]string),
 		expired: make(map[string]struct{}),
 	}
 }
@@ -104,6 +107,16 @@ func (s *ConfirmStore) Create(members []DeleteMember) (string, DeleteSummary, er
 }
 
 func (s *ConfirmStore) Consume(token string) ([]DeleteMember, error) {
+	return s.ConsumeWithTask(token, "")
+}
+
+// ConsumeWithTask consumes the token like Consume and, on success, records
+// taskID in the tombstone so a repeated execute of the same token can be
+// answered with the first accepted task instead of a conflict.
+func (s *ConfirmStore) ConsumeWithTask(
+	token string,
+	taskID string,
+) ([]DeleteMember, error) {
 	if s == nil || s.ttl <= 0 || s.now == nil {
 		return nil, ErrDeleteUnavailable
 	}
@@ -131,9 +144,21 @@ func (s *ConfirmStore) Consume(token string) ([]DeleteMember, error) {
 		s.retainTombstoneLocked(token)
 		return nil, ErrConfirmationExpired
 	}
-	s.used[token] = struct{}{}
+	s.used[token] = taskID
 	s.retainTombstoneLocked(token)
 	return append([]DeleteMember(nil), record.members...), nil
+}
+
+// ConsumedTaskID reports the task ID recorded when the token was consumed by
+// an execute. Tokens consumed without a task (or never consumed) report "".
+func (s *ConfirmStore) ConsumedTaskID(token string) (string, bool) {
+	if s == nil {
+		return "", false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	taskID, ok := s.used[token]
+	return taskID, ok
 }
 
 func (s *ConfirmStore) pruneExpiredLocked(now time.Time) {
@@ -267,6 +292,9 @@ type DeleteMachineStatus struct {
 	Complete          bool                            `json:"complete"`
 	StateSyncFailures int64                           `json:"state_sync_failures"`
 	Sequences         map[uint32]DeleteSequenceStatus `json:"sequences"`
+	// RecycledTo maps each soft-deleted path to the recycle destination
+	// reported by the agent. Absent for hard mode or when nothing recycled.
+	RecycledTo map[string]string `json:"recycled_to,omitempty"`
 }
 
 type DeleteTaskStatus struct {
@@ -286,6 +314,10 @@ type DeleteTaskStatus struct {
 
 const deleteReportDeadline = 12 * time.Minute
 
+// deleteTerminalRetention is how long a finished task stays queryable before
+// its state is reclaimed, bounding the otherwise unbounded tasks map growth.
+const deleteTerminalRetention = 30 * time.Minute
+
 type deleteStoredResult struct {
 	sequence uint32
 	result   proto.DeleteResult
@@ -304,10 +336,25 @@ type deleteMachineState struct {
 type deleteTaskState struct {
 	taskID           string
 	mode             string
+	createdAt        time.Time
 	deadline         time.Time
 	machines         map[string]*deleteMachineState
 	terminal         bool
 	deadlineTerminal bool
+	terminalAt       time.Time
+	// snapshot is set for tasks restored from delete_tasks after a restart.
+	// Snapshot-backed tasks serve the persisted status verbatim (the member
+	// detail needed to validate late reports is not persisted), so reports
+	// for them are dropped; once the report deadline passes again the
+	// snapshot flips to a deadline-exceeded terminal state.
+	snapshot *DeleteTaskStatus
+}
+
+// deleteTaskStore is the persistence backend for delete task snapshots;
+// *pgxpool.Pool and pgx.Tx both satisfy it.
+type deleteTaskStore interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+	Query(context.Context, string, ...any) (pgx.Rows, error)
 }
 
 type DeleteService struct {
@@ -315,6 +362,7 @@ type DeleteService struct {
 	transport DeleteTransport
 	confirms  *ConfirmStore
 	logger    *slog.Logger
+	store     deleteTaskStore
 
 	mu    sync.Mutex
 	tasks map[string]*deleteTaskState
@@ -337,6 +385,249 @@ func NewDeleteService(
 		logger:    logger,
 		tasks:     make(map[string]*deleteTaskState),
 		now:       time.Now,
+	}
+}
+
+// SetTaskStore attaches the delete_tasks persistence backend. Without a
+// store the service degrades to in-memory only.
+func (s *DeleteService) SetTaskStore(store deleteTaskStore) {
+	if s == nil {
+		return
+	}
+	s.store = store
+}
+
+// Restore reloads non-terminal delete tasks persisted before a restart, like
+// TaskRegistry.Restore does for scan tasks. The in-memory map stays the
+// runtime authority; restored rows never overwrite in-memory state.
+func (s *DeleteService) Restore(ctx context.Context) error {
+	if s == nil || s.store == nil {
+		return nil
+	}
+	rows, err := s.store.Query(ctx, `
+		SELECT id, mode, status_json, created_at
+		FROM delete_tasks
+		WHERE COALESCE(status_json->>'complete','false') <> 'true'
+		ORDER BY created_at, id;`)
+	if err != nil {
+		return fmt.Errorf("restore delete tasks: query: %w", err)
+	}
+	defer rows.Close()
+
+	restored := make([]*deleteTaskState, 0)
+	for rows.Next() {
+		var (
+			taskID     string
+			mode       string
+			statusJSON []byte
+			createdAt  time.Time
+		)
+		if err := rows.Scan(&taskID, &mode, &statusJSON, &createdAt); err != nil {
+			return fmt.Errorf("restore delete tasks: scan: %w", err)
+		}
+		if taskID == "" || (mode != proto.ModeSoft && mode != proto.ModeHard) {
+			return fmt.Errorf("restore delete task %s: invalid envelope", taskID)
+		}
+		var status DeleteTaskStatus
+		if err := json.Unmarshal(statusJSON, &status); err != nil {
+			return fmt.Errorf("restore delete task %s status: %w", taskID, err)
+		}
+		status.TaskID = taskID
+		status.Mode = mode
+		snapshot := status
+		restored = append(restored, &deleteTaskState{
+			taskID:    taskID,
+			mode:      mode,
+			createdAt: createdAt,
+			deadline:  s.now().Add(deleteReportDeadline),
+			machines:  make(map[string]*deleteMachineState),
+			snapshot:  &snapshot,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("restore delete tasks: rows: %w", err)
+	}
+	s.mu.Lock()
+	for _, task := range restored {
+		if _, exists := s.tasks[task.taskID]; !exists {
+			s.tasks[task.taskID] = task
+		}
+	}
+	s.mu.Unlock()
+	return nil
+}
+
+// deleteTaskListLimit bounds GET /api/delete/tasks responses.
+const deleteTaskListLimit = 100
+
+// DeleteTaskSummary is the sanitized list view of a delete task: counts only,
+// no problem detail (same disclosure level as safeDeleteStatus).
+type DeleteTaskSummary struct {
+	TaskID    string    `json:"task_id"`
+	Mode      string    `json:"mode"`
+	Total     int64     `json:"total"`
+	OK        int64     `json:"ok"`
+	Failed    int64     `json:"failed"`
+	Uncertain int64     `json:"uncertain"`
+	Pending   int64     `json:"pending"`
+	Complete  bool      `json:"complete"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// ListTasks returns up to limit task summaries, in-progress first, newest
+// created first. It reads from delete_tasks when a store is attached and
+// falls back to the in-memory map when the store is missing or fails.
+func (s *DeleteService) ListTasks(ctx context.Context, limit int) []DeleteTaskSummary {
+	if s == nil {
+		return []DeleteTaskSummary{}
+	}
+	if limit <= 0 {
+		limit = deleteTaskListLimit
+	}
+	if s.store != nil {
+		summaries, err := s.listTasksFromStore(ctx, limit)
+		if err == nil {
+			return summaries
+		}
+		s.logger.Warn("list delete tasks from store, falling back to memory", "err", err)
+	}
+	return s.listTasksFromMemory(limit)
+}
+
+func (s *DeleteService) listTasksFromStore(
+	ctx context.Context,
+	limit int,
+) ([]DeleteTaskSummary, error) {
+	rows, err := s.store.Query(ctx, `
+		SELECT id, mode, status_json, created_at
+		FROM delete_tasks
+		ORDER BY COALESCE(status_json->>'complete','false')::boolean,
+			created_at DESC, id
+		LIMIT $1;`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list delete tasks: query: %w", err)
+	}
+	defer rows.Close()
+
+	summaries := make([]DeleteTaskSummary, 0)
+	for rows.Next() {
+		var (
+			summary    DeleteTaskSummary
+			statusJSON []byte
+		)
+		if err := rows.Scan(
+			&summary.TaskID,
+			&summary.Mode,
+			&statusJSON,
+			&summary.CreatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("list delete tasks: scan: %w", err)
+		}
+		var status DeleteTaskStatus
+		if err := json.Unmarshal(statusJSON, &status); err != nil {
+			return nil, fmt.Errorf("list delete tasks: task %s status: %w", summary.TaskID, err)
+		}
+		summary.Total = status.Total
+		summary.OK = status.OK
+		summary.Failed = status.Failed
+		summary.Uncertain = status.Uncertain
+		summary.Pending = status.Pending
+		summary.Complete = status.Complete
+		summaries = append(summaries, summary)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list delete tasks: rows: %w", err)
+	}
+	return summaries, nil
+}
+
+func (s *DeleteService) listTasksFromMemory(limit int) []DeleteTaskSummary {
+	s.mu.Lock()
+	statuses := make([]DeleteTaskStatus, 0, len(s.tasks))
+	createdAt := make(map[string]time.Time, len(s.tasks))
+	for taskID, task := range s.tasks {
+		statuses = append(statuses, buildDeleteTaskStatus(task))
+		createdAt[taskID] = task.createdAt
+	}
+	s.mu.Unlock()
+	summaries := make([]DeleteTaskSummary, 0, len(statuses))
+	for _, status := range statuses {
+		summaries = append(summaries, DeleteTaskSummary{
+			TaskID:    status.TaskID,
+			Mode:      status.Mode,
+			Total:     status.Total,
+			OK:        status.OK,
+			Failed:    status.Failed,
+			Uncertain: status.Uncertain,
+			Pending:   status.Pending,
+			Complete:  status.Complete,
+			CreatedAt: createdAt[status.TaskID],
+		})
+	}
+	sort.Slice(summaries, func(left, right int) bool {
+		if summaries[left].Complete != summaries[right].Complete {
+			return !summaries[left].Complete
+		}
+		if !summaries[left].CreatedAt.Equal(summaries[right].CreatedAt) {
+			return summaries[left].CreatedAt.After(summaries[right].CreatedAt)
+		}
+		return summaries[left].TaskID < summaries[right].TaskID
+	})
+	if len(summaries) > limit {
+		summaries = summaries[:limit]
+	}
+	return summaries
+}
+
+// persistTask upserts the current status snapshot of one task into
+// delete_tasks. Persistence is best-effort: failures degrade to in-memory
+// only with a warning, mirroring TaskRegistry.upsertScanTask.
+func (s *DeleteService) persistTask(taskID string) {
+	if s == nil || s.store == nil {
+		return
+	}
+	s.mu.Lock()
+	task, ok := s.tasks[taskID]
+	if !ok {
+		s.mu.Unlock()
+		return
+	}
+	payload, err := json.Marshal(buildDeleteTaskStatus(task))
+	mode := task.mode
+	createdAt := task.createdAt
+	s.mu.Unlock()
+	if err != nil {
+		s.logger.Warn("marshal delete task snapshot", "task", taskID, "err", err)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err = s.store.Exec(ctx, `
+		INSERT INTO delete_tasks (id, mode, status_json, created_at)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (id) DO UPDATE SET
+			status_json = CASE
+				WHEN COALESCE(delete_tasks.status_json->>'complete','false') = 'true'
+					AND COALESCE(EXCLUDED.status_json->>'complete','false') <> 'true'
+				THEN delete_tasks.status_json
+				ELSE EXCLUDED.status_json
+			END,
+			updated_at = now();`,
+		taskID,
+		mode,
+		payload,
+		createdAt,
+	)
+	if err != nil {
+		s.logger.Warn("upsert delete task", "task", taskID, "err", err)
+	}
+}
+
+func (s *DeleteService) persistTasks(tasks []*deleteTaskState) {
+	for _, task := range tasks {
+		if task != nil {
+			s.persistTask(task.taskID)
+		}
 	}
 }
 
@@ -491,7 +782,7 @@ func (s *DeleteService) Execute(
 		return "", fmt.Errorf("%w: task identity", ErrDeleteUnavailable)
 	}
 	taskID := taskUUID.String()
-	members, err := s.confirms.Consume(token)
+	members, err := s.confirms.ConsumeWithTask(token, taskID)
 	if err != nil {
 		return "", err
 	}
@@ -499,11 +790,13 @@ func (s *DeleteService) Execute(
 	for _, member := range members {
 		grouped[member.MachineID] = append(grouped[member.MachineID], member)
 	}
+	now := s.now()
 	task := &deleteTaskState{
-		taskID:   taskID,
-		mode:     mode,
-		deadline: s.now().Add(deleteReportDeadline),
-		machines: make(map[string]*deleteMachineState, len(grouped)),
+		taskID:    taskID,
+		mode:      mode,
+		createdAt: now,
+		deadline:  now.Add(deleteReportDeadline),
+		machines:  make(map[string]*deleteMachineState, len(grouped)),
 	}
 	for machineID, machineMembers := range grouped {
 		machine := &deleteMachineState{
@@ -519,6 +812,7 @@ func (s *DeleteService) Execute(
 	}
 	s.mu.Lock()
 	s.tasks[taskID] = task
+	finalized := s.pruneTasksLocked(s.now())
 	s.mu.Unlock()
 
 	machineIDs := make([]string, 0, len(grouped))
@@ -566,6 +860,8 @@ func (s *DeleteService) Execute(
 			s.mu.Unlock()
 		}
 	}
+	s.persistTask(taskID)
+	s.persistTasks(finalized)
 	return taskID, nil
 }
 
@@ -575,19 +871,36 @@ func (s *DeleteService) HandleReport(machineID string, report *proto.DeleteRepor
 	}
 	copied := cloneDeleteReport(*report)
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	taskID, persist := s.applyReportLocked(machineID, copied)
+	s.mu.Unlock()
+	if persist {
+		s.persistTask(taskID)
+	}
+}
+
+// applyReportLocked applies one report to the in-memory state. It returns
+// the task ID and whether the state changed in a way worth persisting.
+func (s *DeleteService) applyReportLocked(
+	machineID string,
+	copied proto.DeleteReport,
+) (string, bool) {
 	task, ok := s.tasks[copied.TaskID]
 	if !ok {
-		return
+		return "", false
 	}
-	s.finalizeDeadlineLocked(task)
+	persist := s.finalizeDeadlineLocked(task)
 	machine, ok := task.machines[machineID]
 	if !ok || task.deadlineTerminal {
-		return
+		return task.taskID, persist
+	}
+	if task.snapshot != nil {
+		// Snapshot-backed (restored) tasks cannot validate late reports
+		// against the persisted member detail, so reports are dropped.
+		return task.taskID, persist
 	}
 	if existing, ok := machine.reports[copied.Seq]; ok {
 		if reflect.DeepEqual(existing, copied) {
-			return
+			return task.taskID, persist
 		}
 		s.failAllLocked(
 			machine,
@@ -597,10 +910,10 @@ func (s *DeleteService) HandleReport(machineID string, report *proto.DeleteRepor
 			true,
 		)
 		s.refreshTerminalLocked(task)
-		return
+		return task.taskID, true
 	}
 	if task.terminal || machine.terminal {
-		return
+		return task.taskID, persist
 	}
 	if err := validateDeleteReport(machine, task.taskID, copied); err != nil {
 		s.failAllLocked(
@@ -611,7 +924,7 @@ func (s *DeleteService) HandleReport(machineID string, report *proto.DeleteRepor
 			true,
 		)
 		s.refreshTerminalLocked(task)
-		return
+		return task.taskID, true
 	}
 	for _, entry := range copied.Entries {
 		if previousSequence, exists := machine.pathSequence[entry.Path]; exists &&
@@ -624,7 +937,7 @@ func (s *DeleteService) HandleReport(machineID string, report *proto.DeleteRepor
 				true,
 			)
 			s.refreshTerminalLocked(task)
-			return
+			return task.taskID, true
 		}
 	}
 	if !machine.lastSeqKnown {
@@ -652,6 +965,7 @@ func (s *DeleteService) HandleReport(machineID string, report *proto.DeleteRepor
 		}
 	}
 	s.refreshTerminalLocked(task)
+	return task.taskID, true
 }
 
 func (s *DeleteService) Status(taskID string) (DeleteTaskStatus, bool) {
@@ -659,13 +973,29 @@ func (s *DeleteService) Status(taskID string) (DeleteTaskStatus, bool) {
 		return DeleteTaskStatus{}, false
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	finalized := s.pruneTasksLocked(s.now())
 	task, ok := s.tasks[taskID]
 	if !ok {
+		s.mu.Unlock()
+		s.persistTasks(finalized)
 		return DeleteTaskStatus{}, false
 	}
-	s.finalizeDeadlineLocked(task)
-	return buildDeleteTaskStatus(task), true
+	if s.finalizeDeadlineLocked(task) {
+		finalized = append(finalized, task)
+	}
+	status := buildDeleteTaskStatus(task)
+	s.mu.Unlock()
+	s.persistTasks(finalized)
+	return status, true
+}
+
+// ConsumedTaskID reports the task first accepted for a consumed confirmation
+// token, letting the HTTP layer answer a repeated execute idempotently.
+func (s *DeleteService) ConsumedTaskID(token string) (string, bool) {
+	if s == nil || s.confirms == nil {
+		return "", false
+	}
+	return s.confirms.ConsumedTaskID(token)
 }
 
 func validateDeleteReport(
@@ -782,11 +1112,18 @@ func (s *DeleteService) failUnresolvedLocked(
 	}
 }
 
-func (s *DeleteService) finalizeDeadlineLocked(task *deleteTaskState) {
+// finalizeDeadlineLocked flips a task past its report deadline into a
+// terminal state and reports whether anything changed.
+func (s *DeleteService) finalizeDeadlineLocked(task *deleteTaskState) bool {
 	if task.terminal || s.now().Before(task.deadline) {
-		return
+		return false
 	}
 	task.deadlineTerminal = true
+	if task.snapshot != nil {
+		finalizeRestoredDeleteSnapshot(task.snapshot)
+		s.refreshTerminalLocked(task)
+		return true
+	}
 	for _, machine := range task.machines {
 		s.failUnresolvedLocked(
 			machine,
@@ -797,6 +1134,30 @@ func (s *DeleteService) finalizeDeadlineLocked(task *deleteTaskState) {
 		)
 	}
 	s.refreshTerminalLocked(task)
+	return true
+}
+
+// finalizeRestoredDeleteSnapshot flips the pending counts of a restored
+// snapshot to failed/uncertain, matching what failUnresolvedLocked does for
+// live tasks when the report deadline is exceeded.
+func finalizeRestoredDeleteSnapshot(status *DeleteTaskStatus) {
+	if status.Pending > 0 {
+		if status.ErrorCodes == nil {
+			status.ErrorCodes = make(map[string]int64)
+		}
+		status.ErrorCodes[proto.DeleteErrHelperLost] += status.Pending
+	}
+	status.Failed += status.Pending
+	status.Uncertain += status.Pending
+	status.Pending = 0
+	status.Complete = true
+	for machineID, machine := range status.ByMachine {
+		machine.Failed += machine.Pending
+		machine.Uncertain += machine.Pending
+		machine.Pending = 0
+		machine.Complete = true
+		status.ByMachine[machineID] = machine
+	}
 }
 
 func (s *DeleteService) refreshTerminalLocked(task *deleteTaskState) {
@@ -807,9 +1168,59 @@ func (s *DeleteService) refreshTerminalLocked(task *deleteTaskState) {
 			return
 		}
 	}
+	if task.terminalAt.IsZero() {
+		task.terminalAt = s.now()
+	}
+}
+
+// pruneTasksLocked reclaims terminal tasks past the retention window. It also
+// finalizes tasks whose deadline has passed so that tasks nobody polls still
+// reach a terminal state and become eligible for cleanup. It returns the
+// tasks it finalized during this call so callers can persist them.
+func (s *DeleteService) pruneTasksLocked(now time.Time) []*deleteTaskState {
+	var finalized []*deleteTaskState
+	for taskID, task := range s.tasks {
+		if s.finalizeDeadlineLocked(task) {
+			finalized = append(finalized, task)
+		}
+		if task.terminal && now.Sub(task.terminalAt) >= deleteTerminalRetention {
+			delete(s.tasks, taskID)
+		}
+	}
+	return finalized
+}
+
+func cloneDeleteTaskStatus(status DeleteTaskStatus) DeleteTaskStatus {
+	clone := status
+	clone.ByMachine = make(map[string]DeleteMachineStatus, len(status.ByMachine))
+	for machineID, machine := range status.ByMachine {
+		machine.Sequences = cloneDeleteSequences(machine.Sequences)
+		machine.RecycledTo = cloneDeleteRecycledTo(machine.RecycledTo)
+		clone.ByMachine[machineID] = machine
+	}
+	clone.ErrorCodes = make(map[string]int64, len(status.ErrorCodes))
+	for code, count := range status.ErrorCodes {
+		clone.ErrorCodes[code] = count
+	}
+	clone.Problems = append([]DeleteProblemItem(nil), status.Problems...)
+	return clone
+}
+
+func cloneDeleteRecycledTo(recycledTo map[string]string) map[string]string {
+	if recycledTo == nil {
+		return nil
+	}
+	clone := make(map[string]string, len(recycledTo))
+	for path, destination := range recycledTo {
+		clone[path] = destination
+	}
+	return clone
 }
 
 func buildDeleteTaskStatus(task *deleteTaskState) DeleteTaskStatus {
+	if task.snapshot != nil {
+		return cloneDeleteTaskStatus(*task.snapshot)
+	}
 	status := DeleteTaskStatus{
 		TaskID:     task.taskID,
 		Mode:       task.mode,
@@ -865,6 +1276,12 @@ func buildDeleteTaskStatus(task *deleteTaskState) DeleteTaskStatus {
 					machineStatus.Uncertain++
 				}
 				status.ErrorCodes[result.ErrCode]++
+			}
+			if result.OK && result.RecycledTo != "" {
+				if machineStatus.RecycledTo == nil {
+					machineStatus.RecycledTo = make(map[string]string)
+				}
+				machineStatus.RecycledTo[result.Path] = result.RecycledTo
 			}
 			if result.StateSyncErr != "" {
 				machineStatus.StateSyncFailures++

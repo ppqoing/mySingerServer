@@ -1195,6 +1195,192 @@ func TestServerKeepsPhase1RoutedOnlyToScanHandlerWhenPhase2Enabled(t *testing.T)
 	}
 }
 
+type scanCancelTestHandler struct {
+	prepare scanHandlerFunc
+	cancel  func(taskID string) (bool, *proto.TaskStats)
+}
+
+func (h scanCancelTestHandler) Prepare(
+	task proto.ScanTask,
+	sender Sender,
+) (proto.TaskAck, func()) {
+	return h.prepare(task, sender)
+}
+
+func (h scanCancelTestHandler) Cancel(taskID string) (bool, *proto.TaskStats) {
+	return h.cancel(taskID)
+}
+
+func newScanCancelTestConn(
+	t *testing.T,
+	handler ScanHandler,
+) (*proto.Conn, net.Conn, func()) {
+	t.Helper()
+	cfg := config.DefaultAgent()
+	cfg.MachineID = "machine-a"
+	cfg.Proto.HeartbeatS = 60
+	log := slog.New(slog.NewJSONHandler(&bytes.Buffer{}, nil))
+	server := NewServer(cfg, handler, log)
+	serverSide, clientSide := net.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	go server.handleConn(ctx, serverSide)
+	client := proto.NewConn(clientSide)
+	if _, _, err := client.ReadFrame(); err != nil {
+		t.Fatal(err)
+	}
+	return client, clientSide, func() {
+		_ = client.Close()
+		cancel()
+	}
+}
+
+// An accepted cancel must not produce an immediate acknowledgement: the
+// terminal receipt is the scan loop's regular MsgTaskDone.
+func TestServerScanCancelAcceptedDefersTerminalReceiptToScanLoop(t *testing.T) {
+	cancelledIDs := make(chan string, 1)
+	var capturedSender Sender
+	client, clientSide, teardown := newScanCancelTestConn(t, scanCancelTestHandler{
+		prepare: func(task proto.ScanTask, sender Sender) (proto.TaskAck, func()) {
+			capturedSender = sender
+			return proto.TaskAck{
+				TaskID: task.TaskID, Accepted: true, Reason: "accepted", Total: -1,
+			}, nil
+		},
+		cancel: func(taskID string) (bool, *proto.TaskStats) {
+			cancelledIDs <- taskID
+			return true, nil
+		},
+	})
+	defer teardown()
+	if err := client.WriteFrame(proto.MsgScanTask, &proto.ScanTask{
+		TaskID: "scan-1", Roots: []string{`D:\media`}, Phase: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if ack := readDeleteTestMessage(t, client).(*proto.TaskAck); !ack.Accepted {
+		t.Fatalf("scan ack = %#v", ack)
+	}
+	if err := client.WriteFrame(proto.MsgScanTaskCancel, &proto.ScanTaskCancel{
+		TaskID: "scan-1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := <-cancelledIDs; got != "scan-1" {
+		t.Fatalf("cancelled task id = %q", got)
+	}
+	if err := clientSide.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := client.ReadFrame(); err == nil {
+		t.Fatal("accepted cancel produced an immediate frame")
+	}
+	if err := clientSide.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	// The scan loop itself delivers the terminal receipt after unwinding.
+	// The write goes from a separate goroutine because a net.Pipe write
+	// blocks until the client starts reading.
+	writeDone := make(chan error, 1)
+	go func() {
+		writeDone <- capturedSender(proto.MsgTaskDone, &proto.TaskDone{TaskID: "scan-1"})
+	}()
+	msgType, _, err := client.ReadFrame()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-writeDone; err != nil {
+		t.Fatal(err)
+	}
+	if msgType != proto.MsgTaskDone {
+		t.Fatalf("terminal receipt type = %d, want MsgTaskDone", msgType)
+	}
+}
+
+func TestServerScanCancelAlreadyDoneRepliesFinalStats(t *testing.T) {
+	stats := &proto.TaskStats{Total: 10, Done: 7, ElapsedMS: 42}
+	client, _, teardown := newScanCancelTestConn(t, scanCancelTestHandler{
+		prepare: func(task proto.ScanTask, _ Sender) (proto.TaskAck, func()) {
+			return proto.TaskAck{TaskID: task.TaskID, Accepted: true, Reason: "accepted"}, nil
+		},
+		cancel: func(string) (bool, *proto.TaskStats) { return false, stats },
+	})
+	defer teardown()
+	if err := client.WriteFrame(proto.MsgScanTaskCancel, &proto.ScanTaskCancel{
+		TaskID: "scan-done",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ack := readDeleteTestMessage(t, client).(*proto.TaskAck)
+	if !ack.Accepted || ack.Reason != "already_done" || ack.Stats == nil ||
+		*ack.Stats != *stats {
+		t.Fatalf("already_done ack = %#v", ack)
+	}
+}
+
+func TestServerScanCancelUnknownTaskRejected(t *testing.T) {
+	client, _, teardown := newScanCancelTestConn(t, scanCancelTestHandler{
+		prepare: func(task proto.ScanTask, _ Sender) (proto.TaskAck, func()) {
+			return proto.TaskAck{TaskID: task.TaskID, Accepted: true, Reason: "accepted"}, nil
+		},
+		cancel: func(string) (bool, *proto.TaskStats) { return false, nil },
+	})
+	defer teardown()
+	if err := client.WriteFrame(proto.MsgScanTaskCancel, &proto.ScanTaskCancel{
+		TaskID: "scan-missing",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ack := readDeleteTestMessage(t, client).(*proto.TaskAck)
+	if ack.Accepted || ack.Reason != "unknown_task" {
+		t.Fatalf("unknown-task ack = %#v", ack)
+	}
+}
+
+func TestServerScanCancelWithoutHandlerSupportRejected(t *testing.T) {
+	client, _, teardown := newScanCancelTestConn(t, scanHandlerFunc(func(
+		task proto.ScanTask,
+		_ Sender,
+	) (proto.TaskAck, func()) {
+		return proto.TaskAck{TaskID: task.TaskID, Accepted: true, Reason: "accepted"}, nil
+	}))
+	defer teardown()
+	if err := client.WriteFrame(proto.MsgScanTaskCancel, &proto.ScanTaskCancel{
+		TaskID: "scan-1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ack := readDeleteTestMessage(t, client).(*proto.TaskAck)
+	if ack.Accepted || ack.Reason != "cancel_unsupported" {
+		t.Fatalf("unsupported ack = %#v", ack)
+	}
+}
+
+func TestServerScanCancelEmptyTaskIDRejectedBeforeHandler(t *testing.T) {
+	cancelCalled := make(chan struct{}, 1)
+	client, _, teardown := newScanCancelTestConn(t, scanCancelTestHandler{
+		prepare: func(task proto.ScanTask, _ Sender) (proto.TaskAck, func()) {
+			return proto.TaskAck{TaskID: task.TaskID, Accepted: true, Reason: "accepted"}, nil
+		},
+		cancel: func(string) (bool, *proto.TaskStats) {
+			cancelCalled <- struct{}{}
+			return true, nil
+		},
+	})
+	defer teardown()
+	if err := client.WriteFrame(proto.MsgScanTaskCancel, &proto.ScanTaskCancel{}); err != nil {
+		t.Fatal(err)
+	}
+	ack := readDeleteTestMessage(t, client).(*proto.TaskAck)
+	if ack.Accepted || !strings.Contains(ack.Reason, "empty task_id") {
+		t.Fatalf("empty task_id ack = %#v", ack)
+	}
+	select {
+	case <-cancelCalled:
+		t.Fatal("handler Cancel ran for an invalid request")
+	default:
+	}
+}
+
 type scanHandlerFunc func(proto.ScanTask, Sender) (proto.TaskAck, func())
 
 func (fn scanHandlerFunc) Prepare(

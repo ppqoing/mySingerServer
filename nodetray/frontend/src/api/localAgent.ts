@@ -1,5 +1,5 @@
 export type LocalTaskCreate = { taskId: string; roots: string[]; mode: string; rescan: boolean; extensions: string[] }
-export type LocalTask = { taskId: string; source: string; stage: number; status: string; speed?: string; failures?: number; duration?: string; syncStatus?: string }
+export type LocalTask = { taskId: string; source: string; mode?: string; stage: number; status: string; roots?: string[]; progressComplete?: number; progressTotal?: number; speed?: string; failures?: number; duration?: string; syncStatus?: string; errorCode?: string; errorSummary?: string }
 export type LocalTaskPage = { ok: boolean; tasks: LocalTask[]; errorCode?: string; errorSummary?: string }
 export type LocalGroupMember = { fileId: number; fileName: string; size: number; decision: string }
 export type LocalGroup = { runId: string; groupId: string; category: string; verdict: string; stageOne?: string; stageTwo?: string; stageThree?: string; members: LocalGroupMember[] }
@@ -20,7 +20,6 @@ async function call<T>(method: string, fallback: T, ...args: unknown[]): Promise
 export const createLocalTask = (request: LocalTaskCreate) => call('CreateLocalTask', { ok: false, task: {} as LocalTask, errorSummary: 'Agent 暂不可用' }, request)
 export const chooseLocalTaskRoot = (currentPath: string) => call<PathSelectionResult>('ChooseLocalTaskRoot', { ok: false, path: '', cancelled: false, errorCode: 'backend_unavailable' }, currentPath)
 export const listLocalTasks = () => call<LocalTaskPage>('ListLocalTasks', { ok: false, tasks: [], errorSummary: 'Agent 暂不可用' }, { offset: 0, limit: 100 })
-export const startLocalAnalysis = (request: LocalTaskCreate) => call('StartLocalAnalysis', { ok: false, errorSummary: 'Agent 暂不可用' }, request)
 export const listLocalGroups = (category = '') => call<LocalGroupPage>('ListLocalGroups', { ok: false, groups: [], errorSummary: 'Agent 暂不可用' }, { scope: 'current', category, offset: 0, limit: 100 })
 export const saveLocalReview = (request: unknown) => call('SaveLocalReview', { ok: false, errorSummary: 'Agent 暂不可用' }, request)
 export const prepareLocalDelete = (request: { runId: string; groupId: string }) => call<DeletePreview>('PrepareLocalDelete', { ok: false, batchId: '', selectionDigest: '', count: 0, totalSize: 0, files: [], errorSummary: 'Agent 暂不可用' }, request)

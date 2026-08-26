@@ -68,6 +68,8 @@ int32_t PublishImageFailure(vc_analysis_result* out,
     out->media_type = VC_MEDIA_TYPE_IMAGE;
     out->image_status = code;
     out->completed_frame_mask = 0u;
+    out->image_width = 0u;
+    out->image_height = 0u;
     SetError(error, code, 0, 0, message);
     return code;
 }
@@ -143,6 +145,8 @@ int32_t AnalyzeImageBytes(const std::vector<uint8_t>& encoded,
     out->media_type = VC_MEDIA_TYPE_IMAGE;
     out->image_status = VC_OK;
     out->completed_frame_mask = 0u;
+    out->image_width = static_cast<uint32_t>(gray.width);
+    out->image_height = static_cast<uint32_t>(gray.height);
     SetError(error, VC_OK, 0, 0, "");
     return VC_OK;
 }

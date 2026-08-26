@@ -5,7 +5,6 @@ package config
 import (
 	"errors"
 	"os"
-	"path/filepath"
 	"syscall"
 	"time"
 	"unsafe"
@@ -29,39 +28,6 @@ const helperMutationAccess = windows.ACCESS_MASK(
 		windows.FILE_WRITE_ATTRIBUTES |
 		0x00000040, // FILE_DELETE_CHILD: replace/delete children through the parent.
 )
-
-func platformValidateProtectedHelper(path string) error {
-	parent := filepath.Dir(path)
-	if err := validateProtectedHelperDACL(parent); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			// Fresh installations have no existing Helper replacement surface yet.
-			// The later elevated writer is responsible for creating it securely.
-			return nil
-		}
-		return err
-	}
-	if err := validateProtectedHelperDACL(path); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return err
-	}
-	return nil
-}
-
-func validateProtectedHelperDACL(path string) error {
-	descriptor, err := windows.GetNamedSecurityInfo(
-		path,
-		windows.SE_FILE_OBJECT,
-		windows.OWNER_SECURITY_INFORMATION|
-			windows.DACL_SECURITY_INFORMATION|
-			windows.PROTECTED_DACL_SECURITY_INFORMATION,
-	)
-	if err != nil {
-		return err
-	}
-	return validateProtectedHelperSecurityDescriptor(descriptor)
-}
 
 func validateProtectedHelperSecurityDescriptor(descriptor *windows.SECURITY_DESCRIPTOR) error {
 	owner, _, err := descriptor.Owner()

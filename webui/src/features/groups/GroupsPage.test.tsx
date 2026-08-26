@@ -12,10 +12,13 @@ import type {
   GroupMember,
   GroupPage,
   GroupQuery,
+  GroupsStats,
+  GroupsStatsQuery,
   GroupSummary
 } from "../../api/contracts";
 import { deriveDeleteRetryPlan, type DeleteReviewSnapshot } from "./deleteReview";
 import { GroupsPage } from "./GroupsPage";
+import type { GroupSelectByStrategyInput, GroupSelectByStrategyResult } from "../../api/contracts";
 
 function group(id: number, kind: GroupKind = "exact", overrides: Partial<GroupSummary> = {}): GroupSummary {
   return {
@@ -138,6 +141,9 @@ function apiFor(options: {
   prepareDelete?: (memberIds: number[], signal?: AbortSignal) => Promise<DeletePreparation>;
   executeDelete?: (confirmToken: string, mode: "soft" | "hard", signal?: AbortSignal) => Promise<{ taskId: string }>;
   getDeleteStatus?: (taskId: string, signal?: AbortSignal) => Promise<DeleteTaskStatus>;
+  getGroupsStats?: (query?: GroupsStatsQuery, signal?: AbortSignal) => Promise<GroupsStats>;
+  setGroupRepresentative?: (groupId: number, fileId: number, signal?: AbortSignal) => Promise<void>;
+  selectGroupsByStrategy?: (input: GroupSelectByStrategyInput, signal?: AbortSignal) => Promise<GroupSelectByStrategyResult>;
 } = {}): AppApi {
   return {
     listAgents: vi.fn(typeof options.agents === "function" ? options.agents : async () => options.agents ?? [
@@ -148,7 +154,15 @@ function apiFor(options: {
     getGroup: vi.fn(options.detail ?? (async (id, memberPage, memberSize) => detail(id, { memberPage, memberSize }))),
     prepareDelete: vi.fn(options.prepareDelete ?? (async () => deletePreparation())),
     executeDelete: vi.fn(options.executeDelete ?? (async () => ({ taskId: "delete-task-groups" }))),
-    getDeleteStatus: vi.fn(options.getDeleteStatus ?? (async () => deleteTaskStatus()))
+    getDeleteStatus: vi.fn(options.getDeleteStatus ?? (async () => deleteTaskStatus())),
+    getGroupsStats: vi.fn(options.getGroupsStats ?? (async query => ({
+      kind: query?.kind ?? "",
+      groups: 0,
+      totalBytes: 0,
+      wastedBytes: 0
+    }))),
+    setGroupRepresentative: vi.fn(options.setGroupRepresentative ?? (async () => undefined)),
+    selectGroupsByStrategy: vi.fn(options.selectGroupsByStrategy ?? (async () => ({ fileIds: [], groups: 0, truncated: false })))
   } as unknown as AppApi;
 }
 
@@ -676,6 +690,8 @@ describe("GroupsPage", () => {
     expect(api.getDeleteStatus).toHaveBeenCalledTimes(1);
     expect(within(screen.getByRole("dialog", { name: "确认删除" }))
       .getByText("任务 ID：delete-task-groups")).toBeInTheDocument();
+    // 任务已到终态：后台入口文案从"查看进行中的删除任务"切换为"查看删除任务结果"。
+    expect(screen.getByRole("button", { name: "查看删除任务结果", hidden: true })).toBeInTheDocument();
 
     await user.click(within(screen.getByRole("dialog", { name: "确认删除" }))
       .getByRole("button", { name: "关闭" }));
@@ -720,7 +736,7 @@ describe("GroupsPage", () => {
     expect(api.prepareDelete).toHaveBeenCalledTimes(2);
   });
 
-  test("an older task finishing does not clear or refresh a different group selection", async () => {
+  test("an older task finishing refreshes the whole list cache but keeps a different group selection", async () => {
     const getGroup = vi.fn(async (id: number, memberPage: number, memberSize: number) => detail(id, {
       representativeFileId: id * 10 + 1,
       memberPage,
@@ -756,7 +772,8 @@ describe("GroupsPage", () => {
     expect(screen.getByText("已选 1 项")).toBeInTheDocument();
     expect(screen.getByRole("checkbox", { name: "选择文件 22", hidden: true })).toBeChecked();
     expect(getGroup.mock.calls.filter(([id]) => id === 2)).toHaveLength(1);
-    expect(listGroups).toHaveBeenCalledTimes(1);
+    // 删除完成后整组缓存失效：即使当前在另一组，列表也会重取（初始 1 次 + invalidateAll 1 次）。
+    expect(listGroups).toHaveBeenCalledTimes(2);
   });
 
   test("a 503 prepare failure preserves selection and requires an explicit re-prepare", async () => {
@@ -930,6 +947,9 @@ describe("GroupsPage", () => {
     expect(listAgents).toHaveBeenCalledTimes(2);
     expect(screen.getByRole("checkbox", { name: "选择文件 2" })).toBeDisabled();
     expect(screen.getByText("已选 0 项")).toBeInTheDocument();
+    // 离线通知经 0ms 宏任务投递（避免 effect 内同步 setState），再推进 1ms 等待其落地。
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(screen.getByText("1 项因 Agent 离线被移除。")).toBeInTheDocument();
     expect(screen.getAllByText("Agent 离线")).toHaveLength(2);
   });
 
@@ -972,6 +992,8 @@ describe("GroupsPage", () => {
 
     expect(listAgents).toHaveBeenCalledTimes(2);
     expect(screen.getByText("已选 0 项")).toBeInTheDocument();
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(screen.getByText("1 项因 Agent 离线被移除。")).toBeInTheDocument();
   });
 
   test("treats a polling failure as unverified Agent state and clears selection", async () => {
@@ -1048,7 +1070,12 @@ describe("GroupsPage", () => {
     expect(await screen.findByText(malicious)).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "打开重复组 1" }));
     await screen.findByText(/a: \[safe, <img src=x onerror=alert\(1\)>\], z: <img src=x onerror=alert\(1\)>/);
-    expect(document.querySelector("img")).toBeNull();
+    // 合法预览缩略图是 img；注入的 <img src=x onerror=...> 不得落地。
+    expect(document.querySelector("img[src='x']")).toBeNull();
+    for (const image of Array.from(document.querySelectorAll("img"))) {
+      expect(image).not.toHaveAttribute("onerror");
+      expect(image.getAttribute("src")).toMatch(/^\/api\/files\/\d+\/preview\?/);
+    }
   });
 
   test("bounds huge score keys, strings, object breadth, and circular references", async () => {
@@ -1132,6 +1159,10 @@ describe("GroupsPage", () => {
     const dialog = screen.getByRole("dialog", { name: "文件 2 完整信息" });
     const close = within(dialog).getByRole("button", { name: /关闭.*文件 2 完整信息/ });
     expect(close).toHaveFocus();
+    // 对话框内容区有"复制路径"按钮：Tab 进入内容区，再 Tab 循环回关闭按钮（焦点被圈定）。
+    await user.tab();
+    expect(close).not.toHaveFocus();
+    expect(dialog.contains(document.activeElement)).toBe(true);
     await user.tab();
     expect(close).toHaveFocus();
 
@@ -1180,11 +1211,10 @@ describe("GroupsPage", () => {
     render(<GroupsPage api={api} />);
 
     await screen.findByRole("list", { name: "重复组列表" });
-    expect(screen.getByText("行高估算：44px")).toBeInTheDocument();
+    expect(screen.queryByText(/行高估算/)).not.toBeInTheDocument();
     expect(screen.getByRole("region", { name: "重复组结果" })).toHaveAttribute("data-row-height", "44");
     expect(screen.getByRole("button", { name: "打开重复组 1" })).toHaveAttribute("data-row-height", "44");
     await user.click(screen.getByRole("radio", { name: "舒适密度" }));
-    expect(screen.getByText("行高估算：56px")).toBeInTheDocument();
     expect(screen.getByRole("region", { name: "重复组结果" })).toHaveAttribute("data-row-height", "56");
     expect(screen.getByRole("button", { name: "打开重复组 1" })).toHaveAttribute("data-row-height", "56");
   });
@@ -1345,16 +1375,65 @@ describe("GroupsPage", () => {
       .toHaveClass("group-table__heading--compact");
   });
 
-  test("uses a decorative local placeholder without adding an accessible member image", async () => {
-    render(<GroupsPage api={apiFor()} />);
+  test("shows a video preview placeholder without requesting previews in video groups", async () => {
+    render(<GroupsPage api={apiFor({ detail: async id => detail(id, { kind: "video" }) })} />);
 
     fireEvent.click(await screen.findByRole("button", { name: "打开重复组 1" }));
     const placeholders = await screen.findAllByTestId("member-thumbnail-placeholder");
     expect(placeholders.length).toBeGreaterThan(0);
     for (const placeholder of placeholders) {
-      expect(placeholder).toHaveAttribute("aria-hidden", "true");
+      expect(placeholder).toHaveTextContent("视频预览暂不支持");
     }
     expect(screen.queryByRole("img")).not.toBeInTheDocument();
+  });
+
+  test("loads member thumbnails lazily from the preview proxy endpoint", async () => {
+    render(<GroupsPage api={apiFor()} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "打开重复组 1" }));
+    const image = await screen.findByRole("img", { name: "文件 2 预览" });
+    expect(image).toHaveAttribute("src", "/api/files/2/preview?machine=agent-b&w=320&h=320");
+    expect(image).toHaveAttribute("loading", "lazy");
+  });
+
+  test("falls back to the local placeholder artwork when a member preview fails", async () => {
+    render(<GroupsPage api={apiFor()} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "打开重复组 1" }));
+    const image = await screen.findByRole("img", { name: "文件 2 预览" });
+    fireEvent.error(image);
+    expect(screen.queryByRole("img", { name: "文件 2 预览" })).not.toBeInTheDocument();
+    expect(await screen.findAllByTestId("member-thumbnail-placeholder")).not.toHaveLength(0);
+    expect(screen.getByRole("img", { name: "文件 1 预览" })).toBeInTheDocument();
+  });
+
+  test("compares a member side by side with the representative file from the thumbnail", async () => {
+    const compared = detail(1, {
+      members: [
+        member(1),
+        member(2, "agent-b", { path: "D:\\media\\copy-2.jpg", size: 2_000, mtime: 1_722_500_000, score: 0.5 }),
+        member(3, "agent-c")
+      ]
+    });
+    render(<GroupsPage api={apiFor({ detail: async () => compared })} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "打开重复组 1" }));
+    expect(await screen.findByRole("button", { name: "对比文件 1 与代表文件" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "对比文件 2 与代表文件" }));
+
+    const dialog = await screen.findByRole("dialog", { name: "文件 2 对比" });
+    expect(within(dialog).getByRole("img", { name: "文件 2 预览" }))
+      .toHaveAttribute("src", "/api/files/2/preview?machine=agent-b&w=640&h=640");
+    expect(within(dialog).getByRole("img", { name: "文件 1 预览" }))
+      .toHaveAttribute("src", "/api/files/1/preview?machine=agent-a&w=640&h=640");
+    expect(within(dialog).getByText("D:\\media\\copy-2.jpg")).toBeInTheDocument();
+    expect(within(dialog).getByText("2.0 KB")).toBeInTheDocument();
+    expect(within(dialog).getByText("1000 B")).toBeInTheDocument();
+    // 路径、大小、修改时间、相似度四行双方取值均不同，两格同时高亮。
+    expect(dialog.querySelectorAll(".group-detail__compare-value--different")).toHaveLength(8);
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "关闭 文件 2 对比" }));
+    expect(screen.queryByRole("dialog", { name: "文件 2 对比" })).not.toBeInTheDocument();
   });
 
   test("retries list and same-group detail failures from their own error surfaces", async () => {
@@ -1408,5 +1487,609 @@ describe("GroupsPage", () => {
     expect(within(kindGroup).getByRole("button", { name: "精确重复" })).toHaveAttribute("aria-pressed", "true");
     expect(within(kindGroup).getByRole("button", { name: "相似图片" })).toHaveAttribute("aria-pressed", "false");
     expect(container.querySelector("main")).toBeNull();
+  });
+
+  test("disables member selection entirely at mobile width", async () => {
+    setViewport(640);
+    const user = userEvent.setup();
+    render(<GroupsPage api={apiFor()} />);
+
+    await user.click(await screen.findByRole("button", { name: "打开重复组 1" }));
+    const drawer = await screen.findByRole("dialog", { name: "重复组详情" });
+    await within(drawer).findByText(/D:\\media\\file-2\.jpg/);
+
+    expect(within(drawer).queryByRole("checkbox")).not.toBeInTheDocument();
+    expect(within(drawer).queryByRole("button", { name: /删除已选/ })).not.toBeInTheDocument();
+    expect(within(drawer).getByText("文件 #2")).toBeInTheDocument();
+    expect(screen.queryByText(/已选 \d+ 项/)).not.toBeInTheDocument();
+  });
+
+  test("renders readable image scores and hides internal score fields", async () => {
+    const peerHash = "ab".repeat(64);
+    const api = apiFor({
+      detail: async (id, memberPage, memberSize) => detail(id, {
+        kind: "image",
+        memberPage,
+        memberSize,
+        members: [
+          member(1, "agent-a", { score: { hamming: 2, quality_self: 90, quality_peer: 91, peer_sha512: peerHash } }),
+          member(2, "agent-b", { score: { hamming: 7, quality_self: 80, quality_peer: 79, peer_sha512: peerHash } }),
+          member(3, "agent-c", { score: { hamming: 20, quality_self: 70, quality_peer: 68, peer_sha512: peerHash } })
+        ]
+      })
+    });
+    const user = userEvent.setup();
+    render(<GroupsPage api={api} />);
+
+    await user.click(screen.getByRole("button", { name: "相似图片" }));
+    await user.click(await screen.findByRole("button", { name: "打开重复组 1" }));
+
+    expect(await screen.findByText("与代表文件的差异：距离 2（极小）")).toBeInTheDocument();
+    expect(screen.getByText("与代表文件的差异：距离 7（小）")).toBeInTheDocument();
+    expect(screen.getByText("与代表文件的差异：距离 20（中）")).toBeInTheDocument();
+    expect(screen.queryByText(new RegExp(peerHash))).not.toBeInTheDocument();
+    expect(screen.queryByText(/quality_self/)).not.toBeInTheDocument();
+  });
+
+  test("renders exact scores as 内容完全一致 and falls back to — for missing scores", async () => {
+    const api = apiFor({
+      detail: async (id, memberPage, memberSize) => detail(id, {
+        memberPage,
+        memberSize,
+        members: [
+          member(1, "agent-a", { score: { basis: "sha512" } }),
+          member(2, "agent-b", { score: null }),
+          member(3, "agent-c", { score: { basis: "sha512" } })
+        ]
+      })
+    });
+    render(<GroupsPage api={api} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "打开重复组 1" }));
+
+    expect((await screen.findAllByText("内容完全一致")).length).toBe(2);
+    expect(screen.getByText("—")).toBeInTheDocument();
+  });
+
+  test("shows the video duration difference alongside the hamming distance", async () => {
+    const api = apiFor({
+      detail: async (id, memberPage, memberSize) => detail(id, {
+        kind: "video",
+        memberPage,
+        memberSize,
+        members: [member(1, "agent-a", {
+          score: { hamming: 3, duration_diff_ms: 1500, quality_self: 88, quality_peer: 87, peer_sha512: "cd".repeat(64) }
+        })]
+      })
+    });
+    const user = userEvent.setup();
+    render(<GroupsPage api={api} />);
+
+    await user.click(screen.getByRole("button", { name: "相似视频" }));
+    await user.click(await screen.findByRole("button", { name: "打开重复组 1" }));
+
+    expect(await screen.findByText("与代表文件的差异：距离 3（极小）；时长差 1.5 秒")).toBeInTheDocument();
+  });
+
+  test("summarizes the selection with total size and distinct machine count", async () => {
+    const api = apiFor({
+      detail: async (id, memberPage, memberSize) => detail(id, {
+        memberPage,
+        memberSize,
+        members: [
+          member(1),
+          member(2, "agent-b", { size: 2 * 1024 ** 2 }),
+          member(3, "agent-b", { size: 3 * 1024 ** 2 }),
+          member(4, "agent-a", { size: 1024 ** 2 })
+        ]
+      })
+    });
+    const user = userEvent.setup();
+    render(<GroupsPage api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "打开重复组 1" }));
+    await user.click(await screen.findByRole("checkbox", { name: "选择文件 2" }));
+    expect(screen.getByText("共 2.0 MB，涉及 1 台设备")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("checkbox", { name: "选择文件 3" }));
+    expect(screen.getByText("共 5.0 MB，涉及 1 台设备")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("checkbox", { name: "选择文件 4" }));
+    expect(screen.getByText("共 6.0 MB，涉及 2 台设备")).toBeInTheDocument();
+  });
+
+  test("paginates with first/last buttons and a page-jump input", async () => {
+    const api = apiFor({
+      groups: async query => page(query, { total: 300, groups: [group(query.page, query.kind)] })
+    });
+    const user = userEvent.setup();
+    render(<GroupsPage api={api} />);
+
+    await screen.findByRole("button", { name: "打开重复组 1" });
+    expect(screen.getByText("第 1 / 3 页")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "末页" }));
+    await screen.findByRole("button", { name: "打开重复组 3" });
+    expect(screen.getByText("第 3 / 3 页")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "首页" }));
+    await screen.findByRole("button", { name: "打开重复组 1" });
+    expect(screen.getByText("第 1 / 3 页")).toBeInTheDocument();
+
+    await user.type(screen.getByRole("spinbutton", { name: "跳转页码" }), "2");
+    await user.click(screen.getByRole("button", { name: "跳转" }));
+    await screen.findByRole("button", { name: "打开重复组 2" });
+    expect(screen.getByText("第 2 / 3 页")).toBeInTheDocument();
+  });
+
+  test("keeps the last real page number in the pager while the next page loads", async () => {
+    const secondPage = deferred<GroupPage>();
+    const listGroups = vi.fn()
+      .mockResolvedValueOnce(page({ kind: "exact", page: 1, size: 100, sort: "members_desc" }, { total: 300, groups: [group(1)] }))
+      .mockReturnValueOnce(secondPage.promise)
+      .mockImplementation(async query => page(query, { total: 300, groups: [group(query.page)] }));
+    const api = apiFor({ groups: listGroups });
+    const user = userEvent.setup();
+    render(<GroupsPage api={api} />);
+    await screen.findByRole("button", { name: "打开重复组 1" });
+
+    await user.click(screen.getByRole("button", { name: "下一页" }));
+
+    expect(screen.getByText("第 1 / 3 页")).toBeInTheDocument();
+    expect(screen.queryByText("第 1 / 1 页")).not.toBeInTheDocument();
+
+    await act(async () => secondPage.resolve(page({ kind: "exact", page: 2, size: 100, sort: "members_desc" }, { total: 300, groups: [group(2)] })));
+    expect(screen.getByText("第 2 / 3 页")).toBeInTheDocument();
+  });
+
+  test("refreshes the list manually and discards every cached page", async () => {
+    const api = apiFor({
+      groups: async query => page(query, { total: 300, groups: [group(query.page, query.kind)] })
+    });
+    const user = userEvent.setup();
+    render(<GroupsPage api={api} />);
+    await screen.findByRole("button", { name: "打开重复组 1" });
+    await user.click(screen.getByRole("button", { name: "下一页" }));
+    await screen.findByRole("button", { name: "打开重复组 2" });
+    expect(api.listGroups).toHaveBeenCalledTimes(2);
+
+    await user.click(screen.getByRole("button", { name: "刷新列表" }));
+
+    await waitFor(() => expect(api.listGroups).toHaveBeenCalledTimes(3));
+    expect(api.listGroups).toHaveBeenLastCalledWith(
+      expect.objectContaining({ page: 2 }),
+      expect.any(AbortSignal)
+    );
+
+    await user.click(screen.getByRole("button", { name: "上一页" }));
+    await waitFor(() => expect(api.listGroups).toHaveBeenCalledTimes(4));
+    expect(api.listGroups).toHaveBeenLastCalledWith(
+      expect.objectContaining({ page: 1 }),
+      expect.any(AbortSignal)
+    );
+  });
+
+  test("debounces min-members keystrokes into one effective list request", async () => {
+    vi.useFakeTimers();
+    const api = apiFor();
+    render(<GroupsPage api={api} />);
+    await act(async () => {});
+    vi.mocked(api.listGroups).mockClear();
+
+    fireEvent.change(screen.getByRole("spinbutton", { name: "最少文件数" }), { target: { value: "1" } });
+    await act(async () => { await vi.advanceTimersByTimeAsync(299); });
+    fireEvent.change(screen.getByRole("spinbutton", { name: "最少文件数" }), { target: { value: "10" } });
+    await act(async () => { await vi.advanceTimersByTimeAsync(299); });
+    expect(api.listGroups).not.toHaveBeenCalled();
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    await act(async () => {});
+    expect(api.listGroups).toHaveBeenCalledTimes(1);
+    expect(api.listGroups).toHaveBeenLastCalledWith({
+      kind: "exact",
+      page: 1,
+      size: 100,
+      minMembers: 10,
+      sort: "members_desc"
+    }, expect.any(AbortSignal));
+  });
+
+  test("notifies when switching groups discards the previous selection", async () => {
+    const api = apiFor({
+      groups: async query => page(query, { total: 2, groups: [group(1), group(2)] }),
+      detail: async (id, memberPage, memberSize) => detail(id, {
+        representativeFileId: id * 10 + 1,
+        memberPage,
+        memberSize,
+        members: [member(id * 10 + 1), member(id * 10 + 2, "agent-b")]
+      })
+    });
+    const user = userEvent.setup();
+    render(<GroupsPage api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "打开重复组 1" }));
+    await user.click(await screen.findByRole("checkbox", { name: "选择文件 12" }));
+    expect(screen.getByText("已选 1 项")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "打开重复组 2" }));
+
+    expect(screen.getByText("已切换分组，已清空原选择。")).toBeInTheDocument();
+    expect(screen.getByText("已选 0 项")).toBeInTheDocument();
+  });
+
+  test("copies member paths from the row and the full-information dialog", async () => {
+    const user = userEvent.setup();
+    // userEvent.setup() 自带剪贴板 stub，须在其后覆盖为自己的 mock。
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+    render(<GroupsPage api={apiFor()} />);
+
+    await user.click(await screen.findByRole("button", { name: "打开重复组 1" }));
+    const rowCopies = await screen.findAllByRole("button", { name: "复制路径" });
+    expect(rowCopies.length).toBeGreaterThan(0);
+    await user.click(rowCopies[0]);
+    expect(writeText).toHaveBeenCalledWith("D:\\media\\file-1.jpg");
+    expect(await screen.findByText("已复制")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "查看文件 2 完整信息" }));
+    const dialog = screen.getByRole("dialog", { name: "文件 2 完整信息" });
+    await user.click(within(dialog).getByRole("button", { name: "复制路径" }));
+    expect(writeText).toHaveBeenCalledWith("D:\\media\\file-2.jpg");
+  });
+
+  test("shows aggregate stats for the current filter under the toolbar", async () => {
+    const getGroupsStats = vi.fn(async (query?: GroupsStatsQuery): Promise<GroupsStats> => ({
+      kind: query?.kind ?? "",
+      groups: 7,
+      totalBytes: 9_000,
+      wastedBytes: 4 * 1024 ** 3
+    }));
+    const api = apiFor({ getGroupsStats });
+    render(<GroupsPage api={api} />);
+
+    expect(await screen.findByText("当前筛选共 7 组，可回收 4.0 GB")).toBeInTheDocument();
+    expect(getGroupsStats).toHaveBeenCalledWith({ kind: "exact" }, expect.any(AbortSignal));
+  });
+
+  test("stats line follows the debounced search and min-members filters", async () => {
+    vi.useFakeTimers();
+    const getGroupsStats = vi.fn(async (query?: GroupsStatsQuery): Promise<GroupsStats> => ({
+      kind: query?.kind ?? "",
+      groups: 1,
+      totalBytes: 2_048,
+      wastedBytes: 1_024
+    }));
+    const api = apiFor({ getGroupsStats });
+    render(<GroupsPage api={api} />);
+    await act(async () => {});
+    expect(getGroupsStats).toHaveBeenCalledTimes(1);
+    expect(screen.getByText("当前筛选共 1 组，可回收 1.0 KB")).toBeInTheDocument();
+    vi.mocked(getGroupsStats).mockClear();
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "路径搜索" }), { target: { value: "poster" } });
+    fireEvent.change(screen.getByRole("spinbutton", { name: "最少文件数" }), { target: { value: "3" } });
+    await act(async () => { await vi.advanceTimersByTimeAsync(299); });
+    expect(getGroupsStats).not.toHaveBeenCalled();
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    await act(async () => {});
+    expect(getGroupsStats).toHaveBeenCalledTimes(1);
+    expect(getGroupsStats).toHaveBeenLastCalledWith(
+      { kind: "exact", q: "poster", minMembers: 3 },
+      expect.any(AbortSignal)
+    );
+    expect(screen.getByText("当前筛选共 1 组，可回收 1.0 KB")).toBeInTheDocument();
+  });
+
+  test("hides the stats line silently when the stats request fails", async () => {
+    const api = apiFor({ getGroupsStats: vi.fn().mockRejectedValue(new Error("stats down")) });
+    render(<GroupsPage api={api} />);
+
+    await screen.findByRole("button", { name: "打开重复组 1" });
+    expect(screen.queryByText(/当前筛选共/)).not.toBeInTheDocument();
+  });
+
+  test("keeps showing the previous stats only until the filter changes", async () => {
+    vi.useFakeTimers();
+    const statsRequest = deferred<GroupsStats>();
+    const getGroupsStats = vi.fn()
+      .mockResolvedValueOnce({ kind: "exact", groups: 5, totalBytes: 6_000, wastedBytes: 2_048 })
+      .mockReturnValueOnce(statsRequest.promise);
+    const api = apiFor({ getGroupsStats });
+    render(<GroupsPage api={api} />);
+    await act(async () => {});
+    expect(screen.getByText("当前筛选共 5 组，可回收 2.0 KB")).toBeInTheDocument();
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "路径搜索" }), { target: { value: "poster" } });
+    await act(async () => { await vi.advanceTimersByTimeAsync(300); });
+    await act(async () => {});
+    expect(getGroupsStats).toHaveBeenCalledTimes(2);
+    // 新筛选的统计未返回前不沿用旧筛选的数字，避免误导。
+    expect(screen.queryByText(/当前筛选共/)).not.toBeInTheDocument();
+
+    await act(async () => statsRequest.resolve({ kind: "exact", groups: 2, totalBytes: 3_072, wastedBytes: 1_024 }));
+    await act(async () => {});
+    expect(screen.getByText("当前筛选共 2 组，可回收 1.0 KB")).toBeInTheDocument();
+  });
+
+  test("sets a member as the kept representative and reloads the detail", async () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const setGroupRepresentative = vi.fn().mockResolvedValue(undefined);
+    const getGroup = vi.fn(async (id: number, memberPage: number, memberSize: number) =>
+      detail(id, { memberPage, memberSize }));
+    const api = apiFor({ detail: getGroup, setGroupRepresentative });
+    const user = userEvent.setup();
+    render(<GroupsPage api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "打开重复组 1" }));
+    const keep = await screen.findByRole("button", { name: "将文件 2 设为保留副本" });
+    // 当前代表与 Agent 离线成员不显示该操作
+    expect(screen.queryByRole("button", { name: "将文件 1 设为保留副本" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "将文件 3 设为保留副本" })).not.toBeInTheDocument();
+
+    await user.click(keep);
+
+    expect(confirm).toHaveBeenCalled();
+    await waitFor(() => expect(setGroupRepresentative).toHaveBeenCalledWith(1, 2));
+    expect(await screen.findByText("已将文件 #2 设为保留副本。")).toBeInTheDocument();
+    await waitFor(() => expect(getGroup).toHaveBeenCalledTimes(2));
+  });
+
+  test("removes a selected member from the deletion selection after making it representative", async () => {
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    const setGroupRepresentative = vi.fn().mockResolvedValue(undefined);
+    const api = apiFor({ setGroupRepresentative });
+    const user = userEvent.setup();
+    render(<GroupsPage api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "打开重复组 1" }));
+    await user.click(await screen.findByRole("checkbox", { name: "选择文件 2" }));
+    expect(screen.getByText("已选 1 项")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "将文件 2 设为保留副本" }));
+
+    expect(await screen.findByText("已将文件 #2 设为保留副本，并从删除选择中移除。")).toBeInTheDocument();
+    expect(screen.getByText("已选 0 项")).toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: "选择文件 2" })).not.toBeChecked();
+  });
+
+  test("reports a representative change failure without touching the selection", async () => {
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    const setGroupRepresentative = vi.fn().mockRejectedValue(new Error("agent_offline"));
+    const api = apiFor({ setGroupRepresentative });
+    const user = userEvent.setup();
+    render(<GroupsPage api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "打开重复组 1" }));
+    await user.click(await screen.findByRole("checkbox", { name: "选择文件 2" }));
+    await user.click(screen.getByRole("button", { name: "将文件 2 设为保留副本" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Agent 离线：请确认目标节点在线后重试。");
+    expect(screen.getByText("已选 1 项")).toBeInTheDocument();
+  });
+
+  test("does not call the API when the representative change is cancelled", async () => {
+    vi.spyOn(window, "confirm").mockReturnValue(false);
+    const api = apiFor();
+    const user = userEvent.setup();
+    render(<GroupsPage api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "打开重复组 1" }));
+    await user.click(await screen.findByRole("button", { name: "将文件 2 设为保留副本" }));
+
+    expect(api.setGroupRepresentative).not.toHaveBeenCalled();
+  });
+
+  test("auto-selects the other loaded members by the keep-newest strategy", async () => {
+    const api = apiFor({
+      detail: async (id, memberPage, memberSize) => detail(id, {
+        memberPage,
+        memberSize,
+        members: [
+          member(1),
+          member(2, "agent-b", { mtime: 1_722_000_000 }),
+          member(3, "agent-b", { mtime: 1_723_000_000 })
+        ]
+      })
+    });
+    const user = userEvent.setup();
+    render(<GroupsPage api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "打开重复组 1" }));
+    await user.selectOptions(await screen.findByRole("combobox", { name: "自动选择" }), "newest");
+
+    await waitFor(() => expect(screen.getByText("已选 1 项")).toBeInTheDocument());
+    // 保留最新 → mtime 最大的文件 3 被保留，文件 2 被勾选
+    expect(screen.getByRole("checkbox", { name: "选择文件 2" })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "选择文件 3" })).not.toBeChecked();
+    expect(screen.getByText("已按「保留最新」选中 1 项。")).toBeInTheDocument();
+  });
+
+  test("warns that auto-select only covers the loaded members when the group has more pages", async () => {
+    const api = apiFor({
+      detail: async (id, memberPage, memberSize) => detail(id, {
+        memberPage,
+        memberSize,
+        memberTotal: 250,
+        members: [member(1), member(2, "agent-b"), member(3, "agent-b", { size: 9_000 })]
+      })
+    });
+    const user = userEvent.setup();
+    render(<GroupsPage api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "打开重复组 1" }));
+    await user.selectOptions(await screen.findByRole("combobox", { name: "自动选择" }), "largest");
+
+    await waitFor(() => expect(screen.getByText("已选 1 项")).toBeInTheDocument());
+    expect(screen.getByText(/成员超过 100 个，仅覆盖当前已加载成员。/)).toBeInTheDocument();
+  });
+
+  test("batch-selects across groups by strategy with the current filters", async () => {
+    const selectGroupsByStrategy = vi.fn().mockResolvedValue({ fileIds: [11, 12], groups: 2, truncated: false });
+    const api = apiFor({ selectGroupsByStrategy });
+    const user = userEvent.setup();
+    render(<GroupsPage api={api} />);
+
+    await screen.findByRole("button", { name: "打开重复组 1" });
+    fireEvent.change(screen.getByRole("combobox", { name: "Agent" }), { target: { value: "agent-b" } });
+    await user.click(screen.getByRole("button", { name: "批量选择" }));
+    const dialog = await screen.findByRole("dialog", { name: "批量选择" });
+    await user.selectOptions(within(dialog).getByRole("combobox", { name: "保留策略" }), "largest");
+    await user.click(within(dialog).getByRole("button", { name: "应用策略" }));
+
+    await waitFor(() => expect(selectGroupsByStrategy)
+      .toHaveBeenCalledWith({ kind: "exact", machine: "agent-b", strategy: "largest" }));
+    await waitFor(() => expect(screen.getByText("已选 2 项")).toBeInTheDocument());
+    expect(screen.getByText("已按「保留最大」选中 2 项（覆盖 2 个重复组）。")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "删除已选 2 项" })).toBeEnabled();
+  });
+
+  test("warns when the batch selection hit the result cap", async () => {
+    const selectGroupsByStrategy = vi.fn().mockResolvedValue({ fileIds: [11, 12], groups: 5, truncated: true });
+    const api = apiFor({ selectGroupsByStrategy });
+    const user = userEvent.setup();
+    render(<GroupsPage api={api} />);
+
+    await screen.findByRole("button", { name: "打开重复组 1" });
+    await user.click(screen.getByRole("button", { name: "批量选择" }));
+    const dialog = await screen.findByRole("dialog", { name: "批量选择" });
+    await user.click(within(dialog).getByRole("button", { name: "应用策略" }));
+
+    await waitFor(() => expect(screen.getByText("已选 2 项")).toBeInTheDocument());
+    expect(screen.getByText(/已达上限，仅选中前 2 个。/)).toBeInTheDocument();
+  });
+
+  test("keeps the batch dialog open with an alert when the strategy selection fails", async () => {
+    const selectGroupsByStrategy = vi.fn().mockRejectedValue(new Error("postgres_unavailable"));
+    const api = apiFor({ selectGroupsByStrategy });
+    const user = userEvent.setup();
+    render(<GroupsPage api={api} />);
+
+    await screen.findByRole("button", { name: "打开重复组 1" });
+    await user.click(screen.getByRole("button", { name: "批量选择" }));
+    const dialog = await screen.findByRole("dialog", { name: "批量选择" });
+    await user.click(within(dialog).getByRole("button", { name: "应用策略" }));
+
+    expect(await within(dialog).findByRole("alert"))
+      .toHaveTextContent("数据库暂不可用：Manager 会继续尝试恢复连接。");
+    expect(screen.getByRole("dialog", { name: "批量选择" })).toBeInTheDocument();
+    expect(screen.getByText("已选 0 项")).toBeInTheDocument();
+  });
+
+  test("a terminal multi-group deletion clears the batch selection without an itemized snapshot", async () => {
+    const selectGroupsByStrategy = vi.fn().mockResolvedValue({ fileIds: [2], groups: 1, truncated: false });
+    const api = apiFor({ selectGroupsByStrategy });
+    const user = userEvent.setup();
+    render(<GroupsPage api={api} />);
+
+    await screen.findByRole("button", { name: "打开重复组 1" });
+    await user.click(screen.getByRole("button", { name: "批量选择" }));
+    const dialog = await screen.findByRole("dialog", { name: "批量选择" });
+    await user.click(within(dialog).getByRole("button", { name: "应用策略" }));
+    await waitFor(() => expect(screen.getByText("已选 1 项")).toBeInTheDocument());
+
+    await user.click(screen.getByRole("button", { name: "删除已选 1 项" }));
+    const deleteDialog = await screen.findByRole("dialog", { name: "确认删除" });
+    await user.click(await within(deleteDialog).findByRole("button", { name: "最终确认删除" }));
+    await screen.findByText("任务 ID：delete-task-groups");
+
+    expect(api.prepareDelete).toHaveBeenCalledWith([2], expect.any(AbortSignal));
+    await waitFor(() => expect(screen.getByText("已选 0 项")).toBeInTheDocument());
+    expect(screen.getByText(/已清空跨组选择/)).toBeInTheDocument();
+  });
+
+  test("selects the rest of a group's members from the row action without opening the detail", async () => {
+    const getGroup = vi.fn(async (id: number, memberPage: number, memberSize: number) =>
+      detail(id, { memberPage, memberSize, members: [member(1), member(2, "agent-b"), member(4, "agent-b")] }));
+    const api = apiFor({ detail: getGroup });
+    const user = userEvent.setup();
+    render(<GroupsPage api={api} />);
+
+    await screen.findByRole("button", { name: "打开重复组 1" });
+    await user.click(screen.getByRole("button", { name: "选中重复组 1 的其余成员" }));
+
+    await waitFor(() => expect(screen.getByText("已选 2 项")).toBeInTheDocument());
+    expect(screen.getByText("已选中重复组 #1 的其余 2 个成员（保留代表文件）。")).toBeInTheDocument();
+    expect(getGroup).toHaveBeenCalledWith(1, 1, 100);
+    // 不打开详情
+    expect(screen.getByText("选择一个重复组以查看文件。")).toBeInTheDocument();
+
+    // 选择落在该组 scope：打开详情后可手动微调，勾选保持
+    await user.click(screen.getByRole("button", { name: "打开重复组 1" }));
+    expect(await screen.findByRole("checkbox", { name: "选择文件 2" })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "选择文件 4" })).toBeChecked();
+    expect(screen.getByText("已选 2 项")).toBeInTheDocument();
+  });
+
+  test("lists the kept representative and unselected members on the delete confirmation", async () => {
+    const api = apiFor();
+    const user = userEvent.setup();
+    render(<GroupsPage api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "打开重复组 1" }));
+    await user.click(await screen.findByRole("checkbox", { name: "选择文件 2" }));
+    await user.click(screen.getByRole("button", { name: "删除已选 1 项" }));
+
+    const dialog = await screen.findByRole("dialog", { name: "确认删除" });
+    const keptRegion = await within(dialog).findByRole("region", { name: "本次保留的文件" });
+    expect(within(keptRegion).getAllByTestId("kept-member").map(item => item.textContent)).toEqual([
+      "agent-a：D:\\media\\file-1.jpg",
+      "agent-c：D:\\media\\file-3.jpg"
+    ]);
+  });
+
+  test("restores an audit retry handoff selection and opens delete preparation automatically", async () => {
+    const terminal = deleteTaskStatus({
+      ok: 0,
+      uncertain: 1,
+      problems: [{
+        machineId: "agent-b",
+        sequence: 0,
+        path: "D:\\media\\file-2.jpg",
+        errorCode: "E_HELPER_LOST",
+        errorMessage: "helper connection lost",
+        uncertain: true
+      }]
+    });
+    const snapshot: DeleteReviewSnapshot = {
+      groupId: 1,
+      kind: "exact",
+      scopeKey: "exact:1",
+      members: [{ fileId: 2, machineId: "agent-b", path: "D:\\media\\file-2.jpg", size: 1_000 }],
+      terminalStatus: terminal,
+      reconciled: true
+    };
+    const onRetryFileIdsConsumed = vi.fn();
+    const api = apiFor();
+    render(<GroupsPage
+      api={api}
+      deleteReviewSnapshot={snapshot}
+      onDeleteReviewSnapshotChange={vi.fn()}
+      onRetryFileIdsConsumed={onRetryFileIdsConsumed}
+      retryFileIds={[2]}
+    />);
+
+    await waitFor(() => expect(onRetryFileIdsConsumed).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(api.prepareDelete).toHaveBeenCalledWith([2], expect.any(AbortSignal)));
+    expect(await screen.findByRole("dialog", { name: "确认删除" })).toBeInTheDocument();
+    expect(screen.getByText("已选 1 项")).toBeInTheDocument();
+    expect(screen.getByText("已恢复 1 个待重试项，确认后将重新发起删除。")).toBeInTheDocument();
+    // 删除对话框打开时根容器 aria-hidden，详情复选框需 hidden 查询
+    expect(await screen.findByRole("checkbox", { name: "选择文件 2", hidden: true })).toBeChecked();
+  });
+
+  test("rejects the audit retry handoff when no review snapshot exists", async () => {
+    const onRetryFileIdsConsumed = vi.fn();
+    const api = apiFor();
+    render(<GroupsPage
+      api={api}
+      onRetryFileIdsConsumed={onRetryFileIdsConsumed}
+      retryFileIds={[2]}
+    />);
+
+    await waitFor(() => expect(onRetryFileIdsConsumed).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText("缺少可核对的原始选择，无法一键重试。")).toBeInTheDocument();
+    expect(api.prepareDelete).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog", { name: "确认删除" })).not.toBeInTheDocument();
   });
 });

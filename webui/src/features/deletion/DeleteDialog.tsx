@@ -7,7 +7,13 @@ import type {
   DeletePreparation,
   DeleteTaskStatus
 } from "../../api/contracts";
+import { apiErrorText } from "../../api/errorText";
+import { CopyButton } from "../../components/CopyButton";
 import { Modal } from "../../components/Modal";
+import type { DeleteReviewMember } from "../groups/deleteReview";
+import "./deletion.css";
+import { errorCodeText } from "./errorCodes";
+import { RecycledToList } from "./RecycledToList";
 
 type DeletePhase =
   | { name: "idle" }
@@ -24,7 +30,12 @@ type DeletePhase =
       preparation: DeletePreparation;
       mode: DeleteMode;
     }
-  | { name: "polling"; taskId: string; lastStatus?: DeleteTaskStatus }
+  | {
+      name: "polling";
+      taskId: string;
+      lastStatus?: DeleteTaskStatus;
+      pollError?: { failures: number; message: string };
+    }
   | {
       name: "poll-error";
       taskId: string;
@@ -45,6 +56,8 @@ export interface DeleteDialogProps {
   readonly memberIds: number[];
   readonly initialTaskId?: string;
   readonly api?: AppApi;
+  /** 确认页展示的保留文件（代表与未选中成员）；空数组表示无法穷举，仅展示口径说明。 */
+  readonly keptMembers?: readonly DeleteReviewMember[];
   readonly onClose: () => void;
   readonly onAccepted?: (taskId: string) => void;
   readonly onExecutionRejected?: () => void;
@@ -59,6 +72,7 @@ interface OpenDeleteDialogSessionProps {
   readonly selectionKey: string;
   readonly initialTaskId?: string;
   readonly api: AppApi;
+  readonly keptMembers?: readonly DeleteReviewMember[];
   readonly onClose: () => void;
   readonly onAccepted?: (taskId: string) => void;
   readonly onExecutionRejected?: () => void;
@@ -72,6 +86,7 @@ interface DeleteConfirmationSessionProps {
   readonly memberIds: number[];
   readonly selectionKey: string;
   readonly api: AppApi;
+  readonly keptMembers: readonly DeleteReviewMember[];
   readonly onClose: () => void;
   readonly onExecutionRejected: () => void;
   readonly onExecutionStarted: (memberIds: number[], selectionKey: string) => void;
@@ -97,14 +112,14 @@ function errorValue(error: unknown, fallback: string): ApiError | Error {
   return error instanceof Error ? error : new Error(fallback);
 }
 
-function errorMessage(error: unknown, fallback: string): string {
-  return error instanceof Error && error.message ? error.message : fallback;
-}
-
 function isExpiredConfirmation(error: unknown): boolean {
-  return error instanceof ApiError
-    && error.status === 400
-    && /invalid confirmation|expired/i.test(error.message);
+  if (!(error instanceof ApiError)) return false;
+  if (error.status === 400) return /invalid confirmation|expired/i.test(error.message);
+  // A consumed token can never succeed again; treat it like an expired one so
+  // the user is forced back to an explicit re-prepare instead of retrying a
+  // dead confirmation forever.
+  if (error.status === 409) return /already used/i.test(error.message);
+  return false;
 }
 
 function StatusDetails({ status }: { readonly status: DeleteTaskStatus }) {
@@ -145,6 +160,9 @@ function StatusDetails({ status }: { readonly status: DeleteTaskStatus }) {
                     </li>)}
                   </ul>
                 </section>}
+            {machine.recycledTo === undefined ? null : (
+              <RecycledToList machineId={machine.machineId} recycledTo={machine.recycledTo} />
+            )}
           </li>;
         })}
       </ul>
@@ -154,18 +172,23 @@ function StatusDetails({ status }: { readonly status: DeleteTaskStatus }) {
       <h3>错误代码</h3>
       {errorCodes.length === 0
         ? <p>无</p>
-        : <ul>{errorCodes.map(([code, count]) => <li key={code}>{code}：{count}</li>)}</ul>}
+        : <ul>{errorCodes.map(([code, count]) => <li key={code}>{errorCodeText(code)}：{count}</li>)}</ul>}
     </section>
 
     <section aria-label="删除问题项目">
       <h3>问题项目</h3>
       {status.problems.length === 0
         ? <p>无</p>
-        : <ul>{status.problems.map((problem, index) => <li key={`${problem.machineId}-${problem.sequence}-${index}`}>
-          Agent：{problem.machineId}；序列：{problem.sequence}；路径：{problem.path}；
-          错误代码：{problem.errorCode ?? "未提供"}；错误消息：{problem.errorMessage ?? "未提供"}；
-          不确定：{problem.uncertain ? "是" : "否"}；状态同步错误：{problem.stateSyncErr ?? "无"}
-        </li>)}</ul>}
+        : <ul>{status.problems.map((problem, index) => {
+          const detail = problem.errorMessage ?? problem.stateSyncErr;
+          return <li key={`${problem.machineId}-${problem.sequence}-${index}`}>
+            Agent：{problem.machineId}；序列：{problem.sequence}；路径：{problem.path}
+            {" "}<CopyButton label="复制路径" text={problem.path} />
+            ；错误代码：{errorCodeText(problem.errorCode)}；错误消息：{problem.errorMessage ?? "未提供"}；
+            不确定：{problem.uncertain ? "是" : "否"}；状态同步错误：{problem.stateSyncErr ?? "无"}
+            {detail ? <> <CopyButton label="复制错误详情" text={detail} /></> : null}
+          </li>;
+        })}</ul>}
     </section>
   </>;
 }
@@ -174,6 +197,7 @@ function DeleteConfirmationSession({
   memberIds,
   selectionKey,
   api,
+  keptMembers,
   onClose,
   onExecutionRejected,
   onExecutionStarted,
@@ -226,7 +250,7 @@ function DeleteConfirmationSession({
       error => {
         if (controller.signal.aborted || isAbortError(error)) return;
         setPhase({ name: "idle" });
-        setFault({ kind: "prepare", message: errorMessage(error, "准备删除失败") });
+        setFault({ kind: "prepare", message: apiErrorText(error, "准备删除失败") });
       }
     );
 
@@ -301,7 +325,12 @@ function DeleteConfirmationSession({
         executeStartedRef.current = false;
         if (isExpiredConfirmation(error)) {
           setPhase({ name: "idle" });
-          setFault({ kind: "expired-api", message: "确认已过期，请重新准备" });
+          setFault({
+            kind: "expired-api",
+            message: error instanceof ApiError && error.status === 409
+              ? "该确认已被使用，请重新准备"
+              : "确认已过期，请重新准备"
+          });
           return;
         }
         onExecutionRejected();
@@ -311,7 +340,7 @@ function DeleteConfirmationSession({
           preparation: executing.preparation,
           mode: executing.mode
         });
-        setFault({ kind: "execute", message: errorMessage(error, "提交删除失败") });
+        setFault({ kind: "execute", message: apiErrorText(error, "提交删除失败") });
       }
     );
   }
@@ -335,6 +364,13 @@ function DeleteConfirmationSession({
       <ul aria-label="路径样本">
         {preparation.summary.samples.map((sample, index) => <li key={`${sample}-${index}`}>{sample}</li>)}
       </ul>
+      <section aria-label="本次保留的文件">
+        <h3>本次保留的文件</h3>
+        {keptMembers.length === 0
+          ? <p>未选中的成员与各组代表文件将全部保留。</p>
+          : <ul>{keptMembers.map(kept =>
+              <li data-testid="kept-member" key={kept.fileId}>{kept.machineId}：{kept.path}</li>)}</ul>}
+      </section>
       <p>确认令牌剩余 {remainingSeconds} 秒</p>
       <p>硬删除会永久删除文件且不可恢复。</p>
       {fault?.kind === "execute" ? <p role="alert">{fault.message}</p> : null}
@@ -380,6 +416,11 @@ function DeleteConfirmationSession({
   </Modal>;
 }
 
+// 轮询容错上限：瞬时故障按 1s→2s→4s→8s（封顶）退避自动恢复，
+// 连续失败 MAX_POLL_FAILURES 次后进入手动重试态
+const MAX_POLL_FAILURES = 5;
+const MAX_POLL_RETRY_DELAY_MS = 8_000;
+
 function DeleteTaskSession({ api, onClose, onTerminal, taskId }: DeleteTaskSessionProps) {
   const [phase, setPhase] = useState<Extract<
     DeletePhase,
@@ -387,6 +428,7 @@ function DeleteTaskSession({ api, onClose, onTerminal, taskId }: DeleteTaskSessi
   >>({ name: "polling", taskId });
   const [pollVersion, setPollVersion] = useState(0);
   const lastStatusRef = useRef<DeleteTaskStatus | undefined>(undefined);
+  const consecutiveFailuresRef = useRef(0);
   const terminalNotifiedRef = useRef(false);
   const onTerminalRef = useRef(onTerminal);
 
@@ -403,6 +445,7 @@ function DeleteTaskSession({ api, onClose, onTerminal, taskId }: DeleteTaskSessi
       try {
         const status = await api.getDeleteStatus(taskId, controller.signal);
         if (!active || controller.signal.aborted) return;
+        consecutiveFailuresRef.current = 0;
         lastStatusRef.current = status;
         if (status.complete) {
           setPhase({ name: "terminal", status });
@@ -412,11 +455,32 @@ function DeleteTaskSession({ api, onClose, onTerminal, taskId }: DeleteTaskSessi
         timer = window.setTimeout(() => void poll(), 1_000);
       } catch (error) {
         if (!active || controller.signal.aborted || isAbortError(error)) return;
+        const failure = errorValue(error, "读取删除进度失败");
+        // 仅可重试错误（408/429/5xx 与网络错误，ApiError.retryable=true）做退避恢复
+        const retryable = failure instanceof ApiError && failure.retryable;
+        consecutiveFailuresRef.current += 1;
+        if (retryable && consecutiveFailuresRef.current < MAX_POLL_FAILURES) {
+          const delay = Math.min(
+            1_000 * 2 ** (consecutiveFailuresRef.current - 1),
+            MAX_POLL_RETRY_DELAY_MS
+          );
+          setPhase({
+            name: "polling",
+            taskId,
+            lastStatus: lastStatusRef.current,
+            pollError: {
+              failures: consecutiveFailuresRef.current,
+              message: apiErrorText(failure, "读取删除进度失败")
+            }
+          });
+          timer = window.setTimeout(() => void poll(), delay);
+          return;
+        }
         setPhase({
           name: "poll-error",
           taskId,
           lastStatus: lastStatusRef.current,
-          error: errorValue(error, "读取删除进度失败")
+          error: failure
         });
       }
     };
@@ -438,6 +502,7 @@ function DeleteTaskSession({ api, onClose, onTerminal, taskId }: DeleteTaskSessi
 
   function retryPoll() {
     if (phase.name !== "poll-error") return;
+    consecutiveFailuresRef.current = 0;
     lastStatusRef.current = phase.lastStatus;
     setPhase({ name: "polling", taskId, lastStatus: phase.lastStatus });
     setPollVersion(version => version + 1);
@@ -446,20 +511,24 @@ function DeleteTaskSession({ api, onClose, onTerminal, taskId }: DeleteTaskSessi
   let content: ReactNode;
   if (phase.name === "polling" || phase.name === "poll-error") {
     content = <>
-      <p>任务 ID：{taskId}</p>
+      <p><span>任务 ID：{taskId}</span> <CopyButton text={taskId} /></p>
       {phase.lastStatus ? <StatusDetails status={phase.lastStatus} /> : <p role="status">正在获取删除进度</p>}
+      {phase.name === "polling" && phase.pollError
+        ? <p role="status">{phase.pollError.message} 正在自动重试（连续第 {phase.pollError.failures} 次失败）</p>
+        : null}
       {phase.name === "poll-error" ? <>
-        <p role="alert">{phase.error.message}</p>
+        <p role="alert">{apiErrorText(phase.error, "读取删除进度失败")}</p>
         <button onClick={retryPoll} type="button">重试获取进度</button>
       </> : null}
     </>;
   } else {
     content = <>
-      <p>任务 ID：{phase.status.taskId}</p>
+      <p><span>任务 ID：{phase.status.taskId}</span> <CopyButton text={phase.status.taskId} /></p>
       <StatusDetails status={phase.status} />
       {phase.status.failed > 0 || phase.status.uncertain > 0 || phase.status.stateSyncFailures > 0
         ? <p role="status">失败或不确定项已保留；关闭后可重新检查并明确重试。</p>
         : null}
+      <p><a href={`#/audit?task=${encodeURIComponent(phase.status.taskId)}`}>前往删除审计页查看 →</a></p>
       <button onClick={onClose} type="button">关闭</button>
     </>;
   }
@@ -474,6 +543,7 @@ function OpenDeleteDialogSession({
   selectionKey,
   initialTaskId,
   api,
+  keptMembers,
   onClose,
   onAccepted,
   onExecutionRejected,
@@ -516,6 +586,7 @@ function OpenDeleteDialogSession({
   const confirmationSelection = frozenSelection ?? { memberIds, selectionKey };
   return <DeleteConfirmationSession
     api={api}
+    keptMembers={keptMembers ?? []}
     key={confirmationSelection.selectionKey}
     memberIds={confirmationSelection.memberIds}
     onClose={onClose}
@@ -546,6 +617,7 @@ export function DeleteDialog({
   memberIds,
   initialTaskId,
   api = appApi,
+  keptMembers,
   onClose,
   onAccepted,
   onExecutionRejected,
@@ -560,6 +632,7 @@ export function DeleteDialog({
   return <OpenDeleteDialogSession
     api={api}
     initialTaskId={initialTaskId}
+    keptMembers={keptMembers}
     memberIds={normalizedMemberIds}
     onAccepted={onAccepted}
     onClose={onClose}

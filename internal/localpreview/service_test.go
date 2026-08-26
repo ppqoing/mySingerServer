@@ -79,6 +79,50 @@ func TestImagePreviewServiceRejectsUnsafeDatabaseRowsBeforeWorker(t *testing.T) 
 	}
 }
 
+// Break caught: the manager SHA-512 bridge resolves through the file-ID query
+// (wrong ID space) or skips the digest re-check, returning another file's bytes.
+func TestImagePreviewServiceResolvesManagerSHA512Bridge(t *testing.T) {
+	sha := bytes64Preview(0x94)
+	shaHex := hex.EncodeToString(sha)
+	backend := &previewSourceStoreFake{source: store.LocalPreviewSource{
+		FileID: 94, MachineID: "machine-a", Path: `D:\media\bridged.jpg`,
+		Kind: "image", Status: "done", SHA512: shaHex,
+		Size: 321, MTime: 654,
+	}}
+	executor := &previewWorkerFake{result: &worker.JobResultMsg{
+		Path: backend.source.Path, Kind: worker.MediaImage, SHA512: append([]byte(nil), sha...),
+		PreviewFormat: worker.PreviewFormatJPEG, PreviewWidth: 40, PreviewHeight: 30,
+		PreviewBytes: []byte{9, 8, 7},
+	}}
+	service := NewService("machine-a", backend, executor)
+	response, err := service.Preview(context.Background(), proto.LocalImagePreviewRequest{
+		MaxWidth: 100, MaxHeight: 100, Format: "jpeg", Quality: 80, Sha512: shaHex,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backend.sha512 != shaHex || backend.fileID != 0 ||
+		executor.job.Path != backend.source.Path || !bytes.Equal(executor.job.KnownSHA, sha) {
+		t.Fatalf("bridge resolution = %#v / %#v", backend, executor.job)
+	}
+	if response.MIME != "image/jpeg" || len(response.Bytes) != 3 {
+		t.Fatalf("response = %#v", response)
+	}
+
+	mismatch := &previewSourceStoreFake{source: store.LocalPreviewSource{
+		FileID: 95, MachineID: "machine-a", Path: `D:\media\other.jpg`,
+		Kind: "image", Status: "done", SHA512: hex.EncodeToString(bytes64Preview(0x95)),
+		Size: 1, MTime: 2,
+	}}
+	mismatchExecutor := &previewWorkerFake{}
+	service = NewService("machine-a", mismatch, mismatchExecutor)
+	if _, err := service.Preview(context.Background(), proto.LocalImagePreviewRequest{
+		MaxWidth: 10, MaxHeight: 10, Format: "jpeg", Quality: 80, Sha512: shaHex,
+	}); err == nil || mismatchExecutor.calls != 0 {
+		t.Fatalf("digest mismatch reached worker: err=%v calls=%d", err, mismatchExecutor.calls)
+	}
+}
+
 func TestStalePreviewServiceRejectsWorkerPayloadMismatch(t *testing.T) {
 	sha := bytes64Preview(0x93)
 	source := store.LocalPreviewSource{
@@ -127,10 +171,16 @@ type previewSourceStoreFake struct {
 	err       error
 	machineID string
 	fileID    int64
+	sha512    string
 }
 
 func (fake *previewSourceStoreFake) LoadLocalPreviewSource(_ context.Context, machineID string, fileID int64) (store.LocalPreviewSource, error) {
 	fake.machineID, fake.fileID = machineID, fileID
+	return fake.source, fake.err
+}
+
+func (fake *previewSourceStoreFake) LoadLocalPreviewSourceBySHA(_ context.Context, machineID string, sha512 string) (store.LocalPreviewSource, error) {
+	fake.machineID, fake.sha512 = machineID, sha512
 	return fake.source, fake.err
 }
 

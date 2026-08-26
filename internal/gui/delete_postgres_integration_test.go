@@ -2,6 +2,7 @@ package gui
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +15,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"dedup/internal/proto"
 )
 
 func TestDeletePrepareResolvesCanonicalMembersFromPostgres(t *testing.T) {
@@ -207,4 +210,123 @@ func (fixture *deletePostgresFixture) service() *DeleteService {
 		NewConfirmStore(time.Minute, time.Now),
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
 	)
+}
+
+func TestDeleteTaskPersistenceRoundTrip(t *testing.T) {
+	fixture := newDeletePostgresFixture(t)
+	transport := &deleteTestTransport{
+		online: map[string]bool{
+			fixture.machineA: true,
+			fixture.machineB: true,
+		},
+		onlineCalls: make(map[string]int),
+		sendErrors:  make(map[string]error),
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	service := NewDeleteService(
+		fixture.tx,
+		transport,
+		NewConfirmStore(time.Minute, time.Now),
+		logger,
+	)
+	service.SetTaskStore(fixture.tx)
+
+	summary, token, err := service.Prepare(
+		fixture.ctx,
+		[]int64{fixture.goodA, fixture.goodB},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.TotalFiles != 2 {
+		t.Fatalf("summary = %#v", summary)
+	}
+	taskID, err := service.Execute(fixture.ctx, token, "soft")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Task creation persisted a non-terminal snapshot.
+	var (
+		mode       string
+		statusJSON []byte
+	)
+	if err := fixture.tx.QueryRow(fixture.ctx, `
+		SELECT mode, status_json FROM delete_tasks WHERE id=$1`, taskID,
+	).Scan(&mode, &statusJSON); err != nil {
+		t.Fatal(err)
+	}
+	if mode != "soft" {
+		t.Fatalf("persisted mode = %q, want soft", mode)
+	}
+	var persisted DeleteTaskStatus
+	if err := json.Unmarshal(statusJSON, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted.TaskID != taskID || persisted.Complete ||
+		persisted.Pending != 2 || persisted.Total != 2 {
+		t.Fatalf("persisted snapshot = %#v", persisted)
+	}
+
+	// Each accepted report refreshes the snapshot.
+	service.HandleReport(fixture.machineA, &proto.DeleteReport{
+		TaskID: taskID, Seq: 0, LastSeq: 0,
+		Stats:   proto.DeleteStats{Total: 1, OK: 1},
+		Entries: []proto.DeleteResult{{Path: fixture.pathA, OK: true, RecycledTo: `Z:\recycled\a`}},
+	})
+	if err := fixture.tx.QueryRow(fixture.ctx, `
+		SELECT status_json FROM delete_tasks WHERE id=$1`, taskID,
+	).Scan(&statusJSON); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(statusJSON, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted.OK != 1 || persisted.Pending != 1 || persisted.Complete {
+		t.Fatalf("snapshot after report = %#v", persisted)
+	}
+
+	// A fresh service (post-restart) restores the non-terminal task; the
+	// restore is idempotent and reports for it are dropped.
+	restored := NewDeleteService(
+		fixture.tx,
+		nil,
+		NewConfirmStore(time.Minute, time.Now),
+		logger,
+	)
+	restored.SetTaskStore(fixture.tx)
+	if err := restored.Restore(fixture.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := restored.Restore(fixture.ctx); err != nil {
+		t.Fatalf("second Restore() error = %v", err)
+	}
+	status, ok := restored.Status(taskID)
+	if !ok || status.Complete || status.OK != 1 || status.Pending != 1 ||
+		status.Mode != "soft" {
+		t.Fatalf("restored status = %#v found=%v", status, ok)
+	}
+	if status.ByMachine[fixture.machineA].RecycledTo[fixture.pathA] != `Z:\recycled\a` {
+		t.Fatalf("restored RecycledTo = %#v", status.ByMachine[fixture.machineA].RecycledTo)
+	}
+	restored.HandleReport(fixture.machineB, &proto.DeleteReport{
+		TaskID: taskID, Seq: 0, LastSeq: 0,
+		Stats:   proto.DeleteStats{Total: 1, OK: 1},
+		Entries: []proto.DeleteResult{{Path: fixture.pathB, OK: true}},
+	})
+	status, ok = restored.Status(taskID)
+	if !ok || status.Pending != 1 || status.OK != 1 {
+		t.Fatalf("restored status after late report = %#v found=%v", status, ok)
+	}
+
+	// The store-backed list surfaces the in-progress task with counts only.
+	summaries := restored.ListTasks(fixture.ctx, 10)
+	if len(summaries) == 0 || summaries[0].TaskID != taskID {
+		t.Fatalf("ListTasks() = %#v", summaries)
+	}
+	if summaries[0].Complete || summaries[0].Pending != 1 ||
+		summaries[0].OK != 1 || summaries[0].Total != 2 ||
+		summaries[0].CreatedAt.IsZero() {
+		t.Fatalf("summary = %#v", summaries[0])
+	}
 }

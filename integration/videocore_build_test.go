@@ -281,6 +281,9 @@ func TestVideoCoreBuildStaticContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	source := string(data)
+	// build.ps1 may be checked out with CRLF or LF (core.autocrlf); normalize
+	// so anchors below match either form.
+	source = strings.ReplaceAll(source, "\r\n", "\n")
 	if err := validateVideoCoreBuildContract(source); err != nil {
 		t.Fatalf("repository build contract: %v", err)
 	}

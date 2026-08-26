@@ -608,19 +608,6 @@ func TestBuildScriptPackagesHelperWithoutOverwritingOperatorConfig(t *testing.T)
 		t.Fatal(err)
 	}
 	defer removeRunUniqueTemp(t, base, work)
-	out := filepath.Join(work, "out")
-	if err := os.MkdirAll(out, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	operatorConfig := filepath.Join(out, "helper.json")
-	const operatorConfigBody = "{\"operator_config\":true}\n"
-	if err := os.WriteFile(operatorConfig, []byte(operatorConfigBody), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	relativeOut, err := filepath.Rel(root, out)
-	if err != nil {
-		t.Fatal(err)
-	}
 	powershell := requiredPowerShell(t)
 	goExe := requiredExecutable(t, "Go", filepath.Join(runtime.GOROOT(), "bin", "go.exe"))
 	cc := os.Getenv("M5_CC")
@@ -632,7 +619,33 @@ func TestBuildScriptPackagesHelperWithoutOverwritingOperatorConfig(t *testing.T)
 	}
 	cc = requiredExecutable(t, "C compiler", cc)
 	windres := requiredWindres(t)
-	command := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", filepath.Join(root, "scripts", "build.ps1"), "-Go", goExe, "-CC", cc, "-Windres", windres, "-OutDir", relativeOut)
+
+	// The staged build fails closed when its stage directory already exists,
+	// so an operator config can never be overwritten by a build: the script
+	// only ever writes into a stage it created itself.
+	occupied := filepath.Join(work, "occupied-stage")
+	if err := os.MkdirAll(occupied, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	operatorConfig := filepath.Join(occupied, "helper.json")
+	const operatorConfigBody = "{\"operator_config\":true}\n"
+	if err := os.WriteFile(operatorConfig, []byte(operatorConfigBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rejected := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", filepath.Join(root, "scripts", "build.ps1"), "-Go", goExe, "-CC", cc, "-Windres", windres, "-StageDir", occupied)
+	rejected.Dir = root
+	if rejectOutput, err := rejected.CombinedOutput(); err == nil ||
+		!strings.Contains(string(rejectOutput), "VIDEOCORE_STAGE_EXISTS") {
+		t.Fatalf("build over an existing operator stage did not fail closed: err=%v\n%s", err, rejectOutput)
+	}
+	if body, err := os.ReadFile(operatorConfig); err != nil || string(body) != operatorConfigBody {
+		t.Fatalf("operator helper config was touched: body=%q err=%v", body, err)
+	}
+
+	// Fresh stage (must not exist beforehand): the full build packages
+	// helper.exe and never fabricates an operator helper.json.
+	out := filepath.Join(work, "out")
+	command := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", filepath.Join(root, "scripts", "build.ps1"), "-Go", goExe, "-CC", cc, "-Windres", windres, "-StageDir", out)
 	command.Dir = root
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("fresh build script failed: %v\n%s", err, output)
@@ -640,12 +653,8 @@ func TestBuildScriptPackagesHelperWithoutOverwritingOperatorConfig(t *testing.T)
 	if _, err := os.Stat(filepath.Join(out, "helper.exe")); err != nil {
 		t.Fatalf("helper.exe was not packaged: %v", err)
 	}
-	body, err := os.ReadFile(operatorConfig)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(body) != operatorConfigBody {
-		t.Fatalf("operator helper config was overwritten: %q", body)
+	if _, err := os.Stat(filepath.Join(out, "helper.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("build fabricated an operator helper config in the stage: %v", err)
 	}
 	if matches, err := filepath.Glob(filepath.Join(root, "cmd", "helper", "*.syso")); err != nil {
 		t.Fatal(err)
@@ -680,14 +689,9 @@ func TestBuildScriptFailsClosedWhenExactResourceCleanupFails(t *testing.T) {
 	if err := os.WriteFile(fakeWindres, []byte("@echo off\r\nmkdir \"%6\"\r\nif errorlevel 1 exit /b 2\r\necho "+magic+">\"%6\\marker\"\r\nif errorlevel 1 exit /b 3\r\necho "+magic+"\r\nexit /b 1\r\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	// Fresh stage path: the staged build owns and creates it (and fails
+	// closed on a pre-existing one), so it must not exist beforehand.
 	out := filepath.Join(work, "out")
-	if err := os.MkdirAll(out, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	relativeOut, err := filepath.Rel(root, out)
-	if err != nil {
-		t.Fatal(err)
-	}
 	powershell := requiredPowerShell(t)
 	goExe := requiredExecutable(t, "Go", filepath.Join(runtime.GOROOT(), "bin", "go.exe"))
 	cc := os.Getenv("M5_CC")
@@ -698,7 +702,7 @@ func TestBuildScriptFailsClosedWhenExactResourceCleanupFails(t *testing.T) {
 		t.Fatal("build script test requires M5_CC or CC")
 	}
 	cc = requiredExecutable(t, "C compiler", cc)
-	command := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", filepath.Join(root, "scripts", "build.ps1"), "-Go", goExe, "-CC", cc, "-Windres", fakeWindres, "-OutDir", relativeOut)
+	command := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", filepath.Join(root, "scripts", "build.ps1"), "-Go", goExe, "-CC", cc, "-Windres", fakeWindres, "-StageDir", out)
 	command.Dir = root
 	output, err := command.CombinedOutput()
 	if info, statErr := os.Stat(syso); statErr != nil || !info.IsDir() {

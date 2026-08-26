@@ -4465,14 +4465,19 @@ func (fixture *m5Fixture) tc12KillAfterFirstChunk(t *testing.T) {
 		}
 	}
 	fixture.waitAgentOnline(t)
-	var conflict map[string]string
+	// A repeated execute of the consumed token is an idempotent replay: it
+	// returns the first accepted task instead of a conflict.
+	var replay map[string]string
 	fixture.postJSON(
 		t,
 		"/api/delete/execute",
 		map[string]any{"confirm_token": token, "mode": proto.ModeHard},
-		http.StatusConflict,
-		&conflict,
+		http.StatusOK,
+		&replay,
 	)
+	if replay["task_id"] != taskID {
+		t.Fatalf("TC-12 replay task_id=%q, want %q", replay["task_id"], taskID)
+	}
 
 	restarted := fixture.startHelper(t)
 	fixture.activeHelper = restarted

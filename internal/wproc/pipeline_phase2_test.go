@@ -370,10 +370,10 @@ func TestPhase2ImageIgnoresVideoOnlyConfiguration(t *testing.T) {
 	}
 }
 
-func TestPhase2ImageDetectsSubMillisecondSourceDrift(t *testing.T) {
-	job, deps, state := newPhase2ImageHarness([]byte("sub-ms drift"))
+func TestPhase2ImageDetectsSourceDrift(t *testing.T) {
+	job, deps, state := newPhase2ImageHarness([]byte("source drift"))
 	drifted := state.pathStats[0]
-	drifted.mtimeNS = drifted.ModTime().UnixNano() + 1
+	drifted.mtimeNS = drifted.ModTime().Add(time.Second).UnixNano()
 	state.file.handleStats[1] = drifted
 	state.file.handleStats[2] = drifted
 	state.pathStats[1] = drifted
@@ -411,7 +411,9 @@ func (f phase2Info) ModTime() time.Time {
 	if f.mtimeNS != 0 {
 		return time.Unix(0, f.mtimeNS)
 	}
-	return time.UnixMilli(f.mtimeMS)
+	// The system-wide mtime precision is Unix seconds (see worker.JobMsg
+	// MTimeMS); the fixture field keeps its historical name.
+	return time.Unix(f.mtimeMS, 0)
 }
 func (f phase2Info) IsDir() bool { return false }
 func (f phase2Info) Sys() any    { return nil }

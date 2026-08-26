@@ -6,10 +6,6 @@ import (
 	"dedup/internal/wproc/mediacore"
 )
 
-func mediacoreVersion() string {
-	return mediacore.Version()
-}
-
 func mediacoreDebugCrash() {
 	mediacore.DebugCrash()
 }

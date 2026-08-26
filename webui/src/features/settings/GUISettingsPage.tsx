@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { appApi, GUIConfigRestartError, GUIConfigValidationError, waitForManager, type AppApi } from "../../api/appApi";
 import { isAbortError } from "../../api/client";
+import { apiErrorText } from "../../api/errorText";
 import type {
   GUIConfig,
   GUIFirstScreenConfig,
@@ -29,6 +30,8 @@ interface TextFieldProps extends FieldProps {
 }
 
 interface NumberFieldProps extends FieldProps {
+  readonly max?: number;
+  readonly min?: number;
   readonly note?: string;
   readonly onChange: (value: number) => void;
   readonly step?: number;
@@ -37,6 +40,16 @@ interface NumberFieldProps extends FieldProps {
 
 function fieldID(path: string): string {
   return `gui-config-${path.replace(/[^a-z0-9]+/gi, "-")}`;
+}
+
+/** 滚动并聚焦到指定配置字段（服务端/客户端校验错误定位用）。 */
+function focusField(path: string) {
+  const element = document.getElementById(fieldID(path));
+  if (!element) return;
+  if (typeof element.scrollIntoView === "function") {
+    element.scrollIntoView({ block: "center" });
+  }
+  element.focus();
 }
 
 function TextField({ error, label, onChange, path, type = "text", value }: TextFieldProps) {
@@ -59,26 +72,52 @@ function TextField({ error, label, onChange, path, type = "text", value }: TextF
   );
 }
 
-function NumberField({ error, label, note, onChange, path, step = 1, value }: NumberFieldProps) {
+function NumberField({ error, label, max, min, note, onChange, path, step = 1, value }: NumberFieldProps) {
   const id = fieldID(path);
   const errorID = `${id}-error`;
   const noteID = `${id}-note`;
-  const describedBy = [note ? noteID : undefined, error ? errorID : undefined].filter(Boolean).join(" ") || undefined;
+  // 内部持有字符串，空值/非法输入保持非法态，绝不静默变 0（NaN 不进入草稿）。
+  // 重新加载时由父组件通过 form key 重挂载本组件，使输入框回到磁盘值。
+  const [text, setText] = useState(String(value));
+  const [localError, setLocalError] = useState<string>();
+
+  const validate = (raw: string): string | undefined => {
+    const trimmed = raw.trim();
+    if (trimmed === "" || !Number.isFinite(Number(trimmed))) return "请输入有效数字";
+    const parsed = Number(trimmed);
+    if (min !== undefined && parsed < min) return `不能小于 ${min}`;
+    if (max !== undefined && parsed > max) return `不能大于 ${max}`;
+    return undefined;
+  };
+
+  const shownError = localError ?? error;
+  const describedBy = [note ? noteID : undefined, shownError ? errorID : undefined].filter(Boolean).join(" ") || undefined;
   return (
     <div className="gui-settings__field">
       <label htmlFor={id}>{label}</label>
       <input
         aria-describedby={describedBy}
-        aria-invalid={error ? "true" : undefined}
+        aria-invalid={shownError ? "true" : undefined}
         id={id}
+        max={max}
+        min={min}
         name={path}
-        onChange={event => onChange(Number(event.currentTarget.value))}
+        onBlur={event => setLocalError(validate(event.currentTarget.value))}
+        onChange={event => {
+          const raw = event.currentTarget.value;
+          setText(raw);
+          // 只有完全合法的数字才写入草稿；非法输入等失焦/提交时统一报错。
+          if (validate(raw) === undefined) {
+            setLocalError(undefined);
+            onChange(Number(raw.trim()));
+          }
+        }}
         step={step}
         type="number"
-        value={value}
+        value={text}
       />
       {note ? <p className="gui-settings__field-note" id={noteID}>{note}</p> : null}
-      {error ? <p className="gui-settings__field-error" id={errorID} role="alert">{error}</p> : null}
+      {shownError ? <p className="gui-settings__field-error" id={errorID} role="alert">{shownError}</p> : null}
     </div>
   );
 }
@@ -93,6 +132,8 @@ export function GUISettingsPage({ api = appApi, navigate = target => window.loca
   const [notice, setNotice] = useState<string>();
   const [pageError, setPageError] = useState<string>();
   const [diskRestartRequired, setDiskRestartRequired] = useState(false);
+  // 每次成功加载递增，作为 form key 让各 NumberField 重挂载回磁盘值。
+  const [loadRevision, setLoadRevision] = useState(0);
   const loadController = useRef<AbortController | null>(null);
   const saveController = useRef<AbortController | null>(null);
 
@@ -110,6 +151,7 @@ export function GUISettingsPage({ api = appApi, navigate = target => window.loca
       setConfig(snapshot.config);
       setBaseline(snapshot.config);
       setDiskRestartRequired(snapshot.restartRequired);
+      setLoadRevision(revision => revision + 1);
       setLoadState("ready");
     } catch (error) {
       if (isAbortError(error) || controller.signal.aborted) return;
@@ -126,6 +168,7 @@ export function GUISettingsPage({ api = appApi, navigate = target => window.loca
       setConfig(snapshot.config);
       setBaseline(snapshot.config);
       setDiskRestartRequired(snapshot.restartRequired);
+      setLoadRevision(revision => revision + 1);
       setLoadState("ready");
     }).catch(error => {
       if (isAbortError(error) || controller.signal.aborted) return;
@@ -142,6 +185,19 @@ export function GUISettingsPage({ api = appApi, navigate = target => window.loca
     () => config !== undefined && baseline !== undefined && JSON.stringify(config) !== JSON.stringify(baseline),
     [baseline, config]
   );
+
+  const reloadConfig = useCallback(() => {
+    if (dirty && !window.confirm("有未保存更改，重新加载会丢弃这些更改。确定继续吗？")) return;
+    void loadConfig();
+  }, [dirty, loadConfig]);
+
+  // 有未保存更改时拦截页面关闭/刷新，防止草稿丢失。
+  useEffect(() => {
+    if (!dirty) return;
+    const warnUnsaved = (event: BeforeUnloadEvent) => event.preventDefault();
+    window.addEventListener("beforeunload", warnUnsaved);
+    return () => window.removeEventListener("beforeunload", warnUnsaved);
+  }, [dirty]);
 
   const beginEdit = () => {
     setFieldErrors({});
@@ -219,6 +275,23 @@ export function GUISettingsPage({ api = appApi, navigate = target => window.loca
   const saveConfig = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!config || saving) return;
+    // 提交时统一校验数字输入：非法值从未写入草稿（NaN 不提交），这里阻止提交并定位到第一个非法字段。
+    const clientErrors: Record<string, string> = {};
+    for (const input of Array.from(event.currentTarget.querySelectorAll<HTMLInputElement>('input[type="number"]'))) {
+      const raw = input.value.trim();
+      const parsed = Number(raw);
+      if (raw === "" || !Number.isFinite(parsed)) clientErrors[input.name] = "请输入有效数字";
+      else if (input.min !== "" && parsed < Number(input.min)) clientErrors[input.name] = `不能小于 ${input.min}`;
+      else if (input.max !== "" && parsed > Number(input.max)) clientErrors[input.name] = `不能大于 ${input.max}`;
+    }
+    const firstInvalid = Object.keys(clientErrors)[0];
+    if (firstInvalid !== undefined) {
+      setPageError(undefined);
+      setNotice(undefined);
+      setFieldErrors(clientErrors);
+      focusField(firstInvalid);
+      return;
+    }
     saveController.current?.abort();
     const controller = new AbortController();
     saveController.current = controller;
@@ -250,10 +323,13 @@ export function GUISettingsPage({ api = appApi, navigate = target => window.loca
           : "自动重启失败，请检查 data\\logs\\gui.log");
       } else if (error instanceof GUIConfigValidationError) {
         setFieldErrors(Object.fromEntries(error.fields.map(field => [field.field, field.message])));
+        // 校验失败后定位到第一个带 aria-invalid 的字段，约 25 个字段不再靠肉眼找。
+        const first = error.fields.find(field => document.getElementById(fieldID(field.field)));
+        if (first) focusField(first.field);
       } else {
         setPageError(error instanceof Error && error.message === "Manager restart timed out"
           ? "重启后监听失败，请检查 data\\logs\\gui.log"
-          : error instanceof Error ? error.message : "保存配置失败");
+          : apiErrorText(error, "保存配置失败"));
       }
     } finally {
       if (!controller.signal.aborted) setSaving(false);
@@ -273,12 +349,12 @@ export function GUISettingsPage({ api = appApi, navigate = target => window.loca
       {loadState === "error" ? (
         <section className="operational-surface">
           <p role="alert">{pageError || "读取配置失败"}</p>
-          <button onClick={() => void loadConfig()} type="button">重新加载</button>
+          <button onClick={reloadConfig} type="button">重新加载</button>
         </section>
       ) : null}
 
       {loadState === "ready" && config ? (
-        <form className="gui-settings__form" onSubmit={saveConfig}>
+        <form className="gui-settings__form" key={loadRevision} noValidate onSubmit={saveConfig}>
           <section className="operational-surface gui-settings__section">
             <h2>基本设置</h2>
             <div className="gui-settings__grid">
@@ -292,6 +368,8 @@ export function GUISettingsPage({ api = appApi, navigate = target => window.loca
               <NumberField
                 error={fieldErrors.heartbeat_s}
                 label="心跳间隔（秒）"
+                min={1}
+                note="单位：秒，必须为正整数；过短会增加 Agent 通信压力。"
                 onChange={value => updateTopLevel("heartbeatS", value)}
                 path="heartbeat_s"
                 value={config.heartbeatS}
@@ -368,30 +446,30 @@ export function GUISettingsPage({ api = appApi, navigate = target => window.loca
           <section className="operational-surface gui-settings__section">
             <h2>一筛参数</h2>
             <div className="gui-settings__grid">
-              <NumberField error={fieldErrors["firstscreen.hamming_max"]} label="一筛汉明距离上限" onChange={value => updateFirstScreen("hammingMax", value)} path="firstscreen.hamming_max" value={config.firstScreen.hammingMax} />
-              <NumberField error={fieldErrors["firstscreen.aspect_tolerance"]} label="一筛宽高比容差" onChange={value => updateFirstScreen("aspectTolerance", value)} path="firstscreen.aspect_tolerance" step={0.01} value={config.firstScreen.aspectTolerance} />
-              <NumberField error={fieldErrors["firstscreen.video_duration_window_ms"]} label="视频时长窗口（毫秒）" onChange={value => updateFirstScreen("videoDurationWindowMs", value)} path="firstscreen.video_duration_window_ms" value={config.firstScreen.videoDurationWindowMs} />
-              <NumberField error={fieldErrors["firstscreen.image_quality_min"]} label="图片质量下限" onChange={value => updateFirstScreen("imageQualityMin", value)} path="firstscreen.image_quality_min" value={config.firstScreen.imageQualityMin} />
-              <NumberField error={fieldErrors["firstscreen.read_page_size"]} label="一筛读取页大小" onChange={value => updateFirstScreen("readPageSize", value)} path="firstscreen.read_page_size" value={config.firstScreen.readPageSize} />
-              <NumberField error={fieldErrors["firstscreen.group_insert_batch"]} label="分组写入批次" onChange={value => updateFirstScreen("groupInsertBatch", value)} path="firstscreen.group_insert_batch" value={config.firstScreen.groupInsertBatch} />
-              <NumberField error={fieldErrors["firstscreen.sha_resolve_chunk"]} label="SHA 解析分块" onChange={value => updateFirstScreen("shaResolveChunk", value)} path="firstscreen.sha_resolve_chunk" value={config.firstScreen.shaResolveChunk} />
+              <NumberField error={fieldErrors["firstscreen.hamming_max"]} label="一筛汉明距离上限" max={256} min={0} note="范围 0–256；越大分组越宽松，误并风险越高。" onChange={value => updateFirstScreen("hammingMax", value)} path="firstscreen.hamming_max" value={config.firstScreen.hammingMax} />
+              <NumberField error={fieldErrors["firstscreen.aspect_tolerance"]} label="一筛宽高比容差" max={1} min={0} note="范围 0–1；宽高比差异超过该值不进入同组。" onChange={value => updateFirstScreen("aspectTolerance", value)} path="firstscreen.aspect_tolerance" step={0.01} value={config.firstScreen.aspectTolerance} />
+              <NumberField error={fieldErrors["firstscreen.video_duration_window_ms"]} label="视频时长窗口（毫秒）" min={0} note="单位：毫秒，不能为负；时长差超过该窗口的视频不进入同组。" onChange={value => updateFirstScreen("videoDurationWindowMs", value)} path="firstscreen.video_duration_window_ms" value={config.firstScreen.videoDurationWindowMs} />
+              <NumberField error={fieldErrors["firstscreen.image_quality_min"]} label="图片质量下限" max={100} min={0} note="范围 0–100；低于该质量的图片不参与一筛。" onChange={value => updateFirstScreen("imageQualityMin", value)} path="firstscreen.image_quality_min" value={config.firstScreen.imageQualityMin} />
+              <NumberField error={fieldErrors["firstscreen.read_page_size"]} label="一筛读取页大小" min={1} note="必须为正整数；单次读取的记录数，过大占用更多内存。" onChange={value => updateFirstScreen("readPageSize", value)} path="firstscreen.read_page_size" value={config.firstScreen.readPageSize} />
+              <NumberField error={fieldErrors["firstscreen.group_insert_batch"]} label="分组写入批次" min={1} note="必须为正整数；每批写入数据库的分组数。" onChange={value => updateFirstScreen("groupInsertBatch", value)} path="firstscreen.group_insert_batch" value={config.firstScreen.groupInsertBatch} />
+              <NumberField error={fieldErrors["firstscreen.sha_resolve_chunk"]} label="SHA 解析分块" min={1} note="必须为正整数；每次解析 SHA 的分块大小。" onChange={value => updateFirstScreen("shaResolveChunk", value)} path="firstscreen.sha_resolve_chunk" value={config.firstScreen.shaResolveChunk} />
             </div>
           </section>
 
           <section className="operational-surface gui-settings__section">
             <h2>二筛参数</h2>
             <div className="gui-settings__grid">
-              <NumberField error={fieldErrors["phase2.phash_pass_t2"]} label="二筛 PHash 通过阈值" onChange={value => updatePhase2("phashPassT2", value)} path="phase2.phash_pass_t2" step={0.01} value={config.phase2.phashPassT2} />
-              <NumberField error={fieldErrors["phase2.phash_part_threshold"]} label="二筛 PHash 分块阈值" onChange={value => updatePhase2("phashPartThreshold", value)} path="phase2.phash_part_threshold" value={config.phase2.phashPartThreshold} />
-              <NumberField error={fieldErrors["phase2.sobel_t3"]} label="二筛 Sobel 阈值" onChange={value => updatePhase2("sobelT3", value)} path="phase2.sobel_t3" step={0.01} value={config.phase2.sobelT3} />
-              <NumberField error={fieldErrors["phase2.video_frames"]} label="视频抽帧数" note="当前必须为 6" onChange={value => updatePhase2("videoFrames", value)} path="phase2.video_frames" value={config.phase2.videoFrames} />
-              <NumberField error={fieldErrors["phase2.video_avg_t4"]} label="视频平均阈值" onChange={value => updatePhase2("videoAvgT4", value)} path="phase2.video_avg_t4" step={0.01} value={config.phase2.videoAvgT4} />
-              <NumberField error={fieldErrors["phase2.video_min_passed"]} label="视频最少通过帧数" onChange={value => updatePhase2("videoMinPassed", value)} path="phase2.video_min_passed" value={config.phase2.videoMinPassed} />
-              <NumberField error={fieldErrors["phase2.video_min_valid"]} label="视频最少有效帧数" onChange={value => updatePhase2("videoMinValid", value)} path="phase2.video_min_valid" value={config.phase2.videoMinValid} />
-              <NumberField error={fieldErrors["phase2.video_file_timeout_s"]} label="视频文件超时（秒）" onChange={value => updatePhase2("videoFileTimeoutS", value)} path="phase2.video_file_timeout_s" value={config.phase2.videoFileTimeoutS} />
-              <NumberField error={fieldErrors["phase2.video_frame_command_timeout_s"]} label="单帧命令超时（秒）" onChange={value => updatePhase2("videoFrameCommandTimeoutS", value)} path="phase2.video_frame_command_timeout_s" value={config.phase2.videoFrameCommandTimeoutS} />
-              <NumberField error={fieldErrors["phase2.image_file_timeout_s"]} label="图片文件超时（秒）" onChange={value => updatePhase2("imageFileTimeoutS", value)} path="phase2.image_file_timeout_s" value={config.phase2.imageFileTimeoutS} />
-              <NumberField error={fieldErrors["phase2.task_shard_size"]} label="二筛任务分片大小" onChange={value => updatePhase2("taskShardSize", value)} path="phase2.task_shard_size" value={config.phase2.taskShardSize} />
+              <NumberField error={fieldErrors["phase2.phash_pass_t2"]} label="二筛 PHash 通过阈值" max={1} min={0} note="范围 0–1；PHash 相似度达到该阈值视为通过。" onChange={value => updatePhase2("phashPassT2", value)} path="phase2.phash_pass_t2" step={0.01} value={config.phase2.phashPassT2} />
+              <NumberField error={fieldErrors["phase2.phash_part_threshold"]} label="二筛 PHash 分块阈值" max={64} min={0} note="范围 0–64；PHash 分块判定阈值。" onChange={value => updatePhase2("phashPartThreshold", value)} path="phase2.phash_part_threshold" value={config.phase2.phashPartThreshold} />
+              <NumberField error={fieldErrors["phase2.sobel_t3"]} label="二筛 Sobel 阈值" max={1} min={0} note="范围 0–1；Sobel 边缘相似度阈值。" onChange={value => updatePhase2("sobelT3", value)} path="phase2.sobel_t3" step={0.01} value={config.phase2.sobelT3} />
+              <NumberField error={fieldErrors["phase2.video_frames"]} label="视频抽帧数" max={6} min={6} note="当前必须为 6" onChange={value => updatePhase2("videoFrames", value)} path="phase2.video_frames" value={config.phase2.videoFrames} />
+              <NumberField error={fieldErrors["phase2.video_avg_t4"]} label="视频平均阈值" max={1} min={0} note="范围 0–1；视频帧平均相似度阈值。" onChange={value => updatePhase2("videoAvgT4", value)} path="phase2.video_avg_t4" step={0.01} value={config.phase2.videoAvgT4} />
+              <NumberField error={fieldErrors["phase2.video_min_passed"]} label="视频最少通过帧数" max={config.phase2.videoFrames} min={1} note="范围 1–视频抽帧数；达到该通过帧数才判为重复。" onChange={value => updatePhase2("videoMinPassed", value)} path="phase2.video_min_passed" value={config.phase2.videoMinPassed} />
+              <NumberField error={fieldErrors["phase2.video_min_valid"]} label="视频最少有效帧数" max={config.phase2.videoFrames} min={1} note="范围 1–视频抽帧数；有效帧不足则跳过判定。" onChange={value => updatePhase2("videoMinValid", value)} path="phase2.video_min_valid" value={config.phase2.videoMinValid} />
+              <NumberField error={fieldErrors["phase2.video_file_timeout_s"]} label="视频文件超时（秒）" min={1} note="单位：秒，必须为正整数；超时放弃该视频文件。" onChange={value => updatePhase2("videoFileTimeoutS", value)} path="phase2.video_file_timeout_s" value={config.phase2.videoFileTimeoutS} />
+              <NumberField error={fieldErrors["phase2.video_frame_command_timeout_s"]} label="单帧命令超时（秒）" min={1} note="单位：秒，必须为正整数；单帧抽取命令超时。" onChange={value => updatePhase2("videoFrameCommandTimeoutS", value)} path="phase2.video_frame_command_timeout_s" value={config.phase2.videoFrameCommandTimeoutS} />
+              <NumberField error={fieldErrors["phase2.image_file_timeout_s"]} label="图片文件超时（秒）" min={1} note="单位：秒，必须为正整数；超时放弃该图片文件。" onChange={value => updatePhase2("imageFileTimeoutS", value)} path="phase2.image_file_timeout_s" value={config.phase2.imageFileTimeoutS} />
+              <NumberField error={fieldErrors["phase2.task_shard_size"]} label="二筛任务分片大小" max={5000} min={1} note="范围 1–5000；每个二筛任务包含的记录数。" onChange={value => updatePhase2("taskShardSize", value)} path="phase2.task_shard_size" value={config.phase2.taskShardSize} />
               <div className="gui-settings__field gui-settings__checkbox">
                 <label htmlFor="gui-config-phase2-auto-dispatch">
                   <input
@@ -413,7 +491,7 @@ export function GUISettingsPage({ api = appApi, navigate = target => window.loca
               {notice ? <p className="gui-settings__notice" role="status">{notice}</p> : null}
               {pageError ? <p className="gui-settings__field-error" role="alert">{pageError}</p> : null}
             </div>
-            <button className="gui-settings__secondary" disabled={saving} onClick={() => void loadConfig()} type="button">重新加载</button>
+            <button className="gui-settings__secondary" disabled={saving} onClick={reloadConfig} type="button">重新加载</button>
             <button disabled={saving} type="submit">{saving ? "正在保存…" : "保存配置"}</button>
           </section>
         </form>

@@ -350,12 +350,19 @@ func TestLocalTaskRunnerRecoverySkipsScanAndCompletesStageThree(t *testing.T) {
 	if scans.calls != 0 || analysis.calls != 1 || !reflect.DeepEqual(stages, []int{2, 3}) {
 		t.Fatalf("scan=%d analysis=%d stages=%v", scans.calls, analysis.calls, stages)
 	}
+	if analysis.taskID != "recover" || !reflect.DeepEqual(analysis.roots, []string{`D:\media`}) {
+		t.Fatalf("analysis task=%q roots=%v", analysis.taskID, analysis.roots)
+	}
 	stages = nil
 	if err := runner.Run(context.Background(), request, 2, func(stage int) error { stages = append(stages, stage); return nil }); err != nil {
 		t.Fatal(err)
 	}
 	if scans.calls != 0 || analysis.calls != 2 || !reflect.DeepEqual(stages, []int{2, 3}) {
 		t.Fatalf("stage2 recovery scan=%d analysis=%d stages=%v", scans.calls, analysis.calls, stages)
+	}
+	request.Roots[0] = `D:\changed`
+	if !reflect.DeepEqual(analysis.roots, []string{`D:\media`}) {
+		t.Fatalf("analysis roots aliased request=%v", analysis.roots)
 	}
 }
 
@@ -383,6 +390,9 @@ func TestLocalTaskRunnerAutoAnalysisPersistsEveryDurableCheckpoint(t *testing.T)
 	}
 	if scans.calls != 1 || analysis.calls != 1 || !reflect.DeepEqual(stages, []int{1, 2, 3}) {
 		t.Fatalf("scan=%d analysis=%d stages=%v", scans.calls, analysis.calls, stages)
+	}
+	if analysis.taskID != "auto" || !reflect.DeepEqual(analysis.roots, []string{`D:\media`}) {
+		t.Fatalf("analysis task=%q roots=%v", analysis.taskID, analysis.roots)
 	}
 }
 
@@ -1160,14 +1170,20 @@ func (r *recordingLocalScanRunner) Prepare(task proto.ScanTask, sender agent.Sen
 	}
 }
 
-type recordingLocalAnalysisRunner struct{ calls int }
+type recordingLocalAnalysisRunner struct {
+	calls  int
+	taskID string
+	roots  []string
+}
 
 func (r *recordingLocalAnalysisRunner) Run(context.Context, string) error {
 	r.calls++
 	return nil
 }
-func (r *recordingLocalAnalysisRunner) RunWithProgress(ctx context.Context, task string, checkpoint func(int) error) error {
+func (r *recordingLocalAnalysisRunner) RunWithProgressForRoots(ctx context.Context, task string, roots []string, checkpoint func(int) error) error {
 	r.calls++
+	r.taskID = task
+	r.roots = roots
 	return checkpoint(2)
 }
 

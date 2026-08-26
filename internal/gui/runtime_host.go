@@ -117,7 +117,7 @@ func (h *RuntimeHost) ServeHTTP(response http.ResponseWriter, request *http.Requ
 	case request.URL.Path == "/api/config":
 		h.configAPI.ServeHTTP(response, request)
 	case request.URL.Path == "/api/runtime/status":
-		h.handleRuntimeStatus(response, request)
+		h.handleRuntimeStatus(response, request, api)
 	case request.URL.Path == "/api/restart/health":
 		h.handleRestartHealth(response, request)
 	case request.URL.Path == "/api/agents" && api == nil:
@@ -137,11 +137,14 @@ func (h *RuntimeHost) current() *API {
 	return h.api
 }
 
-func (h *RuntimeHost) handleRuntimeStatus(response http.ResponseWriter, _ *http.Request) {
+func (h *RuntimeHost) handleRuntimeStatus(response http.ResponseWriter, _ *http.Request, api *API) {
 	h.mu.RLock()
 	status := h.status
 	status.Agents = append([]AgentStatus(nil), h.status.Agents...)
 	h.mu.RUnlock()
+	if api != nil && api.pool != nil {
+		status.Agents = api.pool.Status()
+	}
 	writeJSON(response, http.StatusOK, status)
 }
 

@@ -4,6 +4,8 @@ export interface DeleteReviewMember {
   readonly fileId: number;
   readonly machineId: string;
   readonly path: string;
+  /** 字节大小；用于选择摘要汇总，来源不可知时缺省。 */
+  readonly size?: number;
 }
 
 export interface DeleteReviewSnapshot {

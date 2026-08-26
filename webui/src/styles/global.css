@@ -111,6 +111,20 @@ textarea:focus-visible,
   content: "";
 }
 
+.app-shell__status--muted {
+  color: var(--color-muted);
+  font-weight: 600;
+}
+
+.app-shell__status--error {
+  color: var(--color-danger-strong);
+  text-decoration: none;
+}
+
+.app-shell__status--error:hover {
+  text-decoration: underline;
+}
+
 .app-shell__menu-toggle {
   display: none;
   padding: var(--space-2) var(--space-3);

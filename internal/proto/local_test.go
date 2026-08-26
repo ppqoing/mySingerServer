@@ -168,6 +168,48 @@ func TestLocalImagePreviewRequestStrictDecodeRejectsUnknownPath(t *testing.T) {
 	}
 }
 
+// Break caught: the manager bridge SHA-512 does not survive the wire, or the
+// strict decoder rejects the additive field and breaks the new GUI client.
+func TestLocalImagePreviewRequestSHA512BridgeRoundTripsThroughStrictDecode(t *testing.T) {
+	sha := strings.Repeat("ab", 64)
+	request := LocalImagePreviewRequest{
+		MaxWidth: 320, MaxHeight: 320, Format: "jpeg", Quality: 80, Sha512: sha,
+	}
+	if err := request.Validate(); err != nil {
+		t.Fatalf("sha-only request: %v", err)
+	}
+	payload, err := EncodeLocalPayload(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded LocalImagePreviewRequest
+	if err := DecodeLocalImagePreviewPayload(payload, &decoded); err != nil {
+		t.Fatalf("strict decode rejected sha512: %v", err)
+	}
+	if decoded != request {
+		t.Fatalf("round trip = %#v, want %#v", decoded, request)
+	}
+	for _, mutate := range []func(*LocalImagePreviewRequest){
+		func(in *LocalImagePreviewRequest) { in.Sha512 = "" },
+		func(in *LocalImagePreviewRequest) { in.Sha512 = strings.Repeat("ab", 63) },
+		func(in *LocalImagePreviewRequest) { in.Sha512 = strings.Repeat("AB", 64) },
+		func(in *LocalImagePreviewRequest) { in.Sha512 = strings.Repeat("zz", 64) },
+	} {
+		invalid := request
+		mutate(&invalid)
+		if err := invalid.Validate(); err == nil {
+			t.Fatalf("invalid sha-only preview request accepted: %#v", invalid)
+		}
+	}
+	// FileID wins when both are set: a bogus Sha512 is ignored.
+	both := request
+	both.FileID = 7
+	both.Sha512 = "not-hex"
+	if err := both.Validate(); err != nil {
+		t.Fatalf("file-id priority request: %v", err)
+	}
+}
+
 // Break caught: making preview strict globally rejects additive fields on all
 // existing local-control DTOs and breaks rolling NodeTray/Agent compatibility.
 func TestDecodeLocalPayloadKeepsUnknownFieldCompatibilityOutsidePreview(t *testing.T) {

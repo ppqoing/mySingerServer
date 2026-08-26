@@ -99,10 +99,6 @@ func DecodeBody[T any](env *Envelope) (T, error) {
 	return body, nil
 }
 
-func validFrameLength(length int) error {
-	return validFrameLengthMax(length, MaxFrameBytes)
-}
-
 func validFrameLengthMax(length, maximum int) error {
 	if length == 0 || length > maximum {
 		return fmt.Errorf("worker IPC: invalid frame length %d", length)

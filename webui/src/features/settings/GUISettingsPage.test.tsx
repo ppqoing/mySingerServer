@@ -109,6 +109,8 @@ test("keeps edited values and binds indexed field errors after save failure", as
   expect(await screen.findByText("Agent 地址不能重复")).toHaveAttribute("role", "alert");
   expect(address).toHaveValue("192.168.1.10:9101");
   expect(address).toHaveAttribute("aria-invalid", "true");
+  // 校验失败后滚动并聚焦到第一个 aria-invalid 字段。
+  expect(address).toHaveFocus();
   expect(saveGUIConfig).toHaveBeenCalledTimes(1);
 });
 
@@ -118,6 +120,7 @@ test("reloads disk configuration and clears dirty state", async () => {
   const loadGUIConfig = vi.fn()
     .mockResolvedValueOnce({ config: copyConfig(), restartRequired: false })
     .mockResolvedValueOnce({ config: reloaded, restartRequired: true });
+  const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
   const user = userEvent.setup();
   render(<GUISettingsPage api={apiFor({ loadGUIConfig })} />);
   const listen = await screen.findByLabelText("监听地址");
@@ -126,9 +129,93 @@ test("reloads disk configuration and clears dirty state", async () => {
   expect(screen.getByText("有未保存更改")).toBeInTheDocument();
 
   await user.click(screen.getByRole("button", { name: "重新加载" }));
+  expect(confirm).toHaveBeenCalledOnce();
   await waitFor(() => expect(screen.getByLabelText("监听地址")).toHaveValue("127.0.0.1:28080"));
   expect(screen.queryByText("有未保存更改")).not.toBeInTheDocument();
   expect(loadGUIConfig).toHaveBeenCalledTimes(2);
+});
+
+test("keeps the draft when the dirty reload confirmation is cancelled", async () => {
+  const loadGUIConfig = vi.fn().mockResolvedValue({ config: copyConfig(), restartRequired: false });
+  vi.spyOn(window, "confirm").mockReturnValue(false);
+  const user = userEvent.setup();
+  render(<GUISettingsPage api={apiFor({ loadGUIConfig })} />);
+  const listen = await screen.findByLabelText("监听地址");
+  await user.clear(listen);
+  await user.type(listen, "127.0.0.1:38080");
+
+  await user.click(screen.getByRole("button", { name: "重新加载" }));
+  expect(screen.getByLabelText("监听地址")).toHaveValue("127.0.0.1:38080");
+  expect(screen.getByText("有未保存更改")).toBeInTheDocument();
+  expect(loadGUIConfig).toHaveBeenCalledTimes(1);
+});
+
+test("warns before unloading the page while the draft is dirty", async () => {
+  const user = userEvent.setup();
+  render(<GUISettingsPage api={apiFor()} />);
+  const listen = await screen.findByLabelText("监听地址");
+
+  const clean = new Event("beforeunload", { cancelable: true });
+  window.dispatchEvent(clean);
+  expect(clean.defaultPrevented).toBe(false);
+
+  await user.type(listen, "x");
+  const dirtyEvent = new Event("beforeunload", { cancelable: true });
+  window.dispatchEvent(dirtyEvent);
+  expect(dirtyEvent.defaultPrevented).toBe(true);
+});
+
+test("keeps an empty number field invalid instead of silently turning it into zero", async () => {
+  const saveGUIConfig = vi.fn();
+  const user = userEvent.setup();
+  render(<GUISettingsPage api={apiFor({ saveGUIConfig })} />);
+  const heartbeat = await screen.findByLabelText("心跳间隔（秒）");
+  expect(heartbeat).toHaveAttribute("min", "1");
+
+  await user.clear(heartbeat);
+  expect(heartbeat).toHaveValue(null);
+  await user.tab();
+  expect(await screen.findByText("请输入有效数字")).toHaveAttribute("role", "alert");
+  expect(heartbeat).toHaveAttribute("aria-invalid", "true");
+
+  await user.click(screen.getByRole("button", { name: "保存配置" }));
+  expect(saveGUIConfig).not.toHaveBeenCalled();
+  expect(heartbeat).toHaveFocus();
+});
+
+test("rejects out-of-range numbers on blur and keeps them out of the draft", async () => {
+  const saveGUIConfig = vi.fn();
+  const user = userEvent.setup();
+  render(<GUISettingsPage api={apiFor({ saveGUIConfig })} />);
+  const heartbeat = await screen.findByLabelText("心跳间隔（秒）");
+
+  await user.clear(heartbeat);
+  await user.type(heartbeat, "0");
+  await user.tab();
+  expect(await screen.findByText("不能小于 1")).toHaveAttribute("role", "alert");
+
+  await user.click(screen.getByRole("button", { name: "保存配置" }));
+  expect(saveGUIConfig).not.toHaveBeenCalled();
+
+  await user.clear(heartbeat);
+  await user.type(heartbeat, "20");
+  expect(screen.queryByText("不能小于 1")).not.toBeInTheDocument();
+});
+
+test("maps an invalid recovery URL to a guided error message", async () => {
+  const saveGUIConfig = vi.fn().mockResolvedValue({
+    saved: true,
+    restartRequired: true,
+    restarting: true,
+    recoveryURL: "not-a-url"
+  });
+  const user = userEvent.setup();
+  render(<GUISettingsPage api={apiFor({ saveGUIConfig })} />);
+
+  await screen.findByLabelText("监听地址");
+  await user.click(screen.getByRole("button", { name: "保存配置" }));
+
+  expect(await screen.findByText("恢复地址无效：请检查配置中的监听/恢复地址。")).toHaveAttribute("role", "alert");
 });
 
 test("shows a manual restart notice when an applied configuration could not restart automatically", async () => {

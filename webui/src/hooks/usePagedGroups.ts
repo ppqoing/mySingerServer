@@ -7,6 +7,7 @@ export interface PagedGroupsState {
   error: Error | undefined;
   loading: boolean;
   reload(): void;
+  invalidateAll(): void;
 }
 
 type GroupApi = Pick<AppApi, "listGroups">;
@@ -87,12 +88,19 @@ export function usePagedGroups(api: GroupApi, query: GroupQuery): PagedGroupsSta
     reloadTarget.current = pageKey;
     setReloadVersion(version => version + 1);
   }, [pageKey]);
+  // 写操作（如删除）完成后调用：丢弃全部 scope 的缓存页，避免翻页读到删除前的陈旧数据。
+  const invalidateAll = useCallback(() => {
+    cache.current.clear();
+    reloadTarget.current = pageKey;
+    setReloadVersion(version => version + 1);
+  }, [pageKey]);
   const isCurrentPageKey = state.pageKey === pageKey;
   return {
     data: isCurrentPageKey ? state.data : undefined,
     error: isCurrentPageKey ? state.error : undefined,
     loading: isCurrentPageKey ? state.loading : true,
-    reload
+    reload,
+    invalidateAll
   };
 }
 

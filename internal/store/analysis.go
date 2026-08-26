@@ -514,10 +514,6 @@ func committedAnalysisState(
 	return state, nil
 }
 
-func committedFrameMask(ctx context.Context, tx *sql.Tx, sha string) (uint8, error) {
-	return committedFrameMaskForFields(ctx, tx, sha, proto.FieldVideo6F)
-}
-
 func committedFrameMaskForFields(ctx context.Context, tx *sql.Tx, sha string, fields uint32) (uint8, error) {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT frame_idx, pdq256, phash_parts, sobel_hist
@@ -543,10 +539,6 @@ func committedFrameMaskForFields(ctx context.Context, tx *sql.Tx, sha string, fi
 		return 0, fmt.Errorf("store: iterate committed analysis frames: %w", err)
 	}
 	return mask, nil
-}
-
-func analysisPhase1Done(kind MediaKind, missing uint32) bool {
-	return missing&RequiredStageOneMask(kind) == 0
 }
 
 func hasAnalysisFrameErrors(frames []Phase2Frame) bool {

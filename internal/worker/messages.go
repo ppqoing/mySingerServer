@@ -167,6 +167,8 @@ type JobMsg struct {
 	Size             int64       `msgpack:"size"`
 	MTimeUnix        int64       `msgpack:"mtime_unix"`
 	KnownSHA         []byte      `msgpack:"known_sha,omitempty"`
+	// MTimeMS carries the file modification time in Unix seconds despite its
+	// name; the identifier is kept for wire compatibility.
 	MTimeMS          int64       `msgpack:"mtime_ms,omitempty"`
 	FrameMask        uint8       `msgpack:"frame_mask,omitempty"`
 	DurationMS       int64       `msgpack:"duration_ms,omitempty"`

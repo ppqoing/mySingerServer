@@ -239,21 +239,36 @@ func TestBuildTasksRejectsInvalidSelectedIdentity(t *testing.T) {
 		}
 	})
 	t.Run("non-positive video duration", func(t *testing.T) {
+		shaC := strings.Repeat("5e", 64)
+		shaD := strings.Repeat("6e", 64)
 		snapshot := buildSnapshot{
-			Groups: []candidateGroup{{
-				Kind: candidateVideo,
-				Members: []candidateMember{
-					{FileID: 1, SHA512: shaA},
-					{FileID: 2, SHA512: shaB},
+			Groups: []candidateGroup{
+				{
+					Kind: candidateVideo,
+					Members: []candidateMember{
+						{FileID: 1, SHA512: shaA},
+						{FileID: 2, SHA512: shaB},
+					},
 				},
-			}},
+				{
+					Kind: candidateVideo,
+					Members: []candidateMember{
+						{FileID: 3, SHA512: shaC},
+						{FileID: 4, SHA512: shaD},
+					},
+				},
+			},
 			Copies: []fileCopy{
 				{ID: 1, MachineID: "machine-a", Path: `D:\a.mp4`, SHA512: shaA, Size: 1, MTime: 1, Status: proto.StatusDone},
 				{ID: 2, MachineID: "machine-b", Path: `D:\b.mp4`, SHA512: shaB, Size: 1, MTime: 1, Status: proto.StatusDone},
+				{ID: 3, MachineID: "machine-a", Path: `D:\c.mp4`, SHA512: shaC, Size: 1, MTime: 1, Status: proto.StatusDone},
+				{ID: 4, MachineID: "machine-b", Path: `D:\d.mp4`, SHA512: shaD, Size: 1, MTime: 1, Status: proto.StatusDone},
 			},
 			Features: map[string]featureState{
 				shaA: {DurationMS: 0},
 				shaB: {DurationMS: 1000},
+				shaC: {DurationMS: 1000},
+				shaD: {DurationMS: 1000},
 			},
 		}
 		dispatcher := newDispatcher(
@@ -262,11 +277,28 @@ func TestBuildTasksRejectsInvalidSelectedIdentity(t *testing.T) {
 			config.Phase2Config{TaskShardSize: 5000},
 			nil,
 		)
-		if _, err := dispatcher.BuildTasks(
+		tasks, err := dispatcher.BuildTasks(
 			context.Background(),
 			proto.KindVideo,
-		); err == nil {
-			t.Fatal("BuildTasks silently skipped a non-positive video duration")
+		)
+		if err != nil {
+			t.Fatalf("BuildTasks aborted the whole batch on a non-positive video duration: %v", err)
+		}
+		// The zero-duration pair must be skipped while the valid pair is
+		// still dispatched.
+		for _, task := range tasks {
+			for _, item := range task.Task.Items {
+				if item.SHA512 == shaA || item.SHA512 == shaB {
+					t.Fatalf("zero-duration pair was dispatched: %#v", item)
+				}
+			}
+		}
+		dispatched := 0
+		for _, task := range tasks {
+			dispatched += len(task.Task.Items)
+		}
+		if dispatched != 2 {
+			t.Fatalf("valid pair was not dispatched alongside the skip: %d items", dispatched)
 		}
 	})
 }

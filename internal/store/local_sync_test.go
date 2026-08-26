@@ -23,6 +23,13 @@ func TestLocalOutboxLoadsLocalScopeSnapshotAndAcknowledgesBySequence(t *testing.
 	}); err != nil {
 		t.Fatal(err)
 	}
+	selection, err := db.LoadCommittedDeletion(ctx, "machine-a", run.RunID, "group-video")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.BeginDeletionBatch(ctx, "sync-delete", selection, "digest"); err != nil {
+		t.Fatal(err)
+	}
 	if err := db.CommitDeletionResults(ctx, "sync-delete", []DeletionResult{{
 		FileID: 6, MachineID: "machine-a", Path: `D:\Video\copy.mp4`, SHA512: "sha-6",
 		Size: 500, MTime: 1000, BatchID: "sync-delete", RunID: run.RunID,

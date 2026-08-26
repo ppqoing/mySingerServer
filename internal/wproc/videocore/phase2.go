@@ -51,6 +51,8 @@ type AnalysisResult struct {
 	Frames               [6]FrameResult
 	OperationElapsedMS   uint64
 	DecodeElapsedMS      uint64
+	ImageWidth           uint32
+	ImageHeight          uint32
 }
 
 type nativeFrameResult struct {
@@ -74,6 +76,8 @@ type nativeAnalysisResult struct {
 	frames             [6]nativeFrameResult
 	operationElapsedMS uint64
 	decodeElapsedMS    uint64
+	imageWidth         uint32
+	imageHeight        uint32
 }
 
 func analysisResultFromNative(native nativeAnalysisResult) AnalysisResult {
@@ -90,6 +94,8 @@ func analysisResultFromNative(native nativeAnalysisResult) AnalysisResult {
 		ContactSheetFeatures: featureSetFromNative(native.contactFeatures),
 		OperationElapsedMS:   native.operationElapsedMS,
 		DecodeElapsedMS:      native.decodeElapsedMS,
+		ImageWidth:           native.imageWidth,
+		ImageHeight:          native.imageHeight,
 	}
 	for index := range result.Frames {
 		frame := native.frames[index]

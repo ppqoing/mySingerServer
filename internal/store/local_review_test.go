@@ -129,6 +129,35 @@ func TestDeletePrepareLoadsOnlyCommittedEligibleActiveReviewMembers(t *testing.T
 	}
 }
 
+func TestBeginDeletionBatchPersistsPendingJournal(t *testing.T) {
+	db := openLocalTestDB(t)
+	run := seedLocalResultGroups(t, db)
+	ctx := context.Background()
+	if err := db.CommitLocalReview(ctx, LocalReviewCommit{
+		MachineID: "machine-a", RunID: run.RunID, GroupID: "group-video", Reviewer: "user",
+		Decisions: []LocalReviewChoice{{FileID: 5, Decision: "keep"}, {FileID: 6, Decision: "delete"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	selection, err := db.LoadCommittedDeletion(ctx, "machine-a", run.RunID, "group-video")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.BeginDeletionBatch(ctx, "batch-pending", selection, "digest"); err != nil {
+		t.Fatal(err)
+	}
+	batch, err := db.LoadDeletionBatch(ctx, "machine-a", "batch-pending")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if batch.Status != "running" || batch.Requested != 1 || len(batch.Items) != 1 || batch.Items[0].Result != "pending" {
+		t.Fatalf("pending batch=%#v", batch)
+	}
+	if _, err := db.LoadCommittedDeletion(ctx, "machine-a", run.RunID, "group-video"); err == nil {
+		t.Fatal("pending deletion remained eligible for a second delete selection")
+	}
+}
+
 // Break caught: a partial Helper report marks uncertain/failed rows deleted,
 // clears retained analysis data, or emits an incomplete PostgreSQL event.
 func TestCommitDeletionResultsIsAtomicRetainsHashesAndAuditsPartialDelete(t *testing.T) {
@@ -176,6 +205,9 @@ func TestCommitDeletionResultsIsAtomicRetainsHashesAndAuditsPartialDelete(t *tes
 		GroupID: "group-video", Generation: run.Generation, ConfirmationDigest: "digest",
 		ErrorCode: "access_denied",
 	}}
+	if err := db.BeginDeletionBatch(ctx, "batch-partial", selection, "digest"); err != nil {
+		t.Fatal(err)
+	}
 	if err := db.CommitDeletionResults(ctx, "batch-partial", results); err != nil {
 		t.Fatal(err)
 	}
@@ -251,6 +283,9 @@ func TestCommitDeletionResultsUncertainDoesNotChangeFileAndOutboxFailureRollsBac
 		GroupID: "group-video", Generation: run.Generation, ConfirmationDigest: "digest"}
 	uncertain := base
 	uncertain.BatchID, uncertain.OK, uncertain.Uncertain, uncertain.ErrorCode = "batch-uncertain", true, true, "helper_lost"
+	if err := db.BeginDeletionBatch(ctx, uncertain.BatchID, selection, "digest"); err != nil {
+		t.Fatal(err)
+	}
 	if err := db.CommitDeletionResults(ctx, uncertain.BatchID, []DeletionResult{uncertain}); err != nil {
 		t.Fatal(err)
 	}
@@ -267,13 +302,17 @@ func TestCommitDeletionResultsUncertainDoesNotChangeFileAndOutboxFailureRollsBac
 	}
 	success := base
 	success.BatchID, success.OK = "batch-rollback", true
+	if err := db.BeginDeletionBatch(ctx, success.BatchID, selection, "digest"); err != nil {
+		t.Fatal(err)
+	}
 	if err := db.CommitDeletionResults(ctx, success.BatchID, []DeletionResult{success}); err == nil {
 		t.Fatal("outbox failure did not fail deletion transaction")
 	}
 	if err := db.db.QueryRow(`SELECT status FROM files WHERE id=6`).Scan(&status); err != nil || status != "done" {
 		t.Fatalf("rolled-back file status=%q err=%v", status, err)
 	}
-	if countRows(t, db, `SELECT count(*) FROM local_delete_batches WHERE batch_id='batch-rollback'`) != 0 {
-		t.Fatal("failed transaction left delete audit")
+	if countRows(t, db, `SELECT count(*) FROM local_delete_batches WHERE batch_id='batch-rollback' AND status='running'`) != 1 ||
+		countRows(t, db, `SELECT count(*) FROM local_delete_items WHERE batch_id='batch-rollback' AND result='pending'`) != 1 {
+		t.Fatal("failed result transaction did not retain pending delete journal")
 	}
 }

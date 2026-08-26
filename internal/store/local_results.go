@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"dedup/internal/proto"
 )
 
 var ErrLocalResultNotFound = errors.New("local_result_not_found")
@@ -495,6 +497,32 @@ func (d *DB) LoadLocalPreviewSource(ctx context.Context, machineID string, fileI
 		JOIN image_features i ON i.sha512=f.sha512
 		WHERE f.machine_id=?1 AND f.id=?2 AND f.status<>'deleted'
 		  AND f.sha512 IS NOT NULL`, machineID, fileID).Scan(
+		&source.FileID, &source.MachineID, &source.Path, &source.Kind,
+		&source.Status, &source.SHA512, &source.Size, &source.MTime,
+	)
+	if err == sql.ErrNoRows {
+		return LocalPreviewSource{}, ErrLocalResultNotFound
+	}
+	if err != nil {
+		return LocalPreviewSource{}, err
+	}
+	return source, nil
+}
+
+// LoadLocalPreviewSourceBySHA resolves the same guarded preview source through
+// the caller-supplied SHA-512 (the manager bridge key) instead of the local
+// file ID. Duplicate copies share content, so the lowest-ID live row wins.
+func (d *DB) LoadLocalPreviewSourceBySHA(ctx context.Context, machineID string, sha512 string) (LocalPreviewSource, error) {
+	if d == nil || d.db == nil || machineID == "" || !proto.IsSHA512LowerHex(sha512) {
+		return LocalPreviewSource{}, fmt.Errorf("store: invalid preview identity")
+	}
+	var source LocalPreviewSource
+	err := d.db.QueryRowContext(ctx, `
+		SELECT f.id,f.machine_id,f.path,'image',f.status,f.sha512,f.size,f.mtime
+		FROM files f
+		JOIN image_features i ON i.sha512=f.sha512
+		WHERE f.machine_id=?1 AND f.sha512=?2 AND f.status<>'deleted'
+		ORDER BY f.id LIMIT 1`, machineID, sha512).Scan(
 		&source.FileID, &source.MachineID, &source.Path, &source.Kind,
 		&source.Status, &source.SHA512, &source.Size, &source.MTime,
 	)

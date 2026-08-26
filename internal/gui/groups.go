@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/http"
 	"sort"
@@ -48,6 +49,13 @@ type GroupSummary struct {
 	CreatedAt   time.Time `json:"created_at"`
 }
 
+type GroupStatsResponse struct {
+	Kind        string `json:"kind"`
+	Groups      int64  `json:"groups"`
+	TotalBytes  int64  `json:"total_bytes"`
+	WastedBytes int64  `json:"wasted_bytes"`
+}
+
 type GroupDetail struct {
 	ID                   int64         `json:"id"`
 	Kind                 string        `json:"kind"`
@@ -83,6 +91,72 @@ type groupListQuery struct {
 	sort       string
 }
 
+type groupStatsQuery struct {
+	kind       string
+	query      string
+	machine    string
+	minMembers int64
+}
+
+type setGroupRepresentativeRequest struct {
+	FileID int64 `json:"file_id"`
+}
+
+const (
+	groupStrategyNewest       = "newest"
+	groupStrategyOldest       = "oldest"
+	groupStrategyLargest      = "largest"
+	groupStrategyShortestPath = "shortest_path"
+)
+
+// groupSelectStrategyMaxLimit 是策略批量选择的默认与最大返回条数。
+const groupSelectStrategyMaxLimit = 50_000
+
+type groupSelectByStrategyRequest struct {
+	Kind       string `json:"kind"`
+	Query      string `json:"q"`
+	Machine    string `json:"machine"`
+	MinMembers int64  `json:"min_members"`
+	Strategy   string `json:"strategy"`
+	Limit      int    `json:"limit"`
+}
+
+type GroupSelectByStrategyResponse struct {
+	FileIDs   []int64 `json:"file_ids"`
+	Groups    int64   `json:"groups"`
+	Truncated bool    `json:"truncated"`
+}
+
+// groupFilterCTEs returns the live-member filter CTEs shared by the group
+// list, stats, and strategy-selection queries: $1 is the group kind (''
+// aggregates every display kind), $2 the machine filter, $3 the path
+// substring filter; summarySelect lists the aggregate columns selected next
+// to group_id in summary. all_live additionally carries mtime and the stored
+// representative_file_id for consumers that rank members (select-by-strategy).
+func groupFilterCTEs(summarySelect string) string {
+	return `
+		WITH all_live AS (
+			SELECT g.id AS group_id,f.id,f.machine_id,f.path,f.size,f.mtime,
+				g.representative_file_id
+			FROM dup_groups AS g
+			JOIN dup_members AS m ON m.group_id=g.id
+			JOIN files AS f ON f.id=m.file_id
+			WHERE (g.kind=$1 OR ($1='' AND g.kind IN ('exact','image','video')))
+			  AND f.status <> 'deleted'
+		),
+		summary AS (
+			SELECT group_id,` + summarySelect + `
+			FROM all_live
+			GROUP BY group_id
+		),
+		matching_groups AS (
+			SELECT DISTINCT group_id
+			FROM all_live
+			WHERE ($2='' OR machine_id=$2)
+			  AND ($3='' OR strpos(lower(path),lower($3)) > 0)
+		)`
+}
+
 type groupMemberPagination struct {
 	enabled bool
 	page    int
@@ -114,26 +188,8 @@ func (handlers *GroupHandlers) handleList(
 	}
 
 	var total int64
-	if err := handlers.db.QueryRow(request.Context(), `
-		WITH all_live AS (
-			SELECT g.id AS group_id,f.id,f.machine_id,f.path,f.size
-			FROM dup_groups AS g
-			JOIN dup_members AS m ON m.group_id=g.id
-			JOIN files AS f ON f.id=m.file_id
-			WHERE g.kind=$1
-			  AND f.status <> 'deleted'
-		),
-		summary AS (
-			SELECT group_id,count(*) AS live_member_count
-			FROM all_live
-			GROUP BY group_id
-		),
-		matching_groups AS (
-			SELECT DISTINCT group_id
-			FROM all_live
-			WHERE ($2='' OR machine_id=$2)
-			  AND ($3='' OR strpos(lower(path),lower($3)) > 0)
-		)
+	if err := handlers.db.QueryRow(request.Context(),
+		groupFilterCTEs(`count(*) AS live_member_count`)+`
 		SELECT count(*)
 		FROM summary
 		JOIN matching_groups USING (group_id)
@@ -165,36 +221,12 @@ func (handlers *GroupHandlers) handleList(
 		writeGroupInternalError(response, "select paged group sort", err)
 		return
 	}
-	rows, err := handlers.db.Query(request.Context(), fmt.Sprintf(`
-		WITH all_live AS (
-			SELECT
-				g.id AS group_id,
-				f.id,
-				f.machine_id,
-				f.path,
-				f.size
-			FROM dup_groups AS g
-			JOIN dup_members AS m ON m.group_id=g.id
-			JOIN files AS f ON f.id=m.file_id
-			WHERE g.kind=$1
-			  AND f.status <> 'deleted'
-		),
-		summary AS (
-			SELECT
-				group_id,
-				count(*) AS live_member_count,
-				array_agg(DISTINCT machine_id ORDER BY machine_id) AS machines,
-				sum(size) AS total_bytes,
-				GREATEST(sum(size)-max(size),0) AS wasted_bytes
-			FROM all_live
-			GROUP BY group_id
-		),
-		matching_groups AS (
-			SELECT DISTINCT group_id
-			FROM all_live
-			WHERE ($2='' OR machine_id=$2)
-			  AND ($3='' OR strpos(lower(path),lower($3)) > 0)
-		),
+	rows, err := handlers.db.Query(request.Context(), fmt.Sprintf(
+		groupFilterCTEs(`
+			count(*) AS live_member_count,
+			array_agg(DISTINCT machine_id ORDER BY machine_id) AS machines,
+			sum(size) AS total_bytes,
+			GREATEST(sum(size)-max(size),0) AS wasted_bytes`)+`,
 		page_groups AS MATERIALIZED (
 			SELECT
 				g.id,
@@ -285,6 +317,291 @@ func (handlers *GroupHandlers) handleList(
 		Total:  total,
 		Groups: groups,
 	})
+}
+
+func (handlers *GroupHandlers) handleStats(
+	response http.ResponseWriter,
+	request *http.Request,
+) {
+	statsQuery, err := parseGroupStatsQuery(request)
+	if err != nil {
+		writeJSON(response, http.StatusBadRequest, map[string]string{
+			"error": err.Error(),
+		})
+		return
+	}
+	if handlers == nil || handlers.db == nil {
+		writeGroupUnavailable(response)
+		return
+	}
+
+	stats := GroupStatsResponse{Kind: statsQuery.kind}
+	if err := handlers.db.QueryRow(request.Context(),
+		groupFilterCTEs(`
+			count(*) AS live_member_count,
+			sum(size) AS total_bytes,
+			GREATEST(sum(size)-max(size),0) AS wasted_bytes`)+`
+		SELECT
+			count(*),
+			COALESCE(sum(summary.total_bytes),0),
+			COALESCE(sum(summary.wasted_bytes),0)
+		FROM summary
+		JOIN matching_groups USING (group_id)
+		WHERE summary.live_member_count >= $4`,
+		statsQuery.kind,
+		statsQuery.machine,
+		statsQuery.query,
+		statsQuery.minMembers,
+	).Scan(&stats.Groups, &stats.TotalBytes, &stats.WastedBytes); err != nil {
+		writeGroupInternalError(response, "aggregate group stats", err)
+		return
+	}
+	if stats.Groups < 0 || stats.TotalBytes < 0 || stats.WastedBytes < 0 ||
+		stats.WastedBytes > stats.TotalBytes {
+		writeGroupInternalError(
+			response,
+			"aggregate group stats",
+			fmt.Errorf("invalid group stats %#v", stats),
+		)
+		return
+	}
+	writeJSON(response, http.StatusOK, stats)
+}
+
+// handleSetRepresentative 指定组的保留副本：校验 file_id 是该组的活成员后
+// 更新 dup_groups.representative_file_id。成功返回简版 {"ok":true}——前端
+// 收到 200 后经 detailSession/reload 机制刷新详情，故不回传整份详情。
+// 校验与更新非原子：分析写入是单运行者的，并发移除兜底为 404。
+func (handlers *GroupHandlers) handleSetRepresentative(
+	response http.ResponseWriter,
+	request *http.Request,
+) {
+	id, err := parsePositiveInt64(request.PathValue("id"))
+	if err != nil {
+		writeJSON(response, http.StatusBadRequest, map[string]string{
+			"error": "组 ID 必须是正整数",
+		})
+		return
+	}
+	var input setGroupRepresentativeRequest
+	decoder := json.NewDecoder(request.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&input); err != nil {
+		writeJSON(response, http.StatusBadRequest, map[string]string{
+			"error": "请求体必须是 JSON 对象",
+		})
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeJSON(response, http.StatusBadRequest, map[string]string{
+			"error": "请求体必须是单个 JSON 对象",
+		})
+		return
+	}
+	if input.FileID <= 0 {
+		writeJSON(response, http.StatusBadRequest, map[string]string{
+			"error": "file_id 必须是正整数",
+		})
+		return
+	}
+	if handlers == nil || handlers.db == nil {
+		writeGroupUnavailable(response)
+		return
+	}
+
+	var groupMarker int
+	err = handlers.db.QueryRow(request.Context(), `
+		SELECT 1
+		FROM dup_groups
+		WHERE id=$1
+		  AND kind IN ('exact','image','video')`, id,
+	).Scan(&groupMarker)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeJSON(response, http.StatusNotFound, map[string]string{
+			"error": "重复组不存在",
+		})
+		return
+	}
+	if err != nil {
+		writeGroupInternalError(response, "query group", err)
+		return
+	}
+	var fileMarker int
+	err = handlers.db.QueryRow(request.Context(), `
+		SELECT 1
+		FROM files
+		WHERE id=$1`, input.FileID,
+	).Scan(&fileMarker)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeJSON(response, http.StatusNotFound, map[string]string{
+			"error": "文件不存在",
+		})
+		return
+	}
+	if err != nil {
+		writeGroupInternalError(response, "query file", err)
+		return
+	}
+	var memberMarker int
+	err = handlers.db.QueryRow(request.Context(), `
+		SELECT 1
+		FROM dup_members AS m
+		JOIN files AS f ON f.id=m.file_id
+		WHERE m.group_id=$1
+		  AND m.file_id=$2
+		  AND f.status <> 'deleted'`, id, input.FileID,
+	).Scan(&memberMarker)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeJSON(response, http.StatusBadRequest, map[string]string{
+			"error": "文件不是该重复组的成员或已删除",
+		})
+		return
+	}
+	if err != nil {
+		writeGroupInternalError(response, "query group membership", err)
+		return
+	}
+	var updatedID int64
+	err = handlers.db.QueryRow(request.Context(), `
+		UPDATE dup_groups
+		SET representative_file_id=$2
+		WHERE id=$1
+		RETURNING id`, id, input.FileID,
+	).Scan(&updatedID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeJSON(response, http.StatusNotFound, map[string]string{
+			"error": "重复组不存在",
+		})
+		return
+	}
+	if err != nil {
+		writeGroupInternalError(response, "update group representative", err)
+		return
+	}
+	writeJSON(response, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// handleSelectByStrategy 按保留策略批量选出"应删除"的成员：筛选命中的每一
+// 组保留策略最优者与 effective representative（二者永不在返回集中），其余
+// 活成员进入选择。limit 上限 groupSelectStrategyMaxLimit，超出时
+// truncated=true 并截断——前端据此提示用户缩小筛选。
+func (handlers *GroupHandlers) handleSelectByStrategy(
+	response http.ResponseWriter,
+	request *http.Request,
+) {
+	input, err := parseGroupSelectByStrategyRequest(request)
+	if err != nil {
+		writeJSON(response, http.StatusBadRequest, map[string]string{
+			"error": err.Error(),
+		})
+		return
+	}
+	if handlers == nil || handlers.db == nil {
+		writeGroupUnavailable(response)
+		return
+	}
+	strategyOrder, err := groupStrategyOrderBy(input.Strategy)
+	if err != nil {
+		writeGroupInternalError(response, "select strategy order", err)
+		return
+	}
+
+	result := GroupSelectByStrategyResponse{FileIDs: make([]int64, 0)}
+	if err := handlers.db.QueryRow(request.Context(),
+		groupFilterCTEs(`count(*) AS live_member_count`)+`
+		SELECT count(*)
+		FROM summary
+		JOIN matching_groups USING (group_id)
+		WHERE summary.live_member_count >= $4`,
+		input.Kind,
+		input.Machine,
+		input.Query,
+		input.MinMembers,
+	).Scan(&result.Groups); err != nil {
+		writeGroupInternalError(response, "count strategy groups", err)
+		return
+	}
+	if result.Groups < 0 {
+		writeGroupInternalError(
+			response,
+			"count strategy groups",
+			fmt.Errorf("negative group count %d", result.Groups),
+		)
+		return
+	}
+
+	rows, err := handlers.db.Query(request.Context(), fmt.Sprintf(
+		groupFilterCTEs(`count(*) AS live_member_count`)+`,
+		eligible AS (
+			SELECT
+				all_live.group_id,
+				all_live.id,
+				all_live.machine_id,
+				all_live.path,
+				all_live.size,
+				all_live.mtime,
+				all_live.representative_file_id
+			FROM all_live
+			JOIN matching_groups USING (group_id)
+			JOIN summary USING (group_id)
+			WHERE summary.live_member_count >= $4
+		),
+		ranked AS (
+			SELECT
+				group_id,
+				id,
+				ROW_NUMBER() OVER (
+					PARTITION BY group_id
+					ORDER BY
+					  CASE WHEN id=representative_file_id THEN 0 ELSE 1 END,
+					  machine_id,path,id
+				) AS representative_rank,
+				ROW_NUMBER() OVER (
+					PARTITION BY group_id
+					ORDER BY %s, id
+				) AS keep_rank
+			FROM eligible
+		)
+		SELECT id, count(*) OVER () AS total_selected
+		FROM ranked
+		WHERE representative_rank <> 1
+		  AND keep_rank <> 1
+		ORDER BY id
+		LIMIT $5`, strategyOrder),
+		input.Kind,
+		input.Machine,
+		input.Query,
+		input.MinMembers,
+		input.Limit,
+	)
+	if err != nil {
+		writeGroupInternalError(response, "query strategy selection", err)
+		return
+	}
+	defer rows.Close()
+	var totalSelected int64
+	for rows.Next() {
+		var fileID int64
+		if err := rows.Scan(&fileID, &totalSelected); err != nil {
+			writeGroupInternalError(response, "scan strategy selection", err)
+			return
+		}
+		if fileID <= 0 {
+			writeGroupInternalError(
+				response,
+				"validate strategy selection",
+				fmt.Errorf("invalid file id %d", fileID),
+			)
+			return
+		}
+		result.FileIDs = append(result.FileIDs, fileID)
+	}
+	if err := rows.Err(); err != nil {
+		writeGroupInternalError(response, "read strategy selection", err)
+		return
+	}
+	result.Truncated = totalSelected > int64(input.Limit)
+	writeJSON(response, http.StatusOK, result)
 }
 
 func (handlers *GroupHandlers) handleDetail(
@@ -542,6 +859,88 @@ func parseGroupListQuery(request *http.Request) (groupListQuery, error) {
 	return result, nil
 }
 
+func parseGroupStatsQuery(request *http.Request) (groupStatsQuery, error) {
+	values := request.URL.Query()
+	result := groupStatsQuery{
+		kind:    values.Get("kind"),
+		query:   values.Get("q"),
+		machine: values.Get("machine"),
+	}
+	if result.kind != "" && !validDisplayedGroupKind(result.kind) {
+		return groupStatsQuery{}, fmt.Errorf("kind must be exact, image, or video")
+	}
+	if utf8.RuneCountInString(result.query) > 256 {
+		return groupStatsQuery{}, fmt.Errorf("q must be at most 256 Unicode code points")
+	}
+	if utf8.RuneCountInString(result.machine) > 128 {
+		return groupStatsQuery{}, fmt.Errorf("machine must be at most 128 Unicode code points")
+	}
+	if raw := values.Get("min_members"); raw != "" {
+		var err error
+		result.minMembers, err = parsePositiveInt64(raw)
+		if err != nil {
+			return groupStatsQuery{}, fmt.Errorf("min_members must be a positive decimal integer")
+		}
+	}
+	return result, nil
+}
+
+// parseGroupSelectByStrategyRequest 在触碰数据库前完成全部入参校验。
+func parseGroupSelectByStrategyRequest(
+	request *http.Request,
+) (groupSelectByStrategyRequest, error) {
+	var input groupSelectByStrategyRequest
+	decoder := json.NewDecoder(request.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&input); err != nil {
+		return groupSelectByStrategyRequest{}, fmt.Errorf("请求体必须是 JSON 对象")
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return groupSelectByStrategyRequest{}, fmt.Errorf("请求体必须是单个 JSON 对象")
+	}
+	if !validDisplayedGroupKind(input.Kind) {
+		return groupSelectByStrategyRequest{}, fmt.Errorf("kind 必须是 exact、image 或 video")
+	}
+	if _, err := groupStrategyOrderBy(input.Strategy); err != nil {
+		return groupSelectByStrategyRequest{}, fmt.Errorf("strategy 必须是 newest、oldest、largest 或 shortest_path")
+	}
+	if utf8.RuneCountInString(input.Query) > 256 {
+		return groupSelectByStrategyRequest{}, fmt.Errorf("q 不能超过 256 个字符")
+	}
+	if utf8.RuneCountInString(input.Machine) > 128 {
+		return groupSelectByStrategyRequest{}, fmt.Errorf("machine 不能超过 128 个字符")
+	}
+	if input.MinMembers < 0 {
+		return groupSelectByStrategyRequest{}, fmt.Errorf("min_members 必须是正整数")
+	}
+	if input.Limit < 0 || input.Limit > groupSelectStrategyMaxLimit {
+		return groupSelectByStrategyRequest{}, fmt.Errorf(
+			"limit 必须在 1..%d 之间", groupSelectStrategyMaxLimit)
+	}
+	if input.Limit == 0 {
+		input.Limit = groupSelectStrategyMaxLimit
+	}
+	return input, nil
+}
+
+// groupStrategyOrderBy 给出每组"保留者"的排序： newest=mtime 最大者保留，
+// oldest=mtime 最小者保留，largest=size 最大者保留，shortest_path=路径最短者
+// 保留；调用方以 id ASC 收尾，保证并列时取 file_id 小者（确定性）。
+func groupStrategyOrderBy(strategy string) (string, error) {
+	switch strategy {
+	case groupStrategyNewest:
+		return "mtime DESC", nil
+	case groupStrategyOldest:
+		return "mtime ASC", nil
+	case groupStrategyLargest:
+		return "size DESC", nil
+	case groupStrategyShortestPath:
+		return "length(path) ASC", nil
+	default:
+		return "", fmt.Errorf("unknown group strategy %q", strategy)
+	}
+}
+
 func groupListOrderBy(sortName string) (string, error) {
 	switch sortName {
 	case groupSortMembers:
@@ -585,7 +984,7 @@ func parseGroupMemberPagination(
 		return groupMemberPagination{}, fmt.Errorf("member_page must be a positive decimal integer")
 	}
 	size, err := parsePositiveDecimal(values.Get("member_size"), 0)
-	if err != nil || size > 500 {
+	if err != nil || size < 1 || size > 500 {
 		return groupMemberPagination{}, fmt.Errorf("member_size must be a decimal integer in 1..500")
 	}
 	maxInt64 := int64(^uint64(0) >> 1)

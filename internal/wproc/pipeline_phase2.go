@@ -282,7 +282,8 @@ func validatePhase2ImageConfig(cfg Config) error {
 }
 
 func matchesPhase2Dispatch(info os.FileInfo, job *worker.JobMsg) bool {
-	return info.Size() == job.Size && info.ModTime().UnixMilli() == job.MTimeMS
+	// MTimeMS carries Unix seconds despite its name (see worker.JobMsg).
+	return info.Size() == job.Size && info.ModTime().Unix() == job.MTimeMS
 }
 
 func samePhase2FileState(left, right os.FileInfo) bool {

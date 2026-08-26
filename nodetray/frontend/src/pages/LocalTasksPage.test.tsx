@@ -1,5 +1,5 @@
 import '@testing-library/jest-dom/vitest'
-import { render, screen, waitFor } from '@testing-library/react'
+import { act, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { LocalTasksPage } from './LocalTasksPage'
 import type { LocalTasksAPI } from './LocalTasksPage'
@@ -77,4 +77,53 @@ it('创建扫描或自动三筛任务且一筛特征固定启用', async () => {
   await user.selectOptions(screen.getByLabelText('任务模式'), 'scan_then_analysis')
   await user.click(screen.getByRole('button', { name: '创建任务' }))
   expect(create).toHaveBeenCalledWith(expect.objectContaining({ roots: ['D:\\media'], mode: 'scan_then_analysis' }))
+})
+
+it('创建成功后刷新任务列表并展示状态与进度', async () => {
+  const list = vi.fn()
+    .mockResolvedValueOnce({ ok: true, tasks: [] })
+    .mockResolvedValue({ ok: true, tasks: [{ taskId: 't1', source: 'local', stage: 1, status: 'running', progressComplete: 3, progressTotal: 10, speed: '5 文件/秒' }] })
+  render(<LocalTasksPage api={api({ list })} />)
+  const user = userEvent.setup()
+  await user.type(screen.getByLabelText('手工目录'), 'D:\\media')
+  await user.click(screen.getByRole('button', { name: '添加目录' }))
+  await user.click(screen.getByRole('button', { name: '创建任务' }))
+  expect(await screen.findByText('t1')).toBeInTheDocument()
+  expect(screen.getByText(/运行中/)).toBeInTheDocument()
+  expect(screen.getByText('3/10')).toBeInTheDocument()
+  expect(screen.getByText(/5 文件\/秒/)).toBeInTheDocument()
+  expect(list).toHaveBeenCalledTimes(2)
+  expect(screen.queryByText('暂无本地任务。')).not.toBeInTheDocument()
+})
+
+it('创建失败展示错误摘要且不刷新列表', async () => {
+  const create = vi.fn(async () => ({ ok: false, errorSummary: 'Agent 暂不可用' }))
+  const list = vi.fn(async () => ({ ok: true, tasks: [] }))
+  render(<LocalTasksPage api={api({ create, list })} />)
+  const user = userEvent.setup()
+  await user.type(screen.getByLabelText('手工目录'), 'D:\\media')
+  await user.click(screen.getByRole('button', { name: '添加目录' }))
+  await user.click(screen.getByRole('button', { name: '创建任务' }))
+  await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('Agent 暂不可用'))
+  expect(list).toHaveBeenCalledTimes(1)
+  expect(screen.getByText('暂无本地任务。')).toBeInTheDocument()
+})
+
+it('非终态任务每 2 秒轮询进度，全部终态后停止', async () => {
+  vi.useFakeTimers()
+  try {
+    const list = vi.fn()
+      .mockResolvedValueOnce({ ok: true, tasks: [{ taskId: 't1', source: 'local', stage: 1, status: 'running', progressComplete: 1, progressTotal: 2 }] })
+      .mockResolvedValue({ ok: true, tasks: [{ taskId: 't1', source: 'local', stage: 1, status: 'succeeded', progressComplete: 2, progressTotal: 2 }] })
+    render(<LocalTasksPage api={api({ list })} />)
+    await act(async () => { /* 初次加载：running */ })
+    expect(list).toHaveBeenCalledTimes(1)
+    await act(async () => { await vi.advanceTimersByTimeAsync(2000) })
+    expect(list).toHaveBeenCalledTimes(2)
+    expect(screen.getByText(/已完成/)).toBeInTheDocument()
+    await act(async () => { await vi.advanceTimersByTimeAsync(10000) })
+    expect(list).toHaveBeenCalledTimes(2)
+  } finally {
+    vi.useRealTimers()
+  }
 })

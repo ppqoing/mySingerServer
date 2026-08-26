@@ -428,7 +428,6 @@ type runRecord struct {
 type recordingTaskRunner struct {
 	started chan runRecord
 	release chan struct{}
-	once    sync.Once
 }
 
 func (r *recordingTaskRunner) Run(ctx context.Context, request CreateRequest, stage int, advance func(int) error) error {

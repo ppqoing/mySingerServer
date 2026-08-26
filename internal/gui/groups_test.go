@@ -220,6 +220,112 @@ func TestGroupsListFilterRejectsInvalidInputBeforeDatabase(t *testing.T) {
 	}
 }
 
+func TestGroupsStatsValidatesFiltersBeforeDatabase(t *testing.T) {
+	api := newGroupTestAPI(&groupAPIFakeDB{panicOnUse: true})
+	for _, test := range []struct {
+		name string
+		url  string
+	}{
+		{"candidate kind", "/api/groups/stats?kind=image_candidate"},
+		{"case changed kind", "/api/groups/stats?kind=Image"},
+		{"query longer than 256 runes", "/api/groups/stats?kind=image&q=" + strings.Repeat("界", 257)},
+		{"machine longer than 128 runes", "/api/groups/stats?kind=image&machine=" + strings.Repeat("机", 129)},
+		{"minimum members zero", "/api/groups/stats?kind=image&min_members=0"},
+		{"minimum members signed", "/api/groups/stats?kind=image&min_members=%2B3"},
+		{"minimum members non decimal", "/api/groups/stats?kind=image&min_members=three"},
+		{"minimum members overflows", "/api/groups/stats?kind=image&min_members=999999999999999999999999"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			response := groupRequest(t, api, test.url)
+			assertGroupJSONError(t, response, http.StatusBadRequest)
+		})
+	}
+}
+
+func TestGroupsStatsUnavailableWithoutDatabase(t *testing.T) {
+	// A 503 (not 400) proves /api/groups/stats routed to handleStats: the
+	// {id} detail route would reject "stats" as a non-numeric id first.
+	response := groupRequest(t, NewAPI(nil, nil, nil), "/api/groups/stats?kind=exact")
+	assertGroupJSONError(t, response, http.StatusServiceUnavailable)
+	response = groupRequest(t, NewAPI(nil, nil, nil), "/api/groups/stats")
+	assertGroupJSONError(t, response, http.StatusServiceUnavailable)
+}
+
+func TestGroupsStatsAggregatesOverLiveFilter(t *testing.T) {
+	db := &groupAPIFakeDB{
+		rowResults: []groupAPIRowResult{{values: []any{int64(3), int64(9000), int64(5000)}}},
+	}
+	api := newGroupTestAPI(db)
+	response := groupRequest(
+		t,
+		api,
+		"/api/groups/stats?kind=image&q=poster&machine=agent-a&min_members=2",
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var got GroupStatsResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Kind != "image" || got.Groups != 3 ||
+		got.TotalBytes != 9000 || got.WastedBytes != 5000 {
+		t.Fatalf("stats=%#v", got)
+	}
+	if len(db.rowCalls) != 1 || len(db.queryCalls) != 0 {
+		t.Fatalf("query calls row=%d rows=%d", len(db.rowCalls), len(db.queryCalls))
+	}
+	if gotArgs := db.rowCalls[0].args; !reflect.DeepEqual(
+		gotArgs,
+		[]any{"image", "agent-a", "poster", int64(2)},
+	) {
+		t.Fatalf("stats args=%#v", gotArgs)
+	}
+	sql := normalizedGroupSQL(db.rowCalls[0].sql)
+	for _, fragment := range []string{
+		"all_live AS",
+		"matching_groups AS",
+		"f.status <> 'deleted'",
+		"GREATEST(sum(size)-max(size),0) AS wasted_bytes",
+		"COALESCE(sum(summary.total_bytes),0)",
+		"COALESCE(sum(summary.wasted_bytes),0)",
+		"summary.live_member_count >= $4",
+	} {
+		if !strings.Contains(sql, fragment) {
+			t.Fatalf("stats SQL missing %q:\n%s", fragment, sql)
+		}
+	}
+}
+
+func TestGroupsStatsEmptySetReturnsZeroes(t *testing.T) {
+	db := &groupAPIFakeDB{
+		rowResults: []groupAPIRowResult{{values: []any{int64(0), int64(0), int64(0)}}},
+	}
+	api := newGroupTestAPI(db)
+	response := groupRequest(t, api, "/api/groups/stats")
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var got GroupStatsResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Kind != "" || got.Groups != 0 || got.TotalBytes != 0 || got.WastedBytes != 0 {
+		t.Fatalf("empty stats=%#v", got)
+	}
+	if gotArgs := db.rowCalls[0].args; !reflect.DeepEqual(
+		gotArgs,
+		[]any{"", "", "", int64(0)},
+	) {
+		t.Fatalf("stats args=%#v", gotArgs)
+	}
+	if sql := normalizedGroupSQL(db.rowCalls[0].sql); !strings.Contains(
+		sql, "kind IN ('exact','image','video')",
+	) {
+		t.Fatalf("stats SQL does not restrict all-kinds aggregation to display kinds:\n%s", sql)
+	}
+}
+
 func TestGroupsDetailValidatesIDAndReportsMissing(t *testing.T) {
 	invalidAPI := newGroupTestAPI(&groupAPIFakeDB{panicOnUse: true})
 	for _, id := range []string{"0", "-1", "+1", "abc", "1.5", "999999999999999999999999"} {
@@ -396,6 +502,7 @@ func TestGroupsDetailMemberPaginationValidatesBeforeDatabase(t *testing.T) {
 		{"page zero", "/api/groups/1?member_page=0&member_size=100"},
 		{"page signed", "/api/groups/1?member_page=%2B1&member_size=100"},
 		{"size zero", "/api/groups/1?member_page=1&member_size=0"},
+		{"size empty", "/api/groups/1?member_page=1&member_size="},
 		{"size above max", "/api/groups/1?member_page=1&member_size=501"},
 		{"offset overflows", "/api/groups/1?member_page=9223372036854775807&member_size=500"},
 	} {
@@ -449,6 +556,13 @@ func TestGroupsFailClosedWithoutPartialSuccess(t *testing.T) {
 			url: "/api/groups?kind=exact",
 		},
 		{
+			name: "stats query",
+			db: &groupAPIFakeDB{
+				rowResults: []groupAPIRowResult{{err: errors.New("stats failed")}},
+			},
+			url: "/api/groups/stats?kind=image",
+		},
+		{
 			name: "detail invalid returned kind",
 			db: &groupAPIFakeDB{
 				rowResults: []groupAPIRowResult{{
@@ -495,6 +609,283 @@ func TestGroupsFailClosedWithoutPartialSuccess(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestGroupsSetRepresentativeValidatesBeforeDatabase(t *testing.T) {
+	api := newGroupTestAPI(&groupAPIFakeDB{panicOnUse: true})
+	for _, test := range []struct {
+		name string
+		url  string
+		body string
+	}{
+		{"zero group id", "/api/groups/0/representative", `{"file_id":7}`},
+		{"non-numeric group id", "/api/groups/abc/representative", `{"file_id":7}`},
+		{"malformed json", "/api/groups/5/representative", `{"file_id":`},
+		{"unknown field", "/api/groups/5/representative", `{"file_id":7,"extra":1}`},
+		{"trailing data", "/api/groups/5/representative", `{"file_id":7} {}`},
+		{"zero file id", "/api/groups/5/representative", `{"file_id":0}`},
+		{"negative file id", "/api/groups/5/representative", `{"file_id":-3}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			response := groupPostRequest(t, api, test.url, test.body)
+			assertGroupJSONError(t, response, http.StatusBadRequest)
+		})
+	}
+	// 无库时 503 而不是 404：证明路由命中且校验已通过。
+	response := groupPostRequest(t, NewAPI(nil, nil, nil), "/api/groups/5/representative", `{"file_id":7}`)
+	assertGroupJSONError(t, response, http.StatusServiceUnavailable)
+}
+
+func TestGroupsSetRepresentativeLookupFailures(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		db   *groupAPIFakeDB
+		want int
+	}{
+		{
+			name: "group missing",
+			db: &groupAPIFakeDB{
+				rowResults: []groupAPIRowResult{{err: pgx.ErrNoRows}},
+			},
+			want: http.StatusNotFound,
+		},
+		{
+			name: "file missing",
+			db: &groupAPIFakeDB{
+				rowResults: []groupAPIRowResult{{values: []any{1}}, {err: pgx.ErrNoRows}},
+			},
+			want: http.StatusNotFound,
+		},
+		{
+			name: "not a live member",
+			db: &groupAPIFakeDB{
+				rowResults: []groupAPIRowResult{
+					{values: []any{1}}, {values: []any{1}}, {err: pgx.ErrNoRows},
+				},
+			},
+			want: http.StatusBadRequest,
+		},
+		{
+			name: "group vanished before update",
+			db: &groupAPIFakeDB{
+				rowResults: []groupAPIRowResult{
+					{values: []any{1}}, {values: []any{1}}, {values: []any{1}},
+					{err: pgx.ErrNoRows},
+				},
+			},
+			want: http.StatusNotFound,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			response := groupPostRequest(
+				t, newGroupTestAPI(test.db), "/api/groups/5/representative", `{"file_id":7}`,
+			)
+			assertGroupJSONError(t, response, test.want)
+		})
+	}
+}
+
+func TestGroupsSetRepresentativeUpdatesStoredRepresentative(t *testing.T) {
+	db := &groupAPIFakeDB{
+		rowResults: []groupAPIRowResult{
+			{values: []any{1}}, {values: []any{1}}, {values: []any{1}},
+			{values: []any{int64(5)}},
+		},
+	}
+	response := groupPostRequest(
+		t, newGroupTestAPI(db), "/api/groups/5/representative", `{"file_id":7}`,
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var body map[string]bool
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if !body["ok"] {
+		t.Fatalf("body=%v", body)
+	}
+	if len(db.rowCalls) != 4 {
+		t.Fatalf("row calls=%d", len(db.rowCalls))
+	}
+	updateSQL := normalizedGroupSQL(db.rowCalls[3].sql)
+	if !strings.Contains(updateSQL, "UPDATE dup_groups") ||
+		!strings.Contains(updateSQL, "representative_file_id=$2") {
+		t.Fatalf("update SQL=%s", updateSQL)
+	}
+	if args := db.rowCalls[3].args; !reflect.DeepEqual(args, []any{int64(5), int64(7)}) {
+		t.Fatalf("update args=%#v", args)
+	}
+	memberSQL := normalizedGroupSQL(db.rowCalls[2].sql)
+	if !strings.Contains(memberSQL, "f.status <> 'deleted'") {
+		t.Fatalf("membership SQL does not exclude deleted files:\n%s", memberSQL)
+	}
+}
+
+func TestGroupsSelectByStrategyValidatesBeforeDatabase(t *testing.T) {
+	api := newGroupTestAPI(&groupAPIFakeDB{panicOnUse: true})
+	for _, test := range []struct {
+		name string
+		body string
+	}{
+		{"malformed json", `{"kind":`},
+		{"unknown field", `{"kind":"exact","strategy":"newest","extra":1}`},
+		{"missing kind", `{"strategy":"newest"}`},
+		{"candidate kind", `{"kind":"image_candidate","strategy":"newest"}`},
+		{"missing strategy", `{"kind":"exact"}`},
+		{"unknown strategy", `{"kind":"exact","strategy":"smallest"}`},
+		{"query too long", `{"kind":"exact","strategy":"newest","q":"` + strings.Repeat("界", 257) + `"}`},
+		{"machine too long", `{"kind":"exact","strategy":"newest","machine":"` + strings.Repeat("机", 129) + `"}`},
+		{"negative min members", `{"kind":"exact","strategy":"newest","min_members":-1}`},
+		{"negative limit", `{"kind":"exact","strategy":"newest","limit":-1}`},
+		{"limit above max", `{"kind":"exact","strategy":"newest","limit":50001}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			response := groupPostRequest(t, api, "/api/groups/select-by-strategy", test.body)
+			assertGroupJSONError(t, response, http.StatusBadRequest)
+		})
+	}
+	response := groupPostRequest(
+		t, NewAPI(nil, nil, nil), "/api/groups/select-by-strategy",
+		`{"kind":"exact","strategy":"newest"}`,
+	)
+	assertGroupJSONError(t, response, http.StatusServiceUnavailable)
+}
+
+func TestGroupsSelectByStrategyQueriesAndProtectsRepresentative(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		strategy  string
+		orderFrag string
+	}{
+		{"newest", "newest", "ORDER BY mtime DESC, id"},
+		{"oldest", "oldest", "ORDER BY mtime ASC, id"},
+		{"largest", "largest", "ORDER BY size DESC, id"},
+		{"shortest path", "shortest_path", "ORDER BY length(path) ASC, id"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			db := &groupAPIFakeDB{
+				rowResults: []groupAPIRowResult{{values: []any{int64(2)}}},
+				rowsResults: []*groupAPIRows{groupAPIRowsFrom(
+					[]any{int64(11), int64(3)},
+					[]any{int64(12), int64(3)},
+				)},
+			}
+			response := groupPostRequest(
+				t, newGroupTestAPI(db), "/api/groups/select-by-strategy",
+				`{"kind":"image","q":"poster","machine":"agent-a","min_members":2,"strategy":"`+test.strategy+`","limit":10}`,
+			)
+			if response.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			var got GroupSelectByStrategyResponse
+			if err := json.Unmarshal(response.Body.Bytes(), &got); err != nil {
+				t.Fatal(err)
+			}
+			if got.Groups != 2 || len(got.FileIDs) != 2 ||
+				got.FileIDs[0] != 11 || got.FileIDs[1] != 12 || got.Truncated {
+				t.Fatalf("selection=%#v", got)
+			}
+			if len(db.rowCalls) != 1 || len(db.queryCalls) != 1 {
+				t.Fatalf("calls row=%d query=%d", len(db.rowCalls), len(db.queryCalls))
+			}
+			wantArgs := []any{"image", "agent-a", "poster", int64(2)}
+			if !reflect.DeepEqual(db.rowCalls[0].args, wantArgs) {
+				t.Fatalf("count args=%#v", db.rowCalls[0].args)
+			}
+			if !reflect.DeepEqual(
+				db.queryCalls[0].args,
+				[]any{"image", "agent-a", "poster", int64(2), 10},
+			) {
+				t.Fatalf("select args=%#v", db.queryCalls[0].args)
+			}
+			sql := normalizedGroupSQL(db.queryCalls[0].sql)
+			for _, fragment := range []string{
+				"all_live AS",
+				"matching_groups AS",
+				"f.status <> 'deleted'",
+				"summary.live_member_count >= $4",
+				// effective 代表与策略保留者都被排除在选择之外
+				"CASE WHEN id=representative_file_id THEN 0 ELSE 1 END",
+				"representative_rank <> 1",
+				"keep_rank <> 1",
+				test.orderFrag,
+				"LIMIT $5",
+			} {
+				if !strings.Contains(sql, fragment) {
+					t.Fatalf("strategy SQL missing %q:\n%s", fragment, sql)
+				}
+			}
+		})
+	}
+}
+
+func TestGroupsSelectByStrategyDefaultsTruncatesAndStaysFailClosed(t *testing.T) {
+	t.Run("default limit and truncation", func(t *testing.T) {
+		db := &groupAPIFakeDB{
+			rowResults: []groupAPIRowResult{{values: []any{int64(1)}}},
+			rowsResults: []*groupAPIRows{groupAPIRowsFrom(
+				[]any{int64(11), int64(50001)},
+			)},
+		}
+		response := groupPostRequest(
+			t, newGroupTestAPI(db), "/api/groups/select-by-strategy",
+			`{"kind":"exact","strategy":"oldest"}`,
+		)
+		if response.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+		}
+		var got GroupSelectByStrategyResponse
+		if err := json.Unmarshal(response.Body.Bytes(), &got); err != nil {
+			t.Fatal(err)
+		}
+		if !got.Truncated || len(got.FileIDs) != 1 {
+			t.Fatalf("selection=%#v", got)
+		}
+		if args := db.queryCalls[0].args; args[4] != groupSelectStrategyMaxLimit {
+			t.Fatalf("default limit arg=%#v", args[4])
+		}
+	})
+
+	t.Run("empty selection stays a JSON array", func(t *testing.T) {
+		db := &groupAPIFakeDB{
+			rowResults:  []groupAPIRowResult{{values: []any{int64(0)}}},
+			rowsResults: []*groupAPIRows{groupAPIRowsFrom()},
+		}
+		response := groupPostRequest(
+			t, newGroupTestAPI(db), "/api/groups/select-by-strategy",
+			`{"kind":"video","strategy":"largest"}`,
+		)
+		if response.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+		}
+		if !strings.Contains(response.Body.String(), `"file_ids":[]`) {
+			t.Fatalf("empty selection not an array: %s", response.Body.String())
+		}
+	})
+
+	t.Run("count failure", func(t *testing.T) {
+		db := &groupAPIFakeDB{
+			rowResults: []groupAPIRowResult{{err: errors.New("count failed")}},
+		}
+		response := groupPostRequest(
+			t, newGroupTestAPI(db), "/api/groups/select-by-strategy",
+			`{"kind":"exact","strategy":"newest"}`,
+		)
+		assertGroupJSONError(t, response, http.StatusInternalServerError)
+	})
+
+	t.Run("selection failure", func(t *testing.T) {
+		db := &groupAPIFakeDB{
+			rowResults:  []groupAPIRowResult{{values: []any{int64(1)}}},
+			queryErrors: []error{errors.New("query failed")},
+		}
+		response := groupPostRequest(
+			t, newGroupTestAPI(db), "/api/groups/select-by-strategy",
+			`{"kind":"exact","strategy":"newest"}`,
+		)
+		assertGroupJSONError(t, response, http.StatusInternalServerError)
+	})
 }
 
 func TestGroupsDedicatedCompatibilityEntryServesReactHTML(t *testing.T) {
@@ -729,6 +1120,247 @@ func TestPostgresGroupsDeletedRepresentativeFallbackAndLiveFilteringWhenEnabled(
 		t, api, fmt.Sprintf("/api/groups/%d", candidateID),
 	)
 	assertGroupJSONError(t, candidateResponse, http.StatusNotFound)
+
+	stats := func(url string) GroupStatsResponse {
+		t.Helper()
+		response := groupRequest(t, api, url)
+		if response.Code != http.StatusOK {
+			t.Fatalf("stats %s status=%d body=%s",
+				url, response.Code, response.Body.String())
+		}
+		var got GroupStatsResponse
+		if err := json.Unmarshal(response.Body.Bytes(), &got); err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	if got := stats("/api/groups/stats?kind=exact"); got.Kind != "exact" ||
+		got.Groups != 1 || got.TotalBytes != 200 || got.WastedBytes != 100 {
+		t.Fatalf("exact stats=%#v", got)
+	}
+	if got := stats("/api/groups/stats?kind=image"); got.Groups != 0 ||
+		got.TotalBytes != 0 || got.WastedBytes != 0 {
+		t.Fatalf("all-deleted image stats leaked: %#v", got)
+	}
+	if got := stats("/api/groups/stats"); got.Kind != "" ||
+		got.Groups != 2 || got.TotalBytes != 400 || got.WastedBytes != 200 {
+		t.Fatalf("all-kinds stats=%#v (candidate kinds must stay hidden)", got)
+	}
+	if got := stats("/api/groups/stats?machine=a-live"); got.Groups != 1 ||
+		got.TotalBytes != 200 || got.WastedBytes != 100 {
+		t.Fatalf("machine-filtered stats=%#v", got)
+	}
+	if got := stats("/api/groups/stats?q=first"); got.Groups != 1 ||
+		got.TotalBytes != 200 || got.WastedBytes != 100 {
+		t.Fatalf("path-filtered stats=%#v", got)
+	}
+	if got := stats("/api/groups/stats?kind=exact&min_members=3"); got.Groups != 0 ||
+		got.TotalBytes != 0 || got.WastedBytes != 0 {
+		t.Fatalf("min_members stats=%#v", got)
+	}
+}
+
+func TestPostgresGroupRepresentativeAndStrategySelectionWhenEnabled(t *testing.T) {
+	dsn := os.Getenv("DEDUP_TEST_PG_DSN")
+	if dsn == "" {
+		t.Skip("DEDUP_TEST_PG_DSN is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	admin, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close()
+
+	schema := "task_batch3_groups_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	quotedSchema := pgx.Identifier{schema}.Sanitize()
+	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+quotedSchema); err != nil {
+		t.Fatal(err)
+	}
+	config, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.ConnConfig.RuntimeParams["search_path"] = schema
+	scoped, err := pgxpool.NewWithConfig(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		scoped.Close()
+		if _, dropErr := admin.Exec(
+			context.Background(),
+			"DROP SCHEMA "+quotedSchema+" CASCADE",
+		); dropErr != nil {
+			t.Errorf("drop schema: %v", dropErr)
+		}
+	}()
+
+	centralSQL, err := os.ReadFile(filepath.Join("..", "..", "deploy", "central.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := scoped.Exec(ctx, string(centralSQL)); err != nil {
+		t.Fatal(err)
+	}
+
+	insertFile := func(machine, path string, size, mtime int64, status string) int64 {
+		t.Helper()
+		var id int64
+		if err := scoped.QueryRow(
+			ctx,
+			`INSERT INTO files(machine_id,path,size,mtime,status)
+			 VALUES($1,$2,$3,$4,$5) RETURNING id`,
+			machine, path, size, mtime, status,
+		).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+
+	keep := insertFile("a-live", `A:\keep.bin`, 100, 10, "done")
+	newer := insertFile("b-live", `B:\newer.bin`, 200, 20, "done")
+	old := insertFile("a-live", `A:\old.bin`, 50, 5, "done")
+	deleted := insertFile("a-live", `A:\deleted.bin`, 60, 6, "deleted")
+	other := insertFile("a-video", `A:\other.mp4`, 300, 30, "done")
+	videoRep := insertFile("z-video", `Z:\representative.mp4`, 300, 30, "done")
+
+	var groupID int64
+	if err := scoped.QueryRow(
+		ctx,
+		`INSERT INTO dup_groups(kind,representative_file_id,member_count)
+		 VALUES('exact',$1,4) RETURNING id`,
+		keep,
+	).Scan(&groupID); err != nil {
+		t.Fatal(err)
+	}
+	for _, fileID := range []int64{keep, newer, old, deleted} {
+		if _, err := scoped.Exec(
+			ctx,
+			`INSERT INTO dup_members(group_id,file_id) VALUES($1,$2)`,
+			groupID, fileID,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var videoGroupID int64
+	if err := scoped.QueryRow(
+		ctx,
+		`INSERT INTO dup_groups(kind,representative_file_id,member_count)
+		 VALUES('video',$1,2) RETURNING id`,
+		videoRep,
+	).Scan(&videoGroupID); err != nil {
+		t.Fatal(err)
+	}
+	for _, fileID := range []int64{other, videoRep} {
+		if _, err := scoped.Exec(
+			ctx,
+			`INSERT INTO dup_members(group_id,file_id) VALUES($1,$2)`,
+			videoGroupID, fileID,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	api := NewAPI(nil, nil, scoped)
+	strategyURL := "/api/groups/select-by-strategy"
+	selectByStrategy := func(body string) GroupSelectByStrategyResponse {
+		t.Helper()
+		response := groupPostRequest(t, api, strategyURL, body)
+		if response.Code != http.StatusOK {
+			t.Fatalf("select-by-strategy %s status=%d body=%s",
+				body, response.Code, response.Body.String())
+		}
+		var got GroupSelectByStrategyResponse
+		if err := json.Unmarshal(response.Body.Bytes(), &got); err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+
+	// newest：保留 mtime 最大者（newer）与代表（keep），选中 old；deleted 不参与。
+	if got := selectByStrategy(`{"kind":"exact","strategy":"newest"}`); got.Groups != 1 ||
+		got.Truncated || len(got.FileIDs) != 1 || got.FileIDs[0] != old {
+		t.Fatalf("newest selection=%#v", got)
+	}
+	// oldest：保留 mtime 最小者（old）与代表（keep），选中 newer。
+	if got := selectByStrategy(`{"kind":"exact","strategy":"oldest"}`); len(got.FileIDs) != 1 ||
+		got.FileIDs[0] != newer {
+		t.Fatalf("oldest selection=%#v", got)
+	}
+	// shortest_path：A:\old.bin 最短保留，选中 newer。
+	if got := selectByStrategy(`{"kind":"exact","strategy":"shortest_path"}`); len(got.FileIDs) != 1 ||
+		got.FileIDs[0] != newer {
+		t.Fatalf("shortest_path selection=%#v", got)
+	}
+	// 筛选透传：machine/q/min_members 与 kind 共同作用。
+	if got := selectByStrategy(
+		`{"kind":"exact","strategy":"newest","machine":"b-live"}`,
+	); got.Groups != 1 || len(got.FileIDs) != 1 {
+		t.Fatalf("machine-filtered selection=%#v", got)
+	}
+	if got := selectByStrategy(
+		`{"kind":"exact","strategy":"newest","min_members":5}`,
+	); got.Groups != 0 || len(got.FileIDs) != 0 {
+		t.Fatalf("min_members selection=%#v", got)
+	}
+	// 代表与策略保留者并列保护：video 组策略保留者 other（并列取小 id），
+	// 代表 videoRep 同受保护，无可选成员。
+	if got := selectByStrategy(`{"kind":"video","strategy":"largest"}`); got.Groups != 1 ||
+		len(got.FileIDs) != 0 {
+		t.Fatalf("video selection=%#v", got)
+	}
+
+	// 指定保留副本的错误分支。
+	representativeURL := func(id int64) string {
+		return fmt.Sprintf("/api/groups/%d/representative", id)
+	}
+	if response := groupPostRequest(
+		t, api, representativeURL(999999), fmt.Sprintf(`{"file_id":%d}`, old),
+	); response.Code != http.StatusNotFound {
+		t.Fatalf("unknown group status=%d", response.Code)
+	}
+	if response := groupPostRequest(
+		t, api, representativeURL(groupID), `{"file_id":999999}`,
+	); response.Code != http.StatusNotFound {
+		t.Fatalf("unknown file status=%d", response.Code)
+	}
+	if response := groupPostRequest(
+		t, api, representativeURL(groupID), fmt.Sprintf(`{"file_id":%d}`, other),
+	); response.Code != http.StatusBadRequest {
+		t.Fatalf("foreign member status=%d", response.Code)
+	}
+	if response := groupPostRequest(
+		t, api, representativeURL(groupID), fmt.Sprintf(`{"file_id":%d}`, deleted),
+	); response.Code != http.StatusBadRequest {
+		t.Fatalf("deleted member status=%d", response.Code)
+	}
+
+	// 成功路径：指定 old 为保留副本后，详情代表变更且策略选择不再选中 old。
+	response := groupPostRequest(
+		t, api, representativeURL(groupID), fmt.Sprintf(`{"file_id":%d}`, old),
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf("set representative status=%d body=%s", response.Code, response.Body.String())
+	}
+	detailResponse := groupRequest(t, api, fmt.Sprintf("/api/groups/%d", groupID))
+	if detailResponse.Code != http.StatusOK {
+		t.Fatalf("detail status=%d", detailResponse.Code)
+	}
+	var detail GroupDetail
+	if err := json.Unmarshal(detailResponse.Body.Bytes(), &detail); err != nil {
+		t.Fatal(err)
+	}
+	if detail.RepresentativeFileID == nil || *detail.RepresentativeFileID != old {
+		t.Fatalf("representative after update=%#v", detail.RepresentativeFileID)
+	}
+	// newest 保留 newer，代表 old 受保护，选中 keep。
+	if got := selectByStrategy(`{"kind":"exact","strategy":"newest"}`); len(got.FileIDs) != 1 ||
+		got.FileIDs[0] != keep {
+		t.Fatalf("selection after representative change=%#v", got)
+	}
 }
 
 func newGroupTestAPI(db groupQueryDB) *API {
@@ -740,6 +1372,19 @@ func newGroupTestAPI(db groupQueryDB) *API {
 func groupRequest(t *testing.T, api *API, url string) *httptest.ResponseRecorder {
 	t.Helper()
 	request := httptest.NewRequest(http.MethodGet, url, nil)
+	response := httptest.NewRecorder()
+	api.Routes().ServeHTTP(response, request)
+	return response
+}
+
+func groupPostRequest(
+	t *testing.T,
+	api *API,
+	url string,
+	body string,
+) *httptest.ResponseRecorder {
+	t.Helper()
+	request := httptest.NewRequest(http.MethodPost, url, strings.NewReader(body))
 	response := httptest.NewRecorder()
 	api.Routes().ServeHTTP(response, request)
 	return response

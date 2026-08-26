@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -22,6 +23,56 @@ type engineStageOne struct {
 
 func (s engineStageOne) Run(context.Context, string, string) (firstscreen.Result, error) {
 	return s.result, s.err
+}
+
+type rootScopedEngineStageOne struct {
+	result      firstscreen.Result
+	globalCalls int
+	roots       []string
+}
+
+func (s *rootScopedEngineStageOne) Run(context.Context, string, string) (firstscreen.Result, error) {
+	s.globalCalls++
+	return s.result, nil
+}
+
+func (s *rootScopedEngineStageOne) RunForRoots(_ context.Context, _ string, _ string, roots []string) (firstscreen.Result, error) {
+	s.roots = append([]string(nil), roots...)
+	roots[0] = `H:\mutated`
+	return s.result, nil
+}
+
+func TestEngineRunWithProgressForRootsForwardsCopiedRoots(t *testing.T) {
+	stage := &rootScopedEngineStageOne{}
+	analysisStore := &engineStore{run: store.LocalAnalysisRun{RunID: "run-roots", MachineID: "machine-a", TaskID: "task-roots", Status: "building"}}
+	engine := NewEngine("machine-a", stage, analysisStore, &engineWorker{makeResult: validEngineStageResult}, testPhase2Config())
+	roots := []string{`I:\tmp\wallpa`}
+	if err := engine.RunWithProgressForRoots(context.Background(), "task-roots", roots, nil); err != nil {
+		t.Fatalf("RunWithProgressForRoots: %v", err)
+	}
+	if len(stage.roots) != 1 || stage.roots[0] != `I:\tmp\wallpa` || roots[0] != `I:\tmp\wallpa` {
+		t.Fatalf("stage roots=%v caller roots=%v", stage.roots, roots)
+	}
+	if stage.globalCalls != 0 {
+		t.Fatalf("global stage one calls = %d, want 0", stage.globalCalls)
+	}
+}
+
+func TestEngineRunWithProgressForRootsRejectsInvalidRootsBeforeStoreCalls(t *testing.T) {
+	for _, root := range []string{`tmp\wallpa`, `I:\`, `I:\tmp\wallpa\..\wallpaper`} {
+		t.Run(root, func(t *testing.T) {
+			stage := &rootScopedEngineStageOne{}
+			analysisStore := &engineStore{}
+			engine := NewEngine("machine-a", stage, analysisStore, &engineWorker{makeResult: validEngineStageResult}, testPhase2Config())
+			err := engine.RunWithProgressForRoots(context.Background(), "task-roots", []string{root}, nil)
+			if err == nil || !strings.Contains(err.Error(), "task root") {
+				t.Fatalf("RunWithProgressForRoots error = %v", err)
+			}
+			if len(analysisStore.calls) != 0 || len(stage.roots) != 0 || stage.globalCalls != 0 {
+				t.Fatalf("invalid roots reached dependencies: store=%v roots=%v global=%d", analysisStore.calls, stage.roots, stage.globalCalls)
+			}
+		})
+	}
 }
 
 type engineStore struct {
@@ -565,4 +616,29 @@ func hasEngineStageEvent(events []store.LocalOutboxEvent, stage string) bool {
 
 func testPhase2Config() config.Phase2Config {
 	return config.Phase2Config{PHashPassT2: .8, PHashPartThreshold: 10, SobelT3: .85, VideoFrames: 6, VideoAvgT4: .8, VideoMinPassed: 4, VideoMinValid: 4}
+}
+
+// This fails if the engine's default file metadata stops reporting the
+// modification time in Unix seconds, which is the precision the files table
+// and the worker job contract (worker.JobMsg.MTimeMS) use.
+func TestEngineDefaultFileMetadataUsesUnixSeconds(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "media.bin")
+	if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := NewEngine("machine-a", nil, nil, nil, config.Phase2Config{})
+	size, mtime, err := engine.fileMetadata(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if size != info.Size() || mtime != info.ModTime().Unix() {
+		t.Fatalf(
+			"metadata = (%d, %d), want (%d, %d unix seconds)",
+			size, mtime, info.Size(), info.ModTime().Unix(),
+		)
+	}
 }

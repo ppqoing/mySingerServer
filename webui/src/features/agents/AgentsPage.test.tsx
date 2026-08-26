@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, test, vi } from "vitest";
 import type { AppApi, AgentStatus } from "../../api/contracts";
@@ -8,6 +8,14 @@ function apiFor(agents: AgentStatus[] | (() => Promise<AgentStatus[]>)): AppApi 
   return {
     listAgents: vi.fn(typeof agents === "function" ? agents : async () => agents)
   } as unknown as AppApi;
+}
+
+function deferred<T>() {
+  let resolve: ((value: T) => void) | undefined;
+  const promise = new Promise<T>(resolvePromise => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve: (value: T) => resolve?.(value) };
 }
 
 describe("AgentsPage", () => {
@@ -61,5 +69,36 @@ describe("AgentsPage", () => {
 
     render(<AgentsPage api={apiFor([])} />);
     await waitFor(() => expect(screen.getAllByText("当前没有 Agent。").length).toBeGreaterThan(0));
+  });
+
+  test("keeps the refresh button enabled during background polling and disables it only for a manual refresh", async () => {
+    const first = deferred<AgentStatus[]>();
+    const second = deferred<AgentStatus[]>();
+    const listAgents = vi.fn()
+      .mockImplementationOnce(() => first.promise)
+      .mockImplementationOnce(() => second.promise)
+      .mockResolvedValue([]);
+    const user = userEvent.setup();
+    render(<AgentsPage api={{ listAgents } as unknown as AppApi} />);
+
+    // 首屏轮询进行中也不禁用：禁用态只跟随手动点击的这一轮。
+    expect(screen.getByRole("button", { name: "刷新 Agent 列表" })).toBeEnabled();
+    await act(async () => first.resolve([{ machineId: "agent-a", addr: "10.0.0.1", online: true, identityState: "claimed" }]));
+    await screen.findByText("agent-a");
+
+    await user.click(screen.getByRole("button", { name: "刷新 Agent 列表" }));
+    expect(screen.getByRole("button", { name: "刷新 Agent 列表" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "刷新 Agent 列表" })).toHaveTextContent("正在刷新…");
+
+    await act(async () => second.resolve([]));
+    await waitFor(() => expect(screen.getByRole("button", { name: "刷新 Agent 列表" })).toBeEnabled());
+  });
+
+  test("explains what an identity conflict means", async () => {
+    render(<AgentsPage api={apiFor([
+      { machineId: "node-a", addr: "10.0.0.5:9101", online: false, identityState: "conflict" }
+    ])} />);
+
+    expect(await screen.findByText(/同一机器可能被重复部署或配置冲突，请检查 Agent 安装/)).toBeInTheDocument();
   });
 });

@@ -22,6 +22,10 @@ type StageOneRunner interface {
 	Run(context.Context, string, string) (firstscreen.Result, error)
 }
 
+type RootScopedStageOneRunner interface {
+	RunForRoots(context.Context, string, string, []string) (firstscreen.Result, error)
+}
+
 type StageWorker interface {
 	Execute(context.Context, *worker.JobMsg) (*worker.JobResultMsg, error)
 }
@@ -51,7 +55,7 @@ func NewEngine(machineID string, stageOne StageOneRunner, analysisStore EngineSt
 		if err != nil {
 			return 0, 0, err
 		}
-		return info.Size(), info.ModTime().UnixMilli(), nil
+		return info.Size(), info.ModTime().Unix(), nil
 	}}
 }
 
@@ -60,6 +64,29 @@ func (e *Engine) Run(ctx context.Context, taskID string) error {
 }
 
 func (e *Engine) RunWithProgress(ctx context.Context, taskID string, checkpoint func(int) error) error {
+	return e.runWithProgress(ctx, taskID, checkpoint, func(ctx context.Context, machineID, runID string) (firstscreen.Result, error) {
+		return e.stageOne.Run(ctx, machineID, runID)
+	})
+}
+
+func (e *Engine) RunWithProgressForRoots(ctx context.Context, taskID string, roots []string, checkpoint func(int) error) error {
+	if e == nil {
+		return fmt.Errorf("localanalysis: engine dependencies are required")
+	}
+	if _, err := validateTaskRoots(roots); err != nil {
+		return err
+	}
+	stageOne, ok := e.stageOne.(RootScopedStageOneRunner)
+	if !ok {
+		return fmt.Errorf("localanalysis: root-scoped stage one is required")
+	}
+	rootCopy := append([]string(nil), roots...)
+	return e.runWithProgress(ctx, taskID, checkpoint, func(ctx context.Context, machineID, runID string) (firstscreen.Result, error) {
+		return stageOne.RunForRoots(ctx, machineID, runID, rootCopy)
+	})
+}
+
+func (e *Engine) runWithProgress(ctx context.Context, taskID string, checkpoint func(int) error, runStageOne func(context.Context, string, string) (firstscreen.Result, error)) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -92,7 +119,7 @@ func (e *Engine) RunWithProgress(ctx context.Context, taskID string, checkpoint 
 	default:
 		return fmt.Errorf("localanalysis: unsupported run status %q", run.Status)
 	}
-	result, err := e.stageOne.Run(ctx, e.machineID, run.RunID)
+	result, err := runStageOne(ctx, e.machineID, run.RunID)
 	if err != nil {
 		return fmt.Errorf("localanalysis: stage one: %w", err)
 	}
@@ -228,7 +255,7 @@ func (e *Engine) RunWithProgress(ctx context.Context, taskID string, checkpoint 
 }
 
 func (e *Engine) compute(ctx context.Context, taskID string, file firstscreen.File, kind worker.MediaKind, stage worker.ScreenStage) (*worker.JobResultMsg, error) {
-	size, mtimeMS, err := e.fileMetadata(file.Path)
+	size, mtime, err := e.fileMetadata(file.Path)
 	if err != nil {
 		return nil, fmt.Errorf("localanalysis: stat media for stage %d failed", stage)
 	}
@@ -245,7 +272,7 @@ func (e *Engine) compute(ctx context.Context, taskID string, file firstscreen.Fi
 			fields = worker.MaskVideo6FSobel
 		}
 	}
-	job := &worker.JobMsg{ScanTaskID: taskID, Path: file.Path, Kind: kind, Phase: worker.Phase2, ScreenStage: stage, Source: worker.JobSourceLocal, FieldsMask: fields, Size: size, MTimeMS: mtimeMS, KnownSHA: append([]byte(nil), file.SHA512[:]...), FrameMask: frameMask}
+	job := &worker.JobMsg{ScanTaskID: taskID, Path: file.Path, Kind: kind, Phase: worker.Phase2, ScreenStage: stage, Source: worker.JobSourceLocal, FieldsMask: fields, Size: size, MTimeMS: mtime, KnownSHA: append([]byte(nil), file.SHA512[:]...), FrameMask: frameMask}
 	result, err := e.worker.Execute(ctx, job)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {

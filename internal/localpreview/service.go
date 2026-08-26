@@ -16,6 +16,7 @@ var ErrUnavailable = errors.New("local_preview_unavailable")
 
 type SourceStore interface {
 	LoadLocalPreviewSource(context.Context, string, int64) (store.LocalPreviewSource, error)
+	LoadLocalPreviewSourceBySHA(context.Context, string, string) (store.LocalPreviewSource, error)
 }
 
 type Executor interface {
@@ -42,13 +43,27 @@ func (service *Service) Preview(ctx context.Context, request proto.LocalImagePre
 	if err := request.Validate(); err != nil {
 		return proto.LocalImagePreviewResponse{}, err
 	}
-	source, err := service.store.LoadLocalPreviewSource(ctx, service.machineID, request.FileID)
+	var source store.LocalPreviewSource
+	var err error
+	if request.FileID > 0 {
+		source, err = service.store.LoadLocalPreviewSource(ctx, service.machineID, request.FileID)
+	} else {
+		source, err = service.store.LoadLocalPreviewSourceBySHA(ctx, service.machineID, request.Sha512)
+	}
 	if err != nil {
 		return proto.LocalImagePreviewResponse{}, err
 	}
-	if source.FileID != request.FileID || source.MachineID != service.machineID ||
+	if source.MachineID != service.machineID ||
 		source.Path == "" || source.Kind != "image" || source.Status == "deleted" ||
 		source.Size < 0 || source.MTime <= 0 {
+		return proto.LocalImagePreviewResponse{}, errors.New("preview_not_available")
+	}
+	// The identity check matches the resolution key: FileID requests must return
+	// that exact row, SHA-512 requests must return the exact digest.
+	if request.FileID > 0 && source.FileID != request.FileID {
+		return proto.LocalImagePreviewResponse{}, errors.New("preview_not_available")
+	}
+	if request.FileID <= 0 && source.SHA512 != request.Sha512 {
 		return proto.LocalImagePreviewResponse{}, errors.New("preview_not_available")
 	}
 	sha, err := hex.DecodeString(source.SHA512)

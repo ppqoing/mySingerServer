@@ -328,32 +328,11 @@ func (d *DB) MarkDeleted(
 	return tx.Commit()
 }
 
-// CommitDeletionResults atomically records the complete Helper outcome and
-// marks only explicit, certain successes deleted. It intentionally leaves all
-// hashes, features, scores, groups, members, and reviews untouched.
-func (d *DB) CommitDeletionResults(ctx context.Context, batchID string, results []DeletionResult) error {
-	if d == nil || d.db == nil || batchID == "" || len(results) == 0 {
-		return fmt.Errorf("store: invalid deletion results")
+func (d *DB) BeginDeletionBatch(ctx context.Context, batchID string, selection CommittedDeletion, confirmationDigest string) error {
+	if d == nil || d.db == nil || batchID == "" || confirmationDigest == "" || selection.MachineID == "" ||
+		selection.RunID == "" || selection.GroupID == "" || selection.Generation <= 0 || len(selection.Files) == 0 {
+		return fmt.Errorf("store: invalid deletion batch")
 	}
-	first := results[0]
-	if first.BatchID != batchID || first.MachineID == "" || first.RunID == "" ||
-		first.GroupID == "" || first.Generation <= 0 || first.ConfirmationDigest == "" {
-		return fmt.Errorf("store: invalid deletion batch identity")
-	}
-	seen := make(map[int64]struct{}, len(results))
-	for _, result := range results {
-		if result.BatchID != batchID || result.MachineID != first.MachineID ||
-			result.RunID != first.RunID || result.GroupID != first.GroupID ||
-			result.Generation != first.Generation || result.ConfirmationDigest != first.ConfirmationDigest ||
-			result.FileID <= 0 || result.Path == "" || result.SHA512 == "" {
-			return fmt.Errorf("store: inconsistent deletion result identity")
-		}
-		if _, duplicate := seen[result.FileID]; duplicate {
-			return fmt.Errorf("store: duplicate deletion file %d", result.FileID)
-		}
-		seen[result.FileID] = struct{}{}
-	}
-
 	tx, err := d.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -361,10 +340,10 @@ func (d *DB) CommitDeletionResults(ctx context.Context, batchID string, results 
 	defer tx.Rollback()
 	var currentRun string
 	var currentGeneration int64
-	if err := tx.QueryRowContext(ctx, `SELECT run_id,generation FROM local_current_analysis WHERE machine_id=?1`, first.MachineID).Scan(&currentRun, &currentGeneration); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT run_id,generation FROM local_current_analysis WHERE machine_id=?1`, selection.MachineID).Scan(&currentRun, &currentGeneration); err != nil {
 		return fmt.Errorf("store: verify current deletion review: %w", err)
 	}
-	if currentRun != first.RunID || currentGeneration != first.Generation {
+	if currentRun != selection.RunID || currentGeneration != selection.Generation {
 		return fmt.Errorf("store: deletion review generation changed")
 	}
 	now := time.Now().UnixMilli()
@@ -372,21 +351,19 @@ func (d *DB) CommitDeletionResults(ctx context.Context, batchID string, results 
 		INSERT INTO local_delete_batches(
 		 batch_id,machine_id,run_id,confirmation_digest,status,requested_count,created_at,updated_at)
 		VALUES (?1,?2,?3,?4,'running',?5,?6,?6)`,
-		batchID, first.MachineID, first.RunID, first.ConfirmationDigest, len(results), now); err != nil {
+		batchID, selection.MachineID, selection.RunID, confirmationDigest, len(selection.Files), now); err != nil {
 		return fmt.Errorf("store: begin deletion batch: %w", err)
 	}
-
-	succeeded, failed, uncertainCount := 0, 0, 0
-	for _, result := range results {
+	for _, file := range selection.Files {
 		var status, sha string
 		var size, mtime int64
 		if err := tx.QueryRowContext(ctx, `
 			SELECT status,sha512,size,mtime FROM files
-			WHERE machine_id=?1 AND id=?2 AND path=?3`, result.MachineID, result.FileID, result.Path,
+			WHERE machine_id=?1 AND id=?2 AND path=?3`, file.MachineID, file.FileID, file.Path,
 		).Scan(&status, &sha, &size, &mtime); err != nil {
-			return fmt.Errorf("store: verify deletion file %d: %w", result.FileID, err)
+			return fmt.Errorf("store: verify deletion file %d: %w", file.FileID, err)
 		}
-		if status == "deleted" || sha != result.SHA512 || size != result.Size || mtime != result.MTime {
+		if status == "deleted" || file.MachineID != selection.MachineID || sha != file.SHA512 || size != file.Size || mtime != file.MTime {
 			return fmt.Errorf("store: deletion file identity changed")
 		}
 		var reviewCount int
@@ -394,33 +371,96 @@ func (d *DB) CommitDeletionResults(ctx context.Context, batchID string, results 
 			SELECT COUNT(*) FROM local_reviews
 			WHERE machine_id=?1 AND run_id=?2 AND generation=?3 AND group_id=?4
 			  AND file_id=?5 AND decision='delete'`,
-			result.MachineID, result.RunID, result.Generation, result.GroupID, result.FileID,
+			selection.MachineID, selection.RunID, selection.Generation, selection.GroupID, file.FileID,
 		).Scan(&reviewCount); err != nil || reviewCount != 1 {
 			return fmt.Errorf("store: deletion review changed")
 		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO local_delete_items(
+			 batch_id,machine_id,file_id,path_snapshot,sha512,result,uncertain,created_at,updated_at)
+			VALUES (?1,?2,?3,?4,?5,'pending',0,?6,?6)`,
+			batchID, selection.MachineID, file.FileID, file.Path, file.SHA512, now); err != nil {
+			return fmt.Errorf("store: begin deletion item: %w", err)
+		}
+	}
+	return tx.Commit()
+}
 
-		itemResult := "failed"
-		itemUncertain := 0
-		if result.OK && !result.Uncertain {
-			itemResult = "deleted"
+// CommitDeletionResults atomically completes a previously persisted batch and
+// marks only explicit, certain successes deleted.
+func (d *DB) CommitDeletionResults(ctx context.Context, batchID string, results []DeletionResult) error {
+	if d == nil || d.db == nil || batchID == "" || len(results) == 0 {
+		return fmt.Errorf("store: invalid deletion results")
+	}
+	first := results[0]
+	if first.BatchID != batchID || first.MachineID == "" || first.RunID == "" || first.GroupID == "" ||
+		first.Generation <= 0 || first.ConfirmationDigest == "" {
+		return fmt.Errorf("store: invalid deletion batch identity")
+	}
+	seen := make(map[int64]struct{}, len(results))
+	for _, result := range results {
+		if result.BatchID != batchID || result.MachineID != first.MachineID || result.RunID != first.RunID ||
+			result.GroupID != first.GroupID || result.Generation != first.Generation ||
+			result.ConfirmationDigest != first.ConfirmationDigest || result.FileID <= 0 || result.Path == "" || result.SHA512 == "" {
+			return fmt.Errorf("store: inconsistent deletion result identity")
+		}
+		if _, duplicate := seen[result.FileID]; duplicate {
+			return fmt.Errorf("store: duplicate deletion file %d", result.FileID)
+		}
+		seen[result.FileID] = struct{}{}
+	}
+	tx, err := d.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var machineID, runID, digest, status string
+	var requested int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT machine_id,run_id,confirmation_digest,status,requested_count
+		FROM local_delete_batches WHERE batch_id=?1`, batchID,
+	).Scan(&machineID, &runID, &digest, &status, &requested); err != nil {
+		return fmt.Errorf("store: load deletion batch: %w", err)
+	}
+	if machineID != first.MachineID || runID != first.RunID || digest != first.ConfirmationDigest || status != "running" || requested != len(results) {
+		return fmt.Errorf("store: deletion batch identity changed")
+	}
+
+	now := time.Now().UnixMilli()
+	succeeded, failed, uncertainCount := 0, 0, 0
+	for _, result := range results {
+		var path, sha, itemStatus string
+		if err := tx.QueryRowContext(ctx, `
+			SELECT path_snapshot,sha512,result FROM local_delete_items
+			WHERE batch_id=?1 AND machine_id=?2 AND file_id=?3`,
+			batchID, result.MachineID, result.FileID,
+		).Scan(&path, &sha, &itemStatus); err != nil {
+			return fmt.Errorf("store: load deletion item %d: %w", result.FileID, err)
+		}
+		if path != result.Path || sha != result.SHA512 || itemStatus != "pending" {
+			return fmt.Errorf("store: deletion item identity changed")
+		}
+		resultStatus := "failed"
+		uncertain := 0
+		switch {
+		case result.OK && !result.Uncertain:
+			resultStatus = "deleted"
 			succeeded++
-		} else if result.Uncertain {
-			itemResult = "uncertain"
-			itemUncertain = 1
+		case result.Uncertain:
+			resultStatus = "uncertain"
+			uncertain = 1
 			uncertainCount++
-		} else {
+		default:
 			failed++
 		}
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO local_delete_items(
-			 batch_id,machine_id,file_id,path_snapshot,sha512,result,error_code,error_message,
-			 uncertain,created_at,updated_at,completed_at)
-			VALUES (?1,?2,?3,?4,?5,?6,NULLIF(?7,''),NULLIF(?8,''),?9,?10,?10,?10)`,
-			batchID, result.MachineID, result.FileID, result.Path, result.SHA512,
-			itemResult, result.ErrorCode, result.ErrorMessage, itemUncertain, now); err != nil {
-			return fmt.Errorf("store: record deletion item: %w", err)
+			UPDATE local_delete_items SET result=?4,error_code=NULLIF(?5,''),error_message=NULLIF(?6,''),
+			 uncertain=?7,updated_at=?8,completed_at=?8
+			WHERE batch_id=?1 AND machine_id=?2 AND file_id=?3`,
+			batchID, result.MachineID, result.FileID, resultStatus, result.ErrorCode, result.ErrorMessage, uncertain, now); err != nil {
+			return fmt.Errorf("store: update deletion item: %w", err)
 		}
-		if itemResult != "deleted" {
+		if resultStatus != "deleted" {
 			continue
 		}
 		changed, err := tx.ExecContext(ctx, markDeletedSQL, result.MachineID, result.Path, now)

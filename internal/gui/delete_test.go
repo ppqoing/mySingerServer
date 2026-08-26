@@ -3,6 +3,7 @@ package gui
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -990,5 +991,437 @@ func TestDeleteReportStateIsRaceSafe(t *testing.T) {
 	status, _ := service.Status(taskID)
 	if !status.Complete || status.OK != 1 || status.Total != 1 {
 		t.Fatalf("concurrent status = %#v", status)
+	}
+}
+
+func TestDeleteTerminalTaskIsPrunedAfterRetention(t *testing.T) {
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	transport := &deleteTestTransport{
+		online:      map[string]bool{"machine": true},
+		onlineCalls: make(map[string]int),
+		sendErrors:  make(map[string]error),
+	}
+	service, token := newDeleteTestService(t, []DeleteMember{
+		{FileID: 1, MachineID: "machine", Path: `A:\one`, Size: 1},
+	}, transport)
+	service.now = func() time.Time { return now }
+	taskID, err := service.Execute(context.Background(), token, "soft")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.HandleReport("machine", &proto.DeleteReport{
+		TaskID: taskID, Seq: 0, LastSeq: 0,
+		Stats:   proto.DeleteStats{Total: 1, OK: 1},
+		Entries: []proto.DeleteResult{{Path: `A:\one`, OK: true}},
+	})
+	if status, ok := service.Status(taskID); !ok || !status.Complete {
+		t.Fatalf("task not complete: %#v found=%v", status, ok)
+	}
+	// Within the retention window the terminal task stays queryable.
+	now = now.Add(deleteTerminalRetention - time.Minute)
+	if _, ok := service.Status(taskID); !ok {
+		t.Fatal("terminal task pruned before retention elapsed")
+	}
+	// After the retention window the task state is reclaimed.
+	now = now.Add(2 * time.Minute)
+	if _, ok := service.Status(taskID); ok {
+		t.Fatal("terminal task survived past retention")
+	}
+}
+
+func TestDeleteUnpolledTaskIsFinalizedAndPrunedPastDeadline(t *testing.T) {
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	transport := &deleteTestTransport{
+		online:      map[string]bool{"machine": true},
+		onlineCalls: make(map[string]int),
+		sendErrors:  make(map[string]error),
+	}
+	service, token := newDeleteTestService(t, []DeleteMember{
+		{FileID: 1, MachineID: "machine", Path: `A:\one`, Size: 1},
+	}, transport)
+	service.now = func() time.Time { return now }
+	taskID, err := service.Execute(context.Background(), token, "hard")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No reports arrive and nobody polls: once the deadline passes, a later
+	// Status call must finalize the task on demand...
+	now = now.Add(deleteReportDeadline + time.Minute)
+	status, ok := service.Status(taskID)
+	if !ok || !status.Complete {
+		t.Fatalf("abandoned task was not finalized on demand: %#v found=%v", status, ok)
+	}
+	// ... and once the retention window also passes, the task is reclaimed.
+	now = now.Add(deleteTerminalRetention + time.Minute)
+	if _, ok := service.Status(taskID); ok {
+		t.Fatal("abandoned task was never pruned")
+	}
+}
+
+func TestConfirmStoreConsumedTombstoneRecordsFirstTaskID(t *testing.T) {
+	now := time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC)
+	store := NewConfirmStore(time.Minute, func() time.Time { return now })
+	members := []DeleteMember{{
+		FileID: 1, MachineID: "machine", Path: `Z:\one`, Size: 1,
+	}}
+
+	if _, ok := store.ConsumedTaskID("abcdefghijklmnopqrstuv"); ok {
+		t.Fatal("unknown token reported consumed")
+	}
+	token, _, err := store.Create(members)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := store.ConsumedTaskID(token); ok {
+		t.Fatal("active token reported consumed")
+	}
+	if _, err := store.ConsumeWithTask(token, "task-1"); err != nil {
+		t.Fatal(err)
+	}
+	taskID, ok := store.ConsumedTaskID(token)
+	if !ok || taskID != "task-1" {
+		t.Fatalf("ConsumedTaskID() = %q/%v, want task-1/true", taskID, ok)
+	}
+	// A repeated consume keeps the first recorded task ID.
+	if _, err := store.ConsumeWithTask(token, "task-2"); !errors.Is(err, ErrConfirmationConsumed) {
+		t.Fatalf("second ConsumeWithTask() error = %v, want consumed", err)
+	}
+	if taskID, ok := store.ConsumedTaskID(token); !ok || taskID != "task-1" {
+		t.Fatalf("tombstone after replay = %q/%v, want task-1/true", taskID, ok)
+	}
+
+	// The legacy Consume path records no task ID.
+	legacyToken, _, err := store.Create([]DeleteMember{{
+		FileID: 2, MachineID: "machine", Path: `Z:\two`, Size: 1,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Consume(legacyToken); err != nil {
+		t.Fatal(err)
+	}
+	if taskID, ok := store.ConsumedTaskID(legacyToken); !ok || taskID != "" {
+		t.Fatalf("legacy tombstone = %q/%v, want empty/true", taskID, ok)
+	}
+
+	// Expired tokens are tombstoned as expired, not consumed.
+	expiringToken, _, err := store.Create([]DeleteMember{{
+		FileID: 3, MachineID: "machine", Path: `Z:\three`, Size: 1,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Minute)
+	if _, err := store.ConsumeWithTask(expiringToken, "task-3"); !errors.Is(err, ErrConfirmationExpired) {
+		t.Fatalf("expired ConsumeWithTask() error = %v, want expired", err)
+	}
+	if _, ok := store.ConsumedTaskID(expiringToken); ok {
+		t.Fatal("expired token reported consumed")
+	}
+}
+
+func TestDeleteExecuteConsumedTokenExposesFirstTaskID(t *testing.T) {
+	transport := &deleteTestTransport{
+		online:      map[string]bool{"machine": true},
+		onlineCalls: make(map[string]int),
+		sendErrors:  make(map[string]error),
+	}
+	service, token := newDeleteTestService(t, []DeleteMember{{
+		FileID: 1, MachineID: "machine", Path: `Z:\one`, Size: 1,
+	}}, transport)
+	taskID, err := service.Execute(context.Background(), token, "soft")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Execute(context.Background(), token, "soft"); !errors.Is(err, ErrConfirmationConsumed) {
+		t.Fatalf("second Execute() error = %v, want ErrConfirmationConsumed", err)
+	}
+	first, ok := service.ConsumedTaskID(token)
+	if !ok || first != taskID {
+		t.Fatalf("ConsumedTaskID() = %q/%v, want %q/true", first, ok, taskID)
+	}
+	if len(transport.sends) != 1 {
+		t.Fatalf("replayed execute redispatched: sends = %#v", transport.sends)
+	}
+}
+
+func TestDeleteStatusExposesRecycledToForSoftDeletes(t *testing.T) {
+	transport := &deleteTestTransport{
+		online:      map[string]bool{"machine": true},
+		onlineCalls: make(map[string]int),
+		sendErrors:  make(map[string]error),
+	}
+	service, token := newDeleteTestService(t, []DeleteMember{
+		{FileID: 1, MachineID: "machine", Path: `Z:\one`, Size: 1},
+		{FileID: 2, MachineID: "machine", Path: `Z:\two`, Size: 1},
+	}, transport)
+	taskID, err := service.Execute(context.Background(), token, "soft")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.HandleReport("machine", &proto.DeleteReport{
+		TaskID: taskID, Seq: 0, LastSeq: 0,
+		Stats: proto.DeleteStats{Total: 2, OK: 2},
+		Entries: []proto.DeleteResult{
+			{Path: `Z:\one`, OK: true, RecycledTo: `Z:\recycled\one`},
+			{Path: `Z:\two`, OK: true},
+		},
+	})
+	status, ok := service.Status(taskID)
+	if !ok || !status.Complete || status.OK != 2 {
+		t.Fatalf("status = %#v found=%v", status, ok)
+	}
+	want := map[string]string{`Z:\one`: `Z:\recycled\one`}
+	if !reflect.DeepEqual(status.ByMachine["machine"].RecycledTo, want) {
+		t.Fatalf("RecycledTo = %#v, want %#v", status.ByMachine["machine"].RecycledTo, want)
+	}
+	// The sanitized HTTP view keeps the user's own recycle destinations.
+	safe := safeDeleteStatus(status)
+	if !reflect.DeepEqual(safe.ByMachine["machine"].RecycledTo, want) {
+		t.Fatalf("sanitized RecycledTo = %#v, want %#v", safe.ByMachine["machine"].RecycledTo, want)
+	}
+	safeJSON, err := json.Marshal(safe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(safeJSON), `"recycled_to"`) ||
+		!strings.Contains(string(safeJSON), `Z:\\recycled\\one`) {
+		t.Fatalf("sanitized status JSON lost recycled_to: %s", safeJSON)
+	}
+
+	// Hard mode reports carry no recycle destination and omit the field.
+	hardService, hardToken := newDeleteTestService(t, []DeleteMember{
+		{FileID: 3, MachineID: "machine", Path: `Z:\hard`, Size: 1},
+	}, transport)
+	hardTaskID, err := hardService.Execute(context.Background(), hardToken, "hard")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hardService.HandleReport("machine", &proto.DeleteReport{
+		TaskID: hardTaskID, Seq: 0, LastSeq: 0,
+		Stats:   proto.DeleteStats{Total: 1, OK: 1},
+		Entries: []proto.DeleteResult{{Path: `Z:\hard`, OK: true}},
+	})
+	hardStatus, ok := hardService.Status(hardTaskID)
+	if !ok || hardStatus.ByMachine["machine"].RecycledTo != nil {
+		t.Fatalf("hard mode RecycledTo = %#v found=%v", hardStatus.ByMachine["machine"].RecycledTo, ok)
+	}
+	hardJSON, err := json.Marshal(safeDeleteStatus(hardStatus))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(hardJSON), "recycled_to") {
+		t.Fatalf("hard mode status JSON contains recycled_to: %s", hardJSON)
+	}
+}
+
+func TestDeleteListTasksMemoryOrdersInProgressFirst(t *testing.T) {
+	now := time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC)
+	createdA := now
+	createdB := now.Add(time.Minute)
+	createdC := now.Add(2 * time.Minute)
+	transport := &deleteTestTransport{
+		online:      map[string]bool{"machine-a": true},
+		onlineCalls: make(map[string]int),
+		sendErrors:  make(map[string]error),
+	}
+	service, tokenA := newDeleteTestService(t, []DeleteMember{
+		{FileID: 1, MachineID: "machine-a", Path: `Z:\one`, Size: 1},
+	}, transport)
+	service.now = func() time.Time { return now }
+	taskA, err := service.Execute(context.Background(), tokenA, "soft")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now = createdB
+	tokenB, _, err := service.confirms.Create([]DeleteMember{
+		{FileID: 2, MachineID: "machine-a", Path: `Z:\two`, Size: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskB, err := service.Execute(context.Background(), tokenB, "hard")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Task C targets an offline machine and turns terminal immediately.
+	now = createdC
+	tokenC, _, err := service.confirms.Create([]DeleteMember{
+		{FileID: 3, MachineID: "machine-off", Path: `Z:\three`, Size: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskC, err := service.Execute(context.Background(), tokenC, "soft")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	summaries := service.ListTasks(context.Background(), 10)
+	if len(summaries) != 3 {
+		t.Fatalf("summaries = %#v", summaries)
+	}
+	// In-progress first, newest created first; terminal tasks last.
+	if summaries[0].TaskID != taskB || summaries[1].TaskID != taskA ||
+		summaries[2].TaskID != taskC {
+		t.Fatalf("order = %q, %q, %q; want %q, %q, %q",
+			summaries[0].TaskID, summaries[1].TaskID, summaries[2].TaskID,
+			taskB, taskA, taskC)
+	}
+	if summaries[0].Complete || summaries[0].Pending != 1 ||
+		summaries[0].Mode != proto.ModeHard ||
+		!summaries[0].CreatedAt.Equal(createdB) {
+		t.Fatalf("summary[0] = %#v", summaries[0])
+	}
+	if !summaries[1].CreatedAt.Equal(createdA) {
+		t.Fatalf("summary[1].CreatedAt = %v, want %v", summaries[1].CreatedAt, createdA)
+	}
+	if !summaries[2].Complete || summaries[2].Failed != 1 ||
+		!summaries[2].CreatedAt.Equal(createdC) {
+		t.Fatalf("summary[2] = %#v", summaries[2])
+	}
+}
+
+func TestDeleteListTasksMemoryHonorsLimit(t *testing.T) {
+	transport := &deleteTestTransport{
+		online:      map[string]bool{"machine": true},
+		onlineCalls: make(map[string]int),
+		sendErrors:  make(map[string]error),
+	}
+	service, token := newDeleteTestService(t, []DeleteMember{
+		{FileID: 1, MachineID: "machine", Path: `Z:\one`, Size: 1},
+	}, transport)
+	if _, err := service.Execute(context.Background(), token, "soft"); err != nil {
+		t.Fatal(err)
+	}
+	secondToken, _, err := service.confirms.Create([]DeleteMember{
+		{FileID: 2, MachineID: "machine", Path: `Z:\two`, Size: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Execute(context.Background(), secondToken, "soft"); err != nil {
+		t.Fatal(err)
+	}
+	if summaries := service.ListTasks(context.Background(), 1); len(summaries) != 1 {
+		t.Fatalf("limited summaries = %#v", summaries)
+	}
+	if summaries := service.ListTasks(context.Background(), 0); len(summaries) != 2 {
+		t.Fatalf("default-limit summaries = %#v", summaries)
+	}
+}
+
+func TestDeleteRestoreAndListWithoutStoreStayInMemory(t *testing.T) {
+	var nilService *DeleteService
+	if err := nilService.Restore(context.Background()); err != nil {
+		t.Fatalf("nil Restore() error = %v", err)
+	}
+	if summaries := nilService.ListTasks(context.Background(), 10); summaries == nil ||
+		len(summaries) != 0 {
+		t.Fatalf("nil ListTasks() = %#v", summaries)
+	}
+	if _, ok := nilService.ConsumedTaskID("token"); ok {
+		t.Fatal("nil ConsumedTaskID() reported consumed")
+	}
+
+	transport := &deleteTestTransport{
+		online:      map[string]bool{"machine": true},
+		onlineCalls: make(map[string]int),
+		sendErrors:  make(map[string]error),
+	}
+	service, token := newDeleteTestService(t, []DeleteMember{
+		{FileID: 1, MachineID: "machine", Path: `Z:\one`, Size: 1},
+	}, transport)
+	if err := service.Restore(context.Background()); err != nil {
+		t.Fatalf("storeless Restore() error = %v", err)
+	}
+	taskID, err := service.Execute(context.Background(), token, "soft")
+	if err != nil {
+		t.Fatal(err)
+	}
+	summaries := service.ListTasks(context.Background(), 10)
+	if len(summaries) != 1 || summaries[0].TaskID != taskID ||
+		summaries[0].Complete || summaries[0].Pending != 1 {
+		t.Fatalf("storeless ListTasks() = %#v", summaries)
+	}
+}
+
+func TestDeleteRestoredSnapshotDropsReportsAndFinalizesPastDeadline(t *testing.T) {
+	now := time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC)
+	service := NewDeleteService(nil, nil, nil, nil)
+	service.now = func() time.Time { return now }
+	const taskID = "b7b0ba1c-1ec1-4be4-b769-cbe40607fe25"
+	createdAt := now.Add(-30 * time.Minute)
+	snapshot := DeleteTaskStatus{
+		TaskID:  taskID,
+		Mode:    proto.ModeSoft,
+		Total:   2,
+		OK:      1,
+		Pending: 1,
+		ByMachine: map[string]DeleteMachineStatus{
+			"machine-a": {
+				MachineID: "machine-a",
+				Total:     2,
+				OK:        1,
+				Pending:   1,
+				Sequences: map[uint32]DeleteSequenceStatus{
+					0: {Sequence: 0, Received: true, Total: 1, OK: 1},
+				},
+				RecycledTo: map[string]string{`Z:\one`: `Z:\recycled\one`},
+			},
+		},
+		ErrorCodes: map[string]int64{},
+	}
+	service.tasks[taskID] = &deleteTaskState{
+		taskID:    taskID,
+		mode:      proto.ModeSoft,
+		createdAt: createdAt,
+		deadline:  now.Add(deleteReportDeadline),
+		machines:  make(map[string]*deleteMachineState),
+		snapshot:  &snapshot,
+	}
+
+	// Late reports for a snapshot-backed task are dropped without mutation.
+	service.HandleReport("machine-a", &proto.DeleteReport{
+		TaskID: taskID, Seq: 1, LastSeq: 1,
+		Stats:   proto.DeleteStats{Total: 1, OK: 1},
+		Entries: []proto.DeleteResult{{Path: `Z:\two`, OK: true}},
+	})
+	status, ok := service.Status(taskID)
+	if !ok || status.Complete || status.Pending != 1 || status.OK != 1 {
+		t.Fatalf("restored status = %#v found=%v", status, ok)
+	}
+	if !reflect.DeepEqual(
+		status.ByMachine["machine-a"].RecycledTo,
+		map[string]string{`Z:\one`: `Z:\recycled\one`},
+	) {
+		t.Fatalf("restored RecycledTo = %#v", status.ByMachine["machine-a"].RecycledTo)
+	}
+	summaries := service.ListTasks(context.Background(), 10)
+	if len(summaries) != 1 || summaries[0].TaskID != taskID ||
+		!summaries[0].CreatedAt.Equal(createdAt) {
+		t.Fatalf("restored summary = %#v", summaries)
+	}
+
+	// Once the (fresh) report deadline passes, the restored snapshot flips
+	// its unresolved counts to failed/uncertain like a live task would.
+	now = now.Add(deleteReportDeadline + time.Minute)
+	status, ok = service.Status(taskID)
+	if !ok || !status.Complete || status.Pending != 0 ||
+		status.Failed != 1 || status.Uncertain != 1 ||
+		status.ErrorCodes[proto.DeleteErrHelperLost] != 1 {
+		t.Fatalf("finalized restored status = %#v found=%v", status, ok)
+	}
+	machine := status.ByMachine["machine-a"]
+	if !machine.Complete || machine.Pending != 0 ||
+		machine.Failed != 1 || machine.Uncertain != 1 {
+		t.Fatalf("finalized restored machine = %#v", machine)
+	}
+	// Finalization is terminal: further Status calls keep the same state.
+	again, ok := service.Status(taskID)
+	if !ok || !reflect.DeepEqual(again, status) {
+		t.Fatalf("refinalized status = %#v, want %#v", again, status)
 	}
 }

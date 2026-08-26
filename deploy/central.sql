@@ -146,6 +146,20 @@ CREATE TABLE IF NOT EXISTS scan_tasks (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Delete task journal backing GET /api/delete/tasks. status_json stores the
+-- DeleteTaskStatus snapshot (complete flag included); the in-memory map stays
+-- the runtime authority and the table is the restart/task-center record.
+-- CREATE ... IF NOT EXISTS keeps this block idempotent like scan_tasks above.
+CREATE TABLE IF NOT EXISTS delete_tasks (
+    id         TEXT PRIMARY KEY,
+    mode       TEXT NOT NULL CHECK (mode IN ('soft','hard')),
+    status_json JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_delete_tasks_created_at
+    ON delete_tasks (created_at DESC);
+
 -- Agent-local scope is isolated from Manager's global duplicate tables. All
 -- identities below include machine_id and generation so replay is idempotent.
 CREATE TABLE IF NOT EXISTS local_analysis_runs (

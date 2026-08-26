@@ -30,15 +30,6 @@ type serverPlatform interface {
 	Dial(context.Context, string) (peerConnection, error)
 }
 
-func ServeOnce(ctx context.Context, pipeName, nonce string, inspector nodeprocess.Inspector, handler Handler) error {
-	if handler == nil {
-		return errors.New("elevation: server dependencies are invalid")
-	}
-	return ServeOnceWithHandlerFactory(ctx, pipeName, nonce, inspector, func(nodeprocess.Identity) (Handler, error) {
-		return handler, nil
-	})
-}
-
 func ServeOnceWithHandlerFactory(ctx context.Context, pipeName, nonce string, inspector nodeprocess.Inspector, factory HandlerFactory) error {
 	if inspector == nil {
 		inspector = nodeprocess.NewInspector()

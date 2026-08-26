@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"dedup/internal/proto"
@@ -189,10 +190,13 @@ func TestFilesystemBrowserDoesNotReturnPathsAfterLateCancellation(t *testing.T) 
 }
 
 // This fails if an entry attribute error after a successful directory read
-// leaves CurrentPath or ParentPath in the error response.
-func TestFilesystemBrowserDoesNotReturnPathsAfterAttributeError(t *testing.T) {
+// aborts the whole listing instead of skipping just the failed entry.
+func TestFilesystemBrowserSkipsEntriesWithAttributeErrors(t *testing.T) {
 	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, "entry.txt"), []byte("x"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "good.txt"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "broken.txt"), []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	entries, err := os.ReadDir(root)
@@ -201,13 +205,21 @@ func TestFilesystemBrowserDoesNotReturnPathsAfterAttributeError(t *testing.T) {
 	}
 	browser := newFilesystemBrowser(
 		func(string) ([]os.DirEntry, error) { return entries, nil },
-		func(*uint16) (uint32, error) { return 0, windows.ERROR_ACCESS_DENIED },
+		func(path *uint16) (uint32, error) {
+			if strings.HasSuffix(windows.UTF16PtrToString(path), "broken.txt") {
+				return 0, windows.ERROR_ACCESS_DENIED
+			}
+			return 0, nil
+		},
 	)
 	response := browser.Browse(context.Background(), proto.FilesystemBrowseRequest{
 		RequestID: "browse-attribute-error", Path: root, Limit: 200,
 	})
-	if response.ErrorCode != "access_denied" || response.CurrentPath != "" || response.ParentPath != "" {
-		t.Fatalf("attribute error response=%#v", response)
+	if response.ErrorCode != "" || response.CurrentPath != root {
+		t.Fatalf("attribute error aborted listing: %#v", response)
+	}
+	if len(response.Entries) != 1 || response.Entries[0].Name != "good.txt" {
+		t.Fatalf("failed entry was not skipped: %#v", response.Entries)
 	}
 }
 

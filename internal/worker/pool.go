@@ -723,30 +723,6 @@ func clearPhase2FeaturePayload(result *JobResultMsg) {
 	result.Frames = nil
 }
 
-func attemptedPhase2Fields(result JobResultMsg) uint32 {
-	attempted := result.FieldsDone & (MaskPHashParts | MaskSobelHist | videoSixFrameWorkerFields())
-	if len(result.PHashParts) != 0 {
-		attempted |= MaskPHashParts
-	}
-	if len(result.SobelHist) != 0 {
-		attempted |= MaskSobelHist
-	}
-	if len(result.Frames) != 0 {
-		switch result.ScreenStage {
-		case ScreenStageTwo:
-			attempted |= MaskVideo6FPHash
-		case ScreenStageThree:
-			attempted |= MaskVideo6FSobel
-		default:
-			attempted |= MaskVideo6F
-		}
-	}
-	for _, fieldError := range result.Errors {
-		attempted |= fieldError.Field & (MaskPHashParts | MaskSobelHist | videoSixFrameWorkerFields())
-	}
-	return attempted
-}
-
 func videoSixFrameWorkerFields() uint32 {
 	return MaskVideo6F | MaskVideo6FPHash | MaskVideo6FSobel
 }
@@ -762,59 +738,4 @@ func erroredFrames(frames []FrameFeature) []FrameFeature {
 		}
 	}
 	return out
-}
-
-func phase1StoreResult(machineID string, result JobResultMsg) store.Phase1Result {
-	errors := make([]store.FieldError, len(result.Errors))
-	for i, fieldError := range result.Errors {
-		errors[i] = store.FieldError{Field: fieldError.Field, Stage: fieldError.Stage, Msg: fieldError.Msg}
-	}
-	kind := store.MediaImage
-	if result.Kind == MediaVideo {
-		kind = store.MediaVideo
-	}
-	return store.Phase1Result{
-		MachineID: machineID, Path: result.Path, Kind: kind, SHA512: cloneBytes(result.SHA512),
-		FieldsDone: result.FieldsDone, PDQ: cloneBytes(result.PDQ), Quality: result.Quality,
-		Width: result.Width, Height: result.Height, DurationMS: cloneInt64(result.DurationMS),
-		ThumbPath: result.ThumbPath, ThumbPDQ: cloneBytes(result.ThumbPDQ),
-		ThumbQuality: cloneInt32(result.ThumbQuality), Errors: errors,
-	}
-}
-
-func phase2StoreResult(machineID string, result JobResultMsg) store.Phase2Result {
-	errors := make([]store.FieldError, len(result.Errors))
-	for i, fieldError := range result.Errors {
-		errors[i] = store.FieldError{
-			Field: fieldError.Field,
-			Stage: fieldError.Stage,
-			Msg:   fieldError.Msg,
-		}
-	}
-	frames := make([]store.Phase2Frame, len(result.Frames))
-	for i, frame := range result.Frames {
-		frames[i] = store.Phase2Frame{
-			FrameIdx:   frame.FrameIdx,
-			PDQ256:     cloneBytes(frame.PDQ256),
-			Quality:    frame.Quality,
-			PHashParts: cloneBytes(frame.PHashParts),
-			SobelHist:  cloneBytes(frame.SobelHist),
-			Error:      frame.Error,
-		}
-	}
-	kind := store.MediaImage
-	if result.Kind == MediaVideo {
-		kind = store.MediaVideo
-	}
-	return store.Phase2Result{
-		MachineID:  machineID,
-		Path:       result.Path,
-		Kind:       kind,
-		SHA512:     cloneBytes(result.SHA512),
-		FieldsDone: result.FieldsDone,
-		PHashParts: cloneBytes(result.PHashParts),
-		SobelHist:  cloneBytes(result.SobelHist),
-		Frames:     frames,
-		Errors:     errors,
-	}
 }

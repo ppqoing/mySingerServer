@@ -43,6 +43,7 @@ type postgresOperationalRuntimeResources struct {
 	tasks             *gui.TaskRegistry
 	pool              *gui.Pool
 	filesystemBrowser *gui.FilesystemBroker
+	previewBroker     *gui.PreviewBroker
 	deleteService     *gui.DeleteService
 	phase2Dispatcher  *phase2.Dispatcher
 	phase2Router      *phase2Orchestration
@@ -151,7 +152,11 @@ func (resources *postgresOperationalRuntimeResources) RestorePhase2(ctx context.
 		},
 	)
 	resources.filesystemBrowser = gui.NewFilesystemBroker(resources.pool)
-	resources.pool.SetOnDisconnect(resources.filesystemBrowser.FailMachine)
+	resources.previewBroker = gui.NewPreviewBroker(resources.pool)
+	resources.pool.SetOnDisconnect(func(machineID string) {
+		resources.filesystemBrowser.FailMachine(machineID)
+		resources.previewBroker.FailMachine(machineID)
+	})
 	resources.deleteService, _ = newDeleteRuntime(
 		resources.pg,
 		resources.pool,
@@ -214,7 +219,14 @@ func (resources *postgresOperationalRuntimeResources) Start(ctx context.Context)
 		analysisRunner,
 	)
 	resources.api.SetDeleteService(resources.deleteService)
+	resources.deleteService.SetTaskStore(resources.pg)
+	if err := resources.deleteService.Restore(ctx); err != nil {
+		// Delete task persistence is best-effort: without it the service
+		// degrades to in-memory tasks only.
+		resources.logger.Warn("restore delete tasks", "err", err)
+	}
 	resources.api.SetFilesystemBrowser(resources.filesystemBrowser)
+	resources.api.SetPreviewBroker(resources.previewBroker)
 	resources.api.SetAnalysisSuccessHook(func() error {
 		hookContext, cancelHook := context.WithTimeout(ctx, 5*time.Minute)
 		defer cancelHook()
@@ -234,6 +246,9 @@ func (resources *postgresOperationalRuntimeResources) dispatchAgentMessage(
 	message any,
 ) {
 	if resources.filesystemBrowser != nil && resources.filesystemBrowser.Dispatch(machineID, message) {
+		return
+	}
+	if resources.previewBroker != nil && resources.previewBroker.Dispatch(machineID, message) {
 		return
 	}
 	if resources.phase2Dispatcher != nil && resources.phase2Router != nil {

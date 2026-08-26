@@ -14,10 +14,10 @@ import (
 	"dedup/internal/firstscreen"
 )
 
-type analysisRunnerFunc func() (*firstscreen.RunStats, error)
+type analysisRunnerFunc func(context.Context) (*firstscreen.RunStats, error)
 
-func (f analysisRunnerFunc) Run() (*firstscreen.RunStats, error) {
-	return f()
+func (f analysisRunnerFunc) Run(ctx context.Context) (*firstscreen.RunStats, error) {
+	return f(ctx)
 }
 
 type channelAnalysisRunner struct {
@@ -38,9 +38,14 @@ func newChannelAnalysisRunner(stats *firstscreen.RunStats, err error) *channelAn
 	}
 }
 
-func (r *channelAnalysisRunner) Run() (*firstscreen.RunStats, error) {
+func (r *channelAnalysisRunner) Run(ctx context.Context) (*firstscreen.RunStats, error) {
 	close(r.started)
-	<-r.release
+	select {
+	case <-r.release:
+	case <-ctx.Done():
+		close(r.finished)
+		return r.stats, ctx.Err()
+	}
 	close(r.finished)
 	return r.stats, r.err
 }
@@ -188,7 +193,7 @@ func TestFirstScreenHTTPRetainsRunnerErrorAndRecoversPanic(t *testing.T) {
 	})
 
 	t.Run("panic", func(t *testing.T) {
-		routes := NewAPI(nil, nil, nil, analysisRunnerFunc(func() (*firstscreen.RunStats, error) {
+		routes := NewAPI(nil, nil, nil, analysisRunnerFunc(func(context.Context) (*firstscreen.RunStats, error) {
 			panic("runner exploded")
 		})).Routes()
 
@@ -383,6 +388,73 @@ func TestFirstScreenSuccessHookIsGatedBySuccessAndShutdown(t *testing.T) {
 		default:
 		}
 	})
+}
+
+func TestFirstScreenHTTPCancelStopsRunningAnalysis(t *testing.T) {
+	runner := newChannelAnalysisRunner(&firstscreen.RunStats{
+		StageElapsedMs: map[string]int64{},
+	}, nil)
+	routes := NewAPI(nil, nil, nil, runner).Routes()
+
+	runResponse := httptest.NewRecorder()
+	routes.ServeHTTP(runResponse, httptest.NewRequest(
+		http.MethodPost,
+		"/api/analysis/firstscreen/run",
+		nil,
+	))
+	if runResponse.Code != http.StatusAccepted {
+		t.Fatalf("POST status = %d body=%s", runResponse.Code, runResponse.Body.String())
+	}
+	<-runner.started
+
+	cancelResponse := httptest.NewRecorder()
+	routes.ServeHTTP(cancelResponse, httptest.NewRequest(
+		http.MethodPost,
+		"/api/analysis/firstscreen/cancel",
+		nil,
+	))
+	if cancelResponse.Code != http.StatusOK {
+		t.Fatalf("cancel status = %d body=%s", cancelResponse.Code, cancelResponse.Body.String())
+	}
+	// 取消幂等：运行未收口前重复取消仍返回 200。
+	repeatResponse := httptest.NewRecorder()
+	routes.ServeHTTP(repeatResponse, httptest.NewRequest(
+		http.MethodPost,
+		"/api/analysis/firstscreen/cancel",
+		nil,
+	))
+	if repeatResponse.Code != http.StatusOK {
+		t.Fatalf("repeat cancel status = %d body=%s", repeatResponse.Code, repeatResponse.Body.String())
+	}
+
+	status := waitFirstScreenStopped(t, routes)
+	if status.LastErr != "已取消" {
+		t.Fatalf("last_err after cancel = %q", status.LastErr)
+	}
+
+	// 空闲后再次取消 → 409。
+	idleResponse := httptest.NewRecorder()
+	routes.ServeHTTP(idleResponse, httptest.NewRequest(
+		http.MethodPost,
+		"/api/analysis/firstscreen/cancel",
+		nil,
+	))
+	if idleResponse.Code != http.StatusConflict {
+		t.Fatalf("idle cancel status = %d body=%s", idleResponse.Code, idleResponse.Body.String())
+	}
+}
+
+func TestFirstScreenHTTPCancelWithoutRunnerIs503(t *testing.T) {
+	routes := NewAPI(nil, nil, nil).Routes()
+	response := httptest.NewRecorder()
+	routes.ServeHTTP(response, httptest.NewRequest(
+		http.MethodPost,
+		"/api/analysis/firstscreen/cancel",
+		nil,
+	))
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("cancel status = %d body=%s", response.Code, response.Body.String())
+	}
 }
 
 func readFirstScreenStatus(t *testing.T, routes http.Handler) (firstScreenStatusDocument, int) {

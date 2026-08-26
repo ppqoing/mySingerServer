@@ -541,10 +541,10 @@ func (f analysisEngineFunc) Run(ctx context.Context) (*firstscreen.RunStats, err
 	return f(ctx)
 }
 
-type guiAnalysisRunnerFunc func() (*firstscreen.RunStats, error)
+type guiAnalysisRunnerFunc func(context.Context) (*firstscreen.RunStats, error)
 
-func (f guiAnalysisRunnerFunc) Run() (*firstscreen.RunStats, error) {
-	return f()
+func (f guiAnalysisRunnerFunc) Run(ctx context.Context) (*firstscreen.RunStats, error) {
+	return f(ctx)
 }
 
 func TestFirstScreenCompositionAcquiresAndReleasesDedicatedConnectionPerRun(t *testing.T) {
@@ -571,11 +571,11 @@ func TestFirstScreenCompositionAcquiresAndReleasesDedicatedConnectionPerRun(t *t
 		factory,
 	)
 
-	first, err := runner.Run()
+	first, err := runner.Run(context.Background())
 	if err != nil || first == nil || first.FilesScanned != 1 {
 		t.Fatalf("first Run() = (%#v, %v)", first, err)
 	}
-	if _, err := runner.Run(); err == nil || !strings.Contains(err.Error(), "second run failed") {
+	if _, err := runner.Run(context.Background()); err == nil || !strings.Contains(err.Error(), "second run failed") {
 		t.Fatalf("second Run() error = %v", err)
 	}
 
@@ -617,7 +617,7 @@ func TestFirstScreenCompositionPassesShutdownCancellationToAnalyzer(t *testing.T
 
 	result := make(chan error, 1)
 	go func() {
-		_, err := runner.Run()
+		_, err := runner.Run(context.Background())
 		result <- err
 	}()
 	var analyzerContext context.Context
@@ -626,8 +626,9 @@ func TestFirstScreenCompositionPassesShutdownCancellationToAnalyzer(t *testing.T
 	case <-time.After(time.Second):
 		t.Fatal("analyzer did not start")
 	}
-	if analyzerContext != shutdownContext {
-		t.Fatal("analyzer did not receive the process shutdown context")
+	// 分析器收到的是叠加 per-run 取消的派生上下文：进程 shutdown 依旧兜底。
+	if analyzerContext == shutdownContext || analyzerContext.Err() != nil {
+		t.Fatal("analyzer did not receive a live run-scoped context")
 	}
 	cancelShutdown()
 	select {
@@ -642,6 +643,55 @@ func TestFirstScreenCompositionPassesShutdownCancellationToAnalyzer(t *testing.T
 	_, conns := pool.snapshot()
 	if len(conns) != 1 || conns[0].releaseCount() != 1 {
 		t.Fatalf("connections after cancellation = %#v", conns)
+	}
+}
+
+func TestFirstScreenCompositionPerRunCancelReachesAnalyzerWithoutShutdown(t *testing.T) {
+	shutdownContext, cancelShutdown := context.WithCancel(context.Background())
+	defer cancelShutdown()
+	pool := &fakeAnalysisPool{}
+	analyzerStarted := make(chan context.Context, 1)
+	factory := analysisEngineFactory(func(*pgx.Conn, firstscreen.Config, *slog.Logger) analysisEngine {
+		return analysisEngineFunc(func(ctx context.Context) (*firstscreen.RunStats, error) {
+			analyzerStarted <- ctx
+			<-ctx.Done()
+			return nil, ctx.Err()
+		})
+	})
+	runner := newPooledAnalysisRunner(
+		shutdownContext,
+		pool,
+		firstscreen.DefaultConfig(),
+		slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)),
+		factory,
+	)
+
+	runContext, cancelRun := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := runner.Run(runContext)
+		result <- err
+	}()
+	select {
+	case <-analyzerStarted:
+	case <-time.After(time.Second):
+		t.Fatal("analyzer did not start")
+	}
+	cancelRun()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run() error = %v, want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("per-run cancellation did not reach analyzer")
+	}
+	if shutdownContext.Err() != nil {
+		t.Fatal("per-run cancel leaked into the process shutdown context")
+	}
+	_, conns := pool.snapshot()
+	if len(conns) != 1 || conns[0].releaseCount() != 1 {
+		t.Fatalf("connections after per-run cancellation = %#v", conns)
 	}
 }
 
@@ -663,7 +713,7 @@ func TestFirstScreenCompositionAcquireFailureIsVisibleAndDoesNotLeak(t *testing.
 		factory,
 	)
 
-	stats, err := runner.Run()
+	stats, err := runner.Run(context.Background())
 	if stats != nil {
 		t.Fatalf("stats = %#v, want nil", stats)
 	}
@@ -856,7 +906,7 @@ func TestFirstScreenServeErrorDrainsAcceptedRunBeforeReturning(t *testing.T) {
 func TestServeErrorCancelsAdmittedSuccessHookBeforeWaiting(t *testing.T) {
 	processContext, cancelProcess := context.WithCancel(context.Background())
 	defer cancelProcess()
-	runner := guiAnalysisRunnerFunc(func() (*firstscreen.RunStats, error) {
+	runner := guiAnalysisRunnerFunc(func(context.Context) (*firstscreen.RunStats, error) {
 		return &firstscreen.RunStats{StageElapsedMs: map[string]int64{}}, nil
 	})
 	api := gui.NewAPI(nil, nil, nil, runner)

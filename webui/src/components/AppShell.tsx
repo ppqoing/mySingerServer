@@ -6,8 +6,11 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode
 } from "react";
-import { NavLink } from "react-router-dom";
+import { Link, NavLink } from "react-router-dom";
+import { appApi, type AppApi } from "../api/appApi";
+import { databaseErrorText } from "../api/errorText";
 import { navigation } from "../app/navigation";
+import { usePolling } from "../hooks/usePolling";
 import "../styles/global.css";
 
 const narrowQuery = "(max-width: 1099px)";
@@ -28,7 +31,42 @@ function useNarrowViewport() {
   return isNarrow;
 }
 
-export function AppShell({ children }: { children: ReactNode }) {
+export interface AppShellProps {
+  readonly api?: AppApi;
+  readonly children: ReactNode;
+}
+
+/** 顶部状态栏：低频轮询 RuntimeStatus，如实反映数据库与在线节点状态。 */
+function HeaderStatus({ api }: { api: AppApi }) {
+  const request = useCallback((signal: AbortSignal) => api.getRuntimeStatus(signal), [api]);
+  const runtime = usePolling(request, { dependencies: [api] });
+  const status = runtime.data;
+
+  if (!status) {
+    return (
+      <span className="app-shell__status app-shell__status--muted">
+        {runtime.error ? "中央服务：状态获取失败" : "中央服务：连接中…"}
+      </span>
+    );
+  }
+  if (status.databaseState === "connecting") {
+    return <span className="app-shell__status app-shell__status--muted">数据库：连接中…</span>;
+  }
+  if (status.databaseState === "error") {
+    const detail = databaseErrorText(status.databaseErrorCode);
+    // 顶栏只放摘要，完整引导文案放在 title 与概览页警报里。
+    const summary = detail.split(/[：，。]/)[0];
+    return (
+      <Link className="app-shell__status app-shell__status--error" title={detail} to="/overview">
+        数据库异常：{summary}
+      </Link>
+    );
+  }
+  const online = status.agents.filter(agent => agent.online).length;
+  return <span className="app-shell__status">数据库：正常 · 在线节点 {online}/{status.agents.length}</span>;
+}
+
+export function AppShell({ api = appApi, children }: AppShellProps) {
   const isNarrow = useNarrowViewport();
   const [drawerOpen, setDrawerOpen] = useState(false);
   const navigationRef = useRef<HTMLElement>(null);
@@ -144,7 +182,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           {drawerOpen ? "关闭导航" : "打开导航"}
         </button>
         <strong>媒体去重控制台</strong>
-        <span className="app-shell__status">中央服务：正常</span>
+        <HeaderStatus api={api} />
       </header>
       <main className="app-shell__main" inert={isNarrow && drawerOpen}>{children}</main>
     </div>

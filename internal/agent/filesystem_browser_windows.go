@@ -122,8 +122,10 @@ func (browser filesystemBrowser) browseWindowsDirectory(
 		path := filepath.Join(request.Path, directoryEntry.Name())
 		attributes, err := browser.getFileAttributes(windows.StringToUTF16Ptr(path))
 		if err != nil {
-			response.ErrorCode = mapFilesystemBrowseError(err)
-			return response
+			// A single unreadable entry (denied access, broken reparse
+			// point, offline placeholder) must not fail the whole
+			// directory listing; skip it.
+			continue
 		}
 		hidden := attributes&windows.FILE_ATTRIBUTE_HIDDEN != 0
 		system := attributes&windows.FILE_ATTRIBUTE_SYSTEM != 0

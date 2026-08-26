@@ -29,7 +29,3 @@ func NewClient(string, nodeprocess.Inspector) (*Client, error) {
 func (*Client) Invoke(context.Context, Action, []byte) (InvocationResult, error) {
 	return InvocationResult{}, ErrWindowsRequired
 }
-
-func ServeOnce(context.Context, string, string, nodeprocess.Inspector, Handler) error {
-	return ErrWindowsRequired
-}

@@ -2,9 +2,30 @@ import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, test, vi } from "vitest";
+import type { AppApi, RuntimeStatus } from "../api/contracts";
 import { AppShell } from "./AppShell";
 import { AsyncState } from "./AsyncState";
 import { VirtualTable } from "./VirtualTable";
+
+function runtimeStatus(overrides: Partial<RuntimeStatus> = {}): RuntimeStatus {
+  return {
+    databaseState: "connected",
+    databaseErrorCode: "",
+    agents: [
+      { machineId: "agent-a", addr: "10.0.0.1", online: true, identityState: "claimed" },
+      { machineId: "agent-b", addr: "10.0.0.2", online: false, identityState: "claimed" }
+    ],
+    restarting: false,
+    recoveryURL: "",
+    ...overrides
+  };
+}
+
+function apiFor(status: Partial<RuntimeStatus> = {}): AppApi {
+  return {
+    getRuntimeStatus: vi.fn().mockResolvedValue(runtimeStatus(status))
+  } as unknown as AppApi;
+}
 
 function setViewport(width: number) {
   const listeners = new Set<(event: MediaQueryListEvent) => void>();
@@ -21,10 +42,10 @@ function setViewport(width: number) {
   });
 }
 
-function renderShell(path = "/overview") {
+function renderShell(path = "/overview", api: AppApi = apiFor()) {
   return render(
     <MemoryRouter initialEntries={[path]}>
-      <AppShell>
+      <AppShell api={api}>
         <h1>页面内容</h1>
         <button type="button">主内容操作</button>
       </AppShell>
@@ -37,7 +58,7 @@ afterEach(() => {
 });
 
 describe("AppShell", () => {
-  test("renders six operational links and marks the active route", () => {
+  test("renders six operational links and marks the active route", async () => {
     setViewport(1440);
     renderShell("/groups");
 
@@ -45,7 +66,23 @@ describe("AppShell", () => {
       expect(screen.getByRole("link", { name: label })).toBeInTheDocument();
     }
     expect(screen.getByRole("link", { name: "重复组" })).toHaveAttribute("aria-current", "page");
-    expect(screen.getByText("中央服务：正常")).toBeInTheDocument();
+    expect(await screen.findByText("数据库：正常 · 在线节点 1/2")).toBeInTheDocument();
+  });
+
+  test("shows a linked error summary when the database is degraded", async () => {
+    setViewport(1440);
+    renderShell("/overview", apiFor({ databaseState: "error", databaseErrorCode: "postgres_unreachable" }));
+
+    const status = await screen.findByRole("link", { name: "数据库异常：无法连接数据库" });
+    expect(status).toHaveAttribute("href", "/overview");
+    expect(status).toHaveAttribute("title", expect.stringContaining("请检查网络与数据库服务状态"));
+  });
+
+  test("shows a muted connecting state while the database connects", async () => {
+    setViewport(1440);
+    renderShell("/overview", apiFor({ databaseState: "connecting" }));
+
+    expect(await screen.findByText("数据库：连接中…")).toBeInTheDocument();
   });
 
   test("moves focus to the first link and traps Tab in the narrow navigation drawer", async () => {

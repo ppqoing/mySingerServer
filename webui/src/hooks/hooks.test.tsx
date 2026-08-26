@@ -176,6 +176,31 @@ test("uses reload to bypass only the current cached page once", async () => {
   expect(api.listGroups).toHaveBeenCalledTimes(3);
 });
 
+test("invalidateAll clears every cached page and refetches the current one", async () => {
+  const api = {
+    listGroups: vi.fn((query: GroupQuery) => Promise.resolve(page(query.page)))
+  } as Pick<AppApi, "listGroups">;
+  const query: GroupQuery = { kind: "exact", page: 1, size: 100 };
+  const { result, rerender } = renderHook(
+    ({ current }) => usePagedGroups(api, current),
+    { initialProps: { current: query } }
+  );
+  await waitFor(() => expect(result.current.data?.page).toBe(1));
+  rerender({ current: { ...query, page: 2 } });
+  await waitFor(() => expect(result.current.data?.page).toBe(2));
+  expect(api.listGroups).toHaveBeenCalledTimes(2);
+
+  act(() => result.current.invalidateAll());
+  // 当前页（第 2 页）强制重取
+  await waitFor(() => expect(api.listGroups).toHaveBeenCalledTimes(3));
+  await waitFor(() => expect(result.current.data?.page).toBe(2));
+
+  // 全部缓存已清空：翻回第 1 页必须重新请求，而不是命中删除前的缓存
+  rerender({ current: query });
+  await waitFor(() => expect(api.listGroups).toHaveBeenCalledTimes(4));
+  await waitFor(() => expect(result.current.data?.page).toBe(1));
+});
+
 test("hides data from a different page key while its replacement request is pending", async () => {
   let resolveSecond: ((value: GroupPage) => void) | undefined;
   const api = {

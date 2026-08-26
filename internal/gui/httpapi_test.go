@@ -16,6 +16,9 @@ import (
 	"strings"
 	"testing"
 	"testing/fstest"
+	"time"
+
+	"github.com/jackc/pgx/v5"
 
 	"dedup/internal/config"
 	"dedup/internal/proto"
@@ -648,5 +651,302 @@ func TestScanAPIRejectsTaskIDReusedWithDifferentEnvelope(t *testing.T) {
 	api.Routes().ServeHTTP(response, request)
 	if response.Code != http.StatusConflict {
 		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+}
+
+
+func cancelRequest(api *API, taskID string) *httptest.ResponseRecorder {
+	request := httptest.NewRequest(http.MethodPost, "/api/tasks/"+taskID+"/cancel", nil)
+	response := httptest.NewRecorder()
+	api.Routes().ServeHTTP(response, request)
+	return response
+}
+
+func TestTaskCancelHTTPValidatesTaskState(t *testing.T) {
+	registry := NewTaskRegistry(nil, testLogger())
+	pool := NewPool(nil, testLogger(), nil)
+	api := NewAPI(pool, registry, nil)
+
+	if response := cancelRequest(api, "missing"); response.Code != http.StatusNotFound {
+		t.Fatalf("missing task status = %d body=%s", response.Code, response.Body.String())
+	}
+	for _, status := range []string{"done", "failed"} {
+		if err := registry.Register(&TaskInfo{
+			TaskID: "terminal-" + status, MachineID: machineA, Phase: 1,
+			Roots: []string{`D:\media`}, Status: status,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if response := cancelRequest(api, "terminal-"+status); response.Code != http.StatusConflict {
+			t.Fatalf("terminal %s status = %d body=%s", status, response.Code, response.Body.String())
+		}
+	}
+}
+
+func TestTaskCancelHTTPUnavailableWithoutServices(t *testing.T) {
+	response := cancelRequest(NewAPI(nil, nil, nil), "task-1")
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestTaskCancelHTTPOfflineAgentRollsBackAndReturns503(t *testing.T) {
+	registry := NewTaskRegistry(nil, testLogger())
+	if err := registry.Register(&TaskInfo{
+		TaskID: "task-offline", MachineID: "machine-offline", Phase: 1,
+		Roots: []string{`D:\media`}, Status: "running",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 空连接池：machine-offline 不在线。
+	api := NewAPI(NewPool(nil, testLogger(), nil), registry, nil)
+	response := cancelRequest(api, "task-offline")
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+	if got := registry.List()[0]; got.Status != "running" {
+		t.Fatalf("offline cancel did not roll back: %#v", got)
+	}
+}
+
+func TestTaskCancelHTTPSendsMessageAndStaysIdempotent(t *testing.T) {
+	serverSide, guiSide := net.Pipe()
+	defer serverSide.Close()
+	defer guiSide.Close()
+	agent := &AgentConn{
+		ep: config.AgentEndpoint{Addr: "pipe"}, conn: proto.NewConn(guiSide),
+		machineID: machineA, identityState: IdentityClaimed, online: true,
+	}
+	pool := &Pool{
+		byAddr:      map[string]*AgentConn{"pipe": agent},
+		byMachineID: map[string]*AgentConn{machineA: agent},
+	}
+	registry := NewTaskRegistry(nil, testLogger())
+	if err := registry.Register(&TaskInfo{
+		TaskID: "task-cancel-http", MachineID: machineA, Phase: 1,
+		Roots: []string{`D:\media`}, Status: "running",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	api := NewAPI(pool, registry, nil)
+
+	received := make(chan proto.ScanTaskCancel, 1)
+	go func() {
+		connection := proto.NewConn(serverSide)
+		for {
+			msgType, body, err := connection.ReadFrame()
+			if err != nil {
+				return
+			}
+			message, err := proto.Decode(msgType, body)
+			if err != nil {
+				continue
+			}
+			if cancel, ok := message.(*proto.ScanTaskCancel); ok {
+				received <- *cancel
+			}
+		}
+	}()
+
+	response := cancelRequest(api, "task-cancel-http")
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+	select {
+	case cancel := <-received:
+		if cancel.TaskID != "task-cancel-http" {
+			t.Fatalf("wire cancel = %#v", cancel)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("agent did not receive MsgScanTaskCancel")
+	}
+	if got := registry.List()[0]; got.Status != "cancelling" {
+		t.Fatalf("status after cancel = %#v", got)
+	}
+
+	// 重复取消幂等：返回 200 但不再重发消息。
+	response = cancelRequest(api, "task-cancel-http")
+	if response.Code != http.StatusOK {
+		t.Fatalf("repeat cancel status = %d body=%s", response.Code, response.Body.String())
+	}
+	select {
+	case cancel := <-received:
+		t.Fatalf("idempotent repeat re-sent the message: %#v", cancel)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+type fakePreviewService struct {
+	response proto.LocalResponse
+	err      error
+	machine  string
+	request  proto.LocalImagePreviewRequest
+}
+
+func (service *fakePreviewService) Preview(
+	_ context.Context,
+	machineID string,
+	request proto.LocalImagePreviewRequest,
+) (proto.LocalResponse, error) {
+	service.machine = machineID
+	service.request = request
+	return service.response, service.err
+}
+
+const previewTestSHA512 = "abcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcd" +
+	"abcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcd"
+
+func newPreviewTestAPI(service previewService, db *groupAPIFakeDB) *API {
+	api := NewAPI(nil, nil, nil)
+	api.SetPreviewBroker(service)
+	api.previewDB = db
+	return api
+}
+
+func TestFilePreviewHTTPValidatesParametersBeforeTouchingDatabase(t *testing.T) {
+	tests := []struct {
+		name   string
+		target string
+	}{
+		{"non-numeric file id", "/api/files/abc/preview?machine=machine-a"},
+		{"zero file id", "/api/files/0/preview?machine=machine-a"},
+		{"negative file id", "/api/files/-3/preview?machine=machine-a"},
+		{"missing machine", "/api/files/1/preview"},
+		{"bad width", "/api/files/1/preview?machine=machine-a&w=0"},
+		{"bad height", "/api/files/1/preview?machine=machine-a&h=8193"},
+		{"non-numeric height", "/api/files/1/preview?machine=machine-a&h=big"},
+		{"bad format", "/api/files/1/preview?machine=machine-a&format=png"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			service := &fakePreviewService{}
+			api := newPreviewTestAPI(service, &groupAPIFakeDB{panicOnUse: true})
+			response := httptest.NewRecorder()
+			api.Routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, test.target, nil))
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			if service.machine != "" {
+				t.Fatalf("preview reached transport: %#v", service.request)
+			}
+		})
+	}
+}
+
+func TestFilePreviewHTTPReturnsUnavailableWhenNotConfigured(t *testing.T) {
+	api := NewAPI(nil, nil, nil)
+	response := httptest.NewRecorder()
+	api.Routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/files/1/preview?machine=machine-a", nil))
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestFilePreviewHTTPMapsDatabaseMissDeletedAndMissingSHA(t *testing.T) {
+	tests := []struct {
+		name string
+		row  groupAPIRowResult
+	}{
+		{"unknown file", groupAPIRowResult{err: pgx.ErrNoRows}},
+		{"deleted file", groupAPIRowResult{values: []any{previewTestSHA512, "deleted"}}},
+		{"missing sha", groupAPIRowResult{values: []any{"", "done"}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			service := &fakePreviewService{}
+			api := newPreviewTestAPI(service, &groupAPIFakeDB{rowResults: []groupAPIRowResult{test.row}})
+			response := httptest.NewRecorder()
+			api.Routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/files/1/preview?machine=machine-a", nil))
+			if response.Code != http.StatusNotFound {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			if service.machine != "" {
+				t.Fatalf("preview reached transport for %s", test.name)
+			}
+		})
+	}
+}
+
+func TestFilePreviewHTTPReportsOfflineAgent(t *testing.T) {
+	service := &fakePreviewService{err: ErrPreviewAgentOffline}
+	api := newPreviewTestAPI(service, &groupAPIFakeDB{
+		rowResults: []groupAPIRowResult{{values: []any{previewTestSHA512, "done"}}},
+	})
+	response := httptest.NewRecorder()
+	api.Routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/files/1/preview?machine=machine-a", nil))
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var body map[string]string
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["error"] != "agent_offline" {
+		t.Fatalf("body=%s", response.Body.String())
+	}
+}
+
+func TestFilePreviewHTTPStreamsAgentBytesWithCacheHeaders(t *testing.T) {
+	payload, err := proto.EncodeLocalPayload(proto.LocalImagePreviewResponse{
+		MIME: "image/webp", Width: 64, Height: 48, Bytes: []byte{9, 8, 7, 6},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &fakePreviewService{response: proto.LocalResponse{OK: true, Payload: payload}}
+	api := newPreviewTestAPI(service, &groupAPIFakeDB{
+		rowResults: []groupAPIRowResult{{values: []any{previewTestSHA512, "done"}}},
+	})
+	response := httptest.NewRecorder()
+	api.Routes().ServeHTTP(response, httptest.NewRequest(
+		http.MethodGet, "/api/files/41/preview?machine=machine-a&w=128&h=96&format=webp", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if got := response.Header().Get("Content-Type"); got != "image/webp" {
+		t.Fatalf("Content-Type=%q", got)
+	}
+	if got := response.Header().Get("Cache-Control"); got != "private, max-age=300" {
+		t.Fatalf("Cache-Control=%q", got)
+	}
+	if !bytes.Equal(response.Body.Bytes(), []byte{9, 8, 7, 6}) {
+		t.Fatalf("body=%v", response.Body.Bytes())
+	}
+	if service.machine != "machine-a" || service.request.Sha512 != previewTestSHA512 ||
+		service.request.FileID != 0 || service.request.MaxWidth != 128 ||
+		service.request.MaxHeight != 96 || service.request.Format != "webp" {
+		t.Fatalf("agent request=%q %#v", service.machine, service.request)
+	}
+}
+
+func TestFilePreviewHTTPMapsAgentErrorCodesToSafeStatuses(t *testing.T) {
+	tests := []struct {
+		name      string
+		errorCode string
+		wantCode  int
+	}{
+		{"stale", "stale_preview", http.StatusConflict},
+		{"not available", "preview_not_available", http.StatusNotFound},
+		{"too large", "preview_too_large", http.StatusRequestEntityTooLarge},
+		{"memory limit", "preview_memory_limit", http.StatusInsufficientStorage},
+		{"disconnected", "agent_disconnected", http.StatusServiceUnavailable},
+		{"generic failure", "preview_failed", http.StatusBadGateway},
+		{"legacy unauthorized agent", "unauthorized", http.StatusBadGateway},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			service := &fakePreviewService{response: proto.LocalResponse{ErrorCode: test.errorCode}}
+			api := newPreviewTestAPI(service, &groupAPIFakeDB{
+				rowResults: []groupAPIRowResult{{values: []any{previewTestSHA512, "done"}}},
+			})
+			response := httptest.NewRecorder()
+			api.Routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/files/1/preview?machine=machine-a", nil))
+			if response.Code != test.wantCode {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			if strings.Contains(response.Body.String(), test.errorCode) && test.errorCode != "agent_disconnected" {
+				t.Fatalf("internal error code leaked: %s", response.Body.String())
+			}
+		})
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -32,10 +33,11 @@ func TestTaskRegistryRestoresPendingScanEnvelopeWhenIntegrationEnabled(
 	t.Cleanup(pool.Close)
 	const taskID = "integration-restore-task"
 	const phase2TaskID = "integration-restore-phase2-isolation-task"
+	const terminalTaskID = "integration-restore-terminal-task"
 	if _, err := pool.Exec(
 		ctx,
 		`DELETE FROM scan_tasks WHERE id=ANY($1::text[])`,
-		[]string{taskID, phase2TaskID},
+		[]string{taskID, phase2TaskID, terminalTaskID},
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +47,7 @@ func TestTaskRegistryRestoresPendingScanEnvelopeWhenIntegrationEnabled(
 		_, _ = pool.Exec(
 			cleanupCtx,
 			`DELETE FROM scan_tasks WHERE id=ANY($1::text[])`,
-			[]string{taskID, phase2TaskID},
+			[]string{taskID, phase2TaskID, terminalTaskID},
 		)
 	})
 	if _, err := pool.Exec(ctx, `
@@ -54,6 +56,16 @@ func TestTaskRegistryRestoresPendingScanEnvelopeWhenIntegrationEnabled(
 		taskID,
 		"integration-restore-machine",
 		`{"roots":["D:\\media"],"rescan":true}`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO scan_tasks (id, machine_id, phase, target, status, stats_json)
+		VALUES ($1, $2, 1, $3::jsonb, 'done', $4::jsonb)`,
+		terminalTaskID,
+		"integration-restore-machine",
+		`{"roots":["D:\\finished"],"rescan":false}`,
+		`{"Total":12,"Done":11,"Skipped":1,"Failed":2,"ScanErrors":3,"ElapsedMS":4000}`,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -76,6 +88,63 @@ func TestTaskRegistryRestoresPendingScanEnvelopeWhenIntegrationEnabled(
 		len(scans[0].Roots) != 1 || scans[0].Roots[0] != `D:\media` ||
 		!scans[0].Options.Rescan {
 		t.Fatalf("restored scans = %#v", scans)
+	}
+	var terminal *TaskInfo
+	for _, task := range registry.List() {
+		if task.TaskID == terminalTaskID {
+			terminal = task
+			break
+		}
+	}
+	if terminal == nil || terminal.Status != "done" || terminal.Total != 12 || terminal.Done != 11 ||
+		terminal.Skipped != 1 || terminal.Failed != 2 || terminal.ScanErrors != 3 || terminal.ElapsedMS != 4000 {
+		t.Fatalf("restored terminal task = %#v", terminal)
+	}
+}
+
+func TestTaskRegistryRestoresOnlyLatestTwoHundredTerminalScansWhenIntegrationEnabled(t *testing.T) {
+	dsn := os.Getenv("DEDUP_TEST_PG_DSN")
+	if dsn == "" {
+		t.Skip("set DEDUP_TEST_PG_DSN to run PostgreSQL integration")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	const prefix = "integration-terminal-limit-"
+	if _, err := pool.Exec(ctx, `DELETE FROM scan_tasks WHERE id LIKE $1`, prefix+"%"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		_, _ = pool.Exec(cleanupCtx, `DELETE FROM scan_tasks WHERE id LIKE $1`, prefix+"%")
+	})
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO scan_tasks(id,machine_id,phase,target,status,updated_at)
+		SELECT $1 || lpad(n::text,3,'0'), 'integration-limit-machine', 1,
+		       '{"roots":["D:\\media"]}'::jsonb, 'done',
+		       '2099-01-01 00:00:00+00'::timestamptz + n * interval '1 second'
+		FROM generate_series(1,201) AS n`, prefix); err != nil {
+		t.Fatal(err)
+	}
+	registry := NewTaskRegistry(pool, testLogger())
+	if err := registry.Restore(ctx); err != nil {
+		t.Fatal(err)
+	}
+	found := map[string]bool{}
+	count := 0
+	for _, task := range registry.List() {
+		if strings.HasPrefix(task.TaskID, prefix) {
+			found[task.TaskID] = true
+			count++
+		}
+	}
+	if count != 200 || found[fmt.Sprintf("%s%03d", prefix, 1)] || !found[fmt.Sprintf("%s%03d", prefix, 201)] {
+		t.Fatalf("terminal history count=%d oldest=%t newest=%t", count, found[prefix+"001"], found[prefix+"201"])
 	}
 }
 

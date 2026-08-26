@@ -145,6 +145,8 @@ typedef struct vc_analysis_result {
     vc_video_frame_result frames[VC_VIDEO_FRAME_COUNT];
     uint64_t operation_elapsed_ms;
     uint64_t decode_elapsed_ms;
+    uint32_t image_width;
+    uint32_t image_height;
 } vc_analysis_result;
 
 typedef struct vc_cancel_token vc_cancel_token;

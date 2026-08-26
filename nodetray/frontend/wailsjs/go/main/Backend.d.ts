@@ -5,6 +5,8 @@ import {config} from '../models';
 import {context} from '../models';
 import {main} from '../models';
 
+export function ChooseLocalTaskRoot(arg1:string):Promise<traymodel.PathSelectionResult>;
+
 export function CreateLocalTask(arg1:traymodel.LocalTaskCreate):Promise<traymodel.LocalTaskResult>;
 
 export function ExecuteLocalDelete(arg1:traymodel.LocalDeleteExecute):Promise<traymodel.LocalDeleteBatch>;

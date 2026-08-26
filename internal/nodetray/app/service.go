@@ -16,7 +16,6 @@ import (
 	"dedup/internal/nodetray/windows/elevation"
 	nodetask "dedup/internal/nodetray/windows/task"
 	"dedup/internal/proto"
-	"github.com/vmihailenco/msgpack/v5"
 )
 
 type Store interface {
@@ -137,7 +136,6 @@ type Service struct {
 	elevation         ElevationClient
 	loginStart        LoginStart
 	trayExecutable    string
-	taskDefinition    nodetask.Definition
 	locations         map[traymodel.LocationKind]Location
 	pathResolver      PathResolver
 	opener            LocationOpener
@@ -157,7 +155,7 @@ func NewService(dependencies Dependencies) *Service {
 		agent:     dependencies.Agent, helper: dependencies.Helper, task: dependencies.Task,
 		agentFingerprint: dependencies.AgentFingerprint, helperFingerprint: dependencies.HelperFingerprint,
 		elevation: dependencies.Elevation, loginStart: dependencies.LoginStart,
-		trayExecutable: dependencies.TrayExecutable, taskDefinition: dependencies.TaskDefinition,
+		trayExecutable: dependencies.TrayExecutable,
 		locations: locations, pathResolver: dependencies.PathResolver,
 		opener: dependencies.Opener, workers: dependencies.Workers, processWaiter: dependencies.ProcessWaiter,
 	}
@@ -690,79 +688,6 @@ func (s *Service) SaveTraySettings(ctx context.Context, value traymodel.TraySett
 	return traymodel.OperationResult{OK: true}
 }
 
-func (s *Service) ensureDefaultHelperConfig(ctx context.Context) traymodel.OperationResult {
-	prepared, err := s.store.PrepareDefaultHelperWrite()
-	if errors.Is(err, config.ErrHelperConfigExists) {
-		return traymodel.OperationResult{OK: true}
-	}
-	if err != nil {
-		return operationFailure("helper_config_invalid", "Helper 默认配置无效")
-	}
-	payload, err := msgpack.Marshal(prepared)
-	if err != nil {
-		return operationFailure("helper_config_invalid", "配置请求编码失败")
-	}
-	invoked, err := s.elevation.Invoke(ctx, elevation.ActionWriteHelperConfig, payload)
-	if err != nil {
-		return operationFailure("helper_config_invalid", err.Error())
-	}
-	if invoked.UACCancelled {
-		return operationFailure(elevation.ErrorCodeUACCancelled, invoked.Response.ErrorSummary)
-	}
-	if !invoked.Response.OK && invoked.Response.ErrorCode != elevation.ErrorCodeHelperConfigExists {
-		return operationFailure(stableCode(invoked.Response.ErrorCode, "helper_config_invalid"), invoked.Response.ErrorSummary)
-	}
-	if s.helperFingerprint == nil {
-		return operationFailure("unavailable", "Helper 摘要更新服务不可用")
-	}
-	actualSHA, err := s.store.HelperFingerprint()
-	if err != nil {
-		return operationFailure("helper_config_invalid", "Helper 配置读取失败")
-	}
-	return sanitizeOperation(s.helperFingerprint.UpdateExpectedSHA256(actualSHA))
-}
-
-func (s *Service) reconcileHelperTaskPolicy(ctx context.Context, value traymodel.TraySettings) traymodel.OperationResult {
-	if s.task == nil {
-		return operationFailure("task_failed", "计划任务状态服务不可用")
-	}
-	status, err := s.task.Inspect(ctx)
-	if err != nil {
-		return operationFailure("task_failed", "计划任务状态读取失败")
-	}
-	desiredInstalled := value.HelperEnabled && value.HelperStartMode == traymodel.StartAutomatic
-	if status.Installed == desiredInstalled {
-		return traymodel.OperationResult{OK: true}
-	}
-	return s.applyHelperTaskPolicy(ctx, value)
-}
-
-func (s *Service) applyHelperTaskPolicy(ctx context.Context, value traymodel.TraySettings) traymodel.OperationResult {
-	var action elevation.Action
-	var payload []byte
-	var err error
-	if value.HelperEnabled && value.HelperStartMode == traymodel.StartAutomatic {
-		action = elevation.ActionInstallHelperTask
-		payload, err = msgpack.Marshal(s.taskDefinition)
-	} else {
-		action = elevation.ActionRemoveHelperTask
-	}
-	if err != nil {
-		return operationFailure("task_failed", "任务请求编码失败")
-	}
-	invoked, err := s.elevation.Invoke(ctx, action, payload)
-	if err != nil {
-		return operationFailure("task_failed", err.Error())
-	}
-	if invoked.UACCancelled {
-		return traymodel.OperationResult{ErrorCode: elevation.ErrorCodeUACCancelled, ErrorSummary: sanitizeText(invoked.Response.ErrorSummary), UACCancelled: true}
-	}
-	if !invoked.Response.OK {
-		return operationFailure(stableCode(invoked.Response.ErrorCode, "task_failed"), invoked.Response.ErrorSummary)
-	}
-	return traymodel.OperationResult{OK: true}
-}
-
 func (s *Service) reloadSettingsActualState(ctx context.Context, reloadTask bool) error {
 	if _, err := s.store.LoadTraySettings(); err != nil {
 		return err
@@ -832,17 +757,6 @@ func callComponent(s *Service, component Component, ctx context.Context, operati
 		result = component.ForceStopTracked(ctx)
 	}
 	return sanitizeOperation(result)
-}
-
-func taskOperation(ctx context.Context, service TaskController) traymodel.OperationResult {
-	if service == nil {
-		return operationFailure("unavailable", "任务服务不可用")
-	}
-	err := service.Run(ctx)
-	if err != nil {
-		return operationFailure("task_failed", err.Error())
-	}
-	return traymodel.OperationResult{OK: true}
 }
 
 func sameOrBelow(path, root string) bool {

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -281,6 +282,77 @@ func TestLocalPreviewSourceLookupReturnsMachineOwnedIdentity(t *testing.T) {
 		if _, err := db.LoadLocalPreviewSource(ctx, input.machine, input.fileID); err == nil {
 			t.Fatalf("preview source accepted machine=%s file=%d", input.machine, input.fileID)
 		}
+	}
+}
+
+// Break caught: the SHA-512 bridge resolves a row on the wrong machine, a
+// deleted row, or a video row (no image_features join), re-opening arbitrary
+// path reads for the manager channel.
+func TestLocalPreviewSourceBySHAResolvesMachineOwnedLiveImage(t *testing.T) {
+	db := openLocalTestDB(t)
+	ctx := context.Background()
+	sharedSHA := strings.Repeat("cd", 64)
+	deletedSHA := strings.Repeat("ef", 64)
+	videoSHA := strings.Repeat("ab", 64)
+	files := []struct {
+		id       int64
+		machine  string
+		path     string
+		status   string
+		sha      string
+		features bool
+	}{
+		{1, "machine-a", `D:\Albums\copy-low.jpg`, "done", sharedSHA, true},
+		{2, "machine-a", `D:\Albums\copy-deleted.jpg`, "deleted", sharedSHA, true},
+		{3, "machine-b", `E:\Media\copy-remote.jpg`, "done", sharedSHA, true},
+		{4, "machine-a", `D:\Albums\gone.jpg`, "deleted", deletedSHA, true},
+		{5, "machine-a", `D:\Video\clip.mp4`, "done", videoSHA, false},
+	}
+	for _, file := range files {
+		if _, err := db.db.Exec(`INSERT INTO files(id,machine_id,path,size,mtime,sha512,status) VALUES (?,?,?,100,1000,?,?)`,
+			file.id, file.machine, file.path, file.sha, file.status); err != nil {
+			t.Fatal(err)
+		}
+		if file.features {
+			if _, err := db.db.Exec(`INSERT OR IGNORE INTO image_features(sha512,width,height) VALUES (?,10,10)`, file.sha); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	source, err := db.LoadLocalPreviewSourceBySHA(ctx, "machine-a", sharedSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if source.FileID != 1 || source.MachineID != "machine-a" || source.Kind != "image" ||
+		source.Status != "done" || source.SHA512 != sharedSHA || source.Path != `D:\Albums\copy-low.jpg` {
+		t.Fatalf("preview source = %#v", source)
+	}
+	remote, err := db.LoadLocalPreviewSourceBySHA(ctx, "machine-b", sharedSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remote.FileID != 3 || remote.MachineID != "machine-b" {
+		t.Fatalf("remote preview source = %#v", remote)
+	}
+	for _, input := range []struct {
+		name    string
+		machine string
+		sha     string
+	}{
+		{"cross machine", "machine-b", deletedSHA},
+		{"deleted only", "machine-a", deletedSHA},
+		{"video only", "machine-a", videoSHA},
+		{"unknown", "machine-a", strings.Repeat("00", 64)},
+		{"non-hex", "machine-a", "sha-1"},
+		{"uppercase", "machine-a", strings.ToUpper(sharedSHA)},
+		{"short", "machine-a", "cd"},
+	} {
+		t.Run(input.name, func(t *testing.T) {
+			if _, err := db.LoadLocalPreviewSourceBySHA(ctx, input.machine, input.sha); err == nil {
+				t.Fatalf("preview source accepted machine=%s sha=%q", input.machine, input.sha)
+			}
+		})
 	}
 }
 

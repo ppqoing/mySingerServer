@@ -12,6 +12,8 @@ import type {
   DeleteSequenceStatus,
   DeleteSummary,
   DeleteTaskStatus,
+  DeleteTaskSummary,
+  FeatureItem,
   FilesystemEntry,
   FilesystemPage,
   ConfigFieldError,
@@ -23,6 +25,11 @@ import type {
   GroupMember,
   GroupPage,
   GroupQuery,
+  GroupsStats,
+  GroupsStatsQuery,
+  GroupSelectByStrategyInput,
+  GroupSelectByStrategyResult,
+  GroupSelectStrategy,
   GroupSummary,
   RuntimeStatus,
   ScanTask,
@@ -61,6 +68,7 @@ export function createAppApi(): AppApi {
       { method: "POST", signal, allowNoContent: true }
     ),
     listGroups: (query, signal) => requestJson(groupListUrl(query), get(signal), groupPage),
+    getGroupsStats: (query, signal) => requestJson(groupsStatsUrl(query), get(signal), groupsStats),
     getGroup: (id, memberPage, memberSize, signal) => requestJson(
       `/api/groups/${positiveInteger(id, "group id")}?${new URLSearchParams({
         member_page: String(positiveInteger(memberPage, "member page")),
@@ -68,6 +76,23 @@ export function createAppApi(): AppApi {
       })}`,
       get(signal),
       groupDetail
+    ),
+    setGroupRepresentative: (groupId, fileId, signal) => requestVoid(
+      `/api/groups/${positiveInteger(groupId, "group id")}/representative`,
+      jsonPost({ file_id: positiveInteger(fileId, "file id") }, signal)
+    ),
+    selectGroupsByStrategy: (input, signal) => requestJson(
+      "/api/groups/select-by-strategy",
+      jsonPost(groupSelectByStrategyInput(input), signal),
+      groupSelectByStrategyResult
+    ),
+    cancelTask: (taskIdValue, signal) => requestVoid(
+      `/api/tasks/${encodeURIComponent(requiredText(taskIdValue, "task id"))}/cancel`,
+      { method: "POST", signal }
+    ),
+    cancelAnalysis: signal => requestVoid(
+      "/api/analysis/firstscreen/cancel",
+      { method: "POST", signal }
     ),
     prepareDelete: (memberIds, signal) => requestJson(
       "/api/delete/prepare",
@@ -84,6 +109,7 @@ export function createAppApi(): AppApi {
       get(signal),
       deleteTaskStatus
     ),
+    listDeleteTasks: signal => requestJson("/api/delete/tasks", get(signal), deleteTaskList),
     loadGUIConfig: signal => requestJson("/api/config", get(signal), guiConfigSnapshot),
     saveGUIConfig: (configValue, signal) => requestJson(
       "/api/config",
@@ -238,6 +264,61 @@ function groupListUrl(query: GroupQuery): string {
   return `/api/groups?${params}`;
 }
 
+function groupsStatsUrl(query: GroupsStatsQuery = {}): string {
+  const params = new URLSearchParams();
+  if (query.kind !== undefined) {
+    params.set("kind", groupKind(query.kind));
+  }
+  if (query.q !== undefined) {
+    params.set("q", query.q);
+  }
+  if (query.machine !== undefined) {
+    params.set("machine", query.machine);
+  }
+  if (query.minMembers !== undefined) {
+    params.set("min_members", String(positiveInteger(query.minMembers, "min members")));
+  }
+  const suffix = params.toString();
+  return suffix === "" ? "/api/groups/stats" : `/api/groups/stats?${suffix}`;
+}
+
+function groupSelectByStrategyInput(input: GroupSelectByStrategyInput): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    kind: groupKind(input.kind),
+    strategy: groupSelectStrategy(input.strategy)
+  };
+  if (input.q !== undefined) {
+    body.q = input.q;
+  }
+  if (input.machine !== undefined) {
+    body.machine = input.machine;
+  }
+  if (input.minMembers !== undefined) {
+    body.min_members = positiveInteger(input.minMembers, "min members");
+  }
+  if (input.limit !== undefined) {
+    body.limit = positiveInteger(input.limit, "limit");
+  }
+  return body;
+}
+
+function groupSelectByStrategyResult(value: unknown): GroupSelectByStrategyResult {
+  const raw = record(value, "strategy selection");
+  return {
+    fileIds: array(raw.file_ids, "strategy selection.file_ids")
+      .map((item, index) => number(item, `strategy selection.file_ids[${index}]`)),
+    groups: number(raw.groups, "strategy selection.groups"),
+    truncated: boolean(raw.truncated, "strategy selection.truncated")
+  };
+}
+
+function groupSelectStrategy(value: unknown): GroupSelectStrategy {
+  if (value === "newest" || value === "oldest" || value === "largest" || value === "shortest_path") {
+    return value;
+  }
+  throw new TypeError("group select strategy is invalid");
+}
+
 function normalizedMemberIds(memberIds: number[]): number[] {
   if (memberIds.length === 0) {
     throw new Error("at least one member id is required");
@@ -277,11 +358,22 @@ function tasks(value: unknown): ScanTask[] {
       elapsedMs: number(raw.elapsed_ms, "task.elapsed_ms"),
       speed: number(raw.speed, "task.speed"),
       lastErr: optionalText(raw.last_err, "task.last_err"),
-      recent: nullableArray(raw.recent, "task.recent"),
+      recent: nullableArray(raw.recent, "task.recent").map((item, index) => featureItem(item, `task.recent[${index}]`)),
       lastSeq: optionalNumber(raw.last_seq, "task.last_seq"),
       updatedAt: text(raw.updated_at, "task.updated_at")
     };
   });
+}
+
+// proto.FeatureItem 没有 json tag，encoding/json 以 Go 字段名（PascalCase）输出。
+function featureItem(value: unknown, field: string): FeatureItem {
+  const raw = record(value, field);
+  const err = optionalText(raw.Err, `${field}.Err`);
+  return {
+    path: text(raw.Path, `${field}.Path`),
+    status: text(raw.Status, `${field}.Status`),
+    err: err === "" ? undefined : err
+  };
 }
 
 function taskId(value: unknown): { taskId: string } {
@@ -346,6 +438,16 @@ function groupPage(value: unknown): GroupPage {
     size: number(raw.size, "groups.size"),
     total: number(raw.total, "groups.total"),
     groups: array(raw.groups, "groups.groups").map(groupSummary)
+  };
+}
+
+function groupsStats(value: unknown): GroupsStats {
+  const raw = record(value, "groups stats");
+  return {
+    kind: raw.kind === "" ? "" : groupKind(raw.kind),
+    groups: number(raw.groups, "groups stats.groups"),
+    totalBytes: number(raw.total_bytes, "groups stats.total_bytes"),
+    wastedBytes: number(raw.wasted_bytes, "groups stats.wasted_bytes")
   };
 }
 
@@ -425,6 +527,25 @@ function deleteTaskStatus(value: unknown): DeleteTaskStatus {
     byMachine: objectMap(raw.by_machine, deleteMachineStatus, "delete.by_machine"),
     errorCodes: numberMap(raw.error_codes, "delete.error_codes"),
     problems: nullableArray(raw.problems, "delete.problems").map(deleteProblem)
+  };
+}
+
+function deleteTaskList(value: unknown): DeleteTaskSummary[] {
+  return array(record(value, "delete task list").tasks, "delete tasks.tasks").map(deleteTaskSummary);
+}
+
+function deleteTaskSummary(value: unknown): DeleteTaskSummary {
+  const raw = record(value, "delete task summary");
+  return {
+    taskId: text(raw.task_id, "delete task.task_id"),
+    mode: deleteMode(raw.mode),
+    total: number(raw.total, "delete task.total"),
+    ok: number(raw.ok, "delete task.ok"),
+    failed: number(raw.failed, "delete task.failed"),
+    uncertain: number(raw.uncertain, "delete task.uncertain"),
+    pending: number(raw.pending, "delete task.pending"),
+    complete: boolean(raw.complete, "delete task.complete"),
+    createdAt: text(raw.created_at, "delete task.created_at")
   };
 }
 
@@ -571,7 +692,8 @@ function deleteMachineStatus(value: unknown): DeleteMachineStatus {
     pending: number(raw.pending, "machine.pending"),
     complete: boolean(raw.complete, "machine.complete"),
     stateSyncFailures: number(raw.state_sync_failures, "machine.state_sync_failures"),
-    sequences: objectMap(raw.sequences, deleteSequenceStatus, "machine.sequences")
+    sequences: objectMap(raw.sequences, deleteSequenceStatus, "machine.sequences"),
+    recycledTo: optionalStringMap(raw.recycled_to, "machine.recycled_to")
   };
 }
 
@@ -654,6 +776,10 @@ function boolean(value: unknown, field: string): boolean {
 
 function numberMap(value: unknown, field: string): Record<string, number> {
   return objectMap(value, item => number(item, field), field);
+}
+
+function optionalStringMap(value: unknown, field: string): Record<string, string> | undefined {
+  return value === undefined ? undefined : objectMap(value, item => text(item, field), field);
 }
 
 function objectMap<T>(

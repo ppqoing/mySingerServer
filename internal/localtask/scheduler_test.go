@@ -359,13 +359,3 @@ func (p *blockedSchedulerPool) waitForWaiting(t *testing.T, count int) {
 		}
 	}
 }
-
-func (p *blockedSchedulerPool) jobIDs() []int64 {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	ids := make([]int64, len(p.submitted))
-	for index, job := range p.submitted {
-		ids[index] = job.JobID
-	}
-	return ids
-}

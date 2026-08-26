@@ -196,33 +196,27 @@ func TestServeDispatchesPhase2ThroughSessionPipeline(t *testing.T) {
 	}
 }
 
-func TestImageNoThumbnailServeUsesImagePipelineEvenWithSessionConfigured(t *testing.T) {
-	file := newFakeFile([]byte("pixels"), 6, 123)
+func TestServeDispatchesPhase1ImageThroughSessionPipeline(t *testing.T) {
+	job, sessionDeps, sessionFake := newSessionPipelineTest(
+		t, worker.MediaImage, worker.MaskAllImage, 0,
+	)
+	job.Phase = worker.Phase1
+	job.KnownSHA = nil
+	file := newFakeFile([]byte("pixels"), job.Size, job.MTimeUnix)
 	imageDeps, imageState := testPipelineDeps(file)
 	imageDeps.runtime = testReadyRuntimeInfo
 	imageDeps.query = nil
-	cacheDir := t.TempDir()
-	cfg := testConfig()
-	cfg.ThumbCacheDir = cacheDir
-	_, sessionDeps, sessionFake := newSessionPipelineTest(
-		t, worker.MediaImage, worker.MaskAllImage, 0,
-	)
 	sessionDeps.query = nil
 	imageDeps.session = &sessionDeps
 
 	server, parent := net.Pipe()
 	done := make(chan int, 1)
-	go func() { done <- serve(server, 14, cfg, imageDeps) }()
+	go func() { done <- serve(server, 14, sessionPipelineTestConfig(), imageDeps) }()
 	conn := worker.NewIPCConn(parent)
 	if _, err := conn.Read(); err != nil {
 		t.Fatal(err)
 	}
-	job := worker.JobMsg{
-		JobID: 1401, Path: `C:\media\no-thumb.jpg`, Kind: worker.MediaImage,
-		Phase: worker.Phase1, FieldsMask: worker.MaskAllImage,
-		Size: 6, MTimeUnix: 123,
-	}
-	if err := conn.Write(worker.MsgJob, job); err != nil {
+	if err := conn.Write(worker.MsgJob, *job); err != nil {
 		t.Fatal(err)
 	}
 	envelope, err := conn.Read()
@@ -233,7 +227,11 @@ func TestImageNoThumbnailServeUsesImagePipelineEvenWithSessionConfigured(t *test
 	if err != nil || envelope.Type != worker.MsgSHAQuery {
 		t.Fatalf("image query = type %q %#v err=%v", envelope.Type, query, err)
 	}
-	if err := conn.Write(worker.MsgSHAReply, worker.SHAReplyMsg{JobID: query.JobID}); err != nil {
+	if err := conn.Write(worker.MsgSHAReply, worker.SHAReplyMsg{
+		JobID: query.JobID, Found: true,
+		RequestedFields: worker.MaskImagePDQ, FieldsPresent: worker.MaskImagePDQ,
+		PDQ: make([]byte, 32), Quality: 80, Width: 20, Height: 10,
+	}); err != nil {
 		t.Fatal(err)
 	}
 	envelope, err = conn.Read()
@@ -249,17 +247,11 @@ func TestImageNoThumbnailServeUsesImagePipelineEvenWithSessionConfigured(t *test
 		result.ThumbPath != "" || result.ThumbGenerated || result.ThumbCacheHit {
 		t.Fatalf("image result = type %q %#v", envelope.Type, result)
 	}
-	if imageState.decodeCalls != 1 || sessionFake.opens != 0 || sessionFake.analyzes != 0 ||
-		sessionFake.closes != 0 {
-		t.Fatalf("image/session calls = decode:%d open/analyze/close:%d/%d/%d",
-			imageState.decodeCalls, sessionFake.opens, sessionFake.analyzes, sessionFake.closes)
-	}
-	entries, err := os.ReadDir(cacheDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) != 0 {
-		t.Fatalf("image pipeline created thumbnail cache entries: %#v", entries)
+	if imageState.decodeCalls != 0 || sessionFake.opens != 1 || sessionFake.hashes != 1 ||
+		sessionFake.rehashes != 1 || sessionFake.analyzes != 0 || sessionFake.closes != 1 {
+		t.Fatalf("image/session calls = decode:%d open/hash/rehash/analyze/close:%d/%d/%d/%d/%d",
+			imageState.decodeCalls, sessionFake.opens, sessionFake.hashes, sessionFake.rehashes,
+			sessionFake.analyzes, sessionFake.closes)
 	}
 	if err := conn.Write(worker.MsgShutdown, struct{}{}); err != nil {
 		t.Fatal(err)

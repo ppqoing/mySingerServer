@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { StrictMode, useState } from "react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
@@ -63,6 +63,7 @@ function apiFor(overrides: Partial<AppApi> = {}): AppApi {
     prepareDelete: vi.fn().mockResolvedValue(preparation()),
     executeDelete: vi.fn().mockResolvedValue({ taskId: "task-a" }),
     getDeleteStatus: vi.fn().mockResolvedValue(taskStatus()),
+    getGroupsStats: vi.fn().mockResolvedValue({ kind: "", groups: 0, totalBytes: 0, wastedBytes: 0 }),
     ...overrides
   } as unknown as AppApi;
 }
@@ -371,6 +372,20 @@ describe("DeleteDialog", () => {
     await screen.findByRole("radio", { name: "软删除" });
     await user.click(screen.getByRole("button", { name: "最终确认删除" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("确认已过期，请重新准备");
+    expect(api.executeDelete).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("button", { name: "最终确认删除" })).toBeNull();
+  });
+
+  test("a consumed-token execute rejection returns to explicit re-prepare instead of retrying the dead token", async () => {
+    const api = apiFor({
+      executeDelete: vi.fn().mockRejectedValue(new ApiError(409, "confirmation already used", false))
+    });
+    const user = userEvent.setup();
+    render(<DialogHarness api={api} />);
+
+    await screen.findByRole("radio", { name: "软删除" });
+    await user.click(screen.getByRole("button", { name: "最终确认删除" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("该确认已被使用，请重新准备");
     expect(api.executeDelete).toHaveBeenCalledTimes(1);
     expect(screen.queryByRole("button", { name: "最终确认删除" })).toBeNull();
   });
@@ -773,6 +788,182 @@ describe("DeleteDialog", () => {
     await flush();
     expect(onTerminal).toHaveBeenCalledTimes(1);
   });
+
+  test("a prepare selection conflict shows Chinese guidance instead of the raw English error", async () => {
+    const api = apiFor({
+      prepareDelete: vi.fn().mockRejectedValue(new ApiError(409, "delete selection conflict", false))
+    });
+    render(<DialogHarness api={api} />);
+
+    expect(await screen.findByRole("alert"))
+      .toHaveTextContent("选择冲突：部分文件已在其他删除任务中，请调整选择后重试。");
+    expect(screen.queryByText(/delete selection conflict/)).toBeNull();
+  });
+
+  test("renders delete error codes with Chinese labels", async () => {
+    const api = apiFor({
+      getDeleteStatus: vi.fn().mockResolvedValue(taskStatus({
+        errorCodes: { E_NOT_FOUND: 2, E_IN_USE: 1, E_UNKNOWN_XYZ: 3 }
+      }))
+    });
+    render(
+      <DeleteDialog api={api} initialTaskId="task-a" memberIds={[7, 3]} onClose={vi.fn()} onTerminal={vi.fn()} open />
+    );
+
+    expect(await screen.findByText("E_NOT_FOUND（文件不存在）：2")).toBeInTheDocument();
+    expect(screen.getByText("E_IN_USE（文件正在使用）：1")).toBeInTheDocument();
+    expect(screen.getByText("E_UNKNOWN_XYZ：3")).toBeInTheDocument();
+  });
+
+  test("shows recycle destinations for soft-deleted machines", async () => {
+    const api = apiFor({
+      getDeleteStatus: vi.fn().mockResolvedValue(taskStatus({
+        complete: true,
+        pending: 0,
+        ok: 2,
+        byMachine: {
+          "agent-a": {
+            machineId: "agent-a", total: 1, ok: 1, failed: 0, uncertain: 0,
+            pending: 0, complete: true, stateSyncFailures: 0, sequences: {},
+            recycledTo: { "D:\\dupes\\one.jpg": "Z:\\recycled\\one.jpg" }
+          }
+        }
+      }))
+    });
+    render(
+      <DeleteDialog api={api} initialTaskId="task-a" memberIds={[7, 3]} onClose={vi.fn()} onTerminal={vi.fn()} open />
+    );
+
+    const region = await screen.findByLabelText("Agent agent-a 已移入回收目录");
+    expect(region).toHaveTextContent("已移入回收目录：1 项");
+    expect(region).toHaveTextContent("D:\\dupes\\one.jpg");
+    expect(region).toHaveTextContent("Z:\\recycled\\one.jpg");
+    expect(within(region).getByRole("button", { name: "复制去向" })).toBeInTheDocument();
+  });
+
+  test("omits recycle destinations when the task recycled nothing", async () => {
+    const api = apiFor({
+      getDeleteStatus: vi.fn().mockResolvedValue(taskStatus({ complete: true, pending: 0, ok: 2 }))
+    });
+    render(
+      <DeleteDialog api={api} initialTaskId="task-a" memberIds={[7, 3]} onClose={vi.fn()} onTerminal={vi.fn()} open />
+    );
+
+    await screen.findByText("状态：已完成");
+    expect(screen.queryByLabelText(/已移入回收目录/)).not.toBeInTheDocument();
+  });
+
+  test("retryable polling failures back off with growing delays and recover without manual retry", async () => {
+    vi.useFakeTimers();
+    const inProgress = taskStatus({ pending: 1 });
+    const terminal = taskStatus({ complete: true, pending: 0, ok: 2 });
+    const api = apiFor({
+      getDeleteStatus: vi.fn()
+        .mockResolvedValueOnce(inProgress)
+        .mockRejectedValueOnce(new ApiError(503, "delete service unavailable", true))
+        .mockRejectedValueOnce(new ApiError(0, "网络请求失败", true))
+        .mockResolvedValueOnce(inProgress)
+        .mockResolvedValueOnce(terminal)
+    });
+    const onTerminal = vi.fn();
+    render(
+      <DeleteDialog api={api} initialTaskId="task-a" memberIds={[7, 3]} onClose={vi.fn()} onTerminal={onTerminal} open />
+    );
+
+    await flush();
+    expect(api.getDeleteStatus).toHaveBeenCalledTimes(1);
+
+    // t=1s：第一次失败（可重试）→ 1s 退避，不进入手动重试态
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+    expect(api.getDeleteStatus).toHaveBeenCalledTimes(2);
+    expect(screen.getByText(/自动重试/)).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).toBeNull();
+
+    // t=2s：第二次失败 → 2s 退避
+    await act(async () => { await vi.advanceTimersByTimeAsync(999); });
+    expect(api.getDeleteStatus).toHaveBeenCalledTimes(2);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(api.getDeleteStatus).toHaveBeenCalledTimes(3);
+
+    // t=4s：恢复成功，退避提示消失，回到 1s 轮询并在 t=5s 到达终态
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_999); });
+    expect(api.getDeleteStatus).toHaveBeenCalledTimes(3);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(api.getDeleteStatus).toHaveBeenCalledTimes(4);
+    expect(screen.queryByText(/自动重试/)).toBeNull();
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+    expect(onTerminal).toHaveBeenCalledWith(terminal);
+  });
+
+  test("sustained retryable polling failures stop into manual retry after capped backoff", async () => {
+    vi.useFakeTimers();
+    const terminal = taskStatus({ complete: true, pending: 0, ok: 2 });
+    const api = apiFor({
+      getDeleteStatus: vi.fn()
+        .mockRejectedValueOnce(new ApiError(503, "delete service unavailable", true))
+        .mockRejectedValueOnce(new ApiError(503, "delete service unavailable", true))
+        .mockRejectedValueOnce(new ApiError(503, "delete service unavailable", true))
+        .mockRejectedValueOnce(new ApiError(503, "delete service unavailable", true))
+        .mockRejectedValueOnce(new ApiError(503, "delete service unavailable", true))
+        .mockResolvedValueOnce(terminal)
+    });
+    const onTerminal = vi.fn();
+    render(
+      <DeleteDialog api={api} initialTaskId="task-a" memberIds={[7, 3]} onClose={vi.fn()} onTerminal={onTerminal} open />
+    );
+
+    // 退避节奏 1s→2s→4s→8s，第 5 次连续失败才进入手动重试态
+    await flush();
+    expect(api.getDeleteStatus).toHaveBeenCalledTimes(1);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(4_000); });
+    expect(api.getDeleteStatus).toHaveBeenCalledTimes(4);
+    expect(screen.queryByRole("alert")).toBeNull();
+    await act(async () => { await vi.advanceTimersByTimeAsync(8_000); });
+    expect(api.getDeleteStatus).toHaveBeenCalledTimes(5);
+    expect(screen.getByRole("alert")).toHaveTextContent("delete service unavailable");
+    await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+    expect(api.getDeleteStatus).toHaveBeenCalledTimes(5);
+
+    fireEvent.click(screen.getByRole("button", { name: "重试获取进度" }));
+    await flush();
+    expect(onTerminal).toHaveBeenCalledWith(terminal);
+  });
+
+  test("a non-retryable polling failure stops immediately with a mapped Chinese message", async () => {
+    vi.useFakeTimers();
+    const api = apiFor({
+      getDeleteStatus: vi.fn().mockRejectedValue(new ApiError(404, "delete task not found", false))
+    });
+    render(
+      <DeleteDialog api={api} initialTaskId="task-gone" memberIds={[7, 3]} onClose={vi.fn()} onTerminal={vi.fn()} open />
+    );
+
+    await flush();
+    expect(screen.getByRole("alert")).toHaveTextContent("删除任务不存在或已随 Manager 重启清除。");
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+    expect(api.getDeleteStatus).toHaveBeenCalledTimes(1);
+  });
+
+  test("the terminal view links to the audit page and copies the task ID", async () => {
+    const terminal = taskStatus({ complete: true, pending: 0, ok: 2 });
+    const api = apiFor({ getDeleteStatus: vi.fn().mockResolvedValue(terminal) });
+    const user = userEvent.setup();
+    // userEvent.setup 会安装自己的剪贴板桩，须在其后覆盖
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+    render(
+      <DeleteDialog api={api} initialTaskId="task-a" memberIds={[7, 3]} onClose={vi.fn()} onTerminal={vi.fn()} open />
+    );
+
+    const link = await screen.findByRole("link", { name: "前往删除审计页查看 →" });
+    expect(link).toHaveAttribute("href", "#/audit?task=task-a");
+
+    await user.click(screen.getByRole("button", { name: "复制" }));
+    expect(writeText).toHaveBeenCalledWith("task-a");
+    expect(await screen.findByRole("button", { name: "已复制" })).toBeInTheDocument();
+  });
 });
 
 function groupPage(query: GroupQuery): GroupPage {
@@ -832,13 +1023,44 @@ describe("GroupsPage deletion handoff", () => {
 
     await user.click(await screen.findByRole("button", { name: "打开重复组 1" }));
     await user.click(await screen.findByRole("checkbox", { name: "选择文件 2" }));
-    expect(screen.getByText("已选 1 项")).toBeInTheDocument();
+    expect(screen.getByText(/^已选 1 项/)).toBeInTheDocument();
     expect(screen.getByRole("checkbox", { name: "选择文件 3" })).toBeDisabled();
 
     await user.click(screen.getByRole("button", { name: "刷新成员" }));
     await waitFor(() => expect(screen.getByRole("checkbox", { name: "选择文件 2" })).toBeDisabled());
-    expect(screen.getByText("已选 0 项")).toBeInTheDocument();
+    expect(screen.getByText(/^已选 0 项/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "删除已选 0 项" })).toBeDisabled();
     expect(prepareDelete).not.toHaveBeenCalled();
+  });
+});
+
+describe("DeleteDialog kept files", () => {
+  test("lists kept files with machine and path on the confirmation step", async () => {
+    const api = apiFor();
+    render(<DeleteDialog
+      api={api}
+      keptMembers={[
+        { fileId: 1, machineId: "agent-a", path: "D:\\keep\\representative.jpg" },
+        { fileId: 9, machineId: "agent-b", path: "E:\\keep\\unselected.jpg" }
+      ]}
+      memberIds={[3]}
+      onClose={vi.fn()}
+      onTerminal={vi.fn()}
+      open
+    />);
+
+    const region = await screen.findByRole("region", { name: "本次保留的文件" });
+    expect(within(region).getAllByTestId("kept-member").map(item => item.textContent)).toEqual([
+      "agent-a：D:\\keep\\representative.jpg",
+      "agent-b：E:\\keep\\unselected.jpg"
+    ]);
+  });
+
+  test("states the kept-files fallback when the selection cannot enumerate them", async () => {
+    const api = apiFor();
+    render(<DeleteDialog api={api} memberIds={[3]} onClose={vi.fn()} onTerminal={vi.fn()} open />);
+
+    const region = await screen.findByRole("region", { name: "本次保留的文件" });
+    expect(region).toHaveTextContent("未选中的成员与各组代表文件将全部保留。");
   });
 });

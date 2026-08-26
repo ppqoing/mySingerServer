@@ -230,6 +230,58 @@ test("decodes a Go nil task recent slice as empty", async () => {
   await expect(createAppApi().listTasks()).resolves.toMatchObject([{ recent: [] }]);
 });
 
+test("decodes recent feature items from PascalCase Go field names", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse([{
+    task_id: "task-1",
+    machine_id: "agent-a",
+    phase: 1,
+    roots: ["D:\\media"],
+    rescan: false,
+    status: "running",
+    done: 1,
+    total: 3,
+    skipped: 0,
+    failed: 1,
+    scan_errors: 0,
+    elapsed_ms: 0,
+    speed: 0,
+    recent: [
+      { Path: "D:\\media\\a.jpg", Status: "failed", Err: "read denied" },
+      { Path: "D:\\media\\b.jpg", Status: "done", Err: "" }
+    ],
+    updated_at: "2026-07-31T00:00:00Z"
+  }])));
+
+  await expect(createAppApi().listTasks()).resolves.toMatchObject([{
+    recent: [
+      { path: "D:\\media\\a.jpg", status: "failed", err: "read denied" },
+      { path: "D:\\media\\b.jpg", status: "done", err: undefined }
+    ]
+  }]);
+});
+
+test("rejects malformed recent feature items instead of passing them through", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse([{
+    task_id: "task-1",
+    machine_id: "agent-a",
+    phase: 1,
+    roots: ["D:\\media"],
+    rescan: false,
+    status: "running",
+    done: 1,
+    total: 3,
+    skipped: 0,
+    failed: 1,
+    scan_errors: 0,
+    elapsed_ms: 0,
+    speed: 0,
+    recent: [{ Path: "D:\\media\\a.jpg" }],
+    updated_at: "2026-07-31T00:00:00Z"
+  }])));
+
+  await expect(createAppApi().listTasks()).rejects.toBeInstanceOf(ApiError);
+});
+
 test("decodes a Go nil delete problems slice as empty", async () => {
   vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse({
       task_id: "11111111-1111-4111-8111-111111111111",
@@ -293,6 +345,222 @@ test("sends the exact confirmation token and mode when executing deletion", asyn
     method: "POST",
     body: "{\"confirm_token\":\"confirm-7\",\"mode\":\"hard\"}"
   }));
+});
+
+test("accepts the idempotent 200 re-execute response", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse({ task_id: "task-7" }, 200)));
+
+  await expect(createAppApi().executeDelete("confirm-7", "soft")).resolves.toEqual({ taskId: "task-7" });
+});
+
+test("decodes the delete task list with snake_case fields", async () => {
+  const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+    tasks: [{
+      task_id: "11111111-1111-4111-8111-111111111111",
+      mode: "soft",
+      total: 5,
+      ok: 3,
+      failed: 1,
+      uncertain: 1,
+      pending: 0,
+      complete: true,
+      created_at: "2026-08-14T01:02:03Z"
+    }]
+  }));
+  vi.stubGlobal("fetch", fetchMock);
+
+  await expect(createAppApi().listDeleteTasks()).resolves.toEqual([{
+    taskId: "11111111-1111-4111-8111-111111111111",
+    mode: "soft",
+    total: 5,
+    ok: 3,
+    failed: 1,
+    uncertain: 1,
+    pending: 0,
+    complete: true,
+    createdAt: "2026-08-14T01:02:03Z"
+  }]);
+  expect(fetchMock).toHaveBeenCalledWith("/api/delete/tasks",
+    expect.objectContaining({ method: "GET", body: undefined }));
+});
+
+test("decodes recycled_to per machine and omits it when absent", async () => {
+  const machine = {
+    machine_id: "agent-a",
+    total: 1,
+    ok: 1,
+    failed: 0,
+    uncertain: 0,
+    pending: 0,
+    complete: true,
+    state_sync_failures: 0,
+    sequences: {}
+  };
+  vi.stubGlobal("fetch", vi.fn()
+    .mockResolvedValueOnce(jsonResponse({
+      task_id: "task-1",
+      mode: "soft",
+      total: 1,
+      ok: 1,
+      failed: 0,
+      uncertain: 0,
+      pending: 0,
+      complete: true,
+      state_sync_failures: 0,
+      by_machine: {
+        "agent-a": {
+          ...machine,
+          recycled_to: { "D:\\dupes\\song.flac": "Z:\\recycled\\song.flac" }
+        }
+      },
+      error_codes: {},
+      problems: []
+    }))
+    .mockResolvedValueOnce(jsonResponse({
+      task_id: "task-2",
+      mode: "hard",
+      total: 1,
+      ok: 1,
+      failed: 0,
+      uncertain: 0,
+      pending: 0,
+      complete: true,
+      state_sync_failures: 0,
+      by_machine: { "agent-a": machine },
+      error_codes: {},
+      problems: []
+    })));
+  const api = createAppApi();
+
+  await expect(api.getDeleteStatus("task-1")).resolves.toMatchObject({
+    byMachine: { "agent-a": { recycledTo: { "D:\\dupes\\song.flac": "Z:\\recycled\\song.flac" } } }
+  });
+  const hard = await api.getDeleteStatus("task-2");
+  expect(hard.byMachine["agent-a"].recycledTo).toBeUndefined();
+});
+
+test("decodes an idempotent execute replay from its 200 response", async () => {
+  const fetchMock = vi.fn()
+    .mockResolvedValueOnce(jsonResponse({ task_id: "task-7" }, 202))
+    .mockResolvedValueOnce(jsonResponse({ task_id: "task-7" }, 200));
+  vi.stubGlobal("fetch", fetchMock);
+  const api = createAppApi();
+
+  await expect(api.executeDelete("confirm-7", "soft")).resolves.toEqual({ taskId: "task-7" });
+  await expect(api.executeDelete("confirm-7", "soft")).resolves.toEqual({ taskId: "task-7" });
+});
+
+test("encodes optional group stats filters and decodes the aggregate", async () => {
+  const fetchMock = vi.fn()
+    .mockResolvedValueOnce(jsonResponse({ kind: "", groups: 8, total_bytes: 9000, wasted_bytes: 4096 }))
+    .mockResolvedValueOnce(jsonResponse({ kind: "image", groups: 2, total_bytes: 3000, wasted_bytes: 1024 }));
+  vi.stubGlobal("fetch", fetchMock);
+  const api = createAppApi();
+
+  await expect(api.getGroupsStats()).resolves.toEqual({
+    kind: "",
+    groups: 8,
+    totalBytes: 9000,
+    wastedBytes: 4096
+  });
+  expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/groups/stats",
+    expect.objectContaining({ method: "GET", body: undefined }));
+
+  await expect(api.getGroupsStats({ kind: "image", q: "poster", machine: "agent-a", minMembers: 2 }))
+    .resolves.toEqual({ kind: "image", groups: 2, totalBytes: 3000, wastedBytes: 1024 });
+  expect(fetchMock).toHaveBeenNthCalledWith(2,
+    "/api/groups/stats?kind=image&q=poster&machine=agent-a&min_members=2",
+    expect.objectContaining({ method: "GET", body: undefined }));
+});
+
+test("sets a group representative through the POST body and surfaces failures", async () => {
+  const fetchMock = vi.fn()
+    .mockResolvedValueOnce(jsonResponse({ ok: true }))
+    .mockResolvedValueOnce(jsonResponse({ error: "文件不是该重复组的成员或已删除" }, 400));
+  vi.stubGlobal("fetch", fetchMock);
+  const api = createAppApi();
+
+  await expect(api.setGroupRepresentative(5, 7)).resolves.toBeUndefined();
+  expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/groups/5/representative",
+    expect.objectContaining({ method: "POST", body: JSON.stringify({ file_id: 7 }) }));
+
+  await expect(api.setGroupRepresentative(5, 8)).rejects.toMatchObject({
+    name: "ApiError",
+    status: 400,
+    message: "文件不是该重复组的成员或已删除"
+  });
+  // 参数校验在发请求前同步抛出。
+  expect(() => api.setGroupRepresentative(0, 7)).toThrow("group id");
+});
+
+test("encodes the strategy selection request and decodes file ids", async () => {
+  const fetchMock = vi.fn()
+    .mockResolvedValueOnce(jsonResponse({ file_ids: [11, 12], groups: 2, truncated: false }))
+    .mockResolvedValueOnce(jsonResponse({ file_ids: [], groups: 0, truncated: false }))
+    .mockResolvedValueOnce(jsonResponse({ file_ids: "11", groups: 0, truncated: false }));
+  vi.stubGlobal("fetch", fetchMock);
+  const api = createAppApi();
+
+  await expect(api.selectGroupsByStrategy({
+    kind: "image", q: "poster", machine: "agent-a", minMembers: 2, strategy: "shortest_path", limit: 10
+  })).resolves.toEqual({ fileIds: [11, 12], groups: 2, truncated: false });
+  expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/groups/select-by-strategy",
+    expect.objectContaining({
+      method: "POST",
+      body: JSON.stringify({
+        kind: "image", strategy: "shortest_path", q: "poster",
+        machine: "agent-a", min_members: 2, limit: 10
+      })
+    }));
+
+  // 缺省可选项时请求体只带 kind 与 strategy。
+  await expect(api.selectGroupsByStrategy({ kind: "exact", strategy: "newest" }))
+    .resolves.toEqual({ fileIds: [], groups: 0, truncated: false });
+  expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/groups/select-by-strategy",
+    expect.objectContaining({
+      method: "POST",
+      body: JSON.stringify({ kind: "exact", strategy: "newest" })
+    }));
+
+  // 形状不符的响应必须拒绝，不得静默接受。
+  await expect(api.selectGroupsByStrategy({ kind: "exact", strategy: "newest" }))
+    .rejects.toBeInstanceOf(ApiError);
+});
+
+test("cancels a scan task with an encoded id and surfaces state failures", async () => {
+  const fetchMock = vi.fn()
+    .mockResolvedValueOnce(jsonResponse({ status: "cancelling" }))
+    .mockResolvedValueOnce(jsonResponse({ error: "任务已结束，无法取消" }, 409));
+  vi.stubGlobal("fetch", fetchMock);
+  const api = createAppApi();
+
+  await expect(api.cancelTask("task/1")).resolves.toBeUndefined();
+  expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/tasks/task%2F1/cancel",
+    expect.objectContaining({ method: "POST" }));
+
+  await expect(api.cancelTask("task-1")).rejects.toMatchObject({
+    name: "ApiError",
+    status: 409,
+    message: "任务已结束，无法取消"
+  });
+});
+
+test("cancels the running analysis and surfaces the idle conflict", async () => {
+  const fetchMock = vi.fn()
+    .mockResolvedValueOnce(jsonResponse({ status: "cancelling" }))
+    .mockResolvedValueOnce(jsonResponse({ error: "没有正在运行的分析" }, 409));
+  vi.stubGlobal("fetch", fetchMock);
+  const api = createAppApi();
+
+  await expect(api.cancelAnalysis()).resolves.toBeUndefined();
+  expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/analysis/firstscreen/cancel",
+    expect.objectContaining({ method: "POST" }));
+
+  await expect(api.cancelAnalysis()).rejects.toMatchObject({
+    name: "ApiError",
+    status: 409,
+    message: "没有正在运行的分析"
+  });
 });
 
 const guiConfigResponse = {

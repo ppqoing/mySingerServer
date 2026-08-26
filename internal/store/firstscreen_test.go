@@ -13,10 +13,25 @@ func TestDeletedExcludedFromCandidateSourceWhileHistoricalGenerationRemains(t *t
 	ctx := context.Background()
 	sha := firstscreenTestSHA(0x41)
 	shaText := hex.EncodeToString(sha[:])
-	for _, row := range []struct{ path, status string }{{`D:\active.jpg`, "done"}, {`D:\deleted.jpg`, "deleted"}} {
-		if _, err := db.db.Exec(`INSERT INTO files(machine_id,path,sha512,status) VALUES ('machine-a',?,?,?)`, row.path, shaText, row.status); err != nil {
+	var pendingID int64
+	for _, row := range []struct{ path, status string }{{`D:\active.jpg`, "done"}, {`D:\deleted.jpg`, "deleted"}, {`D:\pending-delete.jpg`, "done"}} {
+		result, err := db.db.Exec(`INSERT INTO files(machine_id,path,sha512,status) VALUES ('machine-a',?,?,?)`, row.path, shaText, row.status)
+		if err != nil {
 			t.Fatal(err)
 		}
+		if row.path == `D:\pending-delete.jpg` {
+			pendingID, err = result.LastInsertId()
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if _, err := db.db.Exec(`
+		INSERT INTO local_delete_batches(batch_id,machine_id,confirmation_digest,status,requested_count,created_at,updated_at)
+		VALUES ('pending-delete','machine-a','digest','running',1,1,1);
+		INSERT INTO local_delete_items(batch_id,machine_id,file_id,path_snapshot,sha512,result,uncertain,created_at,updated_at)
+		VALUES ('pending-delete','machine-a',?1,'D:\pending-delete.jpg',?2,'pending',0,1,1)`, pendingID, shaText); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := db.db.Exec(`INSERT INTO image_features(sha512,width,height,pdq256,pdq_quality) VALUES (?,100,100,?,80)`, shaText, make([]byte, 32)); err != nil {
 		t.Fatal(err)
@@ -29,7 +44,7 @@ func TestDeletedExcludedFromCandidateSourceWhileHistoricalGenerationRemains(t *t
 		t.Fatalf("StreamActiveFiles: %v", err)
 	}
 	if len(active) != 1 || active[0].Path != `D:\active.jpg` {
-		t.Fatalf("active files = %#v, want only active row", active)
+		t.Fatalf("active files = %#v, want only non-deleting active row", active)
 	}
 	features, err := db.LoadImageFeatures(ctx, []string{shaText})
 	if err != nil {

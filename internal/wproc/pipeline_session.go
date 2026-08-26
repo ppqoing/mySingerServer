@@ -371,7 +371,8 @@ func matchesSessionDispatchedFile(info os.FileInfo, job *worker.JobMsg) bool {
 		return false
 	}
 	if job.Phase == worker.Phase2 {
-		return info.ModTime().UnixMilli() == job.MTimeMS
+		// MTimeMS carries Unix seconds despite its name (see worker.JobMsg).
+		return info.ModTime().Unix() == job.MTimeMS
 	}
 	return info.ModTime().Unix() == job.MTimeUnix
 }
@@ -508,6 +509,8 @@ func sessionPipelineMergeAnalysis(result *worker.JobResultMsg, job *worker.JobMs
 	if analysisFields&worker.MaskImagePDQ != 0 && analysis.ImageStatus == videocore.StatusOK {
 		result.PDQ = append([]byte(nil), analysis.ImageFeatures.PDQ[:]...)
 		result.Quality = int32(analysis.ImageFeatures.PDQQuality)
+		result.Width = int32(analysis.ImageWidth)
+		result.Height = int32(analysis.ImageHeight)
 		result.FieldsDone |= worker.MaskImagePDQ
 	}
 	if analysisFields&worker.MaskPHashParts != 0 && analysis.ImageStatus == videocore.StatusOK {
@@ -591,7 +594,11 @@ func sessionPipelineFileError(result *worker.JobResultMsg, fields uint32, stage 
 	if fields == 0 {
 		fields = 1
 	}
-	result.Errors = append(result.Errors, worker.FieldError{Field: fields, Stage: stage, Msg: err.Error()})
+	for bit := uint32(1); bit != 0; bit <<= 1 {
+		if fields&bit != 0 {
+			result.Errors = append(result.Errors, worker.FieldError{Field: bit, Stage: stage, Msg: err.Error()})
+		}
+	}
 	return result
 }
 
@@ -624,8 +631,7 @@ func sessionPipelineStale(result *worker.JobResultMsg, job *worker.JobMsg, paths
 	if job.Phase == worker.Phase2 && len(job.KnownSHA) == 64 {
 		result.SHA512 = append([]byte(nil), job.KnownSHA...)
 	}
-	result.Errors = append(result.Errors, worker.FieldError{Field: job.FieldsMask, Stage: "stale", Msg: "media file changed"})
-	return result
+	return sessionPipelineFileError(result, job.FieldsMask, "stale", errors.New("media file changed"))
 }
 
 func clearSessionPipelineResult(result *worker.JobResultMsg) {

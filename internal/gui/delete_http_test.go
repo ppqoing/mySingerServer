@@ -9,21 +9,26 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"dedup/internal/proto"
 )
 
 type deleteHTTPStub struct {
-	prepareFn func(context.Context, []int64) (DeleteSummary, string, error)
-	executeFn func(context.Context, string, string) (string, error)
-	statusFn  func(string) (DeleteTaskStatus, bool)
+	prepareFn  func(context.Context, []int64) (DeleteSummary, string, error)
+	executeFn  func(context.Context, string, string) (string, error)
+	statusFn   func(string) (DeleteTaskStatus, bool)
+	listFn     func(context.Context, int) []DeleteTaskSummary
+	consumedFn func(string) (string, bool)
 
 	prepareCalls int
 	executeCalls int
 	statusCalls  int
+	listCalls    int
 	gotIDs       []int64
 	gotToken     string
 	gotMode      string
+	gotListLimit int
 }
 
 func (stub *deleteHTTPStub) Prepare(
@@ -58,6 +63,25 @@ func (stub *deleteHTTPStub) Status(taskID string) (DeleteTaskStatus, bool) {
 		return DeleteTaskStatus{}, false
 	}
 	return stub.statusFn(taskID)
+}
+
+func (stub *deleteHTTPStub) ListTasks(
+	ctx context.Context,
+	limit int,
+) []DeleteTaskSummary {
+	stub.listCalls++
+	stub.gotListLimit = limit
+	if stub.listFn == nil {
+		return []DeleteTaskSummary{}
+	}
+	return stub.listFn(ctx, limit)
+}
+
+func (stub *deleteHTTPStub) ConsumedTaskID(token string) (string, bool) {
+	if stub.consumedFn == nil {
+		return "", false
+	}
+	return stub.consumedFn(token)
 }
 
 func deleteHTTPResponse(
@@ -556,7 +580,6 @@ func TestDeleteHTTPStatusValidatesCanonicalTaskAndReturnsFullSafeStatus(t *testi
 	api := NewAPI(nil, nil, nil)
 	api.delete = stub
 	for _, badID := range []string{
-		"",
 		"not-a-uuid",
 		"B7B0BA1C-1EC1-4BE4-B769-CBE40607FE25",
 		"{b7b0ba1c-1ec1-4be4-b769-cbe40607fe25}",
@@ -773,5 +796,254 @@ func TestDeleteHTTPSetDeleteServiceNilClearsAllRoutes(t *testing.T) {
 				t.Fatalf("payload=%v", payload)
 			}
 		})
+	}
+}
+
+func TestDeleteHTTPTaskListReturnsSummariesInServiceOrder(t *testing.T) {
+	createdOld := time.Date(2026, 8, 14, 10, 0, 0, 0, time.UTC)
+	createdNew := time.Date(2026, 8, 14, 11, 0, 0, 0, time.UTC)
+	summaries := []DeleteTaskSummary{
+		{
+			TaskID: "b7b0ba1c-1ec1-4be4-b769-cbe40607fe25", Mode: proto.ModeSoft,
+			Total: 3, OK: 1, Failed: 1, Uncertain: 1, Pending: 1,
+			CreatedAt: createdOld,
+		},
+		{
+			TaskID: "c8c1cb2d-2fd2-5cf5-c870-dcf51718df36", Mode: proto.ModeHard,
+			Total: 2, OK: 2, Complete: true,
+			CreatedAt: createdNew,
+		},
+	}
+	stub := &deleteHTTPStub{
+		listFn: func(_ context.Context, limit int) []DeleteTaskSummary {
+			if limit != deleteTaskListLimit {
+				t.Fatalf("ListTasks limit=%d, want %d", limit, deleteTaskListLimit)
+			}
+			return summaries
+		},
+	}
+	api := NewAPI(nil, nil, nil)
+	api.delete = stub
+
+	for _, target := range []string{"/api/delete/tasks", "/api/delete/tasks/"} {
+		response := deleteHTTPResponse(api, http.MethodGet, target, "", "")
+		if response.Code != http.StatusOK {
+			t.Fatalf("%s status=%d body=%s", target, response.Code, response.Body.String())
+		}
+		var payload struct {
+			Tasks []DeleteTaskSummary `json:"tasks"`
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("%s body is not JSON: %v", target, err)
+		}
+		if !reflect.DeepEqual(payload.Tasks, summaries) {
+			t.Fatalf("%s tasks=%#v, want %#v", target, payload.Tasks, summaries)
+		}
+		// The list view carries counts only: no problem detail, no raw errors.
+		if strings.Contains(response.Body.String(), "problems") ||
+			strings.Contains(response.Body.String(), "error_message") {
+			t.Fatalf("%s list leaked problem detail: %s", target, response.Body.String())
+		}
+	}
+	if stub.listCalls != 2 {
+		t.Fatalf("ListTasks calls=%d, want 2", stub.listCalls)
+	}
+}
+
+func TestDeleteHTTPTaskListUnavailableWithoutServiceAndEmptyIsArray(t *testing.T) {
+	for _, target := range []string{"/api/delete/tasks", "/api/delete/tasks/"} {
+		response := deleteHTTPResponse(NewAPI(nil, nil, nil), http.MethodGet, target, "", "")
+		if response.Code != http.StatusServiceUnavailable {
+			t.Fatalf("%s nil service status=%d body=%s", target, response.Code, response.Body.String())
+		}
+		assertDeleteJSONResponse(t, response)
+	}
+
+	api := NewAPI(nil, nil, nil)
+	api.delete = &deleteHTTPStub{}
+	response := deleteHTTPResponse(api, http.MethodGet, "/api/delete/tasks", "", "")
+	if response.Code != http.StatusOK {
+		t.Fatalf("empty list status=%d body=%s", response.Code, response.Body.String())
+	}
+	if got := strings.TrimSpace(response.Body.String()); got != `{"tasks":[]}` {
+		t.Fatalf("empty list body=%s, want {\"tasks\":[]}", got)
+	}
+}
+
+func TestDeleteHTTPExecuteReplayReturnsFirstTaskWithOK(t *testing.T) {
+	const token = "abcdefghijklmnopqrstuv"
+	const taskID = "b7b0ba1c-1ec1-4be4-b769-cbe40607fe25"
+	stub := &deleteHTTPStub{
+		executeFn: func(context.Context, string, string) (string, error) {
+			return "", ErrConfirmationConsumed
+		},
+		consumedFn: func(got string) (string, bool) {
+			if got != token {
+				t.Fatalf("ConsumedTaskID token=%q", got)
+			}
+			return taskID, true
+		},
+	}
+	api := NewAPI(nil, nil, nil)
+	api.delete = stub
+
+	response := deleteHTTPResponse(
+		api,
+		http.MethodPost,
+		"/api/delete/execute",
+		"application/json",
+		`{"confirm_token":"`+token+`","mode":"soft"}`,
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf("replay status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	var payload map[string]string
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(payload, map[string]string{"task_id": taskID}) {
+		t.Fatalf("replay payload=%v", payload)
+	}
+	if strings.Contains(response.Body.String(), token) {
+		t.Fatalf("replay leaked token: %s", response.Body.String())
+	}
+
+	// Consumed tokens without a recorded first task keep the legacy 409.
+	stub.consumedFn = nil
+	response = deleteHTTPResponse(
+		api,
+		http.MethodPost,
+		"/api/delete/execute",
+		"application/json",
+		`{"confirm_token":"`+token+`"}`,
+	)
+	if response.Code != http.StatusConflict {
+		t.Fatalf("untracked replay status=%d body=%s, want 409", response.Code, response.Body.String())
+	}
+	assertDeleteJSONResponse(t, response)
+}
+
+func TestDeleteHTTPExecuteReplayEndToEndAndExpiredStaysBadRequest(t *testing.T) {
+	transport := &deleteTestTransport{
+		online:      map[string]bool{"machine": true},
+		onlineCalls: make(map[string]int),
+		sendErrors:  make(map[string]error),
+	}
+	service, token := newDeleteTestService(t, []DeleteMember{{
+		FileID: 1, MachineID: "machine", Path: `Z:\one`, Size: 1,
+	}}, transport)
+	api := NewAPI(nil, nil, nil)
+	api.SetDeleteService(service)
+
+	body := `{"confirm_token":"` + token + `","mode":"soft"}`
+	first := deleteHTTPResponse(api, http.MethodPost, "/api/delete/execute", "application/json", body)
+	if first.Code != http.StatusAccepted {
+		t.Fatalf("first execute status=%d body=%s", first.Code, first.Body.String())
+	}
+	var firstPayload map[string]string
+	if err := json.Unmarshal(first.Body.Bytes(), &firstPayload); err != nil {
+		t.Fatal(err)
+	}
+
+	replay := deleteHTTPResponse(api, http.MethodPost, "/api/delete/execute", "application/json", body)
+	if replay.Code != http.StatusOK {
+		t.Fatalf("replay status=%d body=%s, want 200", replay.Code, replay.Body.String())
+	}
+	var replayPayload map[string]string
+	if err := json.Unmarshal(replay.Body.Bytes(), &replayPayload); err != nil {
+		t.Fatal(err)
+	}
+	if replayPayload["task_id"] == "" || replayPayload["task_id"] != firstPayload["task_id"] {
+		t.Fatalf("replay task_id=%q, want %q", replayPayload["task_id"], firstPayload["task_id"])
+	}
+	if len(transport.sends) != 1 {
+		t.Fatalf("replay redispatched: sends=%#v", transport.sends)
+	}
+
+	// Tokens that never existed still fail as invalid confirmations.
+	unknown := deleteHTTPResponse(
+		api,
+		http.MethodPost,
+		"/api/delete/execute",
+		"application/json",
+		`{"confirm_token":"abcdefghijklmnopqrstuv"}`,
+	)
+	if unknown.Code != http.StatusBadRequest {
+		t.Fatalf("unknown token status=%d body=%s, want 400", unknown.Code, unknown.Body.String())
+	}
+
+	// Expired tokens still fail as bad request, not as idempotent replays.
+	now := time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC)
+	confirms := NewConfirmStore(time.Minute, func() time.Time { return now })
+	expiredToken, _, err := confirms.Create([]DeleteMember{{
+		FileID: 2, MachineID: "machine", Path: `Z:\two`, Size: 1,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(2 * time.Minute)
+	expiringService := NewDeleteService(nil, transport, confirms, nil)
+	expiringAPI := NewAPI(nil, nil, nil)
+	expiringAPI.SetDeleteService(expiringService)
+	expired := deleteHTTPResponse(
+		expiringAPI,
+		http.MethodPost,
+		"/api/delete/execute",
+		"application/json",
+		`{"confirm_token":"`+expiredToken+`"}`,
+	)
+	if expired.Code != http.StatusBadRequest {
+		t.Fatalf("expired token status=%d body=%s, want 400", expired.Code, expired.Body.String())
+	}
+}
+
+func TestDeleteHTTPStatusPassesRecycledToThrough(t *testing.T) {
+	const taskID = "b7b0ba1c-1ec1-4be4-b769-cbe40607fe25"
+	source := DeleteTaskStatus{
+		TaskID:   taskID,
+		Mode:     proto.ModeSoft,
+		Total:    1,
+		OK:       1,
+		Complete: true,
+		ByMachine: map[string]DeleteMachineStatus{
+			"machine-a": {
+				MachineID: "machine-a",
+				Total:     1,
+				OK:        1,
+				Complete:  true,
+				Sequences: map[uint32]DeleteSequenceStatus{
+					0: {Sequence: 0, Received: true, Total: 1, OK: 1},
+				},
+				RecycledTo: map[string]string{
+					`D:\dupes\song.flac`: `D:\RecycleBin\2026-08-14\song.flac`,
+				},
+			},
+		},
+		ErrorCodes: map[string]int64{},
+	}
+	stub := &deleteHTTPStub{
+		statusFn: func(string) (DeleteTaskStatus, bool) {
+			return source, true
+		},
+	}
+	api := NewAPI(nil, nil, nil)
+	api.delete = stub
+
+	response := deleteHTTPResponse(api, http.MethodGet, "/api/delete/tasks/"+taskID, "", "")
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var got DeleteTaskStatus
+	if err := json.Unmarshal(response.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.ByMachine["machine-a"].RecycledTo[`D:\dupes\song.flac`] !=
+		`D:\RecycleBin\2026-08-14\song.flac` {
+		t.Fatalf("recycled_to lost: %#v", got.ByMachine["machine-a"].RecycledTo)
+	}
+	// The handler must not mutate the service state.
+	if source.ByMachine["machine-a"].RecycledTo[`D:\dupes\song.flac`] !=
+		`D:\RecycleBin\2026-08-14\song.flac` {
+		t.Fatalf("handler mutated service status: %#v", source.ByMachine["machine-a"].RecycledTo)
 	}
 }

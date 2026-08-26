@@ -1,6 +1,8 @@
 package gui
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"sync"
@@ -11,9 +13,11 @@ import (
 const analysisUnavailable = "firstscreen analysis unavailable"
 
 // AnalysisRunner is the narrow boundary between the GUI HTTP lifecycle and
-// one configured first-screen analysis run.
+// one configured first-screen analysis run. The ctx is the per-run
+// cancellation scope: POST /api/analysis/firstscreen/cancel cancels it, and
+// implementations layer it on top of the process shutdown context.
 type AnalysisRunner interface {
-	Run() (*firstscreen.RunStats, error)
+	Run(ctx context.Context) (*firstscreen.RunStats, error)
 }
 
 type analysisStatus struct {
@@ -32,6 +36,7 @@ type AnalysisHandlers struct {
 	closing bool
 	running bool
 	runDone chan struct{}
+	cancel  context.CancelFunc
 	last    *firstscreen.RunStats
 	lastErr string
 }
@@ -55,6 +60,7 @@ func (h *AnalysisHandlers) SetSuccessHook(hook func() error) {
 
 func (h *AnalysisHandlers) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/analysis/firstscreen/run", h.handleRun)
+	mux.HandleFunc("POST /api/analysis/firstscreen/cancel", h.handleCancel)
 	mux.HandleFunc("GET /api/analysis/firstscreen/status", h.handleStatus)
 }
 
@@ -83,15 +89,43 @@ func (h *AnalysisHandlers) handleRun(response http.ResponseWriter, _ *http.Reque
 	}
 	h.running = true
 	h.runDone = make(chan struct{})
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	h.cancel = cancelRun
 	h.mu.Unlock()
 
-	go h.execute()
+	go h.execute(runCtx)
 	writeJSON(response, http.StatusAccepted, map[string]string{
 		"status": "started",
 	})
 }
 
-func (h *AnalysisHandlers) execute() {
+// handleCancel 取消当前运行的分析：无运行中任务 409，runner 未配置 503。
+// 取消幂等——运行未结束前重复调用重复触发同一取消信号。
+func (h *AnalysisHandlers) handleCancel(response http.ResponseWriter, _ *http.Request) {
+	h.mu.Lock()
+	cancel := h.cancel
+	running := h.running
+	runnerConfigured := h.runner != nil
+	h.mu.Unlock()
+	if !runnerConfigured {
+		writeJSON(response, http.StatusServiceUnavailable, map[string]string{
+			"error": analysisUnavailable,
+		})
+		return
+	}
+	if !running || cancel == nil {
+		writeJSON(response, http.StatusConflict, map[string]string{
+			"error": "没有正在运行的分析",
+		})
+		return
+	}
+	cancel()
+	writeJSON(response, http.StatusOK, map[string]string{
+		"status": "cancelling",
+	})
+}
+
+func (h *AnalysisHandlers) execute(ctx context.Context) {
 	var (
 		stats *firstscreen.RunStats
 		err   error
@@ -105,9 +139,14 @@ func (h *AnalysisHandlers) execute() {
 		h.mu.Lock()
 		defer h.mu.Unlock()
 		h.running = false
+		h.cancel = nil
 		h.last = cloneRunStats(stats)
 		if err != nil {
-			h.lastErr = err.Error()
+			if errors.Is(err, context.Canceled) {
+				h.lastErr = "已取消"
+			} else {
+				h.lastErr = err.Error()
+			}
 		} else {
 			h.lastErr = ""
 		}
@@ -115,7 +154,7 @@ func (h *AnalysisHandlers) execute() {
 		h.runDone = nil
 	}()
 
-	stats, err = h.runner.Run()
+	stats, err = h.runner.Run(ctx)
 	if err != nil {
 		return
 	}

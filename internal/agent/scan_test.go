@@ -1105,6 +1105,148 @@ func TestScanDrainsStaleCrashBeforeActiveTerminalAndCompletesRoute(t *testing.T)
 	}
 }
 
+func TestScanManagerCancelUnknownTask(t *testing.T) {
+	manager, cleanup := newTestScanManager(t, nil, nil)
+	defer cleanup()
+	cancelled, stats := manager.Cancel("no-such-task")
+	if cancelled || stats != nil {
+		t.Fatalf("Cancel unknown task = (%v, %#v), want (false, nil)", cancelled, stats)
+	}
+}
+
+func TestScanManagerCancelStopsRunningScanAndReportsDoneStatsAfterwards(t *testing.T) {
+	hashStarted := make(chan struct{})
+	releaseHash := make(chan struct{})
+	var once sync.Once
+	hasher := hasherFunc(func(string) (string, error) {
+		once.Do(func() { close(hashStarted) })
+		<-releaseHash
+		return "hash", nil
+	})
+	enumr := &fakeEnumerator{records: map[string][]fileenum.FileRecord{
+		`D:\media`: {
+			{Path: `D:\media\a.bin`, Size: 1, MTime: 100},
+			{Path: `D:\media\b.bin`, Size: 1, MTime: 100},
+		},
+	}}
+	manager, cleanup := newTestScanManager(t, enumr, hasher)
+	defer cleanup()
+
+	done := make(chan proto.TaskDone, 1)
+	task := proto.ScanTask{TaskID: "task-cancel", Roots: []string{`D:\media`}, Phase: 1}
+	if ack := manager.Handle(task, captureTaskDone(done)); !ack.Accepted {
+		t.Fatalf("ack = %#v", ack)
+	}
+	select {
+	case <-hashStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("hash did not start")
+	}
+	cancelled, stats := manager.Cancel("task-cancel")
+	if !cancelled || stats != nil {
+		t.Fatalf("Cancel running = (%v, %#v), want (true, nil)", cancelled, stats)
+	}
+	// Repeated cancel of a task still unwinding is idempotent.
+	again, againStats := manager.Cancel("task-cancel")
+	if !again || againStats != nil {
+		t.Fatalf("repeated Cancel = (%v, %#v), want (true, nil)", again, againStats)
+	}
+	close(releaseHash)
+	select {
+	case result := <-done:
+		if result.TaskID != "task-cancel" || result.Reason != "cancelled" {
+			t.Fatalf("TaskDone = %#v", result)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelled scan did not emit its terminal receipt")
+	}
+	// After completion the same task id reports its final stats instead of
+	// accepting another cancel.
+	after, afterStats := manager.Cancel("task-cancel")
+	if after || afterStats == nil {
+		t.Fatalf("post-completion Cancel = (%v, %#v), want (false, stats)", after, afterStats)
+	}
+}
+
+func TestScanManagerCancelBeforeStartSkipsEnumeration(t *testing.T) {
+	enumr := &fakeEnumerator{records: map[string][]fileenum.FileRecord{
+		`D:\media`: {{Path: `D:\media\a.bin`, Size: 1, MTime: 100}},
+	}}
+	manager, cleanup := newTestScanManager(t, enumr, nil)
+	defer cleanup()
+	done := make(chan proto.TaskDone, 1)
+	task := proto.ScanTask{TaskID: "task-pre-cancel", Roots: []string{`D:\media`}, Phase: 1}
+	ack, start := manager.Prepare(task, captureTaskDone(done))
+	if !ack.Accepted {
+		t.Fatalf("prepared ack = %#v", ack)
+	}
+	cancelled, stats := manager.Cancel("task-pre-cancel")
+	if !cancelled || stats != nil {
+		t.Fatalf("Cancel = (%v, %#v), want (true, nil)", cancelled, stats)
+	}
+	start()
+	select {
+	case result := <-done:
+		if result.Reason != "cancelled" {
+			t.Fatalf("TaskDone reason = %q, want cancelled", result.Reason)
+		}
+		if result.Stats.ScanErrors != 0 || result.Stats.Total != 0 {
+			t.Fatalf("cancelled-before-start stats = %#v, want zero work and no scan error", result.Stats)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelled scan did not reach its terminal receipt")
+	}
+	if enumr.callCount() != 0 {
+		t.Fatalf("enumerator ran after cancellation: %d calls", enumr.callCount())
+	}
+}
+
+func TestScanManagerCancelDuringEnumerationAbortsWithoutScanError(t *testing.T) {
+	enumStarted := make(chan struct{})
+	var manager *ScanManager
+	var once sync.Once
+	enumr := &fakeEnumerator{
+		records: map[string][]fileenum.FileRecord{
+			`D:\media`: {
+				{Path: `D:\media\a.bin`, Size: 1, MTime: 100},
+				{Path: `D:\media\b.bin`, Size: 1, MTime: 100},
+			},
+		},
+		onRecord: func(fileenum.FileRecord) {
+			once.Do(func() {
+				close(enumStarted)
+				manager.Cancel("task-enum-cancel")
+			})
+		},
+	}
+	var cleanup func()
+	manager, cleanup = newTestScanManager(t, enumr, nil)
+	defer cleanup()
+	done := make(chan proto.TaskDone, 1)
+	task := proto.ScanTask{TaskID: "task-enum-cancel", Roots: []string{`D:\media`}, Phase: 1}
+	if ack := manager.Handle(task, captureTaskDone(done)); !ack.Accepted {
+		t.Fatalf("ack = %#v", ack)
+	}
+	select {
+	case <-enumStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("enumeration did not start")
+	}
+	select {
+	case result := <-done:
+		// The cancel landed before the first record visit, so no record was
+		// enumerated and the interruption is not counted as a scan error.
+		if result.Reason != "cancelled" {
+			t.Fatalf("TaskDone reason = %q, want cancelled", result.Reason)
+		}
+		if result.Stats.ScanErrors != 0 || result.Stats.Total != 0 {
+			t.Fatalf("cancel-during-enum stats = %#v, want zero work and no scan error", result.Stats)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelled scan did not finish")
+	}
+}
+
 type fakeScanPool struct {
 	mu        sync.Mutex
 	submitted []worker.JobMsg
@@ -1214,6 +1356,9 @@ type fakeEnumerator struct {
 	calls   int
 	records map[string][]fileenum.FileRecord
 	errors  map[string]error
+	// onRecord, when set, runs before each record is handed to visit; tests
+	// use it to trigger cancellation mid-enumeration.
+	onRecord func(fileenum.FileRecord)
 }
 
 func (f *fakeEnumerator) Name() string     { return "fake" }
@@ -1224,6 +1369,9 @@ func (f *fakeEnumerator) Enum(root string, visit func(fileenum.FileRecord) error
 	records := append([]fileenum.FileRecord(nil), f.records[root]...)
 	f.mu.Unlock()
 	for _, record := range records {
+		if f.onRecord != nil {
+			f.onRecord(record)
+		}
 		if err := visit(record); err != nil {
 			return err
 		}

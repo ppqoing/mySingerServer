@@ -111,7 +111,7 @@ func assertRealPhase2Video(t *testing.T, ffmpeg, path string, durationMS int64) 
 	job := &worker.JobMsg{
 		JobID: 701, Path: path, Kind: worker.MediaVideo, Phase: worker.Phase2,
 		FieldsMask: worker.MaskVideo6F, Size: info.Size(),
-		MTimeMS: info.ModTime().UnixMilli(), KnownSHA: hasher.Sum(nil),
+		MTimeMS: info.ModTime().Unix(), KnownSHA: hasher.Sum(nil),
 		DurationMS: durationMS,
 	}
 	result, err := processPhase2WithDeps(

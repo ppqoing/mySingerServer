@@ -102,13 +102,19 @@ func newPooledAnalysisRunner(
 	}
 }
 
-func (r *pooledAnalysisRunner) Run() (*firstscreen.RunStats, error) {
-	conn, err := r.pool.Acquire(r.shutdownContext)
+func (r *pooledAnalysisRunner) Run(ctx context.Context) (*firstscreen.RunStats, error) {
+	// Per-run 取消（HTTP cancel 端点）叠加在进程 shutdownContext 之上：
+	// 任一触发都中止本次分析；shutdown 仍是最终兜底。
+	runCtx, cancel := context.WithCancel(r.shutdownContext)
+	defer cancel()
+	stop := context.AfterFunc(ctx, cancel)
+	defer stop()
+	conn, err := r.pool.Acquire(runCtx)
 	if err != nil {
 		return nil, fmt.Errorf("firstscreen: acquire dedicated connection: %w", err)
 	}
 	defer conn.Release()
-	return r.factory(conn.Conn(), r.cfg, r.logger).Run(r.shutdownContext)
+	return r.factory(conn.Conn(), r.cfg, r.logger).Run(runCtx)
 }
 
 func firstScreenConfig(cfg config.FirstScreenConfig) firstscreen.Config {

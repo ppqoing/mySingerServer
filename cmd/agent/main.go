@@ -138,13 +138,6 @@ func logEverythingRootFallback(logger *slog.Logger, root string, _ error) {
 	logger.Warn("everything root unavailable, fallback to walker", "path_id", worker.PathID(root), "error_code", "everything_root_fallback")
 }
 
-func runWithDeleteLogger(
-	configPath string,
-	openDeleteLogger deleteLoggerFactory,
-) error {
-	return runWithDependencies(configPath, openDeleteLogger, machineid.Current)
-}
-
 func runWithDependencies(
 	configPath string,
 	openDeleteLogger deleteLoggerFactory,
@@ -746,7 +739,7 @@ func (h *agentLocalHandler) HandleLocal(ctx context.Context, request proto.Local
 
 type localAnalysisRunner interface {
 	Run(context.Context, string) error
-	RunWithProgress(context.Context, string, func(int) error) error
+	RunWithProgressForRoots(context.Context, string, []string, func(int) error) error
 }
 
 type localScanRunner interface {
@@ -793,7 +786,8 @@ func (r *agentLocalTaskRunner) Run(ctx context.Context, request localtask.Create
 		stage = 1
 	}
 	if request.Mode == proto.LocalTaskModeScanThenAnalysis && stage < 3 {
-		if err := r.analysis.RunWithProgress(ctx, request.TaskID, advance); err != nil {
+		roots := append([]string(nil), request.Roots...)
+		if err := r.analysis.RunWithProgressForRoots(ctx, request.TaskID, roots, advance); err != nil {
 			return err
 		}
 		return advance(3)

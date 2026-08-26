@@ -189,10 +189,17 @@ func (d *Dispatcher) BuildTasks(
 		if !firstOK || !secondOK {
 			continue
 		}
-		if err := validateSelectedIdentity(kind, pair[0], firstCopy, snapshot.Features[pair[0]]); err != nil {
+		// A missing or corrupt duration metadata makes the pair unusable for
+		// frame comparison; skip the pair instead of aborting the whole batch.
+		if kind == proto.KindVideo &&
+			(snapshot.Features[pair[0]].DurationMS <= 0 ||
+				snapshot.Features[pair[1]].DurationMS <= 0) {
+			continue
+		}
+		if err := validateSelectedIdentity(pair[0], firstCopy); err != nil {
 			return nil, err
 		}
-		if err := validateSelectedIdentity(kind, pair[1], secondCopy, snapshot.Features[pair[1]]); err != nil {
+		if err := validateSelectedIdentity(pair[1], secondCopy); err != nil {
 			return nil, err
 		}
 		for _, entry := range []struct {
@@ -456,10 +463,8 @@ func buildItem(
 }
 
 func validateSelectedIdentity(
-	kind uint8,
 	sha string,
 	copy fileCopy,
-	state featureState,
 ) error {
 	if copy.MachineID == "" || copy.Path == "" ||
 		!isCanonicalSHA512(sha) ||
@@ -473,12 +478,6 @@ func validateSelectedIdentity(
 		return fmt.Errorf(
 			"phase2: invalid selected file status %q for %s",
 			copy.Status,
-			sha,
-		)
-	}
-	if kind == proto.KindVideo && state.DurationMS <= 0 {
-		return fmt.Errorf(
-			"phase2: video duration must be positive for %s",
 			sha,
 		)
 	}

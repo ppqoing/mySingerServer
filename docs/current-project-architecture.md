@@ -3,6 +3,7 @@
 > 文档日期：2026-08-04  
 > 基线：当前工作区源码快照  
 > 定位：描述现在已经实现的工程结构；`docs/architecture-plan.md` 保留为早期架构选型和演进计划。
+> 目标结构：各 EXE 的分层重构目标见 [`docs/superpowers/specs/2026-08-08-executable-target-layered-architecture-design.md`](superpowers/specs/2026-08-08-executable-target-layered-architecture-design.md)。
 
 ## 1. 系统定位
 

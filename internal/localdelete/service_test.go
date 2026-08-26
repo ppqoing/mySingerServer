@@ -126,13 +126,34 @@ type fakeDeleteStore struct {
 	selection store.CommittedDeletion
 	committed []store.DeletionResult
 	batch     store.DeletionBatch
+	begun     bool
+	beginErr  error
+	commitErr error
+	events    *[]string
 }
 
 func (fake *fakeDeleteStore) LoadCommittedDeletion(context.Context, string, string, string) (store.CommittedDeletion, error) {
 	return fake.selection, nil
 }
 
+func (fake *fakeDeleteStore) BeginDeletionBatch(_ context.Context, _ string, _ store.CommittedDeletion, _ string) error {
+	if fake.events != nil {
+		*fake.events = append(*fake.events, "begin")
+	}
+	if fake.beginErr != nil {
+		return fake.beginErr
+	}
+	fake.begun = true
+	return nil
+}
+
 func (fake *fakeDeleteStore) CommitDeletionResults(_ context.Context, _ string, results []store.DeletionResult) error {
+	if fake.events != nil {
+		*fake.events = append(*fake.events, "commit")
+	}
+	if fake.commitErr != nil {
+		return fake.commitErr
+	}
 	fake.committed = append([]store.DeletionResult(nil), results...)
 	fake.batch = store.DeletionBatch{BatchID: results[0].BatchID, Requested: len(results)}
 	for _, result := range results {
@@ -163,10 +184,14 @@ type fakeDeleteHelper struct {
 	results map[string]proto.DeleteResult
 	err     error
 	calls   int
+	events  *[]string
 }
 
 func (fake *fakeDeleteHelper) Execute(_ context.Context, task proto.DeleteTask) ([]proto.DeleteReport, error) {
 	fake.calls++
+	if fake.events != nil {
+		*fake.events = append(*fake.events, "helper")
+	}
 	entries := make([]proto.DeleteResult, 0, len(task.Entries))
 	for _, path := range task.Entries {
 		result, ok := fake.results[path]
@@ -176,6 +201,57 @@ func (fake *fakeDeleteHelper) Execute(_ context.Context, task proto.DeleteTask) 
 		entries = append(entries, result)
 	}
 	return []proto.DeleteReport{{TaskID: task.TaskID, Entries: entries}}, fake.err
+}
+
+func TestDeleteExecutePersistsIntentBeforeHelper(t *testing.T) {
+	selection := deletionFixture(t, 1)
+	events := []string{}
+	backend := &fakeDeleteStore{selection: selection, events: &events}
+	helper := &fakeDeleteHelper{events: &events}
+	service := NewService("machine-a", backend, helper)
+	preview, err := service.Prepare(context.Background(), DeleteSelection{RunID: "run-1", GroupID: "group-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Execute(context.Background(), DeleteExecution{BatchID: preview.BatchID, SelectionDigest: preview.SelectionDigest, Token: preview.Token}); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"begin", "helper", "commit"}
+	if len(events) != len(want) || events[0] != want[0] || events[1] != want[1] || events[2] != want[2] {
+		t.Fatalf("delete events=%v, want %v", events, want)
+	}
+}
+
+func TestDeleteExecuteDoesNotCallHelperWhenIntentFails(t *testing.T) {
+	selection := deletionFixture(t, 1)
+	beginErr := errors.New("begin failed")
+	backend := &fakeDeleteStore{selection: selection, beginErr: beginErr}
+	helper := &fakeDeleteHelper{}
+	service := NewService("machine-a", backend, helper)
+	preview, err := service.Prepare(context.Background(), DeleteSelection{RunID: "run-1", GroupID: "group-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.Execute(context.Background(), DeleteExecution{BatchID: preview.BatchID, SelectionDigest: preview.SelectionDigest, Token: preview.Token})
+	if !errors.Is(err, beginErr) || helper.calls != 0 {
+		t.Fatalf("execute error=%v helper calls=%d", err, helper.calls)
+	}
+}
+
+func TestDeleteExecuteKeepsIntentWhenResultCommitFails(t *testing.T) {
+	selection := deletionFixture(t, 1)
+	commitErr := errors.New("commit failed")
+	backend := &fakeDeleteStore{selection: selection, commitErr: commitErr}
+	helper := &fakeDeleteHelper{}
+	service := NewService("machine-a", backend, helper)
+	preview, err := service.Prepare(context.Background(), DeleteSelection{RunID: "run-1", GroupID: "group-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.Execute(context.Background(), DeleteExecution{BatchID: preview.BatchID, SelectionDigest: preview.SelectionDigest, Token: preview.Token})
+	if !errors.Is(err, commitErr) || !backend.begun || helper.calls != 1 {
+		t.Fatalf("execute error=%v begun=%t helper calls=%d", err, backend.begun, helper.calls)
+	}
 }
 
 func TestDeletePreparedTokenExpires(t *testing.T) {

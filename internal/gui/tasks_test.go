@@ -244,3 +244,163 @@ func TestTaskRegistryDoesNotRegisterWhenInitialPersistenceFails(t *testing.T) {
 func testLogger() *slog.Logger {
 	return slog.New(slog.NewJSONHandler(&bytes.Buffer{}, nil))
 }
+
+func TestTaskRegistryCancelLifecycle(t *testing.T) {
+	registry := NewTaskRegistry(nil, testLogger())
+	if err := registry.Register(&TaskInfo{
+		TaskID: "task-cancel", MachineID: "machine-a", Phase: 1,
+		Roots: []string{`D:\media`}, Status: "running",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	task, already, err := registry.BeginCancel("task-cancel")
+	if err != nil || already || task.Status != "cancelling" ||
+		task.MachineID != "machine-a" {
+		t.Fatalf("BeginCancel = (%#v, %v, %v)", task, already, err)
+	}
+	// 重复取消幂等：已处于 cancelling 时无需重发消息。
+	if _, already, err = registry.BeginCancel("task-cancel"); err != nil || !already {
+		t.Fatalf("second BeginCancel = (_, %v, %v)", already, err)
+	}
+	// 取消展开期间的迟到进度只更新计数，不回退可见状态。
+	registry.Dispatch("machine-a", &proto.TaskProgress{
+		TaskID: "task-cancel", Done: 3, Total: 9,
+	})
+	if got := registry.List()[0]; got.Status != "cancelling" || got.Done != 3 {
+		t.Fatalf("progress during cancel = %#v", got)
+	}
+	// 迟到的 accepted 应答同样不能回退 cancelling。
+	registry.Dispatch("machine-a", &proto.TaskAck{
+		TaskID: "task-cancel", Accepted: true, Reason: "accepted", Total: 9,
+	})
+	if got := registry.List()[0]; got.Status != "cancelling" {
+		t.Fatalf("ack during cancel regressed = %#v", got)
+	}
+	// 终态回执收口为 failed + ack_reason=cancelled，统计照常落账。
+	registry.Dispatch("machine-a", &proto.TaskDone{
+		TaskID: "task-cancel", Reason: "cancelled",
+		Stats: proto.TaskStats{Total: 9, Done: 3, Skipped: 6},
+	})
+	got := registry.List()[0]
+	if got.Status != "failed" || got.AckReason != "cancelled" ||
+		got.Done != 3 || got.Skipped != 6 {
+		t.Fatalf("cancelled terminal = %#v", got)
+	}
+	if got := registry.PendingScans("machine-a"); len(got) != 0 {
+		t.Fatalf("cancelled task stayed pending: %#v", got)
+	}
+}
+
+func TestTaskRegistryCancelValidatesStateAndRollsBack(t *testing.T) {
+	registry := NewTaskRegistry(nil, testLogger())
+	if _, _, err := registry.BeginCancel("missing"); !errors.Is(err, ErrTaskNotFound) {
+		t.Fatalf("missing BeginCancel err = %v", err)
+	}
+	if err := registry.Register(&TaskInfo{
+		TaskID: "task-done", MachineID: "machine-a", Status: "done",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := registry.BeginCancel("task-done"); !errors.Is(err, ErrTaskTerminal) {
+		t.Fatalf("terminal BeginCancel err = %v", err)
+	}
+	if err := registry.Register(&TaskInfo{
+		TaskID: "task-running", MachineID: "machine-a", Status: "running",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := registry.BeginCancel("task-running"); err != nil {
+		t.Fatal(err)
+	}
+	registry.RollbackCancel("task-running")
+	for _, got := range registry.List() {
+		if got.TaskID == "task-running" && got.Status != "running" {
+			t.Fatalf("rollback status = %#v", got)
+		}
+	}
+	// 回滚只针对 cancelling：已收口的终态不被恢复覆盖。
+	if _, _, err := registry.BeginCancel("task-running"); err != nil {
+		t.Fatal(err)
+	}
+	registry.Dispatch("machine-a", &proto.TaskDone{
+		TaskID: "task-running", Reason: "cancelled",
+		Stats: proto.TaskStats{Total: 2, Done: 1},
+	})
+	registry.RollbackCancel("task-running")
+	for _, got := range registry.List() {
+		if got.TaskID == "task-running" && got.Status != "failed" {
+			t.Fatalf("terminal after cancel was rolled back: %#v", got)
+		}
+	}
+}
+
+// Manager 重启后任务从 PostgreSQL 恢复为 running（无内存 cancelling）；
+// agent 已取消的回执凭 TaskDone.Reason 自描述收口。
+func TestTaskRegistryCancelledReceiptAppliesWithoutInMemoryState(t *testing.T) {
+	registry := NewTaskRegistry(nil, testLogger())
+	if err := registry.Register(&TaskInfo{
+		TaskID: "task-restored", MachineID: "machine-a", Status: "running",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	registry.Dispatch("machine-a", &proto.TaskDone{
+		TaskID: "task-restored", Reason: "cancelled",
+		Stats: proto.TaskStats{Total: 2, Done: 1},
+	})
+	got := registry.List()[0]
+	if got.Status != "failed" || got.AckReason != "cancelled" || got.Done != 1 {
+		t.Fatalf("restored cancel = %#v", got)
+	}
+}
+
+// 取消请求与自然完成竞态：cancelling 期间到达的无 Reason TaskDone 同样
+// 按用户取消意图收口。
+func TestTaskRegistryNaturalDoneDuringCancellingMapsToCancelled(t *testing.T) {
+	registry := NewTaskRegistry(nil, testLogger())
+	if err := registry.Register(&TaskInfo{
+		TaskID: "task-race", MachineID: "machine-a", Status: "running",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := registry.BeginCancel("task-race"); err != nil {
+		t.Fatal(err)
+	}
+	registry.Dispatch("machine-a", &proto.TaskDone{
+		TaskID: "task-race",
+		Stats:  proto.TaskStats{Total: 4, Done: 4},
+	})
+	got := registry.List()[0]
+	if got.Status != "failed" || got.AckReason != "cancelled" {
+		t.Fatalf("natural done during cancelling = %#v", got)
+	}
+}
+
+func TestTaskRegistrySameEnvelopeRetryResetsFailedTask(t *testing.T) {
+	registry := NewTaskRegistry(nil, testLogger())
+	task := &TaskInfo{
+		TaskID: "task-retry", MachineID: "machine-a", Phase: 1,
+		Roots: []string{`D:\one`}, Status: "sent",
+	}
+	if err := registry.Register(task); err != nil {
+		t.Fatal(err)
+	}
+	registry.MarkSendFailed("task-retry", errors.New("connection refused"))
+	if got := registry.List()[0]; got.Status != "failed" {
+		t.Fatalf("status after send failure = %q", got.Status)
+	}
+	if err := registry.Register(cloneTask(task)); err != nil {
+		t.Fatal(err)
+	}
+	got := registry.List()[0]
+	if got.Status != "sent" || got.LastErr != "" {
+		t.Fatalf("retry did not reset the failed task: %#v", got)
+	}
+	// Receipts must flow again after the reset instead of being swallowed by
+	// the terminal status check.
+	registry.Dispatch("machine-a", &proto.TaskAck{TaskID: "task-retry", Accepted: true, Total: 3})
+	registry.Dispatch("machine-a", &proto.TaskProgress{TaskID: "task-retry", Done: 1, Total: 3})
+	got = registry.List()[0]
+	if got.Status != "running" || got.Done != 1 || got.Total != 3 {
+		t.Fatalf("progress after retry was swallowed: %#v", got)
+	}
+}

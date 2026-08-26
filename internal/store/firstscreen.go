@@ -20,10 +20,14 @@ func (d *DB) StreamActiveFiles(ctx context.Context, machineID string, visit func
 		return fmt.Errorf("store: stream active candidates: empty machine ID")
 	}
 	rows, err := d.db.QueryContext(ctx, `
-		SELECT id,machine_id,disk_no,path,size,sha512
-		FROM files
-		WHERE machine_id=?1 AND status!='deleted' AND sha512 IS NOT NULL
-		ORDER BY sha512,id`, machineID)
+		SELECT f.id,f.machine_id,f.disk_no,f.path,f.size,f.sha512
+		FROM files f
+		WHERE f.machine_id=?1 AND f.status!='deleted' AND f.sha512 IS NOT NULL
+		  AND NOT EXISTS (
+		    SELECT 1 FROM local_delete_items d
+		    WHERE d.machine_id=f.machine_id AND d.file_id=f.id
+		      AND d.result IN ('pending','uncertain'))
+		ORDER BY f.sha512,f.id`, machineID)
 	if err != nil {
 		return fmt.Errorf("store: query active candidates: %w", err)
 	}

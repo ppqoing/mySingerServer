@@ -121,6 +121,29 @@ func TestRuntimeHostUsesFrontendRuntimeWireStatesAndRestartHealth(t *testing.T) 
 	}
 }
 
+func TestRuntimeHostReportsLiveAgentStatusFromInstalledPool(t *testing.T) {
+	const address = "127.0.0.1:9101"
+	const machineID = "node-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	pool := &Pool{byAddr: map[string]*AgentConn{
+		address: {
+			ep: config.AgentEndpoint{Addr: address}, machineID: machineID,
+			online: true, identityState: IdentityClaimed,
+		},
+	}}
+	host := NewRuntimeHost(&fakeGUIConfigStore{}, []config.AgentEndpoint{{Addr: address}})
+	host.Install(NewAPI(pool, NewTaskRegistry(nil, testLogger()), nil))
+
+	response := assertRuntimeHostStatus(t, host, http.MethodGet, "/api/runtime/status", http.StatusOK)
+	var status RuntimeStatus
+	if err := json.Unmarshal(response.Body.Bytes(), &status); err != nil {
+		t.Fatal(err)
+	}
+	if len(status.Agents) != 1 || status.Agents[0].MachineID != machineID ||
+		!status.Agents[0].Online || status.Agents[0].IdentityState != IdentityClaimed {
+		t.Fatalf("runtime agents=%#v", status.Agents)
+	}
+}
+
 func TestRuntimeHostInstallsAndSafelyStopsCompleteRuntime(t *testing.T) {
 	host := NewRuntimeHost(&fakeGUIConfigStore{}, nil)
 	host.BeginAnalysisShutdown()

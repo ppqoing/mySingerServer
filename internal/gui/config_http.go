@@ -62,10 +62,6 @@ func (api *API) SetConfigService(service guiConfigStore) {
 	api.config = service
 }
 
-func (api *API) handleConfigGet(response http.ResponseWriter, _ *http.Request) {
-	configHTTP{config: api.config}.handleGet(response)
-}
-
 func (handler configHTTP) handleGet(response http.ResponseWriter) {
 	if handler.config == nil {
 		writeJSON(response, http.StatusServiceUnavailable, guiConfigErrorResponse{Error: "config_unavailable"})
@@ -77,10 +73,6 @@ func (handler configHTTP) handleGet(response http.ResponseWriter) {
 		return
 	}
 	writeJSON(response, http.StatusOK, snapshot)
-}
-
-func (api *API) handleConfigPut(response http.ResponseWriter, request *http.Request) {
-	configHTTP{config: api.config}.handlePut(response, request)
 }
 
 func (handler configHTTP) handlePut(response http.ResponseWriter, request *http.Request) {

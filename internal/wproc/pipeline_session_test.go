@@ -34,6 +34,45 @@ func TestSessionPipelineOneOpenOneHashOneAnalyze(t *testing.T) {
 	}
 }
 
+func TestSessionPipelinePhase1ImagePublishesNativeDimensions(t *testing.T) {
+	job, deps, fake := newSessionPipelineTest(t, worker.MediaImage,
+		worker.MaskSHA512|worker.MaskImagePDQ, 0)
+	job.Phase = worker.Phase1
+	job.KnownSHA = nil
+	deps.query = sessionPipelineMissingReply(job, worker.MaskImagePDQ, 0)
+	fake.result = videocore.AnalysisResult{
+		MediaType: 1, ImageStatus: videocore.StatusOK,
+		ImageWidth: 640, ImageHeight: 480,
+		ImageFeatures: videocore.FeatureSet{PDQ: [32]byte{5}, PDQQuality: 82},
+	}
+
+	result, err := processMediaWithDeps(context.Background(), sessionPipelineTestConfig(), job, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Width != 640 || result.Height != 480 ||
+		result.FieldsDone&worker.MaskImagePDQ == 0 {
+		t.Fatalf("phase-1 image dimensions/result = %dx%d %#v", result.Width, result.Height, result)
+	}
+}
+
+func TestSessionPipelineFileErrorUsesSingleFieldBits(t *testing.T) {
+	result := sessionPipelineFileError(
+		&worker.JobResultMsg{},
+		worker.MaskVideoDuration|worker.MaskVideoContactSheet,
+		"video_contact_sheet",
+		errors.New("decode failed"),
+	)
+	if len(result.Errors) != 2 {
+		t.Fatalf("errors = %#v, want one entry per field", result.Errors)
+	}
+	for _, fieldErr := range result.Errors {
+		if fieldErr.Field == 0 || fieldErr.Field&(fieldErr.Field-1) != 0 {
+			t.Fatalf("error field %#x is not a single bit", fieldErr.Field)
+		}
+	}
+}
+
 func TestSessionPipelineCompleteHitSkipsAnalyze(t *testing.T) {
 	job, deps, fake := newSessionPipelineTest(t, worker.MediaImage,
 		worker.MaskSHA512|worker.MaskImagePDQ, 0)
@@ -60,8 +99,8 @@ func TestSessionPipelineCompleteHitSkipsAnalyze(t *testing.T) {
 func TestSessionPipelineFinalIdentityRejectsDriftAfterCacheQuery(t *testing.T) {
 	job, deps, fake := newSessionPipelineTest(t, worker.MediaImage,
 		worker.MaskImagePDQ, 0)
-	before := sessionPipelineTestInfo{size: job.Size, mtime: time.UnixMilli(job.MTimeMS)}
-	after := sessionPipelineTestInfo{size: job.Size + 1, mtime: time.UnixMilli(job.MTimeMS + 1)}
+	before := sessionPipelineTestInfo{size: job.Size, mtime: time.Unix(job.MTimeMS, 0)}
+	after := sessionPipelineTestInfo{size: job.Size + 1, mtime: time.Unix(job.MTimeMS+1, 0)}
 	current := fs.FileInfo(before)
 	deps.stat = func(string) (fs.FileInfo, error) { return current, nil }
 	deps.query = func(*worker.SHAQueryMsg) (*worker.SHAReplyMsg, error) {
@@ -120,7 +159,7 @@ func TestDefaultSessionPipelineRehashReadsFreshBytesAndHonorsCancellation(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	job := &worker.JobMsg{Size: before.Size(), MTimeUnix: before.ModTime().Unix(), MTimeMS: before.ModTime().UnixMilli()}
+	job := &worker.JobMsg{Size: before.Size(), MTimeUnix: before.ModTime().Unix(), MTimeMS: before.ModTime().Unix()}
 	deps := defaultSessionPipelineDeps(nil)
 	firstDigest, err := deps.rehash(context.Background(), path, before, job)
 	if err != nil || firstDigest != sha512.Sum512(first) {
@@ -260,9 +299,7 @@ func TestSessionPipelineStale(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertSessionPipelineCleared(t, result, fake, paths, true)
-	if len(result.Errors) != 1 || result.Errors[0].Stage != "stale" {
-		t.Fatalf("stale errors = %#v, want one stale file error", result.Errors)
-	}
+	assertSessionPipelineErrorBits(t, result.Errors, "stale")
 }
 
 func TestSessionPipelinePartialFrames(t *testing.T) {
@@ -759,8 +796,18 @@ func assertSessionPipelineStalePayload(t *testing.T, result *worker.JobResultMsg
 		len(result.ThumbPDQ) != 0 || result.ThumbQuality != nil {
 		t.Fatalf("stale result retained payload: %#v", result)
 	}
-	if len(result.Errors) != 1 || result.Errors[0].Stage != "stale" {
-		t.Fatalf("stale errors = %#v, want stable stale", result.Errors)
+	assertSessionPipelineErrorBits(t, result.Errors, "stale")
+}
+
+func assertSessionPipelineErrorBits(t *testing.T, fieldErrors []worker.FieldError, stage string) {
+	t.Helper()
+	if len(fieldErrors) == 0 {
+		t.Fatalf("%s errors are empty", stage)
+	}
+	for _, fieldErr := range fieldErrors {
+		if fieldErr.Stage != stage || fieldErr.Field == 0 || fieldErr.Field&(fieldErr.Field-1) != 0 {
+			t.Fatalf("invalid %s error: %#v", stage, fieldErr)
+		}
 	}
 }
 
@@ -779,7 +826,7 @@ func newSessionPipelineTest(t *testing.T, kind worker.MediaKind, fields uint32, 
 	job := &worker.JobMsg{
 		JobID: 77, ScanTaskID: "scan", Path: `C:\synthetic\input.bin`, Kind: kind,
 		Phase: worker.Phase2, FieldsMask: fields, FrameMask: frames,
-		Size: info.size, MTimeUnix: info.mtime.Unix(), MTimeMS: info.mtime.UnixMilli(),
+		Size: info.size, MTimeUnix: info.mtime.Unix(), MTimeMS: info.mtime.Unix(),
 	}
 	job.KnownSHA = append([]byte(nil), fake.sha[:]...)
 	deps := sessionPipelineDeps{

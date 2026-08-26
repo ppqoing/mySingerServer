@@ -248,6 +248,8 @@ void InitializeVideoResult(vc_analysis_result* out) noexcept {
     ClearFeaturePayload(&out->contact_sheet_features);
     out->operation_elapsed_ms = 0u;
     out->decode_elapsed_ms = 0u;
+    out->image_width = 0u;
+    out->image_height = 0u;
     for (uint32_t index = 0u; index < VC_VIDEO_FRAME_COUNT; ++index) {
         vc_video_frame_result& frame = out->frames[index];
         frame.standard_index = index;

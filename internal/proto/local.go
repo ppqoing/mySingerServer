@@ -425,16 +425,40 @@ type LocalImagePreviewRequest struct {
 	MaxHeight int32  `msgpack:"max_height"`
 	Format    string `msgpack:"format"`
 	Quality   int32  `msgpack:"quality"`
+	// Sha512 bridges the manager (GUI) channel: the Web side only knows the
+	// Postgres files.id, which lives in a different ID space than the Agent's
+	// local database. FileID wins when both are set; Sha512 is used only when
+	// FileID is zero.
+	Sha512 string `msgpack:"sha512,omitempty"`
 }
 
 func (request LocalImagePreviewRequest) Validate() error {
-	if request.FileID <= 0 || request.MaxWidth <= 0 || request.MaxWidth > 8192 ||
+	if request.MaxWidth <= 0 || request.MaxWidth > 8192 ||
 		request.MaxHeight <= 0 || request.MaxHeight > 8192 ||
 		(request.Format != "jpeg" && request.Format != "webp") ||
 		request.Quality < 1 || request.Quality > 100 {
 		return fmt.Errorf("invalid_preview")
 	}
+	if request.FileID > 0 {
+		return nil
+	}
+	if !IsSHA512LowerHex(request.Sha512) {
+		return fmt.Errorf("invalid_preview")
+	}
 	return nil
+}
+
+// IsSHA512LowerHex reports whether value is a canonical SHA-512 hex digest.
+func IsSHA512LowerHex(value string) bool {
+	if len(value) != 128 {
+		return false
+	}
+	for _, char := range value {
+		if (char < '0' || char > '9') && (char < 'a' || char > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 type LocalImagePreviewResponse struct {

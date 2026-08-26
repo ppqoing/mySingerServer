@@ -97,6 +97,8 @@ vc_analysis_result PoisonedResult() {
     result.media_type = VC_MEDIA_TYPE_VIDEO;
     result.image_status = 0x13572468;
     result.completed_frame_mask = VC_ALL_FRAME_MASK;
+    result.image_width = 0xfeedbeefU;
+    result.image_height = 0xdecafbadU;
     std::memset(result.image_features.pdq,
                 0xa5,
                 sizeof(result.image_features.pdq));
@@ -132,6 +134,7 @@ void CheckSafeImageFailure(const vc_analysis_result& result,
     Check(result.media_type == VC_MEDIA_TYPE_IMAGE, message);
     Check(result.image_status == expected_status, message);
     Check(result.completed_frame_mask == 0u, message);
+    Check(result.image_width == 0u && result.image_height == 0u, message);
     Check(ImagePayloadIsZero(result.image_features), message);
 }
 
@@ -233,6 +236,8 @@ void TestImageAnalysisUsesOneCachedDecodeAndHonorsMasks() {
           "image analysis reports image media type");
     Check(full.image_status == VC_OK,
           "image analysis marks fulfilled image item successful");
+    Check(full.image_width == 8u && full.image_height == 8u,
+          "image analysis publishes decoded dimensions");
     Check(full.completed_frame_mask == 0u,
           "image analysis never reports video frame completion");
     const uint64_t full_decode_after =

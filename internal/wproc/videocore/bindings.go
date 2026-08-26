@@ -6,6 +6,7 @@ package videocore
 #cgo CFLAGS: -I${SRCDIR}/../../../videocore/include
 #cgo LDFLAGS: -L${SRCDIR} -lvideocore
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <videocore/videocore.h>
 
@@ -208,12 +209,21 @@ func (cgoBridge) analyze(session nativeSession, request AnalysisRequest) (Analys
 	if err != nil {
 		return AnalysisResult{}, err
 	}
-	var temporaryPath []uint16
+	var temporaryPath unsafe.Pointer
+	var temporaryPathUnits int
 	if request.TempJPEGPath != "" {
-		temporaryPath, err = utf16Path(request.TempJPEGPath)
-		if err != nil {
-			return AnalysisResult{}, err
+		units, pathErr := utf16Path(request.TempJPEGPath)
+		if pathErr != nil {
+			return AnalysisResult{}, pathErr
 		}
+		temporaryPathUnits = len(units)
+		bytes := C.size_t(len(units)) * C.size_t(unsafe.Sizeof(C.uint16_t(0)))
+		temporaryPath = C.malloc(bytes)
+		if temporaryPath == nil {
+			return AnalysisResult{}, fmt.Errorf("videocore: allocate temporary JPEG path")
+		}
+		C.memcpy(temporaryPath, unsafe.Pointer(unsafe.SliceData(units)), bytes)
+		defer C.free(temporaryPath)
 	}
 	var nativeRequest C.vc_analysis_request
 	var nativeResult C.vc_analysis_result
@@ -227,9 +237,9 @@ func (cgoBridge) analyze(session nativeSession, request AnalysisRequest) (Analys
 	nativeRequest.probe_timeout_ms = C.uint32_t(probeTimeout)
 	nativeRequest.frame_timeout_ms = C.uint32_t(frameTimeout)
 	nativeRequest.contact_sheet_tile_max_side = C.uint32_t(request.TileMaxSide)
-	if len(temporaryPath) != 0 {
-		nativeRequest.temporary_jpeg_path = (*C.uint16_t)(unsafe.Pointer(unsafe.SliceData(temporaryPath)))
-		nativeRequest.temporary_jpeg_path_units = C.uint32_t(len(temporaryPath))
+	if temporaryPath != nil {
+		nativeRequest.temporary_jpeg_path = (*C.uint16_t)(temporaryPath)
+		nativeRequest.temporary_jpeg_path_units = C.uint32_t(temporaryPathUnits)
 	}
 	rc := int32(C.vc_media_analyze(
 		(*C.vc_media_session)(session.value),
@@ -237,7 +247,6 @@ func (cgoBridge) analyze(session nativeSession, request AnalysisRequest) (Analys
 		&nativeResult,
 		&nativeErr,
 	))
-	runtime.KeepAlive(temporaryPath)
 	if rc != StatusOK {
 		return AnalysisResult{}, cgoCallError("media analyze", rc, &nativeErr)
 	}
@@ -349,6 +358,8 @@ func analysisResultFromC(native C.vc_analysis_result) AnalysisResult {
 		contactFeatures:    featureSetFromC(native.contact_sheet_features),
 		operationElapsedMS: uint64(native.operation_elapsed_ms),
 		decodeElapsedMS:    uint64(native.decode_elapsed_ms),
+		imageWidth:         uint32(native.image_width),
+		imageHeight:        uint32(native.image_height),
 	}
 	for index := range result.frames {
 		frame := native.frames[index]

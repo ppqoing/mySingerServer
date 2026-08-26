@@ -11,12 +11,6 @@ type platformFileLock struct {
 	file *os.File
 }
 
-func platformValidateProtectedHelper(string) error {
-	// Node Tray is Windows-only. This stub keeps common storage code buildable;
-	// it does not claim to enforce the Windows Helper DACL contract.
-	return nil
-}
-
 func platformAcquireLock(path string) (*platformFileLock, error) {
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {

@@ -25,6 +25,7 @@ const (
 	MsgConfigPush       uint8 = 14
 	MsgStatsQuery       uint8 = 15
 	MsgFilesystemBrowse uint8 = 16
+	MsgScanTaskCancel   uint8 = 17
 
 	MsgTaskProgress           uint8 = 20
 	MsgFeatureResult          uint8 = 21
@@ -198,6 +199,19 @@ type ScanOptions struct {
 	Extensions []string `msgpack:"extensions,omitempty"`
 }
 
+// ScanTaskCancel asks the agent to stop a running scan. The terminal
+// MsgTaskDone receipt carries Reason "cancelled" once the run unwinds.
+type ScanTaskCancel struct {
+	TaskID string `msgpack:"task_id"`
+}
+
+func (cancel ScanTaskCancel) Validate() error {
+	if cancel.TaskID == "" {
+		return fmt.Errorf("proto: scan task cancel task_id required")
+	}
+	return nil
+}
+
 type TaskAck struct {
 	TaskID   string     `msgpack:"task_id"`
 	Accepted bool       `msgpack:"accepted"`
@@ -212,6 +226,8 @@ type Phase2Item struct {
 	MachineID  string `msgpack:"machine_id"`
 	SHA512     string `msgpack:"sha512"`
 	Size       int64  `msgpack:"size"`
+	// MTimeMS carries the file modification time in Unix seconds despite its
+	// name; the identifier is kept for wire compatibility.
 	MTimeMS    int64  `msgpack:"mtime_ms"`
 	Kind       uint8  `msgpack:"kind"`
 	FrameMask  uint8  `msgpack:"frame_mask"`
@@ -436,6 +452,9 @@ type TaskStats struct {
 type TaskDone struct {
 	TaskID string    `msgpack:"task_id"`
 	Stats  TaskStats `msgpack:"stats"`
+	// Reason is empty for a natural completion and "cancelled" when the run
+	// unwound after a MsgScanTaskCancel.
+	Reason string `msgpack:"reason,omitempty"`
 }
 
 type Error struct {
@@ -508,6 +527,8 @@ func Decode(msgType uint8, body []byte) (any, error) {
 		value = &StatsQuery{}
 	case MsgFilesystemBrowse:
 		value = &FilesystemBrowseRequest{}
+	case MsgScanTaskCancel:
+		value = &ScanTaskCancel{}
 	case MsgTaskProgress:
 		value = &TaskProgress{}
 	case MsgFeatureResult:

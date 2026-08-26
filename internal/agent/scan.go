@@ -54,6 +54,12 @@ type ScanState struct {
 	Status string
 	Stats  proto.TaskStats
 
+	// ctx bounds the whole run; Cancel cancels it and the run unwinds
+	// through its normal cleanup path, emitting the terminal MsgTaskDone
+	// receipt with Reason "cancelled".
+	ctx    context.Context
+	cancel context.CancelFunc
+
 	mu        sync.Mutex
 	featureMu sync.Mutex
 	sender    Sender
@@ -86,21 +92,6 @@ func NewScanManager(
 		errLog,
 		resolveDisk,
 	)
-}
-
-func NewScanManagerWithPool(
-	cfg *config.AgentConfig,
-	st *store.DB,
-	enumr fileenum.Enumerator,
-	hasher Hasher,
-	pool WorkerPool,
-	log *slog.Logger,
-	errLog *slog.Logger,
-) *ScanManager {
-	manager := NewScanManager(cfg, st, enumr, hasher, log, errLog)
-	manager.pool = pool
-	manager.router = NewPoolRouter(pool, log)
-	return manager
 }
 
 func NewScanManagerWithPoolRouter(
@@ -219,9 +210,12 @@ func (m *ScanManager) Prepare(
 		}, m.startScan(state)
 	}
 
+	stateCtx, stateCancel := context.WithCancel(context.Background())
 	state := &ScanState{
 		Task:     task,
 		Status:   "running",
+		ctx:      stateCtx,
+		cancel:   stateCancel,
 		speedWin: newSpeedWindow(10 * time.Second),
 	}
 	state.bindSender(sender)
@@ -245,6 +239,30 @@ func (m *ScanManager) startScan(state *ScanState) func() {
 			}()
 		})
 	}
+}
+
+// Cancel implements ScanCancelHandler. It returns (true, nil) when a live
+// task accepted the cancel — the terminal MsgTaskDone receipt (Reason
+// "cancelled") follows once the run unwinds — (false, stats) when the task
+// already completed, and (false, nil) for an unknown task. Cancelling a task
+// that is still unwinding is idempotent: context.CancelFunc is safe to call
+// repeatedly, so repeated cancels report (true, nil) without side effects.
+func (m *ScanManager) Cancel(taskID string) (bool, *proto.TaskStats) {
+	m.mu.Lock()
+	state, exists := m.tasks[taskID]
+	m.mu.Unlock()
+	if !exists {
+		return false, nil
+	}
+	state.mu.Lock()
+	if state.Status == "done" {
+		stats := state.Stats
+		state.mu.Unlock()
+		return false, &stats
+	}
+	state.mu.Unlock()
+	state.cancel()
+	return true, nil
 }
 
 func sameScanEnvelope(left, right proto.ScanTask) bool {
@@ -318,7 +336,13 @@ func (state *ScanState) publishFeatures(items []proto.FeatureItem) {
 
 func (m *ScanManager) run(state *ScanState) {
 	started := time.Now()
-	ctx := context.Background()
+	ctx := state.ctx
+	// A task cancelled between Prepare and start unwinds here without
+	// touching the enumerator: zero work, no scan error, Reason "cancelled".
+	if ctx.Err() != nil {
+		m.finish(state, started, 0)
+		return
+	}
 	if m.pool != nil {
 		state.poolStart = m.pool.Metrics()
 	}
@@ -326,6 +350,9 @@ func (m *ScanManager) run(state *ScanState) {
 	seen := make(map[string]struct{})
 
 	for _, root := range state.Task.Roots {
+		if ctx.Err() != nil {
+			break
+		}
 		diskNo, isSSD, err := m.resolver(root)
 		if err != nil {
 			state.failed.Add(1)
@@ -352,6 +379,11 @@ func (m *ScanManager) run(state *ScanState) {
 			return nil
 		}
 		err = m.enumr.Enum(root, func(record fileenum.FileRecord) error {
+			// Checked before counting so a cancel landing mid-enumeration
+			// leaves the in-flight record uncounted and aborts the walk.
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			if len(state.Task.Options.Extensions) > 0 &&
 				!extIn(record.Path, state.Task.Options.Extensions) {
 				return nil
@@ -378,18 +410,26 @@ func (m *ScanManager) run(state *ScanState) {
 		if err == nil {
 			err = flush()
 		}
-		if err != nil {
+		// Cancellation is not a scan error: the interruption unwinds without
+		// penalizing the task's stats.
+		if err != nil && ctx.Err() == nil {
 			state.failed.Add(1)
 			state.scanErrors.Add(1)
 			m.reportErr(state, root, "enum", err)
 		}
 	}
 
+	if ctx.Err() != nil {
+		m.finish(state, started, enumerated)
+		return
+	}
 	pending, err := m.st.PendingSnapshot(ctx, m.cfg.MachineID)
 	if err != nil {
-		state.failed.Add(1)
-		state.scanErrors.Add(1)
-		m.reportErr(state, "", "enum", err)
+		if ctx.Err() == nil {
+			state.failed.Add(1)
+			state.scanErrors.Add(1)
+			m.reportErr(state, "", "enum", err)
+		}
 		m.finish(state, started, enumerated)
 		return
 	}
@@ -585,6 +625,11 @@ func (m *ScanManager) processDisk(
 		go func() {
 			defer workers.Done()
 			for work := range jobs {
+				// After cancellation keep draining without processing so the
+				// feeder never blocks; remaining files stay unhashed.
+				if state.ctx.Err() != nil {
+					continue
+				}
 				err := runObservedWork(
 					context.Background(),
 					m.limiter,
@@ -939,6 +984,12 @@ func (m *ScanManager) finish(
 	if m.pool != nil {
 		poolDelta = subtractMetrics(m.pool.Metrics(), state.poolStart)
 	}
+	// A run unwound by Cancel reports Reason "cancelled" on its terminal
+	// receipt; natural completions leave it empty.
+	reason := ""
+	if state.ctx != nil && state.ctx.Err() != nil {
+		reason = "cancelled"
+	}
 	state.mu.Lock()
 	state.Status = "done"
 	avgReadMS, avgDecodeMS := metricAveragesMS(poolDelta)
@@ -982,6 +1033,7 @@ func (m *ScanManager) finish(
 	state.send(proto.MsgTaskDone, &proto.TaskDone{
 		TaskID: state.Task.TaskID,
 		Stats:  stats,
+		Reason: reason,
 	})
 	if taskPool, ok := m.pool.(interface{ EndTask(string) }); ok {
 		taskPool.EndTask(state.Task.TaskID)

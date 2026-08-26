@@ -50,6 +50,7 @@ type Service interface {
 
 type Store interface {
 	LoadCommittedDeletion(context.Context, string, string, string) (store.CommittedDeletion, error)
+	BeginDeletionBatch(context.Context, string, store.CommittedDeletion, string) error
 	CommitDeletionResults(context.Context, string, []store.DeletionResult) error
 	LoadDeletionBatch(context.Context, string, string) (store.DeletionBatch, error)
 }
@@ -166,6 +167,9 @@ func (service *service) Execute(ctx context.Context, request DeleteExecution) (D
 		if err := verifyFileIdentity(ctx, file); err != nil {
 			return DeleteBatch{}, ErrSelectionChanged
 		}
+	}
+	if err := service.store.BeginDeletionBatch(ctx, prepared.batchID, current, prepared.digest); err != nil {
+		return DeleteBatch{}, err
 	}
 
 	paths := make([]string, len(current.Files))

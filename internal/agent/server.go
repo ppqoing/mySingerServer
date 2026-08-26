@@ -23,6 +23,15 @@ type ScanHandler interface {
 	Prepare(task proto.ScanTask, sender Sender) (proto.TaskAck, func())
 }
 
+// ScanCancelHandler is implemented by scan handlers that support task
+// cancellation (ScanManager). Cancel returns (true, nil) when a live task
+// accepted the cancel and its terminal MsgTaskDone receipt is on the way;
+// (false, stats) when the task already completed; (false, nil) when the task
+// is unknown.
+type ScanCancelHandler interface {
+	Cancel(taskID string) (bool, *proto.TaskStats)
+}
+
 type Phase2Handler interface {
 	Prepare(task proto.Phase2Task, sender Sender) (proto.TaskAck, func())
 }
@@ -281,7 +290,11 @@ func (s *Server) handleConn(parent context.Context, connection net.Conn) {
 				return
 			}
 		case *proto.LocalRequest:
-			if !authenticatedNodeTray {
+			// The manager (GUI) channel has no loopback NodeTray auth: only the
+			// whitelisted preview/review operations are exposed there (the same
+			// network boundary already trusts unauthenticated filesystem browse).
+			// Loopback NodeTray sessions keep the full local-control surface.
+			if !authenticatedNodeTray && !managerLocalOperationAllowed(value.Operation) {
 				_ = sendLocalResponse(proto.LocalResponse{
 					RequestID: value.RequestID,
 					ErrorCode: "unauthorized",
@@ -368,6 +381,48 @@ func (s *Server) handleConn(parent context.Context, connection net.Conn) {
 			if start != nil {
 				start()
 			}
+		case *proto.ScanTaskCancel:
+			// 取消的终态回执是扫描循环收尾时发出的 MsgTaskDone；agent 已完成的
+			// 任务用 already_done 应答回传最终统计，未知任务拒绝。重复取消幂等：
+			// 对已取消但仍运行的任务再次取消不额外应答。
+			if err := value.Validate(); err != nil {
+				if err := sender(proto.MsgTaskAck, &proto.TaskAck{
+					TaskID: value.TaskID, Accepted: false,
+					Reason: "rejected:empty task_id", Total: -1,
+				}); err != nil {
+					return
+				}
+				continue
+			}
+			canceller, ok := s.sm.(ScanCancelHandler)
+			if !ok {
+				if err := sender(proto.MsgTaskAck, &proto.TaskAck{
+					TaskID: value.TaskID, Accepted: false,
+					Reason: "cancel_unsupported", Total: -1,
+				}); err != nil {
+					return
+				}
+				continue
+			}
+			cancelled, stats := canceller.Cancel(value.TaskID)
+			switch {
+			case cancelled:
+				// The terminal receipt is the scan loop's MsgTaskDone.
+			case stats != nil:
+				if err := sender(proto.MsgTaskAck, &proto.TaskAck{
+					TaskID: value.TaskID, Accepted: true,
+					Reason: "already_done", Total: stats.Total, Stats: stats,
+				}); err != nil {
+					return
+				}
+			default:
+				if err := sender(proto.MsgTaskAck, &proto.TaskAck{
+					TaskID: value.TaskID, Accepted: false,
+					Reason: "unknown_task", Total: -1,
+				}); err != nil {
+					return
+				}
+			}
 		case *proto.Phase2Task:
 			if s.phase2 == nil {
 				_ = sender(proto.MsgError, &proto.Error{
@@ -439,6 +494,19 @@ func isLoopbackRemote(address net.Addr) bool {
 		return false
 	}
 	return net.ParseIP(host).IsLoopback()
+}
+
+// managerLocalOperationAllowed reports the local-control operations a manager
+// (GUI) connection may use without loopback NodeTray authentication. Preview
+// is read-only and integrity-checked; review save stays scoped to review
+// decisions. Everything else remains NodeTray-only.
+func managerLocalOperationAllowed(operation string) bool {
+	switch operation {
+	case proto.LocalOperationPreviewImage, proto.LocalOperationReviewSave:
+		return true
+	default:
+		return false
+	}
 }
 
 func protectLocalResponse(response proto.LocalResponse, token string) proto.LocalResponse {

@@ -199,6 +199,52 @@ func TestLocalResultSocketRequiresLoopbackNodeTrayAuth(t *testing.T) {
 	}
 }
 
+// Break caught: the manager channel (no loopback NodeTray auth) either keeps
+// every local operation unauthorized — breaking the Web preview proxy — or
+// inherits the full NodeTray surface including config/delete/shutdown.
+func TestLocalResultSocketAllowsManagerChannelPreviewWhitelistOnly(t *testing.T) {
+	const token = "manager-token"
+	server, _ := newLocalControlTestServer(t)
+	reviews := &fakeLocalReviewService{}
+	previews := &fakeLocalPreviewService{}
+	server.SetLocalControl(token, NewLocalResultHandler(reviews, previews))
+
+	manager, closeManager := startLocalControlTestConnection(t, server, net.ParseIP("10.2.3.4"))
+	defer closeManager()
+	previewPayload, _ := proto.EncodeLocalPayload(proto.LocalImagePreviewRequest{
+		FileID: 1, MaxWidth: 10, MaxHeight: 10, Format: "jpeg", Quality: 80,
+	})
+	if err := manager.WriteFrame(proto.MsgLocalRequest, &proto.LocalRequest{
+		RequestID: "manager-preview", Operation: proto.LocalOperationPreviewImage, Payload: previewPayload,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if response := readDeleteTestMessage(t, manager).(*proto.LocalResponse); !response.OK || previews.calls != 1 {
+		t.Fatalf("manager preview response = %#v calls=%d", response, previews.calls)
+	}
+	reviewPayload, _ := proto.EncodeLocalPayload(proto.LocalReviewSaveRequest{
+		RunID: "run", GroupID: "group", Reviewer: "web",
+		Decisions: []proto.LocalReviewDecision{{FileID: 1, Decision: "keep"}},
+	})
+	if err := manager.WriteFrame(proto.MsgLocalRequest, &proto.LocalRequest{
+		RequestID: "manager-review", Operation: proto.LocalOperationReviewSave, Payload: reviewPayload,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if response := readDeleteTestMessage(t, manager).(*proto.LocalResponse); !response.OK || reviews.saveCalls != 1 {
+		t.Fatalf("manager review response = %#v calls=%d", response, reviews.saveCalls)
+	}
+	groupsPayload, _ := proto.EncodeLocalPayload(proto.LocalGroupListRequest{Scope: "current", Limit: 20})
+	if err := manager.WriteFrame(proto.MsgLocalRequest, &proto.LocalRequest{
+		RequestID: "manager-groups", Operation: proto.LocalOperationGroupsList, Payload: groupsPayload,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if response := readDeleteTestMessage(t, manager).(*proto.LocalResponse); response.OK || response.ErrorCode != "unauthorized" || reviews.listCalls != 0 {
+		t.Fatalf("manager groups response = %#v calls=%d", response, reviews.listCalls)
+	}
+}
+
 type fakeLocalReviewService struct {
 	listCalls   int
 	detailCalls int

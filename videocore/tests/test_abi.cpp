@@ -126,6 +126,8 @@ typedef struct vc_analysis_result {
     vc_video_frame_result frames[VC_VIDEO_FRAME_COUNT];
     uint64_t operation_elapsed_ms;
     uint64_t decode_elapsed_ms;
+    uint32_t image_width;
+    uint32_t image_height;
 } vc_analysis_result;
 
 typedef struct vc_cancel_token vc_cancel_token;
@@ -407,6 +409,8 @@ void TestLayouts() {
     static_assert(
         offsetof(vc_analysis_result, operation_elapsed_ms) == 5248u);
     static_assert(offsetof(vc_analysis_result, decode_elapsed_ms) == 5256u);
+    static_assert(offsetof(vc_analysis_result, image_width) == 5264u);
+    static_assert(offsetof(vc_analysis_result, image_height) == 5268u);
 
     Check(sizeof(vc_error) == 532u, "vc_error size");
     Check(offsetof(vc_error, struct_size) == 0u, "vc_error struct_size offset");
@@ -465,7 +469,7 @@ void TestLayouts() {
               sizeof(vc_video_frame_result) ==
               6u,
           "analysis result frame slot count");
-    Check(sizeof(vc_analysis_result) == 5264u, "analysis result size");
+    Check(sizeof(vc_analysis_result) == 5272u, "analysis result size");
 
     std::cout << "ABI_LAYOUT"
               << " vc_error=" << sizeof(vc_error)

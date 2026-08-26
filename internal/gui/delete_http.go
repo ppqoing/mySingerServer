@@ -19,6 +19,8 @@ type deleteHTTPService interface {
 	Prepare(context.Context, []int64) (DeleteSummary, string, error)
 	Execute(context.Context, string, string) (string, error)
 	Status(string) (DeleteTaskStatus, bool)
+	ListTasks(context.Context, int) []DeleteTaskSummary
+	ConsumedTaskID(string) (string, bool)
 }
 
 type deletePrepareRequest struct {
@@ -164,6 +166,18 @@ func (api *API) handleDeleteExecute(response http.ResponseWriter, request *http.
 		input.Mode,
 	)
 	if err != nil {
+		if errors.Is(err, ErrConfirmationConsumed) {
+			// Idempotent replay: a repeated execute of a consumed token
+			// returns the first accepted task instead of a conflict.
+			if firstTaskID, ok := api.delete.ConsumedTaskID(
+				input.ConfirmToken,
+			); ok && firstTaskID != "" {
+				writeJSON(response, http.StatusOK, map[string]string{
+					"task_id": firstTaskID,
+				})
+				return
+			}
+		}
 		writeDeleteExecuteError(response, err)
 		return
 	}
@@ -197,6 +211,10 @@ func writeDeleteExecuteError(response http.ResponseWriter, err error) {
 
 func (api *API) handleDeleteStatus(response http.ResponseWriter, request *http.Request) {
 	taskID := request.PathValue("task_id")
+	if taskID == "" {
+		api.handleDeleteTaskList(response, request)
+		return
+	}
 	parsed, err := uuid.Parse(taskID)
 	if err != nil || parsed.String() != taskID {
 		writeJSON(response, http.StatusNotFound, map[string]string{
@@ -220,18 +238,28 @@ func (api *API) handleDeleteStatus(response http.ResponseWriter, request *http.R
 	writeJSON(response, http.StatusOK, safeDeleteStatus(status))
 }
 
+// handleDeleteTaskList serves GET /api/delete/tasks and /api/delete/tasks/:
+// the task-center list view, in-progress first, newest created first.
+func (api *API) handleDeleteTaskList(response http.ResponseWriter, request *http.Request) {
+	if api.delete == nil {
+		writeJSON(response, http.StatusServiceUnavailable, map[string]string{
+			"error": "delete service unavailable",
+		})
+		return
+	}
+	summaries := api.delete.ListTasks(request.Context(), deleteTaskListLimit)
+	writeJSON(response, http.StatusOK, map[string]any{
+		"tasks": summaries,
+	})
+}
+
 func safeDeleteStatus(status DeleteTaskStatus) DeleteTaskStatus {
-	safe := status
-	safe.ByMachine = make(map[string]DeleteMachineStatus, len(status.ByMachine))
-	for machineID, machine := range status.ByMachine {
-		machine.Sequences = cloneDeleteSequences(machine.Sequences)
-		safe.ByMachine[machineID] = machine
+	safe := cloneDeleteTaskStatus(status)
+	sanitized := make(map[string]int64, len(safe.ErrorCodes))
+	for code, count := range safe.ErrorCodes {
+		sanitized[safeDeleteErrorCode(code)] += count
 	}
-	safe.ErrorCodes = make(map[string]int64, len(status.ErrorCodes))
-	for code, count := range status.ErrorCodes {
-		safe.ErrorCodes[safeDeleteErrorCode(code)] += count
-	}
-	safe.Problems = append([]DeleteProblemItem(nil), status.Problems...)
+	safe.ErrorCodes = sanitized
 	for index := range safe.Problems {
 		safe.Problems[index].ErrorCode = safeDeleteErrorCode(
 			safe.Problems[index].ErrorCode,

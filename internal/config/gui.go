@@ -187,12 +187,6 @@ func defaultFirstScreen() FirstScreenConfig {
 	}
 }
 
-func (c FirstScreenConfig) validate() error {
-	validation := &guiValidation{}
-	c.collectValidation(validation)
-	return validation.err()
-}
-
 func (c FirstScreenConfig) collectValidation(validation *guiValidation) {
 	if c.HammingMax < 0 || c.HammingMax > 256 {
 		validation.add("firstscreen.hamming_max", "out_of_range", "必须在 0 到 256 之间")

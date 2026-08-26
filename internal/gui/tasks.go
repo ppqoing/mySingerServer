@@ -18,6 +18,9 @@ import (
 
 var ErrTaskEnvelopeConflict = errors.New("task_id already uses a different scan envelope")
 
+var ErrTaskNotFound = errors.New("scan task not found")
+var ErrTaskTerminal = errors.New("scan task is already terminal")
+
 type TaskInfo struct {
 	TaskID     string              `json:"task_id"`
 	MachineID  string              `json:"machine_id"`
@@ -37,6 +40,11 @@ type TaskInfo struct {
 	Recent     []proto.FeatureItem `json:"recent"`
 	LastSeq    uint64              `json:"last_seq,omitempty"`
 	UpdatedAt  time.Time           `json:"updated_at"`
+
+	// preCancelStatus remembers the live status a task had before entering the
+	// in-memory "cancelling" state, so a failed cancel dispatch can roll back
+	// and persistence can fall back to a CHECK-allowed value.
+	preCancelStatus string
 }
 
 type TaskRegistry struct {
@@ -59,11 +67,23 @@ func (registry *TaskRegistry) Restore(ctx context.Context) error {
 		return nil
 	}
 	rows, err := registry.pg.Query(ctx, `
-		SELECT id, machine_id, phase, target, status, updated_at
-		FROM scan_tasks
-		WHERE status IN ('sent','acked','running')
-		  AND COALESCE(target->>'type','scan') = 'scan'
-		ORDER BY updated_at, id;`)
+		WITH active AS (
+			SELECT id,machine_id,phase,target,status,stats_json,updated_at
+			FROM scan_tasks
+			WHERE status IN ('sent','acked','running')
+			  AND COALESCE(target->>'type','scan') = 'scan'
+		), terminal AS (
+			SELECT id,machine_id,phase,target,status,stats_json,updated_at
+			FROM scan_tasks
+			WHERE status IN ('done','failed')
+			  AND COALESCE(target->>'type','scan') = 'scan'
+			ORDER BY updated_at DESC,id DESC
+			LIMIT 200
+		)
+		SELECT * FROM active
+		UNION ALL
+		SELECT * FROM terminal
+		ORDER BY updated_at,id;`)
 	if err != nil {
 		return fmt.Errorf("restore tasks: query: %w", err)
 	}
@@ -72,13 +92,14 @@ func (registry *TaskRegistry) Restore(ctx context.Context) error {
 	restored := make([]*TaskInfo, 0)
 	for rows.Next() {
 		var task TaskInfo
-		var targetJSON []byte
+		var targetJSON, statsJSON []byte
 		if err := rows.Scan(
 			&task.TaskID,
 			&task.MachineID,
 			&task.Phase,
 			&targetJSON,
 			&task.Status,
+			&statsJSON,
 			&task.UpdatedAt,
 		); err != nil {
 			return fmt.Errorf("restore tasks: scan: %w", err)
@@ -96,6 +117,13 @@ func (registry *TaskRegistry) Restore(ctx context.Context) error {
 		}
 		task.Roots = append([]string(nil), target.Roots...)
 		task.Rescan = target.Rescan
+		if len(statsJSON) != 0 {
+			var stats proto.TaskStats
+			if err := json.Unmarshal(statsJSON, &stats); err != nil {
+				return fmt.Errorf("restore task %s stats: %w", task.TaskID, err)
+			}
+			applyTaskStats(&task, stats)
+		}
 		restored = append(restored, &task)
 	}
 	if err := rows.Err(); err != nil {
@@ -120,6 +148,16 @@ func (registry *TaskRegistry) Register(task *TaskInfo) error {
 		if !sameTaskEnvelope(existing, copyTask) {
 			return ErrTaskEnvelopeConflict
 		}
+		if existing.Status == "failed" {
+			// A same-envelope retry after a failed dispatch: the task never
+			// reached the agent, so reset the terminal state and let the new
+			// dispatch and its receipts flow normally.
+			existing.Status = "sent"
+			existing.LastErr = ""
+			existing.AckReason = ""
+			existing.UpdatedAt = time.Now()
+			registry.resetFailedTask(existing.TaskID)
+		}
 		return nil
 	}
 	if registry.pg != nil {
@@ -131,6 +169,26 @@ func (registry *TaskRegistry) Register(task *TaskInfo) error {
 	}
 	registry.byID[copyTask.TaskID] = copyTask
 	return nil
+}
+
+// resetFailedTask force-clears a terminal 'failed' record for a same-envelope
+// retry. The generic upsert preserves terminal states, so a dedicated UPDATE
+// is required here.
+func (registry *TaskRegistry) resetFailedTask(taskID string) {
+	if registry.pg == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := registry.pg.Exec(ctx, `
+		UPDATE scan_tasks
+		SET status = 'sent', updated_at = now()
+		WHERE id = $1 AND status = 'failed';`,
+		taskID,
+	)
+	if err != nil {
+		registry.log.Error("reset failed scan task", "err", err)
+	}
 }
 
 func (registry *TaskRegistry) MarkSendFailed(taskID string, err error) {
@@ -146,6 +204,52 @@ func (registry *TaskRegistry) MarkSendFailed(taskID string, err error) {
 	if copyTask != nil {
 		registry.upsertScanTask(copyTask, nil)
 	}
+}
+
+// BeginCancel moves a live scan task into the in-memory "cancelling" state
+// and returns a snapshot for dispatching proto.MsgScanTaskCancel. The state
+// is deliberately memory-only: scan_tasks.status has a CHECK constraint
+// without it, and a Manager restart simply re-dispatches the restored task —
+// an agent that already cancelled answers already_done (see Dispatch).
+// alreadyCancelling=true means an earlier cancel is in flight; the caller
+// must not re-send the message.
+func (registry *TaskRegistry) BeginCancel(
+	taskID string,
+) (task *TaskInfo, alreadyCancelling bool, err error) {
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	current := registry.byID[taskID]
+	if current == nil {
+		return nil, false, ErrTaskNotFound
+	}
+	if isTerminalTaskStatus(current.Status) {
+		return nil, false, ErrTaskTerminal
+	}
+	if current.Status == "cancelling" {
+		return cloneTask(current), true, nil
+	}
+	current.preCancelStatus = current.Status
+	current.Status = "cancelling"
+	current.UpdatedAt = time.Now()
+	return cloneTask(current), false, nil
+}
+
+// RollbackCancel restores the pre-cancel status when the cancel message
+// could not be delivered, so agent receipts keep flowing normally. A task
+// that reached a terminal state in the meantime is left alone.
+func (registry *TaskRegistry) RollbackCancel(taskID string) {
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	task := registry.byID[taskID]
+	if task == nil || task.Status != "cancelling" {
+		return
+	}
+	task.Status = task.preCancelStatus
+	if task.Status == "" || task.Status == "cancelling" {
+		task.Status = "running"
+	}
+	task.preCancelStatus = ""
+	task.UpdatedAt = time.Now()
 }
 
 func (registry *TaskRegistry) Dispatch(machineID string, message any) {
@@ -185,7 +289,11 @@ func (registry *TaskRegistry) Dispatch(machineID string, message any) {
 			if isTerminalTaskStatus(task.Status) {
 				break
 			}
-			task.Status = "running"
+			// Progress may still arrive while a cancel unwinds the scan;
+			// keep the user-visible "cancelling" until the terminal receipt.
+			if task.Status != "cancelling" {
+				task.Status = "running"
+			}
 			task.Done = value.Done
 			task.Total = value.Total
 			task.Speed = value.Speed
@@ -214,7 +322,15 @@ func (registry *TaskRegistry) Dispatch(machineID string, message any) {
 	case *proto.TaskDone:
 		if task := registry.byID[value.TaskID]; task != nil {
 			applyTaskStats(task, value.Stats)
-			task.Status = completedTaskStatus(value.Stats)
+			if value.Reason == "cancelled" || task.Status == "cancelling" {
+				// 取消完成的最小展示态：status 映射为 failed（终态、可重试），
+				// ack_reason 保留 "cancelled"，前端据此显示"已取消"。
+				// TaskDone.Reason 使该结论自描述：Manager 重启恢复后仍能识别。
+				task.AckReason = "cancelled"
+				task.Status = "failed"
+			} else {
+				task.Status = completedTaskStatus(value.Stats)
+			}
 			task.UpdatedAt = time.Now()
 			persistTask = cloneTask(task)
 			stats := value.Stats
@@ -254,6 +370,10 @@ func taskStatusRank(status string) int {
 		return 1
 	case "running":
 		return 2
+	// "cancelling" outranks acked/running so late receipts cannot regress it;
+	// only a TaskDone (or rejected cancel ack) moves it to a terminal state.
+	case "cancelling":
+		return 3
 	case "done", "failed":
 		return 3
 	default:
@@ -354,6 +474,16 @@ func (registry *TaskRegistry) upsertScanTask(
 	if stats != nil {
 		statsJSON, _ = json.Marshal(stats)
 	}
+	// "cancelling" 是内存中间态，scan_tasks.status 的 CHECK 约束不含它；
+	// 落库回退为取消前状态。恢复后任务按运行中重派——若 agent 已取消，
+	// 会以 already_done 或 TaskDone.Reason="cancelled" 收口（见 Dispatch）。
+	persistStatus := task.Status
+	if persistStatus == "cancelling" {
+		persistStatus = task.preCancelStatus
+		if persistStatus == "" || persistStatus == "cancelling" {
+			persistStatus = "running"
+		}
+	}
 	_, err := registry.pg.Exec(ctx, `
 		INSERT INTO scan_tasks (
 		    id, machine_id, phase, target, status, stats_json
@@ -379,7 +509,7 @@ func (registry *TaskRegistry) upsertScanTask(
 		task.Phase,
 		task.Roots,
 		task.Rescan,
-		task.Status,
+		persistStatus,
 		nullableJSON(statsJSON),
 	)
 	if err != nil {

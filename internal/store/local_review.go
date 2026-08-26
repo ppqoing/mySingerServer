@@ -85,6 +85,10 @@ func (d *DB) LoadCommittedDeletion(
 		JOIN files f ON f.machine_id=r.machine_id AND f.id=r.file_id
 		WHERE r.machine_id=?1 AND r.run_id=?2 AND r.generation=?3 AND r.group_id=?4
 		  AND r.decision='delete' AND f.status<>'deleted' AND f.sha512 IS NOT NULL
+		  AND NOT EXISTS (
+		    SELECT 1 FROM local_delete_items d
+		    WHERE d.machine_id=f.machine_id AND d.file_id=f.id
+		      AND d.result IN ('pending','uncertain'))
 		ORDER BY f.id`, machineID, runID, selection.Generation, groupID)
 	if err != nil {
 		return CommittedDeletion{}, err

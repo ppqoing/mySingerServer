@@ -94,6 +94,35 @@ func TestFilesystemBrowseMessagesRoundTrip(t *testing.T) {
 	}
 }
 
+// These cases fail if the scan-cancel envelope loses its append-only message
+// type 17, stops decoding into the concrete DTO, or accepts an empty task_id.
+func TestScanTaskCancelRoundTripAndValidate(t *testing.T) {
+	if MsgScanTaskCancel != 17 {
+		t.Fatalf("MsgScanTaskCancel = %d, want 17", MsgScanTaskCancel)
+	}
+	body, err := msgpack.Marshal(ScanTaskCancel{TaskID: "task-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := Decode(MsgScanTaskCancel, body)
+	if err != nil {
+		t.Fatalf("Decode(%d): %v", MsgScanTaskCancel, err)
+	}
+	got, ok := decoded.(*ScanTaskCancel)
+	if !ok {
+		t.Fatalf("Decode(%d) type = %T, want *ScanTaskCancel", MsgScanTaskCancel, decoded)
+	}
+	if got.TaskID != "task-1" {
+		t.Fatalf("decoded task_id = %q", got.TaskID)
+	}
+	if err := got.Validate(); err != nil {
+		t.Fatalf("Validate() = %v", err)
+	}
+	if err := (ScanTaskCancel{}).Validate(); err == nil {
+		t.Fatal("empty task_id passed validation")
+	}
+}
+
 // These cases fail if malformed browse requests reach filesystem enumeration,
 // or if a future implementation narrows accepted Windows absolute paths.
 func TestFilesystemBrowseRequestValidate(t *testing.T) {

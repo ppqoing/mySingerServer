@@ -284,8 +284,8 @@ function Validate-CompileRecord(
         throw "$role compile include set mismatch"
     }
     $expectedExternal = @(
-        (Join-Path $script:BuildRootFull 'vcpkg_installed\x64-windows-static\include'),
-        (Join-Path $script:BuildRootFull 'vcpkg_installed\x64-windows-static\include\webp'))
+        (Join-Path $script:VcpkgTripletRootFull 'include'),
+        (Join-Path $script:VcpkgTripletRootFull 'include\webp'))
     if (-not (Compare-PathMultiset @($externalIncludes) $expectedExternal)) {
         throw "$role compile external include set mismatch"
     }
@@ -363,7 +363,7 @@ function Get-ExpectedLinkLibraries([bool]$IsDll) {
         }
     }
     foreach ($name in @('turbojpeg.lib','libpng16.lib','zs.lib','libwebp.lib','libsharpyuv.lib')) {
-        $libraries.Add('path:' + [IO.Path]::GetFullPath((Join-Path $script:BuildRootFull "vcpkg_installed\x64-windows-static\lib\$name")).ToLowerInvariant())
+        $libraries.Add('path:' + [IO.Path]::GetFullPath((Join-Path $script:VcpkgTripletRootFull "lib\$name")).ToLowerInvariant())
     }
     foreach ($name in @('shlwapi.lib','ole32.lib','windowscodecs.lib','kernel32.lib','user32.lib',
         'gdi32.lib','winspool.lib','shell32.lib','ole32.lib','oleaut32.lib','uuid.lib','comdlg32.lib','advapi32.lib')) {
@@ -637,6 +637,22 @@ function New-LinkReplay(
 $script:SourceRootFull = [IO.Path]::GetFullPath($SourceRoot)
 $legacySourceRootFull = [IO.Path]::GetFullPath($LegacySourceRoot)
 $script:BuildRootFull = [IO.Path]::GetFullPath($BuildRoot)
+# vcpkg 依赖根以构建时 CMakeCache 记录的 VCPKG_INSTALLED_DIR 为准（标准缓存布局为
+# 共享的 C:\vcpkg\installed）；缓存条目缺失时回退到 build 本地 vcpkg_installed（manifest 布局）。
+$script:VcpkgInstalledRootFull = Join-Path $script:BuildRootFull 'vcpkg_installed'
+$script:VcpkgTriplet = 'x64-windows-static'
+$cmakeCachePath = Join-Path $script:BuildRootFull 'CMakeCache.txt'
+if (Test-Path -LiteralPath $cmakeCachePath -PathType Leaf) {
+    $installedMatch = Select-String -LiteralPath $cmakeCachePath -Pattern '^VCPKG_INSTALLED_DIR:PATH=(.+)$' | Select-Object -First 1
+    if ($installedMatch) {
+        $script:VcpkgInstalledRootFull = [IO.Path]::GetFullPath($installedMatch.Matches[0].Groups[1].Value.Trim())
+    }
+    $tripletMatch = Select-String -LiteralPath $cmakeCachePath -Pattern '^VCPKG_TARGET_TRIPLET:STRING=(.+)$' | Select-Object -First 1
+    if ($tripletMatch) {
+        $script:VcpkgTriplet = $tripletMatch.Matches[0].Groups[1].Value.Trim()
+    }
+}
+$script:VcpkgTripletRootFull = Join-Path $script:VcpkgInstalledRootFull $script:VcpkgTriplet
 $script:CanonicalImageObjectDirFull = [IO.Path]::GetFullPath($CanonicalImageObjectDir)
 $compilerFile = Require-MicrosoftTool $Compiler 'cl.exe' 'MSVC compiler'
 $script:CompilerDirectory = $compilerFile.Directory.FullName.TrimEnd('\')
