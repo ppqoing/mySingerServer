@@ -1,0 +1,527 @@
+// 当前已载入组的复核筛选与删除入口；不创建新后端命令或虚构持久批次。
+
+import { LineEdit, ScrollView } from "std-widgets.slint";
+import { Theme, UiGroupRow, UiMemberRow } from "../theme.slint";
+import { ActionButton } from "../components/action-button.slint";
+import { DetailPanel } from "../components/detail-panel.slint";
+import { EmptyState } from "../components/empty-state.slint";
+import { FilterBar } from "../components/filter-bar.slint";
+import { GroupTable } from "../components/group-table.slint";
+import { SectionHeader } from "../components/section-header.slint";
+import { StatusPill } from "../components/status-pill.slint";
+import { TabStrip } from "../components/tab-strip.slint";
+
+// 复核成员只按已加载模型的领域状态筛选，整行选择与三个行内动作保持独立命中。
+component ReviewMemberList inherits Rectangle {
+    in property <[UiMemberRow]> members;
+    in property <int> review-filter;
+    in property <bool> preview-in-flight;
+    in-out property <string> selected-machine;
+    in-out property <string> selected-path;
+    callback preview(string, string);
+    callback review(string, string, int);
+
+    background: Theme.panel;
+    min-width: 50px;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: Theme.border;
+    accessible-role: AccessibleRole.groupbox;
+    accessible-label: "审核成员列表";
+
+    ScrollView {
+        VerticalLayout {
+            min-width: 560px;
+            spacing: 0px;
+            Rectangle {
+                height: Theme.table-header-height;
+                background: Theme.panel-hover;
+                HorizontalLayout {
+                    padding-left: 10px;
+                    padding-right: 10px;
+                    spacing: 8px;
+                    alignment: center;
+                    Text { text: "决定"; width: 64px; color: Theme.muted; font-size: 10px; }
+                    Text { text: "路径 / 机器"; horizontal-stretch: 1; color: Theme.muted; font-size: 10px; }
+                    Text { text: "大小 / 分数"; width: 100px; color: Theme.muted; font-size: 10px; }
+                    Text { text: "成员动作"; width: 228px; color: Theme.muted; font-size: 10px; }
+                }
+            }
+            Rectangle { height: 1px; background: Theme.border; }
+            if root.members.length == 0 : EmptyState {
+                density: 0;
+                title: "当前组没有已加载成员";
+                detail: "先在重复结果页加载组和成员，再进入审核工作台。";
+            }
+            for member in root.members : row := Rectangle {
+                private property <bool> matches-filter:
+                    root.review-filter == 0 ? member.review == "未决定" :
+                    root.review-filter == 1 ? member.review == "保留" :
+                    member.review == "删除";
+                visible: row.matches-filter;
+                height: row.matches-filter ? 56px : 0px;
+                background: member.path == root.selected-path || member.representative ? Theme.accent-soft : Theme.panel;
+                accessible-role: AccessibleRole.list-item;
+                accessible-label: "成员：" + member.path;
+                accessible-description: "复核状态：" + member.review;
+                accessible-item-selected: member.path == root.selected-path;
+                accessible-action-default => {
+                    root.selected-machine = member.machine-id;
+                    root.selected-path = member.path;
+                }
+
+                // 整行选择层先声明，后面的预览/保留/删除动作在真实指针路径中优先命中。
+                row-touch := TouchArea {
+                    clicked => {
+                        root.selected-machine = member.machine-id;
+                        root.selected-path = member.path;
+                    }
+                }
+                HorizontalLayout {
+                    padding-left: 10px;
+                    padding-right: 10px;
+                    spacing: 8px;
+                    alignment: center;
+                    HorizontalLayout {
+                        width: 64px;
+                        spacing: 6px;
+                        alignment: center;
+                        Image {
+                            source: member.review == "保留" ? @image-url("../assets/icons/keep.png")
+                                : member.review == "删除" ? @image-url("../assets/icons/delete.png")
+                                : @image-url("../assets/icons/info.png");
+                            width: 16px;
+                            height: 16px;
+                            image-fit: contain;
+                            colorize: member.review == "删除" ? Theme.danger
+                                : member.review == "保留" ? Theme.success
+                                : Theme.nav-icon;
+                        }
+                        Text {
+                            text: member.review;
+                            color: member.review == "删除" ? Theme.danger
+                                : member.review == "保留" ? Theme.success
+                                : Theme.text;
+                            font-size: 10px;
+                            font-weight: 650;
+                        }
+                    }
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        spacing: 2px;
+                        alignment: center;
+                        Text { text: member.path; color: Theme.text; font-size: 10px; overflow: elide; }
+                        Text { text: member.machine-id + (member.online ? " · 在线" : " · 离线"); color: Theme.muted; font-size: 10px; overflow: elide; }
+                    }
+                    VerticalLayout {
+                        width: 100px;
+                        spacing: 2px;
+                        alignment: center;
+                        Text { text: member.size + " · " + member.metadata; color: Theme.text; font-size: 10px; overflow: elide; }
+                        Text { text: "S1 " + member.stage1 + " · pH " + member.phash + " · S2 " + member.stage2; color: Theme.muted; font-size: 10px; overflow: elide; }
+                    }
+                    HorizontalLayout {
+                        width: 228px;
+                        spacing: 6px;
+                        ActionButton {
+                            label: "预览";
+                            icon: @image-url("../assets/icons/preview.png");
+                            action-enabled: member.preview-enabled && !root.preview-in-flight;
+                            accessible-label: "预览成员：" + member.path;
+                            clicked => {
+                                root.selected-machine = member.machine-id;
+                                root.selected-path = member.path;
+                                root.preview(member.machine-id, member.path);
+                            }
+                        }
+                        ActionButton {
+                            label: "保留";
+                            icon: @image-url("../assets/icons/keep.png");
+                            accessible-label: "保留成员：" + member.path;
+                            clicked => {
+                                root.selected-machine = member.machine-id;
+                                root.selected-path = member.path;
+                                root.review(member.machine-id, member.path, 1);
+                            }
+                        }
+                        ActionButton {
+                            label: "删除";
+                            icon: @image-url("../assets/icons/delete.png");
+                            tone: 2;
+                            action-enabled: member.delete-enabled;
+                            accessible-label: "删除成员：" + member.path;
+                            clicked => {
+                                root.selected-machine = member.machine-id;
+                                root.selected-path = member.path;
+                                root.review(member.machine-id, member.path, 2);
+                            }
+                        }
+                    }
+                }
+                Rectangle { y: parent.height - 1px; height: 1px; background: Theme.border; }
+            }
+        }
+    }
+}
+
+export component ReviewDeleteWorkspace inherits Rectangle {
+    in property <[UiGroupRow]> groups;
+    in property <[UiMemberRow]> members;
+    in property <string> selected-group-id;
+    in property <image> preview-image;
+    in property <string> preview-info;
+    in property <string> preview-result-machine;
+    in property <string> preview-result-path;
+    in property <bool> preview-result-succeeded;
+    in property <int> preview-result-sequence;
+    in-out property <string> path-rule;
+    in-out property <int> review-tab: 0;
+    in-out property <int> review-filter: 0;
+    in-out property <int> delete-filter: 0;
+    in property <int> delete-file-count;
+    in property <int> delete-node-count;
+    in property <string> delete-reclaimable;
+    in property <string> delete-mode;
+    in property <bool> delete-can-execute;
+    in property <string> delete-warning;
+    callback save-review(string, string, int);
+    callback preview(string, string);
+    callback quick-review(int, string);
+    callback prepare-delete();
+    private property <string> selected-review-machine;
+    private property <string> selected-review-path;
+    private property <string> preview-pending-machine;
+    private property <string> preview-pending-path;
+    private property <string> preview-owner-machine;
+    private property <string> preview-owner-path;
+    private property <bool> preview-in-flight;
+    private property <bool> preview-matches-selection:
+        root.preview-owner-path != ""
+        && root.preview-owner-machine == root.selected-review-machine
+        && root.preview-owner-path == root.selected-review-path;
+    // 只有带完整身份且匹配唯一 pending 的完成信号才能释放 single-flight。
+    changed preview-result-sequence => {
+        if root.preview-in-flight
+            && root.preview-result-machine == root.preview-pending-machine
+            && root.preview-result-path == root.preview-pending-path {
+            if root.preview-result-succeeded {
+                root.preview-owner-machine = root.preview-result-machine;
+                root.preview-owner-path = root.preview-result-path;
+            } else {
+                root.preview-owner-machine = "";
+                root.preview-owner-path = "";
+            }
+            root.preview-pending-machine = "";
+            root.preview-pending-path = "";
+            root.preview-in-flight = false;
+        }
+    }
+    background: transparent;
+
+    VerticalLayout {
+        padding: 20px;
+        spacing: 12px;
+
+        // 一级模式只切换当前 UI，不触发后端读取或删除命令。
+        TabStrip {
+            labels: ["审核工作台", "删除中心"];
+            active-index <=> root.review-tab;
+        }
+
+        if root.review-tab == 0 : VerticalLayout {
+            spacing: 12px;
+            FilterBar {
+                accessible-role: AccessibleRole.groupbox;
+                accessible-label: "审核过滤栏";
+                Text { text: "审核状态"; color: Theme.text; font-size: 12px; font-weight: 650; }
+                TabStrip {
+                    width: 240px;
+                    labels: ["未决定", "保留", "删除"];
+                    active-index <=> root.review-filter;
+                }
+                Text {
+                    width: 200px;
+                    text: root.selected-group-id == "" ? "当前组：未选择" : "当前组：" + root.selected-group-id;
+                    color: Theme.muted;
+                    font-size: 10px;
+                    overflow: elide;
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 12px;
+                vertical-stretch: 1;
+
+                Rectangle {
+                    width: 370px;
+                    background: transparent;
+                    accessible-role: AccessibleRole.groupbox;
+                    accessible-label: "审核组队列";
+                    accessible-description: "显示重复结果页已经加载的组；当前页面不新增后端读取命令。";
+                    VerticalLayout {
+                        spacing: 8px;
+                        SectionHeader {
+                            title: "审核组队列";
+                            subtitle: root.groups.length == 0 ? "尚未加载重复组；请先到重复结果页加载。" : "当前只展示已加载组，成员模型沿用已选组。";
+                        }
+                        GroupTable {
+                            vertical-stretch: 1;
+                            groups: root.groups;
+                            selected-id: root.selected-group-id;
+                            has-more: false;
+                            select-group(id) => { }
+                        }
+                    }
+                }
+
+                Rectangle {
+                    horizontal-stretch: 1;
+                    min-width: 50px;
+                    background: transparent;
+                    accessible-role: AccessibleRole.groupbox;
+                    accessible-label: "审核成员列表";
+                    VerticalLayout {
+                        spacing: 8px;
+                        SectionHeader {
+                            title: "审核成员列表";
+                            subtitle: root.members.length == 0 ? "当前组没有成员；不会生成示例行。" : "未决定、保留、删除只筛选已加载复核状态。";
+                        }
+                        ReviewMemberList {
+                            vertical-stretch: 1;
+                            members: root.members;
+                            review-filter: root.review-filter;
+                            preview-in-flight: root.preview-in-flight;
+                            selected-machine <=> root.selected-review-machine;
+                            selected-path <=> root.selected-review-path;
+                            preview(machine, path) => {
+                                if !root.preview-in-flight {
+                                    root.selected-review-machine = machine;
+                                    root.selected-review-path = path;
+                                    root.preview-pending-machine = machine;
+                                    root.preview-pending-path = path;
+                                    root.preview-owner-machine = "";
+                                    root.preview-owner-path = "";
+                                    root.preview-in-flight = true;
+                                    root.preview(machine, path);
+                                }
+                            }
+                            review(machine, path, decision) => { root.save-review(machine, path, decision); }
+                        }
+                    }
+                }
+
+                DetailPanel {
+                    width: 300px;
+                    accessible-role: AccessibleRole.groupbox;
+                    accessible-label: "复核详情";
+                    VerticalLayout {
+                        padding: 12px;
+                        spacing: 10px;
+                        SectionHeader {
+                            title: "复核详情";
+                            subtitle: root.selected-review-path == "" ? "选择成员行后可执行明确复核动作。" : root.selected-review-path;
+                        }
+                        if root.preview-image.width > 0 && root.preview-image.height > 0 && root.preview-matches-selection : Rectangle {
+                            height: 150px;
+                            background: transparent;
+                            accessible-role: AccessibleRole.groupbox;
+                            accessible-label: "当前预览：" + root.preview-owner-path;
+                            Image {
+                                source: root.preview-image;
+                                image-fit: contain;
+                            }
+                        }
+                        if root.preview-image.width > 0 && root.preview-image.height > 0 && !root.preview-matches-selection && root.selected-review-path != "" : Rectangle {
+                            height: 150px;
+                            background: transparent;
+                            accessible-role: AccessibleRole.groupbox;
+                            accessible-label: "预览需要重新加载：" + root.selected-review-path;
+                            EmptyState {
+                                density: 0;
+                                title: "需重新预览";
+                                detail: "当前图片属于另一成员；请预览当前选择后再核对。";
+                                icon: @image-url("../assets/icons/preview.png");
+                            }
+                        }
+                        if root.preview-image.width <= 0 || root.preview-image.height <= 0 || root.selected-review-path == "" : EmptyState {
+                            density: 0;
+                            title: "尚未触发预览";
+                            detail: "只有成员行的预览动作会调用现有按需加载回调。";
+                            icon: @image-url("../assets/icons/preview.png");
+                        }
+                        if root.preview-info != "" && root.preview-matches-selection : Text { text: root.preview-info; color: Theme.muted; font-size: 10px; wrap: word-wrap; }
+
+                        Rectangle {
+                            height: 150px;
+                            background: Theme.panel-hover;
+                            border-radius: 8px;
+                            VerticalLayout {
+                                padding: 10px;
+                                spacing: 6px;
+                                Text { text: "快捷复核"; color: Theme.text; font-size: 12px; font-weight: 680; }
+                                ActionButton { label: "保留最大文件"; icon: @image-url("../assets/icons/keep.png"); clicked => { root.quick-review(0, ""); } }
+                                ActionButton { label: "保留最高分辨率"; icon: @image-url("../assets/icons/keep.png"); clicked => { root.quick-review(1, ""); } }
+                                ActionButton { label: "保留最高 Quality"; icon: @image-url("../assets/icons/keep.png"); clicked => { root.quick-review(2, ""); } }
+                            }
+                        }
+                        Rectangle {
+                            height: 100px;
+                            background: Theme.panel-hover;
+                            border-radius: 8px;
+                            VerticalLayout {
+                                padding: 10px;
+                                spacing: 6px;
+                                Text { text: "路径规则"; color: Theme.text; font-size: 12px; font-weight: 680; }
+                                LineEdit { text <=> root.path-rule; placeholder-text: "路径包含"; accessible-label: "复核路径包含"; }
+                                ActionButton { label: "按路径保留"; icon: @image-url("../assets/icons/keep.png"); clicked => { root.quick-review(3, root.path-rule); } }
+                            }
+                        }
+                        Rectangle {
+                            height: 102px;
+                            background: Theme.panel-hover;
+                            border-radius: 8px;
+                            VerticalLayout {
+                                padding: 10px;
+                                spacing: 6px;
+                                Text { text: "确认动作"; color: Theme.text; font-size: 12px; font-weight: 680; }
+                                Text { text: "只保存复核决定，不准备或执行删除。"; color: Theme.muted; font-size: 10px; }
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    ActionButton {
+                                        label: "标记保留";
+                                        icon: @image-url("../assets/icons/keep.png");
+                                        action-enabled: root.selected-review-path != "";
+                                        clicked => { root.save-review(root.selected-review-machine, root.selected-review-path, 1); }
+                                    }
+                                    ActionButton {
+                                        label: "标记删除";
+                                        icon: @image-url("../assets/icons/delete.png");
+                                        tone: 2;
+                                        action-enabled: root.selected-review-path != "";
+                                        clicked => { root.save-review(root.selected-review-machine, root.selected-review-path, 2); }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if root.review-tab == 1 : VerticalLayout {
+            spacing: 12px;
+            TabStrip {
+                labels: ["待执行", "执行中", "历史记录"];
+                active-index <=> root.delete-filter;
+            }
+            if root.delete-filter == 0 : HorizontalLayout {
+                spacing: 12px;
+                vertical-stretch: 1;
+                Rectangle {
+                    width: 370px;
+                    background: Theme.panel;
+                    border-radius: 8px;
+                    border-width: 1px;
+                    border-color: Theme.border;
+                    accessible-role: AccessibleRole.groupbox;
+                    accessible-label: "删除批次摘要";
+                    VerticalLayout {
+                        padding: 16px;
+                        spacing: 12px;
+                        SectionHeader {
+                            title: "删除批次摘要";
+                            subtitle: "仅显示根窗口已经提供的当前准备结果。";
+                            icon: @image-url("../assets/icons/info.png");
+                        }
+                        Text { text: "文件数"; color: Theme.muted; font-size: 11px; }
+                        Text { text: root.delete-file-count + " 个"; color: Theme.text; font-size: 22px; font-weight: 720; }
+                        Text { text: "节点数"; color: Theme.muted; font-size: 11px; }
+                        Text { text: root.delete-node-count + " 台"; color: Theme.text; font-size: 22px; font-weight: 720; }
+                        Text { text: "预计释放空间"; color: Theme.muted; font-size: 11px; }
+                        Text { text: root.delete-reclaimable == "" ? "—" : root.delete-reclaimable; color: Theme.success; font-size: 18px; font-weight: 680; }
+                        Text { text: "处理方式：" + root.delete-mode; color: Theme.text; font-size: 12px; }
+                        Rectangle { vertical-stretch: 1; background: transparent; }
+                        Text {
+                            text: "当前后端没有删除批次历史模型，因此这里不生成批次编号或时间。";
+                            color: Theme.muted;
+                            font-size: 10px;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+                Rectangle {
+                    horizontal-stretch: 1;
+                    background: Theme.panel;
+                    border-radius: 8px;
+                    border-width: 1px;
+                    border-color: Theme.border;
+                    accessible-role: AccessibleRole.groupbox;
+                    accessible-label: "删除执行详情";
+                    VerticalLayout {
+                        padding: 16px;
+                        spacing: 12px;
+                        SectionHeader {
+                            title: "删除执行详情";
+                            subtitle: "准备动作只生成根级确认数据；本页不会直接执行删除。";
+                            icon: @image-url("../assets/icons/delete.png");
+                        }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Text { text: "确认门禁"; color: Theme.muted; font-size: 11px; vertical-alignment: center; }
+                            StatusPill {
+                                width: 88px;
+                                label: root.delete-can-execute ? "允许确认" : "禁止确认";
+                                tone: root.delete-can-execute ? Theme.success : Theme.warning;
+                            }
+                        }
+                        Text {
+                            text: root.delete-warning == "" ? "准备后将由后端给出活动 Keep、Delete 项和节点在线门禁。" : root.delete-warning;
+                            color: root.delete-warning == "" ? Theme.muted : Theme.warning;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+                        if root.delete-mode == "永久删除" : Text {
+                            text: "永久删除不可恢复；实际确认仍只能在根级删除确认框完成。";
+                            color: Theme.danger;
+                            font-size: 12px;
+                            font-weight: 680;
+                            wrap: word-wrap;
+                        }
+                        Rectangle { vertical-stretch: 1; background: transparent; }
+                        ActionButton {
+                            label: "准备删除";
+                            icon: @image-url("../assets/icons/delete.png");
+                            tone: 2;
+                            action-enabled: root.members.length > 0;
+                            clicked => { root.prepare-delete(); }
+                        }
+                        Text {
+                            text: root.members.length == 0 ? "当前没有已加载成员，无法准备确认数据。" : "点击后只调用 prepare-delete；confirm-delete 仍唯一位于根级 DeleteDialog。";
+                            color: Theme.muted;
+                            font-size: 10px;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+            }
+            if root.delete-filter == 1 : Rectangle {
+                accessible-role: AccessibleRole.groupbox;
+                accessible-label: "删除执行空态：当前版本没有持久删除批次；当前后端没有执行中批次模型，因此不生成模拟记录。";
+                EmptyState {
+                    title: "当前版本没有持久删除批次";
+                    detail: "当前后端没有执行中批次模型，因此不生成模拟记录。";
+                    disabled-feature: true;
+                }
+            }
+            if root.delete-filter == 2 : Rectangle {
+                accessible-role: AccessibleRole.groupbox;
+                accessible-label: "删除历史空态：当前版本没有持久删除批次；当前后端没有删除批次历史模型，因此不生成模拟记录。";
+                EmptyState {
+                    title: "当前版本没有持久删除批次";
+                    detail: "当前后端没有删除批次历史模型，因此不生成模拟记录。";
+                    disabled-feature: true;
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,140 @@
+// 固定侧栏提供应用菜单和七项主导航，所有页面切换仍走既有索引回调。
+
+import { Theme } from "../theme.slint";
+
+// 单个导航项统一 46px 行高、20px 图标和选中态左侧标记。
+component NavItem inherits Rectangle {
+    // 图标、标签和选中态完全由父侧栏提供。
+    in property <image> icon;
+    in property <string> label;
+    in property <bool> selected;
+    in property <bool> collapsed;
+    // 激活回调只向父侧栏转发对应的固定索引。
+    callback activated();
+
+    height: 46px;
+    border-radius: 7px;
+    background: root.selected ? Theme.accent-soft : touch.has-hover ? Theme.panel-hover : transparent;
+    accessible-role: AccessibleRole.button;
+    accessible-label: root.label;
+    accessible-action-default => { root.activated(); }
+
+    Rectangle {
+        visible: root.selected;
+        width: 3px;
+        height: 24px;
+        x: 0px;
+        y: 11px;
+        border-radius: 2px;
+        background: Theme.accent;
+    }
+    Image {
+        source: root.icon;
+        width: 20px;
+        height: 20px;
+        x: root.collapsed ? (parent.width - self.width) / 2 : 13px;
+        y: (parent.height - self.height) / 2;
+        image-fit: contain;
+        colorize: root.selected ? Theme.accent : Theme.nav-icon;
+        accessible-label: "导航图标：" + root.label;
+    }
+    Text {
+        visible: !root.collapsed;
+        x: 43px;
+        y: 0px;
+        width: parent.width - 51px;
+        height: parent.height;
+        text: root.label;
+        color: root.selected ? Theme.accent : Theme.text;
+        font-size: 13px;
+        font-weight: root.selected ? 650 : 450;
+        vertical-alignment: center;
+        accessible-label: "导航文字：" + root.label;
+    }
+    // TouchArea 位于图标和文字之后，保证真实指针路径覆盖完整导航行。
+    touch := TouchArea { clicked => { root.activated(); } }
+}
+
+export component SideNavigation inherits Rectangle {
+    // active-index 与 MainWindow 双向导航状态保持一致。
+    in property <int> active-index;
+    in property <bool> collapsed;
+    // navigate 保留 0..6 的既有页面映射，并以 7 追加独立数据库页。
+    callback navigate(int);
+    callback toggle-sidebar();
+
+    width: root.collapsed ? 64px : 144px;
+    background: Theme.sidebar;
+    border-width: 1px;
+    border-color: Theme.border;
+    accessible-role: AccessibleRole.groupbox;
+    accessible-label: root.collapsed ? "应用侧栏：已收起" : "应用侧栏：已展开";
+
+    // 顶部严格占用 58px，只保留居中的 44×44 应用菜单动作。
+    menu-header := Rectangle {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: 58px;
+        background: Theme.sidebar;
+        border-width: 1px;
+        border-color: Theme.border;
+
+        menu-button := Rectangle {
+            x: 10px;
+            y: 7px;
+            width: 44px;
+            height: 44px;
+            border-radius: 7px;
+            background: menu-touch.has-hover ? Theme.panel-hover : transparent;
+            accessible-role: AccessibleRole.button;
+            accessible-label: "应用菜单";
+            accessible-action-default => { root.toggle-sidebar(); }
+            Image {
+                source: @image-url("../assets/icons/menu.png");
+                width: 20px;
+                height: 20px;
+                x: 12px;
+                y: 12px;
+                image-fit: contain;
+                colorize: Theme.nav-icon;
+                accessible-label: "应用菜单图标";
+            }
+            // TouchArea 在图像之后，菜单的真实指针命中范围保持 44×44。
+            menu-touch := TouchArea { clicked => { root.toggle-sidebar(); } }
+        }
+    }
+
+    // 导航区位于 58px 头部下方；设置项通过伸展项固定在底部。
+    navigation-body := Rectangle {
+        y: 58px;
+        height: parent.height - 58px;
+        background: transparent;
+        VerticalLayout {
+            padding-left: 10px;
+            padding-right: 10px;
+            padding-top: 8px;
+            padding-bottom: 10px;
+            spacing: 4px;
+
+            NavItem { icon: @image-url("../assets/icons/overview.png"); label: "总览"; collapsed: root.collapsed; selected: root.active-index == 0; activated => { root.navigate(0); } }
+            NavItem { icon: @image-url("../assets/icons/nodes.png"); label: "节点"; collapsed: root.collapsed; selected: root.active-index == 1; activated => { root.navigate(1); } }
+            NavItem { icon: @image-url("../assets/icons/scan.png"); label: "扫描"; collapsed: root.collapsed; selected: root.active-index == 2; activated => { root.navigate(2); } }
+            NavItem { icon: @image-url("../assets/icons/tasks.png"); label: "任务"; collapsed: root.collapsed; selected: root.active-index == 3; activated => { root.navigate(3); } }
+            NavItem { icon: @image-url("../assets/icons/duplicates.png"); label: "重复文件"; collapsed: root.collapsed; selected: root.active-index == 4; activated => { root.navigate(4); } }
+            NavItem { icon: @image-url("../assets/icons/review-delete.png"); label: "审核删除"; collapsed: root.collapsed; selected: root.active-index == 5; activated => { root.navigate(5); } }
+            Rectangle { vertical-stretch: 1; background: transparent; }
+            NavItem { icon: @image-url("../assets/icons/index.png"); label: "数据库"; collapsed: root.collapsed; selected: root.active-index == 7; activated => { root.navigate(7); } }
+            NavItem { icon: @image-url("../assets/icons/settings.png"); label: "设置"; collapsed: root.collapsed; selected: root.active-index == 6; activated => { root.navigate(6); } }
+            Text {
+                visible: !root.collapsed;
+                height: 24px;
+                text: "本地管理端";
+                color: Theme.muted;
+                font-size: 10px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+    }
+}

@@ -4,7 +4,7 @@
 
 **目标：** 从零实现仅面向 Windows x64 的 Rust 媒体去重系统，使单节点可用 SQLite 完成全部本地功能，并使一个 Slint 管理工具可通过 TCP + Protobuf、PostgreSQL 协调多个局域网节点完成跨机器去重。
 
-**架构：** 工作区由 `desktop.exe`、`node.exe`、`worker.exe` 三个薄入口和九个职责单一的 crate 组成。节点串行拥有 SQLite，Worker 只处理不可信媒体，管理工具拥有 PostgreSQL 与跨节点编排；本地与中心分析共用领域类型、特征算法、不可变输入快照和代表文件分组规则。
+**架构：** 工作区由 `desktop.exe`、`node.exe`、`worker.exe` 三个薄入口和十个职责单一的 crate 组成。节点串行拥有 SQLite，Worker 只处理不可信媒体，管理工具拥有 PostgreSQL 与跨节点编排；本地与中心分析共用领域类型、特征算法、不可变输入快照和代表文件分组规则。
 
 **技术栈：** Rust 1.97.1（edition 2024）、Slint 1.17.1、Tokio 1.53.1、Prost 0.14.4、SQLite/rusqlite 0.40.1、PostgreSQL/tokio-postgres 0.7.18、Windows API、FFmpeg 8.0.1 x64 LGPL shared DLL。
 
@@ -162,7 +162,7 @@ mod tests {
 
 - [ ] **Step 4: 创建最小工作区配置并验证失败边界**
 
-根 `Cargo.toml` 声明上述九个 crate 和三个 app；尚未创建的成员会使 `cargo metadata` 失败。
+根 `Cargo.toml` 声明上述十个 crate 和三个 app；尚未创建的成员会使 `cargo metadata` 失败。
 
 Run: `cargo metadata --no-deps`
 
@@ -184,7 +184,7 @@ Expected: `product_id_is_stable ... ok`。
 
 Run: `cargo metadata --no-deps --format-version 1`
 
-Expected: 12 个 workspace member 全部出现，默认目标为 x64 MSVC。
+Expected: 13 个 workspace member 全部出现，默认目标为 x64 MSVC。
 
 - [ ] **Step 8: 格式化并提交**
 

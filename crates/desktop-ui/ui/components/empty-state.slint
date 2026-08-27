@@ -1,0 +1,55 @@
+// 空状态只解释当前状态，不生成任何示例数据。
+
+import { Theme } from "../theme.slint";
+
+export component EmptyState inherits Rectangle {
+    in property <string> title;
+    in property <string> detail;
+    in property <bool> disabled-feature: false;
+    // 0 为紧凑卡片，1 为工作区；默认工作区保持既有调用方布局兼容。
+    in property <int> density: 1;
+    in property <image> icon;
+
+    min-height: root.density == 0 ? 120px : 0px;
+    preferred-height: root.density == 0 ? 144px : 0px;
+    max-height: root.density == 0 ? 180px : 10000px;
+    vertical-stretch: root.density == 0 ? 0 : 1;
+    background: transparent;
+    accessible-role: AccessibleRole.groupbox;
+    accessible-label: "空状态：" + root.title;
+    VerticalLayout {
+        padding: root.density == 0 ? 16px : 24px;
+        spacing: 8px;
+        alignment: center;
+        // 图像用整行容器居中，避免固定 32px 子项停在左内边距而与文字中心错位。
+        if root.icon.width > 0 && root.icon.height > 0 : Rectangle {
+            height: 32px;
+            vertical-stretch: 0;
+            background: transparent;
+            Image {
+                x: (parent.width - self.width) / 2;
+                source: root.icon;
+                width: 32px;
+                height: 32px;
+                image-fit: contain;
+                colorize: root.disabled-feature ? Theme.warning : Theme.nav-icon;
+                accessible-label: "空状态图标：" + root.title;
+            }
+        }
+        Text {
+            text: root.disabled-feature ? "功能暂不可用" : "暂无内容";
+            color: root.disabled-feature ? Theme.warning : Theme.muted;
+            font-size: 12px;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: root.title;
+            color: Theme.text;
+            font-size: 16px;
+            font-weight: 680;
+            horizontal-alignment: center;
+            accessible-label: "空状态标题：" + root.title;
+        }
+        Text { text: root.detail; color: Theme.muted; font-size: 12px; wrap: word-wrap; horizontal-alignment: center; }
+    }
+}

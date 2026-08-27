@@ -1,0 +1,50 @@
+[workspace]
+resolver = "3"
+members = [
+    "apps/desktop",
+    "apps/node",
+    "apps/worker",
+    "crates/core",
+    "crates/protocol",
+    "crates/transport",
+    "crates/media",
+    "crates/media-ffmpeg",
+    "crates/windows",
+    "crates/node-store",
+    "crates/node-engine",
+    "crates/central-store",
+    "crates/desktop-core",
+    "crates/desktop-ui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+bytes = "1"
+everything-ipc = "=0.1.4"
+futures = "0.3"
+image = { version = "=0.25.8", default-features = false, features = ["jpeg"] }
+libloading = "0.9"
+md-5 = "0.10"
+prost = "=0.14.4"
+prost-build = "=0.14.4"
+protoc-bin-vendored = "=3.2.0"
+rusqlite = { version = "=0.40.1", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+slint = "=1.17.1"
+slint-build = "=1.17.1"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "=1.53.1", features = ["io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "test-util", "time"] }
+tokio-postgres = "=0.7.18"
+toml = "1"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["serde", "v4", "v7"] }
+windows = "0.62"

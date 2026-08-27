@@ -1,0 +1,175 @@
+// 节点目录选择器复用现有 BrowsePaths 协议，可浏览本机或远程计算节点。
+
+import { Theme, UiPathRow } from "../theme.slint";
+import { ActionButton } from "action-button.slint";
+import { EmptyState } from "empty-state.slint";
+import { ScrollView } from "std-widgets.slint";
+
+export component PathPickerDialog inherits Rectangle {
+    in property <int> node-index;
+    in property <string> current-path;
+    in property <string> parent-path;
+    in property <string> status;
+    in property <[UiPathRow]> directories;
+    callback browse(string);
+    callback cancel();
+    callback confirm(string);
+
+    background: #0f172a40;
+    accessible-role: AccessibleRole.groupbox;
+    accessible-label: "节点路径选择器";
+    accessible-description: "浏览当前计算节点上的目录并选择扫描根";
+
+    panel := Rectangle {
+        width: min(760px, parent.width - 48px);
+        height: min(590px, parent.height - 48px);
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        background: Theme.panel;
+        border-radius: 12px;
+        border-width: 1px;
+        border-color: Theme.border;
+        accessible-role: AccessibleRole.groupbox;
+        accessible-label: "选择扫描目录";
+
+        VerticalLayout {
+            padding: 22px;
+            spacing: 12px;
+
+            HorizontalLayout {
+                height: 40px;
+                vertical-stretch: 0;
+                spacing: 10px;
+                Image {
+                    source: @image-url("../assets/icons/folder.png");
+                    width: 24px;
+                    height: 24px;
+                    image-fit: contain;
+                    colorize: Theme.accent;
+                }
+                VerticalLayout {
+                    spacing: 2px;
+                    Text { text: "选择扫描目录"; color: Theme.text; font-size: 18px; font-weight: 720; }
+                    Text { text: "计算节点 " + root.node-index; color: Theme.muted; font-size: 11px; }
+                }
+                Rectangle { horizontal-stretch: 1; background: transparent; }
+                ActionButton { width: 80px; label: "取消"; clicked => { root.cancel(); } }
+            }
+
+            Rectangle {
+                height: 48px;
+                vertical-stretch: 0;
+                background: Theme.panel-hover;
+                border-radius: 8px;
+                HorizontalLayout {
+                    padding: 7px;
+                    spacing: 8px;
+                    ActionButton {
+                        width: 82px;
+                        label: "计算机";
+                        icon: @image-url("../assets/icons/nodes.png");
+                        clicked => { root.browse(""); }
+                    }
+                    ActionButton {
+                        width: 104px;
+                        label: "返回上级目录";
+                        action-enabled: root.current-path != "";
+                        clicked => { root.browse(root.parent-path); }
+                    }
+                    Text {
+                        text: root.current-path == "" ? "计算机 / 可用盘符" : root.current-path;
+                        color: Theme.text;
+                        font-size: 12px;
+                        horizontal-stretch: 1;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        accessible-role: AccessibleRole.groupbox;
+                        accessible-label: "当前目录：" + (root.current-path == "" ? "计算机" : root.current-path);
+                    }
+                }
+            }
+
+            Rectangle {
+                horizontal-stretch: 1;
+                vertical-stretch: 1;
+                background: Theme.panel;
+                border-radius: 8px;
+                border-width: 1px;
+                border-color: Theme.border;
+                accessible-role: AccessibleRole.groupbox;
+                accessible-label: "节点目录列表";
+
+                if root.directories.length > 0 : ScrollView {
+                    VerticalLayout {
+                        spacing: 2px;
+                        for directory in root.directories : row := Rectangle {
+                            height: 42px;
+                            background: row-touch.has-hover ? Theme.accent-soft : transparent;
+                            border-radius: 6px;
+                            HorizontalLayout {
+                                padding-left: 12px;
+                                padding-right: 12px;
+                                spacing: 10px;
+                                Image {
+                                    source: @image-url("../assets/icons/folder.png");
+                                    width: 18px;
+                                    height: 18px;
+                                    image-fit: contain;
+                                    colorize: Theme.accent;
+                                }
+                                Text {
+                                    text: directory.path;
+                                    color: Theme.text;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 1;
+                                    overflow: elide;
+                                }
+                                Text { text: "›"; color: Theme.muted; font-size: 18px; vertical-alignment: center; }
+                            }
+                            row-touch := TouchArea {
+                                accessible-role: AccessibleRole.button;
+                                accessible-label: "进入目录：" + directory.path;
+                                accessible-action-default => { root.browse(directory.path); }
+                                clicked => { root.browse(directory.path); }
+                            }
+                        }
+                    }
+                }
+
+                if root.directories.length == 0 : EmptyState {
+                    density: 1;
+                    icon: @image-url("../assets/icons/folder.png");
+                    title: "当前目录没有子目录";
+                    detail: "可以选择当前目录，或返回上级继续浏览";
+                }
+            }
+
+            HorizontalLayout {
+                height: 36px;
+                vertical-stretch: 0;
+                Text {
+                    text: root.status;
+                    color: Theme.muted;
+                    font-size: 11px;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                    overflow: elide;
+                }
+                ActionButton {
+                    width: 112px;
+                    label: "取消选择目录";
+                    clicked => { root.cancel(); }
+                }
+                ActionButton {
+                    width: 126px;
+                    label: "选择此文件夹";
+                    icon: @image-url("../assets/icons/folder.png");
+                    tone: 1;
+                    action-enabled: root.current-path != "";
+                    clicked => { root.confirm(root.current-path); }
+                }
+            }
+        }
+    }
+}

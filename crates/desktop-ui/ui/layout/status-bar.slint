@@ -1,0 +1,77 @@
+// 32px 底栏显示引擎、同步和 PostgreSQL，并为诊断保留完整可访问文本。
+
+import { Theme } from "../theme.slint";
+
+export component StatusBar inherits Rectangle {
+    // 三项状态与最后错误均来自 MainWindow 的只读属性。
+    in property <string> sync-text;
+    in property <string> postgres-status;
+    in property <color> postgres-color;
+    in property <string> last-error;
+
+    background: Theme.sidebar;
+    border-width: 1px;
+    border-color: Theme.border;
+    accessible-role: AccessibleRole.groupbox;
+    accessible-label: "状态栏：引擎就绪；同步 " + root.sync-text + "；PostgreSQL " + root.postgres-status
+        + (root.last-error == "" ? "" : "；最后错误 " + root.last-error);
+
+    // 左、中、右三段保持单行；中段在错误过长时只做视觉省略。
+    HorizontalLayout {
+        padding-left: 16px;
+        padding-right: 16px;
+        spacing: 12px;
+        alignment: center;
+        engine-segment := Rectangle {
+            width: 92px;
+            height: 22px;
+            background: transparent;
+            accessible-role: AccessibleRole.groupbox;
+            accessible-label: "引擎状态：就绪";
+            Text {
+                text: "●  引擎就绪";
+                color: Theme.success;
+                font-size: 10px;
+                vertical-alignment: center;
+            }
+        }
+        Rectangle { width: 1px; height: 14px; background: Theme.border; }
+        sync-segment := Rectangle {
+            horizontal-stretch: 1;
+            height: 22px;
+            background: transparent;
+            clip: true;
+            accessible-role: AccessibleRole.groupbox;
+            accessible-label: "同步状态：" + root.sync-text;
+            Text {
+                width: parent.width;
+                height: parent.height;
+                text: "同步  " + root.sync-text
+                    + (root.last-error == "" ? "" : "  ·  错误  " + root.last-error);
+                color: root.last-error == "" ? Theme.muted : Theme.danger;
+                font-size: 10px;
+                overflow: elide;
+                wrap: no-wrap;
+                vertical-alignment: center;
+            }
+        }
+        postgres-segment := Rectangle {
+            width: 180px;
+            height: 22px;
+            background: transparent;
+            accessible-role: AccessibleRole.groupbox;
+            accessible-label: "PostgreSQL 状态：" + root.postgres-status;
+            Text {
+                width: parent.width;
+                height: parent.height;
+                text: "PostgreSQL  " + root.postgres-status;
+                color: root.postgres-color;
+                font-size: 10px;
+                overflow: elide;
+                wrap: no-wrap;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+            }
+        }
+    }
+}

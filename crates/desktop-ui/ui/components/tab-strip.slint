@@ -1,0 +1,52 @@
+// 轻量页签条以蓝字和 2px 下划线表达选中状态。
+
+import { Theme } from "../theme.slint";
+
+export component TabStrip inherits Rectangle {
+    in property <[string]> labels;
+    in-out property <int> active-index;
+    callback changed(int);
+
+    height: 42px;
+    background: transparent;
+    HorizontalLayout {
+        spacing: 0px;
+        for label[index] in root.labels : tab := Rectangle {
+            width: max(72px, tab-label.preferred-width + 24px);
+            background: touch.has-hover ? Theme.panel-hover : transparent;
+            accessible-role: AccessibleRole.tab;
+            accessible-label: label;
+            accessible-item-selected: root.active-index == index;
+            accessible-action-default => {
+                root.active-index = index;
+                root.changed(index);
+            }
+            tab-label := Text {
+                text: label;
+                x: 12px;
+                y: 0px;
+                width: parent.width - 24px;
+                height: parent.height - 2px;
+                color: root.active-index == index ? Theme.accent : Theme.muted;
+                font-size: 12px;
+                font-weight: root.active-index == index ? 650 : 450;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                accessible-label: "页签文字：" + label;
+            }
+            Rectangle {
+                visible: root.active-index == index;
+                height: 2px;
+                y: parent.height - self.height;
+                background: Theme.accent;
+            }
+            touch := TouchArea {
+                clicked => {
+                    root.active-index = index;
+                    root.changed(index);
+                }
+            }
+        }
+        Rectangle { horizontal-stretch: 1; background: transparent; }
+    }
+}

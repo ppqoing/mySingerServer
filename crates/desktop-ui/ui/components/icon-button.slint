@@ -1,0 +1,38 @@
+// 统一图标按钮把可访问动作、悬停反馈和真实指针路径收束为单次 clicked 回调。
+
+import { Theme } from "../theme.slint";
+
+export component IconButton inherits Rectangle {
+    // 图标、可访问名称和启用状态由使用方传入。
+    in property <image> icon;
+    in property <string> accessible-name;
+    in property <bool> action-enabled: true;
+    // clicked 是唯一动作出口，禁用态不会触发。
+    callback clicked();
+
+    width: 32px;
+    height: 32px;
+    border-radius: 6px;
+    background: !root.action-enabled ? transparent : touch.has-hover ? Theme.panel-hover : Theme.panel;
+    border-width: 1px;
+    border-color: Theme.border;
+    accessible-role: AccessibleRole.button;
+    accessible-label: root.accessible-name;
+    accessible-enabled: root.action-enabled;
+    accessible-action-default => { if root.action-enabled { root.clicked(); } }
+
+    // 图标固定 16×16，并只通过主题色表达禁用、悬停和普通状态。
+    Image {
+        source: root.icon;
+        width: 16px;
+        height: 16px;
+        x: 8px;
+        y: 8px;
+        image-fit: contain;
+        colorize: !root.action-enabled ? Theme.disabled-text : touch.has-hover ? Theme.accent : Theme.nav-icon;
+    }
+    // TouchArea 必须声明在图像之后，确保完整按钮区域只转发一次 clicked。
+    touch := TouchArea {
+        clicked => { if root.action-enabled { root.clicked(); } }
+    }
+}

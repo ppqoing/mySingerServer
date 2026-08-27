@@ -1,0 +1,46 @@
+// 页面分段标题只承载文字、可选图标和调用方提供的动作槽。
+
+import { Theme } from "../theme.slint";
+
+export component SectionHeader inherits Rectangle {
+    in property <string> title;
+    in property <string> subtitle;
+    in property <image> icon;
+
+    min-height: root.subtitle == "" ? 36px : 48px;
+    horizontal-stretch: 1;
+    background: transparent;
+    accessible-role: AccessibleRole.groupbox;
+    accessible-label: "分区标题：" + root.title;
+    HorizontalLayout {
+        width: parent.width;
+        height: parent.height;
+        spacing: 10px;
+        if root.icon.width > 0 && root.icon.height > 0 : Image {
+            source: root.icon;
+            width: 20px;
+            height: 20px;
+            y: (parent.height - self.height) / 2;
+            image-fit: contain;
+            colorize: Theme.nav-icon;
+            accessible-label: "分区标题图标：" + root.title;
+        }
+        VerticalLayout {
+            height: root.subtitle == "" ? 36px : 48px;
+            spacing: 3px;
+            alignment: center;
+            accessible-role: AccessibleRole.groupbox;
+            accessible-label: "分区标题内容：" + root.title;
+            Text {
+                text: root.title;
+                color: Theme.text;
+                font-size: 16px;
+                font-weight: 680;
+                accessible-label: "分区标题文字：" + root.title;
+            }
+            if root.subtitle != "" : Text { text: root.subtitle; color: Theme.muted; font-size: 11px; overflow: elide; }
+        }
+        Rectangle { horizontal-stretch: 1; background: transparent; }
+        @children
+    }
+}

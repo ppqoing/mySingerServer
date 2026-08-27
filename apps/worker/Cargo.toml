@@ -1,0 +1,26 @@
+[package]
+name = "worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+dedup-core = { path = "../../crates/core" }
+dedup-media-ffmpeg = { path = "../../crates/media-ffmpeg" }
+dedup-node-engine = { path = "../../crates/node-engine" }
+dedup-protocol = { path = "../../crates/protocol" }
+dedup-transport = { path = "../../crates/transport" }
+dedup-windows = { path = "../../crates/windows" }
+prost.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[test]]
+name = "worker_protocol_process"
+path = "tests/worker_protocol_process.rs"
+harness = false

@@ -1,0 +1,250 @@
+// 总览仪表盘只消费后端行模型，以紧凑指标、健康表和任务表呈现当前事实。
+
+import { ScrollView } from "std-widgets.slint";
+import { Theme, UiNodeRow, UiTaskRow } from "../theme.slint";
+import { EmptyState } from "../components/empty-state.slint";
+import { FluentCard } from "../components/fluent-card.slint";
+import { MetricCard } from "../components/metric-card.slint";
+import { SectionHeader } from "../components/section-header.slint";
+import { StatusPill } from "../components/status-pill.slint";
+
+export component OverviewDashboard inherits Rectangle {
+    in property <[UiNodeRow]> nodes;
+    in property <[UiTaskRow]> tasks;
+    in property <int> online-count;
+    in property <int> running-count;
+    in property <string> indexed-text;
+    in property <string> sync-text;
+    in property <string> postgres-status;
+    in property <color> postgres-color;
+
+    background: transparent;
+
+    ScrollView {
+        VerticalLayout {
+            padding: Theme.page-padding;
+            spacing: Theme.section-gap;
+
+            Text {
+                width: root.width - 40px;
+                height: 36px;
+                vertical-stretch: 0;
+                text: "总览";
+                color: Theme.text;
+                font-size: 24px;
+                font-weight: 750;
+                vertical-alignment: center;
+                accessible-role: AccessibleRole.groupbox;
+                accessible-label: "总览标题";
+            }
+
+            // 固定指标行高度，避免 ScrollView 内的横向布局吸收剩余高度。
+            HorizontalLayout {
+                height: 100px;
+                vertical-stretch: 0;
+                spacing: 12px;
+                accessible-role: AccessibleRole.groupbox;
+                accessible-label: "总览主要内容";
+                MetricCard {
+                    horizontal-stretch: 1;
+                    title: "在线节点";
+                    value: root.online-count + " 台";
+                    detail: "当前已连接的计算节点";
+                    tone: Theme.success;
+                    icon: @image-url("../assets/icons/nodes.png");
+                    accessible-role: AccessibleRole.groupbox;
+                    accessible-label: "在线节点：" + root.online-count + " 台";
+                }
+                MetricCard {
+                    horizontal-stretch: 1;
+                    title: "运行任务";
+                    value: root.running-count + " 个";
+                    detail: "正在执行的媒体任务";
+                    tone: Theme.accent;
+                    icon: @image-url("../assets/icons/tasks.png");
+                    accessible-role: AccessibleRole.groupbox;
+                    accessible-label: "运行任务：" + root.running-count + " 个";
+                }
+                MetricCard {
+                    horizontal-stretch: 1;
+                    title: "索引摘要";
+                    value: root.indexed-text;
+                    detail: "后端已汇总的索引范围";
+                    tone: Theme.text;
+                    icon: @image-url("../assets/icons/index.png");
+                    accessible-role: AccessibleRole.groupbox;
+                    accessible-label: "索引摘要：" + root.indexed-text;
+                }
+                MetricCard {
+                    horizontal-stretch: 1;
+                    title: "同步摘要";
+                    value: root.sync-text;
+                    detail: "中心数据库同步位置";
+                    tone: Theme.warning;
+                    icon: @image-url("../assets/icons/sync.png");
+                    accessible-role: AccessibleRole.groupbox;
+                    accessible-label: "同步摘要：" + root.sync-text;
+                }
+                MetricCard {
+                    horizontal-stretch: 1;
+                    title: "数据库状态";
+                    value: root.postgres-status;
+                    detail: "中心 PostgreSQL 运行连接";
+                    tone: root.postgres-color;
+                    icon: @image-url("../assets/icons/index.png");
+                    accessible-role: AccessibleRole.groupbox;
+                    accessible-label: "数据库状态：" + root.postgres-status;
+                }
+            }
+
+            // 节点健康表严格使用 UiNodeRow 现有字段，空模型显示工作区空态。
+            FluentCard {
+                height: root.nodes.length > 0 ? 82px + root.nodes.length * Theme.table-row-height : 224px;
+                vertical-stretch: 0;
+                VerticalLayout {
+                    padding: 6px;
+                    spacing: 0px;
+                    SectionHeader {
+                        height: 36px;
+                        vertical-stretch: 0;
+                        horizontal-stretch: 1;
+                        title: "节点健康";
+                        subtitle: "";
+                        icon: @image-url("../assets/icons/nodes.png");
+                    }
+                    Rectangle {
+                        height: Theme.table-header-height;
+                        vertical-stretch: 0;
+                        background: Theme.panel-hover;
+                        HorizontalLayout {
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            spacing: 10px;
+                            Text { text: "名称"; color: Theme.muted; font-size: 11px; width: 120px; vertical-alignment: center; }
+                            Text { text: "地址"; color: Theme.muted; font-size: 11px; width: 160px; vertical-alignment: center; }
+                            Text { text: "状态"; color: Theme.muted; font-size: 11px; width: 72px; vertical-alignment: center; }
+                            Text { text: "Worker"; color: Theme.muted; font-size: 11px; width: 110px; vertical-alignment: center; }
+                            Text { text: "任务"; color: Theme.muted; font-size: 11px; horizontal-stretch: 1; vertical-alignment: center; }
+                            Text { text: "同步位置"; color: Theme.muted; font-size: 11px; width: 110px; vertical-alignment: center; }
+                        }
+                    }
+                    if root.nodes.length > 0 : VerticalLayout {
+                        spacing: 0px;
+                        for node in root.nodes : Rectangle {
+                            height: Theme.table-row-height;
+                            vertical-stretch: 0;
+                            background: transparent;
+                            accessible-role: AccessibleRole.list-item;
+                            accessible-label: "总览节点：" + node.name + "；" + node.address + "；" + node.status
+                                + "；Worker " + node.worker-text + "；任务 " + node.task-text + "；同步 " + node.sync-text;
+                            HorizontalLayout {
+                                padding-left: 8px;
+                                padding-right: 8px;
+                                spacing: 10px;
+                                Text { text: node.name; color: Theme.text; font-size: 12px; width: 120px; overflow: elide; vertical-alignment: center; }
+                                Text { text: node.address; color: Theme.muted; font-size: 12px; width: 160px; overflow: elide; vertical-alignment: center; }
+                                StatusPill { label: node.status; tone: node.status-color; width: 72px; }
+                                Text { text: node.worker-text; color: Theme.text; font-size: 12px; width: 110px; overflow: elide; vertical-alignment: center; }
+                                Text { text: node.task-text; color: Theme.text; font-size: 12px; horizontal-stretch: 1; overflow: elide; vertical-alignment: center; }
+                                Text { text: node.sync-text; color: Theme.text; font-size: 12px; width: 110px; overflow: elide; vertical-alignment: center; }
+                            }
+                        }
+                    }
+                    if root.nodes.length == 0 : EmptyState {
+                        title: "暂无节点健康数据";
+                        detail: "连接节点后将在此显示真实运行状态";
+                        icon: @image-url("../assets/icons/nodes.png");
+                    }
+                }
+            }
+
+            // 最近任务继续展示后端原始状态与进度，表头和行使用统一密度。
+            FluentCard {
+                height: root.tasks.length > 0 ? 82px + root.tasks.length * Theme.table-row-height : 224px;
+                vertical-stretch: 0;
+                VerticalLayout {
+                    padding: 6px;
+                    spacing: 0px;
+                    SectionHeader {
+                        height: 36px;
+                        vertical-stretch: 0;
+                        horizontal-stretch: 1;
+                        title: "最近任务";
+                        subtitle: "";
+                        icon: @image-url("../assets/icons/tasks.png");
+                    }
+                    Rectangle {
+                        height: Theme.table-header-height;
+                        vertical-stretch: 0;
+                        background: Theme.panel-hover;
+                        HorizontalLayout {
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            spacing: 10px;
+                            Text { text: "任务"; color: Theme.muted; font-size: 11px; horizontal-stretch: 1; vertical-alignment: center; }
+                            Text { text: "节点"; color: Theme.muted; font-size: 11px; width: 72px; vertical-alignment: center; }
+                            Text { text: "阶段"; color: Theme.muted; font-size: 11px; width: 150px; vertical-alignment: center; }
+                            Text { text: "进度"; color: Theme.muted; font-size: 11px; width: 72px; vertical-alignment: center; }
+                            Text { text: "状态"; color: Theme.muted; font-size: 11px; width: 82px; vertical-alignment: center; }
+                        }
+                    }
+                    if root.tasks.length > 0 : VerticalLayout {
+                        spacing: 0px;
+                        for task in root.tasks : Rectangle {
+                            height: Theme.table-row-height;
+                            vertical-stretch: 0;
+                            background: transparent;
+                            accessible-role: AccessibleRole.list-item;
+                            accessible-label: "最近任务：" + task.title + "；节点 " + task.node-index + "；" + task.stage
+                                + "；" + task.progress + "%；" + task.status;
+                            HorizontalLayout {
+                                padding-left: 8px;
+                                padding-right: 8px;
+                                spacing: 10px;
+                                Text { text: task.title; color: Theme.text; font-size: 12px; horizontal-stretch: 1; overflow: elide; vertical-alignment: center; }
+                                Text { text: task.node-index; color: Theme.text; font-size: 12px; width: 72px; vertical-alignment: center; }
+                                Text { text: task.stage; color: Theme.muted; font-size: 12px; width: 150px; overflow: elide; vertical-alignment: center; }
+                                Text { text: task.progress + "%"; color: Theme.text; font-size: 12px; width: 72px; vertical-alignment: center; }
+                                StatusPill { label: task.status; tone: task.status-color; width: 82px; }
+                            }
+                        }
+                    }
+                    if root.tasks.length == 0 : EmptyState {
+                        title: "暂无最近任务";
+                        detail: "创建扫描或分析任务后将在此显示真实进度";
+                        icon: @image-url("../assets/icons/tasks.png");
+                    }
+                }
+            }
+
+            // 模型没有容量与重复类型统计字段，因此保留两张有标题的紧凑禁用说明。
+            HorizontalLayout {
+                width: root.width - 40px;
+                height: 160px;
+                vertical-stretch: 0;
+                horizontal-stretch: 1;
+                spacing: 12px;
+                FluentCard {
+                    width: (root.width - 52px) / 2;
+                    EmptyState {
+                        density: 0;
+                        title: "容量统计暂不可用";
+                        detail: "当前数据源未提供按节点容量汇总";
+                        disabled-feature: true;
+                        icon: @image-url("../assets/icons/info.png");
+                    }
+                }
+                FluentCard {
+                    width: (root.width - 52px) / 2;
+                    EmptyState {
+                        density: 0;
+                        title: "重复类型统计暂不可用";
+                        detail: "当前数据源未提供按空间分类汇总";
+                        disabled-feature: true;
+                        icon: @image-url("../assets/icons/info.png");
+                    }
+                }
+            }
+        }
+    }
+}

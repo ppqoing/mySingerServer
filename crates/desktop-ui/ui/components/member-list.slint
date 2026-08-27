@@ -1,0 +1,164 @@
+// 高密度成员表；在线门禁、分数、复核状态与原有三个动作保持同一行模型。
+
+import { ScrollView } from "std-widgets.slint";
+import { Theme, UiMemberRow } from "../theme.slint";
+import { EmptyState } from "empty-state.slint";
+import { StatusPill } from "status-pill.slint";
+
+// 固定宽度动作避免标准按钮最小宽度挤压 300px 详情列，同时保留真实可访问默认动作。
+component MemberAction inherits Rectangle {
+    in property <string> label;
+    in property <string> accessible-name;
+    in property <image> icon;
+    in property <int> tone: 0;
+    in property <bool> action-enabled: true;
+    callback clicked();
+    width: 62px;
+    height: 34px;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: root.tone == 2 ? Theme.danger.with-alpha(0.45) : Theme.border;
+    background: !root.action-enabled ? Theme.panel-hover
+        : root.tone == 2 ? action-touch.has-hover ? Theme.danger.with-alpha(0.18) : Theme.danger-soft
+        : action-touch.has-hover ? Theme.panel-hover : Theme.panel;
+    opacity: root.action-enabled ? 1 : 0.55;
+    accessible-role: AccessibleRole.button;
+    accessible-label: root.accessible-name;
+    accessible-enabled: root.action-enabled;
+    accessible-action-default => { if root.action-enabled { root.clicked(); } }
+    HorizontalLayout {
+        padding-left: 6px;
+        padding-right: 6px;
+        spacing: 4px;
+        alignment: center;
+        Image {
+            source: root.icon;
+            width: 16px;
+            height: 16px;
+            image-fit: contain;
+            colorize: !root.action-enabled ? Theme.disabled-text : root.tone == 2 ? Theme.danger : Theme.nav-icon;
+        }
+        Text {
+            text: root.label;
+            color: !root.action-enabled ? Theme.disabled-text : root.tone == 2 ? Theme.danger : Theme.text;
+            font-size: 10px;
+            overflow: elide;
+            vertical-alignment: center;
+        }
+    }
+    // 触摸层后声明，动作不会被图标或正文遮挡。
+    action-touch := TouchArea { enabled: root.action-enabled; clicked => { if root.action-enabled { root.clicked(); } } }
+}
+
+export component MemberList inherits Rectangle {
+    in property <[UiMemberRow]> members;
+    callback preview(string, string);
+    callback review(string, string, int);
+    private property <string> selected-path;
+
+    background: Theme.panel;
+    min-width: 50px;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: Theme.border;
+    accessible-role: AccessibleRole.groupbox;
+    accessible-label: "成员表";
+
+    // 表头和成员行同处一个滚动视口，小窗保留区域正宽并允许横向到达所有列。
+    ScrollView {
+        VerticalLayout {
+            min-width: 820px;
+            spacing: 0px;
+            Rectangle {
+                height: Theme.table-header-height;
+                background: Theme.panel-hover;
+                HorizontalLayout {
+                    padding-left: 9px;
+                    padding-right: 9px;
+                    spacing: 6px;
+                    alignment: center;
+                    Text { text: "复核 / 动作"; width: 270px; color: Theme.muted; font-size: 10px; }
+                    Text { text: "代表 / 在线"; width: 72px; color: Theme.muted; font-size: 10px; }
+                    Text { text: "路径 / 机器"; horizontal-stretch: 1; color: Theme.muted; font-size: 10px; }
+                    Text { text: "大小 / 元数据"; width: 90px; color: Theme.muted; font-size: 10px; }
+                    Text { text: "Stage1"; width: 42px; color: Theme.muted; font-size: 10px; horizontal-alignment: center; }
+                    Text { text: "pHash"; width: 38px; color: Theme.muted; font-size: 10px; horizontal-alignment: center; }
+                    Text { text: "Stage2"; width: 42px; color: Theme.muted; font-size: 10px; horizontal-alignment: center; }
+                }
+            }
+            Rectangle { height: 1px; background: Theme.border; }
+            if root.members.length == 0 : EmptyState {
+                density: 0;
+                title: "选择重复组后加载成员";
+                detail: "成员列表不会自动预取图片或视频预览。";
+            }
+            for member in root.members : Rectangle {
+                    height: Theme.member-row-height;
+                    background: member.path == root.selected-path || member.representative ? Theme.accent-soft : Theme.panel;
+                    border-width: 0px;
+                    accessible-role: AccessibleRole.list-item;
+                    accessible-label: "成员：" + member.path;
+                    accessible-item-selected: member.path == root.selected-path;
+                    accessible-action-default => { root.selected-path = member.path; }
+                    // 整行选择层先声明在内容下方；后声明的预览/保留/删除动作优先命中。
+                    row-touch := TouchArea { clicked => { root.selected-path = member.path; } }
+                    HorizontalLayout {
+                        padding-left: 9px;
+                        padding-right: 9px;
+                        spacing: 6px;
+                        alignment: center;
+                        HorizontalLayout {
+                            width: 270px;
+                            spacing: 4px;
+                            alignment: center;
+                            StatusPill { width: 72px; label: member.review; tone: member.review-color; }
+                            MemberAction {
+                                label: "预览";
+                                accessible-name: "预览成员：" + member.path;
+                                icon: @image-url("../assets/icons/preview.png");
+                                action-enabled: member.preview-enabled;
+                                clicked => { root.preview(member.machine-id, member.path); }
+                            }
+                            MemberAction {
+                                label: "保留";
+                                accessible-name: "保留成员：" + member.path;
+                                icon: @image-url("../assets/icons/keep.png");
+                                clicked => { root.review(member.machine-id, member.path, 1); }
+                            }
+                            MemberAction {
+                                label: "删除";
+                                accessible-name: "删除成员：" + member.path;
+                                icon: @image-url("../assets/icons/delete.png");
+                                tone: 2;
+                                action-enabled: member.delete-enabled;
+                                clicked => { root.review(member.machine-id, member.path, 2); }
+                            }
+                        }
+                        StatusPill {
+                            width: 72px;
+                            label: member.representative ? "代表" : member.online ? "在线" : "离线";
+                            tone: member.representative ? Theme.accent : member.online ? Theme.success : Theme.muted;
+                        }
+                        VerticalLayout {
+                            horizontal-stretch: 1;
+                            spacing: 2px;
+                            alignment: center;
+                            Text { text: member.path; color: Theme.text; font-size: 10px; overflow: elide; }
+                            Text { text: member.machine-id + " · " + member.md5; color: Theme.muted; font-size: 10px; overflow: elide; }
+                        }
+                        VerticalLayout {
+                            width: 90px;
+                            spacing: 2px;
+                            alignment: center;
+                            Text { text: member.size; color: Theme.text; font-size: 10px; overflow: elide; }
+                            Text { text: member.metadata; color: Theme.muted; font-size: 10px; overflow: elide; }
+                        }
+                        Text { text: member.stage1; width: 42px; color: Theme.muted; font-size: 10px; horizontal-alignment: center; }
+                        Text { text: member.phash; width: 38px; color: Theme.muted; font-size: 10px; horizontal-alignment: center; }
+                        Text { text: member.stage2; width: 42px; color: Theme.text; font-size: 10px; horizontal-alignment: center; }
+                    }
+                    Rectangle { y: parent.height - 1px; height: 1px; background: Theme.border; }
+                }
+        }
+    }
+}

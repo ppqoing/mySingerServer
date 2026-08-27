@@ -1,66 +1,62 @@
-# mySingerServer 媒体节点部署说明
+# mySingerServer Rust V2 节点部署
 
-本压缩包用于在 Windows x64 机器上部署 mySingerServer 媒体节点，包括托盘管理程序、Agent、Worker、可选 Helper、VideoCore 和所需原生运行库。
+Rust V2 Windows x64 便携包包含 `node.exe`、`worker.exe`、`Everything.exe`、固定 FFmpeg DLL、
+`bootstrap.toml`、默认 `config/node.toml` 和中心建库脚本。请完整解压到本地物理磁盘目录，
+不要只复制单个 EXE，也不要从 ZIP 内直接运行。
 
-## 快速部署
+## 启动
 
-1. 将压缩包内完整的 `MySingerServer-Compute` 文件夹解压到任意本地、当前用户可写的目录，例如 `D:\Apps\MySingerServer-Compute`。不要只复制单个 EXE，也不要从压缩包内直接运行。
-2. 不能解压到 UNC 网络路径（如 `\\server\share\...`）；可使用本地磁盘或可移动磁盘。
-3. 确认 `nodetray.exe`、所有同级 EXE/DLL、`data` 目录和许可证目录都保留在同一个包根目录。新包不会预建 `data\helper`。
-4. 启动 `nodetray.exe`。
-5. NodeTray 会自动安全导入包内默认配置；在托盘界面的配置页签中交互式填写 Agent 参数并保存。不要直接修改生产 JSON 配置文件。
-6. 根据需要选择自动或手动启动，并决定是否启用开机启动。
+1. 运行 `node.exe`。程序清单要求管理员权限，Windows 会显示 UAC 提示。
+2. Node 按 `bootstrap.toml` 找到完整配置，默认监听 `127.0.0.1:39091`。
+3. Node 启动 Worker 池；`worker.exe` 不访问 SQLite、PostgreSQL 或 TCP。
+4. 管理端连接后，可在“设置 → 节点服务”选择此 Node，点击“加载配置”。修改后点击
+   “保存并重启”，配置由 Node 写入本机，随后 Node 自行重启并重新连接。
 
-机器 ID 由 CPU ID、主板序列号和 Windows MachineGuid 自动计算为 `node-<sha256>`，无需填写；NodeTray 只在概览页显示该只读 ID。
+Node 的机器唯一 ID 由 SMBIOS System UUID、System Serial 和 Baseboard Serial 生成，只读显示，
+不写入配置。远程计算机只需要运行 `node.exe` 和它启动的 Worker，不需要运行 `desktop.exe`。
 
-## 组件说明
+## Everything 与扫描路径
 
-- `nodetray.exe`：常驻托盘管理界面，用于配置、启动、停止和重启节点组件。
-- `agent.exe`：媒体节点 Agent。
-- `worker.exe`：调用 `videocore.dll` 完成媒体计算。
-- `helper.exe`：可选删除辅助组件，随包提供但默认不启用，也不会由 Agent 自动启动。Helper 需要管理员权限，只有用户显式启用或启动时才可能出现 UAC 提示。
-- `Everything.exe`、`Everything64.dll`：Everything 1.4 后台客户端和 SDK 运行库。启用 `use_everything` 后，Agent 会在 IPC 不可用时自动执行同目录的 `Everything.exe -startup`，并让扫描等待索引数据库完成加载。程序不会安装或管理 Windows Everything 服务。
-- `MicrosoftEdgeWebview2Setup.exe`：WebView2 Runtime 官方引导程序。只有目标机缺少 WebView2 时才由用户手动运行。
+默认枚举器为 Everything。Node 收到扫描任务后会检查当前会话中的 Everything IPC 和索引数据库；
+若未就绪，则启动 `node.exe` 同目录的 `Everything.exe -startup` 并等待初始化。启动、等待或首次
+完整枚举失败时，本次扫描从头使用 Windows Walker，绝不混合两种枚举结果。
 
-## Helper 安全配置
+扫描页可以添加多个路径项；每项可选择 Node、选择该 Node 上的路径并单独删除。切换 Node 会清空
+已选路径。当前只支持本地物理磁盘路径，不保证 UNC 或映射网络盘的物理盘并发语义。
 
-Helper 必须与 Agent 位于同一台机器，建议由同一账号运行，并需要管理员权限。只在确实需要删除辅助功能时启用，并在界面中把 `allowed_roots` 配置为明确、窄范围的媒体目录。默认采用 soft 删除；是否允许硬删除由用户在配置界面中明确决定。
+## Node 配置
 
-首次解压后即可在 NodeTray 界面中查看和修改 `data\helper\helper.json`。保存 Agent、Helper 与 NodeTray 配置都不需要管理员权限；只有真正启动 `helper.exe` 时 Windows 才会显示 UAC 提示。
+配置路径支持绝对路径和相对路径。相对字符串保存时保持原样，运行时以 `node.exe` 所在目录解析。
+可配置数据、配置、日志、缓存目录，以及 HDD、SSD、未知磁盘的每盘读取线程数、全局读取线程数、
+读取块大小、单块超时和重试次数。默认单块超时为 3 秒。
 
-当包根允许普通用户写入时，启用 Helper 会带来额外的提权风险：管理员任务会从该包根启动 `helper.exe`。只应在受信任的本地目录中启用它，并限制该目录的写入权限；移动、替换或允许不受信任用户写入包根后，应先禁用并重新检查 Helper 配置和任务。
+单机只使用 SQLite 时保持：
 
-## 便携数据、配置和日志目录
-
-| 用途 | 目录 |
-|---|---|
-| 程序文件 | 包根目录（`nodetray.exe` 同级） |
-| Agent 配置与日志 | `data\agent\` 与 `data\agent\logs\` |
-| Helper 配置与日志 | `data\helper\` 与 `data\helper\logs\` |
-| NodeTray 设置与 WebView2 数据 | `data\nodetray\` 与 `data\nodetray\webview2\` |
-
-包内预置 `data\agent\agent.json`、`data\helper\helper.json` 和 `data\nodetray\tray.json`；Agent 的 Worker 参数唯一位于 `data\agent\agent.json` 的 `worker` 段，不会生成 `worker.json`。所有默认运行路径都相对包根，不依赖系统安装目录或用户配置目录。
-
-如需移动整个计算包，请先通过 NodeTray 停止组件，再完整移动整个目录。移动后在 NodeTray 中检查并修复登录启动；若曾启用 Helper，也要检查并重新保存其任务配置，使其指向新目录。不要混用旧目录中的 `data`。
-
-## 哈希验证
-
-发布目录中的 `.zip.sha256` 文件记录整个 ZIP 的 SHA-256。可使用 PowerShell 验证：
-
-```powershell
-Get-FileHash -Algorithm SHA256 .\MySingerServer-compute-win-x64-*.zip
+```toml
+[postgres]
+enabled = false
+host = "127.0.0.1"
+port = 5432
+database = "media_dedup"
+username = "postgres"
+password = ""
+connect_timeout_seconds = 3
 ```
 
-计算结果应与对应 `.zip.sha256` 文件中的 64 位哈希完全一致。包内 `release-manifest.json` 还记录了各发布文件的大小和 SHA-256。
+多机器模式把 `enabled` 改为 `true`，并填写可达的 PostgreSQL 基础连接参数。Node 会先把结果事务
+提交到本地 SQLite，再发布 outbox；基础和二次特征缓存会先查 SQLite，再查 PostgreSQL。
+PostgreSQL 连接或查询失败时，本次任务记录警告并降级为 SQLite-only，不会把本地计算标为失败。
 
-## 基础排查
+## 数据与 schema
 
-- NodeTray 无法启动：确认程序位于完整的本地包根目录，而非 UNC 路径，并确认系统已安装 WebView2 Runtime。
-- Agent 无法连接：检查 Agent 监听地址、中央 GUI 配置的 Agent 地址、状态页上报 ID、PostgreSQL 连接和 Windows 防火墙；不要在聊天、日志截图或问题报告中公开 DSN、密码或令牌。
-- 路径扫描长期等待：确认任务管理器中存在 `Everything.exe`，并查看 Agent 日志中的 Everything IPC/索引等待状态；首次建立大型索引时扫描会持续等待，不会自动切换为普通目录遍历。
-- Helper 无法启动：确认已显式启用、配置了有效的窄范围 `allowed_roots`，并检查 Helper 日志目录。
-- 需要卸载：先通过 NodeTray 停止 Agent、Worker 和 Helper，再删除整个包根目录；包内运行期配置和日志会随该目录一并移除。
+- SQLite 当前固定为 `PRAGMA user_version=3`，只自动初始化空数据库。
+- 旧 SQLite 不自动迁移；升级不兼容版本时请手工备份并重建数据目录。
+- 视频联系表保存在 `<cache_path>/contact-sheets/<md5前两位>/<md5>.jpg`，存在且有效时直接复用。
+- 读取超时和 Worker 崩溃按机器 ID、路径及故障详情记录；同一次运行不无限重试崩溃文件。
+- 磁盘空间不足时会触发清理 `mySingerServer` 项目路径下全部符合条件的临时文件和可再生产物。
 
-## 验收边界
+## 完整性与验收边界
 
-本发布包在生成时仅进行静态构建、白名单裁剪、依赖闭包、文件清单和 ZIP 哈希复核。它不代表已在当前目标机上启动组件、连接 PostgreSQL、处理真实媒体目录或完成长时间驻留测试。
+发布 ZIP 位于 `dist-rust-v2/mySingerServer-rust-v2-win-x64.zip`，同目录 `.zip.sha256` 保存本轮归档
+SHA-256。包内 `manifest/files.sha256` 覆盖解压文件。静态打包验证不等于真实媒体运行验收；
+实际验收结果必须单独记录运行目录、媒体根、持续时间、任务终态和日志证据。

@@ -1,0 +1,302 @@
+// 节点管理页在左侧选择和编辑节点，右侧只解释当前 UiNodeRow 的真实字段。
+
+import { LineEdit, SpinBox, ScrollView } from "std-widgets.slint";
+import { Theme, UiNodeRow } from "../theme.slint";
+import { ActionButton } from "../components/action-button.slint";
+import { DetailPanel } from "../components/detail-panel.slint";
+import { EmptyState } from "../components/empty-state.slint";
+import { FluentCard } from "../components/fluent-card.slint";
+import { StatusPill } from "../components/status-pill.slint";
+
+export component NodesPage inherits Rectangle {
+    in property <[UiNodeRow]> nodes;
+    in-out property <string> new-node-ip;
+    in-out property <int> new-node-port;
+    in-out property <int> selected-node-index: 0;
+    callback connect-all();
+    callback add-node(string, int);
+    callback edit-node(int, string, int);
+    callback sync-node(int);
+    callback remove-node(int);
+
+    background: transparent;
+
+    VerticalLayout {
+        padding: Theme.page-padding;
+        spacing: Theme.section-gap;
+
+        Rectangle {
+            width: root.width - 40px;
+            height: 48px;
+            vertical-stretch: 0;
+            background: transparent;
+            HorizontalLayout {
+                spacing: 10px;
+                Image {
+                    source: @image-url("../assets/icons/nodes.png");
+                    width: 20px;
+                    height: 20px;
+                    image-fit: contain;
+                    colorize: Theme.nav-icon;
+                }
+                VerticalLayout {
+                    width: 230px;
+                    spacing: 3px;
+                    Text { text: "节点管理"; color: Theme.text; font-size: 20px; font-weight: 720; }
+                    Text { text: "连接可信局域网内的计算节点"; color: Theme.muted; font-size: 11px; }
+                }
+                Rectangle { horizontal-stretch: 1; background: transparent; }
+                ActionButton {
+                    width: 100px;
+                    label: "连接全部";
+                    icon: @image-url("../assets/icons/connect.png");
+                    tone: 1;
+                    accessible-label: "连接全部节点";
+                    clicked => { root.connect-all(); }
+                }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: Theme.section-gap;
+            vertical-stretch: 1;
+
+            VerticalLayout {
+                spacing: 12px;
+                horizontal-stretch: 1;
+
+                // 节点行既是可访问列表项，也是详情面板的唯一选择入口。
+                FluentCard {
+                    vertical-stretch: 1;
+                    accessible-role: AccessibleRole.groupbox;
+                    accessible-label: "节点表";
+                    VerticalLayout {
+                        padding: 12px;
+                        spacing: 0px;
+                        ScrollView {
+                            VerticalLayout {
+                                min-width: 720px;
+                                spacing: 0px;
+                                Rectangle {
+                                    height: Theme.table-header-height;
+                                    vertical-stretch: 0;
+                                    background: Theme.panel-hover;
+                                    HorizontalLayout {
+                                        padding-left: 8px;
+                                        padding-right: 8px;
+                                        spacing: 10px;
+                                        Text { text: "名称"; color: Theme.muted; font-size: 11px; width: 85px; vertical-alignment: center; }
+                                        Text { text: "地址"; color: Theme.muted; font-size: 11px; width: 120px; vertical-alignment: center; }
+                                        Text { text: "机器 ID"; color: Theme.muted; font-size: 11px; width: 180px; vertical-alignment: center; }
+                                        Text { text: "状态"; color: Theme.muted; font-size: 11px; width: 72px; vertical-alignment: center; }
+                                        Text { text: "Worker"; color: Theme.muted; font-size: 11px; width: 75px; vertical-alignment: center; }
+                                        Text { text: "任务"; color: Theme.muted; font-size: 11px; horizontal-stretch: 1; vertical-alignment: center; }
+                                        Text { text: "同步位置"; color: Theme.muted; font-size: 11px; width: 70px; vertical-alignment: center; }
+                                    }
+                                }
+                                if root.nodes.length > 0 : VerticalLayout {
+                                    spacing: 0px;
+                                    for node[index] in root.nodes : row := Rectangle {
+                                        height: Theme.table-row-height;
+                                        vertical-stretch: 0;
+                                        border-radius: 6px;
+                                        background: root.selected-node-index == index ? Theme.accent-soft : row-touch.has-hover ? Theme.panel-hover : transparent;
+                                        accessible-role: AccessibleRole.list-item;
+                                        accessible-label: "节点项：" + node.name + "；" + node.address + "；" + node.status
+                                            + "；Worker " + node.worker-text + "；任务 " + node.task-text + "；同步 " + node.sync-text;
+                                        accessible-item-selectable: true;
+                                        accessible-item-selected: root.selected-node-index == index;
+                                        accessible-action-default => { root.selected-node-index = index; }
+                                        HorizontalLayout {
+                                            padding-left: 8px;
+                                            padding-right: 8px;
+                                            spacing: 10px;
+                                            Text { text: node.name; color: Theme.text; font-size: 12px; width: 85px; overflow: elide; vertical-alignment: center; }
+                                            Text { text: node.address; color: Theme.muted; font-size: 12px; width: 120px; overflow: elide; vertical-alignment: center; }
+                                            Text {
+                                                text: node.machine-id;
+                                                color: Theme.text;
+                                                font-size: 11px;
+                                                width: 180px;
+                                                overflow: elide;
+                                                vertical-alignment: center;
+                                                accessible-label: "节点机器 ID：" + node.machine-id;
+                                            }
+                                            StatusPill { label: node.status; tone: node.status-color; width: 72px; }
+                                            Text { text: node.worker-text; color: Theme.text; font-size: 12px; width: 75px; overflow: elide; vertical-alignment: center; }
+                                            Text { text: node.task-text; color: Theme.text; font-size: 12px; horizontal-stretch: 1; overflow: elide; vertical-alignment: center; }
+                                            Text { text: node.sync-text; color: Theme.text; font-size: 12px; width: 70px; overflow: elide; vertical-alignment: center; }
+                                        }
+                                        row-touch := TouchArea { clicked => { root.selected-node-index = index; } }
+                                    }
+                                }
+                                if root.nodes.length == 0 : EmptyState {
+                                    title: "尚未配置节点";
+                                    detail: "请通过下方表单添加计算节点";
+                                    icon: @image-url("../assets/icons/nodes.png");
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 添加表单与根属性保持双向绑定，动作只转发原 IP 和端口。
+                FluentCard {
+                    height: 84px;
+                    vertical-stretch: 0;
+                    accessible-role: AccessibleRole.groupbox;
+                    accessible-label: "添加节点栏";
+                    HorizontalLayout {
+                        padding: 14px;
+                        spacing: 10px;
+                        alignment: center;
+                        VerticalLayout {
+                            width: 72px;
+                            alignment: center;
+                            Text { text: "新节点"; color: Theme.text; font-size: 14px; font-weight: 650; }
+                            Text { text: "IP 与端口"; color: Theme.muted; font-size: 11px; }
+                        }
+                        LineEdit {
+                            text <=> root.new-node-ip;
+                            placeholder-text: "192.168.1.20";
+                            accessible-label: "新节点 IP";
+                        }
+                        SpinBox {
+                            value <=> root.new-node-port;
+                            minimum: 1;
+                            maximum: 65535;
+                            width: 120px;
+                            accessible-label: "新节点端口";
+                        }
+                        ActionButton {
+                            label: "添加节点";
+                            icon: @image-url("../assets/icons/add.png");
+                            tone: 1;
+                            clicked => { root.add-node(root.new-node-ip, root.new-node-port); }
+                        }
+                    }
+                }
+            }
+
+            DetailPanel {
+                accessible-label: "节点详情";
+                // 详情只使用已选 UiNodeRow；模型为空或索引越界时不访问列表。
+                if root.nodes.length > 0 && root.selected-node-index >= 0 && root.selected-node-index < root.nodes.length : VerticalLayout {
+                    padding: 18px;
+                    spacing: 12px;
+                    HorizontalLayout {
+                        width: Theme.detail-width - 36px;
+                        height: 48px;
+                        vertical-stretch: 0;
+                        spacing: 10px;
+                        Image {
+                            source: @image-url("../assets/icons/nodes.png");
+                            width: 20px;
+                            height: 20px;
+                            image-fit: contain;
+                            colorize: Theme.nav-icon;
+                        }
+                        VerticalLayout {
+                            spacing: 3px;
+                            Text { text: root.nodes[root.selected-node-index].name; color: Theme.text; font-size: 16px; font-weight: 680; }
+                            Text { text: root.nodes[root.selected-node-index].address; color: Theme.muted; font-size: 11px; }
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        StatusPill {
+                            label: root.nodes[root.selected-node-index].status;
+                            tone: root.nodes[root.selected-node-index].status-color;
+                        }
+                    }
+                    Text {
+                        text: "机器 ID  " + root.nodes[root.selected-node-index].machine-id;
+                        color: Theme.muted;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                        vertical-stretch: 0;
+                        accessible-label: "节点详情机器 ID：" + root.nodes[root.selected-node-index].machine-id;
+                    }
+                    Text { text: "Worker  " + root.nodes[root.selected-node-index].worker-text; color: Theme.text; font-size: 12px; vertical-stretch: 0; }
+                    Text { text: "任务  " + root.nodes[root.selected-node-index].task-text; color: Theme.text; font-size: 12px; vertical-stretch: 0; }
+                    Text { text: "同步位置  " + root.nodes[root.selected-node-index].sync-text; color: Theme.text; font-size: 12px; vertical-stretch: 0; }
+
+                    if root.nodes[root.selected-node-index].error-text != "" : Rectangle {
+                        height: 82px;
+                        vertical-stretch: 0;
+                        background: Theme.danger-soft;
+                        border-radius: 6px;
+                        border-width: 1px;
+                        border-color: Theme.danger.with-alpha(0.35);
+                        accessible-role: AccessibleRole.groupbox;
+                        accessible-label: "节点错误：" + root.nodes[root.selected-node-index].error-text;
+                        HorizontalLayout {
+                            padding: 12px;
+                            spacing: 10px;
+                            alignment: start;
+                            Image {
+                                source: @image-url("../assets/icons/info.png");
+                                width: 16px;
+                                height: 16px;
+                                image-fit: contain;
+                                colorize: Theme.danger;
+                            }
+                            VerticalLayout {
+                                spacing: 5px;
+                                Text { text: "连接错误"; color: Theme.danger; font-size: 12px; font-weight: 680; }
+                                Text {
+                                    text: root.nodes[root.selected-node-index].error-text;
+                                    color: Theme.text;
+                                    font-size: 11px;
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+                    }
+
+                    HorizontalLayout {
+                        height: 34px;
+                        vertical-stretch: 0;
+                        spacing: 8px;
+                        ActionButton {
+                            horizontal-stretch: 1;
+                            label: "编辑";
+                            icon: @image-url("../assets/icons/edit.png");
+                            accessible-label: "编辑节点";
+                            clicked => {
+                                root.edit-node(root.nodes[root.selected-node-index].index, root.new-node-ip, root.new-node-port);
+                            }
+                        }
+                        ActionButton {
+                            horizontal-stretch: 1;
+                            label: "同步";
+                            icon: @image-url("../assets/icons/sync.png");
+                            accessible-label: "立即同步";
+                            clicked => { root.sync-node(root.nodes[root.selected-node-index].index); }
+                        }
+                        ActionButton {
+                            horizontal-stretch: 1;
+                            label: "移除";
+                            icon: @image-url("../assets/icons/remove.png");
+                            tone: 2;
+                            accessible-label: "移除节点";
+                            clicked => { root.remove-node(root.nodes[root.selected-node-index].index); }
+                        }
+                    }
+
+                    EmptyState {
+                        density: 0;
+                        title: "运行详情暂不可用";
+                        detail: "当前节点模型未提供版本、运行时长、服务明细和存储目录";
+                        disabled-feature: true;
+                        icon: @image-url("../assets/icons/info.png");
+                    }
+                    Rectangle { vertical-stretch: 1; background: transparent; }
+                }
+                if root.nodes.length == 0 || root.selected-node-index < 0 || root.selected-node-index >= root.nodes.length : EmptyState {
+                    title: "尚未配置节点";
+                    detail: "请先通过左侧表单添加计算节点";
+                    icon: @image-url("../assets/icons/nodes.png");
+                }
+            }
+        }
+    }
+}

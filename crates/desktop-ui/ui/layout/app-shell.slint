@@ -1,0 +1,70 @@
+// 固定应用壳统一侧栏、命令栏、内容槽和底部状态栏。
+
+import { Theme } from "../theme.slint";
+import { SideNavigation } from "side-navigation.slint";
+import { TopCommandBar } from "top-command-bar.slint";
+import { StatusBar } from "status-bar.slint";
+
+export component AppShell inherits Rectangle {
+    // 外壳属性只镜像 MainWindow 已有状态，不保存业务事实。
+    in-out property <int> active-nav: 0;
+    in property <int> online-count;
+    in property <string> sync-text;
+    in property <string> postgres-status;
+    in property <color> postgres-color;
+    in property <string> last-error;
+    // 两个回调保持既有导航索引和刷新命令边界。
+    callback navigate(int);
+    callback refresh();
+    private property <bool> sidebar-collapsed: false;
+    private property <length> sidebar-width: root.sidebar-collapsed ? 64px : 144px;
+    background: Theme.window;
+
+    // 侧栏在 144px 展开态与 64px 图标态之间切换，并始终锚定窗口左侧。
+    SideNavigation {
+        x: 0px;
+        y: 0px;
+        width: root.sidebar-width;
+        height: root.height;
+        collapsed: root.sidebar-collapsed;
+        active-index: root.active-nav;
+        toggle-sidebar => { root.sidebar-collapsed = !root.sidebar-collapsed; }
+        navigate(index) => { root.navigate(index); }
+    }
+    // 右侧严格拆为 58px 顶栏、弹性内容和 32px 底栏。
+    right-shell := Rectangle {
+        x: root.sidebar-width;
+        y: 0px;
+        width: root.width - root.sidebar-width;
+        height: root.height;
+        background: Theme.window;
+
+        TopCommandBar {
+            x: 0px;
+            y: 0px;
+            width: parent.width;
+            height: 58px;
+            online-count: root.online-count;
+            refresh => { root.refresh(); }
+        }
+        Rectangle {
+            x: 0px;
+            y: 58px;
+            width: parent.width;
+            height: parent.height - 90px;
+            background: Theme.window;
+            clip: true;
+            @children
+        }
+        StatusBar {
+            x: 0px;
+            y: parent.height - 32px;
+            width: parent.width;
+            height: 32px;
+            sync-text: root.sync-text;
+            postgres-status: root.postgres-status;
+            postgres-color: root.postgres-color;
+            last-error: root.last-error;
+        }
+    }
+}

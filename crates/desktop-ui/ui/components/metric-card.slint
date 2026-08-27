@@ -1,0 +1,37 @@
+// 指标卡只展示可选图标、标题、数值、补充说明与语义色。
+
+import { Theme } from "../theme.slint";
+
+export component MetricCard inherits Rectangle {
+    in property <string> title;
+    in property <string> value;
+    in property <string> detail;
+    in property <color> tone: Theme.accent;
+    // 默认空图像保持现有页面无需立即接线图标。
+    in property <image> icon;
+
+    height: 100px;
+    background: Theme.panel;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: Theme.border;
+    HorizontalLayout {
+        padding: 16px;
+        spacing: 12px;
+        alignment: center;
+        if root.icon.width > 0 && root.icon.height > 0 : Image {
+            source: root.icon;
+            width: 20px;
+            height: 20px;
+            image-fit: contain;
+            colorize: root.tone;
+        }
+        VerticalLayout {
+            spacing: 4px;
+            alignment: center;
+            Text { text: root.title; color: Theme.muted; font-size: 12px; }
+            Text { text: root.value; color: root.tone; font-size: 24px; font-weight: 720; }
+            Text { text: root.detail; color: Theme.muted; font-size: 11px; overflow: elide; }
+        }
+    }
+}

@@ -1,0 +1,15 @@
+// 固定宽度的右侧详情容器；内容通过自己的滚动视口在最小窗口中保持可达。
+
+import { ScrollView } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
+
+export component DetailPanel inherits Rectangle {
+    width: Theme.detail-width;
+    background: Theme.panel;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: Theme.border;
+    accessible-role: AccessibleRole.groupbox;
+    accessible-label: "详情面板";
+    ScrollView { @children }
+}

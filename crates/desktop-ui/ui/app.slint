@@ -1,0 +1,430 @@
+// desktop.exe 唯一主窗口；页面只通过属性与回调接触 Rust。
+
+import { Theme, UiDatabaseTableRow, UiFileFaultRow, UiGroupRow, UiMemberRow, UiNodeRow, UiPathRow, UiRuntimeFailureRow, UiRuntimeStageRow, UiRuntimeWorkerRow, UiScanRootRow, UiTaskRow } from "theme.slint";
+import { DeleteDialog } from "components/delete-dialog.slint";
+import { PathPickerDialog } from "components/path-picker-dialog.slint";
+import { AppShell } from "layout/app-shell.slint";
+import { OverviewDashboard } from "pages/overview-dashboard.slint";
+import { NodesPage } from "pages/nodes-page.slint";
+import { ScanPage } from "pages/scan-page.slint";
+import { TaskCenterPage } from "pages/task-center-page.slint";
+import { DuplicateWorkspace } from "pages/duplicate-workspace.slint";
+import { ReviewDeleteWorkspace } from "pages/review-delete-workspace.slint";
+import { SettingsWorkspace } from "pages/settings-workspace.slint";
+import { DatabasePage } from "pages/database-page.slint";
+
+export component MainWindow inherits Window {
+    title: "mySingerServer · Media Dedup";
+    icon: @image-url("assets/icons/app-256.png");
+    preferred-width: 1440px;
+    preferred-height: 900px;
+    min-width: 1080px;
+    min-height: 700px;
+    background: Theme.window;
+
+    in property <[UiNodeRow]> nodes;
+    in property <[UiTaskRow]> tasks;
+    // 运行详情由 Rust 在收到 core 快照时整体替换，Slint 不自行轮询后端。
+    in property <[UiRuntimeStageRow]> runtime-stages;
+    in property <[UiRuntimeWorkerRow]> runtime-workers;
+    in property <[UiRuntimeFailureRow]> runtime-failures;
+    in property <string> runtime-detail-title;
+    in property <string> runtime-detail-machine-id;
+    in property <string> runtime-detail-state;
+    in property <string> runtime-detail-counts;
+    in property <string> runtime-execution-config: "—";
+    in property <string> runtime-pipeline-metrics: "—";
+    in property <bool> runtime-detail-stale;
+    in property <string> runtime-detail-error;
+    in property <[UiGroupRow]> groups;
+    in property <[UiMemberRow]> members;
+    in property <int> online-count;
+    in property <int> running-count;
+    in property <string> indexed-text: "—";
+    in property <string> sync-text: "未同步";
+    in property <bool> filtering-enabled;
+    in property <string> filtering-reason;
+    in property <string> postgres-status;
+    in property <color> postgres-color: Theme.warning;
+    // 临时数据库连接测试只存在于当前窗口，不修改已保存配置或运行连接。
+    in-out property <bool> database-testing: false;
+    in-out property <string> database-test-status;
+    in-out property <string> database-test-error;
+    in-out property <[UiDatabaseTableRow]> database-tables;
+    in property <string> data-path;
+    in property <string> logs-path;
+    in property <string> cache-path;
+    in property <string> config-path;
+    in-out property <int> current-page: 0;
+    in-out property <int> active-nav: 0;
+    in-out property <int> overview-mode: 0;
+    in-out property <int> task-mode: 0;
+    in-out property <int> task-tab: 0;
+    in-out property <int> review-tab: 0;
+    in-out property <int> review-filter: 0;
+    in-out property <int> delete-filter: 0;
+    in-out property <int> settings-section: 0;
+    in-out property <string> last-error;
+
+    in-out property <string> new-node-ip: "127.0.0.1";
+    in-out property <int> new-node-port: 39091;
+    in-out property <string> scan-root: "D:\\Media";
+    in-out property <[UiScanRootRow]> scan-roots: [{ path: "D:\\Media" }];
+    in-out property <bool> scan-roots-valid: true;
+    in-out property <int> scan-node-index: 0;
+    in property <[string]> scan-node-options;
+    in-out property <int> enumerator-index: 1;
+    in-out property <bool> force-recalculate: false;
+    in-out property <string> analysis-task-ids;
+    in-out property <int> analysis-kind-index: 0;
+    // 图形路径选择器由现有节点 BrowsePaths 事件驱动，不引入管理端本机路径假象。
+    in-out property <bool> path-picker-open: false;
+    in-out property <int> path-picker-node-index: 0;
+    in-out property <string> path-picker-current-path;
+    in-out property <string> path-picker-parent-path;
+    in-out property <string> path-picker-status;
+    in-out property <[UiPathRow]> path-picker-directories;
+    in-out property <int> path-picker-target-index: -1;
+
+    in-out property <int> result-source-index: 0;
+    in-out property <int> result-node-index: 0;
+    in-out property <string> result-run-id;
+    in-out property <string> selected-group-id;
+    in-out property <string> group-next-cursor;
+    in-out property <string> member-next-cursor;
+    in-out property <image> preview-image;
+    in-out property <string> preview-info;
+    // 预览完成状态只供页面关联唯一在途请求，不增加业务回调或持久状态。
+    in property <string> preview-result-machine;
+    in property <string> preview-result-path;
+    in property <bool> preview-result-succeeded;
+    in property <int> preview-result-sequence;
+    in-out property <string> cross-selections;
+    in-out property <string> cross-status: "未创建";
+    in-out property <string> cross-summary;
+    in-out property <string> review-path-rule;
+
+    in-out property <bool> delete-dialog-open: false;
+    in-out property <int> delete-file-count;
+    in-out property <int> delete-node-count;
+    in-out property <string> delete-reclaimable;
+    in-out property <string> delete-mode: "回收站";
+    in-out property <bool> delete-can-execute;
+    in-out property <string> delete-warning;
+
+    in-out property <string> postgres-url;
+    // PostgreSQL 页面把连接串拆为基础字段；Rust 保存边界负责重新组装 postgres-url。
+    in-out property <string> postgres-host;
+    in-out property <int> postgres-port: 5432;
+    in-out property <string> postgres-database;
+    in-out property <string> postgres-username;
+    in-out property <string> postgres-password;
+    in-out property <int> reconnect-seconds: 5;
+    in-out property <int> delete-mode-index: 0;
+    in-out property <string> pdq-quality: "50";
+    in-out property <string> aspect-tolerance: "0.10";
+    in-out property <string> pdq-hamming: "31";
+    in-out property <string> phash-hamming: "10";
+    in-out property <string> phash-parts: "8";
+    in-out property <string> sobel-min: "0.85";
+    in-out property <string> video-valid: "4";
+    in-out property <string> video-stage1: "0.80";
+    in-out property <string> video-stage2: "0.80";
+
+    // 远程 Node 配置只保存 UI 编辑快照；Rust 回调负责转换为 Task6 UiCommand。
+    in property <[string]> node-config-options;
+    in-out property <int> node-config-selected-index: 0;
+    in-out property <bool> node-config-node-online: false;
+    in-out property <bool> node-config-loaded: false;
+    in-out property <bool> node-config-dirty: false;
+    in-out property <bool> node-config-saving: false;
+    in-out property <string> node-config-machine-id;
+    in-out property <string> node-config-version;
+    in-out property <string> node-config-phase: "未加载";
+    in-out property <string> node-config-error;
+    in-out property <string> node-config-listen-ip;
+    in-out property <int> node-config-port: 39091;
+    in-out property <int> node-config-enumerator-index: 1;
+    in-out property <string> node-config-data-path;
+    in-out property <string> node-config-config-path;
+    in-out property <string> node-config-log-path;
+    in-out property <string> node-config-cache-path;
+    in-out property <int> node-config-hdd-threads: 1;
+    in-out property <int> node-config-ssd-threads: 2;
+    in-out property <int> node-config-unknown-threads: 1;
+    in-out property <int> node-config-total-threads: 4;
+    in-out property <int> node-config-block-size: 4194304;
+    in-out property <int> node-config-timeout-seconds: 3;
+    in-out property <int> node-config-retries: 2;
+    in-out property <int> node-config-legacy-workers: 1;
+    in-out property <int> node-config-worker-mode-index: 0;
+    in-out property <int> node-config-reserved-cores: 1;
+    in-out property <int> node-config-manual-workers: 1;
+    in-out property <int> node-config-logical-cpus;
+    in-out property <int> node-config-effective-workers;
+    in-out property <bool> node-config-postgres-enabled: false;
+    in-out property <string> node-config-postgres-host: "127.0.0.1";
+    in-out property <int> node-config-postgres-port: 5432;
+    in-out property <string> node-config-postgres-database: "media_dedup";
+    in-out property <string> node-config-postgres-username: "postgres";
+    in-out property <string> node-config-postgres-password;
+    in-out property <int> node-config-postgres-timeout-seconds: 3;
+
+    in-out property <int> file-fault-selected-node: 0;
+    in-out property <bool> file-fault-node-online: false;
+    in-out property <bool> file-fault-loading: false;
+    in-out property <[UiFileFaultRow]> file-fault-rows;
+    in-out property <string> file-fault-next-cursor;
+    in-out property <string> file-fault-error;
+    in-out property <string> disk-cleanup-summary: "尚无磁盘满清理记录";
+
+    callback add-node(string, int);
+    callback edit-node(int, string, int);
+    callback remove-node(int);
+    callback connect-all();
+    callback refresh();
+    callback sync-node(int);
+    callback browse-paths(int, string);
+    callback start-scan(int, [UiScanRootRow], bool, int);
+    callback add-scan-root();
+    callback update-scan-root(int, string);
+    callback remove-scan-root(int);
+    callback select-scan-node(int);
+    callback start-local-analysis(int, string, int);
+    callback start-cross-analysis(string);
+    callback poll-cross-analysis();
+    callback retry-cross-analysis();
+    callback load-groups(bool, int, string, int, string);
+    callback load-members(bool, int, string, string, int, string);
+    callback save-review(string, string, int);
+    callback quick-review(int, string);
+    callback load-preview(string, string);
+    callback prepare-delete();
+    callback confirm-delete();
+    callback cancel-task(int, string);
+    callback select-runtime-task(string, int, string);
+    callback save-settings();
+    callback test-database-connection();
+    callback select-node-config(int);
+    callback load-node-config();
+    callback save-node-config-and-restart();
+    callback node-config-edited();
+    callback select-file-fault-node(int);
+    callback load-file-faults(bool);
+    callback clear-file-fault(int);
+    callback navigate-to(int);
+
+    navigate-to(index) => {
+        if index == 0 {
+            root.current-page = 0;
+            root.overview-mode = 0;
+        } else if index == 1 {
+            root.current-page = 0;
+            root.overview-mode = 1;
+        } else if index == 2 {
+            root.current-page = 1;
+            root.task-mode = 0;
+        } else if index == 3 {
+            root.current-page = 1;
+            root.task-mode = 1;
+        } else if index == 4 {
+            if root.current-page < 2 || root.current-page > 5 {
+                root.current-page = 2;
+            }
+        } else if index == 5 {
+            root.current-page = 6;
+        } else if index == 6 {
+            root.current-page = 7;
+            if root.settings-section == 1 {
+                root.settings-section = 0;
+            }
+        } else {
+            root.current-page = 8;
+        }
+        root.active-nav = index;
+    }
+
+    AppShell {
+        active-nav <=> root.active-nav;
+        online-count: root.online-count;
+        sync-text: root.sync-text;
+        postgres-status: root.postgres-status;
+        postgres-color: root.postgres-color;
+        last-error: root.last-error;
+        navigate(index) => { root.navigate-to(index); }
+        refresh => { root.refresh(); }
+                if root.current-page == 0 && root.overview-mode == 0 : OverviewDashboard {
+                    nodes: root.nodes; tasks: root.tasks;
+                    online-count: root.online-count; running-count: root.running-count;
+                    indexed-text: root.indexed-text; sync-text: root.sync-text;
+                    postgres-status: root.postgres-status; postgres-color: root.postgres-color;
+                }
+                if root.current-page == 0 && root.overview-mode == 1 : NodesPage {
+                    nodes: root.nodes;
+                    new-node-ip <=> root.new-node-ip; new-node-port <=> root.new-node-port;
+                    connect-all => { root.connect-all(); }
+                    add-node(ip, port) => { root.add-node(ip, port); }
+                    edit-node(index, ip, port) => { root.edit-node(index, ip, port); }
+                    sync-node(index) => { root.sync-node(index); }
+                    remove-node(index) => { root.remove-node(index); }
+                }
+                if root.current-page == 1 && root.task-mode == 0 : ScanPage {
+                    filtering-enabled: root.filtering-enabled; filtering-reason: root.filtering-reason;
+                    scan-roots: root.scan-roots; scan-roots-valid: root.scan-roots-valid;
+                    node-options: root.scan-node-options;
+                    selected-node <=> root.scan-node-index; enumerator-index <=> root.enumerator-index; force-recalculate <=> root.force-recalculate;
+                    analysis-task-ids <=> root.analysis-task-ids; analysis-kind-index <=> root.analysis-kind-index;
+                    add-root => { root.add-scan-root(); }
+                    update-root(index, path) => { root.update-scan-root(index, path); }
+                    remove-root(index) => { root.remove-scan-root(index); }
+                    select-node(index) => { root.select-scan-node(index); }
+                    browse-root(target-index, index, path) => {
+                        root.path-picker-open = true;
+                        root.path-picker-target-index = target-index;
+                        root.path-picker-node-index = index;
+                        root.path-picker-current-path = path;
+                        root.path-picker-parent-path = "";
+                        root.path-picker-status = "正在读取节点目录…";
+                        root.path-picker-directories = [];
+                        root.browse-paths(index, path);
+                    }
+                    start-scan(index, roots, force, enumerator) => { root.start-scan(index, roots, force, enumerator); }
+                    start-analysis(index, task-ids, kind) => { root.start-local-analysis(index, task-ids, kind); }
+                }
+                if root.current-page == 1 && root.task-mode == 1 : TaskCenterPage {
+                    tasks: root.tasks;
+                    runtime-stages: root.runtime-stages;
+                    runtime-workers: root.runtime-workers;
+                    runtime-failures: root.runtime-failures;
+                    runtime-detail-title: root.runtime-detail-title;
+                    runtime-detail-machine-id: root.runtime-detail-machine-id;
+                    runtime-detail-state: root.runtime-detail-state;
+                    runtime-detail-counts: root.runtime-detail-counts;
+                    runtime-execution-config: root.runtime-execution-config;
+                    runtime-pipeline-metrics: root.runtime-pipeline-metrics;
+                    runtime-detail-stale: root.runtime-detail-stale;
+                    runtime-detail-error: root.runtime-detail-error;
+                    task-tab <=> root.task-tab;
+                    select-runtime-task(owner, node-index, runtime-id) => {
+                        root.select-runtime-task(owner, node-index, runtime-id);
+                    }
+                    cancel-task(index, id) => { root.cancel-task(index, id); }
+                }
+                if root.current-page >= 2 && root.current-page <= 5 : DuplicateWorkspace {
+                    duplicate-tab: root.current-page - 2;
+                    groups: root.groups; members: root.members;
+                    group-next-cursor: root.group-next-cursor; member-next-cursor: root.member-next-cursor;
+                    preview-image: root.preview-image; preview-info: root.preview-info;
+                    source-index <=> root.result-source-index; node-index <=> root.result-node-index; run-id <=> root.result-run-id; selected-group-id <=> root.selected-group-id;
+                    cross-selections <=> root.cross-selections; cross-status: root.cross-status; cross-summary: root.cross-summary;
+                    select-tab(tab) => { root.current-page = 2 + tab; }
+                    load-groups(central, node, run, kind, cursor) => { root.load-groups(central, node, run, kind, cursor); }
+                    load-members(central, node, run, group, kind, cursor) => { root.load-members(central, node, run, group, kind, cursor); }
+                    save-review(machine, path, decision) => { root.save-review(machine, path, decision); }
+                    preview(machine, path) => { root.load-preview(machine, path); }
+                    start-cross(selections) => { root.start-cross-analysis(selections); }
+                    poll-cross => { root.poll-cross-analysis(); }
+                    retry-cross => { root.retry-cross-analysis(); }
+                }
+                if root.current-page == 6 : ReviewDeleteWorkspace {
+                    groups: root.groups; members: root.members; selected-group-id: root.selected-group-id;
+                    preview-image: root.preview-image; preview-info: root.preview-info;
+                    preview-result-machine: root.preview-result-machine; preview-result-path: root.preview-result-path;
+                    preview-result-succeeded: root.preview-result-succeeded; preview-result-sequence: root.preview-result-sequence;
+                    path-rule <=> root.review-path-rule;
+                    review-tab <=> root.review-tab; review-filter <=> root.review-filter; delete-filter <=> root.delete-filter;
+                    delete-file-count: root.delete-file-count; delete-node-count: root.delete-node-count;
+                    delete-reclaimable: root.delete-reclaimable; delete-mode: root.delete-mode;
+                    delete-can-execute: root.delete-can-execute; delete-warning: root.delete-warning;
+                    save-review(machine, path, decision) => { root.save-review(machine, path, decision); }
+                    preview(machine, path) => { root.load-preview(machine, path); }
+                    quick-review(rule, value) => { root.quick-review(rule, value); }
+                    prepare-delete => { root.prepare-delete(); }
+                }
+                if root.current-page == 7 : SettingsWorkspace {
+                    active-section <=> root.settings-section;
+                    data-path: root.data-path; logs-path: root.logs-path; cache-path: root.cache-path; config-path: root.config-path;
+                    postgres-status: root.postgres-status; postgres-color: root.postgres-color; last-error: root.last-error; postgres-url <=> root.postgres-url;
+                    postgres-host <=> root.postgres-host; postgres-port <=> root.postgres-port;
+                    postgres-database <=> root.postgres-database; postgres-username <=> root.postgres-username;
+                    postgres-password <=> root.postgres-password;
+                    reconnect-seconds <=> root.reconnect-seconds; delete-mode-index <=> root.delete-mode-index;
+                    pdq-quality <=> root.pdq-quality; aspect-tolerance <=> root.aspect-tolerance; pdq-hamming <=> root.pdq-hamming;
+                    phash-hamming <=> root.phash-hamming; phash-parts <=> root.phash-parts; sobel-min <=> root.sobel-min;
+                    video-valid <=> root.video-valid; video-stage1 <=> root.video-stage1; video-stage2 <=> root.video-stage2;
+                    node-options: root.node-config-options; selected-node <=> root.node-config-selected-index;
+                    node-online: root.node-config-node-online; node-loaded: root.node-config-loaded;
+                    node-dirty: root.node-config-dirty; node-saving: root.node-config-saving;
+                    node-machine-id: root.node-config-machine-id; node-version: root.node-config-version;
+                    node-phase: root.node-config-phase; node-error: root.node-config-error;
+                    node-listen-ip <=> root.node-config-listen-ip; node-port <=> root.node-config-port;
+                    node-enumerator-index <=> root.node-config-enumerator-index;
+                    node-data-path <=> root.node-config-data-path; node-config-path <=> root.node-config-config-path;
+                    node-log-path <=> root.node-config-log-path; node-cache-path <=> root.node-config-cache-path;
+                    node-hdd-threads <=> root.node-config-hdd-threads; node-ssd-threads <=> root.node-config-ssd-threads;
+                    node-unknown-threads <=> root.node-config-unknown-threads; node-total-threads <=> root.node-config-total-threads;
+                    node-block-size <=> root.node-config-block-size; node-timeout-seconds <=> root.node-config-timeout-seconds;
+                    node-retries <=> root.node-config-retries; node-legacy-workers <=> root.node-config-legacy-workers;
+                    node-worker-mode-index <=> root.node-config-worker-mode-index;
+                    node-reserved-cores <=> root.node-config-reserved-cores; node-manual-workers <=> root.node-config-manual-workers;
+                    node-logical-cpus: root.node-config-logical-cpus; node-effective-workers: root.node-config-effective-workers;
+                    node-postgres-enabled <=> root.node-config-postgres-enabled;
+                    node-postgres-host <=> root.node-config-postgres-host;
+                    node-postgres-port <=> root.node-config-postgres-port;
+                    node-postgres-database <=> root.node-config-postgres-database;
+                    node-postgres-username <=> root.node-config-postgres-username;
+                    node-postgres-password <=> root.node-config-postgres-password;
+                    node-postgres-timeout-seconds <=> root.node-config-postgres-timeout-seconds;
+                    file-fault-selected-node <=> root.file-fault-selected-node;
+                    file-fault-node-online: root.file-fault-node-online;
+                    file-fault-loading: root.file-fault-loading;
+                    file-fault-rows: root.file-fault-rows;
+                    file-fault-next-cursor: root.file-fault-next-cursor;
+                    file-fault-error: root.file-fault-error;
+                    disk-cleanup-summary: root.disk-cleanup-summary;
+                    select-node(index) => { root.select-node-config(index); }
+                    load-node => { root.load-node-config(); }
+                    save-node => { root.save-node-config-and-restart(); }
+                    node-edited => { root.node-config-edited(); }
+                    select-file-fault-node(index) => { root.select-file-fault-node(index); }
+                    load-file-faults(next-page) => { root.load-file-faults(next-page); }
+                    clear-file-fault(index) => { root.clear-file-fault(index); }
+                    save-settings => { root.save-settings(); }
+                }
+                if root.current-page == 8 : DatabasePage {
+                    postgres-status: root.postgres-status; postgres-color: root.postgres-color;
+                    postgres-host <=> root.postgres-host; postgres-port <=> root.postgres-port;
+                    postgres-database <=> root.postgres-database; postgres-username <=> root.postgres-username;
+                    postgres-password <=> root.postgres-password; reconnect-seconds <=> root.reconnect-seconds;
+                    testing: root.database-testing; test-status: root.database-test-status;
+                    test-error: root.database-test-error; tables: root.database-tables;
+                    test-connection => { root.test-database-connection(); }
+                    save-settings => { root.save-settings(); }
+                }
+    }
+
+    if root.path-picker-open : PathPickerDialog {
+        node-index: root.path-picker-node-index;
+        current-path: root.path-picker-current-path;
+        parent-path: root.path-picker-parent-path;
+        status: root.path-picker-status;
+        directories: root.path-picker-directories;
+        browse(path) => {
+            root.path-picker-status = "正在读取节点目录…";
+            root.browse-paths(root.path-picker-node-index, path);
+        }
+        cancel => { root.path-picker-open = false; }
+        confirm(path) => {
+            root.update-scan-root(root.path-picker-target-index, path);
+            root.path-picker-open = false;
+        }
+    }
+
+    if root.delete-dialog-open : DeleteDialog {
+        file-count: root.delete-file-count; node-count: root.delete-node-count;
+        reclaimable: root.delete-reclaimable; mode: root.delete-mode;
+        can-execute: root.delete-can-execute; warning: root.delete-warning;
+        cancel => { root.delete-dialog-open = false; }
+        confirm => { root.confirm-delete(); }
+    }
+}

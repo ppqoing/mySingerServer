@@ -1,0 +1,17 @@
+// 一筛与联合二筛分数的紧凑展示。
+
+import { Theme } from "../theme.slint";
+
+export component ScorePanel inherits Rectangle {
+    in property <string> stage1;
+    in property <string> phash;
+    in property <string> stage2;
+    width: 250px;
+    height: 38px;
+    background: transparent;
+    HorizontalLayout { spacing: 10px; alignment: center;
+        Text { text: "一筛 " + root.stage1; color: Theme.muted; font-size: 10px; }
+        Text { text: "pHash " + root.phash; color: Theme.muted; font-size: 10px; }
+        Text { text: "二筛 " + root.stage2; color: Theme.text; font-size: 10px; }
+    }
+}

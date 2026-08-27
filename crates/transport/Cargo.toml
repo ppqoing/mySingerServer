@@ -1,0 +1,15 @@
+[package]
+name = "dedup-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+dedup-protocol = { path = "../protocol" }
+prost.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

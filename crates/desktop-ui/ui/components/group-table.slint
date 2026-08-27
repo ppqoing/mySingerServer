@@ -1,0 +1,84 @@
+// 高密度重复组表；只消费有限窗口模型，下一页仍由服务端不透明游标驱动。
+
+import { Button, ScrollView } from "std-widgets.slint";
+import { Theme, UiGroupRow } from "../theme.slint";
+import { EmptyState } from "empty-state.slint";
+
+export component GroupTable inherits Rectangle {
+    in property <[UiGroupRow]> groups;
+    in property <string> selected-id;
+    in property <bool> has-more;
+    callback select-group(string);
+    callback load-more();
+
+    background: Theme.panel;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: Theme.border;
+    accessible-role: AccessibleRole.groupbox;
+    accessible-label: "重复组表";
+
+    VerticalLayout {
+        Rectangle {
+            height: Theme.table-header-height;
+            background: Theme.panel-hover;
+            HorizontalLayout {
+                padding-left: 10px;
+                padding-right: 10px;
+                spacing: 7px;
+                alignment: center;
+                Text { text: "类型"; width: 68px; color: Theme.muted; font-size: 10px; }
+                Text { text: "组 ID / MD5"; horizontal-stretch: 1; color: Theme.muted; font-size: 10px; }
+                Text { text: "代表大小"; width: 70px; color: Theme.muted; font-size: 10px; horizontal-alignment: right; }
+                Text { text: "成员"; width: 38px; color: Theme.muted; font-size: 10px; horizontal-alignment: right; }
+                Text { text: "可回收空间"; width: 78px; color: Theme.muted; font-size: 10px; horizontal-alignment: right; }
+            }
+        }
+        Rectangle { height: 1px; background: Theme.border; }
+        if root.groups.length == 0 : EmptyState {
+            vertical-stretch: 1;
+            title: "当前运行没有此类重复组";
+            detail: "更换来源、节点或运行 ID 后重新加载。";
+        }
+        if root.groups.length > 0 : ScrollView {
+            vertical-stretch: 1;
+            VerticalLayout {
+                spacing: 0px;
+                for group in root.groups : row := Rectangle {
+                    height: Theme.table-row-height;
+                    background: group.id == root.selected-id ? Theme.accent-soft : row-touch.has-hover ? Theme.panel-hover : Theme.panel;
+                    border-width: 0px;
+                    accessible-role: AccessibleRole.list-item;
+                    accessible-label: "重复组：" + group.id;
+                    accessible-item-selected: group.id == root.selected-id;
+                    accessible-action-default => { root.select-group(group.id); }
+                    // 整行选择层先声明在内容下方；后续行内动作可自然取得更高命中优先级。
+                    row-touch := TouchArea { clicked => { root.select-group(group.id); } }
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        spacing: 7px;
+                        alignment: center;
+                        Text { text: group.kind; width: 68px; color: Theme.text; font-size: 10px; overflow: elide; }
+                        VerticalLayout {
+                            horizontal-stretch: 1;
+                            spacing: 1px;
+                            alignment: center;
+                            Text { text: group.id; color: Theme.text; font-size: 10px; font-weight: 620; overflow: elide; }
+                            Text { text: group.md5; color: Theme.muted; font-size: 10px; overflow: elide; }
+                        }
+                        Text { text: group.size; width: 70px; color: Theme.text; font-size: 10px; horizontal-alignment: right; overflow: elide; }
+                        Text { text: group.members; width: 38px; color: Theme.text; font-size: 10px; horizontal-alignment: right; }
+                        Text { text: group.reclaimable; width: 78px; color: Theme.success; font-size: 10px; horizontal-alignment: right; overflow: elide; }
+                    }
+                    Rectangle { y: parent.height - 1px; height: 1px; background: Theme.border; }
+                }
+            }
+        }
+        if root.has-more : Button {
+            text: "加载下一页";
+            accessible-label: "加载下一页重复组";
+            clicked => { root.load-more(); }
+        }
+    }
+}

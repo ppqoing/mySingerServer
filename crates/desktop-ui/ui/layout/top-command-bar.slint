@@ -1,0 +1,59 @@
+// 58px 顶栏按固定顺序承载节点范围、在线摘要、本地搜索和刷新入口。
+
+import { Theme } from "../theme.slint";
+import { IconButton } from "../components/icon-button.slint";
+import { SearchField } from "../components/search-field.slint";
+
+export component TopCommandBar inherits Rectangle {
+    // 在线节点数来自 MainWindow；搜索词只在本地控件内双向保存。
+    in property <int> online-count;
+    private property <string> local-query;
+    // 刷新回调原样转发既有 MainWindow::refresh。
+    callback refresh();
+
+    background: Theme.sidebar;
+    border-width: 1px;
+    border-color: Theme.border;
+
+    // 固定项之后只允许中间空白伸展，搜索与刷新始终贴近右侧。
+    HorizontalLayout {
+        padding-left: 18px;
+        padding-right: 18px;
+        spacing: 12px;
+        alignment: center;
+
+        Rectangle {
+            width: 142px;
+            height: Theme.control-height;
+            border-radius: 6px;
+            background: Theme.panel-hover;
+            border-width: 1px;
+            border-color: Theme.border;
+            Text {
+                text: "节点范围 · 全部";
+                color: Theme.text;
+                font-size: 12px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+        Text {
+            text: root.online-count + " 个节点在线";
+            color: root.online-count > 0 ? Theme.success : Theme.muted;
+            font-size: 12px;
+            font-weight: 600;
+            vertical-alignment: center;
+        }
+        Rectangle { horizontal-stretch: 1; background: transparent; }
+        SearchField {
+            width: 260px;
+            query <=> root.local-query;
+            accessible-name: "本地搜索";
+        }
+        IconButton {
+            icon: @image-url("../assets/icons/refresh.png");
+            accessible-name: "刷新";
+            clicked => { root.refresh(); }
+        }
+    }
+}

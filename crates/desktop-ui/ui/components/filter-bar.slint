@@ -1,0 +1,19 @@
+// 筛选条只提供统一表面和布局槽，具体来源、节点、运行 ID 与动作由页面接线。
+
+import { Theme } from "../theme.slint";
+
+export component FilterBar inherits Rectangle {
+    height: 60px;
+    background: Theme.panel;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: Theme.border;
+    HorizontalLayout {
+        padding: 12px;
+        spacing: 10px;
+        alignment: center;
+        Rectangle { horizontal-stretch: 1; background: transparent; }
+        @children
+        Rectangle { horizontal-stretch: 1; background: transparent; }
+    }
+}

@@ -1,0 +1,22 @@
+[package]
+name = "dedup-media-ffmpeg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/lib.rs"
+# bindgen 会原样保留 FFmpeg C 注释，其中的公式/图示不是 Rust 代码示例。
+doctest = false
+
+[dependencies]
+dedup-core = { path = "../core" }
+thiserror.workspace = true
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+] }
+
+[dev-dependencies]
+tempfile.workspace = true

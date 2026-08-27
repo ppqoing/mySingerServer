@@ -1,0 +1,34 @@
+// node.exe 只显示系统托盘图标，不创建主窗口。
+export component NodeTray inherits SystemTrayIcon {
+    in property <string> status-text;
+    in property <string> address-text;
+    callback open-logs();
+    callback restart-engine();
+    callback exit-node();
+
+    icon: @image-url("../assets/tray-icon.png");
+    tooltip: "mySingerServer 计算节点";
+
+    Menu {
+        MenuItem {
+            title: root.status-text;
+            enabled: false;
+        }
+        MenuItem {
+            title: root.address-text;
+            enabled: false;
+        }
+        MenuItem {
+            title: "打开日志目录";
+            activated => { root.open-logs(); }
+        }
+        MenuItem {
+            title: "重启计算引擎";
+            activated => { root.restart-engine(); }
+        }
+        MenuItem {
+            title: "退出节点";
+            activated => { root.exit-node(); }
+        }
+    }
+}

@@ -1,0 +1,29 @@
+[package]
+name = "dedup-desktop-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+dedup-central-store = { path = "../central-store" }
+dedup-core = { path = "../core" }
+dedup-media = { path = "../media" }
+dedup-protocol = { path = "../protocol" }
+dedup-transport = { path = "../transport" }
+serde.workspace = true
+serde_json = "1"
+thiserror.workspace = true
+tokio.workspace = true
+toml.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+dedup-node-engine = { path = "../node-engine" }
+dedup-node-store = { path = "../node-store" }
+dedup-windows = { path = "../windows" }
+tempfile.workspace = true
+tokio-postgres.workspace = true
