@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -33,12 +34,24 @@ type StageWorker interface {
 type EngineStore interface {
 	BeginLocalAnalysis(context.Context, string, string) (store.LocalAnalysisRun, error)
 	CurrentLocalAnalysis(context.Context, string) (store.LocalAnalysisRun, error)
+	ListLocalPairScoresForRun(context.Context, string) ([]store.LocalPairScore, error)
+	LoadLocalStageOneForRun(context.Context, string) (firstscreen.Result, error)
 	SaveLocalPairScore(context.Context, store.LocalPairScore) error
 	ReplaceLocalAnalysisGroups(context.Context, string, []store.LocalAnalysisGroup) error
 	CompleteLocalAnalysis(context.Context, string) error
 	PublishLocalAnalysis(context.Context, string) error
 	EnqueueLocalEvent(context.Context, store.LocalOutboxEvent) error
 }
+
+type AnalysisProgress struct {
+	Phase           string
+	Complete        int64
+	Total           int64
+	TotalKnown      bool
+	CheckpointStage int
+}
+
+var ErrDrainRequested = errors.New("local_analysis_drain_requested")
 
 type Engine struct {
 	machineID    string
@@ -60,16 +73,18 @@ func NewEngine(machineID string, stageOne StageOneRunner, analysisStore EngineSt
 }
 
 func (e *Engine) Run(ctx context.Context, taskID string) error {
-	return e.RunWithProgress(ctx, taskID, nil)
+	return e.RunWithProgress(ctx, taskID, nil, nil)
 }
 
-func (e *Engine) RunWithProgress(ctx context.Context, taskID string, checkpoint func(int) error) error {
-	return e.runWithProgress(ctx, taskID, checkpoint, func(ctx context.Context, machineID, runID string) (firstscreen.Result, error) {
-		return e.stageOne.Run(ctx, machineID, runID)
-	})
-}
-
-func (e *Engine) RunWithProgressForRoots(ctx context.Context, taskID string, roots []string, checkpoint func(int) error) error {
+// RunWithProgressForRootsAndDrain 在指定根目录执行分析，并同时支持排水与细粒度进度回调。
+// roots 会被复制后再传给阶段一，避免阶段一修改调用方的切片。
+func (e *Engine) RunWithProgressForRootsAndDrain(
+	ctx context.Context,
+	taskID string,
+	roots []string,
+	drain <-chan struct{},
+	report func(AnalysisProgress) error,
+) error {
 	if e == nil {
 		return fmt.Errorf("localanalysis: engine dependencies are required")
 	}
@@ -81,17 +96,46 @@ func (e *Engine) RunWithProgressForRoots(ctx context.Context, taskID string, roo
 		return fmt.Errorf("localanalysis: root-scoped stage one is required")
 	}
 	rootCopy := append([]string(nil), roots...)
-	return e.runWithProgress(ctx, taskID, checkpoint, func(ctx context.Context, machineID, runID string) (firstscreen.Result, error) {
+	return e.runWithProgress(ctx, taskID, drain, report, func(ctx context.Context, machineID, runID string) (firstscreen.Result, error) {
 		return stageOne.RunForRoots(ctx, machineID, runID, rootCopy)
 	})
 }
 
-func (e *Engine) runWithProgress(ctx context.Context, taskID string, checkpoint func(int) error, runStageOne func(context.Context, string, string) (firstscreen.Result, error)) error {
+// RunWithProgressForRoots 保留旧版阶段回调契约，同时使用新版可恢复分析核心。
+func (e *Engine) RunWithProgressForRoots(ctx context.Context, taskID string, roots []string, checkpoint func(int) error) error {
+	checkpointed := false
+	return e.RunWithProgressForRootsAndDrain(ctx, taskID, roots, nil, func(progress AnalysisProgress) error {
+		if !checkpointed && progress.Phase == "stage2" {
+			checkpointed = true
+			if checkpoint != nil {
+				return checkpoint(2)
+			}
+		}
+		return nil
+	})
+}
+
+func (e *Engine) RunWithProgress(ctx context.Context, taskID string, drain <-chan struct{}, report func(AnalysisProgress) error) error {
+	return e.runWithProgress(ctx, taskID, drain, report, func(ctx context.Context, machineID, runID string) (firstscreen.Result, error) {
+		return e.stageOne.Run(ctx, machineID, runID)
+	})
+}
+
+func (e *Engine) runWithProgress(
+	ctx context.Context,
+	taskID string,
+	drain <-chan struct{},
+	report func(AnalysisProgress) error,
+	runStageOne func(context.Context, string, string) (firstscreen.Result, error),
+) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if e == nil || e.machineID == "" || taskID == "" || e.stageOne == nil || e.store == nil || e.worker == nil {
 		return fmt.Errorf("localanalysis: engine dependencies are required")
+	}
+	if drainRequested(drain) {
+		return ErrDrainRequested
 	}
 	run, err := e.store.BeginLocalAnalysis(ctx, e.machineID, taskID)
 	if err != nil {
@@ -102,10 +146,16 @@ func (e *Engine) runWithProgress(ctx context.Context, taskID string, checkpoint 
 	}
 	switch run.Status {
 	case "complete":
+		if err := reportAnalysisProgress(report, AnalysisProgress{Phase: "finalizing", TotalKnown: false, CheckpointStage: 3}); err != nil {
+			return err
+		}
+		if drainRequested(drain) {
+			return ErrDrainRequested
+		}
 		if err := e.store.PublishLocalAnalysis(ctx, run.RunID); err != nil {
 			return fmt.Errorf("localanalysis: publish completed run: %w", err)
 		}
-		return nil
+		return reportAnalysisProgress(report, AnalysisProgress{Phase: "finalizing", Complete: 1, Total: 1, TotalKnown: true, CheckpointStage: 3})
 	case "published":
 		current, err := e.store.CurrentLocalAnalysis(ctx, e.machineID)
 		if err != nil {
@@ -114,17 +164,47 @@ func (e *Engine) runWithProgress(ctx context.Context, taskID string, checkpoint 
 		if current.RunID != run.RunID || current.MachineID != e.machineID {
 			return fmt.Errorf("localanalysis: published run is not current")
 		}
-		return nil
+		return reportAnalysisProgress(report, AnalysisProgress{Phase: "finalizing", Complete: 1, Total: 1, TotalKnown: true, CheckpointStage: 3})
 	case "building":
 	default:
 		return fmt.Errorf("localanalysis: unsupported run status %q", run.Status)
 	}
-	result, err := runStageOne(ctx, e.machineID, run.RunID)
+	existingRows, err := e.store.ListLocalPairScoresForRun(ctx, run.RunID)
+	if err != nil {
+		return fmt.Errorf("localanalysis: list durable pair scores: %w", err)
+	}
+	existing := make(map[string]store.LocalPairScore, len(existingRows))
+	for _, pair := range existingRows {
+		if pair.RunID == run.RunID {
+			existing[pair.PairKey] = pair
+		}
+	}
+	if err := reportAnalysisProgress(report, AnalysisProgress{Phase: "stage1", TotalKnown: false, CheckpointStage: 1}); err != nil {
+		return err
+	}
+	if drainRequested(drain) {
+		return ErrDrainRequested
+	}
+	var result firstscreen.Result
+	if hasDurablePairCheckpoint(existingRows) {
+		result, err = e.store.LoadLocalStageOneForRun(ctx, run.RunID)
+		if err != nil {
+			return fmt.Errorf("localanalysis: load durable stage one: %w", err)
+		}
+	} else {
+		result, err = runStageOne(ctx, e.machineID, run.RunID)
+	}
 	if err != nil {
 		return fmt.Errorf("localanalysis: stage one: %w", err)
 	}
 	if err = e.event(ctx, run, "stage1", map[string]int{"files": len(result.Files), "pairs": len(result.CandidatePairs), "exact_groups": len(result.ExactGroups)}); err != nil {
 		return err
+	}
+	if err := reportAnalysisProgress(report, AnalysisProgress{Phase: "stage1", Complete: 1, Total: 1, TotalKnown: true, CheckpointStage: 1}); err != nil {
+		return err
+	}
+	if drainRequested(drain) {
+		return ErrDrainRequested
 	}
 
 	filesBySHA := make(map[[64]byte][]firstscreen.File)
@@ -148,7 +228,19 @@ func (e *Engine) runWithProgress(ctx context.Context, taskID string, checkpoint 
 		persisted store.LocalPairScore
 	}
 	stage2Passed := make([]stagedPair, 0, len(result.CandidatePairs))
+	persistedStage2 := int64(0)
 	for _, pair := range result.CandidatePairs {
+		if saved, ok := existing[pairKey(pair)]; ok && saved.Stage2JSON != nil {
+			persistedStage2++
+		}
+	}
+	if err := reportAnalysisProgress(report, AnalysisProgress{Phase: "stage2", Complete: persistedStage2, Total: int64(len(result.CandidatePairs)), TotalKnown: true, CheckpointStage: 2}); err != nil {
+		return err
+	}
+	for _, pair := range result.CandidatePairs {
+		if drainRequested(drain) {
+			return ErrDrainRequested
+		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -160,6 +252,17 @@ func (e *Engine) runWithProgress(ctx context.Context, taskID string, checkpoint 
 		category, kind, err := candidateKind(pair.Kind)
 		if err != nil {
 			return err
+		}
+		key := pairKey(pair)
+		if saved, ok := existing[key]; ok && saved.Stage2JSON != nil {
+			stage2Verdict, err := storedStageVerdict(saved.Stage2JSON)
+			if err != nil {
+				return fmt.Errorf("localanalysis: decode durable stage two verdict: %w", err)
+			}
+			if stage2Verdict == "yes" {
+				stage2Passed = append(stage2Passed, stagedPair{category: category, kind: kind, left: leftFiles[0], right: rightFiles[0], persisted: saved})
+			}
+			continue
 		}
 		left2, err := e.compute(ctx, run.TaskID, leftFiles[0], kind, worker.ScreenStageTwo)
 		if err != nil {
@@ -178,9 +281,14 @@ func (e *Engine) runWithProgress(ctx context.Context, taskID string, checkpoint 
 		if err != nil {
 			return fmt.Errorf("localanalysis: marshal stage two: %w", err)
 		}
-		localPair := store.LocalPairScore{RunID: run.RunID, PairKey: pairKey(pair), LeftFileID: leftFiles[0].ID, RightFileID: rightFiles[0].ID, LeftSHA512: hex.EncodeToString(pair.ShaA[:]), RightSHA512: hex.EncodeToString(pair.ShaB[:]), Stage1JSON: string(stage1JSON), Stage2JSON: stringPointer(string(stage2JSON)), Verdict: localVerdict(stage2.Verdict)}
+		localPair := store.LocalPairScore{RunID: run.RunID, PairKey: key, LeftFileID: leftFiles[0].ID, RightFileID: rightFiles[0].ID, LeftSHA512: hex.EncodeToString(pair.ShaA[:]), RightSHA512: hex.EncodeToString(pair.ShaB[:]), Stage1JSON: string(stage1JSON), Stage2JSON: stringPointer(string(stage2JSON)), Verdict: localVerdict(stage2.Verdict)}
 		if err := e.store.SaveLocalPairScore(ctx, localPair); err != nil {
 			return fmt.Errorf("localanalysis: save stage two: %w", err)
+		}
+		existing[key] = localPair
+		persistedStage2++
+		if err := reportAnalysisProgress(report, AnalysisProgress{Phase: "stage2", Complete: persistedStage2, Total: int64(len(result.CandidatePairs)), TotalKnown: true, CheckpointStage: 2}); err != nil {
+			return err
 		}
 		if stage2.Verdict == phase2.VerdictYes {
 			stage2Passed = append(stage2Passed, stagedPair{category: category, kind: kind, left: leftFiles[0], right: rightFiles[0], persisted: localPair})
@@ -189,16 +297,31 @@ func (e *Engine) runWithProgress(ctx context.Context, taskID string, checkpoint 
 	if err = e.event(ctx, run, "stage2", map[string]int{"pairs": len(result.CandidatePairs)}); err != nil {
 		return err
 	}
-	if checkpoint != nil {
-		if err := checkpoint(2); err != nil {
-			return err
-		}
-	}
 
 	decisions := make([]PairDecision, 0, len(stage2Passed))
+	persistedStage3 := int64(0)
 	for _, staged := range stage2Passed {
+		if staged.persisted.Stage3JSON != nil {
+			persistedStage3++
+		}
+	}
+	if err := reportAnalysisProgress(report, AnalysisProgress{Phase: "stage3", Complete: persistedStage3, Total: int64(len(stage2Passed)), TotalKnown: true, CheckpointStage: 3}); err != nil {
+		return err
+	}
+	for _, staged := range stage2Passed {
+		if drainRequested(drain) {
+			return ErrDrainRequested
+		}
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		if staged.persisted.Stage3JSON != nil {
+			stage3Verdict, err := storedStageVerdict(staged.persisted.Stage3JSON)
+			if err != nil {
+				return fmt.Errorf("localanalysis: decode durable stage three verdict: %w", err)
+			}
+			decisions = append(decisions, PairDecision{Category: staged.category, SHAA: staged.persisted.LeftSHA512, SHAB: staged.persisted.RightSHA512, Verdict: stage3Verdict})
+			continue
 		}
 		left3, err := e.compute(ctx, run.TaskID, staged.left, staged.kind, worker.ScreenStageThree)
 		if err != nil {
@@ -219,10 +342,24 @@ func (e *Engine) runWithProgress(ctx context.Context, taskID string, checkpoint 
 		if err := e.store.SaveLocalPairScore(ctx, localPair); err != nil {
 			return fmt.Errorf("localanalysis: save stage three: %w", err)
 		}
+		existing[localPair.PairKey] = localPair
+		persistedStage3++
+		if err := reportAnalysisProgress(report, AnalysisProgress{Phase: "stage3", Complete: persistedStage3, Total: int64(len(stage2Passed)), TotalKnown: true, CheckpointStage: 3}); err != nil {
+			return err
+		}
 		decisions = append(decisions, PairDecision{Category: staged.category, SHAA: localPair.LeftSHA512, SHAB: localPair.RightSHA512, Verdict: verdictText(stage3.Verdict)})
 	}
 	if err = e.event(ctx, run, "stage3", map[string]int{"pairs": len(stage2Passed)}); err != nil {
 		return err
+	}
+	if drainRequested(drain) {
+		return ErrDrainRequested
+	}
+	if err := reportAnalysisProgress(report, AnalysisProgress{Phase: "finalizing", TotalKnown: false, CheckpointStage: 3}); err != nil {
+		return err
+	}
+	if drainRequested(drain) {
+		return ErrDrainRequested
 	}
 	groupFiles := make([]GroupFile, 0, len(result.Files))
 	for _, file := range result.Files {
@@ -251,7 +388,53 @@ func (e *Engine) runWithProgress(ctx context.Context, taskID string, checkpoint 
 	if err = e.store.PublishLocalAnalysis(ctx, run.RunID); err != nil {
 		return fmt.Errorf("localanalysis: publish run: %w", err)
 	}
-	return nil
+	return reportAnalysisProgress(report, AnalysisProgress{Phase: "finalizing", Complete: 1, Total: 1, TotalKnown: true, CheckpointStage: 3})
+}
+
+func hasDurablePairCheckpoint(rows []store.LocalPairScore) bool {
+	for _, row := range rows {
+		if row.Stage2JSON != nil || row.Stage3JSON != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func reportAnalysisProgress(report func(AnalysisProgress) error, progress AnalysisProgress) error {
+	if report == nil {
+		return nil
+	}
+	return report(progress)
+}
+
+func drainRequested(drain <-chan struct{}) bool {
+	if drain == nil {
+		return false
+	}
+	select {
+	case <-drain:
+		return true
+	default:
+		return false
+	}
+}
+
+func storedStageVerdict(raw *string) (string, error) {
+	if raw == nil {
+		return "", fmt.Errorf("missing stage JSON")
+	}
+	var payload struct {
+		Verdict string `json:"verdict"`
+	}
+	if err := json.Unmarshal([]byte(*raw), &payload); err != nil {
+		return "", err
+	}
+	switch payload.Verdict {
+	case "yes", "no", "inconclusive":
+		return payload.Verdict, nil
+	default:
+		return "", fmt.Errorf("invalid stage verdict %q", payload.Verdict)
+	}
 }
 
 func (e *Engine) compute(ctx context.Context, taskID string, file firstscreen.File, kind worker.MediaKind, stage worker.ScreenStage) (*worker.JobResultMsg, error) {

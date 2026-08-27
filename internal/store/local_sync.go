@@ -187,6 +187,7 @@ func (d *DB) LoadLocalSyncBatch(ctx context.Context, events []LocalOutboxSyncRow
 			var payload struct {
 				FileID    int64  `json:"file_id"`
 				MachineID string `json:"machine_id"`
+				RunID     string `json:"run_id"`
 				Status    string `json:"status"`
 				SHA512    string `json:"sha512"`
 				BatchID   string `json:"batch_id"`
@@ -195,17 +196,29 @@ func (d *DB) LoadLocalSyncBatch(ctx context.Context, events []LocalOutboxSyncRow
 				payload.MachineID == "" || payload.Status != "deleted" || payload.SHA512 == "" || payload.BatchID == "" {
 				return LocalSyncBatch{}, fmt.Errorf("store: invalid local delete event")
 			}
-			row, err := d.loadLocalSyncDelete(ctx, payload.MachineID, payload.BatchID, payload.FileID, event.Generation)
+			row, attachedToRun, err := d.loadLocalSyncDelete(ctx, payload.MachineID, payload.BatchID, payload.FileID, event.Generation)
 			if err != nil || row.SHA512 != payload.SHA512 || row.Status != "deleted" {
 				return LocalSyncBatch{}, fmt.Errorf("store: local delete identity mismatch")
 			}
+			if attachedToRun {
+				if payload.RunID != "" && payload.RunID != row.RunID {
+					return LocalSyncBatch{}, fmt.Errorf("store: local delete run mismatch")
+				}
+			} else {
+				if payload.RunID == "" {
+					return LocalSyncBatch{}, fmt.Errorf("store: detached local delete missing run identity")
+				}
+				row.RunID = payload.RunID
+			}
 			deletes[fmt.Sprintf("%s\x00%d", row.BatchID, row.FileID)] = row
 			event.MachineID = row.MachineID
-			run, err := d.loadLocalSyncRun(ctx, row.RunID, row.Generation)
-			if err != nil || run.MachineID != row.MachineID {
-				return LocalSyncBatch{}, fmt.Errorf("store: local delete run mismatch")
+			if attachedToRun {
+				run, err := d.loadLocalSyncRun(ctx, row.RunID, row.Generation)
+				if err != nil || run.MachineID != row.MachineID {
+					return LocalSyncBatch{}, fmt.Errorf("store: local delete run mismatch")
+				}
+				runs[runKey(run.MachineID, run.RunID, run.Generation)] = run
 			}
-			runs[runKey(run.MachineID, run.RunID, run.Generation)] = run
 		case "local.task":
 			var payload struct {
 				MachineID string `json:"machine_id"`
@@ -352,8 +365,9 @@ func (d *DB) loadLocalSyncReviews(ctx context.Context, machineID, runID string, 
 	return reviews, rows.Err()
 }
 
-func (d *DB) loadLocalSyncDelete(ctx context.Context, machineID, batchID string, fileID, generation int64) (LocalDeleteSyncRow, error) {
+func (d *DB) loadLocalSyncDelete(ctx context.Context, machineID, batchID string, fileID, generation int64) (LocalDeleteSyncRow, bool, error) {
 	var row LocalDeleteSyncRow
+	var runID sql.NullString
 	var completed sql.NullInt64
 	err := d.db.QueryRowContext(ctx, `
 		SELECT b.machine_id,b.run_id,?4,b.batch_id,i.file_id,i.path_snapshot,i.sha512,
@@ -362,16 +376,19 @@ func (d *DB) loadLocalSyncDelete(ctx context.Context, machineID, batchID string,
 		JOIN local_delete_items i ON i.machine_id=b.machine_id AND i.batch_id=b.batch_id
 		JOIN files f ON f.machine_id=i.machine_id AND f.id=i.file_id
 		WHERE b.machine_id=?1 AND b.batch_id=?2 AND i.file_id=?3`, machineID, batchID, fileID, generation).Scan(
-		&row.MachineID, &row.RunID, &row.Generation, &row.BatchID, &row.FileID, &row.Path,
+		&row.MachineID, &runID, &row.Generation, &row.BatchID, &row.FileID, &row.Path,
 		&row.SHA512, &row.Result, &row.Status, &row.ErrorCode, &row.Uncertain, &completed,
 	)
 	if err != nil {
-		return row, err
+		return row, false, err
+	}
+	if runID.Valid {
+		row.RunID = runID.String
 	}
 	if completed.Valid {
 		row.CompletedAt = completed.Int64
 	}
-	return row, nil
+	return row, runID.Valid, nil
 }
 
 func (d *DB) AcknowledgeLocalSyncEvents(ctx context.Context, events []LocalOutboxSyncRow) error {

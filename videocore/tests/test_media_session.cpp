@@ -1384,6 +1384,36 @@ void TestOpenValidationAndNoPartialPublish() {
     DeleteFileW(path.c_str());
 }
 
+void TestVideoMetadataRequiresCompletedStreamProbe() {
+    const std::wstring path = MakeTemporaryPath(L"-metadata-before-probe.bin");
+    Check(WriteBytes(path, {'n', 'o', 't', '-', 'v', 'i', 'd', 'e', 'o'}),
+          "metadata pre-probe fixture write");
+    vc_media_session* session = nullptr;
+    vc_error error = FreshError();
+    const vc_media_open_options options = FreshOptions(VC_MEDIA_TYPE_VIDEO);
+    Check(Open(path, options, nullptr, &session, &error) == VC_OK,
+          "video session opens before probe");
+    if (session != nullptr) {
+        vc_video_container_info container{};
+        container.struct_size = sizeof(container);
+        container.abi_version = VC_ABI_VERSION;
+        error = FreshError();
+        Check(vc_media_container_info(session, &container, &error) ==
+                  VC_ERR_UNSUPPORTED,
+              "container snapshot is unavailable before stream probe");
+        Check(vc_media_stream_count(session) == 0u,
+              "stream count is zero before stream probe");
+        uint32_t required = 99u;
+        error = FreshError();
+        Check(vc_media_metadata_json(session, -1, nullptr, 0u, &required,
+                                     &error) == VC_ERR_UNSUPPORTED &&
+                  required == 0u,
+              "metadata JSON is unavailable before stream probe");
+        vc_media_close(session);
+    }
+    DeleteFileW(path.c_str());
+}
+
 }  // namespace
 
 int main() {
@@ -1404,6 +1434,7 @@ int main() {
     TestSuccessfulHashIsCached();
     TestCancellationAndRetainedLifetime();
     TestOpenValidationAndNoPartialPublish();
+    TestVideoMetadataRequiresCompletedStreamProbe();
     TestExactSessionCapacityAndRecovery();
     TestMaximumGenerationRetiresWithoutWrap();
     if (failures != 0) {

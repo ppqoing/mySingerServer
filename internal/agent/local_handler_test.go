@@ -2,14 +2,19 @@ package agent
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"fmt"
 	"net"
+	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	"dedup/internal/localdelete"
 	"dedup/internal/localtask"
 	"dedup/internal/proto"
+	"dedup/internal/store"
 	"dedup/internal/worker"
 	"github.com/vmihailenco/msgpack/v5"
 )
@@ -409,8 +414,34 @@ func TestLocalTaskSocketRequiresNodeTrayAuthAndKeepsHeartbeatResponsive(t *testi
 }
 
 type fakeLocalTaskService struct {
-	created       chan struct{}
-	createRelease chan struct{}
+	created           chan struct{}
+	createRelease     chan struct{}
+	pauseTask         localtask.Task
+	resumeTask        localtask.Task
+	cancelTask        localtask.Task
+	retryTask         localtask.Task
+	deleteResult      localtask.ControlResult
+	pauseRequest      localtask.ControlRequest
+	resumeRequest     localtask.ControlRequest
+	cancelRequest     localtask.ControlRequest
+	retryRequest      localtask.ControlRequest
+	deleteRequest     localtask.ControlRequest
+	legacyCancel      string
+	legacyRetry       string
+	pauseCalls        int
+	resumeCalls       int
+	cancelCalls       int
+	retryCalls        int
+	deleteCalls       int
+	legacyCancelCalls int
+	legacyRetryCalls  int
+	pauseErr          error
+	resumeErr         error
+	cancelErr         error
+	retryErr          error
+	deleteErr         error
+	legacyCancelErr   error
+	legacyRetryErr    error
 }
 
 func (s *fakeLocalTaskService) Create(_ context.Context, request localtask.CreateRequest) (localtask.Task, error) {
@@ -424,8 +455,300 @@ func (s *fakeLocalTaskService) Create(_ context.Context, request localtask.Creat
 func (*fakeLocalTaskService) List(context.Context, localtask.ListRequest) (localtask.Page[localtask.Task], error) {
 	return localtask.Page[localtask.Task]{}, nil
 }
-func (*fakeLocalTaskService) Cancel(context.Context, string) error { return nil }
-func (*fakeLocalTaskService) Retry(context.Context, string) (localtask.Task, error) {
-	return localtask.Task{}, nil
+
+func (s *fakeLocalTaskService) Pause(_ context.Context, request localtask.ControlRequest) (localtask.Task, error) {
+	s.pauseCalls++
+	s.pauseRequest = request
+	return s.pauseTask, s.pauseErr
 }
-func (*fakeLocalTaskService) Resume(context.Context) error { return nil }
+
+func (s *fakeLocalTaskService) ResumeTask(_ context.Context, request localtask.ControlRequest) (localtask.Task, error) {
+	s.resumeCalls++
+	s.resumeRequest = request
+	return s.resumeTask, s.resumeErr
+}
+
+func (s *fakeLocalTaskService) Cancel(_ context.Context, request localtask.ControlRequest) (localtask.Task, error) {
+	s.cancelCalls++
+	s.cancelRequest = request
+	return s.cancelTask, s.cancelErr
+}
+
+func (s *fakeLocalTaskService) Delete(_ context.Context, request localtask.ControlRequest) (localtask.ControlResult, error) {
+	s.deleteCalls++
+	s.deleteRequest = request
+	return s.deleteResult, s.deleteErr
+}
+
+func (s *fakeLocalTaskService) Retry(_ context.Context, request localtask.ControlRequest) (localtask.Task, error) {
+	s.retryCalls++
+	s.retryRequest = request
+	return s.retryTask, s.retryErr
+}
+
+func (s *fakeLocalTaskService) LegacyCancel(_ context.Context, taskID string) (localtask.Task, error) {
+	s.legacyCancelCalls++
+	s.legacyCancel = taskID
+	return s.cancelTask, s.legacyCancelErr
+}
+
+func (s *fakeLocalTaskService) LegacyRetry(_ context.Context, taskID string) (localtask.Task, error) {
+	s.legacyRetryCalls++
+	s.legacyRetry = taskID
+	return s.retryTask, s.legacyRetryErr
+}
+
+// Break caught: versioned lifecycle commands may be decoded as legacy task-ID
+// requests, routed to the wrong Service method, or return an incomplete task.
+func TestLocalTaskHandlerRoutesVersionedLifecycleControls(t *testing.T) {
+	request := proto.LocalTaskControlRequest{TaskID: "task-1", InstanceID: "instance-1", ExpectedRevision: 7}
+	for _, test := range []struct {
+		name      string
+		operation string
+		configure func(*fakeLocalTaskService)
+		calls     func(*fakeLocalTaskService) int
+		got       func(*fakeLocalTaskService) localtask.ControlRequest
+	}{
+		{name: "pause", operation: proto.LocalOperationTaskPause, configure: func(s *fakeLocalTaskService) { s.pauseTask = taskSnapshot("pausing", 8) }, calls: func(s *fakeLocalTaskService) int { return s.pauseCalls }, got: func(s *fakeLocalTaskService) localtask.ControlRequest { return s.pauseRequest }},
+		{name: "resume", operation: proto.LocalOperationTaskResume, configure: func(s *fakeLocalTaskService) { s.resumeTask = taskSnapshot("pending", 8) }, calls: func(s *fakeLocalTaskService) int { return s.resumeCalls }, got: func(s *fakeLocalTaskService) localtask.ControlRequest { return s.resumeRequest }},
+		{name: "cancel", operation: proto.LocalOperationTaskCancel, configure: func(s *fakeLocalTaskService) { s.cancelTask = taskSnapshot("stopping", 8) }, calls: func(s *fakeLocalTaskService) int { return s.cancelCalls }, got: func(s *fakeLocalTaskService) localtask.ControlRequest { return s.cancelRequest }},
+		{name: "retry", operation: proto.LocalOperationTaskRetry, configure: func(s *fakeLocalTaskService) { s.retryTask = taskSnapshot("pending", 8) }, calls: func(s *fakeLocalTaskService) int { return s.retryCalls }, got: func(s *fakeLocalTaskService) localtask.ControlRequest { return s.retryRequest }},
+		{name: "delete", operation: proto.LocalOperationTaskDelete, configure: func(s *fakeLocalTaskService) {
+			task := taskSnapshot("deleting", 8)
+			s.deleteResult = localtask.ControlResult{Task: &task}
+		}, calls: func(s *fakeLocalTaskService) int { return s.deleteCalls }, got: func(s *fakeLocalTaskService) localtask.ControlRequest { return s.deleteRequest }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service := &fakeLocalTaskService{}
+			test.configure(service)
+			response := handleLocalTaskRequest(t, service, test.operation, request)
+			if !response.OK || test.calls(service) != 1 {
+				t.Fatalf("response=%#v calls=%d", response, test.calls(service))
+			}
+			if got := test.got(service); got != request {
+				t.Fatalf("request=%#v want=%#v", got, request)
+			}
+			var accepted proto.LocalTaskControlResponse
+			if err := proto.DecodeLocalPayload(response.Payload, &accepted); err != nil || accepted.Task == nil || accepted.Task.Status == "" || accepted.Task.Revision != 8 {
+				t.Fatalf("accepted=%#v err=%v", accepted, err)
+			}
+		})
+	}
+}
+
+// Break caught: a completed deletion receipt is discarded instead of producing
+// the idempotent deleted acknowledgement expected by the tray.
+func TestLocalTaskDeleteReturnsDeletionReceipt(t *testing.T) {
+	service := &fakeLocalTaskService{deleteResult: localtask.ControlResult{Deleted: true}}
+	response := handleLocalTaskRequest(t, service, proto.LocalOperationTaskDelete,
+		proto.LocalTaskControlRequest{TaskID: "task-1", InstanceID: "instance-1", ExpectedRevision: 7})
+	var accepted proto.LocalTaskControlResponse
+	if !response.OK || proto.DecodeLocalPayload(response.Payload, &accepted) != nil || !accepted.Deleted || accepted.Task != nil {
+		t.Fatalf("response=%#v accepted=%#v", response, accepted)
+	}
+}
+
+// Break caught: cancel/retry either lose backwards compatibility or accept a
+// partial versioned payload as an unsafe legacy control.
+func TestLocalTaskHandlerLimitsLegacyControlsToStrictTaskIDPayloads(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		operation string
+		calls     func(*fakeLocalTaskService) int
+		got       func(*fakeLocalTaskService) string
+	}{
+		{name: "cancel", operation: proto.LocalOperationTaskCancel, calls: func(s *fakeLocalTaskService) int { return s.legacyCancelCalls }, got: func(s *fakeLocalTaskService) string { return s.legacyCancel }},
+		{name: "retry", operation: proto.LocalOperationTaskRetry, calls: func(s *fakeLocalTaskService) int { return s.legacyRetryCalls }, got: func(s *fakeLocalTaskService) string { return s.legacyRetry }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service := &fakeLocalTaskService{cancelTask: taskSnapshot("stopping", 8), retryTask: taskSnapshot("pending", 8)}
+			response := handleLocalTaskRequest(t, service, test.operation, proto.LocalTaskIDRequest{TaskID: "task-1"})
+			if !response.OK || test.calls(service) != 1 || test.got(service) != "task-1" {
+				t.Fatalf("legacy response=%#v calls=%d taskID=%q", response, test.calls(service), test.got(service))
+			}
+		})
+	}
+
+	partial, err := msgpack.Marshal(map[string]any{"task_id": "task-1", "instance_id": "instance-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &fakeLocalTaskService{}
+	response := NewLocalTaskHandler(service).HandleLocal(context.Background(), proto.LocalRequest{RequestID: "partial", Operation: proto.LocalOperationTaskCancel, Payload: partial})
+	if response.OK || response.ErrorCode != proto.InvalidTaskControlErrorCode || service.legacyCancelCalls != 0 || service.cancelCalls != 0 {
+		t.Fatalf("partial response=%#v service=%#v", response, service)
+	}
+
+	extra, err := msgpack.Marshal(map[string]any{"task_id": "task-1", "unexpected": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response = NewLocalTaskHandler(service).HandleLocal(context.Background(), proto.LocalRequest{RequestID: "extra", Operation: proto.LocalOperationTaskRetry, Payload: extra})
+	if response.OK || response.ErrorCode != proto.InvalidTaskControlErrorCode || service.legacyRetryCalls != 0 || service.retryCalls != 0 {
+		t.Fatalf("extra response=%#v service=%#v", response, service)
+	}
+
+	response = handleLocalTaskRequest(t, service, proto.LocalOperationTaskPause, proto.LocalTaskIDRequest{TaskID: "task-1"})
+	if response.OK || response.ErrorCode != proto.InvalidTaskControlErrorCode || service.pauseCalls != 0 {
+		t.Fatalf("pause legacy response=%#v service=%#v", response, service)
+	}
+}
+
+// Break caught: backend errors leak implementation details or lose their
+// stable control-plane meaning for tray recovery and conflict handling.
+func TestLocalTaskHandlerMapsControlErrorsWithoutLeakingBackendText(t *testing.T) {
+	secret := errors.New("database secret must never cross the local socket")
+	for _, test := range []struct {
+		name      string
+		operation string
+		configure func(*fakeLocalTaskService, error)
+		err       error
+		want      string
+	}{
+		{name: "stale", operation: proto.LocalOperationTaskPause, configure: func(s *fakeLocalTaskService, err error) { s.pauseErr = err }, err: fmt.Errorf("wrapped: %w", store.ErrLocalTaskStale), want: "stale_task"},
+		{name: "instance mismatch", operation: proto.LocalOperationTaskResume, configure: func(s *fakeLocalTaskService, err error) { s.resumeErr = err }, err: fmt.Errorf("wrapped: %w", store.ErrLocalTaskInstanceMismatch), want: "task_instance_mismatch"},
+		{name: "invalid state", operation: proto.LocalOperationTaskCancel, configure: func(s *fakeLocalTaskService, err error) { s.cancelErr = err }, err: fmt.Errorf("wrapped: %w", store.ErrLocalTaskTransition), want: "invalid_task_state"},
+		{name: "not found", operation: proto.LocalOperationTaskRetry, configure: func(s *fakeLocalTaskService, err error) { s.retryErr = err }, err: sql.ErrNoRows, want: "task_not_found"},
+		{name: "reused legacy task", operation: proto.LocalOperationTaskCancel, configure: func(s *fakeLocalTaskService, err error) { s.legacyCancelErr = err }, err: fmt.Errorf("wrapped: %w", localtask.ErrTaskInstanceRequired), want: "task_instance_required"},
+		{name: "delete failure", operation: proto.LocalOperationTaskDelete, configure: func(s *fakeLocalTaskService, err error) { s.deleteErr = err }, err: secret, want: "task_delete_failed"},
+		{name: "other control failure", operation: proto.LocalOperationTaskPause, configure: func(s *fakeLocalTaskService, err error) { s.pauseErr = err }, err: secret, want: "task_control_failed"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service := &fakeLocalTaskService{}
+			test.configure(service, test.err)
+			input := any(proto.LocalTaskControlRequest{TaskID: "task-1", InstanceID: "instance-1", ExpectedRevision: 7})
+			if test.name == "reused legacy task" {
+				input = proto.LocalTaskIDRequest{TaskID: "task-1"}
+			}
+			response := handleLocalTaskRequest(t, service, test.operation, input)
+			if response.OK || response.ErrorCode != test.want || response.ErrorCode == secret.Error() {
+				t.Fatalf("response=%#v want=%q", response, test.want)
+			}
+		})
+	}
+
+	response := NewLocalTaskHandler(nil).HandleLocal(context.Background(), proto.LocalRequest{RequestID: "unavailable", Operation: proto.LocalOperationTaskPause})
+	if response.OK || response.ErrorCode != "local_task_unavailable" {
+		t.Fatalf("unavailable=%#v", response)
+	}
+}
+
+// Break caught: legacy cancel/retry can target a new task that reused a
+// deleted task ID, instead of requiring an instance-aware control request.
+func TestLocalTaskHandlerRequiresInstanceForReusedLegacyTaskID(t *testing.T) {
+	service := newReceiptBlockedLocalTaskService(t)
+	handler := NewLocalTaskHandler(service)
+	for _, operation := range []string{proto.LocalOperationTaskCancel, proto.LocalOperationTaskRetry} {
+		t.Run(operation, func(t *testing.T) {
+			payload, err := proto.EncodeLocalPayload(proto.LocalTaskIDRequest{TaskID: "reused-task"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			response := handler.HandleLocal(context.Background(), proto.LocalRequest{RequestID: operation, Operation: operation, Payload: payload})
+			if response.OK || response.ErrorCode != "task_instance_required" {
+				t.Fatalf("response=%#v", response)
+			}
+		})
+	}
+}
+
+func handleLocalTaskRequest(t *testing.T, service LocalTaskService, operation string, input any) proto.LocalResponse {
+	t.Helper()
+	payload, err := proto.EncodeLocalPayload(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return NewLocalTaskHandler(service).HandleLocal(context.Background(), proto.LocalRequest{RequestID: operation, Operation: operation, Payload: payload})
+}
+
+func taskSnapshot(status string, revision int64) localtask.Task {
+	return localtask.Task{TaskID: "task-1", InstanceID: "instance-1", Revision: revision, Mode: proto.LocalTaskModeScanOnly, Status: status}
+}
+
+func newReceiptBlockedLocalTaskService(t *testing.T) localtask.Service {
+	t.Helper()
+	db, err := store.Open(filepath.Join(t.TempDir(), "agent.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	runner := &receiptTaskRunner{started: make(chan struct{}), release: make(chan struct{})}
+	t.Cleanup(func() { close(runner.release) })
+	service := localtask.NewService("machine-a", db, runner)
+	request := localtask.CreateRequest{TaskID: "reused-task", Roots: []string{`D:\\media`}, Mode: proto.LocalTaskModeScanOnly}
+	original, err := service.Create(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-runner.started:
+	case <-time.After(time.Second):
+		t.Fatal("task did not start")
+	}
+	current := waitTaskForHandler(t, service, original.TaskID, "running")
+	if _, err := service.Delete(context.Background(), localtask.ControlRequest{
+		TaskID: current.TaskID, InstanceID: current.InstanceID, ExpectedRevision: current.Revision,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitReceiptForHandler(t, db, original)
+	replacement, err := service.Create(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replacement.InstanceID == original.InstanceID {
+		t.Fatalf("replacement instance=%q original=%q", replacement.InstanceID, original.InstanceID)
+	}
+	return service
+}
+
+type receiptTaskRunner struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (runner *receiptTaskRunner) Run(control localtask.RunControl, _ localtask.CreateRequest, _ localtask.Task, _ func(localtask.ProgressUpdate) error) error {
+	runner.once.Do(func() { close(runner.started) })
+	select {
+	case <-control.Drain:
+		return localtask.ErrDrainRequested
+	case <-control.Context.Done():
+		return control.Context.Err()
+	case <-runner.release:
+		return nil
+	}
+}
+
+func waitReceiptForHandler(t *testing.T, db *store.DB, task localtask.Task) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := db.LoadLocalTaskDeletionReceipt(context.Background(), "machine-a", task.TaskID, task.InstanceID); err == nil {
+			return
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			t.Fatal(err)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("deletion receipt for task %q was not persisted", task.TaskID)
+}
+
+func waitTaskForHandler(t *testing.T, service localtask.Service, taskID, status string) localtask.Task {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		page, err := service.List(context.Background(), localtask.ListRequest{Limit: 200})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, task := range page.Items {
+			if task.TaskID == taskID && task.Status == status {
+				return task
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("task %q did not reach %s", taskID, status)
+	return localtask.Task{}
+}

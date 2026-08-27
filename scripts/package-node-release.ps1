@@ -267,6 +267,11 @@ Start-Process -FilePath (Join-Path $root 'nodetray.exe') -WorkingDirectory $root
         build_date = $BuildDate
         source_revision = $SourceRevision
         portable_root = '.'
+        compatibility = [ordered]@{
+            agent_worker_ipc_version = 2
+            videocore_abi_version = 2
+            media_metadata_schema_version = 5
+        }
         helper = [ordered]@{
             included = $true
             default_enabled = $false

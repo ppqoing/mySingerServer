@@ -165,6 +165,34 @@ func TestSavePhase1PreSHAFailureWhitelist(t *testing.T) {
 			allow: true,
 		},
 		{
+			name: "legacy SHA backend failure",
+			mutate: func(result *Phase1Result) {
+				result.Errors = []FieldError{{Field: proto.FieldSHA512 | proto.FieldPDQ256, Stage: "sha512", Msg: "backend unavailable"}}
+			},
+			allow: true,
+		},
+		{
+			name: "native open failure",
+			mutate: func(result *Phase1Result) {
+				result.Errors = []FieldError{{Field: proto.FieldSHA512 | proto.FieldPDQ256, Stage: "native_open", Msg: "sharing violation"}}
+			},
+			allow: true,
+		},
+		{
+			name: "native hash failure",
+			mutate: func(result *Phase1Result) {
+				result.Errors = []FieldError{{Field: proto.FieldSHA512, Stage: "native_hash", Msg: "read failed"}}
+			},
+			allow: true,
+		},
+		{
+			name: "stale before hash",
+			mutate: func(result *Phase1Result) {
+				result.Errors = []FieldError{{Field: proto.FieldSHA512 | proto.FieldPDQ256, Stage: "stale", Msg: "media file changed"}}
+			},
+			allow: true,
+		},
+		{
 			name: "decode stage",
 			mutate: func(result *Phase1Result) {
 				result.Errors = []FieldError{{Field: proto.FieldSHA512 | proto.FieldPDQ256, Stage: "decode", Msg: "bad image"}}
@@ -520,10 +548,10 @@ func TestPhase1MigrationIdempotent(t *testing.T) {
 			db.Close()
 			t.Fatal(err)
 		}
-		if durationNotNull != 0 || qualityNotNull != 0 || dimensionColumns != 2 || userVersion != 3 {
+		if durationNotNull != 0 || qualityNotNull != 0 || dimensionColumns != 2 || userVersion != localSchemaVersion {
 			db.Close()
-			t.Fatalf("video schema duration_notnull=%d quality_notnull=%d dimension_columns=%d user_version=%d, want 0/0/2/3",
-				durationNotNull, qualityNotNull, dimensionColumns, userVersion)
+			t.Fatalf("video schema duration_notnull=%d quality_notnull=%d dimension_columns=%d user_version=%d, want 0/0/2/%d",
+				durationNotNull, qualityNotNull, dimensionColumns, userVersion, localSchemaVersion)
 		}
 		var gotSHA, gotPath string
 		var gotDuration, gotQuality int64
@@ -635,6 +663,10 @@ func TestVideoBaseFeaturesSavePhase1PersistsContactDimensions(t *testing.T) {
 		DurationMS: &duration, ThumbPath: `D:\cache\contact.jpg`,
 		ThumbPDQ: make([]byte, 32), ThumbQuality: &quality,
 		Width: 960, Height: 540,
+		VideoContainer: &proto.VideoContainerMetadata{FormatName: "mp4", TagsJSON: `{}`},
+		VideoStreams: []proto.VideoStreamMetadata{{
+			Index: 0, MediaType: "video", CodecID: 27, CodecName: "h264", TagsJSON: `{}`,
+		}},
 	}); err != nil {
 		t.Fatalf("SavePhase1: %v", err)
 	}

@@ -75,6 +75,40 @@ function Resolve-CMakeExecutable {
     throw "CMake was not found on PATH or in the vcpkg tools cache: $cached"
 }
 
+function Invoke-AgentBuild {
+    param(
+        [Parameter(Mandatory)] [string]$Go,
+        [Parameter(Mandatory)] [string]$RepositoryRoot,
+        [Parameter(Mandatory)] [string]$OutputPath,
+        [Parameter(Mandatory)] [string]$CCompiler,
+        [Parameter(Mandatory)] [ValidateSet('./cmd/agent')] [string]$Package
+    )
+    if (-not (Test-Path -LiteralPath $CCompiler -PathType Leaf)) {
+        throw "AGENT_CGO_COMPILER_NOT_FOUND path=$CCompiler"
+    }
+    $previousCGO = $env:CGO_ENABLED
+    $previousCC = $env:CC
+    try {
+        $env:CGO_ENABLED = '1'
+        $env:CC = $CCompiler
+        & $Go -C $RepositoryRoot build -trimpath -tags nodynamic `
+            -o $OutputPath $Package
+        if (-not $? -or $LASTEXITCODE -ne 0) { throw 'agent build failed' }
+    }
+    finally {
+        if ($null -eq $previousCGO) {
+            Remove-Item Env:CGO_ENABLED -ErrorAction SilentlyContinue
+        } else {
+            $env:CGO_ENABLED = $previousCGO
+        }
+        if ($null -eq $previousCC) {
+            Remove-Item Env:CC -ErrorAction SilentlyContinue
+        } else {
+            $env:CC = $previousCC
+        }
+    }
+}
+
 if ($MyInvocation.InvocationName -eq '.') {
     return
 }
@@ -342,8 +376,9 @@ try {
     & $Go -C $repo test @controlPackages -count=1
     if ($LASTEXITCODE -ne 0) { throw "node control package tests failed" }
 
-    & $Go -C $repo build -trimpath -tags nodynamic -o (Join-Path $out "agent.exe") ./cmd/agent
-    if ($LASTEXITCODE -ne 0) { throw "agent build failed" }
+    Invoke-AgentBuild -Go $Go -RepositoryRoot $repo `
+        -OutputPath (Join-Path $out "agent.exe") -CCompiler $ccExe `
+        -Package './cmd/agent'
 
     & $Go -C $repo build -trimpath -o (Join-Path $out "gui.exe") ./cmd/gui
     if ($LASTEXITCODE -ne 0) { throw "gui build failed" }

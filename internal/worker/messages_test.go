@@ -5,8 +5,83 @@ import (
 	"strings"
 	"testing"
 
+	"dedup/internal/proto"
+
 	"github.com/vmihailenco/msgpack/v5"
 )
+
+// Break caught: the worker wire mask renumbers an existing field or omits the
+// independently persisted video-metadata field.
+func TestVideoMetadataMaskPreservesWireBits(t *testing.T) {
+	if MaskVideo6FSobel != 1<<9 || MaskVideoMetadata != 1<<10 {
+		t.Fatalf("video mask bits sobel=%#x metadata=%#x", MaskVideo6FSobel, MaskVideoMetadata)
+	}
+}
+
+func validWorkerVideoMetadata() (*proto.VideoContainerMetadata, []proto.VideoStreamMetadata) {
+	primary := int32(0)
+	return &proto.VideoContainerMetadata{
+			FormatName: "matroska,webm", TagsJSON: `{"album":"demo"}`,
+			PrimaryVideoStream: &primary, DecoderName: "h264",
+		}, []proto.VideoStreamMetadata{
+			{Index: 0, MediaType: "video", CodecID: 27, CodecName: "h264", TagsJSON: `{}`},
+			{Index: 1, MediaType: "audio", CodecID: 86018, CodecName: "aac", TagsJSON: `{}`},
+		}
+}
+
+// Break caught: malicious or unclaimed metadata crosses the Worker boundary
+// and reaches the transactional store validator.
+func TestJobResultVideoMetadataValidation(t *testing.T) {
+	container, streams := validWorkerVideoMetadata()
+	valid := JobResultMsg{FieldsDone: MaskVideoMetadata, VideoContainer: container, VideoStreams: streams}
+	if err := valid.ValidateVideoCoreMasks(); err != nil {
+		t.Fatalf("valid metadata rejected: %v", err)
+	}
+	withIndependentFailure := valid
+	withIndependentFailure.Errors = []FieldError{{Field: MaskVideoContactSheet, Stage: "contact_sheet", Msg: "encode failed"}}
+	if err := withIndependentFailure.ValidateVideoCoreMasks(); err != nil {
+		t.Fatalf("metadata plus independent field error rejected: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		edit func(*JobResultMsg)
+	}{
+		{"payload without completed bit", func(msg *JobResultMsg) { msg.FieldsDone = 0 }},
+		{"257 streams", func(msg *JobResultMsg) { msg.VideoStreams = append(make([]proto.VideoStreamMetadata, 255), streams...) }},
+		{"duplicate index", func(msg *JobResultMsg) { msg.VideoStreams = append(streams, streams[0]) }},
+		{"unknown media type", func(msg *JobResultMsg) { msg.VideoStreams[0].MediaType = "control" }},
+		{"oversized payload", func(msg *JobResultMsg) { msg.VideoStreams[0].Title = strings.Repeat("x", 1<<20) }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := valid
+			candidate.VideoStreams = append([]proto.VideoStreamMetadata(nil), valid.VideoStreams...)
+			test.edit(&candidate)
+			if err := candidate.ValidateVideoCoreMasks(); err == nil {
+				t.Fatal("malicious metadata accepted")
+			}
+		})
+	}
+}
+
+// Break caught: a cache reply advertises metadata without a valid complete
+// payload, or carries payload while reporting that field missing.
+func TestSHAReplyVideoMetadataValidation(t *testing.T) {
+	container, streams := validWorkerVideoMetadata()
+	valid := SHAReplyMsg{
+		RequestedFields: MaskVideoMetadata, FieldsPresent: MaskVideoMetadata,
+		VideoContainer: container, VideoStreams: streams,
+	}
+	if err := valid.ValidateMasks(); err != nil {
+		t.Fatalf("valid cached metadata rejected: %v", err)
+	}
+	valid.FieldsPresent = 0
+	valid.MissingFields = MaskVideoMetadata
+	if err := valid.ValidateMasks(); err == nil {
+		t.Fatal("cached payload without present bit accepted")
+	}
+}
 
 func TestRedactKnownPathHandlesMixedSeparatorsAndUnicode(t *testing.T) {
 	tests := []struct {
@@ -125,11 +200,109 @@ func TestMessageRoundTrip(t *testing.T) {
 	}
 }
 
+// Break caught: lease protocol fields are dropped or renamed on the wire, so
+// the Agent and Worker silently disagree about the lease they are exchanging.
+func TestIOLeaseMessagesRoundTrip(t *testing.T) {
+	acquire := IOLeaseAcquireMsg{
+		JobID: 71, RequestID: 72, TaskID: "task-71", InstanceID: "instance-71",
+		DiskKey: "disk-0", Class: 1, WantBytes: 4 << 20, WantSeek: true,
+	}
+	grant := IOLeaseGrantMsg{
+		JobID: 71, RequestID: 72, LeaseID: 73, Generation: 4,
+		Bytes: 4 << 20, Seeks: 1,
+	}
+	report := IOLeaseReportMsg{
+		JobID: 71, RequestID: 72, LeaseID: 73, Generation: 4,
+		TaskID: "task-71", InstanceID: "instance-71", DiskKey: "disk-0",
+		Bytes: 3 << 20, Seeks: 1, ReadNS: 20_000, WaitNS: 30_000,
+		Completed: true,
+	}
+	cancel := IOLeaseCancelMsg{JobID: 71, RequestID: 72}
+
+	for _, tc := range []struct {
+		name  string
+		value any
+		new   func() any
+	}{
+		{"acquire", acquire, func() any { return new(IOLeaseAcquireMsg) }},
+		{"grant", grant, func() any { return new(IOLeaseGrantMsg) }},
+		{"report", report, func() any { return new(IOLeaseReportMsg) }},
+		{"cancel", cancel, func() any { return new(IOLeaseCancelMsg) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			encoded, err := msgpack.Marshal(tc.value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := tc.new()
+			if err := msgpack.Unmarshal(encoded, got); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(tc.value, reflect.ValueOf(got).Elem().Interface()) {
+				t.Fatalf("round trip mismatch\nwant: %#v\n got: %#v", tc.value, got)
+			}
+		})
+	}
+}
+
+// Break caught: malformed or over-budget Worker lease requests reach the
+// broker, or an over-sized/mismatched grant/report is accepted as authoritative.
+func TestIOLeaseMessageValidationRejectsUnsafeBoundaries(t *testing.T) {
+	validAcquire := IOLeaseAcquireMsg{
+		JobID: 81, RequestID: 82, TaskID: "task-81", InstanceID: "instance-81",
+		DiskKey: "disk-1", Class: 1, WantBytes: 4 << 20,
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*IOLeaseAcquireMsg)
+	}{
+		{"empty task", func(msg *IOLeaseAcquireMsg) { msg.TaskID = "" }},
+		{"empty instance", func(msg *IOLeaseAcquireMsg) { msg.InstanceID = "" }},
+		{"empty disk", func(msg *IOLeaseAcquireMsg) { msg.DiskKey = "" }},
+		{"unknown class", func(msg *IOLeaseAcquireMsg) { msg.Class = 99 }},
+		{"over 16 MiB", func(msg *IOLeaseAcquireMsg) { msg.WantBytes = (16 << 20) + 1 }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			msg := validAcquire
+			tc.mutate(&msg)
+			if err := msg.Validate(); err == nil {
+				t.Fatalf("Validate(%#v) unexpectedly succeeded", msg)
+			}
+		})
+	}
+
+	validGrant := IOLeaseGrantMsg{
+		JobID: 81, RequestID: 82, LeaseID: 83, Generation: 2,
+		Bytes: validAcquire.WantBytes,
+	}
+	overGrant := validGrant
+	overGrant.Bytes++
+	if err := overGrant.ValidateFor(validAcquire); err == nil {
+		t.Fatal("grant larger than request unexpectedly validated")
+	}
+
+	report := IOLeaseReportMsg{
+		JobID: 81, RequestID: 82, LeaseID: 83, Generation: 3,
+		TaskID: "task-81", InstanceID: "instance-81", DiskKey: "disk-1",
+		Bytes: 1 << 20, Completed: true,
+	}
+	if err := report.ValidateFor(validGrant); err == nil {
+		t.Fatal("report with mismatched generation unexpectedly validated")
+	}
+
+	report.Generation = validGrant.Generation
+	report.Completed = false
+	report.Cancelled = false
+	if err := report.ValidateFor(validGrant); err == nil {
+		t.Fatal("report without a terminal state unexpectedly validated")
+	}
+}
+
 func TestDefaultStageOneWorkerMasksUseExplicitVideoFields(t *testing.T) {
 	if MaskAllImage != MaskSHA512|MaskImagePDQ {
 		t.Fatalf("image stage-one mask = %#x", uint32(MaskAllImage))
 	}
-	wantVideo := uint32(MaskSHA512 | MaskVideoDuration | MaskVideoContactSheet)
+	wantVideo := uint32(MaskSHA512 | MaskVideoDuration | MaskVideoContactSheet | MaskVideoMetadata)
 	if MaskAllVideo != wantVideo {
 		t.Fatalf("video stage-one mask = %#x, want %#x", uint32(MaskAllVideo), wantVideo)
 	}
@@ -310,8 +483,8 @@ func TestVideoCoreProtocolReadyIsAdditiveAndMapCompatible(t *testing.T) {
 	}}
 	ready := ReadyMsg{
 		PID: 41, WorkerIndex: 3, IPCVersion: IPCCompatibilityVersion,
-		DLLVersion: MediaCoreDLLVersion, VideoCoreABI: 1,
-		VideoCoreVersion: "1.0.0", FFmpegComponents: components,
+		DLLVersion: MediaCoreDLLVersion, VideoCoreABI: VideoCoreABIVersion,
+		VideoCoreVersion: VideoCoreVersion, FFmpegComponents: components,
 	}
 	body, err := msgpack.Marshal(ready)
 	if err != nil {

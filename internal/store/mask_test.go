@@ -15,7 +15,7 @@ func TestDefaultStageOneRequiredMasks(t *testing.T) {
 		want uint32
 	}{
 		{name: "image", kind: MediaImage, want: proto.FieldSHA512 | proto.FieldPDQ256},
-		{name: "video", kind: MediaVideo, want: proto.FieldSHA512 | proto.FieldVideoDuration | proto.FieldVideoContactSheet},
+		{name: "video", kind: MediaVideo, want: proto.FieldSHA512 | proto.FieldVideoDuration | proto.FieldVideoContactSheet | proto.FieldVideoMetadata},
 		{name: "other", kind: MediaKind("other"), want: proto.FieldSHA512},
 	}
 	for _, tc := range tests {
@@ -40,7 +40,10 @@ func TestVideoBaseFeaturesMissingMaskRequiresContactDimensions(t *testing.T) {
 		VALUES ('m', 'video.mp4', 10, 20, ?1);
 		INSERT INTO video_features
 			(sha512, duration_ms, thumb_path, thumb_pdq256, thumb_quality)
-		VALUES (?1, 1, 'thumb.jpg', ?2, 80);`, sha, make([]byte, 32)); err != nil {
+		VALUES (?1, 1, 'thumb.jpg', ?2, 80);
+		INSERT INTO video_containers(sha512,format_name,tags_json) VALUES(?1,'mp4','{}');
+		INSERT INTO video_streams(sha512,stream_index,media_type,codec_id,codec_name,tags_json)
+		VALUES(?1,0,'video',27,'h264','{}');`, sha, make([]byte, 32)); err != nil {
 		t.Fatal(err)
 	}
 	row := FileRow{MachineID: "m", Path: "video.mp4", Size: 10, MTime: 20, SHA512: &sha}
@@ -75,7 +78,7 @@ func TestPhase1MissingMask(t *testing.T) {
 	if got, err := db.MissingPhase1(ctx, absent, MediaImage); err != nil || got != 3 {
 		t.Fatalf("absent image = (%d, %v), want (3, nil)", got, err)
 	}
-	videoRequired := proto.FieldSHA512 | proto.FieldVideoDuration | proto.FieldVideoContactSheet
+	videoRequired := proto.FieldSHA512 | proto.FieldVideoDuration | proto.FieldVideoContactSheet | proto.FieldVideoMetadata
 	if got, err := db.MissingPhase1(ctx, absent, MediaVideo); err != nil || got != videoRequired {
 		t.Fatalf("absent video = (%d, %v), want (%d, nil)", got, err, videoRequired)
 	}
@@ -94,6 +97,12 @@ func TestPhase1MissingMask(t *testing.T) {
 	}
 
 	video := FileRow{MachineID: "m", Path: "video.mp4", Size: 10, MTime: 20, SHA512: &shaText}
+	if _, err := db.db.ExecContext(ctx, `
+		INSERT INTO video_containers(sha512,format_name,tags_json) VALUES(?1,'mp4','{}');
+		INSERT INTO video_streams(sha512,stream_index,media_type,codec_id,codec_name,tags_json)
+		VALUES(?1,0,'video',27,'h264','{}')`, shaText); err != nil {
+		t.Fatal(err)
+	}
 	videoCases := []struct {
 		name   string
 		insert string

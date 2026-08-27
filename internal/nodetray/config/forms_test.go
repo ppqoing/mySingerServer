@@ -333,5 +333,12 @@ func fullyPopulatedAgentConfig() *agentconfig.AgentConfig {
 		IPC:      agentconfig.IPCConfig{MaxFrameMB: 8},
 		Delete:   agentconfig.DeleteConfig{PipeName: `\\.\pipe\dedup-delete`, MaxEntriesPerFrame: 1999, DialTimeoutMS: 501, HelloTimeoutS: 6, ReportTimeoutS: 601},
 		Tuning:   agentconfig.TuningConfig{StatsEnabled: false, StatsIntervalS: 2, StatsHistoryS: 299, PendingBytesMB: 1023, StatsLogMB: 31, PprofAddr: "127.0.0.1:6060"},
+		IO: agentconfig.IOConfig{
+			LeaseMB: 4, MinLeaseMB: 1, MaxLeaseMB: 16,
+			HDDInitial: 2, SSDInitial: 4, MaxPerDisk: 24,
+			HDDRandomMax: 1, WindowMS: 1000,
+			IncreaseThreshold: 0.80, DecreaseThreshold: 0.60,
+			MaxQueuedPerWorker: 4,
+		},
 	}
 }

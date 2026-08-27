@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"path/filepath"
-	"sync"
 	"testing"
 	"time"
 
@@ -60,312 +59,47 @@ func TestLocalTaskCreateUsesPersistedEnvelopeCopy(t *testing.T) {
 	close(runner.release)
 }
 
-func TestLocalTaskCancelThenImmediateRetryWaitsOldAttemptAndStartsOnce(t *testing.T) {
+// Break caught: an old task-ID-only control can operate on a replacement task
+// after the original attempt was deleted and its ID was reused.
+func TestLocalTaskLegacyControlsRequireInstanceAfterTaskIDReuse(t *testing.T) {
 	db := openServiceDB(t)
-	runner := &attemptRunner{starts: make(chan int, 4), release: make(chan struct{})}
-	service := NewService("m", db, runner)
-	_, err := service.Create(context.Background(), CreateRequest{TaskID: "retry", Roots: []string{`D:\media`}, Mode: proto.LocalTaskModeScanOnly})
+	runner := &recordingTaskRunner{started: make(chan runRecord, 2), release: make(chan struct{})}
+	defer close(runner.release)
+	service := NewService("machine-a", db, runner)
+	request := CreateRequest{TaskID: "reused-task", Roots: []string{`D:\\media`}, Mode: proto.LocalTaskModeScanOnly}
+	original, err := service.Create(context.Background(), request)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := <-runner.starts; got != 1 {
-		t.Fatal(got)
+	_ = waitRun(t, runner.started)
+	current := waitLocalTaskSnapshot(t, service, original.TaskID, "running")
+	if _, err := service.Delete(context.Background(), ControlRequest{
+		TaskID: current.TaskID, InstanceID: current.InstanceID, ExpectedRevision: current.Revision,
+	}); err != nil {
+		t.Fatal(err)
 	}
-	cancelDone := make(chan error, 1)
-	go func() { cancelDone <- service.Cancel(context.Background(), "retry") }()
-	select {
-	case err := <-cancelDone:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("Cancel did not wait old attempt exit")
-	}
-	var wg sync.WaitGroup
-	results := make(chan error, 2)
-	for range 2 {
-		wg.Add(1)
-		go func() { defer wg.Done(); _, err := service.Retry(context.Background(), "retry"); results <- err }()
-	}
-	wg.Wait()
-	close(results)
-	success := 0
-	for err := range results {
-		if err == nil {
-			success++
-		}
-	}
-	if success != 1 {
-		t.Fatalf("successful retries=%d want1", success)
-	}
-	if got := <-runner.starts; got != 2 {
-		t.Fatalf("attempt=%d want2", got)
-	}
-	close(runner.release)
-}
-
-func TestLocalTaskRetrySupersedesFailedAttemptInActiveDeferWindow(t *testing.T) {
-	db := openServiceDB(t)
-	blocking := &blockingFailedStore{
-		TaskStore:     db,
-		failedWritten: make(chan struct{}),
-		releaseFailed: make(chan struct{}),
-		failedResult:  make(chan error, 1),
-	}
-	runner := &failFirstAttemptRunner{starts: make(chan int, 4), release: make(chan struct{})}
-	service := NewService("m", blocking, runner)
-	_, err := service.Create(context.Background(), CreateRequest{TaskID: "failed-retry", Roots: []string{`D:\media`}, Mode: proto.LocalTaskModeScanOnly})
+	waitLocalTaskDeletionReceipt(t, db, "machine-a", original)
+	replacement, err := service.Create(context.Background(), request)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := <-runner.starts; got != 1 {
-		t.Fatalf("attempt=%d want1", got)
-	}
-	select {
-	case <-blocking.failedWritten:
-	case err := <-blocking.failedResult:
-		t.Fatalf("failed terminal transition: %v", err)
-	case <-time.After(time.Second):
-		t.Fatal("failed terminal was not persisted")
+	if replacement.InstanceID == original.InstanceID {
+		t.Fatalf("replacement instance=%q original=%q", replacement.InstanceID, original.InstanceID)
 	}
 
-	results := make(chan error, 1)
-	go func() { _, err := service.Retry(context.Background(), "failed-retry"); results <- err }()
-	select {
-	case err := <-results:
-		t.Fatalf("Retry returned before old terminal completed: %v", err)
-	case <-time.After(20 * time.Millisecond):
+	for _, control := range []struct {
+		name string
+		call func(context.Context, string) (Task, error)
+	}{
+		{name: "cancel", call: service.LegacyCancel},
+		{name: "retry", call: service.LegacyRetry},
+	} {
+		t.Run(control.name, func(t *testing.T) {
+			if _, err := control.call(context.Background(), original.TaskID); !errors.Is(err, ErrTaskInstanceRequired) {
+				t.Fatalf("legacy %s error=%v, want task instance required", control.name, err)
+			}
+		})
 	}
-	close(blocking.releaseFailed)
-	if err := <-results; err != nil {
-		t.Fatal(err)
-	}
-	if got := <-runner.starts; got != 2 {
-		t.Fatalf("attempt=%d want2", got)
-	}
-	close(runner.release)
-}
-
-// Break caught: per-task serialization used sync.Mutex.Lock, so a Retry whose
-// context expired could remain blocked behind terminal commit indefinitely.
-func TestLocalTaskRetryGateWaitHonorsContextWithoutChangingFailedState(t *testing.T) {
-	db := openServiceDB(t)
-	blocking := &blockingFailedStore{TaskStore: db, failedWritten: make(chan struct{}), releaseFailed: make(chan struct{}), failedResult: make(chan error, 1)}
-	runner := &failFirstAttemptRunner{starts: make(chan int, 2), release: make(chan struct{})}
-	service := NewService("m", blocking, runner)
-	_, err := service.Create(context.Background(), CreateRequest{TaskID: "gate-timeout", Roots: []string{`D:\media`}, Mode: proto.LocalTaskModeScanOnly})
-	if err != nil {
-		t.Fatal(err)
-	}
-	<-runner.starts
-	select {
-	case <-blocking.failedWritten:
-	case err := <-blocking.failedResult:
-		t.Fatal(err)
-	case <-time.After(time.Second):
-		t.Fatal("terminal commit did not reach barrier")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
-	done := make(chan error, 1)
-	go func() { _, err := service.Retry(ctx, "gate-timeout"); done <- err }()
-	var retryErr error
-	select {
-	case retryErr = <-done:
-	case <-time.After(100 * time.Millisecond):
-		close(blocking.releaseFailed)
-		t.Fatal("Retry ignored context while waiting per-task gate")
-	}
-	if !errors.Is(retryErr, context.DeadlineExceeded) {
-		t.Fatalf("Retry=%v, want deadline", retryErr)
-	}
-	close(blocking.releaseFailed)
-	waitTaskStatus(t, service, "gate-timeout", "failed")
-	select {
-	case <-runner.starts:
-		t.Fatal("gate timeout launched a replacement attempt")
-	default:
-	}
-}
-
-func TestLocalTaskCancelGateWaitHonorsContextWithoutCancellingCompletedRunner(t *testing.T) {
-	db := openServiceDB(t)
-	blocking := &blockingFailedStore{TaskStore: db, failedWritten: make(chan struct{}), releaseFailed: make(chan struct{}), failedResult: make(chan error, 1)}
-	runner := &failFirstAttemptRunner{starts: make(chan int, 2), release: make(chan struct{})}
-	service := NewService("m", blocking, runner)
-	_, err := service.Create(context.Background(), CreateRequest{TaskID: "cancel-gate-timeout", Roots: []string{`D:\media`}, Mode: proto.LocalTaskModeScanOnly})
-	if err != nil {
-		t.Fatal(err)
-	}
-	<-runner.starts
-	select {
-	case <-blocking.failedWritten:
-	case err := <-blocking.failedResult:
-		t.Fatal(err)
-	case <-time.After(time.Second):
-		t.Fatal("terminal commit did not reach barrier")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
-	if err := service.Cancel(ctx, "cancel-gate-timeout"); !errors.Is(err, context.DeadlineExceeded) {
-		close(blocking.releaseFailed)
-		t.Fatalf("Cancel=%v, want deadline", err)
-	}
-	close(blocking.releaseFailed)
-	waitTaskStatus(t, service, "cancel-gate-timeout", "failed")
-}
-
-func TestLocalTaskRetryContextExpiryBeforeTransitionLeavesCancelledAttempt(t *testing.T) {
-	db := openServiceDB(t)
-	runner := &stubbornAttemptRunner{starts: make(chan int, 2), releaseFirst: make(chan struct{}), releaseSecond: make(chan struct{})}
-	service := NewService("m", db, runner)
-	_, err := service.Create(context.Background(), CreateRequest{TaskID: "retry-timeout", Roots: []string{`D:\media`}, Mode: proto.LocalTaskModeScanOnly})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := <-runner.starts; got != 1 {
-		t.Fatalf("attempt=%d want1", got)
-	}
-	cancelCtx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
-	defer cancel()
-	if err := service.Cancel(cancelCtx, "retry-timeout"); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Cancel=%v, want deadline", err)
-	}
-	retryCtx, stopRetry := context.WithTimeout(context.Background(), 10*time.Millisecond)
-	defer stopRetry()
-	if _, err := service.Retry(retryCtx, "retry-timeout"); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Retry=%v, want deadline", err)
-	}
-	close(runner.releaseFirst)
-	select {
-	case got := <-runner.starts:
-		t.Fatalf("context-expired Retry launched attempt %d", got)
-	case <-time.After(50 * time.Millisecond):
-	}
-	waitTaskStatus(t, service, "retry-timeout", "cancelled")
-}
-
-func TestLocalTaskRetryRejectsInvalidPersistedEnvelopeBeforePendingTransition(t *testing.T) {
-	db := openServiceDB(t)
-	request := CreateRequest{TaskID: "invalid-retry", Roots: []string{`D:\media`}, Mode: proto.LocalTaskModeScanOnly}
-	envelope, digest, err := EncodeCreateEnvelope(request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.CreateOrLoadLocalTask(context.Background(), store.LocalTaskCreate{TaskID: request.TaskID, MachineID: "m", Source: "local", Type: "scan", EnvelopeDigest: digest, Envelope: envelope}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.TransitionLocalTask(context.Background(), "m", request.TaskID, store.LocalTaskUpdate{Status: "running"}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.TransitionLocalTask(context.Background(), "m", request.TaskID, store.LocalTaskUpdate{Status: "failed"}); err != nil {
-		t.Fatal(err)
-	}
-	service := NewService("m", &malformedLoadStore{TaskStore: db}, &recordingTaskRunner{started: make(chan runRecord, 1), release: make(chan struct{})})
-	if _, err := service.Retry(context.Background(), request.TaskID); err == nil {
-		t.Fatal("Retry accepted malformed persisted envelope")
-	}
-	loaded, err := db.LoadLocalTask(context.Background(), "m", request.TaskID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if loaded.Status != "failed" {
-		t.Fatalf("invalid envelope status=%q, want failed", loaded.Status)
-	}
-}
-
-type malformedLoadStore struct{ TaskStore }
-
-func (s *malformedLoadStore) LoadLocalTask(ctx context.Context, machineID, taskID string) (store.LocalTask, error) {
-	task, err := s.TaskStore.LoadLocalTask(ctx, machineID, taskID)
-	if err == nil {
-		task.Envelope = []byte{0x80}
-	}
-	return task, err
-}
-
-type stubbornAttemptRunner struct {
-	mu            sync.Mutex
-	attempt       int
-	starts        chan int
-	releaseFirst  chan struct{}
-	releaseSecond chan struct{}
-}
-
-func (r *stubbornAttemptRunner) Run(_ context.Context, _ CreateRequest, _ int, _ func(int) error) error {
-	r.mu.Lock()
-	r.attempt++
-	n := r.attempt
-	r.mu.Unlock()
-	r.starts <- n
-	if n == 1 {
-		<-r.releaseFirst
-		return context.Canceled
-	}
-	<-r.releaseSecond
-	return nil
-}
-
-type blockingFailedStore struct {
-	TaskStore
-	failedWritten chan struct{}
-	releaseFailed chan struct{}
-	failedResult  chan error
-	once          sync.Once
-}
-
-func (s *blockingFailedStore) TransitionLocalTask(ctx context.Context, machineID, taskID string, update store.LocalTaskUpdate) (store.LocalTask, error) {
-	task, err := s.TaskStore.TransitionLocalTask(ctx, machineID, taskID, update)
-	if update.Status == "failed" {
-		if err != nil {
-			s.failedResult <- err
-		} else {
-			s.once.Do(func() { close(s.failedWritten) })
-			<-s.releaseFailed
-		}
-	}
-	return task, err
-}
-
-type failFirstAttemptRunner struct {
-	mu      sync.Mutex
-	attempt int
-	starts  chan int
-	release chan struct{}
-}
-
-func (r *failFirstAttemptRunner) Run(_ context.Context, _ CreateRequest, _ int, _ func(int) error) error {
-	r.mu.Lock()
-	r.attempt++
-	n := r.attempt
-	r.mu.Unlock()
-	r.starts <- n
-	if n == 1 {
-		return errors.New("failed")
-	}
-	<-r.release
-	return nil
-}
-
-type attemptRunner struct {
-	mu      sync.Mutex
-	attempt int
-	starts  chan int
-	release chan struct{}
-}
-
-func (r *attemptRunner) Run(ctx context.Context, _ CreateRequest, _ int, _ func(int) error) error {
-	r.mu.Lock()
-	r.attempt++
-	n := r.attempt
-	r.mu.Unlock()
-	r.starts <- n
-	if n == 1 {
-		<-ctx.Done()
-		return ctx.Err()
-	}
-	<-r.release
-	return nil
 }
 
 // Break caught: recovery restarts completed scan work from stage zero or
@@ -387,6 +121,17 @@ func TestLocalTaskRecoveryContinuesFromPersistedStageAndRejectsLegacyEnvelope(t 
 	if _, err := db.TransitionLocalTask(context.Background(), "machine-a", request.TaskID, store.LocalTaskUpdate{Status: "running", Stage: 1}); err != nil {
 		t.Fatal(err)
 	}
+	legacyRequest := CreateRequest{TaskID: "legacy", Roots: []string{`D:\\legacy`}, Mode: proto.LocalTaskModeScanOnly}
+	legacyEnvelope, legacyDigest, err := EncodeCreateEnvelope(legacyRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.CreateOrLoadLocalTask(context.Background(), store.LocalTaskCreate{
+		TaskID: "legacy", MachineID: "machine-a", Source: "local", Type: "scan",
+		EnvelopeDigest: legacyDigest, Envelope: legacyEnvelope,
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -394,7 +139,7 @@ func TestLocalTaskRecoveryContinuesFromPersistedStageAndRejectsLegacyEnvelope(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := raw.Exec(`INSERT INTO local_tasks(task_id,machine_id,source,type,stage,status,envelope_digest,envelope,created_at,updated_at) VALUES ('legacy','machine-a','local','scan',0,'running','old',X'',1,1)`); err != nil {
+	if _, err := raw.Exec(`UPDATE local_tasks SET status='running',envelope=X'' WHERE task_id='legacy'`); err != nil {
 		t.Fatal(err)
 	}
 	if err := raw.Close(); err != nil {
@@ -408,7 +153,7 @@ func TestLocalTaskRecoveryContinuesFromPersistedStageAndRejectsLegacyEnvelope(t 
 
 	runner := &recordingTaskRunner{started: make(chan runRecord, 4), release: make(chan struct{})}
 	service := NewService("machine-a", db, runner)
-	if err := service.Resume(context.Background()); err != nil {
+	if err := service.ResumeRecoveredTasks(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	recovered := waitRun(t, runner.started)
@@ -430,15 +175,17 @@ type recordingTaskRunner struct {
 	release chan struct{}
 }
 
-func (r *recordingTaskRunner) Run(ctx context.Context, request CreateRequest, stage int, advance func(int) error) error {
-	r.started <- runRecord{request: request, stage: stage}
+func (r *recordingTaskRunner) Run(control RunControl, request CreateRequest, task Task, report func(ProgressUpdate) error) error {
+	r.started <- runRecord{request: request, stage: task.Stage}
 	select {
-	case <-ctx.Done():
-		return ctx.Err()
+	case <-control.Context.Done():
+		return control.Context.Err()
+	case <-control.Drain:
+		return ErrDrainRequested
 	case <-r.release:
 	}
-	if request.Mode == proto.LocalTaskModeScanThenAnalysis && stage < 1 {
-		return advance(1)
+	if request.Mode == proto.LocalTaskModeScanThenAnalysis && task.Stage < 1 {
+		return report(ProgressUpdate{Phase: "stage1", Stage: 1, StatsJSON: "{}"})
 	}
 	return nil
 }
@@ -480,4 +227,37 @@ func waitTaskStatus(t *testing.T, service Service, taskID, status string) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatalf("task %s did not reach %s", taskID, status)
+}
+
+func waitLocalTaskDeletionReceipt(t *testing.T, db *store.DB, machineID string, task Task) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := db.LoadLocalTaskDeletionReceipt(context.Background(), machineID, task.TaskID, task.InstanceID); err == nil {
+			return
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			t.Fatal(err)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("deletion receipt for task %q was not persisted", task.TaskID)
+}
+
+func waitLocalTaskSnapshot(t *testing.T, service Service, taskID, status string) Task {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		page, err := service.List(context.Background(), ListRequest{Limit: 200})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, task := range page.Items {
+			if task.TaskID == taskID && task.Status == status {
+				return task
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("task %q did not reach %s", taskID, status)
+	return Task{}
 }

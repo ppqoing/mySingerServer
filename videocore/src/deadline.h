@@ -31,6 +31,8 @@ public:
                        const void* context) noexcept;
     static Deadline After(std::chrono::milliseconds timeout) noexcept;
 
+    TimePoint Now() const noexcept;
+    void Extend(std::chrono::nanoseconds extension) noexcept;
     bool Expired() const noexcept;
 
 private:

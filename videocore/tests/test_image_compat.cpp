@@ -290,10 +290,18 @@ void check_strict_tga_pnm_validation() {
             ImageStatus::decode_error);
     }
 
-    expect_decode_status_and_empty(
-        "strict/PNM/too_small",
-        make_pnm(7, 8),
-        ImageStatus::size_error);
+    GrayImage tiny{};
+    const std::vector<uint8_t> tiny_pnm = make_pnm(1, 1);
+    expect(
+        videocore::native::DecodeImage(
+            tiny_pnm.data(), tiny_pnm.size(), &tiny) == ImageStatus::ok,
+        "strict/PNM/tiny",
+        "valid 1x1 PNM was rejected");
+    expect(
+        tiny.width == 1 && tiny.height == 1 && tiny.stride == 1 &&
+            tiny.pixels.size() == 1,
+        "strict/PNM/tiny",
+        "valid 1x1 PNM dimensions mismatch");
 
     const std::string huge_pnm_header = "P6\n20001 20001\n255\n";
     expect_decode_status_and_empty(
@@ -656,6 +664,24 @@ void check_invalid_algorithm_outputs() {
     expect(all_zero, "invalid/sobel", "failed Sobel did not clear output");
 }
 
+void check_tiny_webp_decodes_actual_pixel() {
+    const std::vector<uint8_t> encoded = parse_hex_bytes(
+        "52494646220000005745425056503820160000003001009D012A010001000140"
+        "2625A400037000FEFF3D58000000");
+    GrayImage image{};
+    expect(
+        videocore::native::DecodeImage(
+            encoded.data(), encoded.size(), &image) == ImageStatus::ok,
+        "tiny_webp/decode",
+        "valid 1x1 WebP bytes were rejected");
+    expect(
+        image.width == 1 && image.height == 1 && image.stride == 1 &&
+            image.pixels == std::vector<uint8_t>{255},
+        "tiny_webp/pixel",
+        "decoded 1x1 WebP pixel=" +
+            std::to_string(image.pixels.empty() ? -1 : image.pixels[0]));
+}
+
 #endif
 
 }  // namespace
@@ -693,6 +719,7 @@ int main() {
         "000055555510555555505555555155550000ffff5515ffff5110ffffc1127fdf",
         100);
     check_invalid_algorithm_outputs();
+    check_tiny_webp_decodes_actual_pixel();
     check_strict_tga_pnm_validation();
     check_gray_allocation_failure_is_test_local(
         testdata_root / "level_b");

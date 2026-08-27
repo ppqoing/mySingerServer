@@ -24,6 +24,16 @@ type byteLimiter struct {
 	weighted *semaphore.Weighted
 }
 
+func pendingJobCapacity(workerCount, maxQueuedPerWorker int) int {
+	if workerCount < 1 {
+		workerCount = 1
+	}
+	if maxQueuedPerWorker < 1 {
+		maxQueuedPerWorker = 1
+	}
+	return workerCount * maxQueuedPerWorker
+}
+
 func newByteLimiter(capacity int64) *byteLimiter {
 	if capacity < 1 {
 		capacity = 1

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -29,6 +30,7 @@ import (
 	agentdelete "dedup/internal/agent/delete"
 	"dedup/internal/agentinstance"
 	"dedup/internal/config"
+	"dedup/internal/diskio"
 	fileenum "dedup/internal/enum"
 	"dedup/internal/firstscreen"
 	"dedup/internal/localanalysis"
@@ -45,6 +47,7 @@ import (
 	"dedup/internal/store"
 	"dedup/internal/syncer"
 	"dedup/internal/worker"
+	"dedup/internal/wproc"
 )
 
 func main() {
@@ -181,6 +184,9 @@ func runWithDependencies(
 	if err != nil {
 		return fmt.Errorf("load local control token: %w", err)
 	}
+	if err := wproc.PrepareContactSheetRoot(cfg.Thumb.CacheDir); err != nil {
+		return fmt.Errorf("prepare thumb cache root: %w", err)
+	}
 	logger, errorLogger, closeLogs, err := agent.NewLoggers(cfg.DataDir, os.Stdout)
 	if err != nil {
 		return fmt.Errorf("open logs: %w", err)
@@ -206,8 +212,22 @@ func runWithDependencies(
 		return fmt.Errorf("open sqlite: %w", err)
 	}
 	defer local.Close()
+	ioPolicy, err := cfg.IO.Policy(cfg.Worker.Count)
+	if err != nil {
+		return fmt.Errorf("configure disk I/O controller: %w", err)
+	}
+	ioContext, stopIO := context.WithCancel(context.Background())
+	var stopIOOnce sync.Once
+	stopIOController := func() { stopIOOnce.Do(stopIO) }
+	defer stopIOController()
+	ioIdentities := make(map[diskio.DiskKey]diskio.Identity)
+	ioController := diskio.NewController(ioContext, diskio.ControllerOptions{
+		WorkerCount: cfg.Worker.Count,
+		Policy:      ioPolicy,
+		Identities:  ioIdentities,
+	})
 	workerPool := worker.NewPool(
-		workerPoolConfig(cfg),
+		workerPoolConfig(cfg, ioController),
 		local,
 		logger,
 		errorLogger,
@@ -284,6 +304,7 @@ func runWithDependencies(
 		logger,
 		errorLogger,
 	)
+	scans.SetIOController(ioController, ioIdentities)
 	if statistics != nil {
 		scans.SetObserver(statistics)
 	}
@@ -298,7 +319,7 @@ func runWithDependencies(
 	stageOne := localanalysis.NewStageOne(local, local, firstscreen.DefaultConfig(), logger)
 	stageWorker := agent.NewLocalStageWorker(fairPool, router)
 	analysisEngine := localanalysis.NewEngine(cfg.MachineID, stageOne, local, stageWorker, config.DefaultGUI().Phase2)
-	tasks := localtask.NewService(cfg.MachineID, local, &agentLocalTaskRunner{scans: scans, analysis: analysisEngine})
+	tasks := localtask.NewService(cfg.MachineID, local, &agentLocalTaskRunner{scans: scans, analysis: analysisEngine, ioController: ioController})
 	reviews := localreview.NewService(cfg.MachineID, local)
 	previews := localpreview.NewService(cfg.MachineID, local, stageWorker)
 	resumeLocalTasks, err := prepareLocalTaskLifecycle(ctx, tasks, logger)
@@ -333,7 +354,7 @@ func runWithDependencies(
 		Deletes:               agent.NewLocalDeleteHandler(deletes),
 	})
 	return runService(
-		workerPool,
+		managedPoolWithFinalizer(workerPool, stopIOController),
 		func() error {
 			businessLogger := slog.New(&listenerReadyHandler{
 				next: logger.Handler(),
@@ -354,6 +375,11 @@ func runWithDependencies(
 				return fmt.Errorf("server exited: %w", err)
 			}
 			return nil
+		},
+		func() error {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), phase2DrainTimeout(cfg))
+			defer cancel()
+			return tasks.Shutdown(shutdownCtx)
 		},
 		func() error { return drainPhase2(phase2, phase2DrainTimeout(cfg)) },
 		func() error {
@@ -430,7 +456,8 @@ func initializePostgres(ctx context.Context, dsn string, health *syncHealthState
 
 type localTaskLifecycle interface {
 	PrepareRecovery(context.Context) error
-	Resume(context.Context) error
+	ResumeRecoveredTasks(context.Context) error
+	Shutdown(context.Context) error
 }
 
 func prepareLocalTaskLifecycle(ctx context.Context, tasks localTaskLifecycle, logger *slog.Logger) (func(), error) {
@@ -444,7 +471,7 @@ func prepareLocalTaskLifecycle(ctx context.Context, tasks localTaskLifecycle, lo
 	return func() {
 		once.Do(func() {
 			go func() {
-				if err := tasks.Resume(ctx); err != nil && logger != nil {
+				if err := tasks.ResumeRecoveredTasks(ctx); err != nil && logger != nil {
 					logger.Error("resume local tasks failed", "err", safeAgentSummary(err.Error()))
 				}
 			}()
@@ -455,6 +482,25 @@ func prepareLocalTaskLifecycle(ctx context.Context, tasks localTaskLifecycle, lo
 type managedPool interface {
 	Start()
 	Close()
+}
+
+type finalizingManagedPool struct {
+	managedPool
+	finalize func()
+	once     sync.Once
+}
+
+func managedPoolWithFinalizer(pool managedPool, finalize func()) managedPool {
+	return &finalizingManagedPool{managedPool: pool, finalize: finalize}
+}
+
+func (pool *finalizingManagedPool) Close() {
+	pool.managedPool.Close()
+	pool.once.Do(func() {
+		if pool.finalize != nil {
+			pool.finalize()
+		}
+	})
 }
 
 func runService(
@@ -739,28 +785,94 @@ func (h *agentLocalHandler) HandleLocal(ctx context.Context, request proto.Local
 
 type localAnalysisRunner interface {
 	Run(context.Context, string) error
+	RunWithProgress(context.Context, string, <-chan struct{}, func(localanalysis.AnalysisProgress) error) error
+}
+
+// localAnalysisRootProgressRunner 是支持根目录范围与排水控制的分析实现。
+type localAnalysisRootProgressRunner interface {
+	RunWithProgressForRootsAndDrain(context.Context, string, []string, <-chan struct{}, func(localanalysis.AnalysisProgress) error) error
+}
+
+// localAnalysisLegacyRootRunner 兼容旧版仅能报告阶段编号的分析实现。
+type localAnalysisLegacyRootRunner interface {
 	RunWithProgressForRoots(context.Context, string, []string, func(int) error) error
 }
 
 type localScanRunner interface {
 	Prepare(proto.ScanTask, agent.Sender) (proto.TaskAck, func())
+	DrainInstance(string, string, proto.TaskDrainReason) (bool, *proto.TaskStats)
+	AbortInstance(string, string) bool
 }
 
 type agentLocalTaskRunner struct {
-	scans    localScanRunner
-	analysis localAnalysisRunner
+	scans        localScanRunner
+	analysis     localAnalysisRunner
+	ioController diskio.Controller
+	now          func() time.Time
 }
 
-func (r *agentLocalTaskRunner) Run(ctx context.Context, request localtask.CreateRequest, stage int, advance func(int) error) error {
+func (r *agentLocalTaskRunner) currentTime() time.Time {
+	if r != nil && r.now != nil {
+		return r.now()
+	}
+	return time.Now()
+}
+
+func (r *agentLocalTaskRunner) Run(control localtask.RunControl, request localtask.CreateRequest, snapshot localtask.Task, report func(localtask.ProgressUpdate) error) error {
 	if r == nil || r.scans == nil || r.analysis == nil {
 		return errors.New("local task runner unavailable")
 	}
-	if stage < 1 {
-		terminal := make(chan error, 1)
-		ack, start := r.scans.Prepare(proto.ScanTask{TaskID: request.TaskID, Roots: append([]string(nil), request.Roots...), Phase: 1, Options: proto.ScanOptions{Rescan: request.Rescan, Extensions: append([]string(nil), request.Extensions...)}}, func(messageType uint8, value any) error {
-			if messageType == proto.MsgTaskDone {
+	if control.Context == nil {
+		control.Context = context.Background()
+	}
+	emit := func(update localtask.ProgressUpdate) error {
+		if report == nil {
+			return nil
+		}
+		return report(update)
+	}
+	displayStats := runnerDecodeDisplayStats(snapshot.StatsJSON)
+	if snapshot.Stage < 1 {
+		terminal := make(chan proto.TaskDone, 1)
+		var progressMu sync.Mutex
+		latest := proto.TaskProgress{TaskID: request.TaskID}
+		if snapshot.Phase == "scan" {
+			latest.Done = snapshot.ProgressComplete
+			latest.Total = snapshot.ProgressTotal
+			latest.TotalKnown = snapshot.ProgressTotalKnown
+		}
+		var callbackErr error
+		reportScan := func(message proto.TaskProgress, checkpoint int, finalStats *proto.TaskStats) {
+			if r.ioController != nil {
+				message.IO = runnerTaskIOStats(r.ioController.Snapshot(request.TaskID, snapshot.InstanceID))
+			}
+			progressMu.Lock()
+			message.Done = max(message.Done, latest.Done)
+			message.Total = max(message.Total, latest.Total)
+			message.TotalKnown = message.TotalKnown || latest.TotalKnown
+			latest = message
+			displayStats = runnerMergeProgressStats(displayStats, message)
+			if finalStats != nil {
+				displayStats = runnerMergeFinalStats(displayStats, *finalStats)
+			}
+			statsJSON := runnerDisplayStatsJSON(displayStats)
+			progressMu.Unlock()
+			if err := emit(localtask.ProgressUpdate{Phase: "scan", Stage: checkpoint, ProgressComplete: message.Done, ProgressTotal: message.Total, ProgressTotalKnown: message.TotalKnown, StatsJSON: statsJSON}); err != nil {
+				progressMu.Lock()
+				if callbackErr == nil {
+					callbackErr = err
+				}
+				progressMu.Unlock()
+			}
+		}
+		reportScan(latest, 0, nil)
+		ack, start := r.scans.Prepare(proto.ScanTask{TaskID: request.TaskID, InstanceID: snapshot.InstanceID, Roots: append([]string(nil), request.Roots...), Phase: 1, Options: proto.ScanOptions{Rescan: request.Rescan, Extensions: append([]string(nil), request.Extensions...)}}, func(messageType uint8, value any) error {
+			switch messageType {
+			case proto.MsgTaskProgress:
+				reportScan(*value.(*proto.TaskProgress), 0, nil)
+			case proto.MsgTaskDone:
 				select {
-				case terminal <- nil:
+				case terminal <- *value.(*proto.TaskDone):
 				default:
 				}
 			}
@@ -771,28 +883,200 @@ func (r *agentLocalTaskRunner) Run(ctx context.Context, request localtask.Create
 		}
 		if start != nil {
 			start()
+		} else if ack.Stats != nil {
+			terminal <- proto.TaskDone{TaskID: request.TaskID, Stats: *ack.Stats}
+		}
+		drain := control.Drain
+		drainIssued := false
+		var final proto.TaskDone
+		for {
 			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case err := <-terminal:
-				if err != nil {
-					return err
-				}
+			case <-control.Context.Done():
+				r.scans.AbortInstance(request.TaskID, snapshot.InstanceID)
+				return control.Context.Err()
+			case <-drain:
+				reason := localDrainReason(control)
+				r.scans.DrainInstance(request.TaskID, snapshot.InstanceID, reason)
+				drainIssued = true
+				drain = nil
+			case final = <-terminal:
+				goto scanFinished
 			}
 		}
-		if err := advance(1); err != nil {
-			return err
+	scanFinished:
+		progressMu.Lock()
+		message := latest
+		progressMu.Unlock()
+		message.Total = max(message.Total, final.Stats.Total)
+		message.Done = max(message.Done, final.Stats.Done)
+		checkpoint := 0
+		if !drainIssued && final.Reason == "" {
+			if missing := message.Total - final.Stats.Total; missing > 0 {
+				final.Stats.Skipped += missing
+			}
+			message.Done = message.Total
+			message.TotalKnown = true
+			checkpoint = 1
 		}
-		stage = 1
+		final.Stats.Total = message.Total
+		final.Stats.Done = message.Done
+		reportScan(message, checkpoint, &final.Stats)
+		progressMu.Lock()
+		reportError := callbackErr
+		progressMu.Unlock()
+		if reportError != nil {
+			return reportError
+		}
+		if drainIssued || final.Reason != "" {
+			return localtask.ErrDrainRequested
+		}
+		snapshot.Stage = 1
+		snapshot.Phase = "scan"
+		snapshot.ProgressComplete = message.Done
+		snapshot.ProgressTotal = message.Total
+		snapshot.ProgressTotalKnown = true
+		snapshot.StatsJSON = runnerDisplayStatsJSON(displayStats)
 	}
-	if request.Mode == proto.LocalTaskModeScanThenAnalysis && stage < 3 {
-		roots := append([]string(nil), request.Roots...)
-		if err := r.analysis.RunWithProgressForRoots(ctx, request.TaskID, roots, advance); err != nil {
-			return err
+	if request.Mode == proto.LocalTaskModeScanOnly {
+		if snapshot.Phase != "finalizing" || !snapshot.ProgressTotalKnown || snapshot.ProgressComplete < snapshot.ProgressTotal {
+			if err := emit(localtask.ProgressUpdate{Phase: "finalizing", Stage: 1, ProgressTotalKnown: false, StatsJSON: snapshot.StatsJSON}); err != nil {
+				return err
+			}
+			if err := emit(localtask.ProgressUpdate{Phase: "finalizing", Stage: 1, ProgressComplete: 1, ProgressTotal: 1, ProgressTotalKnown: true, StatsJSON: snapshot.StatsJSON}); err != nil {
+				return err
+			}
 		}
-		return advance(3)
+		return nil
+	}
+	if request.Mode == proto.LocalTaskModeScanThenAnalysis {
+		analysisStarted := r.currentTime()
+		analysisBaseDuration := displayStats.DurationMS
+		reportProgress := func(progress localanalysis.AnalysisProgress) error {
+			if phaseRank(progress.Phase) < phaseRank(snapshot.Phase) {
+				return nil
+			}
+			complete, total, known := progress.Complete, progress.Total, progress.TotalKnown
+			if progress.Phase == snapshot.Phase {
+				complete = max(complete, snapshot.ProgressComplete)
+				total = max(total, snapshot.ProgressTotal)
+				known = known || snapshot.ProgressTotalKnown
+			}
+			analysisElapsed := r.currentTime().Sub(analysisStarted).Milliseconds()
+			if analysisElapsed < 0 {
+				analysisElapsed = 0
+			}
+			displayStats.DurationMS = max(displayStats.DurationMS, analysisBaseDuration+analysisElapsed)
+			return emit(localtask.ProgressUpdate{Phase: progress.Phase, Stage: progress.CheckpointStage, ProgressComplete: complete, ProgressTotal: total, ProgressTotalKnown: known, StatsJSON: runnerDisplayStatsJSON(displayStats)})
+		}
+		var analysisErr error
+		if rootRunner, ok := r.analysis.(localAnalysisRootProgressRunner); ok {
+			roots := append([]string(nil), request.Roots...)
+			analysisErr = rootRunner.RunWithProgressForRootsAndDrain(control.Context, request.TaskID, roots, control.Drain, reportProgress)
+		} else {
+			analysisErr = r.analysis.RunWithProgress(control.Context, request.TaskID, control.Drain, reportProgress)
+		}
+		if analysisErr != nil {
+			if errors.Is(analysisErr, localanalysis.ErrDrainRequested) {
+				return localtask.ErrDrainRequested
+			}
+			return analysisErr
+		}
 	}
 	return nil
+}
+
+func localDrainReason(control localtask.RunControl) proto.TaskDrainReason {
+	if control.Reason == nil {
+		return proto.TaskDrainProcessShutdown
+	}
+	switch control.Reason() {
+	case localtask.DrainPause:
+		return proto.TaskDrainPause
+	case localtask.DrainStop:
+		return proto.TaskDrainStop
+	case localtask.DrainDelete:
+		return proto.TaskDrainDelete
+	default:
+		return proto.TaskDrainProcessShutdown
+	}
+}
+
+func phaseRank(phase string) int {
+	switch phase {
+	case "scan":
+		return 1
+	case "stage1":
+		return 2
+	case "stage2":
+		return 3
+	case "stage3":
+		return 4
+	case "finalizing":
+		return 5
+	default:
+		return 0
+	}
+}
+
+func runnerDisplayStatsJSON(stats proto.LocalTaskDisplayStats) string {
+	stats.SchemaVersion = proto.LocalTaskDisplayStatsVersion
+	encoded, err := json.Marshal(stats)
+	if err != nil {
+		return "{}"
+	}
+	return string(encoded)
+}
+
+func runnerDecodeDisplayStats(statsJSON string) proto.LocalTaskDisplayStats {
+	var stats proto.LocalTaskDisplayStats
+	if json.Unmarshal([]byte(statsJSON), &stats) != nil || (stats.SchemaVersion != 1 && stats.SchemaVersion != proto.LocalTaskDisplayStatsVersion) {
+		return proto.LocalTaskDisplayStats{SchemaVersion: proto.LocalTaskDisplayStatsVersion}
+	}
+	stats.SchemaVersion = proto.LocalTaskDisplayStatsVersion
+	if math.IsNaN(stats.Speed) || math.IsInf(stats.Speed, 0) || stats.Speed < 0 {
+		stats.Speed = 0
+	}
+	stats.Failures = max(stats.Failures, 0)
+	stats.DurationMS = max(stats.DurationMS, 0)
+	stats.IO = runnerMergeIOStats(proto.TaskIOStats{}, stats.IO)
+	return stats
+}
+
+func runnerMergeProgressStats(current proto.LocalTaskDisplayStats, progress proto.TaskProgress) proto.LocalTaskDisplayStats {
+	if progress.Speed > 0 && !math.IsNaN(progress.Speed) && !math.IsInf(progress.Speed, 0) {
+		current.Speed = progress.Speed
+	}
+	current.Failures = max(current.Failures, progress.Failed)
+	current.DurationMS = max(current.DurationMS, progress.ElapsedMS)
+	current.IO = runnerMergeIOStats(current.IO, progress.IO)
+	return current
+}
+
+func runnerMergeFinalStats(current proto.LocalTaskDisplayStats, stats proto.TaskStats) proto.LocalTaskDisplayStats {
+	current.Failures = max(current.Failures, stats.Failed)
+	current.DurationMS = max(current.DurationMS, stats.ElapsedMS)
+	return current
+}
+
+func runnerTaskIOStats(snapshot diskio.Snapshot) proto.TaskIOStats {
+	return proto.TaskIOStats{
+		DiskConcurrency: snapshot.Concurrency, EffectiveReadBPS: snapshot.EffectiveBytesPerSecond,
+		LeaseWaitMS: snapshot.LeaseWait.Milliseconds(), SequentialBytes: snapshot.SequentialBytes,
+		SeekCount: snapshot.SeekCount, BusyWorkers: snapshot.BusyWorkers, IOWaitWorkers: snapshot.IOWaitWorkers,
+	}
+}
+
+func runnerMergeIOStats(current, update proto.TaskIOStats) proto.TaskIOStats {
+	current.DiskConcurrency = max(current.DiskConcurrency, max(update.DiskConcurrency, 0))
+	if update.EffectiveReadBPS > current.EffectiveReadBPS && !math.IsNaN(update.EffectiveReadBPS) && !math.IsInf(update.EffectiveReadBPS, 0) {
+		current.EffectiveReadBPS = update.EffectiveReadBPS
+	}
+	current.LeaseWaitMS = max(current.LeaseWaitMS, max(update.LeaseWaitMS, 0))
+	current.SequentialBytes = max(current.SequentialBytes, max(update.SequentialBytes, 0))
+	current.SeekCount = max(current.SeekCount, max(update.SeekCount, 0))
+	current.BusyWorkers = max(current.BusyWorkers, max(update.BusyWorkers, 0))
+	current.IOWaitWorkers = max(current.IOWaitWorkers, max(update.IOWaitWorkers, 0))
+	return current
 }
 
 func (h *agentLocalHandler) loadConfig() (*config.AgentConfig, []byte, string, error) {
@@ -867,7 +1151,7 @@ func localAgentFailure(requestID, code string) proto.LocalResponse {
 	return proto.LocalResponse{RequestID: requestID, ErrorCode: code}
 }
 
-func workerPoolConfig(cfg *config.AgentConfig) worker.Config {
+func workerPoolConfig(cfg *config.AgentConfig, ioBroker diskio.Controller) worker.Config {
 	return worker.Config{
 		WorkerExe:        cfg.Worker.ExePath,
 		WorkerCount:      cfg.Worker.Count,
@@ -877,5 +1161,6 @@ func workerPoolConfig(cfg *config.AgentConfig) worker.Config {
 		RespawnDelay:     time.Duration(cfg.Worker.RespawnDelayMS) * time.Millisecond,
 		WorkerEnv:        cfg.WorkerEnv(),
 		IPCMaxFrameBytes: cfg.IPC.MaxFrameMB << 20,
+		IOBroker:         ioBroker,
 	}
 }

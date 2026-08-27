@@ -15,8 +15,8 @@
 #define VC_TESTING_REAL_HEADER 1
 #else
 #define VC_TESTING_REAL_HEADER 0
-#define VC_ABI_VERSION 1u
-#define VC_VERSION_STRING "1.0.0"
+#define VC_ABI_VERSION 2u
+#define VC_VERSION_STRING "2.0.0"
 #define VC_SHA512_SIZE 64u
 #define VC_PDQ_SIZE 32u
 #define VC_PHASH_COUNT 9u
@@ -49,6 +49,19 @@ typedef struct vc_error {
     char message_utf8[512];
 } vc_error;
 
+typedef int32_t(VC_CALL* vc_io_acquire_fn)(
+    uintptr_t, uint32_t, uint64_t, uint64_t*, uint64_t*, vc_error*);
+typedef void(VC_CALL* vc_io_report_fn)(
+    uintptr_t, uint64_t, uint64_t, uint64_t, int32_t);
+
+typedef struct vc_io_governor {
+    uint32_t struct_size;
+    uint32_t abi_version;
+    uintptr_t context;
+    vc_io_acquire_fn acquire;
+    vc_io_report_fn report;
+} vc_io_governor;
+
 struct vc_runtime_info {
     uint32_t struct_size;
     uint32_t abi_version;
@@ -72,6 +85,7 @@ typedef struct vc_media_open_options {
     uint64_t image_max_bytes;
     uint32_t operation_timeout_ms;
     uint32_t reserved_0;
+    const vc_io_governor* io_governor;
 } vc_media_open_options;
 
 typedef struct vc_feature_set {
@@ -279,9 +293,9 @@ void CheckGuardsIntact(const GuardedValue<Value>& guarded,
 }
 
 void TestConstants() {
-    Check(VC_ABI_VERSION == 1u, "VC_ABI_VERSION must be 1");
-    Check(std::strcmp(VC_VERSION_STRING, "1.0.0") == 0,
-          "VC_VERSION_STRING must be 1.0.0");
+    Check(VC_ABI_VERSION == 2u, "VC_ABI_VERSION must be 2");
+    Check(std::strcmp(VC_VERSION_STRING, "2.0.0") == 0,
+          "VC_VERSION_STRING must be 2.0.0");
     Check(VC_SHA512_SIZE == 64u, "SHA-512 size must be 64");
     Check(VC_PDQ_SIZE == 32u, "PDQ size must be 32");
     Check(VC_PHASH_COUNT == 9u, "pHash count must be 9");
@@ -313,11 +327,35 @@ void TestConstants() {
     };
     Check(std::equal(std::begin(statuses), std::end(statuses),
                      std::begin(expected)),
-          "status values must exactly match ABI 1");
+          "status values must exactly match ABI 2");
+}
+
+int32_t VC_CALL TestAcquire(uintptr_t,
+                            uint32_t,
+                            uint64_t requested,
+                            uint64_t* lease_id,
+                            uint64_t* granted,
+                            vc_error*) {
+    *lease_id = 1u;
+    *granted = requested;
+    return VC_OK;
+}
+
+void VC_CALL TestReport(uintptr_t,
+                        uint64_t,
+                        uint64_t,
+                        uint64_t,
+                        int32_t) {}
+
+vc_io_governor FreshGovernor() {
+    return vc_io_governor{
+        sizeof(vc_io_governor), VC_ABI_VERSION, 1u,
+        &TestAcquire, &TestReport};
 }
 
 void TestLayouts() {
     static_assert(std::is_standard_layout<vc_error>::value);
+    static_assert(std::is_standard_layout<vc_io_governor>::value);
     static_assert(std::is_standard_layout<vc_media_open_options>::value);
     static_assert(std::is_standard_layout<vc_feature_set>::value);
     static_assert(std::is_standard_layout<vc_video_frame_result>::value);
@@ -347,6 +385,14 @@ void TestLayouts() {
     static_assert(offsetof(RuntimeInfoLayout, swscale_header_version) == 128u);
     static_assert(offsetof(RuntimeInfoLayout, swscale_runtime_version) == 132u);
 
+    static_assert(alignof(vc_io_governor) == 8u);
+    static_assert(sizeof(vc_io_governor) == 32u);
+    static_assert(offsetof(vc_io_governor, struct_size) == 0u);
+    static_assert(offsetof(vc_io_governor, abi_version) == 4u);
+    static_assert(offsetof(vc_io_governor, context) == 8u);
+    static_assert(offsetof(vc_io_governor, acquire) == 16u);
+    static_assert(offsetof(vc_io_governor, report) == 24u);
+
     static_assert(alignof(vc_media_open_options) == 8u);
     static_assert(offsetof(vc_media_open_options, struct_size) == 0u);
     static_assert(offsetof(vc_media_open_options, abi_version) == 4u);
@@ -355,6 +401,7 @@ void TestLayouts() {
     static_assert(offsetof(vc_media_open_options, image_max_bytes) == 16u);
     static_assert(offsetof(vc_media_open_options, operation_timeout_ms) == 24u);
     static_assert(offsetof(vc_media_open_options, reserved_0) == 28u);
+    static_assert(offsetof(vc_media_open_options, io_governor) == 32u);
 
     static_assert(alignof(vc_feature_set) == 8u);
     static_assert(offsetof(vc_feature_set, struct_size) == 0u);
@@ -429,13 +476,15 @@ void TestLayouts() {
     Check(offsetof(RuntimeInfoLayout, avformat_header_version) == 104u,
           "runtime info component offset");
 
-    Check(sizeof(vc_media_open_options) == 32u, "open options size");
+    Check(sizeof(vc_media_open_options) == 40u, "open options size");
     Check(offsetof(vc_media_open_options, struct_size) == 0u,
           "open options struct_size offset");
     Check(offsetof(vc_media_open_options, abi_version) == 4u,
           "open options abi_version offset");
     Check(offsetof(vc_media_open_options, image_max_bytes) == 16u,
           "open options image limit offset");
+    Check(offsetof(vc_media_open_options, io_governor) == 32u,
+          "open options governor offset");
 
     Check(sizeof(((vc_feature_set*)nullptr)->pdq) == 32u,
           "feature PDQ array size");
@@ -543,8 +592,8 @@ void TestCallingConventionAndVersions() {
     static_assert(std::is_same<decltype(&vc_media_close),
                                MediaCloseFunction>::value);
 
-    Check(vc_abi_version() == 1u, "vc_abi_version result");
-    Check(std::strcmp(vc_version(), "1.0.0") == 0, "vc_version result");
+    Check(vc_abi_version() == 2u, "vc_abi_version result");
+    Check(std::strcmp(vc_version(), "2.0.0") == 0, "vc_version result");
 }
 
 void TestSafeFailureShells() {
@@ -621,6 +670,31 @@ void TestSafeFailureShells() {
           "missing media open populates IO error");
     Check(session == reinterpret_cast<vc_media_session*>(1),
           "failed media open must leave session unchanged");
+
+    for (uint32_t invalid = 0u; invalid < 4u; ++invalid) {
+        vc_io_governor governor = FreshGovernor();
+        if (invalid == 0u) governor.struct_size--;
+        if (invalid == 1u) governor.struct_size++;
+        if (invalid == 2u) governor.abi_version++;
+        if (invalid == 3u) governor.acquire = nullptr;
+        options.io_governor = &governor;
+        session = reinterpret_cast<vc_media_session*>(1);
+        error = FreshError();
+        Check(vc_media_open_w(path, 1u, &options, nullptr, &session,
+                              &error) == VC_ERR_ABI,
+              "malformed I/O governor must fail closed");
+        Check(session == reinterpret_cast<vc_media_session*>(1),
+              "governor ABI failure changed output session");
+    }
+    vc_io_governor governor = FreshGovernor();
+    governor.report = nullptr;
+    options.io_governor = &governor;
+    session = reinterpret_cast<vc_media_session*>(1);
+    error = FreshError();
+    Check(vc_media_open_w(path, 1u, &options, nullptr, &session, &error) ==
+              VC_ERR_ABI,
+          "I/O governor without report callback must fail closed");
+    options.io_governor = nullptr;
 
     options.abi_version = VC_ABI_VERSION + 1u;
     session = reinterpret_cast<vc_media_session*>(1);
@@ -1083,10 +1157,10 @@ void TestExactExports() {
     }
     const auto* exports = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY*>(
         base + directory.VirtualAddress);
-    Check(exports->NumberOfFunctions == 10u,
-          "DLL export function table must contain exactly ten entries");
-    Check(exports->NumberOfNames == 10u,
-          "DLL export name table must contain exactly ten entries");
+    Check(exports->NumberOfFunctions == 14u,
+          "DLL export function table must contain exactly fourteen entries");
+    Check(exports->NumberOfNames == 14u,
+          "DLL export name table must contain exactly fourteen entries");
     const auto* name_rvas =
         reinterpret_cast<const uint32_t*>(base + exports->AddressOfNames);
     std::vector<std::string> actual;
@@ -1103,12 +1177,16 @@ void TestExactExports() {
         "vc_cancel_request",
         "vc_media_analyze",
         "vc_media_close",
+        "vc_media_container_info",
         "vc_media_hash",
+        "vc_media_metadata_json",
         "vc_media_open_w",
+        "vc_media_stream_count",
+        "vc_media_stream_info",
         "vc_runtime_info",
         "vc_version",
     };
-    Check(actual == expected, "DLL must export exactly ten vc_* names");
+    Check(actual == expected, "DLL must export exactly fourteen vc_* names");
 
     std::cout << "ABI_EXPORTS";
     for (const auto& name : actual) {

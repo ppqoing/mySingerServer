@@ -68,8 +68,8 @@ try {
             }
     )
     $expectedUnique = @($expected | Sort-Object -Unique -CaseSensitive)
-    if ($expected.Count -ne 10 -or $expectedUnique.Count -ne 10) {
-        throw "VIDEOCORE_EXPORT_DEF_INVALID expected=10 actual=$($expected.Count) unique=$($expectedUnique.Count)"
+    if ($expected.Count -ne 14 -or $expectedUnique.Count -ne 14) {
+        throw "VIDEOCORE_EXPORT_DEF_INVALID expected=14 actual=$($expected.Count) unique=$($expectedUnique.Count)"
     }
 
     $dumpOutput = @(& $dumpbinPath /exports $dllPath 2>&1)
@@ -87,9 +87,9 @@ try {
     $actualUnique = @($actual | Sort-Object -Unique -CaseSensitive)
     $missing = @($expectedUnique | Where-Object { $_ -cnotin $actualUnique })
     $extra = @($actualUnique | Where-Object { $_ -cnotin $expectedUnique })
-    if ($actual.Count -ne 10 -or $actualUnique.Count -ne 10 -or
+    if ($actual.Count -ne 14 -or $actualUnique.Count -ne 14 -or
         $missing.Count -ne 0 -or $extra.Count -ne 0) {
-        Write-Error ("VIDEOCORE_EXPORT_MISMATCH expected=10 actual={0} missing=[{1}] extra=[{2}]" -f `
+        Write-Error ("VIDEOCORE_EXPORT_MISMATCH expected=14 actual={0} missing=[{1}] extra=[{2}]" -f `
             $actualUnique.Count,
             ($missing -join ','),
             ($extra -join ','))
@@ -114,7 +114,7 @@ try {
         Move-Item -LiteralPath $temporary -Destination $outFull
         $temporary = $null
     }
-    Write-Host "10/10 exact exports"
+    Write-Host "14/14 exact exports"
     exit 0
 }
 catch {

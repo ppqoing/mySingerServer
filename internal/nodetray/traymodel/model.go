@@ -163,26 +163,52 @@ type LocalTaskCreate struct {
 
 type LocalAnalysisStart = LocalTaskCreate
 
+type LocalTaskControl struct {
+	TaskID           string `json:"taskId"`
+	InstanceID       string `json:"instanceId"`
+	ExpectedRevision int64  `json:"expectedRevision"`
+}
+
+type LocalTaskIOStats struct {
+	DiskConcurrency  int     `json:"diskConcurrency"`
+	EffectiveReadBPS float64 `json:"effectiveReadBps"`
+	LeaseWaitMS      int64   `json:"leaseWaitMs"`
+	SequentialBytes  int64   `json:"sequentialBytes"`
+	SeekCount        int64   `json:"seekCount"`
+	BusyWorkers      int     `json:"busyWorkers"`
+	IOWaitWorkers    int     `json:"ioWaitWorkers"`
+}
+
 type LocalTask struct {
-	TaskID           string   `json:"taskId"`
-	Source           string   `json:"source"`
-	Mode             string   `json:"mode"`
-	Stage            int      `json:"stage"`
-	Status           string   `json:"status"`
-	Roots            []string `json:"roots"`
-	ProgressComplete int64    `json:"progressComplete"`
-	ProgressTotal    int64    `json:"progressTotal"`
-	Speed            string   `json:"speed"`
-	Failures         int64    `json:"failures"`
-	Duration         string   `json:"duration"`
-	SyncStatus       string   `json:"syncStatus"`
-	ErrorCode        string   `json:"errorCode"`
-	ErrorSummary     string   `json:"errorSummary"`
+	TaskID             string           `json:"taskId"`
+	InstanceID         string           `json:"instanceId"`
+	Revision           int64            `json:"revision"`
+	Source             string           `json:"source"`
+	Mode               string           `json:"mode"`
+	Stage              int              `json:"stage"`
+	Status             string           `json:"status"`
+	Phase              string           `json:"phase"`
+	Roots              []string         `json:"roots"`
+	ProgressComplete   int64            `json:"progressComplete"`
+	ProgressTotal      int64            `json:"progressTotal"`
+	ProgressTotalKnown bool             `json:"progressTotalKnown"`
+	Speed              string           `json:"speed"`
+	Failures           int64            `json:"failures"`
+	Duration           string           `json:"duration"`
+	IO                 LocalTaskIOStats `json:"io"`
+	SyncStatus         string           `json:"syncStatus"`
+	ErrorCode          string           `json:"errorCode"`
+	ErrorSummary       string           `json:"errorSummary"`
+	CreatedAt          int64            `json:"createdAt"`
+	UpdatedAt          int64            `json:"updatedAt"`
+	StartedAt          int64            `json:"startedAt"`
+	CompletedAt        int64            `json:"completedAt"`
 }
 
 type LocalTaskResult struct {
 	OK           bool      `json:"ok"`
 	Task         LocalTask `json:"task"`
+	Deleted      bool      `json:"deleted"`
 	ErrorCode    string    `json:"errorCode"`
 	ErrorSummary string    `json:"errorSummary"`
 }

@@ -8,7 +8,9 @@ param(
     [Parameter(Mandatory = $true)] [string]$Compiler,
     [Parameter(Mandatory = $true)] [string]$VsDevCmd,
     [Parameter(Mandatory = $true)] [string]$CompilerCommandTlog,
-    [Parameter(Mandatory = $true)] [string]$BuildRoot
+    [Parameter(Mandatory = $true)] [string]$BuildRoot,
+    [Parameter(Mandatory = $true)] [ValidateNotNullOrEmpty()] [string]$VcpkgInstalledDir,
+    [Parameter(Mandatory = $true)] [ValidateNotNullOrEmpty()] [string]$VcpkgTargetTriplet
 )
 
 $ErrorActionPreference = 'Stop'
@@ -101,8 +103,8 @@ function New-Case([string]$Name, [switch]$TextObjects, [switch]$TextPe, [switch]
                   [switch]$AppendIncompleteLinkRecord, [switch]$ForgeCompilerTlog,
                    [switch]$ResponseFileShadow, [switch]$ShellInjection,
                    [switch]$OmitImageAnalysis,
-                  [ValidateSet('', 'ForcedInclude', 'ResponseFile', 'ExtraInclude', 'ExtraInput',
-                      'ExtraOutput', 'WrongPathMapLeft')]
+                  [ValidateSet('', 'ForcedInclude', 'ResponseFile', 'ExtraInclude',
+                      'ExtraExternalInclude', 'ExtraInput', 'ExtraOutput', 'WrongPathMapLeft')]
                   [string]$CompileMutation = '', [switch]$ToolShadow) {
     $root = Join-Path $caseFull $Name
     $objectDir = Join-Path $root 'objects'
@@ -320,6 +322,8 @@ int wmain(int argc, wchar_t** argv) {
         } else {
             $emptyDir = Join-Path $root 'empty-include'
             New-Item -ItemType Directory -Path $emptyDir | Out-Null
+            $emptyExternalDir = Join-Path $root 'empty-external-include'
+            New-Item -ItemType Directory -Path $emptyExternalDir | Out-Null
             $emptyHeader = Join-Path $root 'empty-forced-include.h'
             [IO.File]::WriteAllText($emptyHeader, '', [Text.UTF8Encoding]::new($false))
             $emptyRsp = Join-Path $root 'empty-compile.rsp'
@@ -337,6 +341,10 @@ int wmain(int argc, wchar_t** argv) {
                 }
                 'ExtraInclude' {
                     $insertion = ' /I"' + $emptyDir + '"'
+                    $compilerText = [regex]::Replace($compilerText, '(?im)^/c(?=\s)', ('/c' + $insertion), 1)
+                }
+                'ExtraExternalInclude' {
+                    $insertion = ' /external:I "' + $emptyExternalDir + '"'
                     $compilerText = [regex]::Replace($compilerText, '(?im)^/c(?=\s)', ('/c' + $insertion), 1)
                 }
                 'ExtraInput' {
@@ -388,7 +396,9 @@ function Invoke-Gate([Collections.IDictionary]$Case) {
         -Compiler $Compiler -VsDevCmd $VsDevCmd `
         -CompilerCommandTlog $Case.CompilerTlog `
         -CanonicalImageObjectDir $CurrentImageObjectDir `
-        -BuildRoot $Case.BuildRoot 2>&1 | Out-String)
+        -BuildRoot $Case.BuildRoot `
+        -VcpkgInstalledDir $VcpkgInstalledDir `
+        -VcpkgTargetTriplet $VcpkgTargetTriplet 2>&1 | Out-String)
     return [ordered]@{ ExitCode=$LASTEXITCODE; Output=$output }
 }
 
@@ -409,6 +419,7 @@ try {
         'compile-forced-include' = @{ Case=New-Case 'compile-forced-include' -CompileMutation ForcedInclude; Diagnostic='forced include is forbidden' }
         'compile-response-file' = @{ Case=New-Case 'compile-response-file' -CompileMutation ResponseFile; Diagnostic='compiler response files are forbidden' }
         'compile-extra-include' = @{ Case=New-Case 'compile-extra-include' -CompileMutation ExtraInclude; Diagnostic='compile include set mismatch' }
+        'compile-extra-external-include' = @{ Case=New-Case 'compile-extra-external-include' -CompileMutation ExtraExternalInclude; Diagnostic='compile external include set mismatch' }
         'compile-extra-input' = @{ Case=New-Case 'compile-extra-input' -CompileMutation ExtraInput; Diagnostic='compile positional input mismatch' }
         'compile-extra-output' = @{ Case=New-Case 'compile-extra-output' -CompileMutation ExtraOutput; Diagnostic='compile output switch set mismatch' }
         'compile-pathmap-left' = @{ Case=New-Case 'compile-pathmap-left' -CompileMutation WrongPathMapLeft; Diagnostic='compiler pathmap left side mismatch' }
@@ -467,7 +478,7 @@ try {
     if ($accepted.Count -ne 0 -or $wrongDiagnostics.Count -ne 0) {
         throw "object provenance mutation failures: accepted=$($accepted -join ',') wrong_diagnostic=$($wrongDiagnostics -join ',')"
     }
-    Write-Output 'IMAGE_OBJECT_PROVENANCE_MUTATION PASS clean_copied_baseline=GREEN non_coff=RED non_pe=RED valid_object_substitution=RED renamed_private_duplicate=RED missing_image_analysis_private_tu=RED link_response_shadow=RED link_shell_injection=RED compile_forced_include=RED compile_response_file=RED compile_extra_include=RED compile_extra_input=RED compile_extra_output=RED compile_pathmap_left=RED stale_pe_forged_complete_tlog=RED object_content_change=RED pe_overlay=RED stale_complete_link_record=RED forged_compiler_command_tlog=RED tool_shadow=IGNORED temp_only=true dedicated_diagnostics=true'
+    Write-Output 'IMAGE_OBJECT_PROVENANCE_MUTATION PASS clean_copied_baseline=GREEN non_coff=RED non_pe=RED valid_object_substitution=RED renamed_private_duplicate=RED missing_image_analysis_private_tu=RED link_response_shadow=RED link_shell_injection=RED compile_forced_include=RED compile_response_file=RED compile_extra_include=RED compile_extra_external_include=RED compile_extra_input=RED compile_extra_output=RED compile_pathmap_left=RED stale_pe_forged_complete_tlog=RED object_content_change=RED pe_overlay=RED stale_complete_link_record=RED forged_compiler_command_tlog=RED tool_shadow=IGNORED temp_only=true dedicated_diagnostics=true'
 } finally {
     if ((Test-Path -LiteralPath $caseFull) -and
         $caseFull.StartsWith($tempBase, [StringComparison]::OrdinalIgnoreCase)) {

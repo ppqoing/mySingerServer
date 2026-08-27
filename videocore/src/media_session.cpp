@@ -128,7 +128,9 @@ public:
                 "media analysis requires a completed media hash");
         }
         if (expected_media_type_ == VC_MEDIA_TYPE_VIDEO) {
-            return AnalyzeVideo(avio_.get(), cancel_, request, out, error);
+            return AnalyzeVideo(avio_.get(), cancel_, request,
+                                file_->snapshot().size, &video_metadata_,
+                                out, error);
         }
         if (expected_media_type_ != VC_MEDIA_TYPE_IMAGE) {
             SetError(error,
@@ -139,6 +141,108 @@ public:
             return VC_ERR_UNSUPPORTED;
         }
         return AnalyzeImageBytes(image_bytes_, feature_mask, out, error);
+    }
+
+    int32_t ContainerInfo(vc_video_container_info* out,
+                          vc_error* error) {
+        OperationGuard guard(operation_active_);
+        if (!guard.acquired()) {
+            SetError(error, VC_ERR_INVALID_ARG, 0, 0,
+                     "media session operation is already active");
+            return VC_ERR_INVALID_ARG;
+        }
+        if (!HasVideoMetadata()) {
+            SetError(error, VC_ERR_UNSUPPORTED, 0, 0,
+                     "video metadata is unavailable before stream probing");
+            return VC_ERR_UNSUPPORTED;
+        }
+        *out = video_metadata_.container;
+        SetError(error, VC_OK, 0, 0, "");
+        return VC_OK;
+    }
+
+    uint32_t StreamCount() {
+        OperationGuard guard(operation_active_);
+        if (!guard.acquired() || !HasVideoMetadata()) return 0u;
+        return static_cast<uint32_t>(video_metadata_.streams.size());
+    }
+
+    int32_t StreamInfo(uint32_t ordinal,
+                       vc_video_stream_info* out,
+                       vc_error* error) {
+        OperationGuard guard(operation_active_);
+        if (!guard.acquired()) {
+            SetError(error, VC_ERR_INVALID_ARG, 0, 0,
+                     "media session operation is already active");
+            return VC_ERR_INVALID_ARG;
+        }
+        if (!HasVideoMetadata()) {
+            SetError(error, VC_ERR_UNSUPPORTED, 0, 0,
+                     "video metadata is unavailable before stream probing");
+            return VC_ERR_UNSUPPORTED;
+        }
+        if (ordinal >= video_metadata_.streams.size()) {
+            SetError(error, VC_ERR_INVALID_ARG, 0, 0,
+                     "video stream ordinal is out of range");
+            return VC_ERR_INVALID_ARG;
+        }
+        *out = video_metadata_.streams[ordinal];
+        SetError(error, VC_OK, 0, 0, "");
+        return VC_OK;
+    }
+
+    int32_t MetadataJson(int32_t stream_index,
+                         char* destination,
+                         uint32_t capacity,
+                         uint32_t* required,
+                         vc_error* error) {
+        OperationGuard guard(operation_active_);
+        if (!guard.acquired()) {
+            SetError(error, VC_ERR_INVALID_ARG, 0, 0,
+                     "media session operation is already active");
+            return VC_ERR_INVALID_ARG;
+        }
+        if (!HasVideoMetadata()) {
+            SetError(error, VC_ERR_UNSUPPORTED, 0, 0,
+                     "video metadata is unavailable before stream probing");
+            return VC_ERR_UNSUPPORTED;
+        }
+        const std::string* json = nullptr;
+        if (stream_index == -1) {
+            json = &video_metadata_.container_tags;
+        } else {
+            for (size_t ordinal = 0u;
+                 ordinal < video_metadata_.streams.size(); ++ordinal) {
+                if (video_metadata_.streams[ordinal].stream_index ==
+                    static_cast<uint32_t>(stream_index)) {
+                    json = &video_metadata_.stream_tags[ordinal];
+                    break;
+                }
+            }
+        }
+        if (json == nullptr) {
+            SetError(error, VC_ERR_INVALID_ARG, 0, 0,
+                     "video metadata stream index is unavailable");
+            return VC_ERR_INVALID_ARG;
+        }
+        if (json->size() >= (std::numeric_limits<uint32_t>::max)()) {
+            SetError(error, VC_ERR_OUTPUT_TOO_LARGE, 0, 0,
+                     "video metadata JSON is too large");
+            return VC_ERR_OUTPUT_TOO_LARGE;
+        }
+        *required = static_cast<uint32_t>(json->size() + 1u);
+        if (destination == nullptr && capacity == 0u) {
+            SetError(error, VC_OK, 0, 0, "");
+            return VC_OK;
+        }
+        if (destination == nullptr || capacity < *required) {
+            SetError(error, VC_ERR_OUTPUT_TOO_LARGE, 0, 0,
+                     "video metadata JSON buffer is too small");
+            return VC_ERR_OUTPUT_TOO_LARGE;
+        }
+        std::memcpy(destination, json->c_str(), *required);
+        SetError(error, VC_OK, 0, 0, "");
+        return VC_OK;
     }
 
     int32_t RejectInvalidAnalysisRequest(
@@ -188,6 +292,13 @@ public:
 #endif
 
 private:
+    bool HasVideoMetadata() const noexcept {
+        return video_metadata_.container.struct_size ==
+                   sizeof(video_metadata_.container) &&
+               video_metadata_.streams.size() ==
+                   video_metadata_.stream_tags.size();
+    }
+
     int32_t FailAnalyze(vc_analysis_result* out,
                         vc_error* error,
                         int32_t code,
@@ -204,13 +315,13 @@ private:
 
     int32_t HashOnce(uint8_t out[VC_SHA512_SIZE],
                      vc_error* error) {
-        const Deadline deadline = OperationDeadline();
+        Deadline deadline = OperationDeadline();
         int64_t position = -1;
         int32_t status = file_->Seek(0,
                                      FILE_BEGIN,
                                      &position,
                                      cancel_,
-                                     deadline,
+                                     &deadline,
                                      error);
         if (status != VC_OK) {
             RememberHashFailure(status, error);
@@ -242,7 +353,7 @@ private:
                                  static_cast<int>(chunk.size()),
                                  &bytes_read,
                                  cancel_,
-                                 deadline,
+                                 &deadline,
                                  error);
             if (status != VC_OK) {
                 RememberHashFailure(status, error);
@@ -344,12 +455,13 @@ private:
 #endif
     std::array<uint8_t, VC_SHA512_SIZE> hash_{};
     std::vector<uint8_t> image_bytes_;
+    VideoMetadataSnapshot video_metadata_{};
 };
 
 #if !defined(VC_MEDIA_SESSION_TESTING) && defined(_MSC_VER) && \
     _ITERATOR_DEBUG_LEVEL == 0
 static_assert(
-    sizeof(MediaSession) == 152u,
+    sizeof(MediaSession) == 800u,
     "MSVC x64 production MediaSession contains unexpected state");
 #endif
 
@@ -604,7 +716,8 @@ int32_t CreateMediaSession(const uint16_t* path,
     const Deadline deadline =
         OpenDeadline(options.operation_timeout_ms);
     int32_t status = WinFile::Open(
-        wide_path, cancel_state, deadline, &file, error);
+        wide_path, cancel_state, deadline, &file, error,
+        options.io_governor);
     if (status != VC_OK) {
         return status;
     }
@@ -676,6 +789,59 @@ int32_t AnalyzeMediaSession(
         return VC_ERR_UNSUPPORTED;
     }
     return media->Analyze(request, out, error);
+}
+
+int32_t MediaSessionContainerInfo(
+    vc_media_session* session,
+    vc_video_container_info* out,
+    vc_error* error) {
+    const std::shared_ptr<MediaSession> media = Lookup(session);
+    if (!media) {
+        SetError(error, VC_ERR_UNSUPPORTED, 0, 0,
+                 "media session is not active");
+        return VC_ERR_UNSUPPORTED;
+    }
+    return media->ContainerInfo(out, error);
+}
+
+uint32_t MediaSessionStreamCount(vc_media_session* session) noexcept {
+    try {
+        const std::shared_ptr<MediaSession> media = Lookup(session);
+        return media ? media->StreamCount() : 0u;
+    } catch (...) {
+        return 0u;
+    }
+}
+
+int32_t MediaSessionStreamInfo(
+    vc_media_session* session,
+    uint32_t ordinal,
+    vc_video_stream_info* out,
+    vc_error* error) {
+    const std::shared_ptr<MediaSession> media = Lookup(session);
+    if (!media) {
+        SetError(error, VC_ERR_UNSUPPORTED, 0, 0,
+                 "media session is not active");
+        return VC_ERR_UNSUPPORTED;
+    }
+    return media->StreamInfo(ordinal, out, error);
+}
+
+int32_t MediaSessionMetadataJson(
+    vc_media_session* session,
+    int32_t stream_index,
+    char* destination,
+    uint32_t capacity,
+    uint32_t* required,
+    vc_error* error) {
+    const std::shared_ptr<MediaSession> media = Lookup(session);
+    if (!media) {
+        SetError(error, VC_ERR_UNSUPPORTED, 0, 0,
+                 "media session is not active");
+        return VC_ERR_UNSUPPORTED;
+    }
+    return media->MetadataJson(stream_index, destination, capacity,
+                               required, error);
 }
 
 void CloseMediaSession(vc_media_session* session) noexcept {

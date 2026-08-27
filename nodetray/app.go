@@ -143,6 +143,46 @@ func (b *Backend) CreateLocalTask(value traymodel.LocalTaskCreate) traymodel.Loc
 	return service.CreateLocalTask(ctx, value)
 }
 
+func (b *Backend) PauseLocalTask(value traymodel.LocalTaskControl) traymodel.LocalTaskResult {
+	ctx, service, err := b.ready()
+	if err != nil {
+		return traymodel.LocalTaskResult{ErrorCode: "backend_not_started", ErrorSummary: "本机控制台尚未启动"}
+	}
+	return service.PauseLocalTask(ctx, value)
+}
+
+func (b *Backend) ResumeLocalTask(value traymodel.LocalTaskControl) traymodel.LocalTaskResult {
+	ctx, service, err := b.ready()
+	if err != nil {
+		return traymodel.LocalTaskResult{ErrorCode: "backend_not_started", ErrorSummary: "本机控制台尚未启动"}
+	}
+	return service.ResumeLocalTask(ctx, value)
+}
+
+func (b *Backend) CancelLocalTask(value traymodel.LocalTaskControl) traymodel.LocalTaskResult {
+	ctx, service, err := b.ready()
+	if err != nil {
+		return traymodel.LocalTaskResult{ErrorCode: "backend_not_started", ErrorSummary: "本机控制台尚未启动"}
+	}
+	return service.CancelLocalTask(ctx, value)
+}
+
+func (b *Backend) DeleteLocalTask(value traymodel.LocalTaskControl) traymodel.LocalTaskResult {
+	ctx, service, err := b.ready()
+	if err != nil {
+		return traymodel.LocalTaskResult{ErrorCode: "backend_not_started", ErrorSummary: "本机控制台尚未启动"}
+	}
+	return service.DeleteLocalTask(ctx, value)
+}
+
+func (b *Backend) RetryLocalTask(value traymodel.LocalTaskControl) traymodel.LocalTaskResult {
+	ctx, service, err := b.ready()
+	if err != nil {
+		return traymodel.LocalTaskResult{ErrorCode: "backend_not_started", ErrorSummary: "本机控制台尚未启动"}
+	}
+	return service.RetryLocalTask(ctx, value)
+}
+
 func (b *Backend) ChooseLocalTaskRoot(currentPath string) traymodel.PathSelectionResult {
 	if b == nil {
 		return traymodel.PathSelectionResult{ErrorCode: "backend_not_started", ErrorSummary: "本机控制台尚未启动"}

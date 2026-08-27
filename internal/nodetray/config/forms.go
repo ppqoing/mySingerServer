@@ -176,8 +176,10 @@ func AgentFromForm(form AgentForm, base *agentconfig.AgentConfig) (*agentconfig.
 		return nil, err
 	}
 	crashInjection := false
+	ioConfig := agentconfig.DefaultAgent().IO
 	if base != nil {
 		crashInjection = base.Worker.CrashInjection
+		ioConfig = base.IO
 	}
 	return &agentconfig.AgentConfig{
 		ListenAddr:    net.JoinHostPort(form.ListenHost, strconv.Itoa(form.ListenPort)),
@@ -199,6 +201,7 @@ func AgentFromForm(form AgentForm, base *agentconfig.AgentConfig) (*agentconfig.
 		IPC:      agentconfig.IPCConfig{MaxFrameMB: form.IPC.MaxFrameMB},
 		Delete:   agentconfig.DeleteConfig{PipeName: form.Delete.PipeName, MaxEntriesPerFrame: form.Delete.MaxEntriesPerFrame, DialTimeoutMS: form.Delete.DialTimeoutMS, HelloTimeoutS: form.Delete.HelloTimeoutS, ReportTimeoutS: form.Delete.ReportTimeoutS},
 		Tuning:   agentconfig.TuningConfig{StatsEnabled: form.Tuning.StatsEnabled, StatsIntervalS: form.Tuning.StatsIntervalS, StatsHistoryS: form.Tuning.StatsHistoryS, PendingBytesMB: form.Tuning.PendingBytesMB, StatsLogMB: form.Tuning.StatsLogMB, PprofAddr: form.Tuning.PprofAddr},
+		IO:       ioConfig,
 	}, nil
 }
 

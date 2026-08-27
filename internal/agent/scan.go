@@ -3,15 +3,18 @@ package agent
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"dedup/internal/config"
+	"dedup/internal/diskio"
 	"dedup/internal/diskmap"
 	fileenum "dedup/internal/enum"
 	"dedup/internal/proto"
@@ -21,7 +24,7 @@ import (
 
 type Sender func(msgType uint8, value any) error
 
-type DiskResolver func(root string) (diskNo int64, isSSD bool, err error)
+type DiskResolver func(root string) (diskio.Identity, error)
 
 type WorkerPool interface {
 	Submit(*worker.JobMsg) error
@@ -30,23 +33,48 @@ type WorkerPool interface {
 	Metrics() worker.MetricsSnapshot
 }
 
+type contextWorkerPool interface {
+	SubmitContext(context.Context, *worker.JobMsg) error
+}
+
+func submitScanJob(ctx context.Context, pool WorkerPool, job *worker.JobMsg) error {
+	if contextual, ok := pool.(contextWorkerPool); ok {
+		return contextual.SubmitContext(ctx, job)
+	}
+	return pool.Submit(job)
+}
+
 type ScanManager struct {
-	cfg      *config.AgentConfig
-	st       *store.DB
-	enumr    fileenum.Enumerator
-	hasher   Hasher
-	log      *slog.Logger
-	errLog   *slog.Logger
-	resolver DiskResolver
-	pool     WorkerPool
-	router   *PoolRouter
-	limiter  *byteLimiter
-	observer ScanObserver
+	cfg             *config.AgentConfig
+	st              *store.DB
+	enumr           fileenum.Enumerator
+	hasher          Hasher
+	log             *slog.Logger
+	errLog          *slog.Logger
+	resolver        DiskResolver
+	pool            WorkerPool
+	router          *PoolRouter
+	limiter         *byteLimiter
+	observer        ScanObserver
+	ioController    diskio.Controller
+	ioIdentities    map[diskio.DiskKey]diskio.Identity
+	pendingSnapshot func(context.Context, string) (map[int64][]store.PendingFile, error)
+	progressTicks   func() (<-chan time.Time, func())
+	pendingJobsFull func()
 
 	mu    sync.Mutex
-	tasks map[string]*ScanState
-	disks map[int64]bool
+	tasks map[scanIdentity]*ScanState
+	disks map[int64]diskio.Identity
 	runMu sync.Mutex
+}
+
+type scanIdentity struct {
+	taskID     string
+	instanceID string
+}
+
+func scanTaskIdentity(task proto.ScanTask) scanIdentity {
+	return scanIdentity{taskID: task.TaskID, instanceID: task.InstanceID}
 }
 
 type ScanState struct {
@@ -54,26 +82,39 @@ type ScanState struct {
 	Status string
 	Stats  proto.TaskStats
 
-	// ctx bounds the whole run; Cancel cancels it and the run unwinds
-	// through its normal cleanup path, emitting the terminal MsgTaskDone
-	// receipt with Reason "cancelled".
-	ctx    context.Context
-	cancel context.CancelFunc
+	// ctx 用于兼容旧版取消协议；取消后运行会沿正常收尾路径发送终态回执。
+	ctx          context.Context
+	cancel       context.CancelFunc
+	mu           sync.Mutex
+	featureMu    sync.Mutex
+	sender       Sender
+	binding      uint64
+	seq          uint64
+	start        sync.Once
+	control      sync.Once
+	stopOnce     sync.Once
+	dispatchMu   sync.Mutex
+	workCtx      context.Context
+	abortWork    context.CancelFunc
+	dispatchCtx  context.Context
+	stopDispatch context.CancelFunc
+	stopNew      chan struct{}
+	drainReason  proto.TaskDrainReason
+	startedAt    time.Time
 
-	mu        sync.Mutex
-	featureMu sync.Mutex
-	sender    Sender
-	binding   uint64
-	seq       uint64
-	start     sync.Once
-
-	total      atomic.Int64
-	done       atomic.Int64
-	failed     atomic.Int64
-	scanErrors atomic.Int64
-	speedWin   *speedWindow
-	poolStart  worker.MetricsSnapshot
+	total               atomic.Int64
+	done                atomic.Int64
+	failed              atomic.Int64
+	scanErrors          atomic.Int64
+	speedWin            *speedWindow
+	poolStart           worker.MetricsSnapshot
+	enumerationComplete atomic.Bool
 }
+
+var errScanDrainRequested = errors.New("agent: scan drain requested")
+
+// scanTaskReasonCancelled 是旧版 MsgScanTaskCancel 使用的终态原因。
+const scanTaskReasonCancelled proto.TaskDrainReason = "cancelled"
 
 func NewScanManager(
 	cfg *config.AgentConfig,
@@ -119,7 +160,7 @@ func NewScanManagerWithResolver(
 	errLog *slog.Logger,
 	resolver DiskResolver,
 ) *ScanManager {
-	return &ScanManager{
+	manager := &ScanManager{
 		cfg:      cfg,
 		st:       st,
 		enumr:    enumr,
@@ -127,15 +168,33 @@ func NewScanManagerWithResolver(
 		log:      log,
 		errLog:   errLog,
 		resolver: resolver,
-		tasks:    make(map[string]*ScanState),
-		disks:    make(map[int64]bool),
+		tasks:    make(map[scanIdentity]*ScanState),
+		disks:    make(map[int64]diskio.Identity),
 		limiter:  newByteLimiter(int64(cfg.Tuning.PendingBytesMB) << 20),
 	}
+	manager.pendingSnapshot = st.PendingSnapshot
+	manager.progressTicks = func() (<-chan time.Time, func()) {
+		ticker := time.NewTicker(time.Second)
+		return ticker.C, ticker.Stop
+	}
+	return manager
 }
 
 func (m *ScanManager) SetObserver(observer ScanObserver) {
 	m.mu.Lock()
 	m.observer = observer
+	m.mu.Unlock()
+}
+
+func (m *ScanManager) SetIOController(
+	controller diskio.Controller,
+	identities ...map[diskio.DiskKey]diskio.Identity,
+) {
+	m.mu.Lock()
+	m.ioController = controller
+	if len(identities) != 0 {
+		m.ioIdentities = identities[0]
+	}
 	m.mu.Unlock()
 }
 
@@ -145,19 +204,34 @@ func (m *ScanManager) currentObserver() ScanObserver {
 	return m.observer
 }
 
-func resolveDisk(root string) (int64, bool, error) {
+func resolveDisk(root string) (diskio.Identity, error) {
 	mountPoint, err := diskmap.MountPointOf(root)
 	if err != nil {
-		return -1, false, err
+		return diskio.Identity{}, err
 	}
 	info, err := diskmap.Resolve(mountPoint)
 	if err != nil {
-		return -1, false, err
+		return diskio.Identity{}, err
 	}
 	if !info.MediaTypeKnown {
 		logUnknownDiskMedia(slog.Default(), root, mountPoint, info.DeviceNumber)
 	}
-	return int64(info.DeviceNumber), info.IsSSD, nil
+	return info.Identity, nil
+}
+
+func diskNumber(identity diskio.Identity) int64 {
+	if len(identity.DiskNos) == 0 {
+		return 0
+	}
+	return int64(identity.DiskNos[0])
+}
+
+func resolvePhase2Disk(root string) (int64, bool, error) {
+	identity, err := resolveDisk(root)
+	if err != nil {
+		return 0, false, err
+	}
+	return diskNumber(identity), identity.KnownSSD && identity.SSD, nil
 }
 
 func logUnknownDiskMedia(logger *slog.Logger, root, _ string, deviceNumber uint32) {
@@ -187,7 +261,8 @@ func (m *ScanManager) Prepare(
 	}
 
 	m.mu.Lock()
-	if state, exists := m.tasks[task.TaskID]; exists {
+	identity := scanTaskIdentity(task)
+	if state, exists := m.tasks[identity]; exists {
 		if !sameScanEnvelope(state.Task, task) {
 			m.mu.Unlock()
 			return rejectedAck(task.TaskID, "task_id envelope mismatch"), nil
@@ -196,7 +271,18 @@ func (m *ScanManager) Prepare(
 		state.mu.Lock()
 		status := state.Status
 		stats := state.Stats
+		drainReason := state.drainReason
 		state.mu.Unlock()
+		if status == "done" && drainReason != "" {
+			resumed := newScanState(task)
+			resumed.bindSender(sender)
+			m.tasks[identity] = resumed
+			m.mu.Unlock()
+			return proto.TaskAck{
+				TaskID: task.TaskID, Accepted: true,
+				Reason: "resumed", Total: -1,
+			}, m.startScan(resumed)
+		}
 		m.mu.Unlock()
 		if status == "done" {
 			return proto.TaskAck{
@@ -209,21 +295,21 @@ func (m *ScanManager) Prepare(
 			Reason: "resumed", Total: state.total.Load(),
 		}, m.startScan(state)
 	}
-
-	stateCtx, stateCancel := context.WithCancel(context.Background())
-	state := &ScanState{
-		Task:     task,
-		Status:   "running",
-		ctx:      stateCtx,
-		cancel:   stateCancel,
-		speedWin: newSpeedWindow(10 * time.Second),
-	}
+	state := newScanState(task)
 	state.bindSender(sender)
-	m.tasks[task.TaskID] = state
+	m.tasks[identity] = state
 	m.mu.Unlock()
 	return proto.TaskAck{
 		TaskID: task.TaskID, Accepted: true, Reason: "accepted", Total: -1,
 	}, m.startScan(state)
+}
+
+func newScanState(task proto.ScanTask) *ScanState {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &ScanState{
+		Task: task, Status: "running", ctx: ctx, cancel: cancel,
+		speedWin: newSpeedWindow(10 * time.Second),
+	}
 }
 
 func (m *ScanManager) startScan(state *ScanState) func() {
@@ -249,11 +335,20 @@ func (m *ScanManager) startScan(state *ScanState) func() {
 // repeatedly, so repeated cancels report (true, nil) without side effects.
 func (m *ScanManager) Cancel(taskID string) (bool, *proto.TaskStats) {
 	m.mu.Lock()
-	state, exists := m.tasks[taskID]
+	state := m.tasks[scanIdentity{taskID: taskID, instanceID: ""}]
+	if state == nil {
+		for identity, candidate := range m.tasks {
+			if identity.taskID == taskID {
+				state = candidate
+				break
+			}
+		}
+	}
 	m.mu.Unlock()
-	if !exists {
+	if state == nil {
 		return false, nil
 	}
+	state.ensureControl()
 	state.mu.Lock()
 	if state.Status == "done" {
 		stats := state.Stats
@@ -261,12 +356,21 @@ func (m *ScanManager) Cancel(taskID string) (bool, *proto.TaskStats) {
 		return false, &stats
 	}
 	state.mu.Unlock()
+	// 取消同时停止新派发，但保留当前工作收尾所需的正常清理路径。
 	state.cancel()
+	state.stopOnce.Do(func() { close(state.stopNew) })
+	state.stopDispatch()
+	m.mu.Lock()
+	controller := m.ioController
+	m.mu.Unlock()
+	if controller != nil {
+		controller.CancelTask(taskID, state.Task.InstanceID)
+	}
 	return true, nil
 }
 
 func sameScanEnvelope(left, right proto.ScanTask) bool {
-	if left.TaskID != right.TaskID || left.Phase != right.Phase ||
+	if left.TaskID != right.TaskID || left.InstanceID != right.InstanceID || left.Phase != right.Phase ||
 		left.Options.Rescan != right.Options.Rescan ||
 		len(left.Roots) != len(right.Roots) ||
 		len(left.Options.Extensions) != len(right.Options.Extensions) {
@@ -317,6 +421,117 @@ func (state *ScanState) bindSender(sender Sender) {
 	state.mu.Unlock()
 }
 
+func (state *ScanState) ensureControl() {
+	state.control.Do(func() {
+		parent := state.ctx
+		if parent == nil {
+			parent, state.cancel = context.WithCancel(context.Background())
+			state.ctx = parent
+		}
+		state.workCtx, state.abortWork = context.WithCancel(parent)
+		state.dispatchCtx, state.stopDispatch = context.WithCancel(parent)
+		state.stopNew = make(chan struct{})
+	})
+}
+
+func (state *ScanState) stopRequested() bool {
+	state.ensureControl()
+	select {
+	case <-state.stopNew:
+		return true
+	default:
+		return false
+	}
+}
+
+func scanDrainPriority(reason proto.TaskDrainReason) int {
+	switch reason {
+	case proto.TaskDrainDelete:
+		return 4
+	case proto.TaskDrainStop:
+		return 3
+	case proto.TaskDrainPause:
+		return 2
+	case proto.TaskDrainProcessShutdown:
+		return 1
+	default:
+		return 0
+	}
+}
+
+// Drain preserves the task-ID-only legacy scan contract. Instance-aware local
+// tasks must use DrainInstance so an old cached instance cannot control a new
+// task that reused the same task ID.
+func (m *ScanManager) Drain(taskID string, reason proto.TaskDrainReason) (bool, *proto.TaskStats) {
+	return m.DrainInstance(taskID, "", reason)
+}
+
+func (m *ScanManager) DrainInstance(taskID, instanceID string, reason proto.TaskDrainReason) (bool, *proto.TaskStats) {
+	if taskID == "" || scanDrainPriority(reason) == 0 {
+		return false, nil
+	}
+	m.mu.Lock()
+	state := m.tasks[scanIdentity{taskID: taskID, instanceID: instanceID}]
+	m.mu.Unlock()
+	if state == nil {
+		return false, nil
+	}
+	state.ensureControl()
+	state.mu.Lock()
+	if state.Status != "done" && scanDrainPriority(reason) > scanDrainPriority(state.drainReason) {
+		state.drainReason = reason
+	}
+	stats := state.Stats
+	if state.Status != "done" {
+		stats.Total = state.total.Load()
+		stats.Done = state.done.Load()
+		stats.Failed = state.failed.Load()
+		stats.ScanErrors = state.scanErrors.Load()
+		if !state.startedAt.IsZero() {
+			stats.ElapsedMS = time.Since(state.startedAt).Milliseconds()
+		}
+	}
+	state.mu.Unlock()
+	state.stopOnce.Do(func() { close(state.stopNew) })
+	state.stopDispatch()
+	m.mu.Lock()
+	controller := m.ioController
+	m.mu.Unlock()
+	if controller != nil {
+		controller.CancelTask(taskID, instanceID)
+	}
+	state.dispatchMu.Lock()
+	state.dispatchMu.Unlock()
+	return true, &stats
+}
+
+// Abort preserves the task-ID-only legacy scan contract. See Drain.
+func (m *ScanManager) Abort(taskID string) bool {
+	return m.AbortInstance(taskID, "")
+}
+
+func (m *ScanManager) AbortInstance(taskID, instanceID string) bool {
+	m.mu.Lock()
+	state := m.tasks[scanIdentity{taskID: taskID, instanceID: instanceID}]
+	m.mu.Unlock()
+	if state == nil {
+		return false
+	}
+	state.ensureControl()
+	state.stopOnce.Do(func() { close(state.stopNew) })
+	state.stopDispatch()
+	m.mu.Lock()
+	controller := m.ioController
+	m.mu.Unlock()
+	if controller != nil {
+		controller.CancelTask(taskID, instanceID)
+	}
+	state.dispatchMu.Lock()
+	state.abortWork()
+	state.dispatchMu.Unlock()
+	return true
+}
+
 func (state *ScanState) publishFeatures(items []proto.FeatureItem) {
 	if len(items) == 0 {
 		return
@@ -336,9 +551,12 @@ func (state *ScanState) publishFeatures(items []proto.FeatureItem) {
 
 func (m *ScanManager) run(state *ScanState) {
 	started := time.Now()
-	ctx := state.ctx
-	// A task cancelled between Prepare and start unwinds here without
-	// touching the enumerator: zero work, no scan error, Reason "cancelled".
+	state.ensureControl()
+	state.mu.Lock()
+	state.startedAt = started
+	state.mu.Unlock()
+	ctx := state.workCtx
+	// 任务在 Prepare 与 start 之间被取消时，不触碰枚举器并直接走终态收尾。
 	if ctx.Err() != nil {
 		m.finish(state, started, 0)
 		return
@@ -346,23 +564,56 @@ func (m *ScanManager) run(state *ScanState) {
 	if m.pool != nil {
 		state.poolStart = m.pool.Metrics()
 	}
+	progressDone := make(chan struct{})
+	progressExited := make(chan struct{})
+	go func() {
+		defer close(progressExited)
+		m.progressLoop(state, progressDone)
+	}()
+	finishRun := func(enumerated int64) {
+		close(progressDone)
+		<-progressExited
+		m.finish(state, started, enumerated)
+	}
 	var enumerated int64
-	seen := make(map[string]struct{})
+	seen := make(map[string]diskio.Identity)
+	drained := false
 
 	for _, root := range state.Task.Roots {
 		if ctx.Err() != nil {
 			break
 		}
-		diskNo, isSSD, err := m.resolver(root)
+		if state.stopRequested() {
+			drained = true
+			break
+		}
+		identity, err := m.resolver(root)
 		if err != nil {
 			state.failed.Add(1)
 			state.scanErrors.Add(1)
 			m.reportErr(state, root, "enum", err)
 			continue
 		}
+		diskNo := diskNumber(identity)
 		m.mu.Lock()
-		m.disks[diskNo] = isSSD
+		m.disks[diskNo] = identity
+		controllerConfigured := m.ioController != nil
+		if m.ioIdentities != nil {
+			m.ioIdentities[identity.Key] = identity
+		}
 		m.mu.Unlock()
+		if controllerConfigured {
+			initial := m.cfg.IO.HDDInitial
+			if identity.KnownSSD && identity.SSD {
+				initial = m.cfg.IO.SSDInitial
+			}
+			m.log.Info(
+				"disk I/O configured",
+				"disk_key", identity.Key,
+				"initial_concurrency", initial,
+				"max_concurrency", max(1, min(m.cfg.IO.MaxPerDisk, m.cfg.Worker.Count)),
+			)
+		}
 
 		buffer := make([]store.EnumUpsert, 0, 10_000)
 		flush := func() error {
@@ -373,7 +624,7 @@ func (m *ScanManager) run(state *ScanState) {
 				return err
 			}
 			for _, record := range buffer {
-				seen[pathKey(record.Path)] = struct{}{}
+				seen[pathKey(record.Path)] = identity
 			}
 			buffer = buffer[:0]
 			return nil
@@ -384,11 +635,15 @@ func (m *ScanManager) run(state *ScanState) {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
+			if state.stopRequested() {
+				return errScanDrainRequested
+			}
 			if len(state.Task.Options.Extensions) > 0 &&
 				!extIn(record.Path, state.Task.Options.Extensions) {
 				return nil
 			}
 			enumerated++
+			state.total.Store(enumerated)
 			buffer = append(buffer, store.EnumUpsert{
 				MachineID: m.cfg.MachineID,
 				DiskNo:    diskNo,
@@ -407,8 +662,18 @@ func (m *ScanManager) run(state *ScanState) {
 			}
 			return nil
 		})
+		flushErr := flush()
+		if errors.Is(err, errScanDrainRequested) || (state.stopRequested() && ctx.Err() == nil) {
+			drained = true
+			if flushErr != nil {
+				state.failed.Add(1)
+				state.scanErrors.Add(1)
+				m.reportErr(state, root, "enum", flushErr)
+			}
+			break
+		}
 		if err == nil {
-			err = flush()
+			err = flushErr
 		}
 		// Cancellation is not a scan error: the interruption unwinds without
 		// penalizing the task's stats.
@@ -418,75 +683,90 @@ func (m *ScanManager) run(state *ScanState) {
 			m.reportErr(state, root, "enum", err)
 		}
 	}
-
 	if ctx.Err() != nil {
-		m.finish(state, started, enumerated)
+		finishRun(enumerated)
 		return
 	}
-	pending, err := m.st.PendingSnapshot(ctx, m.cfg.MachineID)
+	if drained {
+		state.send(proto.MsgTaskProgress, m.scanProgress(state))
+		finishRun(enumerated)
+		return
+	}
+	state.enumerationComplete.Store(true)
+
+	pending, err := m.pendingSnapshot(ctx, m.cfg.MachineID)
 	if err != nil {
 		if ctx.Err() == nil {
 			state.failed.Add(1)
 			state.scanErrors.Add(1)
 			m.reportErr(state, "", "enum", err)
 		}
-		m.finish(state, started, enumerated)
+		finishRun(enumerated)
 		return
 	}
 	pending = filterPendingSeen(pending, seen)
-	work, _ := m.preparePending(state, pending)
-	var total int64
-	for _, files := range work {
-		total += int64(len(files))
+	pendingWork := m.pendingWorkCount(pending)
+	work, _ := m.preparePending(state, pending, seen)
+	cached := enumerated - pendingWork
+	if cached < 0 {
+		cached = 0
 	}
-	state.total.Store(total)
-	state.send(proto.MsgTaskProgress, &proto.TaskProgress{
-		TaskID: state.Task.TaskID, Total: total,
-	})
+	state.total.Store(enumerated)
+	state.done.Store(cached)
+	state.send(proto.MsgTaskProgress, m.scanProgress(state))
 
 	hashResults := make(chan store.HashResult, 1024)
 	mediaResults := make(chan proto.FeatureItem, 1024)
 	var disks sync.WaitGroup
-	for diskNo, files := range work {
+	for _, group := range groupScanWork(work) {
 		streams := m.cfg.Scan.HDDStreams
-		if m.isSSD(diskNo) {
+		if group.identity.KnownSSD && group.identity.SSD {
 			streams = m.cfg.Scan.SSDStreams
 		}
 		disks.Add(1)
-		go func(diskNo int64, files []scanWork, streams int) {
+		go func(group scanDiskWork, streams int) {
 			defer disks.Done()
 			m.processDisk(
 				state,
-				diskNo,
-				files,
+				diskNumber(group.identity),
+				group.identity,
+				group.files,
 				streams,
 				hashResults,
 				mediaResults,
 			)
-		}(diskNo, files, streams)
+		}(group, streams)
 	}
 
 	hashWriterDone := make(chan struct{})
 	go m.resultWriter(state, hashResults, hashWriterDone)
 	mediaWriterDone := make(chan struct{})
 	go m.mediaResultWriter(state, mediaResults, mediaWriterDone)
-	progressDone := make(chan struct{})
-	go m.progressLoop(state, progressDone)
 	disks.Wait()
 	close(hashResults)
 	close(mediaResults)
 	<-hashWriterDone
 	<-mediaWriterDone
-	close(progressDone)
-	m.finish(state, started, enumerated)
+	finishRun(enumerated)
 }
 
 type scanWork struct {
 	file        store.PendingFile
+	identity    diskio.Identity
 	media       *worker.JobMsg
 	terminal    <-chan poolTerminal
 	cancelRoute func()
 	prepareErr  error
+}
+
+type scanDiskWork struct {
+	identity diskio.Identity
+	files    []scanWork
+}
+
+type queuedScanWork struct {
+	order int
+	work  scanWork
 }
 
 type mediaRoute struct {
@@ -494,38 +774,74 @@ type mediaRoute struct {
 	cancel func()
 }
 
+type pendingWorkSpec struct {
+	media bool
+	kind  worker.MediaKind
+	mask  uint32
+}
+
+func (m *ScanManager) pendingSpec(file store.PendingFile) (pendingWorkSpec, bool) {
+	kind := MediaKindWithExtensions(
+		file.Path,
+		m.cfg.Scan.ImageExts,
+		m.cfg.Scan.VideoExts,
+	)
+	if kind == "other" {
+		return pendingWorkSpec{}, file.MissingMask&proto.FieldSHA512 != 0
+	}
+	spec := pendingWorkSpec{media: true, kind: worker.MediaImage}
+	if kind == "image" {
+		spec.mask = file.MissingMask & store.RequiredStageOneMask(store.MediaImage)
+	} else {
+		spec.kind = worker.MediaVideo
+		spec.mask = file.MissingMask & store.RequiredStageOneMask(store.MediaVideo)
+	}
+	return spec, spec.mask != 0
+}
+
+func (m *ScanManager) pendingWorkCount(pending map[int64][]store.PendingFile) int64 {
+	var count int64
+	for _, files := range pending {
+		for _, file := range files {
+			if _, ok := m.pendingSpec(file); ok {
+				count++
+			}
+		}
+	}
+	return count
+}
+
 func (m *ScanManager) preparePending(
 	state *ScanState,
 	pending map[int64][]store.PendingFile,
+	identitiesByPath ...map[string]diskio.Identity,
 ) (map[int64][]scanWork, map[int64]mediaRoute) {
+	state.ensureControl()
+	state.dispatchMu.Lock()
+	defer state.dispatchMu.Unlock()
 	work := make(map[int64][]scanWork, len(pending))
 	terminals := make(map[int64]mediaRoute)
+	if state.stopRequested() {
+		return work, terminals
+	}
 	router := m.ensurePoolRouter()
 	for diskNo, files := range pending {
 		for _, file := range files {
-			kind := MediaKindWithExtensions(
-				file.Path,
-				m.cfg.Scan.ImageExts,
-				m.cfg.Scan.VideoExts,
-			)
-			if kind == "other" {
-				if file.MissingMask&proto.FieldSHA512 != 0 {
-					work[diskNo] = append(work[diskNo], scanWork{file: file})
+			identity := m.diskIdentity(diskNo)
+			if len(identitiesByPath) != 0 {
+				if exact, ok := identitiesByPath[0][pathKey(file.Path)]; ok {
+					identity = exact
 				}
+			}
+			spec, needed := m.pendingSpec(file)
+			if !needed {
 				continue
 			}
-			mask := file.MissingMask
-			mediaKind := worker.MediaImage
-			if kind == "image" {
-				mask &= store.RequiredStageOneMask(store.MediaImage)
-			} else {
-				mediaKind = worker.MediaVideo
-				mask &= store.RequiredStageOneMask(store.MediaVideo)
-			}
-			if mask == 0 {
+			if !spec.media {
+				work[diskNo] = append(work[diskNo], scanWork{file: file, identity: identity})
 				continue
 			}
-			current := scanWork{file: file}
+			current := scanWork{file: file, identity: identity}
 			if m.pool == nil || router == nil {
 				current.prepareErr = fmt.Errorf("worker pool is unavailable")
 				work[diskNo] = append(work[diskNo], current)
@@ -554,23 +870,13 @@ func (m *ScanManager) preparePending(
 			jobID := router.NextJobID()
 			current.media = &worker.JobMsg{
 				JobID: jobID, ScanTaskID: state.Task.TaskID,
-				Path: file.Path, Kind: mediaKind, Phase: worker.Phase1,
-				FieldsMask: mask, Size: file.Size, MTimeUnix: file.MTime,
+				ScanInstanceID: state.Task.InstanceID,
+				DiskKey:        string(identity.Key),
+				Path:           file.Path, Kind: spec.kind, Phase: worker.Phase1,
+				FieldsMask: spec.mask, Size: file.Size, MTimeUnix: file.MTime,
 				KnownSHA: knownSHA,
 			}
-			terminal, cancelRoute, err := router.Register(current.media)
-			if err != nil {
-				current.media = nil
-				current.prepareErr = err
-				work[diskNo] = append(work[diskNo], current)
-				continue
-			}
-			current.terminal = terminal
-			current.cancelRoute = cancelRoute
 			work[diskNo] = append(work[diskNo], current)
-			terminals[jobID] = mediaRoute{
-				job: current.media, cancel: current.cancelRoute,
-			}
 		}
 	}
 	return work, terminals
@@ -587,7 +893,7 @@ func (m *ScanManager) ensurePoolRouter() *PoolRouter {
 
 func filterPendingSeen(
 	pending map[int64][]store.PendingFile,
-	seen map[string]struct{},
+	seen map[string]diskio.Identity,
 ) map[int64][]store.PendingFile {
 	filtered := make(map[int64][]store.PendingFile, len(pending))
 	for diskNo, files := range pending {
@@ -600,11 +906,32 @@ func filterPendingSeen(
 	return filtered
 }
 
+func groupScanWork(work map[int64][]scanWork) map[diskio.DiskKey]scanDiskWork {
+	groups := make(map[diskio.DiskKey]scanDiskWork)
+	for _, files := range work {
+		for _, item := range files {
+			key := item.identity.Key
+			group := groups[key]
+			group.identity = item.identity
+			group.files = append(group.files, item)
+			groups[key] = group
+		}
+	}
+	return groups
+}
+
 func pathKey(path string) string {
 	return strings.ToLower(strings.TrimPrefix(path, `\\?\`))
 }
 
 func (m *ScanManager) isSSD(diskNo int64) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	identity := m.disks[diskNo]
+	return identity.KnownSSD && identity.SSD
+}
+
+func (m *ScanManager) diskIdentity(diskNo int64) diskio.Identity {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.disks[diskNo]
@@ -613,32 +940,128 @@ func (m *ScanManager) isSSD(diskNo int64) bool {
 func (m *ScanManager) processDisk(
 	state *ScanState,
 	diskNo int64,
+	identity diskio.Identity,
 	files []scanWork,
 	streams int,
 	hashOut chan<- store.HashResult,
 	mediaOut chan<- proto.FeatureItem,
 ) {
-	jobs := make(chan scanWork)
+	if identity.KnownSSD && identity.SSD {
+		m.processDiskBatch(state, diskNo, files, streams, hashOut, mediaOut)
+		return
+	}
+
+	images := make([]scanWork, 0, len(files))
+	other := make([]scanWork, 0, len(files))
+	videos := make([]scanWork, 0, len(files))
+	for _, work := range files {
+		switch {
+		case work.media != nil && work.media.Kind == worker.MediaImage:
+			images = append(images, work)
+		case work.media != nil && work.media.Kind == worker.MediaVideo:
+			videos = append(videos, work)
+		default:
+			other = append(other, work)
+		}
+	}
+	sort.SliceStable(images, func(left, right int) bool {
+		if images[left].file.Size != images[right].file.Size {
+			return images[left].file.Size < images[right].file.Size
+		}
+		return pathKey(images[left].file.Path) < pathKey(images[right].file.Path)
+	})
+
+	m.processDiskBatch(state, diskNo, images, streams, hashOut, mediaOut)
+	if state.stopRequested() {
+		cancelScanWorkBatch(other)
+		cancelScanWorkBatch(videos)
+		return
+	}
+	m.processDiskBatch(state, diskNo, other, streams, hashOut, mediaOut)
+	if state.stopRequested() {
+		cancelScanWorkBatch(videos)
+		return
+	}
+	m.processDiskBatch(state, diskNo, videos, streams, hashOut, mediaOut)
+}
+
+func (m *ScanManager) processDiskBatch(
+	state *ScanState,
+	diskNo int64,
+	files []scanWork,
+	streams int,
+	hashOut chan<- store.HashResult,
+	mediaOut chan<- proto.FeatureItem,
+) {
+	if len(files) == 0 {
+		return
+	}
+	jobs := make(chan queuedScanWork, pendingJobCapacity(
+		m.cfg.Worker.Count,
+		m.cfg.IO.MaxQueuedPerWorker,
+	))
+	var orderMu sync.Mutex
+	orderCond := sync.NewCond(&orderMu)
+	nextOrder := 0
 	var workers sync.WaitGroup
 	for index := 0; index < streams; index++ {
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
-			for work := range jobs {
-				// After cancellation keep draining without processing so the
-				// feeder never blocks; remaining files stay unhashed.
-				if state.ctx.Err() != nil {
+			for queued := range jobs {
+				work := queued.work
+				orderMu.Lock()
+				for queued.order != nextOrder {
+					orderCond.Wait()
+				}
+				orderMu.Unlock()
+				var releaseOrder sync.Once
+				advanceOrder := func() {
+					releaseOrder.Do(func() {
+						orderMu.Lock()
+						nextOrder++
+						orderCond.Broadcast()
+						orderMu.Unlock()
+					})
+				}
+				// 取消后仍需释放顺序闸门，确保 feeder 和其他 worker 能收尾。
+				if state.workCtx.Err() != nil {
+					advanceOrder()
 					continue
 				}
 				err := runObservedWork(
-					context.Background(),
+					state.dispatchCtx,
 					m.limiter,
 					m.currentObserver(),
 					diskNo,
 					work.file.Size,
 					func() (time.Duration, time.Duration) {
+						state.dispatchMu.Lock()
+						if state.stopRequested() {
+							state.dispatchMu.Unlock()
+							cancelScanWork(work)
+							advanceOrder()
+							return 0, 0
+						}
+						var submitErr error
+						if work.media != nil && work.prepareErr == nil {
+							terminal, cancelRoute, registerErr := m.ensurePoolRouter().Register(work.media)
+							if registerErr != nil {
+								submitErr = registerErr
+							} else {
+								work.terminal = terminal
+								work.cancelRoute = cancelRoute
+								submitErr = submitScanJob(state.dispatchCtx, m.pool, work.media)
+							}
+						}
+						state.dispatchMu.Unlock()
+						advanceOrder()
+						if submitErr != nil && state.stopRequested() {
+							cancelScanWork(work)
+							return 0, 0
+						}
 						if work.media != nil || work.prepareErr != nil {
-							return m.processMediaWork(state, work, mediaOut)
+							return m.processMediaWork(state, work, submitErr, mediaOut)
 						}
 						started := time.Now()
 						file := work.file
@@ -655,35 +1078,80 @@ func (m *ScanManager) processDisk(
 						} else {
 							result.SHA512 = hash
 						}
-						state.speedWin.Add(1)
-						state.done.Add(1)
 						hashOut <- result
 						return time.Since(started), 0
 					},
 				)
+				advanceOrder()
 				if err != nil {
+					cancelScanWork(work)
+					if state.stopRequested() {
+						continue
+					}
 					state.failed.Add(1)
 					m.reportErr(state, work.file.Path, "backpressure", err)
 				}
 			}
 		}()
 	}
-	for _, file := range files {
-		jobs <- file
+	for index, file := range files {
+		select {
+		case <-state.stopNew:
+			for _, remaining := range files[index:] {
+				cancelScanWork(remaining)
+			}
+			close(jobs)
+			workers.Wait()
+			return
+		default:
+		}
+		select {
+		case jobs <- queuedScanWork{order: index, work: file}:
+			if len(jobs) == cap(jobs) {
+				m.notifyPendingJobsFull()
+			}
+		case <-state.stopNew:
+			for _, remaining := range files[index:] {
+				cancelScanWork(remaining)
+			}
+			close(jobs)
+			workers.Wait()
+			return
+		}
 	}
 	close(jobs)
 	workers.Wait()
 }
 
+func (m *ScanManager) notifyPendingJobsFull() {
+	m.mu.Lock()
+	notify := m.pendingJobsFull
+	m.mu.Unlock()
+	if notify != nil {
+		notify()
+	}
+}
+
+func cancelScanWorkBatch(work []scanWork) {
+	for _, item := range work {
+		cancelScanWork(item)
+	}
+}
+
+func cancelScanWork(work scanWork) {
+	if work.cancelRoute != nil {
+		work.cancelRoute()
+	}
+}
+
 func (m *ScanManager) processMediaWork(
 	state *ScanState,
 	work scanWork,
+	submitErr error,
 	out chan<- proto.FeatureItem,
 ) (time.Duration, time.Duration) {
 	if work.prepareErr != nil {
 		state.failed.Add(1)
-		state.done.Add(1)
-		state.speedWin.Add(1)
 		m.reportErr(state, work.file.Path, "worker", work.prepareErr)
 		out <- proto.FeatureItem{
 			Path:   work.file.Path,
@@ -699,27 +1167,31 @@ func (m *ScanManager) processMediaWork(
 		}
 		return 0, 0
 	}
-	if err := m.pool.Submit(work.media); err != nil {
-		work.cancelRoute()
+	if submitErr != nil {
+		cancelScanWork(work)
 		state.failed.Add(1)
-		state.done.Add(1)
-		state.speedWin.Add(1)
-		m.reportErr(state, work.file.Path, "worker", err)
+		m.reportErr(state, work.file.Path, "worker", submitErr)
 		out <- proto.FeatureItem{
 			Path:   work.file.Path,
 			Size:   work.file.Size,
 			MTime:  work.file.MTime,
 			Status: proto.StatusFailed,
-			Err:    err.Error(),
+			Err:    submitErr.Error(),
 			FieldErrors: []proto.FieldError{{
 				Field: work.media.FieldsMask,
 				Stage: "worker",
-				Msg:   err.Error(),
+				Msg:   submitErr.Error(),
 			}},
 		}
 		return 0, 0
 	}
-	terminal := <-work.terminal
+	var terminal poolTerminal
+	select {
+	case terminal = <-work.terminal:
+	case <-state.workCtx.Done():
+		work.cancelRoute()
+		return 0, 0
+	}
 	work.cancelRoute()
 	item := proto.FeatureItem{
 		Path:  work.file.Path,
@@ -756,8 +1228,6 @@ func (m *ScanManager) processMediaWork(
 			state.failed.Add(1)
 		}
 	}
-	state.done.Add(1)
-	state.speedWin.Add(1)
 	out <- item
 	if terminal.result == nil {
 		return 0, 0
@@ -873,7 +1343,7 @@ func (m *ScanManager) resultWriter(
 			return
 		}
 		if err := m.st.ApplyHashResults(
-			context.Background(),
+			state.workCtx,
 			m.cfg.MachineID,
 			buffer,
 		); err != nil {
@@ -904,6 +1374,8 @@ func (m *ScanManager) resultWriter(
 			}
 		}
 		state.publishFeatures(items)
+		state.done.Add(int64(len(buffer)))
+		state.speedWin.Add(int64(len(buffer)))
 		buffer = buffer[:0]
 	}
 	for {
@@ -938,6 +1410,8 @@ func (m *ScanManager) mediaResultWriter(
 		}
 		items := append([]proto.FeatureItem(nil), buffer...)
 		state.publishFeatures(items)
+		state.done.Add(int64(len(buffer)))
+		state.speedWin.Add(int64(len(buffer)))
 		buffer = buffer[:0]
 	}
 	for {
@@ -958,20 +1432,38 @@ func (m *ScanManager) mediaResultWriter(
 }
 
 func (m *ScanManager) progressLoop(state *ScanState, done <-chan struct{}) {
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
+	ticks, stop := m.progressTicks()
+	defer stop()
 	for {
 		select {
 		case <-done:
 			return
-		case <-ticker.C:
-			state.send(proto.MsgTaskProgress, &proto.TaskProgress{
-				TaskID: state.Task.TaskID,
-				Done:   state.done.Load(),
-				Total:  state.total.Load(),
-				Speed:  state.speedWin.Rate(),
-			})
+		case <-ticks:
+			state.send(proto.MsgTaskProgress, m.scanProgress(state))
 		}
+	}
+}
+
+func (m *ScanManager) scanProgress(state *ScanState) *proto.TaskProgress {
+	state.mu.Lock()
+	startedAt := state.startedAt
+	state.mu.Unlock()
+	elapsedMS := int64(0)
+	if !startedAt.IsZero() {
+		elapsedMS = time.Since(startedAt).Milliseconds()
+	}
+	done := state.done.Load()
+	if !state.enumerationComplete.Load() {
+		done = 0
+	}
+	return &proto.TaskProgress{
+		TaskID:     state.Task.TaskID,
+		Done:       done,
+		Total:      state.total.Load(),
+		TotalKnown: state.enumerationComplete.Load(),
+		Speed:      state.speedWin.Rate(),
+		Failed:     state.failed.Load(),
+		ElapsedMS:  elapsedMS,
 	}
 }
 
@@ -984,19 +1476,32 @@ func (m *ScanManager) finish(
 	if m.pool != nil {
 		poolDelta = subtractMetrics(m.pool.Metrics(), state.poolStart)
 	}
-	// A run unwound by Cancel reports Reason "cancelled" on its terminal
-	// receipt; natural completions leave it empty.
-	reason := ""
+	// 旧版取消协议使用 cancelled；排水协议则保留 pause/stop/delete 等原因。
+	reason := proto.TaskDrainReason("")
 	if state.ctx != nil && state.ctx.Err() != nil {
-		reason = "cancelled"
+		reason = scanTaskReasonCancelled
 	}
 	state.mu.Lock()
+	if reason == "" {
+		reason = state.drainReason
+	}
+	total := state.total.Load()
+	if enumerated > total {
+		total = enumerated
+	}
+	done := state.done.Load()
+	skipped := int64(0)
+	if reason == "" && done < total {
+		skipped = total - done
+		done = total
+		state.done.Store(done)
+	}
 	state.Status = "done"
 	avgReadMS, avgDecodeMS := metricAveragesMS(poolDelta)
 	state.Stats = proto.TaskStats{
-		Total:            enumerated,
-		Done:             state.done.Load(),
-		Skipped:          enumerated - state.done.Load(),
+		Total:            total,
+		Done:             done,
+		Skipped:          skipped,
 		Failed:           state.failed.Load(),
 		ScanErrors:       state.scanErrors.Load(),
 		ElapsedMS:        time.Since(started).Milliseconds(),
@@ -1030,6 +1535,7 @@ func (m *ScanManager) finish(
 		"crashes", stats.Crashes,
 		"elapsed_ms", stats.ElapsedMS,
 	)
+	state.send(proto.MsgTaskProgress, m.scanProgress(state))
 	state.send(proto.MsgTaskDone, &proto.TaskDone{
 		TaskID: state.Task.TaskID,
 		Stats:  stats,
@@ -1040,7 +1546,10 @@ func (m *ScanManager) finish(
 	}
 	time.AfterFunc(10*time.Minute, func() {
 		m.mu.Lock()
-		delete(m.tasks, state.Task.TaskID)
+		identity := scanTaskIdentity(state.Task)
+		if m.tasks[identity] == state {
+			delete(m.tasks, identity)
+		}
 		m.mu.Unlock()
 	})
 }

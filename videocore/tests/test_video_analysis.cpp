@@ -23,12 +23,39 @@ extern "C" {
 
 #include "media_session.h"
 #include "native_algorithms/gray_image.h"
+#include "native_algorithms/rgb_image.h"
 #include "native_algorithms/pdq.h"
 #include "native_algorithms/phash_parts.h"
 #include "native_algorithms/sobel_hist.h"
 #include "native_algorithms/sha512.h"
 #include "video_analysis.h"
 #include "videocore/videocore.h"
+
+namespace vc::detail {
+
+struct RgbTileTestInfo {
+    AVColorRange range = AVCOL_RANGE_UNSPECIFIED;
+    AVColorSpace colorspace = AVCOL_SPC_UNSPECIFIED;
+    AVColorTransferCharacteristic transfer = AVCOL_TRC_UNSPECIFIED;
+    AVColorPrimaries primaries = AVCOL_PRI_UNSPECIFIED;
+    uint32_t boundary_checks = 0u;
+};
+
+int32_t VideoAnalysisTestFrameToRgbTile(
+    const AVFrame* frame,
+    int rotation,
+    int sar_num,
+    int sar_den,
+    uint32_t tile_max_side,
+    AVColorRange stream_range,
+    AVColorSpace stream_colorspace,
+    AVColorTransferCharacteristic stream_transfer,
+    AVColorPrimaries stream_primaries,
+    int interrupt_mode,
+    videocore::native::RgbImage* out,
+    RgbTileTestInfo* info) noexcept;
+
+}  // namespace vc::detail
 
 namespace {
 
@@ -77,6 +104,20 @@ vc_analysis_request FreshRequest(uint32_t frame_mask = 0u) {
     request.probe_timeout_ms = 15000u;
     request.frame_timeout_ms = 20000u;
     return request;
+}
+
+vc_video_container_info FreshContainerInfo() {
+    vc_video_container_info value{};
+    value.struct_size = sizeof(value);
+    value.abi_version = VC_ABI_VERSION;
+    return value;
+}
+
+vc_video_stream_info FreshStreamInfo() {
+    vc_video_stream_info value{};
+    value.struct_size = sizeof(value);
+    value.abi_version = VC_ABI_VERSION;
+    return value;
 }
 
 std::wstring FixturePath(const wchar_t* name) {
@@ -311,6 +352,179 @@ void TestFixture(const FixtureExpectation& expected) {
     vc_media_close(session);
 }
 
+// Break caught: metadata is reprobed through another input traversal, or is
+// populated from decoder defaults instead of codecpar from the one probed
+// AVFormatContext.
+void TestFrozenMetadataUsesTheAnalyzedFormatContext() {
+    const std::wstring path = FixturePath(L"h264-standard.mp4");
+    vc_media_open_options options{};
+    options.struct_size = sizeof(options);
+    options.abi_version = VC_ABI_VERSION;
+    options.expected_media_type = VC_MEDIA_TYPE_VIDEO;
+    vc_media_session* session = nullptr;
+    vc_error error = FreshError();
+    Check(vc_media_open_w(reinterpret_cast<const uint16_t*>(path.data()),
+                          static_cast<uint32_t>(path.size()), &options,
+                          nullptr, &session, &error) == VC_OK,
+          "metadata fixture opens");
+    if (session == nullptr) return;
+
+    vc_video_container_info before = FreshContainerInfo();
+    error = FreshError();
+    Check(vc_media_container_info(session, &before, &error) ==
+              VC_ERR_UNSUPPORTED,
+          "metadata is unavailable before stream probing");
+    std::array<uint8_t, VC_SHA512_SIZE> digest{};
+    error = FreshError();
+    Check(vc_media_hash(session, digest.data(), &error) == VC_OK,
+          "metadata fixture hashes");
+    vc_analysis_request request = FreshRequest(0x01u);
+    vc_analysis_result result = FreshResult();
+    vc::detail::VideoAnalysisTestReset();
+    error = FreshError();
+    Check(vc_media_analyze(session, &request, &result, &error) == VC_OK,
+          "metadata fixture analyzes");
+
+    vc_video_container_info container = FreshContainerInfo();
+    error = FreshError();
+    Check(vc_media_container_info(session, &container, &error) == VC_OK,
+          "container snapshot is available");
+    Check(std::string(container.format_name_utf8).find("mp4") !=
+              std::string::npos,
+          "container format comes from AVInputFormat");
+    Check((container.present_mask & VC_CONTAINER_HAS_PRIMARY_VIDEO) != 0u &&
+              container.primary_video_stream == 0 &&
+              std::string(container.decoder_name_utf8) == "h264",
+          "primary stream and actual decoder are frozen together");
+    Check(vc_media_stream_count(session) == 1u,
+          "all probed streams are frozen once");
+    vc_video_stream_info stream = FreshStreamInfo();
+    error = FreshError();
+    Check(vc_media_stream_info(session, 0u, &stream, &error) == VC_OK,
+          "stream snapshot is available");
+    Check(stream.stream_index == 0u && stream.media_type ==
+              VC_STREAM_MEDIA_TYPE_VIDEO && stream.codec_id == 27 &&
+              std::string(stream.codec_name_utf8) == "h264",
+          "stream index and codec come from codecpar");
+    Check((stream.present_mask & VC_STREAM_HAS_WIDTH) != 0u &&
+              stream.width == 160 && stream.height == 90,
+          "known codecpar dimensions set the presence bit");
+    Check((stream.present_mask & VC_STREAM_HAS_AUDIO_BIT_DEPTH) == 0u,
+          "unavailable values do not masquerade as zero");
+
+    uint32_t required = 0u;
+    error = FreshError();
+    Check(vc_media_metadata_json(session, -1, nullptr, 0u, &required,
+                                 &error) == VC_OK && required >= 3u,
+          "container tags support required-length query");
+    std::vector<char> tags(required);
+    error = FreshError();
+    Check(vc_media_metadata_json(session, -1, tags.data(), required,
+                                 &required, &error) == VC_OK &&
+              tags.front() == '{' && tags[required - 2u] == '}',
+          "container tags return canonical JSON with NUL capacity");
+    const auto stats = vc::detail::VideoAnalysisTestGetStats();
+    vc::detail::MediaSessionTestSnapshot snapshot{};
+    Check(vc::detail::GetMediaSessionTestSnapshot(session, &snapshot) &&
+              snapshot.io.create_file_calls == 1u &&
+              stats.format_contexts == 1u,
+          "metadata performs no external process or second source traversal");
+    vc_media_close(session);
+}
+
+// Break caught: only the primary decoder is reported and packetless
+// audio/subtitle/attachment or secondary HEVC codecpar streams disappear.
+void TestFrozenMetadataIncludesEveryProbedStream() {
+    AVFormatContext* format = avformat_alloc_context();
+    Check(format != nullptr, "synthetic probed format context allocates");
+    if (format == nullptr) return;
+    format->iformat = av_find_input_format("matroska");
+    format->start_time = AV_NOPTS_VALUE;
+    format->duration = 2 * AV_TIME_BASE;
+    format->bit_rate = 900000;
+    format->probe_score = AVPROBE_SCORE_MAX;
+    av_dict_set(&format->metadata, "zeta", "2", 0);
+    av_dict_set(&format->metadata, "alpha", "1", 0);
+    av_dict_set(&format->metadata, "line", "\xe2\x80\xa8", 0);
+
+    struct StreamSpec {
+        AVMediaType type;
+        AVCodecID codec;
+    };
+    constexpr std::array<StreamSpec, 5> specs{{
+        {AVMEDIA_TYPE_VIDEO, AV_CODEC_ID_H264},
+        {AVMEDIA_TYPE_VIDEO, AV_CODEC_ID_HEVC},
+        {AVMEDIA_TYPE_AUDIO, AV_CODEC_ID_AAC},
+        {AVMEDIA_TYPE_SUBTITLE, AV_CODEC_ID_SUBRIP},
+        {AVMEDIA_TYPE_ATTACHMENT, AV_CODEC_ID_TTF},
+    }};
+    bool allocated = true;
+    for (const StreamSpec spec : specs) {
+        AVStream* stream = avformat_new_stream(format, nullptr);
+        if (stream == nullptr) {
+            allocated = false;
+            break;
+        }
+        stream->time_base = AVRational{1, 1000};
+        stream->codecpar->codec_type = spec.type;
+        stream->codecpar->codec_id = spec.codec;
+        if (spec.type == AVMEDIA_TYPE_VIDEO) {
+            stream->codecpar->width = spec.codec == AV_CODEC_ID_H264 ? 160 : 64;
+            stream->codecpar->height = spec.codec == AV_CODEC_ID_H264 ? 90 : 36;
+            stream->codecpar->format = AV_PIX_FMT_YUV420P;
+        }
+        if (spec.type == AVMEDIA_TYPE_AUDIO) {
+            stream->codecpar->sample_rate = 48000;
+            stream->codecpar->ch_layout = AV_CHANNEL_LAYOUT_STEREO;
+        }
+    }
+    Check(allocated, "all synthetic probed streams allocate");
+    if (!allocated) {
+        avformat_free_context(format);
+        return;
+    }
+    av_dict_set(&format->streams[0]->metadata, "title", "Primary", 0);
+    av_dict_set(&format->streams[2]->metadata, "language", "eng", 0);
+    av_dict_set(&format->streams[3]->metadata, "language", "zho", 0);
+
+    vc::detail::VideoMetadataSnapshot metadata;
+    const AVCodec* decoder = avcodec_find_decoder(AV_CODEC_ID_H264);
+    Check(decoder != nullptr && vc::detail::VideoAnalysisTestFreezeMetadata(
+              format, 0, decoder, 12345u, &metadata),
+          "one probed format context freezes all streams");
+    const uint32_t count = static_cast<uint32_t>(metadata.streams.size());
+    Check(count == 5u, "all five probed streams are frozen");
+    std::array<bool, 6> types{};
+    bool saw_h264 = false;
+    bool saw_hevc = false;
+    for (uint32_t ordinal = 0u; ordinal < count; ++ordinal) {
+        const vc_video_stream_info& stream = metadata.streams[ordinal];
+        if (stream.media_type < types.size()) types[stream.media_type] = true;
+        saw_h264 = saw_h264 ||
+            (stream.codec_id == AV_CODEC_ID_H264 &&
+             std::string(stream.codec_name_utf8) == "h264");
+        saw_hevc = saw_hevc ||
+            (stream.codec_id == AV_CODEC_ID_HEVC &&
+             std::string(stream.codec_name_utf8) == "hevc");
+    }
+    Check(saw_h264 && saw_hevc,
+          "H264 and HEVC codec identities come from codecpar");
+    Check(types[VC_STREAM_MEDIA_TYPE_VIDEO] &&
+              types[VC_STREAM_MEDIA_TYPE_AUDIO] &&
+              types[VC_STREAM_MEDIA_TYPE_SUBTITLE] &&
+              types[VC_STREAM_MEDIA_TYPE_ATTACHMENT],
+          "video audio subtitle and attachment types are preserved");
+    Check(metadata.container_tags ==
+              "{\"alpha\":\"1\",\"line\":\"\\u2028\",\"zeta\":\"2\"}",
+          "container tags use canonical key order");
+    Check(metadata.container.primary_video_stream == 0 &&
+              std::string(metadata.container.decoder_name_utf8) == "h264",
+          "primary stream and decoder match the selected H264 decoder");
+    Check((metadata.streams[3].present_mask & VC_STREAM_HAS_WIDTH) == 0u,
+          "N/A subtitle dimensions remain absent rather than zero-valued");
+    avformat_free_context(format);
+}
+
 void TestFrameMaskZeroAndSparseMask() {
     const std::wstring path = FixturePath(L"h264-standard.mp4");
     vc_media_open_options options{};
@@ -352,6 +566,109 @@ void TestFrameMaskZeroAndSparseMask() {
                   "unrequested slot is not decoded");
         }
     }
+    vc_media_close(session);
+}
+
+void TestNormalSampleUsesDirectSeekBeforeDecoderPrerollRecovery() {
+    const std::wstring path = FixturePath(L"h264-standard.mp4");
+    vc_media_open_options options{};
+    options.struct_size = sizeof(options);
+    options.abi_version = VC_ABI_VERSION;
+    options.expected_media_type = VC_MEDIA_TYPE_VIDEO;
+    vc_media_session* session = nullptr;
+    vc_error error = FreshError();
+    Check(vc_media_open_w(reinterpret_cast<const uint16_t*>(path.data()),
+                          static_cast<uint32_t>(path.size()), &options,
+                          nullptr, &session, &error) == VC_OK,
+          "direct-seek fixture opens");
+    if (session == nullptr) return;
+    std::array<uint8_t, VC_SHA512_SIZE> digest{};
+    Check(vc_media_hash(session, digest.data(), &error) == VC_OK,
+          "direct-seek fixture hashes");
+
+    vc::detail::VideoAnalysisTestReset();
+    vc_analysis_request request = FreshRequest(0x20u);
+    vc_analysis_result result = FreshResult();
+    error = FreshError();
+    Check(vc_media_analyze(session, &request, &result, &error) == VC_OK &&
+              result.completed_frame_mask == 0x20u,
+          "normal late sample publishes requested slot");
+    const auto stats = vc::detail::VideoAnalysisTestGetStats();
+    Check(stats.seek_call_count == 1u &&
+              stats.recovery_seek_call_count == 0u,
+          "normal sample uses direct target seek before decoder-preroll recovery");
+    Check(stats.selected_pts[5] == 27648 &&
+              stats.selected_decode_ordinals[5] == 27,
+          "direct target seek preserves the frozen absolute source frame identity");
+    vc_media_close(session);
+}
+
+void TestUnknownCadenceUsesLastDecodedFrameAtCleanEof() {
+    const std::wstring path = FixturePath(L"h264-short.mp4");
+    vc_media_open_options options{};
+    options.struct_size = sizeof(options);
+    options.abi_version = VC_ABI_VERSION;
+    options.expected_media_type = VC_MEDIA_TYPE_VIDEO;
+    vc_media_session* session = nullptr;
+    vc_error error = FreshError();
+    Check(vc_media_open_w(reinterpret_cast<const uint16_t*>(path.data()),
+                          static_cast<uint32_t>(path.size()), &options,
+                          nullptr, &session, &error) == VC_OK,
+          "unknown-cadence fixture opens");
+    if (session == nullptr) return;
+    std::array<uint8_t, VC_SHA512_SIZE> digest{};
+    Check(vc_media_hash(session, digest.data(), &error) == VC_OK,
+          "unknown-cadence fixture hashes");
+    vc::detail::VideoAnalysisTestReset();
+    vc::detail::VideoAnalysisTestOverrideAverageFrameRateUnknown();
+    vc_analysis_request request = FreshRequest(0x20u);
+    vc_analysis_result result = FreshResult();
+    error = FreshError();
+    Check(vc_media_analyze(session, &request, &result, &error) == VC_OK &&
+              result.completed_frame_mask == 0x20u &&
+              result.frames[5].status == VC_OK,
+          "unknown-cadence sparse video publishes its final decoded frame");
+    vc_media_close(session);
+}
+
+void TestDirectSeekOvershootUsesDecoderPrerollRecovery() {
+    const std::wstring path = FixturePath(L"corrupt-packet.ts");
+    vc_media_open_options options{};
+    options.struct_size = sizeof(options);
+    options.abi_version = VC_ABI_VERSION;
+    options.expected_media_type = VC_MEDIA_TYPE_VIDEO;
+    vc_media_session* session = nullptr;
+    vc_error error = FreshError();
+    Check(vc_media_open_w(reinterpret_cast<const uint16_t*>(path.data()),
+                          static_cast<uint32_t>(path.size()), &options,
+                          nullptr, &session, &error) == VC_OK,
+          "direct-seek overshoot fixture opens");
+    if (session == nullptr) return;
+    std::array<uint8_t, VC_SHA512_SIZE> digest{};
+    Check(vc_media_hash(session, digest.data(), &error) == VC_OK,
+          "direct-seek overshoot fixture hashes");
+
+    vc::detail::VideoAnalysisTestReset();
+    vc_analysis_request request = FreshRequest(0x01u);
+    vc_analysis_result result = FreshResult();
+    error = FreshError();
+    Check(vc_media_analyze(session, &request, &result, &error) == VC_OK &&
+              result.completed_frame_mask == 0x01u,
+          "decoder-preroll recovery publishes an overshot sample");
+    const auto stats = vc::detail::VideoAnalysisTestGetStats();
+    Check(stats.seek_call_count == 2u &&
+              stats.recovery_seek_call_count == 1u,
+          "direct seek overshoot triggers exactly one decoder-preroll recovery");
+    Check(stats.recovery_seek_stream_index == 0 &&
+              stats.recovery_seek_min == 51000 &&
+              stats.recovery_seek_target == 51000 &&
+              stats.recovery_seek_max == 141000 &&
+              stats.recovery_seek_flags == AVSEEK_FLAG_BACKWARD,
+          "decoder-preroll recovery uses the bounded stream-start window");
+    Check(stats.selected_pts[0] == 15000 &&
+              stats.selected_pts_time_micros[0] == 166667 &&
+              stats.selected_decode_ordinals[0] == 2,
+          "decoder-preroll recovery preserves the frozen target frame identity");
     vc_media_close(session);
 }
 
@@ -683,7 +1000,7 @@ void TestTimestampSaturationAndNormalization() {
           "negative-start selected identity normalizes deterministically");
 }
 
-void TestNegativeStartUsesDecoderPrerollWindowAndSelectedIdentity() {
+void TestNegativeStartDirectSeekPreservesSelectedIdentity() {
     const std::wstring path = FixturePath(L"h264-standard.mp4");
     vc_media_open_options options{};
     options.struct_size = sizeof(options);
@@ -706,17 +1023,11 @@ void TestNegativeStartUsesDecoderPrerollWindowAndSelectedIdentity() {
     error = FreshError();
     Check(vc_media_analyze(session, &request, &result, &error) == VC_OK &&
               result.completed_frame_mask == 0x01u,
-          "negative-start decoder-preroll analysis publishes slot zero");
+          "negative-start direct-seek analysis publishes slot zero");
     const auto stats = vc::detail::VideoAnalysisTestGetStats();
-    Check(stats.recovery_seek_call_count == 1u &&
-              stats.seek_call_count == 1u,
-          "negative-start analysis executes one decoder-preroll seek");
-    Check(stats.recovery_seek_stream_index == 0 &&
-              stats.recovery_seek_min == -12289 &&
-              stats.recovery_seek_target == -12289 &&
-              stats.recovery_seek_max == -1 &&
-              stats.recovery_seek_flags == AVSEEK_FLAG_BACKWARD,
-          "negative-start decoder-preroll uses derived target and real-start upper bound");
+    Check(stats.seek_call_count == 1u &&
+              stats.recovery_seek_call_count == 0u,
+          "negative-start analysis uses direct target seek without recovery");
     Check(stats.selected_decode_ordinals[0] == 3 &&
               stats.selected_pts[0] == 3073 &&
               stats.selected_key_frames[0] == 0u &&
@@ -766,15 +1077,15 @@ void TestRecoverableReadErrorsContinueWithoutReseek() {
     }
     vc::detail::VideoAnalysisTestReset();
     vc::detail::VideoAnalysisTestInjectReadPlan(
-        5u,
+        4u,
         nonconsecutive_eagain.data(),
         static_cast<uint32_t>(nonconsecutive_eagain.size()));
-    vc_analysis_request separated_request = FreshRequest(0x20u);
+    vc_analysis_request separated_request = FreshRequest(0x10u);
     vc_analysis_result separated_result = FreshResult();
     error = FreshError();
     Check(vc_media_analyze(session, &separated_request, &separated_result,
                            &error) == VC_OK &&
-              separated_result.completed_frame_mask == 0x20u,
+              separated_result.completed_frame_mask == 0x10u,
           "successful packets reset the consecutive read EAGAIN budget");
     const auto separated_stats = vc::detail::VideoAnalysisTestGetStats();
     Check(separated_stats.injected_read_error_count == 9u &&
@@ -1065,15 +1376,138 @@ void TestProbeDeadlineAndOverflowSafeSampling() {
     }
 }
 
+void TestRgbTilesAreBoundedMetadataAwareAndInterruptible() {
+    constexpr int width = 3840;
+    constexpr int height = 2160;
+    AVFrame* frame = av_frame_alloc();
+    Check(frame != nullptr, "4K RGB tile source frame allocates");
+    if (frame == nullptr) return;
+    frame->format = AV_PIX_FMT_YUV420P;
+    frame->width = width;
+    frame->height = height;
+    frame->color_range = AVCOL_RANGE_UNSPECIFIED;
+    frame->colorspace = AVCOL_SPC_UNSPECIFIED;
+    frame->color_trc = AVCOL_TRC_UNSPECIFIED;
+    frame->color_primaries = AVCOL_PRI_UNSPECIFIED;
+    Check(av_frame_get_buffer(frame, 32) >= 0,
+          "4K RGB tile source buffer allocates");
+    if (frame->data[0] == nullptr) {
+        av_frame_free(&frame);
+        return;
+    }
+    for (int plane = 0; plane < 3; ++plane) {
+        const int rows = plane == 0 ? height : height / 2;
+        const int columns = plane == 0 ? width : width / 2;
+        const uint8_t value = plane == 0 ? 96u : (plane == 1 ? 72u : 192u);
+        for (int y = 0; y < rows; ++y) {
+            std::memset(frame->data[plane] + y * frame->linesize[plane],
+                        value, static_cast<size_t>(columns));
+        }
+    }
+
+    std::array<videocore::native::RgbImage, VC_VIDEO_FRAME_COUNT> tiles;
+    uint64_t total_rgb_bytes = 0u;
+    for (uint32_t index = 0u; index < VC_VIDEO_FRAME_COUNT; ++index) {
+        vc::detail::RgbTileTestInfo info;
+        const int32_t status = vc::detail::VideoAnalysisTestFrameToRgbTile(
+            frame, index % 2u == 0u ? 90 : 0, 4, 3, 256u,
+            AVCOL_RANGE_MPEG, AVCOL_SPC_BT709, AVCOL_TRC_BT709,
+            AVCOL_PRI_BT709, 0, &tiles[index], &info);
+        Check(status == VC_OK && tiles[index].width > 0 &&
+                  tiles[index].height > 0 && tiles[index].width <= 256 &&
+                  tiles[index].height <= 256 &&
+                  tiles[index].stride == tiles[index].width * 3 &&
+                  tiles[index].pixels.size() ==
+                      static_cast<size_t>(tiles[index].stride) *
+                          tiles[index].height,
+              "4K frame leaves only a tile_max_side-bounded RGB24 tile");
+        Check(info.range == AVCOL_RANGE_MPEG &&
+                  info.colorspace == AVCOL_SPC_BT709 &&
+                  info.transfer == AVCOL_TRC_BT709 &&
+                  info.primaries == AVCOL_PRI_BT709 &&
+                  info.boundary_checks == 2u,
+              "unspecified frame color metadata uses stream fallback");
+        total_rgb_bytes += tiles[index].pixels.size();
+    }
+    Check(tiles[0].width == 108 && tiles[0].height == 256,
+          "rotation and 4:3 SAR produce the hand-derived portrait tile");
+    Check(total_rgb_bytes <=
+              static_cast<uint64_t>(VC_VIDEO_FRAME_COUNT) * 256u * 256u * 3u,
+          "six retained RGB tiles obey the hard byte budget");
+
+    frame->color_range = AVCOL_RANGE_JPEG;
+    frame->colorspace = AVCOL_SPC_BT2020_NCL;
+    frame->color_trc = AVCOL_TRC_SMPTE2084;
+    frame->color_primaries = AVCOL_PRI_BT2020;
+    videocore::native::RgbImage frame_metadata_tile;
+    vc::detail::RgbTileTestInfo frame_metadata_info;
+    Check(vc::detail::VideoAnalysisTestFrameToRgbTile(
+              frame, 0, 1, 1, 64u, AVCOL_RANGE_MPEG, AVCOL_SPC_BT709,
+              AVCOL_TRC_BT709, AVCOL_PRI_BT709, 0, &frame_metadata_tile,
+              &frame_metadata_info) == VC_OK &&
+              frame_metadata_info.range == AVCOL_RANGE_JPEG &&
+              frame_metadata_info.colorspace == AVCOL_SPC_BT2020_NCL &&
+              frame_metadata_info.transfer == AVCOL_TRC_SMPTE2084 &&
+              frame_metadata_info.primaries == AVCOL_PRI_BT2020,
+          "frame color metadata takes priority over stream fallback");
+
+    videocore::native::RgbImage interrupted;
+    vc::detail::RgbTileTestInfo interrupt_info;
+    for (int mode = 1; mode <= 4; ++mode) {
+        const int32_t expected = mode <= 2 ? VC_ERR_TIMEOUT : VC_ERR_CANCELLED;
+        const int32_t status = vc::detail::VideoAnalysisTestFrameToRgbTile(
+            frame, 0, 1, 1, 64u, AVCOL_RANGE_MPEG, AVCOL_SPC_BT709,
+            AVCOL_TRC_BT709, AVCOL_PRI_BT709, mode, &interrupted,
+            &interrupt_info);
+        Check(status == expected && interrupted.pixels.empty(),
+              "RGB conversion checks deadline and cancellation before and after");
+    }
+    av_frame_free(&frame);
+
+    AVFrame* frame_8k = av_frame_alloc();
+    Check(frame_8k != nullptr, "8K RGB tile source frame allocates");
+    if (frame_8k != nullptr) {
+        frame_8k->format = AV_PIX_FMT_YUV420P;
+        frame_8k->width = 7680;
+        frame_8k->height = 4320;
+        Check(av_frame_get_buffer(frame_8k, 32) >= 0,
+              "8K RGB tile source buffer allocates");
+        if (frame_8k->data[0] != nullptr) {
+            for (int plane = 0; plane < 3; ++plane) {
+                const int rows = plane == 0 ? 4320 : 2160;
+                std::memset(frame_8k->data[plane], plane == 0 ? 96 : 128,
+                            static_cast<size_t>(frame_8k->linesize[plane]) *
+                                rows);
+            }
+            videocore::native::RgbImage tile_8k;
+            vc::detail::RgbTileTestInfo info_8k;
+            Check(vc::detail::VideoAnalysisTestFrameToRgbTile(
+                      frame_8k, 0, 1, 1, 256u, AVCOL_RANGE_MPEG,
+                      AVCOL_SPC_BT709, AVCOL_TRC_BT709, AVCOL_PRI_BT709, 0,
+                      &tile_8k, &info_8k) == VC_OK &&
+                      tile_8k.width == 256 && tile_8k.height == 144 &&
+                      tile_8k.pixels.size() == 256u * 144u * 3u,
+                  "8K source retains only the bounded RGB24 tile");
+        }
+        av_frame_free(&frame_8k);
+    }
+}
+
 }  // namespace
 
 int main() {
     for (const auto& fixture : fixtures) TestFixture(fixture);
+    TestFrozenMetadataUsesTheAnalyzedFormatContext();
+    TestFrozenMetadataIncludesEveryProbedStream();
     TestFrameMaskZeroAndSparseMask();
+    TestNormalSampleUsesDirectSeekBeforeDecoderPrerollRecovery();
+    TestUnknownCadenceUsesLastDecodedFrameAtCleanEof();
+    TestDirectSeekOvershootUsesDecoderPrerollRecovery();
     TestRotatedRgbNegativeStrideUsesPixelFormatConversion();
+    TestRgbTilesAreBoundedMetadataAwareAndInterruptible();
     TestUnrotatedFramesUseExplicitColorspaceAndRangeConversion();
     TestTimestampSaturationAndNormalization();
-    TestNegativeStartUsesDecoderPrerollWindowAndSelectedIdentity();
+    TestNegativeStartDirectSeekPreservesSelectedIdentity();
     TestRecoverableReadErrorsContinueWithoutReseek();
     TestHardFailureStopsRemainingWork(false);
     TestHardFailureStopsRemainingWork(true);

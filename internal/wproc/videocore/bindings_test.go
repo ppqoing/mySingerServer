@@ -14,16 +14,23 @@ type fakeNativeBridge struct {
 	runtimeInfo RuntimeInfo
 	runtimeErr  error
 
-	mu             sync.Mutex
-	openCalls      int
-	closeCalls     int
-	cancelCreates  int
-	cancelRequests int
-	cancelFrees    int
-	analyzeStarted chan struct{}
-	analyzeRelease chan struct{}
-	analyzeResult  AnalysisResult
-	analyzeErr     error
+	mu               sync.Mutex
+	openCalls        int
+	closeCalls       int
+	cancelCreates    int
+	cancelRequests   int
+	cancelFrees      int
+	analyzeStarted   chan struct{}
+	analyzeRelease   chan struct{}
+	analyzeResult    AnalysisResult
+	analyzeErr       error
+	metadataResult   *VideoMetadata
+	videoMetadataErr error
+	openErr          error
+	openPanic        any
+	openEntered      chan struct{}
+	openRelease      chan struct{}
+	lastOpenOptions  OpenOptions
 }
 
 func (f *fakeNativeBridge) runtime() (RuntimeInfo, error) {
@@ -49,10 +56,23 @@ func (f *fakeNativeBridge) cancelFree(nativeCancel) {
 	f.mu.Unlock()
 }
 
-func (f *fakeNativeBridge) open([]uint16, OpenOptions, nativeCancel) (nativeSession, error) {
+func (f *fakeNativeBridge) open(_ []uint16, options OpenOptions, _ nativeCancel) (nativeSession, error) {
 	f.mu.Lock()
 	f.openCalls++
+	f.lastOpenOptions = options
 	f.mu.Unlock()
+	if f.openEntered != nil {
+		close(f.openEntered)
+	}
+	if f.openRelease != nil {
+		<-f.openRelease
+	}
+	if f.openPanic != nil {
+		panic(f.openPanic)
+	}
+	if f.openErr != nil {
+		return nativeSession{}, f.openErr
+	}
 	return nativeSession{value: unsafe.Pointer(new(byte))}, nil
 }
 
@@ -70,6 +90,10 @@ func (f *fakeNativeBridge) analyze(nativeSession, AnalysisRequest) (AnalysisResu
 	return f.analyzeResult, f.analyzeErr
 }
 
+func (f *fakeNativeBridge) videoMetadata(nativeSession) (*VideoMetadata, error) {
+	return f.metadataResult, f.videoMetadataErr
+}
+
 func (f *fakeNativeBridge) close(nativeSession) {
 	f.mu.Lock()
 	f.closeCalls++
@@ -85,7 +109,7 @@ func (f *fakeNativeBridge) counts() (closeCalls, cancelRequests, cancelFrees int
 func TestRuntimeRejectsMajorMismatch(t *testing.T) {
 	bridge := &fakeNativeBridge{runtimeInfo: RuntimeInfo{
 		ABI:     ABIVersion,
-		Version: "1.0.0",
+		Version: "2.0.0",
 		Components: [4]RuntimeComponent{
 			{Name: "avformat", HeaderVersion: 61 << 16, RuntimeVersion: 60 << 16},
 			{Name: "avcodec", HeaderVersion: 61 << 16, RuntimeVersion: 61 << 16},
@@ -96,6 +120,13 @@ func TestRuntimeRejectsMajorMismatch(t *testing.T) {
 
 	if _, err := runtimeWith(bridge); !errors.Is(err, ErrABIMismatch) {
 		t.Fatalf("runtimeWith major mismatch error = %v, want ErrABIMismatch", err)
+	}
+}
+
+func TestRuntimeRejectsV1(t *testing.T) {
+	bridge := &fakeNativeBridge{runtimeInfo: RuntimeInfo{ABI: 1, Version: "1.0.0"}}
+	if _, err := runtimeWith(bridge); !errors.Is(err, ErrABIMismatch) {
+		t.Fatalf("runtimeWith v1 error = %v, want ErrABIMismatch", err)
 	}
 }
 

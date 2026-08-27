@@ -1,6 +1,6 @@
 package store
 
-const localSchemaVersion = 3
+const localSchemaVersion = 5
 
 const ddl = `
 PRAGMA foreign_keys = ON;
@@ -57,6 +57,62 @@ CREATE TABLE IF NOT EXISTS video_frames (
     PRIMARY KEY (sha512, frame_idx)
 );
 
+CREATE TABLE IF NOT EXISTS video_containers (
+    sha512              TEXT PRIMARY KEY,
+    format_name         TEXT NOT NULL,
+    format_long_name    TEXT,
+    start_time_us       INTEGER,
+    duration_us         INTEGER,
+    bit_rate            INTEGER,
+    file_size           INTEGER,
+    probe_score         INTEGER,
+    tags_json           TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(tags_json)),
+    primary_video_stream INTEGER,
+    decoder_name        TEXT
+);
+
+CREATE TABLE IF NOT EXISTS video_streams (
+    sha512          TEXT NOT NULL REFERENCES video_containers(sha512) ON DELETE CASCADE,
+    stream_index    INTEGER NOT NULL CHECK (stream_index >= 0),
+    media_type      TEXT NOT NULL CHECK (media_type IN ('video','audio','subtitle','data','attachment')),
+    codec_id        INTEGER NOT NULL,
+    codec_name      TEXT NOT NULL,
+    codec_long_name TEXT,
+    codec_tag       TEXT,
+    profile         TEXT,
+    level           INTEGER,
+    time_base       TEXT,
+    start_time_us   INTEGER,
+    duration_us     INTEGER,
+    bit_rate        INTEGER,
+    frame_count     INTEGER,
+    disposition     INTEGER NOT NULL DEFAULT 0,
+    language        TEXT,
+    title           TEXT,
+    tags_json       TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(tags_json)),
+    pixel_format    TEXT,
+    bit_depth       INTEGER,
+    width           INTEGER,
+    height          INTEGER,
+    sar             TEXT,
+    dar             TEXT,
+    avg_frame_rate  TEXT,
+    real_frame_rate TEXT,
+    rotation        INTEGER,
+    color_range     TEXT,
+    color_space     TEXT,
+    color_transfer  TEXT,
+    color_primaries TEXT,
+    chroma_location TEXT,
+    field_order     TEXT,
+    sample_format   TEXT,
+    sample_rate     INTEGER,
+    channels        INTEGER,
+    channel_layout  TEXT,
+    audio_bit_depth INTEGER,
+    PRIMARY KEY (sha512, stream_index)
+);
+
 CREATE TABLE IF NOT EXISTS sync_queue (
     table_name  TEXT    NOT NULL,
     row_pk      TEXT    NOT NULL,
@@ -69,16 +125,20 @@ CREATE INDEX IF NOT EXISTS idx_sync_queue_pending ON sync_queue (synced);
 
 CREATE TABLE IF NOT EXISTS local_tasks (
     task_id            TEXT    PRIMARY KEY,
+    instance_id        TEXT    NOT NULL,
+    revision           INTEGER NOT NULL DEFAULT 1 CHECK (revision > 0),
     machine_id         TEXT    NOT NULL,
     source             TEXT    NOT NULL CHECK (source IN ('local','manager')),
     type               TEXT    NOT NULL CHECK (type IN ('scan','analysis','stage2','stage3','delete')),
     stage              INTEGER NOT NULL CHECK (stage IN (0,1,2,3)),
-    status             TEXT    NOT NULL CHECK (status IN
-                               ('pending','running','waiting_recovery','succeeded','failed','cancelled')),
+    status             TEXT    NOT NULL CHECK (status IN ('pending','running','waiting_recovery','pausing','paused','stopping','cancelled','succeeded','failed','deleting','delete_failed')),
+    phase              TEXT    NOT NULL DEFAULT 'waiting'
+                               CHECK (phase IN ('waiting','scan','stage1','stage2','stage3','finalizing')),
     envelope_digest    TEXT    NOT NULL,
     envelope           BLOB    NOT NULL DEFAULT X'',
     progress_completed INTEGER NOT NULL DEFAULT 0 CHECK (progress_completed >= 0),
     progress_total     INTEGER NOT NULL DEFAULT 0 CHECK (progress_total >= 0),
+    progress_total_known INTEGER NOT NULL DEFAULT 0 CHECK (progress_total_known IN (0,1)),
     stats_json         TEXT    NOT NULL DEFAULT '{}' CHECK (json_valid(stats_json)),
     safe_error_code    TEXT,
     safe_error_message TEXT,
@@ -91,6 +151,14 @@ CREATE TABLE IF NOT EXISTS local_tasks (
 );
 CREATE INDEX IF NOT EXISTS idx_local_tasks_machine_status
     ON local_tasks (machine_id, status, created_at, task_id);
+
+CREATE TABLE IF NOT EXISTS local_task_deletion_receipts (
+    machine_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    instance_id TEXT NOT NULL,
+    deleted_at INTEGER NOT NULL,
+    PRIMARY KEY (machine_id, task_id, instance_id)
+);
 
 CREATE TABLE IF NOT EXISTS local_analysis_runs (
     run_id       TEXT    PRIMARY KEY,
@@ -275,5 +343,4 @@ CREATE TABLE IF NOT EXISTS local_outbox (
 CREATE INDEX IF NOT EXISTS idx_local_outbox_pending
     ON local_outbox (ack_at, next_retry_at, sequence);
 
-PRAGMA user_version = 3;
 `

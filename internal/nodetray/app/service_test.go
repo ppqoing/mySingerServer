@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"dedup/internal/nodetray/agentclient"
 	"dedup/internal/nodetray/config"
 	"dedup/internal/nodetray/traymodel"
 	"dedup/internal/nodetray/windows/elevation"
@@ -98,16 +100,275 @@ type fakeAgentConfigGateway struct {
 type fakeLocalAgentGateway struct {
 	requests  []string
 	responses map[string]any
+	operation string
+	control   proto.LocalTaskControlRequest
+	err       error
 }
 
-func (f *fakeLocalAgentGateway) CallLocal(_ context.Context, operation string, _, response any) error {
+type deadlineInspectLocalAgentGateway struct {
+	deadlines []time.Time
+}
+
+func (f *deadlineInspectLocalAgentGateway) CallLocal(ctx context.Context, _ string, _, _ any) error {
+	deadline, ok := ctx.Deadline()
+	if ok {
+		f.deadlines = append(f.deadlines, deadline)
+	} else {
+		f.deadlines = append(f.deadlines, time.Time{})
+	}
+	return errors.New("deadline inspection")
+}
+
+type blockingLocalAgentGateway struct{}
+
+func (*blockingLocalAgentGateway) CallLocal(ctx context.Context, _ string, _, _ any) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (f *fakeLocalAgentGateway) CallLocal(_ context.Context, operation string, request, response any) error {
 	f.requests = append(f.requests, operation)
+	f.operation = operation
+	if control, ok := request.(proto.LocalTaskControlRequest); ok {
+		f.control = control
+	}
+	if f.err != nil {
+		return f.err
+	}
 	value, ok := f.responses[operation]
 	if !ok {
 		return errors.New("agent_disconnected")
 	}
 	raw, _ := msgpack.Marshal(value)
 	return msgpack.Unmarshal(raw, response)
+}
+
+// Break caught: a task action omits the instance or revision and can control a
+// newer task attempt that reuses the same task ID.
+func TestLocalTaskControlsForwardVersionedIdentityAndSafeSnapshot(t *testing.T) {
+	operations := []struct {
+		name      string
+		operation string
+		call      func(*Service, context.Context, traymodel.LocalTaskControl) traymodel.LocalTaskResult
+	}{
+		{"pause", proto.LocalOperationTaskPause, (*Service).PauseLocalTask},
+		{"resume", proto.LocalOperationTaskResume, (*Service).ResumeLocalTask},
+		{"cancel", proto.LocalOperationTaskCancel, (*Service).CancelLocalTask},
+		{"delete", proto.LocalOperationTaskDelete, (*Service).DeleteLocalTask},
+		{"retry", proto.LocalOperationTaskRetry, (*Service).RetryLocalTask},
+	}
+	for _, test := range operations {
+		t.Run(test.name, func(t *testing.T) {
+			service, _, _, _, _, _ := serviceFixture(t)
+			gateway := &fakeLocalAgentGateway{responses: map[string]any{
+				test.operation: encodedTaskControlResponse("paused", 8),
+			}}
+			service.localAgent = gateway
+
+			result := test.call(service, context.Background(), traymodel.LocalTaskControl{
+				TaskID: "task-1", InstanceID: "instance-1", ExpectedRevision: 7,
+			})
+			if !result.OK || result.Deleted || result.Task.Phase != "analysis" || result.Task.Revision != 8 ||
+				!result.Task.ProgressTotalKnown || result.Task.CreatedAt != 100 || result.Task.UpdatedAt != 200 ||
+				result.Task.StartedAt != 110 || result.Task.CompletedAt != 0 || result.Task.ErrorCode != "safe_error" ||
+				result.Task.ErrorSummary != "safe message" {
+				t.Fatalf("result=%#v", result)
+			}
+			if gateway.operation != test.operation {
+				t.Fatalf("operation=%q, want %q", gateway.operation, test.operation)
+			}
+			if want := (proto.LocalTaskControlRequest{TaskID: "task-1", InstanceID: "instance-1", ExpectedRevision: 7}); gateway.control != want {
+				t.Fatalf("control=%#v, want %#v", gateway.control, want)
+			}
+		})
+	}
+}
+
+// Break caught: raw transport errors reach the WebView, or malformed versioned
+// requests are sent to the Agent before being rejected locally.
+func TestLocalTaskControlsRejectInvalidVersionAndRedactGatewayError(t *testing.T) {
+	service, _, _, _, _, _ := serviceFixture(t)
+	gateway := &fakeLocalAgentGateway{responses: map[string]any{}, err: errors.New("private_socket_failure")}
+	service.localAgent = gateway
+
+	invalid := service.PauseLocalTask(context.Background(), traymodel.LocalTaskControl{TaskID: "task-1", InstanceID: "instance-1"})
+	if invalid.OK || invalid.ErrorCode != proto.InvalidTaskControlErrorCode || len(gateway.requests) != 0 {
+		t.Fatalf("invalid=%#v, requests=%v", invalid, gateway.requests)
+	}
+	failed := service.PauseLocalTask(context.Background(), traymodel.LocalTaskControl{TaskID: "task-1", InstanceID: "instance-1", ExpectedRevision: 7})
+	if failed.OK || failed.ErrorCode != "local_operation_failed" || strings.Contains(fmt.Sprintf("%#v", failed), "private_socket_failure") {
+		t.Fatalf("failed=%#v", failed)
+	}
+}
+
+// Break caught: refreshable optimistic-concurrency codes are hidden from the
+// WebView, or arbitrary remote/private error text is exposed as a public code.
+func TestLocalTaskControlsExposeAllSafeRemoteCodesWithFixedSummaries(t *testing.T) {
+	tests := []struct {
+		code    string
+		summary string
+	}{
+		{"stale_task", "任务状态已更新，请刷新后重试"},
+		{"task_instance_mismatch", "任务实例已更新，请刷新后重试"},
+		{"invalid_task_state", "当前任务状态不支持此操作"},
+		{"task_not_found", "任务不存在或已删除"},
+		{"local_task_unavailable", "本机任务服务暂不可用"},
+		{"task_delete_failed", "删除任务失败，请稍后重试"},
+		{"task_control_failed", "任务操作失败，请稍后重试"},
+		{"task_instance_required", "任务实例信息缺失，请刷新后重试"},
+	}
+	for _, test := range tests {
+		t.Run(test.code, func(t *testing.T) {
+			service, _, _, _, _, _ := serviceFixture(t)
+			service.localAgent = &fakeLocalAgentGateway{responses: map[string]any{}, err: fmt.Errorf("wrapped transport secret: %w", &agentclient.RemoteError{Code: test.code})}
+
+			result := service.PauseLocalTask(context.Background(), traymodel.LocalTaskControl{
+				TaskID: "task-1", InstanceID: "instance-1", ExpectedRevision: 7,
+			})
+			if result.OK || result.ErrorCode != test.code || result.ErrorSummary != test.summary {
+				t.Fatalf("result=%#v", result)
+			}
+			if strings.Contains(fmt.Sprintf("%#v", result), "secret") {
+				t.Fatalf("result leaked transport text: %#v", result)
+			}
+		})
+	}
+
+	service, _, _, _, _, _ := serviceFixture(t)
+	service.localAgent = &fakeLocalAgentGateway{responses: map[string]any{}, err: &agentclient.RemoteError{Code: "private_backend_failure"}}
+	result := service.DeleteLocalTask(context.Background(), traymodel.LocalTaskControl{
+		TaskID: "task-1", InstanceID: "instance-1", ExpectedRevision: 7,
+	})
+	if result.OK || result.ErrorCode != "local_operation_failed" || result.ErrorSummary != "本机 Agent 暂不可用，请稍后重试" ||
+		strings.Contains(fmt.Sprintf("%#v", result), "private_backend_failure") {
+		t.Fatalf("result=%#v", result)
+	}
+	service.localAgent = &fakeLocalAgentGateway{responses: map[string]any{}, err: errors.New("raw_private_failure")}
+	page := service.ListLocalTasks(context.Background(), traymodel.PageRequest{Limit: 50})
+	if page.OK || page.ErrorCode != "local_operation_failed" || page.ErrorSummary != "本机 Agent 暂不可用，请稍后重试" ||
+		strings.Contains(fmt.Sprintf("%#v", page), "raw_private_failure") {
+		t.Fatalf("page leaked raw error: %#v", page)
+	}
+}
+
+// Break caught: a local request inherited the process lifetime context and
+// could leave Wails calls and frontend polling pending forever.
+func TestLocalTaskListAndControlUseBoundedRequestContexts(t *testing.T) {
+	service, _, _, _, _, _ := serviceFixture(t)
+	gateway := &deadlineInspectLocalAgentGateway{}
+	service.localAgent = gateway
+	started := time.Now()
+
+	_ = service.ListLocalTasks(context.Background(), traymodel.PageRequest{Limit: 50})
+	_ = service.PauseLocalTask(context.Background(), traymodel.LocalTaskControl{
+		TaskID: "task-1", InstanceID: "instance-1", ExpectedRevision: 7,
+	})
+
+	if len(gateway.deadlines) != 2 {
+		t.Fatalf("deadline observations=%v", gateway.deadlines)
+	}
+	for i, deadline := range gateway.deadlines {
+		if deadline.IsZero() {
+			t.Fatalf("call %d had no deadline", i)
+		}
+		remaining := deadline.Sub(started)
+		if remaining <= 0 || remaining > 11*time.Second {
+			t.Fatalf("call %d deadline bound=%v, want <= 11s", i, remaining)
+		}
+	}
+}
+
+func TestLocalTaskListDeadlineCancelsBlockingGateway(t *testing.T) {
+	service, _, _, _, _, _ := serviceFixture(t)
+	service.localAgent = &blockingLocalAgentGateway{}
+	service.localRequestTimeout = 5 * time.Millisecond
+	started := time.Now()
+
+	page := service.ListLocalTasks(context.Background(), traymodel.PageRequest{Limit: 50})
+
+	if page.OK || page.ErrorCode != "local_operation_failed" {
+		t.Fatalf("page=%#v", page)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("blocking gateway returned after %v", elapsed)
+	}
+}
+
+// Break caught: Agent display stats reached Store, but numeric production JSON
+// could not be decoded into the string-only Wails projection.
+func TestListLocalTasksMapsProductionDisplayStatsJSON(t *testing.T) {
+	service, _, _, _, _, _ := serviceFixture(t)
+	statsJSON, err := json.Marshal(proto.LocalTaskDisplayStats{
+		SchemaVersion: proto.LocalTaskDisplayStatsVersion,
+		Speed:         12.5, Failures: 1, DurationMS: 192_000,
+		IO: proto.TaskIOStats{
+			DiskConcurrency: 4, EffectiveReadBPS: 12_582_912, LeaseWaitMS: 250,
+			SequentialBytes: 67_108_864, SeekCount: 7, BusyWorkers: 3, IOWaitWorkers: 2,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.localAgent = &fakeLocalAgentGateway{responses: map[string]any{
+		proto.LocalOperationTaskList: proto.LocalTaskListResponse{Tasks: []proto.LocalTask{{
+			TaskID: "stats-task", InstanceID: "stats-instance", Revision: 1,
+			Mode: proto.LocalTaskModeScanThenAnalysis, Status: "running",
+			StatsJSON: string(statsJSON),
+		}}},
+	}}
+
+	page := service.ListLocalTasks(context.Background(), traymodel.PageRequest{Limit: 50})
+	if !page.OK || len(page.Tasks) != 1 {
+		t.Fatalf("page=%#v", page)
+	}
+	task := page.Tasks[0]
+	if task.Speed != "12.5 文件/秒" || task.Failures != 1 || task.Duration != "00:03:12" {
+		t.Fatalf("mapped task=%#v", task)
+	}
+	if task.IO != (traymodel.LocalTaskIOStats{
+		DiskConcurrency: 4, EffectiveReadBPS: 12_582_912, LeaseWaitMS: 250,
+		SequentialBytes: 67_108_864, SeekCount: 7, BusyWorkers: 3, IOWaitWorkers: 2,
+	}) {
+		t.Fatalf("mapped I/O=%#v", task.IO)
+	}
+}
+
+// Break caught: NodeTray treats persisted schema v1 as invalid after the v2
+// rollout and blanks its legacy display fields instead of only zeroing I/O.
+func TestLocalTaskIOStatsV1MapsLegacyFieldsWithZeroIO(t *testing.T) {
+	service, _, _, _, _, _ := serviceFixture(t)
+	service.localAgent = &fakeLocalAgentGateway{responses: map[string]any{
+		proto.LocalOperationTaskList: proto.LocalTaskListResponse{Tasks: []proto.LocalTask{{
+			TaskID: "legacy", InstanceID: "legacy-instance", Revision: 3,
+			StatsJSON: `{"schema_version":1,"speed":5.5,"failures":2,"duration_ms":3000}`,
+		}}},
+	}}
+	task := service.ListLocalTasks(context.Background(), traymodel.PageRequest{Limit: 1}).Tasks[0]
+	if task.Speed != "5.5 文件/秒" || task.Failures != 2 || task.Duration != "00:00:03" || task.IO != (traymodel.LocalTaskIOStats{}) {
+		t.Fatalf("mapped legacy task=%#v", task)
+	}
+}
+
+// Break caught: successful idempotent deletion is rendered as a failed or
+// partially populated task response instead of an explicit deletion result.
+func TestDeleteLocalTaskReturnsDeletedWithoutTaskSnapshot(t *testing.T) {
+	service, _, _, _, _, _ := serviceFixture(t)
+	service.localAgent = &fakeLocalAgentGateway{responses: map[string]any{
+		proto.LocalOperationTaskDelete: proto.LocalTaskControlResponse{Deleted: true},
+	}}
+
+	result := service.DeleteLocalTask(context.Background(), traymodel.LocalTaskControl{TaskID: "task-1", InstanceID: "instance-1", ExpectedRevision: 7})
+	if !result.OK || !result.Deleted || !reflect.DeepEqual(result.Task, traymodel.LocalTask{}) {
+		t.Fatalf("result=%#v", result)
+	}
+}
+
+func encodedTaskControlResponse(status string, revision int64) proto.LocalTaskControlResponse {
+	return proto.LocalTaskControlResponse{Task: &proto.LocalTask{
+		TaskID: "task-1", InstanceID: "instance-1", Revision: revision, Source: "nodetray", Mode: proto.LocalTaskModeScanThenAnalysis,
+		Stage: 2, Phase: "analysis", Status: status, Roots: []string{`D:\media`}, ProgressComplete: 4, ProgressTotal: 10,
+		ProgressTotalKnown: true, SafeErrorCode: "safe_error", SafeErrorMessage: "safe message", CreatedAt: 100, UpdatedAt: 200, StartedAt: 110,
+	}}
 }
 
 func TestLocalConsoleUsesSocketAndKeepsDeleteTokenServerSide(t *testing.T) {

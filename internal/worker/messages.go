@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 
+	"dedup/internal/proto"
 	"dedup/internal/store"
 )
 
@@ -50,19 +51,23 @@ func replaceWindowsPath(text, target string) string {
 }
 
 const (
-	MsgReady    = "ready"
-	MsgJob      = "job"
-	MsgShutdown = "shutdown"
-	MsgSHAQuery = "sha_query"
-	MsgSHAReply = "sha_reply"
-	MsgResult   = "result"
+	MsgReady          = "ready"
+	MsgJob            = "job"
+	MsgShutdown       = "shutdown"
+	MsgSHAQuery       = "sha_query"
+	MsgSHAReply       = "sha_reply"
+	MsgResult         = "result"
+	MsgIOLeaseAcquire = "io_lease_acquire"
+	MsgIOLeaseGrant   = "io_lease_grant"
+	MsgIOLeaseReport  = "io_lease_report"
+	MsgIOLeaseCancel  = "io_lease_cancel"
 )
 
 const (
-	IPCCompatibilityVersion = 1
+	IPCCompatibilityVersion = 2
 	MediaCoreDLLVersion     = "1.0.0"
-	VideoCoreABIVersion     = 1
-	VideoCoreVersion        = "1.0.0"
+	VideoCoreABIVersion     = 2
+	VideoCoreVersion        = "2.0.0"
 )
 
 type Envelope struct {
@@ -122,6 +127,7 @@ const (
 	MaskVideoContactSheet uint32 = 1 << 7
 	MaskVideo6FPHash      uint32 = 1 << 8
 	MaskVideo6FSobel      uint32 = 1 << 9
+	MaskVideoMetadata     uint32 = 1 << 10
 )
 
 var (
@@ -134,7 +140,7 @@ const (
 	fieldMaskFull uint32 = MaskSHA512 | MaskImagePDQ | MaskVideoThumb |
 		MaskPHashParts | MaskSobelHist | MaskVideo6F |
 		MaskVideoDuration | MaskVideoContactSheet |
-		MaskVideo6FPHash | MaskVideo6FSobel
+		MaskVideo6FPHash | MaskVideo6FSobel | MaskVideoMetadata
 )
 
 type RuntimeComponent struct {
@@ -158,6 +164,8 @@ type ReadyMsg struct {
 type JobMsg struct {
 	JobID            int64       `msgpack:"job_id"`
 	ScanTaskID       string      `msgpack:"scan_task_id"`
+	ScanInstanceID   string      `msgpack:"scan_instance_id"`
+	DiskKey          string      `msgpack:"disk_key"`
 	Path             string      `msgpack:"path"`
 	Kind             MediaKind   `msgpack:"kind"`
 	Phase            Phase       `msgpack:"phase"`
@@ -178,6 +186,93 @@ type JobMsg struct {
 	PreviewQuality   int32       `msgpack:"preview_quality,omitempty"`
 }
 
+type IOLeaseAcquireMsg struct {
+	JobID      int64  `msgpack:"job_id"`
+	RequestID  uint64 `msgpack:"request_id"`
+	TaskID     string `msgpack:"task_id"`
+	InstanceID string `msgpack:"instance_id"`
+	DiskKey    string `msgpack:"disk_key"`
+	Class      uint8  `msgpack:"class"`
+	WantBytes  int64  `msgpack:"want_bytes"`
+	WantSeek   bool   `msgpack:"want_seek"`
+}
+
+type IOLeaseGrantMsg struct {
+	JobID      int64  `msgpack:"job_id"`
+	RequestID  uint64 `msgpack:"request_id"`
+	LeaseID    uint64 `msgpack:"lease_id"`
+	Generation uint64 `msgpack:"generation"`
+	Bytes      int64  `msgpack:"bytes"`
+	Seeks      uint32 `msgpack:"seeks"`
+}
+
+type IOLeaseReportMsg struct {
+	JobID      int64  `msgpack:"job_id"`
+	RequestID  uint64 `msgpack:"request_id"`
+	LeaseID    uint64 `msgpack:"lease_id"`
+	Generation uint64 `msgpack:"generation"`
+	TaskID     string `msgpack:"task_id"`
+	InstanceID string `msgpack:"instance_id"`
+	DiskKey    string `msgpack:"disk_key"`
+	Bytes      int64  `msgpack:"bytes"`
+	Seeks      uint32 `msgpack:"seeks"`
+	ReadNS     int64  `msgpack:"read_ns"`
+	WaitNS     int64  `msgpack:"wait_ns"`
+	Completed  bool   `msgpack:"completed"`
+	Cancelled  bool   `msgpack:"cancelled"`
+}
+
+type IOLeaseCancelMsg struct {
+	JobID     int64  `msgpack:"job_id"`
+	RequestID uint64 `msgpack:"request_id"`
+}
+
+func (msg IOLeaseAcquireMsg) Validate() error {
+	if msg.JobID <= 0 || msg.RequestID == 0 {
+		return fmt.Errorf("worker: I/O lease acquire identity is required")
+	}
+	if strings.TrimSpace(msg.TaskID) == "" || strings.TrimSpace(msg.InstanceID) == "" || strings.TrimSpace(msg.DiskKey) == "" {
+		return fmt.Errorf("worker: I/O lease acquire task, instance, and disk are required")
+	}
+	if msg.Class != 1 && msg.Class != 2 {
+		return fmt.Errorf("worker: I/O lease acquire class %d is unknown", msg.Class)
+	}
+	if msg.WantBytes <= 0 || msg.WantBytes > 16<<20 {
+		return fmt.Errorf("worker: I/O lease acquire want_bytes %d is outside range", msg.WantBytes)
+	}
+	return nil
+}
+
+func (msg IOLeaseGrantMsg) ValidateFor(request IOLeaseAcquireMsg) error {
+	if msg.JobID != request.JobID || msg.RequestID != request.RequestID || msg.LeaseID == 0 || msg.Generation == 0 {
+		return fmt.Errorf("worker: I/O lease grant identity mismatch")
+	}
+	if msg.Bytes <= 0 || msg.Bytes > request.WantBytes || msg.Bytes > 16<<20 {
+		return fmt.Errorf("worker: I/O lease grant bytes %d exceed request %d", msg.Bytes, request.WantBytes)
+	}
+	if msg.Seeks > 1 || (!request.WantSeek && msg.Seeks != 0) {
+		return fmt.Errorf("worker: I/O lease grant seeks %d exceed request", msg.Seeks)
+	}
+	return nil
+}
+
+func (msg IOLeaseReportMsg) ValidateFor(grant IOLeaseGrantMsg) error {
+	if msg.JobID != grant.JobID || msg.RequestID != grant.RequestID ||
+		msg.LeaseID != grant.LeaseID || msg.Generation != grant.Generation {
+		return fmt.Errorf("worker: I/O lease report identity or generation mismatch")
+	}
+	if strings.TrimSpace(msg.TaskID) == "" || strings.TrimSpace(msg.InstanceID) == "" || strings.TrimSpace(msg.DiskKey) == "" {
+		return fmt.Errorf("worker: I/O lease report task, instance, and disk are required")
+	}
+	if msg.Bytes < 0 || msg.Bytes > grant.Bytes || msg.Seeks > grant.Seeks || msg.ReadNS < 0 || msg.WaitNS < 0 {
+		return fmt.Errorf("worker: I/O lease report exceeds grant")
+	}
+	if msg.Completed == msg.Cancelled {
+		return fmt.Errorf("worker: I/O lease report must be completed or cancelled")
+	}
+	return nil
+}
+
 type SHAQueryMsg struct {
 	JobID           int64     `msgpack:"job_id"`
 	ScanTaskID      string    `msgpack:"-"`
@@ -188,24 +283,26 @@ type SHAQueryMsg struct {
 }
 
 type SHAReplyMsg struct {
-	JobID           int64          `msgpack:"job_id"`
-	Found           bool           `msgpack:"found"`
-	RequestedFields uint32         `msgpack:"requested_fields"`
-	FieldsPresent   uint32         `msgpack:"present_fields"`
-	MissingFields   uint32         `msgpack:"missing_fields"`
-	RequestedFrames uint8          `msgpack:"requested_frames"`
-	FramesPresent   uint8          `msgpack:"present_frames"`
-	MissingFrames   uint8          `msgpack:"missing_frames"`
-	PDQ             []byte         `msgpack:"pdq,omitempty"`
-	Quality         int32          `msgpack:"quality,omitempty"`
-	Width           int32          `msgpack:"width,omitempty"`
-	Height          int32          `msgpack:"height,omitempty"`
-	DurationMS      *int64         `msgpack:"duration_ms,omitempty"`
-	ThumbPath       string         `msgpack:"thumb_path,omitempty"`
-	ThumbPDQ        []byte         `msgpack:"thumb_pdq,omitempty"`
-	ThumbQuality    *int32         `msgpack:"thumb_quality,omitempty"`
-	FrameResults    [6]FrameResult `msgpack:"frame_results,omitempty"`
-	ReusedFlight    bool           `msgpack:"reused_flight,omitempty"`
+	JobID           int64                         `msgpack:"job_id"`
+	Found           bool                          `msgpack:"found"`
+	RequestedFields uint32                        `msgpack:"requested_fields"`
+	FieldsPresent   uint32                        `msgpack:"present_fields"`
+	MissingFields   uint32                        `msgpack:"missing_fields"`
+	RequestedFrames uint8                         `msgpack:"requested_frames"`
+	FramesPresent   uint8                         `msgpack:"present_frames"`
+	MissingFrames   uint8                         `msgpack:"missing_frames"`
+	PDQ             []byte                        `msgpack:"pdq,omitempty"`
+	Quality         int32                         `msgpack:"quality,omitempty"`
+	Width           int32                         `msgpack:"width,omitempty"`
+	Height          int32                         `msgpack:"height,omitempty"`
+	DurationMS      *int64                        `msgpack:"duration_ms,omitempty"`
+	ThumbPath       string                        `msgpack:"thumb_path,omitempty"`
+	ThumbPDQ        []byte                        `msgpack:"thumb_pdq,omitempty"`
+	ThumbQuality    *int32                        `msgpack:"thumb_quality,omitempty"`
+	FrameResults    [6]FrameResult                `msgpack:"frame_results,omitempty"`
+	VideoContainer  *proto.VideoContainerMetadata `msgpack:"video_container,omitempty"`
+	VideoStreams    []proto.VideoStreamMetadata   `msgpack:"video_streams,omitempty"`
+	ReusedFlight    bool                          `msgpack:"reused_flight,omitempty"`
 }
 
 func (msg SHAQueryMsg) ValidateMasks() error {
@@ -237,6 +334,12 @@ func (msg SHAReplyMsg) ValidateMasks() error {
 	if msg.FramesPresent|msg.MissingFrames != msg.RequestedFrames {
 		return fmt.Errorf("worker: SHA reply frame masks do not exactly cover requested_frames")
 	}
+	if err := validateWorkerVideoMetadata(
+		msg.FieldsPresent&MaskVideoMetadata != 0,
+		msg.VideoContainer, msg.VideoStreams,
+	); err != nil {
+		return fmt.Errorf("worker: SHA reply: %w", err)
+	}
 	return nil
 }
 
@@ -267,47 +370,49 @@ type FrameResult struct {
 }
 
 type JobResultMsg struct {
-	JobID              int64          `msgpack:"job_id"`
-	ScanTaskID         string         `msgpack:"scan_task_id,omitempty"`
-	WorkerPID          int            `msgpack:"-"`
-	Phase              Phase          `msgpack:"-"`
-	ScreenStage        ScreenStage    `msgpack:"screen_stage,omitempty"`
-	Source             JobSource      `msgpack:"source,omitempty"`
-	Path               string         `msgpack:"path"`
-	Kind               MediaKind      `msgpack:"kind"`
-	SHA512             []byte         `msgpack:"sha512,omitempty"`
-	FieldsDone         uint32         `msgpack:"fields_done"`
-	FramesDone         uint8          `msgpack:"frames_done"`
-	DurationStatus     int32          `msgpack:"duration_status"`
-	ContactSheetStatus int32          `msgpack:"contact_sheet_status"`
-	ContactSheetWidth  int32          `msgpack:"contact_sheet_width"`
-	ContactSheetHeight int32          `msgpack:"contact_sheet_height"`
-	FrameResults       [6]FrameResult `msgpack:"frame_results"`
-	PDQ                []byte         `msgpack:"pdq,omitempty"`
-	Quality            int32          `msgpack:"quality,omitempty"`
-	Width              int32          `msgpack:"width,omitempty"`
-	Height             int32          `msgpack:"height,omitempty"`
-	DurationMS         *int64         `msgpack:"duration_ms,omitempty"`
-	ThumbPath          string         `msgpack:"thumb_path,omitempty"`
-	ThumbPDQ           []byte         `msgpack:"thumb_pdq,omitempty"`
-	ThumbQuality       *int32         `msgpack:"thumb_quality,omitempty"`
-	PHashParts         []byte         `msgpack:"phash_parts,omitempty"`
-	SobelHist          []byte         `msgpack:"sobel_hist,omitempty"`
-	Frames             []FrameFeature `msgpack:"frames,omitempty"`
-	Errors             []FieldError   `msgpack:"errors,omitempty"`
-	ReadAttempts       int64          `msgpack:"read_attempts,omitempty"`
-	DecodeAttempts     int64          `msgpack:"decode_attempts,omitempty"`
-	ReadNS             int64          `msgpack:"read_ns,omitempty"`
-	DecodeNS           int64          `msgpack:"decode_ns,omitempty"`
-	ThumbMS            int64          `msgpack:"thumb_ms,omitempty"`
-	Decoded            bool           `msgpack:"decoded,omitempty"`
-	ThumbGenerated     bool           `msgpack:"thumb_generated,omitempty"`
-	ThumbCacheHit      bool           `msgpack:"thumb_cache_hit,omitempty"`
-	PreviewFormat      string         `msgpack:"preview_format,omitempty"`
-	PreviewWidth       int32          `msgpack:"preview_width,omitempty"`
-	PreviewHeight      int32          `msgpack:"preview_height,omitempty"`
-	PreviewBytes       []byte         `msgpack:"preview_bytes,omitempty"`
-	PreviewErrorCode   string         `msgpack:"preview_error_code,omitempty"`
+	JobID              int64                         `msgpack:"job_id"`
+	ScanTaskID         string                        `msgpack:"scan_task_id,omitempty"`
+	WorkerPID          int                           `msgpack:"-"`
+	Phase              Phase                         `msgpack:"-"`
+	ScreenStage        ScreenStage                   `msgpack:"screen_stage,omitempty"`
+	Source             JobSource                     `msgpack:"source,omitempty"`
+	Path               string                        `msgpack:"path"`
+	Kind               MediaKind                     `msgpack:"kind"`
+	SHA512             []byte                        `msgpack:"sha512,omitempty"`
+	FieldsDone         uint32                        `msgpack:"fields_done"`
+	FramesDone         uint8                         `msgpack:"frames_done"`
+	DurationStatus     int32                         `msgpack:"duration_status"`
+	ContactSheetStatus int32                         `msgpack:"contact_sheet_status"`
+	ContactSheetWidth  int32                         `msgpack:"contact_sheet_width"`
+	ContactSheetHeight int32                         `msgpack:"contact_sheet_height"`
+	FrameResults       [6]FrameResult                `msgpack:"frame_results"`
+	PDQ                []byte                        `msgpack:"pdq,omitempty"`
+	Quality            int32                         `msgpack:"quality,omitempty"`
+	Width              int32                         `msgpack:"width,omitempty"`
+	Height             int32                         `msgpack:"height,omitempty"`
+	DurationMS         *int64                        `msgpack:"duration_ms,omitempty"`
+	ThumbPath          string                        `msgpack:"thumb_path,omitempty"`
+	ThumbPDQ           []byte                        `msgpack:"thumb_pdq,omitempty"`
+	ThumbQuality       *int32                        `msgpack:"thumb_quality,omitempty"`
+	PHashParts         []byte                        `msgpack:"phash_parts,omitempty"`
+	SobelHist          []byte                        `msgpack:"sobel_hist,omitempty"`
+	VideoContainer     *proto.VideoContainerMetadata `msgpack:"video_container,omitempty"`
+	VideoStreams       []proto.VideoStreamMetadata   `msgpack:"video_streams,omitempty"`
+	Frames             []FrameFeature                `msgpack:"frames,omitempty"`
+	Errors             []FieldError                  `msgpack:"errors,omitempty"`
+	ReadAttempts       int64                         `msgpack:"read_attempts,omitempty"`
+	DecodeAttempts     int64                         `msgpack:"decode_attempts,omitempty"`
+	ReadNS             int64                         `msgpack:"read_ns,omitempty"`
+	DecodeNS           int64                         `msgpack:"decode_ns,omitempty"`
+	ThumbMS            int64                         `msgpack:"thumb_ms,omitempty"`
+	Decoded            bool                          `msgpack:"decoded,omitempty"`
+	ThumbGenerated     bool                          `msgpack:"thumb_generated,omitempty"`
+	ThumbCacheHit      bool                          `msgpack:"thumb_cache_hit,omitempty"`
+	PreviewFormat      string                        `msgpack:"preview_format,omitempty"`
+	PreviewWidth       int32                         `msgpack:"preview_width,omitempty"`
+	PreviewHeight      int32                         `msgpack:"preview_height,omitempty"`
+	PreviewBytes       []byte                        `msgpack:"preview_bytes,omitempty"`
+	PreviewErrorCode   string                        `msgpack:"preview_error_code,omitempty"`
 }
 
 func (msg JobResultMsg) ValidateVideoCoreMasks() error {
@@ -316,6 +421,12 @@ func (msg JobResultMsg) ValidateVideoCoreMasks() error {
 	}
 	if msg.FramesDone&^FrameMaskFull != 0 {
 		return fmt.Errorf("worker: job result frames_done contains bits outside six frames")
+	}
+	if err := validateWorkerVideoMetadata(
+		msg.FieldsDone&MaskVideoMetadata != 0,
+		msg.VideoContainer, msg.VideoStreams,
+	); err != nil {
+		return fmt.Errorf("worker: job result: %w", err)
 	}
 
 	hasFrameResults := msg.FieldsDone&videoSixFrameWorkerFields() != 0 || msg.FramesDone != 0
@@ -343,6 +454,23 @@ func (msg JobResultMsg) ValidateVideoCoreMasks() error {
 		if !done && frameHasFeaturePayload(frame) {
 			return fmt.Errorf("worker: unsuccessful frame %d carries feature payload", index)
 		}
+	}
+	return nil
+}
+
+func validateWorkerVideoMetadata(
+	claimed bool,
+	container *proto.VideoContainerMetadata,
+	streams []proto.VideoStreamMetadata,
+) error {
+	if !claimed {
+		if container != nil || len(streams) != 0 {
+			return fmt.Errorf("video metadata payload exists without completed field bit")
+		}
+		return nil
+	}
+	if err := proto.ValidateVideoMetadata(container, streams); err != nil {
+		return fmt.Errorf("invalid video metadata: %w", err)
 	}
 	return nil
 }

@@ -3,19 +3,32 @@
 
 #include <array>
 #include <cstdint>
+#include <string>
+#include <vector>
 
 #include "videocore/videocore.h"
 
 struct AVFrame;
+struct AVCodec;
+struct AVFormatContext;
 
 namespace vc::detail {
 
 class AvioBridge;
 struct CancelState;
 
+struct VideoMetadataSnapshot {
+    vc_video_container_info container{};
+    std::string container_tags{"{}"};
+    std::vector<vc_video_stream_info> streams;
+    std::vector<std::string> stream_tags;
+};
+
 int32_t AnalyzeVideo(AvioBridge* avio,
                      const CancelState* cancel,
                      const vc_analysis_request& request,
+                     uint64_t source_file_size,
+                     VideoMetadataSnapshot* metadata,
                      vc_analysis_result* out,
                      vc_error* error) noexcept;
 int32_t PublishVideoFailure(vc_analysis_result* out,
@@ -77,6 +90,7 @@ void VideoAnalysisTestInjectSeekError(uint32_t frame_index,
                                       int32_t ffmpeg_error,
                                       uint32_t repetitions) noexcept;
 void VideoAnalysisTestOverrideStreamStart(int64_t start) noexcept;
+void VideoAnalysisTestOverrideAverageFrameRateUnknown() noexcept;
 int64_t VideoAnalysisTestTargetTimestamp(int64_t relative,
                                          int64_t start) noexcept;
 int64_t VideoAnalysisTestNormalizedTimestamp(int64_t timestamp,
@@ -89,6 +103,12 @@ int32_t VideoAnalysisTestFrameToFeatures(
     vc_feature_set* features,
     int32_t* width,
     int32_t* height) noexcept;
+bool VideoAnalysisTestFreezeMetadata(
+    const AVFormatContext* format,
+    int primary_stream,
+    const AVCodec* decoder,
+    uint64_t source_file_size,
+    VideoMetadataSnapshot* output) noexcept;
 void VideoAnalysisTestSetBeforePublishHook(
     VideoAnalysisBeforePublishHook hook,
     void* context) noexcept;

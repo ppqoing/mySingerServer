@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 
+	"dedup/internal/proto"
 	"dedup/internal/store"
 )
 
@@ -405,6 +406,11 @@ func replyFromContentState(query SHAQueryMsg, state store.ContentState) SHAReply
 		reply.ThumbPDQ = cloneBytes(state.Video.ThumbPDQ)
 		reply.ThumbQuality = cloneInt32(state.Video.ThumbQuality)
 	}
+	if state.FieldsPresent&MaskVideoMetadata != 0 {
+		reply.VideoContainer, reply.VideoStreams = cloneVideoMetadata(
+			state.VideoContainer, state.VideoStreams,
+		)
+	}
 	for _, frame := range state.Frames {
 		if frame.FrameIdx < 0 || frame.FrameIdx >= len(reply.FrameResults) {
 			continue
@@ -466,6 +472,13 @@ func replyFromCommittedResult(result JobResultMsg, key dedupeKey) (SHAReplyMsg, 
 		result.ThumbPath != "" && len(result.ThumbPDQ) != 0 && result.ThumbQuality != nil {
 		reply.FieldsPresent |= MaskVideoContactSheet
 	}
+	if key.fields&MaskVideoMetadata != 0 && result.FieldsDone&MaskVideoMetadata != 0 &&
+		result.VideoContainer != nil {
+		reply.FieldsPresent |= MaskVideoMetadata
+		reply.VideoContainer, reply.VideoStreams = cloneVideoMetadata(
+			result.VideoContainer, result.VideoStreams,
+		)
+	}
 	reply.FramesPresent = result.FramesDone & key.frames
 	if key.fields&MaskVideo6F != 0 && result.FieldsDone&MaskVideo6F != 0 &&
 		reply.FramesPresent == key.frames {
@@ -511,12 +524,59 @@ func cloneReply(reply SHAReplyMsg) SHAReplyMsg {
 	reply.DurationMS = cloneInt64(reply.DurationMS)
 	reply.ThumbPDQ = cloneBytes(reply.ThumbPDQ)
 	reply.ThumbQuality = cloneInt32(reply.ThumbQuality)
+	reply.VideoContainer, reply.VideoStreams = cloneVideoMetadata(
+		reply.VideoContainer, reply.VideoStreams,
+	)
 	for index := range reply.FrameResults {
 		reply.FrameResults[index].PDQ256 = cloneBytes(reply.FrameResults[index].PDQ256)
 		reply.FrameResults[index].PHashParts = cloneBytes(reply.FrameResults[index].PHashParts)
 		reply.FrameResults[index].SobelHist = cloneBytes(reply.FrameResults[index].SobelHist)
 	}
 	return reply
+}
+
+func cloneVideoMetadata(
+	container *proto.VideoContainerMetadata,
+	streams []proto.VideoStreamMetadata,
+) (*proto.VideoContainerMetadata, []proto.VideoStreamMetadata) {
+	return cloneVideoContainer(container), cloneVideoStreams(streams)
+}
+
+func cloneVideoContainer(value *proto.VideoContainerMetadata) *proto.VideoContainerMetadata {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	cloned.StartTimeUS = cloneInt64(value.StartTimeUS)
+	cloned.DurationUS = cloneInt64(value.DurationUS)
+	cloned.BitRate = cloneInt64(value.BitRate)
+	cloned.FileSize = cloneInt64(value.FileSize)
+	cloned.ProbeScore = cloneInt32(value.ProbeScore)
+	cloned.PrimaryVideoStream = cloneInt32(value.PrimaryVideoStream)
+	return &cloned
+}
+
+func cloneVideoStreams(values []proto.VideoStreamMetadata) []proto.VideoStreamMetadata {
+	if values == nil {
+		return nil
+	}
+	cloned := append([]proto.VideoStreamMetadata(nil), values...)
+	for index := range cloned {
+		value := &cloned[index]
+		value.Level = cloneInt32(value.Level)
+		value.StartTimeUS = cloneInt64(value.StartTimeUS)
+		value.DurationUS = cloneInt64(value.DurationUS)
+		value.BitRate = cloneInt64(value.BitRate)
+		value.FrameCount = cloneInt64(value.FrameCount)
+		value.BitDepth = cloneInt32(value.BitDepth)
+		value.Width = cloneInt32(value.Width)
+		value.Height = cloneInt32(value.Height)
+		value.Rotation = cloneInt32(value.Rotation)
+		value.SampleRate = cloneInt32(value.SampleRate)
+		value.Channels = cloneInt32(value.Channels)
+		value.AudioBitDepth = cloneInt32(value.AudioBitDepth)
+	}
+	return cloned
 }
 
 func replyForJob(jobID int64, reply SHAReplyMsg) SHAReplyMsg {

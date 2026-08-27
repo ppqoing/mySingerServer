@@ -9,4 +9,8 @@ EXPORTS
     vc_media_open_w
     vc_media_hash
     vc_media_analyze
+    vc_media_container_info
+    vc_media_stream_count
+    vc_media_stream_info
+    vc_media_metadata_json
     vc_media_close

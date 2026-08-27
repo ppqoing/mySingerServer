@@ -110,6 +110,17 @@ func TestPathSelectionResultExposesWailsSafeJSONContract(t *testing.T) {
 	assertJSONKeys(t, result, "ok", "path", "cancelled", "errorCode", "errorSummary")
 }
 
+// Break caught: Wails receives formatted strings or drops one of the seven
+// numeric I/O fields, preventing the frontend from formatting safe units.
+func TestLocalTaskIOStatsExposeNumericWailsJSONContract(t *testing.T) {
+	io := LocalTaskIOStats{
+		DiskConcurrency: 4, EffectiveReadBPS: 12_582_912, LeaseWaitMS: 250,
+		SequentialBytes: 67_108_864, SeekCount: 7, BusyWorkers: 3, IOWaitWorkers: 2,
+	}
+	assertJSONKeys(t, io, "diskConcurrency", "effectiveReadBps", "leaseWaitMs", "sequentialBytes", "seekCount", "busyWorkers", "ioWaitWorkers")
+	assertJSONKeys(t, LocalTask{IO: io}, "io")
+}
+
 func assertJSONKeys(t *testing.T, value any, keys ...string) {
 	t.Helper()
 	raw, err := json.Marshal(value)

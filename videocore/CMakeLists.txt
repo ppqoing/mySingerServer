@@ -146,6 +146,42 @@ target_include_directories(test_vc_cancel PRIVATE
 target_link_libraries(test_vc_cancel PRIVATE videocore)
 add_test(NAME videocore_cancel COMMAND test_vc_cancel)
 
+add_executable(test_vc_deadline
+  tests/test_deadline.cpp
+  src/cancel_token.cpp
+  src/deadline.cpp
+  src/error.cpp
+)
+target_compile_features(test_vc_deadline PRIVATE cxx_std_17)
+target_compile_options(test_vc_deadline PRIVATE
+  $<$<CXX_COMPILER_ID:MSVC>:/EHsc>
+  $<$<CXX_COMPILER_ID:MSVC>:/utf-8>
+)
+target_include_directories(test_vc_deadline PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src"
+)
+add_test(NAME videocore_deadline COMMAND test_vc_deadline)
+
+add_executable(test_vc_win_file
+  tests/test_win_file.cpp
+  src/cancel_token.cpp
+  src/deadline.cpp
+  src/error.cpp
+  src/win_file.cpp
+)
+target_compile_features(test_vc_win_file PRIVATE cxx_std_17)
+target_compile_definitions(test_vc_win_file PRIVATE VC_WIN_FILE_TESTING)
+target_compile_options(test_vc_win_file PRIVATE
+  $<$<CXX_COMPILER_ID:MSVC>:/EHsc>
+  $<$<CXX_COMPILER_ID:MSVC>:/utf-8>
+)
+target_include_directories(test_vc_win_file PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src"
+)
+add_test(NAME videocore_win_file COMMAND test_vc_win_file)
+
 add_executable(test_vc_session
   tests/test_media_session.cpp
   src/api.cpp
@@ -534,6 +570,19 @@ target_link_libraries(test_vc_resilience PRIVATE videocore_image_algorithms)
 target_link_libraries(test_vc_video_sar_reference PRIVATE videocore_image_algorithms)
 add_test(NAME videocore_image_compat COMMAND test_vc_image_compat)
 
+if(NOT IS_ABSOLUTE "${VCPKG_INSTALLED_DIR}")
+  message(FATAL_ERROR
+    "VCPKG_INSTALLED_DIR must be an absolute path for provenance tests")
+endif()
+get_filename_component(_vc_vcpkg_installed_dir
+  "${VCPKG_INSTALLED_DIR}" ABSOLUTE)
+if("${VCPKG_TARGET_TRIPLET}" STREQUAL "" OR
+   VCPKG_TARGET_TRIPLET MATCHES "[/\\\\]")
+  message(FATAL_ERROR
+    "VCPKG_TARGET_TRIPLET must be a non-empty path segment for provenance tests")
+endif()
+set(_vc_vcpkg_target_triplet "${VCPKG_TARGET_TRIPLET}")
+
 add_test(
   NAME videocore_image_object_provenance
   COMMAND "${_vc_powershell}" -NoProfile
@@ -556,6 +605,8 @@ add_test(
     -CanonicalImageObjectDir
       "${CMAKE_CURRENT_BINARY_DIR}/videocore_image_algorithms.dir/$<CONFIG>"
     -BuildRoot "${CMAKE_CURRENT_BINARY_DIR}"
+    -VcpkgInstalledDir "${_vc_vcpkg_installed_dir}"
+    -VcpkgTargetTriplet "${_vc_vcpkg_target_triplet}"
 )
 
 add_test(
@@ -574,6 +625,8 @@ add_test(
     -CompilerCommandTlog
       "${CMAKE_CURRENT_BINARY_DIR}/videocore_image_algorithms.dir/$<CONFIG>"
     -BuildRoot "${CMAKE_CURRENT_BINARY_DIR}"
+    -VcpkgInstalledDir "${_vc_vcpkg_installed_dir}"
+    -VcpkgTargetTriplet "${_vc_vcpkg_target_triplet}"
 )
 
 set(_vc_dumpbin "${CMAKE_DUMPBIN}")
@@ -662,8 +715,12 @@ set(CMAKE_REQUIRED_INCLUDES "${CMAKE_CURRENT_SOURCE_DIR}/include")
 check_c_source_compiles([=[
   #include <stddef.h>
   #include <videocore/videocore.h>
-  _Static_assert(VC_ABI_VERSION == 1u, "ABI version");
+  _Static_assert(VC_ABI_VERSION == 2u, "ABI version");
   _Static_assert(sizeof(struct vc_runtime_info) == 136u, "runtime layout");
+  _Static_assert(sizeof(vc_io_governor) == 32u, "governor layout");
+  _Static_assert(sizeof(vc_media_open_options) == 40u, "open layout");
+  _Static_assert(offsetof(vc_media_open_options, io_governor) == 32u,
+                 "governor pointer offset");
   _Static_assert(offsetof(struct vc_runtime_info, struct_size) == 0u,
                  "runtime struct_size");
   _Static_assert(offsetof(struct vc_runtime_info, abi_version) == 4u,

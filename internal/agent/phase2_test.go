@@ -1020,7 +1020,7 @@ func TestPhase2FailuresAfterCommittedLookupUseOriginalFieldMask(t *testing.T) {
 func TestPhase2FailuresBeforeOwnershipUseFileLevelAccurateStage(t *testing.T) {
 	for _, test := range []struct {
 		name     string
-		resolver DiskResolver
+		resolver Phase2DiskResolver
 		storeErr error
 		want     string
 	}{
@@ -1096,7 +1096,6 @@ func TestScanAndPhase2UseSharedRouterJobIDAllocator(t *testing.T) {
 		},
 	)
 	phase1 := scanWork[1][0]
-	defer phase1.cancelRoute()
 
 	path := `E:\scan\phase2.jpg`
 	phase2 := NewPhase2ManagerWithRuntime(

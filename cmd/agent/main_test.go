@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,9 +23,16 @@ import (
 	agentdelete "dedup/internal/agent/delete"
 	"dedup/internal/agentinstance"
 	"dedup/internal/config"
+	"dedup/internal/diskio"
 	fileenum "dedup/internal/enum"
+	"dedup/internal/firstscreen"
+	"dedup/internal/localanalysis"
+	"dedup/internal/localtask"
 	"dedup/internal/machineid"
+	nodetrayapp "dedup/internal/nodetray/app"
+	"dedup/internal/nodetray/traymodel"
 	"dedup/internal/proto"
+	"dedup/internal/store"
 	"dedup/internal/worker"
 )
 
@@ -280,7 +288,8 @@ func TestWorkerPoolConfigMapsAllAgentWorkerSettingsAndExactEnv(t *testing.T) {
 	cfg.Thumb.FrameTimeoutS = 21
 	cfg.IPC.MaxFrameMB = 8
 
-	got := workerPoolConfig(cfg)
+	broker := &mainTestDiskController{}
+	got := workerPoolConfig(cfg, broker)
 	if got.WorkerExe != cfg.Worker.ExePath ||
 		got.WorkerCount != 7 ||
 		got.MachineID != "machine-a" ||
@@ -288,9 +297,199 @@ func TestWorkerPoolConfigMapsAllAgentWorkerSettingsAndExactEnv(t *testing.T) {
 		got.VideoTimeout != 121*time.Second ||
 		got.RespawnDelay != 750*time.Millisecond ||
 		got.IPCMaxFrameBytes != 8<<20 ||
-		!reflect.DeepEqual(got.WorkerEnv, cfg.WorkerEnv()) {
+		!reflect.DeepEqual(got.WorkerEnv, cfg.WorkerEnv()) || got.IOBroker != broker {
 		t.Fatalf("worker pool config = %#v", got)
 	}
+}
+
+// Break caught: Agent constructs a disk controller but the Worker pool is
+// created from an unrelated config, so lease requests never reach the one
+// process-wide broker.
+func TestAgentRunnerDiskIdentityInjectsExactProcessController(t *testing.T) {
+	cfg := config.DefaultAgent()
+	broker := &mainTestDiskController{}
+	if got := workerPoolConfig(cfg, broker).IOBroker; got != broker {
+		t.Fatalf("worker pool I/O broker=%T, want exact injected controller", got)
+	}
+}
+
+// Break caught: the process-level disk controller is stopped by root-context
+// cancellation before scan TaskDone and Worker reporter/pool drain complete.
+func TestAgentRunnerDiskIdentityShutdownStopsControllerAfterTaskDoneAndPool(t *testing.T) {
+	events := &shutdownEventLog{}
+	controllerCtx, stopController := context.WithCancel(context.Background())
+	controller := diskio.NewController(controllerCtx, diskio.ControllerOptions{
+		WorkerCount: 1,
+		Policy: diskio.PolicyConfig{
+			LeaseBytes: 1 << 20, MinLeaseBytes: 1 << 20, MaxLeaseBytes: 1 << 20,
+			HDDInitial: 1, SSDInitial: 1, MaxPerDisk: 1, HDDRandomMax: 1, MaxQueuedPerWorker: 4,
+		},
+		Identities: map[diskio.DiskKey]diskio.Identity{
+			"physical:shutdown": {Key: "physical:shutdown", Local: true, KnownSSD: true, SSD: false},
+		},
+	})
+	pool := newShutdownBrokerPool(controller, events)
+	fairPool := localtask.NewFairScheduler(pool)
+	managed := managedPoolWithFinalizer(pool, func() {
+		events.add("controller-stop")
+		stopController()
+	})
+	job := &worker.JobMsg{
+		JobID: 1, Path: `D:\media\shutdown.jpg`, Kind: worker.MediaImage,
+		ScanTaskID: "shutdown-task", ScanInstanceID: "shutdown-instance", DiskKey: "physical:shutdown",
+		Source: worker.JobSourceScan,
+	}
+	if err := runService(
+		managed,
+		func() error {
+			if err := fairPool.Submit(job); err != nil {
+				return err
+			}
+			events.add("serve")
+			return nil
+		},
+		func() error {
+			pool.complete()
+			select {
+			case result := <-fairPool.Results():
+				if result == nil || result.JobID != job.JobID {
+					return fmt.Errorf("forwarded reporter result=%#v", result)
+				}
+				events.add("reporter-result")
+			case <-time.After(time.Second):
+				return errors.New("timed out waiting for real scheduler reporter")
+			}
+			events.add("task-done")
+			return nil
+		},
+		func() error {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if err := fairPool.Shutdown(shutdownCtx); err != nil {
+				return err
+			}
+			events.add("reporter-close")
+			return nil
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"start", "broker-acquire", "serve", "broker-report", "reporter-result", "task-done", "reporter-close", "pool-close", "controller-stop"}
+	if got := events.snapshot(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("shutdown order=%v want %v", got, want)
+	}
+	closedCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := controller.Acquire(closedCtx, diskio.Request{
+		RequestID: 2, TaskID: "after-shutdown", InstanceID: "after-shutdown", WorkerID: 0,
+		Disk: "physical:shutdown", Class: diskio.SourceRandom, WantBytes: 1 << 20,
+	}); !errors.Is(err, diskio.ErrControllerClosed) {
+		t.Fatalf("controller Acquire after shutdown error=%v, want ErrControllerClosed", err)
+	}
+}
+
+type shutdownEventLog struct {
+	mu     sync.Mutex
+	events []string
+}
+
+func (log *shutdownEventLog) add(event string) {
+	log.mu.Lock()
+	log.events = append(log.events, event)
+	log.mu.Unlock()
+}
+
+func (log *shutdownEventLog) snapshot() []string {
+	log.mu.Lock()
+	defer log.mu.Unlock()
+	return append([]string(nil), log.events...)
+}
+
+type shutdownBrokerPool struct {
+	controller diskio.Controller
+	events     *shutdownEventLog
+	results    chan *worker.JobResultMsg
+	crashes    chan worker.CrashRecord
+
+	mu    sync.Mutex
+	job   worker.JobMsg
+	grant diskio.Grant
+}
+
+func newShutdownBrokerPool(controller diskio.Controller, events *shutdownEventLog) *shutdownBrokerPool {
+	return &shutdownBrokerPool{
+		controller: controller, events: events,
+		results: make(chan *worker.JobResultMsg, 1), crashes: make(chan worker.CrashRecord),
+	}
+}
+
+func (pool *shutdownBrokerPool) Start() { pool.events.add("start") }
+
+func (pool *shutdownBrokerPool) Close() { pool.events.add("pool-close") }
+
+func (pool *shutdownBrokerPool) Submit(job *worker.JobMsg) error {
+	grant, err := pool.controller.Acquire(context.Background(), diskio.Request{
+		RequestID: 1, TaskID: job.ScanTaskID, InstanceID: job.ScanInstanceID,
+		WorkerID: 0, Disk: diskio.DiskKey(job.DiskKey), Class: diskio.SourceRandom, WantBytes: 1 << 20, WantSeek: true,
+	})
+	if err != nil {
+		return err
+	}
+	pool.mu.Lock()
+	pool.job = *job
+	pool.grant = grant
+	pool.mu.Unlock()
+	pool.events.add("broker-acquire")
+	return nil
+}
+
+func (pool *shutdownBrokerPool) complete() {
+	pool.mu.Lock()
+	job := pool.job
+	grant := pool.grant
+	pool.mu.Unlock()
+	pool.controller.Report(diskio.Report{
+		LeaseID: grant.LeaseID, Generation: grant.Generation,
+		TaskID: job.ScanTaskID, InstanceID: job.ScanInstanceID, WorkerID: 0,
+		Disk: diskio.DiskKey(job.DiskKey), Bytes: 1 << 20, Completed: true,
+	})
+	pool.events.add("broker-report")
+	pool.results <- &worker.JobResultMsg{JobID: job.JobID, ScanTaskID: job.ScanTaskID, Path: job.Path, Kind: job.Kind, Source: job.Source}
+}
+
+func (pool *shutdownBrokerPool) Results() <-chan *worker.JobResultMsg { return pool.results }
+func (pool *shutdownBrokerPool) Crashes() <-chan worker.CrashRecord   { return pool.crashes }
+func (*shutdownBrokerPool) Metrics() worker.MetricsSnapshot           { return worker.MetricsSnapshot{} }
+
+type mainTestDiskController struct{}
+
+func (*mainTestDiskController) Acquire(context.Context, diskio.Request) (diskio.Grant, error) {
+	return diskio.Grant{}, nil
+}
+func (*mainTestDiskController) Report(diskio.Report)                    {}
+func (*mainTestDiskController) CancelTask(string, string)               {}
+func (*mainTestDiskController) ReclaimWorker(int)                       {}
+func (*mainTestDiskController) Snapshot(string, string) diskio.Snapshot { return diskio.Snapshot{} }
+
+type localTaskIOController struct {
+	calls     [][2]string
+	snapshots []diskio.Snapshot
+}
+
+func (*localTaskIOController) Acquire(context.Context, diskio.Request) (diskio.Grant, error) {
+	return diskio.Grant{}, nil
+}
+func (*localTaskIOController) Report(diskio.Report)      {}
+func (*localTaskIOController) CancelTask(string, string) {}
+func (*localTaskIOController) ReclaimWorker(int)         {}
+func (c *localTaskIOController) Snapshot(taskID, instanceID string) diskio.Snapshot {
+	c.calls = append(c.calls, [2]string{taskID, instanceID})
+	if len(c.snapshots) == 0 {
+		return diskio.Snapshot{}
+	}
+	result := c.snapshots[0]
+	c.snapshots = c.snapshots[1:]
+	return result
 }
 
 func TestRunServiceClosesStartedPoolWhenServerReturnsError(t *testing.T) {
@@ -305,13 +504,17 @@ func TestRunServiceClosesStartedPoolWhenServerReturnsError(t *testing.T) {
 	}
 }
 
-func TestRunServiceDrainsPhase2ThenSchedulerBeforeClosingPool(t *testing.T) {
+func TestRunServiceDrainsTasksThenPhase2ThenSchedulerBeforeClosingPool(t *testing.T) {
 	var events []string
 	pool := &orderedLifecyclePool{events: &events}
 	err := runService(
 		pool,
 		func() error {
 			events = append(events, "serve")
+			return nil
+		},
+		func() error {
+			events = append(events, "task-drain")
 			return nil
 		},
 		func() error {
@@ -332,7 +535,7 @@ func TestRunServiceDrainsPhase2ThenSchedulerBeforeClosingPool(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"start", "serve", "phase2-drain", "scheduler-shutdown", "close"}
+	want := []string{"start", "serve", "task-drain", "phase2-drain", "scheduler-shutdown", "close"}
 	if !reflect.DeepEqual(events, want) {
 		t.Fatalf("lifecycle events=%v, want %v", events, want)
 	}
@@ -342,23 +545,23 @@ func TestLocalTaskRunnerRecoverySkipsScanAndCompletesStageThree(t *testing.T) {
 	scans := &recordingLocalScanRunner{}
 	analysis := &recordingLocalAnalysisRunner{}
 	runner := &agentLocalTaskRunner{scans: scans, analysis: analysis}
-	var stages []int
+	var updates []localtask.ProgressUpdate
 	request := proto.LocalTaskCreateRequest{TaskID: "recover", Roots: []string{`D:\media`}, Mode: proto.LocalTaskModeScanThenAnalysis}
-	if err := runner.Run(context.Background(), request, 1, func(stage int) error { stages = append(stages, stage); return nil }); err != nil {
+	if err := runner.Run(localtask.RunControl{Context: context.Background()}, request, localtask.Task{TaskID: request.TaskID, Stage: 1, Phase: "stage1"}, func(update localtask.ProgressUpdate) error { updates = append(updates, update); return nil }); err != nil {
 		t.Fatal(err)
 	}
-	if scans.calls != 0 || analysis.calls != 1 || !reflect.DeepEqual(stages, []int{2, 3}) {
-		t.Fatalf("scan=%d analysis=%d stages=%v", scans.calls, analysis.calls, stages)
+	if scans.calls != 0 || analysis.calls != 1 || updates[len(updates)-1].Phase != "finalizing" {
+		t.Fatalf("scan=%d analysis=%d updates=%v", scans.calls, analysis.calls, updates)
 	}
 	if analysis.taskID != "recover" || !reflect.DeepEqual(analysis.roots, []string{`D:\media`}) {
 		t.Fatalf("analysis task=%q roots=%v", analysis.taskID, analysis.roots)
 	}
-	stages = nil
-	if err := runner.Run(context.Background(), request, 2, func(stage int) error { stages = append(stages, stage); return nil }); err != nil {
+	updates = nil
+	if err := runner.Run(localtask.RunControl{Context: context.Background()}, request, localtask.Task{TaskID: request.TaskID, Stage: 2, Phase: "stage2", ProgressComplete: 1, ProgressTotal: 2, ProgressTotalKnown: true}, func(update localtask.ProgressUpdate) error { updates = append(updates, update); return nil }); err != nil {
 		t.Fatal(err)
 	}
-	if scans.calls != 0 || analysis.calls != 2 || !reflect.DeepEqual(stages, []int{2, 3}) {
-		t.Fatalf("stage2 recovery scan=%d analysis=%d stages=%v", scans.calls, analysis.calls, stages)
+	if scans.calls != 0 || analysis.calls != 2 || updates[0].Phase != "stage2" || updates[0].ProgressComplete != 1 {
+		t.Fatalf("stage2 recovery scan=%d analysis=%d updates=%v", scans.calls, analysis.calls, updates)
 	}
 	request.Roots[0] = `D:\changed`
 	if !reflect.DeepEqual(analysis.roots, []string{`D:\media`}) {
@@ -369,13 +572,14 @@ func TestLocalTaskRunnerRecoverySkipsScanAndCompletesStageThree(t *testing.T) {
 func TestLocalTaskRunnerScanOnlyEndsAtStageOne(t *testing.T) {
 	scans := &recordingLocalScanRunner{}
 	runner := &agentLocalTaskRunner{scans: scans, analysis: &recordingLocalAnalysisRunner{}}
-	var stages []int
+	var updates []localtask.ProgressUpdate
 	request := proto.LocalTaskCreateRequest{TaskID: "scan", Roots: []string{`D:\media`}, Mode: proto.LocalTaskModeScanOnly}
-	if err := runner.Run(context.Background(), request, 0, func(stage int) error { stages = append(stages, stage); return nil }); err != nil {
+	if err := runner.Run(localtask.RunControl{Context: context.Background()}, request, localtask.Task{TaskID: request.TaskID, InstanceID: "instance-scan", Phase: "waiting"}, func(update localtask.ProgressUpdate) error { updates = append(updates, update); return nil }); err != nil {
 		t.Fatal(err)
 	}
-	if scans.calls != 1 || !reflect.DeepEqual(stages, []int{1}) {
-		t.Fatalf("scan=%d stages=%v", scans.calls, stages)
+	last := updates[len(updates)-1]
+	if scans.calls != 1 || scans.tasks[0].InstanceID != "instance-scan" || last.Phase != "finalizing" || last.Stage != 1 || last.ProgressComplete != 1 || last.ProgressTotal != 1 || !last.ProgressTotalKnown {
+		t.Fatalf("scan=%d tasks=%#v updates=%v", scans.calls, scans.tasks, updates)
 	}
 }
 
@@ -383,16 +587,347 @@ func TestLocalTaskRunnerAutoAnalysisPersistsEveryDurableCheckpoint(t *testing.T)
 	scans := &recordingLocalScanRunner{}
 	analysis := &recordingLocalAnalysisRunner{}
 	runner := &agentLocalTaskRunner{scans: scans, analysis: analysis}
-	var stages []int
+	var updates []localtask.ProgressUpdate
 	request := proto.LocalTaskCreateRequest{TaskID: "auto", Roots: []string{`D:\media`}, Mode: proto.LocalTaskModeScanThenAnalysis}
-	if err := runner.Run(context.Background(), request, 0, func(stage int) error { stages = append(stages, stage); return nil }); err != nil {
+	if err := runner.Run(localtask.RunControl{Context: context.Background()}, request, localtask.Task{TaskID: request.TaskID, Phase: "waiting"}, func(update localtask.ProgressUpdate) error { updates = append(updates, update); return nil }); err != nil {
 		t.Fatal(err)
 	}
-	if scans.calls != 1 || analysis.calls != 1 || !reflect.DeepEqual(stages, []int{1, 2, 3}) {
-		t.Fatalf("scan=%d analysis=%d stages=%v", scans.calls, analysis.calls, stages)
+	if scans.calls != 1 || analysis.calls != 1 || updates[len(updates)-1].Phase != "finalizing" {
+		t.Fatalf("scan=%d analysis=%d updates=%v", scans.calls, analysis.calls, updates)
 	}
 	if analysis.taskID != "auto" || !reflect.DeepEqual(analysis.roots, []string{`D:\media`}) {
 		t.Fatalf("analysis task=%q roots=%v", analysis.taskID, analysis.roots)
+	}
+}
+
+// Break caught: production scan/analysis progress structs were marshalled
+// directly, so the NodeTray display contract changed shape at every phase and
+// analysis erased the scan speed, failures, and elapsed duration.
+func TestLocalTaskRunnerEmitsStableDisplayStatsAcrossScanAndAnalysis(t *testing.T) {
+	base := time.Unix(1_700_000_000, 0)
+	times := []time.Time{base, base.Add(time.Second), base.Add(2 * time.Second), base.Add(3 * time.Second)}
+	nextTime := func() time.Time {
+		value := times[0]
+		times = times[1:]
+		return value
+	}
+	runner := &agentLocalTaskRunner{
+		scans:    &displayStatsLocalScanRunner{},
+		analysis: &recordingLocalAnalysisRunner{},
+		now:      nextTime,
+	}
+	var updates []localtask.ProgressUpdate
+	request := proto.LocalTaskCreateRequest{TaskID: "stats-contract", Roots: []string{`D:\media`}, Mode: proto.LocalTaskModeScanThenAnalysis}
+	if err := runner.Run(localtask.RunControl{Context: context.Background()}, request, localtask.Task{
+		TaskID: request.TaskID, InstanceID: "stats-instance", Phase: "waiting",
+	}, func(update localtask.ProgressUpdate) error {
+		updates = append(updates, update)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	type displayStats struct {
+		SchemaVersion int     `json:"schema_version"`
+		Speed         float64 `json:"speed"`
+		Failures      int64   `json:"failures"`
+		DurationMS    int64   `json:"duration_ms"`
+	}
+	var scanFinal *displayStats
+	analysisDurations := make([]int64, 0, 3)
+	for _, update := range updates {
+		var stats displayStats
+		if err := json.Unmarshal([]byte(update.StatsJSON), &stats); err != nil {
+			t.Fatalf("phase=%q stats_json=%q: %v", update.Phase, update.StatsJSON, err)
+		}
+		var raw map[string]any
+		if err := json.Unmarshal([]byte(update.StatsJSON), &raw); err != nil {
+			t.Fatal(err)
+		}
+		for _, key := range []string{"schema_version", "speed", "failures", "duration_ms"} {
+			if _, ok := raw[key]; !ok {
+				t.Fatalf("phase=%q stats_json=%q missing %q", update.Phase, update.StatsJSON, key)
+			}
+		}
+		if stats.SchemaVersion != proto.LocalTaskDisplayStatsVersion {
+			t.Fatalf("phase=%q schema_version=%d", update.Phase, stats.SchemaVersion)
+		}
+		if update.Phase == "scan" && update.Stage == 1 {
+			copy := stats
+			scanFinal = &copy
+		}
+		if phaseRank(update.Phase) >= phaseRank("stage2") {
+			if stats.Speed != 12.5 || stats.Failures != 2 {
+				t.Fatalf("analysis phase=%q stats=%#v, want preserved scan speed/failures", update.Phase, stats)
+			}
+			analysisDurations = append(analysisDurations, stats.DurationMS)
+		}
+	}
+	if scanFinal == nil || scanFinal.Speed != 12.5 || scanFinal.Failures != 2 || scanFinal.DurationMS != 4_000 {
+		t.Fatalf("scan final stats=%#v", scanFinal)
+	}
+	if want := []int64{5_000, 6_000, 7_000}; !reflect.DeepEqual(analysisDurations, want) {
+		t.Fatalf("analysis durations=%v, want %v", analysisDurations, want)
+	}
+}
+
+// Break caught: local-task scan progress uses aggregate/stale controller data,
+// or a later lower snapshot regresses counters already shown for this instance.
+func TestLocalTaskIOSnapshotUsesExactInstanceAndDoesNotRegress(t *testing.T) {
+	controller := &localTaskIOController{snapshots: []diskio.Snapshot{
+		{},
+		{Concurrency: 4, EffectiveBytesPerSecond: 12_582_912, LeaseWait: 250 * time.Millisecond, SequentialBytes: 67_108_864, SeekCount: 7, BusyWorkers: 3, IOWaitWorkers: 2},
+		{Concurrency: 1, EffectiveBytesPerSecond: 1024, LeaseWait: time.Millisecond, SequentialBytes: 1024, SeekCount: 1, BusyWorkers: 1, IOWaitWorkers: 1},
+	}}
+	runner := &agentLocalTaskRunner{
+		scans: &displayStatsLocalScanRunner{}, analysis: &recordingLocalAnalysisRunner{}, ioController: controller,
+	}
+	request := proto.LocalTaskCreateRequest{TaskID: "io-task", Roots: []string{`D:\media`}, Mode: proto.LocalTaskModeScanThenAnalysis}
+	var updates []localtask.ProgressUpdate
+	if err := runner.Run(localtask.RunControl{Context: context.Background()}, request, localtask.Task{
+		TaskID: request.TaskID, InstanceID: "io-instance", Revision: 17, Phase: "waiting",
+	}, func(update localtask.ProgressUpdate) error {
+		updates = append(updates, update)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(controller.calls) < 3 {
+		t.Fatalf("Snapshot calls=%v, want progress and final snapshots", controller.calls)
+	}
+	for _, call := range controller.calls {
+		if call != [2]string{"io-task", "io-instance"} {
+			t.Fatalf("Snapshot identity=%v, want exact current instance", call)
+		}
+	}
+	var got proto.LocalTaskDisplayStats
+	if err := json.Unmarshal([]byte(updates[len(updates)-1].StatsJSON), &got); err != nil {
+		t.Fatal(err)
+	}
+	want := proto.TaskIOStats{
+		DiskConcurrency: 4, EffectiveReadBPS: 12_582_912, LeaseWaitMS: 250,
+		SequentialBytes: 67_108_864, SeekCount: 7, BusyWorkers: 3, IOWaitWorkers: 2,
+	}
+	if got.IO != want {
+		t.Fatalf("final I/O stats=%#v, want monotonic %#v", got.IO, want)
+	}
+}
+
+// Break caught: Stats v2 rejects persisted v1 values wholesale instead of
+// carrying the original display fields forward with zero-valued I/O metrics.
+func TestLocalTaskIOStatsV1DecodePreservesLegacyFields(t *testing.T) {
+	got := runnerDecodeDisplayStats(`{"schema_version":1,"speed":6.5,"failures":2,"duration_ms":9000}`)
+	if got.SchemaVersion != 2 || got.Speed != 6.5 || got.Failures != 2 || got.DurationMS != 9_000 || got.IO != (proto.TaskIOStats{}) {
+		t.Fatalf("decoded v1 stats=%#v", got)
+	}
+}
+
+// Break caught: resolver/enumerator failures increment both Failed and its
+// diagnostic subset ScanErrors, and the display path counted both fields.
+func TestLocalTaskRunnerProductionResolverErrorCountsOneDisplayFailure(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "agent.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	cfg := config.DefaultAgent()
+	cfg.MachineID = "machine-display-failure"
+	logger := slog.New(slog.NewJSONHandler(&bytes.Buffer{}, nil))
+	scans := agent.NewScanManagerWithResolver(cfg, db, nil, nil, logger, logger, func(string) (diskio.Identity, error) {
+		return diskio.Identity{}, errors.New("volume unavailable")
+	})
+	runner := &agentLocalTaskRunner{scans: scans, analysis: &recordingLocalAnalysisRunner{}}
+	request := proto.LocalTaskCreateRequest{
+		TaskID: "resolver-failure", Roots: []string{`Z:\missing`}, Mode: proto.LocalTaskModeScanOnly,
+	}
+	var updates []localtask.ProgressUpdate
+	if err := runner.Run(localtask.RunControl{Context: context.Background()}, request, localtask.Task{
+		TaskID: request.TaskID, InstanceID: "resolver-instance", Phase: "waiting",
+	}, func(update localtask.ProgressUpdate) error {
+		updates = append(updates, update)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var final proto.LocalTaskDisplayStats
+	var finalStatsJSON string
+	found := false
+	for _, update := range updates {
+		if update.Phase != "scan" || update.Stage != 1 {
+			continue
+		}
+		if err := json.Unmarshal([]byte(update.StatsJSON), &final); err != nil {
+			t.Fatalf("stats_json=%q: %v", update.StatsJSON, err)
+		}
+		finalStatsJSON = update.StatsJSON
+		found = true
+	}
+	if !found {
+		t.Fatal("final scan display stats were not emitted")
+	}
+	nodeService := nodetrayapp.NewService(nodetrayapp.Dependencies{LocalAgent: &displayStatsListGateway{task: proto.LocalTask{
+		TaskID: "resolver-failure", InstanceID: "resolver-instance", Revision: 1,
+		Mode: proto.LocalTaskModeScanOnly, Status: "succeeded", StatsJSON: finalStatsJSON,
+	}}})
+	page := nodeService.ListLocalTasks(context.Background(), traymodel.PageRequest{Limit: 50})
+	if !page.OK || len(page.Tasks) != 1 || page.Tasks[0].Failures != 1 {
+		t.Fatalf("NodeTray/Wails page=%#v, want one resolver failure", page)
+	}
+}
+
+func TestAgentLocalTaskRunnerWaitsForScanDrainBeforeReturning(t *testing.T) {
+	scan := newBlockedLocalScanRunner()
+	runner := &agentLocalTaskRunner{scans: scan, analysis: &recordingLocalAnalysisRunner{}}
+	drain := make(chan struct{})
+	control := localtask.RunControl{Context: context.Background(), Drain: drain, Reason: func() localtask.DrainReason { return localtask.DrainPause }}
+	request := proto.LocalTaskCreateRequest{TaskID: "drain-scan", Roots: []string{`D:\media`}, Mode: proto.LocalTaskModeScanOnly}
+	done := make(chan error, 1)
+	go func() {
+		done <- runner.Run(control, request, localtask.Task{TaskID: request.TaskID, Phase: "waiting"}, func(localtask.ProgressUpdate) error { return nil })
+	}()
+	<-scan.started
+	close(drain)
+	<-scan.drainCalled
+	select {
+	case err := <-done:
+		t.Fatalf("runner returned before scan terminal: %v", err)
+	default:
+	}
+	scan.finish(proto.TaskDrainPause)
+	if err := <-done; !errors.Is(err, localtask.ErrDrainRequested) {
+		t.Fatalf("error=%v", err)
+	}
+}
+
+// Break caught: analysis begin rewrote a control state to running after the
+// scan terminal, preventing Service from settling pause, stop, or delete.
+func TestLocalTaskControlBetweenScanTerminalAndAnalysisBeginConverges(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		control    func(localtask.RecoverableService, context.Context, localtask.ControlRequest) error
+		wantStatus string
+		deleted    bool
+	}{
+		{
+			name: "pause", wantStatus: "paused",
+			control: func(service localtask.RecoverableService, ctx context.Context, control localtask.ControlRequest) error {
+				got, err := service.Pause(ctx, control)
+				if err == nil && got.Status != "pausing" {
+					return fmt.Errorf("pause accepted status=%q", got.Status)
+				}
+				return err
+			},
+		},
+		{
+			name: "stop", wantStatus: "cancelled",
+			control: func(service localtask.RecoverableService, ctx context.Context, control localtask.ControlRequest) error {
+				got, err := service.Cancel(ctx, control)
+				if err == nil && got.Status != "stopping" {
+					return fmt.Errorf("stop accepted status=%q", got.Status)
+				}
+				return err
+			},
+		},
+		{
+			name: "delete", deleted: true,
+			control: func(service localtask.RecoverableService, ctx context.Context, control localtask.ControlRequest) error {
+				got, err := service.Delete(ctx, control)
+				if err == nil && (got.Task == nil || got.Task.Status != "deleting") {
+					return fmt.Errorf("delete accepted result=%#v", got)
+				}
+				return err
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			dbPath := filepath.Join(t.TempDir(), "agent.db")
+			db, err := store.Open(dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = db.Close() })
+			observed := &observedLocalTaskStore{
+				DB: db, terminal: make(chan observedLifecycleTransition, 1),
+				deleted: make(chan error, 1),
+			}
+			analysis := &beginBarrierLocalAnalysisRunner{
+				engine: localanalysis.NewEngine(
+					"machine-a", rejectedStageOneRunner{}, db, rejectedAnalysisWorker{}, config.Phase2Config{},
+				),
+				entered: make(chan struct{}), release: make(chan struct{}),
+			}
+			runner := &agentLocalTaskRunner{scans: &recordingLocalScanRunner{}, analysis: analysis}
+			service := localtask.NewService("machine-a", observed, runner)
+			if err := service.PrepareRecovery(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := service.ResumeRecoveredTasks(ctx); err != nil {
+				t.Fatal(err)
+			}
+			taskID := "scan-analysis-" + test.name
+			if _, err := service.Create(ctx, proto.LocalTaskCreateRequest{
+				TaskID: taskID, Roots: []string{`D:\media`}, Mode: proto.LocalTaskModeScanThenAnalysis,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-analysis.entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("analysis did not reach begin barrier")
+			}
+			current, err := db.LoadLocalTask(ctx, "machine-a", taskID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			control := localtask.ControlRequest{
+				TaskID: taskID, InstanceID: current.InstanceID, ExpectedRevision: current.Revision,
+			}
+			if err := test.control(service, ctx, control); err != nil {
+				t.Fatal(err)
+			}
+			close(analysis.release)
+
+			if test.deleted {
+				select {
+				case deleteErr := <-observed.deleted:
+					if deleteErr != nil {
+						t.Fatalf("durable delete error=%v", deleteErr)
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatal("delete did not reach durable store")
+				}
+				if _, err := db.LoadLocalTask(ctx, "machine-a", taskID); !errors.Is(err, sql.ErrNoRows) {
+					t.Fatalf("deleted task load error=%v, want sql.ErrNoRows", err)
+				}
+			} else {
+				select {
+				case transition := <-observed.terminal:
+					if transition.target != test.wantStatus || transition.err != nil {
+						t.Fatalf("terminal transition=%#v", transition)
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatal("terminal transition was not attempted")
+				}
+				settled, err := db.LoadLocalTask(ctx, "machine-a", taskID)
+				if err != nil || settled.Status != test.wantStatus {
+					t.Fatalf("settled task=%#v err=%v", settled, err)
+				}
+			}
+			raw, err := sql.Open("sqlite", "file:"+filepath.ToSlash(dbPath))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer raw.Close()
+			var runCount int
+			if err := raw.QueryRow(`SELECT count(*) FROM local_analysis_runs WHERE task_id=?1`, taskID).Scan(&runCount); err != nil {
+				t.Fatal(err)
+			}
+			if runCount != 0 {
+				t.Fatalf("analysis runs after accepted %s=%d, want 0", test.name, runCount)
+			}
+		})
 	}
 }
 
@@ -880,6 +1415,46 @@ func TestSingleInstanceReleasedWhenAgentStartupFails(t *testing.T) {
 	}
 }
 
+// Break caught: a fresh Agent created its data directory but never created the
+// configured contact-sheet cache root before workers could receive jobs.
+func TestAgentStartupCreatesThumbCacheRootBeforeWorkerPoolStart(t *testing.T) {
+	root := t.TempDir()
+	blockedListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blockedListener.Close()
+	cfg := config.DefaultAgent()
+	cfg.PGDSN = ""
+	cfg.ListenAddr = blockedListener.Addr().String()
+	cfg.DataDir = filepath.Join(root, "data")
+	cfg.Thumb.CacheDir = filepath.Join(root, "cache", "thumbcache")
+	cfg.Worker.ExePath = filepath.Join(root, "missing-worker.exe")
+	cfg.UseEverything = false
+	cfg.Tuning.StatsEnabled = false
+	body, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(root, "agent.json")
+	if err := os.WriteFile(configPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	runErr := runWithDependencies(
+		configPath,
+		agent.NewDeleteLogger,
+		fixedMachineIdentity("t"),
+	)
+	if runErr == nil {
+		t.Fatal("run unexpectedly accepted occupied listen address")
+	}
+	info, statErr := os.Lstat(cfg.Thumb.CacheDir)
+	if statErr != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("thumb cache root was not prepared before Worker start: info=%v stat_err=%v run_err=%v", info, statErr, runErr)
+	}
+}
+
 func TestDrainPhase2UsesBoundedProductionContext(t *testing.T) {
 	cfg := config.DefaultAgent()
 	cfg.Worker.ImageTimeoutS = 31
@@ -1147,12 +1722,13 @@ func TestAgentDeleteWiringClosesDedicatedLoggerOnLaterStartupError(t *testing.T)
 			return nil
 		}, nil
 	}
-	if err := runWithDependencies(configPath, openDeleteLogger, fixedMachineIdentity("c")); err == nil {
+	runErr := runWithDependencies(configPath, openDeleteLogger, fixedMachineIdentity("c"))
+	if runErr == nil {
 		t.Fatal("run unexpectedly accepted invalid listen address")
 	}
 	if acquisitions != 1 || closes != 1 {
-		t.Fatalf("delete logger lifecycle acquisitions=%d closes=%d, want 1/1",
-			acquisitions, closes)
+		t.Fatalf("delete logger lifecycle acquisitions=%d closes=%d, want 1/1; run error=%v",
+			acquisitions, closes, runErr)
 	}
 }
 
@@ -1161,14 +1737,58 @@ type lifecyclePool struct {
 	closes int
 }
 
-type recordingLocalScanRunner struct{ calls int }
+type recordingLocalScanRunner struct {
+	calls int
+	tasks []proto.ScanTask
+}
 
 func (r *recordingLocalScanRunner) Prepare(task proto.ScanTask, sender agent.Sender) (proto.TaskAck, func()) {
 	r.calls++
+	r.tasks = append(r.tasks, task)
 	return proto.TaskAck{TaskID: task.TaskID, Accepted: true}, func() {
 		_ = sender(proto.MsgTaskDone, &proto.TaskDone{TaskID: task.TaskID})
 	}
 }
+func (*recordingLocalScanRunner) DrainInstance(string, string, proto.TaskDrainReason) (bool, *proto.TaskStats) {
+	return true, &proto.TaskStats{}
+}
+func (*recordingLocalScanRunner) AbortInstance(string, string) bool { return true }
+
+type displayStatsLocalScanRunner struct{}
+
+type displayStatsListGateway struct {
+	task proto.LocalTask
+}
+
+func (g *displayStatsListGateway) CallLocal(_ context.Context, operation string, _, response any) error {
+	if operation != proto.LocalOperationTaskList {
+		return fmt.Errorf("unexpected operation %q", operation)
+	}
+	list, ok := response.(*proto.LocalTaskListResponse)
+	if !ok {
+		return fmt.Errorf("unexpected response %T", response)
+	}
+	*list = proto.LocalTaskListResponse{Tasks: []proto.LocalTask{g.task}}
+	return nil
+}
+
+func (*displayStatsLocalScanRunner) Prepare(task proto.ScanTask, sender agent.Sender) (proto.TaskAck, func()) {
+	return proto.TaskAck{TaskID: task.TaskID, Accepted: true}, func() {
+		_ = sender(proto.MsgTaskProgress, &proto.TaskProgress{
+			TaskID: task.TaskID, Done: 5, Total: 10, TotalKnown: true,
+			Failed: 2, ElapsedMS: 2_500, Speed: 12.5,
+		})
+		_ = sender(proto.MsgTaskDone, &proto.TaskDone{TaskID: task.TaskID, Stats: proto.TaskStats{
+			Total: 10, Done: 10, Failed: 2, ScanErrors: 1, ElapsedMS: 4_000,
+		}})
+	}
+}
+
+func (*displayStatsLocalScanRunner) DrainInstance(string, string, proto.TaskDrainReason) (bool, *proto.TaskStats) {
+	return true, &proto.TaskStats{}
+}
+
+func (*displayStatsLocalScanRunner) AbortInstance(string, string) bool { return true }
 
 type recordingLocalAnalysisRunner struct {
 	calls  int
@@ -1183,8 +1803,147 @@ func (r *recordingLocalAnalysisRunner) Run(context.Context, string) error {
 func (r *recordingLocalAnalysisRunner) RunWithProgressForRoots(ctx context.Context, task string, roots []string, checkpoint func(int) error) error {
 	r.calls++
 	r.taskID = task
-	r.roots = roots
+	r.roots = append([]string(nil), roots...)
+	if checkpoint == nil {
+		return nil
+	}
 	return checkpoint(2)
+}
+
+func (r *recordingLocalAnalysisRunner) RunWithProgressForRootsAndDrain(_ context.Context, task string, roots []string, _ <-chan struct{}, report func(localanalysis.AnalysisProgress) error) error {
+	r.calls++
+	r.taskID = task
+	r.roots = append([]string(nil), roots...)
+	for _, progress := range []localanalysis.AnalysisProgress{
+		{Phase: "stage2", Complete: 1, Total: 2, TotalKnown: true, CheckpointStage: 2},
+		{Phase: "stage3", Complete: 1, Total: 1, TotalKnown: true, CheckpointStage: 3},
+		{Phase: "finalizing", Complete: 1, Total: 1, TotalKnown: true, CheckpointStage: 3},
+	} {
+		if report != nil {
+			if err := report(progress); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (r *recordingLocalAnalysisRunner) RunWithProgress(_ context.Context, _ string, _ <-chan struct{}, report func(localanalysis.AnalysisProgress) error) error {
+	r.calls++
+	for _, progress := range []localanalysis.AnalysisProgress{
+		{Phase: "stage2", Complete: 1, Total: 2, TotalKnown: true, CheckpointStage: 2},
+		{Phase: "stage3", Complete: 1, Total: 1, TotalKnown: true, CheckpointStage: 3},
+		{Phase: "finalizing", Complete: 1, Total: 1, TotalKnown: true, CheckpointStage: 3},
+	} {
+		if report != nil {
+			if err := report(progress); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+type observedLifecycleTransition struct {
+	target string
+	err    error
+}
+
+type observedLocalTaskStore struct {
+	*store.DB
+	terminal chan observedLifecycleTransition
+	deleted  chan error
+}
+
+func (s *observedLocalTaskStore) TransitionLocalTaskLifecycle(
+	ctx context.Context,
+	machineID string,
+	control store.LocalTaskControl,
+	target string,
+	code *string,
+	message *string,
+) (store.LocalTask, error) {
+	task, err := s.DB.TransitionLocalTaskLifecycle(ctx, machineID, control, target, code, message)
+	if target == "paused" || target == "cancelled" {
+		s.terminal <- observedLifecycleTransition{target: target, err: err}
+	}
+	return task, err
+}
+
+func (s *observedLocalTaskStore) DeleteLocalTaskData(
+	ctx context.Context,
+	machineID string,
+	control store.LocalTaskControl,
+) (store.LocalTaskDeleteResult, error) {
+	result, err := s.DB.DeleteLocalTaskData(ctx, machineID, control)
+	s.deleted <- err
+	return result, err
+}
+
+type beginBarrierLocalAnalysisRunner struct {
+	engine  *localanalysis.Engine
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (r *beginBarrierLocalAnalysisRunner) Run(ctx context.Context, taskID string) error {
+	return r.engine.Run(ctx, taskID)
+}
+
+func (r *beginBarrierLocalAnalysisRunner) RunWithProgress(
+	_ context.Context,
+	taskID string,
+	drain <-chan struct{},
+	_ func(localanalysis.AnalysisProgress) error,
+) error {
+	close(r.entered)
+	<-r.release
+	return r.engine.RunWithProgress(context.Background(), taskID, drain, nil)
+}
+
+type rejectedStageOneRunner struct{}
+
+func (rejectedStageOneRunner) Run(context.Context, string, string) (firstscreen.Result, error) {
+	return firstscreen.Result{}, errors.New("stage one started after lifecycle drain")
+}
+
+type rejectedAnalysisWorker struct{}
+
+func (rejectedAnalysisWorker) Execute(context.Context, *worker.JobMsg) (*worker.JobResultMsg, error) {
+	return nil, errors.New("analysis worker started after lifecycle drain")
+}
+
+type blockedLocalScanRunner struct {
+	started     chan struct{}
+	drainCalled chan struct{}
+	mu          sync.Mutex
+	sender      agent.Sender
+}
+
+func newBlockedLocalScanRunner() *blockedLocalScanRunner {
+	return &blockedLocalScanRunner{started: make(chan struct{}), drainCalled: make(chan struct{})}
+}
+
+func (r *blockedLocalScanRunner) Prepare(task proto.ScanTask, sender agent.Sender) (proto.TaskAck, func()) {
+	r.mu.Lock()
+	r.sender = sender
+	r.mu.Unlock()
+	return proto.TaskAck{TaskID: task.TaskID, Accepted: true}, func() { close(r.started) }
+}
+func (r *blockedLocalScanRunner) DrainInstance(string, string, proto.TaskDrainReason) (bool, *proto.TaskStats) {
+	select {
+	case <-r.drainCalled:
+	default:
+		close(r.drainCalled)
+	}
+	return true, &proto.TaskStats{}
+}
+func (*blockedLocalScanRunner) AbortInstance(string, string) bool { return true }
+func (r *blockedLocalScanRunner) finish(reason proto.TaskDrainReason) {
+	r.mu.Lock()
+	sender := r.sender
+	r.mu.Unlock()
+	_ = sender(proto.MsgTaskDone, &proto.TaskDone{TaskID: "drain-scan", Reason: reason})
 }
 
 type recordingLocalTaskLifecycle struct {
@@ -1196,10 +1955,11 @@ func (r *recordingLocalTaskLifecycle) PrepareRecovery(context.Context) error {
 	close(r.prepared)
 	return nil
 }
-func (r *recordingLocalTaskLifecycle) Resume(context.Context) error {
+func (r *recordingLocalTaskLifecycle) ResumeRecoveredTasks(context.Context) error {
 	close(r.resumed)
 	return nil
 }
+func (*recordingLocalTaskLifecycle) Shutdown(context.Context) error { return nil }
 
 type disabledInfoHandler struct{}
 

@@ -20,6 +20,8 @@ import (
 	"dedup/internal/nodetray/windows/elevation"
 	nodetask "dedup/internal/nodetray/windows/task"
 	traynative "dedup/internal/nodetray/windows/tray"
+	"dedup/internal/proto"
+	"github.com/vmihailenco/msgpack/v5"
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/windows"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
@@ -28,6 +30,61 @@ import (
 type backendTestRecorder struct {
 	mu    sync.Mutex
 	calls []string
+}
+
+type backendControlGateway struct {
+	operation string
+	control   proto.LocalTaskControlRequest
+}
+
+func (f *backendControlGateway) CallLocal(_ context.Context, operation string, request, response any) error {
+	f.operation = operation
+	control, ok := request.(proto.LocalTaskControlRequest)
+	if !ok {
+		return errors.New("unexpected_control_request")
+	}
+	f.control = control
+	raw, err := msgpack.Marshal(encodedBackendTaskControlResponse())
+	if err != nil {
+		return err
+	}
+	return msgpack.Unmarshal(raw, response)
+}
+
+func encodedBackendTaskControlResponse() proto.LocalTaskControlResponse {
+	return proto.LocalTaskControlResponse{Task: &proto.LocalTask{TaskID: "task-1", InstanceID: "instance-1", Revision: 8, Phase: "analysis", ProgressTotalKnown: true, CreatedAt: 100, UpdatedAt: 200, StartedAt: 110}}
+}
+
+// Break caught: a Wails-exposed task control wrapper calls a stale operation or
+// drops the versioned identity before it reaches the NodeTray service.
+func TestBackendLocalTaskControlsForwardVersionedRequest(t *testing.T) {
+	operations := []struct {
+		name      string
+		operation string
+		call      func(*Backend, traymodel.LocalTaskControl) traymodel.LocalTaskResult
+	}{
+		{"pause", proto.LocalOperationTaskPause, (*Backend).PauseLocalTask},
+		{"resume", proto.LocalOperationTaskResume, (*Backend).ResumeLocalTask},
+		{"cancel", proto.LocalOperationTaskCancel, (*Backend).CancelLocalTask},
+		{"delete", proto.LocalOperationTaskDelete, (*Backend).DeleteLocalTask},
+		{"retry", proto.LocalOperationTaskRetry, (*Backend).RetryLocalTask},
+	}
+	for _, test := range operations {
+		t.Run(test.name, func(t *testing.T) {
+			gateway := &backendControlGateway{}
+			backend := NewBackend(trayapp.NewService(trayapp.Dependencies{LocalAgent: gateway}))
+			backend.Startup(context.Background())
+			t.Cleanup(func() { _ = backend.Shutdown(context.Background()) })
+
+			result := test.call(backend, traymodel.LocalTaskControl{TaskID: "task-1", InstanceID: "instance-1", ExpectedRevision: 7})
+			if !result.OK || result.Task.Revision != 8 || result.Task.Phase != "analysis" {
+				t.Fatalf("result=%#v", result)
+			}
+			if gateway.operation != test.operation || gateway.control != (proto.LocalTaskControlRequest{TaskID: "task-1", InstanceID: "instance-1", ExpectedRevision: 7}) {
+				t.Fatalf("operation=%q control=%#v", gateway.operation, gateway.control)
+			}
+		})
+	}
 }
 
 // Break caught: a valid current task directory is not forwarded to the native

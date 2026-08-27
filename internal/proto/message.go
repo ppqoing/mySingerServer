@@ -61,6 +61,7 @@ const (
 	FieldVideoContactSheet uint32 = 1 << 7
 	FieldVideo6FPHash      uint32 = 1 << 8
 	FieldVideo6FSobel      uint32 = 1 << 9
+	FieldVideoMetadata     uint32 = 1 << 10
 )
 
 const FrameMaskFull uint8 = 0x3f
@@ -188,10 +189,11 @@ type Hello struct {
 }
 
 type ScanTask struct {
-	TaskID  string      `msgpack:"task_id"`
-	Roots   []string    `msgpack:"roots"`
-	Phase   uint8       `msgpack:"phase"`
-	Options ScanOptions `msgpack:"options"`
+	TaskID     string      `msgpack:"task_id"`
+	InstanceID string      `msgpack:"instance_id,omitempty"`
+	Roots      []string    `msgpack:"roots"`
+	Phase      uint8       `msgpack:"phase"`
+	Options    ScanOptions `msgpack:"options"`
 }
 
 type ScanOptions struct {
@@ -228,10 +230,10 @@ type Phase2Item struct {
 	Size       int64  `msgpack:"size"`
 	// MTimeMS carries the file modification time in Unix seconds despite its
 	// name; the identifier is kept for wire compatibility.
-	MTimeMS    int64  `msgpack:"mtime_ms"`
-	Kind       uint8  `msgpack:"kind"`
-	FrameMask  uint8  `msgpack:"frame_mask"`
-	DurationMS int64  `msgpack:"duration_ms"`
+	MTimeMS    int64 `msgpack:"mtime_ms"`
+	Kind       uint8 `msgpack:"kind"`
+	FrameMask  uint8 `msgpack:"frame_mask"`
+	DurationMS int64 `msgpack:"duration_ms"`
 }
 
 func (item Phase2Item) Validate() error {
@@ -378,33 +380,49 @@ type StatsReport struct {
 	DecodeP95MS  float64     `msgpack:"decode_p95_ms,omitempty"`
 }
 
+type TaskIOStats struct {
+	DiskConcurrency  int     `json:"disk_concurrency" msgpack:"disk_concurrency"`
+	EffectiveReadBPS float64 `json:"effective_read_bps" msgpack:"effective_read_bps"`
+	LeaseWaitMS      int64   `json:"lease_wait_ms" msgpack:"lease_wait_ms"`
+	SequentialBytes  int64   `json:"sequential_bytes" msgpack:"sequential_bytes"`
+	SeekCount        int64   `json:"seek_count" msgpack:"seek_count"`
+	BusyWorkers      int     `json:"busy_workers" msgpack:"busy_workers"`
+	IOWaitWorkers    int     `json:"io_wait_workers" msgpack:"io_wait_workers"`
+}
+
 type TaskProgress struct {
-	TaskID string  `msgpack:"task_id"`
-	Done   int64   `msgpack:"done"`
-	Total  int64   `msgpack:"total"`
-	Speed  float64 `msgpack:"speed"`
+	TaskID     string      `msgpack:"task_id"`
+	Done       int64       `msgpack:"done"`
+	Total      int64       `msgpack:"total"`
+	TotalKnown bool        `msgpack:"total_known"`
+	Failed     int64       `msgpack:"failed"`
+	ElapsedMS  int64       `msgpack:"elapsed_ms"`
+	Speed      float64     `msgpack:"speed"`
+	IO         TaskIOStats `msgpack:"io"`
 }
 
 type FeatureItem struct {
-	Path         string         `msgpack:"path"`
-	SHA512       string         `msgpack:"sha512,omitempty"`
-	Size         int64          `msgpack:"size"`
-	MTime        int64          `msgpack:"mtime"`
-	Status       string         `msgpack:"status"`
-	Err          string         `msgpack:"err,omitempty"`
-	FieldsDone   uint32         `msgpack:"fields_done,omitempty"`
-	PDQ256       string         `msgpack:"pdq256,omitempty"`
-	Quality      int32          `msgpack:"quality,omitempty"`
-	Width        int32          `msgpack:"width,omitempty"`
-	Height       int32          `msgpack:"height,omitempty"`
-	DurationMS   *int64         `msgpack:"duration_ms,omitempty"`
-	ThumbPath    string         `msgpack:"thumb_path,omitempty"`
-	ThumbPDQ256  string         `msgpack:"thumb_pdq256,omitempty"`
-	ThumbQuality *int32         `msgpack:"thumb_quality,omitempty"`
-	FieldErrors  []FieldError   `msgpack:"field_errors,omitempty"`
-	PHashParts   []byte         `msgpack:"phash_parts,omitempty"`
-	SobelHist    []byte         `msgpack:"sobel_hist,omitempty"`
-	Frames       []FrameFeature `msgpack:"frames,omitempty"`
+	Path           string                  `msgpack:"path"`
+	SHA512         string                  `msgpack:"sha512,omitempty"`
+	Size           int64                   `msgpack:"size"`
+	MTime          int64                   `msgpack:"mtime"`
+	Status         string                  `msgpack:"status"`
+	Err            string                  `msgpack:"err,omitempty"`
+	FieldsDone     uint32                  `msgpack:"fields_done,omitempty"`
+	PDQ256         string                  `msgpack:"pdq256,omitempty"`
+	Quality        int32                   `msgpack:"quality,omitempty"`
+	Width          int32                   `msgpack:"width,omitempty"`
+	Height         int32                   `msgpack:"height,omitempty"`
+	DurationMS     *int64                  `msgpack:"duration_ms,omitempty"`
+	ThumbPath      string                  `msgpack:"thumb_path,omitempty"`
+	ThumbPDQ256    string                  `msgpack:"thumb_pdq256,omitempty"`
+	ThumbQuality   *int32                  `msgpack:"thumb_quality,omitempty"`
+	FieldErrors    []FieldError            `msgpack:"field_errors,omitempty"`
+	PHashParts     []byte                  `msgpack:"phash_parts,omitempty"`
+	SobelHist      []byte                  `msgpack:"sobel_hist,omitempty"`
+	Frames         []FrameFeature          `msgpack:"frames,omitempty"`
+	VideoContainer *VideoContainerMetadata `msgpack:"video_container,omitempty"`
+	VideoStreams   []VideoStreamMetadata   `msgpack:"video_streams,omitempty"`
 }
 
 type FrameFeature struct {
@@ -450,11 +468,18 @@ type TaskStats struct {
 }
 
 type TaskDone struct {
-	TaskID string    `msgpack:"task_id"`
-	Stats  TaskStats `msgpack:"stats"`
-	// Reason is empty for a natural completion and "cancelled" when the run
-	// unwound after a MsgScanTaskCancel.
-	Reason string `msgpack:"reason,omitempty"`
+	TaskID string          `msgpack:"task_id"`
+	Stats  TaskStats       `msgpack:"stats"`
+	Reason TaskDrainReason `msgpack:"reason,omitempty"`
+}
+
+func (done TaskDone) Validate() error {
+	switch done.Reason {
+	case "", "cancelled", TaskDrainPause, TaskDrainStop, TaskDrainDelete, TaskDrainProcessShutdown:
+		return nil
+	default:
+		return fmt.Errorf("%s", InvalidTaskDrainReasonErrorCode)
+	}
 }
 
 type Error struct {

@@ -148,6 +148,9 @@ try {
         build_date = $BuildDate
         source_revision = $SourceRevision
         portable_root = '.'
+        compatibility = [ordered]@{
+            media_metadata_schema_version = 5
+        }
         files = @(Get-ManifestFiles -Root $payload)
     }
     Write-Utf8NoBom -Path (Join-Path $payload 'release-manifest.json') -Value (($manifest | ConvertTo-Json -Depth 8) + [Environment]::NewLine)

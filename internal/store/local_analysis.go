@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"database/sql"
@@ -10,6 +11,8 @@ import (
 	"fmt"
 	"sort"
 	"time"
+
+	"dedup/internal/firstscreen"
 )
 
 const MaxLocalPageSize = 200
@@ -53,6 +56,148 @@ type LocalAnalysisGroup struct {
 	Category             string
 	RepresentativeFileID int64
 	Members              []LocalAnalysisMember
+}
+
+// LoadLocalStageOneForRun rebuilds the immutable stage-one input from the
+// durable pair and exact-group rows of a building run. It is used only after a
+// later-stage pair checkpoint exists, so recovery never calls destructive
+// stage-one replacement over saved stage-two or stage-three JSON.
+func (d *DB) LoadLocalStageOneForRun(ctx context.Context, runID string) (firstscreen.Result, error) {
+	if runID == "" {
+		return firstscreen.Result{}, fmt.Errorf("store: load local stage one: empty run ID")
+	}
+	var machineID, status string
+	if err := d.db.QueryRowContext(ctx, `SELECT machine_id,status FROM local_analysis_runs WHERE run_id=?1`, runID).Scan(&machineID, &status); err != nil {
+		return firstscreen.Result{}, fmt.Errorf("store: load local stage one: load run: %w", err)
+	}
+	if status != "building" {
+		return firstscreen.Result{}, fmt.Errorf("store: load local stage one: run is not building")
+	}
+	pairs, err := d.ListLocalPairScoresForRun(ctx, runID)
+	if err != nil {
+		return firstscreen.Result{}, err
+	}
+	result := firstscreen.Result{ExactVerdicts: make(map[[64]byte]string)}
+	fileIDs := make(map[int64]struct{}, len(pairs)*2)
+	for _, row := range pairs {
+		var stage1 struct {
+			Kind           string `json:"kind"`
+			Hamming        int    `json:"hamming"`
+			DurationDiffMS int64  `json:"duration_diff_ms"`
+			QualityA       int    `json:"quality_a"`
+			QualityB       int    `json:"quality_b"`
+		}
+		if err := json.Unmarshal([]byte(row.Stage1JSON), &stage1); err != nil {
+			return firstscreen.Result{}, fmt.Errorf("store: load local stage one: decode pair %q: %w", row.PairKey, err)
+		}
+		if stage1.Kind != firstscreen.KindImageCandidate && stage1.Kind != firstscreen.KindVideoCandidate {
+			return firstscreen.Result{}, fmt.Errorf("store: load local stage one: invalid pair kind %q", stage1.Kind)
+		}
+		left, leftOK := firstscreenSHA(row.LeftSHA512)
+		right, rightOK := firstscreenSHA(row.RightSHA512)
+		if !leftOK || !rightOK || row.PairKey != stage1.Kind+":"+row.LeftSHA512+":"+row.RightSHA512 {
+			return firstscreen.Result{}, fmt.Errorf("store: load local stage one: invalid pair identity %q", row.PairKey)
+		}
+		result.CandidatePairs = append(result.CandidatePairs, firstscreen.CandidatePair{
+			Kind: stage1.Kind, ShaA: left, ShaB: right, Hamming: stage1.Hamming,
+			DurationDiffMs: stage1.DurationDiffMS, QualityA: stage1.QualityA, QualityB: stage1.QualityB,
+		})
+		fileIDs[row.LeftFileID] = struct{}{}
+		fileIDs[row.RightFileID] = struct{}{}
+	}
+
+	type exactMember struct {
+		groupID string
+		fileID  int64
+		sha     [64]byte
+	}
+	exactRows, err := d.db.QueryContext(ctx, `
+		SELECT g.group_id,m.file_id,m.sha512
+		FROM local_dup_groups g
+		JOIN local_dup_members m ON m.run_id=g.run_id AND m.group_id=g.group_id
+		WHERE g.run_id=?1 AND g.category='exact'
+		ORDER BY g.group_id,m.file_id`, runID)
+	if err != nil {
+		return firstscreen.Result{}, fmt.Errorf("store: load local stage one: query exact groups: %w", err)
+	}
+	var exact []exactMember
+	for exactRows.Next() {
+		var member exactMember
+		var shaText string
+		if err := exactRows.Scan(&member.groupID, &member.fileID, &shaText); err != nil {
+			exactRows.Close()
+			return firstscreen.Result{}, err
+		}
+		var ok bool
+		member.sha, ok = firstscreenSHA(shaText)
+		if !ok {
+			exactRows.Close()
+			return firstscreen.Result{}, fmt.Errorf("store: load local stage one: invalid exact member SHA")
+		}
+		exact = append(exact, member)
+		fileIDs[member.fileID] = struct{}{}
+	}
+	if err := exactRows.Err(); err != nil {
+		exactRows.Close()
+		return firstscreen.Result{}, err
+	}
+	if err := exactRows.Close(); err != nil {
+		return firstscreen.Result{}, err
+	}
+
+	filesByID := make(map[int64]firstscreen.File, len(fileIDs))
+	for fileID := range fileIDs {
+		var file firstscreen.File
+		var shaText string
+		if err := d.db.QueryRowContext(ctx, `
+			SELECT id,machine_id,disk_no,path,size,sha512 FROM files
+			WHERE machine_id=?1 AND id=?2`, machineID, fileID).Scan(
+			&file.ID, &file.MachineID, &file.DiskNo, &file.Path, &file.Size, &shaText,
+		); err != nil {
+			return firstscreen.Result{}, fmt.Errorf("store: load local stage one: load file %d: %w", fileID, err)
+		}
+		sha, ok := firstscreenSHA(shaText)
+		if !ok {
+			return firstscreen.Result{}, fmt.Errorf("store: load local stage one: invalid file SHA")
+		}
+		file.SHA512 = sha
+		filesByID[fileID] = file
+		result.Files = append(result.Files, file)
+	}
+	sort.Slice(result.Files, func(i, j int) bool {
+		if order := bytes.Compare(result.Files[i].SHA512[:], result.Files[j].SHA512[:]); order != 0 {
+			return order < 0
+		}
+		return result.Files[i].ID < result.Files[j].ID
+	})
+	for index := 0; index < len(exact); {
+		end := index + 1
+		for end < len(exact) && exact[end].groupID == exact[index].groupID {
+			end++
+		}
+		group := firstscreen.ExactGroup{SHA512: exact[index].sha}
+		for _, member := range exact[index:end] {
+			file, ok := filesByID[member.fileID]
+			if !ok || file.SHA512 != group.SHA512 {
+				return firstscreen.Result{}, fmt.Errorf("store: load local stage one: exact group identity mismatch")
+			}
+			group.Members = append(group.Members, file.FileRef)
+		}
+		if len(group.Members) < 2 {
+			return firstscreen.Result{}, fmt.Errorf("store: load local stage one: exact group has fewer than two members")
+		}
+		result.ExactGroups = append(result.ExactGroups, group)
+		result.ExactVerdicts[group.SHA512] = "yes"
+		index = end
+	}
+	for index, row := range pairs {
+		left, leftOK := filesByID[row.LeftFileID]
+		right, rightOK := filesByID[row.RightFileID]
+		if !leftOK || !rightOK || left.SHA512 != result.CandidatePairs[index].ShaA || right.SHA512 != result.CandidatePairs[index].ShaB {
+			return firstscreen.Result{}, fmt.Errorf("store: load local stage one: pair file identity mismatch")
+		}
+	}
+	return result, nil
 }
 
 // ReplaceLocalAnalysisGroups atomically replaces only the final groups of a
@@ -185,11 +330,6 @@ func (d *DB) BeginLocalAnalysis(ctx context.Context, machineID, taskID string) (
 		INSERT INTO local_analysis_runs(run_id,machine_id,generation,task_id,status,created_at)
 		VALUES (?1,?2,?3,?4,'building',?5)`, runID, machineID, generation, taskID, now); err != nil {
 		return LocalAnalysisRun{}, fmt.Errorf("store: insert local analysis: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, `
-		UPDATE local_tasks SET status='running',started_at=COALESCE(started_at,?2),updated_at=?2
-		WHERE task_id=?1`, taskID, now); err != nil {
-		return LocalAnalysisRun{}, fmt.Errorf("store: start local analysis task: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return LocalAnalysisRun{}, err
@@ -407,6 +547,49 @@ func (d *DB) SaveLocalPairScore(ctx context.Context, pair LocalPairScore) error 
 		return fmt.Errorf("store: save local pair score: run or file identity mismatch")
 	}
 	return nil
+}
+
+func (d *DB) ListLocalPairScoresForRun(ctx context.Context, runID string) ([]LocalPairScore, error) {
+	if runID == "" {
+		return nil, fmt.Errorf("store: list local pair scores for run: empty run ID")
+	}
+	rows, err := d.db.QueryContext(ctx, `
+		SELECT pair_id,machine_id,run_id,generation,pair_key,
+		       left_file_id,right_file_id,left_sha512,right_sha512,
+		       stage1_json,stage2_json,stage3_json,final_verdict
+		FROM local_pair_scores
+		WHERE run_id=?1
+		ORDER BY pair_key,pair_id`, runID)
+	if err != nil {
+		return nil, fmt.Errorf("store: list local pair scores for run: %w", err)
+	}
+	defer rows.Close()
+	result := make([]LocalPairScore, 0)
+	for rows.Next() {
+		var pair LocalPairScore
+		var stage2, stage3 sql.NullString
+		if err := rows.Scan(
+			&pair.PairID, &pair.MachineID, &pair.RunID, &pair.Generation,
+			&pair.PairKey, &pair.LeftFileID, &pair.RightFileID,
+			&pair.LeftSHA512, &pair.RightSHA512, &pair.Stage1JSON,
+			&stage2, &stage3, &pair.Verdict,
+		); err != nil {
+			return nil, err
+		}
+		if stage2.Valid {
+			value := stage2.String
+			pair.Stage2JSON = &value
+		}
+		if stage3.Valid {
+			value := stage3.String
+			pair.Stage3JSON = &value
+		}
+		result = append(result, pair)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: list local pair scores for run: %w", err)
+	}
+	return result, nil
 }
 
 func (d *DB) ListCurrentLocalPairScores(ctx context.Context, machineID string, offset, limit int) ([]LocalPairScore, error) {

@@ -5,15 +5,51 @@ import (
 	"context"
 	"crypto/sha512"
 	"errors"
+	"image/color"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"dedup/internal/proto"
 	"dedup/internal/worker"
 	"dedup/internal/wproc/videocore"
 )
+
+// Break caught: a frame/contact-sheet failure erases metadata that was frozen
+// successfully after the same AVFormatContext completed stream probing.
+func TestSessionPipelineKeepsVideoMetadataWhenContactSheetFails(t *testing.T) {
+	job, deps, fake := newSessionPipelineTest(t, worker.MediaVideo,
+		worker.MaskVideoMetadata|worker.MaskVideoContactSheet, 0)
+	job.Phase = worker.Phase1
+	deps.query = sessionPipelineMissingReply(job,
+		worker.MaskVideoMetadata|worker.MaskVideoContactSheet, 0)
+	primary := int32(0)
+	fake.videoMetadata = &videocore.VideoMetadata{
+		Container: proto.VideoContainerMetadata{
+			FormatName: "mov,mp4", TagsJSON: `{}`, PrimaryVideoStream: &primary,
+		},
+		Streams: []proto.VideoStreamMetadata{{
+			Index: 0, MediaType: "video", CodecID: 27, CodecName: "h264", TagsJSON: `{}`,
+		}},
+	}
+	fake.analyzeErr = errors.New("contact sheet decode failed")
+
+	result, err := processMediaWithDeps(context.Background(), sessionPipelineTestConfig(), job, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.FieldsDone&worker.MaskVideoMetadata == 0 || result.VideoContainer == nil || len(result.VideoStreams) != 1 {
+		t.Fatalf("metadata lost on independent failure: %#v", result)
+	}
+	if result.FieldsDone&worker.MaskVideoContactSheet != 0 || len(result.Errors) == 0 {
+		t.Fatalf("contact failure not isolated: %#v", result)
+	}
+	if fake.rehashes != 1 {
+		t.Fatalf("partial metadata result skipped final identity rehash: %d", fake.rehashes)
+	}
+}
 
 func TestSessionPipelineOneOpenOneHashOneAnalyze(t *testing.T) {
 	job, deps, fake := newSessionPipelineTest(t, worker.MediaImage,
@@ -34,41 +70,27 @@ func TestSessionPipelineOneOpenOneHashOneAnalyze(t *testing.T) {
 	}
 }
 
-func TestSessionPipelinePhase1ImagePublishesNativeDimensions(t *testing.T) {
-	job, deps, fake := newSessionPipelineTest(t, worker.MediaImage,
-		worker.MaskSHA512|worker.MaskImagePDQ, 0)
-	job.Phase = worker.Phase1
-	job.KnownSHA = nil
-	deps.query = sessionPipelineMissingReply(job, worker.MaskImagePDQ, 0)
-	fake.result = videocore.AnalysisResult{
-		MediaType: 1, ImageStatus: videocore.StatusOK,
-		ImageWidth: 640, ImageHeight: 480,
-		ImageFeatures: videocore.FeatureSet{PDQ: [32]byte{5}, PDQQuality: 82},
+// Break caught: file-level decoder failures combine independent requested
+// fields into one protocol-invalid error instead of preserving each field.
+func TestSessionPipelineFileErrorSplitsRequestedFieldBits(t *testing.T) {
+	job := &worker.JobMsg{
+		JobID: 801, Path: `D:\media\broken.mp4`, Kind: worker.MediaVideo,
+		Phase:      worker.Phase1,
+		FieldsMask: worker.MaskSHA512 | worker.MaskVideoDuration | worker.MaskVideoContactSheet,
 	}
-
-	result, err := processMediaWithDeps(context.Background(), sessionPipelineTestConfig(), job, deps)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Width != 640 || result.Height != 480 ||
-		result.FieldsDone&worker.MaskImagePDQ == 0 {
-		t.Fatalf("phase-1 image dimensions/result = %dx%d %#v", result.Width, result.Height, result)
-	}
-}
-
-func TestSessionPipelineFileErrorUsesSingleFieldBits(t *testing.T) {
-	result := sessionPipelineFileError(
-		&worker.JobResultMsg{},
+	result := newSessionPipelineResult(job)
+	sessionPipelineFileError(result,
 		worker.MaskVideoDuration|worker.MaskVideoContactSheet,
-		"video_contact_sheet",
-		errors.New("decode failed"),
-	)
-	if len(result.Errors) != 2 {
-		t.Fatalf("errors = %#v, want one entry per field", result.Errors)
+		"video_probe", errors.New("decoder rejected stream"))
+	if len(result.Errors) != 2 ||
+		result.Errors[0].Field != worker.MaskVideoDuration ||
+		result.Errors[1].Field != worker.MaskVideoContactSheet {
+		t.Fatalf("field errors = %#v", result.Errors)
 	}
-	for _, fieldErr := range result.Errors {
-		if fieldErr.Field == 0 || fieldErr.Field&(fieldErr.Field-1) != 0 {
-			t.Fatalf("error field %#x is not a single bit", fieldErr.Field)
+	for _, fieldError := range result.Errors {
+		if fieldError.Stage != "video_probe" || fieldError.Msg != "decoder rejected stream" ||
+			fieldError.Field&(fieldError.Field-1) != 0 {
+			t.Fatalf("invalid field error = %#v", fieldError)
 		}
 	}
 }
@@ -204,7 +226,7 @@ func TestSessionPipelineContactGuardRejectsDriftBeforeAtomicPublish(t *testing.T
 		Frames:               [6]videocore.FrameResult{{StandardIndex: 0, Status: videocore.StatusOK}},
 	}
 	fake.onAnalyze = func(request videocore.AnalysisRequest) {
-		if err := os.WriteFile(request.TempJPEGPath, []byte("jpeg"), 0o600); err != nil {
+		if err := writeRGBJPEG(request.TempJPEGPath, color.RGBA{R: 200, G: 40, B: 20, A: 255}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -213,10 +235,8 @@ func TestSessionPipelineContactGuardRejectsDriftBeforeAtomicPublish(t *testing.T
 		t.Fatal(err)
 	}
 	assertSessionPipelineStalePayload(t, result)
-	for _, path := range []string{paths.JPEG, paths.Sidecar} {
-		if _, err := os.Stat(path); !os.IsNotExist(err) {
-			t.Fatalf("stale contact published final %q: %v", path, err)
-		}
+	if _, err := os.Stat(paths.JPEG); !os.IsNotExist(err) {
+		t.Fatalf("stale contact published final %q: %v", paths.JPEG, err)
 	}
 }
 
@@ -253,7 +273,7 @@ func TestSessionPipelineCancellation(t *testing.T) {
 	job, deps, fake := newSessionPipelineTest(t, worker.MediaVideo,
 		worker.MaskSHA512|worker.MaskVideo6F|worker.MaskVideoContactSheet, worker.FrameMaskFull)
 	temporary := filepath.Join(t.TempDir(), "contact.tmp.jpg")
-	paths := ContactSheetPaths{TempJPEG: temporary, TempSidecar: temporary + ".json"}
+	paths := ContactSheetPaths{TempJPEG: temporary}
 	deps.contactSheetPaths = func(string, [64]byte, int, int64, string) (ContactSheetPaths, error) { return paths, nil }
 	deps.query = sessionPipelineMissingReply(job, worker.MaskVideo6F|worker.MaskVideoContactSheet, worker.FrameMaskFull)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -263,9 +283,6 @@ func TestSessionPipelineCancellation(t *testing.T) {
 			t.Errorf("temp JPEG = %q, want %q", request.TempJPEGPath, temporary)
 		}
 		if err := os.WriteFile(temporary, []byte("temp"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(paths.TempSidecar, []byte("temp"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		cancel()
@@ -282,7 +299,7 @@ func TestSessionPipelineStale(t *testing.T) {
 	job, deps, fake := newSessionPipelineTest(t, worker.MediaVideo,
 		worker.MaskSHA512|worker.MaskVideo6F|worker.MaskVideoContactSheet, worker.FrameMaskFull)
 	temporary := filepath.Join(t.TempDir(), "contact.tmp.jpg")
-	paths := ContactSheetPaths{TempJPEG: temporary, TempSidecar: temporary + ".json"}
+	paths := ContactSheetPaths{TempJPEG: temporary}
 	deps.contactSheetPaths = func(string, [64]byte, int, int64, string) (ContactSheetPaths, error) { return paths, nil }
 	deps.query = sessionPipelineMissingReply(job, worker.MaskVideo6F|worker.MaskVideoContactSheet, worker.FrameMaskFull)
 	current := sessionPipelineTestInfo{size: job.Size, mtime: time.Unix(job.MTimeUnix, 0)}
@@ -332,7 +349,7 @@ func TestSessionPipelinePartialFrames(t *testing.T) {
 			worker.MaskSHA512|worker.MaskVideo6F|worker.MaskVideoContactSheet, 0x03)
 		deps.query = sessionPipelineMissingReply(job, worker.MaskVideo6F|worker.MaskVideoContactSheet, 0x03)
 		published := 0
-		deps.publishContactSheet = func(ContactSheetPaths, ContactSheetMeta, func() error) error {
+		deps.publishContactSheet = func(ContactSheetPaths, func() error) error {
 			published++
 			return nil
 		}
@@ -384,18 +401,18 @@ func TestSessionPipelineStaleIdentityHashMismatchReturnsStableStaleWithoutPayloa
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(result.Errors) != 1 || result.Errors[0].Stage != "stale" ||
-		string(result.SHA512) != string(job.KnownSHA) || result.FieldsDone != 0 ||
+	if string(result.SHA512) != string(job.KnownSHA) || result.FieldsDone != 0 ||
 		len(result.PHashParts) != 0 || fake.analyzes != 0 {
 		t.Fatalf("hash-mismatch stale result=%#v analyze=%d", result, fake.analyzes)
 	}
+	assertSessionPipelineErrorBits(t, result.Errors, "stale")
 }
 
 func TestSessionPipelineLegacyThumbValidatesAndPublishes(t *testing.T) {
 	t.Run("present cache needs a valid contact sheet", func(t *testing.T) {
 		job, deps, fake := newSessionPipelineTest(t, worker.MediaVideo, worker.MaskSHA512|worker.MaskVideoThumb, 0)
-		meta := testContactSheetMeta(fake.sha, job.Size)
-		deps.contactSheetLookup = func(string, [64]byte) (ContactSheetMeta, bool, error) { return meta, true, nil }
+		cached := ContactSheetJPEG{Path: `C:\cache\grid.jpg`, Width: 960, Height: 360}
+		deps.contactSheetLookup = func(string, [64]byte) (ContactSheetJPEG, bool, error) { return cached, true, nil }
 		quality := int32(76)
 		deps.query = func(*worker.SHAQueryMsg) (*worker.SHAReplyMsg, error) {
 			return &worker.SHAReplyMsg{JobID: job.JobID, Found: true, RequestedFields: worker.MaskVideoThumb, FieldsPresent: worker.MaskVideoThumb,
@@ -410,14 +427,42 @@ func TestSessionPipelineLegacyThumbValidatesAndPublishes(t *testing.T) {
 		}
 	})
 
-	t.Run("missing legacy maps duration and contact then publishes", func(t *testing.T) {
+	t.Run("valid JPEG repairs missing Store PDQ and dimensions without video analysis", func(t *testing.T) {
+		job, deps, fake := newSessionPipelineTest(t, worker.MediaVideo, worker.MaskSHA512|worker.MaskVideoThumb, 0)
+		cached := ContactSheetJPEG{Path: `C:\cache\00\sha.jpg`, Width: 640, Height: 360}
+		deps.contactSheetLookup = func(string, [64]byte) (ContactSheetJPEG, bool, error) { return cached, true, nil }
+		decoded := 0
+		deps.decodeContactSheet = func(path string) (imagePhase1, error) {
+			decoded++
+			if path != cached.Path {
+				t.Fatalf("decoded path = %q, want canonical cache %q", path, cached.Path)
+			}
+			return imagePhase1{Hash: bytes.Repeat([]byte{9}, 32), Quality: 82, Width: 640, Height: 360}, nil
+		}
+		deps.query = func(*worker.SHAQueryMsg) (*worker.SHAReplyMsg, error) {
+			return &worker.SHAReplyMsg{JobID: job.JobID, Found: true, RequestedFields: worker.MaskVideoThumb, FieldsPresent: worker.MaskVideoThumb}, nil
+		}
+		result, err := processMediaWithDeps(context.Background(), sessionPipelineTestConfig(), job, deps)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if decoded != 1 || fake.opens != 0 || fake.hashes != 0 || fake.rehashes != 0 || fake.analyzes != 0 || result.ThumbPath != cached.Path || len(result.ThumbPDQ) != 32 || result.ThumbQuality == nil || *result.ThumbQuality != 82 || result.ContactSheetWidth != 640 || result.ContactSheetHeight != 360 {
+			t.Fatalf("repaired cache = decoded:%d open/hash/rehash/analyze:%d/%d/%d/%d result:%#v", decoded, fake.opens, fake.hashes, fake.rehashes, fake.analyzes, result)
+		}
+	})
+
+	t.Run("force or missing field overwrites the same final path", func(t *testing.T) {
 		job, deps, fake := newSessionPipelineTest(t, worker.MediaVideo, worker.MaskSHA512|worker.MaskVideoThumb, 0)
 		temporary := filepath.Join(t.TempDir(), "grid.jpg.tmp")
-		paths := ContactSheetPaths{TempJPEG: temporary, TempSidecar: temporary + ".json"}
+		paths := ContactSheetPaths{TempJPEG: temporary}
 		deps.contactSheetPaths = func(string, [64]byte, int, int64, string) (ContactSheetPaths, error) { return paths, nil }
+		deps.contactSheetLookup = func(string, [64]byte) (ContactSheetJPEG, bool, error) {
+			t.Fatal("forced missing field must not reuse an existing JPEG")
+			return ContactSheetJPEG{}, false, nil
+		}
 		deps.query = sessionPipelineMissingReply(job, worker.MaskVideoThumb, 0)
 		published := 0
-		deps.publishContactSheet = func(ContactSheetPaths, ContactSheetMeta, func() error) error { published++; return nil }
+		deps.publishContactSheet = func(ContactSheetPaths, func() error) error { published++; return nil }
 		fake.result = videocore.AnalysisResult{MediaType: 2, DurationStatus: videocore.StatusOK, DurationMS: 1234,
 			ContactSheetStatus: videocore.StatusOK, ContactSheetWidth: 960, ContactSheetHeight: 360, CompletedFrameMask: 1,
 			Frames: [6]videocore.FrameResult{{StandardIndex: 0, Status: videocore.StatusOK, SampleTimeMS: 1000}}}
@@ -444,18 +489,15 @@ func TestVideoBaseFeaturesSessionPublishesCompleteContactPayload(t *testing.T) {
 		t, worker.MediaVideo, worker.MaskAllVideo, 0,
 	)
 	root := t.TempDir()
-	paths := ContactSheetPaths{
-		JPEG: filepath.Join(root, "grid.jpg"), Sidecar: filepath.Join(root, "grid.jpg.json"),
-		TempJPEG: filepath.Join(root, "grid.tmp.jpg"), TempSidecar: filepath.Join(root, "grid.tmp.json"),
-	}
+	paths := ContactSheetPaths{JPEG: filepath.Join(root, "grid.jpg"), TempJPEG: filepath.Join(root, "grid.tmp.jpg")}
 	deps.contactSheetPaths = func(string, [64]byte, int, int64, string) (ContactSheetPaths, error) {
 		return paths, nil
 	}
 	deps.query = sessionPipelineMissingReply(
-		job, worker.MaskVideoDuration|worker.MaskVideoContactSheet, 0,
+		job, worker.MaskVideoDuration|worker.MaskVideoContactSheet|worker.MaskVideoMetadata, 0,
 	)
 	published := 0
-	deps.publishContactSheet = func(got ContactSheetPaths, _ ContactSheetMeta, validate func() error) error {
+	deps.publishContactSheet = func(got ContactSheetPaths, validate func() error) error {
 		published++
 		if got != paths {
 			t.Fatalf("publish paths = %#v, want %#v", got, paths)
@@ -493,15 +535,7 @@ func TestVideoBaseFeaturesUnpublishedContactPreservesDurationPartial(t *testing.
 		configure func(*sessionPipelineDeps, *videocore.AnalysisResult)
 	}{
 		{
-			name: "runtime lookup failure",
-			configure: func(deps *sessionPipelineDeps, _ *videocore.AnalysisResult) {
-				deps.runtime = func() (videocore.RuntimeInfo, error) {
-					return videocore.RuntimeInfo{}, errors.New("runtime unavailable")
-				}
-			},
-		},
-		{
-			name: "invalid metadata",
+			name: "invalid dimensions",
 			configure: func(_ *sessionPipelineDeps, analysis *videocore.AnalysisResult) {
 				analysis.ContactSheetWidth = 2
 				analysis.ContactSheetHeight = 1
@@ -510,7 +544,7 @@ func TestVideoBaseFeaturesUnpublishedContactPreservesDurationPartial(t *testing.
 		{
 			name: "publish failure",
 			configure: func(deps *sessionPipelineDeps, _ *videocore.AnalysisResult) {
-				deps.publishContactSheet = func(ContactSheetPaths, ContactSheetMeta, func() error) error {
+				deps.publishContactSheet = func(ContactSheetPaths, func() error) error {
 					return errors.New("publish failed")
 				}
 			},
@@ -522,15 +556,12 @@ func TestVideoBaseFeaturesUnpublishedContactPreservesDurationPartial(t *testing.
 				t, worker.MediaVideo, worker.MaskAllVideo, 0,
 			)
 			root := t.TempDir()
-			paths := ContactSheetPaths{
-				JPEG: filepath.Join(root, "grid.jpg"), Sidecar: filepath.Join(root, "grid.jpg.json"),
-				TempJPEG: filepath.Join(root, "grid.tmp.jpg"), TempSidecar: filepath.Join(root, "grid.tmp.json"),
-			}
+			paths := ContactSheetPaths{JPEG: filepath.Join(root, "grid.jpg"), TempJPEG: filepath.Join(root, "grid.tmp.jpg")}
 			deps.contactSheetPaths = func(string, [64]byte, int, int64, string) (ContactSheetPaths, error) {
 				return paths, nil
 			}
 			deps.query = sessionPipelineMissingReply(
-				job, worker.MaskVideoDuration|worker.MaskVideoContactSheet, 0,
+				job, worker.MaskVideoDuration|worker.MaskVideoContactSheet|worker.MaskVideoMetadata, 0,
 			)
 			fake.result = videocore.AnalysisResult{
 				MediaType: 2, DurationStatus: videocore.StatusOK, DurationMS: 4321,
@@ -552,8 +583,9 @@ func TestVideoBaseFeaturesUnpublishedContactPreservesDurationPartial(t *testing.
 			if err != nil {
 				t.Fatal(err)
 			}
-			wantDone := uint32(worker.MaskSHA512 | worker.MaskVideoDuration)
+			wantDone := uint32(worker.MaskSHA512 | worker.MaskVideoDuration | worker.MaskVideoMetadata)
 			if result.FieldsDone != wantDone || result.DurationMS == nil || *result.DurationMS != 4321 ||
+				result.VideoContainer == nil || len(result.VideoStreams) != 1 ||
 				result.ContactSheetStatus != 0 || result.ContactSheetWidth != 0 || result.ContactSheetHeight != 0 ||
 				result.ThumbPath != "" || len(result.ThumbPDQ) != 0 || result.ThumbQuality != nil ||
 				result.ThumbGenerated || len(result.Errors) != 1 ||
@@ -732,18 +764,20 @@ func TestSessionPipelineUnrequestedSHABit(t *testing.T) {
 }
 
 type sessionPipelineFake struct {
-	sha        [64]byte
-	result     videocore.AnalysisResult
-	opens      int
-	hashes     int
-	analyzes   int
-	closes     int
-	request    videocore.AnalysisRequest
-	onAnalyze  func(videocore.AnalysisRequest)
-	analyzeErr error
-	rehashes   int
-	rehashSHA  *[64]byte
-	rehashErr  error
+	sha              [64]byte
+	result           videocore.AnalysisResult
+	opens            int
+	hashes           int
+	analyzes         int
+	closes           int
+	request          videocore.AnalysisRequest
+	onAnalyze        func(videocore.AnalysisRequest)
+	analyzeErr       error
+	videoMetadata    *videocore.VideoMetadata
+	videoMetadataErr error
+	rehashes         int
+	rehashSHA        *[64]byte
+	rehashErr        error
 }
 
 func (fake *sessionPipelineFake) Hash() ([64]byte, error) {
@@ -758,6 +792,10 @@ func (fake *sessionPipelineFake) Analyze(_ context.Context, request videocore.An
 		fake.onAnalyze(request)
 	}
 	return fake.result, fake.analyzeErr
+}
+
+func (fake *sessionPipelineFake) VideoMetadata() (*videocore.VideoMetadata, error) {
+	return fake.videoMetadata, fake.videoMetadataErr
 }
 
 func sessionPipelineMissingReply(job *worker.JobMsg, fields uint32, frames uint8) func(*worker.SHAQueryMsg) (*worker.SHAReplyMsg, error) {
@@ -782,10 +820,8 @@ func assertSessionPipelineCleared(t *testing.T, result *worker.JobResultMsg, fak
 	if fake.closes != 1 || len(result.SHA512) != wantSHALen || result.FieldsDone != 0 || result.FramesDone != 0 || len(result.PDQ) != 0 || result.DurationMS != nil || result.ContactSheetWidth != 0 || result.ContactSheetHeight != 0 {
 		t.Fatalf("cancellation/stale retained result or did not close once: close=%d result=%#v", fake.closes, result)
 	}
-	for _, path := range []string{paths.TempJPEG, paths.TempSidecar} {
-		if _, err := os.Stat(path); !os.IsNotExist(err) {
-			t.Fatalf("cancellation/stale left temp %q: %v", path, err)
-		}
+	if _, err := os.Stat(paths.TempJPEG); !os.IsNotExist(err) {
+		t.Fatalf("cancellation/stale left temp %q: %v", paths.TempJPEG, err)
 	}
 }
 
@@ -799,6 +835,8 @@ func assertSessionPipelineStalePayload(t *testing.T, result *worker.JobResultMsg
 	assertSessionPipelineErrorBits(t, result.Errors, "stale")
 }
 
+// assertSessionPipelineErrorBits verifies that each field failure remains a
+// single protocol bit so combined masks cannot be mistaken for one field.
 func assertSessionPipelineErrorBits(t *testing.T, fieldErrors []worker.FieldError, stage string) {
 	t.Helper()
 	if len(fieldErrors) == 0 {
@@ -820,6 +858,19 @@ func newSessionPipelineTest(t *testing.T, kind worker.MediaKind, fields uint32, 
 	t.Helper()
 	info := sessionPipelineTestInfo{size: 1234, mtime: time.Unix(1_700_000_000, 0)}
 	fake := &sessionPipelineFake{}
+	if kind == worker.MediaVideo {
+		primary := int32(0)
+		fake.videoMetadata = &videocore.VideoMetadata{
+			Container: proto.VideoContainerMetadata{
+				FormatName: "mov,mp4", TagsJSON: `{}`,
+				PrimaryVideoStream: &primary, DecoderName: "h264",
+			},
+			Streams: []proto.VideoStreamMetadata{{
+				Index: 0, MediaType: "video", CodecID: 27,
+				CodecName: "h264", TagsJSON: `{}`,
+			}},
+		}
+	}
 	for index := range fake.sha {
 		fake.sha[index] = byte(index)
 	}
@@ -833,12 +884,7 @@ func newSessionPipelineTest(t *testing.T, kind worker.MediaKind, fields uint32, 
 		stat:     func(string) (fs.FileInfo, error) { return info, nil },
 		sameFile: func(left, right fs.FileInfo) bool { return left == right },
 		runtime: func() (videocore.RuntimeInfo, error) {
-			return videocore.RuntimeInfo{Version: "1.0.0", Components: [4]videocore.RuntimeComponent{
-				{Name: "avformat", HeaderVersion: 1, RuntimeVersion: 1},
-				{Name: "avcodec", HeaderVersion: 1, RuntimeVersion: 1},
-				{Name: "avutil", HeaderVersion: 1, RuntimeVersion: 1},
-				{Name: "swscale", HeaderVersion: 1, RuntimeVersion: 1},
-			}}, nil
+			return videocore.RuntimeInfo{Version: "test"}, nil
 		},
 		open: func(context.Context, string, videocore.OpenOptions) (mediaSession, error) {
 			fake.opens++
@@ -857,8 +903,11 @@ func newSessionPipelineTest(t *testing.T, kind worker.MediaKind, fields uint32, 
 		query:              func(*worker.SHAQueryMsg) (*worker.SHAReplyMsg, error) { return nil, nil },
 		contactSheetLookup: contactSheetLookupNoop,
 		contactSheetPaths:  contactSheetPathsNoop,
-		publishContactSheet: func(ContactSheetPaths, ContactSheetMeta, func() error) error {
+		publishContactSheet: func(ContactSheetPaths, func() error) error {
 			return nil
+		},
+		decodeContactSheet: func(string) (imagePhase1, error) {
+			return imagePhase1{Hash: bytes.Repeat([]byte{7}, 32), Quality: 76, Width: 960, Height: 360}, nil
 		},
 		pid:   func() int { return 99 },
 		nonce: func() string { return "test" },
@@ -875,8 +924,8 @@ func bytesRepeat64(value byte) []byte {
 	return out
 }
 
-func contactSheetLookupNoop(string, [64]byte) (ContactSheetMeta, bool, error) {
-	return ContactSheetMeta{}, false, nil
+func contactSheetLookupNoop(string, [64]byte) (ContactSheetJPEG, bool, error) {
+	return ContactSheetJPEG{}, false, nil
 }
 
 func contactSheetPathsNoop(string, [64]byte, int, int64, string) (ContactSheetPaths, error) {

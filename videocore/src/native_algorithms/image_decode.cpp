@@ -24,7 +24,7 @@ namespace videocore::native {
 namespace {
 
 constexpr int64_t kMaxPixels = 400000000LL;
-constexpr int32_t kMinSide = 8;
+constexpr int32_t kMinSide = 1;
 
 ImageStatus validate_dimensions(int64_t width, int64_t height) noexcept {
     if (width < kMinSide || height < kMinSide) {

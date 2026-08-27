@@ -11,14 +11,16 @@ import (
 )
 
 type ContentState struct {
-	SHA512        []byte
-	FieldsPresent uint32
-	MissingFields uint32
-	FramesPresent uint8
-	MissingFrames uint8
-	Image         *ImageFeature
-	Video         *VideoFeature
-	Frames        []VideoFrameFeature
+	SHA512         []byte
+	FieldsPresent  uint32
+	MissingFields  uint32
+	FramesPresent  uint8
+	MissingFrames  uint8
+	Image          *ImageFeature
+	Video          *VideoFeature
+	Frames         []VideoFrameFeature
+	VideoContainer *proto.VideoContainerMetadata
+	VideoStreams   []proto.VideoStreamMetadata
 }
 
 func (d *DB) LookupContent(
@@ -83,7 +85,7 @@ func contentFieldMask(kind MediaKind) uint32 {
 	case MediaVideo:
 		return proto.FieldSHA512 | proto.FieldThumb | proto.FieldVideo6F |
 			proto.FieldVideoDuration | proto.FieldVideoContactSheet |
-			proto.FieldVideo6FPHash | proto.FieldVideo6FSobel
+			proto.FieldVideo6FPHash | proto.FieldVideo6FSobel | proto.FieldVideoMetadata
 	default:
 		return 0
 	}
@@ -154,6 +156,18 @@ func (d *DB) lookupVideoContent(
 	requestedFrames uint8,
 	state *ContentState,
 ) error {
+	if requestedFields&proto.FieldVideoMetadata != 0 {
+		container, streams, complete, err := loadVideoMetadata(ctx, d.db, shaText)
+		if err != nil {
+			return err
+		}
+		if complete {
+			state.VideoContainer = container
+			state.VideoStreams = streams
+			state.FieldsPresent |= proto.FieldVideoMetadata
+			state.MissingFields &^= proto.FieldVideoMetadata
+		}
+	}
 	wantsHeader := requestedFields&(proto.FieldThumb|proto.FieldVideoDuration|proto.FieldVideoContactSheet) != 0
 	if wantsHeader {
 		var storedSHA string

@@ -16,9 +16,13 @@ const LocalPayloadMaxBytes = 4 * 1024 * 1024
 const MaxLocalPreviewEncodedBytes = LocalPayloadMaxBytes - 1024
 
 const (
-	UnsupportedOperationErrorCode = "unsupported_operation"
-	LocalPayloadTooLargeErrorCode = "payload_too_large"
-	InvalidLocalTopicErrorCode    = "invalid_topic"
+	UnsupportedOperationErrorCode   = "unsupported_operation"
+	LocalPayloadTooLargeErrorCode   = "payload_too_large"
+	InvalidLocalTopicErrorCode      = "invalid_topic"
+	InvalidTaskControlErrorCode     = "invalid_task_control"
+	InvalidTaskDrainReasonErrorCode = "invalid_task_drain_reason"
+	// InvalidTaskDoneReasonErrorCode is a descriptive alias for terminal-message callers.
+	InvalidTaskDoneReasonErrorCode = InvalidTaskDrainReasonErrorCode
 )
 
 const (
@@ -30,6 +34,9 @@ const (
 	LocalOperationTaskList       = "local.task.list"
 	LocalOperationTaskCancel     = "local.task.cancel"
 	LocalOperationTaskRetry      = "local.task.retry"
+	LocalOperationTaskPause      = "local.task.pause"
+	LocalOperationTaskResume     = "local.task.resume"
+	LocalOperationTaskDelete     = "local.task.delete"
 	LocalOperationAnalysisStart  = "local.analysis.start"
 	LocalOperationAnalysisStatus = "local.analysis.status"
 	LocalOperationGroupsList     = "local.groups.list"
@@ -120,6 +127,48 @@ type LocalShutdownResponse struct {
 const (
 	LocalTaskModeScanOnly         = "scan_only"
 	LocalTaskModeScanThenAnalysis = "scan_then_analysis"
+	LocalTaskDisplayStatsVersion  = 2
+)
+
+// LocalTaskDisplayStats is the stable JSON payload persisted in
+// LocalTask.StatsJSON. Speed preserves the last non-zero scan rate, Failures is
+// cumulative, and DurationMS accumulates scan and analysis wall-clock time.
+type LocalTaskDisplayStats struct {
+	SchemaVersion int         `json:"schema_version"`
+	Speed         float64     `json:"speed"`
+	Failures      int64       `json:"failures"`
+	DurationMS    int64       `json:"duration_ms"`
+	SyncStatus    string      `json:"sync_status,omitempty"`
+	IO            TaskIOStats `json:"io"`
+}
+
+type LocalTaskControlRequest struct {
+	TaskID           string `msgpack:"task_id"`
+	InstanceID       string `msgpack:"instance_id"`
+	ExpectedRevision int64  `msgpack:"expected_revision"`
+}
+
+func (request LocalTaskControlRequest) Validate() error {
+	if request.TaskID == "" || strings.TrimSpace(request.TaskID) != request.TaskID ||
+		request.InstanceID == "" || strings.TrimSpace(request.InstanceID) != request.InstanceID ||
+		request.ExpectedRevision <= 0 {
+		return errors.New(InvalidTaskControlErrorCode)
+	}
+	return nil
+}
+
+type LocalTaskControlResponse struct {
+	Task    *LocalTask `msgpack:"task,omitempty"`
+	Deleted bool       `msgpack:"deleted,omitempty"`
+}
+
+type TaskDrainReason string
+
+const (
+	TaskDrainPause           TaskDrainReason = "pause"
+	TaskDrainStop            TaskDrainReason = "stop"
+	TaskDrainDelete          TaskDrainReason = "delete"
+	TaskDrainProcessShutdown TaskDrainReason = "process_shutdown"
 )
 
 type LocalTaskCreateRequest struct {
@@ -166,21 +215,27 @@ func (request LocalTaskCreateRequest) Validate() error {
 }
 
 type LocalTask struct {
-	TaskID           string   `msgpack:"task_id"`
-	Source           string   `msgpack:"source"`
-	Mode             string   `msgpack:"mode"`
-	Stage            int      `msgpack:"stage"`
-	Status           string   `msgpack:"status"`
-	Roots            []string `msgpack:"roots,omitempty"`
-	Rescan           bool     `msgpack:"rescan,omitempty"`
-	Extensions       []string `msgpack:"extensions,omitempty"`
-	ProgressComplete int64    `msgpack:"progress_complete"`
-	ProgressTotal    int64    `msgpack:"progress_total"`
-	StatsJSON        string   `msgpack:"stats_json"`
-	SafeErrorCode    string   `msgpack:"safe_error_code,omitempty"`
-	SafeErrorMessage string   `msgpack:"safe_error_message,omitempty"`
-	CreatedAt        int64    `msgpack:"created_at"`
-	UpdatedAt        int64    `msgpack:"updated_at"`
+	TaskID             string   `msgpack:"task_id"`
+	InstanceID         string   `msgpack:"instance_id"`
+	Revision           int64    `msgpack:"revision"`
+	Source             string   `msgpack:"source"`
+	Mode               string   `msgpack:"mode"`
+	Stage              int      `msgpack:"stage"`
+	Phase              string   `msgpack:"phase"`
+	Status             string   `msgpack:"status"`
+	Roots              []string `msgpack:"roots,omitempty"`
+	Rescan             bool     `msgpack:"rescan,omitempty"`
+	Extensions         []string `msgpack:"extensions,omitempty"`
+	ProgressComplete   int64    `msgpack:"progress_complete"`
+	ProgressTotal      int64    `msgpack:"progress_total"`
+	ProgressTotalKnown bool     `msgpack:"progress_total_known"`
+	StatsJSON          string   `msgpack:"stats_json"`
+	SafeErrorCode      string   `msgpack:"safe_error_code,omitempty"`
+	SafeErrorMessage   string   `msgpack:"safe_error_message,omitempty"`
+	CreatedAt          int64    `msgpack:"created_at"`
+	UpdatedAt          int64    `msgpack:"updated_at"`
+	StartedAt          int64    `msgpack:"started_at"`
+	CompletedAt        int64    `msgpack:"completed_at"`
 }
 
 type LocalTaskCreateResponse struct {
@@ -530,6 +585,9 @@ func IsLocalOperation(operation string) bool {
 		LocalOperationTaskList,
 		LocalOperationTaskCancel,
 		LocalOperationTaskRetry,
+		LocalOperationTaskPause,
+		LocalOperationTaskResume,
+		LocalOperationTaskDelete,
 		LocalOperationAnalysisStart,
 		LocalOperationAnalysisStatus,
 		LocalOperationGroupsList,

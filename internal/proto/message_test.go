@@ -59,6 +59,62 @@ func TestDecodeClientAuthAndLocalEnvelope(t *testing.T) {
 	}
 }
 
+func TestVideoMetadataFieldBitPreservesEveryLegacyValue(t *testing.T) {
+	want := []uint32{1 << 0, 1 << 1, 1 << 2, 1 << 3, 1 << 4, 1 << 5, 1 << 6, 1 << 7, 1 << 8, 1 << 9}
+	got := []uint32{
+		FieldSHA512, FieldPDQ256, FieldThumb, FieldPHashParts, FieldSobelHist,
+		FieldVideo6F, FieldVideoDuration, FieldVideoContactSheet, FieldVideo6FPHash, FieldVideo6FSobel,
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("legacy field bit %d = %#x, want %#x", index, got[index], want[index])
+		}
+	}
+	if FieldVideoMetadata != 1<<10 {
+		t.Fatalf("FieldVideoMetadata = %#x, want %#x", FieldVideoMetadata, uint32(1<<10))
+	}
+}
+
+func TestTaskProgressAndDoneLifecycleFieldsRoundTrip(t *testing.T) {
+	progress := TaskProgress{TaskID: "task-1", Done: 4, Total: 10, TotalKnown: true, Failed: 1, ElapsedMS: 2500, Speed: 2.5}
+	body, err := msgpack.Marshal(progress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotProgress TaskProgress
+	if err := msgpack.Unmarshal(body, &gotProgress); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(gotProgress, progress) {
+		t.Fatalf("progress = %#v, want %#v", gotProgress, progress)
+	}
+
+	for _, reason := range []TaskDrainReason{"", TaskDrainPause, TaskDrainStop, TaskDrainDelete, TaskDrainProcessShutdown} {
+		done := TaskDone{TaskID: "task-1", Reason: reason, Stats: TaskStats{Total: 10, Done: 9, Failed: 1, ElapsedMS: 2500}}
+		body, err := msgpack.Marshal(done)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got TaskDone
+		if err := msgpack.Unmarshal(body, &got); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got, done) {
+			t.Fatalf("done = %#v, want %#v", got, done)
+		}
+		if err := got.Validate(); err != nil {
+			t.Fatalf("reason %q rejected: %v", reason, err)
+		}
+	}
+}
+
+func TestTaskDoneRejectsUnknownDrainReason(t *testing.T) {
+	done := TaskDone{TaskID: "task-1", Reason: "internal_worker_error"}
+	if err := done.Validate(); err == nil || err.Error() != InvalidTaskDrainReasonErrorCode {
+		t.Fatalf("Validate() error = %v, want %q", err, InvalidTaskDrainReasonErrorCode)
+	}
+}
+
 // These cases fail if the filesystem browse envelope is assigned a conflicting
 // message type or Decode stops producing the concrete request/response DTOs.
 func TestFilesystemBrowseMessagesRoundTrip(t *testing.T) {

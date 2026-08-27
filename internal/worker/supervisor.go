@@ -4,6 +4,7 @@ package worker
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +18,7 @@ import (
 	"time"
 	"unsafe"
 
+	"dedup/internal/diskio"
 	"dedup/internal/features"
 
 	"github.com/Microsoft/go-winio"
@@ -219,6 +221,8 @@ type workerProc struct {
 	nextGeneration uint64
 	ready          bool
 	readyMsg       ReadyMsg
+	ioLeases       map[uint64]activeIOLease
+	ioAcquireWG    sync.WaitGroup
 	failureClaimed atomic.Bool
 	killOnce       sync.Once
 	done           chan struct{}
@@ -229,6 +233,21 @@ type activeJob struct {
 	generation uint64
 	terminal   bool
 	timer      poolTimer
+	ctx        context.Context
+	cancel     context.CancelFunc
+}
+
+type leaseJobIdentity struct {
+	jobID      int64
+	taskID     string
+	instanceID string
+	diskKey    string
+}
+
+type activeIOLease struct {
+	run      *activeJob
+	identity leaseJobIdentity
+	grant    IOLeaseGrantMsg
 }
 
 type workerOutcome struct {
@@ -421,7 +440,12 @@ func (p *Pool) unregister(worker *workerProc) {
 		p.metrics.readyWorkers.Add(-1)
 	}
 	worker.stopWatchdog()
+	worker.cancelCurrentJob()
 	_ = worker.conn.Close()
+	if p.cfg.IOBroker != nil {
+		p.cfg.IOBroker.ReclaimWorker(worker.index)
+	}
+	worker.ioAcquireWG.Wait()
 }
 
 func (p *Pool) offerFree(worker *workerProc) bool {
@@ -569,7 +593,7 @@ func (worker *workerProc) readLoop(out chan<- workerOutcome) {
 			if askErr != nil {
 				worker.pool.deps.logger.Error("feature lookup failed; worker will compute",
 					"job_id", query.JobID, "err", askErr)
-				reply = SHAReplyMsg{JobID: query.JobID, Found: false}
+				reply = missingReply(query)
 			}
 			if reply.Found && reply.ReusedFlight {
 				worker.pool.metrics.singleFlightHits.Add(1)
@@ -578,10 +602,197 @@ func (worker *workerProc) readLoop(out chan<- workerOutcome) {
 				out <- workerOutcome{reason: "pipe_write", err: writeErr}
 				return
 			}
+		case MsgIOLeaseAcquire:
+			request, decodeErr := DecodeBody[IOLeaseAcquireMsg](env)
+			if decodeErr != nil {
+				worker.failProtocol(out, decodeErr)
+				return
+			}
+			run, identity, requestContext, brokerRequest, validationErr := worker.validateLeaseAcquire(request)
+			if validationErr != nil {
+				worker.failProtocol(out, validationErr)
+				return
+			}
+			worker.ioAcquireWG.Add(1)
+			go func() {
+				defer worker.ioAcquireWG.Done()
+				worker.acquireIOLease(run, identity, requestContext, request, brokerRequest)
+			}()
+		case MsgIOLeaseReport:
+			report, decodeErr := DecodeBody[IOLeaseReportMsg](env)
+			if decodeErr != nil {
+				worker.failProtocol(out, decodeErr)
+				return
+			}
+			if validationErr := worker.reportIOLease(report); validationErr != nil {
+				worker.failProtocol(out, validationErr)
+				return
+			}
 		default:
 			worker.failProtocol(out, fmt.Errorf("unexpected worker message %q", env.Type))
 			return
 		}
+	}
+}
+
+func (worker *workerProc) validateLeaseAcquire(request IOLeaseAcquireMsg) (*activeJob, leaseJobIdentity, context.Context, diskio.Request, error) {
+	if err := request.Validate(); err != nil {
+		return nil, leaseJobIdentity{}, nil, diskio.Request{}, err
+	}
+	worker.mu.Lock()
+	defer worker.mu.Unlock()
+	run := worker.current
+	if run == nil || run.terminal || worker.failureClaimed.Load() || run.message == nil {
+		return nil, leaseJobIdentity{}, nil, diskio.Request{}, fmt.Errorf("worker %d requested I/O lease without an active job", worker.index)
+	}
+	identity := leaseIdentityOf(run.message)
+	if request.JobID != identity.jobID {
+		return nil, leaseJobIdentity{}, nil, diskio.Request{}, fmt.Errorf("worker %d I/O lease job identity mismatch", worker.index)
+	}
+	if identity.taskID == "" || identity.instanceID == "" || identity.diskKey == "" {
+		return nil, leaseJobIdentity{}, nil, diskio.Request{}, fmt.Errorf("worker %d current job has incomplete I/O identity", worker.index)
+	}
+	requestContext := run.ctx
+	if requestContext == nil {
+		requestContext = worker.pool.ctx
+	}
+	if requestContext == nil {
+		requestContext = context.Background()
+	}
+	return run, identity, requestContext, diskio.Request{
+		RequestID: request.RequestID,
+		TaskID:    identity.taskID, InstanceID: identity.instanceID,
+		WorkerID: worker.index, Disk: diskio.DiskKey(identity.diskKey),
+		Class: diskio.SourceClass(request.Class), WantBytes: request.WantBytes, WantSeek: request.WantSeek,
+	}, nil
+}
+
+func (worker *workerProc) acquireIOLease(
+	run *activeJob,
+	identity leaseJobIdentity,
+	requestContext context.Context,
+	request IOLeaseAcquireMsg,
+	brokerRequest diskio.Request,
+) {
+	broker := worker.pool.cfg.IOBroker
+	if broker == nil {
+		worker.writeLeaseCancelIfCurrent(run, identity, request)
+		return
+	}
+	grant, err := broker.Acquire(requestContext, brokerRequest)
+	if err != nil {
+		worker.writeLeaseCancelIfCurrent(run, identity, request)
+		return
+	}
+	wireGrant := IOLeaseGrantMsg{
+		JobID: identity.jobID, RequestID: request.RequestID,
+		LeaseID: grant.LeaseID, Generation: grant.Generation,
+		Bytes: grant.Bytes, Seeks: grant.Seeks,
+	}
+	if err := wireGrant.ValidateFor(request); err != nil {
+		worker.reclaimIOGrant(identity, grant)
+		worker.writeLeaseCancelIfCurrent(run, identity, request)
+		return
+	}
+
+	worker.mu.Lock()
+	if worker.current != run || run.terminal || worker.failureClaimed.Load() ||
+		run.message == nil || leaseIdentityOf(run.message) != identity {
+		worker.mu.Unlock()
+		worker.reclaimIOGrant(identity, grant)
+		return
+	}
+	if worker.ioLeases == nil {
+		worker.ioLeases = make(map[uint64]activeIOLease)
+	}
+	if _, exists := worker.ioLeases[grant.LeaseID]; exists {
+		worker.mu.Unlock()
+		worker.reclaimIOGrant(identity, grant)
+		_ = worker.conn.Close()
+		return
+	}
+	worker.ioLeases[grant.LeaseID] = activeIOLease{
+		run: run, identity: identity, grant: wireGrant,
+	}
+	writeErr := worker.ipc.Write(MsgIOLeaseGrant, wireGrant)
+	worker.mu.Unlock()
+	if writeErr != nil {
+		_ = worker.conn.Close()
+	}
+}
+
+func (worker *workerProc) writeLeaseCancelIfCurrent(run *activeJob, identity leaseJobIdentity, request IOLeaseAcquireMsg) {
+	cancel := IOLeaseCancelMsg{JobID: identity.jobID, RequestID: request.RequestID}
+	worker.mu.Lock()
+	if worker.current != run || run.terminal || worker.failureClaimed.Load() ||
+		run.message == nil || leaseIdentityOf(run.message) != identity {
+		worker.mu.Unlock()
+		return
+	}
+	writeErr := worker.ipc.Write(MsgIOLeaseCancel, cancel)
+	worker.mu.Unlock()
+	if writeErr != nil {
+		_ = worker.conn.Close()
+	}
+}
+
+func (worker *workerProc) reportIOLease(message IOLeaseReportMsg) error {
+	broker := worker.pool.cfg.IOBroker
+	if broker == nil {
+		return fmt.Errorf("worker %d reported I/O lease without a broker", worker.index)
+	}
+	worker.mu.Lock()
+	lease, exists := worker.ioLeases[message.LeaseID]
+	if !exists {
+		worker.mu.Unlock()
+		return fmt.Errorf("worker %d reported unknown I/O lease %d", worker.index, message.LeaseID)
+	}
+	if err := message.ValidateFor(lease.grant); err != nil {
+		worker.mu.Unlock()
+		return err
+	}
+	delete(worker.ioLeases, message.LeaseID)
+	current := worker.current
+	fresh := current == lease.run && current != nil && !current.terminal &&
+		current.message != nil && leaseIdentityOf(current.message) == lease.identity
+	trusted := leaseJobIdentity{}
+	if current != nil && current.message != nil {
+		trusted = leaseIdentityOf(current.message)
+	}
+	worker.mu.Unlock()
+
+	report := diskio.Report{
+		LeaseID: message.LeaseID, Generation: message.Generation,
+		TaskID: trusted.taskID, InstanceID: trusted.instanceID,
+		WorkerID: worker.index, Disk: diskio.DiskKey(trusted.diskKey),
+		Bytes: message.Bytes, Seeks: message.Seeks,
+		ReadTime: time.Duration(message.ReadNS), WaitTime: time.Duration(message.WaitNS),
+		Completed: message.Completed, Cancelled: message.Cancelled,
+	}
+	if !fresh {
+		report.Completed = false
+		report.Cancelled = true
+	}
+	broker.Report(report)
+	return nil
+}
+
+func (worker *workerProc) reclaimIOGrant(identity leaseJobIdentity, grant diskio.Grant) {
+	worker.pool.cfg.IOBroker.Report(diskio.Report{
+		LeaseID: grant.LeaseID, Generation: grant.Generation,
+		TaskID: identity.taskID, InstanceID: identity.instanceID,
+		WorkerID: worker.index, Disk: diskio.DiskKey(identity.diskKey),
+		Cancelled: true,
+	})
+}
+
+func leaseIdentityOf(job *JobMsg) leaseJobIdentity {
+	if job == nil {
+		return leaseJobIdentity{}
+	}
+	return leaseJobIdentity{
+		jobID: job.JobID, taskID: job.ScanTaskID,
+		instanceID: job.ScanInstanceID, diskKey: job.DiskKey,
 	}
 }
 
@@ -599,7 +810,8 @@ func (worker *workerProc) assign(job *JobMsg, timeout time.Duration) bool {
 		return false
 	}
 	worker.nextGeneration++
-	run := &activeJob{message: job, generation: worker.nextGeneration}
+	jobContext, cancelJob := context.WithCancel(worker.pool.ctx)
+	run := &activeJob{message: job, generation: worker.nextGeneration, ctx: jobContext, cancel: cancelJob}
 	worker.current = run
 	run.timer = worker.pool.deps.clock.AfterFunc(timeout, func() {
 		if worker.pool.deps.beforeWatchdogClaim != nil {
@@ -668,6 +880,9 @@ func (worker *workerProc) claim(reason string, exitCode int32, cause error, owne
 	if run != nil && run.timer != nil {
 		run.timer.Stop()
 	}
+	if run != nil && run.cancel != nil {
+		run.cancel()
+	}
 	var job *JobMsg
 	if run != nil {
 		job = run.message
@@ -732,7 +947,19 @@ func (worker *workerProc) claimResult(result *JobResultMsg) (*JobMsg, error) {
 	if run.timer != nil {
 		run.timer.Stop()
 	}
+	if run.cancel != nil {
+		run.cancel()
+	}
 	return run.message, nil
+}
+
+func (worker *workerProc) cancelCurrentJob() {
+	worker.mu.Lock()
+	run := worker.current
+	worker.mu.Unlock()
+	if run != nil && run.cancel != nil {
+		run.cancel()
+	}
 }
 
 func (worker *workerProc) validateQuery(query *SHAQueryMsg) error {
@@ -879,7 +1106,7 @@ func validateMergedWorkerResult(job *JobMsg, result *JobResultMsg) error {
 		allowed = MaskSHA512 | MaskImagePDQ | MaskPHashParts | MaskSobelHist
 	case MediaVideo:
 		allowed = MaskSHA512 | MaskVideoThumb | MaskVideo6F | MaskVideoDuration |
-			MaskVideoContactSheet | MaskVideo6FPHash | MaskVideo6FSobel
+			MaskVideoContactSheet | MaskVideo6FPHash | MaskVideo6FSobel | MaskVideoMetadata
 	default:
 		return fmt.Errorf("worker protocol: invalid media kind %d", job.Kind)
 	}

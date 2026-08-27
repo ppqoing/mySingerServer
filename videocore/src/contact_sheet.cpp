@@ -28,6 +28,7 @@ namespace vc::detail {
 namespace {
 
 using GrayImage = videocore::native::GrayImage;
+using RgbImage = videocore::native::RgbImage;
 using ImageFeatures = videocore::native::ImageFeatures;
 using ImageStatus = videocore::native::ImageStatus;
 
@@ -40,6 +41,10 @@ constexpr uint8_t kPlaceholderLine = 192u;
 // libjpeg-turbo's 0..100 scale has no exact algebraic mapping; 90 is the
 // named deterministic equivalent used by the fixed Task 9 fixture.
 constexpr int kContactSheetJpegQuality = 90;
+
+#if defined(VC_VIDEO_ANALYSIS_TESTING)
+ContactSheetJpegContract contact_last_jpeg_contract;
+#endif
 
 #if defined(VC_RESILIENCE_TESTING)
 std::atomic<uint64_t> contact_live_sws{0u};
@@ -110,7 +115,8 @@ void ResetResult(ContactSheetResult* out, int32_t state) noexcept {
     out->height = 0;
     out->tile_width = 0;
     out->tile_height = 0;
-    out->canvas = {};
+    out->feature_canvas = {};
+    out->rgb_canvas = {};
     out->features = {};
 }
 
@@ -124,6 +130,40 @@ bool ValidSource(const GrayImage* image) noexcept {
     return required <= image->pixels.size();
 }
 
+bool ValidSource(const RgbImage* image) noexcept {
+    if (image == nullptr || image->width <= 0 || image->height <= 0) {
+        return false;
+    }
+    const uint64_t minimum_stride =
+        static_cast<uint64_t>(image->width) * 3u;
+    if (minimum_stride > static_cast<uint64_t>(
+                              (std::numeric_limits<int32_t>::max)()) ||
+        image->stride < static_cast<int32_t>(minimum_stride)) {
+        return false;
+    }
+    const uint64_t required =
+        static_cast<uint64_t>(image->stride) * image->height;
+    return required <= image->pixels.size();
+}
+
+bool ValidFrame(const ContactSheetFrame& frame) noexcept {
+    return ValidSource(frame.gray) && ValidSource(frame.rgb) &&
+           frame.gray->width == frame.rgb->width &&
+           frame.gray->height == frame.rgb->height;
+}
+
+bool CheckedMultiply(uint64_t left,
+                     uint64_t right,
+                     uint64_t* product) noexcept {
+    if (product == nullptr ||
+        (right != 0u &&
+         left > (std::numeric_limits<uint64_t>::max)() / right)) {
+        return false;
+    }
+    *product = left * right;
+    return true;
+}
+
 bool SafeCanvasSize(int32_t tile_width,
                     int32_t tile_height,
                     int32_t* canvas_width,
@@ -133,11 +173,30 @@ bool SafeCanvasSize(int32_t tile_width,
         canvas_height == nullptr || canvas_bytes == nullptr) {
         return false;
     }
-    const uint64_t width = static_cast<uint64_t>(tile_width) * 3u;
-    const uint64_t height = static_cast<uint64_t>(tile_height) * 2u;
-    const uint64_t bytes = width * height;
-    if (width > static_cast<uint64_t>((std::numeric_limits<int32_t>::max)()) ||
-        height > static_cast<uint64_t>((std::numeric_limits<int32_t>::max)()) ||
+    uint64_t width = 0u;
+    uint64_t height = 0u;
+    if (!CheckedMultiply(static_cast<uint64_t>(tile_width), 3u, &width) ||
+        !CheckedMultiply(static_cast<uint64_t>(tile_height), 2u, &height) ||
+        width > static_cast<uint64_t>((std::numeric_limits<int32_t>::max)()) ||
+        height > static_cast<uint64_t>((std::numeric_limits<int32_t>::max)())) {
+        return false;
+    }
+    uint64_t tile_pixels = 0u;
+    uint64_t bytes = 0u;
+    uint64_t color_bytes = 0u;
+    uint64_t retained_gray_bytes = 0u;
+    uint64_t retained_rgb_bytes = 0u;
+    uint64_t conversion_rgb_peak_bytes = 0u;
+    if (!CheckedMultiply(static_cast<uint64_t>(tile_width),
+                         static_cast<uint64_t>(tile_height), &tile_pixels) ||
+        !CheckedMultiply(width, height, &bytes) ||
+        !CheckedMultiply(bytes, 3u, &color_bytes) ||
+        !CheckedMultiply(tile_pixels, VC_VIDEO_FRAME_COUNT,
+                         &retained_gray_bytes) ||
+        !CheckedMultiply(tile_pixels, 3u * VC_VIDEO_FRAME_COUNT,
+                         &retained_rgb_bytes) ||
+        !CheckedMultiply(tile_pixels, 3u * 2u,
+                         &conversion_rgb_peak_bytes) ||
         bytes > static_cast<uint64_t>((std::numeric_limits<size_t>::max)())) {
         return false;
     }
@@ -148,16 +207,14 @@ bool SafeCanvasSize(int32_t tile_width,
         return false;
     }
     const uint64_t feature_pixels = feature_width * feature_height;
-    if (feature_pixels > (std::numeric_limits<uint64_t>::max)() /
-                             (sizeof(float) * 2u)) {
+    uint64_t pdq_bytes = 0u;
+    if (!CheckedMultiply(feature_pixels, sizeof(float) * 2u, &pdq_bytes)) {
         return false;
     }
-    const uint64_t pdq_bytes =
-        feature_pixels * sizeof(float) * 2u;
     const uint64_t feature_gray_bytes =
         (width < 8u || height < 8u) ? feature_pixels : 0u;
     const unsigned long jpeg_bytes = tjBufSize(
-        static_cast<int>(width), static_cast<int>(height), TJSAMP_GRAY);
+        static_cast<int>(width), static_cast<int>(height), TJSAMP_420);
     if (jpeg_bytes == (std::numeric_limits<unsigned long>::max)()) {
         return false;
     }
@@ -167,7 +224,11 @@ bool SafeCanvasSize(int32_t tile_width,
         total += value;
         return true;
     };
-    if (!add_to_budget(bytes) || !add_to_budget(feature_gray_bytes) ||
+    if (!add_to_budget(retained_gray_bytes) ||
+        !add_to_budget(retained_rgb_bytes) ||
+        !add_to_budget(conversion_rgb_peak_bytes) ||
+        !add_to_budget(bytes) || !add_to_budget(color_bytes) ||
+        !add_to_budget(feature_gray_bytes) ||
         !add_to_budget(pdq_bytes) ||
         !add_to_budget(jpeg_bytes)) {
         return false;
@@ -258,6 +319,96 @@ int32_t ScaleIntoTile(const GrayImage& source,
                : VC_ERR_ENCODE;
 }
 
+int32_t ScaleIntoTile(const RgbImage& source,
+                      int32_t tile_width,
+                      int32_t tile_height,
+                      RgbImage* canvas,
+                      int32_t tile_x,
+                      int32_t tile_y) noexcept {
+    int32_t fitted_width = 0;
+    int32_t fitted_height = 0;
+    if (!FitInsideTile(source.width, source.height,
+                       tile_width, tile_height,
+                       &fitted_width, &fitted_height)) {
+        return VC_ERR_INVALID_ARG;
+    }
+    const int32_t offset_x = tile_x + (tile_width - fitted_width) / 2;
+    const int32_t offset_y = tile_y + (tile_height - fitted_height) / 2;
+    SwsOwner scaler(sws_getContext(source.width,
+                                   source.height,
+                                   AV_PIX_FMT_RGB24,
+                                   fitted_width,
+                                   fitted_height,
+                                   AV_PIX_FMT_RGB24,
+                                   SWS_BICUBIC,
+                                   nullptr,
+                                   nullptr,
+                                   nullptr));
+    if (!scaler) return VC_ERR_ENCODE;
+#if defined(VC_RESILIENCE_TESTING)
+    contact_live_sws.fetch_add(1u, std::memory_order_acq_rel);
+    contact_acquired_sws.fetch_add(1u, std::memory_order_acq_rel);
+#endif
+    const uint8_t* source_planes[4]{
+        source.pixels.data(), nullptr, nullptr, nullptr};
+    int source_strides[4]{source.stride, 0, 0, 0};
+    uint8_t* destination_planes[4]{
+        canvas->pixels.data() +
+            static_cast<size_t>(offset_y) * canvas->stride + offset_x * 3,
+        nullptr, nullptr, nullptr};
+    int destination_strides[4]{canvas->stride, 0, 0, 0};
+    return sws_scale(scaler.get(), source_planes, source_strides, 0,
+                     source.height, destination_planes,
+                     destination_strides) == fitted_height
+               ? VC_OK
+               : VC_ERR_ENCODE;
+}
+
+int32_t ScaleGrayIntoRgbTile(const GrayImage& source,
+                             int32_t tile_width,
+                             int32_t tile_height,
+                             RgbImage* canvas,
+                             int32_t tile_x,
+                             int32_t tile_y) noexcept {
+    int32_t fitted_width = 0;
+    int32_t fitted_height = 0;
+    if (!FitInsideTile(source.width, source.height,
+                       tile_width, tile_height,
+                       &fitted_width, &fitted_height)) {
+        return VC_ERR_INVALID_ARG;
+    }
+    const int32_t offset_x = tile_x + (tile_width - fitted_width) / 2;
+    const int32_t offset_y = tile_y + (tile_height - fitted_height) / 2;
+    SwsOwner scaler(sws_getContext(source.width,
+                                   source.height,
+                                   AV_PIX_FMT_GRAY8,
+                                   fitted_width,
+                                   fitted_height,
+                                   AV_PIX_FMT_RGB24,
+                                   SWS_BICUBIC,
+                                   nullptr,
+                                   nullptr,
+                                   nullptr));
+    if (!scaler) return VC_ERR_ENCODE;
+#if defined(VC_RESILIENCE_TESTING)
+    contact_live_sws.fetch_add(1u, std::memory_order_acq_rel);
+    contact_acquired_sws.fetch_add(1u, std::memory_order_acq_rel);
+#endif
+    const uint8_t* source_planes[4]{
+        source.pixels.data(), nullptr, nullptr, nullptr};
+    int source_strides[4]{source.stride, 0, 0, 0};
+    uint8_t* destination_planes[4]{
+        canvas->pixels.data() +
+            static_cast<size_t>(offset_y) * canvas->stride + offset_x * 3,
+        nullptr, nullptr, nullptr};
+    int destination_strides[4]{canvas->stride, 0, 0, 0};
+    return sws_scale(scaler.get(), source_planes, source_strides, 0,
+                     source.height, destination_planes,
+                     destination_strides) == fitted_height
+               ? VC_OK
+               : VC_ERR_ENCODE;
+}
+
 void DrawPlaceholder(GrayImage* canvas,
                      int32_t tile_x,
                      int32_t tile_y,
@@ -308,6 +459,59 @@ void DrawPlaceholder(GrayImage* canvas,
     draw_line(tile_width - 1, 0, 0, tile_height - 1);
 }
 
+void DrawPlaceholder(RgbImage* canvas,
+                     int32_t tile_x,
+                     int32_t tile_y,
+                     int32_t tile_width,
+                     int32_t tile_height) noexcept {
+    const int32_t line_width =
+        (std::min)(tile_width, tile_height) < 64 ? 1 : 2;
+    const auto plot = [&](int32_t x, int32_t y) noexcept {
+        const int32_t brush_x = (std::min)(
+            (std::max)(x, 0), tile_width - line_width);
+        const int32_t brush_y = (std::min)(
+            (std::max)(y, 0), tile_height - line_width);
+        for (int32_t dy = 0; dy < line_width; ++dy) {
+            for (int32_t dx = 0; dx < line_width; ++dx) {
+                uint8_t* pixel = canvas->pixels.data() +
+                    static_cast<size_t>(tile_y + brush_y + dy) *
+                        canvas->stride +
+                    (tile_x + brush_x + dx) * 3;
+                pixel[0] = kPlaceholderLine;
+                pixel[1] = kPlaceholderLine;
+                pixel[2] = kPlaceholderLine;
+            }
+        }
+    };
+    const auto draw_line = [&](int32_t start_x,
+                               int32_t start_y,
+                               int32_t end_x,
+                               int32_t end_y) noexcept {
+        int32_t x = start_x;
+        int32_t y = start_y;
+        const int32_t dx = std::abs(end_x - start_x);
+        const int32_t sx = start_x < end_x ? 1 : -1;
+        const int32_t dy = -std::abs(end_y - start_y);
+        const int32_t sy = start_y < end_y ? 1 : -1;
+        int32_t error = dx + dy;
+        for (;;) {
+            plot(x, y);
+            if (x == end_x && y == end_y) break;
+            const int32_t twice_error = error * 2;
+            if (twice_error >= dy) {
+                error += dy;
+                x += sx;
+            }
+            if (twice_error <= dx) {
+                error += dx;
+                y += sy;
+            }
+        }
+    };
+    draw_line(0, 0, tile_width - 1, tile_height - 1);
+    draw_line(tile_width - 1, 0, 0, tile_height - 1);
+}
+
 bool ValidContactCanvas(const GrayImage& canvas) noexcept {
     if (canvas.width <= 0 || canvas.height <= 0 ||
         canvas.stride < canvas.width) {
@@ -316,6 +520,10 @@ bool ValidContactCanvas(const GrayImage& canvas) noexcept {
     const uint64_t required =
         static_cast<uint64_t>(canvas.stride) * canvas.height;
     return required <= canvas.pixels.size();
+}
+
+bool ValidContactCanvas(const RgbImage& canvas) noexcept {
+    return ValidSource(&canvas);
 }
 
 int32_t ComputeContactFeatures(const GrayImage& canvas,
@@ -414,18 +622,20 @@ int32_t ContactSheetTileDimensions(int32_t source_width,
     return VC_OK;
 }
 
-int32_t BuildContactSheet(
-    const std::array<const GrayImage*, VC_VIDEO_FRAME_COUNT>& frames,
+int32_t BuildContactSheetInternal(
+    const std::array<ContactSheetFrame, VC_VIDEO_FRAME_COUNT>& frames,
     uint32_t tile_max_side,
     ContactSheetResult* out,
     const CancelState* cancel,
-    Deadline deadline) noexcept {
+    Deadline deadline,
+    bool legacy_gray_color) noexcept {
     if (out == nullptr) return VC_ERR_INVALID_ARG;
     ResetResult(out, VC_ERR_NO_FRAME);
     const GrayImage* authority = nullptr;
-    for (const GrayImage* frame : frames) {
-        if (ValidSource(frame)) {
-            authority = frame;
+    for (const ContactSheetFrame& frame : frames) {
+        if ((legacy_gray_color && ValidSource(frame.gray)) ||
+            (!legacy_gray_color && ValidFrame(frame))) {
+            authority = frame.gray;
             break;
         }
     }
@@ -449,10 +659,26 @@ int32_t BuildContactSheet(
         return VC_ERR_OUTPUT_TOO_LARGE;
     }
     try {
-        out->canvas.width = canvas_width;
-        out->canvas.height = canvas_height;
-        out->canvas.stride = canvas_width;
-        out->canvas.pixels.assign(canvas_bytes, kPlaceholderBackground);
+        out->feature_canvas.width = canvas_width;
+        out->feature_canvas.height = canvas_height;
+        out->feature_canvas.stride = canvas_width;
+        out->feature_canvas.pixels.assign(
+            canvas_bytes, kPlaceholderBackground);
+        const uint64_t color_stride = static_cast<uint64_t>(canvas_width) * 3u;
+        const uint64_t color_bytes = color_stride *
+            static_cast<uint64_t>(canvas_height);
+        if (color_stride > static_cast<uint64_t>(
+                               (std::numeric_limits<int32_t>::max)()) ||
+            color_bytes > static_cast<uint64_t>(
+                               (std::numeric_limits<size_t>::max)())) {
+            ResetResult(out, VC_ERR_OUTPUT_TOO_LARGE);
+            return VC_ERR_OUTPUT_TOO_LARGE;
+        }
+        out->rgb_canvas.width = canvas_width;
+        out->rgb_canvas.height = canvas_height;
+        out->rgb_canvas.stride = static_cast<int32_t>(color_stride);
+        out->rgb_canvas.pixels.assign(static_cast<size_t>(color_bytes),
+                                      kPlaceholderBackground);
     } catch (const std::bad_alloc&) {
         ResetResult(out, VC_ERR_OOM);
         return VC_ERR_OOM;
@@ -464,17 +690,38 @@ int32_t BuildContactSheet(
     for (uint32_t index = 0u; index < VC_VIDEO_FRAME_COUNT; ++index) {
         const int32_t tile_x = static_cast<int32_t>(index % 3u) * tile_width;
         const int32_t tile_y = static_cast<int32_t>(index / 3u) * tile_height;
-        if (ValidSource(frames[index])) {
+        const int32_t before_scale = CheckOperationBoundary(
+            cancel, deadline, OperationBoundary::feature);
+        if (before_scale != VC_OK) {
+            ResetResult(out, before_scale);
+            return before_scale;
+        }
+        const bool valid = (legacy_gray_color &&
+                            ValidSource(frames[index].gray)) ||
+                           (!legacy_gray_color && ValidFrame(frames[index]));
+        if (valid) {
             const int32_t scale = ScaleIntoTile(
-                *frames[index], tile_width, tile_height,
-                &out->canvas, tile_x, tile_y);
+                *frames[index].gray, tile_width, tile_height,
+                &out->feature_canvas, tile_x, tile_y);
             if (scale != VC_OK) {
                 ResetResult(out, scale);
                 return scale;
             }
+            const int32_t color_scale = legacy_gray_color
+                ? ScaleGrayIntoRgbTile(*frames[index].gray,
+                                       tile_width, tile_height,
+                                       &out->rgb_canvas, tile_x, tile_y)
+                : ScaleIntoTile(*frames[index].rgb, tile_width, tile_height,
+                                &out->rgb_canvas, tile_x, tile_y);
+            if (color_scale != VC_OK) {
+                ResetResult(out, color_scale);
+                return color_scale;
+            }
             out->successful_mask |= 1u << index;
         } else {
-            DrawPlaceholder(&out->canvas, tile_x, tile_y,
+            DrawPlaceholder(&out->feature_canvas, tile_x, tile_y,
+                            tile_width, tile_height);
+            DrawPlaceholder(&out->rgb_canvas, tile_x, tile_y,
                             tile_width, tile_height);
             out->placeholder_mask |= 1u << index;
         }
@@ -486,7 +733,7 @@ int32_t BuildContactSheet(
         return before_feature;
     }
     const int32_t feature_status =
-        ComputeContactFeatures(out->canvas, &out->features);
+        ComputeContactFeatures(out->feature_canvas, &out->features);
     if (feature_status != VC_OK) {
         ResetResult(out, feature_status);
         return feature_status;
@@ -499,7 +746,7 @@ int32_t BuildContactSheet(
     return VC_OK;
 }
 
-int32_t WriteContactSheetJpeg(const GrayImage& canvas,
+int32_t WriteContactSheetJpeg(const RgbImage& canvas,
                               const uint16_t* temporary_path,
                               uint32_t temporary_path_units,
                               const CancelState* cancel,
@@ -517,27 +764,51 @@ int32_t WriteContactSheetJpeg(const GrayImage& canvas,
     contact_live_turbo.fetch_add(1u, std::memory_order_acq_rel);
     contact_acquired_turbo.fetch_add(1u, std::memory_order_acq_rel);
 #endif
-    unsigned char* encoded_raw = nullptr;
-    unsigned long encoded_size = 0u;
+    const unsigned long encoded_capacity =
+        tjBufSize(canvas.width, canvas.height, TJSAMP_420);
+    if (encoded_capacity == (std::numeric_limits<unsigned long>::max)() ||
+        encoded_capacity == 0u ||
+        encoded_capacity > static_cast<unsigned long>(
+                               (std::numeric_limits<int>::max)())) {
+        return VC_ERR_OUTPUT_TOO_LARGE;
+    }
+    unsigned char* encoded_raw =
+        tjAlloc(static_cast<int>(encoded_capacity));
+    if (encoded_raw == nullptr) return VC_ERR_OOM;
+    TurboBuffer encoded_owner(encoded_raw);
+#if defined(VC_RESILIENCE_TESTING)
+    contact_live_buffers.fetch_add(1u, std::memory_order_acq_rel);
+    contact_acquired_buffers.fetch_add(1u, std::memory_order_acq_rel);
+#endif
+    unsigned char* const encoded_initial = encoded_raw;
+    unsigned long encoded_size = encoded_capacity;
+#if defined(VC_VIDEO_ANALYSIS_TESTING)
+    contact_last_jpeg_contract = {TJPF_RGB,
+                                  TJSAMP_420,
+                                  kContactSheetJpegQuality,
+                                  TJFLAG_NOREALLOC,
+                                  encoded_capacity,
+                                  0u,
+                                  false};
+#endif
     const int encoded = tjCompress2(compressor.get(),
                                     canvas.pixels.data(),
                                     canvas.width,
                                     canvas.stride,
                                     canvas.height,
-                                    TJPF_GRAY,
+                                    TJPF_RGB,
                                     &encoded_raw,
                                     &encoded_size,
-                                    TJSAMP_GRAY,
+                                    TJSAMP_420,
                                     kContactSheetJpegQuality,
-                                    TJFLAG_ACCURATEDCT);
-    TurboBuffer encoded_owner(encoded_raw);
-#if defined(VC_RESILIENCE_TESTING)
-    if (encoded_raw != nullptr) {
-        contact_live_buffers.fetch_add(1u, std::memory_order_acq_rel);
-        contact_acquired_buffers.fetch_add(1u, std::memory_order_acq_rel);
-    }
+                                    TJFLAG_NOREALLOC);
+#if defined(VC_VIDEO_ANALYSIS_TESTING)
+    contact_last_jpeg_contract.final_size = encoded_size;
+    contact_last_jpeg_contract.buffer_stable =
+        encoded_raw == encoded_initial;
 #endif
-    if (encoded != 0 || encoded_raw == nullptr || encoded_size == 0u) {
+    if (encoded != 0 || encoded_raw != encoded_initial || encoded_size == 0u ||
+        encoded_size > encoded_capacity) {
         return VC_ERR_ENCODE;
     }
 
@@ -598,6 +869,56 @@ int32_t WriteContactSheetJpeg(const GrayImage& canvas,
 }
 
 int32_t GenerateContactSheet(
+    const std::array<ContactSheetFrame, VC_VIDEO_FRAME_COUNT>& frames,
+    uint32_t tile_max_side,
+    const uint16_t* temporary_path,
+    uint32_t temporary_path_units,
+    ContactSheetResult* out,
+    const CancelState* cancel,
+    Deadline deadline) noexcept {
+    if (out == nullptr) return VC_ERR_INVALID_ARG;
+    if (!ValidUtf16Path(temporary_path, temporary_path_units)) {
+        ResetResult(out, VC_ERR_INVALID_ARG);
+        return VC_ERR_INVALID_ARG;
+    }
+    const int32_t build = BuildContactSheet(
+        frames, tile_max_side, out, cancel, deadline);
+    if (build != VC_OK) return build;
+    const int32_t write = WriteContactSheetJpeg(
+        out->rgb_canvas, temporary_path, temporary_path_units,
+        cancel, deadline);
+    if (write != VC_OK) {
+        ResetResult(out, write);
+        return write;
+    }
+    return VC_OK;
+}
+
+int32_t BuildContactSheet(
+    const std::array<ContactSheetFrame, VC_VIDEO_FRAME_COUNT>& frames,
+    uint32_t tile_max_side,
+    ContactSheetResult* out,
+    const CancelState* cancel,
+    Deadline deadline) noexcept {
+    return BuildContactSheetInternal(frames, tile_max_side, out, cancel,
+                                     deadline, false);
+}
+
+int32_t BuildContactSheet(
+    const std::array<const GrayImage*, VC_VIDEO_FRAME_COUNT>& frames,
+    uint32_t tile_max_side,
+    ContactSheetResult* out,
+    const CancelState* cancel,
+    Deadline deadline) noexcept {
+    std::array<ContactSheetFrame, VC_VIDEO_FRAME_COUNT> paired;
+    for (uint32_t index = 0u; index < VC_VIDEO_FRAME_COUNT; ++index) {
+        paired[index].gray = frames[index];
+    }
+    return BuildContactSheetInternal(paired, tile_max_side, out, cancel,
+                                     deadline, true);
+}
+
+int32_t GenerateContactSheet(
     const std::array<const GrayImage*, VC_VIDEO_FRAME_COUNT>& frames,
     uint32_t tile_max_side,
     const uint16_t* temporary_path,
@@ -614,7 +935,7 @@ int32_t GenerateContactSheet(
         frames, tile_max_side, out, cancel, deadline);
     if (build != VC_OK) return build;
     const int32_t write = WriteContactSheetJpeg(
-        out->canvas, temporary_path, temporary_path_units,
+        out->rgb_canvas, temporary_path, temporary_path_units,
         cancel, deadline);
     if (write != VC_OK) {
         ResetResult(out, write);
@@ -622,6 +943,18 @@ int32_t GenerateContactSheet(
     }
     return VC_OK;
 }
+
+#if defined(VC_VIDEO_ANALYSIS_TESTING)
+ContactSheetJpegContract ContactSheetTestLastJpegContract() noexcept {
+    return contact_last_jpeg_contract;
+}
+
+void ContactSheetTestResetLegacyRgbCopyPixels() noexcept {}
+
+uint64_t ContactSheetTestLegacyRgbCopyPixels() noexcept {
+    return 0u;
+}
+#endif
 
 #if defined(VC_RESILIENCE_TESTING)
 uint64_t ContactSheetTestLiveResourceCount() noexcept {

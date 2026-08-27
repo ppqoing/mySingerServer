@@ -13,33 +13,38 @@ export interface RemotePathBrowserProps {
 const pageSize = 100;
 
 export function RemotePathBrowser({ machineID, api, open, onAdd, onClose }: RemotePathBrowserProps) {
+  const [showHidden, setShowHidden] = useState(false);
+  if (!open) return null;
+
+  return <RemotePathBrowserSession
+    api={api}
+    key={machineID}
+    machineID={machineID}
+    onAdd={onAdd}
+    onClose={onClose}
+    onShowHiddenChange={setShowHidden}
+    showHidden={showHidden}
+  />;
+}
+
+function RemotePathBrowserSession({ machineID, api, onAdd, onClose, onShowHiddenChange, showHidden }: {
+  readonly machineID: string;
+  readonly api: AppApi;
+  readonly onAdd: (path: string) => void;
+  readonly onClose: () => void;
+  readonly onShowHiddenChange: (showHidden: boolean) => void;
+  readonly showHidden: boolean;
+}) {
   const [currentPath, setCurrentPath] = useState("");
   const [parentPath, setParentPath] = useState("");
   const [selectedPath, setSelectedPath] = useState("");
   const [entries, setEntries] = useState<FilesystemEntry[]>([]);
   const [nextCursor, setNextCursor] = useState("");
-  const [showHidden, setShowHidden] = useState(false);
-  const [loading, setLoading] = useState(false);
+  const [initialShowHidden] = useState(showHidden);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
   const controller = useRef<AbortController | undefined>(undefined);
   const lastAttemptedPath = useRef("");
-
-  // Reset the dialog state synchronously when it opens or the agent changes,
-  // so a reopened dialog never shows the previous session's (possibly another
-  // machine's) directory listing. Adjusting state during render is the
-  // React-sanctioned alternative to setState inside an effect.
-  const [prevDialogKey, setPrevDialogKey] = useState(`${open}|${machineID}`);
-  const dialogKey = `${open}|${machineID}`;
-  if (dialogKey !== prevDialogKey) {
-    setPrevDialogKey(dialogKey);
-    setCurrentPath("");
-    setParentPath("");
-    setSelectedPath("");
-    setEntries([]);
-    setNextCursor("");
-    setShowHidden(false);
-    setError(undefined);
-  }
 
   const applyPage = useCallback((result: FilesystemPage, append: boolean) => {
     setCurrentPath(result.currentPath);
@@ -48,13 +53,13 @@ export function RemotePathBrowser({ machineID, api, open, onAdd, onClose }: Remo
     setNextCursor(result.nextCursor);
   }, []);
 
-  const browse = useCallback(async (path: string, cursor: string, append: boolean, hidden: boolean) => {
-    controller.current?.abort();
-    const request = new AbortController();
-    controller.current = request;
-    lastAttemptedPath.current = path;
-    setLoading(true);
-    setError(undefined);
+  const performBrowse = useCallback(async (
+    request: AbortController,
+    path: string,
+    cursor: string,
+    append: boolean,
+    hidden: boolean
+  ) => {
     try {
       const result = await api.browseAgentFilesystem(machineID, {
         path, showHidden: hidden, cursor, limit: pageSize
@@ -70,20 +75,30 @@ export function RemotePathBrowser({ machineID, api, open, onAdd, onClose }: Remo
     }
   }, [api, applyPage, machineID]);
 
+  const browse = useCallback((path: string, cursor: string, append: boolean, hidden: boolean) => {
+    controller.current?.abort();
+    const request = new AbortController();
+    controller.current = request;
+    setLoading(true);
+    setError(undefined);
+    return performBrowse(request, path, cursor, append, hidden);
+  }, [performBrowse]);
+
   useEffect(() => {
-    if (!open) {
-      controller.current?.abort();
-      return;
-    }
-    // The render-time reset above guarantees showHidden === false here. The
-    // local async wrapper mirrors usePolling's shape so the loading state is
-    // not raised synchronously from the effect body.
-    const openRoot = async () => {
-      await browse("", "", false, false);
-    };
-    void openRoot();
+    const request = new AbortController();
+    controller.current = request;
+    lastAttemptedPath.current = "";
+    void api.browseAgentFilesystem(machineID, {
+      path: "", showHidden: initialShowHidden, cursor: "", limit: pageSize
+    }, request.signal).then(result => {
+      if (!request.signal.aborted) applyPage(result, false);
+    }).catch(cause => {
+      if (!request.signal.aborted) setError(cause instanceof Error ? cause.message : "无法浏览远程目录。");
+    }).finally(() => {
+      if (controller.current === request) setLoading(false);
+    });
     return () => controller.current?.abort();
-  }, [browse, machineID, open]);
+  }, [api, applyPage, initialShowHidden, machineID]);
 
   const breadcrumbPaths = useMemo(() => windowsBreadcrumbs(currentPath), [currentPath]);
 
@@ -100,7 +115,7 @@ export function RemotePathBrowser({ machineID, api, open, onAdd, onClose }: Remo
   };
 
   return (
-    <Modal onClose={onClose} open={open} title="选择目录">
+    <Modal onClose={onClose} open={true} title="选择目录">
       <div className="remote-path-browser">
         <nav aria-label="目录面包屑" className="remote-path-browser__breadcrumbs">
           <button disabled={!parentPath} onClick={() => void navigate(parentPath)} type="button">返回上一级</button>
@@ -110,7 +125,7 @@ export function RemotePathBrowser({ machineID, api, open, onAdd, onClose }: Remo
         <label className="remote-path-browser__toggle">
           <input checked={showHidden} onChange={event => {
             const hidden = event.target.checked;
-            setShowHidden(hidden);
+            onShowHiddenChange(hidden);
             void browse(currentPath, "", false, hidden);
           }} type="checkbox" />显示隐藏和系统项目
         </label>

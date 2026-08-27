@@ -1,11 +1,225 @@
 package store
 
 import (
+	"bytes"
 	"context"
+	"encoding/hex"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
+
+	"dedup/internal/proto"
 )
+
+func TestSyncVideoMetadataLoaderReturnsOneContainerWithAllOrderedStreams(t *testing.T) {
+	db := openSyncQueueTestStore(t)
+	ctx := context.Background()
+	sha := strings.Repeat("8", 128)
+	if _, err := db.db.ExecContext(ctx, `
+		INSERT INTO video_containers(
+			sha512,format_name,start_time_us,tags_json,primary_video_stream
+		) VALUES(?1,'matroska',NULL,'{}',2);
+		INSERT INTO video_streams(
+			sha512,stream_index,media_type,codec_id,codec_name,tags_json,width,height
+		) VALUES
+			(?1,2,'video',27,'h264','{}',1920,1080),
+			(?1,0,'audio',86018,'aac','{}',NULL,NULL);`, sha); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.LoadVideoMetadataBySHAs(ctx, []string{sha, sha})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].SHA512 != sha || rows[0].Container.StartTimeUS != nil ||
+		len(rows[0].Streams) != 2 || rows[0].Streams[0].Index != 0 || rows[0].Streams[1].Index != 2 {
+		t.Fatalf("loaded metadata = %#v", rows)
+	}
+	want := []string{"audio", "video"}
+	got := []string{rows[0].Streams[0].MediaType, rows[0].Streams[1].MediaType}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ordered media types=%v, want %v", got, want)
+	}
+}
+
+func TestSyncVideoMetadataLoaderUsesOneSnapshotAcrossConcurrentExactReplace(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	dbPath := filepath.Join(t.TempDir(), "snapshot.db")
+	reader, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	writer, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+
+	shaBytes := bytes.Repeat([]byte{0x42}, 64)
+	sha := hex.EncodeToString(shaBytes)
+	path := `D:\snapshot\video.mkv`
+	if _, err := reader.db.ExecContext(ctx, `
+		INSERT INTO files(machine_id,path,size,mtime,sha512,missing_mask)
+		VALUES('m',?1,10,20,?2,?3)`, path, sha, proto.FieldVideoMetadata); err != nil {
+		t.Fatal(err)
+	}
+	save := func(db *DB, formatName, codecName string, streamIndex int32) error {
+		_, err := db.SaveAnalysis(ctx, AnalysisResult{
+			MachineID: "m", Path: path, Kind: MediaVideo, Size: 10, MTime: 20,
+			SHA512: shaBytes, RequestedFields: proto.FieldVideoMetadata,
+			FieldsDone:     proto.FieldVideoMetadata,
+			VideoContainer: &proto.VideoContainerMetadata{FormatName: formatName, TagsJSON: `{}`},
+			VideoStreams: []proto.VideoStreamMetadata{{
+				Index: streamIndex, MediaType: "video", CodecID: 27,
+				CodecName: codecName, TagsJSON: `{}`,
+			}},
+		})
+		return err
+	}
+	if err := save(reader, "old-container", "old-codec", 0); err != nil {
+		t.Fatal(err)
+	}
+	var observed []SyncQueueRow
+	for _, table := range []string{"video_containers", "video_streams"} {
+		rows, err := reader.PendingSyncRows(ctx, table, 1)
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("pending %s before replace=%#v err=%v", table, rows, err)
+		}
+		observed = append(observed, rows[0])
+	}
+
+	containerRead := make(chan struct{})
+	continueWithStreams := make(chan struct{})
+	type loadResult struct {
+		rows []VideoMetadataSyncRow
+		err  error
+	}
+	loaded := make(chan loadResult, 1)
+	go func() {
+		rows, err := reader.loadVideoMetadataBySHAsWithBarrier(ctx, []string{sha}, func() {
+			close(containerRead)
+			<-continueWithStreams
+		})
+		loaded <- loadResult{rows: rows, err: err}
+	}()
+
+	select {
+	case <-containerRead:
+	case <-ctx.Done():
+		t.Fatalf("loader did not reach container/streams barrier: %v", ctx.Err())
+	}
+	writerDone := make(chan error, 1)
+	go func() { writerDone <- save(writer, "new-container", "new-codec", 1) }()
+	select {
+	case err := <-writerDone:
+		if err != nil {
+			t.Fatalf("concurrent exact replace: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("writer could not commit while WAL reader snapshot was open: %v", ctx.Err())
+	}
+	close(continueWithStreams)
+
+	var result loadResult
+	select {
+	case result = <-loaded:
+	case <-ctx.Done():
+		t.Fatalf("loader did not complete after barrier release: %v", ctx.Err())
+	}
+	if result.err != nil || len(result.rows) != 1 || len(result.rows[0].Streams) != 1 {
+		t.Fatalf("snapshot load=%#v err=%v", result.rows, result.err)
+	}
+	containerName := result.rows[0].Container.FormatName
+	stream := result.rows[0].Streams[0]
+	oldSet := containerName == "old-container" && stream.CodecName == "old-codec" && stream.Index == 0
+	newSet := containerName == "new-container" && stream.CodecName == "new-codec" && stream.Index == 1
+	if !oldSet && !newSet {
+		t.Fatalf("loader returned mixed snapshot: container=%q stream=%#v", containerName, stream)
+	}
+
+	if err := reader.MarkSyncBatch(ctx, observed); err != nil {
+		t.Fatal(err)
+	}
+	for _, before := range observed {
+		rows, err := reader.PendingSyncRows(ctx, before.TableName, 1)
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("new generation %s pending=%#v err=%v", before.TableName, rows, err)
+		}
+		if rows[0].Generation != before.Generation+1 {
+			t.Fatalf("%s generation=%d, want %d pending", before.TableName, rows[0].Generation, before.Generation+1)
+		}
+	}
+}
+
+func TestSyncVideoMetadataTablesParticipateInFairRoundRobin(t *testing.T) {
+	db := openSyncQueueTestStore(t)
+	ctx := context.Background()
+	sha := strings.Repeat("9", 128)
+	if _, err := db.db.ExecContext(ctx, `
+		INSERT INTO sync_queue(table_name,row_pk,synced,enqueued_at,generation) VALUES
+			('files','1',0,1,1),('image_features',?1,0,1,1),
+			('video_features',?1,0,1,1),('video_frames',?2,0,1,1),
+			('video_containers',?1,0,1,1),('video_streams',?1,0,1,1);`, sha, sha+":0"); err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	for round := 0; round < 6; round++ {
+		rows, err := db.PendingSyncBatch(ctx, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) != 1 {
+			t.Fatalf("round %d rows=%#v", round, rows)
+		}
+		seen[rows[0].TableName] = true
+	}
+	for _, table := range []string{
+		"files", "image_features", "video_features", "video_frames", "video_containers", "video_streams",
+	} {
+		if !seen[table] {
+			t.Fatalf("fair round robin starved %s: %#v", table, seen)
+		}
+	}
+}
+
+func TestSyncVideoMetadataAckUsesExactObservedGeneration(t *testing.T) {
+	db := openSyncQueueTestStore(t)
+	ctx := context.Background()
+	sha := strings.Repeat("a", 128)
+	if _, err := db.db.ExecContext(ctx, `
+		INSERT INTO sync_queue(table_name,row_pk,synced,enqueued_at,generation)
+		VALUES('video_containers',?1,0,1,5),('video_streams',?1,0,1,7)`, sha); err != nil {
+		t.Fatal(err)
+	}
+	observed := []SyncQueueRow{
+		{TableName: "video_containers", RowPK: sha, Generation: 5},
+		{TableName: "video_streams", RowPK: sha, Generation: 7},
+	}
+	if _, err := db.db.ExecContext(ctx, `
+		UPDATE sync_queue SET generation=generation+1,synced=0 WHERE row_pk=?1`, sha); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkSyncBatch(ctx, observed); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.db.QueryContext(ctx, `SELECT generation,synced FROM sync_queue WHERE row_pk=?1 ORDER BY table_name`, sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var generation, synced int64
+		if err := rows.Scan(&generation, &synced); err != nil {
+			t.Fatal(err)
+		}
+		if synced != 0 || generation != 6 && generation != 8 {
+			t.Fatalf("new metadata generation acknowledged: generation=%d synced=%d", generation, synced)
+		}
+	}
+}
 
 func openSyncQueueTestStore(t *testing.T) *DB {
 	t.Helper()

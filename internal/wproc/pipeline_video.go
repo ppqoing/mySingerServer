@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"dedup/internal/worker"
@@ -19,11 +22,14 @@ type videoPipelineDeps struct {
 	newSHA      func() (sha512Stream, error)
 	query       func(*worker.SHAQueryMsg) (*worker.SHAReplyMsg, error)
 	probe       func(context.Context, Config, string) (int64, error)
-	cache       func(Config, string, os.FileInfo) (string, bool, string, error)
+	cache       func(Config, [64]byte) (ContactSheetJPEG, bool, error)
+	paths       func(Config, [64]byte, int, int64, string) (ContactSheetPaths, error)
 	generate    func(context.Context, Config, string, float64, string) (string, error)
-	writeMeta   func(Config, string, os.FileInfo, string) error
+	publish     func(ContactSheetPaths, func() error) error
 	readThumb   func(string) ([]byte, error)
 	decodeThumb func([]byte) (imagePhase1, error)
+	pid         func() int
+	nonce       func() string
 }
 
 func defaultVideoPipelineDeps(query func(*worker.SHAQueryMsg) (*worker.SHAReplyMsg, error)) videoPipelineDeps {
@@ -41,11 +47,16 @@ func defaultVideoPipelineDeps(query func(*worker.SHAQueryMsg) (*worker.SHAReplyM
 		probe: func(ctx context.Context, cfg Config, path string) (int64, error) {
 			return ffprobeDuration(ctx, cfg, path, runner)
 		},
-		cache: thumbCacheLookupWithDigest,
-		generate: func(ctx context.Context, cfg Config, source string, seek float64, destination string) (string, error) {
-			return ffmpegShotWithDigest(ctx, cfg, source, seek, destination, runner)
+		cache: func(cfg Config, sha [64]byte) (ContactSheetJPEG, bool, error) {
+			return lookupContactSheet(cfg.ThumbCacheDir, sha)
 		},
-		writeMeta: thumbCacheWriteMeta,
+		paths: func(cfg Config, sha [64]byte, pid int, jobID int64, nonce string) (ContactSheetPaths, error) {
+			return contactSheetPaths(cfg.ThumbCacheDir, sha, pid, jobID, nonce)
+		},
+		generate: func(ctx context.Context, cfg Config, source string, seek float64, destination string) (string, error) {
+			return ffmpegRGBShotWithDigest(ctx, cfg, source, seek, destination, runner)
+		},
+		publish:   publishContactSheet,
 		readThumb: os.ReadFile,
 		decodeThumb: func(data []byte) (imagePhase1, error) {
 			result, err := mediacore.ImagePhase1(data)
@@ -59,6 +70,8 @@ func defaultVideoPipelineDeps(query func(*worker.SHAQueryMsg) (*worker.SHAReplyM
 				Height:  result.Height,
 			}, nil
 		},
+		pid:   os.Getpid,
+		nonce: func() string { return strconv.FormatInt(time.Now().UnixNano(), 36) },
 	}
 }
 
@@ -105,21 +118,39 @@ func processVideoWithDeps(ctx context.Context, cfg Config, job *worker.JobMsg, d
 	if reply == nil || reply.JobID != job.JobID {
 		return nil, fmt.Errorf("worker video pipeline: incompatible SHA reply")
 	}
+	var sha [64]byte
+	copy(sha[:], result.SHA512)
+	var cached ContactSheetJPEG
+	hit := false
 	if reply.Found {
 		if err := validateCachedVideoReply(reply); err != nil {
 			return nil, fmt.Errorf("worker video pipeline: incompatible SHA reply: %w", err)
 		}
+		cached, hit, err = deps.cache(cfg, sha)
+		if err != nil {
+			appendFieldError(result, worker.MaskVideoThumb, "thumb_cache", err)
+			return result, nil
+		}
+		result.ThumbCacheHit = hit
 		duration := *reply.DurationMS
-		quality := *reply.ThumbQuality
 		result.DurationMS = &duration
-		result.ThumbPath = reply.ThumbPath
-		result.ThumbPDQ = append([]byte(nil), reply.ThumbPDQ...)
-		result.ThumbQuality = &quality
-		result.FieldsDone |= worker.MaskVideoThumb
-		return result, nil
+		if hit && len(reply.ThumbPDQ) == mediacore.PDQ256Bytes && reply.ThumbQuality != nil && *reply.ThumbQuality >= 0 && *reply.ThumbQuality <= 100 {
+			quality := *reply.ThumbQuality
+			result.ThumbPath = cached.Path
+			result.ThumbPDQ = append([]byte(nil), reply.ThumbPDQ...)
+			result.ThumbQuality = &quality
+			result.FieldsDone |= worker.MaskVideoThumb
+			return result, nil
+		}
 	}
 
-	duration, durationErr := deps.probe(ctx, cfg, fixPath(job.Path))
+	duration := int64(0)
+	durationErr := error(nil)
+	if reply.Found {
+		duration = *reply.DurationMS
+	} else {
+		duration, durationErr = deps.probe(ctx, cfg, fixPath(job.Path))
+	}
 	seek := 0.0
 	if durationErr != nil {
 		appendFieldError(result, worker.MaskVideoThumb, "ffprobe", durationErr)
@@ -129,38 +160,52 @@ func processVideoWithDeps(ctx context.Context, cfg Config, job *worker.JobMsg, d
 		result.FieldsDone |= worker.MaskVideoThumb
 		seek = float64(duration) / 2000
 	}
-
-	thumbPath, hit, expectedJPEG, err := deps.cache(cfg, job.Path, sourceInfo)
-	if err != nil {
-		appendFieldError(result, worker.MaskVideoThumb, "thumb_cache", err)
-		return result, nil
+	if !reply.Found {
+		cached, hit, err = deps.cache(cfg, sha)
+		if err != nil {
+			appendFieldError(result, worker.MaskVideoThumb, "thumb_cache", err)
+			return result, nil
+		}
+		result.ThumbCacheHit = hit
 	}
-	result.ThumbCacheHit = hit
-	generated := false
+
 	if !hit {
+		paths, pathErr := deps.paths(cfg, sha, deps.pid(), job.JobID, deps.nonce())
+		if pathErr != nil {
+			appendFieldError(result, worker.MaskVideoThumb, "thumb_cache", pathErr)
+			return result, nil
+		}
+		defer func() { _ = os.Remove(paths.TempJPEG) }()
 		started := time.Now()
-		expectedJPEG, err = deps.generate(ctx, cfg, fixPath(job.Path), seek, thumbPath)
+		_, err = deps.generate(ctx, cfg, fixPath(job.Path), seek, paths.TempJPEG)
 		if err != nil {
 			appendFieldError(result, worker.MaskVideoThumb, "ffmpeg", err)
 			return result, nil
 		}
 		result.ThumbMS = time.Since(started).Milliseconds()
+		if err := deps.publish(paths, func() error { return videoSourceDrifted(deps, job, sourceInfo) }); err != nil {
+			if errors.Is(err, errVideoSourceDrifted) {
+				invalidateVideoResultForDrift(result, job, err)
+				return result, nil
+			}
+			appendFieldError(result, worker.MaskVideoThumb, "thumb_cache", err)
+			return result, nil
+		}
 		result.ThumbGenerated = true
-		generated = true
+		cached = ContactSheetJPEG{Path: paths.JPEG}
 	}
 	if err := videoSourceDrifted(deps, job, sourceInfo); err != nil {
 		invalidateVideoResultForDrift(result, job, err)
 		return result, nil
 	}
 
-	data, err := deps.readThumb(thumbPath)
+	data, err := deps.readThumb(cached.Path)
 	if err != nil {
 		appendFieldError(result, worker.MaskVideoThumb, "thumb_pdq", err)
 		return result, nil
 	}
-	if actual := bytesSHA256Hex(data); actual != expectedJPEG {
-		appendFieldError(result, worker.MaskVideoThumb, "thumb_cache",
-			fmt.Errorf("%w: expected %s, read %s", errThumbnailPublishConflict, expectedJPEG, actual))
+	if _, err := inspectRGBJPEG(data); err != nil {
+		appendFieldError(result, worker.MaskVideoThumb, "thumb_cache", err)
 		return result, nil
 	}
 	started := time.Now()
@@ -179,30 +224,24 @@ func processVideoWithDeps(ctx context.Context, cfg Config, job *worker.JobMsg, d
 		invalidateVideoResultForDrift(result, job, err)
 		return result, nil
 	}
-	if generated {
-		if err := deps.writeMeta(cfg, job.Path, sourceInfo, expectedJPEG); err != nil {
-			appendFieldError(result, 0, "thumb_cache", err)
-			if errors.Is(err, errThumbnailPublishConflict) {
-				return result, nil
-			}
-		}
-	}
 	quality := thumb.Quality
 	result.Decoded = true
-	result.ThumbPath = thumbPath
+	result.ThumbPath = cached.Path
 	result.ThumbPDQ = append([]byte(nil), thumb.Hash...)
 	result.ThumbQuality = &quality
 	result.FieldsDone |= worker.MaskVideoThumb
 	return result, nil
 }
 
+var errVideoSourceDrifted = errors.New("video source drifted")
+
 func videoSourceDrifted(deps videoPipelineDeps, job *worker.JobMsg, baseline os.FileInfo) error {
 	current, err := deps.stat(fixPath(job.Path))
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %v", errVideoSourceDrifted, err)
 	}
 	if !deps.sameFile(baseline, current) || !sameFileState(baseline, current) || !matchesDispatchedFile(current, job) {
-		return fmt.Errorf("file changed during video feature extraction")
+		return fmt.Errorf("%w: file changed during video feature extraction", errVideoSourceDrifted)
 	}
 	return nil
 }
@@ -332,8 +371,8 @@ func validateVideoPipelineConfig(cfg Config) error {
 
 func validateVideoDeps(deps videoPipelineDeps) error {
 	if deps.open == nil || deps.stat == nil || deps.sameFile == nil || deps.newSHA == nil ||
-		deps.query == nil || deps.probe == nil || deps.cache == nil || deps.generate == nil ||
-		deps.writeMeta == nil || deps.readThumb == nil || deps.decodeThumb == nil {
+		deps.query == nil || deps.probe == nil || deps.cache == nil || deps.paths == nil || deps.generate == nil ||
+		deps.publish == nil || deps.readThumb == nil || deps.decodeThumb == nil || deps.pid == nil || deps.nonce == nil {
 		return fmt.Errorf("worker video pipeline: pipeline dependency is unavailable")
 	}
 	return nil
@@ -343,14 +382,67 @@ func validateCachedVideoReply(reply *worker.SHAReplyMsg) error {
 	if reply.DurationMS == nil || *reply.DurationMS <= 0 {
 		return fmt.Errorf("duration must be positive")
 	}
-	if reply.ThumbPath == "" {
-		return fmt.Errorf("thumbnail path is empty")
-	}
-	if len(reply.ThumbPDQ) != mediacore.PDQ256Bytes {
-		return fmt.Errorf("thumbnail PDQ must be %d bytes", mediacore.PDQ256Bytes)
-	}
-	if reply.ThumbQuality == nil || *reply.ThumbQuality < 0 || *reply.ThumbQuality > 100 {
-		return fmt.Errorf("thumbnail quality must be between 0 and 100")
-	}
 	return nil
+}
+
+func ffmpegRGBShotWithDigest(parent context.Context, cfg Config, source string, seekSeconds float64, destination string, runner commandRunner) (string, error) {
+	if runner == nil {
+		runner = execCommandRunner{}
+	}
+	if !isFiniteNonNegative(seekSeconds) {
+		return "", fmt.Errorf("ffmpeg seek must be finite and non-negative")
+	}
+	if cfg.ThumbMaxSide <= 0 {
+		return "", fmt.Errorf("thumbnail maximum side must be positive")
+	}
+	if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
+		return "", fmt.Errorf("create thumbnail directory: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(parent, cfg.FFmpegTimeout)
+	defer cancel()
+	filter := fmt.Sprintf("scale=%d:%d:force_original_aspect_ratio=decrease,format=rgb24", cfg.ThumbMaxSide, cfg.ThumbMaxSide)
+	args := []string{
+		"-hide_banner", "-loglevel", "error",
+		"-ss", strconv.FormatFloat(seekSeconds, 'f', 3, 64),
+		"-i", source,
+		"-frames:v", "1",
+		"-an", "-sn", "-dn",
+		"-vf", filter,
+		"-q:v", "3",
+		"-f", "image2",
+		"-y", destination,
+	}
+	_, stderr, err := runner.Run(ctx, cfg.FFmpegPath, args)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		if ctxErr == context.DeadlineExceeded {
+			return "", fmt.Errorf("ffmpeg timeout after %s: %w", cfg.FFmpegTimeout, ctxErr)
+		}
+		return "", fmt.Errorf("ffmpeg cancelled: %w", ctxErr)
+	}
+	if err != nil {
+		message := strings.TrimSpace(string(stderr))
+		if message == "" {
+			return "", fmt.Errorf("ffmpeg: %w", err)
+		}
+		return "", fmt.Errorf("ffmpeg: %w: %s", err, message)
+	}
+	output, err := os.OpenFile(destination, os.O_RDWR, 0)
+	if err != nil {
+		return "", fmt.Errorf("open generated thumbnail: %w", err)
+	}
+	info, statErr := output.Stat()
+	if statErr == nil && (!info.Mode().IsRegular() || info.Size() == 0) {
+		statErr = fmt.Errorf("ffmpeg produced no thumbnail")
+	}
+	if statErr == nil {
+		statErr = output.Sync()
+	}
+	closeErr := output.Close()
+	if statErr != nil {
+		return "", statErr
+	}
+	if closeErr != nil {
+		return "", fmt.Errorf("close generated thumbnail: %w", closeErr)
+	}
+	return fileSHA256Hex(destination)
 }
