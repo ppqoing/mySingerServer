@@ -1,12 +1,35 @@
 //! 复用六个视频槽位生成三列两行、RGB24、质量 80 的 JPG 联系表。
 
 use image::{ExtendedColorType, ImageError, codecs::jpeg::JpegEncoder};
+use thiserror::Error;
 
-use crate::Rgb24Image;
+use crate::{GrayImage, MediaError, Rgb24Image, rgb24_to_gray};
 
 const COLUMNS: u32 = 3;
 const ROWS: u32 = 2;
 const MISSING_COLOR: [u8; 3] = [0x60, 0x65, 0x6f];
+
+/// 解码固定三列两行联系表时的格式或槽位错误。
+#[derive(Debug, Error)]
+pub enum ContactSheetError {
+    /// JPEG 内容损坏或不是可解码图片。
+    #[error("联系表 JPEG 解码失败: {0}")]
+    Decode(#[from] ImageError),
+    /// 联系表尺寸必须能等分为三列两行。
+    #[error("联系表尺寸无效: {width}x{height}")]
+    InvalidDimensions {
+        /// JPEG 像素宽度。
+        width: u32,
+        /// JPEG 像素高度。
+        height: u32,
+    },
+    /// 视频槽位必须位于固定六槽范围。
+    #[error("联系表槽位无效: {0}")]
+    InvalidSlot(u8),
+    /// 裁剪后的 RGB24 长度与尺寸不一致。
+    #[error(transparent)]
+    InvalidPixels(#[from] MediaError),
+}
 
 /// 把六个已有槽位按行优先编码为 JPG；`None` 使用固定灰色单元格。
 pub fn encode_contact_sheet(
@@ -47,6 +70,52 @@ pub fn encode_contact_sheet(
         ExtendedColorType::Rgb8,
     )?;
     Ok(jpeg)
+}
+
+/// 一次解码联系表 JPEG，并按请求顺序裁剪固定三列两行中的槽位。
+pub fn decode_contact_sheet_slots(
+    jpeg: &[u8],
+    slots: &[u8],
+) -> Result<Vec<(u8, Rgb24Image)>, ContactSheetError> {
+    let decoded = image::load_from_memory_with_format(jpeg, image::ImageFormat::Jpeg)?.to_rgb8();
+    let (width, height) = decoded.dimensions();
+    if width == 0 || height == 0 || width % COLUMNS != 0 || height % ROWS != 0 {
+        return Err(ContactSheetError::InvalidDimensions { width, height });
+    }
+    let cell_width = width / COLUMNS;
+    let cell_height = height / ROWS;
+    let raw = decoded.as_raw();
+    let mut output = Vec::with_capacity(slots.len());
+    for &slot in slots {
+        if usize::from(slot) >= 6 {
+            return Err(ContactSheetError::InvalidSlot(slot));
+        }
+        let offset_x = u32::from(slot) % COLUMNS * cell_width;
+        let offset_y = u32::from(slot) / COLUMNS * cell_height;
+        let mut pixels = Vec::with_capacity((cell_width * cell_height * 3) as usize);
+        for y in 0..cell_height {
+            let start = (((offset_y + y) * width + offset_x) * 3) as usize;
+            let bytes = (cell_width * 3) as usize;
+            pixels.extend_from_slice(&raw[start..start + bytes]);
+        }
+        output.push((slot, Rgb24Image::new(cell_width, cell_height, pixels)?));
+    }
+    Ok(output)
+}
+
+/// 一次解码完整联系表，并按行优先返回六个灰度单元格。
+pub fn decode_contact_sheet(jpeg: &[u8]) -> Result<[GrayImage; 6], ContactSheetError> {
+    let slots = [0, 1, 2, 3, 4, 5];
+    let frames = decode_contact_sheet_slots(jpeg, &slots)?
+        .into_iter()
+        .map(|(_, rgb)| rgb24_to_gray(&rgb))
+        .collect::<Vec<_>>();
+    frames
+        .try_into()
+        .map_err(|_| ContactSheetError::InvalidDimensions {
+            width: 0,
+            height: 0,
+        })
 }
 
 fn fitted_size(frame: &Rgb24Image, cell_width: u32, cell_height: u32) -> (u32, u32) {

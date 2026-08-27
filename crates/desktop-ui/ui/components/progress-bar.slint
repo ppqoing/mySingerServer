@@ -11,7 +11,10 @@ export component ProgressBar inherits Rectangle {
     background: Theme.border;
     accessible-role: AccessibleRole.progress-indicator;
     accessible-label: root.accessible-name + "：" + root.value + "%";
+    // 填充始终锚定左上角，进度只沿水平方向从左向右增长。
     Rectangle {
+        x: 0px;
+        y: 0px;
         width: parent.width * max(0, min(100, root.value)) / 100;
         height: parent.height;
         border-radius: 4px;

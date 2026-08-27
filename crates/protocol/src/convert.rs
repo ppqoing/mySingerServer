@@ -4,7 +4,7 @@ use std::net::IpAddr;
 
 use dedup_core::{
     ContentKey, DiskReadConfig, EnumeratorKind, LocationKey, MachineId, NodeConfig,
-    NodePathsConfig, NormalizedPath, Thresholds, WorkerConfig, WorkerMode,
+    NodePathsConfig, NodePostgresConfig, NormalizedPath, Thresholds, WorkerConfig, WorkerMode,
 };
 
 use crate::{ProtocolError, proto};
@@ -28,9 +28,18 @@ impl TryFrom<&NodeConfig> for proto::NodeConfigValue {
             config_path: value.paths.config_path.clone(),
             log_path: value.paths.log_path.clone(),
             cache_path: value.paths.cache_path.clone(),
-            hdd_threads_per_disk: encode_u32(value.read.hdd_threads_per_disk, "read.hdd_threads_per_disk")?,
-            ssd_threads_per_disk: encode_u32(value.read.ssd_threads_per_disk, "read.ssd_threads_per_disk")?,
-            unknown_threads_per_disk: encode_u32(value.read.unknown_threads_per_disk, "read.unknown_threads_per_disk")?,
+            hdd_threads_per_disk: encode_u32(
+                value.read.hdd_threads_per_disk,
+                "read.hdd_threads_per_disk",
+            )?,
+            ssd_threads_per_disk: encode_u32(
+                value.read.ssd_threads_per_disk,
+                "read.ssd_threads_per_disk",
+            )?,
+            unknown_threads_per_disk: encode_u32(
+                value.read.unknown_threads_per_disk,
+                "read.unknown_threads_per_disk",
+            )?,
             total_threads: encode_u32(value.read.total_threads, "read.total_threads")?,
             block_size_bytes: encode_u64(value.read.block_size_bytes, "read.block_size_bytes")?,
             block_timeout_seconds: value.read.block_timeout_seconds,
@@ -41,7 +50,19 @@ impl TryFrom<&NodeConfig> for proto::NodeConfigValue {
                 WorkerMode::Manual => proto::NodeWorkerMode::NodeWorkerManual as i32,
             },
             reserved_cores: encode_u32(value.worker.reserved_cores, "worker.reserved_cores")?,
-            manual_worker_count: encode_u32(value.worker.manual_worker_count, "worker.manual_worker_count")?,
+            manual_worker_count: encode_u32(
+                value.worker.manual_worker_count,
+                "worker.manual_worker_count",
+            )?,
+            postgres: Some(proto::NodePostgresConfigValue {
+                enabled: value.postgres.enabled,
+                host: value.postgres.host.clone(),
+                port: u32::from(value.postgres.port),
+                database: value.postgres.database.clone(),
+                username: value.postgres.username.clone(),
+                password: value.postgres.password.clone(),
+                connect_timeout_seconds: value.postgres.connect_timeout_seconds,
+            }),
         })
     }
 }
@@ -50,10 +71,10 @@ impl TryFrom<proto::NodeConfigValue> for NodeConfig {
     type Error = ProtocolError;
 
     fn try_from(value: proto::NodeConfigValue) -> Result<Self, Self::Error> {
-        let listen_ip = value.listen_ip.parse::<IpAddr>().map_err(|_| invalid_config(
-            "listen_ip",
-            "不是有效 IP 地址",
-        ))?;
+        let listen_ip = value
+            .listen_ip
+            .parse::<IpAddr>()
+            .map_err(|_| invalid_config("listen_ip", "不是有效 IP 地址"))?;
         let enumerator = match proto::NodeEnumerator::try_from(value.enumerator) {
             Ok(proto::NodeEnumerator::NodeWindowsWalker) => EnumeratorKind::WindowsWalker,
             Ok(proto::NodeEnumerator::NodeEverything) => EnumeratorKind::Everything,
@@ -68,9 +89,13 @@ impl TryFrom<proto::NodeConfigValue> for NodeConfig {
                 return Err(invalid_config("worker.mode", "未知枚举值"));
             }
         };
+        let postgres = value.postgres.unwrap_or_default();
         let config = Self {
             listen_ip,
-            port: value.port.try_into().map_err(|_| invalid_config("port", "超出 u16"))?,
+            port: value
+                .port
+                .try_into()
+                .map_err(|_| invalid_config("port", "超出 u16"))?,
             worker_count: narrow_usize(value.legacy_worker_count, "worker_count")?,
             enumerator,
             paths: NodePathsConfig {
@@ -80,9 +105,18 @@ impl TryFrom<proto::NodeConfigValue> for NodeConfig {
                 cache_path: value.cache_path,
             },
             read: DiskReadConfig {
-                hdd_threads_per_disk: narrow_usize(value.hdd_threads_per_disk, "read.hdd_threads_per_disk")?,
-                ssd_threads_per_disk: narrow_usize(value.ssd_threads_per_disk, "read.ssd_threads_per_disk")?,
-                unknown_threads_per_disk: narrow_usize(value.unknown_threads_per_disk, "read.unknown_threads_per_disk")?,
+                hdd_threads_per_disk: narrow_usize(
+                    value.hdd_threads_per_disk,
+                    "read.hdd_threads_per_disk",
+                )?,
+                ssd_threads_per_disk: narrow_usize(
+                    value.ssd_threads_per_disk,
+                    "read.ssd_threads_per_disk",
+                )?,
+                unknown_threads_per_disk: narrow_usize(
+                    value.unknown_threads_per_disk,
+                    "read.unknown_threads_per_disk",
+                )?,
                 total_threads: narrow_usize(value.total_threads, "read.total_threads")?,
                 block_size_bytes: usize::try_from(value.block_size_bytes)
                     .map_err(|_| invalid_config("read.block_size_bytes", "超出 usize"))?,
@@ -92,7 +126,22 @@ impl TryFrom<proto::NodeConfigValue> for NodeConfig {
             worker: WorkerConfig {
                 mode,
                 reserved_cores: narrow_usize(value.reserved_cores, "worker.reserved_cores")?,
-                manual_worker_count: narrow_usize(value.manual_worker_count, "worker.manual_worker_count")?,
+                manual_worker_count: narrow_usize(
+                    value.manual_worker_count,
+                    "worker.manual_worker_count",
+                )?,
+            },
+            postgres: NodePostgresConfig {
+                enabled: postgres.enabled,
+                host: postgres.host,
+                port: postgres
+                    .port
+                    .try_into()
+                    .map_err(|_| invalid_config("postgres.port", "超出 u16"))?,
+                database: postgres.database,
+                username: postgres.username,
+                password: postgres.password,
+                connect_timeout_seconds: postgres.connect_timeout_seconds,
             },
         };
         config.validate()?;

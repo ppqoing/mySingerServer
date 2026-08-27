@@ -32,12 +32,13 @@ impl Stage2Processor for CompleteStage2 {
                 feature: Some(stage2()),
                 error: None,
             }],
+            regenerated_contact_sheet_jpeg: None,
         })
     }
 }
 
 #[tokio::test]
-async fn local_analysis_reports_six_real_stages_and_units() {
+async fn local_analysis_reports_three_persistent_duplicate_list_stages() {
     let machine = MachineId::from_sha256([0x81; 32]);
     let registry = RuntimeTaskRegistry::new();
     let reporter = registry
@@ -65,14 +66,13 @@ async fn local_analysis_reports_six_real_stages_and_units() {
     assert!(summary.overall_total_known);
     assert_eq!(summary.overall_total, 2);
     assert_eq!(summary.overall_completed, 2);
+    assert_eq!(summary.task_kind, "duplicate_list");
     let expected = [
-        ("freeze_inputs", "files"),
-        ("load_features", "files"),
-        ("stage1_candidates", "candidate_pairs"),
-        ("fill_stage2", "candidate_pairs"),
-        ("cluster", "candidate_pairs"),
-        ("save_results", "files"),
+        ("build_candidates", "candidate_pairs"),
+        ("dispatch_stage2", "files"),
+        ("final_compare", "candidate_pairs"),
     ];
+    assert_eq!(details.stages.len(), expected.len());
     for (id, unit) in expected {
         let stage = details
             .stages
@@ -82,10 +82,20 @@ async fn local_analysis_reports_six_real_stages_and_units() {
         assert_eq!(stage.unit, unit);
         assert_eq!(stage.state, RuntimeStageState::RuntimeStageCompleted as i32);
     }
+    let persisted = store.analysis_stages(run_id).unwrap();
+    assert_eq!(
+        persisted
+            .iter()
+            .map(|stage| stage.stage_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["build_candidates", "dispatch_stage2", "final_compare"]
+    );
+    assert!(persisted.iter().all(|stage| stage.started_at_ms.is_some()));
+    assert!(persisted.iter().all(|stage| stage.finished_at_ms.is_some()));
 }
 
 #[tokio::test]
-async fn unresolved_stage2_marks_fill_failed_and_downstream_skipped() {
+async fn unresolved_stage2_marks_final_compare_failed() {
     let machine = MachineId::from_sha256([0x82; 32]);
     let registry = RuntimeTaskRegistry::new();
     let reporter = registry
@@ -110,24 +120,27 @@ async fn unresolved_stage2_marks_fill_failed_and_downstream_skipped() {
     assert_eq!(report.status, AnalysisStatus::Partial);
     let details = registry.details(reporter.id()).await.unwrap();
     assert!(details.summary.as_ref().unwrap().overall_failed > 0);
-    let fill = details
+    let dispatch = details
         .stages
         .iter()
-        .find(|stage| stage.stage_id == "fill_stage2")
+        .find(|stage| stage.stage_id == "dispatch_stage2")
         .unwrap();
-    assert_eq!(fill.state, RuntimeStageState::RuntimeStageFailed as i32);
-    for id in ["cluster", "save_results"] {
-        let stage = details
-            .stages
-            .iter()
-            .find(|stage| stage.stage_id == id)
-            .unwrap();
-        assert_eq!(stage.state, RuntimeStageState::RuntimeStageSkipped as i32);
-        let expected_total = if id == "cluster" { 1 } else { 2 };
-        assert_eq!(stage.total, expected_total);
-        assert_eq!(stage.completed, 0);
-        assert_eq!(stage.skipped, expected_total);
-    }
+    assert_eq!(
+        dispatch.state,
+        RuntimeStageState::RuntimeStageCompleted as i32
+    );
+    let compare = details
+        .stages
+        .iter()
+        .find(|stage| stage.stage_id == "final_compare")
+        .unwrap();
+    assert_eq!(compare.state, RuntimeStageState::RuntimeStageFailed as i32);
+    assert_eq!(compare.total, 1);
+    assert_eq!(compare.completed, 0);
+    assert_eq!(compare.failed, 1);
+    let persisted = store.analysis_stages(run_id).unwrap();
+    assert_eq!(persisted[1].state.as_str(), "completed");
+    assert_eq!(persisted[2].state.as_str(), "failed");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -152,6 +165,12 @@ async fn local_analysis_real_pool_crash_is_persisted_before_next_dispatch_and_sl
     let controller_reporter_id = reporter_id.clone();
     let controller = tokio::spawn(async move {
         let (task_id, first_item) = started.recv().await.unwrap();
+        let (second_task, second_item) = started.recv().await.unwrap();
+        assert_eq!(second_task, task_id);
+        assert_ne!(
+            second_item, first_item,
+            "两个 Worker 应在任何结果返回前同时占满"
+        );
         control
             .crash(
                 task_id.clone(),
@@ -159,8 +178,22 @@ async fn local_analysis_real_pool_crash_is_persisted_before_next_dispatch_and_sl
                 "controlled stage2 crash".into(),
             )
             .await;
+        control
+            .complete_stage2(
+                task_id.clone(),
+                second_item,
+                Stage2Output {
+                    frames: vec![Stage2Frame {
+                        slot: 0,
+                        feature: Some(stage2()),
+                        error: None,
+                    }],
+                    regenerated_contact_sheet_jpeg: None,
+                },
+            )
+            .await;
 
-        let (_, second_item) = started.recv().await.unwrap();
+        let (_, third_item) = started.recv().await.unwrap();
         let reopened =
             NodeStore::open(&controller_database, MachineId::from_sha256([0x84; 32])).unwrap();
         let stage2_task = reopened
@@ -170,8 +203,9 @@ async fn local_analysis_real_pool_crash_is_persisted_before_next_dispatch_and_sl
             .into_iter()
             .find(|task| task.task_id.as_uuid().to_string() == task_id)
             .unwrap();
-        assert_eq!(stage2_task.failed, 1, "A 必须先写 Store Failed 再派发 B");
-        assert_eq!(stage2_task.succeeded, 0);
+        assert_eq!(stage2_task.failed, 0, "Worker 崩溃项不应再次进入失败重试");
+        assert_eq!(stage2_task.cancelled, 1, "Worker 崩溃项必须立即标记跳过");
+        assert_eq!(stage2_task.succeeded, 1, "并行完成项必须独立写入成功终态");
         let live = controller_registry
             .details(&controller_reporter_id)
             .await
@@ -184,21 +218,6 @@ async fn local_analysis_real_pool_crash_is_persisted_before_next_dispatch_and_sl
         assert!(live.failures[0].message.contains("controlled stage2 crash"));
         control
             .complete_stage2(
-                task_id.clone(),
-                second_item,
-                Stage2Output {
-                    frames: vec![Stage2Frame {
-                        slot: 0,
-                        feature: Some(stage2()),
-                        error: None,
-                    }],
-                },
-            )
-            .await;
-
-        let (_, third_item) = started.recv().await.unwrap();
-        control
-            .complete_stage2(
                 task_id,
                 third_item,
                 Stage2Output {
@@ -207,6 +226,7 @@ async fn local_analysis_real_pool_crash_is_persisted_before_next_dispatch_and_sl
                         feature: Some(stage2()),
                         error: None,
                     }],
+                    regenerated_contact_sheet_jpeg: None,
                 },
             )
             .await;
@@ -247,9 +267,10 @@ async fn local_analysis_real_pool_crash_is_persisted_before_next_dispatch_and_sl
         .unwrap()
         .items
         .into_iter()
-        .find(|task| task.kind == "analysis_stage2")
+        .find(|task| task.kind == "stage2_compute")
         .unwrap();
-    assert_eq!(stage2_task.failed, 1);
+    assert_eq!(stage2_task.failed, 0);
+    assert_eq!(stage2_task.cancelled, 1);
     assert_eq!(stage2_task.succeeded, 2);
     let details = registry.details(&reporter_id).await.unwrap();
     assert_eq!(
@@ -271,7 +292,11 @@ async fn phase2_worker_reports_actual_started_slot_pid_path_disk_and_completion(
     let machine = MachineId::from_sha256([0x83; 32]);
     let registry = RuntimeTaskRegistry::new();
     let reporter = registry
-        .begin(RuntimeTaskKind::Stage2, machine.clone(), "二筛")
+        .begin(
+            RuntimeTaskKind::Stage2Compute,
+            machine.clone(),
+            "二次特征计算",
+        )
         .await;
     let mut store = NodeStore::open_in_memory(machine.clone()).unwrap();
     let scanned = ScannedPath::new(
@@ -296,6 +321,7 @@ async fn phase2_worker_reports_actual_started_slot_pid_path_disk_and_completion(
                             feature: Some(stage2()),
                             error: None,
                         }],
+                        regenerated_contact_sheet_jpeg: None,
                     },
                 )
                 .await;
@@ -314,6 +340,7 @@ async fn phase2_worker_reports_actual_started_slot_pid_path_disk_and_completion(
                 display_path: scanned.display_path.clone(),
                 media_kind: MediaKind::Image,
                 frame_slots: Vec::new(),
+                contact_sheet_path: None,
             })
             .await
             .unwrap();
@@ -325,11 +352,13 @@ async fn phase2_worker_reports_actual_started_slot_pid_path_disk_and_completion(
     let worker = &details.workers[0];
     assert_eq!(worker.slot, 0);
     assert_eq!(worker.process_id, Some(1));
-    assert_eq!(worker.stage_id, "fill_stage2");
+    assert_eq!(worker.stage_id, "compute_stage2_features");
     assert_eq!(worker.display_path, path.to_string_lossy());
     assert!(!worker.physical_disk_id.is_empty());
     assert_eq!(worker.completed_files, 2);
     assert!(worker.speed_per_second > 0.0);
+    assert_eq!(worker.current_step, "计算二次特征");
+    assert_eq!(worker.cache_detail, "读取原图");
 }
 
 type Seeded = (ScannedPath, LocationKey, dedup_node_store::ContentId);

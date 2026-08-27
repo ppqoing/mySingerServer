@@ -48,10 +48,15 @@ export struct UiRuntimeWorkerRow {
     slot: int,
     identity: string,
     stage-id: string,
+    step: string,
+    cache-detail: string,
     path: string,
     disk: string,
     completed: string,
     speed: string,
+    phase: string,
+    cpu-weight: string,
+    decoder-threads: string,
 }
 
 // 最近失败行只承载后端已经提供的阶段、路径和错误消息。
@@ -71,6 +76,14 @@ export struct UiFileFaultRow {
     stage: string,
     error-code: string,
     message: string,
+}
+
+// 数据库表行只展示固定表名、检查状态和成功后的精确行数。
+export struct UiDatabaseTableRow {
+    name: string,
+    status: string,
+    status-color: color,
+    row-count: string,
 }
 
 export struct UiGroupRow {
@@ -97,6 +110,16 @@ export struct UiMemberRow {
     online: bool,
     preview-enabled: bool,
     delete-enabled: bool,
+}
+
+// 节点路径选择器只接收节点已经确认存在的目录，不把普通文件伪装成可选根。
+export struct UiPathRow {
+    path: string,
+}
+
+// 每个扫描根都是独立可编辑、可选择和可删除的页面 Item。
+export struct UiScanRootRow {
+    path: string,
 }
 
 export global Theme {

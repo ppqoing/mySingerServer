@@ -1,4 +1,4 @@
-//! 远程 Node 配置 V3 的 wire、转换与 descriptor 契约。
+//! 远程 Node 配置 V4 的 wire、转换与 descriptor 契约。
 
 use std::net::{IpAddr, Ipv4Addr};
 
@@ -28,13 +28,25 @@ fn node_config_value_round_trips_every_approved_field() {
     config.worker.mode = WorkerMode::Manual;
     config.worker.reserved_cores = 11;
     config.worker.manual_worker_count = 12;
+    config.postgres.enabled = true;
+    config.postgres.host = "192.168.1.8".into();
+    config.postgres.port = 15432;
+    config.postgres.database = "media".into();
+    config.postgres.username = "dedup".into();
+    config.postgres.password = "secret".into();
+    config.postgres.connect_timeout_seconds = 7;
 
     let wire = proto::NodeConfigValue::try_from(&config).unwrap();
     let decoded = NodeConfig::try_from(wire.clone()).unwrap();
 
     assert_eq!(decoded, config);
     assert_eq!(wire.legacy_worker_count, 17);
-    assert_eq!(wire.worker_mode, proto::NodeWorkerMode::NodeWorkerManual as i32);
+    assert_eq!(
+        wire.worker_mode,
+        proto::NodeWorkerMode::NodeWorkerManual as i32
+    );
+    assert_eq!(wire.postgres.as_ref().unwrap().username, "dedup");
+    assert_eq!(wire.postgres.as_ref().unwrap().password, "secret");
 }
 
 #[test]
@@ -44,10 +56,12 @@ fn unknown_config_enum_is_rejected_instead_of_silently_defaulting() {
 
     assert!(matches!(
         NodeConfig::try_from(wire),
-        Err(ProtocolError::InvalidDomain(dedup_core::CoreError::InvalidConfig {
-            field: "enumerator",
-            ..
-        }))
+        Err(ProtocolError::InvalidDomain(
+            dedup_core::CoreError::InvalidConfig {
+                field: "enumerator",
+                ..
+            }
+        ))
     ));
 }
 
@@ -73,8 +87,14 @@ fn config_messages_round_trip_snapshot_and_restart_values() {
         machine_id: snapshot.machine_id,
         saved_version_sha256: "c".repeat(64),
     };
-    assert_eq!(proto::SaveNodeConfigAndRestart::decode(save.encode_to_vec().as_slice()).unwrap(), save);
-    assert_eq!(proto::NodeRestartAccepted::decode(accepted.encode_to_vec().as_slice()).unwrap(), accepted);
+    assert_eq!(
+        proto::SaveNodeConfigAndRestart::decode(save.encode_to_vec().as_slice()).unwrap(),
+        save
+    );
+    assert_eq!(
+        proto::NodeRestartAccepted::decode(accepted.encode_to_vec().as_slice()).unwrap(),
+        accepted
+    );
 }
 
 #[test]
@@ -84,10 +104,12 @@ fn invalid_node_config_is_rejected_before_encoding() {
 
     assert!(matches!(
         proto::NodeConfigValue::try_from(&config),
-        Err(ProtocolError::InvalidDomain(dedup_core::CoreError::InvalidConfig {
-            field: "worker_count",
-            ..
-        }))
+        Err(ProtocolError::InvalidDomain(
+            dedup_core::CoreError::InvalidConfig {
+                field: "worker_count",
+                ..
+            }
+        ))
     ));
 }
 
@@ -97,20 +119,24 @@ fn invalid_worker_enum_and_oversized_block_size_are_rejected_while_decoding() {
     unknown_worker.worker_mode = 99;
     assert!(matches!(
         NodeConfig::try_from(unknown_worker),
-        Err(ProtocolError::InvalidDomain(dedup_core::CoreError::InvalidConfig {
-            field: "worker.mode",
-            ..
-        }))
+        Err(ProtocolError::InvalidDomain(
+            dedup_core::CoreError::InvalidConfig {
+                field: "worker.mode",
+                ..
+            }
+        ))
     ));
 
     let mut oversized_block = proto::NodeConfigValue::try_from(&NodeConfig::default()).unwrap();
     oversized_block.block_size_bytes = u64::MAX;
     assert!(matches!(
         NodeConfig::try_from(oversized_block),
-        Err(ProtocolError::InvalidDomain(dedup_core::CoreError::InvalidConfig {
-            field: "read.block_size_bytes",
-            ..
-        }))
+        Err(ProtocolError::InvalidDomain(
+            dedup_core::CoreError::InvalidConfig {
+                field: "read.block_size_bytes",
+                ..
+            }
+        ))
     ));
 }
 
@@ -157,23 +183,29 @@ fn descriptor_contains_only_the_approved_config_messages_and_envelope_tags() {
     .map(|name| message(messages, name).unwrap())
     {
         for field in &message.field {
-        let name = field.name.as_deref().unwrap_or_default().to_ascii_lowercase();
-        assert!(
-            !["auth", "key", "tls", "token", "certificate"]
-                .iter()
-                .any(|forbidden| name.contains(forbidden)),
-            "配置协议不得含安全扩展字段: {name}"
-        );
+            let name = field
+                .name
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            assert!(
+                !["auth", "key", "tls", "token", "certificate"]
+                    .iter()
+                    .any(|forbidden| name.contains(forbidden)),
+                "配置协议不得含安全扩展字段: {name}"
+            );
         }
     }
 }
 
 #[test]
-fn get_node_config_uses_protocol_v3_envelope_payload() {
-    assert_eq!(PROTOCOL_VERSION, 3);
+fn get_node_config_uses_protocol_v5_envelope_payload() {
+    assert_eq!(PROTOCOL_VERSION, 5);
     let envelope = proto::Envelope {
         request_id: 7,
-        payload: Some(proto::envelope::Payload::GetNodeConfig(proto::GetNodeConfig {})),
+        payload: Some(proto::envelope::Payload::GetNodeConfig(
+            proto::GetNodeConfig {},
+        )),
     };
     let decoded = proto::Envelope::decode(envelope.encode_to_vec().as_slice()).unwrap();
     assert!(matches!(

@@ -121,7 +121,7 @@ impl SnapshotReader<'_> {
 
     fn read_contents(&self, cursor: &str, limit: usize) -> Result<Vec<SnapshotRow>, StoreError> {
         let mut statement = self.0.prepare(
-            "SELECT hex(md5)||':'||printf('%020d',file_size),md5,file_size,media_kind
+            "SELECT hex(md5)||':'||printf('%020d',file_size),md5,file_size,media_kind,base_complete
              FROM contents
              WHERE hex(md5)||':'||printf('%020d',file_size)>?1
              ORDER BY md5,file_size LIMIT ?2",
@@ -133,16 +133,17 @@ impl SnapshotReader<'_> {
                     row.get::<_, Vec<u8>>(1)?,
                     row.get::<_, i64>(2)?,
                     row.get::<_, String>(3)?,
+                    row.get::<_, bool>(4)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         raw.into_iter()
-            .map(|(key, md5, size, kind)| {
+            .map(|(key, md5, size, kind, base_complete)| {
                 let kind = parse_media_kind(&kind)?;
                 let content_key = ContentKey::new(fixed_bytes(md5, "contents.md5")?, size as u64);
                 Ok(SnapshotRow {
                     key,
-                    payload: encode_content(content_key, kind),
+                    payload: encode_content(content_key, kind, base_complete),
                 })
             })
             .collect()

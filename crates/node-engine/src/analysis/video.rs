@@ -67,7 +67,7 @@ pub(crate) fn video_candidates_with_runtime(
     let candidates = video_candidates(features, thresholds);
     if let Some(reporter) = reporter {
         let _ = reporter.update_stage_nowait(RuntimeStageUpdate {
-            stage: RuntimeStage::Stage1Candidates,
+            stage: RuntimeStage::BuildCandidates,
             state: dedup_protocol::proto::RuntimeStageState::RuntimeStageRunning,
             unit: RuntimeProgressUnit::CandidatePairs,
             completed: completed_before.saturating_add(candidates.len() as u64),

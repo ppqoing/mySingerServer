@@ -10,7 +10,14 @@ pub use error::ProtocolError;
 pub use generated::{FILE_DESCRIPTOR_SET, proto};
 
 /// 当前 Rust V2 节点与管理端握手使用的固定协议版本。
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 5;
+
+/// 基础计算缺失掩码：需要探测媒体元数据。
+pub const BASE_MISSING_PROBE: u32 = 1;
+/// 基础计算缺失掩码：需要计算一阶段媒体特征。
+pub const BASE_MISSING_STAGE1: u32 = 2;
+/// 基础计算缺失掩码：需要生成视频联系表缩略图。
+pub const BASE_MISSING_CONTACT_SHEET: u32 = 4;
 
 /// 每个运行时任务详情最多保留并通过 wire 返回的最近失败数量。
 pub const MAX_RUNTIME_FAILURES: usize = 20;

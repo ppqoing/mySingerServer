@@ -10,7 +10,9 @@ mod resize;
 mod sobel;
 mod video_score;
 
-pub use contact_sheet::encode_contact_sheet;
+pub use contact_sheet::{
+    ContactSheetError, decode_contact_sheet, decode_contact_sheet_slots, encode_contact_sheet,
+};
 pub use image::{GrayImage, MediaError, Rgb24Image, rgb24_to_gray};
 pub use image_score::{
     ImageStage1, ImageStage1Score, ImageStage2, ImageStage2Score, compute_image_stage2, pdq_bands,

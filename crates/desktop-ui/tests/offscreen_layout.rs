@@ -75,6 +75,57 @@ fn assert_element_has_positive_size(element: &ElementHandle, label: &str) {
     );
 }
 
+fn center(element: &ElementHandle) -> (f32, f32) {
+    let position = element.absolute_position();
+    let size = element.size();
+    (
+        position.x + size.width / 2.0,
+        position.y + size.height / 2.0,
+    )
+}
+
+fn assert_action_button_content_centered(
+    window: &MainWindow,
+    accessible_label: &str,
+    visual_label: &str,
+) {
+    let button = accessible(window, accessible_label);
+    let icon = accessible(window, &format!("按钮图标：{visual_label}"));
+    let text = accessible(window, &format!("按钮文字：{visual_label}"));
+    let button_center = center(&button);
+    let icon_center = center(&icon);
+    let text_center = center(&text);
+    assert!(
+        (button_center.1 - icon_center.1).abs() <= 1.0
+            && (button_center.1 - text_center.1).abs() <= 1.0,
+        "{accessible_label} 的图标和文字必须与按钮共享垂直中心轴，按钮={button_center:?}，图标={icon_center:?}，文字={text_center:?}",
+    );
+    let group_left = icon.absolute_position().x.min(text.absolute_position().x);
+    let group_right = (icon.absolute_position().x + icon.size().width)
+        .max(text.absolute_position().x + text.size().width);
+    assert!(
+        (button_center.0 - (group_left + group_right) / 2.0).abs() <= 1.0,
+        "{accessible_label} 的图标文字组必须在按钮内水平居中",
+    );
+}
+
+fn assert_empty_state_centered(window: &MainWindow, title: &str) {
+    let empty = accessible(window, &format!("空状态：{title}"));
+    let title_text = accessible(window, &format!("空状态标题：{title}"));
+    assert!(
+        (center(&empty).0 - center(&title_text).0).abs() <= 1.0,
+        "空状态“{title}”的标题必须位于工作区水平中心轴",
+    );
+    if let Some(icon) =
+        ElementHandle::find_by_accessible_label(window, &format!("空状态图标：{title}")).next()
+    {
+        assert!(
+            (center(&empty).0 - center(&icon).0).abs() <= 1.0,
+            "空状态“{title}”存在图标时必须与标题共用水平中心轴",
+        );
+    }
+}
+
 fn accessible(window: &MainWindow, label: &str) -> ElementHandle {
     ElementHandle::find_by_accessible_label(window, label)
         .next()
@@ -220,6 +271,10 @@ fn install_scan_and_task_fixture(window: &MainWindow) {
     window.set_runtime_detail_machine_id("machine-runtime-very-long-001".into());
     window.set_runtime_detail_state("运行中".into());
     window.set_runtime_detail_counts("7 / 20 · 失败 0 · 跳过 1".into());
+    window.set_runtime_pipeline_metrics(
+        "队列：Hash队列 当前 0 / 峰值 2 / 容量 4；等待 —；耗时 —\nI/O：Hash IO 当前 1 / 峰值 2 / 容量 4；等待 —；耗时 —\nHash / media：Hash等待许可 当前 1 / 峰值 2 / 容量 4\nWorker phase：Worker解码 当前 1 / 峰值 2 / 容量 4\ncredit：decode credit 当前 1 / 峰值 2 / 容量 4\n吞吐 / item P95：Hash字节 4.0 KiB · 媒体吞吐 — · item P95 42ms"
+            .into(),
+    );
     window.set_runtime_detail_stale(true);
     window.set_runtime_stages(ModelRc::new(VecModel::from(vec![
         UiRuntimeStageRow {
@@ -253,10 +308,15 @@ fn install_scan_and_task_fixture(window: &MainWindow) {
         slot: 2,
         identity: "PID 4812 · 槽位 2".into(),
         stage_id: "probe_stage1".into(),
+        step: "生成缩略图".into(),
+        cache_detail: "复用本地缩略图".into(),
         path: r"D:\Media\very-long-directory\nested\clip-001.mp4".into(),
         disk: "PhysicalDisk 1".into(),
         completed: "12 个文件".into(),
         speed: "3.5 文件/秒".into(),
+        phase: "特征计算".into(),
+        cpu_weight: "2".into(),
+        decoder_threads: "2".into(),
     }])));
     window.set_runtime_failures(ModelRc::new(VecModel::from(vec![UiRuntimeFailureRow {
         stage_id: "probe_stage1".into(),
@@ -303,7 +363,7 @@ fn scan_and_task_primary_actions_stay_above_the_fold() {
             (0.0..=32.0).contains(&scan_gap),
             "扫描主要内容必须紧随标题，实际间距={scan_gap}px",
         );
-        for label in ["浏览节点路径", "开始扫描"] {
+        for label in ["添加扫描路径", "开始扫描"] {
             let action = ElementHandle::find_by_accessible_label(&window, label)
                 .next()
                 .unwrap_or_else(|| panic!("扫描工作区应公开{label}"));
@@ -403,12 +463,12 @@ fn scan_and_task_primary_actions_stay_above_the_fold() {
 fn runtime_task_details_keep_thirty_five_sixty_five_columns_at_both_sizes() {
     install_testing_backend();
 
-    let window = MainWindow::new().expect("应能构造真实 MainWindow");
-    install_scan_and_task_fixture(&window);
-    window.show().expect("应能显示运行任务详情工作区");
-    window.invoke_navigate_to(3);
-
     for (width, height) in [(1440.0, 900.0), (1080.0, 700.0)] {
+        // 每种窗口尺寸独立构造视图，避免上一尺寸的真实滚动位置影响下一尺寸的顶部断言。
+        let window = MainWindow::new().expect("应能构造真实 MainWindow");
+        install_scan_and_task_fixture(&window);
+        window.show().expect("应能显示运行任务详情工作区");
+        window.invoke_navigate_to(3);
         window
             .window()
             .set_size(slint::PhysicalSize::new(width as u32, height as u32));
@@ -443,15 +503,135 @@ fn runtime_task_details_keep_thirty_five_sixty_five_columns_at_both_sizes() {
             assert_element_has_positive_size(&scroll, label);
             assert_element_inside_window(&scroll, label, width, height);
         }
-        for label in ["全部阶段", "当前 Worker", "最近失败", "数据已过期"] {
-            assert_element_has_positive_size(&accessible(&window, label), label);
+        let detail_scroll = accessible(&window, "运行详情滚动区");
+        window
+            .window()
+            .take_snapshot()
+            .expect("运行详情顶部应能完成软件渲染");
+        let worker_label = r"Worker：PID 4812 · 槽位 2；阶段 probe_stage1；步骤 生成缩略图；缓存 复用本地缩略图；路径 D:\Media\very-long-directory\nested\clip-001.mp4；磁盘 PhysicalDisk 1；阶段身份 特征计算；CPU权重 2；解码线程 2；12 个文件；3.5 文件/秒";
+        let required = [
+            "任务机器：machine-runtime-very-long-001",
+            "数据已过期",
+            "实际执行配置：—",
+            "流水线指标：队列：Hash队列 当前 0 / 峰值 2 / 容量 4；等待 —；耗时 —\nI/O：Hash IO 当前 1 / 峰值 2 / 容量 4；等待 —；耗时 —\nHash / media：Hash等待许可 当前 1 / 峰值 2 / 容量 4\nWorker phase：Worker解码 当前 1 / 峰值 2 / 容量 4\ncredit：decode credit 当前 1 / 峰值 2 / 容量 4\n吞吐 / item P95：Hash字节 4.0 KiB · 媒体吞吐 — · item P95 42ms",
+            "流水线指标内容：队列：Hash队列 当前 0 / 峰值 2 / 容量 4；等待 —；耗时 —\nI/O：Hash IO 当前 1 / 峰值 2 / 容量 4；等待 —；耗时 —\nHash / media：Hash等待许可 当前 1 / 峰值 2 / 容量 4\nWorker phase：Worker解码 当前 1 / 峰值 2 / 容量 4\ncredit：decode credit 当前 1 / 峰值 2 / 容量 4\n吞吐 / item P95：Hash字节 4.0 KiB · 媒体吞吐 — · item P95 42ms",
+            "全部阶段",
+            "当前 Worker",
+            worker_label,
+        ];
+        let mut seen = vec![false; required.len()];
+        let mut worker = None;
+        for _ in 0..80 {
+            for (index, label) in required.iter().enumerate() {
+                if let Some(element) =
+                    ElementHandle::find_by_accessible_label(&window, label).next()
+                {
+                    assert_element_has_positive_size(&element, label);
+                    seen[index] = true;
+                    if *label == worker_label {
+                        worker = Some(element);
+                    }
+                }
+            }
+            if seen.iter().all(|visible| *visible) {
+                break;
+            }
+            // 24px 小步进也覆盖 34px 的过期提示，避免测试滚轮跨过短行。
+            detail_scroll.scroll(0.0, -24.0);
+            // 测试后端使用模拟时钟，显式结束 180ms 平滑滚动后再读取可访问树。
+            i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(200));
         }
-        accessible(&window, "任务机器：machine-runtime-very-long-001");
-        accessible(
-            &window,
-            r"Worker：PID 4812 · 槽位 2；阶段 probe_stage1；路径 D:\Media\very-long-directory\nested\clip-001.mp4；磁盘 PhysicalDisk 1；12 个文件；3.5 文件/秒",
+        for (label, visible) in required.iter().zip(seen) {
+            assert!(
+                visible,
+                "{width}×{height} 运行详情自己的滚动区必须能到达：{label}"
+            );
+        }
+        assert_element_has_positive_size(
+            &worker.expect("Worker 行必须能通过运行详情自己的滚动区到达"),
+            "Worker 行",
         );
     }
+}
+
+// 验证共享进度条从左边缘开始填充，并在当前百分比之后保留未填充轨道。
+#[test]
+fn progress_bars_fill_from_left_to_right() {
+    install_testing_backend();
+
+    let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    install_scan_and_task_fixture(&window);
+    window.show().expect("应能显示运行任务详情工作区");
+    window.invoke_navigate_to(3);
+    window
+        .window()
+        .set_size(slint::PhysicalSize::new(1440, 900));
+    let snapshot = window
+        .window()
+        .take_snapshot()
+        .expect("任务进度条应能完成软件渲染");
+
+    let progress = accessible(&window, "任务进度：35%");
+    let position = progress.absolute_position();
+    let size = progress.size();
+    assert!(
+        size.width >= 120.0 && size.height >= 8.0,
+        "任务进度条必须拥有可读尺寸，实际={size:?}",
+    );
+
+    // 取圆角之外的左侧填充像素，以及百分比之后的右侧轨道像素。
+    let sample_y = (position.y + size.height / 2.0).floor() as usize;
+    let filled_x = (position.x + 3.0).floor() as usize;
+    let track_x = (position.x + size.width * 0.75).floor() as usize;
+    let pixels = snapshot.as_slice();
+    let row_width = snapshot.width() as usize;
+    let filled = pixels[sample_y * row_width + filled_x];
+    let track = pixels[sample_y * row_width + track_x];
+
+    assert!(
+        filled.b > filled.r.saturating_add(80) && filled.b > filled.g.saturating_add(40),
+        "35% 进度必须从左边缘显示蓝色填充，实际={filled:?}",
+    );
+    assert!(
+        track.r.abs_diff(track.g) <= 12 && track.g.abs_diff(track.b) <= 12,
+        "35% 之后必须保留中性轨道颜色，实际={track:?}",
+    );
+}
+
+#[test]
+fn empty_state_icon_stays_on_the_text_center_axis() {
+    install_testing_backend();
+
+    let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    window.show().expect("应能显示空任务工作区");
+    window.invoke_navigate_to(3);
+    window
+        .window()
+        .set_size(slint::PhysicalSize::new(1440, 900));
+    window
+        .window()
+        .take_snapshot()
+        .expect("空任务工作区应能完成软件渲染");
+
+    let empty = accessible(&window, "任务表空态：运行中");
+    let icon = empty
+        .query_descendants()
+        .match_inherits("Image")
+        .find_first()
+        .expect("任务空态应保留语义图标");
+    assert_element_has_positive_size(&empty, "任务空态");
+    assert_element_has_positive_size(&icon, "任务空态图标");
+
+    let empty_position = empty.absolute_position();
+    let empty_size = empty.size();
+    let icon_position = icon.absolute_position();
+    let icon_size = icon.size();
+    let empty_center_x = empty_position.x + empty_size.width / 2.0;
+    let icon_center_x = icon_position.x + icon_size.width / 2.0;
+    assert!(
+        (empty_center_x - icon_center_x).abs() <= 1.0,
+        "空态图标必须与空态文本位于同一水平中心轴，空态中心={empty_center_x}，图标中心={icon_center_x}",
+    );
 }
 
 #[test]
@@ -635,6 +815,193 @@ fn shell_landmarks_fit_both_window_sizes() {
             );
             assert_element_inside_window(&segment, label, width, height);
         }
+    }
+}
+
+#[test]
+fn shared_icon_text_groups_and_status_labels_are_geometrically_centered() {
+    install_testing_backend();
+
+    let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    install_overview_and_nodes_fixture(&window);
+    window.show().expect("应能显示真实 MainWindow");
+    window
+        .window()
+        .set_size(slint::PhysicalSize::new(1440, 900));
+    window.invoke_navigate_to(1);
+    window
+        .window()
+        .take_snapshot()
+        .expect("节点页应能完成软件渲染");
+
+    let nav_icon = accessible(&window, "导航图标：节点");
+    let nav_text = accessible(&window, "导航文字：节点");
+    assert!(
+        (center(&nav_icon).1 - center(&nav_text).1).abs() <= 1.0,
+        "侧栏图标与名称必须共享垂直中心轴",
+    );
+
+    let status = accessible(&window, "状态：在线");
+    let status_text = accessible(&window, "状态文字：在线");
+    assert_eq!(status.size().height, 24.0, "状态标签应保持紧凑矩形高度");
+    assert!(
+        (center(&status).0 - center(&status_text).0).abs() <= 1.0
+            && (center(&status).1 - center(&status_text).1).abs() <= 1.0,
+        "状态文字必须在矩形内部双向居中",
+    );
+
+    let connect = accessible(&window, "连接全部节点");
+    let connect_content = accessible(&window, "按钮内容：连接全部");
+    assert!(
+        (center(&connect).0 - center(&connect_content).0).abs() <= 1.0
+            && (center(&connect).1 - center(&connect_content).1).abs() <= 1.0,
+        "按钮图标和文字组必须在按钮内部双向居中",
+    );
+
+    window.invoke_navigate_to(0);
+    window
+        .window()
+        .take_snapshot()
+        .expect("总览页应能完成软件渲染");
+    let node_health_title = accessible(&window, "分区标题文字：节点健康");
+    assert!(
+        node_health_title.absolute_position().x < 400.0,
+        "节点健康标题应靠近卡片左侧，不得漂移到页面中央，位置={:?}，尺寸={:?}",
+        node_health_title.absolute_position(),
+        node_health_title.size(),
+    );
+}
+
+#[test]
+fn scan_workspace_primary_actions_share_the_same_right_edge() {
+    install_testing_backend();
+
+    let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    window.show().expect("应能显示真实 MainWindow");
+    window
+        .window()
+        .set_size(slint::PhysicalSize::new(1440, 900));
+    window.invoke_navigate_to(2);
+    window
+        .window()
+        .take_snapshot()
+        .expect("扫描页应能完成软件渲染");
+
+    let add_path = accessible(&window, "添加扫描路径");
+    let start_scan = accessible(&window, "开始扫描");
+    let start_analysis = accessible(&window, "开始本地分析");
+    let right_edge = |element: &ElementHandle| element.absolute_position().x + element.size().width;
+    assert!(
+        (right_edge(&add_path) - right_edge(&start_scan)).abs() <= 1.0,
+        "添加路径与开始扫描动作应共享右边界，添加={:?}/{:?}，扫描={:?}/{:?}",
+        add_path.absolute_position(),
+        add_path.size(),
+        start_scan.absolute_position(),
+        start_scan.size(),
+    );
+    assert!(
+        (right_edge(&start_scan) - right_edge(&start_analysis)).abs() <= 1.0,
+        "开始扫描与开始本地分析动作应共享右边界，扫描={:?}/{:?}，分析={:?}/{:?}",
+        start_scan.absolute_position(),
+        start_scan.size(),
+        start_analysis.absolute_position(),
+        start_analysis.size(),
+    );
+}
+
+#[test]
+fn annotated_pages_center_each_real_icon_text_group() {
+    install_testing_backend();
+
+    let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    install_overview_and_nodes_fixture(&window);
+    window.show().expect("应能显示真实 MainWindow");
+    window
+        .window()
+        .set_size(slint::PhysicalSize::new(1440, 900));
+
+    window.invoke_navigate_to(1);
+    window.window().take_snapshot().expect("节点页应能渲染");
+    assert_action_button_content_centered(&window, "连接全部节点", "连接全部");
+    assert_action_button_content_centered(&window, "编辑节点", "编辑");
+    assert_action_button_content_centered(&window, "立即同步", "同步");
+    assert_action_button_content_centered(&window, "移除节点", "移除");
+    assert_action_button_content_centered(&window, "添加节点", "添加节点");
+
+    window.invoke_navigate_to(2);
+    window.window().take_snapshot().expect("扫描页应能渲染");
+    assert_action_button_content_centered(&window, "添加扫描路径", "添加扫描路径");
+    assert_action_button_content_centered(&window, "选择扫描路径：1", "选择扫描路径：1");
+    assert_action_button_content_centered(&window, "删除扫描路径：1", "删除扫描路径：1");
+    assert_action_button_content_centered(&window, "开始扫描", "开始扫描");
+    assert_action_button_content_centered(&window, "开始本地分析", "开始本地分析");
+
+    window.invoke_navigate_to(4);
+    window.window().take_snapshot().expect("重复结果页应能渲染");
+    assert_action_button_content_centered(&window, "加载结果", "加载结果");
+    assert_empty_state_centered(&window, "当前运行没有此类重复组");
+    assert_empty_state_centered(&window, "选择重复组后加载成员");
+    assert_empty_state_centered(&window, "尚未加载预览");
+    accessible(&window, "跨机器").invoke_accessible_default_action();
+    window.window().take_snapshot().expect("跨机器页应能渲染");
+    assert_action_button_content_centered(&window, "创建中心分析", "创建中心分析");
+    assert_action_button_content_centered(&window, "推进到下一门禁", "推进到下一门禁");
+    assert_action_button_content_centered(&window, "重试未解决二筛", "重试未解决二筛");
+
+    window.invoke_navigate_to(5);
+    window.window().take_snapshot().expect("审核页应能渲染");
+    let undecided_tab = accessible(&window, "未决定");
+    let undecided_text = accessible(&window, "页签文字：未决定");
+    assert!(
+        (center(&undecided_tab).1 - center(&undecided_text).1).abs() <= 1.0,
+        "审核页签文字必须在页签内垂直居中",
+    );
+    assert_action_button_content_centered(&window, "保留最大文件", "保留最大文件");
+    assert_action_button_content_centered(&window, "按路径保留", "按路径保留");
+    assert_action_button_content_centered(&window, "标记保留", "标记保留");
+    assert_action_button_content_centered(&window, "标记删除", "标记删除");
+    assert_empty_state_centered(&window, "当前组没有已加载成员");
+
+    window.invoke_navigate_to(6);
+    window.window().take_snapshot().expect("设置页应能渲染");
+    let settings_header = accessible(&window, "设置标题");
+    let settings_icon = accessible(&window, "分区标题图标：设置");
+    let settings_content = accessible(&window, "分区标题内容：设置");
+    assert!(
+        (center(&settings_header).1 - center(&settings_icon).1).abs() <= 1.0
+            && (center(&settings_header).1 - center(&settings_content).1).abs() <= 1.0
+            && (center(&settings_header).1 - center(&accessible(&window, "关于 Slint")).1).abs()
+                <= 1.0
+            && (center(&settings_header).1 - center(&accessible(&window, "保存设置")).1).abs()
+                <= 1.0,
+        "设置标题、图标、说明和动作必须共享垂直中心轴",
+    );
+    assert_action_button_content_centered(&window, "关于 Slint", "关于 Slint");
+    assert_action_button_content_centered(&window, "保存设置", "保存设置");
+
+    accessible(&window, "扫描与性能").invoke_accessible_default_action();
+    window.window().take_snapshot().expect("扫描设置页应能渲染");
+    assert_action_button_content_centered(
+        &window,
+        "扫描性能配置（当前版本未提供）",
+        "扫描性能配置（当前版本未提供）",
+    );
+    accessible(&window, "外部工具").invoke_accessible_default_action();
+    window.window().take_snapshot().expect("外部工具页应能渲染");
+    assert_action_button_content_centered(
+        &window,
+        "外部工具配置（当前版本未提供）",
+        "外部工具配置（当前版本未提供）",
+    );
+    accessible(&window, "日志与诊断").invoke_accessible_default_action();
+    window.window().take_snapshot().expect("诊断页应能渲染");
+    for label in [
+        "日志筛选（当前版本未提供）",
+        "日志导出（当前版本未提供）",
+        "日志清空（当前版本未提供）",
+        "环境版本（当前版本未提供）",
+    ] {
+        assert_action_button_content_centered(&window, label, label);
     }
 }
 
@@ -1040,30 +1407,14 @@ fn settings_workspace_stays_reachable_at_minimum_size() {
         .next()
         .expect("常规设置应公开标签、控件与说明三列网格");
     assert_element_has_positive_size(&grid, "常规表单网格");
-    let labels = ["PostgreSQL URL 标签", "重连间隔（秒）标签", "删除方式标签"].map(|label| {
-        ElementHandle::find_by_accessible_label(&window, label)
-            .next()
-            .unwrap_or_else(|| panic!("常规表单应公开 {label}"))
-    });
-    let controls = ["PostgreSQL URL 控件", "重连间隔（秒）控件", "删除方式控件"].map(|label| {
-        ElementHandle::find_by_accessible_label(&window, label)
-            .next()
-            .unwrap_or_else(|| panic!("常规表单应公开 {label}"))
-    });
-    let label_x = labels[0].absolute_position().x;
-    let control_x = controls[0].absolute_position().x;
-    for (label, control) in labels.iter().zip(controls.iter()) {
-        assert!(
-            (label.absolute_position().x - label_x).abs() < 0.5
-                && (control.absolute_position().x - control_x).abs() < 0.5
-                && (control.size().height - 34.0).abs() < 0.5,
-            "常规表单的标签列、控件列和 34px 控件高度必须稳定对齐：标签={:?}/{:?}，控件={:?}/{:?}",
-            label.absolute_position(),
-            label.size(),
-            control.absolute_position(),
-            control.size(),
-        );
-    }
+    let delete_label = ElementHandle::find_by_accessible_label(&window, "删除方式标签")
+        .next()
+        .expect("常规设置应保留删除方式标签");
+    let delete_control = ElementHandle::find_by_accessible_label(&window, "删除方式控件")
+        .next()
+        .expect("常规设置应保留删除方式控件");
+    assert!((delete_control.size().height - 34.0).abs() < 0.5);
+    assert!(delete_control.absolute_position().x > delete_label.absolute_position().x);
 
     accessible(&window, "日志与诊断").invoke_accessible_default_action();
     window

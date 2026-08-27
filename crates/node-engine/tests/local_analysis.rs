@@ -29,6 +29,7 @@ impl Stage2Processor for CountingStage2 {
                 feature: Some(stage2()),
                 error: None,
             }],
+            regenerated_contact_sheet_jpeg: None,
         })
     }
 }

@@ -2,9 +2,9 @@
 
 use std::{
     collections::HashMap,
+    ffi::OsString,
     fs::{self, File, OpenOptions},
     io::{self, Write},
-    ffi::OsString,
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard, OnceLock, Weak},
 };
@@ -239,16 +239,14 @@ impl NodeConfigRepository {
         target_bootstrap_toml: &str,
     ) -> Result<LoadedNodeConfig, ConfigRepositoryError> {
         let config_temp = write_synced_temp(target_config_path, target_config_toml.as_bytes())?;
-        let bootstrap_temp = match write_synced_temp(
-            &self.bootstrap_path(),
-            target_bootstrap_toml.as_bytes(),
-        ) {
-            Ok(path) => path,
-            Err(error) => {
-                discard_repository_temp(&config_temp);
-                return Err(error);
-            }
-        };
+        let bootstrap_temp =
+            match write_synced_temp(&self.bootstrap_path(), target_bootstrap_toml.as_bytes()) {
+                Ok(path) => path,
+                Err(error) => {
+                    discard_repository_temp(&config_temp);
+                    return Err(error);
+                }
+            };
         let journal = ConfigTransactionJournal::from_loaded(current, target_config_path_raw);
         if let Err(error) = self.write_journal(&journal) {
             discard_repository_temp(&config_temp);
@@ -262,7 +260,9 @@ impl NodeConfigRepository {
             return self.recover_after_error(self.io_error(target_config_path, error));
         }
         if self.consume_failpoint(ConfigSaveFailpoint::AfterConfigReplace) {
-            return Err(ConfigRepositoryError::SimulatedInterruption("config rename 后"));
+            return Err(ConfigRepositoryError::SimulatedInterruption(
+                "config rename 后",
+            ));
         }
 
         if let Err(error) = replace_file(&bootstrap_temp, &self.bootstrap_path()) {
@@ -270,7 +270,9 @@ impl NodeConfigRepository {
             return self.recover_after_error(self.io_error(self.bootstrap_path(), error));
         }
         if self.consume_failpoint(ConfigSaveFailpoint::AfterBootstrapReplace) {
-            return Err(ConfigRepositoryError::SimulatedInterruption("bootstrap rename 后"));
+            return Err(ConfigRepositoryError::SimulatedInterruption(
+                "bootstrap rename 后",
+            ));
         }
 
         if let Err(error) = fs::remove_file(self.journal_path()) {
@@ -317,12 +319,16 @@ impl NodeConfigRepository {
         let old_config = LocalNodePath::validate(&self.executable_dir, &journal.old_config_path)?;
         self.reject_control_path(old_config.resolved())?;
 
-        let config_temp = write_synced_temp(old_config.resolved(), journal.old_config_toml.as_bytes())?;
+        let config_temp =
+            write_synced_temp(old_config.resolved(), journal.old_config_toml.as_bytes())?;
         if let Err(error) = replace_file(&config_temp, old_config.resolved()) {
             discard_repository_temp(&config_temp);
             return Err(self.io_error(old_config.resolved(), error));
         }
-        let bootstrap_temp = write_synced_temp(&self.bootstrap_path(), journal.old_bootstrap_toml.as_bytes())?;
+        let bootstrap_temp = write_synced_temp(
+            &self.bootstrap_path(),
+            journal.old_bootstrap_toml.as_bytes(),
+        )?;
         if let Err(error) = replace_file(&bootstrap_temp, &self.bootstrap_path()) {
             discard_repository_temp(&bootstrap_temp);
             return Err(self.io_error(self.bootstrap_path(), error));
@@ -330,7 +336,10 @@ impl NodeConfigRepository {
         fs::remove_file(&journal_path).map_err(|source| self.io_error(&journal_path, source))
     }
 
-    fn write_journal(&self, journal: &ConfigTransactionJournal) -> Result<(), ConfigRepositoryError> {
+    fn write_journal(
+        &self,
+        journal: &ConfigTransactionJournal,
+    ) -> Result<(), ConfigRepositoryError> {
         let journal_path = self.journal_path();
         let temporary = write_synced_temp(&journal_path, journal.to_toml()?.as_bytes())?;
         if let Err(error) = replace_file(&temporary, &journal_path) {
@@ -353,7 +362,10 @@ impl NodeConfigRepository {
         }
     }
 
-    fn resolve_paths(&self, config: &NodeConfig) -> Result<ResolvedNodePaths, ConfigRepositoryError> {
+    fn resolve_paths(
+        &self,
+        config: &NodeConfig,
+    ) -> Result<ResolvedNodePaths, ConfigRepositoryError> {
         let data_path = LocalNodePath::validate(&self.executable_dir, &config.paths.data_path)?;
         let config_path = LocalNodePath::validate(&self.executable_dir, &config.paths.config_path)?;
         self.reject_control_path(config_path.resolved())?;
@@ -444,7 +456,8 @@ impl ConfigTransactionJournal {
     }
 
     fn parse(text: &str) -> Result<Self, ConfigRepositoryError> {
-        let value: toml::Value = toml::from_str(text).map_err(ConfigRepositoryError::JournalToml)?;
+        let value: toml::Value =
+            toml::from_str(text).map_err(ConfigRepositoryError::JournalToml)?;
         let table = value
             .as_table()
             .ok_or(ConfigRepositoryError::InvalidJournal("根节点必须是表"))?;
@@ -477,7 +490,8 @@ impl ConfigTransactionJournal {
             "target_config_path".to_owned(),
             toml::Value::String(self.target_config_path.clone()),
         );
-        toml::to_string_pretty(&toml::Value::Table(table)).map_err(ConfigRepositoryError::JournalEncode)
+        toml::to_string_pretty(&toml::Value::Table(table))
+            .map_err(ConfigRepositoryError::JournalEncode)
     }
 }
 
@@ -517,7 +531,8 @@ fn bootstrap_toml(config_path: &str) -> Result<String, ConfigRepositoryError> {
         "config_path".to_owned(),
         toml::Value::String(config_path.to_owned()),
     );
-    toml::to_string_pretty(&toml::Value::Table(table)).map_err(ConfigRepositoryError::BootstrapEncode)
+    toml::to_string_pretty(&toml::Value::Table(table))
+        .map_err(ConfigRepositoryError::BootstrapEncode)
 }
 
 fn config_sha256(text: &str) -> String {
@@ -533,10 +548,12 @@ fn write_synced_temp(target: &Path, content: &[u8]) -> Result<PathBuf, ConfigRep
         path: parent.to_path_buf(),
         source,
     })?;
-    let file_name = target.file_name().ok_or_else(|| ConfigRepositoryError::Io {
-        path: target.to_path_buf(),
-        source: io::Error::new(io::ErrorKind::InvalidInput, "目标路径没有文件名"),
-    })?;
+    let file_name = target
+        .file_name()
+        .ok_or_else(|| ConfigRepositoryError::Io {
+            path: target.to_path_buf(),
+            source: io::Error::new(io::ErrorKind::InvalidInput, "目标路径没有文件名"),
+        })?;
     let temporary = parent.join(format!(
         ".{}.{}.tmp",
         file_name.to_string_lossy(),

@@ -7,8 +7,8 @@ CREATE TABLE schema_metadata (
     value TEXT NOT NULL
 );
 INSERT INTO schema_metadata(key, value) VALUES
-    ('schema_id', 'mysingerserver-rust-v2'),
-    ('schema_version', '1');
+    ('schema_id', 'mysingerserver-rust-v2-central-schema-3'),
+    ('schema_version', '3');
 
 CREATE TABLE nodes (
     machine_id       CHAR(64) PRIMARY KEY,
@@ -28,6 +28,7 @@ CREATE TABLE contents (
     md5        BYTEA NOT NULL CHECK(octet_length(md5) = 16),
     file_size  BIGINT NOT NULL CHECK(file_size >= 0),
     media_kind TEXT NOT NULL CHECK(media_kind IN ('image', 'video', 'other')),
+    base_complete BOOLEAN NOT NULL DEFAULT FALSE,
     UNIQUE(md5, file_size)
 );
 CREATE INDEX contents_md5_idx ON contents(md5);
@@ -108,6 +109,20 @@ CREATE TABLE analysis_runs (
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE analysis_run_stages (
+    analysis_run_id TEXT NOT NULL REFERENCES analysis_runs(analysis_run_id) ON DELETE CASCADE,
+    stage_id        TEXT NOT NULL,
+    state           TEXT NOT NULL CHECK(state IN ('waiting', 'running', 'completed', 'failed', 'skipped')),
+    completed       BIGINT NOT NULL DEFAULT 0 CHECK(completed >= 0),
+    total           BIGINT CHECK(total IS NULL OR total >= 0),
+    failed          BIGINT NOT NULL DEFAULT 0 CHECK(failed >= 0),
+    skipped         BIGINT NOT NULL DEFAULT 0 CHECK(skipped >= 0),
+    started_at_ms   BIGINT CHECK(started_at_ms IS NULL OR started_at_ms >= 0),
+    finished_at_ms  BIGINT CHECK(finished_at_ms IS NULL OR finished_at_ms >= 0),
+    warning_text    TEXT,
+    PRIMARY KEY(analysis_run_id, stage_id)
+);
+
 CREATE TABLE analysis_run_nodes (
     analysis_run_id TEXT NOT NULL REFERENCES analysis_runs(analysis_run_id) ON DELETE CASCADE,
     machine_id      CHAR(64) NOT NULL REFERENCES nodes(machine_id),
@@ -128,6 +143,18 @@ CREATE TABLE analysis_run_inputs (
     FOREIGN KEY(md5, file_size) REFERENCES contents(md5, file_size),
     FOREIGN KEY(machine_id, normalized_path)
         REFERENCES file_locations(machine_id, normalized_path)
+);
+
+CREATE TABLE analysis_stage2_dispatches (
+    analysis_run_id TEXT NOT NULL REFERENCES analysis_runs(analysis_run_id) ON DELETE CASCADE,
+    machine_id      CHAR(64) NOT NULL REFERENCES nodes(machine_id),
+    md5             BYTEA NOT NULL CHECK(octet_length(md5) = 16),
+    file_size       BIGINT NOT NULL CHECK(file_size >= 0),
+    node_task_id    TEXT,
+    state           TEXT NOT NULL CHECK(state IN ('queued', 'running', 'completed', 'failed', 'cancelled')),
+    updated_at_ms   BIGINT NOT NULL CHECK(updated_at_ms >= 0),
+    PRIMARY KEY(analysis_run_id, machine_id, md5, file_size),
+    FOREIGN KEY(md5, file_size) REFERENCES contents(md5, file_size)
 );
 
 -- 输入一旦封存只能随整个 AnalysisRun 级联删除，不能原地改写为另一份内容。

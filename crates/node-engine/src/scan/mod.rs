@@ -1,11 +1,25 @@
 //! 文件列表进入 SQLite 内容模型和一筛结果的单一扫描流程。
 
+mod base_compute;
+mod base_flow_control;
+mod base_persistence;
+mod cache_resolver;
 mod engine;
 mod enumerator;
 mod everything;
 mod hash;
+pub(crate) mod input_order;
 mod pipeline;
 
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub use base_compute::BaseComputeJoinObservationHooks;
+pub use base_compute::{BaseComputeDecision, BaseComputeEngine};
+/// 生产读取器在真实 Hash 磁盘许可边界发布的阶段信号。
+pub use base_flow_control::HashReadStartedSignal;
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub use base_persistence::{BasePersistTestController, BasePersistTestWaiter};
 pub use dedup_windows::WindowsWalker;
 pub use engine::{
     ScanEngine, ScanOptions, ScanSummary, Stage1BatchResult, Stage1ProcessError, Stage1Processor,
@@ -15,6 +29,9 @@ pub use enumerator::FileEnumerator;
 pub use everything::EverythingEnumerator;
 pub(crate) use everything::{PreferredEverythingEnumerator, ensure_everything_ready};
 pub use hash::{FileHasher, SystemMd5, md5_bytes, md5_file};
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub use input_order::interleave_rows_by_root_for_test;
 pub use pipeline::{PipelineFileReader, PipelineLimits, ReadProduct, ScheduledFileReader};
 
 use thiserror::Error;

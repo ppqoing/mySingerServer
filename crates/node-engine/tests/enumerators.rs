@@ -1,8 +1,22 @@
-use std::fs;
+use std::{collections::BTreeSet, fs};
 
 use dedup_core::DisplayPath;
 use dedup_node_engine::scan::{EverythingEnumerator, FileEnumerator, WindowsWalker};
+use dedup_node_store::ScannedPath;
 use tempfile::tempdir;
+
+/// 断言枚举结果保持全局规范排序且每个规范路径仅出现一次。
+fn assert_globally_sorted_and_unique(rows: &[ScannedPath]) {
+    let keys = rows
+        .iter()
+        .map(|row| row.normalized_path.as_str())
+        .collect::<Vec<_>>();
+    assert!(keys.windows(2).all(|pair| pair[0] < pair[1]));
+    assert_eq!(
+        keys.iter().copied().collect::<BTreeSet<_>>().len(),
+        rows.len()
+    );
+}
 
 #[test]
 fn windows_walker_returns_all_files_in_stable_normalized_order() {
@@ -41,6 +55,7 @@ fn everything_has_the_same_sorted_output_contract_when_ipc_is_available() {
         Err(error) => {
             // 原始 IPC 适配器保持严格错误；Node 上层负责把整次扫描回退到 Walker。
             assert!(error.to_string().contains("Everything IPC 不可用"));
+            eprintln!("SKIP_EVERYTHING_IPC_UNAVAILABLE: {error}");
             return;
         }
     };
@@ -52,4 +67,48 @@ fn everything_has_the_same_sorted_output_contract_when_ipc_is_available() {
         rows.iter()
             .all(|row| row.display_path.as_path().is_absolute())
     );
+}
+
+#[test]
+fn windows_walker_keeps_two_roots_globally_sorted_and_unique() {
+    let first_root = tempdir().unwrap();
+    let second_root = tempdir().unwrap();
+    fs::create_dir(first_root.path().join("nested")).unwrap();
+    fs::write(first_root.path().join("z.bin"), b"first-z").unwrap();
+    fs::write(first_root.path().join("nested/a.bin"), b"first-a").unwrap();
+    fs::write(second_root.path().join("b.bin"), b"second-b").unwrap();
+    fs::write(second_root.path().join("a.bin"), b"second-a").unwrap();
+    let roots = [
+        DisplayPath::new(first_root.path()).unwrap(),
+        DisplayPath::new(second_root.path()).unwrap(),
+    ];
+
+    let rows = WindowsWalker.enumerate(&roots).unwrap();
+
+    assert_eq!(rows.len(), 4);
+    assert_globally_sorted_and_unique(&rows);
+}
+
+#[test]
+fn everything_keeps_two_roots_globally_sorted_and_unique_when_ipc_is_available() {
+    let first_root = tempdir().unwrap();
+    let second_root = tempdir().unwrap();
+    fs::write(first_root.path().join("indexed-a.bin"), b"first").unwrap();
+    fs::write(second_root.path().join("indexed-b.bin"), b"second").unwrap();
+    let roots = [
+        DisplayPath::new(first_root.path()).unwrap(),
+        DisplayPath::new(second_root.path()).unwrap(),
+    ];
+
+    let rows = match EverythingEnumerator.enumerate(&roots) {
+        Ok(rows) => rows,
+        Err(error) => {
+            // Everything 不可用时沿既有契约跳过，禁止为测试启动全盘索引。
+            assert!(error.to_string().contains("Everything IPC 不可用"));
+            eprintln!("SKIP_EVERYTHING_IPC_UNAVAILABLE: {error}");
+            return;
+        }
+    };
+
+    assert_globally_sorted_and_unique(&rows);
 }

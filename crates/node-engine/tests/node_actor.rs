@@ -318,6 +318,15 @@ async fn remote_config_get_returns_original_snapshot_and_effective_workers() {
             worker_mode: proto::NodeWorkerMode::NodeWorkerManual as i32,
             reserved_cores: 2,
             manual_worker_count: 7,
+            postgres: Some(proto::NodePostgresConfigValue {
+                enabled: false,
+                host: "127.0.0.1".into(),
+                port: 5432,
+                database: "media_dedup".into(),
+                username: "postgres".into(),
+                password: String::new(),
+                connect_timeout_seconds: 3,
+            }),
         })
     );
     assert_eq!(repository_state.lock().unwrap().load_calls, 1);
@@ -396,11 +405,8 @@ async fn remote_config_version_conflict_and_path_failure_do_not_prepare_replacem
 #[tokio::test]
 async fn remote_config_prepare_failure_keeps_old_node_running() {
     let events = Arc::new(Mutex::new(Vec::new()));
-    let repository = FakeConfigRepository::with_control(
-        SaveBehavior::Success,
-        false,
-        Arc::clone(&events),
-    );
+    let repository =
+        FakeConfigRepository::with_control(SaveBehavior::Success, false, Arc::clone(&events));
     let repository_state = Arc::clone(&repository.state);
     let host = FakeHostControl::with_control(true, 0, Arc::clone(&events));
     let host_state = Arc::clone(&host.state);
@@ -439,11 +445,8 @@ async fn remote_config_prepare_failure_keeps_old_node_running() {
 #[tokio::test]
 async fn remote_config_prepare_and_restore_failure_reports_partial_save() {
     let events = Arc::new(Mutex::new(Vec::new()));
-    let repository = FakeConfigRepository::with_control(
-        SaveBehavior::Success,
-        true,
-        Arc::clone(&events),
-    );
+    let repository =
+        FakeConfigRepository::with_control(SaveBehavior::Success, true, Arc::clone(&events));
     let repository_state = Arc::clone(&repository.state);
     let host = FakeHostControl::with_control(true, 0, Arc::clone(&events));
     let (handle, actor) = spawn_remote_config_actor(repository, Some(host));
@@ -473,11 +476,8 @@ async fn remote_config_prepare_and_restore_failure_reports_partial_save() {
 #[tokio::test]
 async fn remote_config_commit_failure_keeps_pending_for_same_request_retry() {
     let events = Arc::new(Mutex::new(Vec::new()));
-    let repository = FakeConfigRepository::with_control(
-        SaveBehavior::Success,
-        false,
-        Arc::clone(&events),
-    );
+    let repository =
+        FakeConfigRepository::with_control(SaveBehavior::Success, false, Arc::clone(&events));
     let repository_state = Arc::clone(&repository.state);
     let host = FakeHostControl::with_control(false, 2, Arc::clone(&events));
     let host_state = Arc::clone(&host.state);
@@ -531,9 +531,7 @@ async fn remote_config_commit_failure_keeps_pending_for_same_request_retry() {
     drop(host_after_duplicate);
     assert_eq!(
         events.lock().unwrap().as_slice(),
-        [
-            "snapshot", "save", "prepare", "commit", "commit", "commit"
-        ]
+        ["snapshot", "save", "prepare", "commit", "commit", "commit"]
     );
 
     handle.shutdown().await.unwrap();
@@ -777,6 +775,15 @@ fn save_request(request_id: u64, expected_version: &str) -> proto::Envelope {
                 worker_mode: proto::NodeWorkerMode::NodeWorkerManual as i32,
                 reserved_cores: 2,
                 manual_worker_count: 7,
+                postgres: Some(proto::NodePostgresConfigValue {
+                    enabled: false,
+                    host: "127.0.0.1".into(),
+                    port: 5432,
+                    database: "media_dedup".into(),
+                    username: "postgres".into(),
+                    password: String::new(),
+                    connect_timeout_seconds: 3,
+                }),
             }),
         }),
     )

@@ -15,6 +15,8 @@ export component OverviewDashboard inherits Rectangle {
     in property <int> running-count;
     in property <string> indexed-text;
     in property <string> sync-text;
+    in property <string> postgres-status;
+    in property <color> postgres-color;
 
     background: transparent;
 
@@ -83,6 +85,16 @@ export component OverviewDashboard inherits Rectangle {
                     accessible-role: AccessibleRole.groupbox;
                     accessible-label: "同步摘要：" + root.sync-text;
                 }
+                MetricCard {
+                    horizontal-stretch: 1;
+                    title: "数据库状态";
+                    value: root.postgres-status;
+                    detail: "中心 PostgreSQL 运行连接";
+                    tone: root.postgres-color;
+                    icon: @image-url("../assets/icons/index.png");
+                    accessible-role: AccessibleRole.groupbox;
+                    accessible-label: "数据库状态：" + root.postgres-status;
+                }
             }
 
             // 节点健康表严格使用 UiNodeRow 现有字段，空模型显示工作区空态。
@@ -93,7 +105,6 @@ export component OverviewDashboard inherits Rectangle {
                     padding: 6px;
                     spacing: 0px;
                     SectionHeader {
-                        width: root.width - 52px;
                         height: 36px;
                         vertical-stretch: 0;
                         horizontal-stretch: 1;
@@ -155,7 +166,6 @@ export component OverviewDashboard inherits Rectangle {
                     padding: 6px;
                     spacing: 0px;
                     SectionHeader {
-                        width: root.width - 52px;
                         height: 36px;
                         vertical-stretch: 0;
                         horizontal-stretch: 1;

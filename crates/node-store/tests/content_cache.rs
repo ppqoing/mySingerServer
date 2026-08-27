@@ -80,6 +80,29 @@ fn equal_md5_with_different_size_does_not_reuse_content() {
     assert_ne!(first.key, second.key);
 }
 
+/// 新内容的 Other 只是探测前占位；只有显式完成后才能作为基础缓存命中。
+#[test]
+fn base_complete_distinguishes_placeholder_other_from_confirmed_other() {
+    let mut store = NodeStore::open_in_memory(machine()).unwrap();
+    let content = store
+        .upsert_content_and_location(&scan(r"D:\unknown.bin", 12), [0x24; 16], MediaKind::Other)
+        .unwrap();
+
+    assert!(
+        !store
+            .load_base_cache_record(content.id)
+            .unwrap()
+            .base_complete
+    );
+    store.mark_base_complete(content.id).unwrap();
+    assert!(
+        store
+            .load_base_cache_record(content.id)
+            .unwrap()
+            .base_complete
+    );
+}
+
 /// 图片一筛四个字段必须全部存在；查询不会补算缺失 Quality。
 #[test]
 fn image_stage1_requires_width_height_pdq_and_quality() {

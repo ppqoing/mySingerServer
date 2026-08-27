@@ -1,10 +1,15 @@
 //! 批量路径缓存查询，以及 MD5 索引后按文件大小确认的内容/位置事务。
 
+use std::time::Duration;
+
 use dedup_core::{ContentKey, LocationKey, MediaKind};
+use dedup_media::sample_positions;
 use rusqlite::{OptionalExtension, Transaction, params};
 
 use crate::{
-    ActiveFile, CacheLookup, ContentId, ContentRecord, NodeStore, ScannedPath, StoreError,
+    ActiveFile, BaseCacheRecord, CacheLookup, CompleteStage1, ContentId, ContentRecord,
+    FeatureWrite, ImageStage1Fields, NodeStore, ScannedPath, StoreError, VideoFrameStage1Fields,
+    VideoMetadataFields,
     open::{fixed_bytes, sqlite_integer},
     outbox::append_sync_change,
     rows::RowEncoder,
@@ -93,7 +98,7 @@ impl NodeStore {
             append_sync_change(
                 &transaction,
                 "content",
-                encode_content(ContentKey::new(md5, scanned.file_size), media_kind),
+                encode_content(ContentKey::new(md5, scanned.file_size), media_kind, false),
             )?;
             (content_id, false)
         };
@@ -165,7 +170,41 @@ impl NodeStore {
             return Err(StoreError::InvalidState("要更新的内容不存在".into()));
         }
         let key = content_key_in_transaction(&transaction, content_id)?;
-        append_sync_change(&transaction, "content", encode_content(key, media_kind))?;
+        let base_complete: bool = transaction.query_row(
+            "SELECT base_complete FROM contents WHERE content_id=?1",
+            [content_id.as_i64()],
+            |row| row.get(0),
+        )?;
+        append_sync_change(
+            &transaction,
+            "content",
+            encode_content(key, media_kind, base_complete),
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// 在基础探测和必需一筛均已写入后设置完成标记并同步中心库。
+    pub fn mark_base_complete(&mut self, content_id: ContentId) -> Result<(), StoreError> {
+        let transaction = self.connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE contents SET base_complete=1 WHERE content_id=?1",
+            [content_id.as_i64()],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::InvalidState("要完成的内容不存在".into()));
+        }
+        let key = content_key_in_transaction(&transaction, content_id)?;
+        let media_kind: String = transaction.query_row(
+            "SELECT media_kind FROM contents WHERE content_id=?1",
+            [content_id.as_i64()],
+            |row| row.get(0),
+        )?;
+        append_sync_change(
+            &transaction,
+            "content",
+            encode_content(key, parse_media_kind(&media_kind)?, true),
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -275,6 +314,127 @@ impl NodeStore {
             )
             .optional()?)
     }
+
+    /// 加载内容键、探测字段和严格完整的一筛，供 Node 计算缺失掩码。
+    pub fn load_base_cache_record(
+        &self,
+        content_id: ContentId,
+    ) -> Result<BaseCacheRecord, StoreError> {
+        let (md5, file_size, media_kind, base_complete): (Vec<u8>, i64, String, bool) =
+            self.connection.query_row(
+                "SELECT md5,file_size,media_kind,base_complete FROM contents WHERE content_id=?1",
+                [content_id.as_i64()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+        let media_kind = parse_media_kind(&media_kind)?;
+        let (width, height, duration_ms) = match media_kind {
+            MediaKind::Image => self
+                .connection
+                .query_row(
+                    "SELECT width,height FROM image_stage1 WHERE content_id=?1",
+                    [content_id.as_i64()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?
+                .map_or((None, None, None), |(width, height)| (width, height, None)),
+            MediaKind::Video => self
+                .connection
+                .query_row(
+                    "SELECT width,height,duration_ms FROM video_metadata WHERE content_id=?1",
+                    [content_id.as_i64()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, Option<i64>>(2)?)),
+                )
+                .optional()?
+                .map_or((None, None, None), |(width, height, duration)| {
+                    (width, height, duration.map(|value| value as u64))
+                }),
+            MediaKind::Other => (None, None, None),
+        };
+        Ok(BaseCacheRecord {
+            content_id: Some(content_id),
+            content_key: ContentKey::new(
+                fixed_bytes(md5, "contents.md5")?,
+                u64::try_from(file_size)
+                    .map_err(|_| StoreError::InvalidState("内容文件大小不能为负数".into()))?,
+            ),
+            media_kind,
+            base_complete,
+            width,
+            height,
+            duration_ms,
+            stage1: self.load_complete_stage1(content_id)?,
+        })
+    }
+
+    /// 把 PostgreSQL 缓存导入本地内容、位置和一筛；不修改任何任务项终态。
+    pub fn import_base_cache_record(
+        &mut self,
+        scanned: &ScannedPath,
+        cached: &BaseCacheRecord,
+    ) -> Result<ContentRecord, StoreError> {
+        if cached.content_key.file_size() != scanned.file_size {
+            return Err(StoreError::InvalidState(
+                "中心缓存文件大小与枚举结果不一致".into(),
+            ));
+        }
+        let content =
+            self.upsert_content_and_location(scanned, cached.content_key.md5(), cached.media_kind)?;
+        self.set_content_media_kind(content.id, cached.media_kind)?;
+        match &cached.stage1 {
+            Some(CompleteStage1::Image(feature)) => {
+                self.commit_feature_result(
+                    content.id,
+                    None,
+                    FeatureWrite::ImageStage1(ImageStage1Fields::from(*feature)),
+                )?;
+            }
+            Some(CompleteStage1::Video(frames)) => {
+                self.commit_feature_result(
+                    content.id,
+                    None,
+                    FeatureWrite::VideoMetadata(VideoMetadataFields {
+                        duration_ms: cached.duration_ms,
+                        width: cached.width,
+                        height: cached.height,
+                    }),
+                )?;
+                let positions = sample_positions(Duration::from_millis(
+                    cached.duration_ms.unwrap_or_default(),
+                ));
+                for (slot, feature) in frames.iter().enumerate() {
+                    self.commit_feature_result(
+                        content.id,
+                        None,
+                        FeatureWrite::VideoFrameStage1(VideoFrameStage1Fields {
+                            slot: slot as u8,
+                            time_ms: positions[slot].as_millis() as u64,
+                            decoded: feature.is_some(),
+                            width: feature.map(|value| value.width),
+                            height: feature.map(|value| value.height),
+                            pdq: feature.map(|value| value.pdq),
+                            quality: feature.map(|value| value.quality),
+                        }),
+                    )?;
+                }
+            }
+            None if cached.media_kind == MediaKind::Video => {
+                self.commit_feature_result(
+                    content.id,
+                    None,
+                    FeatureWrite::VideoMetadata(VideoMetadataFields {
+                        duration_ms: cached.duration_ms,
+                        width: cached.width,
+                        height: cached.height,
+                    }),
+                )?;
+            }
+            None => {}
+        }
+        if cached.base_complete {
+            self.mark_base_complete(content.id)?;
+        }
+        Ok(content)
+    }
 }
 
 fn parse_media_kind(value: &str) -> Result<MediaKind, StoreError> {
@@ -311,8 +471,8 @@ pub(crate) fn content_key_in_transaction(
     ))
 }
 
-pub(crate) fn encode_content(key: ContentKey, kind: MediaKind) -> Vec<u8> {
-    RowEncoder::new(1)
+pub(crate) fn encode_content(key: ContentKey, kind: MediaKind, base_complete: bool) -> Vec<u8> {
+    RowEncoder::new(2)
         .bytes(&key.md5())
         .u64(key.file_size())
         .u8(match kind {
@@ -320,6 +480,7 @@ pub(crate) fn encode_content(key: ContentKey, kind: MediaKind) -> Vec<u8> {
             MediaKind::Video => 2,
             MediaKind::Other => 3,
         })
+        .u8(u8::from(base_complete))
         .finish()
 }
 

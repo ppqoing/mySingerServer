@@ -2,8 +2,7 @@
 
 use std::{
     collections::BTreeMap,
-    fs,
-    io,
+    fs, io,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };

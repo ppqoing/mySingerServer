@@ -191,6 +191,7 @@ enum DecodedChange {
     Content {
         key: ContentKey,
         media_kind: &'static str,
+        base_complete: bool,
     },
     File {
         machine_id: String,
@@ -250,15 +251,21 @@ async fn apply_change(
     change: &DecodedChange,
 ) -> Result<(), CentralError> {
     match change {
-        DecodedChange::Content { key, media_kind } => {
+        DecodedChange::Content {
+            key,
+            media_kind,
+            base_complete,
+        } => {
             transaction
                 .execute(
-                    "INSERT INTO contents(md5,file_size,media_kind) VALUES($1,$2,$3)
-                     ON CONFLICT(md5,file_size) DO UPDATE SET media_kind=excluded.media_kind",
+                    "INSERT INTO contents(md5,file_size,media_kind,base_complete) VALUES($1,$2,$3,$4)
+                     ON CONFLICT(md5,file_size) DO UPDATE SET
+                       media_kind=excluded.media_kind,base_complete=excluded.base_complete",
                     &[
                         &key.md5().as_slice(),
                         &pg_i64(key.file_size(), "文件大小")?,
                         media_kind,
+                        base_complete,
                     ],
                 )
                 .await?;
@@ -453,15 +460,25 @@ fn decode_change(change: &proto::SyncChange) -> Result<DecodedChange, CentralErr
     }
     let mut reader = PayloadReader::new(&change.payload)?;
     let decoded = match change.entity_kind.as_str() {
-        "content" => DecodedChange::Content {
-            key: reader.content_key()?,
-            media_kind: match reader.u8()? {
+        "content" => {
+            let key = reader.content_key()?;
+            let media_kind = match reader.u8()? {
                 1 => "image",
                 2 => "video",
                 3 => "other",
                 _ => return Err(invalid_payload("content.media_kind 无效")),
-            },
-        },
+            };
+            let base_complete = if reader.version() >= 2 {
+                reader.boolean()?
+            } else {
+                false
+            };
+            DecodedChange::Content {
+                key,
+                media_kind,
+                base_complete,
+            }
+        }
         "file" => DecodedChange::File {
             machine_id: reader.text()?,
             normalized_path: reader.text()?,
@@ -537,14 +554,25 @@ fn snapshot_entity_kind(table_name: &str) -> Result<&'static str, CentralError> 
 struct PayloadReader<'a> {
     bytes: &'a [u8],
     at: usize,
+    version: u8,
 }
 
 impl<'a> PayloadReader<'a> {
     fn new(bytes: &'a [u8]) -> Result<Self, CentralError> {
-        if bytes.first() != Some(&1) {
-            return Err(invalid_payload("载荷版本不是 1"));
+        let version = bytes.first().copied().unwrap_or_default();
+        if !matches!(version, 1 | 2) {
+            return Err(invalid_payload("载荷版本不是 1 或 2"));
         }
-        Ok(Self { bytes, at: 1 })
+        Ok(Self {
+            bytes,
+            at: 1,
+            version,
+        })
+    }
+
+    /// 返回当前实体载荷版本；只有 content 从版本 2 增加完成标记。
+    const fn version(&self) -> u8 {
+        self.version
     }
 
     fn content_key(&mut self) -> Result<ContentKey, CentralError> {

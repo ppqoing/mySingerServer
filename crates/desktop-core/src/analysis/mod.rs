@@ -1,6 +1,9 @@
 //! 固定高水位的跨机器两层去重编排及其纯决策组件。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use dedup_core::{AnalysisRunId, ContentKey, LocationKey, MachineId, TaskId, Thresholds};
 use dedup_protocol::{ProtocolError, proto};
@@ -9,7 +12,7 @@ use thiserror::Error;
 use crate::{
     central::{
         CentralAnalysisInput, CentralAnalysisNode, CentralAnalysisStatus, CentralError,
-        CentralStore,
+        CentralStore, PersistentStageState, Stage2DispatchWrite,
     },
     node_session::{NodeSession, SessionError},
     sync::{SyncEngine, SyncError, SyncTrigger},
@@ -19,6 +22,7 @@ mod dispatch;
 mod finalize;
 mod gate;
 mod screen;
+mod task;
 
 pub use dispatch::{
     PlannedStage2Batch, PlannedStage2Item, STAGE2_BATCH_SIZE, Stage2Availability,
@@ -27,6 +31,7 @@ pub use dispatch::{
 pub use finalize::build_groups;
 pub use gate::{CrossTaskState, GateDecision, GateState, phase2_gate, stage_gate};
 pub use screen::{CrossFeatureSet, evaluate_candidates, screen_candidates};
+pub use task::{DuplicateListStage, stage_write, stage2_dispatch_stage, waiting_stages};
 
 /// 分页读取节点冻结输入及单次二筛派发的固定上限。
 const ANALYSIS_PAGE_SIZE: u32 = 1000;
@@ -145,6 +150,9 @@ impl CrossAnalysisCoordinator {
             });
         }
         let run_id = central.create_analysis_run(&thresholds, &nodes).await?;
+        for stage in waiting_stages() {
+            central.save_analysis_stage(run_id, stage).await?;
+        }
         Ok(Self {
             run_id,
             thresholds,
@@ -159,6 +167,49 @@ impl CrossAnalysisCoordinator {
     /// 返回当前中心运行 ID，供 UI、分页和复核操作复用。
     pub const fn run_id(&self) -> AnalysisRunId {
         self.run_id
+    }
+
+    /// 从 PostgreSQL 恢复一次未完成清单任务，不依赖原 Desktop 进程仍存活。
+    pub async fn resume(
+        central: &CentralStore,
+        run_id: AnalysisRunId,
+    ) -> Result<Self, CrossAnalysisError> {
+        let snapshot = central.analysis_run_snapshot(run_id).await?;
+        let dispatches = central.stage2_dispatches(run_id).await?;
+        let phase2_keys = dispatches
+            .iter()
+            .filter_map(|dispatch| {
+                dispatch
+                    .node_task_id
+                    .map(|task_id| (dispatch.machine_id.clone(), task_id))
+            })
+            .collect::<BTreeSet<_>>();
+        let tasks = central.analysis_node_tasks(run_id).await?;
+        let selected = tasks
+            .iter()
+            .filter(|task| !phase2_keys.contains(&(task.machine_id.clone(), task.task_id)))
+            .map(|task| SelectedTask {
+                machine_id: task.machine_id.clone(),
+                task_id: task.task_id,
+            })
+            .collect();
+        let phase2_tasks = tasks
+            .into_iter()
+            .filter(|task| phase2_keys.contains(&(task.machine_id.clone(), task.task_id)))
+            .map(|task| SelectedTask {
+                machine_id: task.machine_id,
+                task_id: task.task_id,
+            })
+            .collect();
+        Ok(Self {
+            run_id,
+            thresholds: snapshot.thresholds,
+            selected,
+            phase2_tasks,
+            availability: Vec::new(),
+            skipped_incomplete: 0,
+            sync_engine: SyncEngine::new(),
+        })
     }
 
     /// 推进当前运行，直到遇到未满足门禁或到达 Completed/Partial。
@@ -196,6 +247,21 @@ impl CrossAnalysisCoordinator {
                         .await?;
                 }
                 CentralAnalysisStatus::Screening => {
+                    let stage_started = wall_clock_ms();
+                    central
+                        .save_analysis_stage(
+                            self.run_id,
+                            stage_write(
+                                DuplicateListStage::BuildCandidates,
+                                PersistentStageState::Running,
+                                0,
+                                None,
+                                0,
+                                Some(stage_started),
+                                None,
+                            ),
+                        )
+                        .await?;
                     if self.availability.is_empty() {
                         let frozen = central.analysis_inputs(self.run_id).await?;
                         let allowed = frozen
@@ -208,7 +274,36 @@ impl CrossAnalysisCoordinator {
                     let (candidates, skipped) = screen_candidates(&features, &self.thresholds);
                     self.skipped_incomplete = skipped;
                     central.replace_candidates(self.run_id, &candidates).await?;
+                    central
+                        .save_analysis_stage(
+                            self.run_id,
+                            stage_write(
+                                DuplicateListStage::BuildCandidates,
+                                PersistentStageState::Completed,
+                                candidates.len() as u64,
+                                Some(candidates.len() as u64),
+                                0,
+                                Some(stage_started),
+                                Some(wall_clock_ms()),
+                            ),
+                        )
+                        .await?;
 
+                    let dispatch_started = wall_clock_ms();
+                    central
+                        .save_analysis_stage(
+                            self.run_id,
+                            stage_write(
+                                DuplicateListStage::DispatchStage2,
+                                PersistentStageState::Running,
+                                0,
+                                None,
+                                0,
+                                Some(dispatch_started),
+                                None,
+                            ),
+                        )
+                        .await?;
                     self.restore_phase2_tasks(central).await?;
                     if self.phase2_tasks.is_empty() {
                         let online = online_machines(sessions);
@@ -222,8 +317,24 @@ impl CrossAnalysisCoordinator {
                         self.dispatch_batches(central, sessions, batches).await?;
                     }
                     if self.phase2_tasks.is_empty() {
+                        central
+                            .save_analysis_stage(
+                                self.run_id,
+                                stage_write(
+                                    DuplicateListStage::DispatchStage2,
+                                    PersistentStageState::Completed,
+                                    0,
+                                    Some(0),
+                                    0,
+                                    Some(dispatch_started),
+                                    Some(wall_clock_ms()),
+                                ),
+                            )
+                            .await?;
                         return self.finish(central).await;
                     }
+                    self.save_dispatch_progress(central, dispatch_started)
+                        .await?;
                     central
                         .set_analysis_status(
                             self.run_id,
@@ -239,10 +350,13 @@ impl CrossAnalysisCoordinator {
                 }
                 CentralAnalysisStatus::Phase2Dispatched => {
                     self.restore_phase2_tasks(central).await?;
+                    let dispatch_started = wall_clock_ms();
                     let Some(states) = self
                         .refresh_tasks(central, sessions, &self.phase2_tasks.clone())
                         .await?
                     else {
+                        self.save_dispatch_progress(central, dispatch_started)
+                            .await?;
                         let count = central.analysis_candidates(self.run_id).await?.len();
                         return Ok(self.report(
                             CentralAnalysisStatus::Phase2Dispatched,
@@ -250,6 +364,8 @@ impl CrossAnalysisCoordinator {
                             count,
                         ));
                     };
+                    self.save_dispatch_progress(central, dispatch_started)
+                        .await?;
                     if phase2_gate(&states) == GateDecision::Waiting {
                         let count = central.analysis_candidates(self.run_id).await?.len();
                         return Ok(self.report(
@@ -315,7 +431,24 @@ impl CrossAnalysisCoordinator {
             &online_machines(sessions),
             STAGE2_BATCH_SIZE,
         );
+        let dispatch_started = wall_clock_ms();
+        central
+            .save_analysis_stage(
+                self.run_id,
+                stage_write(
+                    DuplicateListStage::DispatchStage2,
+                    PersistentStageState::Running,
+                    0,
+                    None,
+                    0,
+                    Some(dispatch_started),
+                    None,
+                ),
+            )
+            .await?;
         self.dispatch_batches(central, sessions, batches).await?;
+        self.save_dispatch_progress(central, dispatch_started)
+            .await?;
         if self.phase2_tasks.is_empty() {
             return Ok(self.report(CentralAnalysisStatus::Partial, evaluated.len(), unresolved));
         }
@@ -352,18 +485,37 @@ impl CrossAnalysisCoordinator {
                     .await?;
             }
         }
+        let dispatches = central.stage2_dispatches(self.run_id).await?;
         let mut states = Vec::with_capacity(tasks.len());
         for (task, summary) in summaries {
             let state = task_state(summary.state)?;
+            let state_name = task_state_name(state);
             let sync_highwater = central.sync_cursor(&task.machine_id).await?;
             let node = CentralAnalysisNode {
                 machine_id: task.machine_id.clone(),
                 task_id: task.task_id,
                 task_highwater: summary.outbox_high_seq,
                 sync_highwater,
-                task_status: task_state_name(state).into(),
+                task_status: state_name.into(),
             };
             central.update_analysis_node(self.run_id, &node).await?;
+            for dispatch in dispatches.iter().filter(|dispatch| {
+                dispatch.machine_id == task.machine_id
+                    && dispatch.node_task_id == Some(task.task_id)
+            }) {
+                central
+                    .upsert_stage2_dispatch(
+                        self.run_id,
+                        Stage2DispatchWrite {
+                            machine_id: dispatch.machine_id.clone(),
+                            content: dispatch.content,
+                            node_task_id: dispatch.node_task_id,
+                            state: state_name.into(),
+                            updated_at_ms: wall_clock_ms(),
+                        },
+                    )
+                    .await?;
+            }
             states.push(GateState {
                 machine_id: task.machine_id,
                 task_id: task.task_id,
@@ -452,8 +604,28 @@ impl CrossAnalysisCoordinator {
         batches: Vec<PlannedStage2Batch>,
     ) -> Result<(), CrossAnalysisError> {
         for batch in batches {
+            let queued_at = wall_clock_ms();
+            for item in &batch.items {
+                central
+                    .upsert_stage2_dispatch(
+                        self.run_id,
+                        Stage2DispatchWrite {
+                            machine_id: batch.machine_id.clone(),
+                            content: item.content,
+                            node_task_id: None,
+                            state: "queued".into(),
+                            updated_at_ms: queued_at,
+                        },
+                    )
+                    .await?;
+            }
             let session = session_for(sessions, &batch.machine_id)
                 .ok_or_else(|| CrossAnalysisError::InvalidState("二筛目标节点已经断开".into()))?;
+            let contents = batch
+                .items
+                .iter()
+                .map(|item| item.content)
+                .collect::<Vec<_>>();
             let items = batch
                 .items
                 .into_iter()
@@ -480,6 +652,20 @@ impl CrossAnalysisCoordinator {
                     },
                 )
                 .await?;
+            for content in contents {
+                central
+                    .upsert_stage2_dispatch(
+                        self.run_id,
+                        Stage2DispatchWrite {
+                            machine_id: task.machine_id.clone(),
+                            content,
+                            node_task_id: Some(task_id),
+                            state: "queued".into(),
+                            updated_at_ms: wall_clock_ms(),
+                        },
+                    )
+                    .await?;
+            }
             self.phase2_tasks.push(task);
         }
         Ok(())
@@ -490,6 +676,25 @@ impl CrossAnalysisCoordinator {
         central: &CentralStore,
     ) -> Result<(), CrossAnalysisError> {
         if !self.phase2_tasks.is_empty() {
+            return Ok(());
+        }
+        let dispatches = central.stage2_dispatches(self.run_id).await?;
+        let task_keys = dispatches
+            .iter()
+            .filter_map(|dispatch| {
+                dispatch
+                    .node_task_id
+                    .map(|task_id| (dispatch.machine_id.clone(), task_id))
+            })
+            .collect::<BTreeSet<_>>();
+        if !task_keys.is_empty() {
+            self.phase2_tasks = task_keys
+                .into_iter()
+                .map(|(machine_id, task_id)| SelectedTask {
+                    machine_id,
+                    task_id,
+                })
+                .collect();
             return Ok(());
         }
         let selected = self
@@ -510,15 +715,65 @@ impl CrossAnalysisCoordinator {
         Ok(())
     }
 
+    /// 以每个内容项的持久派发状态更新二次特征阶段，而不是按批次数计数。
+    async fn save_dispatch_progress(
+        &self,
+        central: &CentralStore,
+        started_at_ms: u64,
+    ) -> Result<(), CrossAnalysisError> {
+        let states = central
+            .stage2_dispatches(self.run_id)
+            .await?
+            .into_iter()
+            .map(|dispatch| dispatch.state)
+            .collect::<Vec<_>>();
+        central
+            .save_analysis_stage(
+                self.run_id,
+                stage2_dispatch_stage(&states, started_at_ms, wall_clock_ms()),
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn finish(
         &mut self,
         central: &mut CentralStore,
     ) -> Result<CrossPollReport, CrossAnalysisError> {
+        let final_started = wall_clock_ms();
+        central
+            .save_analysis_stage(
+                self.run_id,
+                stage_write(
+                    DuplicateListStage::FinalCompare,
+                    PersistentStageState::Running,
+                    0,
+                    None,
+                    0,
+                    Some(final_started),
+                    None,
+                ),
+            )
+            .await?;
         let features = central.analysis_features(self.run_id).await?;
         let candidates = central.analysis_candidates(self.run_id).await?;
         let (evaluated, unresolved) = evaluate_candidates(&candidates, &features, &self.thresholds);
         central.replace_candidates(self.run_id, &evaluated).await?;
         if unresolved > 0 {
+            central
+                .save_analysis_stage(
+                    self.run_id,
+                    stage_write(
+                        DuplicateListStage::FinalCompare,
+                        PersistentStageState::Failed,
+                        evaluated.len().saturating_sub(unresolved) as u64,
+                        Some(evaluated.len() as u64),
+                        unresolved as u64,
+                        Some(final_started),
+                        Some(wall_clock_ms()),
+                    ),
+                )
+                .await?;
             central
                 .set_analysis_status(self.run_id, CentralAnalysisStatus::Partial, None)
                 .await?;
@@ -533,6 +788,20 @@ impl CrossAnalysisCoordinator {
         let inputs = central.analysis_inputs(self.run_id).await?;
         let groups = build_groups(&inputs, &evaluated);
         central.replace_groups(self.run_id, &groups).await?;
+        central
+            .save_analysis_stage(
+                self.run_id,
+                stage_write(
+                    DuplicateListStage::FinalCompare,
+                    PersistentStageState::Completed,
+                    evaluated.len() as u64,
+                    Some(evaluated.len() as u64),
+                    0,
+                    Some(final_started),
+                    Some(wall_clock_ms()),
+                ),
+            )
+            .await?;
         central
             .set_analysis_status(self.run_id, CentralAnalysisStatus::Completed, None)
             .await?;
@@ -571,6 +840,14 @@ fn online_machines(sessions: &[&NodeSession]) -> BTreeSet<MachineId> {
         .iter()
         .map(|session| session.machine_id().clone())
         .collect()
+}
+
+/// 返回当前墙钟毫秒时间，供跨进程恢复后的阶段计时继续使用。
+fn wall_clock_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn task_state(value: i32) -> Result<CrossTaskState, CrossAnalysisError> {

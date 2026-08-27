@@ -8,14 +8,30 @@ publish.workspace = true
 [lib]
 path = "src/lib.rs"
 
+[features]
+default = []
+acceptance-tools = ["dep:serde", "dep:serde_json", "dep:sha2"]
+
 [dependencies]
 dedup-core = { path = "../core" }
 dedup-media = { path = "../media" }
 dedup-protocol = { path = "../protocol" }
 rusqlite.workspace = true
+serde = { workspace = true, optional = true }
+serde_json = { version = "1", optional = true }
+sha2 = { workspace = true, optional = true }
 thiserror.workspace = true
 toml.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[[example]]
+name = "export_scan_result_summary"
+required-features = ["acceptance-tools"]
+
+[[test]]
+name = "result_summary_export"
+path = "tests/result_summary_export.rs"
+required-features = ["acceptance-tools"]

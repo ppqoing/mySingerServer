@@ -698,6 +698,14 @@ impl CentralAnalysisStatus {
 }
 
 impl CentralPairKind {
+    /// 返回图片优先、视频其次的稳定候选排序键。
+    pub const fn sort_key(self) -> u8 {
+        match self {
+            Self::Image => 0,
+            Self::Video => 1,
+        }
+    }
+
     const fn as_str(self) -> &'static str {
         match self {
             Self::Image => "image",

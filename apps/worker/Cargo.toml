@@ -19,3 +19,8 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[[test]]
+name = "worker_protocol_process"
+path = "tests/worker_protocol_process.rs"
+harness = false

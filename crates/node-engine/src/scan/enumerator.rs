@@ -25,6 +25,19 @@ pub trait FileEnumerator {
         }
         Ok(())
     }
+
+    /// 枚举源完成时发送一次最终边界；流式实现默认在最后一项交付后通知。
+    ///
+    /// 完整物化清单的实现可在逐项交付前提供文件数和字节数，使下游背压不再延长枚举计时。
+    fn enumerate_into_with_completion(
+        &self,
+        roots: &[DisplayPath],
+        complete: &mut dyn FnMut(Option<(u64, u64)>) -> Result<(), ScanError>,
+        emit: &mut dyn FnMut(ScannedPath) -> Result<(), ScanError>,
+    ) -> Result<(), ScanError> {
+        self.enumerate_into(roots, emit)?;
+        complete(None)
+    }
 }
 
 impl FileEnumerator for dedup_windows::WindowsWalker {

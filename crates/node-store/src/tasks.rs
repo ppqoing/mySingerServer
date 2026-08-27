@@ -3,12 +3,13 @@
 use std::collections::HashSet;
 
 use dedup_core::{DisplayPath, LocationKey, MachineId, NormalizedPath, TaskId};
-use rusqlite::{OptionalExtension, Transaction, params};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use uuid::Uuid;
 
 use crate::{
     ContentId, FileFaultKind, FileFaultRecord, NodeStore, ScannedPath, StoreError,
     content::{content_key_in_transaction, encode_file},
+    faults::upsert_file_fault_in_transaction,
     open::sqlite_integer,
     outbox::append_sync_change,
 };
@@ -138,6 +139,38 @@ pub struct TaskEvent {
     pub event_seq: u64,
 }
 
+/// 单写持久化边界用于精确归并任务项的稳定身份。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskItemIdentity {
+    /// 结果所属任务；不得仅凭全局 item ID 推断。
+    pub task_id: TaskId,
+    /// Worker 领取时冻结的任务项 ID。
+    pub item_id: String,
+    /// Worker 领取后冻结的本地内容 ID；无内容控制项可为空。
+    pub content_id: Option<ContentId>,
+}
+
+/// 带身份门禁的任务项写入结果。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TaskItemApplyResult {
+    /// 身份和活动状态都匹配，事务已经提交。
+    Applied(TaskEvent),
+    /// 身份匹配，但任务或任务项已经不活动，未产生写入。
+    IgnoredInactive,
+    /// item 不存在，或 task/content 身份不匹配，未产生写入。
+    IdentityMismatch,
+}
+
+/// 事务内身份门禁的内部判定，供终态和一筛写入共享。
+pub(crate) enum TaskItemIdentityState {
+    /// 当前任务项仍可写入。
+    Active,
+    /// 身份正确但任务项已经不活动。
+    Inactive,
+    /// item 不存在或三元身份不一致。
+    Mismatch,
+}
+
 /// UI 和恢复逻辑读取的任务统计快照。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TaskSnapshot {
@@ -202,7 +235,7 @@ impl NodeStore {
         )?;
         Ok((queued as u64, running as u64))
     }
-    /// 在枚举前创建扫描任务并持久化规范扫描根。
+    /// 在枚举前创建基础计算任务并持久化规范扫描根。
     pub fn create_scan_task(
         &mut self,
         roots: &[NormalizedPath],
@@ -217,7 +250,7 @@ impl NodeStore {
         let transaction = self.connection.transaction()?;
         transaction.execute(
             "INSERT INTO tasks(task_id,kind,status,total_items,created_at_ms,updated_at_ms)
-             VALUES(?1,'scan','queued',0,?2,?2)",
+             VALUES(?1,'base_compute','queued',0,?2,?2)",
             params![task_id.as_uuid().to_string(), now_ms],
         )?;
         for root in roots {
@@ -319,6 +352,21 @@ impl NodeStore {
         Ok(Some(item_id))
     }
 
+    /// 缓存查询未命中后，把已保留的扫描项转为可持久恢复的 MD5 读取队列。
+    pub fn queue_scan_item_for_read(&mut self, item_id: &str) -> Result<(), StoreError> {
+        let changed = self.connection.execute(
+            "UPDATE task_items SET status='queued',stage='read_md5'
+             WHERE item_id=?1 AND status='running' AND stage='enumerated'",
+            [item_id],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::InvalidState(
+                "只能把刚完成缓存查询的扫描项加入读取队列".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// 在一个事务中创建任务及全部初始 queued 项。
     pub fn create_task(
         &mut self,
@@ -379,10 +427,34 @@ impl NodeStore {
         completion: TaskItemCompletion,
         now_ms: i64,
     ) -> Result<TaskEvent, StoreError> {
-        let transaction = self.connection.transaction()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let event = complete_item_in_transaction(&transaction, item_id, completion, now_ms)?;
         transaction.commit()?;
         Ok(event)
+    }
+
+    /// 仅在 task/item/content 身份匹配且仍活动时完成任务项。
+    pub fn complete_item_guarded(
+        &mut self,
+        identity: &TaskItemIdentity,
+        completion: TaskItemCompletion,
+        now_ms: i64,
+    ) -> Result<TaskItemApplyResult, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let state = classify_task_item_identity(&transaction, identity)?;
+        let result = match state {
+            TaskItemIdentityState::Active => TaskItemApplyResult::Applied(
+                complete_item_in_transaction(&transaction, &identity.item_id, completion, now_ms)?,
+            ),
+            TaskItemIdentityState::Inactive => TaskItemApplyResult::IgnoredInactive,
+            TaskItemIdentityState::Mismatch => TaskItemApplyResult::IdentityMismatch,
+        };
+        transaction.commit()?;
+        Ok(result)
     }
 
     /// 在一个事务中先把 running 项置为 Failed，再 UPSERT 对应 worker_crash 文件故障。
@@ -393,86 +465,47 @@ impl NodeStore {
         error: &str,
         now_ms: i64,
     ) -> Result<TaskEvent, StoreError> {
-        if fault.kind != FileFaultKind::WorkerCrash {
-            return Err(StoreError::InvalidState(
-                "Worker 崩溃终态只能写 worker_crash 故障".into(),
-            ));
-        }
-        let transaction = self.connection.transaction()?;
-        let (machine_id, normalized_path, display_path, file_size, stage, status): (
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<i64>,
-            String,
-            String,
-        ) = transaction.query_row(
-            "SELECT machine_id,normalized_path,display_path,file_size,stage,status
-             FROM task_items WHERE item_id=?1",
-            [item_id],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                ))
-            },
-        )?;
-        let (Some(machine_id), Some(normalized_path), Some(display_path), Some(file_size)) =
-            (machine_id, normalized_path, display_path, file_size)
-        else {
-            return Err(StoreError::InvalidState(
-                "Worker 崩溃项缺少持久文件身份".into(),
-            ));
-        };
-        let persisted_machine = MachineId::parse(&machine_id)?;
-        let persisted_normalized = NormalizedPath::new(&normalized_path)?;
-        let persisted_display = DisplayPath::new(&display_path)?;
-        let persisted_size = u64::try_from(file_size)
-            .map_err(|_| StoreError::InvalidState("Worker 崩溃项文件大小无效".into()))?;
-        if status != "running"
-            || fault.machine_id != persisted_machine
-            || fault.normalized_path != persisted_normalized
-            || fault.display_path != persisted_display
-            || fault.file_size != persisted_size
-            || fault.stage != stage
-            || fault.windows_error_code.is_some()
-        {
-            return Err(StoreError::InvalidState(
-                "Worker 崩溃事件身份与持久任务项不一致".into(),
-            ));
-        }
-        let event = complete_item_in_transaction(
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let event = fail_running_item_with_file_fault_in_transaction(
             &transaction,
             item_id,
-            TaskItemCompletion::Failed(error.to_owned()),
+            fault,
+            error,
             now_ms,
-        )?;
-        transaction.execute(
-            "INSERT INTO file_faults(
-                machine_id,normalized_path,display_path,file_size,fault_kind,stage,
-                windows_error_code,message
-             ) VALUES(?1,?2,?3,?4,?5,?6,NULL,?7)
-             ON CONFLICT(machine_id,normalized_path,fault_kind) DO UPDATE SET
-                file_size=excluded.file_size,
-                stage=excluded.stage,
-                windows_error_code=NULL,
-                message=excluded.message",
-            params![
-                machine_id,
-                normalized_path,
-                display_path,
-                file_size,
-                fault.kind.as_str(),
-                stage,
-                fault.message,
-            ],
         )?;
         transaction.commit()?;
         Ok(event)
+    }
+
+    /// 仅在 task/item/content 身份匹配且仍活动时提交 Worker 崩溃终态和故障。
+    pub fn fail_running_item_with_file_fault_guarded(
+        &mut self,
+        identity: &TaskItemIdentity,
+        fault: &FileFaultRecord,
+        error: &str,
+        now_ms: i64,
+    ) -> Result<TaskItemApplyResult, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let state = classify_task_item_identity(&transaction, identity)?;
+        let result = match state {
+            TaskItemIdentityState::Active => {
+                TaskItemApplyResult::Applied(fail_running_item_with_file_fault_in_transaction(
+                    &transaction,
+                    &identity.item_id,
+                    fault,
+                    error,
+                    now_ms,
+                )?)
+            }
+            TaskItemIdentityState::Inactive => TaskItemApplyResult::IgnoredInactive,
+            TaskItemIdentityState::Mismatch => TaskItemApplyResult::IdentityMismatch,
+        };
+        transaction.commit()?;
+        Ok(result)
     }
 
     /// 在 Worker dispatch 前把 running 扫描项冻结为实际 content 与处理阶段。
@@ -646,7 +679,9 @@ impl NodeStore {
             [task_id.as_uuid().to_string()],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        if kind != "scan" || !matches!(status.as_str(), "queued" | "running") {
+        if !matches!(kind.as_str(), "scan" | "base_compute")
+            || !matches!(status.as_str(), "queued" | "running")
+        {
             return Err(StoreError::InvalidState("扫描任务不处于可完成状态".into()));
         }
         let pending: i64 = transaction.query_row(
@@ -734,7 +769,9 @@ impl NodeStore {
             [&task_id_text],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        if kind != "scan" || !matches!(status.as_str(), "queued" | "running") {
+        if !matches!(kind.as_str(), "scan" | "base_compute")
+            || !matches!(status.as_str(), "queued" | "running")
+        {
             return Err(StoreError::InvalidState("扫描任务不处于可完成状态".into()));
         }
         let pending: i64 = transaction.query_row(
@@ -1032,6 +1069,101 @@ fn item_counts(
     )?)
 }
 
+/// 在当前事务快照内判定三元身份和活动状态，任何业务写入都必须晚于此门禁。
+pub(crate) fn classify_task_item_identity(
+    transaction: &Transaction<'_>,
+    identity: &TaskItemIdentity,
+) -> Result<TaskItemIdentityState, StoreError> {
+    let row: Option<(String, Option<i64>, String, String)> = transaction
+        .query_row(
+            "SELECT ti.task_id,ti.content_id,ti.status,t.status
+             FROM task_items ti JOIN tasks t ON t.task_id=ti.task_id
+             WHERE ti.item_id=?1",
+            [&identity.item_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((task_id, content_id, item_status, task_status)) = row else {
+        return Ok(TaskItemIdentityState::Mismatch);
+    };
+    if task_id != identity.task_id.as_uuid().to_string()
+        || content_id.map(ContentId::from_i64) != identity.content_id
+    {
+        return Ok(TaskItemIdentityState::Mismatch);
+    }
+    if item_status != "running" || !matches!(task_status.as_str(), "queued" | "running") {
+        return Ok(TaskItemIdentityState::Inactive);
+    }
+    Ok(TaskItemIdentityState::Active)
+}
+
+/// 在已有事务中提交 Worker 崩溃终态和文件故障，供旧入口与 guarded 入口复用。
+fn fail_running_item_with_file_fault_in_transaction(
+    transaction: &Transaction<'_>,
+    item_id: &str,
+    fault: &FileFaultRecord,
+    error: &str,
+    now_ms: i64,
+) -> Result<TaskEvent, StoreError> {
+    if fault.kind != FileFaultKind::WorkerCrash {
+        return Err(StoreError::InvalidState(
+            "Worker 崩溃终态只能写 worker_crash 故障".into(),
+        ));
+    }
+    let (machine_id, normalized_path, display_path, file_size, status): (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        String,
+    ) = transaction.query_row(
+        "SELECT machine_id,normalized_path,display_path,file_size,status
+         FROM task_items WHERE item_id=?1",
+        [item_id],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
+    )?;
+    let (Some(machine_id), Some(normalized_path), Some(display_path), Some(file_size)) =
+        (machine_id, normalized_path, display_path, file_size)
+    else {
+        return Err(StoreError::InvalidState(
+            "Worker 崩溃项缺少持久文件身份".into(),
+        ));
+    };
+    let persisted_machine = MachineId::parse(&machine_id)?;
+    let persisted_normalized = NormalizedPath::new(&normalized_path)?;
+    let persisted_display = DisplayPath::new(&display_path)?;
+    let persisted_size = u64::try_from(file_size)
+        .map_err(|_| StoreError::InvalidState("Worker 崩溃项文件大小无效".into()))?;
+    if status != "running"
+        || fault.machine_id != persisted_machine
+        || fault.normalized_path != persisted_normalized
+        || fault.file_size != persisted_size
+        || fault.windows_error_code.is_some()
+    {
+        return Err(StoreError::InvalidState(
+            "Worker 崩溃事件身份与持久任务项不一致".into(),
+        ));
+    }
+    let mut persisted_fault = fault.clone();
+    persisted_fault.display_path = persisted_display;
+    let event = complete_item_in_transaction(
+        transaction,
+        item_id,
+        TaskItemCompletion::Failed(error.to_owned()),
+        now_ms,
+    )?;
+    upsert_file_fault_in_transaction(transaction, &persisted_fault)?;
+    Ok(event)
+}
+
 pub(crate) fn complete_item_in_transaction(
     transaction: &Transaction<'_>,
     item_id: &str,
@@ -1076,7 +1208,8 @@ pub(crate) fn complete_item_in_transaction(
         [&task_id_text],
         |row| row.get(0),
     )?;
-    let waits_for_scan_finalize = kind == "scan" && persisted_root_count > 0;
+    let waits_for_scan_finalize =
+        matches!(kind.as_str(), "scan" | "base_compute") && persisted_root_count > 0;
     let task_status = if counts.3 == 0 && !waits_for_scan_finalize {
         TaskStatus::Completed
     } else {

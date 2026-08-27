@@ -233,6 +233,8 @@ impl NodeRequestHandler for RuntimeTaskHandler {
                     stages: Vec::new(),
                     workers: Vec::new(),
                     failures: Vec::new(),
+                    execution_config: None,
+                    pipeline_metrics: None,
                 });
                 proto::envelope::Payload::GetRuntimeTaskDetails(response)
             }

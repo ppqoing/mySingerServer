@@ -1,30 +1,226 @@
 //! 多 Worker 进程的串行 actor、异常替换、取消与两阶段计划重启。
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    future::Future,
+    pin::Pin,
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-use dedup_core::{DisplayPath, MachineId, NormalizedPath};
+use dedup_core::{DisplayPath, MachineId, MediaKind, NormalizedPath};
 use dedup_protocol::proto::{self, worker_envelope};
 use dedup_windows::{ReadCancellationToken, WorkerJob};
 use thiserror::Error;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 
 use super::process::{WorkerLaunch, WorkerProcess};
-use super::{Stage1Output, Stage2Output, encode_stage1_payload, encode_stage2_payload};
+use super::{
+    BaseComputeOutput, Stage1Output, Stage2Output, encode_base_compute_payload,
+    encode_stage1_payload, encode_stage2_payload,
+};
 
 const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(15);
+/// 等待项被其他任务绕过达到该次数后，为最老任务保留后续 CPU 预算。
+const CPU_AGING_BYPASS_LIMIT: usize = 8;
+/// 对外 WorkerEvent 通道和内部待发送事件队列的固定容量，避免事件无界增长。
+const WORKER_EVENT_CAPACITY: usize = 256;
+/// WorkerPool 控制命令通道的固定容量，等待队列上界据此吸收已入站命令。
+const POOL_COMMAND_CAPACITY: usize = 64;
+
+/// 将事件排入池 actor 独立的 FIFO 发送队列；实现者不得丢弃或重排事件。
+trait WorkerEventSink {
+    /// 把事件交给发送队列；等待的只是有限 outbox 空间，不是外部消费速度。
+    fn send_event<'a>(
+        &'a self,
+        event: WorkerEvent,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+}
+
+/// 独立转发 WorkerEvent 的有限 FIFO outbox，解除控制命令与外部事件通道的直接耦合。
+#[derive(Clone)]
+struct WorkerEventOutbox {
+    /// 外层事件通道前的固定容量 FIFO。
+    pending: mpsc::Sender<WorkerEvent>,
+    /// 内层消费或外层恢复写入时唤醒 actor。
+    progress: Arc<Notify>,
+}
+
+impl WorkerEventOutbox {
+    /// 创建固定容量 outbox，并启动唯一 drain 保持事件顺序和完整性。
+    fn new(events: mpsc::Sender<WorkerEvent>) -> Self {
+        let (pending, mut receiver) = mpsc::channel(WORKER_EVENT_CAPACITY);
+        let progress = Arc::new(Notify::new());
+        let drain_progress = Arc::clone(&progress);
+        tokio::spawn(async move {
+            while let Some(event) = receiver.recv().await {
+                // 内层 sender 已取走一个事件，actor 本地暂存可以尝试继续入队。
+                drain_progress.notify_one();
+                if events.send(event).await.is_err() {
+                    break;
+                }
+                // 外层成功接收后再次唤醒，覆盖外层从满到可写的进度。
+                drain_progress.notify_one();
+            }
+            drain_progress.notify_one();
+        });
+        Self { pending, progress }
+    }
+
+    /// 非阻塞地把事件送入内层有限队列，满时把事件交还给调用方保留。
+    fn try_send_event(
+        &self,
+        event: WorkerEvent,
+    ) -> Result<(), mpsc::error::TrySendError<WorkerEvent>> {
+        self.pending.try_send(event)
+    }
+
+    /// 等待 outbox 消费进度，避免 actor 通过定时器忙轮询。
+    async fn wait_for_progress(&self) {
+        self.progress.notified().await;
+    }
+}
+
+impl WorkerEventSink for WorkerEventOutbox {
+    /// 将事件放入内部有限队列，由唯一 drain 按入队顺序交付给 owner。
+    fn send_event<'a>(
+        &'a self,
+        event: WorkerEvent,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let _ = self.pending.send(event).await;
+        })
+    }
+}
+
+impl WorkerEventSink for mpsc::Sender<WorkerEvent> {
+    /// 直接发送仅供底层单元测试使用；生产 actor 使用独立 outbox。
+    fn send_event<'a>(
+        &'a self,
+        event: WorkerEvent,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let _ = self.send(event).await;
+        })
+    }
+}
+
+/// actor 私有的有界 FIFO 事件暂存；外层/内层满时仍不丢弃任何事件。
+struct PendingWorkerEvents {
+    /// actor 独占的待发送事件，只有 sink 与 flush 路径会访问。
+    queue: Mutex<VecDeque<WorkerEvent>>,
+    /// 由 Worker 数量和控制命令容量推导出的硬上限。
+    capacity: usize,
+}
+
+impl PendingWorkerEvents {
+    /// 按 Worker/命令状态计算的固定容量创建本地暂存。
+    fn new(capacity: usize) -> Self {
+        assert!(capacity > 0, "Worker 事件暂存容量必须大于零");
+        Self {
+            queue: Mutex::new(VecDeque::new()),
+            capacity,
+        }
+    }
+
+    /// 尝试追加一条事件；容量满时原样返回，调用方负责等待进度。
+    fn try_push(&self, event: WorkerEvent) -> Result<(), WorkerEvent> {
+        let mut queue = self.queue.lock().unwrap();
+        if queue.len() >= self.capacity {
+            return Err(event);
+        }
+        queue.push_back(event);
+        Ok(())
+    }
+
+    /// 将本地 FIFO 尽可能送入 outbox；失败事件放回队首，保证顺序和所有权。
+    fn try_flush(&self, outbox: &WorkerEventOutbox) {
+        loop {
+            let Some(event) = self.queue.lock().unwrap().pop_front() else {
+                return;
+            };
+            match outbox.try_send_event(event) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(event))
+                | Err(mpsc::error::TrySendError::Closed(event)) => {
+                    self.queue.lock().unwrap().push_front(event);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// 判断本地是否仍有待交付事件，作为 actor 进度分支的启用条件。
+    fn has_pending(&self) -> bool {
+        !self.queue.lock().unwrap().is_empty()
+    }
+}
+
+/// 使用 actor 本地有界暂存的事件 sink；控制路径只等待暂存空间，不等待外部消费者。
+#[derive(Clone)]
+struct ActorWorkerEventSink {
+    /// 本 actor 的有界事件暂存。
+    pending: Arc<PendingWorkerEvents>,
+    /// 保持与外部事件 owner 相同的 FIFO 出口。
+    outbox: WorkerEventOutbox,
+}
+
+impl ActorWorkerEventSink {
+    /// 绑定唯一 actor 的暂存与有序 outbox。
+    fn new(pending: Arc<PendingWorkerEvents>, outbox: WorkerEventOutbox) -> Self {
+        Self { pending, outbox }
+    }
+}
+
+impl WorkerEventSink for ActorWorkerEventSink {
+    /// 事件先进入 actor 私有 FIFO；暂存满时等待 outbox 进度而非忙轮询。
+    fn send_event<'a>(
+        &'a self,
+        event: WorkerEvent,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        let pending = Arc::clone(&self.pending);
+        let outbox = self.outbox.clone();
+        Box::pin(async move {
+            let mut event = event;
+            loop {
+                match pending.try_push(event) {
+                    Ok(()) => return,
+                    Err(returned) => event = returned,
+                }
+                let progress = outbox.wait_for_progress();
+                pending.try_flush(&outbox);
+                match pending.try_push(event) {
+                    Ok(()) => return,
+                    Err(returned) => event = returned,
+                }
+                progress.await;
+            }
+        })
+    }
+}
+
+/// 等待队列上界：Worker 槽位与已进入控制通道的命令共同决定最大积压。
+fn max_waiting_work_items(worker_count: usize) -> usize {
+    worker_count.max(1).saturating_add(POOL_COMMAND_CAPACITY)
+}
+
+/// 本地事件上界：运行槽位终态 + 等待项取消 + 一批控制命令各自最多产生一条事件。
+fn actor_event_buffer_capacity(worker_count: usize) -> usize {
+    let worker_count = worker_count.max(1);
+    worker_count
+        .saturating_add(max_waiting_work_items(worker_count))
+        .saturating_add(POOL_COMMAND_CAPACITY)
+}
 
 /// WorkerPool 的进程数量、可执行文件和 Ready 超时。
 #[derive(Clone, Debug)]
 pub struct WorkerPoolConfig {
     launch: WorkerLaunch,
     worker_count: usize,
+    cpu_budget: usize,
     ready_timeout: Duration,
     result_read_delay: Duration,
 }
@@ -35,9 +231,16 @@ impl WorkerPoolConfig {
         Self {
             launch,
             worker_count,
+            cpu_budget: worker_count,
             ready_timeout: DEFAULT_READY_TIMEOUT,
             result_read_delay: Duration::ZERO,
         }
+    }
+
+    /// 覆盖 WorkerPool 的统一 CPU 权重预算；生产入口应传入扣除保留核心后的值。
+    pub const fn with_cpu_budget(mut self, cpu_budget: usize) -> Self {
+        self.cpu_budget = cpu_budget;
+        self
     }
 
     /// 覆盖进程启动的 Ready 超时，主要用于进程级测试。
@@ -69,6 +272,36 @@ pub enum WorkerEvent {
         process_id: Option<u32>,
         /// dispatch 冻结文件身份。
         identity: WorkerFileIdentity,
+        /// 实际原子登记的 CPU 权重。
+        cpu_weight: u32,
+        /// 一次性基础媒体请求显式使用的解码线程数。
+        decoder_threads: Option<u32>,
+        /// 从进入 WorkerPool 有界队列到真实发送 Run 的等待微秒。
+        queue_wait_us: u64,
+    },
+    /// Worker 进程在真实执行边界即时发出的非终态阶段。
+    PhaseChanged {
+        /// 所属任务 ID。
+        task_id: String,
+        /// 任务项 ID。
+        item_id: String,
+        /// 实际槽位。
+        slot: u32,
+        /// 仅接受协议定义的 idle/decode/feature/result_wait。
+        phase: proto::RuntimeWorkerPhase,
+        /// 从 Worker 收到请求起累计的微秒。
+        request_elapsed_us: Option<u64>,
+    },
+    /// 一次性基础计算已结束全部源文件读取，但当前任务仍等待终态结果。
+    BaseSourceReadComplete {
+        /// 所属任务 ID。
+        task_id: String,
+        /// 任务项 ID。
+        item_id: String,
+        /// 实际槽位。
+        slot: u32,
+        /// 从 Worker 收到请求到关闭源文件的微秒。
+        request_elapsed_us: Option<u64>,
     },
     /// Worker 正常返回一个协议结果。
     Completed {
@@ -87,6 +320,10 @@ pub enum WorkerEvent {
         item_id: String,
         /// dispatch 时冻结并随真实运行项返回的文件身份。
         identity: WorkerFileIdentity,
+        /// 发生崩溃的 Worker PID。
+        process_id: Option<u32>,
+        /// 操作系统可提供时的 Worker 退出码。
+        exit_code: Option<i32>,
         /// 进程或管道诊断。
         message: String,
     },
@@ -104,7 +341,7 @@ pub enum WorkerEvent {
     },
 }
 
-/// 扫描 Worker dispatch 时冻结的批准文件身份，不含进程或尝试诊断。
+/// 扫描 Worker dispatch 时冻结的批准文件上下文；路径身份固定，阶段由 Node 随运行更新。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkerFileIdentity {
     /// 节点物理机器 ID。
@@ -115,7 +352,7 @@ pub struct WorkerFileIdentity {
     pub display_path: DisplayPath,
     /// 枚举/任务项冻结的文件大小。
     pub file_size: u64,
-    /// Worker 正在执行的流水线阶段。
+    /// Node 记录的 Worker 当前流水线阶段；非终态事件可更新该值。
     pub stage: String,
     /// 读取许可冻结的物理盘显示身份。
     pub physical_disk_id: String,
@@ -195,9 +432,58 @@ pub struct ControlledWorkerPool {
     commands: mpsc::Sender<ControlledWorkerCommand>,
     available_slots: Arc<AtomicUsize>,
     state: Arc<Mutex<PoolState>>,
+    /// 已实际取得 slot 与 CPU 的基础命令快照，仅供 Node 调度行为测试读取。
+    started_base_commands: Arc<Mutex<Vec<proto::ComputeBaseFeatures>>>,
+    /// 下一次可控取消在清除 Worker 后、返回 ACK 前使用的测试闸门。
+    cancel_gate: Arc<Mutex<Option<(Arc<Notify>, Arc<Notify>)>>>,
 }
 
 impl ControlledWorkerPool {
+    /// 让指定运行项上报一个真实 Worker 阶段，只供 Node 运行时投影行为测试。
+    #[doc(hidden)]
+    pub async fn phase_changed(
+        &self,
+        task_id: String,
+        item_id: String,
+        phase: proto::RuntimeWorkerPhase,
+    ) {
+        let _ = self
+            .commands
+            .send(ControlledWorkerCommand::PhaseChanged {
+                task_id,
+                item_id,
+                phase,
+            })
+            .await;
+    }
+
+    /// 让一次性基础计算返回源读取完成事件，但继续占用同一逻辑槽位等待终态。
+    pub async fn base_source_read_complete(&self, task_id: String, item_id: String) {
+        let _ = self
+            .commands
+            .send(ControlledWorkerCommand::BaseSourceReadComplete { task_id, item_id })
+            .await;
+    }
+
+    /// 让一次性基础计算返回最终媒体结果。
+    pub async fn complete_base(
+        &self,
+        task_id: String,
+        item_id: String,
+        md5: [u8; 16],
+        output: BaseComputeOutput,
+    ) {
+        let _ = self
+            .commands
+            .send(ControlledWorkerCommand::CompleteBase {
+                task_id,
+                item_id,
+                md5,
+                output,
+            })
+            .await;
+    }
+
     /// 让指定运行项按 Worker 崩溃返回并立即补回逻辑槽位。
     pub async fn crash(&self, task_id: String, item_id: String, message: String) {
         let _ = self
@@ -240,7 +526,31 @@ impl ControlledWorkerPool {
         self.available_slots.load(Ordering::Acquire)
     }
 
-    /// 返回当前真实 running map 中携带冻结文件身份的项。
+    /// 返回当前已被运行项原子登记的 CPU 权重。
+    pub fn cpu_in_use(&self) -> usize {
+        self.state.lock().unwrap().cpu_in_use
+    }
+
+    /// 返回该可控池的 CPU 权重硬上限。
+    pub fn cpu_budget(&self) -> usize {
+        self.state.lock().unwrap().cpu_budget
+    }
+
+    /// 返回已实际开始的基础命令副本，供线程策略测试核对协议预算。
+    pub fn started_base_commands(&self) -> Vec<proto::ComputeBaseFeatures> {
+        self.started_base_commands.lock().unwrap().clone()
+    }
+
+    /// 给下一次可控取消安装“Worker 已停止”和“允许 ACK”两个通知，只供生命周期测试。
+    #[doc(hidden)]
+    pub fn gate_next_cancel_ack_for_test(&self) -> (Arc<Notify>, Arc<Notify>) {
+        let stopped = Arc::new(Notify::new());
+        let release_ack = Arc::new(Notify::new());
+        *self.cancel_gate.lock().unwrap() = Some((Arc::clone(&stopped), Arc::clone(&release_ack)));
+        (stopped, release_ack)
+    }
+
+    /// 返回当前真实 running map 中携带完整路径和当前阶段的项。
     pub fn running_files(&self) -> Vec<(String, String, WorkerFileIdentity)> {
         let mut rows = self
             .state
@@ -260,6 +570,22 @@ impl ControlledWorkerPool {
 }
 
 enum ControlledWorkerCommand {
+    /// 注入一个非终态 Worker 阶段事件。
+    PhaseChanged {
+        task_id: String,
+        item_id: String,
+        phase: proto::RuntimeWorkerPhase,
+    },
+    BaseSourceReadComplete {
+        task_id: String,
+        item_id: String,
+    },
+    CompleteBase {
+        task_id: String,
+        item_id: String,
+        md5: [u8; 16],
+        output: BaseComputeOutput,
+    },
     Crash {
         task_id: String,
         item_id: String,
@@ -417,11 +743,14 @@ impl WorkerPool {
         if config.worker_count == 0 {
             return Err(WorkerPoolError::EmptyPool);
         }
+        if config.cpu_budget == 0 {
+            return Err(WorkerPoolError::EmptyCpuBudget);
+        }
         let job = WorkerJob::create().map_err(|error| WorkerPoolError::Job(error.to_string()))?;
-        let state = Arc::new(Mutex::new(PoolState::default()));
+        let state = Arc::new(Mutex::new(PoolState::new(config.cpu_budget)));
         let (slot_events_tx, slot_events_rx) = mpsc::unbounded_channel();
         let mut slots = BTreeMap::new();
-        let mut idle = BTreeSet::new();
+        let mut idle = VecDeque::<usize>::new();
         for slot_id in 0..config.worker_count {
             let slot = spawn_slot(slot_id, &config, &job, slot_events_tx.clone()).await?;
             state
@@ -429,12 +758,13 @@ impl WorkerPool {
                 .unwrap()
                 .process_ids
                 .insert(slot_id, slot.process_id);
-            idle.insert(slot_id);
+            idle.push_back(slot_id);
             slots.insert(slot_id, slot);
         }
 
-        let (commands_tx, commands_rx) = mpsc::channel(64);
-        let (events_tx, events_rx) = mpsc::channel(256);
+        let (commands_tx, commands_rx) = mpsc::channel(POOL_COMMAND_CAPACITY);
+        let (events_tx, events_rx) = mpsc::channel(WORKER_EVENT_CAPACITY);
+        let event_outbox = WorkerEventOutbox::new(events_tx);
         let actor_state = Arc::clone(&state);
         tokio::spawn(run_pool(
             config,
@@ -444,7 +774,7 @@ impl WorkerPool {
             commands_rx,
             slot_events_rx,
             slot_events_tx,
-            events_tx,
+            event_outbox,
             actor_state,
         ));
         Ok(Self {
@@ -556,6 +886,11 @@ impl WorkerPool {
         self.events.recv().await
     }
 
+    /// 非阻塞取得当前已经排队的下一事件，供 MD5 完成项合并为一次缓存查询。
+    pub fn try_next_event(&mut self) -> Option<WorkerEvent> {
+        self.events.try_recv().ok()
+    }
+
     /// 返回按槽位排序的当前 Worker PID，供状态页和进程级测试使用。
     pub fn worker_process_ids(&self) -> Vec<u32> {
         self.state
@@ -577,6 +912,22 @@ impl WorkerPool {
         self.state.lock().unwrap().running.len()
     }
 
+    /// 返回当前池已经原子登记的 CPU 权重，供调度行为和后续遥测读取。
+    pub fn cpu_in_use(&self) -> usize {
+        self.state.lock().unwrap().cpu_in_use
+    }
+
+    /// 返回生产池实际采用的统一 CPU 权重硬上限。
+    pub fn cpu_budget(&self) -> usize {
+        self.state.lock().unwrap().cpu_budget
+    }
+
+    /// 根据媒体类型返回单项显式解码线程数；未知、图片和其他媒体固定为一。
+    pub fn decoder_threads_for(&self, media_kind: MediaKind) -> u32 {
+        let state = self.state.lock().unwrap();
+        decoder_threads_for_state(&state, media_kind)
+    }
+
     /// 强制终止指定 Worker 并让池按“意外退出”路径补建，仅供进程级故障测试。
     #[doc(hidden)]
     pub async fn terminate_worker_for_test(&self, process_id: u32) -> Result<(), WorkerPoolError> {
@@ -593,8 +944,35 @@ impl WorkerPool {
     pub fn controlled_batch_for_test(
         worker_count: usize,
     ) -> (Self, mpsc::Receiver<(String, String)>, ControlledWorkerPool) {
+        Self::controlled_batch_with_cpu_budget_for_test(worker_count, worker_count)
+    }
+
+    /// 创建带显式 CPU 权重预算的可控多槽池，验证加权调度和资源生命周期。
+    #[doc(hidden)]
+    pub fn controlled_batch_with_cpu_budget_for_test(
+        worker_count: usize,
+        cpu_budget: usize,
+    ) -> (Self, mpsc::Receiver<(String, String)>, ControlledWorkerPool) {
+        Self::controlled_batch_inner(worker_count, cpu_budget, true)
+    }
+
+    /// 创建延迟 Started 遥测的可控池，精确观察已派发但尚未登记 slot 的解码 ownership。
+    #[doc(hidden)]
+    pub fn controlled_batch_without_started_event_for_test(
+        worker_count: usize,
+    ) -> (Self, mpsc::Receiver<(String, String)>, ControlledWorkerPool) {
+        Self::controlled_batch_inner(worker_count, worker_count, false)
+    }
+
+    /// 复用可控池实现，并允许测试选择是否发送 Started 遥测事件。
+    fn controlled_batch_inner(
+        worker_count: usize,
+        cpu_budget: usize,
+        emit_started_events: bool,
+    ) -> (Self, mpsc::Receiver<(String, String)>, ControlledWorkerPool) {
         assert!(worker_count > 0);
-        let state = Arc::new(Mutex::new(PoolState::default()));
+        assert!(cpu_budget > 0);
+        let state = Arc::new(Mutex::new(PoolState::new(cpu_budget)));
         for slot in 0..worker_count {
             state
                 .lock()
@@ -604,38 +982,95 @@ impl WorkerPool {
         }
         let actor_state = state.clone();
         let (commands, mut command_rx) = mpsc::channel(64);
-        // 小容量直接锁定 dispatch/event owner 必须并发推进，不能依赖大缓冲掩盖死锁。
-        let (events, event_rx) = mpsc::channel(2);
+        // 覆盖每个槽位的 Started 与终态，避免可控池用 try_send 丢失 Worker 详情事件。
+        let (events, event_rx) = mpsc::channel(worker_count.saturating_mul(4).max(64));
         let (started, started_rx) = mpsc::channel(16);
         let (control_tx, mut control_rx) = mpsc::channel(16);
         let available_slots = Arc::new(AtomicUsize::new(worker_count));
         let actor_available = available_slots.clone();
+        let started_base_commands = Arc::new(Mutex::new(Vec::new()));
+        let actor_started_base_commands = Arc::clone(&started_base_commands);
+        let cancel_gate: Arc<Mutex<Option<(Arc<Notify>, Arc<Notify>)>>> =
+            Arc::new(Mutex::new(None));
+        let actor_cancel_gate = Arc::clone(&cancel_gate);
         tokio::spawn(async move {
             let mut queue = VecDeque::new();
             let mut idle = (0..worker_count).collect::<VecDeque<_>>();
             let mut active = HashMap::<String, (usize, WorkIdentity)>::new();
+            let mut next_enqueue_sequence = 0_u64;
             loop {
                 tokio::select! {
                     command = command_rx.recv() => {
                         let Some(command) = command else { break };
                         match command {
                             PoolCommand::Dispatch(envelope, guard, reply) => {
-                                let result = WorkItem::try_from(envelope).map(|mut work| {
+                                let result = WorkItem::try_from(envelope).and_then(|mut work| {
                                     work.set_scan_guard(guard);
+                                    work.prepare_for_queue(next_enqueue_sequence, cpu_budget)?;
+                                    next_enqueue_sequence = next_enqueue_sequence.wrapping_add(1);
                                     queue.push_back(work);
                                     controlled_schedule(
                                         &mut queue, &mut idle, &mut active, &started,
                                         &events, &actor_state, &actor_available,
+                                        &actor_started_base_commands, emit_started_events,
                                     );
+                                    Ok(())
                                 });
                                 let _ = reply.send(result);
                             }
                             PoolCommand::Cancel(task_id, reply) => {
-                                actor_state
-                                    .lock()
-                                    .unwrap()
-                                    .cancelled_tasks
-                                    .insert(task_id);
+                                let mut cancelled = Vec::new();
+                                queue.retain(|work| {
+                                    if work.identity.task_id == task_id {
+                                        cancelled.push((
+                                            work.identity.task_id.clone(),
+                                            work.identity.item_id.clone(),
+                                        ));
+                                        false
+                                    } else {
+                                        true
+                                    }
+                                });
+                                let active_items = active
+                                    .iter()
+                                    .filter(|(_, (_, identity))| identity.task_id == task_id)
+                                    .map(|(item_id, (slot, identity))| {
+                                        (item_id.clone(), *slot, identity.task_id.clone())
+                                    })
+                                    .collect::<Vec<_>>();
+                                {
+                                    let mut state = actor_state.lock().unwrap();
+                                    state.cancelled_tasks.insert(task_id.clone());
+                                    for (_, slot, _) in &active_items {
+                                        release_running_work(&mut state, *slot);
+                                    }
+                                }
+                                for (item_id, slot, event_task) in active_items {
+                                    active.remove(&item_id);
+                                    if !idle.contains(&slot) {
+                                        idle.push_back(slot);
+                                    }
+                                    cancelled.push((event_task, item_id));
+                                }
+                                actor_available.store(idle.len(), Ordering::Release);
+                                for (event_task, item_id) in cancelled {
+                                    let _ = events
+                                        .send(WorkerEvent::Cancelled {
+                                            task_id: event_task,
+                                            item_id,
+                                        })
+                                        .await;
+                                }
+                                controlled_schedule(
+                                    &mut queue, &mut idle, &mut active, &started,
+                                    &events, &actor_state, &actor_available,
+                                    &actor_started_base_commands, emit_started_events,
+                                );
+                                let gate = actor_cancel_gate.lock().unwrap().take();
+                                if let Some((stopped, release_ack)) = gate {
+                                    stopped.notify_one();
+                                    release_ack.notified().await;
+                                }
                                 let _ = reply.send(Ok(()));
                             }
                             PoolCommand::CancelRollback(task_id) => {
@@ -645,29 +1080,111 @@ impl WorkerPool {
                                     .cancelling_tasks
                                     .remove(&task_id);
                             }
-                            PoolCommand::PrepareRestart(reply) => { let _ = reply.send(Ok(Vec::new())); }
-                            PoolCommand::Restart(_, reply) => { let _ = reply.send(Ok(())); }
+                            PoolCommand::PrepareRestart(reply) => {
+                                let mut state = actor_state.lock().unwrap();
+                                if state.restarting {
+                                    let _ = reply.send(Err(WorkerPoolError::Restarting));
+                                    continue;
+                                }
+                                state.restarting = true;
+                                let mut items = state
+                                    .running
+                                    .values()
+                                    .map(|work| work.item_id.clone())
+                                    .collect::<Vec<_>>();
+                                items.sort();
+                                state.restart_items = items.iter().cloned().collect();
+                                let _ = reply.send(Ok(items));
+                            }
+                            PoolCommand::Restart(items, reply) => {
+                                let expected = items.into_iter().collect::<HashSet<_>>();
+                                if expected != actor_state.lock().unwrap().restart_items {
+                                    let _ = reply.send(Err(WorkerPoolError::RequeueMismatch));
+                                    continue;
+                                }
+                                active.clear();
+                                idle = (0..worker_count).collect();
+                                {
+                                    let mut state = actor_state.lock().unwrap();
+                                    let slots = state.running.keys().copied().collect::<Vec<_>>();
+                                    for slot in slots {
+                                        release_running_work(&mut state, slot);
+                                    }
+                                    state.restarting = false;
+                                    state.restart_items.clear();
+                                }
+                                actor_available.store(idle.len(), Ordering::Release);
+                                controlled_schedule(
+                                    &mut queue, &mut idle, &mut active, &started,
+                                    &events, &actor_state, &actor_available,
+                                    &actor_started_base_commands, emit_started_events,
+                                );
+                                let _ = reply.send(Ok(()));
+                            }
                             PoolCommand::TerminateUnexpected(_, reply) => { let _ = reply.send(Ok(())); }
                         }
                     }
                     control = control_rx.recv() => {
                         let Some(control) = control else { break };
                         let (task_id, item_id) = match &control {
-                            ControlledWorkerCommand::Crash { task_id, item_id, .. }
+                            ControlledWorkerCommand::PhaseChanged { task_id, item_id, .. }
+                            | ControlledWorkerCommand::BaseSourceReadComplete { task_id, item_id }
+                            | ControlledWorkerCommand::CompleteBase { task_id, item_id, .. }
+                            | ControlledWorkerCommand::Crash { task_id, item_id, .. }
                             | ControlledWorkerCommand::Complete { task_id, item_id, .. }
                             | ControlledWorkerCommand::CompleteStage2 { task_id, item_id, .. } => {
                                 (task_id.clone(), item_id.clone())
                             }
                         };
-                        let Some((slot, identity)) = active.remove(&item_id) else { continue };
+                        let Some((slot, identity)) = active.get(&item_id).cloned() else { continue };
                         if identity.task_id != task_id { continue; }
+                        let terminal = !matches!(
+                            &control,
+                            ControlledWorkerCommand::PhaseChanged { .. }
+                                | ControlledWorkerCommand::BaseSourceReadComplete { .. }
+                        );
                         let event = match control {
+                            ControlledWorkerCommand::PhaseChanged { phase, .. } => {
+                                WorkerEvent::PhaseChanged {
+                                    task_id: task_id.clone(),
+                                    item_id: item_id.clone(),
+                                    slot: slot as u32,
+                                    phase,
+                                    request_elapsed_us: None,
+                                }
+                            }
+                            ControlledWorkerCommand::BaseSourceReadComplete { .. } => {
+                                WorkerEvent::BaseSourceReadComplete {
+                                    task_id: task_id.clone(),
+                                    item_id: item_id.clone(),
+                                    slot: slot as u32,
+                                    request_elapsed_us: None,
+                                }
+                            }
+                            ControlledWorkerCommand::CompleteBase { md5, output, .. } => {
+                                WorkerEvent::Completed {
+                                    task_id: task_id.clone(),
+                                    item_id: item_id.clone(),
+                                    response: proto::WorkerEnvelope {
+                                        payload: Some(worker_envelope::Payload::BaseComputeResult(
+                                            proto::BaseComputeResult {
+                                                task_id: task_id.clone(),
+                                                item_id: item_id.clone(),
+                                                md5: md5.to_vec(),
+                                                payload: encode_base_compute_payload(&output),
+                                            },
+                                        )),
+                                    },
+                                }
+                            }
                             ControlledWorkerCommand::Crash { message, .. } => {
                                 match identity.file_identity.clone() {
                                     Some(file_identity) => WorkerEvent::Crashed {
                                         task_id: task_id.clone(),
                                         item_id: item_id.clone(),
                                         identity: file_identity,
+                                        process_id: Some(slot as u32 + 1),
+                                        exit_code: None,
                                         message,
                                     },
                                     None => WorkerEvent::InfrastructureFailure {
@@ -706,14 +1223,22 @@ impl WorkerPool {
                                 }
                             }
                         };
-                        actor_state.lock().unwrap().running.remove(&slot);
-                        idle.push_back(slot);
-                        actor_available.store(idle.len(), Ordering::Release);
+                        if terminal {
+                            active.remove(&item_id);
+                            let mut state = actor_state.lock().unwrap();
+                            release_running_work(&mut state, slot);
+                            drop(state);
+                            idle.push_back(slot);
+                            actor_available.store(idle.len(), Ordering::Release);
+                        }
                         let _ = events.send(event).await;
-                        controlled_schedule(
-                            &mut queue, &mut idle, &mut active, &started,
-                            &events, &actor_state, &actor_available,
-                        );
+                        if terminal {
+                            controlled_schedule(
+                                &mut queue, &mut idle, &mut active, &started,
+                                &events, &actor_state, &actor_available,
+                                &actor_started_base_commands, emit_started_events,
+                            );
+                        }
                     }
                 }
             }
@@ -729,6 +1254,8 @@ impl WorkerPool {
                 commands: control_tx,
                 available_slots,
                 state,
+                started_base_commands,
+                cancel_gate,
             },
         )
     }
@@ -754,7 +1281,9 @@ impl WorkerPool {
     fn controlled_inner(
         dispatch_barrier: Option<WorkerDispatchBarrier>,
     ) -> (Self, mpsc::Receiver<(String, String)>) {
-        let state = Arc::new(Mutex::new(PoolState::default()));
+        let state = Arc::new(Mutex::new(PoolState::new(1)));
+        // 单槽可控池必须登记一个测试进程，避免调用方把真实单 Worker 夹具误判为零容量。
+        state.lock().unwrap().process_ids.insert(0, 1);
         let actor_state = Arc::clone(&state);
         let (commands, mut command_rx) = mpsc::channel(64);
         let (events, event_rx) = mpsc::channel(256);
@@ -764,8 +1293,9 @@ impl WorkerPool {
             while let Some(command) = command_rx.recv().await {
                 match command {
                     PoolCommand::Dispatch(envelope, guard, reply) => {
-                        let result = WorkItem::try_from(envelope).map(|mut work| {
+                        let result = WorkItem::try_from(envelope).and_then(|mut work| {
                             work.set_scan_guard(guard);
+                            work.prepare_for_queue(0, 1)?;
                             let mut locked = actor_state.lock().unwrap();
                             let registry_blocked =
                                 locked.cancelled_tasks.contains(&work.identity.task_id)
@@ -776,17 +1306,18 @@ impl WorkerPool {
                                     task_id: work.identity.task_id,
                                     item_id: work.identity.item_id,
                                 });
-                                return;
+                                return Ok(());
                             }
                             if let Some(barrier) = &dispatch_barrier {
                                 barrier.block_before_send();
                             }
                             active = Some(work.identity.clone());
-                            locked.running.insert(0, work.identity.clone());
+                            register_running_work(&mut locked, 0, work.identity.clone());
                             let _ = started.try_send((
                                 work.identity.task_id.clone(),
                                 work.identity.item_id.clone(),
                             ));
+                            Ok(())
                         });
                         let _ = reply.send(result);
                     }
@@ -798,7 +1329,10 @@ impl WorkerPool {
                         }
                         if active.as_ref().is_some_and(|work| work.task_id == task_id) {
                             let work = active.take().expect("活动测试项已经确认存在");
-                            actor_state.lock().unwrap().running.clear();
+                            {
+                                let mut locked = actor_state.lock().unwrap();
+                                release_running_work(&mut locked, 0);
+                            }
                             let _ = events
                                 .send(WorkerEvent::Cancelled {
                                     task_id: work.task_id,
@@ -823,6 +1357,12 @@ impl WorkerPool {
                         let _ = reply.send(Ok(items));
                     }
                     PoolCommand::Restart(_, reply) => {
+                        if active.take().is_some() {
+                            let mut state = actor_state.lock().unwrap();
+                            release_running_work(&mut state, 0);
+                            state.restarting = false;
+                            state.restart_items.clear();
+                        }
                         let _ = reply.send(Ok(()));
                     }
                     PoolCommand::TerminateUnexpected(_, reply) => {
@@ -842,6 +1382,47 @@ impl WorkerPool {
     }
 }
 
+/// 按老化保留与 `(CPU 权重, 文件大小, 入队序号)` 选择当前可容纳的等待项。
+fn take_next_schedulable_work(
+    queue: &mut VecDeque<WorkItem>,
+    cpu_available: usize,
+) -> Option<WorkItem> {
+    let protected = queue
+        .iter()
+        .enumerate()
+        .filter(|(_, work)| work.cost.bypass_count >= CPU_AGING_BYPASS_LIMIT)
+        .min_by_key(|(_, work)| work.cost.enqueue_sequence)
+        .map(|(index, _)| index);
+    let selected = if let Some(index) = protected {
+        if queue[index].cost.cpu_weight > cpu_available {
+            return None;
+        }
+        index
+    } else {
+        queue
+            .iter()
+            .enumerate()
+            .filter(|(_, work)| work.cost.cpu_weight <= cpu_available)
+            .min_by_key(|(_, work)| {
+                (
+                    work.cost.cpu_weight,
+                    work.cost.file_size,
+                    work.cost.enqueue_sequence,
+                )
+            })
+            .map(|(index, _)| index)?
+    };
+    queue.remove(selected)
+}
+
+/// 一项成功取得 slot 与 CPU 后，给仍在等待的所有任务累计一次绕过。
+fn mark_waiters_bypassed(queue: &mut VecDeque<WorkItem>) {
+    for waiting in queue.iter_mut() {
+        waiting.cost.bypass_count = waiting.cost.bypass_count.saturating_add(1);
+    }
+}
+
+/// 让可控池与真实池共享成本选择、CPU 登记和释放规则。
 fn controlled_schedule(
     queue: &mut VecDeque<WorkItem>,
     idle: &mut VecDeque<usize>,
@@ -850,10 +1431,17 @@ fn controlled_schedule(
     events: &mpsc::Sender<WorkerEvent>,
     state: &Arc<Mutex<PoolState>>,
     available_slots: &Arc<AtomicUsize>,
+    started_base_commands: &Arc<Mutex<Vec<proto::ComputeBaseFeatures>>>,
+    emit_started_events: bool,
 ) {
     while !idle.is_empty() && !queue.is_empty() {
-        let slot = idle.pop_front().expect("空闲槽已确认存在");
-        let work = queue.pop_front().expect("等待项已确认存在");
+        let cpu_available = {
+            let state = state.lock().unwrap();
+            state.cpu_budget - state.cpu_in_use
+        };
+        let Some(work) = take_next_schedulable_work(queue, cpu_available) else {
+            break;
+        };
         let blocked = {
             let state = state.lock().unwrap();
             state.cancelled_tasks.contains(&work.identity.task_id)
@@ -861,17 +1449,30 @@ fn controlled_schedule(
                 || !work.dispatch_allowed()
         };
         if blocked {
-            idle.push_front(slot);
             let _ = events.try_send(WorkerEvent::Cancelled {
                 task_id: work.identity.task_id,
                 item_id: work.identity.item_id,
             });
             continue;
         }
+        let slot = idle.pop_front().expect("空闲槽已确认存在");
+        if let Some(worker_envelope::Payload::ComputeBaseFeatures(command)) =
+            work.envelope.payload.as_ref()
+        {
+            started_base_commands.lock().unwrap().push(command.clone());
+        }
+        let queue_wait_us = work
+            .cost
+            .enqueued_at
+            .elapsed()
+            .as_micros()
+            .try_into()
+            .unwrap_or(u64::MAX);
         let identity = work.identity;
-        state.lock().unwrap().running.insert(slot, identity.clone());
+        register_running_work(&mut state.lock().unwrap(), slot, identity.clone());
+        mark_waiters_bypassed(queue);
         active.insert(identity.item_id.clone(), (slot, identity.clone()));
-        if let Some(file_identity) = identity.file_identity.clone() {
+        if emit_started_events && let Some(file_identity) = identity.file_identity.clone() {
             let process_id = state.lock().unwrap().process_ids.get(&slot).copied();
             let _ = events.try_send(WorkerEvent::Started {
                 task_id: identity.task_id.clone(),
@@ -879,6 +1480,9 @@ fn controlled_schedule(
                 slot: slot as u32,
                 process_id,
                 identity: file_identity,
+                cpu_weight: identity.cpu_weight.try_into().unwrap_or(u32::MAX),
+                decoder_threads: identity.decoder_threads,
+                queue_wait_us,
             });
         }
         let _ = started.try_send((identity.task_id, identity.item_id));
@@ -892,6 +1496,9 @@ pub enum WorkerPoolError {
     /// 配置至少需要一个 Worker。
     #[error("Worker 数量必须大于零")]
     EmptyPool,
+    /// CPU 权重预算必须至少为一。
+    #[error("Worker CPU 权重预算必须大于零")]
+    EmptyCpuBudget,
     /// Worker 进程创建或 Ready 握手失败。
     #[error("Worker 进程失败: {0}")]
     Process(String),
@@ -907,6 +1514,28 @@ pub enum WorkerPoolError {
     /// Envelope 不是三类 Worker 请求之一。
     #[error("不是有效的 Worker 请求")]
     InvalidRequest,
+    /// 请求的媒体类型和 FFmpeg 解码线程数不构成有效 CPU 权重。
+    #[error("无效的解码线程数: media_kind={media_kind}, decoder_threads={decoder_threads}")]
+    InvalidDecoderThreads {
+        /// 协议媒体枚举原值。
+        media_kind: i32,
+        /// 请求携带的线程数。
+        decoder_threads: u32,
+    },
+    /// 单项 CPU 权重大于池总预算，永远无法得到调度。
+    #[error("请求 CPU 权重 {weight} 超过池预算 {budget}")]
+    CpuWeightExceedsBudget {
+        /// 请求 CPU 权重。
+        weight: usize,
+        /// 池 CPU 总预算。
+        budget: usize,
+    },
+    /// Worker 等待队列已达到由 Worker/命令容量推导出的边界。
+    #[error("Worker 等待队列已满: capacity={capacity}")]
+    QueueFull {
+        /// 等待队列允许的最大项数。
+        capacity: usize,
+    },
     /// 第二阶段提交的重新排队项与第一阶段快照不一致。
     #[error("重新排队项与计划重启快照不一致")]
     RequeueMismatch,
@@ -915,11 +1544,12 @@ pub enum WorkerPoolError {
     WorkerNotFound(u32),
 }
 
-#[derive(Default)]
 /// actor 与只读状态 API 共享的最小运行快照；所有写入仍只发生在 actor 中。
 struct PoolState {
     running: HashMap<usize, WorkIdentity>,
     process_ids: BTreeMap<usize, u32>,
+    cpu_budget: usize,
+    cpu_in_use: usize,
     restart_items: HashSet<String>,
     failure_count: u64,
     restarting: bool,
@@ -927,12 +1557,96 @@ struct PoolState {
     cancelling_tasks: HashSet<String>,
 }
 
+impl PoolState {
+    /// 使用非零 CPU 预算创建完整状态，避免测试或生产得到不可调度的零值池。
+    fn new(cpu_budget: usize) -> Self {
+        assert!(cpu_budget > 0, "CPU 权重预算必须大于零");
+        Self {
+            running: HashMap::new(),
+            process_ids: BTreeMap::new(),
+            cpu_budget,
+            cpu_in_use: 0,
+            restart_items: HashSet::new(),
+            failure_count: 0,
+            restarting: false,
+            cancelled_tasks: HashSet::new(),
+            cancelling_tasks: HashSet::new(),
+        }
+    }
+}
+
+/// 在发送 Run 成功后同时登记槽位和 CPU 权重；调用方必须持有状态锁。
+fn register_running_work(state: &mut PoolState, slot_id: usize, identity: WorkIdentity) {
+    let next_cpu = state
+        .cpu_in_use
+        .checked_add(identity.cpu_weight)
+        .expect("CPU 权重计数溢出");
+    assert!(next_cpu <= state.cpu_budget, "调度不得突破 CPU 权重预算");
+    state.cpu_in_use = next_cpu;
+    state.running.insert(slot_id, identity);
+}
+
+/// 仅在槽位仍登记运行项时释放一次 CPU 权重，并返回该项身份。
+fn release_running_work(state: &mut PoolState, slot_id: usize) -> Option<WorkIdentity> {
+    let work = state.running.remove(&slot_id)?;
+    state.cpu_in_use = state
+        .cpu_in_use
+        .checked_sub(work.cpu_weight)
+        .expect("CPU 权重释放发生下溢");
+    Some(work)
+}
+
+/// 根据池进程数和 CPU 预算计算已知视频的单项线程数。
+fn decoder_threads_for_state(state: &PoolState, media_kind: MediaKind) -> u32 {
+    if media_kind != MediaKind::Video {
+        return 1;
+    }
+    let worker_count = state.process_ids.len().max(1);
+    let max_active = worker_count.min(state.cpu_budget).max(1);
+    u32::try_from((state.cpu_budget / max_active).clamp(1, 4)).unwrap_or(4)
+}
+
 #[derive(Clone, Debug)]
-/// 不携带路径或特征数据的任务归属，用于崩溃、取消和重启持久化。
+/// Worker 运行项归属，持续携带文件路径上下文直到终态事件取得所有权。
 struct WorkIdentity {
     task_id: String,
     item_id: String,
+    cpu_weight: usize,
+    /// 一次性基础媒体请求的显式解码线程数；其他请求缺失。
+    decoder_threads: Option<u32>,
     file_identity: Option<WorkerFileIdentity>,
+}
+
+/// 更新 Node 保存的 Worker 当前处理阶段；文件路径及大小身份保持冻结。
+fn update_work_stage(work: &mut WorkIdentity, stage: &str) {
+    if let Some(identity) = work.file_identity.as_mut() {
+        identity.stage = stage.to_owned();
+    }
+}
+
+/// 只用显式 Worker phase 更新槽位崩溃上下文；SourceComplete 不推断阶段。
+fn update_slot_work_from_phase_response(work: &mut WorkIdentity, response: &proto::WorkerEnvelope) {
+    let Some(worker_envelope::Payload::WorkerPhaseChanged(event)) = response.payload.as_ref()
+    else {
+        return;
+    };
+    if event.task_id != work.task_id || event.item_id != work.item_id {
+        return;
+    }
+    if let Some(phase) = valid_worker_phase(event.phase) {
+        update_work_stage(work, worker_phase_stage(phase));
+    }
+}
+
+/// 将显式 Worker phase 映射到崩溃文件上下文使用的稳定阶段名。
+const fn worker_phase_stage(phase: proto::RuntimeWorkerPhase) -> &'static str {
+    match phase {
+        proto::RuntimeWorkerPhase::RuntimeWorkerIdle => "idle",
+        proto::RuntimeWorkerPhase::RuntimeWorkerDecode => "base_decode",
+        proto::RuntimeWorkerPhase::RuntimeWorkerFeature => "base_feature",
+        proto::RuntimeWorkerPhase::RuntimeWorkerResultWait => "base_result_wait",
+        proto::RuntimeWorkerPhase::Unspecified => "base_compute",
+    }
 }
 
 /// 等待调度的一条完整协议请求及其任务归属。
@@ -940,6 +1654,17 @@ struct WorkItem {
     identity: WorkIdentity,
     envelope: proto::WorkerEnvelope,
     scan_guard: Option<ScanDispatchGuard>,
+    cost: WorkCost,
+}
+
+/// 单项调度成本；序号和绕过次数只由池 actor 更新。
+struct WorkCost {
+    cpu_weight: usize,
+    file_size: u64,
+    enqueue_sequence: u64,
+    bypass_count: usize,
+    /// 请求进入 WorkerPool 有界等待队列的真实单调时刻。
+    enqueued_at: Instant,
 }
 
 struct ScanDispatchGuard {
@@ -952,8 +1677,27 @@ impl WorkItem {
     fn set_scan_guard(&mut self, guard: Option<ScanDispatchGuard>) {
         if let Some(guard) = &guard {
             self.identity.file_identity = Some(guard.file_identity.clone());
+            if self.cost.file_size == 0 {
+                self.cost.file_size = guard.file_identity.file_size;
+            }
         }
         self.scan_guard = guard;
+    }
+
+    /// 在真正入队前分配稳定序号并拒绝永远无法容纳的 CPU 权重。
+    fn prepare_for_queue(
+        &mut self,
+        enqueue_sequence: u64,
+        cpu_budget: usize,
+    ) -> Result<(), WorkerPoolError> {
+        if self.cost.cpu_weight > cpu_budget {
+            return Err(WorkerPoolError::CpuWeightExceedsBudget {
+                weight: self.cost.cpu_weight,
+                budget: cpu_budget,
+            });
+        }
+        self.cost.enqueue_sequence = enqueue_sequence;
+        Ok(())
     }
 
     fn dispatch_allowed(&self) -> bool {
@@ -1003,6 +1747,8 @@ enum SlotEvent {
     Exited {
         slot_id: usize,
         work: Option<WorkIdentity>,
+        process_id: Option<u32>,
+        exit_code: Option<i32>,
         message: String,
     },
 }
@@ -1012,17 +1758,68 @@ enum SlotEvent {
 async fn run_pool(
     config: WorkerPoolConfig,
     job: WorkerJob,
+    slots: BTreeMap<usize, SlotHandle>,
+    idle: VecDeque<usize>,
+    commands: mpsc::Receiver<PoolCommand>,
+    slot_events: mpsc::UnboundedReceiver<SlotEvent>,
+    slot_events_tx: mpsc::UnboundedSender<SlotEvent>,
+    events: WorkerEventOutbox,
+    state: Arc<Mutex<PoolState>>,
+) {
+    let replacement_config = config.clone();
+    let replacement_job = Arc::new(job);
+    let replacement_events = slot_events_tx.clone();
+    let factory_config = replacement_config.clone();
+    let factory_job = Arc::clone(&replacement_job);
+    let factory_events = replacement_events.clone();
+    let replacement_factory = move |slot_id| {
+        let config = factory_config.clone();
+        let job = Arc::clone(&factory_job);
+        let events = factory_events.clone();
+        async move { spawn_slot(slot_id, &config, &job, events).await }
+    };
+    run_pool_with_replacement(
+        config,
+        replacement_job,
+        slots,
+        idle,
+        commands,
+        slot_events,
+        slot_events_tx,
+        events,
+        state,
+        replacement_factory,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+/// 独占池状态的 actor 实现；替换工厂可注入确定性测试槽位。
+async fn run_pool_with_replacement<F, Fut>(
+    config: WorkerPoolConfig,
+    job: Arc<WorkerJob>,
     mut slots: BTreeMap<usize, SlotHandle>,
-    mut idle: BTreeSet<usize>,
+    mut idle: VecDeque<usize>,
     mut commands: mpsc::Receiver<PoolCommand>,
     mut slot_events: mpsc::UnboundedReceiver<SlotEvent>,
     slot_events_tx: mpsc::UnboundedSender<SlotEvent>,
-    events: mpsc::Sender<WorkerEvent>,
+    events: WorkerEventOutbox,
     state: Arc<Mutex<PoolState>>,
-) {
+    mut replacement_factory: F,
+) where
+    F: FnMut(usize) -> Fut,
+    Fut: Future<Output = Result<SlotHandle, WorkerPoolError>>,
+{
     let mut queue = VecDeque::new();
+    let mut next_enqueue_sequence = 0_u64;
+    let pending_events = Arc::new(PendingWorkerEvents::new(actor_event_buffer_capacity(
+        config.worker_count,
+    )));
+    let actor_events = ActorWorkerEventSink::new(Arc::clone(&pending_events), events.clone());
     loop {
+        pending_events.try_flush(&events);
         tokio::select! {
+            biased;
             command = commands.recv() => {
                 let Some(command) = command else { break };
                 match command {
@@ -1033,9 +1830,24 @@ async fn run_pool(
                             match WorkItem::try_from(envelope) {
                                 Ok(mut work) => {
                                     work.set_scan_guard(guard);
-                                    queue.push_back(work);
-                                    schedule(&mut queue, &mut idle, &slots, &events, &state).await;
-                                    Ok(())
+                                    let cpu_budget = state.lock().unwrap().cpu_budget;
+                                    schedule(&mut queue, &mut idle, &slots, &actor_events, &state).await;
+                                    let queue_capacity = max_waiting_work_items(config.worker_count);
+                                    if queue.len() >= queue_capacity {
+                                        Err(WorkerPoolError::QueueFull {
+                                            capacity: queue_capacity,
+                                        })
+                                    } else {
+                                        match work.prepare_for_queue(next_enqueue_sequence, cpu_budget) {
+                                            Ok(()) => {
+                                                next_enqueue_sequence = next_enqueue_sequence.wrapping_add(1);
+                                                queue.push_back(work);
+                                                schedule(&mut queue, &mut idle, &slots, &actor_events, &state).await;
+                                                Ok(())
+                                            }
+                                            Err(error) => Err(error),
+                                        }
+                                    }
                                 }
                                 Err(error) => Err(error),
                             }
@@ -1066,7 +1878,7 @@ async fn run_pool(
                         }
                         let result = restart_all(
                             &config,
-                            &job,
+                            job.as_ref(),
                             &mut slots,
                             &mut idle,
                             &mut slot_events,
@@ -1079,7 +1891,7 @@ async fn run_pool(
                                 locked.restarting = false;
                                 locked.restart_items.clear();
                             }
-                            schedule(&mut queue, &mut idle, &slots, &events, &state).await;
+                            schedule(&mut queue, &mut idle, &slots, &actor_events, &state).await;
                         }
                         let _ = reply.send(result);
                     }
@@ -1092,16 +1904,17 @@ async fn run_pool(
                         let result = cancel_task_items(
                             &task_id,
                             &config,
-                            &job,
+                            job.as_ref(),
                             &mut queue,
                             &mut slots,
                             &mut idle,
                             &mut slot_events,
                             &slot_events_tx,
-                            &events,
+                            &actor_events,
                             &state,
+                            &mut replacement_factory,
                         ).await;
-                        schedule(&mut queue, &mut idle, &slots, &events, &state).await;
+                        schedule(&mut queue, &mut idle, &slots, &actor_events, &state).await;
                         let _ = reply.send(result);
                     }
                     PoolCommand::CancelRollback(task_id) => {
@@ -1110,7 +1923,7 @@ async fn run_pool(
                             .unwrap()
                             .cancelling_tasks
                             .remove(&task_id);
-                        schedule(&mut queue, &mut idle, &slots, &events, &state).await;
+                        schedule(&mut queue, &mut idle, &slots, &actor_events, &state).await;
                     }
                     PoolCommand::TerminateUnexpected(process_id, reply) => {
                         let result = slots
@@ -1128,28 +1941,29 @@ async fn run_pool(
             }
             event = slot_events.recv() => {
                 let Some(event) = event else { break };
-                handle_slot_event(
+                handle_slot_event_and_schedule_with_replacement(
                     event,
-                    &config,
-                    &job,
+                    &mut queue,
                     &mut slots,
                     &mut idle,
-                    &slot_events_tx,
-                    &events,
+                    &actor_events,
                     &state,
+                    &mut replacement_factory,
                 ).await;
-                schedule(&mut queue, &mut idle, &slots, &events, &state).await;
+            }
+            _ = events.wait_for_progress(), if pending_events.has_pending() => {
+                pending_events.try_flush(&events);
             }
         }
     }
 }
 
-/// 按最小槽位号把等待项发送给空闲 Worker，并原子更新共享运行快照。
-async fn schedule(
+/// 按空闲完成顺序 round-robin 派发等待项，并原子更新共享运行快照。
+async fn schedule<E: WorkerEventSink>(
     queue: &mut VecDeque<WorkItem>,
-    idle: &mut BTreeSet<usize>,
+    idle: &mut VecDeque<usize>,
     slots: &BTreeMap<usize, SlotHandle>,
-    events: &mpsc::Sender<WorkerEvent>,
+    events: &E,
     state: &Arc<Mutex<PoolState>>,
 ) {
     enum DispatchDecision {
@@ -1163,8 +1977,21 @@ async fn schedule(
         return;
     }
     while !idle.is_empty() && !queue.is_empty() {
-        let work = queue.pop_front().expect("队列已判定非空");
-        let slot_id = idle.pop_first().expect("集合已判定非空");
+        let cpu_available = {
+            let locked = state.lock().unwrap();
+            locked.cpu_budget - locked.cpu_in_use
+        };
+        let Some(work) = take_next_schedulable_work(queue, cpu_available) else {
+            break;
+        };
+        let queue_wait_us = work
+            .cost
+            .enqueued_at
+            .elapsed()
+            .as_micros()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        let slot_id = idle.pop_front().expect("空闲槽已确认存在");
         let identity = work.identity.clone();
         let Some(slot) = slots.get(&slot_id) else {
             queue.push_front(work);
@@ -1187,49 +2014,60 @@ async fn schedule(
                     };
                     DispatchDecision::Retry(work)
                 } else {
-                    locked.running.insert(slot_id, identity.clone());
+                    register_running_work(&mut locked, slot_id, identity.clone());
                     DispatchDecision::Sent
                 }
             }
         };
         match decision {
             DispatchDecision::Sent => {
+                mark_waiters_bypassed(queue);
                 if let Some(identity_file) = identity.file_identity.clone() {
-                    let _ = events
-                        .send(WorkerEvent::Started {
+                    events
+                        .send_event(WorkerEvent::Started {
                             task_id: identity.task_id,
                             item_id: identity.item_id,
                             slot: slot_id as u32,
                             process_id: Some(slot.process_id),
                             identity: identity_file,
+                            cpu_weight: identity.cpu_weight.try_into().unwrap_or(u32::MAX),
+                            decoder_threads: identity.decoder_threads,
+                            queue_wait_us,
                         })
                         .await;
                 }
             }
             DispatchDecision::Rejected(identity) => {
-                idle.insert(slot_id);
-                let _ = events
-                    .send(WorkerEvent::Cancelled {
+                idle.push_back(slot_id);
+                events
+                    .send_event(WorkerEvent::Cancelled {
                         task_id: identity.task_id,
                         item_id: identity.item_id,
                     })
                     .await;
             }
             DispatchDecision::Retry(work) => {
-                idle.insert(slot_id);
+                // 命令接收端关闭表示该槽已失效；等待 Exited 统一移除并补建，不能再次进入 idle。
                 queue.push_front(work);
             }
             DispatchDecision::Restarting(work) => {
-                idle.insert(slot_id);
+                idle.push_back(slot_id);
                 queue.push_front(work);
                 return;
             }
             DispatchDecision::Cancelling(work) => {
-                idle.insert(slot_id);
+                idle.push_back(slot_id);
                 queue.push_front(work);
                 return;
             }
         }
+    }
+}
+
+/// 从空闲 FIFO 中移除指定槽位，保留其余槽位原有轮转顺序。
+fn remove_idle_slot(idle: &mut VecDeque<usize>, slot_id: usize) {
+    if let Some(position) = idle.iter().position(|candidate| *candidate == slot_id) {
+        idle.remove(position);
     }
 }
 
@@ -1267,84 +2105,124 @@ async fn run_slot(
     result_read_delay: Duration,
 ) {
     while let Some(command) = commands.recv().await {
-        match command {
+        let (mut work, envelope) = match command {
             SlotCommand::Terminate => {
-                let message = process
-                    .terminate()
-                    .await
+                let process_id = Some(process.process_id());
+                let termination = process.terminate().await;
+                let exit_code = termination.as_ref().ok().copied().flatten();
+                let message = termination
                     .err()
                     .map_or_else(|| "planned termination".into(), |error| error.to_string());
                 let _ = events.send(SlotEvent::Exited {
                     slot_id,
                     work: None,
+                    process_id,
+                    exit_code,
                     message,
                 });
                 return;
             }
             SlotCommand::Run(work) => {
-                if let Err(error) = process.send(&work.envelope).await {
-                    let _ = events.send(SlotEvent::Exited {
-                        slot_id,
-                        work: Some(work.identity),
-                        message: error.to_string(),
-                    });
+                let WorkItem {
+                    identity, envelope, ..
+                } = work;
+                (identity, envelope)
+            }
+        };
+
+        if let Err(error) = process.send(&envelope).await {
+            let process_id = Some(process.process_id());
+            let exit_code = process.stop_after_failure().await;
+            let _ = events.send(SlotEvent::Exited {
+                slot_id,
+                work: Some(work),
+                process_id,
+                exit_code,
+                message: error.to_string(),
+            });
+            return;
+        }
+        if !result_read_delay.is_zero() {
+            tokio::select! {
+                _ = tokio::time::sleep(result_read_delay) => {}
+                command = commands.recv() => {
+                    if matches!(command, Some(SlotCommand::Terminate)) {
+                        let process_id = Some(process.process_id());
+                        let termination = process.terminate().await;
+                        let exit_code = termination.as_ref().ok().copied().flatten();
+                        let message = termination.err().map_or_else(
+                            || "planned termination".into(), |error| error.to_string()
+                        );
+                        let _ = events.send(SlotEvent::Exited {
+                            slot_id,
+                            work: Some(work.clone()),
+                            process_id,
+                            exit_code,
+                            message,
+                        });
+                    }
                     return;
                 }
-                if !result_read_delay.is_zero() {
-                    tokio::select! {
-                        _ = tokio::time::sleep(result_read_delay) => {}
-                        command = commands.recv() => {
-                            if matches!(command, Some(SlotCommand::Terminate)) {
-                                let message = process
-                                    .terminate()
-                                    .await
-                                    .err()
-                                    .map_or_else(|| "planned termination".into(), |error| error.to_string());
-                                let _ = events.send(SlotEvent::Exited {
-                                    slot_id,
-                                    work: Some(work.identity.clone()),
-                                    message,
-                                });
+            }
+        }
+        loop {
+            tokio::select! {
+                response = process.receive() => {
+                    match response {
+                        Ok(response) => {
+                            let keep_receiving = matches!(
+                                response.payload.as_ref(),
+                                Some(worker_envelope::Payload::BaseSourceReadComplete(source))
+                                    if source.task_id == work.task_id
+                                        && source.item_id == work.item_id
+                            ) || matches!(
+                                response.payload.as_ref(),
+                                Some(worker_envelope::Payload::WorkerPhaseChanged(phase))
+                                    if phase.task_id == work.task_id
+                                        && phase.item_id == work.item_id
+                                        && valid_worker_phase(phase.phase).is_some()
+                            );
+                            update_slot_work_from_phase_response(&mut work, &response);
+                            let _ = events.send(SlotEvent::Response {
+                                slot_id,
+                                work: work.clone(),
+                                response,
+                            });
+                            if !keep_receiving {
+                                break;
                             }
+                        }
+                        Err(error) => {
+                            let process_id = Some(process.process_id());
+                            let exit_code = process.stop_after_failure().await;
+                            let _ = events.send(SlotEvent::Exited {
+                                slot_id,
+                                work: Some(work),
+                                process_id,
+                                exit_code,
+                                message: error.to_string(),
+                            });
                             return;
                         }
                     }
                 }
-                tokio::select! {
-                    response = process.receive() => {
-                        match response {
-                            Ok(response) => {
-                                let _ = events.send(SlotEvent::Response {
-                                    slot_id,
-                                    work: work.identity,
-                                    response,
-                                });
-                            }
-                            Err(error) => {
-                                let _ = events.send(SlotEvent::Exited {
-                                    slot_id,
-                                    work: Some(work.identity),
-                                    message: error.to_string(),
-                                });
-                                return;
-                            }
-                        }
+                command = commands.recv() => {
+                    if matches!(command, Some(SlotCommand::Terminate)) {
+                        let process_id = Some(process.process_id());
+                        let termination = process.terminate().await;
+                        let exit_code = termination.as_ref().ok().copied().flatten();
+                        let message = termination.err().map_or_else(
+                            || "planned termination".into(), |error| error.to_string()
+                        );
+                        let _ = events.send(SlotEvent::Exited {
+                            slot_id,
+                            work: Some(work),
+                            process_id,
+                            exit_code,
+                            message,
+                        });
                     }
-                    command = commands.recv() => {
-                        if matches!(command, Some(SlotCommand::Terminate)) {
-                            let message = process
-                                .terminate()
-                                .await
-                                .err()
-                                .map_or_else(|| "planned termination".into(), |error| error.to_string());
-                            let _ = events.send(SlotEvent::Exited {
-                                slot_id,
-                                work: Some(work.identity),
-                                message,
-                            });
-                        }
-                        return;
-                    }
+                    return;
                 }
             }
         }
@@ -1353,27 +2231,132 @@ async fn run_slot(
 
 #[allow(clippy::too_many_arguments)]
 /// 处理正常响应或非计划退出；后者增加失败计数并补建同槽位 Worker。
-async fn handle_slot_event(
+async fn handle_slot_event<E: WorkerEventSink>(
     event: SlotEvent,
     config: &WorkerPoolConfig,
     job: &WorkerJob,
     slots: &mut BTreeMap<usize, SlotHandle>,
-    idle: &mut BTreeSet<usize>,
+    idle: &mut VecDeque<usize>,
     slot_events: &mpsc::UnboundedSender<SlotEvent>,
-    events: &mpsc::Sender<WorkerEvent>,
+    events: &E,
     state: &Arc<Mutex<PoolState>>,
 ) {
+    let mut replacement_factory = |slot_id| spawn_slot(slot_id, config, job, slot_events.clone());
+    handle_slot_event_with_replacement(event, slots, idle, events, state, &mut replacement_factory)
+        .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+/// 让生产 actor 与测试共用 Exited 清理、补槽和随后自动调度的完整转换。
+async fn handle_slot_event_and_schedule_with_replacement<E, F, Fut>(
+    event: SlotEvent,
+    queue: &mut VecDeque<WorkItem>,
+    slots: &mut BTreeMap<usize, SlotHandle>,
+    idle: &mut VecDeque<usize>,
+    events: &E,
+    state: &Arc<Mutex<PoolState>>,
+    replacement_factory: &mut F,
+) where
+    E: WorkerEventSink,
+    F: FnMut(usize) -> Fut,
+    Fut: Future<Output = Result<SlotHandle, WorkerPoolError>>,
+{
+    handle_slot_event_with_replacement(event, slots, idle, events, state, replacement_factory)
+        .await;
+    schedule(queue, idle, slots, events, state).await;
+}
+
+#[allow(clippy::too_many_arguments)]
+/// 处理槽位事件，并通过可注入工厂执行与生产相同的替换安装逻辑。
+async fn handle_slot_event_with_replacement<E, F, Fut>(
+    event: SlotEvent,
+    slots: &mut BTreeMap<usize, SlotHandle>,
+    idle: &mut VecDeque<usize>,
+    events: &E,
+    state: &Arc<Mutex<PoolState>>,
+    replacement_factory: &mut F,
+) where
+    E: WorkerEventSink,
+    F: FnMut(usize) -> Fut,
+    Fut: Future<Output = Result<SlotHandle, WorkerPoolError>>,
+{
     match event {
         SlotEvent::Response {
             slot_id,
             work,
-            response,
+            mut response,
         } => {
-            state.lock().unwrap().running.remove(&slot_id);
-            idle.insert(slot_id);
+            if !response_matches_work(&response, &work) {
+                response = proto::WorkerEnvelope {
+                    payload: Some(worker_envelope::Payload::WorkerFailure(
+                        proto::WorkerFailure {
+                            task_id: work.task_id.clone(),
+                            item_id: work.item_id.clone(),
+                            stage: "protocol".into(),
+                            message: "Worker 响应的任务或任务项身份不匹配".into(),
+                        },
+                    )),
+                };
+            }
+            if let Some(worker_envelope::Payload::WorkerPhaseChanged(phase_event)) =
+                response.payload.as_ref()
+            {
+                let phase_value = phase_event.phase;
+                let request_elapsed_us = phase_event.request_elapsed_us;
+                if let Some(phase) = valid_worker_phase(phase_value) {
+                    {
+                        let mut locked = state.lock().unwrap();
+                        let mut phase_work = work.clone();
+                        update_work_stage(&mut phase_work, worker_phase_stage(phase));
+                        locked.running.insert(slot_id, phase_work);
+                    }
+                    if !state.lock().unwrap().restart_items.contains(&work.item_id) {
+                        events
+                            .send_event(WorkerEvent::PhaseChanged {
+                                task_id: work.task_id,
+                                item_id: work.item_id,
+                                slot: slot_id as u32,
+                                phase,
+                                request_elapsed_us,
+                            })
+                            .await;
+                    }
+                    return;
+                }
+                response = proto::WorkerEnvelope {
+                    payload: Some(worker_envelope::Payload::WorkerFailure(
+                        proto::WorkerFailure {
+                            task_id: work.task_id.clone(),
+                            item_id: work.item_id.clone(),
+                            stage: "protocol".into(),
+                            message: format!("Worker 返回非法阶段值: {phase_value}"),
+                        },
+                    )),
+                };
+            }
+            if let Some(worker_envelope::Payload::BaseSourceReadComplete(source)) =
+                response.payload.as_ref()
+            {
+                if !state.lock().unwrap().restart_items.contains(&work.item_id) {
+                    events
+                        .send_event(WorkerEvent::BaseSourceReadComplete {
+                            task_id: work.task_id,
+                            item_id: work.item_id,
+                            slot: slot_id as u32,
+                            request_elapsed_us: source.request_elapsed_us,
+                        })
+                        .await;
+                }
+                return;
+            }
+            {
+                let mut locked = state.lock().unwrap();
+                release_running_work(&mut locked, slot_id);
+            }
+            idle.push_back(slot_id);
             if !state.lock().unwrap().restart_items.contains(&work.item_id) {
-                let _ = events
-                    .send(WorkerEvent::Completed {
+                events
+                    .send_event(WorkerEvent::Completed {
                         task_id: work.task_id,
                         item_id: work.item_id,
                         response,
@@ -1384,30 +2367,34 @@ async fn handle_slot_event(
         SlotEvent::Exited {
             slot_id,
             work,
+            process_id,
+            exit_code,
             message,
         } => {
             slots.remove(&slot_id);
-            idle.remove(&slot_id);
+            remove_idle_slot(idle, slot_id);
             let work = work.or_else(|| state.lock().unwrap().running.get(&slot_id).cloned());
             {
                 let mut locked = state.lock().unwrap();
-                locked.running.remove(&slot_id);
+                release_running_work(&mut locked, slot_id);
                 locked.process_ids.remove(&slot_id);
                 locked.failure_count += 1;
             }
             if let Some(work) = work {
                 if let Some(identity) = work.file_identity {
-                    let _ = events
-                        .send(WorkerEvent::Crashed {
+                    events
+                        .send_event(WorkerEvent::Crashed {
                             task_id: work.task_id,
                             item_id: work.item_id,
                             identity,
+                            process_id,
+                            exit_code,
                             message,
                         })
                         .await;
                 } else {
-                    let _ = events
-                        .send(WorkerEvent::InfrastructureFailure {
+                    events
+                        .send_event(WorkerEvent::InfrastructureFailure {
                             message: format!(
                                 "Worker 崩溃项缺少冻结文件身份: {}/{}: {message}",
                                 work.task_id, work.item_id
@@ -1416,46 +2403,75 @@ async fn handle_slot_event(
                         .await;
                 }
             }
-            replace_slot(
-                slot_id,
-                config,
-                job,
-                slots,
-                idle,
-                slot_events,
-                events,
-                state,
-            )
-            .await;
+            replace_slot_with_factory(slot_id, slots, idle, events, state, replacement_factory)
+                .await;
         }
     }
 }
 
+/// 校验 Worker 响应仍归属于当前占用槽位的任务项。
+fn response_matches_work(response: &proto::WorkerEnvelope, work: &WorkIdentity) -> bool {
+    let identity = match response.payload.as_ref() {
+        Some(worker_envelope::Payload::BaseSourceReadComplete(value)) => {
+            Some((&value.task_id, &value.item_id))
+        }
+        Some(worker_envelope::Payload::WorkerPhaseChanged(value)) => {
+            Some((&value.task_id, &value.item_id))
+        }
+        Some(worker_envelope::Payload::BaseComputeResult(value)) => {
+            Some((&value.task_id, &value.item_id))
+        }
+        Some(worker_envelope::Payload::Stage1Result(value)) => {
+            Some((&value.task_id, &value.item_id))
+        }
+        Some(worker_envelope::Payload::Stage2Result(value)) => {
+            Some((&value.task_id, &value.item_id))
+        }
+        Some(worker_envelope::Payload::ContactSheetResult(value)) => {
+            Some((&value.task_id, &value.item_id))
+        }
+        Some(worker_envelope::Payload::WorkerFailure(value)) => {
+            Some((&value.task_id, &value.item_id))
+        }
+        _ => None,
+    };
+    identity.is_some_and(|(task_id, item_id)| task_id == &work.task_id && item_id == &work.item_id)
+}
+
+/// 只接受业务阶段；协议默认值和未来未知值都不得进入 Worker 投影。
+fn valid_worker_phase(value: i32) -> Option<proto::RuntimeWorkerPhase> {
+    proto::RuntimeWorkerPhase::try_from(value)
+        .ok()
+        .filter(|phase| *phase != proto::RuntimeWorkerPhase::Unspecified)
+}
+
 #[allow(clippy::too_many_arguments)]
-/// 为已退出槽位启动替代 Worker；失败只报告基础设施事件，不伪造任务结果。
-async fn replace_slot(
+/// 通过生产或测试工厂创建替代槽并原子安装；失败只报告基础设施事件。
+async fn replace_slot_with_factory<E, F, Fut>(
     slot_id: usize,
-    config: &WorkerPoolConfig,
-    job: &WorkerJob,
     slots: &mut BTreeMap<usize, SlotHandle>,
-    idle: &mut BTreeSet<usize>,
-    slot_events: &mpsc::UnboundedSender<SlotEvent>,
-    events: &mpsc::Sender<WorkerEvent>,
+    idle: &mut VecDeque<usize>,
+    events: &E,
     state: &Arc<Mutex<PoolState>>,
-) {
-    match spawn_slot(slot_id, config, job, slot_events.clone()).await {
+    replacement_factory: &mut F,
+) where
+    E: WorkerEventSink,
+    F: FnMut(usize) -> Fut,
+    Fut: Future<Output = Result<SlotHandle, WorkerPoolError>>,
+{
+    match replacement_factory(slot_id).await {
         Ok(slot) => {
             state
                 .lock()
                 .unwrap()
                 .process_ids
                 .insert(slot_id, slot.process_id);
-            idle.insert(slot_id);
+            idle.push_back(slot_id);
             slots.insert(slot_id, slot);
         }
         Err(error) => {
-            let _ = events
-                .send(WorkerEvent::InfrastructureFailure {
+            events
+                .send_event(WorkerEvent::InfrastructureFailure {
                     message: error.to_string(),
                 })
                 .await;
@@ -1468,7 +2484,7 @@ async fn restart_all(
     config: &WorkerPoolConfig,
     job: &WorkerJob,
     slots: &mut BTreeMap<usize, SlotHandle>,
-    idle: &mut BTreeSet<usize>,
+    idle: &mut VecDeque<usize>,
     slot_events: &mut mpsc::UnboundedReceiver<SlotEvent>,
     slot_events_tx: &mpsc::UnboundedSender<SlotEvent>,
     state: &Arc<Mutex<PoolState>>,
@@ -1490,7 +2506,10 @@ async fn restart_all(
     idle.clear();
     {
         let mut locked = state.lock().unwrap();
-        locked.running.clear();
+        let running_slots = locked.running.keys().copied().collect::<Vec<_>>();
+        for slot_id in running_slots {
+            release_running_work(&mut locked, slot_id);
+        }
         locked.process_ids.clear();
     }
     for slot_id in 0..config.worker_count {
@@ -1500,7 +2519,7 @@ async fn restart_all(
             .unwrap()
             .process_ids
             .insert(slot_id, slot.process_id);
-        idle.insert(slot_id);
+        idle.push_back(slot_id);
         slots.insert(slot_id, slot);
     }
     Ok(())
@@ -1508,23 +2527,29 @@ async fn restart_all(
 
 #[allow(clippy::too_many_arguments)]
 /// 删除目标任务等待项，终止其运行槽位，并以新 Worker 补齐池容量。
-async fn cancel_task_items(
+async fn cancel_task_items<E, F, Fut>(
     task_id: &str,
     config: &WorkerPoolConfig,
     job: &WorkerJob,
     queue: &mut VecDeque<WorkItem>,
     slots: &mut BTreeMap<usize, SlotHandle>,
-    idle: &mut BTreeSet<usize>,
+    idle: &mut VecDeque<usize>,
     slot_events: &mut mpsc::UnboundedReceiver<SlotEvent>,
     slot_events_tx: &mpsc::UnboundedSender<SlotEvent>,
-    events: &mpsc::Sender<WorkerEvent>,
+    events: &E,
     state: &Arc<Mutex<PoolState>>,
-) -> Result<(), WorkerPoolError> {
+    replacement_factory: &mut F,
+) -> Result<(), WorkerPoolError>
+where
+    E: WorkerEventSink,
+    F: FnMut(usize) -> Fut,
+    Fut: Future<Output = Result<SlotHandle, WorkerPoolError>>,
+{
     let mut kept = VecDeque::with_capacity(queue.len());
     while let Some(work) = queue.pop_front() {
         if work.identity.task_id == task_id {
-            let _ = events
-                .send(WorkerEvent::Cancelled {
+            events
+                .send_event(WorkerEvent::Cancelled {
                     task_id: work.identity.task_id,
                     item_id: work.identity.item_id,
                 })
@@ -1535,7 +2560,7 @@ async fn cancel_task_items(
     }
     *queue = kept;
 
-    let targets: HashMap<usize, WorkIdentity> = state
+    let mut targets: Vec<(usize, WorkIdentity)> = state
         .lock()
         .unwrap()
         .running
@@ -1543,9 +2568,11 @@ async fn cancel_task_items(
         .filter(|(_, work)| work.task_id == task_id)
         .map(|(slot, work)| (*slot, work.clone()))
         .collect();
-    let mut expected: HashSet<usize> = targets.keys().copied().collect();
+    // HashMap 的遍历顺序不稳定；按 slot 排序后，取消终态与运行身份保持 FIFO。
+    targets.sort_by_key(|(slot_id, _)| *slot_id);
+    let mut expected: HashSet<usize> = targets.iter().map(|(slot_id, _)| *slot_id).collect();
     let mut deferred = Vec::new();
-    for slot_id in &expected {
+    for (slot_id, _) in &targets {
         if let Some(slot) = slots.get(slot_id) {
             let _ = slot.commands.send(SlotCommand::Terminate);
         }
@@ -1560,25 +2587,25 @@ async fn cancel_task_items(
     }
     for (slot_id, work) in targets {
         slots.remove(&slot_id);
-        idle.remove(&slot_id);
+        remove_idle_slot(idle, slot_id);
         {
             let mut locked = state.lock().unwrap();
-            locked.running.remove(&slot_id);
+            release_running_work(&mut locked, slot_id);
             locked.process_ids.remove(&slot_id);
         }
-        let _ = events
-            .send(WorkerEvent::Cancelled {
+        events
+            .send_event(WorkerEvent::Cancelled {
                 task_id: work.task_id,
                 item_id: work.item_id,
             })
             .await;
-        let slot = spawn_slot(slot_id, config, job, slot_events_tx.clone()).await?;
+        let slot = replacement_factory(slot_id).await?;
         state
             .lock()
             .unwrap()
             .process_ids
             .insert(slot_id, slot.process_id);
-        idle.insert(slot_id);
+        idle.push_back(slot_id);
         slots.insert(slot_id, slot);
     }
     for event in deferred {
@@ -1600,30 +2627,815 @@ async fn cancel_task_items(
 impl TryFrom<proto::WorkerEnvelope> for WorkItem {
     type Error = WorkerPoolError;
 
-    /// 只接受三种请求消息，并在进入队列前提取稳定 task/item ID。
+    /// 只接受可新占用 slot 的请求，并在进入队列前提取稳定 task/item ID。
     fn try_from(envelope: proto::WorkerEnvelope) -> Result<Self, Self::Error> {
-        let identity = match envelope.payload.as_ref() {
-            Some(worker_envelope::Payload::ProbeAndStage1(command)) => WorkIdentity {
-                task_id: command.task_id.clone(),
-                item_id: command.item_id.clone(),
-                file_identity: None,
-            },
-            Some(worker_envelope::Payload::ComputeStage2(command)) => WorkIdentity {
-                task_id: command.task_id.clone(),
-                item_id: command.item_id.clone(),
-                file_identity: None,
-            },
-            Some(worker_envelope::Payload::BuildContactSheet(command)) => WorkIdentity {
-                task_id: command.task_id.clone(),
-                item_id: command.item_id.clone(),
-                file_identity: None,
-            },
+        let (task_id, item_id, cpu_weight, decoder_threads, file_size) = match envelope
+            .payload
+            .as_ref()
+        {
+            Some(worker_envelope::Payload::ProbeAndStage1(command)) => {
+                (command.task_id.clone(), command.item_id.clone(), 1, None, 0)
+            }
+            Some(worker_envelope::Payload::ComputeStage2(command)) => {
+                (command.task_id.clone(), command.item_id.clone(), 1, None, 0)
+            }
+            Some(worker_envelope::Payload::BuildContactSheet(command)) => {
+                (command.task_id.clone(), command.item_id.clone(), 1, None, 0)
+            }
+            Some(worker_envelope::Payload::ComputeBaseFeatures(command)) => {
+                let media_kind = proto::MediaKind::try_from(command.media_kind).map_err(|_| {
+                    WorkerPoolError::InvalidDecoderThreads {
+                        media_kind: command.media_kind,
+                        decoder_threads: command.decoder_threads,
+                    }
+                })?;
+                let cpu_weight = match media_kind {
+                    proto::MediaKind::MediaVideo if (1..=4).contains(&command.decoder_threads) => {
+                        command.decoder_threads as usize
+                    }
+                    proto::MediaKind::MediaImage | proto::MediaKind::MediaOther
+                        if command.decoder_threads == 1 =>
+                    {
+                        1
+                    }
+                    _ => {
+                        return Err(WorkerPoolError::InvalidDecoderThreads {
+                            media_kind: command.media_kind,
+                            decoder_threads: command.decoder_threads,
+                        });
+                    }
+                };
+                (
+                    command.task_id.clone(),
+                    command.item_id.clone(),
+                    cpu_weight,
+                    Some(command.decoder_threads),
+                    command.file_size,
+                )
+            }
             _ => return Err(WorkerPoolError::InvalidRequest),
+        };
+        let identity = WorkIdentity {
+            task_id,
+            item_id,
+            cpu_weight,
+            decoder_threads,
+            file_identity: None,
         };
         Ok(Self {
             identity,
             envelope,
             scan_guard: None,
+            cost: WorkCost {
+                cpu_weight,
+                file_size,
+                enqueue_sequence: 0,
+                bypass_count: 0,
+                enqueued_at: Instant::now(),
+            },
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 构造只占一个 CPU 权重的调度项，供关闭槽位行为测试直接驱动生产调度函数。
+    fn scheduler_work(item_id: &str, enqueue_sequence: u64) -> WorkItem {
+        let envelope = proto::WorkerEnvelope {
+            payload: Some(worker_envelope::Payload::ComputeBaseFeatures(
+                proto::ComputeBaseFeatures {
+                    task_id: "closed-slot".into(),
+                    item_id: item_id.into(),
+                    machine_id: "91".repeat(32),
+                    normalized_path: format!(r"I:\task5\{item_id}.bin"),
+                    display_path: format!(r"I:\task5\{item_id}.bin"),
+                    file_size: 4_096,
+                    physical_disk_id: "disk-closed-slot".into(),
+                    md5: vec![9; 16],
+                    media_kind: proto::MediaKind::MediaOther as i32,
+                    missing_parts: 0,
+                    block_size_bytes: 64 * 1_024,
+                    block_timeout_ms: 3_000,
+                    block_retries: 2,
+                    decoder_threads: 1,
+                },
+            )),
+        };
+        let mut work = WorkItem::try_from(envelope).expect("调度夹具必须是合法请求");
+        work.prepare_for_queue(enqueue_sequence, 1)
+            .expect("单权重任务必须可进入单核预算队列");
+        work
+    }
+
+    #[tokio::test]
+    async fn closed_slot_is_quarantined_without_losing_work_and_replacement_resumes_dispatch() {
+        let state = Arc::new(Mutex::new(PoolState::new(1)));
+        let (events, _event_rx) = mpsc::channel(8);
+
+        // 先用健康槽兜底取得原任务，使旧实现能确定性返回并暴露 stale idle 残留。
+        let (closed_commands, closed_receiver) = mpsc::unbounded_channel();
+        drop(closed_receiver);
+        let (healthy_commands, mut healthy_receiver) = mpsc::unbounded_channel();
+        let slots = BTreeMap::from([
+            (
+                0,
+                SlotHandle {
+                    process_id: 100,
+                    commands: closed_commands,
+                },
+            ),
+            (
+                1,
+                SlotHandle {
+                    process_id: 101,
+                    commands: healthy_commands,
+                },
+            ),
+        ]);
+        let mut idle = VecDeque::from([0, 1]);
+        let mut queue = VecDeque::from([scheduler_work("first", 0)]);
+
+        schedule(&mut queue, &mut idle, &slots, &events, &state).await;
+
+        assert!(queue.is_empty(), "发送失败的任务必须保留并转给健康槽");
+        assert!(idle.is_empty(), "命令通道已关闭的槽位不得重新进入 idle");
+        let SlotCommand::Run(first) = healthy_receiver
+            .try_recv()
+            .expect("健康槽必须收到失败后保留的任务")
+        else {
+            panic!("健康槽只能收到 Run")
+        };
+        assert_eq!(first.identity.item_id, "first");
+        {
+            let locked = state.lock().unwrap();
+            assert_eq!(locked.cpu_in_use, 1);
+            assert!(!locked.running.contains_key(&0), "关闭槽不得登记 CPU");
+            assert_eq!(locked.running.get(&1).unwrap().item_id, "first");
+        }
+        release_running_work(&mut state.lock().unwrap(), 1);
+
+        // 唯一槽关闭时 schedule 必须返回，把原任务留给随后到达的 Exited/替换流程。
+        let (stale_commands, stale_receiver) = mpsc::unbounded_channel();
+        drop(stale_receiver);
+        let mut replacement_slots = BTreeMap::from([(
+            2,
+            SlotHandle {
+                process_id: 102,
+                commands: stale_commands,
+            },
+        )]);
+        let mut replacement_idle = VecDeque::from([2]);
+        let mut retained_queue = VecDeque::from([scheduler_work("retained", 1)]);
+        state.lock().unwrap().process_ids.insert(2, 102);
+
+        schedule(
+            &mut retained_queue,
+            &mut replacement_idle,
+            &replacement_slots,
+            &events,
+            &state,
+        )
+        .await;
+
+        assert_eq!(retained_queue.len(), 1, "关闭槽不得吞掉等待任务");
+        assert_eq!(retained_queue[0].identity.item_id, "retained");
+        assert!(replacement_idle.is_empty(), "关闭槽必须等待 Exited 后替换");
+        assert_eq!(state.lock().unwrap().cpu_in_use, 0);
+
+        let (replacement_commands, mut replacement_receiver) = mpsc::unbounded_channel();
+        let replacement_calls = Arc::new(AtomicUsize::new(0));
+        let factory_calls = Arc::clone(&replacement_calls);
+        let mut replacement_factory = move |slot_id: usize| {
+            assert_eq!(slot_id, 2);
+            factory_calls.fetch_add(1, Ordering::AcqRel);
+            std::future::ready(Ok(SlotHandle {
+                process_id: 202,
+                commands: replacement_commands.clone(),
+            }))
+        };
+        handle_slot_event_and_schedule_with_replacement(
+            SlotEvent::Exited {
+                slot_id: 2,
+                work: None,
+                process_id: Some(102),
+                exit_code: Some(1),
+                message: "closed command receiver".into(),
+            },
+            &mut retained_queue,
+            &mut replacement_slots,
+            &mut replacement_idle,
+            &events,
+            &state,
+            &mut replacement_factory,
+        )
+        .await;
+
+        let SlotCommand::Run(retained) = replacement_receiver
+            .try_recv()
+            .expect("替换槽必须继续收到原等待任务")
+        else {
+            panic!("替换槽只能收到 Run")
+        };
+        assert_eq!(retained.identity.item_id, "retained");
+        assert!(retained_queue.is_empty());
+        assert!(replacement_idle.is_empty());
+        assert_eq!(replacement_calls.load(Ordering::Acquire), 1);
+        assert_eq!(replacement_slots.len(), 1);
+        assert_eq!(replacement_slots.get(&2).unwrap().process_id, 202);
+        let locked = state.lock().unwrap();
+        assert_eq!(locked.failure_count, 1);
+        assert_eq!(locked.process_ids.get(&2), Some(&202));
+        assert_eq!(locked.cpu_in_use, 1);
+        assert_eq!(locked.running.get(&2).unwrap().item_id, "retained");
+    }
+
+    #[tokio::test]
+    async fn unspecified_worker_phase_becomes_terminal_failure_and_releases_cpu_slot() {
+        let state = Arc::new(Mutex::new(PoolState::new(1)));
+        let work = scheduler_work("invalid-phase", 0).identity;
+        register_running_work(&mut state.lock().unwrap(), 0, work.clone());
+        let mut slots = BTreeMap::new();
+        let mut idle = VecDeque::new();
+        let (events, mut event_rx) = mpsc::channel(2);
+        let mut replacement_factory = |_| std::future::ready(Err(WorkerPoolError::Closed));
+
+        handle_slot_event_with_replacement(
+            SlotEvent::Response {
+                slot_id: 0,
+                work,
+                response: proto::WorkerEnvelope {
+                    payload: Some(worker_envelope::Payload::WorkerPhaseChanged(
+                        proto::WorkerPhaseChanged {
+                            task_id: "closed-slot".into(),
+                            item_id: "invalid-phase".into(),
+                            phase: proto::RuntimeWorkerPhase::Unspecified as i32,
+                            request_elapsed_us: None,
+                        },
+                    )),
+                },
+            },
+            &mut slots,
+            &mut idle,
+            &events,
+            &state,
+            &mut replacement_factory,
+        )
+        .await;
+
+        let locked = state.lock().unwrap();
+        assert_eq!(locked.cpu_in_use, 0);
+        assert!(locked.running.is_empty());
+        drop(locked);
+        assert_eq!(idle, VecDeque::from([0]));
+        let WorkerEvent::Completed { response, .. } = event_rx.recv().await.unwrap() else {
+            panic!("非法 phase 必须转换成终态失败")
+        };
+        let Some(worker_envelope::Payload::WorkerFailure(failure)) = response.payload else {
+            panic!("非法 phase 必须返回协议失败")
+        };
+        assert_eq!(failure.stage, "protocol");
+    }
+
+    #[test]
+    fn source_complete_does_not_infer_slot_work_phase() {
+        let mut work = scheduler_work("phase-boundary", 0).identity;
+        work.file_identity = Some(WorkerFileIdentity {
+            machine_id: MachineId::from_sha256([0x95; 32]),
+            normalized_path: NormalizedPath::new(r"I:\phase-boundary.bin").unwrap(),
+            display_path: DisplayPath::new(r"I:\phase-boundary.bin").unwrap(),
+            file_size: 4_096,
+            stage: "base_compute".into(),
+            physical_disk_id: "disk-phase".into(),
+        });
+        let source = proto::WorkerEnvelope {
+            payload: Some(worker_envelope::Payload::BaseSourceReadComplete(
+                proto::BaseSourceReadComplete {
+                    task_id: work.task_id.clone(),
+                    item_id: work.item_id.clone(),
+                    request_elapsed_us: Some(8_000),
+                },
+            )),
+        };
+        update_slot_work_from_phase_response(&mut work, &source);
+        assert_eq!(work.file_identity.as_ref().unwrap().stage, "base_compute");
+
+        let feature = proto::WorkerEnvelope {
+            payload: Some(worker_envelope::Payload::WorkerPhaseChanged(
+                proto::WorkerPhaseChanged {
+                    task_id: work.task_id.clone(),
+                    item_id: work.item_id.clone(),
+                    phase: proto::RuntimeWorkerPhase::RuntimeWorkerFeature as i32,
+                    request_elapsed_us: Some(9_000),
+                },
+            )),
+        };
+        update_slot_work_from_phase_response(&mut work, &feature);
+        assert_eq!(work.file_identity.as_ref().unwrap().stage, "base_feature");
+    }
+
+    /// 创建不启动真实进程的 run_pool actor，供控制命令 ACK 背压行为测试使用。
+    fn spawn_ack_backpressure_pool(
+        idle: VecDeque<usize>,
+    ) -> (
+        WorkerPool,
+        mpsc::Sender<WorkerEvent>,
+        mpsc::UnboundedReceiver<SlotCommand>,
+        mpsc::UnboundedSender<SlotEvent>,
+    ) {
+        let state = Arc::new(Mutex::new(PoolState::new(1)));
+        state.lock().unwrap().process_ids.insert(0, 1);
+        let (slot_commands, slot_receiver) = mpsc::unbounded_channel();
+        let slots = BTreeMap::from([(
+            0,
+            SlotHandle {
+                process_id: 1,
+                commands: slot_commands,
+            },
+        )]);
+        let (slot_events, slot_events_receiver) = mpsc::unbounded_channel();
+        let (commands, command_receiver) = mpsc::channel(8);
+        let (events, event_receiver) = mpsc::channel(256);
+        let actor_state = Arc::clone(&state);
+        let config = WorkerPoolConfig::new(WorkerLaunch::new("unused-worker.exe"), 1);
+        let job = WorkerJob::create().expect("测试 actor 需要一个可用 Worker Job");
+        let event_outbox = WorkerEventOutbox::new(events.clone());
+        tokio::spawn(run_pool(
+            config,
+            job,
+            slots,
+            idle,
+            command_receiver,
+            slot_events_receiver,
+            slot_events.clone(),
+            event_outbox,
+            actor_state,
+        ));
+        (
+            WorkerPool {
+                commands,
+                events: event_receiver,
+                state,
+            },
+            events,
+            slot_receiver,
+            slot_events,
+        )
+    }
+
+    /// 创建可同时预填外层与内层事件队列的测试池，保留两层 sender 供真实 actor 背压测试使用。
+    fn spawn_ack_backpressure_pool_with_inner(
+        idle: VecDeque<usize>,
+    ) -> (
+        WorkerPool,
+        mpsc::Sender<WorkerEvent>,
+        mpsc::Sender<WorkerEvent>,
+        mpsc::UnboundedReceiver<SlotCommand>,
+        mpsc::UnboundedSender<SlotEvent>,
+    ) {
+        let state = Arc::new(Mutex::new(PoolState::new(1)));
+        state.lock().unwrap().process_ids.insert(0, 1);
+        let (slot_commands, slot_receiver) = mpsc::unbounded_channel();
+        let slots = BTreeMap::from([(
+            0,
+            SlotHandle {
+                process_id: 1,
+                commands: slot_commands,
+            },
+        )]);
+        let (slot_events, slot_events_receiver) = mpsc::unbounded_channel();
+        let (commands, command_receiver) = mpsc::channel(8);
+        let (events, event_receiver) = mpsc::channel(256);
+        let actor_state = Arc::clone(&state);
+        let config = WorkerPoolConfig::new(WorkerLaunch::new("unused-worker.exe"), 1);
+        let job = WorkerJob::create().expect("测试 actor 需要一个可用 Worker Job");
+        let event_outbox = WorkerEventOutbox::new(events.clone());
+        let inner = event_outbox.pending.clone();
+        tokio::spawn(run_pool(
+            config,
+            job,
+            slots,
+            idle,
+            command_receiver,
+            slot_events_receiver,
+            slot_events.clone(),
+            event_outbox,
+            actor_state,
+        ));
+        (
+            WorkerPool {
+                commands,
+                events: event_receiver,
+                state,
+            },
+            events,
+            inner,
+            slot_receiver,
+            slot_events,
+        )
+    }
+
+    /// 构造可进入真实 run_pool schedule 的带路径基础计算请求。
+    fn ack_backpressure_request(task_id: &str, item_id: &str) -> proto::WorkerEnvelope {
+        let mut work = scheduler_work(item_id, 0);
+        if let Some(worker_envelope::Payload::ComputeBaseFeatures(command)) =
+            work.envelope.payload.as_mut()
+        {
+            command.task_id = task_id.to_owned();
+            command.item_id = item_id.to_owned();
+        }
+        work.envelope
+    }
+
+    /// 构造 Started 事件所需的冻结文件身份，确保测试覆盖完整 dispatch 路径。
+    fn ack_backpressure_identity(item_id: &str) -> WorkerFileIdentity {
+        let path = format!(r"I:\ack-backpressure\{item_id}.bin");
+        WorkerFileIdentity {
+            machine_id: MachineId::from_sha256([0xa1; 32]),
+            normalized_path: NormalizedPath::new(&path).unwrap(),
+            display_path: DisplayPath::new(&path).unwrap(),
+            file_size: 1,
+            stage: "base_compute".into(),
+            physical_disk_id: "disk-ack".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_ack_does_not_wait_for_full_worker_event_channel() {
+        let (mut pool, events, mut slot_receiver, slot_events) =
+            spawn_ack_backpressure_pool(VecDeque::from([0]));
+        for index in 0..256 {
+            events
+                .send(WorkerEvent::InfrastructureFailure {
+                    message: format!("prefill-{index}"),
+                })
+                .await
+                .unwrap();
+        }
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(200),
+            pool.dispatch_runtime(
+                ack_backpressure_request("dispatch-ack", "dispatch-item"),
+                ack_backpressure_identity("dispatch-item"),
+            ),
+        )
+        .await;
+        assert!(result.is_ok(), "dispatch ACK 不得等待 WorkerEvent 通道消费");
+        assert!(result.unwrap().is_ok());
+
+        let SlotCommand::Run(work) = slot_receiver
+            .recv()
+            .await
+            .expect("dispatch 必须到达假 slot")
+        else {
+            panic!("假 slot 只能收到 Run")
+        };
+        let identity = work.identity;
+        let task_id = identity.task_id.clone();
+        let item_id = identity.item_id.clone();
+        slot_events
+            .send(SlotEvent::Response {
+                slot_id: 0,
+                work: identity,
+                response: proto::WorkerEnvelope {
+                    payload: Some(worker_envelope::Payload::WorkerFailure(
+                        proto::WorkerFailure {
+                            task_id,
+                            item_id,
+                            stage: "test-terminal".into(),
+                            message: "terminal".into(),
+                        },
+                    )),
+                },
+            })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if pool.busy_workers() == 0 && pool.cpu_in_use() == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("终态响应必须释放 Worker 与 CPU");
+        assert_eq!(pool.busy_workers(), 0);
+        assert_eq!(pool.cpu_in_use(), 0);
+
+        for index in 0..256 {
+            let event = tokio::time::timeout(Duration::from_secs(1), pool.next_event())
+                .await
+                .expect("预填事件必须可读")
+                .expect("事件通道不得提前关闭");
+            let WorkerEvent::InfrastructureFailure { message } = event else {
+                panic!("预填事件顺序被破坏: index={index}")
+            };
+            assert_eq!(message, format!("prefill-{index}"));
+        }
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), pool.next_event())
+                .await
+                .expect("Started 事件必须可读"),
+            Some(WorkerEvent::Started { task_id, item_id, .. })
+                if task_id == "dispatch-ack" && item_id == "dispatch-item"
+        ));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), pool.next_event())
+                .await
+                .expect("终态事件必须可读"),
+            Some(WorkerEvent::Completed { task_id, item_id, .. })
+                if task_id == "dispatch-ack" && item_id == "dispatch-item"
+        ));
+    }
+
+    #[tokio::test]
+    async fn dispatch_ack_survives_saturated_outer_and_inner_event_queues() {
+        let (mut pool, events, inner, mut slot_receiver, slot_events) =
+            spawn_ack_backpressure_pool_with_inner(VecDeque::from([0]));
+        for index in 0..256 {
+            events
+                .send(WorkerEvent::InfrastructureFailure {
+                    message: format!("outer-{index}"),
+                })
+                .await
+                .unwrap();
+        }
+        for index in 0..256 {
+            inner
+                .send(WorkerEvent::InfrastructureFailure {
+                    message: format!("inner-{index}"),
+                })
+                .await
+                .unwrap();
+        }
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(200),
+            pool.dispatch_runtime(
+                ack_backpressure_request("dispatch-both", "dispatch-both-item"),
+                ack_backpressure_identity("dispatch-both-item"),
+            ),
+        )
+        .await
+        .expect("外层和内层同时饱和时 Dispatch ACK 仍必须完成");
+        result.unwrap();
+
+        let SlotCommand::Run(work) = slot_receiver
+            .recv()
+            .await
+            .expect("dispatch 必须到达假 slot")
+        else {
+            panic!("假 slot 只能收到 Run")
+        };
+        let identity = work.identity;
+        let task_id = identity.task_id.clone();
+        let item_id = identity.item_id.clone();
+        slot_events
+            .send(SlotEvent::Response {
+                slot_id: 0,
+                work: identity,
+                response: proto::WorkerEnvelope {
+                    payload: Some(worker_envelope::Payload::WorkerFailure(
+                        proto::WorkerFailure {
+                            task_id,
+                            item_id,
+                            stage: "test-terminal".into(),
+                            message: "terminal".into(),
+                        },
+                    )),
+                },
+            })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if pool.busy_workers() == 0 && pool.cpu_in_use() == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("终态响应必须释放 Worker 与 CPU");
+
+        for index in 0..256 {
+            let event = tokio::time::timeout(Duration::from_secs(1), pool.next_event())
+                .await
+                .expect("外层预填事件必须可读")
+                .expect("事件通道不得提前关闭");
+            let WorkerEvent::InfrastructureFailure { message } = event else {
+                panic!("外层预填事件顺序被破坏: index={index}")
+            };
+            assert_eq!(message, format!("outer-{index}"));
+        }
+        for index in 0..256 {
+            let event = tokio::time::timeout(Duration::from_secs(1), pool.next_event())
+                .await
+                .expect("内层预填事件必须可读")
+                .expect("事件通道不得提前关闭");
+            let WorkerEvent::InfrastructureFailure { message } = event else {
+                panic!("内层预填事件顺序被破坏: index={index}")
+            };
+            assert_eq!(message, format!("inner-{index}"));
+        }
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), pool.next_event())
+                .await
+                .expect("Started 事件必须可读"),
+            Some(WorkerEvent::Started { task_id, item_id, .. })
+                if task_id == "dispatch-both" && item_id == "dispatch-both-item"
+        ));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), pool.next_event())
+                .await
+                .expect("终态事件必须可读"),
+            Some(WorkerEvent::Completed { task_id, item_id, .. })
+                if task_id == "dispatch-both" && item_id == "dispatch-both-item"
+        ));
+        assert!(matches!(
+            pool.events.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancel_ack_does_not_wait_for_full_worker_event_channel() {
+        let (mut pool, events, _slot_receiver, _slot_events) =
+            spawn_ack_backpressure_pool(VecDeque::new());
+        for index in 0..256 {
+            events
+                .send(WorkerEvent::InfrastructureFailure {
+                    message: format!("prefill-{index}"),
+                })
+                .await
+                .unwrap();
+        }
+
+        pool.dispatch_runtime(
+            ack_backpressure_request("cancel-ack", "cancel-item"),
+            ack_backpressure_identity("cancel-item"),
+        )
+        .await
+        .unwrap();
+        let result =
+            tokio::time::timeout(Duration::from_millis(200), pool.cancel_task("cancel-ack")).await;
+        assert!(result.is_ok(), "cancel ACK 不得等待 WorkerEvent 通道消费");
+        assert!(result.unwrap().is_ok());
+        assert_eq!(pool.busy_workers(), 0);
+        assert_eq!(pool.cpu_in_use(), 0);
+
+        for index in 0..256 {
+            let event = tokio::time::timeout(Duration::from_secs(1), pool.next_event())
+                .await
+                .expect("预填事件必须可读")
+                .expect("事件通道不得提前关闭");
+            let WorkerEvent::InfrastructureFailure { message } = event else {
+                panic!("预填事件顺序被破坏: index={index}")
+            };
+            assert_eq!(message, format!("prefill-{index}"));
+        }
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), pool.next_event())
+                .await
+                .expect("Cancelled 事件必须可读"),
+            Some(WorkerEvent::Cancelled { task_id, item_id })
+                if task_id == "cancel-ack" && item_id == "cancel-item"
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancel_command_ack_survives_256_worker_event_burst() {
+        let worker_count = 256;
+        let state = Arc::new(Mutex::new(PoolState::new(worker_count)));
+        let mut slots = BTreeMap::new();
+        for slot in 0..worker_count {
+            state
+                .lock()
+                .unwrap()
+                .process_ids
+                .insert(slot, slot as u32 + 1);
+            state.lock().unwrap().running.insert(
+                slot,
+                WorkIdentity {
+                    task_id: "cancel-command-256".into(),
+                    item_id: format!("item-{slot:03}"),
+                    cpu_weight: 1,
+                    decoder_threads: None,
+                    file_identity: None,
+                },
+            );
+            let (commands, _receiver) = mpsc::unbounded_channel();
+            slots.insert(
+                slot,
+                SlotHandle {
+                    process_id: slot as u32 + 1,
+                    commands,
+                },
+            );
+        }
+        state.lock().unwrap().cpu_in_use = worker_count;
+
+        let (events, event_receiver) = mpsc::channel(256);
+        let event_outbox = WorkerEventOutbox::new(events.clone());
+        let inner = event_outbox.pending.clone();
+        for index in 0..256 {
+            events
+                .send(WorkerEvent::InfrastructureFailure {
+                    message: format!("outer-{index}"),
+                })
+                .await
+                .unwrap();
+        }
+        for index in 0..256 {
+            inner
+                .send(WorkerEvent::InfrastructureFailure {
+                    message: format!("inner-{index}"),
+                })
+                .await
+                .unwrap();
+        }
+
+        let (slot_events, slot_events_receiver) = mpsc::unbounded_channel();
+        let (commands, command_receiver) = mpsc::channel(8);
+        let job = Arc::new(WorkerJob::create().expect("取消测试需要 Worker Job"));
+        let config = WorkerPoolConfig::new(WorkerLaunch::new("unused-worker.exe"), worker_count);
+        let replacement_commands = mpsc::unbounded_channel().0;
+        let replacement_factory = move |slot_id: usize| {
+            std::future::ready(Ok::<SlotHandle, WorkerPoolError>(SlotHandle {
+                process_id: slot_id as u32 + 10_000,
+                commands: replacement_commands.clone(),
+            }))
+        };
+        let actor_state = Arc::clone(&state);
+        tokio::spawn(run_pool_with_replacement(
+            config,
+            job,
+            slots,
+            VecDeque::new(),
+            command_receiver,
+            slot_events_receiver,
+            slot_events.clone(),
+            event_outbox,
+            actor_state,
+            replacement_factory,
+        ));
+
+        // 先排入 Cancel 命令，再排入 Exited，确保 actor 的命令 ACK 测试覆盖真实取消路径。
+        let (reply, reply_receiver) = oneshot::channel();
+        commands
+            .send(PoolCommand::Cancel("cancel-command-256".into(), reply))
+            .await
+            .unwrap();
+        for slot in 0..worker_count {
+            slot_events
+                .send(SlotEvent::Exited {
+                    slot_id: slot,
+                    work: None,
+                    process_id: Some(slot as u32 + 1),
+                    exit_code: Some(0),
+                    message: "cancelled by test".into(),
+                })
+                .unwrap();
+        }
+
+        let result = tokio::time::timeout(Duration::from_millis(200), reply_receiver)
+            .await
+            .expect("256 Worker 取消突发不得等待事件容量")
+            .expect("actor 必须返回 Cancel ACK");
+        result.expect("可控替换工厂不应失败");
+        assert_eq!(state.lock().unwrap().cpu_in_use, 0);
+        assert!(state.lock().unwrap().running.is_empty());
+
+        let mut event_receiver = event_receiver;
+        for index in 0..256 {
+            let event = event_receiver.recv().await.expect("外层事件必须完整保留");
+            let WorkerEvent::InfrastructureFailure { message } = event else {
+                panic!("外层事件顺序被破坏: index={index}")
+            };
+            assert_eq!(message, format!("outer-{index}"));
+        }
+        for index in 0..256 {
+            let event = event_receiver.recv().await.expect("内层事件必须完整保留");
+            let WorkerEvent::InfrastructureFailure { message } = event else {
+                panic!("内层事件顺序被破坏: index={index}")
+            };
+            assert_eq!(message, format!("inner-{index}"));
+        }
+        for slot in 0..worker_count {
+            let event = event_receiver
+                .recv()
+                .await
+                .expect("Cancelled 事件必须完整保留");
+            let WorkerEvent::Cancelled { task_id, item_id } = event else {
+                panic!("终态事件类型被破坏: slot={slot}")
+            };
+            assert_eq!(task_id, "cancel-command-256");
+            assert_eq!(item_id, format!("item-{slot:03}"));
+        }
+        assert!(matches!(
+            event_receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 }

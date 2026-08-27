@@ -6,10 +6,13 @@ use std::{
     time::Duration,
 };
 
+use dedup_core::{DisplayPath, MachineId, NormalizedPath};
 use dedup_node_engine::worker::{
-    WorkerEvent, WorkerLaunch, WorkerPool, WorkerPoolConfig, decode_stage1_payload,
+    WorkerEvent, WorkerFileIdentity, WorkerLaunch, WorkerPool, WorkerPoolConfig,
+    decode_base_compute_payload, decode_stage1_payload,
 };
 use dedup_protocol::proto::{self, worker_envelope};
+use dedup_protocol::{BASE_MISSING_PROBE, BASE_MISSING_STAGE1};
 
 #[tokio::test]
 /// 用真实 DLL 和 worker.exe 覆盖正常结果及三类进程生命周期分支。
@@ -52,15 +55,36 @@ async fn real_worker_process_supports_results_restart_crash_and_cancel() {
     assert_ne!(pool.worker_process_ids()[0], first_pid);
 
     let crash_pid = pool.worker_process_ids()[0];
-    pool.dispatch(contact_request("task-crash", "item-crash"))
+    let crash_source = media_fixture("video-12s.mp4");
+    // 崩溃事件必须由运行时派发边界冻结完整文件身份，普通 dispatch 不携带路径上下文。
+    let crash_identity = WorkerFileIdentity {
+        machine_id: MachineId::from_sha256([0x74; 32]),
+        normalized_path: NormalizedPath::new(&crash_source).unwrap(),
+        display_path: DisplayPath::new(&crash_source).unwrap(),
+        file_size: std::fs::metadata(&crash_source).unwrap().len(),
+        stage: "contact_sheet".into(),
+        physical_disk_id: "disk-lifecycle".into(),
+    };
+    pool.dispatch_runtime(contact_request("task-crash", "item-crash"), crash_identity)
         .await
         .unwrap();
+    assert!(matches!(
+        next_event(&mut pool).await,
+        WorkerEvent::Started {
+            ref task_id,
+            ref item_id,
+            ..
+        } if task_id == "task-crash" && item_id == "item-crash"
+    ));
     pool.terminate_worker_for_test(crash_pid).await.unwrap();
     let crashed = next_event(&mut pool).await;
-    assert!(matches!(
-        crashed,
-        WorkerEvent::Crashed { ref item_id, .. } if item_id == "item-crash"
-    ));
+    assert!(
+        matches!(
+            &crashed,
+            WorkerEvent::Crashed { item_id, .. } if item_id == "item-crash"
+        ),
+        "终止运行项后收到意外事件: {crashed:?}"
+    );
     assert_eq!(pool.failure_count(), 1);
     wait_for_replacement(&pool, crash_pid).await;
 
@@ -74,6 +98,124 @@ async fn real_worker_process_supports_results_restart_crash_and_cancel() {
         WorkerEvent::Cancelled { ref item_id, .. } if item_id == "item-cancel"
     ));
     assert_eq!(pool.failure_count(), 1);
+}
+
+#[tokio::test]
+/// 源读取完成事件后槽位继续繁忙，并由同一一次性请求返回终态。
+async fn one_shot_base_compute_keeps_slot_busy_until_terminal_result() {
+    let Some(runtime) = runtime_fixture() else {
+        return;
+    };
+    let source = runtime.path().join("base-image.jpg");
+    std::fs::copy(media_fixture("image.jpg"), &source).unwrap();
+    let worker = runtime.path().join("worker.exe");
+    let mut pool = WorkerPool::start(WorkerPoolConfig::new(WorkerLaunch::new(worker), 1))
+        .await
+        .unwrap();
+
+    pool.dispatch(base_compute_request(&source)).await.unwrap();
+    assert!(matches!(
+        next_event(&mut pool).await,
+        WorkerEvent::PhaseChanged {
+            ref task_id,
+            ref item_id,
+            phase: proto::RuntimeWorkerPhase::RuntimeWorkerDecode,
+            request_elapsed_us: Some(_),
+            ..
+        } if task_id == "task-base" && item_id == "item-base"
+    ));
+    let source_event = next_event(&mut pool).await;
+    let WorkerEvent::BaseSourceReadComplete {
+        task_id, item_id, ..
+    } = source_event
+    else {
+        panic!("应先收到 BaseSourceReadComplete")
+    };
+    assert_eq!(task_id, "task-base");
+    assert_eq!(item_id, "item-base");
+    assert_eq!(pool.busy_workers(), 1);
+
+    for phase in [
+        proto::RuntimeWorkerPhase::RuntimeWorkerFeature,
+        proto::RuntimeWorkerPhase::RuntimeWorkerResultWait,
+    ] {
+        assert!(matches!(
+            next_event(&mut pool).await,
+            WorkerEvent::PhaseChanged {
+                ref task_id,
+                ref item_id,
+                phase: actual,
+                request_elapsed_us: Some(_),
+                ..
+            } if task_id == "task-base" && item_id == "item-base" && actual == phase
+        ));
+        assert_eq!(pool.busy_workers(), 1, "非终态阶段不得释放 Worker slot");
+    }
+
+    let completed = next_event(&mut pool).await;
+    let WorkerEvent::Completed { response, .. } = completed else {
+        panic!("一次性基础计算应产生最终完成事件")
+    };
+    let Some(worker_envelope::Payload::BaseComputeResult(result)) = response.payload else {
+        panic!("一次性基础计算应返回 BaseComputeResult")
+    };
+    assert_eq!(result.md5, vec![0x5a; 16]);
+    assert_eq!(
+        decode_base_compute_payload(&result.payload)
+            .unwrap()
+            .stage1_frames
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(pool.busy_workers(), 0);
+}
+
+#[tokio::test]
+/// 真实 Worker 在一次性基础计算期间退出时必须返回完整路径，并由池补建新进程。
+async fn real_base_compute_crash_keeps_full_path_and_replaces_worker() {
+    let Some(runtime) = runtime_fixture() else {
+        return;
+    };
+    let media_root = runtime.path().join("媒体 库");
+    std::fs::create_dir_all(&media_root).unwrap();
+    let source = media_root.join("崩溃文件.jpg");
+    std::fs::copy(media_fixture("image.jpg"), &source).unwrap();
+    let worker = runtime.path().join("worker.exe");
+    let config = WorkerPoolConfig::new(WorkerLaunch::new(worker), 1)
+        .with_result_read_delay(Duration::from_millis(500));
+    let mut pool = WorkerPool::start(config).await.unwrap();
+    let crash_pid = pool.worker_process_ids()[0];
+    let identity = WorkerFileIdentity {
+        machine_id: MachineId::from_sha256([0x73; 32]),
+        normalized_path: NormalizedPath::new(&source).unwrap(),
+        display_path: DisplayPath::new(&source).unwrap(),
+        file_size: std::fs::metadata(&source).unwrap().len(),
+        stage: "base_compute".into(),
+        physical_disk_id: "disk-real".into(),
+    };
+    pool.dispatch_runtime(base_compute_request(&source), identity)
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_event(&mut pool).await,
+        WorkerEvent::Started { .. }
+    ));
+
+    pool.terminate_worker_for_test(crash_pid).await.unwrap();
+
+    let WorkerEvent::Crashed {
+        identity,
+        process_id,
+        ..
+    } = next_event(&mut pool).await
+    else {
+        panic!("一次性基础计算期间退出必须产生文件级崩溃事件");
+    };
+    assert_eq!(identity.display_path.as_path(), source.as_path());
+    assert_eq!(identity.stage, "base_compute");
+    assert_eq!(process_id, Some(crash_pid));
+    wait_for_replacement(&pool, crash_pid).await;
 }
 
 /// 给进程事件设置明确上限，避免测试在协议断开时永久等待。
@@ -128,6 +270,30 @@ fn contact_request(task_id: &str, item_id: &str) -> proto::WorkerEnvelope {
                     .to_string_lossy()
                     .into_owned(),
                 frame_slots: vec![0, 1, 2, 3, 4, 5],
+            },
+        )),
+    }
+}
+
+/// 构造 Worker 一次性基础计算请求。
+fn base_compute_request(path: &Path) -> proto::WorkerEnvelope {
+    proto::WorkerEnvelope {
+        payload: Some(worker_envelope::Payload::ComputeBaseFeatures(
+            proto::ComputeBaseFeatures {
+                task_id: "task-base".into(),
+                item_id: "item-base".into(),
+                machine_id: "machine-base".into(),
+                normalized_path: "i:/media/base-image.jpg".into(),
+                display_path: path.to_string_lossy().into_owned(),
+                file_size: std::fs::metadata(path).unwrap().len(),
+                physical_disk_id: "disk-base".into(),
+                md5: vec![0x5a; 16],
+                media_kind: proto::MediaKind::MediaImage as i32,
+                missing_parts: BASE_MISSING_PROBE | BASE_MISSING_STAGE1,
+                block_size_bytes: 64 * 1024,
+                block_timeout_ms: 3_000,
+                block_retries: 2,
+                decoder_threads: 1,
             },
         )),
     }

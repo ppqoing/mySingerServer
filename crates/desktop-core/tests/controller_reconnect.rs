@@ -138,6 +138,8 @@ impl NodeRequestHandler for RuntimeReconnectHandler {
                     stages: Vec::new(),
                     workers: Vec::new(),
                     failures: Vec::new(),
+                    execution_config: None,
+                    pipeline_metrics: None,
                 });
                 proto::envelope::Payload::GetRuntimeTaskDetails(response)
             }

@@ -64,6 +64,15 @@ block_retries = 2
 mode = "automatic"
 reserved_cores = 1
 manual_worker_count = 4
+
+[postgres]
+enabled = false
+host = "127.0.0.1"
+port = 5432
+database = "media_dedup"
+username = "postgres"
+password = ""
+connect_timeout_seconds = 3
 '@
 $cargoCommand = Get-Command cargo -ErrorAction SilentlyContinue
 $cargoExecutable = if ($cargoCommand) {

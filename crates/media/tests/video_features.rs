@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use dedup_core::{ScreeningOutcome, Thresholds};
 use dedup_media::{
-    ImageStage1, ImageStage2, PdqHash, Rgb24Image, VideoFrameFeatures, encode_contact_sheet,
-    sample_positions, score_video_stage1, score_video_stage2,
+    ImageStage1, ImageStage2, PdqHash, Rgb24Image, VideoFrameFeatures, decode_contact_sheet_slots,
+    encode_contact_sheet, sample_positions, score_video_stage1, score_video_stage2,
 };
 
 /// 六个采样点固定取六等分区间的中点。
@@ -163,4 +163,28 @@ fn contact_sheet_missing_slot_uses_fixed_gray() {
     for (actual, expected) in pixel.into_iter().zip([0x60_u8, 0x65, 0x6f]) {
         assert!((i16::from(actual) - i16::from(expected)).abs() <= 3);
     }
+}
+
+/// 联系表二筛必须一次解码 JPG，并按三列两行准确恢复指定槽位。
+#[test]
+fn contact_sheet_decodes_selected_slots_in_row_major_order() {
+    let frames = [
+        Some(solid(220, 20, 20)),
+        Some(solid(20, 220, 20)),
+        Some(solid(20, 20, 220)),
+        Some(solid(220, 220, 20)),
+        Some(solid(20, 220, 220)),
+        Some(solid(220, 20, 220)),
+    ];
+    let jpeg = encode_contact_sheet(&frames, 8, 6).unwrap();
+
+    let decoded = decode_contact_sheet_slots(&jpeg, &[1, 5]).unwrap();
+
+    assert_eq!(
+        decoded.iter().map(|(slot, _)| *slot).collect::<Vec<_>>(),
+        [1, 5]
+    );
+    assert!(decoded[0].1.pixels()[1] > decoded[0].1.pixels()[0]);
+    assert!(decoded[1].1.pixels()[0] > decoded[1].1.pixels()[1]);
+    assert!(decoded[1].1.pixels()[2] > decoded[1].1.pixels()[1]);
 }

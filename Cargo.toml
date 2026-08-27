@@ -12,6 +12,7 @@ members = [
     "crates/windows",
     "crates/node-store",
     "crates/node-engine",
+    "crates/central-store",
     "crates/desktop-core",
     "crates/desktop-ui",
 ]

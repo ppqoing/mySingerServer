@@ -1,0 +1,19 @@
+[package]
+name = "dedup-central-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+dedup-core = { path = "../core" }
+dedup-media = { path = "../media" }
+dedup-protocol = { path = "../protocol" }
+thiserror.workspace = true
+tokio.workspace = true
+tokio-postgres.workspace = true
+toml.workspace = true
+uuid.workspace = true

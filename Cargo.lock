@@ -1128,6 +1128,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
 
 [[package]]
+name = "dedup-central-store"
+version = "0.1.0"
+dependencies = [
+ "dedup-core",
+ "dedup-media",
+ "dedup-protocol",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-postgres",
+ "toml 1.1.4+spec-1.1.0",
+ "uuid",
+]
+
+[[package]]
 name = "dedup-core"
 version = "0.1.0"
 dependencies = [
@@ -1142,6 +1156,7 @@ dependencies = [
 name = "dedup-desktop-core"
 version = "0.1.0"
 dependencies = [
+ "dedup-central-store",
  "dedup-core",
  "dedup-media",
  "dedup-node-engine",
@@ -1196,6 +1211,7 @@ dependencies = [
 name = "dedup-node-engine"
 version = "0.1.0"
 dependencies = [
+ "dedup-central-store",
  "dedup-core",
  "dedup-media",
  "dedup-media-ffmpeg",
@@ -1206,12 +1222,14 @@ dependencies = [
  "everything-ipc",
  "md-5 0.10.6",
  "prost",
+ "rusqlite",
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "toml 1.1.4+spec-1.1.0",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -1223,6 +1241,9 @@ dependencies = [
  "dedup-media",
  "dedup-protocol",
  "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.20",
  "toml 1.1.4+spec-1.1.0",

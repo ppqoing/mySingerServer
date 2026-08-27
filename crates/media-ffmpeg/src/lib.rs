@@ -5,5 +5,5 @@ mod decode;
 mod ffi;
 mod loader;
 
-pub use decode::{DecodedFrame, MediaProbe};
+pub use decode::{DecodedFrame, MediaProbe, SeekableMediaSource};
 pub use loader::{Ffmpeg, FfmpegError, dll_directory, required_dlls};

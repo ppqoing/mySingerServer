@@ -14,6 +14,8 @@ pub const MAX_TOTAL_READ_THREADS: usize = 256;
 pub const MAX_MANUAL_WORKER_COUNT: usize = 256;
 /// 自动模式允许保留的最大逻辑核心数。
 pub const MAX_RESERVED_CORES: usize = 255;
+/// Node 连接中心 PostgreSQL 时允许的最大连接超时秒数。
+pub const MAX_POSTGRES_CONNECT_TIMEOUT_SECONDS: u64 = 60;
 
 /// 管理工具手工维护的节点 IP 和端口。
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -117,6 +119,8 @@ pub struct NodeConfig {
     pub read: DiskReadConfig,
     /// Worker 自动或手动模式参数。
     pub worker: WorkerConfig,
+    /// Node 可选的中心 PostgreSQL 基础连接参数。
+    pub postgres: NodePostgresConfig,
 }
 
 impl Default for NodeConfig {
@@ -131,6 +135,7 @@ impl Default for NodeConfig {
             paths: NodePathsConfig::default(),
             read: DiskReadConfig::default(),
             worker: WorkerConfig::default(),
+            postgres: NodePostgresConfig::default(),
         }
     }
 }
@@ -152,13 +157,11 @@ impl NodeConfig {
             return Err(invalid_config("worker_count", "Worker 数量必须大于 0"));
         }
         if self.worker_count > MAX_MANUAL_WORKER_COUNT {
-            return Err(invalid_config(
-                "worker_count",
-                "Worker 数量不能超过 256",
-            ));
+            return Err(invalid_config("worker_count", "Worker 数量不能超过 256"));
         }
         self.read.validate()?;
         self.worker.validate()?;
+        self.postgres.validate()?;
         Ok(())
     }
 
@@ -166,6 +169,68 @@ impl NodeConfig {
     pub fn to_toml(&self) -> Result<String, CoreError> {
         self.validate()?;
         Ok(toml::to_string_pretty(self)?)
+    }
+}
+
+/// Node 可选的中心 PostgreSQL 基础连接参数。
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct NodePostgresConfig {
+    /// 是否启用中心 PostgreSQL；关闭时 Node 只使用本地 SQLite。
+    pub enabled: bool,
+    /// PostgreSQL 主机名或 IP 地址。
+    pub host: String,
+    /// PostgreSQL TCP 端口。
+    pub port: u16,
+    /// PostgreSQL 数据库名。
+    pub database: String,
+    /// PostgreSQL 用户名。
+    pub username: String,
+    /// PostgreSQL 密码，配置往返时必须保持原值。
+    pub password: String,
+    /// 建立 PostgreSQL 连接允许等待的秒数。
+    pub connect_timeout_seconds: u64,
+}
+
+impl Default for NodePostgresConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: "127.0.0.1".to_owned(),
+            port: 5432,
+            database: "media_dedup".to_owned(),
+            username: "postgres".to_owned(),
+            password: String::new(),
+            connect_timeout_seconds: 3,
+        }
+    }
+}
+
+impl NodePostgresConfig {
+    /// 仅在启用 PostgreSQL 时验证连接必需字段和超时边界。
+    fn validate(&self) -> Result<(), CoreError> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.host.trim().is_empty() {
+            return Err(invalid_config("postgres.host", "主机不能为空"));
+        }
+        if self.port == 0 {
+            return Err(invalid_config("postgres.port", "端口不能为 0"));
+        }
+        if self.database.trim().is_empty() {
+            return Err(invalid_config("postgres.database", "数据库名不能为空"));
+        }
+        if self.username.trim().is_empty() {
+            return Err(invalid_config("postgres.username", "用户名不能为空"));
+        }
+        if !(1..=MAX_POSTGRES_CONNECT_TIMEOUT_SECONDS).contains(&self.connect_timeout_seconds) {
+            return Err(invalid_config(
+                "postgres.connect_timeout_seconds",
+                "连接超时必须在 1 到 60 秒之间",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -341,6 +406,11 @@ impl WorkerConfig {
             WorkerMode::Automatic => logical_cpus.saturating_sub(self.reserved_cores).max(1),
             WorkerMode::Manual => self.manual_worker_count,
         }
+    }
+
+    /// 根据逻辑 CPU 和保留核心计算统一 CPU 权重预算；手动 Worker 数不会扩大该预算。
+    pub fn effective_cpu_budget(&self, logical_cpus: usize) -> usize {
+        logical_cpus.saturating_sub(self.reserved_cores).max(1)
     }
 
     fn validate(&self) -> Result<(), CoreError> {

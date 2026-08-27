@@ -1,6 +1,6 @@
 // 设置工作区仅消费 MainWindow 已有属性；未实现能力保持禁用且说明原因。
 
-import { AboutSlint, ComboBox, LineEdit, ScrollView, SpinBox } from "std-widgets.slint";
+import { AboutSlint, CheckBox, ComboBox, LineEdit, ScrollView, SpinBox } from "std-widgets.slint";
 import { Theme, UiFileFaultRow } from "../theme.slint";
 import { ActionButton } from "../components/action-button.slint";
 import { SectionHeader } from "../components/section-header.slint";
@@ -115,6 +115,12 @@ export component SettingsWorkspace inherits Rectangle {
     in property <color> postgres-color;
     in property <string> last-error;
     in-out property <string> postgres-url;
+    // PostgreSQL 基础连接字段由 Rust 与既有 postgres-url 双向转换。
+    in-out property <string> postgres-host;
+    in-out property <int> postgres-port: 5432;
+    in-out property <string> postgres-database;
+    in-out property <string> postgres-username;
+    in-out property <string> postgres-password;
     in-out property <int> reconnect-seconds;
     in-out property <int> delete-mode-index;
     in-out property <string> pdq-quality;
@@ -156,6 +162,13 @@ export component SettingsWorkspace inherits Rectangle {
     in-out property <int> node-manual-workers;
     in property <int> node-logical-cpus;
     in property <int> node-effective-workers;
+    in-out property <bool> node-postgres-enabled: false;
+    in-out property <string> node-postgres-host: "127.0.0.1";
+    in-out property <int> node-postgres-port: 5432;
+    in-out property <string> node-postgres-database: "media_dedup";
+    in-out property <string> node-postgres-username: "postgres";
+    in-out property <string> node-postgres-password;
+    in-out property <int> node-postgres-timeout-seconds: 3;
     in-out property <int> file-fault-selected-node: 0;
     in property <bool> file-fault-node-online;
     in property <bool> file-fault-loading;
@@ -181,12 +194,12 @@ export component SettingsWorkspace inherits Rectangle {
             height: 48px;
             vertical-stretch: 0;
             title: "设置";
-            subtitle: "连接、阈值与本机运行状态";
+            subtitle: "阈值、节点服务与本机运行状态";
             icon: @image-url("../assets/icons/settings.png");
             accessible-role: AccessibleRole.groupbox;
             accessible-label: "设置标题";
-            ActionButton { label: root.about-open ? "返回设置" : "关于 Slint"; icon: @image-url("../assets/icons/info.png"); clicked => { root.about-open = !root.about-open; } }
-            ActionButton { label: "保存设置"; icon: @image-url("../assets/icons/save.png"); tone: 1; clicked => { root.save-settings(); } }
+            ActionButton { y: 7px; label: root.about-open ? "返回设置" : "关于 Slint"; icon: @image-url("../assets/icons/info.png"); clicked => { root.about-open = !root.about-open; } }
+            ActionButton { y: 7px; label: "保存设置"; icon: @image-url("../assets/icons/save.png"); tone: 1; clicked => { root.save-settings(); } }
         }
 
         HorizontalLayout {
@@ -205,12 +218,12 @@ export component SettingsWorkspace inherits Rectangle {
                     padding: 12px;
                     spacing: 4px;
                     SettingsMenuItem { label: "常规"; selected: root.active-section == 0; activated => { root.active-section = 0; root.about-open = false; } }
-                    SettingsMenuItem { label: "相似度算法"; selected: root.active-section == 1; activated => { root.active-section = 1; root.about-open = false; } }
-                    SettingsMenuItem { label: "存储"; selected: root.active-section == 2; activated => { root.active-section = 2; root.about-open = false; } }
-                    SettingsMenuItem { label: "节点服务"; selected: root.active-section == 3; activated => { root.active-section = 3; root.about-open = false; } }
-                    SettingsMenuItem { label: "扫描与性能"; selected: root.active-section == 4; activated => { root.active-section = 4; root.about-open = false; } }
-                    SettingsMenuItem { label: "外部工具"; selected: root.active-section == 5; activated => { root.active-section = 5; root.about-open = false; } }
-                    SettingsMenuItem { label: "日志与诊断"; selected: root.active-section == 6; activated => { root.active-section = 6; root.about-open = false; } }
+                    SettingsMenuItem { label: "相似度算法"; selected: root.active-section == 2; activated => { root.active-section = 2; root.about-open = false; } }
+                    SettingsMenuItem { label: "存储"; selected: root.active-section == 3; activated => { root.active-section = 3; root.about-open = false; } }
+                    SettingsMenuItem { label: "节点服务"; selected: root.active-section == 4; activated => { root.active-section = 4; root.about-open = false; } }
+                    SettingsMenuItem { label: "扫描与性能"; selected: root.active-section == 5; activated => { root.active-section = 5; root.about-open = false; } }
+                    SettingsMenuItem { label: "外部工具"; selected: root.active-section == 6; activated => { root.active-section = 6; root.about-open = false; } }
+                    SettingsMenuItem { label: "日志与诊断"; selected: root.active-section == 7; activated => { root.active-section = 7; root.about-open = false; } }
                     Rectangle { vertical-stretch: 1; background: transparent; }
                 }
             }
@@ -252,16 +265,6 @@ export component SettingsWorkspace inherits Rectangle {
                             accessible-role: AccessibleRole.groupbox;
                             accessible-label: "常规表单网格";
                             Row {
-                                FormLabel { width: 112px; accessible-name: "PostgreSQL URL 标签"; text: "PostgreSQL URL"; }
-                                Rectangle { width: 270px; height: Theme.control-height; vertical-stretch: 0; accessible-role: AccessibleRole.groupbox; accessible-label: "PostgreSQL URL 控件"; LineEdit { width: parent.width; height: parent.height; text <=> root.postgres-url; placeholder-text: "postgresql://user:password@host:5432/database"; accessible-label: "PostgreSQL URL"; } }
-                                Text { width: 170px; text: "桌面端唯一中心连接。"; color: Theme.muted; font-size: 12px; overflow: elide; vertical-alignment: center; }
-                            }
-                            Row {
-                                FormLabel { width: 112px; accessible-name: "重连间隔（秒）标签"; text: "重连间隔（秒）"; }
-                                Rectangle { width: 270px; height: Theme.control-height; vertical-stretch: 0; accessible-role: AccessibleRole.groupbox; accessible-label: "重连间隔（秒）控件"; SpinBox { width: parent.width; height: parent.height; value <=> root.reconnect-seconds; minimum: 1; maximum: 3600; accessible-label: "重连间隔（秒）"; } }
-                                Text { width: 170px; text: "固定秒数后重连同一端点。"; color: Theme.muted; font-size: 12px; overflow: elide; vertical-alignment: center; }
-                            }
-                            Row {
                                 FormLabel { width: 112px; accessible-name: "删除方式标签"; text: "删除方式"; }
                                 Rectangle { width: 270px; height: Theme.control-height; vertical-stretch: 0; accessible-role: AccessibleRole.groupbox; accessible-label: "删除方式控件"; ComboBox { width: parent.width; height: parent.height; model: ["回收站（默认）", "永久删除"]; current-index <=> root.delete-mode-index; accessible-label: "删除方式"; } }
                                 Text { width: 170px; text: "默认进入回收站。"; color: Theme.muted; font-size: 12px; overflow: elide; vertical-alignment: center; }
@@ -274,12 +277,63 @@ export component SettingsWorkspace inherits Rectangle {
                             background: Theme.warning.with-alpha(0.10);
                             accessible-role: AccessibleRole.groupbox;
                             accessible-label: "可信局域网明文提示";
-                            HorizontalLayout { padding-left: 12px; padding-right: 12px; Text { text: "安全提示：节点通信和 PostgreSQL 连接均为明文，只应在可信局域网使用。"; color: Theme.warning; font-size: 12px; overflow: elide; vertical-alignment: center; } }
+                            HorizontalLayout { padding-left: 12px; padding-right: 12px; Text { text: "安全提示：节点通信为明文，只应在可信局域网使用。"; color: Theme.warning; font-size: 12px; overflow: elide; vertical-alignment: center; } }
                         }
                     }
                 }
 
-                if !root.about-open && root.active-section == 1 : ScrollView {
+                // PostgreSQL 连接已迁移到一级“数据库”页面；保留旧结构仅供当前脏工作树兼容编译，不再显示。
+                if !root.about-open && root.active-section == -1 : ScrollView {
+                    horizontal-stretch: 1;
+                    vertical-stretch: 1;
+                    accessible-role: AccessibleRole.groupbox;
+                    accessible-label: "PostgreSQL 连接配置";
+                    VerticalLayout {
+                        min-width: 600px;
+                        padding: 20px;
+                        spacing: 12px;
+                        Text { text: "PostgreSQL"; height: 26px; vertical-stretch: 0; color: Theme.text; font-size: 18px; font-weight: 700; }
+                        Text { text: "配置中心数据库的基础连接参数。"; height: 18px; vertical-stretch: 0; color: Theme.muted; font-size: 12px; }
+                        GridLayout {
+                            vertical-stretch: 0;
+                            spacing: 10px;
+                            accessible-role: AccessibleRole.groupbox;
+                            accessible-label: "PostgreSQL 表单网格";
+                            Row {
+                                FormLabel { width: 112px; text: "服务器地址"; accessible-name: "PostgreSQL 服务器标签"; }
+                                Rectangle { width: 270px; height: Theme.control-height; vertical-stretch: 0; accessible-role: AccessibleRole.groupbox; accessible-label: "PostgreSQL 服务器控件"; LineEdit { width: parent.width; height: parent.height; text <=> root.postgres-host; placeholder-text: "127.0.0.1"; accessible-label: "PostgreSQL 服务器"; } }
+                                Text { width: 170px; text: "IPv4、IPv6 或主机名。"; color: Theme.muted; font-size: 12px; overflow: elide; vertical-alignment: center; }
+                            }
+                            Row {
+                                FormLabel { width: 112px; text: "端口"; accessible-name: "PostgreSQL 端口标签"; }
+                                Rectangle { width: 270px; height: Theme.control-height; vertical-stretch: 0; accessible-role: AccessibleRole.groupbox; accessible-label: "PostgreSQL 端口控件"; SpinBox { width: parent.width; height: parent.height; value <=> root.postgres-port; minimum: 1; maximum: 65535; accessible-label: "PostgreSQL 端口"; } }
+                                Text { width: 170px; text: "PostgreSQL 默认端口为 5432。"; color: Theme.muted; font-size: 12px; overflow: elide; vertical-alignment: center; }
+                            }
+                            Row {
+                                FormLabel { width: 112px; text: "数据库名"; accessible-name: "PostgreSQL 数据库标签"; }
+                                Rectangle { width: 270px; height: Theme.control-height; vertical-stretch: 0; accessible-role: AccessibleRole.groupbox; accessible-label: "PostgreSQL 数据库控件"; LineEdit { width: parent.width; height: parent.height; text <=> root.postgres-database; placeholder-text: "dedup_v2"; accessible-label: "PostgreSQL 数据库"; } }
+                                Text { width: 170px; text: "已经执行 central-v2.sql 的空库。"; color: Theme.muted; font-size: 12px; overflow: elide; vertical-alignment: center; }
+                            }
+                            Row {
+                                FormLabel { width: 112px; text: "用户名"; accessible-name: "PostgreSQL 用户名标签"; }
+                                Rectangle { width: 270px; height: Theme.control-height; vertical-stretch: 0; accessible-role: AccessibleRole.groupbox; accessible-label: "PostgreSQL 用户名控件"; LineEdit { width: parent.width; height: parent.height; text <=> root.postgres-username; accessible-label: "PostgreSQL 用户名"; } }
+                                Text { width: 170px; text: "中心数据库登录用户。"; color: Theme.muted; font-size: 12px; overflow: elide; vertical-alignment: center; }
+                            }
+                            Row {
+                                FormLabel { width: 112px; text: "密码"; accessible-name: "PostgreSQL 密码标签"; }
+                                Rectangle { width: 270px; height: Theme.control-height; vertical-stretch: 0; accessible-role: AccessibleRole.groupbox; accessible-label: "PostgreSQL 密码控件"; LineEdit { width: parent.width; height: parent.height; text <=> root.postgres-password; input-type: InputType.password; accessible-label: "PostgreSQL 密码"; } }
+                                Text { width: 170px; text: "连接密码只写入现有桌面配置。"; color: Theme.muted; font-size: 12px; overflow: elide; vertical-alignment: center; }
+                            }
+                            Row {
+                                FormLabel { width: 112px; text: "重连间隔（秒）"; accessible-name: "PostgreSQL 重连间隔标签"; }
+                                Rectangle { width: 270px; height: Theme.control-height; vertical-stretch: 0; accessible-role: AccessibleRole.groupbox; accessible-label: "PostgreSQL 重连间隔控件"; SpinBox { width: parent.width; height: parent.height; value <=> root.reconnect-seconds; minimum: 1; maximum: 3600; accessible-label: "PostgreSQL 重连间隔"; } }
+                                Text { width: 170px; text: "断线后按固定秒数重连。"; color: Theme.muted; font-size: 12px; overflow: elide; vertical-alignment: center; }
+                            }
+                        }
+                    }
+                }
+
+                if !root.about-open && root.active-section == 2 : ScrollView {
                     horizontal-stretch: 1;
                     vertical-stretch: 1;
                     VerticalLayout {
@@ -310,7 +364,7 @@ export component SettingsWorkspace inherits Rectangle {
                     }
                 }
 
-                if !root.about-open && root.active-section == 2 : ScrollView {
+                if !root.about-open && root.active-section == 3 : ScrollView {
                     horizontal-stretch: 1;
                     vertical-stretch: 1;
                     VerticalLayout { min-width: 600px; padding: 20px; spacing: 10px;
@@ -323,7 +377,7 @@ export component SettingsWorkspace inherits Rectangle {
                     }
                 }
 
-                if !root.about-open && root.active-section == 3 : ScrollView {
+                if !root.about-open && root.active-section == 4 : ScrollView {
                     horizontal-stretch: 1;
                     vertical-stretch: 1;
                     accessible-role: AccessibleRole.groupbox;
@@ -368,6 +422,30 @@ export component SettingsWorkspace inherits Rectangle {
                                     overflow: elide;
                                     vertical-alignment: center;
                                     accessible-label: "Node 配置阶段：" + root.node-phase;
+                                }
+                            }
+                        }
+                        // 保存或重连失败时直接展示完整原因；阶段文字只负责表达当前状态。
+                        if root.node-error != "" : Rectangle {
+                            min-height: 52px;
+                            vertical-stretch: 0;
+                            border-radius: 6px;
+                            border-width: 1px;
+                            border-color: Theme.danger.with-alpha(0.35);
+                            background: Theme.danger.with-alpha(0.08);
+                            accessible-role: AccessibleRole.groupbox;
+                            accessible-label: "Node 配置错误：" + root.node-error;
+                            HorizontalLayout {
+                                padding-left: 12px;
+                                padding-right: 12px;
+                                padding-top: 8px;
+                                padding-bottom: 8px;
+                                Text {
+                                    text: root.node-error;
+                                    color: Theme.danger;
+                                    font-size: 12px;
+                                    wrap: word-wrap;
+                                    vertical-alignment: center;
                                 }
                             }
                         }
@@ -422,6 +500,41 @@ export component SettingsWorkspace inherits Rectangle {
                         NodeTextField { label: "Node 配置路径"; value <=> root.node-config-path; field-enabled: root.node-form-enabled; edited => { root.node-edited(); } }
                         NodeTextField { label: "Node 日志路径"; value <=> root.node-log-path; field-enabled: root.node-form-enabled; edited => { root.node-edited(); } }
                         NodeTextField { label: "Node 缓存路径"; value <=> root.node-cache-path; field-enabled: root.node-form-enabled; edited => { root.node-edited(); } }
+                        Text { text: "Node PostgreSQL"; height: 22px; vertical-stretch: 0; color: Theme.text; font-size: 14px; font-weight: 650; }
+                        CheckBox {
+                            text: "启用中心 PostgreSQL";
+                            checked <=> root.node-postgres-enabled;
+                            enabled: root.node-form-enabled;
+                            accessible-label: "启用 Node PostgreSQL";
+                            toggled => { root.node-edited(); }
+                        }
+                        GridLayout {
+                            vertical-stretch: 0;
+                            spacing: 12px;
+                            Row {
+                                NodeTextField { label: "PostgreSQL 主机"; value <=> root.node-postgres-host; field-enabled: root.node-form-enabled && root.node-postgres-enabled; edited => { root.node-edited(); } }
+                                NodeNumberField { label: "PostgreSQL 端口"; value <=> root.node-postgres-port; minimum: 1; maximum: 65535; field-enabled: root.node-form-enabled && root.node-postgres-enabled; edited => { root.node-edited(); } }
+                            }
+                            Row {
+                                NodeTextField { label: "PostgreSQL 数据库"; value <=> root.node-postgres-database; field-enabled: root.node-form-enabled && root.node-postgres-enabled; edited => { root.node-edited(); } }
+                                NodeTextField { label: "PostgreSQL 用户名"; value <=> root.node-postgres-username; field-enabled: root.node-form-enabled && root.node-postgres-enabled; edited => { root.node-edited(); } }
+                            }
+                            Row {
+                                VerticalLayout {
+                                    height: Theme.form-row-height; vertical-stretch: 0; spacing: 4px;
+                                    FormLabel { height: 18px; accessible-name: "PostgreSQL 密码 标签"; text: "PostgreSQL 密码"; }
+                                    LineEdit {
+                                        height: Theme.control-height;
+                                        text <=> root.node-postgres-password;
+                                        input-type: InputType.password;
+                                        enabled: root.node-form-enabled && root.node-postgres-enabled;
+                                        accessible-label: "Node PostgreSQL 密码";
+                                        edited(_) => { root.node-edited(); }
+                                    }
+                                }
+                                NodeNumberField { label: "PostgreSQL 连接超时（秒）"; value <=> root.node-postgres-timeout-seconds; minimum: 1; maximum: 60; field-enabled: root.node-form-enabled && root.node-postgres-enabled; edited => { root.node-edited(); } }
+                            }
+                        }
                         Text { text: "磁盘读取"; height: 22px; vertical-stretch: 0; color: Theme.text; font-size: 14px; font-weight: 650; }
                         GridLayout {
                             vertical-stretch: 0;
@@ -467,14 +580,14 @@ export component SettingsWorkspace inherits Rectangle {
                         }
                     }
                 }
-                if !root.about-open && root.active-section == 4 : ScrollView {
+                if !root.about-open && root.active-section == 5 : ScrollView {
                     horizontal-stretch: 1; vertical-stretch: 1;
                     VerticalLayout { min-width: 600px; padding: 20px; spacing: 12px;
                         Text { text: "扫描与性能"; height: 26px; vertical-stretch: 0; color: Theme.text; font-size: 18px; font-weight: 700; }
                         DisabledFeatureRow { action-label: "扫描性能配置（当前版本未提供）"; reason: "枚举、并发与资源限制当前由既有运行时固定。"; }
                     }
                 }
-                if !root.about-open && root.active-section == 5 : ScrollView {
+                if !root.about-open && root.active-section == 6 : ScrollView {
                     horizontal-stretch: 1; vertical-stretch: 1;
                     VerticalLayout { min-width: 600px; padding: 20px; spacing: 12px;
                         Text { text: "外部工具"; height: 26px; vertical-stretch: 0; color: Theme.text; font-size: 18px; font-weight: 700; }
@@ -482,7 +595,7 @@ export component SettingsWorkspace inherits Rectangle {
                     }
                 }
 
-                if !root.about-open && root.active-section == 6 : ScrollView {
+                if !root.about-open && root.active-section == 7 : ScrollView {
                     horizontal-stretch: 1;
                     vertical-stretch: 1;
                     accessible-role: AccessibleRole.groupbox;
@@ -501,6 +614,10 @@ export component SettingsWorkspace inherits Rectangle {
                                 Text { text: root.postgres-status; color: root.postgres-color; font-size: 12px; vertical-alignment: center; accessible-label: "PostgreSQL 状态：" + root.postgres-status; }
                             }
                         }
+                        DisabledFeatureRow { action-label: "日志筛选（当前版本未提供）"; reason: "当前版本没有日志筛选接口。"; }
+                        DisabledFeatureRow { action-label: "日志导出（当前版本未提供）"; reason: "当前版本没有日志导出接口。"; }
+                        DisabledFeatureRow { action-label: "日志清空（当前版本未提供）"; reason: "当前版本没有日志清空接口。"; }
+                        DisabledFeatureRow { action-label: "环境版本（当前版本未提供）"; reason: "当前版本没有环境版本接口。"; }
                         Rectangle {
                             height: 218px; vertical-stretch: 0; border-radius: 6px; background: Theme.window;
                             accessible-role: AccessibleRole.groupbox; accessible-label: "诊断路径卡";

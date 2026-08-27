@@ -26,7 +26,12 @@ fn load_keeps_relative_paths_raw_and_resolves_them_from_node_executable_director
         fixture.executable_dir.join(r"data\node\cache")
     );
     assert_eq!(loaded.version_sha256.len(), 64);
-    assert!(loaded.version_sha256.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert!(
+        loaded
+            .version_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    );
 }
 
 #[test]
@@ -45,7 +50,10 @@ fn save_to_a_new_config_path_keeps_the_old_config_file() {
         .unwrap();
 
     assert_eq!(saved.config, changed);
-    assert_eq!(fs::read_to_string(fixture.initial_config_path()).unwrap(), old_config_text);
+    assert_eq!(
+        fs::read_to_string(fixture.initial_config_path()).unwrap(),
+        old_config_text
+    );
     let bootstrap: toml::Value =
         toml::from_str(&fs::read_to_string(fixture.bootstrap_path()).unwrap()).unwrap();
     let bootstrap = bootstrap.as_table().unwrap();
@@ -54,7 +62,12 @@ fn save_to_a_new_config_path_keeps_the_old_config_file() {
         bootstrap.get("config_path").and_then(toml::Value::as_str),
         Some(r"settings\node\config.toml")
     );
-    assert!(fixture.executable_dir.join(r"settings\node\config.toml").exists());
+    assert!(
+        fixture
+            .executable_dir
+            .join(r"settings\node\config.toml")
+            .exists()
+    );
 }
 
 #[test]
@@ -126,9 +139,18 @@ fn stale_version_refuses_to_write_either_current_file() {
         .save_if_version("0".repeat(64).as_str(), &initial)
         .unwrap_err();
 
-    assert!(matches!(error, ConfigRepositoryError::VersionConflict { .. }));
-    assert_eq!(fs::read_to_string(fixture.initial_config_path()).unwrap(), old_config);
-    assert_eq!(fs::read_to_string(fixture.bootstrap_path()).unwrap(), old_bootstrap);
+    assert!(matches!(
+        error,
+        ConfigRepositoryError::VersionConflict { .. }
+    ));
+    assert_eq!(
+        fs::read_to_string(fixture.initial_config_path()).unwrap(),
+        old_config
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.bootstrap_path()).unwrap(),
+        old_bootstrap
+    );
 }
 
 #[test]
@@ -142,12 +164,20 @@ fn target_config_write_failure_keeps_the_active_bootstrap_and_config() {
     let mut changed = initial.clone();
     changed.paths.config_path = r"data\node\config.toml\blocked.toml".into();
 
-    assert!(repository
-        .save_if_version(&repository.snapshot().unwrap().version_sha256, &changed)
-        .is_err());
+    assert!(
+        repository
+            .save_if_version(&repository.snapshot().unwrap().version_sha256, &changed)
+            .is_err()
+    );
 
-    assert_eq!(fs::read_to_string(fixture.initial_config_path()).unwrap(), old_config);
-    assert_eq!(fs::read_to_string(fixture.bootstrap_path()).unwrap(), old_bootstrap);
+    assert_eq!(
+        fs::read_to_string(fixture.initial_config_path()).unwrap(),
+        old_config
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.bootstrap_path()).unwrap(),
+        old_bootstrap
+    );
     assert_eq!(repository.load().unwrap().config, initial);
 }
 
@@ -163,13 +193,21 @@ fn bootstrap_replace_failure_rolls_back_an_overwrite_of_the_current_config_path(
     changed.port = 39092;
     fixture.make_bootstrap_read_only();
 
-    assert!(repository
-        .save_if_version(&repository.snapshot().unwrap().version_sha256, &changed)
-        .is_err());
+    assert!(
+        repository
+            .save_if_version(&repository.snapshot().unwrap().version_sha256, &changed)
+            .is_err()
+    );
     fixture.make_bootstrap_writable();
 
-    assert_eq!(fs::read_to_string(fixture.initial_config_path()).unwrap(), old_config);
-    assert_eq!(fs::read_to_string(fixture.bootstrap_path()).unwrap(), old_bootstrap);
+    assert_eq!(
+        fs::read_to_string(fixture.initial_config_path()).unwrap(),
+        old_config
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.bootstrap_path()).unwrap(),
+        old_bootstrap
+    );
     assert_eq!(repository.load().unwrap().config, initial);
 }
 
@@ -186,15 +224,28 @@ fn bootstrap_replace_failure_keeps_the_old_config_active_when_the_path_changes()
     changed.port = 39092;
     fixture.make_bootstrap_read_only();
 
-    assert!(repository
-        .save_if_version(&repository.snapshot().unwrap().version_sha256, &changed)
-        .is_err());
+    assert!(
+        repository
+            .save_if_version(&repository.snapshot().unwrap().version_sha256, &changed)
+            .is_err()
+    );
     fixture.make_bootstrap_writable();
 
-    assert_eq!(fs::read_to_string(fixture.initial_config_path()).unwrap(), old_config);
-    assert_eq!(fs::read_to_string(fixture.bootstrap_path()).unwrap(), old_bootstrap);
+    assert_eq!(
+        fs::read_to_string(fixture.initial_config_path()).unwrap(),
+        old_config
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.bootstrap_path()).unwrap(),
+        old_bootstrap
+    );
     assert_eq!(repository.load().unwrap().config, initial);
-    assert!(fixture.executable_dir.join(r"next\node\config.toml").exists());
+    assert!(
+        fixture
+            .executable_dir
+            .join(r"next\node\config.toml")
+            .exists()
+    );
 }
 
 #[test]
@@ -287,10 +338,16 @@ fn load_recovers_a_persisted_journal_after_config_replace_interruption() {
         Err(ConfigRepositoryError::SimulatedInterruption(_))
     ));
     assert!(fixture.journal_path().exists());
-    assert_ne!(fs::read_to_string(fixture.initial_config_path()).unwrap(), old_config);
+    assert_ne!(
+        fs::read_to_string(fixture.initial_config_path()).unwrap(),
+        old_config
+    );
 
     assert_eq!(repository.load().unwrap().config, initial);
-    assert_eq!(fs::read_to_string(fixture.initial_config_path()).unwrap(), old_config);
+    assert_eq!(
+        fs::read_to_string(fixture.initial_config_path()).unwrap(),
+        old_config
+    );
     assert!(!fixture.journal_path().exists());
 }
 
@@ -310,10 +367,16 @@ fn load_recovers_a_persisted_journal_after_bootstrap_replace_interruption() {
         Err(ConfigRepositoryError::SimulatedInterruption(_))
     ));
     assert!(fixture.journal_path().exists());
-    assert_ne!(fs::read_to_string(fixture.bootstrap_path()).unwrap(), old_bootstrap);
+    assert_ne!(
+        fs::read_to_string(fixture.bootstrap_path()).unwrap(),
+        old_bootstrap
+    );
 
     assert_eq!(repository.load().unwrap().config, initial);
-    assert_eq!(fs::read_to_string(fixture.bootstrap_path()).unwrap(), old_bootstrap);
+    assert_eq!(
+        fs::read_to_string(fixture.bootstrap_path()).unwrap(),
+        old_bootstrap
+    );
     assert!(!fixture.journal_path().exists());
 }
 
@@ -326,9 +389,11 @@ fn failed_recovery_keeps_the_journal_and_does_not_expose_the_new_config() {
     let mut changed = initial.clone();
     changed.port = 39092;
 
-    assert!(repository
-        .save_if_version(&repository.snapshot().unwrap().version_sha256, &changed)
-        .is_err());
+    assert!(
+        repository
+            .save_if_version(&repository.snapshot().unwrap().version_sha256, &changed)
+            .is_err()
+    );
     fixture.make_initial_config_read_only();
     assert!(repository.load().is_err());
     assert!(fixture.journal_path().exists());
@@ -474,7 +539,9 @@ impl RepositoryFixture {
     }
 
     fn set_initial_config_read_only(&self, read_only: bool) {
-        let mut permissions = fs::metadata(self.initial_config_path()).unwrap().permissions();
+        let mut permissions = fs::metadata(self.initial_config_path())
+            .unwrap()
+            .permissions();
         permissions.set_readonly(read_only);
         fs::set_permissions(self.initial_config_path(), permissions).unwrap();
     }

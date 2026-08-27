@@ -235,11 +235,12 @@ export component ReviewDeleteWorkspace inherits Rectangle {
                 accessible-label: "审核过滤栏";
                 Text { text: "审核状态"; color: Theme.text; font-size: 12px; font-weight: 650; }
                 TabStrip {
-                    horizontal-stretch: 1;
+                    width: 240px;
                     labels: ["未决定", "保留", "删除"];
                     active-index <=> root.review-filter;
                 }
                 Text {
+                    width: 200px;
                     text: root.selected-group-id == "" ? "当前组：未选择" : "当前组：" + root.selected-group-id;
                     color: Theme.muted;
                     font-size: 10px;

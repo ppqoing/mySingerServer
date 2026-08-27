@@ -4,22 +4,50 @@ use dedup_core::MachineId;
 use dedup_node_engine::{
     actor::NodeEngine, runtime_tasks::RuntimeStage, server::NodeRequestHandler,
 };
-use dedup_node_store::{NewTaskItem, NodeStore, TaskItemCompletion};
+use dedup_node_store::{
+    NewTaskItem, NodeStore, PersistentStageState, TaskItemCompletion, TaskStageWrite,
+};
 use dedup_protocol::proto;
 
-/// 重启后的 registry 不恢复旧 ID、阶段、Worker 或失败，只包装当前活动持久任务。
+/// 重启后的 registry 复用持久任务 ID，并恢复已经落库的阶段计数和独立计时。
 #[tokio::test]
-async fn restart_exposes_only_fresh_runtime_recovery_tasks() {
+async fn restart_restores_base_and_stage2_runtime_stages_from_sqlite() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("node.db");
     let machine_id = MachineId::from_sha256([0xe4; 32]);
     let persistent_ids = {
         let mut store = NodeStore::open(&database, machine_id.clone()).unwrap();
         let queued = store
-            .create_task("scan", &[NewTaskItem::detached("queued")], 1)
+            .create_task("base_compute", &[NewTaskItem::detached("queued")], 1)
+            .unwrap();
+        store
+            .save_task_stage(
+                queued,
+                persisted_stage(
+                    RuntimeStage::EnumerateFiles,
+                    PersistentStageState::Completed,
+                    1,
+                    Some(1),
+                    Some(100),
+                    Some(200),
+                ),
+            )
+            .unwrap();
+        store
+            .save_task_stage(
+                queued,
+                persisted_stage(
+                    RuntimeStage::LookupBaseCache,
+                    PersistentStageState::Running,
+                    0,
+                    Some(1),
+                    Some(300),
+                    None,
+                ),
+            )
             .unwrap();
         let running = store
-            .create_task("analysis_stage2", &[NewTaskItem::detached("running")], 2)
+            .create_task("stage2_compute", &[NewTaskItem::detached("running")], 2)
             .unwrap();
         store.claim_next_item(running, 3).unwrap().unwrap();
         let completed = store
@@ -62,25 +90,65 @@ async fn restart_exposes_only_fresh_runtime_recovery_tasks() {
     let registry = handle.runtime_tasks_for_test();
     let summaries = registry.list().await;
     assert_eq!(summaries.len(), 2, "只允许 queued/running 任务进入恢复列表");
-    for summary in summaries {
-        assert_eq!(summary.task_kind, "recovery");
-        assert_eq!(summary.machine_id, machine_id.as_str());
-        assert!(
-            persistent_ids
-                .iter()
-                .all(|task_id| summary.runtime_task_id != task_id.as_uuid().to_string()),
-            "恢复运行 ID 不得复用 SQLite 任务 ID"
-        );
-        let details = registry.details(&summary.runtime_task_id).await.unwrap();
-        assert_eq!(details.workers.len(), 0);
-        assert_eq!(details.failures.len(), 0);
-        assert_eq!(details.stages.len(), 1);
-        assert_eq!(
-            details.stages[0].stage_id,
-            RuntimeStage::RecoveryValidate.id()
-        );
-    }
+    let base_id = persistent_ids[0].as_uuid().to_string();
+    let base = summaries
+        .iter()
+        .find(|summary| summary.runtime_task_id == base_id)
+        .unwrap();
+    assert_eq!(base.task_kind, "base_compute");
+    assert_eq!(base.machine_id, machine_id.as_str());
+    let details = registry.details(&base_id).await.unwrap();
+    assert_eq!(details.workers.len(), 0);
+    assert_eq!(details.failures.len(), 0);
+    assert!(
+        details.execution_config.is_none(),
+        "恢复任务没有本进程实际执行配置，必须保持缺失"
+    );
+    assert!(
+        details.pipeline_metrics.is_none(),
+        "恢复任务没有本进程采集指标，必须保持缺失"
+    );
+    assert_eq!(details.stages.len(), 2);
+    let enumerate = details
+        .stages
+        .iter()
+        .find(|stage| stage.stage_id == RuntimeStage::EnumerateFiles.id())
+        .unwrap();
+    assert_eq!(enumerate.completed, 1);
+    assert_eq!(enumerate.elapsed_ms, 100);
+
+    let stage2_id = persistent_ids[1].as_uuid().to_string();
+    assert_eq!(
+        summaries
+            .iter()
+            .find(|summary| summary.runtime_task_id == stage2_id)
+            .unwrap()
+            .task_kind,
+        "stage2_compute"
+    );
 
     handle.shutdown().await.unwrap();
     actor.await.unwrap();
+}
+
+/// 构造恢复测试使用的持久阶段快照。
+fn persisted_stage(
+    stage: RuntimeStage,
+    state: PersistentStageState,
+    completed: u64,
+    total: Option<u64>,
+    started_at_ms: Option<u64>,
+    finished_at_ms: Option<u64>,
+) -> TaskStageWrite {
+    TaskStageWrite {
+        stage_id: stage.id().into(),
+        state,
+        completed,
+        total,
+        failed: 0,
+        skipped: 0,
+        started_at_ms,
+        finished_at_ms,
+        warning_text: None,
+    }
 }

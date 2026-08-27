@@ -2178,6 +2178,121 @@ docs: record cpu io smoothing final gate
 
 ---
 
+### Task 15: 扩展外置验收客户端为多根单轮模式
+
+**User override（2026-08-26）：** 双物理盘测试只执行一个全量真实媒体任务；第一个任务进入 `completed`、`failed` 或 `cancelled` 终态即结束，不等待 1800 秒，也不创建 forced scan。1800 秒仅作为最大截止时间。
+
+**Files:**
+
+- Modify: `crates/desktop-core/examples/runtime_acceptance.rs`
+- Modify: `crates/desktop-core/tests/runtime_acceptance_contract.rs`
+
+**Interfaces:**
+
+- 新环境变量 `RUST_V2_REAL_MEDIA_ROOTS_JSON` 为非空 JSON 字符串数组；存在时优先于旧 `RUST_V2_REAL_MEDIA_ROOT`，旧单根调用保持兼容。
+- 新环境变量 `RUST_V2_ACCEPTANCE_SINGLE_RUN` 接受 `1/true`；默认仍保持原持续时长/forced scan 行为。
+- 首次和后续扫描都必须传递同一完整 roots 数组；单轮模式观察到第一个任务终态后立即写最终 `runtime_result` 并退出。
+- `runtime_result` 记录实际 roots 与 `single_run`，作为 Windows harness 与任务根绑定证据的一部分。
+
+- [ ] **Step 1: RED**
+
+先增加真实 contract tests，证明旧实现：不能把 H/I 两根同时交给 `create_scan`；首个 completed 后仍会创建 forced scan。测试必须断言实际 client seam 收到的 roots 与扫描次数，不得匹配源码字符串。
+
+- [ ] **Step 2: GREEN**
+
+用最小配置解析和终态分支实现多根与单轮模式；为空、空白或 JSON 非数组时返回稳定配置错误。新增方法、字段和关键变量添加中文注释。
+
+- [ ] **Step 3: 定向回归**
+
+运行：
+
+```powershell
+cargo test -p dedup-desktop-core --test runtime_acceptance_contract --locked -- --test-threads=1
+```
+
+---
+
+### Task 16: 扩展 Windows 证据为双物理盘单轮采集
+
+**Files:**
+
+- Modify: `tests/windows/Measure-RustV2RuntimeAcceptance.ps1`
+- Modify: `tests/windows/New-RustV2RuntimeAcceptanceReport.ps1`
+- Modify: `tests/windows/Test-RustV2RuntimeAcceptanceHarness.ps1`
+- Modify: `tests/windows/Test-RustV2RuntimeAcceptanceReport.ps1`
+
+**Interfaces:**
+
+- 增加 `-MediaRoots [string[]]`、`-SingleRun` 与 `-RequireDistinctPhysicalDisks`；旧 `-MediaRoot` 保持兼容，两者不能同时传入。
+- 多根必须全部为绝对、存在的普通目录，不能是 reparse/junction，根之间不能相同或互相包含。
+- 运行前用 `Get-Partition` / `Get-Disk` 将每个根盘符绑定到物理 `DiskNumber`，写入 `physical-disk-map.json`；要求双物理盘时，DiskNumber 不同才允许启动。
+- `media-before.json` / `media-after.json` 保存所有根的组合只读清单；同时保存 `media-before-root-01.json`、`media-after-root-01.json` 等分根清单。前后按 root、相对路径、长度和 UTC mtime 精确比较。
+- 给客户端设置 roots JSON 和 single-run 环境变量；`harness-result.json` 记录 roots、single_run、物理盘映射和各分根清单路径/SHA。
+- 系统采样继续为 2 秒；任务快照继续为 1 秒。报告按实际间隔加权，不把 1800 秒作为完成条件。
+
+- [ ] **Step 1: RED**
+
+先增加行为 fixture，覆盖：多根参数传入、嵌套/重复/reparse 拒绝、同物理盘拒绝、roots JSON 环境变量、首终态即退出、组合和分根媒体清单、旧单根兼容。
+
+- [ ] **Step 2: GREEN**
+
+以小函数实现 roots 解析、路径边界、物理盘映射和组合 manifest；不创建 junction，不修改 Node/协议，不新增读取线程池。
+
+- [ ] **Step 3: 定向回归**
+
+运行 Harness、Runtime report fixtures、PowerShell parser 和 `git diff --check`。
+
+---
+
+### Task 17: 冻结候选并执行一次双物理盘真实媒体任务
+
+**Inputs:**
+
+- 只读根：`H:\pik\00000000000`、`I:\tmp`
+- 候选 B：最终修复后的 Node/Worker；A 只保留历史回滚参考。
+- 配置：Worker `20`、总读取 `12`、HDD/盘 `1`、SSD/盘 `16`、Unknown/盘 `1`、Reserved core `1`、系统采样 `2 秒`。
+- 停止条件：首个全量任务进入任一终态；最大截止 `1800 秒`。
+
+**Outputs:**
+
+- Create: `docs/verification/2026-08-26-dual-physical-disk-single-run.md`
+- Evidence: `C:\tmp\rust-v2-dual-disk-worker20-read12-20260826-*`
+- 不部署、不读取或触碰 `I:\Tool`。
+
+- [ ] **Step 1: 预检与空间门禁**
+
+确认 H/I 存在、不是 reparse、映射到两个不同 DiskNumber；确认 C/D 可用空间。任一盘低于 10 GiB 时，只盘点并清理项目路径内精确、可再生成的 Cargo target/cache，保留所有源码、包和测试证据。
+
+- [ ] **Step 2: 新鲜静态门禁与终审**
+
+运行调度器、WorkerPool、base pipeline、runtime acceptance、Windows harness/report fixtures、fmt 和 diff-check；最终代码审查使用 `gpt-5.6-sol / max`。
+
+- [ ] **Step 3: 重新冻结 B**
+
+重建外置 `runtime_acceptance.exe`，重建 B formal/test-only package，记录 source tree、Cargo.lock、EXE、manifest、ZIP 与工具 SHA。正式 ZIP 仍只允许四个顶层 EXE，验收客户端仍在 ZIP 外。
+
+- [ ] **Step 4: 重跑固定 benchmark**
+
+使用相同 fixture 运行 B 三轮，记录 `elapsed_ms` 中位数；历史 A 不变。该结果仍按原 15% 门禁裁决，但不会改变用户授权的单次双盘诊断范围。
+
+- [ ] **Step 5: 启动一次双盘全量任务**
+
+使用全新隔离根启动一次 B；不得复用或拼接旧轮 evidence。首个任务终态后立即停止采集、退出 Node/Worker、生成结果摘要和报告。
+
+- [ ] **Step 6: 双盘调度判定**
+
+报告分别列出两个 DiskNumber 的时间加权读吞吐、IOPS、队列 P50/P95/峰值；统计两盘同一采样窗口都发生读取的重叠秒数；结合 runtime Worker 的 `display_path`、`physical_disk_id`、phase、空闲 Worker、Hash/Media permit 等字段判断：
+
+- 两根都进入同一任务并产生工作；
+- 两块盘能在同一时间窗口推进；
+- 无一块有可运行工作却长期被另一盘饿死；
+- 全局 12 与各盘类别上限没有越界；
+- CPU/磁盘交替相位属于正常流水线重叠还是调度气泡。
+
+当前生产遥测没有按盘 Hash/Media permit 精确计数，因此不得声称观测到了不存在的逐盘 permit 字段；结论必须区分系统盘吞吐、Worker 路径证据和全局 permit 证据。
+
+---
+
 ## Spec Coverage Matrix
 
 | 规格约束 | 实施任务 | 主要证据 |
@@ -2201,6 +2316,9 @@ docs: record cpu io smoothing final gate
 | `A,B,B,A,A,B` 和 95% 覆盖 | 7、13 | orchestrator / aggregate fixtures |
 | 原全部正确性与性能硬门禁 | 7、13、14 | final report |
 | 不部署、不触碰 `I:\Tool` | 全局、14 | ledger 与 final declaration |
+| 多根同一任务、首终态即结束 | 15、16 | runtime contract 与 Windows harness fixture |
+| H/I 物理盘映射、分根只读清单 | 16、17 | physical-disk-map 与媒体前后 manifest |
+| 单次双盘重叠与饥饿观察 | 17 | runtime/system NDJSON 与双盘报告 |
 
 ## Execution Handoff
 

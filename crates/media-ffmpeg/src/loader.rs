@@ -2,7 +2,7 @@
 
 use std::{
     ffi::{OsStr, c_void},
-    fmt,
+    fmt, io,
     path::{Path, PathBuf},
     ptr,
 };
@@ -187,6 +187,12 @@ pub enum FfmpegError {
     /// 归一化抽帧位置不在 `0.0..=1.0`。
     #[error("frame position must be finite and within 0.0..=1.0: {0}")]
     InvalidPosition(f64),
+    /// 显式解码线程预算为零，无法建立受 CPU 调度约束的解码会话。
+    #[error("decoder thread budget must be at least one: {0}")]
+    InvalidDecoderThreads(u32),
+    /// 调用方提供的自定义媒体来源无法读取或定位。
+    #[error("custom media source failed: {0}")]
+    Source(#[source] io::Error),
 }
 
 struct PendingLoad {
@@ -229,15 +235,21 @@ unsafe fn resolve_api(modules: &[HMODULE]) -> Result<FfmpegApi, FfmpegError> {
     }
 
     Ok(FfmpegApi {
+        avformat_alloc_context: symbol!("avformat_alloc_context"),
         avformat_open_input: symbol!("avformat_open_input"),
         avformat_find_stream_info: symbol!("avformat_find_stream_info"),
         av_find_best_stream: symbol!("av_find_best_stream"),
         avformat_seek_file: symbol!("avformat_seek_file"),
         av_read_frame: symbol!("av_read_frame"),
         avformat_close_input: symbol!("avformat_close_input"),
+        avio_alloc_context: symbol!("avio_alloc_context"),
+        avio_context_free: symbol!("avio_context_free"),
+        av_malloc: symbol!("av_malloc"),
+        av_free: symbol!("av_free"),
         avcodec_find_decoder: symbol!("avcodec_find_decoder"),
         avcodec_alloc_context3: symbol!("avcodec_alloc_context3"),
         avcodec_parameters_to_context: symbol!("avcodec_parameters_to_context"),
+        av_opt_set_int: symbol!("av_opt_set_int"),
         avcodec_open2: symbol!("avcodec_open2"),
         avcodec_send_packet: symbol!("avcodec_send_packet"),
         avcodec_receive_frame: symbol!("avcodec_receive_frame"),

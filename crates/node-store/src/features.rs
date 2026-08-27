@@ -2,17 +2,17 @@
 
 use dedup_core::MediaKind;
 use dedup_media::{ImageStage1, ImageStage2, PdqHash, phash_parts_to_blob};
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
 use crate::{
     CompleteStage1, CompleteStage2, ContentId, FeatureWrite, ImageStage1Fields, NodeStore,
-    StoreError, TaskItemCompletion, VideoFrameStage1Fields, VideoFrameStage2Fields,
-    VideoMetadataFields,
-    content::content_key_in_transaction,
+    StoreError, TaskItemApplyResult, TaskItemCompletion, TaskItemIdentity, VideoFrameStage1Fields,
+    VideoFrameStage2Fields, VideoMetadataFields,
+    content::{content_key_in_transaction, encode_content},
     open::{fixed_bytes, sqlite_integer},
     outbox::append_sync_change,
     rows::RowEncoder,
-    tasks::complete_item_in_transaction,
+    tasks::{TaskItemIdentityState, classify_task_item_identity, complete_item_in_transaction},
 };
 
 impl NodeStore {
@@ -160,7 +160,9 @@ impl NodeStore {
         writes: Vec<FeatureWrite>,
         now_ms: i64,
     ) -> Result<bool, StoreError> {
-        let transaction = self.connection.transaction()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (item_status, task_status): (String, String) = transaction.query_row(
             "SELECT ti.status,t.status
              FROM task_items ti JOIN tasks t ON t.task_id=ti.task_id
@@ -172,99 +174,51 @@ impl NodeStore {
             transaction.commit()?;
             return Ok(false);
         }
-        transaction.execute(
-            "UPDATE contents SET media_kind=?2 WHERE content_id=?1",
-            params![
-                content_id.as_i64(),
-                match media_kind {
-                    MediaKind::Image => "image",
-                    MediaKind::Video => "video",
-                    MediaKind::Other => "other",
-                }
-            ],
-        )?;
-        let key = content_key_in_transaction(&transaction, content_id)?;
-        for write in writes {
-            let (entity_kind, payload) = match write {
-                FeatureWrite::ImageStage1(fields) => {
-                    transaction.execute(
-                        "INSERT INTO image_stage1(content_id,width,height,pdq,quality)
-                         VALUES(?1,?2,?3,?4,?5)
-                         ON CONFLICT(content_id) DO UPDATE SET
-                           width=excluded.width,height=excluded.height,
-                           pdq=excluded.pdq,quality=excluded.quality",
-                        params![
-                            content_id.as_i64(),
-                            fields.width,
-                            fields.height,
-                            fields.pdq.map(|hash| hash.as_bytes().to_vec()),
-                            fields.quality
-                        ],
-                    )?;
-                    ("image_stage1", encode_image_stage1(key, fields))
-                }
-                FeatureWrite::VideoMetadata(fields) => {
-                    transaction.execute(
-                        "INSERT INTO video_metadata(content_id,duration_ms,width,height)
-                         VALUES(?1,?2,?3,?4)
-                         ON CONFLICT(content_id) DO UPDATE SET
-                           duration_ms=excluded.duration_ms,width=excluded.width,height=excluded.height",
-                        params![
-                            content_id.as_i64(),
-                            fields.duration_ms.map(sqlite_integer).transpose()?,
-                            fields.width,
-                            fields.height
-                        ],
-                    )?;
-                    ("video_metadata", encode_video_metadata(key, fields))
-                }
-                FeatureWrite::VideoFrameStage1(frame) => {
-                    validate_slot(frame.slot)?;
-                    transaction.execute(
-                        "INSERT INTO video_frame_stage1(
-                           content_id,slot,time_ms,decoded,width,height,pdq,quality)
-                         VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
-                         ON CONFLICT(content_id,slot) DO UPDATE SET
-                           time_ms=excluded.time_ms,decoded=excluded.decoded,
-                           width=excluded.width,height=excluded.height,
-                           pdq=excluded.pdq,quality=excluded.quality",
-                        params![
-                            content_id.as_i64(),
-                            frame.slot,
-                            sqlite_integer(frame.time_ms)?,
-                            frame.decoded,
-                            frame.width,
-                            frame.height,
-                            frame.pdq.map(|hash| hash.as_bytes().to_vec()),
-                            frame.quality
-                        ],
-                    )?;
-                    ("video_frame_stage1", encode_video_frame_stage1(key, frame))
-                }
-                FeatureWrite::ContactSheet(relative_path) => {
-                    transaction.execute(
-                        "INSERT INTO contact_sheets(content_id,relative_path) VALUES(?1,?2)
-                         ON CONFLICT(content_id) DO UPDATE SET relative_path=excluded.relative_path",
-                        params![content_id.as_i64(), &relative_path],
-                    )?;
-                    contact_sheet_payload(key, &relative_path)
-                }
-                FeatureWrite::ImageStage2(_) | FeatureWrite::VideoFrameStage2(_) => {
-                    return Err(StoreError::InvalidFeature("扫描一筛事务不能写入二筛结果"));
-                }
-            };
-            append_sync_change(&transaction, entity_kind, payload)?;
-        }
-        complete_item_in_transaction(
+        commit_scan_stage1_in_transaction(
             &transaction,
             item_id,
-            TaskItemCompletion::Succeeded {
-                content_id: Some(content_id),
-            },
+            content_id,
+            media_kind,
+            writes,
             now_ms,
         )?;
         transaction.commit()?;
         Ok(true)
+    }
+
+    /// 仅在 task/item/content 身份匹配且仍活动时原子提交全部一筛、outbox 和项成功。
+    pub fn commit_scan_stage1_guarded(
+        &mut self,
+        identity: &TaskItemIdentity,
+        media_kind: MediaKind,
+        writes: Vec<FeatureWrite>,
+        now_ms: i64,
+    ) -> Result<TaskItemApplyResult, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let state = classify_task_item_identity(&transaction, identity)?;
+        let result = match state {
+            TaskItemIdentityState::Active => {
+                let Some(content_id) = identity.content_id else {
+                    return Err(StoreError::InvalidState(
+                        "一筛提交身份必须携带 content_id".into(),
+                    ));
+                };
+                TaskItemApplyResult::Applied(commit_scan_stage1_in_transaction(
+                    &transaction,
+                    &identity.item_id,
+                    content_id,
+                    media_kind,
+                    writes,
+                    now_ms,
+                )?)
+            }
+            TaskItemIdentityState::Inactive => TaskItemApplyResult::IgnoredInactive,
+            TaskItemIdentityState::Mismatch => TaskItemApplyResult::IdentityMismatch,
+        };
+        transaction.commit()?;
+        Ok(result)
     }
 
     /// 只返回图片完整四字段，或六槽位记录且至少四个成功帧字段完整的视频一筛。
@@ -449,6 +403,113 @@ impl NodeStore {
         }
         Ok(Some(CompleteStage2::Video(Box::new(frames))))
     }
+}
+
+/// 在既有事务中按固定顺序写入内容、一筛、outbox 和任务项终态。
+fn commit_scan_stage1_in_transaction(
+    transaction: &Transaction<'_>,
+    item_id: &str,
+    content_id: ContentId,
+    media_kind: MediaKind,
+    writes: Vec<FeatureWrite>,
+    now_ms: i64,
+) -> Result<crate::TaskEvent, StoreError> {
+    transaction.execute(
+        "UPDATE contents SET media_kind=?2,base_complete=1 WHERE content_id=?1",
+        params![
+            content_id.as_i64(),
+            match media_kind {
+                MediaKind::Image => "image",
+                MediaKind::Video => "video",
+                MediaKind::Other => "other",
+            }
+        ],
+    )?;
+    let key = content_key_in_transaction(transaction, content_id)?;
+    append_sync_change(
+        transaction,
+        "content",
+        encode_content(key, media_kind, true),
+    )?;
+    for write in writes {
+        let (entity_kind, payload) = match write {
+            FeatureWrite::ImageStage1(fields) => {
+                transaction.execute(
+                    "INSERT INTO image_stage1(content_id,width,height,pdq,quality)
+                     VALUES(?1,?2,?3,?4,?5)
+                     ON CONFLICT(content_id) DO UPDATE SET
+                       width=excluded.width,height=excluded.height,
+                       pdq=excluded.pdq,quality=excluded.quality",
+                    params![
+                        content_id.as_i64(),
+                        fields.width,
+                        fields.height,
+                        fields.pdq.map(|hash| hash.as_bytes().to_vec()),
+                        fields.quality
+                    ],
+                )?;
+                ("image_stage1", encode_image_stage1(key, fields))
+            }
+            FeatureWrite::VideoMetadata(fields) => {
+                transaction.execute(
+                    "INSERT INTO video_metadata(content_id,duration_ms,width,height)
+                     VALUES(?1,?2,?3,?4)
+                     ON CONFLICT(content_id) DO UPDATE SET
+                       duration_ms=excluded.duration_ms,width=excluded.width,height=excluded.height",
+                    params![
+                        content_id.as_i64(),
+                        fields.duration_ms.map(sqlite_integer).transpose()?,
+                        fields.width,
+                        fields.height
+                    ],
+                )?;
+                ("video_metadata", encode_video_metadata(key, fields))
+            }
+            FeatureWrite::VideoFrameStage1(frame) => {
+                validate_slot(frame.slot)?;
+                transaction.execute(
+                    "INSERT INTO video_frame_stage1(
+                       content_id,slot,time_ms,decoded,width,height,pdq,quality)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+                     ON CONFLICT(content_id,slot) DO UPDATE SET
+                       time_ms=excluded.time_ms,decoded=excluded.decoded,
+                       width=excluded.width,height=excluded.height,
+                       pdq=excluded.pdq,quality=excluded.quality",
+                    params![
+                        content_id.as_i64(),
+                        frame.slot,
+                        sqlite_integer(frame.time_ms)?,
+                        frame.decoded,
+                        frame.width,
+                        frame.height,
+                        frame.pdq.map(|hash| hash.as_bytes().to_vec()),
+                        frame.quality
+                    ],
+                )?;
+                ("video_frame_stage1", encode_video_frame_stage1(key, frame))
+            }
+            FeatureWrite::ContactSheet(relative_path) => {
+                transaction.execute(
+                    "INSERT INTO contact_sheets(content_id,relative_path) VALUES(?1,?2)
+                     ON CONFLICT(content_id) DO UPDATE SET relative_path=excluded.relative_path",
+                    params![content_id.as_i64(), &relative_path],
+                )?;
+                contact_sheet_payload(key, &relative_path)
+            }
+            FeatureWrite::ImageStage2(_) | FeatureWrite::VideoFrameStage2(_) => {
+                return Err(StoreError::InvalidFeature("扫描一筛事务不能写入二筛结果"));
+            }
+        };
+        append_sync_change(transaction, entity_kind, payload)?;
+    }
+    complete_item_in_transaction(
+        transaction,
+        item_id,
+        TaskItemCompletion::Succeeded {
+            content_id: Some(content_id),
+        },
+        now_ms,
+    )
 }
 
 fn validate_slot(slot: u8) -> Result<(), StoreError> {

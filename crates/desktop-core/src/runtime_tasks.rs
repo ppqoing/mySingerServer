@@ -148,6 +148,41 @@ pub enum DesktopRuntimeTaskKind {
     Delete,
 }
 
+/// 任务中心需要固定展示的三类计算任务。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaskKindView {
+    /// 枚举、缓存查询和基础特征计算。
+    BaseCompute,
+    /// 候选生成、二次派发和精准判重。
+    DuplicateList,
+    /// 二次缓存查询和二次特征计算。
+    Stage2Compute,
+    /// 同步、删除或兼容旧任务。
+    Other,
+}
+
+impl TaskKindView {
+    /// 从 Node 稳定任务类别解析任务中心分类。
+    pub fn from_node_kind(kind: &str) -> Self {
+        match kind {
+            "base_compute" => Self::BaseCompute,
+            "duplicate_list" => Self::DuplicateList,
+            "stage2_compute" => Self::Stage2Compute,
+            _ => Self::Other,
+        }
+    }
+
+    /// 返回三类计算任务的固定中文标题；其他任务沿用后端标题。
+    pub const fn title(self) -> Option<&'static str> {
+        match self {
+            Self::BaseCompute => Some("基础计算"),
+            Self::DuplicateList => Some("重复文件清单"),
+            Self::Stage2Compute => Some("二次特征计算"),
+            Self::Other => None,
+        }
+    }
+}
+
 /// 任务整体终态。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DesktopRuntimeTaskState {
@@ -378,6 +413,9 @@ impl DesktopRuntimeTaskRegistry {
         handshake_machine: &MachineId,
         summary: proto::RuntimeTaskSummary,
     ) -> RuntimeTaskSnapshot {
+        let title = TaskKindView::from_node_kind(&summary.task_kind)
+            .title()
+            .map_or(summary.title, str::to_owned);
         RuntimeTaskSnapshot {
             key: RuntimeTaskKey {
                 owner: RuntimeTaskOwner::Node { node_index },
@@ -385,7 +423,7 @@ impl DesktopRuntimeTaskRegistry {
             },
             machine_ids: vec![handshake_machine.as_str().to_owned()],
             kind: DesktopRuntimeTaskKind::Node,
-            title: summary.title,
+            title,
             state: task_state_from_text(&summary.state),
             overall_completed: summary.overall_completed,
             overall_total: summary.overall_total_known.then_some(summary.overall_total),

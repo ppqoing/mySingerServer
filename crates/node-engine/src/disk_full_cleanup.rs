@@ -10,9 +10,7 @@ use std::{
 use dedup_node_store::NodeStore;
 use dedup_windows::resolve_storage_location;
 
-use crate::artifact_registry::{
-    ArtifactKind, ArtifactLease, RegenerableArtifactRegistry,
-};
+use crate::artifact_registry::{ArtifactKind, ArtifactLease, RegenerableArtifactRegistry};
 
 const ERROR_HANDLE_DISK_FULL: i32 = 39;
 const ERROR_DISK_FULL: i32 = 112;

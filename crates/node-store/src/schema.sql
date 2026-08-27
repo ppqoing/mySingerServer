@@ -1,5 +1,5 @@
 -- mySingerServer Rust V2 节点数据库。只在空数据库一次创建，不兼容旧表结构。
-PRAGMA user_version = 2;
+PRAGMA user_version = 3;
 
 CREATE TABLE metadata (
     key   TEXT PRIMARY KEY,
@@ -11,6 +11,7 @@ CREATE TABLE contents (
     md5        BLOB NOT NULL CHECK(length(md5) = 16),
     file_size  INTEGER NOT NULL CHECK(file_size >= 0),
     media_kind TEXT NOT NULL CHECK(media_kind IN ('image', 'video', 'other')),
+    base_complete INTEGER NOT NULL DEFAULT 0 CHECK(base_complete IN (0,1)),
     UNIQUE(md5, file_size)
 ) STRICT;
 CREATE INDEX contents_md5_idx ON contents(md5);
@@ -34,6 +35,13 @@ CREATE TABLE file_faults (
     fault_kind TEXT NOT NULL CHECK(fault_kind IN ('suspected_physical_read','worker_crash')),
     stage TEXT NOT NULL,
     windows_error_code INTEGER,
+    read_offset INTEGER CHECK(read_offset IS NULL OR read_offset >= 0),
+    read_size INTEGER CHECK(read_size IS NULL OR read_size >= 0),
+    worker_pid INTEGER CHECK(worker_pid IS NULL OR worker_pid >= 0),
+    worker_exit_code INTEGER,
+    first_seen_at_ms INTEGER NOT NULL CHECK(first_seen_at_ms >= 0),
+    last_seen_at_ms INTEGER NOT NULL CHECK(last_seen_at_ms >= first_seen_at_ms),
+    occurrence_count INTEGER NOT NULL DEFAULT 1 CHECK(occurrence_count >= 1),
     message TEXT NOT NULL,
     PRIMARY KEY(machine_id, normalized_path, fault_kind)
 ) STRICT;
@@ -119,6 +127,20 @@ CREATE TABLE task_scan_roots (
     PRIMARY KEY(task_id, normalized_root)
 ) STRICT;
 
+CREATE TABLE task_stages (
+    task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
+    stage_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('waiting','running','completed','failed','skipped')),
+    completed INTEGER NOT NULL DEFAULT 0 CHECK(completed >= 0),
+    total INTEGER CHECK(total IS NULL OR total >= 0),
+    failed INTEGER NOT NULL DEFAULT 0 CHECK(failed >= 0),
+    skipped INTEGER NOT NULL DEFAULT 0 CHECK(skipped >= 0),
+    started_at_ms INTEGER CHECK(started_at_ms IS NULL OR started_at_ms >= 0),
+    finished_at_ms INTEGER CHECK(finished_at_ms IS NULL OR finished_at_ms >= 0),
+    warning_text TEXT,
+    PRIMARY KEY(task_id, stage_id)
+) STRICT;
+
 CREATE TABLE analysis_runs (
     analysis_run_id TEXT PRIMARY KEY,
     mode            TEXT NOT NULL CHECK(mode IN ('local','central')),
@@ -128,6 +150,20 @@ CREATE TABLE analysis_runs (
     skipped_incomplete INTEGER NOT NULL DEFAULT 0,
     created_at_ms   INTEGER NOT NULL,
     updated_at_ms   INTEGER NOT NULL
+) STRICT;
+
+CREATE TABLE analysis_run_stages (
+    analysis_run_id TEXT NOT NULL REFERENCES analysis_runs(analysis_run_id) ON DELETE CASCADE,
+    stage_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('waiting','running','completed','failed','skipped')),
+    completed INTEGER NOT NULL DEFAULT 0 CHECK(completed >= 0),
+    total INTEGER CHECK(total IS NULL OR total >= 0),
+    failed INTEGER NOT NULL DEFAULT 0 CHECK(failed >= 0),
+    skipped INTEGER NOT NULL DEFAULT 0 CHECK(skipped >= 0),
+    started_at_ms INTEGER CHECK(started_at_ms IS NULL OR started_at_ms >= 0),
+    finished_at_ms INTEGER CHECK(finished_at_ms IS NULL OR finished_at_ms >= 0),
+    warning_text TEXT,
+    PRIMARY KEY(analysis_run_id, stage_id)
 ) STRICT;
 
 CREATE TABLE analysis_run_inputs (

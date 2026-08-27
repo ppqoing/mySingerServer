@@ -1,4 +1,4 @@
-//! SQLite V2 的创建、兼容性拒绝和单连接所有权边界。
+//! SQLite V3 的创建、兼容性拒绝和单连接所有权边界。
 
 use std::{
     path::{Path, PathBuf},
@@ -162,7 +162,7 @@ fn initialize_or_validate(
         let schema_version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(|_| StoreError::IncompatibleSchema)?;
-        if schema_version != 2 {
+        if schema_version != 3 {
             return Err(StoreError::IncompatibleSchema);
         }
         let stored_machine: String = connection

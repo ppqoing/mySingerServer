@@ -3,7 +3,7 @@
 //! 类型来自已提交的 bindgen 产物；函数签名在这里显式列出，避免构建时依赖
 //! LLVM，也让实际使用的 FFmpeg API 保持在一个可审计的小集合内。
 
-use std::ffi::{c_char, c_double, c_int};
+use std::ffi::{c_char, c_double, c_int, c_void};
 
 #[allow(
     clippy::type_complexity,
@@ -18,9 +18,11 @@ pub(crate) mod bindings {
 }
 
 use bindings::{
-    AVCodec, AVCodecContext, AVCodecID, AVDictionary, AVFormatContext, AVFrame, AVInputFormat,
-    AVMediaType, AVPacket, AVPixelFormat, SwsContext,
+    AVCodec, AVCodecContext, AVCodecID, AVDictionary, AVFormatContext, AVFrame, AVIOContext,
+    AVInputFormat, AVMediaType, AVPacket, AVPixelFormat, SwsContext,
 };
+
+pub(crate) type AvformatAllocContext = unsafe extern "C" fn() -> *mut AVFormatContext;
 
 pub(crate) type AvformatOpenInput = unsafe extern "C" fn(
     *mut *mut AVFormatContext,
@@ -43,12 +45,29 @@ pub(crate) type AvformatSeekFile =
 pub(crate) type AvReadFrame = unsafe extern "C" fn(*mut AVFormatContext, *mut AVPacket) -> c_int;
 pub(crate) type AvformatCloseInput = unsafe extern "C" fn(*mut *mut AVFormatContext);
 
+pub(crate) type AvioReadPacket = unsafe extern "C" fn(*mut c_void, *mut u8, c_int) -> c_int;
+pub(crate) type AvioWritePacket = unsafe extern "C" fn(*mut c_void, *const u8, c_int) -> c_int;
+pub(crate) type AvioSeek = unsafe extern "C" fn(*mut c_void, i64, c_int) -> i64;
+pub(crate) type AvioAllocContext = unsafe extern "C" fn(
+    *mut u8,
+    c_int,
+    c_int,
+    *mut c_void,
+    Option<AvioReadPacket>,
+    Option<AvioWritePacket>,
+    Option<AvioSeek>,
+) -> *mut AVIOContext;
+pub(crate) type AvioContextFree = unsafe extern "C" fn(*mut *mut AVIOContext);
+pub(crate) type AvMalloc = unsafe extern "C" fn(usize) -> *mut c_void;
+pub(crate) type AvFree = unsafe extern "C" fn(*mut c_void);
+
 pub(crate) type AvcodecFindDecoder = unsafe extern "C" fn(AVCodecID) -> *const AVCodec;
 pub(crate) type AvcodecAllocContext3 = unsafe extern "C" fn(*const AVCodec) -> *mut AVCodecContext;
 pub(crate) type AvcodecParametersToContext =
     unsafe extern "C" fn(*mut AVCodecContext, *const bindings::AVCodecParameters) -> c_int;
 pub(crate) type AvcodecOpen2 =
     unsafe extern "C" fn(*mut AVCodecContext, *const AVCodec, *mut *mut AVDictionary) -> c_int;
+pub(crate) type AvOptSetInt = unsafe extern "C" fn(*mut c_void, *const c_char, i64, c_int) -> c_int;
 pub(crate) type AvcodecSendPacket =
     unsafe extern "C" fn(*mut AVCodecContext, *const AVPacket) -> c_int;
 pub(crate) type AvcodecReceiveFrame =
@@ -90,6 +109,16 @@ pub(crate) type SwsFreeContext = unsafe extern "C" fn(*mut SwsContext);
 pub(crate) const AVERROR_EAGAIN: c_int = -11;
 /// FFmpeg 公共 ABI 中的流结束错误值。
 pub(crate) const AVERROR_EOF: c_int = -541_478_725;
+/// FFmpeg `AVERROR(EIO)`；自定义 I/O 回调把 Rust I/O 错误映射为此值。
+pub(crate) const AVERROR_IO: c_int = -5;
+/// FFmpeg `AVERROR(EINVAL)`；自定义 I/O 回调拒绝无效指针、长度或 seek 模式。
+pub(crate) const AVERROR_INVALID: c_int = -22;
+/// 自定义 AVIO seek 回调查询输入总长度的标志。
+pub(crate) const AVSEEK_SIZE: c_int = 0x10000;
+/// 自定义 AVIO seek 回调可能附带的强制定位标志。
+pub(crate) const AVSEEK_FORCE: c_int = 0x20000;
+/// 告知 `AVFormatContext` 的 I/O 由调用方持有和释放。
+pub(crate) const AVFMT_FLAG_CUSTOM_IO: c_int = 0x0080;
 /// `sws_getContext` 的双线性缩放标志；当前只做等尺寸像素格式转换。
 pub(crate) const SWS_BILINEAR: c_int = 2;
 
@@ -99,15 +128,21 @@ pub(crate) const SWS_BILINEAR: c_int = 2;
 /// 上层不会再接触 DLL 句柄或裸符号名。
 #[derive(Clone, Copy)]
 pub(crate) struct FfmpegApi {
+    pub avformat_alloc_context: AvformatAllocContext,
     pub avformat_open_input: AvformatOpenInput,
     pub avformat_find_stream_info: AvformatFindStreamInfo,
     pub av_find_best_stream: AvFindBestStream,
     pub avformat_seek_file: AvformatSeekFile,
     pub av_read_frame: AvReadFrame,
     pub avformat_close_input: AvformatCloseInput,
+    pub avio_alloc_context: AvioAllocContext,
+    pub avio_context_free: AvioContextFree,
+    pub av_malloc: AvMalloc,
+    pub av_free: AvFree,
     pub avcodec_find_decoder: AvcodecFindDecoder,
     pub avcodec_alloc_context3: AvcodecAllocContext3,
     pub avcodec_parameters_to_context: AvcodecParametersToContext,
+    pub av_opt_set_int: AvOptSetInt,
     pub avcodec_open2: AvcodecOpen2,
     pub avcodec_send_packet: AvcodecSendPacket,
     pub avcodec_receive_frame: AvcodecReceiveFrame,

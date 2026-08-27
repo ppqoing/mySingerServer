@@ -23,8 +23,9 @@ use uuid::Uuid;
 use crate::{
     analysis::{CrossAnalysisCoordinator, CrossNodeSelection, CrossPollReport},
     central::{
-        CentralAnalysisStatus, CentralDeleteOutcome, CentralDeleteResult, CentralDeleteSelection,
-        CentralError, CentralReviewDecision, CentralStore,
+        CentralAnalysisStatus, CentralDatabaseDiagnostics, CentralDeleteOutcome,
+        CentralDeleteResult, CentralDeleteSelection, CentralError, CentralReviewDecision,
+        CentralStore, inspect_database,
     },
     delete::{DeleteConfirmation, ReviewGroup},
     node_session::NodeSession,
@@ -51,6 +52,8 @@ use crate::{
 
 const NODE_CONFIG_RECONNECT_ATTEMPTS: u64 = 3;
 const RUNTIME_TASK_REFRESH_SECONDS: u64 = 2;
+/// Node 主动运行事件桥的固定有界容量，发送方在满载时等待消费。
+const RUNTIME_EVENT_BRIDGE_CAPACITY: usize = 64;
 
 /// Slint 回调允许发送的管理命令；回调自身不执行网络或文件 IO。
 #[derive(Clone, Debug)]
@@ -224,6 +227,11 @@ pub enum UiCommand {
     },
     /// 保存完整配置；校验失败保持旧配置。
     SaveSettings(DesktopConfig),
+    /// 使用页面当前未保存的连接串测试 PostgreSQL 并读取固定表行数。
+    TestDatabaseConnection {
+        /// 由 UI 基础字段编码得到的临时连接串。
+        url: String,
+    },
     /// 有序结束后台控制循环。
     Shutdown,
 }
@@ -248,6 +256,8 @@ pub enum UiEvent {
     FileFaultsChanged(FileFaultDiagnosticsState),
     /// 运行任务摘要、选择、详情或 stale 状态已经改变。
     RuntimeTasksChanged(RuntimeTaskControllerState),
+    /// 临时数据库连接测试及固定表精确计数已经完成。
+    DatabaseDiagnosticsChanged(Result<CentralDatabaseDiagnostics, String>),
     /// 返回一页路径浏览结果。
     PathsChanged {
         /// 结果所属节点。
@@ -481,7 +491,7 @@ async fn run_controller(
     let (sync_result_sender, mut sync_results) = mpsc::unbounded_channel();
     let mut runtime_view = RuntimeTaskControllerState::default();
     let mut runtime_watchers = BTreeMap::<usize, NodeRuntimeWatcher>::new();
-    let (runtime_event_sender, mut runtime_events) = mpsc::unbounded_channel();
+    let (runtime_event_sender, mut runtime_events) = mpsc::channel(RUNTIME_EVENT_BRIDGE_CAPACITY);
     let mut cross_analysis: Option<ActiveCrossAnalysis> = None;
     let mut loaded_members: Option<LoadedMembersContext> = None;
     let mut prepared_delete: Option<PreparedDeleteContext> = None;
@@ -950,6 +960,18 @@ async fn run_controller(
                 }
                 result
             }
+            UiCommand::TestDatabaseConnection { url } => {
+                let database_events = events.clone();
+                tokio::spawn(async move {
+                    let result = inspect_database(&url)
+                        .await
+                        .map_err(|error| error.to_string());
+                    let _ = database_events
+                        .send(UiEvent::DatabaseDiagnosticsChanged(result))
+                        .await;
+                });
+                Ok(())
+            }
             UiCommand::Shutdown => {
                 let _ = events.send(UiEvent::ShutdownComplete).await;
                 break;
@@ -982,7 +1004,7 @@ fn runtime_task_interval() -> Interval {
 async fn reconcile_and_publish_runtime_tasks(
     sessions: &BTreeMap<usize, Arc<NodeSession>>,
     watchers: &mut BTreeMap<usize, NodeRuntimeWatcher>,
-    runtime_events: &mpsc::UnboundedSender<NodeRuntimeEvent>,
+    runtime_events: &mpsc::Sender<NodeRuntimeEvent>,
     view: &mut RuntimeTaskControllerState,
     registry: &DesktopRuntimeTaskRegistry,
     ui_events: &mpsc::Sender<UiEvent>,
@@ -997,7 +1019,7 @@ async fn reconcile_and_publish_runtime_tasks(
 fn reconcile_runtime_watchers(
     sessions: &BTreeMap<usize, Arc<NodeSession>>,
     watchers: &mut BTreeMap<usize, NodeRuntimeWatcher>,
-    events: &mpsc::UnboundedSender<NodeRuntimeEvent>,
+    events: &mpsc::Sender<NodeRuntimeEvent>,
     view: &mut RuntimeTaskControllerState,
 ) -> bool {
     let obsolete = watchers
@@ -1044,6 +1066,7 @@ fn reconcile_runtime_watchers(
                         machine_id: event_machine.clone(),
                         outcome,
                     })
+                    .await
                     .is_err()
                 {
                     break;
@@ -1720,8 +1743,7 @@ async fn load_file_faults(
         .get(&node_index)
         .ok_or_else(|| format!("节点 {node_index} 未连接，无法加载文件故障"))?;
     if state.file_faults().selected_node_index != Some(node_index)
-        || state.file_faults().selected_machine_id.as_deref()
-            != Some(session.machine_id().as_str())
+        || state.file_faults().selected_machine_id.as_deref() != Some(session.machine_id().as_str())
     {
         return Err("文件故障加载目标与 core 冻结节点身份不一致".into());
     }
@@ -1774,14 +1796,16 @@ async fn load_file_faults(
         selected_machine_id: Some(session.machine_id().as_str().to_owned()),
         rows,
         next_cursor: page.next_cursor,
-        cleanup_summary: page.cleanup_summary.map(|summary| DiskFullCleanupSummaryView {
-            triggered_at_unix_ms: summary.triggered_at_unix_ms,
-            deleted_files: summary.deleted_files,
-            deleted_bytes: summary.deleted_bytes,
-            skipped_active: summary.skipped_active,
-            skipped_other_disk: summary.skipped_other_disk,
-            failed_files: summary.failed_files,
-        }),
+        cleanup_summary: page
+            .cleanup_summary
+            .map(|summary| DiskFullCleanupSummaryView {
+                triggered_at_unix_ms: summary.triggered_at_unix_ms,
+                deleted_files: summary.deleted_files,
+                deleted_bytes: summary.deleted_bytes,
+                skipped_active: summary.skipped_active,
+                skipped_other_disk: summary.skipped_other_disk,
+                failed_files: summary.failed_files,
+            }),
         loading: false,
         error: None,
     };
@@ -2199,8 +2223,11 @@ async fn start_cross_analysis(
         .iter()
         .map(|selection| selection.session.machine_id().clone())
         .collect::<Vec<_>>();
-    let runtime =
-        runtime_tasks.begin_cross_analysis(run_id.as_uuid().to_string(), &machines, "跨机器分析");
+    let runtime = runtime_tasks.begin_cross_analysis(
+        run_id.as_uuid().to_string(),
+        &machines,
+        "重复文件清单（多机）",
+    );
     *current = Some(ActiveCrossAnalysis {
         coordinator,
         runtime,
@@ -2905,4 +2932,50 @@ async fn publish(events: &mpsc::Sender<UiEvent>, state: &DesktopViewState) {
     let _ = events
         .send(UiEvent::ViewChanged(Box::new(state.clone())))
         .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 构造带明确运行状态的 Node 主动事件。
+    fn runtime_event(index: usize, state: &str) -> NodeRuntimeEvent {
+        NodeRuntimeEvent {
+            node_index: index,
+            generation: Uuid::from_u128(1),
+            machine_id: "91".repeat(32),
+            outcome: NodeRuntimeEventOutcome::Changed(proto::RuntimeTaskChanged {
+                runtime_task_id: format!("task-{index}"),
+                state: state.into(),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_event_bridge_backpressures_and_keeps_terminal_event() {
+        let (sender, mut receiver) = mpsc::channel(RUNTIME_EVENT_BRIDGE_CAPACITY);
+        for index in 0..64 {
+            sender.send(runtime_event(index, "running")).await.unwrap();
+        }
+        let terminal_sender = sender.clone();
+        let pending =
+            tokio::spawn(async move { terminal_sender.send(runtime_event(64, "completed")).await });
+        tokio::task::yield_now().await;
+        assert!(
+            !pending.is_finished(),
+            "64 槽事件桥满时，终态发送必须等待消费而不是绕过背压"
+        );
+
+        let _ = receiver.recv().await.unwrap();
+        pending.await.unwrap().unwrap();
+        let mut terminal_seen = false;
+        while let Ok(event) = receiver.try_recv() {
+            terminal_seen |= matches!(
+                event.outcome,
+                NodeRuntimeEventOutcome::Changed(proto::RuntimeTaskChanged { ref state, .. })
+                    if state == "completed"
+            );
+        }
+        assert!(terminal_seen, "解除背压后终态事件必须保留在桥中");
+    }
 }

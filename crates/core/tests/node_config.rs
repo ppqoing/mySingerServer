@@ -26,8 +26,14 @@ fn defaults_match_the_approved_node_runtime_contract() {
 fn validate_rejects_each_node_runtime_boundary() {
     let cases = [
         ("port = 0", "port"),
-        ("[read]\nhdd_threads_per_disk = 0", "read.hdd_threads_per_disk"),
-        ("[read]\nssd_threads_per_disk = 0", "read.ssd_threads_per_disk"),
+        (
+            "[read]\nhdd_threads_per_disk = 0",
+            "read.hdd_threads_per_disk",
+        ),
+        (
+            "[read]\nssd_threads_per_disk = 0",
+            "read.ssd_threads_per_disk",
+        ),
         (
             "[read]\nunknown_threads_per_disk = 0",
             "read.unknown_threads_per_disk",
@@ -148,6 +154,23 @@ manual_worker_count = 3
 }
 
 #[test]
+fn manual_worker_count_cannot_expand_effective_cpu_budget() {
+    let config = NodeConfig::from_toml(
+        r#"
+[worker]
+mode = "manual"
+reserved_cores = 2
+manual_worker_count = 32
+"#,
+    )
+    .expect("手动 Worker 数量和保留核心配置均有效");
+
+    assert_eq!(config.worker.effective_worker_count(8), 32);
+    assert_eq!(config.worker.effective_cpu_budget(8), 6);
+    assert_eq!(config.worker.effective_cpu_budget(1), 1);
+}
+
+#[test]
 fn node_paths_round_trip_as_raw_strings() {
     let config = NodeConfig::from_toml(
         r#"
@@ -164,4 +187,23 @@ cache_path = "D:\\cache"
     assert_eq!(config.paths.config_path, "D:\\node-config.toml");
     assert_eq!(config.paths.log_path, "logs");
     assert_eq!(config.paths.cache_path, "D:\\cache");
+}
+
+#[test]
+fn node_postgres_defaults_disabled_and_roundtrips_password() {
+    let mut config = NodeConfig::default();
+    assert!(!config.postgres.enabled);
+
+    config.postgres.enabled = true;
+    config.postgres.host = "192.168.1.8".into();
+    config.postgres.port = 15432;
+    config.postgres.database = "media".into();
+    config.postgres.username = "dedup".into();
+    config.postgres.password = "secret".into();
+    config.postgres.connect_timeout_seconds = 7;
+
+    let decoded = NodeConfig::from_toml(&config.to_toml().unwrap()).unwrap();
+    assert_eq!(decoded, config);
+    assert_eq!(decoded.postgres.username, "dedup");
+    assert_eq!(decoded.postgres.password, "secret");
 }

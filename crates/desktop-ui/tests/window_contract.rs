@@ -1,6 +1,6 @@
 use dedup_desktop_ui::{
-    MainWindow, UiFileFaultRow, UiGroupRow, UiMemberRow, UiNodeRow, UiRuntimeFailureRow,
-    UiRuntimeStageRow, UiRuntimeWorkerRow, UiTaskRow,
+    MainWindow, UiDatabaseTableRow, UiFileFaultRow, UiGroupRow, UiMemberRow, UiNodeRow,
+    UiRuntimeFailureRow, UiRuntimeStageRow, UiRuntimeWorkerRow, UiScanRootRow, UiTaskRow,
 };
 use i_slint_backend_testing::ElementHandle;
 use slint::{
@@ -10,10 +10,24 @@ use slint::{
 use std::{cell::Cell, cell::RefCell, rc::Rc};
 
 #[test]
+fn scan_defaults_to_everything_enumerator() {
+    i_slint_backend_testing::init_no_event_loop();
+    let window = MainWindow::new().expect("应能构造真实 MainWindow");
+
+    assert_eq!(
+        window.get_enumerator_index(),
+        1,
+        "新建扫描必须默认选择 Everything",
+    );
+}
+
+#[test]
 fn file_faults_diagnostics_show_only_approved_fields_and_disable_offline_actions() {
     i_slint_backend_testing::init_no_event_loop();
     let window = MainWindow::new().expect("应能构造真实 MainWindow");
-    window.window().set_size(slint::PhysicalSize::new(1080, 700));
+    window
+        .window()
+        .set_size(slint::PhysicalSize::new(1080, 700));
     window.set_node_config_options(ModelRc::new(VecModel::from(vec![
         "本机节点 · machine-online · 127.0.0.1:39091 · 在线".into(),
         "离线节点 · machine-offline · 10.0.0.9:39091 · 离线".into(),
@@ -52,15 +66,23 @@ fn file_faults_diagnostics_show_only_approved_fields_and_disable_offline_actions
     accessible(&window, "诊断内容滚动区").scroll(0.0, -10000.0);
     slint::platform::update_timers_and_animations();
 
-    assert_eq!(accessible(&window, "加载文件故障").accessible_enabled(), Some(true));
-    assert_eq!(accessible(&window, "加载下一页").accessible_enabled(), Some(true));
+    assert_eq!(
+        accessible(&window, "加载文件故障").accessible_enabled(),
+        Some(true)
+    );
+    assert_eq!(
+        accessible(&window, "加载下一页").accessible_enabled(),
+        Some(true)
+    );
     for label in [
         "故障：疑似物理读取故障：D:\\Media\\broken.mp4",
         "故障：Worker 崩溃：D:\\Media\\crash.mp4",
         "最近磁盘满清理：1970-01-01 00:00:01 · 删除 3 个 / 8.00 KiB · 活动跳过 1 · 异盘跳过 2 · 失败 0",
     ] {
         assert!(
-            ElementHandle::find_by_accessible_label(&window, label).next().is_some(),
+            ElementHandle::find_by_accessible_label(&window, label)
+                .next()
+                .is_some(),
             "诊断页必须展示 {label}"
         );
     }
@@ -76,7 +98,9 @@ fn file_faults_diagnostics_show_only_approved_fields_and_disable_offline_actions
         "重复发生次数",
     ] {
         assert!(
-            ElementHandle::find_by_accessible_label(&window, forbidden).next().is_none(),
+            ElementHandle::find_by_accessible_label(&window, forbidden)
+                .next()
+                .is_none(),
             "未经批准的诊断字段不得出现：{forbidden}"
         );
     }
@@ -84,7 +108,10 @@ fn file_faults_diagnostics_show_only_approved_fields_and_disable_offline_actions
     window.set_file_fault_node_online(false);
     window.set_file_fault_selected_node(1);
     assert_eq!(window.get_file_fault_selected_node(), 1);
-    assert_eq!(accessible(&window, "加载文件故障").accessible_enabled(), Some(false));
+    assert_eq!(
+        accessible(&window, "加载文件故障").accessible_enabled(),
+        Some(false)
+    );
     assert_eq!(
         accessible(&window, "清除故障：d:\\media\\broken.mp4：疑似物理读取故障")
             .accessible_enabled(),
@@ -130,6 +157,17 @@ fn remote_node_config_form_exposes_identity_actions_and_mode_gates() {
             .count(),
         1,
         "Node 配置只能有一个保存并重启动作",
+    );
+    window.set_node_config_phase("保存失败".into());
+    window.set_node_config_error("替代 Node 启动失败：拒绝访问 (os error 5)".into());
+    assert!(
+        ElementHandle::find_by_accessible_label(
+            &window,
+            "Node 配置错误：替代 Node 启动失败：拒绝访问 (os error 5)",
+        )
+        .next()
+        .is_some(),
+        "保存失败时必须在节点服务页直接显示完整错误，不能只显示笼统阶段",
     );
     assert!(
         ElementHandle::find_by_accessible_label(&window, "节点服务配置（当前版本未提供）")
@@ -398,7 +436,7 @@ fn main_window_exposes_concept_defaults_and_generated_api() {
     assert_eq!(window.get_new_node_ip(), "127.0.0.1");
     assert_eq!(window.get_new_node_port(), 39091);
     assert_eq!(window.get_scan_root(), "D:\\Media");
-    assert_eq!(window.get_enumerator_index(), 0);
+    assert_eq!(window.get_enumerator_index(), 1);
     assert_eq!(window.get_delete_mode(), "回收站");
 
     window.set_current_page(3);
@@ -424,6 +462,7 @@ fn navigation_actions_preserve_page_mapping() {
         (2, 4, 1, 1), // 重复文件
         (6, 5, 1, 1), // 审核删除
         (7, 6, 1, 1), // 设置
+        (8, 7, 1, 1), // 数据库
     ];
     for (current_page, active_nav, overview_mode, task_mode) in expected {
         window.invoke_navigate_to(active_nav);
@@ -458,6 +497,7 @@ fn navigation_actions_preserve_page_mapping() {
         "任务",
         "重复文件",
         "审核删除",
+        "数据库",
         "设置",
     ];
     for label in labels {
@@ -497,6 +537,45 @@ fn navigation_actions_preserve_page_mapping() {
 }
 
 #[test]
+fn database_page_exposes_actions_table_rows_and_overview_health() {
+    i_slint_backend_testing::init_no_event_loop();
+
+    let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    window.set_postgres_status("PostgreSQL V2 schema 正常".into());
+    window.set_postgres_color(Color::from_rgb_u8(34, 197, 94));
+    window.set_database_test_status("连接成功 · 1 / 1 张表正常".into());
+    window.set_database_tables(ModelRc::new(VecModel::from(vec![UiDatabaseTableRow {
+        name: "contents".into(),
+        status: "正常".into(),
+        status_color: Color::from_rgb_u8(34, 197, 94),
+        row_count: "42".into(),
+    }])));
+    let test_count = Rc::new(Cell::new(0));
+    window.on_test_database_connection({
+        let test_count = test_count.clone();
+        move || test_count.set(test_count.get() + 1)
+    });
+    let save_count = Rc::new(Cell::new(0));
+    window.on_save_settings({
+        let save_count = save_count.clone();
+        move || save_count.set(save_count.get() + 1)
+    });
+
+    window.invoke_navigate_to(7);
+
+    assert_eq!((window.get_current_page(), window.get_active_nav()), (8, 7));
+    accessible(&window, "测试数据库连接").invoke_accessible_default_action();
+    accessible(&window, "保存数据库设置").invoke_accessible_default_action();
+    assert_eq!(test_count.get(), 1);
+    assert_eq!(save_count.get(), 1);
+    accessible(&window, "数据库页面");
+    accessible(&window, "数据库表：contents；正常；42 行");
+
+    window.invoke_navigate_to(0);
+    accessible(&window, "数据库状态：PostgreSQL V2 schema 正常");
+}
+
+#[test]
 fn shell_exposes_menu_search_and_one_refresh_action() {
     i_slint_backend_testing::init_no_event_loop();
 
@@ -518,6 +597,53 @@ fn shell_exposes_menu_search_and_one_refresh_action() {
 }
 
 #[test]
+fn application_menu_collapses_and_expands_sidebar_without_navigation() {
+    i_slint_backend_testing::init_no_event_loop();
+
+    let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    window
+        .window()
+        .set_size(slint::PhysicalSize::new(1440, 900));
+    let original_nav = window.get_active_nav();
+
+    let expanded = accessible(&window, "应用侧栏：已展开");
+    assert_eq!(expanded.size().width, 144.0);
+    let menu = accessible(&window, "应用菜单");
+    menu.invoke_accessible_default_action();
+
+    let collapsed = accessible(&window, "应用侧栏：已收起");
+    assert_eq!(collapsed.size().width, 64.0);
+    assert!(
+        accessible(&window, "总览").size().width <= 44.0,
+        "收起态导航项应只保留居中的图标列",
+    );
+    let menu_icon = accessible(&window, "应用菜单图标");
+    let overview_icon = accessible(&window, "导航图标：总览");
+    let center_x =
+        |element: &ElementHandle| element.absolute_position().x + element.size().width / 2.0;
+    assert!(
+        (center_x(&menu_icon) - center_x(&overview_icon)).abs() <= 1.0,
+        "收起态菜单图标与导航图标必须位于同一竖直中心轴",
+    );
+    let search = accessible(&window, "本地搜索");
+    assert!(
+        search.absolute_position().x >= 64.0
+            && search.absolute_position().x + search.size().width <= 1440.0,
+        "侧栏收起后顶栏必须重新占用释放的宽度",
+    );
+    assert_eq!(
+        window.get_active_nav(),
+        original_nav,
+        "应用菜单不得触发业务导航",
+    );
+
+    click_element_center(&window, &menu);
+    let expanded_again = accessible(&window, "应用侧栏：已展开");
+    assert_eq!(expanded_again.size().width, 144.0);
+    assert_eq!(window.get_active_nav(), original_nav);
+}
+
+#[test]
 fn settings_sections_preserve_real_values_and_save_once() {
     i_slint_backend_testing::init_no_event_loop();
 
@@ -525,7 +651,11 @@ fn settings_sections_preserve_real_values_and_save_once() {
     window
         .window()
         .set_size(slint::PhysicalSize::new(1440, 900));
-    window.set_postgres_url("postgresql://fixture@db.internal:5432/dedup".into());
+    window.set_postgres_host("db.internal".into());
+    window.set_postgres_port(5432);
+    window.set_postgres_database("dedup".into());
+    window.set_postgres_username("fixture".into());
+    window.set_postgres_password("secret".into());
     window.set_reconnect_seconds(17);
     window.set_delete_mode_index(1);
     window.set_pdq_quality("61".into());
@@ -548,10 +678,11 @@ fn settings_sections_preserve_real_values_and_save_once() {
     assert_eq!(window.get_current_page(), 7);
 
     let expected_values = || {
-        assert_eq!(
-            window.get_postgres_url(),
-            "postgresql://fixture@db.internal:5432/dedup"
-        );
+        assert_eq!(window.get_postgres_host(), "db.internal");
+        assert_eq!(window.get_postgres_port(), 5432);
+        assert_eq!(window.get_postgres_database(), "dedup");
+        assert_eq!(window.get_postgres_username(), "fixture");
+        assert_eq!(window.get_postgres_password(), "secret");
         assert_eq!(window.get_reconnect_seconds(), 17);
         assert_eq!(window.get_delete_mode_index(), 1);
         assert_eq!(window.get_pdq_quality(), "61");
@@ -566,12 +697,12 @@ fn settings_sections_preserve_real_values_and_save_once() {
     };
     for (section, label) in [
         (0, "常规"),
-        (1, "相似度算法"),
-        (2, "存储"),
-        (3, "节点服务"),
-        (4, "扫描与性能"),
-        (5, "外部工具"),
-        (6, "日志与诊断"),
+        (2, "相似度算法"),
+        (3, "存储"),
+        (4, "节点服务"),
+        (5, "扫描与性能"),
+        (6, "外部工具"),
+        (7, "日志与诊断"),
     ] {
         accessible(&window, label).invoke_accessible_default_action();
         assert_eq!(
@@ -586,14 +717,14 @@ fn settings_sections_preserve_real_values_and_save_once() {
     accessible(&window, "关于 Slint").invoke_accessible_default_action();
     assert_eq!(
         window.get_settings_section(),
-        1,
+        2,
         "关于 Slint 只能切换视觉面板，不得改变当前设置分区"
     );
     expected_values();
     accessible(&window, "返回设置").invoke_accessible_default_action();
     assert_eq!(
         window.get_settings_section(),
-        1,
+        2,
         "返回设置也不得重置当前分区"
     );
     expected_values();
@@ -613,8 +744,15 @@ fn settings_sections_preserve_real_values_and_save_once() {
         );
     }
 
+    accessible(&window, "节点服务").invoke_accessible_default_action();
+    assert!(
+        ElementHandle::find_by_accessible_label(&window, "远程节点选择")
+            .next()
+            .is_some(),
+        "节点服务分区索引调整后仍必须显示真实远程配置表单"
+    );
+
     for (section, control) in [
-        ("节点服务", "节点服务配置（当前版本未提供）"),
         ("扫描与性能", "扫描性能配置（当前版本未提供）"),
         ("外部工具", "外部工具配置（当前版本未提供）"),
     ] {
@@ -638,12 +776,6 @@ fn settings_sections_preserve_real_values_and_save_once() {
             "诊断分区必须显示真实状态：{label}"
         );
     }
-    assert_eq!(
-        accessible(&window, "日志筛选（当前版本未提供）").accessible_enabled(),
-        Some(false),
-        "日志诊断占位能力必须明确禁用"
-    );
-
     let saves = Rc::new(Cell::new(0));
     window.on_save_settings({
         let saves = saves.clone();
@@ -704,6 +836,49 @@ fn overview_and_nodes_consume_real_models() {
             .is_some(),
         "节点详情必须通过完整可访问文本表达连接错误，不能只使用颜色",
     );
+}
+
+#[test]
+fn scan_and_node_management_display_machine_unique_ids() {
+    i_slint_backend_testing::init_no_event_loop();
+
+    let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    window
+        .window()
+        .set_size(slint::PhysicalSize::new(1440, 900));
+    install_overview_fixture(&window);
+    window.set_scan_node_options(ModelRc::new(VecModel::from(vec![
+        "machine-local · 本机节点 · 127.0.0.1:39091".into(),
+        "machine-remote · 远程节点 · 10.0.0.8:39092".into(),
+    ])));
+
+    window.invoke_navigate_to(2);
+    let selector = accessible(&window, "扫描节点选择");
+    assert_eq!(
+        selector.accessible_value().as_deref(),
+        Some("machine-local · 本机节点 · 127.0.0.1:39091"),
+        "扫描节点选择框必须直接显示对应机器唯一 ID",
+    );
+    window.set_scan_node_index(1);
+    assert_eq!(
+        selector.accessible_value().as_deref(),
+        Some("machine-remote · 远程节点 · 10.0.0.8:39092"),
+        "切换后必须显示新节点的机器唯一 ID",
+    );
+
+    window.invoke_navigate_to(1);
+    for label in [
+        "节点机器 ID：machine-local",
+        "节点机器 ID：machine-remote",
+        "节点详情机器 ID：machine-local",
+    ] {
+        assert!(
+            ElementHandle::find_by_accessible_label(&window, label)
+                .next()
+                .is_some(),
+            "节点管理页必须显示机器唯一 ID：{label}",
+        );
+    }
 }
 
 #[test]
@@ -803,6 +978,9 @@ fn scan_start_forwards_four_arguments_in_order() {
     window.invoke_navigate_to(2);
     window.set_scan_node_index(7);
     window.set_scan_root("D:\\fixture".into());
+    window.set_scan_roots(ModelRc::new(VecModel::from(vec![UiScanRootRow {
+        path: "D:\\fixture".into(),
+    }])));
     window.set_force_recalculate(true);
     window.set_enumerator_index(1);
     window.set_analysis_kind_index(2);
@@ -810,16 +988,24 @@ fn scan_start_forwards_four_arguments_in_order() {
     let captured = Rc::new(RefCell::new(None));
     window.on_start_scan({
         let captured = captured.clone();
-        move |node_index, path, force, enumerator| {
-            *captured.borrow_mut() = Some((node_index, path.to_string(), force, enumerator));
+        move |node_index, roots, force, enumerator| {
+            *captured.borrow_mut() = Some((
+                node_index,
+                (0..roots.row_count())
+                    .filter_map(|index| roots.row_data(index))
+                    .map(|row| row.path.to_string())
+                    .collect::<Vec<_>>(),
+                force,
+                enumerator,
+            ));
         }
     });
     accessible(&window, "开始扫描").invoke_accessible_default_action();
 
     assert_eq!(
         captured.borrow().as_ref(),
-        Some(&(7, String::from("D:\\fixture"), true, 1)),
-        "扫描动作必须保持 node_index、path、force、enumerator 的原有顺序，且不混入分析类型",
+        Some(&(7, vec![String::from("D:\\fixture")], true, 1)),
+        "扫描动作必须保持 node_index、roots、force、enumerator 的顺序，且不混入分析类型",
     );
 
     window.invoke_navigate_to(3);
@@ -842,6 +1028,9 @@ fn scan_browse_and_local_analysis_forward_only_existing_arguments() {
     window.invoke_navigate_to(2);
     window.set_scan_node_index(7);
     window.set_scan_root("D:\\fixture".into());
+    window.set_scan_roots(ModelRc::new(VecModel::from(vec![UiScanRootRow {
+        path: "D:\\fixture".into(),
+    }])));
     window.set_filtering_enabled(true);
     window.set_analysis_task_ids("scan-a,scan-b".into());
     window.set_analysis_kind_index(2);
@@ -861,7 +1050,7 @@ fn scan_browse_and_local_analysis_forward_only_existing_arguments() {
         }
     });
 
-    accessible(&window, "浏览节点路径").invoke_accessible_default_action();
+    accessible(&window, "选择扫描路径：1").invoke_accessible_default_action();
     accessible(&window, "开始本地分析").invoke_accessible_default_action();
 
     assert_eq!(
@@ -1085,6 +1274,10 @@ fn runtime_task_details_select_once_and_show_stages_workers_failures_and_stale_s
     window.set_runtime_detail_machine_id("machine-runtime-very-long-001".into());
     window.set_runtime_detail_state("运行中".into());
     window.set_runtime_detail_counts("7 / 20 · 失败 0 · 跳过 1".into());
+    window.set_runtime_execution_config("Hash 并发 4 · Worker 2 · CPU权重 4".into());
+    window.set_runtime_pipeline_metrics(
+        "队列：Hash队列 当前 0 / 峰值 2 / 容量 4；等待 —；耗时 —\nI/O：Hash IO 当前 1 / 峰值 2 / 容量 4；等待 —；耗时 —\nHash / media：Hash等待许可 当前 1 / 峰值 2 / 容量 4\nWorker phase：Worker解码 当前 1 / 峰值 2 / 容量 4\ncredit：decode credit 当前 1 / 峰值 2 / 容量 4\n吞吐 / item P95：Hash字节 4.0 KiB · 媒体吞吐 — · item P95 42ms".into(),
+    );
     window.set_runtime_detail_stale(true);
     window.set_runtime_detail_error("".into());
     window.set_runtime_stages(ModelRc::new(VecModel::from(vec![
@@ -1119,10 +1312,15 @@ fn runtime_task_details_select_once_and_show_stages_workers_failures_and_stale_s
         slot: 2,
         identity: "PID 4812 · 槽位 2".into(),
         stage_id: "probe_stage1".into(),
+        step: "生成缩略图".into(),
+        cache_detail: "复用本地缩略图".into(),
         path: r"D:\Media\very-long-directory\nested\clip-001.mp4".into(),
         disk: "PhysicalDisk 1".into(),
         completed: "12 个文件".into(),
         speed: "3.5 文件/秒".into(),
+        phase: "特征计算".into(),
+        cpu_weight: "2".into(),
+        decoder_threads: "2".into(),
     }])));
     let failures = (0..21)
         .map(|index| UiRuntimeFailureRow {
@@ -1156,6 +1354,15 @@ fn runtime_task_details_select_once_and_show_stages_workers_failures_and_stale_s
     accessible(&window, "任务列表区域");
     accessible(&window, "运行详情区域");
     accessible(&window, "数据已过期");
+    accessible(&window, "实际执行配置：Hash 并发 4 · Worker 2 · CPU权重 4");
+    accessible(
+        &window,
+        "流水线指标：队列：Hash队列 当前 0 / 峰值 2 / 容量 4；等待 —；耗时 —\nI/O：Hash IO 当前 1 / 峰值 2 / 容量 4；等待 —；耗时 —\nHash / media：Hash等待许可 当前 1 / 峰值 2 / 容量 4\nWorker phase：Worker解码 当前 1 / 峰值 2 / 容量 4\ncredit：decode credit 当前 1 / 峰值 2 / 容量 4\n吞吐 / item P95：Hash字节 4.0 KiB · 媒体吞吐 — · item P95 42ms",
+    );
+    accessible(
+        &window,
+        "流水线指标内容：队列：Hash队列 当前 0 / 峰值 2 / 容量 4；等待 —；耗时 —\nI/O：Hash IO 当前 1 / 峰值 2 / 容量 4；等待 —；耗时 —\nHash / media：Hash等待许可 当前 1 / 峰值 2 / 容量 4\nWorker phase：Worker解码 当前 1 / 峰值 2 / 容量 4\ncredit：decode credit 当前 1 / 峰值 2 / 容量 4\n吞吐 / item P95：Hash字节 4.0 KiB · 媒体吞吐 — · item P95 42ms",
+    );
     accessible(
         &window,
         "阶段：读取文件；运行中；7 / 20；2.0 KiB/s；耗时 2.5 秒；ETA —；失败 0 · 跳过 0",
@@ -1164,11 +1371,33 @@ fn runtime_task_details_select_once_and_show_stages_workers_failures_and_stale_s
         &window,
         "阶段：媒体探测与一筛；运行中；5 / 20；3.5 文件/秒；耗时 1.8 秒；ETA 4.2 秒；失败 1 · 跳过 0",
     );
-    accessible(
-        &window,
-        r"Worker：PID 4812 · 槽位 2；阶段 probe_stage1；路径 D:\Media\very-long-directory\nested\clip-001.mp4；磁盘 PhysicalDisk 1；12 个文件；3.5 文件/秒",
-    );
-    accessible(&window, "最近失败：20 条");
+    let detail_scroll = accessible(&window, "运行详情滚动区");
+    let worker_label = r"Worker：PID 4812 · 槽位 2；阶段 probe_stage1；步骤 生成缩略图；缓存 复用本地缩略图；路径 D:\Media\very-long-directory\nested\clip-001.mp4；磁盘 PhysicalDisk 1；阶段身份 特征计算；CPU权重 2；解码线程 2；12 个文件；3.5 文件/秒";
+    let mut worker_visible = false;
+    for _ in 0..20 {
+        worker_visible = ElementHandle::find_by_accessible_label(&window, worker_label)
+            .next()
+            .is_some();
+        if worker_visible {
+            break;
+        }
+        detail_scroll.scroll(0.0, -120.0);
+        i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(200));
+    }
+    assert!(worker_visible, "详情滚动区必须能到达 Worker 遥测行");
+    let mut failures_visible = false;
+    for _ in 0..20 {
+        failures_visible = ElementHandle::find_by_accessible_label(&window, "最近失败：20 条")
+            .next()
+            .is_some();
+        if failures_visible {
+            break;
+        }
+        detail_scroll.scroll(0.0, -120.0);
+        // 测试后端使用模拟时钟，推进 180ms 平滑滚动后再读取失败列表标题。
+        i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(200));
+    }
+    assert!(failures_visible, "详情滚动区必须能到达最近失败列表");
     assert!(
         ElementHandle::find_by_accessible_label(
             &window,

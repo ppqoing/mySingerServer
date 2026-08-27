@@ -8,7 +8,7 @@ use dedup_core::{
 };
 use dedup_media::{ImageStage1, ImageStage2, PdqHash};
 
-use crate::analysis::CrossFeatureSet;
+use crate::CrossFeatureSet;
 
 use super::{
     CentralAnalysisInput, CentralAnalysisNode, CentralAnalysisStatus, CentralCandidate,

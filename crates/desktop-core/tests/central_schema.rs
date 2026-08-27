@@ -1,4 +1,6 @@
-use dedup_desktop_core::central::{CENTRAL_SCHEMA_SCRIPT, CentralError, CentralStore};
+use dedup_desktop_core::central::{
+    CENTRAL_SCHEMA_ID, CENTRAL_SCHEMA_SCRIPT, CentralError, CentralStore,
+};
 
 const SCHEMA: &str = include_str!("../../../deploy/central-v2.sql");
 
@@ -17,8 +19,10 @@ fn manual_schema_has_all_fixed_tables_and_no_implicit_migration_syntax() {
         "video_frame_stage2",
         "deletion_tombstones",
         "analysis_runs",
+        "analysis_run_stages",
         "analysis_run_nodes",
         "analysis_run_inputs",
+        "analysis_stage2_dispatches",
         "candidate_pairs",
         "duplicate_groups",
         "group_members",
@@ -41,6 +45,7 @@ fn manual_schema_has_all_fixed_tables_and_no_implicit_migration_syntax() {
     assert!(SCHEMA.contains("CHECK(left_md5 < right_md5 OR"));
     assert!(!SCHEMA.contains("contact_sheets"));
     assert_eq!(CENTRAL_SCHEMA_SCRIPT, "schema/central-v2.sql");
+    assert!(SCHEMA.contains(CENTRAL_SCHEMA_ID));
 }
 
 #[tokio::test]

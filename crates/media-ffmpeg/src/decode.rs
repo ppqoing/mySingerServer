@@ -1,7 +1,9 @@
 //! 将 FFmpeg 裸资源约束在短生命周期会话中的探测与 RGB24 解码。
 
 use std::{
-    ffi::{CStr, CString},
+    ffi::{CStr, CString, c_void},
+    io::{self, SeekFrom},
+    panic::{AssertUnwindSafe, catch_unwind},
     path::Path,
     ptr,
 };
@@ -10,10 +12,12 @@ use dedup_core::MediaKind;
 
 use crate::{
     ffi::{
-        AVERROR_EAGAIN, AVERROR_EOF, FfmpegApi, SWS_BILINEAR,
+        AVERROR_EAGAIN, AVERROR_EOF, AVERROR_INVALID, AVERROR_IO, AVFMT_FLAG_CUSTOM_IO,
+        AVSEEK_FORCE, AVSEEK_SIZE, AvOptSetInt, AvcodecOpen2, FfmpegApi, SWS_BILINEAR,
         bindings::{
-            AV_TIME_BASE, AVFormatContext, AVFrame, AVMediaType_AVMEDIA_TYPE_VIDEO, AVPacket,
-            AVPixelFormat_AV_PIX_FMT_RGB24, AVSEEK_FLAG_BACKWARD,
+            AV_TIME_BASE, AVCodec, AVCodecContext, AVFormatContext, AVFrame, AVIOContext,
+            AVMediaType_AVMEDIA_TYPE_VIDEO, AVPacket, AVPixelFormat_AV_PIX_FMT_RGB24,
+            AVSEEK_FLAG_BACKWARD,
         },
     },
     loader::{Ffmpeg, FfmpegError},
@@ -43,27 +47,49 @@ pub struct DecodedFrame {
     pub rgb24: Vec<u8>,
 }
 
+/// FFmpeg 自定义 AVIO 使用的可读、可定位媒体来源。
+///
+/// 实现负责在 `read` 和 `seek` 内完成自身的超时、重试与取消处理；FFmpeg 只看到
+/// 同一个逻辑字节流，不再根据路径重新打开文件。
+pub trait SeekableMediaSource {
+    /// 从当前位置读取数据并推进来源游标。
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize>;
+    /// 按标准文件语义移动来源游标并返回新位置。
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64>;
+    /// 返回当前来源的固定字节长度。
+    fn len(&self) -> u64;
+
+    /// 返回来源是否为空。
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 impl Ffmpeg {
     /// 打开媒体并返回类型、尺寸与视频时长，不生成缩略图。
     pub fn probe_media(&self, path: &Path) -> Result<MediaProbe, FfmpegError> {
-        let session = DecoderSession::open(&self.api, path)?;
-        let (width, height) = session.dimensions()?;
-        let duration = session.duration();
-        // image2 会为单张图片填入一个帧周期的伪时长，媒体类型必须先看实际
-        // 解复用器，不能把所有正 duration 都当作视频。
-        let duration_ms = (duration > 0 && !session.is_still_image_demuxer()).then(|| {
-            ((duration as u128 * 1_000) / AV_TIME_BASE as u128).min(u64::MAX as u128) as u64
-        });
-        Ok(MediaProbe {
-            media_kind: if duration_ms.is_some() {
-                MediaKind::Video
-            } else {
-                MediaKind::Image
-            },
-            width,
-            height,
-            duration_ms,
-        })
+        probe_session(DecoderSession::open_path(&self.api, path, 1)?)
+    }
+
+    /// 从调用方持有的同一可定位来源探测媒体，不接收或重新打开文件路径。
+    pub fn probe_source(
+        &self,
+        source: &mut dyn SeekableMediaSource,
+    ) -> Result<MediaProbe, FfmpegError> {
+        self.probe_source_with_threads(source, 1)
+    }
+
+    /// 使用调用方给定的线程预算从同一可定位来源探测媒体。
+    pub fn probe_source_with_threads(
+        &self,
+        source: &mut dyn SeekableMediaSource,
+        decoder_threads: u32,
+    ) -> Result<MediaProbe, FfmpegError> {
+        probe_session(DecoderSession::open_source(
+            &self.api,
+            source,
+            decoder_threads,
+        )?)
     }
 
     /// 在归一化时间位置解码一帧，并转换为紧凑 RGB24。
@@ -72,38 +98,159 @@ impl Ffmpeg {
         path: &Path,
         normalized_position: f64,
     ) -> Result<DecodedFrame, FfmpegError> {
-        if !normalized_position.is_finite() || !(0.0..=1.0).contains(&normalized_position) {
-            return Err(FfmpegError::InvalidPosition(normalized_position));
-        }
-        let mut session = DecoderSession::open(&self.api, path)?;
+        validate_position(normalized_position)?;
+        let mut session = DecoderSession::open_path(&self.api, path, 1)?;
+        let target_timestamp = session.seek(normalized_position)?;
+        session.decode_one(target_timestamp)
+    }
+
+    /// 从调用方持有的同一可定位来源解码归一化时间位置的一帧。
+    pub fn decode_frame_from_source(
+        &self,
+        source: &mut dyn SeekableMediaSource,
+        normalized_position: f64,
+    ) -> Result<DecodedFrame, FfmpegError> {
+        self.decode_frame_from_source_with_threads(source, normalized_position, 1)
+    }
+
+    /// 使用调用方给定的线程预算从同一可定位来源解码一帧。
+    pub fn decode_frame_from_source_with_threads(
+        &self,
+        source: &mut dyn SeekableMediaSource,
+        normalized_position: f64,
+        decoder_threads: u32,
+    ) -> Result<DecodedFrame, FfmpegError> {
+        validate_position(normalized_position)?;
+        let mut session = DecoderSession::open_source(&self.api, source, decoder_threads)?;
         let target_timestamp = session.seek(normalized_position)?;
         session.decode_one(target_timestamp)
     }
 }
 
+fn probe_session(session: DecoderSession<'_, '_>) -> Result<MediaProbe, FfmpegError> {
+    let (width, height) = session.dimensions()?;
+    let duration = session.duration();
+    // image2 会为单张图片填入一个帧周期的伪时长，媒体类型必须先看实际
+    // 解复用器，不能把所有正 duration 都当作视频。
+    let duration_ms = (duration > 0 && !session.is_still_image_demuxer())
+        .then(|| ((duration as u128 * 1_000) / AV_TIME_BASE as u128).min(u64::MAX as u128) as u64);
+    Ok(MediaProbe {
+        media_kind: if duration_ms.is_some() {
+            MediaKind::Video
+        } else {
+            MediaKind::Image
+        },
+        width,
+        height,
+        duration_ms,
+    })
+}
+
+fn validate_position(normalized_position: f64) -> Result<(), FfmpegError> {
+    if !normalized_position.is_finite() || !(0.0..=1.0).contains(&normalized_position) {
+        Err(FfmpegError::InvalidPosition(normalized_position))
+    } else {
+        Ok(())
+    }
+}
+
+/// 在 FFmpeg 回调期间固定持有借用的 Rust 媒体来源。
+struct SourceBridge<'source> {
+    source: &'source mut (dyn SeekableMediaSource + 'source),
+}
+
+const AVIO_BUFFER_SIZE: usize = 32 * 1024;
+
+/// 把 FFmpeg 顺序读取请求转交给 Worker 持有的 Rust 文件会话。
+unsafe extern "C" fn read_source_callback(
+    opaque: *mut c_void,
+    buffer: *mut u8,
+    buffer_size: i32,
+) -> i32 {
+    if opaque.is_null() || buffer.is_null() || buffer_size <= 0 {
+        return AVERROR_INVALID;
+    }
+    catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: opaque 指向 DecoderSession 持有的 SourceBridge；回调只在该会话内执行。
+        let bridge = unsafe { &mut *opaque.cast::<SourceBridge<'static>>() };
+        // SAFETY: FFmpeg 保证可写缓冲区至少有 buffer_size 字节且只在本次回调使用。
+        let output = unsafe { std::slice::from_raw_parts_mut(buffer, buffer_size as usize) };
+        match bridge.source.read(output) {
+            Ok(0) => AVERROR_EOF,
+            Ok(read) => i32::try_from(read).unwrap_or(AVERROR_INVALID),
+            Err(_) => AVERROR_IO,
+        }
+    }))
+    .unwrap_or(AVERROR_IO)
+}
+
+/// 把 FFmpeg 定位和长度查询请求转交给同一个 Rust 文件会话。
+unsafe extern "C" fn seek_source_callback(opaque: *mut c_void, offset: i64, whence: i32) -> i64 {
+    if opaque.is_null() {
+        return i64::from(AVERROR_INVALID);
+    }
+    catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: opaque 指向 DecoderSession 持有的 SourceBridge；回调只在该会话内执行。
+        let bridge = unsafe { &mut *opaque.cast::<SourceBridge<'static>>() };
+        if whence & AVSEEK_SIZE != 0 {
+            return i64::try_from(bridge.source.len()).unwrap_or(i64::from(AVERROR_INVALID));
+        }
+        let mode = whence & !AVSEEK_FORCE;
+        let position = match mode {
+            0 => match u64::try_from(offset) {
+                Ok(offset) => SeekFrom::Start(offset),
+                Err(_) => return i64::from(AVERROR_INVALID),
+            },
+            1 => SeekFrom::Current(offset),
+            2 => SeekFrom::End(offset),
+            _ => return i64::from(AVERROR_INVALID),
+        };
+        match bridge.source.seek(position) {
+            Ok(position) => i64::try_from(position).unwrap_or(i64::from(AVERROR_INVALID)),
+            Err(_) => i64::from(AVERROR_IO),
+        }
+    }))
+    .unwrap_or(i64::from(AVERROR_IO))
+}
+
 /// 一次媒体打开对应一个会话，所有 FFmpeg 分配对象都在 Drop 中成对释放。
-struct DecoderSession<'api> {
+struct DecoderSession<'api, 'source> {
     api: &'api FfmpegApi,
     format: *mut AVFormatContext,
+    avio: *mut AVIOContext,
+    orphan_avio_buffer: *mut u8,
+    source: Option<Box<SourceBridge<'source>>>,
     codec: *mut crate::ffi::bindings::AVCodecContext,
     packet: *mut AVPacket,
     frame: *mut AVFrame,
     stream_index: i32,
 }
 
-impl<'api> DecoderSession<'api> {
-    fn open(api: &'api FfmpegApi, path: &Path) -> Result<Self, FfmpegError> {
-        let path_text = path.to_string_lossy();
-        let url = CString::new(path_text.as_bytes())
-            .map_err(|_| FfmpegError::PathContainsNul(path.to_path_buf()))?;
-        let mut session = Self {
+impl<'api, 'source> DecoderSession<'api, 'source> {
+    fn empty(api: &'api FfmpegApi) -> Self {
+        Self {
             api,
             format: ptr::null_mut(),
+            avio: ptr::null_mut(),
+            orphan_avio_buffer: ptr::null_mut(),
+            source: None,
             codec: ptr::null_mut(),
             packet: ptr::null_mut(),
             frame: ptr::null_mut(),
             stream_index: -1,
-        };
+        }
+    }
+
+    fn open_path(
+        api: &'api FfmpegApi,
+        path: &Path,
+        decoder_threads: u32,
+    ) -> Result<Self, FfmpegError> {
+        validate_decoder_threads(decoder_threads)?;
+        let path_text = path.to_string_lossy();
+        let url = CString::new(path_text.as_bytes())
+            .map_err(|_| FfmpegError::PathContainsNul(path.to_path_buf()))?;
+        let mut session = Self::empty(api);
 
         // SAFETY: 输出指针属于 session；其余可选参数按 FFmpeg API 允许传空。
         check("avformat_open_input", unsafe {
@@ -114,14 +261,77 @@ impl<'api> DecoderSession<'api> {
                 ptr::null_mut(),
             )
         })?;
+        session.initialize(decoder_threads)
+    }
+
+    fn open_source(
+        api: &'api FfmpegApi,
+        source: &'source mut (dyn SeekableMediaSource + 'source),
+        decoder_threads: u32,
+    ) -> Result<Self, FfmpegError> {
+        validate_decoder_threads(decoder_threads)?;
+        source
+            .seek(SeekFrom::Start(0))
+            .map_err(FfmpegError::Source)?;
+        let mut session = Self::empty(api);
+        session.source = Some(Box::new(SourceBridge { source }));
+        // SAFETY: 无输入参数的 FFmpeg format 分配函数。
+        session.format = unsafe { (api.avformat_alloc_context)() };
+        if session.format.is_null() {
+            return Err(FfmpegError::InvalidMedia("cannot allocate format context"));
+        }
+        // SAFETY: 固定大小非零，返回值由 session Drop 释放。
+        session.orphan_avio_buffer = unsafe { (api.av_malloc)(AVIO_BUFFER_SIZE) }.cast();
+        if session.orphan_avio_buffer.is_null() {
+            return Err(FfmpegError::InvalidMedia("cannot allocate AVIO buffer"));
+        }
+        let opaque = session
+            .source
+            .as_mut()
+            .expect("source bridge was installed")
+            .as_mut() as *mut SourceBridge<'source> as *mut std::ffi::c_void;
+        // SAFETY: buffer、opaque 和三个回调在整个 avio/session 生命周期内保持有效。
+        session.avio = unsafe {
+            (api.avio_alloc_context)(
+                session.orphan_avio_buffer,
+                AVIO_BUFFER_SIZE as i32,
+                0,
+                opaque,
+                Some(read_source_callback),
+                None,
+                Some(seek_source_callback),
+            )
+        };
+        if session.avio.is_null() {
+            return Err(FfmpegError::InvalidMedia("cannot allocate AVIO context"));
+        }
+        session.orphan_avio_buffer = ptr::null_mut();
+        // SAFETY: format 与 avio 均由 session 持有，custom 标志阻止 format 接管 AVIO 所有权。
+        unsafe {
+            (*session.format).pb = session.avio;
+            (*session.format).flags |= AVFMT_FLAG_CUSTOM_IO;
+        }
+        // SAFETY: 自定义 AVIO 已放入预分配 format；URL 和可选格式均允许为空。
+        check("avformat_open_input(custom_io)", unsafe {
+            (api.avformat_open_input)(
+                &mut session.format,
+                ptr::null(),
+                ptr::null(),
+                ptr::null_mut(),
+            )
+        })?;
+        session.initialize(decoder_threads)
+    }
+
+    fn initialize(mut self, decoder_threads: u32) -> Result<Self, FfmpegError> {
         // SAFETY: format 已由成功的 avformat_open_input 初始化。
         check("avformat_find_stream_info", unsafe {
-            (api.avformat_find_stream_info)(session.format, ptr::null_mut())
+            (self.api.avformat_find_stream_info)(self.format, ptr::null_mut())
         })?;
         // SAFETY: format 有效；-1 表示自动选择视觉流，decoder_ret 可为空。
-        session.stream_index = check("av_find_best_stream", unsafe {
-            (api.av_find_best_stream)(
-                session.format,
+        self.stream_index = check("av_find_best_stream", unsafe {
+            (self.api.av_find_best_stream)(
+                self.format,
                 AVMediaType_AVMEDIA_TYPE_VIDEO,
                 -1,
                 -1,
@@ -130,36 +340,39 @@ impl<'api> DecoderSession<'api> {
             )
         })?;
 
-        let codec_parameters = session.codec_parameters()?;
+        let codec_parameters = self.codec_parameters()?;
         // SAFETY: codec_parameters 属于当前 format 且在 session 生命周期内有效。
-        let decoder = unsafe { (api.avcodec_find_decoder)((*codec_parameters).codec_id) };
+        let decoder = unsafe { (self.api.avcodec_find_decoder)((*codec_parameters).codec_id) };
         if decoder.is_null() {
             return Err(FfmpegError::InvalidMedia("video decoder is unavailable"));
         }
         // SAFETY: decoder 是 FFmpeg 返回的静态描述符。
-        session.codec = unsafe { (api.avcodec_alloc_context3)(decoder) };
-        if session.codec.is_null() {
+        self.codec = unsafe { (self.api.avcodec_alloc_context3)(decoder) };
+        if self.codec.is_null() {
             return Err(FfmpegError::InvalidMedia("cannot allocate decoder context"));
         }
         // SAFETY: 两个上下文均有效，函数只复制参数。
         check("avcodec_parameters_to_context", unsafe {
-            (api.avcodec_parameters_to_context)(session.codec, codec_parameters)
+            (self.api.avcodec_parameters_to_context)(self.codec, codec_parameters)
         })?;
-        // SAFETY: codec 与 decoder 匹配，options 按 API 允许传空。
-        check("avcodec_open2", unsafe {
-            (api.avcodec_open2)(session.codec, decoder, ptr::null_mut())
-        })?;
+        open_decoder_with_threads(
+            self.codec,
+            decoder,
+            decoder_threads,
+            self.api.av_opt_set_int,
+            self.api.avcodec_open2,
+        )?;
 
         // SAFETY: 无输入参数的 FFmpeg 分配函数。
-        session.packet = unsafe { (api.av_packet_alloc)() };
+        self.packet = unsafe { (self.api.av_packet_alloc)() };
         // SAFETY: 无输入参数的 FFmpeg 分配函数。
-        session.frame = unsafe { (api.av_frame_alloc)() };
-        if session.packet.is_null() || session.frame.is_null() {
+        self.frame = unsafe { (self.api.av_frame_alloc)() };
+        if self.packet.is_null() || self.frame.is_null() {
             return Err(FfmpegError::InvalidMedia(
                 "cannot allocate decode packet or frame",
             ));
         }
-        Ok(session)
+        Ok(self)
     }
 
     fn codec_parameters(
@@ -427,7 +640,7 @@ enum ReceiveFrame {
     End,
 }
 
-impl Drop for DecoderSession<'_> {
+impl Drop for DecoderSession<'_, '_> {
     fn drop(&mut self) {
         if !self.frame.is_null() {
             // SAFETY: frame 来自 av_frame_alloc；free 接受其地址并置空。
@@ -449,7 +662,58 @@ impl Drop for DecoderSession<'_> {
             // SAFETY: format 来自 avformat_open_input，地址只传入一次。
             unsafe { (self.api.avformat_close_input)(&mut self.format) };
         }
+        if !self.avio.is_null() {
+            // SAFETY: avio 来自 avio_alloc_context；FFmpeg 可能替换 buffer，因此读取当前字段。
+            let buffer = unsafe { (*self.avio).buffer };
+            if !buffer.is_null() {
+                // SAFETY: 当前 AVIO buffer 由 FFmpeg 的 av_malloc 分配且只在此释放一次。
+                unsafe { (self.api.av_free)(buffer.cast()) };
+                // SAFETY: 防止 avio_context_free 再看到已释放的 buffer。
+                unsafe { (*self.avio).buffer = ptr::null_mut() };
+            }
+            // SAFETY: avio 来自 avio_alloc_context，地址只传入一次并由函数置空。
+            unsafe { (self.api.avio_context_free)(&mut self.avio) };
+        } else if !self.orphan_avio_buffer.is_null() {
+            // SAFETY: AVIO 创建失败前留下的 buffer 来自 av_malloc，且只在此释放一次。
+            unsafe { (self.api.av_free)(self.orphan_avio_buffer.cast()) };
+            self.orphan_avio_buffer = ptr::null_mut();
+        }
+        // AVIO 已停止回调后再释放 bridge，确保其中的 Rust 借用不会悬空。
+        self.source.take();
     }
+}
+
+/// 在任何 FFmpeg 打开动作前拒绝零线程预算。
+fn validate_decoder_threads(decoder_threads: u32) -> Result<(), FfmpegError> {
+    if decoder_threads == 0 {
+        return Err(FfmpegError::InvalidDecoderThreads(decoder_threads));
+    }
+    Ok(())
+}
+
+/// 严格按“设置 threads AVOption → 打开 decoder”执行，设置失败时不允许静默回退。
+fn open_decoder_with_threads(
+    codec: *mut AVCodecContext,
+    decoder: *const AVCodec,
+    decoder_threads: u32,
+    av_opt_set_int: AvOptSetInt,
+    avcodec_open2: AvcodecOpen2,
+) -> Result<(), FfmpegError> {
+    validate_decoder_threads(decoder_threads)?;
+    // SAFETY: codec 是刚分配并已复制参数的 AVCodecContext；option 名为静态 C 字符串。
+    check("av_opt_set_int(threads)", unsafe {
+        av_opt_set_int(
+            codec.cast::<c_void>(),
+            c"threads".as_ptr(),
+            i64::from(decoder_threads),
+            0,
+        )
+    })?;
+    // SAFETY: codec 与 decoder 匹配，options 按 API 允许传空。
+    check("avcodec_open2", unsafe {
+        avcodec_open2(codec, decoder, ptr::null_mut())
+    })?;
+    Ok(())
 }
 
 fn check(operation: &'static str, code: i32) -> Result<i32, FfmpegError> {
@@ -466,10 +730,138 @@ fn api_error(operation: &'static str, code: i32) -> FfmpegError {
 
 #[cfg(all(test, windows))]
 mod tests {
-    use std::{env, path::PathBuf};
+    use std::{
+        env,
+        ffi::{CStr, c_char, c_int, c_void},
+        path::PathBuf,
+        ptr,
+        sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     use super::*;
-    use crate::required_dlls;
+    use crate::{
+        ffi::bindings::{AVCodec, AVCodecContext, AVDictionary},
+        required_dlls,
+    };
+
+    /// `av_opt_set_int` 与 `avcodec_open2` 的实际调用顺序。
+    static DECODER_OPEN_ORDER: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+    /// 零线程测试中任一 FFmpeg 打开动作的调用次数。
+    static ZERO_THREAD_OPEN_CALLS: AtomicUsize = AtomicUsize::new(0);
+    /// option 设置失败测试中 decoder open 的调用次数。
+    static FAILED_OPTION_OPEN_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn record_thread_option(
+        _object: *mut c_void,
+        name: *const c_char,
+        value: i64,
+        flags: c_int,
+    ) -> c_int {
+        // SAFETY: 生产 seam 必须传入静态 NUL 结尾的 `threads` 名称。
+        assert_eq!(unsafe { CStr::from_ptr(name) }.to_bytes(), b"threads");
+        assert_eq!(value, 3);
+        assert_eq!(flags, 0);
+        DECODER_OPEN_ORDER.lock().unwrap().push("set");
+        0
+    }
+
+    unsafe extern "C" fn record_decoder_open(
+        _codec: *mut AVCodecContext,
+        _decoder: *const AVCodec,
+        _options: *mut *mut AVDictionary,
+    ) -> c_int {
+        DECODER_OPEN_ORDER.lock().unwrap().push("open");
+        0
+    }
+
+    unsafe extern "C" fn count_zero_thread_call(
+        _object: *mut c_void,
+        _name: *const c_char,
+        _value: i64,
+        _flags: c_int,
+    ) -> c_int {
+        ZERO_THREAD_OPEN_CALLS.fetch_add(1, Ordering::SeqCst);
+        0
+    }
+
+    unsafe extern "C" fn count_zero_thread_open(
+        _codec: *mut AVCodecContext,
+        _decoder: *const AVCodec,
+        _options: *mut *mut AVDictionary,
+    ) -> c_int {
+        ZERO_THREAD_OPEN_CALLS.fetch_add(1, Ordering::SeqCst);
+        0
+    }
+
+    unsafe extern "C" fn fail_thread_option(
+        _object: *mut c_void,
+        _name: *const c_char,
+        _value: i64,
+        _flags: c_int,
+    ) -> c_int {
+        -22
+    }
+
+    unsafe extern "C" fn count_failed_option_open(
+        _codec: *mut AVCodecContext,
+        _decoder: *const AVCodec,
+        _options: *mut *mut AVDictionary,
+    ) -> c_int {
+        FAILED_OPTION_OPEN_CALLS.fetch_add(1, Ordering::SeqCst);
+        0
+    }
+
+    #[test]
+    fn decoder_threads_option_is_set_before_avcodec_open2() {
+        DECODER_OPEN_ORDER.lock().unwrap().clear();
+        let codec = ptr::NonNull::<AVCodecContext>::dangling().as_ptr();
+        let decoder = ptr::NonNull::<AVCodec>::dangling().as_ptr().cast_const();
+
+        open_decoder_with_threads(codec, decoder, 3, record_thread_option, record_decoder_open)
+            .unwrap();
+
+        assert_eq!(*DECODER_OPEN_ORDER.lock().unwrap(), vec!["set", "open"]);
+
+        FAILED_OPTION_OPEN_CALLS.store(0, Ordering::SeqCst);
+        let error = open_decoder_with_threads(
+            codec,
+            decoder,
+            3,
+            fail_thread_option,
+            count_failed_option_open,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            FfmpegError::Api {
+                operation: "av_opt_set_int(threads)",
+                code: -22
+            }
+        ));
+        assert_eq!(FAILED_OPTION_OPEN_CALLS.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn zero_decoder_threads_is_rejected_before_ffmpeg_open() {
+        ZERO_THREAD_OPEN_CALLS.store(0, Ordering::SeqCst);
+        let codec = ptr::NonNull::<AVCodecContext>::dangling().as_ptr();
+        let decoder = ptr::NonNull::<AVCodec>::dangling().as_ptr().cast_const();
+
+        let error = open_decoder_with_threads(
+            codec,
+            decoder,
+            0,
+            count_zero_thread_call,
+            count_zero_thread_open,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, FfmpegError::InvalidDecoderThreads(0)));
+        assert_eq!(ZERO_THREAD_OPEN_CALLS.load(Ordering::SeqCst), 0);
+    }
 
     /// 后向 seek 返回的首帧通常早于目标；解码边界必须继续推进到目标 PTS。
     #[test]
@@ -493,7 +885,7 @@ mod tests {
             .join("fixtures")
             .join("media")
             .join("video-12s.mp4");
-        let mut session = DecoderSession::open(&ffmpeg.api, &video).unwrap();
+        let mut session = DecoderSession::open_path(&ffmpeg.api, &video, 1).unwrap();
         let stream = session.stream().unwrap();
         // SAFETY: stream 属于仍存活的 session，测试只读取时间字段。
         let (time_base, start_time, stream_duration) = unsafe {

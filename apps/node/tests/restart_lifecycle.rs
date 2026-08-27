@@ -98,10 +98,7 @@ async fn prepared_host_commits_orderly_shutdown_only_once() {
     let arguments = directory.path().join("arguments.txt");
     fs::write(
         &script,
-        format!(
-            "@echo off\r\n>\"{}\" echo %*\r\n",
-            arguments.display()
-        ),
+        format!("@echo off\r\n>\"{}\" echo %*\r\n", arguments.display()),
     )
     .unwrap();
     let (shutdown, mut shutdown_receiver) = tokio_mpsc::channel(1);

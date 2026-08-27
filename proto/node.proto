@@ -349,6 +349,17 @@ message NodeConfigValue {
   NodeWorkerMode worker_mode = 16;
   uint32 reserved_cores = 17;
   uint32 manual_worker_count = 18;
+  NodePostgresConfigValue postgres = 19;
+}
+
+message NodePostgresConfigValue {
+  bool enabled = 1;
+  string host = 2;
+  uint32 port = 3;
+  string database = 4;
+  string username = 5;
+  string password = 6;
+  uint64 connect_timeout_seconds = 7;
 }
 
 message NodeConfigSnapshot {
@@ -456,6 +467,131 @@ message RuntimeWorkerDetails {
   string physical_disk_id = 5;
   uint64 completed_files = 6;
   double speed_per_second = 7;
+  string current_step = 8;
+  string cache_detail = 9;
+  optional RuntimeWorkerPhase phase = 10;
+  optional uint32 cpu_weight = 11;
+  optional uint32 decoder_threads = 12;
+}
+
+// Worker 在一次文件请求中的真实执行阶段；Hash 由 Node 负责，不属于 Worker 阶段。
+enum RuntimeWorkerPhase {
+  RUNTIME_WORKER_PHASE_UNSPECIFIED = 0;
+  RUNTIME_WORKER_IDLE = 1;
+  RUNTIME_WORKER_DECODE = 2;
+  RUNTIME_WORKER_FEATURE = 3;
+  RUNTIME_WORKER_RESULT_WAIT = 4;
+}
+
+// 固定延迟桶；缺少 upper_bound_ms 表示正无穷桶。
+message RuntimeLatencyBucket {
+  optional uint64 upper_bound_ms = 1;
+  uint64 count = 2;
+}
+
+// 进程内固定桶延迟分布；空样本时整个消息缺失。
+message RuntimeLatencyHistogram {
+  repeated RuntimeLatencyBucket buckets = 1;
+  uint64 count = 2;
+  optional uint64 p50_ms = 3;
+  optional uint64 p95_ms = 4;
+  optional uint64 p99_ms = 5;
+  optional uint64 max_ms = 6;
+}
+
+// 一个有界阶段队列的实时占用和真实等待/处理耗时。
+message RuntimeQueueMetrics {
+  optional uint64 current = 1;
+  optional uint64 peak = 2;
+  optional uint64 capacity = 3;
+  RuntimeLatencyHistogram wait_latency = 4;
+  RuntimeLatencyHistogram service_latency = 5;
+}
+
+// 一类共享资源的实时占用和真实许可等待/持有耗时。
+message RuntimeResourceMetrics {
+  optional uint64 current = 1;
+  optional uint64 peak = 2;
+  optional uint64 capacity = 3;
+  RuntimeLatencyHistogram wait_latency = 4;
+  RuntimeLatencyHistogram service_latency = 5;
+}
+
+// 基础计算实际采用的硬上限；字段缺失表示该任务没有当前进程遥测。
+message RuntimeExecutionConfig {
+  optional uint32 hash_tasks = 1;
+  optional uint32 path_cache_queue_capacity = 2;
+  optional uint32 content_cache_queue_capacity = 3;
+  optional uint32 decode_queue_capacity = 4;
+  optional uint32 persist_queue_capacity = 5;
+  optional uint32 worker_slots = 6;
+  optional uint32 cpu_budget = 7;
+  optional uint32 global_disk_permits = 8;
+  optional uint32 hdd_per_disk_permits = 9;
+  optional uint32 ssd_per_disk_permits = 10;
+  optional uint32 unknown_per_disk_permits = 11;
+}
+
+// 已由 Applied 持久化 ACK 确认的媒体类型与大小桶吞吐。
+message RuntimeMediaThroughput {
+  MediaKind media_kind = 1;
+  string size_bucket = 2;
+  uint64 files = 3;
+  uint64 bytes = 4;
+}
+
+// 基础计算一个细分 ownership 的当前值、历史峰值和硬容量。
+message RuntimeOwnershipMetrics {
+  optional uint64 current = 1;
+  optional uint64 peak = 2;
+  optional uint64 capacity = 3;
+}
+
+// 一个物理盘真实读取许可的当前状态与累计生命周期计数。
+message RuntimeDiskReadMetrics {
+  string physical_disk_id = 1;
+  optional uint64 capacity = 2;
+  optional uint64 hash_waiting = 3;
+  optional uint64 media_waiting = 4;
+  optional uint64 hash_active = 5;
+  optional uint64 media_active = 6;
+  optional uint64 hash_granted_total = 7;
+  optional uint64 media_granted_total = 8;
+  optional uint64 hash_released_total = 9;
+  optional uint64 media_released_total = 10;
+}
+
+// 基础计算进程内流水线指标；不写入 SQLite 或 PostgreSQL。
+message RuntimePipelineMetrics {
+  RuntimeQueueMetrics hash_queue = 1;
+  RuntimeQueueMetrics path_cache_queue = 2;
+  RuntimeQueueMetrics content_cache_queue = 3;
+  RuntimeQueueMetrics decode_queue = 4;
+  RuntimeQueueMetrics persist_queue = 5;
+  RuntimeResourceMetrics hash_io = 6;
+  RuntimeResourceMetrics media_io = 7;
+  RuntimeResourceMetrics cpu_weight = 8;
+  RuntimeResourceMetrics worker_slots = 9;
+  optional uint64 hash_bytes = 10;
+  repeated RuntimeMediaThroughput media_throughput = 11;
+  RuntimeOwnershipMetrics hash_waiting_permit = 12;
+  RuntimeOwnershipMetrics hash_reading = 13;
+  RuntimeOwnershipMetrics hash_completed_unjoined = 14;
+  RuntimeOwnershipMetrics media_permit_waiting = 15;
+  RuntimeOwnershipMetrics media_acquire_ready = 16;
+  RuntimeOwnershipMetrics media_permit_ready = 17;
+  RuntimeOwnershipMetrics worker_dispatching = 18;
+  RuntimeOwnershipMetrics worker_start_pending = 19;
+  RuntimeOwnershipMetrics worker_decode = 20;
+  RuntimeOwnershipMetrics worker_feature = 21;
+  RuntimeOwnershipMetrics worker_result_wait = 22;
+  RuntimeOwnershipMetrics worker_phase_unknown = 23;
+  RuntimeOwnershipMetrics content_output_credit_owned = 24;
+  // 统一复用 ownership 的 wire shape，但它是控制状态，不参与 RAII 守恒。
+  RuntimeOwnershipMetrics hash_refill_token_available = 25;
+  RuntimeOwnershipMetrics decode_credit_owned = 26;
+  RuntimeLatencyHistogram item_completion_latency = 27;
+  repeated RuntimeDiskReadMetrics disk_reads = 28;
 }
 
 message RuntimeFailureDetails {
@@ -469,6 +605,8 @@ message RuntimeTaskDetails {
   repeated RuntimeStageDetails stages = 2;
   repeated RuntimeWorkerDetails workers = 3;
   repeated RuntimeFailureDetails failures = 4;
+  RuntimeExecutionConfig execution_config = 5;
+  RuntimePipelineMetrics pipeline_metrics = 6;
 }
 
 message ListRuntimeTasks {
@@ -543,6 +681,49 @@ message ComputeStage2 {
   string item_id = 2;
   string display_path = 3;
   repeated uint32 frame_slots = 4;
+  string contact_sheet_path = 5;
+  bool generate_contact_sheet_if_missing = 6;
+}
+
+// Node 已完成 MD5 与缓存解析后发出的单次基础媒体计算请求。
+message ComputeBaseFeatures {
+  string task_id = 1;
+  string item_id = 2;
+  string machine_id = 3;
+  string normalized_path = 4;
+  string display_path = 5;
+  uint64 file_size = 6;
+  string physical_disk_id = 7;
+  bytes md5 = 8;
+  MediaKind media_kind = 9;
+  uint32 missing_parts = 10;
+  uint64 block_size_bytes = 11;
+  uint64 block_timeout_ms = 12;
+  uint32 block_retries = 13;
+  // 当前请求允许 FFmpeg 解码器使用的显式线程预算；必须至少为 1。
+  uint32 decoder_threads = 14;
+}
+
+// Worker 已关闭源文件且后续结果生成不会再访问源媒体的非终态事件。
+message BaseSourceReadComplete {
+  string task_id = 1;
+  string item_id = 2;
+  optional uint64 request_elapsed_us = 3;
+}
+
+// Worker 在真实执行边界即时发出的非终态阶段事件。
+message WorkerPhaseChanged {
+  string task_id = 1;
+  string item_id = 2;
+  RuntimeWorkerPhase phase = 3;
+  optional uint64 request_elapsed_us = 4;
+}
+
+message BaseComputeResult {
+  string task_id = 1;
+  string item_id = 2;
+  bytes md5 = 3;
+  bytes payload = 4;
 }
 
 message BuildContactSheet {
@@ -584,14 +765,21 @@ message WorkerFailure {
 }
 
 message WorkerEnvelope {
+  reserved 13, 14, 25;
+  reserved "begin_base_compute", "continue_base_compute", "base_hash_ready";
+
   oneof payload {
     ProbeAndStage1 probe_and_stage1 = 10;
     ComputeStage2 compute_stage2 = 11;
     BuildContactSheet build_contact_sheet = 12;
+    ComputeBaseFeatures compute_base_features = 15;
     WorkerReady worker_ready = 20;
     Stage1Result stage1_result = 21;
     Stage2Result stage2_result = 22;
     ContactSheetResult contact_sheet_result = 23;
     WorkerFailure worker_failure = 24;
+    BaseComputeResult base_compute_result = 26;
+    BaseSourceReadComplete base_source_read_complete = 27;
+    WorkerPhaseChanged worker_phase_changed = 28;
   }
 }

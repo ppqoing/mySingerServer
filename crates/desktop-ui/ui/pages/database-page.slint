@@ -1,0 +1,159 @@
+// 数据库页编辑桌面 PostgreSQL 连接，并展示一次真实连接测试返回的固定表精确统计。
+
+import { LineEdit, ScrollView, SpinBox } from "std-widgets.slint";
+import { Theme, UiDatabaseTableRow } from "../theme.slint";
+import { ActionButton } from "../components/action-button.slint";
+import { FluentCard } from "../components/fluent-card.slint";
+import { SectionHeader } from "../components/section-header.slint";
+import { StatusPill } from "../components/status-pill.slint";
+
+component DatabaseLabel inherits Text {
+    in property <string> accessible-name;
+    color: Theme.muted;
+    font-size: 11px;
+    vertical-alignment: center;
+    accessible-label: root.accessible-name;
+}
+
+export component DatabasePage inherits Rectangle {
+    in property <string> postgres-status;
+    in property <color> postgres-color;
+    in-out property <string> postgres-host;
+    in-out property <int> postgres-port: 5432;
+    in-out property <string> postgres-database;
+    in-out property <string> postgres-username;
+    in-out property <string> postgres-password;
+    in-out property <int> reconnect-seconds;
+    in property <bool> testing;
+    in property <string> test-status;
+    in property <string> test-error;
+    in property <[UiDatabaseTableRow]> tables;
+    callback test-connection();
+    callback save-settings();
+
+    background: transparent;
+    accessible-role: AccessibleRole.groupbox;
+    accessible-label: "数据库页面";
+
+    VerticalLayout {
+        padding: Theme.page-padding;
+        spacing: 12px;
+
+        SectionHeader {
+            height: 48px;
+            vertical-stretch: 0;
+            title: "数据库";
+            subtitle: "PostgreSQL 连接、Schema 状态与固定表精确统计";
+            icon: @image-url("../assets/icons/index.png");
+            ActionButton {
+                y: 7px;
+                label: root.testing ? "检测中…" : "测试数据库连接";
+                icon: @image-url("../assets/icons/refresh.png");
+                action-enabled: !root.testing;
+                clicked => { root.test-connection(); }
+            }
+            ActionButton {
+                y: 7px;
+                label: "保存数据库设置";
+                icon: @image-url("../assets/icons/save.png");
+                tone: 1;
+                clicked => { root.save-settings(); }
+            }
+        }
+
+        FluentCard {
+            height: 226px;
+            vertical-stretch: 0;
+            VerticalLayout {
+                padding: 14px;
+                spacing: 10px;
+                Text { text: "连接配置"; height: 24px; vertical-stretch: 0; color: Theme.text; font-size: 17px; font-weight: 700; }
+                GridLayout {
+                    vertical-stretch: 0;
+                    spacing: 10px;
+                    accessible-role: AccessibleRole.groupbox;
+                    accessible-label: "数据库连接表单";
+                    Row {
+                        DatabaseLabel { width: 92px; text: "服务器地址"; accessible-name: "PostgreSQL 服务器标签"; }
+                        LineEdit { height: Theme.control-height; text <=> root.postgres-host; placeholder-text: "127.0.0.1"; accessible-label: "PostgreSQL 服务器"; }
+                        DatabaseLabel { width: 48px; text: "端口"; accessible-name: "PostgreSQL 端口标签"; }
+                        SpinBox { width: 132px; height: Theme.control-height; value <=> root.postgres-port; minimum: 1; maximum: 65535; accessible-label: "PostgreSQL 端口"; }
+                    }
+                    Row {
+                        DatabaseLabel { width: 92px; text: "数据库名"; accessible-name: "PostgreSQL 数据库标签"; }
+                        LineEdit { height: Theme.control-height; text <=> root.postgres-database; placeholder-text: "dedup_v2"; accessible-label: "PostgreSQL 数据库"; }
+                        DatabaseLabel { width: 48px; text: "重连"; accessible-name: "PostgreSQL 重连间隔标签"; }
+                        SpinBox { width: 132px; height: Theme.control-height; value <=> root.reconnect-seconds; minimum: 1; maximum: 3600; accessible-label: "PostgreSQL 重连间隔"; }
+                    }
+                    Row {
+                        DatabaseLabel { width: 92px; text: "用户名"; accessible-name: "PostgreSQL 用户名标签"; }
+                        LineEdit { height: Theme.control-height; text <=> root.postgres-username; accessible-label: "PostgreSQL 用户名"; }
+                        DatabaseLabel { width: 48px; text: "密码"; accessible-name: "PostgreSQL 密码标签"; }
+                        LineEdit { width: 260px; height: Theme.control-height; text <=> root.postgres-password; input-type: InputType.password; accessible-label: "PostgreSQL 密码"; }
+                    }
+                }
+            }
+        }
+
+        FluentCard {
+            height: 72px;
+            vertical-stretch: 0;
+            accessible-role: AccessibleRole.groupbox;
+            accessible-label: "数据库运行状态：" + root.postgres-status;
+            HorizontalLayout {
+                padding-left: 14px;
+                padding-right: 14px;
+                spacing: 12px;
+                Text { width: 82px; text: "运行状态"; color: Theme.muted; font-size: 11px; vertical-alignment: center; }
+                StatusPill { width: 96px; label: "连接状态"; tone: root.postgres-color; }
+                Text { horizontal-stretch: 1; text: root.postgres-status; color: root.postgres-color; font-size: 12px; overflow: elide; vertical-alignment: center; }
+                Text { text: root.test-status == "" ? "尚未测试连接" : root.test-status; color: Theme.muted; font-size: 12px; overflow: elide; vertical-alignment: center; }
+            }
+        }
+
+        FluentCard {
+            vertical-stretch: 1;
+            VerticalLayout {
+                padding: 6px;
+                spacing: 0px;
+                SectionHeader { height: 38px; vertical-stretch: 0; title: "数据库表状态"; subtitle: root.test-error; icon: @image-url("../assets/icons/index.png"); }
+                Rectangle {
+                    height: Theme.table-header-height;
+                    vertical-stretch: 0;
+                    background: Theme.panel-hover;
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 12px;
+                        spacing: 12px;
+                        Text { horizontal-stretch: 1; text: "表名"; color: Theme.muted; font-size: 11px; vertical-alignment: center; }
+                        Text { width: 260px; text: "状态"; color: Theme.muted; font-size: 11px; vertical-alignment: center; }
+                        Text { width: 140px; text: "数据条数"; color: Theme.muted; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
+                    }
+                }
+                ScrollView {
+                    vertical-stretch: 1;
+                    accessible-role: AccessibleRole.groupbox;
+                    accessible-label: "数据库表列表滚动区";
+                    VerticalLayout {
+                        spacing: 0px;
+                        for table in root.tables : Rectangle {
+                            height: Theme.table-row-height;
+                            vertical-stretch: 0;
+                            background: transparent;
+                            accessible-role: AccessibleRole.list-item;
+                            accessible-label: "数据库表：" + table.name + "；" + table.status + "；" + table.row-count + " 行";
+                            HorizontalLayout {
+                                padding-left: 12px;
+                                padding-right: 12px;
+                                spacing: 12px;
+                                Text { horizontal-stretch: 1; text: table.name; color: Theme.text; font-size: 12px; overflow: elide; vertical-alignment: center; }
+                                Text { width: 260px; text: table.status; color: table.status-color; font-size: 12px; overflow: elide; vertical-alignment: center; }
+                                Text { width: 140px; text: table.row-count; color: Theme.text; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

@@ -21,9 +21,11 @@ Rust V2 面向 Windows x64，解决单机和可信局域网内多台主机的媒
 desktop.exe
   ├─ 手工 IP:port ── TCP + Protobuf ── node.exe (机器 A)
   │                                      ├─ SQLite: data/node/node.db
+  │                                      ├─ 可选 NoTls ── PostgreSQL（缓存查询与 outbox）
   │                                      └─ 匿名管道 ── worker.exe × N
   ├─ 手工 IP:port ── TCP + Protobuf ── node.exe (机器 B)
   │                                      ├─ SQLite: data/node/node.db
+  │                                      ├─ 可选 NoTls ── PostgreSQL（缓存查询与 outbox）
   │                                      └─ 匿名管道 ── worker.exe × N
   └─ NoTls ── PostgreSQL（中心索引、同步游标、跨机器分析和复核）
 ```
@@ -42,8 +44,9 @@ SQLite、PostgreSQL 或 TCP。三个 `apps` 目录只装配依赖和生命周期
 | `dedup-media` | MD5、像素管线、PDQ、9 分块 pHash、128 维 Sobel、视频评分、JPG 联系表 | FFmpeg FFI、文件删除 |
 | `dedup-media-ffmpeg` | 固定 DLL 加载、FFmpeg FFI、媒体探测与 RGB24 解码 | 特征算法、数据库 |
 | `dedup-windows` | 应用目录、SMBIOS、文件枚举、Job Object、回收站与 Shell | 业务状态机 |
-| `dedup-node-store` | 当前 V2 SQLite schema、事务、任务、分析、结果和 outbox | 网络和媒体计算 |
-| `dedup-node-engine` | 扫描、Worker 池、本地分析、预览、删除与节点 actor | 直接 PostgreSQL 访问 |
+| `dedup-node-store` | SQLite schema 3、事务、任务阶段、分析、结果和 outbox | 网络和媒体计算 |
+| `dedup-central-store` | PostgreSQL schema 3 校验、中心缓存、阶段、跨机分析、同步和删除存储 | UI、SQLite、媒体计算 |
+| `dedup-node-engine` | 三类计算任务、Worker 池、本地分析、可降级中心缓存、预览、删除与节点 actor | UI 与中心跨机编排 |
 | `dedup-desktop-core` | 节点会话、中心同步、PostgreSQL 访问、跨机器分析和 UI 状态 | SQLite 直连、媒体解码 |
 | `dedup-desktop-ui` | Slint 页面、视图模型和回调绑定 | TCP、SQLite、PostgreSQL、FFmpeg |
 
@@ -56,12 +59,13 @@ SQLite、PostgreSQL 或 TCP。三个 `apps` 目录只装配依赖和生命周期
 推导的 `AppLayout`，以及 Raw SMBIOS Type 1/2 读取和机器 ID 计算。生产机器身份只来自
 Win32 `GetSystemFirmwareTable(RSMB)`，不从配置注入。
 
-协议边界也已落地且当前版本为 V3：`proto/node.proto` 是唯一消息源，`dedup-protocol` 用固定 vendored
+协议边界也已落地且当前版本为 V4：`proto/node.proto` 是唯一消息源，`dedup-protocol` 用固定 vendored
 `protoc` 在 `OUT_DIR` 生成 Rust 类型和 descriptor set，并显式转换 `ContentKey`、
 `LocationKey` 与 `Thresholds`。节点 Envelope 覆盖状态、任务、路径、分析、同步、快照、
 文件读取、删除和版本化 Node 配置；配置协议固定为 `GetNodeConfig`、`NodeConfigSnapshot`、
 `SaveNodeConfigAndRestart` 与 `NodeRestartAccepted`，不含认证、密钥或 TLS 字段。WorkerEnvelope
-只携带任务/项目/显示路径、槽位和计算结果，不含数据库或网络地址。
+增加 `BeginBaseCompute → BaseHashReady → ContinueBaseCompute → BaseComputeResult` 两步续算，
+并为视频二次任务携带本地联系表路径；Worker 仍不接收数据库或网络地址。
 
 媒体像素边界已经落地：`Rgb24Image` 和 `GrayImage` 在构造时一次性验证紧凑缓冲区长度，
 内部算法不重复检查尺寸。所有图片特征共用整数亮度公式和像素中心双线性缩放，避免一筛、
@@ -101,11 +105,13 @@ FFmpeg 边界使用 BtbN 固定归档中的 8.0.1 x64 LGPL shared 构建，归�
 frame 和 sws context 只存在于短生命周期解码会话，安全边界外只返回媒体信息或紧凑 RGB24。
 探测媒体类型读取实际解复用器；`image2`/`*_pipe` 的单帧伪时长不被误判为视频。
 
-Worker 媒体流水线通过 `MediaDecoder` 隔离 FFmpeg：图片一筛只解码一次且绝不生成缩略图；
-视频一筛严格按六个中点解码，单次灰度面计算 PDQ/Quality，并把同一批 RGB24 直接交给联系表，
-不做第七次解码。联合二筛的每个请求槽位也只解码、转灰度一次，再共同生成九块 pHash 与
-128 维 Sobel。槽位失败作为结果保存，不让一个坏帧终止其他视频帧。Worker 的内部结果使用
-独立 Protobuf 载荷，进程边界一次校验固定 hash/向量长度，NodeEngine 只接收拥有所有权的值。
+Worker 媒体流水线通过 `MediaDecoder` 隔离 FFmpeg：`WorkerFileSession` 为一个基础任务项只打开一次
+Windows 文件句柄，先流式计算 MD5，再保留同一会话等待 Node 缓存判定。缺失计算继续使用同一
+随机读取句柄；FFmpeg 通过自定义 AVIO 在该句柄上完成 probe、seek 和解码，不按路径二次打开。
+图片一筛只解码一次且不生成缩略图；视频一筛严格按六个中点解码，单次灰度面计算 PDQ/Quality，
+并把同一批 RGB24 直接交给联系表。二次视频优先解码本地联系表，缺失或损坏时才回退原视频并重建。
+槽位失败作为结果保存，不让一个坏帧终止其他视频帧。Worker 的内部结果使用独立 Protobuf 载荷，
+进程边界一次校验固定 hash/向量长度，NodeEngine 只接收拥有所有权的值。
 
 `worker.exe` 启动后先加载相对 DLL，成功才向 stdout 写 `WorkerReady`；stdin/stdout 永远只传
 四字节长度头的 `WorkerEnvelope`，日志直接写 `data/node/logs/worker-<pid>.log`。`WorkerPool`
@@ -121,8 +127,10 @@ Worker 全部加入 `KILL_ON_JOB_CLOSE` Job，节点退出不会留下孤儿进�
 
 - 节点 actor 串行独占一个 `NodeStore` 和一个 `WorkerPool`，所有 SQLite 写入经 actor 排序。
 - 节点 SQLite 是本地扫描、缓存、任务、特征、本地分析、复核、删除和 outbox 的唯一事实源。
-- PostgreSQL 由 `desktop.exe` 独占访问，只存中心索引、外部键、同步游标和跨机器结果；
-  `desktop.exe` 不打开节点 SQLite，节点也不连接 PostgreSQL。
+- PostgreSQL 保存中心索引、外部键、同步游标、任务阶段和跨机器结果；`desktop.exe` 负责跨机器
+  清单编排，Node 在配置启用时直连中心库批量查询基础/二次缓存并发布 SQLite outbox。
+- PostgreSQL 连接、schema 或查询失败时，Node 为当前任务记录警告并降级为 SQLite-only；
+  `desktop.exe` 不打开节点 SQLite，Worker 不访问任何数据库。
 - 跨边界键固定为 `MachineId`、`ContentKey(md5,file_size)` 和
   `LocationKey(machine_id,normalized_path)`；扫描缓存查询再把 `file_size` 作为独立条件，
   因此跳过 MD5 的完整条件仍是机器 ID、规范路径和文件大小。SQLite 自增 ID 不通过网络或同步传播。
@@ -135,16 +143,15 @@ Worker 全部加入 `KILL_ON_JOB_CLOSE` Job，节点退出不会留下孤儿进�
   转大写、跳过空值后以 NUL 分隔，对固定命名空间前缀与字段计算 SHA-256。
 
 运行任务详情采用进程内双 registry 所有权：`node.exe` 的 `RuntimeTaskRegistry` 由唯一 Node actor
-创建并观察扫描、本地分析、二筛和删除；`desktop.exe` 的 `DesktopRuntimeTaskRegistry` 由唯一
-Desktop 控制循环创建并观察跨机器编排、同步和管理端删除。二者都不写 SQLite、PostgreSQL、TOML
-或日志，进程重启后旧阶段、Worker、速度和失败详情全部清空。Desktop 对在线 Node 每 2 秒稳定分页
-刷新摘要和当前选中详情；Node 终态通过同一管理连接的 `request_id=0` 主动事件立即触发刷新，不把
-高频进度变成事件流。连接断开时保留最后成功详情并标记 stale；重连只接受当前会话机器身份和新
-registry 代次，旧运行 ID 不恢复。SQLite `TaskSummary` 仍只负责持久任务恢复、同步门禁和任务统计，
-恢复未完成工作时必须创建新的临时 recovery 运行 ID，不能把持久任务 ID 或旧详情回填进 registry。
+创建并观察基础计算、本地清单、二次特征和删除；`desktop.exe` 的 `DesktopRuntimeTaskRegistry` 由
+唯一 Desktop 控制循环观察跨机器清单、同步和管理端删除。运行中的速度、ETA、Worker 和最近失败
+仍只存在内存，但稳定阶段状态由 SQLite `task_stages`、`analysis_run_stages` 或 PostgreSQL
+`analysis_run_stages` 持久化。进度每 2 秒合并发布，阶段/任务终态立即发布；重启时遗留 running 项
+回到 queued，并从已提交缓存和阶段边界继续。连接断开时 Desktop 保留最后成功详情并标记 stale。
 
-节点 SQLite V2 使用 23 张严格表闭合内容、位置、特征、任务、分析、分组、复核、同步和删除。
-`metadata.schema_id` 是不兼容版本标记：只自动初始化空数据库，旧库或未知 schema 直接拒绝打开。
+节点 SQLite 使用 `PRAGMA user_version=3` 和 26 张严格表闭合内容、位置、特征、任务阶段、分析、
+分组、复核、同步和删除。`metadata.schema_id` 是不兼容产品标记：只自动初始化空数据库，旧库或
+未知 schema 直接拒绝打开，不自动迁移。
 `NodeStore` 独占连接并启用外键、WAL 与五秒 busy timeout；上层 actor 负责串行调用，不在每个
 仓储函数内重复加锁。内容先按 `(md5,file_size)` 复用，再在同一事务写位置和 outbox。
 
@@ -160,17 +167,16 @@ registry 代次，旧运行 ID 不恢复。SQLite `TaskSummary` 仍只负责持�
 扫描实现由 `dedup-node-engine::scan` 统一编排。`FileEnumerator` 只有两个生产实现：
 `WindowsWalker` 直接递归 Windows 文件系统，`EverythingEnumerator` 通过
 `everything-ipc 0.1.4` 对每个根查询并在 Rust 端再次使用 `NormalizedPath::is_within`
-确认组件边界。两者都返回全部普通文件的 `ScannedPath`，按规范路径排序去重；Everything
-不可用或查询失败时当前任务直接返回一条明确错误，不在任务中切换 Walker。文件扩展名不写入
-领域类型；Worker 以 FFmpeg 实际 probe 结果决定 `MediaKind`。
+确认组件边界。两者都返回全部普通文件的 `ScannedPath`，按规范路径排序去重。默认选择 Everything；
+Node 收到扫描命令后检查同会话 IPC 和数据库状态，不可用时启动同目录 `Everything.exe -startup`
+并等待初始化，启动、等待或首次完整枚举失败时整次回退 Windows Walker。文件扩展名不写入领域
+类型；Worker 以 FFmpeg 实际 probe 结果决定 `MediaKind`。
 
-`ScanEngine::run` 在枚举前用 `create_scan_task` 原子保存任务和扫描根。完整列表按 1000 条调用
-`lookup_scanned_paths`：机器、路径、大小命中直接完成 `reused` 项且不打开文件；未命中由
-`SystemMd5` 用 1 MiB 缓冲流式读取，再以 MD5 索引和大小确认 `ContentKey`。已有完整特征只新增
-位置引用；已有媒体内容缺少完整一筛时保存 `skipped_incomplete` 成功项，不自动启动 Worker；
-新内容和用户明确的强制重算才通过 `Stage1Processor` 派发。生产适配器串行借用 `WorkerPool`，
-Worker 只返回实际探测类型和拥有所有权的特征，NodeStore 负责写类型、图片/视频一筛、六槽记录、
-联系表引用和 outbox。单文件读取或计算失败只增加任务失败项，扫描仍可完成。
+基础计算固定为 `enumerate_files → lookup_base_cache → compute_base_features`。枚举阶段先形成稳定清单，
+完成后才一次性发布总数；缓存阶段为每个文件查询 SQLite，再批量查询可选 PostgreSQL。完整路径缓存
+直接形成初始完成数，其余项进入 `WorkerFileSession`：MD5 只能由 Worker 计算，Node 收到 MD5 后再按
+`ContentKey` 查询 SQLite/可选 PostgreSQL 并发送缺失项掩码。Worker 使用原会话完成媒体探测、视频
+联系表和一筛，NodeStore 事务写入本地结果与 outbox。任一 Worker 终态返回即补位，不等待整批完成。
 
 真实扫描任务的最后一个任务项不会提前把任务标为 completed。只有全部项终态后，
 `finalize_scan_task` 才在一个事务内读取已持久化扫描根，按路径组件失效本轮未出现的活动位置、
@@ -180,17 +186,19 @@ Worker 只返回实际探测类型和拥有所有权的特征，NodeStore 负责
 本地分析由 `LocalAnalysisEngine` 完全在节点 SQLite 上执行。开始前先查询所有任务：任何
 `queued/running` 都返回 `ComputationRunning`，所选 `failed/cancelled` 返回需重试或重选；
 `completed` 任务允许包含文件级失败。输入只由这些任务的成功项连接当前活动位置并一次冻结，
-阈值以 TOML 快照保存，随后按 `stage1_synced → screening` 推进。精确组直接按 ContentKey
-聚合冻结位置，至少两个位置成组，不计算额外哈希。
+阈值以 TOML 快照保存，随后按 `build_candidates → dispatch_stage2 → final_compare` 推进。精确组直接
+按 ContentKey 聚合冻结位置，至少两个位置成组，不计算额外哈希；相似任务先提交完整候选，再派发
+缺失二次特征，最后只用完整二次结果精准判重。
 
 相似一筛只装载 Store 定义的完整特征。缺字段的图片、缺六槽记录或有效帧不足的视频在线性地
 增加 `analysis_runs.skipped_incomplete`，不进入候选。图片索引键是带位置的四个 PDQ band；
 视频索引键是“槽位、band 位置、band 值”，任一对齐槽共享后才执行完整六帧平均。一筛通过的
 全部 Candidate 在单事务替换并提交后，状态才进入 `phase2_dispatched`，从而保证不会边筛边派发。
 
-二筛从候选提取并排序去重 ContentKey，先查 SQLite 的联合结果；完整结果零派发，缺失内容只选
-第一个活动位置并创建一个持久 `analysis_stage2` 任务项。图片 Worker 结果必须同时保存九块 pHash
-和 128 维 Sobel；视频只派发一筛成功槽位，每帧联合结果分别写表和 outbox。所有任务项终态后
+二筛从候选提取并排序去重 ContentKey，创建固定 `lookup_stage2_cache → compute_stage2_features`
+任务。先查 SQLite，再查可选 PostgreSQL；完整结果零计算，缺失内容只选第一个活动位置。图片
+Worker 结果必须同时保存九块 pHash 和 128 维 Sobel；视频优先复用
+`<cache>/contact-sheets/<md5前两位>/<md5>.jpg`，仅在缺失或无效时读取原视频并重建。所有任务项终态后
 才读取数据库做最终判定；任何候选缺结果都保存为 `Incomplete`，运行进入 `partial`，不把缺失
 当零分。`retry_phase2` 只从未解决候选重新收集仍缺失的 ContentKey，并复用同一状态链。
 
@@ -209,7 +217,7 @@ Worker 只返回实际探测类型和拥有所有权的特征，NodeStore 负责
 通过容量 64 的命令通道串行独占 `NodeStore` 与 `WorkerPool`；网络
 handler、托盘回调和后续桌面会话都只持有可克隆 `NodeEngineHandle`，不能直接访问 SQLite。
 
-节点 TCP 首帧必须是协议版本 3、产品标识 `mysingerserver-rust-v2` 的 Hello。一个节点同时只接受
+节点 TCP 首帧必须是协议版本 4、产品标识 `mysingerserver-rust-v2` 的 Hello。一个节点同时只接受
 一个管理连接，第二连接立即收到 `NodeBusy`；已取得名额的连接使用 request_id 并发处理多个请求，
 独立写任务串行输出响应。连接断开释放名额，服务关闭会停止 listener 并终止连接任务。actor 已
 统一接入状态、任务查询/取消、路径浏览、扫描、本地分析、结果分页、复核、分析输入、跨机器批量
@@ -332,9 +340,9 @@ phase2 对 queued/running 或游标落后继续等待；completed/failed/cancell
 组按同一 ContentKey 的冻结位置生成；候选、直接证据分数、最终组和成员均由 PostgreSQL 事务保存。
 
 中心 PostgreSQL 只接受管理员在空库手动执行 `deploy/central-v2.sql`。脚本使用
-`schema_metadata.schema_id=mysingerserver-rust-v2` 标记全新且不兼容的产品 schema，建立节点、
+`schema_metadata.schema_id=mysingerserver-rust-v2-central-schema-3` 标记全新且不兼容的产品 schema，建立节点、
 同步游标、全局内容、机器位置、图片/视频两层特征、删除墓碑、分析输入、候选、分组、复核和
-删除批次共 20 张表；故意不使用 `IF NOT EXISTS`，重复执行会失败，不承担迁移职责。
+删除批次共 22 张表；故意不使用 `IF NOT EXISTS`，重复执行会失败，不承担迁移职责。
 `CentralStore::connect` 只读验证产品标记和所需表列，缺失时只禁用中心模式，绝不创建或修改表。
 
 中心内部 `contents.content_id` 只用于 PostgreSQL 连接；所有公开接口和节点同步载荷都使用
@@ -362,12 +370,13 @@ Completed/Failed` 发布状态。加载时冻结握手 MachineId、手工 endpoi
 `desktop.exe` 首次启动只创建 `data/desktop/config.toml`、`data/desktop/cache` 和
 `data/desktop/logs`，并写入默认节点 `127.0.0.1:39091`。日志复用 20 MiB × 10 滚动 writer；
 应用路径全部从 executable 绝对路径推导，设置页显示实际值。界面固定使用 Slint 浅色 `fluent`
-风格和七个主导航：总览、节点、扫描、任务、重复文件、审核删除、设置。重复文件工作区保留
+风格和八个主导航：总览、节点、扫描、任务、重复文件、审核删除、设置、数据库。重复文件工作区保留
 精确重复、相似图片、相似视频、跨机器四个标签；审核删除工作区固定为审核工作台与删除中心
 双模式。总览聚合在线数、任务、同步游标和 Worker 状态；扫描页显示持久任务逐项进度、失败与
 不完整跳过计数，并在任何节点有 queued/running 项时统一禁用筛选。设置工作区固定为常规、
-相似度算法、存储、节点服务、扫描与性能、外部工具、日志与诊断七个二级菜单；只编辑现有
-PostgreSQL NoTls、九项阈值、回收站/永久删除与重连间隔，四个应用路径只读显示。当前版本没有
+相似度算法、存储、节点服务、扫描与性能、外部工具、日志与诊断七个二级菜单；除 Desktop 中心
+PostgreSQL、九项阈值、删除模式与重连间隔外，节点服务页可加载选中 Node 配置并编辑监听、路径、
+磁盘读取、Worker 和 Node PostgreSQL 基础连接参数，保存后由 Node 自重启。当前版本没有
 后端数据的配置、日志筛选、导出、清空和环境版本保持禁用并说明原因，同时保留 `AboutSlint`
 归属入口及可信局域网明文警告。`MainWindow` 已有 21 个业务回调、参数顺序和整数枚举语义不变。
 
@@ -379,7 +388,7 @@ PostgreSQL NoTls、九项阈值、回收站/永久删除与重连间隔，四个
 仅保存当前页模型和不透明 next cursor，不使用 offset，也不自行重算相似分数或删除资格；所有
 页面只消费根属性和既有回调，不得直接访问 TCP、SQLite、PostgreSQL 或 FFmpeg。
 
-七个主导航现已形成闭环：扫描页可从已完成扫描任务创建本地精确/图片/视频分析；重复文件的
+八个主导航现已形成闭环：扫描页可从已完成扫描任务创建本地精确/图片/视频分析；重复文件的
 四个标签共用有限分页和不透明游标，其中单节点与中心结果按统一模型切换，跨机器标签只触发
 `start/poll/retry` 三个协调器入口并展示当前持久门禁；审核删除双模式只操作当前已加载组。
 所有 Slint callback 仍只投递强类型 `UiCommand`，控制循环串行
@@ -549,10 +558,8 @@ PostgreSQL 容器上执行整链集成：扫描任务查询、outbox 同步、�
 任务 19 的四个 PowerShell 文件已经全部通过 AST 解析；package fixture 实际输出
 `RUST_V2_PACKAGE_TEST_PASS`，覆盖完整目录、完整 ZIP，以及错误 sidecar、禁带 FFmpeg EXE、缺失
 `worker.exe`、非 x64 PE 和缺失 Slint 许可证的拒绝路径。固定 Cargo x64 工作区 Release 构建已
-实际通过；notices 生成实际核对 699 个解析包；FFmpeg 锁定归档和五 DLL SHA 已验证。任务 20 在
-回收站修复之后重新执行完整构建，`build-release.ps1`、独立 `verify-release.ps1` 和 package fixture
-均输出 PASS。当前 ZIP 为 `dist-rust-v2/mySingerServer-rust-v2-win-x64.zip`，大小 64,804,379 字节，
-SHA-256 为 `b99f71d79f51aab92092360cde32b6d9d13f887a7729b008927232fe9c7b4c9e`，白名单共 15 个文件。
+实际通过；notices 生成实际核对 699 个解析包；FFmpeg 锁定归档和五 DLL SHA 已验证。历史包的大小
+和 SHA-256 只保留在对应验收记录中；每次发布必须以本轮 `build-release.ps1` 输出及 sidecar 为准。
 
 任务 20 的真实单节点便携链覆盖扫描缓存、精确/图片/视频分析、分页、复核、永久删除和重启恢复；
 双 loopback 节点覆盖独立机器身份、SQLite、高水位和输入隔离；真实 PostgreSQL 16 测试覆盖

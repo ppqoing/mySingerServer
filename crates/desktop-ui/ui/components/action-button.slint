@@ -28,31 +28,46 @@ export component ActionButton inherits Rectangle {
     accessible-enabled: root.action-enabled;
     accessible-action-default => { if root.action-enabled { root.clicked(); } }
 
-    HorizontalLayout {
-        padding-left: 10px;
-        padding-right: 10px;
-        spacing: 6px;
-        alignment: center;
-        if root.icon.width > 0 && root.icon.height > 0 : Image {
-            source: root.icon;
-            width: 16px;
-            height: 16px;
-            image-fit: contain;
-            colorize: !root.action-enabled ? Theme.disabled-text
-                : root.tone == 1 ? #ffffff
-                : root.tone == 2 ? Theme.danger
-                : Theme.nav-icon;
-        }
-        Text {
-            text: root.label;
-            color: !root.action-enabled ? Theme.disabled-text
-                : root.tone == 1 ? #ffffff
-                : root.tone == 2 ? Theme.danger
-                : Theme.text;
-            font-size: 12px;
-            font-weight: root.tone == 0 ? 500 : 650;
-            overflow: elide;
-            vertical-alignment: center;
+    content-row := Rectangle {
+        width: parent.width;
+        height: parent.height;
+        background: transparent;
+        accessible-role: AccessibleRole.groupbox;
+        accessible-label: "按钮内容：" + root.label;
+        HorizontalLayout {
+            padding-left: 10px;
+            padding-right: 10px;
+            spacing: 6px;
+            alignment: center;
+            Rectangle { horizontal-stretch: 1; background: transparent; }
+            if root.icon.width > 0 && root.icon.height > 0 : Image {
+                source: root.icon;
+                width: 16px;
+                height: 16px;
+                y: (parent.height - self.height) / 2;
+                horizontal-stretch: 0;
+                image-fit: contain;
+                accessible-label: "按钮图标：" + root.label;
+                colorize: !root.action-enabled ? Theme.disabled-text
+                    : root.tone == 1 ? #ffffff
+                    : root.tone == 2 ? Theme.danger
+                    : Theme.nav-icon;
+            }
+            Text {
+                height: parent.height;
+                text: root.label;
+                color: !root.action-enabled ? Theme.disabled-text
+                    : root.tone == 1 ? #ffffff
+                    : root.tone == 2 ? Theme.danger
+                    : Theme.text;
+                font-size: 12px;
+                font-weight: root.tone == 0 ? 500 : 650;
+                horizontal-stretch: 0;
+                overflow: elide;
+                vertical-alignment: center;
+                accessible-label: "按钮文字：" + root.label;
+            }
+            Rectangle { horizontal-stretch: 1; background: transparent; }
         }
     }
     // 触摸层后声明，避免图标或正文截断真实指针命中。

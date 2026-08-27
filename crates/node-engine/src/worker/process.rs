@@ -109,14 +109,22 @@ impl WorkerProcess {
     }
 
     /// 请求强制结束并等待进程句柄进入终态。
-    pub(crate) async fn terminate(&mut self) -> Result<(), WorkerProcessError> {
+    pub(crate) async fn terminate(&mut self) -> Result<Option<i32>, WorkerProcessError> {
         match self.child.start_kill() {
-            Ok(()) => {
-                self.child.wait().await?;
-                Ok(())
+            Ok(()) => Ok(self.child.wait().await?.code()),
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+                Ok(self.child.try_wait()?.and_then(|status| status.code()))
             }
-            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
             Err(error) => Err(error.into()),
+        }
+    }
+
+    /// 管道或协议异常后确保进程收束，并返回可取得的退出码。
+    pub(crate) async fn stop_after_failure(&mut self) -> Option<i32> {
+        match self.child.try_wait() {
+            Ok(Some(status)) => status.code(),
+            Ok(None) => self.terminate().await.ok().flatten(),
+            Err(_) => self.terminate().await.ok().flatten(),
         }
     }
 }

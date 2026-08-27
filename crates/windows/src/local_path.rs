@@ -7,10 +7,7 @@ use std::{
 };
 
 use dedup_core::CoreError;
-use windows::{
-    Win32::Storage::FileSystem::GetDriveTypeW,
-    core::PCWSTR,
-};
+use windows::{Win32::Storage::FileSystem::GetDriveTypeW, core::PCWSTR};
 
 const DRIVE_REMOTE: u32 = 4;
 
@@ -86,12 +83,15 @@ impl LocalNodePath {
 
 fn is_unc_path(raw: &str) -> bool {
     let uppercase = raw.to_ascii_uppercase();
-    (raw.starts_with(r"\\") && !raw.starts_with(r"\\?\"))
-        || uppercase.starts_with(r"\\?\UNC\")
+    (raw.starts_with(r"\\") && !raw.starts_with(r"\\?\")) || uppercase.starts_with(r"\\?\UNC\")
 }
 
 fn system_drive_type(path: &Path) -> u32 {
-    let Some(root) = path.ancestors().filter(|ancestor| ancestor.has_root()).last() else {
+    let Some(root) = path
+        .ancestors()
+        .filter(|ancestor| ancestor.has_root())
+        .last()
+    else {
         return 0;
     };
     let wide = root

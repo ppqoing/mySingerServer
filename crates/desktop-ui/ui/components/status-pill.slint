@@ -1,4 +1,4 @@
-// 小型状态胶囊只表达文本和语义色，不承载业务判断。
+// 小型矩形状态标签只表达文本和语义色，不承载业务判断。
 
 import { Theme } from "../theme.slint";
 
@@ -7,28 +7,22 @@ export component StatusPill inherits Rectangle {
     in property <color> tone: Theme.muted;
     height: 24px;
     min-width: 72px;
-    border-radius: 12px;
+    border-radius: 4px;
     background: root.tone.with-alpha(0.13);
     border-width: 1px;
     border-color: root.tone.with-alpha(0.45);
+    accessible-role: AccessibleRole.groupbox;
+    accessible-label: "状态：" + root.label;
 
-    HorizontalLayout {
-        padding-left: 9px;
-        padding-right: 9px;
-        spacing: 6px;
-        alignment: center;
-        Rectangle {
-            width: 6px;
-            height: 6px;
-            border-radius: 3px;
-            background: root.tone;
-        }
-        Text {
-            text: root.label;
-            color: root.tone;
-            font-size: 11px;
-            font-weight: 600;
-            vertical-alignment: center;
-        }
+    Text {
+        width: parent.width;
+        height: parent.height;
+        text: root.label;
+        color: root.tone;
+        font-size: 11px;
+        font-weight: 600;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        accessible-label: "状态文字：" + root.label;
     }
 }

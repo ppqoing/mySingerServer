@@ -4,52 +4,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use dedup_core::{ContentKey, MediaKind, ScreeningOutcome, Thresholds};
 use dedup_media::{
-    ImageStage1, ImageStage2, VideoFrameFeatures, pdq_bands, score_video_stage1,
-    score_video_stage2, screen_image_stage1, screen_image_stage2,
+    ImageStage1, VideoFrameFeatures, pdq_bands, score_video_stage1, score_video_stage2,
+    screen_image_stage1, screen_image_stage2,
 };
 
 use crate::central::{CentralCandidate, CentralCandidateStatus, CentralPairKind};
 
-/// 一次中心运行从 PostgreSQL 读取的完整特征快照。
-///
-/// 缺字段的行不会进入对应 Map；`media_kinds` 仍保留内容，因此一筛可以准确统计跳过项。
-#[derive(Clone, Debug, Default)]
-pub struct CrossFeatureSet {
-    /// 冻结输入中每个唯一内容的实际媒体类型。
-    pub media_kinds: BTreeMap<ContentKey, MediaKind>,
-    /// 字段完整的图片一筛。
-    pub image_stage1: BTreeMap<ContentKey, ImageStage1>,
-    /// 图片联合二筛。
-    pub image_stage2: BTreeMap<ContentKey, ImageStage2>,
-    /// 六槽记录完整且成功帧达到固定完整性要求的视频一筛。
-    pub video_stage1: BTreeMap<ContentKey, Box<[Option<ImageStage1>; 6]>>,
-    /// 覆盖全部成功一筛槽位的视频联合二筛。
-    pub video_stage2: BTreeMap<ContentKey, Box<[Option<ImageStage2>; 6]>>,
-}
-
-impl CrossFeatureSet {
-    /// 判断指定媒体内容的 PostgreSQL 联合二筛是否完整。
-    pub fn stage2_complete(&self, content: ContentKey, kind: CentralPairKind) -> bool {
-        match kind {
-            CentralPairKind::Image => self.image_stage2.contains_key(&content),
-            CentralPairKind::Video => self.video_stage2.contains_key(&content),
-        }
-    }
-
-    /// 返回视频一筛成功槽位；图片或不完整视频返回空列表。
-    pub fn video_frame_slots(&self, content: ContentKey) -> Vec<u32> {
-        self.video_stage1
-            .get(&content)
-            .map(|frames| {
-                frames
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(slot, frame)| frame.map(|_| slot as u32))
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-}
+pub use dedup_central_store::CrossFeatureSet;
 
 /// 使用带位置 PDQ band 索引生成完整一筛候选，并返回缺失一筛的媒体内容数量。
 pub fn screen_candidates(
@@ -248,14 +209,5 @@ fn incomplete(candidate: &CentralCandidate) -> CentralCandidate {
         stage2_score: None,
         status: CentralCandidateStatus::Incomplete,
         ..candidate.clone()
-    }
-}
-
-impl CentralPairKind {
-    const fn sort_key(self) -> u8 {
-        match self {
-            Self::Image => 0,
-            Self::Video => 1,
-        }
     }
 }

@@ -58,6 +58,16 @@ impl FileEnumerator for EverythingEnumerator {
         rows.dedup_by(|left, right| left.normalized_path == right.normalized_path);
         Ok(rows)
     }
+
+    /// Everything 已返回完整去重清单后先冻结总数，再受有界下游背压逐项交付。
+    fn enumerate_into_with_completion(
+        &self,
+        roots: &[DisplayPath],
+        complete: &mut dyn FnMut(Option<(u64, u64)>) -> Result<(), ScanError>,
+        emit: &mut dyn FnMut(ScannedPath) -> Result<(), ScanError>,
+    ) -> Result<(), ScanError> {
+        emit_materialized_rows(self.enumerate(roots)?, complete, emit)
+    }
 }
 
 /// Everything 在首次完整枚举失败时整次回退到 Windows Walker，不混合两种结果。
@@ -66,12 +76,35 @@ pub(crate) struct PreferredEverythingEnumerator;
 
 impl FileEnumerator for PreferredEverythingEnumerator {
     fn enumerate(&self, roots: &[DisplayPath]) -> Result<Vec<ScannedPath>, ScanError> {
-        enumerate_preferred_with(
-            &EverythingEnumerator,
-            &dedup_windows::WindowsWalker,
-            roots,
-        )
+        enumerate_preferred_with(&EverythingEnumerator, &dedup_windows::WindowsWalker, roots)
     }
+
+    /// Everything 或整次 Walker 回退先形成稳定清单，再独立报告枚举完成。
+    fn enumerate_into_with_completion(
+        &self,
+        roots: &[DisplayPath],
+        complete: &mut dyn FnMut(Option<(u64, u64)>) -> Result<(), ScanError>,
+        emit: &mut dyn FnMut(ScannedPath) -> Result<(), ScanError>,
+    ) -> Result<(), ScanError> {
+        emit_materialized_rows(self.enumerate(roots)?, complete, emit)
+    }
+}
+
+/// 把已完成的稳定清单与后续有界交付拆成两个生命周期边界。
+fn emit_materialized_rows(
+    rows: Vec<ScannedPath>,
+    complete: &mut dyn FnMut(Option<(u64, u64)>) -> Result<(), ScanError>,
+    emit: &mut dyn FnMut(ScannedPath) -> Result<(), ScanError>,
+) -> Result<(), ScanError> {
+    let total_files = rows.len() as u64;
+    let total_bytes = rows
+        .iter()
+        .fold(0_u64, |total, row| total.saturating_add(row.file_size));
+    complete(Some((total_files, total_bytes)))?;
+    for row in rows {
+        emit(row)?;
+    }
+    Ok(())
 }
 
 fn enumerate_preferred_with<E, W>(

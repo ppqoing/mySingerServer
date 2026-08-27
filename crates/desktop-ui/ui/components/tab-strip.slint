@@ -24,12 +24,15 @@ export component TabStrip inherits Rectangle {
             tab-label := Text {
                 text: label;
                 x: 12px;
+                y: 0px;
                 width: parent.width - 24px;
+                height: parent.height - 2px;
                 color: root.active-index == index ? Theme.accent : Theme.muted;
                 font-size: 12px;
                 font-weight: root.active-index == index ? 650 : 450;
                 horizontal-alignment: center;
                 vertical-alignment: center;
+                accessible-label: "页签文字：" + label;
             }
             Rectangle {
                 visible: root.active-index == index;

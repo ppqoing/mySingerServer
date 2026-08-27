@@ -123,6 +123,30 @@ fn node_summary_uses_handshake_machine_identity_and_unified_key() {
     assert_eq!(snapshot.overall_completed, 4);
 }
 
+#[test]
+fn node_compute_kinds_use_three_fixed_product_titles() {
+    let machine = MachineId::from_sha256([0xc6; 32]);
+    for (task_kind, expected_title) in [
+        ("base_compute", "基础计算"),
+        ("duplicate_list", "重复文件清单"),
+        ("stage2_compute", "二次特征计算"),
+    ] {
+        let snapshot = DesktopRuntimeTaskRegistry::node_snapshot(
+            0,
+            &machine,
+            proto::RuntimeTaskSummary {
+                runtime_task_id: format!("runtime-{task_kind}"),
+                machine_id: machine.as_str().into(),
+                task_kind: task_kind.into(),
+                title: "旧标题不得覆盖产品任务名".into(),
+                state: "running".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(snapshot.title, expected_title);
+    }
+}
+
 #[tokio::test]
 async fn desktop_app_owns_one_ephemeral_registry_per_process_start() {
     let first_temp = TempDir::new().unwrap();

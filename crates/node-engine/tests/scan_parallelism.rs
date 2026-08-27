@@ -26,7 +26,7 @@ use dedup_node_store::{
     CompleteStage1, FeatureWrite, ImageStage1Fields, NewTaskItem, NodeStore, ScannedPath,
 };
 use dedup_windows::ReadCancellationToken;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 #[derive(Clone)]
 struct StreamingEnumerator {
@@ -79,6 +79,38 @@ struct HoldingPipelineReader {
     started: mpsc::UnboundedSender<PathBuf>,
     completed: mpsc::UnboundedSender<PathBuf>,
     active_leases: Arc<AtomicUsize>,
+}
+
+/// 模拟同一物理盘只有固定读取许可，读取完成后租约仍随一筛项持有。
+#[derive(Clone)]
+struct PermitLimitedReader {
+    data: Arc<BTreeMap<PathBuf, Vec<u8>>>,
+    permits: Arc<Semaphore>,
+    completed: mpsc::UnboundedSender<PathBuf>,
+}
+
+impl PipelineFileReader for PermitLimitedReader {
+    type Lease = OwnedSemaphorePermit;
+
+    fn read(
+        &self,
+        scanned: ScannedPath,
+        _cancellation: ReadCancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<ReadProduct<Self::Lease>, ReadFailure>> + Send + 'static>>
+    {
+        let path = scanned.display_path.as_path().to_path_buf();
+        let data = self.data.get(&path).unwrap().clone();
+        let permits = self.permits.clone();
+        let completed = self.completed.clone();
+        Box::pin(async move {
+            let lease = permits.acquire_owned().await.unwrap();
+            let _ = completed.send(path);
+            Ok(ReadProduct {
+                md5: md5_bytes(&data),
+                lease,
+            })
+        })
+    }
 }
 
 impl PipelineFileReader for HoldingPipelineReader {
@@ -156,6 +188,64 @@ struct ReversedBatchProcessor {
 
 struct InvalidVideoProcessor;
 
+/// 模拟 Worker 数明显大于单盘读取许可的生产批处理器。
+struct WideBatchProcessor {
+    batch_sizes: Arc<Mutex<Vec<usize>>>,
+}
+
+/// 首批 Worker 保持运行，供测试观察后续磁盘读取能否并行推进。
+struct BlockingFirstBatchProcessor {
+    started: mpsc::UnboundedSender<()>,
+    release: Arc<Semaphore>,
+    blocked_once: bool,
+}
+
+impl Stage1Processor for BlockingFirstBatchProcessor {
+    async fn process(&mut self, request: Stage1Request) -> Result<Stage1Output, String> {
+        Ok(image_output(&request))
+    }
+
+    fn max_in_flight(&self) -> usize {
+        24
+    }
+
+    async fn process_batch(&mut self, requests: Vec<Stage1Request>) -> Vec<Stage1BatchResult> {
+        if !self.blocked_once {
+            self.blocked_once = true;
+            let _ = self.started.send(());
+            self.release.acquire().await.unwrap().forget();
+        }
+        requests
+            .into_iter()
+            .map(|request| Stage1BatchResult {
+                item_id: request.item_id.clone(),
+                output: Ok(image_output(&request)),
+            })
+            .collect()
+    }
+}
+
+impl Stage1Processor for WideBatchProcessor {
+    async fn process(&mut self, request: Stage1Request) -> Result<Stage1Output, String> {
+        Ok(image_output(&request))
+    }
+
+    fn max_in_flight(&self) -> usize {
+        24
+    }
+
+    async fn process_batch(&mut self, requests: Vec<Stage1Request>) -> Vec<Stage1BatchResult> {
+        self.batch_sizes.lock().unwrap().push(requests.len());
+        requests
+            .into_iter()
+            .map(|request| Stage1BatchResult {
+                item_id: request.item_id.clone(),
+                output: Ok(image_output(&request)),
+            })
+            .collect()
+    }
+}
+
 impl Stage1Processor for InvalidVideoProcessor {
     async fn process(&mut self, _request: Stage1Request) -> Result<Stage1Output, String> {
         Ok(Stage1Output {
@@ -180,7 +270,11 @@ impl Stage1Processor for ReversedBatchProcessor {
 
     async fn process_batch(&mut self, requests: Vec<Stage1Request>) -> Vec<Stage1BatchResult> {
         self.batch_sizes.lock().unwrap().push(requests.len());
-        assert!(self.active_leases.load(Ordering::Acquire) >= requests.len());
+        assert_eq!(
+            self.active_leases.load(Ordering::Acquire),
+            0,
+            "磁盘读取许可不得延伸到 Worker 计算阶段"
+        );
         requests
             .into_iter()
             .rev()
@@ -190,6 +284,127 @@ impl Stage1Processor for ReversedBatchProcessor {
             })
             .collect()
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn completed_reads_flush_before_same_disk_permits_block_the_worker_batch() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = [
+        directory.path().join("one.bin"),
+        directory.path().join("two.bin"),
+        directory.path().join("three.bin"),
+    ];
+    let mut data = BTreeMap::new();
+    for (index, path) in paths.iter().enumerate() {
+        let bytes = vec![index as u8 + 1; index + 1];
+        std::fs::write(path, &bytes).unwrap();
+        data.insert(path.clone(), bytes);
+    }
+    let rows = paths.iter().map(|path| scanned(path)).collect::<Vec<_>>();
+    let enumerator = StreamingEnumerator {
+        rows: Arc::new(rows),
+        attempted: None,
+        emitted: Arc::new(AtomicUsize::new(0)),
+    };
+    let (completed, _completed_rx) = mpsc::unbounded_channel();
+    let reader = PermitLimitedReader {
+        data: Arc::new(data),
+        permits: Arc::new(Semaphore::new(2)),
+        completed,
+    };
+    let batch_sizes = Arc::new(Mutex::new(Vec::new()));
+    let mut processor = WideBatchProcessor {
+        batch_sizes: batch_sizes.clone(),
+    };
+    let root = DisplayPath::new(directory.path()).unwrap();
+    let mut store = NodeStore::open_in_memory(MachineId::parse(&"43".repeat(32)).unwrap()).unwrap();
+    let mut engine = ScanEngine::new(enumerator, SystemMd5, directory.path().join("sheets"));
+
+    let summary = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        engine.run_parallel_with(
+            &mut store,
+            ScanOptions::new(vec![root]).force_recompute(),
+            reader,
+            &mut processor,
+            PipelineLimits::new(48, 48),
+            ReadCancellationToken::new(),
+            1,
+        ),
+    )
+    .await
+    .expect("已完成的读取必须先进入一筛并释放单盘许可，不能等待凑满 24 个 Worker")
+    .unwrap();
+
+    assert_eq!(summary.scheduled_stage1, 3);
+    assert_eq!(batch_sizes.lock().unwrap().iter().sum::<usize>(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_disk_reads_continue_while_the_first_worker_batch_is_running() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = [
+        directory.path().join("one.bin"),
+        directory.path().join("two.bin"),
+        directory.path().join("three.bin"),
+    ];
+    let mut data = BTreeMap::new();
+    for (index, path) in paths.iter().enumerate() {
+        let bytes = vec![index as u8 + 1; index + 1];
+        std::fs::write(path, &bytes).unwrap();
+        data.insert(path.clone(), bytes);
+    }
+    let rows = paths.iter().map(|path| scanned(path)).collect::<Vec<_>>();
+    let enumerator = StreamingEnumerator {
+        rows: Arc::new(rows),
+        attempted: None,
+        emitted: Arc::new(AtomicUsize::new(0)),
+    };
+    let (completed_tx, mut completed_rx) = mpsc::unbounded_channel();
+    let reader = PermitLimitedReader {
+        data: Arc::new(data),
+        permits: Arc::new(Semaphore::new(2)),
+        completed: completed_tx,
+    };
+    let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+    let worker_release = Arc::new(Semaphore::new(0));
+    let release_after_observation = worker_release.clone();
+    let mut processor = BlockingFirstBatchProcessor {
+        started: started_tx,
+        release: worker_release,
+        blocked_once: false,
+    };
+    let root = DisplayPath::new(directory.path()).unwrap();
+    let mut store = NodeStore::open_in_memory(MachineId::parse(&"44".repeat(32)).unwrap()).unwrap();
+    let mut engine = ScanEngine::new(enumerator, SystemMd5, directory.path().join("sheets"));
+    let scan = tokio::spawn(async move {
+        engine
+            .run_parallel_with(
+                &mut store,
+                ScanOptions::new(vec![root]).force_recompute(),
+                reader,
+                &mut processor,
+                PipelineLimits::new(48, 48),
+                ReadCancellationToken::new(),
+                1,
+            )
+            .await
+    });
+
+    started_rx.recv().await.unwrap();
+    let all_reads_finished = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        for _ in 0..3 {
+            completed_rx.recv().await.unwrap();
+        }
+    })
+    .await;
+    release_after_observation.add_permits(1);
+    all_reads_finished.expect("Worker 处理首批时，同盘后续 MD5 读取必须继续填充流水线");
+    tokio::time::timeout(std::time::Duration::from_secs(1), scan)
+        .await
+        .expect("释放首批 Worker 后扫描必须完成")
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

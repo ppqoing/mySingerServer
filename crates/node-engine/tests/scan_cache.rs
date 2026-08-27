@@ -1,4 +1,4 @@
-use std::{future::Future, fs, path::Path, pin::Pin};
+use std::{fs, future::Future, path::Path, pin::Pin};
 
 use dedup_core::{DisplayPath, MachineId, MediaKind, NormalizedPath};
 use dedup_node_engine::{
@@ -58,8 +58,9 @@ impl PipelineFileReader for ImmediateReader {
         cancellation: ReadCancellationToken,
     ) -> Pin<
         Box<
-            dyn Future<Output = Result<ReadProduct<Self::Lease>, dedup_node_engine::io::ReadFailure>>
-                + Send
+            dyn Future<
+                    Output = Result<ReadProduct<Self::Lease>, dedup_node_engine::io::ReadFailure>,
+                > + Send
                 + 'static,
         >,
     > {
@@ -334,13 +335,12 @@ async fn contact_sheet_md5_path_reuses_existing_file_and_repairs_reference() {
     assert_eq!(processor.encodes, 0, "已有 MD5 联系表不得重复编码");
     assert_eq!(processor.generation_requests, vec![false]);
     assert_eq!(fs::read(&existing_target).unwrap(), b"existing-jpeg");
-    let existing_relative = format!(
-        "contact-sheets/{}/{}.jpg",
-        &existing_hex[..2],
-        existing_hex
-    );
+    let existing_relative = format!("contact-sheets/{}/{}.jpg", &existing_hex[..2], existing_hex);
     assert_eq!(
-        store.contact_sheet_path(existing_content).unwrap().as_deref(),
+        store
+            .contact_sheet_path(existing_content)
+            .unwrap()
+            .as_deref(),
         Some(existing_relative.as_str())
     );
 
@@ -370,7 +370,11 @@ async fn contact_sheet_md5_path_reuses_existing_file_and_repairs_reference() {
             .unwrap()
             .read_dir()
             .unwrap()
-            .all(|entry| !entry.unwrap().file_name().to_string_lossy().contains("partial")),
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("partial")),
         "发布后同目录不得遗留 partial"
     );
 

@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use dedup_core::{
     DeleteMode, DesktopConfig, DiskReadConfig, EnumeratorKind, NodeConfig, NodePathsConfig,
-    Thresholds, WorkerConfig, WorkerMode,
+    NodePostgresConfig, Thresholds, WorkerConfig, WorkerMode,
 };
 use dedup_desktop_core::{
     app::{UiCommand, UiEvent},
@@ -18,7 +18,7 @@ use slint::{
 };
 use tokio::sync::mpsc;
 
-use crate::{MainWindow, UiFileFaultRow, models};
+use crate::{MainWindow, UiFileFaultRow, UiPathRow, UiScanRootRow, models};
 
 /// GUI 回调与事件应用共享的最新已验证配置。
 ///
@@ -27,6 +27,8 @@ use crate::{MainWindow, UiFileFaultRow, models};
 #[derive(Clone)]
 pub struct UiBinding {
     config: Arc<Mutex<DesktopConfig>>,
+    /// 记录最后一次写入数据库表单的持久连接串，避免周期视图刷新覆盖未保存输入。
+    applied_postgres_url: Arc<Mutex<Option<Option<String>>>>,
     node_config: Arc<Mutex<Option<LoadedNodeConfig>>>,
     selected_node: Arc<Mutex<NodeConfigSelection>>,
 }
@@ -52,6 +54,7 @@ pub fn bind_commands(
 ) -> UiBinding {
     let binding = UiBinding {
         config: Arc::new(Mutex::new(initial)),
+        applied_postgres_url: Arc::new(Mutex::new(None)),
         node_config: Arc::new(Mutex::new(None)),
         selected_node: Arc::new(Mutex::new(NodeConfigSelection {
             index: window.get_node_config_selected_index().max(0),
@@ -59,6 +62,7 @@ pub fn bind_commands(
         })),
     };
 
+    bind_scan_roots(window);
     bind_simple(window, &sender);
     bind_results(window, &sender);
     let add_sender = sender.clone();
@@ -123,12 +127,21 @@ pub fn bind_commands(
     });
     let scan_sender = sender.clone();
     let scan_window = window.as_weak();
-    window.on_start_scan(move |index, path, force, enumerator| {
+    window.on_start_scan(move |index, roots, force, enumerator| {
+        let roots = match scan_root_values(&roots) {
+            Ok(roots) => roots,
+            Err(error) => {
+                if let Some(window) = scan_window.upgrade() {
+                    window.set_last_error(error.into());
+                }
+                return;
+            }
+        };
         send(
             &scan_sender,
             UiCommand::CreateScan {
                 node_index: index.max(0) as usize,
-                roots: vec![path.to_string()],
+                roots,
                 force_recalculate: force,
                 enumerator: if enumerator == 1 {
                     EnumeratorKind::Everything
@@ -186,6 +199,35 @@ pub fn bind_commands(
     );
     bind_file_faults(window, &sender);
 
+    let database_sender = sender.clone();
+    let database_window = window.as_weak();
+    window.on_test_database_connection(move || {
+        let Some(window) = database_window.upgrade() else {
+            return;
+        };
+        let url = match postgres_url_from_window(&window) {
+            Ok(Some(url)) => url,
+            Ok(None) => {
+                window.set_database_testing(false);
+                window.set_database_test_error("请先填写 PostgreSQL 服务器".into());
+                return;
+            }
+            Err(error) => {
+                window.set_database_testing(false);
+                window.set_database_test_error(error.into());
+                return;
+            }
+        };
+        window.set_database_testing(true);
+        window.set_database_test_status("正在连接并统计固定表…".into());
+        window.set_database_test_error(SharedString::default());
+        window.set_database_tables(ModelRc::new(VecModel::from(Vec::new())));
+        if let Err(error) = database_sender.try_send(UiCommand::TestDatabaseConnection { url }) {
+            window.set_database_testing(false);
+            window.set_database_test_error(format!("命令队列不可用：{error}").into());
+        }
+    });
+
     let save_sender = sender;
     let save_window = window.as_weak();
     let save_config = Arc::clone(&binding.config);
@@ -224,6 +266,10 @@ fn bind_node_config(
         let changed = update_node_config_selection(&window, index, &selected_for_callback);
         if changed {
             clear_node_config_context(&window, &select_loaded);
+            window.set_scan_roots(ModelRc::new(VecModel::from(Vec::<UiScanRootRow>::new())));
+            window.set_scan_roots_valid(false);
+            window.set_path_picker_open(false);
+            window.set_path_picker_target_index(-1);
         }
     });
 
@@ -329,9 +375,7 @@ fn bind_file_faults(window: &MainWindow, sender: &mpsc::Sender<UiCommand>) {
             .unwrap_or_default();
         window.set_file_fault_selected_node(index);
         window.set_file_fault_node_online(selected_node_online(&window, index));
-        window.set_file_fault_rows(ModelRc::new(VecModel::from(
-            Vec::<UiFileFaultRow>::new(),
-        )));
+        window.set_file_fault_rows(ModelRc::new(VecModel::from(Vec::<UiFileFaultRow>::new())));
         window.set_file_fault_next_cursor(SharedString::default());
         window.set_file_fault_error(SharedString::default());
         window.set_disk_cleanup_summary("尚无磁盘满清理记录".into());
@@ -377,10 +421,7 @@ fn bind_file_faults(window: &MainWindow, sender: &mpsc::Sender<UiCommand>) {
         if !window.get_file_fault_node_online() || window.get_file_fault_loading() {
             return;
         }
-        let Some(row) = window
-            .get_file_fault_rows()
-            .row_data(index.max(0) as usize)
-        else {
+        let Some(row) = window.get_file_fault_rows().row_data(index.max(0) as usize) else {
             return;
         };
         let fault_kind = match row.fault_kind {
@@ -461,6 +502,14 @@ fn clear_node_config_form(window: &MainWindow) {
     window.set_node_config_manual_workers(1);
     window.set_node_config_logical_cpus(0);
     window.set_node_config_effective_workers(0);
+    let postgres = NodePostgresConfig::default();
+    window.set_node_config_postgres_enabled(postgres.enabled);
+    window.set_node_config_postgres_host(postgres.host.into());
+    window.set_node_config_postgres_port(i32::from(postgres.port));
+    window.set_node_config_postgres_database(postgres.database.into());
+    window.set_node_config_postgres_username(postgres.username.into());
+    window.set_node_config_postgres_password(postgres.password.into());
+    window.set_node_config_postgres_timeout_seconds(postgres.connect_timeout_seconds as i32);
     window.set_scan_root(SharedString::default());
 }
 
@@ -480,9 +529,7 @@ fn apply_file_fault_state(window: &MainWindow, state: &FileFaultDiagnosticsState
             "suspected_physical_read" | "worker_crash"
         )
     }) {
-        window.set_file_fault_rows(ModelRc::new(VecModel::from(
-            Vec::<UiFileFaultRow>::new(),
-        )));
+        window.set_file_fault_rows(ModelRc::new(VecModel::from(Vec::<UiFileFaultRow>::new())));
         window.set_file_fault_next_cursor(SharedString::default());
         window.set_file_fault_loading(false);
         window.set_file_fault_error("未知文件故障类别，响应已拒绝".into());
@@ -600,6 +647,21 @@ fn node_config_from_window(window: &MainWindow) -> Result<NodeConfig, String> {
                 "手动 Worker 数量",
             )?,
         },
+        postgres: NodePostgresConfig {
+            enabled: window.get_node_config_postgres_enabled(),
+            host: window.get_node_config_postgres_host().trim().to_owned(),
+            port: window
+                .get_node_config_postgres_port()
+                .try_into()
+                .map_err(|_| "Node PostgreSQL 端口无效".to_owned())?,
+            database: window.get_node_config_postgres_database().trim().to_owned(),
+            username: window.get_node_config_postgres_username().trim().to_owned(),
+            password: window.get_node_config_postgres_password().to_string(),
+            connect_timeout_seconds: window
+                .get_node_config_postgres_timeout_seconds()
+                .try_into()
+                .map_err(|_| "Node PostgreSQL 连接超时无效".to_owned())?,
+        },
     };
     config.validate().map_err(|error| error.to_string())?;
     Ok(config)
@@ -609,12 +671,147 @@ fn positive_usize(value: i32, field: &str) -> Result<usize, String> {
     value.try_into().map_err(|_| format!("{field} 无效"))
 }
 
+/// 扫描根 Item 只修改窗口模型，不新增后端命令；开始扫描时统一读取完整集合。
+fn bind_scan_roots(window: &MainWindow) {
+    let select_window = window.as_weak();
+    window.on_select_scan_node(move |index| {
+        let Some(window) = select_window.upgrade() else {
+            return;
+        };
+        let index = index.max(0);
+        if window.get_scan_node_index() == index {
+            return;
+        }
+        window.set_scan_node_index(index);
+        window.set_scan_root(SharedString::default());
+        window.set_scan_roots(ModelRc::new(VecModel::from(Vec::<UiScanRootRow>::new())));
+        window.set_scan_roots_valid(false);
+        window.set_path_picker_open(false);
+        window.set_path_picker_node_index(index);
+        window.set_path_picker_target_index(-1);
+        window.set_path_picker_current_path(SharedString::default());
+        window.set_path_picker_parent_path(SharedString::default());
+        window.set_path_picker_status(SharedString::default());
+        window.set_path_picker_directories(ModelRc::new(VecModel::from(Vec::<UiPathRow>::new())));
+        window.set_last_error("节点已切换，请重新添加扫描路径".into());
+    });
+
+    let add_window = window.as_weak();
+    window.on_add_scan_root(move || {
+        let Some(window) = add_window.upgrade() else {
+            return;
+        };
+        let mut rows = scan_root_rows(&window.get_scan_roots());
+        rows.push(UiScanRootRow {
+            path: SharedString::default(),
+        });
+        replace_scan_roots(&window, rows);
+    });
+
+    let update_window = window.as_weak();
+    window.on_update_scan_root(move |index, path| {
+        let Some(window) = update_window.upgrade() else {
+            return;
+        };
+        let mut rows = scan_root_rows(&window.get_scan_roots());
+        let index = index.max(0) as usize;
+        let Some(row) = rows.get_mut(index) else {
+            window.set_last_error("扫描路径 Item 已不存在".into());
+            return;
+        };
+        row.path = path;
+        replace_scan_roots(&window, rows);
+    });
+
+    let remove_window = window.as_weak();
+    window.on_remove_scan_root(move |index| {
+        let Some(window) = remove_window.upgrade() else {
+            return;
+        };
+        let mut rows = scan_root_rows(&window.get_scan_roots());
+        let index = index.max(0) as usize;
+        if index >= rows.len() {
+            window.set_last_error("扫描路径 Item 已不存在".into());
+            return;
+        }
+        rows.remove(index);
+        replace_scan_roots(&window, rows);
+    });
+}
+
+fn scan_root_rows(model: &ModelRc<UiScanRootRow>) -> Vec<UiScanRootRow> {
+    (0..model.row_count())
+        .filter_map(|index| model.row_data(index))
+        .collect()
+}
+
+fn replace_scan_roots(window: &MainWindow, rows: Vec<UiScanRootRow>) {
+    let model = ModelRc::new(VecModel::from(rows));
+    let validation = scan_root_values(&model);
+    window.set_scan_root(
+        model
+            .row_data(0)
+            .map_or_else(SharedString::default, |row| row.path),
+    );
+    window.set_scan_roots(model);
+    match validation {
+        Ok(_) => {
+            window.set_scan_roots_valid(true);
+            window.set_last_error(SharedString::default());
+        }
+        Err(error) => {
+            window.set_scan_roots_valid(false);
+            window.set_last_error(error.into());
+        }
+    }
+}
+
+fn scan_root_values(model: &ModelRc<UiScanRootRow>) -> Result<Vec<String>, String> {
+    if model.row_count() == 0 {
+        return Err("请至少添加一个扫描路径".to_owned());
+    }
+    let mut roots = Vec::with_capacity(model.row_count());
+    let mut keys = std::collections::BTreeSet::new();
+    for index in 0..model.row_count() {
+        let path = model
+            .row_data(index)
+            .map(|row| row.path.trim().to_owned())
+            .unwrap_or_default();
+        if path.is_empty() {
+            return Err(format!("扫描路径 {} 为空", index + 1));
+        }
+        let key = path
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_lowercase();
+        if !keys.insert(key) {
+            return Err(format!("扫描路径 {} 与已有路径重复", index + 1));
+        }
+        roots.push(path);
+    }
+    Ok(roots)
+}
+
 /// 在 Slint 线程整体应用一个不可变 core 事件。
 pub fn apply_event(window: &MainWindow, binding: &UiBinding, event: UiEvent) {
     match event {
         UiEvent::ViewChanged(state) => {
             *binding.config.lock().expect("UI 配置锁未中毒") = state.config().clone();
+            let apply_postgres_fields = {
+                let current = state.config().postgres_url.clone();
+                let mut applied = binding
+                    .applied_postgres_url
+                    .lock()
+                    .expect("PostgreSQL 表单快照锁未中毒");
+                if applied.as_ref() == Some(&current) {
+                    false
+                } else {
+                    *applied = Some(current);
+                    true
+                }
+            };
             window.set_nodes(models::nodes(&state));
+            window.set_scan_node_options(models::scan_node_options(&state));
             window.set_tasks(models::tasks(&state));
             window.set_online_count(
                 state
@@ -649,15 +846,9 @@ pub fn apply_event(window: &MainWindow, binding: &UiBinding, event: UiEvent) {
                 .selected_node_index
                 .unwrap_or_else(|| window.get_file_fault_selected_node().max(0) as usize);
             window.set_file_fault_selected_node(file_fault_selected as i32);
-            window.set_file_fault_node_online(
-                state
-                    .nodes()
-                    .get(file_fault_selected)
-                    .is_some_and(|node| {
-                        node.connection == NodeConnectionState::Online
-                            && node.machine_id.is_some()
-                    }),
-            );
+            window.set_file_fault_node_online(state.nodes().get(file_fault_selected).is_some_and(
+                |node| node.connection == NodeConnectionState::Online && node.machine_id.is_some(),
+            ));
             apply_file_fault_state(window, state.file_faults());
             let sync = state
                 .nodes()
@@ -680,32 +871,80 @@ pub fn apply_event(window: &MainWindow, binding: &UiBinding, event: UiEvent) {
             window.set_logs_path(path(&state.paths().logs));
             window.set_cache_path(path(&state.paths().cache));
             window.set_config_path(path(&state.paths().config));
-            apply_settings(window, state.config());
+            apply_settings(window, state.config(), apply_postgres_fields);
             window.set_last_error(SharedString::default());
         }
         UiEvent::PathsChanged {
+            node_index,
             parent_path,
             entries,
             next_cursor,
-            ..
         } => {
-            window.set_last_error(
-                format!(
-                    "路径 {}：{} 项{}",
-                    if parent_path.is_empty() {
-                        "盘符".to_owned()
-                    } else {
-                        parent_path
-                    },
-                    entries.len(),
+            if window.get_path_picker_open()
+                && window.get_path_picker_node_index() == node_index as i32
+            {
+                let directory_count = entries.iter().filter(|entry| entry.is_directory).count();
+                window.set_path_picker_directories(models::paths(&entries));
+                window.set_path_picker_parent_path(models::path_parent(&parent_path).into());
+                window.set_path_picker_current_path(parent_path.into());
+                window.set_path_picker_status(
                     if next_cursor.is_empty() {
-                        ""
+                        format!("{directory_count} 个子目录")
                     } else {
-                        "（还有下一页）"
+                        format!("已显示 {directory_count} 个子目录；当前目录项目较多")
                     }
-                )
-                .into(),
-            );
+                    .into(),
+                );
+                window.set_last_error(SharedString::default());
+            } else {
+                window.set_last_error(
+                    format!(
+                        "路径 {}：{} 项{}",
+                        if parent_path.is_empty() {
+                            "盘符".to_owned()
+                        } else {
+                            parent_path
+                        },
+                        entries.len(),
+                        if next_cursor.is_empty() {
+                            ""
+                        } else {
+                            "（还有下一页）"
+                        }
+                    )
+                    .into(),
+                );
+            }
+        }
+        UiEvent::DatabaseDiagnosticsChanged(result) => {
+            window.set_database_testing(false);
+            match result {
+                Ok(diagnostics) => {
+                    let ready = diagnostics
+                        .tables
+                        .iter()
+                        .filter(|table| {
+                            matches!(
+                                table.status,
+                                dedup_desktop_core::central::CentralTableStatus::Ready
+                            )
+                        })
+                        .count();
+                    window.set_database_test_status(
+                        format!("连接成功 · {ready} / {} 张表正常", diagnostics.tables.len())
+                            .into(),
+                    );
+                    window.set_database_test_error(SharedString::default());
+                    window.set_database_tables(models::database_tables(&diagnostics));
+                    window.set_last_error(SharedString::default());
+                }
+                Err(error) => {
+                    window.set_database_test_status("连接失败".into());
+                    window.set_database_test_error(error.clone().into());
+                    window.set_database_tables(ModelRc::new(VecModel::from(Vec::new())));
+                    window.set_last_error(error.into());
+                }
+            }
         }
         UiEvent::FileFaultsChanged(state) => apply_file_fault_state(window, &state),
         UiEvent::RuntimeTasksChanged(state) => {
@@ -718,6 +957,8 @@ pub fn apply_event(window: &MainWindow, binding: &UiBinding, event: UiEvent) {
             window.set_runtime_detail_machine_id(runtime.machine_id);
             window.set_runtime_detail_state(runtime.state);
             window.set_runtime_detail_counts(runtime.counts);
+            window.set_runtime_execution_config(runtime.execution_config);
+            window.set_runtime_pipeline_metrics(runtime.pipeline_metrics);
             window.set_runtime_detail_stale(runtime.stale);
             window.set_runtime_detail_error(runtime.error);
         }
@@ -941,6 +1182,13 @@ fn apply_node_config(window: &MainWindow, config: &NodeConfig) {
     window.set_node_config_worker_mode_index(i32::from(config.worker.mode == WorkerMode::Manual));
     window.set_node_config_reserved_cores(config.worker.reserved_cores as i32);
     window.set_node_config_manual_workers(config.worker.manual_worker_count as i32);
+    window.set_node_config_postgres_enabled(config.postgres.enabled);
+    window.set_node_config_postgres_host(config.postgres.host.clone().into());
+    window.set_node_config_postgres_port(i32::from(config.postgres.port));
+    window.set_node_config_postgres_database(config.postgres.database.clone().into());
+    window.set_node_config_postgres_username(config.postgres.username.clone().into());
+    window.set_node_config_postgres_password(config.postgres.password.clone().into());
+    window.set_node_config_postgres_timeout_seconds(config.postgres.connect_timeout_seconds as i32);
 }
 
 fn node_config_phase(phase: dedup_desktop_core::view_state::NodeConfigSavePhase) -> &'static str {
@@ -1154,8 +1402,7 @@ fn settings_from_window(
     shared: &Arc<Mutex<DesktopConfig>>,
 ) -> Result<DesktopConfig, String> {
     let mut config = shared.lock().map_err(|_| "配置锁不可用")?.clone();
-    let postgres = window.get_postgres_url().trim().to_owned();
-    config.postgres_url = (!postgres.is_empty()).then_some(postgres);
+    config.postgres_url = postgres_url_from_window(window)?;
     config.reconnect_interval_seconds = window
         .get_reconnect_seconds()
         .try_into()
@@ -1180,8 +1427,16 @@ fn settings_from_window(
     Ok(config)
 }
 
-fn apply_settings(window: &MainWindow, config: &DesktopConfig) {
-    window.set_postgres_url(config.postgres_url.clone().unwrap_or_default().into());
+fn apply_settings(window: &MainWindow, config: &DesktopConfig, apply_postgres_fields: bool) {
+    if apply_postgres_fields {
+        window.set_postgres_url(config.postgres_url.clone().unwrap_or_default().into());
+        let postgres = postgres_fields_from_url(config.postgres_url.as_deref());
+        window.set_postgres_host(postgres.host.into());
+        window.set_postgres_port(postgres.port);
+        window.set_postgres_database(postgres.database.into());
+        window.set_postgres_username(postgres.username.into());
+        window.set_postgres_password(postgres.password.into());
+    }
     window.set_reconnect_seconds(config.reconnect_interval_seconds as i32);
     window.set_delete_mode_index(i32::from(config.delete_mode == DeleteMode::Permanent));
     window.set_pdq_quality(config.thresholds.pdq_quality_min.to_string().into());
@@ -1193,6 +1448,164 @@ fn apply_settings(window: &MainWindow, config: &DesktopConfig) {
     window.set_video_valid(config.thresholds.video_min_valid_frames.to_string().into());
     window.set_video_stage1(format!("{:.2}", config.thresholds.video_stage1_min).into());
     window.set_video_stage2(format!("{:.2}", config.thresholds.video_stage2_min).into());
+}
+
+/// PostgreSQL URL 拆分后的基础连接字段，只存在于桌面 UI 编辑边界。
+#[derive(Debug, Default, Eq, PartialEq)]
+struct PostgresConnectionFields {
+    /// 服务器 IPv4、IPv6 或主机名。
+    host: String,
+    /// PostgreSQL TCP 端口。
+    port: i32,
+    /// 目标数据库名称。
+    database: String,
+    /// 登录用户名。
+    username: String,
+    /// 登录密码。
+    password: String,
+}
+
+/// 将 UI 基础字段编码为既有 `DesktopConfig.postgres_url`，不改变配置文件结构。
+fn postgres_url_from_window(window: &MainWindow) -> Result<Option<String>, String> {
+    let host = window.get_postgres_host().trim().to_owned();
+    if host.is_empty() {
+        return Ok(None);
+    }
+    if host
+        .chars()
+        .any(|character| character.is_whitespace() || matches!(character, '/' | '@' | '?' | '#'))
+    {
+        return Err("PostgreSQL 服务器地址无效".into());
+    }
+
+    let database = window.get_postgres_database().trim().to_owned();
+    if database.is_empty() {
+        return Err("PostgreSQL 数据库名不能为空".into());
+    }
+    let username = window.get_postgres_username().trim().to_owned();
+    if username.is_empty() {
+        return Err("PostgreSQL 用户名不能为空".into());
+    }
+    let port = u16::try_from(window.get_postgres_port())
+        .ok()
+        .filter(|port| *port != 0)
+        .ok_or_else(|| "PostgreSQL 端口无效".to_owned())?;
+    let password = window.get_postgres_password();
+    let authority_host = if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
+        format!("[{host}]")
+    } else {
+        host
+    };
+
+    Ok(Some(format!(
+        "postgresql://{}:{}@{}:{}/{}",
+        encode_postgres_component(&username),
+        encode_postgres_component(password.as_str()),
+        authority_host,
+        port,
+        encode_postgres_component(&database),
+    )))
+}
+
+/// 把现有 PostgreSQL URL 拆回基础字段；缺失或不支持的 URL 返回空字段与默认端口。
+fn postgres_fields_from_url(url: Option<&str>) -> PostgresConnectionFields {
+    let Some(raw_url) = url.map(str::trim).filter(|value| !value.is_empty()) else {
+        return PostgresConnectionFields {
+            port: 5432,
+            ..PostgresConnectionFields::default()
+        };
+    };
+    let Some(connection) = raw_url
+        .strip_prefix("postgresql://")
+        .or_else(|| raw_url.strip_prefix("postgres://"))
+    else {
+        return PostgresConnectionFields {
+            port: 5432,
+            ..PostgresConnectionFields::default()
+        };
+    };
+
+    let (credentials, endpoint) = connection.rsplit_once('@').unwrap_or(("", connection));
+    let (encoded_username, encoded_password) =
+        credentials.split_once(':').unwrap_or((credentials, ""));
+    let (authority, database_path) = endpoint.split_once('/').unwrap_or((endpoint, ""));
+    let encoded_database = database_path
+        .split(|character| matches!(character, '?' | '#'))
+        .next()
+        .unwrap_or_default();
+    let (host, port) = split_postgres_authority(authority);
+
+    PostgresConnectionFields {
+        host: host.to_owned(),
+        port: i32::from(port),
+        database: decode_postgres_component(encoded_database),
+        username: decode_postgres_component(encoded_username),
+        password: decode_postgres_component(encoded_password),
+    }
+}
+
+/// 解析 PostgreSQL authority，并兼容带方括号的 IPv6 地址。
+fn split_postgres_authority(authority: &str) -> (&str, u16) {
+    if let Some(ipv6) = authority.strip_prefix('[')
+        && let Some(end) = ipv6.find(']')
+    {
+        let host = &ipv6[..end];
+        let port = ipv6[end + 1..]
+            .strip_prefix(':')
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(5432);
+        return (host, port);
+    }
+    if let Some((host, port)) = authority.rsplit_once(':')
+        && let Ok(port) = port.parse()
+    {
+        return (host, port);
+    }
+    (authority, 5432)
+}
+
+/// 使用 URL unreserved 规则编码用户名、密码和数据库名的 UTF-8 字节。
+fn encode_postgres_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+/// 解码 URL 百分号字节；无效编码保持原字节，避免加载配置时丢失用户输入。
+fn decode_postgres_component(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let (Some(high), Some(low)) =
+                (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+        {
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).unwrap_or_else(|_| value.to_owned())
+}
+
+/// 把单个 ASCII 十六进制字符转换为数值。
+fn hex_value(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn parse<T>(value: SharedString, field: &str) -> Result<T, String>

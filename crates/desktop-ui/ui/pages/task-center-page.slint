@@ -18,12 +18,27 @@ export component TaskCenterPage inherits Rectangle {
     in property <string> runtime-detail-machine-id;
     in property <string> runtime-detail-state;
     in property <string> runtime-detail-counts;
+    in property <string> runtime-execution-config: "—";
+    in property <string> runtime-pipeline-metrics: "—";
     in property <bool> runtime-detail-stale;
     in property <string> runtime-detail-error;
     in-out property <int> task-tab: 0;
     in-out property <int> selected-task-index: 0;
     callback select-runtime-task(string, int, string);
     callback cancel-task(int, string);
+
+    // 最近失败只展示末尾20条；该计数同时决定详情内容的真实滚动高度。
+    private property <int> visible-runtime-failure-count: root.runtime-failures.length > 20
+        ? 20
+        : root.runtime-failures.length;
+    // Flickable 无法从重复器自动推导高度，按生产布局的固定块和实际模型长度精确投影。
+    private property <length> runtime-detail-content-height: 32px
+        + 104px + 84px + 196px + 60px
+        + 30px + (root.runtime-stages.length == 0 ? 44px : root.runtime-stages.length * 82px)
+        + 30px + (root.runtime-workers.length == 0 ? 44px : root.runtime-workers.length * 92px)
+        + 30px + (root.visible-runtime-failure-count == 0 ? 44px : root.visible-runtime-failure-count * 64px)
+        + (root.runtime-detail-stale ? 46px : 0px)
+        + (root.runtime-detail-error != "" ? 54px : 0px);
 
     pure function status-matches-tab(status: string) -> bool {
         return (root.task-tab == 0 && (status == "排队中" || status == "运行中"))
@@ -79,7 +94,8 @@ export component TaskCenterPage inherits Rectangle {
                         accessible-role: AccessibleRole.groupbox;
                         accessible-label: "任务列表滚动区";
                         VerticalLayout {
-                            min-width: max(300px, task-scroll.visible-width);
+                            // 380px 为阶段名、状态百分比和至少 120px 进度轨道保留稳定空间；窄窗由 ScrollView 横向承接。
+                            min-width: max(380px, task-scroll.visible-width);
                             spacing: 0px;
 
                             Rectangle {
@@ -189,6 +205,9 @@ export component TaskCenterPage inherits Rectangle {
                 detail-scroll := ScrollView {
                     accessible-role: AccessibleRole.groupbox;
                     accessible-label: "运行详情滚动区";
+                    viewport-height: root.runtime-detail-title == ""
+                        ? detail-scroll.visible-height
+                        : max(detail-scroll.visible-height, root.runtime-detail-content-height);
 
                     if root.runtime-detail-title == "" : EmptyState {
                         min-height: detail-scroll.visible-height;
@@ -244,6 +263,48 @@ export component TaskCenterPage inherits Rectangle {
                         }
 
                         Rectangle {
+                            height: 84px;
+                            vertical-stretch: 0;
+                            background: Theme.panel-hover;
+                            border-radius: 6px;
+                            accessible-role: AccessibleRole.groupbox;
+                            accessible-label: "实际执行配置：" + root.runtime-execution-config;
+                            VerticalLayout {
+                                padding: 10px;
+                                spacing: 5px;
+                                Text { text: "实际执行配置"; height: 20px; color: Theme.text; font-size: 13px; font-weight: 700; }
+                                Text {
+                                    text: root.runtime-execution-config;
+                                    color: Theme.muted;
+                                    font-size: 10px;
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+
+                        Rectangle {
+                            height: 196px;
+                            vertical-stretch: 0;
+                            background: Theme.panel-hover;
+                            border-radius: 6px;
+                            accessible-role: AccessibleRole.groupbox;
+                            accessible-label: "流水线指标：" + root.runtime-pipeline-metrics;
+                            VerticalLayout {
+                                padding: 10px;
+                                spacing: 5px;
+                                Text { text: "流水线指标"; height: 20px; color: Theme.text; font-size: 13px; font-weight: 700; }
+                                Text {
+                                    text: root.runtime-pipeline-metrics;
+                                    color: Theme.muted;
+                                    font-size: 10px;
+                                    wrap: word-wrap;
+                                    accessible-role: AccessibleRole.text;
+                                    accessible-label: "流水线指标内容：" + root.runtime-pipeline-metrics;
+                                }
+                            }
+                        }
+
+                        Rectangle {
                             height: 30px + (root.runtime-stages.length == 0 ? 44px : root.runtime-stages.length * 82px);
                             vertical-stretch: 0;
                             background: transparent;
@@ -284,7 +345,7 @@ export component TaskCenterPage inherits Rectangle {
                         }
 
                         Rectangle {
-                            height: 30px + (root.runtime-workers.length == 0 ? 44px : root.runtime-workers.length * 72px);
+                            height: 30px + (root.runtime-workers.length == 0 ? 44px : root.runtime-workers.length * 92px);
                             vertical-stretch: 0;
                             background: transparent;
                             accessible-role: AccessibleRole.groupbox;
@@ -301,12 +362,14 @@ export component TaskCenterPage inherits Rectangle {
                                     Text { text: "当前没有占用 Worker 的阶段"; color: Theme.muted; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
                                 }
                                 for worker in root.runtime-workers : Rectangle {
-                                    height: 66px;
+                                    height: 86px;
                                     background: Theme.panel-hover;
                                     border-radius: 6px;
                                     accessible-role: AccessibleRole.list-item;
-                                    accessible-label: "Worker：" + worker.identity + "；阶段 " + worker.stage-id + "；路径 " + worker.path
-                                        + "；磁盘 " + worker.disk + "；" + worker.completed + "；" + worker.speed;
+                                    accessible-label: "Worker：" + worker.identity + "；阶段 " + worker.stage-id + "；步骤 " + worker.step
+                                        + "；缓存 " + worker.cache-detail + "；路径 " + worker.path + "；磁盘 " + worker.disk
+                                        + "；阶段身份 " + worker.phase + "；CPU权重 " + worker.cpu-weight
+                                        + "；解码线程 " + worker.decoder-threads + "；" + worker.completed + "；" + worker.speed;
                                     VerticalLayout {
                                         padding: 9px;
                                         spacing: 4px;
@@ -315,14 +378,28 @@ export component TaskCenterPage inherits Rectangle {
                                             Text { text: worker.disk; color: Theme.muted; font-size: 10px; width: 110px; overflow: elide; horizontal-alignment: right; }
                                         }
                                         Text { text: worker.path; color: Theme.text; font-size: 10px; overflow: elide; }
-                                        Text { text: worker.stage-id + " · " + worker.completed + " · " + worker.speed; color: Theme.muted; font-size: 10px; overflow: elide; }
+                                        Text {
+                                            text: "阶段身份 " + worker.phase + " · CPU权重 " + worker.cpu-weight + " · 解码线程 " + worker.decoder-threads;
+                                            color: Theme.text;
+                                            font-size: 10px;
+                                            overflow: elide;
+                                        }
+                                        Text {
+                                            text: worker.stage-id
+                                                + (worker.step == "" ? "" : " · " + worker.step)
+                                                + (worker.cache-detail == "" ? "" : " · " + worker.cache-detail)
+                                                + " · " + worker.completed + " · " + worker.speed;
+                                            color: Theme.muted;
+                                            font-size: 10px;
+                                            overflow: elide;
+                                        }
                                     }
                                 }
                             }
                         }
 
                         Rectangle {
-                            property <int> recent-failure-count: root.runtime-failures.length > 20 ? 20 : root.runtime-failures.length;
+                            property <int> recent-failure-count: root.visible-runtime-failure-count;
                             height: 30px + (recent-failure-count == 0 ? 44px : recent-failure-count * 64px);
                             vertical-stretch: 0;
                             background: transparent;

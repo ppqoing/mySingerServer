@@ -16,22 +16,26 @@ export component AppShell inherits Rectangle {
     // 两个回调保持既有导航索引和刷新命令边界。
     callback navigate(int);
     callback refresh();
+    private property <bool> sidebar-collapsed: false;
+    private property <length> sidebar-width: root.sidebar-collapsed ? 64px : 144px;
     background: Theme.window;
 
-    // 144px 侧栏直接锚定窗口左侧，避免内容高度影响外壳几何。
+    // 侧栏在 144px 展开态与 64px 图标态之间切换，并始终锚定窗口左侧。
     SideNavigation {
         x: 0px;
         y: 0px;
-        width: 144px;
+        width: root.sidebar-width;
         height: root.height;
+        collapsed: root.sidebar-collapsed;
         active-index: root.active-nav;
+        toggle-sidebar => { root.sidebar-collapsed = !root.sidebar-collapsed; }
         navigate(index) => { root.navigate(index); }
     }
     // 右侧严格拆为 58px 顶栏、弹性内容和 32px 底栏。
     right-shell := Rectangle {
-        x: 144px;
+        x: root.sidebar-width;
         y: 0px;
-        width: root.width - 144px;
+        width: root.width - root.sidebar-width;
         height: root.height;
         background: Theme.window;
 

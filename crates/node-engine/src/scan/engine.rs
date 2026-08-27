@@ -11,8 +11,8 @@ use std::{
 use dedup_core::{DisplayPath, LocationKey, MachineId, MediaKind, NormalizedPath, TaskId};
 use dedup_media::sample_positions;
 use dedup_node_store::{
-    ContentId, FeatureWrite, FileFaultKind, FileFaultRecord, ImageStage1Fields, NewTaskItem,
-    NodeStore, ScannedPath, TaskItemCompletion, TaskStatus, VideoFrameStage1Fields,
+    ClaimedTaskItem, ContentId, FeatureWrite, FileFaultKind, FileFaultRecord, ImageStage1Fields,
+    NewTaskItem, NodeStore, ScannedPath, TaskItemCompletion, TaskStatus, VideoFrameStage1Fields,
     VideoMetadataFields,
 };
 use dedup_protocol::proto::{self, worker_envelope};
@@ -25,13 +25,16 @@ use crate::{
     contact_sheet_cache::ContactSheetCacheEntry,
     disk_full_cleanup::DiskFullCleaner,
     io::ReadFailure,
-    runtime_tasks::{RuntimeFailureUpdate, RuntimeProgressUnit, RuntimeStage, RuntimeStageUpdate, RuntimeTaskReporter},
+    runtime_tasks::{
+        RuntimeFailureUpdate, RuntimeProgressUnit, RuntimeStage, RuntimeStageUpdate,
+        RuntimeTaskReporter,
+    },
     worker::{WorkerEvent, WorkerPool, decode_stage1_payload},
 };
 
 use super::{
     FileEnumerator, FileHasher, PipelineFileReader, PipelineLimits, ReadProduct, ScanError,
-    pipeline::spawn_bounded_enumeration,
+    pipeline::{EnumerationEvent, spawn_bounded_enumeration},
 };
 
 const LOOKUP_BATCH_SIZE: usize = 1000;
@@ -102,6 +105,26 @@ pub struct ScanSummary {
     pub file_failures: usize,
     /// 成功收尾事务提交后的 SQLite outbox 高水位。
     pub outbox_high_seq: u64,
+}
+
+/// 在枚举源完成边界冻结运行时总数；完整清单可早于有界逐项交付完成。
+fn freeze_enumeration_totals(
+    reporter: Option<&RuntimeTaskReporter>,
+    authoritative: Option<(u64, u64)>,
+    summary: &ScanSummary,
+    frozen: &mut bool,
+) -> Result<(), ScanError> {
+    if *frozen {
+        return Ok(());
+    }
+    let (files, _) = authoritative.unwrap_or((summary.total_files as u64, summary.total_bytes));
+    if let Some(reporter) = reporter {
+        reporter
+            .freeze_scan_totals_nowait(files)
+            .map_err(|error| ScanError::Stage1(error.to_string()))?;
+    }
+    *frozen = true;
+    Ok(())
 }
 
 /// 交给一筛处理器的持久任务身份和文件内容引用。
@@ -279,53 +302,76 @@ impl Stage1Processor for WorkerPoolStage1Processor<'_> {
         let mut started_slot = None;
         loop {
             match self.pool.next_event().await {
-            Some(WorkerEvent::Completed {
-                task_id: event_task,
-                item_id: event_item,
-                response,
-            }) if event_task == task_id && event_item == item_id => {
-                if let Some(slot) = started_slot
-                    && let Some(reporter) = &self.runtime_reporter
-                {
-                    let _ = reporter.worker_completed(slot).await;
+                Some(WorkerEvent::Completed {
+                    task_id: event_task,
+                    item_id: event_item,
+                    response,
+                }) if event_task == task_id && event_item == item_id => {
+                    if let Some(slot) = started_slot
+                        && let Some(reporter) = &self.runtime_reporter
+                    {
+                        let _ = reporter.worker_completed(slot).await;
+                    }
+                    return match response.payload {
+                        Some(worker_envelope::Payload::Stage1Result(result)) => {
+                            decode_stage1_payload(&result.payload)
+                                .map_err(|error| error.to_string())
+                        }
+                        Some(worker_envelope::Payload::WorkerFailure(failure)) => {
+                            Err(failure.message)
+                        }
+                        _ => Err("Worker 返回了非一筛响应".into()),
+                    };
                 }
-                return match response.payload {
-                Some(worker_envelope::Payload::Stage1Result(result)) => {
-                    decode_stage1_payload(&result.payload).map_err(|error| error.to_string())
+                Some(WorkerEvent::Crashed {
+                    task_id: event_task,
+                    item_id: event_item,
+                    message,
+                    ..
+                }) if event_task == task_id && event_item == item_id => return Err(message),
+                Some(WorkerEvent::Cancelled {
+                    task_id: event_task,
+                    item_id: event_item,
+                }) if event_task == task_id && event_item == item_id => {
+                    return Err("一筛已取消".into());
                 }
-                Some(worker_envelope::Payload::WorkerFailure(failure)) => Err(failure.message),
-                _ => Err("Worker 返回了非一筛响应".into()),
-                };
-            }
-            Some(WorkerEvent::Crashed {
-                task_id: event_task,
-                item_id: event_item,
-                message,
-                ..
-            }) if event_task == task_id && event_item == item_id => return Err(message),
-            Some(WorkerEvent::Cancelled {
-                task_id: event_task,
-                item_id: event_item,
-            }) if event_task == task_id && event_item == item_id => return Err("一筛已取消".into()),
-            Some(WorkerEvent::InfrastructureFailure { message }) => return Err(message),
-            Some(WorkerEvent::Started { task_id: event_task, item_id: event_item, slot, process_id, identity })
-                if event_task == task_id && event_item == item_id => {
+                Some(WorkerEvent::InfrastructureFailure { message }) => return Err(message),
+                Some(WorkerEvent::Started {
+                    task_id: event_task,
+                    item_id: event_item,
+                    slot,
+                    process_id,
+                    identity,
+                    ..
+                }) if event_task == task_id && event_item == item_id => {
                     if let Some(reporter) = &self.runtime_reporter {
-                        let _ = reporter.worker_started(crate::runtime_tasks::RuntimeWorkerUpdate {
-                            slot,
-                            process_id,
-                            stage: RuntimeStage::ProbeStage1,
-                            display_path: identity.display_path.as_path().to_string_lossy().into_owned(),
-                            physical_disk_id: identity.physical_disk_id,
-                            completed_files: 0,
-                            speed_per_second: 0.0,
-                        }).await;
+                        let _ = reporter
+                            .worker_started(crate::runtime_tasks::RuntimeWorkerUpdate {
+                                slot,
+                                process_id,
+                                item_id: item_id.clone(),
+                                stage: RuntimeStage::ProbeStage1,
+                                display_path: identity
+                                    .display_path
+                                    .as_path()
+                                    .to_string_lossy()
+                                    .into_owned(),
+                                physical_disk_id: identity.physical_disk_id,
+                                completed_files: 0,
+                                speed_per_second: 0.0,
+                                current_step: "媒体探测与一筛".into(),
+                                cache_detail: String::new(),
+                                phase: None,
+                                cpu_weight: None,
+                                decoder_threads: None,
+                            })
+                            .await;
                     }
                     started_slot = Some(slot);
                     continue;
                 }
-            Some(_) => return Err("WorkerPool 在串行扫描中返回了其他任务事件".into()),
-            None => return Err("WorkerPool 已关闭".into()),
+                Some(_) => return Err("WorkerPool 在串行扫描中返回了其他任务事件".into()),
+                None => return Err("WorkerPool 已关闭".into()),
             }
         }
     }
@@ -401,12 +447,14 @@ impl Stage1Processor for WorkerPoolStage1Processor<'_> {
                     slot,
                     process_id,
                     identity,
+                    ..
                 } if pending.get(&item_id) == Some(&task_id) => {
                     if let Some(reporter) = &self.runtime_reporter {
                         let _ = reporter
                             .worker_started(crate::runtime_tasks::RuntimeWorkerUpdate {
                                 slot,
                                 process_id,
+                                item_id: item_id.clone(),
                                 stage: RuntimeStage::ProbeStage1,
                                 display_path: identity
                                     .display_path
@@ -416,6 +464,11 @@ impl Stage1Processor for WorkerPoolStage1Processor<'_> {
                                 physical_disk_id: identity.physical_disk_id.clone(),
                                 completed_files: 0,
                                 speed_per_second: 0.0,
+                                current_step: "媒体探测与一筛".into(),
+                                cache_detail: String::new(),
+                                phase: None,
+                                cpu_weight: None,
+                                decoder_threads: None,
                             })
                             .await;
                     }
@@ -451,6 +504,7 @@ impl Stage1Processor for WorkerPoolStage1Processor<'_> {
                     item_id,
                     identity,
                     message,
+                    ..
                 } if pending.get(&item_id) == Some(&task_id) => {
                     pending.remove(&item_id);
                     results.push(Stage1BatchResult {
@@ -609,6 +663,33 @@ where
         }
         if let Some(reporter) = &self.runtime_reporter {
             reporter
+                .update_stage(RuntimeStageUpdate::running(
+                    RuntimeStage::Prepare,
+                    RuntimeProgressUnit::Items,
+                    0,
+                    Some(1),
+                ))
+                .await
+                .map_err(|error| ScanError::Stage1(error.to_string()))?;
+            for (stage, unit) in [
+                (RuntimeStage::Enumerate, RuntimeProgressUnit::Files),
+                (RuntimeStage::CacheLookup, RuntimeProgressUnit::Files),
+                (RuntimeStage::ReadMd5, RuntimeProgressUnit::Files),
+                (RuntimeStage::ProbeStage1, RuntimeProgressUnit::Files),
+                (RuntimeStage::PersistFinalize, RuntimeProgressUnit::Files),
+            ] {
+                reporter
+                    .update_stage(stage_update(
+                        stage,
+                        proto::RuntimeStageState::RuntimeStageWaiting,
+                        unit,
+                        0,
+                        None,
+                    ))
+                    .await
+                    .map_err(|error| ScanError::Stage1(error.to_string()))?;
+            }
+            reporter
                 .update_stage(stage_update(
                     RuntimeStage::Prepare,
                     proto::RuntimeStageState::RuntimeStageCompleted,
@@ -618,26 +699,9 @@ where
                 ))
                 .await
                 .map_err(|error| ScanError::Stage1(error.to_string()))?;
-            for stage in [
-                RuntimeStage::Enumerate,
-                RuntimeStage::CacheLookup,
-                RuntimeStage::ReadMd5,
-                RuntimeStage::ProbeStage1,
-            ] {
-                reporter
-                    .update_stage(RuntimeStageUpdate::running(
-                        stage,
-                        if stage == RuntimeStage::ReadMd5 {
-                            RuntimeProgressUnit::Bytes
-                        } else {
-                            RuntimeProgressUnit::Files
-                        },
-                        0,
-                        None,
-                    ))
-                    .await
-                    .map_err(|error| ScanError::Stage1(error.to_string()))?;
-            }
+            reporter
+                .start_stage_nowait(RuntimeStage::Enumerate, RuntimeProgressUnit::Files)
+                .map_err(|error| ScanError::Stage1(error.to_string()))?;
         }
         let (mut enumerated, enumeration_task) = spawn_bounded_enumeration(
             self.enumerator.clone(),
@@ -668,22 +732,27 @@ where
                 drain_parallel_reads(&mut reads).await;
                 let _ = join_enumeration(&mut enumeration_task).await;
                 if let Some(reporter) = &self.runtime_reporter {
-                    let _ = reporter.finish(crate::runtime_tasks::RuntimeTaskState::Cancelled).await;
+                    let _ = reporter
+                        .finish(crate::runtime_tasks::RuntimeTaskState::Cancelled)
+                        .await;
                 }
                 return Err(ScanError::Cancelled);
             }
-            while reads.len() < limits.max_read_tasks() {
+            loop {
                 match enumerated.try_recv() {
-                    Ok(scanned) => self.accept_parallel_row(
+                    Ok(EnumerationEvent::Row(scanned)) => self.accept_cache_row(
                         store,
                         task_id,
                         &options,
-                        &reader,
-                        &cancellation,
-                        &mut reads,
                         &mut summary,
                         scanned,
                         now_ms,
+                    )?,
+                    Ok(EnumerationEvent::Completed(totals)) => freeze_enumeration_totals(
+                        self.runtime_reporter.as_ref(),
+                        totals,
+                        &summary,
+                        &mut enumeration_totals_frozen,
                     )?,
                     Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                     Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
@@ -695,7 +764,7 @@ where
             if enumerated.is_closed() && enumerated.is_empty() {
                 enumeration_closed = true;
             }
-            if enumeration_closed && !enumeration_totals_frozen {
+            if enumeration_closed && enumeration_task.is_some() {
                 match join_enumeration(&mut enumeration_task).await {
                     Ok(()) => {}
                     Err(error) => {
@@ -703,28 +772,89 @@ where
                         drain_parallel_reads(&mut reads).await;
                         if matches!(&error, ScanError::Cancelled) {
                             if let Some(reporter) = &self.runtime_reporter {
-                                let _ = reporter.finish(crate::runtime_tasks::RuntimeTaskState::Cancelled).await;
+                                let _ = reporter
+                                    .finish(crate::runtime_tasks::RuntimeTaskState::Cancelled)
+                                    .await;
                             }
                             return Err(ScanError::Cancelled);
                         }
                         if let Some(reporter) = &self.runtime_reporter {
-                            let _ = reporter.finish(crate::runtime_tasks::RuntimeTaskState::Failed).await;
+                            let _ = reporter
+                                .finish(crate::runtime_tasks::RuntimeTaskState::Failed)
+                                .await;
                         }
                         store.fail_task(task_id, now_ms)?;
                         return Err(error);
                     }
                 }
-                if let Some(reporter) = &self.runtime_reporter {
-                    reporter
-                        .freeze_scan_totals_nowait(
-                            summary.total_files as u64,
-                            summary.total_bytes,
-                        )
-                        .map_err(|error| ScanError::Stage1(error.to_string()))?;
-                }
-                enumeration_totals_frozen = true;
+                freeze_enumeration_totals(
+                    self.runtime_reporter.as_ref(),
+                    None,
+                    &summary,
+                    &mut enumeration_totals_frozen,
+                )?;
             }
-            if pending_stage1.len() >= processor.max_in_flight().max(1) {
+            if enumeration_closed {
+                break;
+            }
+            let step = match enumerated.recv().await {
+                Some(EnumerationEvent::Row(scanned)) => {
+                    self.accept_cache_row(store, task_id, &options, &mut summary, scanned, now_ms)
+                }
+                Some(EnumerationEvent::Completed(totals)) => freeze_enumeration_totals(
+                    self.runtime_reporter.as_ref(),
+                    totals,
+                    &summary,
+                    &mut enumeration_totals_frozen,
+                ),
+                None => {
+                    enumeration_closed = true;
+                    Ok(())
+                }
+            };
+            if matches!(step, Err(ScanError::Cancelled)) {
+                drop(enumerated);
+                drain_parallel_reads(&mut reads).await;
+                let _ = join_enumeration(&mut enumeration_task).await;
+                if let Some(reporter) = &self.runtime_reporter {
+                    let _ = reporter
+                        .finish(crate::runtime_tasks::RuntimeTaskState::Cancelled)
+                        .await;
+                }
+                return Err(ScanError::Cancelled);
+            }
+            step?;
+        }
+        if let Some(reporter) = &self.runtime_reporter {
+            reporter
+                .finish_stage_nowait(
+                    RuntimeStage::CacheLookup,
+                    proto::RuntimeStageState::RuntimeStageCompleted,
+                    Some(summary.total_files as u64),
+                )
+                .map_err(|error| ScanError::Stage1(error.to_string()))?;
+            reporter
+                .update_stage_nowait(stage_update(
+                    RuntimeStage::ReadMd5,
+                    proto::RuntimeStageState::RuntimeStageRunning,
+                    RuntimeProgressUnit::Files,
+                    summary.cache_hits as u64,
+                    Some(summary.total_files as u64),
+                ))
+                .map_err(|error| ScanError::Stage1(error.to_string()))?;
+        }
+        loop {
+            if cancellation.is_cancelled() {
+                drain_parallel_reads(&mut reads).await;
+                if let Some(reporter) = &self.runtime_reporter {
+                    let _ = reporter
+                        .finish(crate::runtime_tasks::RuntimeTaskState::Cancelled)
+                        .await;
+                }
+                return Err(ScanError::Cancelled);
+            }
+            // 已完成读取持有磁盘许可；先提交当前可用批次，避免等待中的读取与 Worker 批次互锁。
+            if !pending_stage1.is_empty() {
                 let result = flush_stage1_batch(
                     store,
                     processor,
@@ -738,24 +868,54 @@ where
                 )
                 .await;
                 if matches!(result, Err(ScanError::Cancelled)) {
-                    drop(enumerated);
                     drain_parallel_reads(&mut reads).await;
-                    let _ = join_enumeration(&mut enumeration_task).await;
                     if let Some(reporter) = &self.runtime_reporter {
-                        let _ = reporter.finish(crate::runtime_tasks::RuntimeTaskState::Cancelled).await;
+                        let _ = reporter
+                            .finish(crate::runtime_tasks::RuntimeTaskState::Cancelled)
+                            .await;
                     }
                     return Err(ScanError::Cancelled);
                 }
                 result?;
             }
-            if enumeration_closed && reads.is_empty() {
+            while reads.len() < limits.max_read_tasks() {
+                let Some(claimed) = store.claim_next_item(task_id, now_ms)? else {
+                    break;
+                };
+                self.schedule_claimed_read(&reader, &cancellation, &mut reads, claimed)?;
+            }
+            if reads.is_empty() {
                 break;
             }
-            if reads.len() >= limits.max_read_tasks() || enumeration_closed {
-                let joined = reads
-                    .join_next()
-                    .await
-                    .ok_or_else(|| ScanError::Stage1("读取任务意外为空".into()))?;
+            let joined = reads
+                .join_next()
+                .await
+                .ok_or_else(|| ScanError::Stage1("读取任务意外为空".into()))?;
+            let result = self.accept_parallel_read(
+                store,
+                &reader,
+                task_id,
+                &options,
+                &mut pending_stage1,
+                &mut summary,
+                joined.map_err(|error| ScanError::Stage1(error.to_string()))?,
+                now_ms,
+            );
+            if matches!(result, Err(ScanError::Cancelled)) {
+                drain_parallel_reads(&mut reads).await;
+                if let Some(reporter) = &self.runtime_reporter {
+                    let _ = reporter
+                        .finish(crate::runtime_tasks::RuntimeTaskState::Cancelled)
+                        .await;
+                }
+                return Err(ScanError::Cancelled);
+            }
+            result?;
+            // 合并当前已经完成的读取，既保留批处理并行度，也不等待仍在争用磁盘许可的任务。
+            while pending_stage1.len() < processor.max_in_flight().max(1) {
+                let Some(joined) = reads.try_join_next() else {
+                    break;
+                };
                 let result = self.accept_parallel_read(
                     store,
                     &reader,
@@ -767,48 +927,16 @@ where
                     now_ms,
                 );
                 if matches!(result, Err(ScanError::Cancelled)) {
-                    drop(enumerated);
                     drain_parallel_reads(&mut reads).await;
-                    let _ = join_enumeration(&mut enumeration_task).await;
                     if let Some(reporter) = &self.runtime_reporter {
-                        let _ = reporter.finish(crate::runtime_tasks::RuntimeTaskState::Cancelled).await;
+                        let _ = reporter
+                            .finish(crate::runtime_tasks::RuntimeTaskState::Cancelled)
+                            .await;
                     }
                     return Err(ScanError::Cancelled);
                 }
                 result?;
-                continue;
             }
-            let step = tokio::select! {
-                row = enumerated.recv() => match row {
-                    Some(scanned) => self.accept_parallel_row(
-                        store, task_id, &options, &reader, &cancellation, &mut reads,
-                        &mut summary, scanned, now_ms,
-                    ),
-                    None => {
-                        enumeration_closed = true;
-                        Ok(())
-                    },
-                },
-                joined = reads.join_next(), if !reads.is_empty() => {
-                    match joined.expect("分支保证存在") {
-                        Ok(value) => self.accept_parallel_read(
-                            store, &reader, task_id, &options, &mut pending_stage1, &mut summary,
-                            value, now_ms,
-                        ),
-                        Err(error) => Err(ScanError::Stage1(error.to_string())),
-                    }
-                }
-            };
-            if matches!(step, Err(ScanError::Cancelled)) {
-                drop(enumerated);
-                drain_parallel_reads(&mut reads).await;
-                let _ = join_enumeration(&mut enumeration_task).await;
-                if let Some(reporter) = &self.runtime_reporter {
-                    let _ = reporter.finish(crate::runtime_tasks::RuntimeTaskState::Cancelled).await;
-                }
-                return Err(ScanError::Cancelled);
-            }
-            step?;
         }
         flush_stage1_batch(
             store,
@@ -825,7 +953,9 @@ where
         if let Err(error) = join_enumeration(&mut enumeration_task).await {
             if matches!(&error, ScanError::Cancelled) {
                 if let Some(reporter) = &self.runtime_reporter {
-                    let _ = reporter.finish(crate::runtime_tasks::RuntimeTaskState::Cancelled).await;
+                    let _ = reporter
+                        .finish(crate::runtime_tasks::RuntimeTaskState::Cancelled)
+                        .await;
                 }
                 return Err(ScanError::Cancelled);
             }
@@ -835,9 +965,16 @@ where
             || store.task_snapshot(task_id)?.status == TaskStatus::Cancelled
         {
             if let Some(reporter) = &self.runtime_reporter {
-                let _ = reporter.finish(crate::runtime_tasks::RuntimeTaskState::Cancelled).await;
+                let _ = reporter
+                    .finish(crate::runtime_tasks::RuntimeTaskState::Cancelled)
+                    .await;
             }
             return Err(ScanError::Cancelled);
+        }
+        if let Some(reporter) = &self.runtime_reporter {
+            reporter
+                .start_stage_nowait(RuntimeStage::PersistFinalize, RuntimeProgressUnit::Files)
+                .map_err(|error| ScanError::Stage1(error.to_string()))?;
         }
         summary.outbox_high_seq = store.finalize_scan_task_from_items(task_id, now_ms)?;
         if let Some(reporter) = &self.runtime_reporter {
@@ -863,7 +1000,7 @@ where
             let _ = reporter.finish_stage_nowait(
                 RuntimeStage::ReadMd5,
                 proto::RuntimeStageState::RuntimeStageCompleted,
-                Some(summary.total_bytes),
+                Some(summary.total_files as u64),
             );
             for stage in [RuntimeStage::ProbeStage1, RuntimeStage::PersistFinalize] {
                 let _ = reporter.finish_stage_nowait(
@@ -935,7 +1072,11 @@ where
                         if let Some(reporter) = &self.runtime_reporter {
                             let _ = reporter.record_failure_nowait(RuntimeFailureUpdate {
                                 stage: RuntimeStage::ReadMd5,
-                                display_path: scanned.display_path.as_path().to_string_lossy().into_owned(),
+                                display_path: scanned
+                                    .display_path
+                                    .as_path()
+                                    .to_string_lossy()
+                                    .into_owned(),
                                 message: error.to_string(),
                             });
                             let _ = reporter.advance_overall_nowait(0, 1, 0);
@@ -961,8 +1102,7 @@ where
                     continue;
                 }
                 summary.scheduled_stage1 += 1;
-                let contact_sheet =
-                    ContactSheetCacheEntry::from_md5(&self.contact_sheet_root, md5);
+                let contact_sheet = ContactSheetCacheEntry::from_md5(&self.contact_sheet_root, md5);
                 let succeeded = self
                     .process_stage1(
                         store,
@@ -988,39 +1128,40 @@ where
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn accept_parallel_row<R>(
+    fn accept_cache_row(
         &self,
         store: &mut NodeStore,
         task_id: TaskId,
         options: &ScanOptions,
-        reader: &R,
-        cancellation: &ReadCancellationToken,
-        reads: &mut JoinSet<(ReservedScan, Result<ReadProduct<R::Lease>, ReadFailure>)>,
         summary: &mut ScanSummary,
         scanned: ScannedPath,
         now_ms: i64,
-    ) -> Result<(), ScanError>
-    where
-        R: PipelineFileReader,
-    {
+    ) -> Result<(), ScanError> {
         let Some(item_id) = store.reserve_scan_path(task_id, &scanned, now_ms)? else {
             return Ok(());
         };
         summary.total_files += 1;
         summary.total_bytes = summary.total_bytes.saturating_add(scanned.file_size);
+        if let Some(reporter) = &self.runtime_reporter {
+            reporter
+                .start_stage_nowait(RuntimeStage::CacheLookup, RuntimeProgressUnit::Files)
+                .map_err(|error| ScanError::Stage1(error.to_string()))?;
+        }
         let cached_content = if options.force_recompute {
             None
         } else {
             store.lookup_scanned_paths(std::slice::from_ref(&scanned))?[0].content_id
         };
+        if let Some(reporter) = &self.runtime_reporter {
+            let _ = reporter.advance_stage_nowait(
+                RuntimeStage::CacheLookup,
+                RuntimeProgressUnit::Files,
+                1,
+            );
+        }
         if let Some(content_id) = cached_content {
             summary.cache_hits += 1;
             if let Some(reporter) = &self.runtime_reporter {
-                let _ = reporter.advance_stage_nowait(
-                    RuntimeStage::CacheLookup,
-                    RuntimeProgressUnit::Files,
-                    1,
-                );
                 let _ = reporter.advance_overall_nowait(1, 0, 0);
             }
             if self.complete_reserved_reused_item(store, &item_id, content_id, now_ms)? {
@@ -1028,8 +1169,42 @@ where
             }
             return Ok(());
         }
+        store.queue_scan_item_for_read(&item_id)?;
+        Ok(())
+    }
+
+    /// 从 SQLite 持久队列领取一个缓存未命中项，并进入有界 MD5 读取。
+    fn schedule_claimed_read<R>(
+        &self,
+        reader: &R,
+        cancellation: &ReadCancellationToken,
+        reads: &mut JoinSet<(ReservedScan, Result<ReadProduct<R::Lease>, ReadFailure>)>,
+        claimed: ClaimedTaskItem,
+    ) -> Result<(), ScanError>
+    where
+        R: PipelineFileReader,
+    {
+        if claimed.stage != "read_md5" {
+            return Err(ScanError::Stage1(format!(
+                "扫描读取队列包含未知阶段: {}",
+                claimed.stage
+            )));
+        }
+        let location = claimed
+            .location
+            .ok_or_else(|| ScanError::Stage1("扫描读取项缺少机器与规范路径".into()))?;
+        let display_path = claimed
+            .display_path
+            .ok_or_else(|| ScanError::Stage1("扫描读取项缺少显示路径".into()))?;
+        let file_size = claimed
+            .file_size
+            .ok_or_else(|| ScanError::Stage1("扫描读取项缺少文件大小".into()))?;
+        let scanned = ScannedPath::new(location.normalized_path().clone(), display_path, file_size);
         let task_reader = reader.clone();
-        let reserved = ReservedScan { scanned, item_id };
+        let reserved = ReservedScan {
+            scanned,
+            item_id: claimed.item_id,
+        };
         let task_scanned = reserved.scanned.clone();
         let task_cancellation = cancellation.clone();
         reads.spawn(async move {
@@ -1069,7 +1244,11 @@ where
                     if let Some(reporter) = &self.runtime_reporter {
                         let _ = reporter.record_failure_nowait(RuntimeFailureUpdate {
                             stage: RuntimeStage::ReadMd5,
-                            display_path: scanned.display_path.as_path().to_string_lossy().into_owned(),
+                            display_path: scanned
+                                .display_path
+                                .as_path()
+                                .to_string_lossy()
+                                .into_owned(),
                             message: error.to_string(),
                         });
                         let _ = reporter.advance_overall_nowait(0, 1, 0);
@@ -1080,11 +1259,8 @@ where
         };
         summary.hashed += 1;
         if let Some(reporter) = &self.runtime_reporter {
-            let _ = reporter.advance_stage_nowait(
-                RuntimeStage::CacheLookup,
-                RuntimeProgressUnit::Files,
-                1,
-            );
+            let _ =
+                reporter.advance_stage_nowait(RuntimeStage::ReadMd5, RuntimeProgressUnit::Files, 1);
         }
         let content = store.upsert_content_and_location(&scanned, md5, MediaKind::Other)?;
         if content.reused && !options.force_recompute {
@@ -1115,7 +1291,7 @@ where
                 physical_disk_id,
                 generate_contact_sheet: !contact_sheet.exists(),
             },
-            lease,
+            lease: Some(lease),
             contact_sheet,
         });
         Ok(())
@@ -1237,7 +1413,8 @@ async fn join_enumeration(
 
 struct PendingStage1<L> {
     request: Stage1Request,
-    lease: L,
+    /// 只限制完整 MD5 读取；派发 Worker 前释放，避免把磁盘线程许可扩散到后续阶段。
+    lease: Option<L>,
     contact_sheet: ContactSheetCacheEntry,
 }
 
@@ -1282,6 +1459,10 @@ where
     }
     if dispatchable.is_empty() {
         return Ok(());
+    }
+    // MD5 已完整返回；先释放读取许可，使下一批文件可以与 Worker 计算并行推进。
+    for work in &mut dispatchable {
+        drop(work.lease.take());
     }
     // 分组只存活于当前有界 Worker batch，容量不会随整次扫描累计。
     let mut groups: Vec<ContactSheetBatchGroup<L>> = Vec::new();
@@ -1337,6 +1518,11 @@ where
             .iter()
             .map(|(_, work)| work.request.clone())
             .collect::<Vec<_>>();
+        if let Some(reporter) = runtime_reporter {
+            reporter
+                .start_stage_nowait(RuntimeStage::ProbeStage1, RuntimeProgressUnit::Files)
+                .map_err(|error| ScanError::Stage1(error.to_string()))?;
+        }
         let mut results = processor
             .process_batch(requests)
             .await
@@ -1367,6 +1553,14 @@ where
             match output {
                 Ok(output) => {
                     let media_kind = output.media_kind;
+                    if let Some(reporter) = runtime_reporter {
+                        reporter
+                            .start_stage_nowait(
+                                RuntimeStage::PersistFinalize,
+                                RuntimeProgressUnit::Files,
+                            )
+                            .map_err(|error| ScanError::Stage1(error.to_string()))?;
+                    }
                     let prepared = prepare_stage1_writes(
                         store,
                         &request.item_id,
@@ -1426,6 +1620,13 @@ where
                             kind: FileFaultKind::WorkerCrash,
                             stage: identity.stage,
                             windows_error_code: None,
+                            read_offset: None,
+                            read_size: None,
+                            worker_pid: None,
+                            worker_exit_code: None,
+                            first_seen_at_ms: now_ms as u64,
+                            last_seen_at_ms: now_ms as u64,
+                            occurrence_count: 1,
                             message: message.clone(),
                         };
                         store.fail_running_item_with_file_fault(
@@ -1438,7 +1639,11 @@ where
                         if let Some(reporter) = runtime_reporter {
                             let _ = reporter.record_failure_nowait(RuntimeFailureUpdate {
                                 stage: RuntimeStage::ProbeStage1,
-                                display_path: request.display_path.as_path().to_string_lossy().into_owned(),
+                                display_path: request
+                                    .display_path
+                                    .as_path()
+                                    .to_string_lossy()
+                                    .into_owned(),
                                 message: message.clone(),
                             });
                             let _ = reporter.advance_overall_nowait(0, 1, 0);
@@ -1456,7 +1661,11 @@ where
                         if let Some(reporter) = runtime_reporter {
                             let _ = reporter.record_failure_nowait(RuntimeFailureUpdate {
                                 stage: RuntimeStage::ProbeStage1,
-                                display_path: request.display_path.as_path().to_string_lossy().into_owned(),
+                                display_path: request
+                                    .display_path
+                                    .as_path()
+                                    .to_string_lossy()
+                                    .into_owned(),
                                 message: error.to_string(),
                             });
                             let _ = reporter.advance_overall_nowait(0, 1, 0);
@@ -1573,16 +1782,17 @@ fn persist_stage1(
     if let Some(contact) = prepared.contact {
         commit_contact_sheet(store, content_id, contact)?;
     }
+    store.mark_base_complete(content_id)?;
     Ok(())
 }
 
-struct PreparedStage1 {
-    media_kind: MediaKind,
-    writes: Vec<FeatureWrite>,
-    contact: Option<PendingContactSheet>,
+pub(super) struct PreparedStage1 {
+    pub(super) media_kind: MediaKind,
+    pub(super) writes: Vec<FeatureWrite>,
+    pub(super) contact: Option<PendingContactSheet>,
 }
 
-struct PendingContactSheet {
+pub(super) struct PendingContactSheet {
     temp_path: Option<PathBuf>,
     final_path: PathBuf,
     relative_path: String,
@@ -1590,8 +1800,18 @@ struct PendingContactSheet {
     artifact_lease: Option<ArtifactLease>,
 }
 
+/// 已完成文件发布、等待 guarded stage1 事务确认的联系表。
+pub(super) struct PublishedContactSheet {
+    final_path: PathBuf,
+    relative_path: String,
+    registry: Option<Arc<RegenerableArtifactRegistry>>,
+    final_lease: Option<ArtifactLease>,
+    /// 仅本轮从 partial rename 出来的最终文件允许失败补偿删除。
+    owned_final: bool,
+}
+
 impl PendingContactSheet {
-    fn remove_partial(self) {
+    pub(super) fn remove_partial(self) {
         drop(self.artifact_lease);
         if let Some(temp_path) = self.temp_path {
             let _ = fs::remove_file(&temp_path);
@@ -1600,9 +1820,97 @@ impl PendingContactSheet {
             }
         }
     }
+
+    /// 发布 partial 或确认复用 final，但暂不写 SQLite 联系表引用。
+    pub(super) fn publish(self) -> Result<PublishedContactSheet, ScanError> {
+        let Self {
+            temp_path,
+            final_path,
+            relative_path,
+            registry,
+            mut artifact_lease,
+        } = self;
+        if let Some(temp_path) = temp_path {
+            let mut owned_final = false;
+            let mut final_lease = None;
+            publish_contact_sheet(&temp_path, &final_path, |published_here| {
+                owned_final = published_here;
+                drop(artifact_lease.take());
+                if let Some(registry) = &registry {
+                    registry.unregister(&temp_path)?;
+                    registry.register(&final_path, ArtifactKind::ContactSheet)?;
+                    match registry.lease(&final_path) {
+                        Ok(lease) => final_lease = Some(lease),
+                        Err(error) => {
+                            if published_here {
+                                let _ = registry.unregister(&final_path);
+                            }
+                            return Err(error.into());
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+            return Ok(PublishedContactSheet {
+                final_path,
+                relative_path,
+                registry,
+                final_lease,
+                owned_final,
+            });
+        }
+        if !final_path.is_file() {
+            return Err(ScanError::Stage1(format!(
+                "复用的视频联系表在写回引用前已不存在: {}",
+                final_path.display()
+            )));
+        }
+        Ok(PublishedContactSheet {
+            final_path,
+            relative_path,
+            registry,
+            final_lease: artifact_lease,
+            owned_final: false,
+        })
+    }
 }
 
-fn prepare_stage1_writes(
+impl PublishedContactSheet {
+    /// 生成必须追加在 stage1 writes 最末尾的联系表写入。
+    pub(super) fn feature_write(&self) -> FeatureWrite {
+        FeatureWrite::ContactSheet(self.relative_path.clone())
+    }
+
+    /// guarded 事务 Applied 后确认文件归属，释放临时租约即可。
+    pub(super) fn confirm(self) {
+        drop(self.final_lease);
+    }
+
+    /// guarded 忽略、身份错配或事务错误时补偿本轮拥有的 final。
+    pub(super) fn rollback(self) -> Result<(), ScanError> {
+        drop(self.final_lease);
+        if !self.owned_final {
+            return Ok(());
+        }
+        let mut registry_error = None;
+        if let Some(registry) = &self.registry
+            && let Err(error) = registry.unregister(&self.final_path)
+        {
+            registry_error = Some(error.to_string());
+        }
+        let file_error = fs::remove_file(&self.final_path).err();
+        match (registry_error, file_error) {
+            (None, None) => Ok(()),
+            (registry, file) => Err(ScanError::Stage1(format!(
+                "联系表事务失败补偿不完整: registry={}, file={}",
+                registry.unwrap_or_else(|| "ok".into()),
+                file.map_or_else(|| "ok".into(), |error| error.to_string())
+            ))),
+        }
+    }
+}
+
+pub(super) fn prepare_stage1_writes(
     store: &mut NodeStore,
     item_id: &str,
     contact_sheet: &ContactSheetCacheEntry,
@@ -1647,23 +1955,17 @@ fn prepare_stage1_writes(
                 }));
             }
             if let Some(jpeg) = output.contact_sheet_jpeg {
-                let (temp_path, registry, artifact_lease) = match (
-                    artifact_registry,
-                    disk_full_cleaner,
-                ) {
-                    (Some(registry), Some(cleaner)) => {
-                        let (path, lease) = contact_sheet
-                            .write_partial_with_disk_full_cleanup(
-                                item_id, &jpeg, registry, cleaner, store,
-                            )?;
-                        (path, Some(Arc::clone(registry)), Some(lease))
-                    }
-                    _ => (
-                        contact_sheet.write_partial(item_id, &jpeg)?,
-                        None,
-                        None,
-                    ),
-                };
+                let (temp_path, registry, artifact_lease) =
+                    match (artifact_registry, disk_full_cleaner) {
+                        (Some(registry), Some(cleaner)) => {
+                            let (path, lease) = contact_sheet
+                                .write_partial_with_disk_full_cleanup(
+                                    item_id, &jpeg, registry, cleaner, store,
+                                )?;
+                            (path, Some(Arc::clone(registry)), Some(lease))
+                        }
+                        _ => (contact_sheet.write_partial(item_id, &jpeg)?, None, None),
+                    };
                 contact = Some(PendingContactSheet {
                     temp_path: Some(temp_path),
                     final_path: contact_sheet.final_path().to_path_buf(),
@@ -1694,64 +1996,25 @@ fn prepare_stage1_writes(
     })
 }
 
-fn commit_contact_sheet(
+pub(super) fn commit_contact_sheet(
     store: &mut NodeStore,
     content_id: ContentId,
     contact: PendingContactSheet,
 ) -> Result<(), ScanError> {
-    let PendingContactSheet {
-        temp_path,
-        final_path,
-        relative_path,
-        registry,
-        mut artifact_lease,
-    } = contact;
-    if let Some(temp_path) = temp_path {
-        publish_contact_sheet(&temp_path, &final_path, |owned_final| {
-            drop(artifact_lease.take());
-            let mut final_lease = None;
-            if let Some(registry) = &registry {
-                registry.unregister(&temp_path)?;
-                registry.register(&final_path, ArtifactKind::ContactSheet)?;
-                match registry.lease(&final_path) {
-                    Ok(lease) => final_lease = Some(lease),
-                    Err(error) => {
-                        if owned_final {
-                            let _ = registry.unregister(&final_path);
-                        }
-                        return Err(error.into());
-                    }
-                }
-            }
-            let result = store
-                .commit_feature_result(
-                    content_id,
-                    None,
-                    FeatureWrite::ContactSheet(relative_path),
-                )
-                .map(|_| ())
-                .map_err(ScanError::from);
-            drop(final_lease);
-            if result.is_err()
-                && owned_final
-                && let Some(registry) = &registry
-            {
-                let _ = registry.unregister(&final_path);
-            }
-            result
-        })
-    } else if final_path.is_file() {
-        let result = store
-            .commit_feature_result(content_id, None, FeatureWrite::ContactSheet(relative_path))
-            .map(|_| ())
-            .map_err(ScanError::from);
-        drop(artifact_lease);
-        result
-    } else {
-        Err(ScanError::Stage1(format!(
-            "复用的视频联系表在写回引用前已不存在: {}",
-            final_path.display()
-        )))
+    let published = contact.publish()?;
+    match store
+        .commit_feature_result(content_id, None, published.feature_write())
+        .map(|_| ())
+        .map_err(ScanError::from)
+    {
+        Ok(()) => {
+            published.confirm();
+            Ok(())
+        }
+        Err(error) => match published.rollback() {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(ScanError::Stage1(format!("{error}; {cleanup}"))),
+        },
     }
 }
 

@@ -6,7 +6,7 @@ use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
 use image::codecs::ico::IcoEncoder;
-use image::imageops::{crop_imm, overlay, resize, FilterType};
+use image::imageops::{FilterType, crop_imm, overlay, resize};
 use image::{ExtendedColorType, ImageEncoder, Rgba, RgbaImage};
 
 const NAVIGATION: [&str; 11] = [

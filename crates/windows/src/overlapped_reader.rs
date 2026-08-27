@@ -19,11 +19,11 @@ use windows::{
         },
         Storage::FileSystem::{
             CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED, FILE_SHARE_DELETE,
-            FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile,
+            FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileSizeEx, OPEN_EXISTING, ReadFile,
         },
         System::{
             IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED, OVERLAPPED_0_0},
-            Threading::{CreateEventW, WaitForSingleObject},
+            Threading::{CreateEventW, ResetEvent, WaitForSingleObject},
         },
     },
     core::{HRESULT, PCWSTR},
@@ -70,18 +70,66 @@ impl OverlappedFileReader {
         timeout: Duration,
         cancellation: &ReadCancellationToken,
     ) -> io::Result<usize> {
+        let mut file = ReusableOverlappedFile::open(path)?;
+        file.read_at(offset, buffer, timeout, cancellation)
+    }
+}
+
+/// Worker 内一次打开并支持重复定点读取的 OVERLAPPED 文件。
+///
+/// 类型以可变借用串行复用同一个文件和事件句柄，避免同一事件同时服务多个内核 I/O。
+pub struct ReusableOverlappedFile {
+    file: OwnedHandle,
+    event: OwnedHandle,
+    len: u64,
+}
+
+impl ReusableOverlappedFile {
+    /// 打开一个允许共享读写和删除的本地文件，并冻结打开时的文件长度。
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let file = open_overlapped_file(path)?;
+        let event = create_event()?;
+        let mut len = 0_i64;
+        // SAFETY: file 是当前值独占的有效文件句柄，输出指针在调用期间有效。
+        unsafe { GetFileSizeEx(file.0, &mut len) }.map_err(io_error)?;
+        let len = u64::try_from(len)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "文件长度不能为负数"))?;
+        Ok(Self { file, event, len })
+    }
+
+    /// 返回打开文件时冻结的字节长度。
+    pub const fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// 返回文件在打开时是否为空。
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// 使用同一文件和事件句柄从指定偏移读取一个块。
+    pub fn read_at(
+        &mut self,
+        offset: u64,
+        buffer: &mut [u8],
+        timeout: Duration,
+        cancellation: &ReadCancellationToken,
+    ) -> io::Result<usize> {
         if cancellation.is_cancelled() {
             return Err(cancelled_error());
         }
-        if buffer.is_empty() {
+        if buffer.is_empty() || offset >= self.len {
             return Ok(0);
         }
+        let maximum = usize::try_from((self.len - offset).min(buffer.len() as u64))
+            .expect("读取长度不超过缓冲区 usize");
+        let buffer = &mut buffer[..maximum];
         let _length = u32::try_from(buffer.len())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "读取块超过 u32"))?;
-        let file = open_overlapped_file(path)?;
-        let event = create_event()?;
+        // SAFETY: event 是当前文件会话独占且没有未收束 I/O 的手动复位事件。
+        unsafe { ResetEvent(self.event.0) }.map_err(io_error)?;
         let mut overlapped = OVERLAPPED {
-            hEvent: event.0,
+            hEvent: self.event.0,
             ..Default::default()
         };
         overlapped.Anonymous.Anonymous = OVERLAPPED_0_0 {
@@ -90,23 +138,29 @@ impl OverlappedFileReader {
         };
 
         // SAFETY: 文件以 OVERLAPPED 打开；buffer 与 OVERLAPPED 保持到完成或取消收束后。
-        let start = unsafe { ReadFile(file.0, Some(buffer), None, Some(&mut overlapped)) };
+        let start = unsafe { ReadFile(self.file.0, Some(buffer), None, Some(&mut overlapped)) };
         match start {
             Ok(()) => {}
             Err(error) if error.code() == HRESULT::from_win32(ERROR_IO_PENDING.0) => {
-                wait_for_completion(file.0, event.0, &mut overlapped, timeout, cancellation)?;
+                wait_for_completion(
+                    self.file.0,
+                    self.event.0,
+                    &mut overlapped,
+                    timeout,
+                    cancellation,
+                )?;
             }
             Err(error) if error.code() == HRESULT::from_win32(ERROR_HANDLE_EOF.0) => return Ok(0),
             Err(error) => return Err(io_error(error)),
         }
 
         if cancellation.is_cancelled() {
-            cancel_and_drain(file.0, &mut overlapped);
+            cancel_and_drain(self.file.0, &mut overlapped);
             return Err(cancelled_error());
         }
         let mut transferred = 0u32;
         // SAFETY: OVERLAPPED 已同步完成；输出指针在调用期间有效。
-        match unsafe { GetOverlappedResult(file.0, &overlapped, &mut transferred, false) } {
+        match unsafe { GetOverlappedResult(self.file.0, &overlapped, &mut transferred, false) } {
             Ok(()) => Ok(transferred as usize),
             Err(error) if error.code() == HRESULT::from_win32(ERROR_HANDLE_EOF.0) => Ok(0),
             Err(error) => Err(io_error(error)),

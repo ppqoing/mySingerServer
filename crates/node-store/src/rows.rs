@@ -79,6 +79,27 @@ pub struct ContentRecord {
     pub reused: bool,
 }
 
+/// SQLite 或中心缓存提供的一份基础媒体计算快照。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BaseCacheRecord {
+    /// SQLite 本地内容 ID；中心导入前为 `None`。
+    pub content_id: Option<ContentId>,
+    /// 跨 SQLite/PostgreSQL 使用的内容键。
+    pub content_key: ContentKey,
+    /// 实际媒体类型。
+    pub media_kind: MediaKind,
+    /// 基础探测与该媒体类型必需的一筛已经在单事务内完成。
+    pub base_complete: bool,
+    /// 已缓存的像素宽度。
+    pub width: Option<u32>,
+    /// 已缓存的像素高度。
+    pub height: Option<u32>,
+    /// 视频时长；图片为空。
+    pub duration_ms: Option<u64>,
+    /// 完整一筛；部分特征不会伪装成完整命中。
+    pub stage1: Option<CompleteStage1>,
+}
+
 /// 预览和删除边界读取的当前活动文件身份。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActiveFile {

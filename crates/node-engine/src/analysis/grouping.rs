@@ -81,7 +81,7 @@ fn final_groups_internal(
 fn report_cluster_progress(reporter: Option<&RuntimeTaskReporter>, completed: u64, total: u64) {
     if let Some(reporter) = reporter {
         let _ = reporter.update_stage_nowait(RuntimeStageUpdate {
-            stage: RuntimeStage::Cluster,
+            stage: RuntimeStage::FinalCompare,
             state: dedup_protocol::proto::RuntimeStageState::RuntimeStageRunning,
             unit: RuntimeProgressUnit::CandidatePairs,
             completed,

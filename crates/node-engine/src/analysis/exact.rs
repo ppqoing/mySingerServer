@@ -41,7 +41,7 @@ pub(crate) fn exact_groups(inputs: &[AnalysisInput]) -> Vec<GroupWrite> {
         .collect()
 }
 
-/// 在精确分组真实子边界完成后保持 cluster 运行态；相似候选进度随后继续推进。
+/// 在精确分组真实子边界完成后保持精准判重运行态；相似候选进度随后继续推进。
 pub(crate) fn exact_groups_with_runtime(
     inputs: &[AnalysisInput],
     reporter: Option<&RuntimeTaskReporter>,
@@ -50,7 +50,7 @@ pub(crate) fn exact_groups_with_runtime(
     let groups = exact_groups(inputs);
     if let Some(reporter) = reporter {
         let _ = reporter.update_stage_nowait(RuntimeStageUpdate {
-            stage: RuntimeStage::Cluster,
+            stage: RuntimeStage::FinalCompare,
             state: dedup_protocol::proto::RuntimeStageState::RuntimeStageRunning,
             unit: RuntimeProgressUnit::CandidatePairs,
             completed: 0,

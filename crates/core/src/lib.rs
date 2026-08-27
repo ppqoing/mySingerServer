@@ -11,8 +11,8 @@ mod path;
 mod thresholds;
 
 pub use config::{
-    DesktopConfig, DiskReadConfig, NodeConfig, NodeEndpoint, NodePathsConfig, WorkerConfig,
-    WorkerMode,
+    DesktopConfig, DiskReadConfig, NodeConfig, NodeEndpoint, NodePathsConfig, NodePostgresConfig,
+    WorkerConfig, WorkerMode,
 };
 pub use error::CoreError;
 pub use grouping::{

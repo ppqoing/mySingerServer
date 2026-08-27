@@ -584,6 +584,7 @@ fn config_value(port: u32) -> proto::NodeConfigValue {
         worker_mode: proto::NodeWorkerMode::NodeWorkerAutomatic as i32,
         reserved_cores: 1,
         manual_worker_count: 1,
+        postgres: Some(proto::NodePostgresConfigValue::default()),
     }
 }
 

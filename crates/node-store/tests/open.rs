@@ -7,18 +7,17 @@ use dedup_node_store::{NodeStore, StoreError};
 use rusqlite::Connection;
 
 fn machine() -> MachineId {
-    MachineId::parse("7373737373737373737373737373737373737373737373737373737373737373")
-        .unwrap()
+    MachineId::parse("7373737373737373737373737373737373737373737373737373737373737373").unwrap()
 }
 
 #[test]
-fn rejects_schema_v1_without_changing_it_and_creates_new_databases_as_v2() {
+fn rejects_schema_v2_without_changing_it_and_creates_new_databases_as_v3() {
     let directory = tempfile::tempdir().unwrap();
-    let legacy_path = directory.path().join("schema-v1.sqlite3");
+    let legacy_path = directory.path().join("schema-v2.sqlite3");
     let legacy = Connection::open(&legacy_path).unwrap();
     legacy
         .execute_batch(
-            "PRAGMA user_version=1;
+            "PRAGMA user_version=2;
              CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
              CREATE TABLE sentinel(value TEXT NOT NULL) STRICT;
              INSERT INTO sentinel(value) VALUES('must-stay');",
@@ -44,11 +43,12 @@ fn rejects_schema_v1_without_changing_it_and_creates_new_databases_as_v2() {
         unchanged
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        1
+        2
     );
     assert_eq!(
         unchanged
-            .query_row("SELECT value FROM sentinel", [], |row| row.get::<_, String>(0))
+            .query_row("SELECT value FROM sentinel", [], |row| row
+                .get::<_, String>(0))
             .unwrap(),
         "must-stay"
     );
@@ -64,7 +64,7 @@ fn rejects_schema_v1_without_changing_it_and_creates_new_databases_as_v2() {
     );
     drop(unchanged);
 
-    let current_path = directory.path().join("schema-v2.sqlite3");
+    let current_path = directory.path().join("schema-v3.sqlite3");
     let current_store = NodeStore::open(&current_path, machine()).unwrap();
     assert_eq!(current_store.schema_id().unwrap(), product_id());
     drop(current_store);
@@ -73,6 +73,6 @@ fn rejects_schema_v1_without_changing_it_and_creates_new_databases_as_v2() {
         current
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        2
+        3
     );
 }

@@ -25,6 +25,13 @@ fn fault(
         kind,
         stage: stage.to_owned(),
         windows_error_code,
+        read_offset: None,
+        read_size: None,
+        worker_pid: None,
+        worker_exit_code: None,
+        first_seen_at_ms: 100,
+        last_seen_at_ms: 100,
+        occurrence_count: 1,
         message: message.to_owned(),
     }
 }
@@ -46,7 +53,7 @@ fn upsert_updates_only_mutable_fault_details_and_clear_removes_all_kinds_for_one
     );
     store.upsert_file_fault(&original).unwrap();
 
-    let replacement = fault(
+    let mut replacement = fault(
         &local,
         r"d:\MEDIA\BROKEN.mp4",
         r"D:\DIFFERENT-SPELLING.mp4",
@@ -56,6 +63,9 @@ fn upsert_updates_only_mutable_fault_details_and_clear_removes_all_kinds_for_one
         Some(1117),
         "重试后仍失败",
     );
+    replacement.read_offset = Some(4 * 1024 * 1024);
+    replacement.read_size = Some(4 * 1024 * 1024);
+    replacement.last_seen_at_ms = 200;
     store.upsert_file_fault(&replacement).unwrap();
     store
         .upsert_file_fault(&fault(
@@ -99,15 +109,21 @@ fn upsert_updates_only_mutable_fault_details_and_clear_removes_all_kinds_for_one
     let updated = page
         .items
         .iter()
-        .find(|item| {
-            item.machine_id == local && item.kind == FileFaultKind::SuspectedPhysicalRead
-        })
+        .find(|item| item.machine_id == local && item.kind == FileFaultKind::SuspectedPhysicalRead)
         .unwrap();
-    assert_eq!(updated.display_path.as_path(), original.display_path.as_path());
+    assert_eq!(
+        updated.display_path.as_path(),
+        original.display_path.as_path()
+    );
     assert_eq!(updated.normalized_path, original.normalized_path);
     assert_eq!(updated.file_size, 120);
     assert_eq!(updated.stage, "hash");
     assert_eq!(updated.windows_error_code, Some(1117));
+    assert_eq!(updated.read_offset, Some(4 * 1024 * 1024));
+    assert_eq!(updated.read_size, Some(4 * 1024 * 1024));
+    assert_eq!(updated.first_seen_at_ms, 100);
+    assert_eq!(updated.last_seen_at_ms, 200);
+    assert_eq!(updated.occurrence_count, 2);
     assert_eq!(updated.message, "重试后仍失败");
 
     assert_eq!(

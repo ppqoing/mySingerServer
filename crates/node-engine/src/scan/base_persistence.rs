@@ -1,0 +1,531 @@
+//! 基础计算任务独占的 SQLite 单写 actor、同步查询句柄和异步终态 ACK。
+
+#[cfg(feature = "test-hooks")]
+use std::sync::{
+    Arc, Condvar, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
+use std::{
+    sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError},
+    thread,
+    time::{Duration, Instant},
+};
+
+use dedup_core::{ContentKey, MachineId, MediaKind, TaskId};
+use dedup_node_store::{
+    BaseCacheRecord, ClaimedTaskItem, ContentId, ContentRecord, NodeStore, ScannedPath, StoreError,
+    SyncBatch, SyncState, TaskItemIdentity, TaskSnapshot, TaskStageWrite,
+};
+#[cfg(feature = "test-hooks")]
+use tokio::sync::Notify;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+
+use super::ScanError;
+
+/// actor 中执行的一次拥有型同步 Store 调用。
+type StoreCall = Box<dyn FnOnce(&mut NodeStore) -> bool + Send + 'static>;
+/// actor 中执行的一次拥有型终态持久化操作。
+type PersistOperation =
+    Box<dyn FnOnce(&mut NodeStore) -> Result<BasePersistOutcome, String> + Send + 'static>;
+
+#[cfg(feature = "test-hooks")]
+#[derive(Default)]
+/// 测试控制端与 actor waiter 共享的通知状态。
+struct BasePersistTestState {
+    /// actor 已取得首条持久化消息的异步通知。
+    entered: Notify,
+    /// 是否已经放行；重复 release 和先 release 后 enter 均安全。
+    released: Mutex<bool>,
+    /// actor 阻塞线程等待控制端放行。
+    release_signal: Condvar,
+    /// `BaseStoreActor::finish` 已真实 join writer 线程。
+    writer_joined: AtomicBool,
+}
+
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+/// 测试专用控制端；显式 release 可重复，Drop 会兜底自动放行。
+pub struct BasePersistTestController {
+    /// 仅控制端拥有此类型；actor 只持有独立 waiter。
+    shared: Arc<BasePersistTestState>,
+}
+
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+/// actor 专用首条持久化 waiter，不具备控制端 Drop 语义。
+pub struct BasePersistTestWaiter {
+    /// 与唯一控制端共享进入和放行状态。
+    shared: Arc<BasePersistTestState>,
+}
+
+#[cfg(feature = "test-hooks")]
+impl BasePersistTestController {
+    /// 创建彼此分离的控制端和 actor waiter。
+    pub fn new() -> (Self, BasePersistTestWaiter) {
+        let shared = Arc::new(BasePersistTestState::default());
+        (
+            Self {
+                shared: Arc::clone(&shared),
+            },
+            BasePersistTestWaiter { shared },
+        )
+    }
+
+    /// 等待 actor 已取得首条消息但尚未执行 SQLite 操作。
+    pub async fn wait_until_entered(&self) {
+        self.shared.entered.notified().await;
+    }
+
+    /// 放行首条持久化，供测试继续等待真实 Applied ACK。
+    pub fn release(&self) {
+        *self
+            .shared
+            .released
+            .lock()
+            .expect("首条持久化 gate 锁不应中毒") = true;
+        self.shared.release_signal.notify_all();
+    }
+
+    /// 返回 task-local writer 是否已经被 `finish` 真实 join。
+    pub fn writer_joined(&self) -> bool {
+        self.shared.writer_joined.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+impl Drop for BasePersistTestController {
+    /// 测试 panic、取消或提前返回时自动解除 actor 阻塞。
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+impl BasePersistTestWaiter {
+    /// 在 actor 阻塞线程报告 entered，并等待测试显式放行。
+    fn enter_and_wait(self) {
+        self.shared.entered.notify_one();
+        let guard = self
+            .shared
+            .released
+            .lock()
+            .expect("首条持久化 gate 锁不应中毒");
+        drop(
+            self.shared
+                .release_signal
+                .wait_while(guard, |released| !*released)
+                .expect("首条持久化 gate 等待不应中毒"),
+        );
+    }
+}
+
+/// 每条 persist 前的静态分派 hook；默认实现编译为空操作。
+trait BeforePersist: Send + 'static {
+    /// 在 actor 执行拥有型持久化操作前运行。
+    fn before_persist(&mut self);
+}
+
+/// 默认生产路径的零大小空 hook。
+struct NoBeforePersist;
+
+impl BeforePersist for NoBeforePersist {
+    #[inline(always)]
+    fn before_persist(&mut self) {}
+}
+
+#[cfg(feature = "test-hooks")]
+/// feature 专用首条 persist hook；后续消息不再检查控制状态。
+struct FirstPersistTestHook(Option<BasePersistTestWaiter>);
+
+#[cfg(feature = "test-hooks")]
+impl BeforePersist for FirstPersistTestHook {
+    fn before_persist(&mut self) {
+        if let Some(waiter) = self.0.take() {
+            waiter.enter_and_wait();
+        }
+    }
+}
+
+/// 一条不携带 Worker、CPU 或媒体许可的拥有型持久化消息。
+pub(crate) struct BasePersistMessage {
+    /// 用于 ACK 精确归并的 task/item/content 身份。
+    pub(crate) identity: TaskItemIdentity,
+    /// 协调器创建消息的单调时刻，用于计算真实持久化排队等待。
+    enqueued_at: Instant,
+    /// actor 独占 NodeStore 后执行的事务操作。
+    operation: PersistOperation,
+}
+
+impl BasePersistMessage {
+    /// 把已经释放计算资源的拥有型数据封装为单写操作。
+    pub(crate) fn new<F>(identity: TaskItemIdentity, operation: F) -> Self
+    where
+        F: FnOnce(&mut NodeStore) -> Result<BasePersistOutcome, String> + Send + 'static,
+    {
+        Self {
+            identity,
+            enqueued_at: Instant::now(),
+            operation: Box::new(operation),
+        }
+    }
+}
+
+/// SQLite 已确认后的运行时汇总动作；协调器收到 ACK 后才可应用。
+pub(crate) enum BasePersistOutcome {
+    /// 一个文件成功持久化。
+    Succeeded {
+        worker_slot: Option<u32>,
+        /// 仅 path 完整缓存命中在 Applied ACK 后增加缓存命中汇总。
+        cache_hit: bool,
+        /// Applied ACK 确认的真实媒体类型，用于内存吞吐分桶。
+        media_kind: MediaKind,
+        /// 枚举阶段冻结的真实文件大小，用于内存吞吐分桶。
+        file_size: u64,
+    },
+    /// 一个文件失败持久化，并保留显示路径和诊断。
+    Failed {
+        display_path: String,
+        message: String,
+        worker_slot: Option<u32>,
+        skipped_incomplete: bool,
+    },
+    /// 活动项确认取消；只推进 skipped，不报告成功或文件失败。
+    Cancelled { worker_slot: Option<u32> },
+    /// 取消或晚到结果被事务门禁忽略。
+    Ignored,
+}
+
+impl BasePersistOutcome {
+    /// 判断该 ACK 是否代表具体 item 已 Applied；Ignored 不应记录完成时延。
+    pub(crate) const fn is_applied(&self) -> bool {
+        !matches!(self, Self::Ignored)
+    }
+}
+
+/// actor 对一条持久化消息的完成回执。
+pub(crate) struct BasePersistAck {
+    /// 回执对应的精确身份。
+    pub(crate) identity: TaskItemIdentity,
+    /// 从协调器创建消息到 actor 取得消息的真实等待耗时。
+    pub(crate) queue_wait: Duration,
+    /// 不含测试 gate 的真实 SQLite 操作耗时。
+    pub(crate) transaction_elapsed: Duration,
+    /// 成功动作或导致 actor 停止的持久化错误。
+    pub(crate) result: Result<BasePersistOutcome, String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BasePersistOutcome;
+
+    /// ACK 的 Applied 与 Ignored 必须可区分，时延只记录 Applied 终态。
+    #[test]
+    fn applied_ack_is_distinguished_from_ignored_ack() {
+        assert!(!BasePersistOutcome::Ignored.is_applied());
+    }
+}
+
+/// 满队列时归还消息所有权，协调器可继续消费 ACK 后重试。
+pub(crate) enum BasePersistSendError {
+    /// 有界队列已满，原消息仍由调用方持有。
+    Full(BasePersistMessage),
+    /// actor 已停止，原消息仍由调用方持有。
+    Closed(BasePersistMessage),
+}
+
+/// BaseCompute 对 task-local 单写 actor 的有界句柄。
+#[derive(Clone)]
+pub(crate) struct BaseStoreHandle {
+    calls: SyncSender<StoreCall>,
+    persists: SyncSender<BasePersistMessage>,
+    machine_id: MachineId,
+}
+
+impl BaseStoreHandle {
+    /// 返回 actor 独占 Store 的物理机器身份，不发送 SQLite 命令。
+    pub(crate) fn machine_id(&self) -> &MachineId {
+        &self.machine_id
+    }
+
+    /// 非阻塞投递终态；满队列时协调器必须先消费 ACK 或控制事件。
+    pub(crate) fn try_persist(
+        &self,
+        message: BasePersistMessage,
+    ) -> Result<(), BasePersistSendError> {
+        self.persists
+            .try_send(message)
+            .map_err(|error| match error {
+                TrySendError::Full(message) => BasePersistSendError::Full(message),
+                TrySendError::Disconnected(message) => BasePersistSendError::Closed(message),
+            })
+    }
+
+    /// 在 actor 线程串行执行一个短 Store 调用；错误会关闭该任务 writer。
+    fn call<T, F>(&self, operation: F) -> Result<T, StoreError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut NodeStore) -> Result<T, StoreError> + Send + 'static,
+    {
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let call = Box::new(move |store: &mut NodeStore| {
+            let result = operation(store);
+            let succeeded = result.is_ok();
+            let _ = result_tx.send(result);
+            succeeded
+        });
+        self.calls.send(call).map_err(|_| {
+            StoreError::InvalidState("基础持久化 actor 已关闭 Store 调用通道".into())
+        })?;
+        result_rx.recv().map_err(|_| {
+            StoreError::InvalidState("基础持久化 actor 未返回 Store 调用结果".into())
+        })?
+    }
+
+    pub(crate) fn task_snapshot(&self, task_id: TaskId) -> Result<TaskSnapshot, StoreError> {
+        self.call(move |store| store.task_snapshot(task_id))
+    }
+
+    pub(crate) fn reserve_scan_path(
+        &self,
+        task_id: TaskId,
+        scanned: &ScannedPath,
+        now_ms: i64,
+    ) -> Result<Option<String>, StoreError> {
+        let scanned = scanned.clone();
+        self.call(move |store| store.reserve_scan_path(task_id, &scanned, now_ms))
+    }
+
+    pub(crate) fn lookup_scanned_paths(
+        &self,
+        paths: &[ScannedPath],
+    ) -> Result<Vec<dedup_node_store::CacheLookup>, StoreError> {
+        let paths = paths.to_vec();
+        self.call(move |store| store.lookup_scanned_paths(&paths))
+    }
+
+    pub(crate) fn load_base_cache_record(
+        &self,
+        content_id: ContentId,
+    ) -> Result<BaseCacheRecord, StoreError> {
+        self.call(move |store| store.load_base_cache_record(content_id))
+    }
+
+    pub(crate) fn import_base_cache_record(
+        &self,
+        scanned: &ScannedPath,
+        record: &BaseCacheRecord,
+    ) -> Result<ContentRecord, StoreError> {
+        let scanned = scanned.clone();
+        let record = record.clone();
+        self.call(move |store| store.import_base_cache_record(&scanned, &record))
+    }
+
+    pub(crate) fn queue_scan_item_for_read(&self, item_id: &str) -> Result<(), StoreError> {
+        let item_id = item_id.to_owned();
+        self.call(move |store| store.queue_scan_item_for_read(&item_id))
+    }
+
+    pub(crate) fn content_id_by_key(
+        &self,
+        key: ContentKey,
+    ) -> Result<Option<ContentId>, StoreError> {
+        self.call(move |store| store.content_id_by_key(key))
+    }
+
+    pub(crate) fn upsert_content_and_location(
+        &self,
+        scanned: &ScannedPath,
+        md5: [u8; 16],
+        media_kind: MediaKind,
+    ) -> Result<ContentRecord, StoreError> {
+        let scanned = scanned.clone();
+        self.call(move |store| store.upsert_content_and_location(&scanned, md5, media_kind))
+    }
+
+    pub(crate) fn set_running_item_content_and_stage(
+        &self,
+        item_id: &str,
+        content_id: ContentId,
+        stage: &str,
+    ) -> Result<(), StoreError> {
+        let item_id = item_id.to_owned();
+        let stage = stage.to_owned();
+        self.call(move |store| {
+            store.set_running_item_content_and_stage(&item_id, content_id, &stage)
+        })
+    }
+
+    pub(crate) fn claim_next_item(
+        &self,
+        task_id: TaskId,
+        now_ms: i64,
+    ) -> Result<Option<ClaimedTaskItem>, StoreError> {
+        self.call(move |store| store.claim_next_item(task_id, now_ms))
+    }
+
+    pub(crate) fn finalize_scan_task_from_items(
+        &self,
+        task_id: TaskId,
+        now_ms: i64,
+    ) -> Result<u64, StoreError> {
+        self.call(move |store| store.finalize_scan_task_from_items(task_id, now_ms))
+    }
+
+    pub(crate) fn sync_state(&self) -> Result<SyncState, StoreError> {
+        self.call(|store| store.sync_state())
+    }
+
+    pub(crate) fn pull_changes(&self, after: u64, limit: usize) -> Result<SyncBatch, StoreError> {
+        self.call(move |store| store.pull_changes(after, limit))
+    }
+
+    pub(crate) fn ack_changes(&self, committed: u64) -> Result<(), StoreError> {
+        self.call(move |store| store.ack_changes(committed))
+    }
+
+    pub(crate) fn save_task_stage(
+        &self,
+        task_id: TaskId,
+        write: TaskStageWrite,
+    ) -> Result<(), StoreError> {
+        self.call(move |store| store.save_task_stage(task_id, write))
+    }
+}
+
+/// 持有 actor 线程并在任务结束时取回原 NodeStore。
+pub(crate) struct BaseStoreActor {
+    thread: thread::JoinHandle<NodeStore>,
+    /// 测试专用 join 观测；默认构建完全不包含该字段。
+    #[cfg(feature = "test-hooks")]
+    test_state: Option<Arc<BasePersistTestState>>,
+}
+
+impl BaseStoreActor {
+    /// 启动 task-local writer；persist 队列容量由 Worker 与产品通道上限共同约束。
+    pub(crate) fn spawn(
+        store: NodeStore,
+        persist_capacity: usize,
+    ) -> (Self, BaseStoreHandle, UnboundedReceiver<BasePersistAck>) {
+        Self::spawn_with_hook(store, persist_capacity, NoBeforePersist)
+    }
+
+    #[cfg(feature = "test-hooks")]
+    /// 启动可在首条持久化前暂停的 writer；默认构建不包含此入口。
+    pub(crate) fn spawn_with_first_persist_waiter(
+        store: NodeStore,
+        persist_capacity: usize,
+        first_persist_waiter: BasePersistTestWaiter,
+    ) -> (Self, BaseStoreHandle, UnboundedReceiver<BasePersistAck>) {
+        let test_state = Arc::clone(&first_persist_waiter.shared);
+        let (mut actor, handle, acknowledgements) = Self::spawn_with_hook(
+            store,
+            persist_capacity,
+            FirstPersistTestHook(Some(first_persist_waiter)),
+        );
+        actor.test_state = Some(test_state);
+        (actor, handle, acknowledgements)
+    }
+
+    /// 使用静态分派 hook 启动 actor；生产实例传入零大小空 hook。
+    fn spawn_with_hook<H: BeforePersist>(
+        store: NodeStore,
+        persist_capacity: usize,
+        before_persist: H,
+    ) -> (Self, BaseStoreHandle, UnboundedReceiver<BasePersistAck>) {
+        let machine_id = store.machine_id().clone();
+        let (call_tx, call_rx) = mpsc::sync_channel(persist_capacity.max(1));
+        let (persist_tx, persist_rx) = mpsc::sync_channel(persist_capacity.max(1));
+        let (ack_tx, ack_rx) = tokio::sync::mpsc::unbounded_channel();
+        let thread =
+            thread::spawn(move || run_actor(store, call_rx, persist_rx, ack_tx, before_persist));
+        (
+            Self {
+                thread,
+                #[cfg(feature = "test-hooks")]
+                test_state: None,
+            },
+            BaseStoreHandle {
+                calls: call_tx,
+                persists: persist_tx,
+                machine_id,
+            },
+            ack_rx,
+        )
+    }
+
+    /// 等待 writer 排空并取回原 Store，供现有借用 API 恢复所有权。
+    pub(crate) async fn finish(self) -> Result<NodeStore, ScanError> {
+        #[cfg(feature = "test-hooks")]
+        let test_state = self.test_state;
+        let store = tokio::task::spawn_blocking(move || self.thread.join())
+            .await
+            .map_err(|error| ScanError::Stage1(format!("基础持久化 actor join 失败: {error}")))?
+            .map_err(|_| ScanError::Stage1("基础持久化 actor 线程 panic".into()))?;
+        #[cfg(feature = "test-hooks")]
+        if let Some(test_state) = test_state {
+            test_state.writer_joined.store(true, Ordering::Release);
+        }
+        Ok(store)
+    }
+}
+
+/// actor 主循环优先排空有界持久化队列，再处理同步 Store 调用。
+fn run_actor<H: BeforePersist>(
+    mut store: NodeStore,
+    calls: Receiver<StoreCall>,
+    persists: Receiver<BasePersistMessage>,
+    acknowledgements: UnboundedSender<BasePersistAck>,
+    mut before_persist: H,
+) -> NodeStore {
+    let mut calls_closed = false;
+    let mut persists_closed = false;
+    while !calls_closed || !persists_closed {
+        match persists.try_recv() {
+            Ok(message) => {
+                let queue_wait = message.enqueued_at.elapsed();
+                before_persist.before_persist();
+                if !apply_persist_message(&mut store, message, queue_wait, &acknowledgements) {
+                    break;
+                }
+                continue;
+            }
+            Err(TryRecvError::Disconnected) => persists_closed = true,
+            Err(TryRecvError::Empty) => {}
+        }
+        match calls.recv_timeout(Duration::from_millis(1)) {
+            Ok(call) => {
+                if !call(&mut store) {
+                    break;
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => calls_closed = true,
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+    }
+    store
+}
+
+/// 执行一条终态并发送 ACK；任何持久化错误都会关闭本任务 writer。
+fn apply_persist_message(
+    store: &mut NodeStore,
+    message: BasePersistMessage,
+    queue_wait: Duration,
+    acknowledgements: &UnboundedSender<BasePersistAck>,
+) -> bool {
+    let BasePersistMessage {
+        identity,
+        enqueued_at: _,
+        operation,
+    } = message;
+    let transaction_started = Instant::now();
+    let result = operation(store);
+    let transaction_elapsed = transaction_started.elapsed();
+    let succeeded = result.is_ok();
+    let _ = acknowledgements.send(BasePersistAck {
+        identity,
+        queue_wait,
+        transaction_elapsed,
+        result,
+    });
+    succeeded
+}

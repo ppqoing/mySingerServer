@@ -4,15 +4,19 @@
 mod analysis;
 mod content;
 mod delete;
-mod features;
 mod faults;
+mod features;
 mod groups;
 mod open;
 mod outbox;
 mod review;
 mod rows;
 mod snapshot;
+mod stages;
 mod tasks;
+
+#[cfg(feature = "acceptance-tools")]
+pub mod result_summary;
 
 pub use analysis::{
     AnalysisInput, AnalysisMode, AnalysisRunSnapshot, AnalysisStatus, CandidateStatus,
@@ -29,12 +33,13 @@ pub use groups::{
 pub use open::{NodeStore, StoreError};
 pub use review::ReviewDecision;
 pub use rows::{
-    ActiveFile, CacheLookup, CompleteStage1, CompleteStage2, ContentId, ContentRecord,
-    FeatureWrite, ImageStage1Fields, ScannedPath, SnapshotPage, SnapshotRow, SyncBatch, SyncState,
-    VideoFrameStage1Fields, VideoFrameStage2Fields, VideoMetadataFields,
+    ActiveFile, BaseCacheRecord, CacheLookup, CompleteStage1, CompleteStage2, ContentId,
+    ContentRecord, FeatureWrite, ImageStage1Fields, ScannedPath, SnapshotPage, SnapshotRow,
+    SyncBatch, SyncState, VideoFrameStage1Fields, VideoFrameStage2Fields, VideoMetadataFields,
 };
 pub use snapshot::{OwnedSnapshot, Snapshot};
+pub use stages::{PersistentStageState, TaskStageSnapshot, TaskStageWrite};
 pub use tasks::{
-    ClaimedTaskItem, NewTaskItem, TaskEvent, TaskItemCompletion, TaskItemSnapshot, TaskItemStatus,
-    TaskPage, TaskSnapshot, TaskStatus,
+    ClaimedTaskItem, NewTaskItem, TaskEvent, TaskItemApplyResult, TaskItemCompletion,
+    TaskItemIdentity, TaskItemSnapshot, TaskItemStatus, TaskPage, TaskSnapshot, TaskStatus,
 };

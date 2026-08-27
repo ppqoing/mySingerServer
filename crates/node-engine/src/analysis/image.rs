@@ -58,7 +58,7 @@ pub(crate) fn image_candidates_with_runtime(
     let candidates = image_candidates(features, thresholds);
     if let Some(reporter) = reporter {
         let _ = reporter.update_stage_nowait(RuntimeStageUpdate {
-            stage: RuntimeStage::Stage1Candidates,
+            stage: RuntimeStage::BuildCandidates,
             state: dedup_protocol::proto::RuntimeStageState::RuntimeStageRunning,
             unit: RuntimeProgressUnit::CandidatePairs,
             completed: candidates.len() as u64,

@@ -4,6 +4,7 @@ use dedup_desktop_ui::{
 };
 use i_slint_backend_testing::{ElementHandle, TestingBackend, TestingBackendOptions};
 use slint::{Color, ComponentHandle, ModelRc, VecModel};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 const VIEWS: [(&str, i32, i32, i32, i32, i32); 12] = [
@@ -18,11 +19,29 @@ const VIEWS: [(&str, i32, i32, i32, i32, i32); 12] = [
     ("09-review", 6, 0, 0, 0, 0),
     ("10-delete-center", 6, 0, 0, 1, 0),
     ("11-settings", 7, 0, 0, 0, 0),
-    ("12-diagnostics", 7, 0, 0, 0, 6),
+    ("12-diagnostics", 7, 0, 0, 0, 7),
+];
+
+const COMPARISONS: [(&str, &str, &str); 6] = [
+    ("01-overview-nodes.png", "01-overview", "02-nodes"),
+    ("02-scan-tasks.png", "03-scan", "04-tasks"),
+    ("03-exact-cross-machine.png", "05-exact", "08-cross-machine"),
+    (
+        "04-similar-media.png",
+        "06-similar-images",
+        "07-similar-videos",
+    ),
+    ("05-review-delete.png", "09-review", "10-delete-center"),
+    (
+        "06-settings-diagnostics.png",
+        "11-settings",
+        "12-diagnostics",
+    ),
 ];
 
 enum PreviewDestination {
-    TargetDirectory,
+    TargetDirectory { root: PathBuf },
+    Documentation { root: PathBuf },
 }
 
 struct VisualFixture {
@@ -256,19 +275,29 @@ impl VisualFixture {
                 slot: 0,
                 identity: "PID 4812 · 槽位 0".into(),
                 stage_id: "probe_stage1".into(),
+                step: "生成缩略图".into(),
+                cache_detail: "复用本地缩略图".into(),
                 path: r"D:\Media\Series\Episode-001.mkv".into(),
                 disk: "PhysicalDisk 0".into(),
                 completed: "12 个文件".into(),
                 speed: "3.5 文件/秒".into(),
+                phase: "特征计算".into(),
+                cpu_weight: "2".into(),
+                decoder_threads: "2".into(),
             },
             UiRuntimeWorkerRow {
                 slot: 1,
                 identity: "PID 4920 · 槽位 1".into(),
                 stage_id: "probe_stage1".into(),
+                step: "计算图片一筛特征".into(),
+                cache_detail: "缓存未命中".into(),
                 path: r"E:\Archive\Movie-002.mp4".into(),
                 disk: "PhysicalDisk 1".into(),
                 completed: "9 个文件".into(),
                 speed: "2.8 文件/秒".into(),
+                phase: "解码".into(),
+                cpu_weight: "1".into(),
+                decoder_threads: "1".into(),
             },
         ])));
         window.set_runtime_failures(ModelRc::new(VecModel::from(vec![UiRuntimeFailureRow {
@@ -404,26 +433,158 @@ fn render_all_views(fixture: &VisualFixture, destination: PreviewDestination) {
             );
         }
     }
+    if requested_views.is_empty() {
+        render_document_comparisons(&destination);
+    }
+}
+
+fn repository_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("桌面 UI crate 应位于工作区 crates 目录")
+        .to_path_buf()
+}
+
+fn resolve_preview_destination(
+    preview_output: Option<&OsStr>,
+    cargo_target: Option<&OsStr>,
+) -> Result<PreviewDestination, String> {
+    if let Some(requested) = preview_output {
+        let document_root = repository_root().join("docs/ui-preview/rust-v2");
+        let requested_path = PathBuf::from(requested);
+        let requested_resolved = requested_path.canonicalize().map_err(|error| {
+            format!(
+                "RUST_V2_PREVIEW_OUTPUT_INVALID requested={} expected={} error={error}",
+                requested_path.display(),
+                document_root.display()
+            )
+        })?;
+        let expected_resolved = document_root.canonicalize().map_err(|error| {
+            format!(
+                "RUST_V2_PREVIEW_OUTPUT_INVALID requested={} expected={} error={error}",
+                requested_path.display(),
+                document_root.display()
+            )
+        })?;
+        if requested_resolved != expected_resolved {
+            return Err(format!(
+                "RUST_V2_PREVIEW_OUTPUT_INVALID requested={} expected={}",
+                requested_path.display(),
+                document_root.display()
+            ));
+        }
+        return Ok(PreviewDestination::Documentation {
+            root: document_root,
+        });
+    }
+
+    let cargo_target = cargo_target
+        .map(PathBuf::from)
+        .unwrap_or_else(|| repository_root().join("target"));
+    Ok(PreviewDestination::TargetDirectory {
+        root: cargo_target.join("visual-preview/current"),
+    })
 }
 
 fn preview_root(destination: &PreviewDestination) -> PathBuf {
     match destination {
-        PreviewDestination::TargetDirectory => std::env::var_os("RUST_V2_PREVIEW_OUTPUT")
-            .map(PathBuf::from)
-            .map(|root| root.join("after"))
-            .or_else(|| {
-                std::env::var_os("CARGO_TARGET_DIR")
-                    .map(PathBuf::from)
-                    .map(|root| root.join("visual-preview/current"))
-            })
-            .unwrap_or_else(|| {
-                Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .parent()
-                    .and_then(Path::parent)
-                    .expect("桌面 UI crate 应位于工作区 crates 目录")
-                    .join("target/visual-preview/current")
-            }),
+        PreviewDestination::TargetDirectory { root } => root.clone(),
+        PreviewDestination::Documentation { root } => root.join("after"),
     }
+}
+
+fn comparison_root(destination: &PreviewDestination) -> Option<PathBuf> {
+    match destination {
+        PreviewDestination::TargetDirectory { .. } => None,
+        PreviewDestination::Documentation { root } => Some(root.join("comparison")),
+    }
+}
+
+fn render_document_comparisons(destination: &PreviewDestination) {
+    let PreviewDestination::Documentation { root } = destination else {
+        return;
+    };
+    let after_root = preview_root(destination).join("1440x900");
+    let output_root = comparison_root(destination).expect("文档模式必须包含对照板目录");
+    std::fs::create_dir_all(&output_root).expect("应能创建对照板目录");
+
+    for (reference_name, upper_view, lower_view) in COMPARISONS {
+        let reference_path = root.join(reference_name);
+        let upper_path = after_root.join(format!("{upper_view}.png"));
+        let lower_path = after_root.join(format!("{lower_view}.png"));
+        let reference = image::open(&reference_path)
+            .unwrap_or_else(|error| panic!("无法读取参考图 {}: {error}", reference_path.display()))
+            .to_rgba8();
+        let upper = image::open(&upper_path)
+            .unwrap_or_else(|error| panic!("无法读取修复后视图 {}: {error}", upper_path.display()))
+            .to_rgba8();
+        let lower = image::open(&lower_path)
+            .unwrap_or_else(|error| panic!("无法读取修复后视图 {}: {error}", lower_path.display()))
+            .to_rgba8();
+        assert_eq!(
+            upper.dimensions(),
+            (1440, 900),
+            "对照板上半区必须来自 1440x900 夹具"
+        );
+        assert_eq!(
+            lower.dimensions(),
+            (1440, 900),
+            "对照板下半区必须来自 1440x900 夹具"
+        );
+
+        let canvas = build_comparison_canvas(&reference, &upper, &lower);
+        let output_path = output_root.join(reference_name);
+        canvas
+            .save(&output_path)
+            .unwrap_or_else(|error| panic!("无法保存对照板 {}: {error}", output_path.display()));
+    }
+}
+
+fn build_comparison_canvas(
+    reference: &image::RgbaImage,
+    upper: &image::RgbaImage,
+    lower: &image::RgbaImage,
+) -> image::RgbaImage {
+    let mut canvas = image::RgbaImage::from_pixel(2320, 900, image::Rgba([255, 255, 255, 255]));
+    let reference = resize_to_fit(reference, 1600, 900);
+    let reference_x = (1600 - reference.width()) / 2;
+    let reference_y = (900 - reference.height()) / 2;
+    image::imageops::overlay(
+        &mut canvas,
+        &reference,
+        i64::from(reference_x),
+        i64::from(reference_y),
+    );
+
+    let upper = image::imageops::resize(upper, 720, 450, image::imageops::FilterType::Lanczos3);
+    let lower = image::imageops::resize(lower, 720, 450, image::imageops::FilterType::Lanczos3);
+    image::imageops::overlay(&mut canvas, &upper, 1600, 0);
+    image::imageops::overlay(&mut canvas, &lower, 1600, 450);
+    canvas
+}
+
+fn resize_to_fit(
+    source: &image::RgbaImage,
+    maximum_width: u32,
+    maximum_height: u32,
+) -> image::RgbaImage {
+    assert!(source.width() > 0 && source.height() > 0);
+    let source_width = u64::from(source.width());
+    let source_height = u64::from(source.height());
+    let maximum_width_u64 = u64::from(maximum_width);
+    let maximum_height_u64 = u64::from(maximum_height);
+    let (width, height) = if source_width * maximum_height_u64 >= source_height * maximum_width_u64
+    {
+        let height =
+            ((source_height * maximum_width_u64 + source_width / 2) / source_width).max(1) as u32;
+        (maximum_width, height)
+    } else {
+        let width =
+            ((source_width * maximum_height_u64 + source_height / 2) / source_height).max(1) as u32;
+        (width, maximum_height)
+    };
+    image::imageops::resize(source, width, height, image::imageops::FilterType::Lanczos3)
 }
 
 fn save_snapshot(snapshot: &slint::SharedPixelBuffer<slint::Rgba8Pixel>, path: &Path) {
@@ -461,5 +622,91 @@ fn render_all_views_with_real_row_states() {
     assert!(fixture.members.iter().any(|row| row.review == "未决定"));
     assert!(fixture.members.iter().any(|row| row.review == "保留"));
     assert!(fixture.members.iter().any(|row| row.review == "删除"));
-    render_all_views(&fixture, PreviewDestination::TargetDirectory);
+    let preview_output = std::env::var_os("RUST_V2_PREVIEW_OUTPUT");
+    let cargo_target = std::env::var_os("CARGO_TARGET_DIR");
+    let destination =
+        resolve_preview_destination(preview_output.as_deref(), cargo_target.as_deref())
+            .unwrap_or_else(|error| panic!("{error}"));
+    render_all_views(&fixture, destination);
+}
+
+#[test]
+fn preview_destination_requires_the_exact_repository_document_root() {
+    let document_root = repository_root().join("docs/ui-preview/rust-v2");
+    let accepted = resolve_preview_destination(Some(document_root.as_os_str()), None)
+        .expect("仓库视觉证据根应允许显式文档输出");
+    assert_eq!(
+        preview_root(&accepted),
+        document_root.join("after"),
+        "文档模式必须自动写入 after 子目录"
+    );
+    assert_eq!(
+        comparison_root(&accepted),
+        Some(document_root.join("comparison")),
+        "文档模式必须同时启用固定对照板目录"
+    );
+
+    let external_root = std::env::temp_dir();
+    let error = resolve_preview_destination(Some(external_root.as_os_str()), None)
+        .err()
+        .expect("仓库外路径必须被拒绝");
+    assert!(error.contains("RUST_V2_PREVIEW_OUTPUT_INVALID"));
+    assert!(error.contains(&document_root.display().to_string()));
+}
+
+#[test]
+fn ordinary_preview_uses_cargo_target_without_comparison_output() {
+    let cargo_target = Path::new(r"C:\tmp\rust-v2-preview-test-target");
+    let destination = resolve_preview_destination(None, Some(cargo_target.as_os_str()))
+        .expect("普通预览应接受独立 Cargo target");
+    assert_eq!(
+        preview_root(&destination),
+        cargo_target.join("visual-preview/current")
+    );
+    assert_eq!(comparison_root(&destination), None);
+}
+
+#[test]
+fn comparison_canvas_fits_reference_and_stacks_two_after_views() {
+    let reference = image::RgbaImage::from_pixel(800, 800, image::Rgba([220, 20, 60, 255]));
+    let upper = image::RgbaImage::from_pixel(1440, 900, image::Rgba([20, 180, 80, 255]));
+    let lower = image::RgbaImage::from_pixel(1440, 900, image::Rgba([30, 90, 220, 255]));
+
+    let canvas = build_comparison_canvas(&reference, &upper, &lower);
+
+    assert_eq!(canvas.dimensions(), (2320, 900));
+    assert_eq!(*canvas.get_pixel(0, 0), image::Rgba([255, 255, 255, 255]));
+    assert_eq!(
+        *canvas.get_pixel(350, 0),
+        image::Rgba([220, 20, 60, 255]),
+        "正方形参考图应在 1600x900 左画布中等比居中"
+    );
+    assert_eq!(*canvas.get_pixel(1600, 0), image::Rgba([20, 180, 80, 255]));
+    assert_eq!(
+        *canvas.get_pixel(1600, 450),
+        image::Rgba([30, 90, 220, 255])
+    );
+}
+
+#[test]
+fn comparison_mapping_is_fixed_to_the_six_design_references() {
+    assert_eq!(
+        COMPARISONS,
+        [
+            ("01-overview-nodes.png", "01-overview", "02-nodes"),
+            ("02-scan-tasks.png", "03-scan", "04-tasks"),
+            ("03-exact-cross-machine.png", "05-exact", "08-cross-machine",),
+            (
+                "04-similar-media.png",
+                "06-similar-images",
+                "07-similar-videos",
+            ),
+            ("05-review-delete.png", "09-review", "10-delete-center"),
+            (
+                "06-settings-diagnostics.png",
+                "11-settings",
+                "12-diagnostics",
+            ),
+        ]
+    );
 }

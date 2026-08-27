@@ -59,13 +59,12 @@ impl PipelineFileReader for ImmediateReader {
         _cancellation: ReadCancellationToken,
     ) -> Pin<Box<dyn Future<Output = Result<ReadProduct<Self::Lease>, ReadFailure>> + Send>> {
         Box::pin(async move {
-            let bytes = fs::read(scanned.display_path.as_path()).map_err(|source| {
-                ReadFailure::Io {
+            let bytes =
+                fs::read(scanned.display_path.as_path()).map_err(|source| ReadFailure::Io {
                     path: scanned.display_path.as_path().to_path_buf(),
                     block_offset: 0,
                     source,
-                }
-            })?;
+                })?;
             Ok(ReadProduct {
                 md5: md5_bytes(&bytes),
                 lease: (),
@@ -108,17 +107,11 @@ async fn production_contact_sheet_write_registers_the_published_artifact() {
         DisplayPath::new(&media).unwrap(),
         fs::metadata(&media).unwrap().len(),
     );
-    let registry = Arc::new(
-        RegenerableArtifactRegistry::new(&install_root, &cache_root).unwrap(),
-    );
+    let registry = Arc::new(RegenerableArtifactRegistry::new(&install_root, &cache_root).unwrap());
     let cleaner = DiskFullCleaner::new(Arc::clone(&registry), FixtureDiskResolver);
     let contact_root = cache_root.join("contact-sheets");
-    let mut engine = ScanEngine::new(
-        OneFileEnumerator(scanned),
-        SystemMd5,
-        &contact_root,
-    )
-    .with_disk_full_cleanup(Arc::clone(&registry), cleaner);
+    let mut engine = ScanEngine::new(OneFileEnumerator(scanned), SystemMd5, &contact_root)
+        .with_disk_full_cleanup(Arc::clone(&registry), cleaner);
     let machine = MachineId::from_sha256([0x83; 32]);
     let mut store = NodeStore::open_in_memory(machine).unwrap();
 
@@ -186,10 +179,10 @@ fn disk_full_cleanup_deletes_the_complete_registered_same_disk_set_once() {
     let media = install_root.join("media/video.mp4");
     write_fixture(&media, b"video");
 
-    let registry = Arc::new(
-        RegenerableArtifactRegistry::new(&install_root, &cache_root).unwrap(),
-    );
-    registry.register(&contact, ArtifactKind::ContactSheet).unwrap();
+    let registry = Arc::new(RegenerableArtifactRegistry::new(&install_root, &cache_root).unwrap());
+    registry
+        .register(&contact, ArtifactKind::ContactSheet)
+        .unwrap();
     registry.register(&preview, ArtifactKind::Preview).unwrap();
     registry
         .register(&orphan, ArtifactKind::OrphanTemporary)
@@ -282,9 +275,7 @@ fn disk_full_cleanup_retries_only_once_and_ignores_other_io_errors() {
     let install_root = fixture.path().join("mySingerServer");
     let cache_root = install_root.join("cache");
     fs::create_dir_all(&cache_root).unwrap();
-    let registry = Arc::new(
-        RegenerableArtifactRegistry::new(&install_root, &cache_root).unwrap(),
-    );
+    let registry = Arc::new(RegenerableArtifactRegistry::new(&install_root, &cache_root).unwrap());
     let first_cleanup = install_root.join("cache/derived/first.bin");
     write_fixture(&first_cleanup, b"first");
     registry
@@ -318,23 +309,17 @@ fn disk_full_cleanup_retries_only_once_and_ignores_other_io_errors() {
 
     let untouched = install_root.join("cache/derived/untouched.bin");
     write_fixture(&untouched, b"untouched");
-    let second_registry = Arc::new(
-        RegenerableArtifactRegistry::new(&install_root, &cache_root).unwrap(),
-    );
+    let second_registry =
+        Arc::new(RegenerableArtifactRegistry::new(&install_root, &cache_root).unwrap());
     second_registry
         .register(&untouched, ArtifactKind::RegisteredDerivation)
         .unwrap();
     let second_cleaner = DiskFullCleaner::new(second_registry, FixtureDiskResolver);
     let mut calls = 0;
-    let error = write_with_disk_full_cleanup(
-        &second_cleaner,
-        &mut store,
-        &write_target,
-        || {
-            calls += 1;
-            Err::<(), _>(io::Error::from_raw_os_error(5))
-        },
-    )
+    let error = write_with_disk_full_cleanup(&second_cleaner, &mut store, &write_target, || {
+        calls += 1;
+        Err::<(), _>(io::Error::from_raw_os_error(5))
+    })
     .unwrap_err();
     assert_eq!(error.raw_os_error(), Some(5));
     assert_eq!(calls, 1);
@@ -365,7 +350,10 @@ fn artifact_registry_rejects_paths_outside_the_absolute_install_root() {
             cache_root.join("contact-sheets/aa/sheet.jpg"),
             ArtifactKind::ContactSheet,
         ),
-        (cache_root.join("previews/preview.bin"), ArtifactKind::Preview),
+        (
+            cache_root.join("previews/preview.bin"),
+            ArtifactKind::Preview,
+        ),
         (
             cache_root.join("tmp/write.partial"),
             ArtifactKind::OrphanTemporary,
@@ -389,7 +377,12 @@ fn artifact_registry_rejects_paths_outside_the_absolute_install_root() {
             .is_err(),
         "安装根内另一个同名 cache 子树不能冒充 exact cache root"
     );
-    for name in ["node.db-wal", "node.db-shm", "node.db-journal", "node.sqlite-wal"] {
+    for name in [
+        "node.db-wal",
+        "node.db-shm",
+        "node.db-journal",
+        "node.sqlite-wal",
+    ] {
         let sidecar = cache_root.join("derived").join(name);
         write_fixture(&sidecar, b"database-sidecar");
         assert!(
@@ -430,9 +423,7 @@ fn planned_partial_lease_blocks_external_cleanup_and_releases_only_for_its_own_d
     let install_root = fixture.path().join("mySingerServer");
     let cache_root = install_root.join("custom-cache");
     fs::create_dir_all(&cache_root).unwrap();
-    let registry = Arc::new(
-        RegenerableArtifactRegistry::new(&install_root, &cache_root).unwrap(),
-    );
+    let registry = Arc::new(RegenerableArtifactRegistry::new(&install_root, &cache_root).unwrap());
     let cleaner = DiskFullCleaner::new(Arc::clone(&registry), FixtureDiskResolver);
     let database = install_root.join("data/node.db");
     fs::create_dir_all(database.parent().unwrap()).unwrap();
@@ -480,7 +471,10 @@ fn planned_partial_lease_blocks_external_cleanup_and_releases_only_for_its_own_d
         }
     })
     .unwrap();
-    assert!(partial.exists(), "外部清理不能删除正在 write/flush/sync 的 partial");
+    assert!(
+        partial.exists(),
+        "外部清理不能删除正在 write/flush/sync 的 partial"
+    );
     assert_eq!(cleaner.recent_summary().unwrap().skipped_active, 1);
     release.wait();
     let (_, active_lease) = writer.join().unwrap();
