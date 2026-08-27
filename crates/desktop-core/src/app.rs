@@ -501,6 +501,8 @@ async fn run_controller(
     let mut runtime_ticks = runtime_task_interval();
     catch_up_ticks.tick().await;
     runtime_ticks.tick().await;
+    // 先发布统一运行任务所有者的空快照，再发布普通视图，避免 UI 启动时出现第二个任务来源。
+    publish_runtime_tasks(&events, &runtime_view).await;
     publish(&events, &state).await;
     loop {
         let command = tokio::select! {

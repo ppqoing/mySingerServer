@@ -6051,6 +6051,11 @@ async fn local_compute_candidate_waits_without_consuming_context_when_credit_is_
     let config = DiskReadConfig::default();
     let cancellation = ReadCancellationToken::new();
     let contact_root = cache_root.join("contact-sheets");
+    // 记录本地 content 批量查询次数，验证背压轮询不会重复读取同一批 SQLite 记录。
+    let local_lookup_calls = Arc::new(AtomicUsize::new(0));
+    let _local_lookup_observer = BaseComputeEngine::install_local_content_lookup_observer_for_test(
+        Arc::clone(&local_lookup_calls),
+    );
     let run = BaseComputeEngine::run_existing(
         &mut store,
         &mut pool,
@@ -6098,6 +6103,14 @@ async fn local_compute_candidate_waits_without_consuming_context_when_credit_is_
             Some(2)
         );
         assert_eq!(started_hashes.load(Ordering::Acquire), 3);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            local_lookup_calls.load(Ordering::Acquire),
+            1,
+            "同一批本地 content 候选在 decode credit 背压时不得重复查询 SQLite"
+        );
         cancellation.cancel();
     };
     let (result, ()) = tokio::join!(run, observe);

@@ -1,6 +1,6 @@
 //! SQLite 新库、路径缓存、内容复用和特征完整性的集成测试。
 
-use dedup_core::{DisplayPath, MachineId, MediaKind, NormalizedPath};
+use dedup_core::{ContentKey, DisplayPath, MachineId, MediaKind, NormalizedPath};
 use dedup_media::{ImageStage1, ImageStage2, PdqHash};
 use dedup_node_store::{
     CompleteStage1, CompleteStage2, FeatureWrite, ImageStage1Fields, NodeStore, ScannedPath,
@@ -217,4 +217,111 @@ fn image_stage2_is_loaded_only_as_joint_result() {
         store.load_complete_stage2(content.id).unwrap(),
         Some(CompleteStage2::Image(value)) if *value == stage2
     ));
+}
+
+/// 路径批量查询必须保持输入位置、重复项和缺失项，并一次还原媒体特征。
+#[test]
+fn base_cache_path_batch_preserves_positions_and_features() {
+    let mut store = NodeStore::open_in_memory(machine()).unwrap();
+    let image = store
+        .upsert_content_and_location(&scan(r"D:\image.jpg", 11), [0x61; 16], MediaKind::Image)
+        .unwrap();
+    store
+        .commit_feature_result(
+            image.id,
+            None,
+            FeatureWrite::ImageStage1(ImageStage1Fields {
+                width: Some(640),
+                height: Some(480),
+                pdq: Some(PdqHash::from_bytes([1; 32])),
+                quality: Some(91),
+            }),
+        )
+        .unwrap();
+
+    let video = store
+        .upsert_content_and_location(&scan(r"D:\video.mp4", 22), [0x62; 16], MediaKind::Video)
+        .unwrap();
+    store
+        .commit_feature_result(
+            video.id,
+            None,
+            FeatureWrite::VideoMetadata(dedup_node_store::VideoMetadataFields {
+                duration_ms: Some(12_000),
+                width: Some(1920),
+                height: Some(1080),
+            }),
+        )
+        .unwrap();
+    for slot in 0..6 {
+        store
+            .commit_feature_result(
+                video.id,
+                None,
+                FeatureWrite::VideoFrameStage1(successful_video_frame(slot)),
+            )
+            .unwrap();
+    }
+
+    let other = store
+        .upsert_content_and_location(&scan(r"D:\other.bin", 33), [0x63; 16], MediaKind::Other)
+        .unwrap();
+    let inputs = vec![
+        scan(r"D:\missing.bin", 44),
+        scan(r"d:\VIDEO.MP4", 22),
+        scan(r"D:\image.jpg", 11),
+        scan(r"D:\other.bin", 33),
+        scan(r"D:\video.mp4", 22),
+    ];
+
+    let results = store.lookup_base_cache_by_paths(&inputs).unwrap();
+    assert_eq!(results.len(), inputs.len());
+    assert!(results[0].is_none());
+    assert_eq!(results[1].as_ref().unwrap().content_id, Some(video.id));
+    assert_eq!(results[2].as_ref().unwrap().content_id, Some(image.id));
+    assert_eq!(results[3].as_ref().unwrap().content_id, Some(other.id));
+    assert_eq!(results[4], results[1]);
+    assert!(matches!(
+        results[1].as_ref().unwrap().stage1,
+        Some(CompleteStage1::Video(ref frames)) if frames.iter().all(Option::is_some)
+    ));
+    assert!(matches!(
+        results[2].as_ref().unwrap().stage1,
+        Some(CompleteStage1::Image(feature)) if feature.width == 640 && feature.quality == 91
+    ));
+}
+
+/// 内容键批量查询必须区分相同 MD5 的不同大小，并保持重复键的结果位置。
+#[test]
+fn base_cache_key_batch_preserves_duplicates_and_size() {
+    let mut store = NodeStore::open_in_memory(machine()).unwrap();
+    let first = store
+        .upsert_content_and_location(&scan(r"D:\first.bin", 51), [0x71; 16], MediaKind::Other)
+        .unwrap();
+    let second = store
+        .upsert_content_and_location(&scan(r"D:\second.bin", 52), [0x71; 16], MediaKind::Other)
+        .unwrap();
+    let keys = vec![
+        first.key,
+        ContentKey::new([0x71; 16], 999),
+        second.key,
+        first.key,
+        ContentKey::new([0x72; 16], 51),
+    ];
+
+    let results = store.lookup_base_cache_by_keys(&keys).unwrap();
+    assert_eq!(results.len(), keys.len());
+    assert_eq!(results[0].as_ref().unwrap().content_id, Some(first.id));
+    assert!(results[1].is_none());
+    assert_eq!(results[2].as_ref().unwrap().content_id, Some(second.id));
+    assert_eq!(results[3], results[0]);
+    assert!(results[4].is_none());
+}
+
+/// 空批次必须直接返回，不能为了构造 SQL 产生任何数据库调用。
+#[test]
+fn base_cache_batch_empty_input_is_empty() {
+    let store = NodeStore::open_in_memory(machine()).unwrap();
+    assert!(store.lookup_base_cache_by_paths(&[]).unwrap().is_empty());
+    assert!(store.lookup_base_cache_by_keys(&[]).unwrap().is_empty());
 }

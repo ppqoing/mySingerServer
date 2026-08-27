@@ -6,7 +6,7 @@ use dedup_desktop_core::{
     central::{CentralDatabaseDiagnostics, CentralTableDiagnostic, CentralTableStatus},
     results::GroupKind,
     review::{QuickReviewRule, ReviewDecision},
-    view_state::{DesktopPaths, DesktopViewState},
+    view_state::{DesktopPaths, DesktopViewState, TaskView, ViewTaskState},
 };
 use dedup_desktop_ui::{MainWindow, UiScanRootRow, apply_event, bind_commands};
 use i_slint_backend_testing::ElementHandle;
@@ -1747,4 +1747,123 @@ fn unavailable_node_and_desktop_telemetry_use_dash() {
     apply_event(&window, &binding, UiEvent::RuntimeTasksChanged(desktop));
     assert_eq!(window.get_runtime_execution_config(), "—");
     assert_eq!(window.get_runtime_pipeline_metrics(), "—");
+}
+
+/// 构造一个会被旧 ViewChanged 快照覆盖的运行任务与持久任务对照样本。
+fn single_owner_task_fixture() -> (
+    dedup_desktop_core::view_state::RuntimeTaskControllerState,
+    DesktopViewState,
+) {
+    let runtime_key = dedup_desktop_core::runtime_tasks::RuntimeTaskKey {
+        owner: dedup_desktop_core::runtime_tasks::RuntimeTaskOwner::Node { node_index: 0 },
+        id: "runtime-base-compute".into(),
+    };
+    let runtime = dedup_desktop_core::view_state::RuntimeTaskControllerState::from_parts_for_test(
+        vec![dedup_desktop_core::runtime_tasks::RuntimeTaskSnapshot {
+            key: runtime_key.clone(),
+            machine_ids: vec!["machine-runtime".into()],
+            kind: dedup_desktop_core::runtime_tasks::DesktopRuntimeTaskKind::Node,
+            title: "基础计算".into(),
+            state: dedup_desktop_core::runtime_tasks::DesktopRuntimeTaskState::Running,
+            overall_completed: 2,
+            overall_total: Some(10),
+            overall_failed: 0,
+            overall_skipped: 0,
+            stages: Vec::new(),
+            failures: Vec::new(),
+        }],
+        Some(runtime_key),
+        None,
+        false,
+        None,
+    );
+
+    let mut view = DesktopViewState::new(
+        DesktopConfig::default(),
+        DesktopPaths {
+            data: PathBuf::from(r"C:\fixture\desktop"),
+            logs: PathBuf::from(r"C:\fixture\desktop\logs"),
+            cache: PathBuf::from(r"C:\fixture\desktop\cache"),
+            config: PathBuf::from(r"C:\fixture\desktop\config.toml"),
+        },
+    );
+    view.upsert_task(TaskView {
+        task_id: "legacy-base-compute".into(),
+        node_index: 0,
+        title: "base_compute".into(),
+        stage: "节点任务".into(),
+        state: ViewTaskState::Completed,
+        completed_items: 10,
+        total_items: 10,
+        failed_items: 0,
+        skipped_incomplete: 0,
+    });
+    (runtime, view)
+}
+
+/// 运行任务快照一旦发布，普通 ViewChanged 不能夺走列表、身份、标题或计数所有权。
+#[test]
+fn runtime_tasks_are_stable_when_view_events_arrive_in_both_orders() {
+    i_slint_backend_testing::init_no_event_loop();
+
+    let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    let (sender, _receiver) = mpsc::channel(8);
+    let binding = bind_commands(&window, sender, DesktopConfig::default());
+    let (runtime, view) = single_owner_task_fixture();
+
+    apply_event(
+        &window,
+        &binding,
+        UiEvent::RuntimeTasksChanged(runtime.clone()),
+    );
+    for _round in 0..3 {
+        let row = window.get_tasks().row_data(0).expect("应保留运行任务");
+        assert_eq!(row.owner_kind, "node");
+        assert_eq!(row.runtime_id, "runtime-base-compute");
+        assert_eq!(row.title, "基础计算");
+        assert_eq!(window.get_running_count(), 1);
+
+        apply_event(
+            &window,
+            &binding,
+            UiEvent::ViewChanged(Box::new(view.clone())),
+        );
+        let row = window
+            .get_tasks()
+            .row_data(0)
+            .expect("ViewChanged 后仍应保留运行任务");
+        assert_eq!(row.owner_kind, "node");
+        assert_eq!(row.runtime_id, "runtime-base-compute");
+        assert_eq!(row.title, "基础计算");
+        assert_eq!(window.get_running_count(), 1);
+
+        apply_event(
+            &window,
+            &binding,
+            UiEvent::RuntimeTasksChanged(runtime.clone()),
+        );
+    }
+
+    // 反向顺序也重复验证：普通视图先到达时不能清空已发布的统一运行任务。
+    for _round in 0..3 {
+        apply_event(
+            &window,
+            &binding,
+            UiEvent::ViewChanged(Box::new(view.clone())),
+        );
+        let row = window
+            .get_tasks()
+            .row_data(0)
+            .expect("反向事件后仍应保留运行任务");
+        assert_eq!(row.owner_kind, "node");
+        assert_eq!(row.runtime_id, "runtime-base-compute");
+        assert_eq!(row.title, "基础计算");
+        assert_eq!(window.get_running_count(), 1);
+
+        apply_event(
+            &window,
+            &binding,
+            UiEvent::RuntimeTasksChanged(runtime.clone()),
+        );
+    }
 }

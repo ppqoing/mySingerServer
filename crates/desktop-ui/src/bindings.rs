@@ -11,7 +11,7 @@ use dedup_desktop_core::{
     results::GroupKind,
     review::{QuickReviewRule, ReviewDecision},
     runtime_tasks::{RuntimeTaskKey, RuntimeTaskOwner},
-    view_state::{FileFaultDiagnosticsState, NodeConnectionState, ViewTaskState},
+    view_state::{FileFaultDiagnosticsState, NodeConnectionState},
 };
 use slint::{
     ComponentHandle, Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, VecModel,
@@ -812,21 +812,11 @@ pub fn apply_event(window: &MainWindow, binding: &UiBinding, event: UiEvent) {
             };
             window.set_nodes(models::nodes(&state));
             window.set_scan_node_options(models::scan_node_options(&state));
-            window.set_tasks(models::tasks(&state));
             window.set_online_count(
                 state
                     .nodes()
                     .iter()
                     .filter(|node| node.connection == NodeConnectionState::Online)
-                    .count() as i32,
-            );
-            window.set_running_count(
-                state
-                    .tasks()
-                    .iter()
-                    .filter(|task| {
-                        matches!(task.state, ViewTaskState::Queued | ViewTaskState::Running)
-                    })
                     .count() as i32,
             );
             window.set_node_config_options(models::node_config_options(&state));
@@ -949,7 +939,9 @@ pub fn apply_event(window: &MainWindow, binding: &UiBinding, event: UiEvent) {
         UiEvent::FileFaultsChanged(state) => apply_file_fault_state(window, &state),
         UiEvent::RuntimeTasksChanged(state) => {
             let runtime = models::runtime_tasks(&state);
+            // 运行任务控制器独占任务列表和运行中计数，普通视图事件无权覆盖它们。
             window.set_tasks(runtime.tasks);
+            window.set_running_count(runtime.running_count);
             window.set_runtime_stages(runtime.stages);
             window.set_runtime_workers(runtime.workers);
             window.set_runtime_failures(runtime.failures);

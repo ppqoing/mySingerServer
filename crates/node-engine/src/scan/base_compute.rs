@@ -12,7 +12,7 @@ use std::{
 #[cfg(feature = "test-hooks")]
 use std::sync::{Mutex, OnceLock};
 
-use dedup_core::{DiskReadConfig, MediaKind, TaskId};
+use dedup_core::{ContentKey, DiskReadConfig, MediaKind, TaskId};
 use dedup_node_store::{
     BaseCacheRecord, ClaimedTaskItem, CompleteStage1, ContentId, FileFaultKind, FileFaultRecord,
     NodeStore, PersistentStageState, ScannedPath, TaskItemApplyResult, TaskItemCompletion,
@@ -350,10 +350,21 @@ pub struct BaseComputeEngine;
 #[cfg(feature = "test-hooks")]
 static CLAIM_OBSERVER: OnceLock<Mutex<Option<Arc<AtomicUsize>>>> = OnceLock::new();
 
+#[cfg(feature = "test-hooks")]
+static LOCAL_CONTENT_LOOKUP_OBSERVER: OnceLock<Mutex<Option<Arc<AtomicUsize>>>> = OnceLock::new();
+
 /// test-hooks 下观察真实 SQLite claim 尝试次数，生产构建不包含该状态或调用。
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub struct BaseComputeClaimObserverGuard {
+    /// 当前测试安装的计数器，Drop 时只移除同一个观察者。
+    counter: Arc<AtomicUsize>,
+}
+
+/// test-hooks 下观察本地 content 批量查询次数，生产构建不包含该状态或调用。
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub struct BaseComputeLocalContentLookupObserverGuard {
     /// 当前测试安装的计数器，Drop 时只移除同一个观察者。
     counter: Arc<AtomicUsize>,
 }
@@ -364,6 +375,22 @@ impl Drop for BaseComputeClaimObserverGuard {
     fn drop(&mut self) {
         if let Some(slot) = CLAIM_OBSERVER.get() {
             let mut current = slot.lock().expect("claim observer 锁不应中毒");
+            if current
+                .as_ref()
+                .is_some_and(|installed| Arc::ptr_eq(installed, &self.counter))
+            {
+                *current = None;
+            }
+        }
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+impl Drop for BaseComputeLocalContentLookupObserverGuard {
+    /// 测试结束自动清除全局观察器，避免相邻管线互相污染。
+    fn drop(&mut self) {
+        if let Some(slot) = LOCAL_CONTENT_LOOKUP_OBSERVER.get() {
+            let mut current = slot.lock().expect("local content observer 锁不应中毒");
             if current
                 .as_ref()
                 .is_some_and(|installed| Arc::ptr_eq(installed, &self.counter))
@@ -385,6 +412,20 @@ fn record_claim_attempt() {
     }
 }
 
+/// 记录一次即将交给 Store actor 的本地 content 批量查询。
+#[cfg(feature = "test-hooks")]
+#[inline]
+fn record_local_content_lookup() {
+    if let Some(slot) = LOCAL_CONTENT_LOOKUP_OBSERVER.get()
+        && let Some(counter) = slot
+            .lock()
+            .expect("local content observer 锁不应中毒")
+            .as_ref()
+    {
+        counter.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
 impl BaseComputeEngine {
     /// 安装仅供 test-hooks 使用的真实 SQLite claim 计数器，不改变生产公共 API 或开销。
     #[cfg(feature = "test-hooks")]
@@ -397,6 +438,22 @@ impl BaseComputeEngine {
         assert!(current.is_none(), "同一测试进程只能安装一个 claim observer");
         *current = Some(Arc::clone(&counter));
         BaseComputeClaimObserverGuard { counter }
+    }
+
+    /// 安装仅供 test-hooks 使用的本地 content 批量查询计数器。
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn install_local_content_lookup_observer_for_test(
+        counter: Arc<AtomicUsize>,
+    ) -> BaseComputeLocalContentLookupObserverGuard {
+        let slot = LOCAL_CONTENT_LOOKUP_OBSERVER.get_or_init(|| Mutex::new(None));
+        let mut current = slot.lock().expect("local content observer 锁不应中毒");
+        assert!(
+            current.is_none(),
+            "同一测试进程只能安装一个 local content observer"
+        );
+        *current = Some(Arc::clone(&counter));
+        BaseComputeLocalContentLookupObserverGuard { counter }
     }
 
     /// 从已完成枚举的固定文件清单运行缓存查询、Worker 计算和 SQLite 单写者收尾。
@@ -767,6 +824,8 @@ impl BaseComputeEngine {
         // 总 ownership 分别受 path/content context、Hash future、pending 和 Worker active 硬上限约束。
         let mut hashing = JoinSet::new();
         let mut pending_hashed = VecDeque::with_capacity(queue_capacity);
+        // 本地 SQLite 批量结果按 Hash 队首顺序消费；背压时游标保留，不重复查询。
+        let mut pending_local_content_batch = None;
         let mut pending_compute = VecDeque::with_capacity(queue_capacity);
         let mut media_acquiring = JoinSet::new();
         let mut active = BTreeMap::<String, ActiveBase>::new();
@@ -853,6 +912,7 @@ impl BaseComputeEngine {
                         &decode_credits,
                         &mut next_request_id,
                         &mut pending_hashed,
+                        &mut pending_local_content_batch,
                         &mut pending_compute,
                         &mut pending_content_request,
                         &mut content_batches,
@@ -960,6 +1020,7 @@ impl BaseComputeEngine {
                     && hash_refill.input_exhausted()
                     && hashing.is_empty()
                     && pending_hashed.is_empty()
+                    && pending_local_content_batch.is_none()
                     && pending_compute.is_empty()
                     && pending_content_request.is_none()
                     && content_batches.is_empty()
@@ -1306,6 +1367,7 @@ impl BaseComputeEngine {
             item_started_at.clear();
             // 错误/取消收尾清空所有本地 ownership 容器，再统一投影字段 12–23 的零值。
             pending_hashed.clear();
+            let _ = pending_local_content_batch.take();
             pending_compute.clear();
             path_batches.clear();
             path_contexts.clear();
@@ -1489,6 +1551,22 @@ struct ContentResolveContext {
     hashed: HashedBaseItem,
     /// 查询远端前读取的 SQLite 候选。
     local: Option<BaseCacheRecord>,
+}
+
+/// 一项已经由 Store actor 批量读取、等待按 Hash 队首消费的本地缓存结果。
+struct LocalContentLookup {
+    /// 必须与 `pending_hashed` 队首一致的持久任务项身份。
+    item_id: String,
+    /// 由 MD5 和冻结文件大小组成的内容键，用于拒绝游标错位。
+    content_key: ContentKey,
+    /// 本次批量 SQLite 查询返回的完整基础缓存记录。
+    local: Option<BaseCacheRecord>,
+}
+
+/// 本地 content 批量查询游标；不持有 Worker、CPU、磁盘或完成许可。
+struct PendingLocalContentBatch {
+    /// 按原始 Hash 队列位置排列的本地结果，背压时保留未消费队首。
+    items: VecDeque<LocalContentLookup>,
 }
 
 /// actor 每轮只消费一项的 content 结果游标；完整 permit 随 cursor 保留到批次结束。
@@ -1857,23 +1935,21 @@ fn prepare_path_batch(
         );
     }
     let reserved = reserve_rows(store, task_id, rows, now_ms)?;
-    let lookups = store.lookup_scanned_paths(
+    let local_records = store.lookup_base_cache_by_paths(
         &reserved
             .iter()
             .map(|row| row.scanned.clone())
             .collect::<Vec<_>>(),
     )?;
-    if lookups.len() != reserved.len() {
-        return Err(ScanError::Stage1("SQLite path 缓存返回数量不匹配".into()));
+    if local_records.len() != reserved.len() {
+        return Err(ScanError::Stage1(
+            "SQLite path 基础缓存批量返回数量不匹配".into(),
+        ));
     }
 
     let mut remote_items = Vec::with_capacity(reserved.len());
     let mut remote_contexts = Vec::with_capacity(reserved.len());
-    for (reserved, lookup) in reserved.into_iter().zip(lookups) {
-        let local = lookup
-            .content_id
-            .map(|content_id| store.load_base_cache_record(content_id))
-            .transpose()?;
+    for (reserved, local) in reserved.into_iter().zip(local_records) {
         if remote_available && !options.force_recompute && !cache_fully_computed(local.as_ref()) {
             let key = CacheContextKey {
                 task_id,
@@ -2109,7 +2185,53 @@ fn report_cache_warning(reporter: &RuntimeTaskReporter, warning: &str) -> Result
         .map_err(runtime_error)
 }
 
-/// 把当前已经 ready 的 Hash 合并为 content 批次；不等待慢 Hash 或凑满上限。
+/// 为当前 Hash 队首建立一次本地 SQLite 批量查询，并冻结输入位置顺序。
+fn load_local_content_batch(
+    store: &BaseStoreHandle,
+    pending_hashed: &VecDeque<HashedBaseItem>,
+    pending_batch: &mut Option<PendingLocalContentBatch>,
+) -> Result<(), ScanError> {
+    if pending_batch.is_some() || pending_hashed.is_empty() {
+        return Ok(());
+    }
+    let identities = pending_hashed
+        .iter()
+        .take(REMOTE_LOOKUP_BATCH_SIZE)
+        .map(|hashed| {
+            (
+                hashed.item_id.clone(),
+                ContentKey::new(hashed.md5, hashed.scanned.file_size),
+            )
+        })
+        .collect::<Vec<_>>();
+    let keys = identities
+        .iter()
+        .map(|(_, content_key)| content_key.clone())
+        .collect::<Vec<_>>();
+    #[cfg(feature = "test-hooks")]
+    record_local_content_lookup();
+    let records = store.lookup_base_cache_by_keys(&keys)?;
+    if records.len() != identities.len() {
+        return Err(ScanError::Stage1(format!(
+            "本地 content 批量查询结果数量不匹配: expected={}, actual={}",
+            identities.len(),
+            records.len()
+        )));
+    }
+    let items = identities
+        .into_iter()
+        .zip(records)
+        .map(|((item_id, content_key), local)| LocalContentLookup {
+            item_id,
+            content_key,
+            local,
+        })
+        .collect();
+    *pending_batch = Some(PendingLocalContentBatch { items });
+    Ok(())
+}
+
+/// 把当前已经 ready 的 Hash 合并为 content 批次；本地结果由批量游标逐项消费。
 #[allow(clippy::too_many_arguments)]
 fn prepare_content_batch(
     store: &BaseStoreHandle,
@@ -2122,6 +2244,7 @@ fn prepare_content_batch(
     decode_credits: &DecodeCredits,
     next_request_id: &mut u64,
     pending_hashed: &mut VecDeque<HashedBaseItem>,
+    pending_local_batch: &mut Option<PendingLocalContentBatch>,
     pending_compute: &mut VecDeque<BaseComputeJob>,
     pending_request: &mut Option<CacheResolveRequest>,
     content_batches: &mut BTreeMap<u64, ContentBatchContext>,
@@ -2135,7 +2258,16 @@ fn prepare_content_batch(
     refill: &mut HashRefillController,
     now_ms: i64,
 ) -> Result<(), ScanError> {
-    if pending_request.is_some() || pending_hashed.is_empty() {
+    if pending_request.is_some() {
+        return Ok(());
+    }
+    if pending_local_batch
+        .as_ref()
+        .is_some_and(|batch| batch.items.is_empty())
+    {
+        *pending_local_batch = None;
+    }
+    if pending_local_batch.is_none() && pending_hashed.is_empty() {
         return Ok(());
     }
     ensure_content_output_bound(
@@ -2144,29 +2276,47 @@ fn prepare_content_batch(
         pending_compute,
         content_contexts,
     )?;
+    load_local_content_batch(store, pending_hashed, pending_local_batch)?;
     let remote_budget = content_credits
         .available_permits()
         .min(queue_capacity.saturating_sub(content_contexts.len()))
         .min(REMOTE_LOOKUP_BATCH_SIZE);
     let mut remote_items = Vec::new();
     let mut remote_contexts = Vec::new();
-    while !pending_hashed.is_empty() && remote_items.len() < REMOTE_LOOKUP_BATCH_SIZE {
-        // 先只读候选，不移动 Hash item；decode credit 不足时必须保留队首。
-        let hashed_view = pending_hashed
-            .front()
-            .expect("content 批次只在 Hash 队列非空时准备");
+    while pending_local_batch
+        .as_ref()
+        .is_some_and(|batch| !batch.items.is_empty())
+        && remote_items.len() < REMOTE_LOOKUP_BATCH_SIZE
+    {
+        // 先只读两个队首并验证批量结果没有错位；资源不足时两边都不移动。
+        let hashed_view = pending_hashed.front().ok_or_else(|| {
+            ScanError::Stage1("本地 content 游标仍有结果，但 Hash 队列已经为空".into())
+        })?;
+        let local_view = pending_local_batch
+            .as_ref()
+            .and_then(|batch| batch.items.front())
+            .expect("循环条件已经确认本地 content 游标非空");
         let hashed_item_id = hashed_view.item_id.clone();
-        let content_key =
-            dedup_core::ContentKey::new(hashed_view.md5, hashed_view.scanned.file_size);
-        let local = store
-            .content_id_by_key(content_key)?
-            .map(|content_id| store.load_base_cache_record(content_id))
-            .transpose()?;
+        let content_key = ContentKey::new(hashed_view.md5, hashed_view.scanned.file_size);
+        if hashed_view.task_id != task_id {
+            return Err(ScanError::Stage1(format!(
+                "Hash 结果任务身份不匹配: expected={}, actual={}",
+                task_id.as_uuid(),
+                hashed_view.task_id.as_uuid()
+            )));
+        }
+        if local_view.item_id != hashed_item_id || local_view.content_key != content_key {
+            return Err(ScanError::Stage1(format!(
+                "本地 content 游标与 Hash 队首身份不匹配: expected_item={}, actual_item={}",
+                hashed_item_id, local_view.item_id
+            )));
+        }
+        let local = local_view.local.as_ref();
         let requires_remote =
-            remote_available && !options.force_recompute && !cache_fully_computed(local.as_ref());
+            remote_available && !options.force_recompute && !cache_fully_computed(local);
         if !requires_remote {
             let need = content_resolution_need(
-                local.as_ref(),
+                local,
                 None,
                 ContactSheetCacheEntry::from_md5(contact_sheet_root, hashed_view.md5).exists(),
                 options.force_recompute,
@@ -2180,16 +2330,14 @@ fn prepare_content_batch(
                     Some(credit)
                 }
             };
+            let local = pending_local_batch
+                .as_mut()
+                .and_then(|batch| batch.items.pop_front())
+                .expect("只读规划成功后本地 content 游标队首仍应存在")
+                .local;
             let hashed = pending_hashed
                 .pop_front()
                 .expect("只读规划成功后仍应保留 Hash 队首");
-            if hashed.task_id != task_id {
-                return Err(ScanError::Stage1(format!(
-                    "Hash 结果任务身份不匹配: expected={}, actual={}",
-                    task_id.as_uuid(),
-                    hashed.task_id.as_uuid()
-                )));
-            }
             let resolved = resolve_content_context(
                 store,
                 options,
@@ -2217,14 +2365,31 @@ fn prepare_content_batch(
             active,
             worker_dispatching_item.as_ref(),
         )?;
+        let local_lookup = pending_local_batch
+            .as_mut()
+            .and_then(|batch| batch.items.pop_front())
+            .expect("远端 content 规划通过后本地游标队首仍应存在");
         remote_items.push(ContentResolveItem {
             key: key.clone(),
-            content_key,
+            content_key: local_lookup.content_key,
         });
         let hashed = pending_hashed
             .pop_front()
             .expect("远端 content 规划通过后仍应保留 Hash 队首");
-        remote_contexts.push((key, ContentResolveContext { hashed, local }));
+        remote_contexts.push((
+            key,
+            ContentResolveContext {
+                hashed,
+                local: local_lookup.local,
+            },
+        ));
+    }
+
+    if pending_local_batch
+        .as_ref()
+        .is_some_and(|batch| batch.items.is_empty())
+    {
+        *pending_local_batch = None;
     }
 
     if remote_items.is_empty() {

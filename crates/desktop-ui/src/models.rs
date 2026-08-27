@@ -13,7 +13,6 @@ use dedup_desktop_core::{
     },
     view_state::{
         DesktopViewState, NodeConnectionState, RuntimeTaskControllerState, RuntimeTaskDetailsView,
-        TaskView, ViewTaskState,
     },
 };
 use dedup_protocol::proto;
@@ -62,6 +61,8 @@ pub(crate) struct RuntimeUiModels {
     pub(crate) machine_id: SharedString,
     pub(crate) state: SharedString,
     pub(crate) counts: SharedString,
+    /// 统一运行任务摘要中仍处于 Running 的任务数量。
+    pub(crate) running_count: i32,
     pub(crate) execution_config: SharedString,
     pub(crate) pipeline_metrics: SharedString,
     pub(crate) stale: bool,
@@ -171,12 +172,6 @@ pub(crate) fn scan_node_options(state: &DesktopViewState) -> ModelRc<SharedStrin
     ModelRc::new(VecModel::from(rows))
 }
 
-/// 把任务快照映射为 Slint 只读列表。
-pub(crate) fn tasks(state: &DesktopViewState) -> ModelRc<UiTaskRow> {
-    let rows = state.tasks().iter().map(task_row).collect::<Vec<_>>();
-    ModelRc::new(VecModel::from(rows))
-}
-
 /// 把 Node/Desktop 统一运行状态整体转换为任务、阶段、Worker 和失败模型。
 pub(crate) fn runtime_tasks(state: &RuntimeTaskControllerState) -> RuntimeUiModels {
     let selected = state.selected();
@@ -185,6 +180,11 @@ pub(crate) fn runtime_tasks(state: &RuntimeTaskControllerState) -> RuntimeUiMode
         .iter()
         .map(|task| runtime_task_row(task, state.is_stale() && selected == Some(&task.key)))
         .collect::<Vec<_>>();
+    let running_count = state
+        .summaries()
+        .iter()
+        .filter(|task| task.state == DesktopRuntimeTaskState::Running)
+        .count() as i32;
     let selected_summary =
         selected.and_then(|key| state.summaries().iter().find(|summary| &summary.key == key));
     let (stages, workers, failures) = runtime_detail_rows(state.details());
@@ -214,6 +214,7 @@ pub(crate) fn runtime_tasks(state: &RuntimeTaskControllerState) -> RuntimeUiMode
         machine_id: machine_id.into(),
         state: status.into(),
         counts: counts.into(),
+        running_count,
         execution_config: execution_config.into(),
         pipeline_metrics: pipeline_metrics.into(),
         stale: state.is_stale(),
@@ -268,34 +269,6 @@ pub(crate) fn members(page: &MemberPage) -> ModelRc<UiMemberRow> {
         })
         .collect::<Vec<_>>();
     ModelRc::new(VecModel::from(rows))
-}
-
-fn task_row(task: &TaskView) -> UiTaskRow {
-    let (status, color) = match task.state {
-        ViewTaskState::Queued => ("排队中", rgb(148, 163, 184)),
-        ViewTaskState::Running => ("运行中", rgb(59, 130, 246)),
-        ViewTaskState::Completed => ("已完成", rgb(34, 197, 94)),
-        ViewTaskState::Failed => ("失败", rgb(248, 113, 113)),
-        ViewTaskState::Cancelled => ("已取消", rgb(245, 158, 11)),
-    };
-    UiTaskRow {
-        id: task.task_id.clone().into(),
-        runtime_id: task.task_id.clone().into(),
-        owner_kind: "legacy".into(),
-        node_index: task.node_index as i32,
-        machine_id: SharedString::default(),
-        title: task.title.clone().into(),
-        stage: task.stage.clone().into(),
-        status: status.into(),
-        status_color: color,
-        progress: i32::from(task.progress_percent()),
-        counts: format!(
-            "{} / {} · 失败 {} · 跳过 {}",
-            task.completed_items, task.total_items, task.failed_items, task.skipped_incomplete
-        )
-        .into(),
-        stale: false,
-    }
 }
 
 /// 把一条统一运行任务摘要映射为任务中心左栏行。

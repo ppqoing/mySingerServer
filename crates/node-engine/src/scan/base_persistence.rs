@@ -216,12 +216,43 @@ pub(crate) struct BasePersistAck {
 
 #[cfg(test)]
 mod tests {
-    use super::BasePersistOutcome;
+    use dedup_core::{ContentKey, DisplayPath, MachineId, NormalizedPath};
+    use dedup_node_store::{NodeStore, ScannedPath};
+
+    use super::{BasePersistOutcome, BaseStoreActor};
 
     /// ACK 的 Applied 与 Ignored 必须可区分，时延只记录 Applied 终态。
     #[test]
     fn applied_ack_is_distinguished_from_ignored_ack() {
         assert!(!BasePersistOutcome::Ignored.is_applied());
+    }
+
+    /// 批量缓存查询必须穿过同一个 Store actor，并按输入位置返回结果。
+    #[tokio::test]
+    async fn batch_cache_lookup_contract_preserves_path_and_key_positions() {
+        let machine = MachineId::from_sha256([0xB1; 32]);
+        let store = NodeStore::open_in_memory(machine).unwrap();
+        let (actor, handle, _acks) = BaseStoreActor::spawn(store, 2);
+        let path = std::path::PathBuf::from(r"C:\batch-contract.bin");
+        let scanned = ScannedPath::new(
+            NormalizedPath::new(&path).unwrap(),
+            DisplayPath::new(&path).unwrap(),
+            17,
+        );
+        let key = ContentKey::new([0xB2; 16], 17);
+
+        let path_results = handle
+            .lookup_base_cache_by_paths(&[scanned.clone(), scanned.clone()])
+            .unwrap();
+        let key_results = handle.lookup_base_cache_by_keys(&[key, key]).unwrap();
+
+        assert_eq!(path_results.len(), 2);
+        assert_eq!(key_results.len(), 2);
+        assert!(path_results.iter().all(Option::is_none));
+        assert!(key_results.iter().all(Option::is_none));
+
+        drop(handle);
+        actor.finish().await.unwrap();
     }
 }
 
@@ -295,12 +326,22 @@ impl BaseStoreHandle {
         self.call(move |store| store.reserve_scan_path(task_id, &scanned, now_ms))
     }
 
-    pub(crate) fn lookup_scanned_paths(
+    /// 在同一个 actor call 中按输入位置批量读取 path 基础缓存；调用方不得逐项回查。
+    pub(crate) fn lookup_base_cache_by_paths(
         &self,
         paths: &[ScannedPath],
-    ) -> Result<Vec<dedup_node_store::CacheLookup>, StoreError> {
+    ) -> Result<Vec<Option<BaseCacheRecord>>, StoreError> {
         let paths = paths.to_vec();
-        self.call(move |store| store.lookup_scanned_paths(&paths))
+        self.call(move |store| store.lookup_base_cache_by_paths(&paths))
+    }
+
+    /// 在同一个 actor call 中按输入位置批量读取 content 基础缓存；供后续 content 游标使用。
+    pub(crate) fn lookup_base_cache_by_keys(
+        &self,
+        keys: &[ContentKey],
+    ) -> Result<Vec<Option<BaseCacheRecord>>, StoreError> {
+        let keys = keys.to_vec();
+        self.call(move |store| store.lookup_base_cache_by_keys(&keys))
     }
 
     pub(crate) fn load_base_cache_record(
@@ -323,13 +364,6 @@ impl BaseStoreHandle {
     pub(crate) fn queue_scan_item_for_read(&self, item_id: &str) -> Result<(), StoreError> {
         let item_id = item_id.to_owned();
         self.call(move |store| store.queue_scan_item_for_read(&item_id))
-    }
-
-    pub(crate) fn content_id_by_key(
-        &self,
-        key: ContentKey,
-    ) -> Result<Option<ContentId>, StoreError> {
-        self.call(move |store| store.content_id_by_key(key))
     }
 
     pub(crate) fn upsert_content_and_location(

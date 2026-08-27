@@ -192,6 +192,29 @@ async fn queued_sync_triggers_are_drained_into_the_active_runtime_row() {
     assert_eq!(receiver.drain_pending(), 2);
 }
 
+/// 控制器启动时先发布统一运行任务快照，保证 UI 从第一条事件起使用唯一数据源。
+#[tokio::test(start_paused = true)]
+async fn controller_publishes_initial_runtime_tasks_snapshot_before_view_snapshot() {
+    let temp = TempDir::new().unwrap();
+    let mut config = DesktopConfig::default();
+    config.nodes.clear();
+    let (app, mut events) = DesktopApp::start(config, desktop_paths(&temp));
+
+    let first = events.recv().await.expect("启动应发布初始运行任务事件");
+    match first {
+        UiEvent::RuntimeTasksChanged(state) => {
+            assert!(state.summaries().is_empty(), "空启动快照不应伪造运行任务");
+        }
+        other => panic!("启动第一条事件必须是 RuntimeTasksChanged，实际为 {other:?}"),
+    }
+    assert!(
+        matches!(events.recv().await, Some(UiEvent::ViewChanged(_))),
+        "统一运行任务快照之后才发布普通视图快照"
+    );
+
+    app.send(UiCommand::Shutdown).await.unwrap();
+}
+
 /// 可控 Node handler 记录列表与详情请求，并向真实 TCP 会话推送终态事件。
 #[derive(Clone)]
 struct RuntimeTaskHandler {
