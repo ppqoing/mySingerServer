@@ -1,4 +1,4 @@
-//! 用户对重复组成员的持久化保留、删除和未决定标记。
+//! 当前进程内用户对重复组成员的保留、删除和未决定标记。
 
 use dedup_core::{AnalysisRunId, LocationKey};
 use rusqlite::{OptionalExtension, params};

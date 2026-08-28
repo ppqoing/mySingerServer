@@ -1,4 +1,4 @@
-//! Node 任务与本地分析阶段的持久化恢复契约。
+//! Node 任务与本地分析阶段的当前进程状态契约。
 
 use dedup_core::{MachineId, Thresholds};
 use dedup_node_store::{
@@ -31,7 +31,7 @@ fn stage(
 }
 
 #[test]
-fn task_stage_keeps_its_own_start_time_and_counts_after_reopen() {
+fn task_stage_is_discarded_after_reopen() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("node.sqlite3");
     let mut store = NodeStore::open(&path, machine()).unwrap();
@@ -67,12 +67,7 @@ fn task_stage_keeps_its_own_start_time_and_counts_after_reopen() {
     drop(store);
 
     let reopened = NodeStore::open(&path, machine()).unwrap();
-    let stages = reopened.task_stages(task).unwrap();
-    assert_eq!(stages.len(), 1);
-    assert_eq!(stages[0].stage_id, "enumerate_files");
-    assert_eq!(stages[0].started_at_ms, Some(1_100));
-    assert_eq!(stages[0].finished_at_ms, Some(1_300));
-    assert_eq!((stages[0].completed, stages[0].total), (10, Some(10)));
+    assert!(reopened.task_stages(task).unwrap().is_empty());
 }
 
 #[test]

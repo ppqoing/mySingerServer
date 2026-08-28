@@ -279,9 +279,9 @@ fn group_pages_reject_replaced_content_at_same_path() {
     );
 }
 
-/// 复核选择持久化在 SQLite，进程重开后不依赖 UI 内存恢复。
+/// 复核选择只属于当前运行，进程重开后不允许恢复旧删除意图。
 #[test]
-fn review_mark_survives_reopen() {
+fn review_mark_is_discarded_after_reopen() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("review.db");
     let run;
@@ -311,10 +311,7 @@ fn review_mark_survives_reopen() {
             .unwrap();
     }
     let store = NodeStore::open(&database, machine()).unwrap();
-    assert_eq!(
-        store.review_mark(run, &group_id, &member).unwrap(),
-        Some(ReviewDecision::Keep)
-    );
+    assert_eq!(store.review_mark(run, &group_id, &member).unwrap(), None);
 }
 
 fn group(id: GroupId, kind: GroupKind, seed: u8, first: &str, second: &str) -> GroupWrite {

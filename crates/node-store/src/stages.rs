@@ -1,4 +1,4 @@
-//! Node 任务和本地分析运行的阶段进度持久化。
+//! 当前 Node 任务和本地分析运行的阶段进度持久化。
 
 use dedup_core::{AnalysisRunId, TaskId};
 use rusqlite::{Connection, params};

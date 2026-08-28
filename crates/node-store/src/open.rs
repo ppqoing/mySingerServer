@@ -87,22 +87,31 @@ impl NodeStore {
     /// 打开应用目录下的数据库；空库创建当前全量 schema，非 V2 旧库直接拒绝。
     pub fn open(path: &Path, machine_id: MachineId) -> Result<Self, StoreError> {
         let connection = Connection::open(path)?;
-        initialize_or_validate(connection, machine_id, Some(path.to_path_buf()), true)
+        initialize_or_validate(connection, machine_id, Some(path.to_path_buf()), true, true)
     }
 
     /// 创建用于单元测试和纯本地计算的内存 V2 数据库。
     pub fn open_in_memory(machine_id: MachineId) -> Result<Self, StoreError> {
         let connection = Connection::open_in_memory()?;
-        initialize_or_validate(connection, machine_id, None, false)
+        initialize_or_validate(connection, machine_id, None, false, true)
     }
 
     /// 为同一文件数据库打开独立 WAL 连接，供后台计算与控制 actor 分离所有权。
+    ///
+    /// 该连接属于已运行节点，不能重复执行仅启动时的运行态清理事务。
     pub fn reopen(&self) -> Result<Self, StoreError> {
         let path = self
             .database_path
             .as_ref()
             .ok_or_else(|| StoreError::InvalidState("内存数据库不能打开独立后台连接".into()))?;
-        Self::open(path, self.machine_id.clone())
+        let connection = Connection::open(path)?;
+        initialize_or_validate(
+            connection,
+            self.machine_id.clone(),
+            Some(path.clone()),
+            true,
+            false,
+        )
     }
 
     /// 返回数据库 schema 的稳定产品标记。
@@ -130,10 +139,11 @@ fn configure(connection: &Connection, file_backed: bool) -> Result<(), StoreErro
 }
 
 fn initialize_or_validate(
-    connection: Connection,
+    mut connection: Connection,
     machine_id: MachineId,
     database_path: Option<PathBuf>,
     file_backed: bool,
+    clear_runtime_state: bool,
 ) -> Result<NodeStore, StoreError> {
     let table_count: i64 = connection.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
@@ -177,11 +187,27 @@ fn initialize_or_validate(
         }
         configure(&connection, file_backed)?;
     }
+    if clear_runtime_state {
+        clear_transient_runtime_state(&mut connection)?;
+    }
     Ok(NodeStore {
         connection,
         machine_id,
         database_path,
     })
+}
+
+/// 在每次节点启动时原子删除不可恢复的任务、分析、复核和删除运行态。
+///
+/// 内容、位置、媒体特征、文件故障、同步 outbox、同步游标和删除墓碑均不属于运行态，
+/// 因此不会由此事务修改。删除批次先于分析运行清理，避免保留不再存在的分析引用。
+fn clear_transient_runtime_state(connection: &mut Connection) -> Result<(), StoreError> {
+    let transaction = connection.transaction()?;
+    transaction.execute("DELETE FROM delete_batches", [])?;
+    transaction.execute("DELETE FROM analysis_runs", [])?;
+    transaction.execute("DELETE FROM tasks", [])?;
+    transaction.commit()?;
+    Ok(())
 }
 
 pub(crate) fn sqlite_integer(value: u64) -> Result<i64, StoreError> {

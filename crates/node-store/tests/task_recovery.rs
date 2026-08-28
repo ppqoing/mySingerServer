@@ -1,6 +1,4 @@
-//! 可恢复任务的状态、计数和持久化事件序号契约。
-
-use std::collections::BTreeSet;
+//! 当前进程任务的状态、计数和持久化事件序号契约。
 
 use dedup_core::{DisplayPath, MachineId, MediaKind, NormalizedPath, TaskId};
 use dedup_node_store::{
@@ -65,202 +63,6 @@ fn crash_fault(scanned: &ScannedPath, now_ms: u64) -> FileFaultRecord {
     }
 }
 
-/// 模拟进程在一个 item 运行时退出；重开后只允许该 item 回到队列。
-#[test]
-fn reopening_requeues_only_running_items() {
-    let directory = tempfile::tempdir().unwrap();
-    let database = directory.path().join("node.db");
-    let task_id;
-    {
-        let mut store = NodeStore::open(&database, machine()).unwrap();
-        let items = (0..5)
-            .map(|index| NewTaskItem::detached(format!("stage-{index}")))
-            .collect::<Vec<_>>();
-        task_id = store.create_task("scan", &items, 100).unwrap();
-
-        let succeeded = store.claim_next_item(task_id, 101).unwrap().unwrap();
-        let first = store
-            .complete_item(
-                &succeeded.item_id,
-                TaskItemCompletion::Succeeded { content_id: None },
-                102,
-            )
-            .unwrap();
-        assert_eq!(first.event_seq, 1);
-
-        let failed = store.claim_next_item(task_id, 103).unwrap().unwrap();
-        let second = store
-            .complete_item(
-                &failed.item_id,
-                TaskItemCompletion::Failed("broken fixture".into()),
-                104,
-            )
-            .unwrap();
-        assert_eq!(second.event_seq, 2);
-
-        let cancelled = store.claim_next_item(task_id, 105).unwrap().unwrap();
-        store
-            .complete_item(&cancelled.item_id, TaskItemCompletion::Cancelled, 106)
-            .unwrap();
-
-        let running = store.claim_next_item(task_id, 107).unwrap().unwrap();
-        assert_eq!(running.status, TaskItemStatus::Running);
-    }
-
-    let mut store = NodeStore::open(&database, machine()).unwrap();
-    assert_eq!(store.recover_running_items(200).unwrap(), 1);
-    let snapshot = store.task_snapshot(task_id).unwrap();
-    assert_eq!(snapshot.status, TaskStatus::Queued);
-    assert_eq!(snapshot.succeeded, 1);
-    assert_eq!(snapshot.failed, 1);
-    assert_eq!(snapshot.cancelled, 1);
-    assert_eq!(
-        store
-            .task_items(task_id)
-            .unwrap()
-            .iter()
-            .filter(|item| item.status == TaskItemStatus::Queued)
-            .count(),
-        2
-    );
-
-    for now in [201, 203] {
-        let item = store.claim_next_item(task_id, now).unwrap().unwrap();
-        store
-            .complete_item(
-                &item.item_id,
-                TaskItemCompletion::Succeeded { content_id: None },
-                now + 1,
-            )
-            .unwrap();
-    }
-    assert!(store.claim_next_item(task_id, 300).unwrap().is_none());
-    let completed = store.task_snapshot(task_id).unwrap();
-    assert_eq!(completed.status, TaskStatus::Completed);
-    assert_eq!(completed.event_seq, 5);
-    assert_eq!(completed.succeeded, 3);
-    assert_eq!(completed.failed, 1);
-    assert_eq!(completed.cancelled, 1);
-}
-
-/// 两根交错保留的 queued/running/succeeded/failed 项在重开后保持唯一身份与状态。
-#[test]
-fn reopening_preserves_interleaved_two_root_item_states() {
-    let directory = tempfile::tempdir().unwrap();
-    let database = directory.path().join("two-root-recovery.db");
-    let roots = [
-        NormalizedPath::new(r"H:\Media").unwrap(),
-        NormalizedPath::new(r"I:\Media").unwrap(),
-    ];
-    let task_id;
-    let queued_item;
-    let running_item;
-    let succeeded_item;
-    let failed_item;
-    {
-        let mut store = NodeStore::open(&database, machine()).unwrap();
-        task_id = store.create_scan_task(&roots, 10).unwrap();
-        let paths = [
-            r"H:\Media\queued.bin",
-            r"I:\Media\running.bin",
-            r"H:\Media\succeeded.bin",
-            r"I:\Media\failed.bin",
-        ];
-        let item_ids = paths
-            .iter()
-            .enumerate()
-            .map(|(index, path)| {
-                let scanned = ScannedPath::new(
-                    NormalizedPath::new(path).unwrap(),
-                    DisplayPath::new(path).unwrap(),
-                    u64::try_from(index + 1).unwrap(),
-                );
-                store
-                    .reserve_scan_path(task_id, &scanned, 11 + index as i64)
-                    .unwrap()
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
-        queued_item = item_ids[0].clone();
-        running_item = item_ids[1].clone();
-        succeeded_item = item_ids[2].clone();
-        failed_item = item_ids[3].clone();
-
-        store.queue_scan_item_for_read(&queued_item).unwrap();
-        store
-            .complete_item(
-                &succeeded_item,
-                TaskItemCompletion::Succeeded { content_id: None },
-                20,
-            )
-            .unwrap();
-        store
-            .complete_item(
-                &failed_item,
-                TaskItemCompletion::Failed("双根恢复测试失败项".into()),
-                21,
-            )
-            .unwrap();
-    }
-
-    let mut store = NodeStore::open(&database, machine()).unwrap();
-    assert_eq!(store.recover_running_items(30).unwrap(), 1);
-    let items = store.task_items(task_id).unwrap();
-    assert_eq!(items.len(), 4);
-    assert_eq!(
-        items
-            .iter()
-            .map(|item| item.item_id.as_str())
-            .collect::<BTreeSet<_>>()
-            .len(),
-        4,
-        "重开后每个交错保留项必须只出现一次"
-    );
-    assert_eq!(
-        items
-            .iter()
-            .filter(|item| item.status == TaskItemStatus::Queued)
-            .count(),
-        2
-    );
-    assert!(items.iter().any(|item| {
-        item.item_id == succeeded_item && item.status == TaskItemStatus::Succeeded
-    }));
-    assert!(
-        items
-            .iter()
-            .any(|item| item.item_id == failed_item && item.status == TaskItemStatus::Failed)
-    );
-    let snapshot = store.task_snapshot(task_id).unwrap();
-    assert_eq!(
-        (snapshot.succeeded, snapshot.failed, snapshot.cancelled),
-        (1, 1, 0)
-    );
-
-    let mut claimed = BTreeSet::new();
-    while let Some(item) = store.claim_next_item(task_id, 40).unwrap() {
-        claimed.insert(item.item_id.clone());
-        store
-            .complete_item(
-                &item.item_id,
-                TaskItemCompletion::Succeeded { content_id: None },
-                41,
-            )
-            .unwrap();
-    }
-    assert_eq!(claimed, BTreeSet::from([queued_item, running_item]));
-    let snapshot_after_claims = store.task_snapshot(task_id).unwrap();
-    // 基础扫描仍等待既有显式 finalize 边界，单项全部完成不会提前改写任务终态。
-    assert_eq!(snapshot_after_claims.status, TaskStatus::Running);
-    assert_eq!(
-        (
-            snapshot_after_claims.succeeded,
-            snapshot_after_claims.failed
-        ),
-        (3, 1)
-    );
-}
-
 /// 单项失败是任务统计，不阻止其他项完成，也不把整个任务误标为 failed。
 #[test]
 fn item_failure_still_allows_task_to_complete() {
@@ -295,18 +97,16 @@ fn item_failure_still_allows_task_to_complete() {
 }
 
 #[test]
-fn crashed_item_is_failed_with_fault_and_never_requeued_after_reopen() {
+fn reopening_preserves_file_fault_after_transient_task_is_discarded() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("crashed.db");
-    let task_id;
-    let item_id;
     let path = NormalizedPath::new(r"D:\Crash\file-a.mp4").unwrap();
     {
         let mut store = NodeStore::open(&database, machine()).unwrap();
-        task_id = store
+        let task_id = store
             .create_scan_task(&[NormalizedPath::new(r"D:\Crash").unwrap()], 1)
             .unwrap();
-        item_id = store
+        let item_id = store
             .reserve_scan_path(
                 task_id,
                 &ScannedPath::new(
@@ -344,16 +144,7 @@ fn crashed_item_is_failed_with_fault_and_never_requeued_after_reopen() {
             .unwrap();
     }
 
-    let mut store = NodeStore::open(&database, machine()).unwrap();
-    assert_eq!(store.recover_running_items(4).unwrap(), 0);
-    let item = store
-        .task_items(task_id)
-        .unwrap()
-        .into_iter()
-        .find(|item| item.item_id == item_id)
-        .unwrap();
-    assert_eq!(item.status, TaskItemStatus::Failed);
-    assert_eq!(store.task_snapshot(task_id).unwrap().failed, 1);
+    let store = NodeStore::open(&database, machine()).unwrap();
     let faults = store.page_file_faults(None, 10).unwrap();
     assert_eq!(faults.items.len(), 1);
     assert_eq!(faults.items[0].machine_id, machine());
@@ -464,60 +255,6 @@ fn crashed_item_rejects_mismatched_fault_identity_without_side_effects() {
     assert_eq!(item.status, TaskItemStatus::Running);
     assert_eq!(store.task_snapshot(task).unwrap().failed, 0);
     assert!(store.page_file_faults(None, 10).unwrap().items.is_empty());
-}
-
-/// 启动恢复只返回 queued/running 任务，并把 running 项重新排队而不复活终态任务。
-#[test]
-fn active_recovery_snapshots_exclude_terminal_tasks() {
-    let mut store = NodeStore::open_in_memory(machine()).unwrap();
-    let queued = store
-        .create_task("scan", &[NewTaskItem::detached("queued")], 1)
-        .unwrap();
-    let running = store
-        .create_task("scan", &[NewTaskItem::detached("running")], 2)
-        .unwrap();
-    store.claim_next_item(running, 3).unwrap().unwrap();
-    let completed = store
-        .create_task("scan", &[NewTaskItem::detached("completed")], 4)
-        .unwrap();
-    let completed_item = store.claim_next_item(completed, 5).unwrap().unwrap();
-    store
-        .complete_item(
-            &completed_item.item_id,
-            TaskItemCompletion::Succeeded { content_id: None },
-            6,
-        )
-        .unwrap();
-    let failed = store
-        .create_task("scan", &[NewTaskItem::detached("failed")], 7)
-        .unwrap();
-    store.fail_task(failed, 8).unwrap();
-
-    let recovered = store.recover_active_computation_tasks(9).unwrap();
-    assert_eq!(
-        recovered
-            .iter()
-            .map(|task| task.task_id)
-            .collect::<Vec<_>>(),
-        vec![queued, running]
-    );
-    assert!(
-        recovered
-            .iter()
-            .all(|task| task.status == TaskStatus::Queued)
-    );
-    assert_eq!(
-        store.task_items(running).unwrap()[0].status,
-        TaskItemStatus::Queued
-    );
-    assert_eq!(
-        store.task_snapshot(completed).unwrap().status,
-        TaskStatus::Completed
-    );
-    assert_eq!(
-        store.task_snapshot(failed).unwrap().status,
-        TaskStatus::Failed
-    );
 }
 
 /// 一筛提交必须在同一事务内区分正确身份、非活动项和身份错配。
