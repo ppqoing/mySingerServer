@@ -40,9 +40,40 @@ GREEN：
 
 ## 提交
 
-`refactor: keep runtime tasks process-local`（当前 HEAD）。
+初始实现：`ae6eab9`（`refactor: keep runtime tasks process-local`）。
 
 ## concerns
 
 - `NodeEngine::spawn` 的可控测试池没有 worker 可执行文件配置，因此测试分支只归还已收束的测试 Pool；生产 `NodeRuntime::start` 保存不可变 `WorkerPoolConfig`，重启会丢弃旧 Pool 并创建新 Pool。
 - PostgreSQL 和打包环境依赖的 desktop-core 测试未配置外部环境，按既有 `ignored` 条件跳过；未修改中心 PostgreSQL 同步恢复事实或协议版本。
+
+## Fix round 1（独立审查修复）
+
+### 审查发现与 RED
+
+- `cargo test -p worker --test worker_pool --no-run --locked`：原 fixture 仍调用已删除的 `prepare_planned_restart` 与 `restart_after_requeue`，报 `E0599` 两处。
+- 替换 fixture 为“活动旧 Pool → `shutdown().await` → 等待旧 PID 退出 → 同配置新 Pool → 新 PID 可派发”后，在实现前同一编译命令报 `shutdown` 缺失的 `E0599` 两处。
+- `cargo test -p dedup-desktop-core --test controller_runtime_tasks runtime_list_failure_removes_old_summary_and_only_selected_details_stale --locked -- --test-threads=1`：新增真实 TCP 会话用例超时，证明列表传输失败时旧 Node 摘要被错误回填。
+
+### 修复
+
+- `WorkerPool::shutdown(self).await` 向唯一 actor 发送单阶段关闭命令，等待所有已发送终止命令的 slot 报告退出、清空运行快照，并等待 actor/Job 释放。生产 `restart_engine` 在启动新 Pool 前必须等待该关闭完成；没有启动配置的可控测试池只验证收束，明确拒绝冒充生产重建。
+- 删除 worker 进程 fixture 的 `FakeStore` 和旧两阶段 API 调用，改为真实旧 PID 退出与新 Pool 派发验证。
+- Desktop 运行任务刷新在列表传输错误时不回填旧摘要；仅当前选中详情的独立请求失败保留详情并标记 stale。
+- `runtime_tasks_e2e` 预置真实 `running` task/item，并通过独立 rusqlite 连接确认 Node 启动事务清除了旧行；旧 `runtime_recovery` 测试改为同一进程事实边界。
+
+### Fix 验证
+
+- `cargo test -p worker --test worker_pool --no-run --locked`：通过。
+- `cargo test -p worker --test worker_pool --locked -- --test-threads=1`：3/3 通过（未配置 FFmpeg fixture 时真实媒体分支按设计返回）。
+- `cargo test -p dedup-desktop-core --test controller_runtime_tasks --locked -- --test-threads=1`：7/7 通过，包含列表失败分支。
+- `cargo test -p dedup-desktop-core --test runtime_tasks_e2e --locked -- --test-threads=1`：1/1 通过。
+- `cargo test -p dedup-node-engine --features test-hooks --locked -- --test-threads=1`：通过；库单元 60/60，受影响集成套件通过。
+- `cargo test -p dedup-node-store --locked -- --test-threads=1`：44/44 通过。
+- `cargo test -p dedup-desktop-ui --test bindings_contract --locked -- --test-threads=1`：16/16 通过。
+
+### 更正
+
+此前报告中“`cargo test -p dedup-desktop-core --locked` 全量通过”不成立：该命令在 `node_config_controller` 子测试挂起，随后被停止，不能计为通过。本轮只报告上述实际退出的 desktop-core 聚焦测试；未重新运行该可能挂起的全量命令。
+
+本轮 fix：`fix: await worker pool shutdown before restart`（当前 HEAD）。

@@ -775,7 +775,11 @@ async fn run_actor(mut state: EngineState, mut commands: mpsc::Receiver<EngineCo
                 let _ = reply.send(state.restart_engine().await);
             }
             EngineCommand::Shutdown(reply) => {
-                drop(state.stop_background_for_shutdown().await);
+                if let Some(pool) = state.stop_background_for_shutdown().await {
+                    if let Err(error) = pool.shutdown().await {
+                        tracing::error!(error = %error, "关闭 WorkerPool 失败");
+                    }
+                }
                 let _ = reply.send(());
                 break;
             }
@@ -1837,27 +1841,25 @@ impl EngineState {
         // 活动任务先走与进程关闭相同的取消门禁，确保 Worker 事件和后台 Store 完整收束。
         let old_pool = self.stop_background_for_shutdown().await;
         self.worker_control = None;
+        let shutdown = match old_pool {
+            Some(pool) => pool.shutdown().await.map_err(|error| error.to_string()),
+            None => Ok(()),
+        };
+        if let Err(error) = shutdown {
+            self.restarting = false;
+            return Err(error);
+        }
         let result = match self.worker_pool_config.clone() {
-            Some(config) => {
-                drop(old_pool);
-                match WorkerPool::start(config).await {
-                    Ok(worker_pool) => {
-                        self.worker_control = Some(worker_pool.handle());
-                        self.worker_pool = Some(worker_pool);
-                        Ok(())
-                    }
-                    Err(error) => Err(error.to_string()),
-                }
-            }
-            // 可控测试池没有可执行文件配置；仍通过已收束的同一测试池验证 actor 边界。
-            None => match old_pool {
-                Some(worker_pool) => {
+            Some(config) => match WorkerPool::start(config).await {
+                Ok(worker_pool) => {
                     self.worker_control = Some(worker_pool.handle());
                     self.worker_pool = Some(worker_pool);
                     Ok(())
                 }
-                None => Err("测试节点没有可重建的 WorkerPool".into()),
+                Err(error) => Err(error.to_string()),
             },
+            // 可控测试池已经关闭，不能冒充生产重建；测试只验证取消和收束边界。
+            None => Err("测试节点没有可重建的 WorkerPool".into()),
         };
         self.restarting = false;
         result
@@ -3024,7 +3026,11 @@ mod tests {
         actor.await.unwrap();
         assert!(controller.running_files().is_empty());
         assert_eq!(controller.cpu_in_use(), 0);
-        assert_eq!(controller.available_slots(), 1);
+        assert_eq!(
+            controller.available_slots(),
+            0,
+            "关闭后的可控 Pool 不得保留旧 slot"
+        );
         let details = registry.details(&runtime_id).await.unwrap();
         assert_eq!(details.summary.unwrap().state, "cancelled");
         assert_eq!(
@@ -3241,7 +3247,11 @@ mod tests {
             assert_eq!(persisted.status, TaskStatus::Cancelled);
             assert!(controller.running_files().is_empty());
             assert_eq!(controller.cpu_in_use(), 0);
-            assert_eq!(controller.available_slots(), 1);
+            assert_eq!(
+                controller.available_slots(),
+                0,
+                "关闭后的可控 Pool 不得保留旧 slot"
+            );
             runtime_id
         });
 
@@ -3386,10 +3396,13 @@ mod tests {
         };
         assert_eq!(accepted.task_id, running_task_id);
 
-        tokio::time::timeout(Duration::from_secs(2), handle.restart_engine())
+        let restart = tokio::time::timeout(Duration::from_secs(2), handle.restart_engine())
             .await
-            .expect("运行中重启必须等待 Worker 收束")
-            .expect("运行中重启必须取消当前任务后继续重建计算引擎");
+            .expect("运行中重启必须等待 Worker 收束");
+        assert!(
+            matches!(restart, Err(EngineError::Operation(_))),
+            "可控测试池必须在收束后明确拒绝冒充生产 Pool 重建"
+        );
         assert!(
             handle
                 .runtime_tasks_for_test()

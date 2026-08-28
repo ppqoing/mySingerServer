@@ -13,6 +13,7 @@ use dedup_node_engine::worker::{
 };
 use dedup_protocol::proto::{self, worker_envelope};
 use dedup_protocol::{BASE_MISSING_PROBE, BASE_MISSING_STAGE1};
+use dedup_windows::wait_for_process_exit;
 
 #[tokio::test]
 /// 用真实 DLL 和 worker.exe 覆盖正常结果及三类进程生命周期分支。
@@ -23,7 +24,7 @@ async fn real_worker_process_supports_results_restart_crash_and_cancel() {
     let worker = runtime.path().join("worker.exe");
     let config = WorkerPoolConfig::new(WorkerLaunch::new(worker), 1)
         .with_result_read_delay(Duration::from_millis(500));
-    let mut pool = WorkerPool::start(config).await.unwrap();
+    let mut pool = WorkerPool::start(config.clone()).await.unwrap();
 
     pool.dispatch(stage1_request("task-result", "item-result"))
         .await
@@ -45,14 +46,24 @@ async fn real_worker_process_supports_results_restart_crash_and_cancel() {
         .await
         .unwrap();
     assert_eq!(pool.busy_workers(), 1);
-    let running = pool.prepare_planned_restart().await.unwrap();
-    assert_eq!(running, vec!["item-restart"]);
-    let mut store = FakeStore::default();
-    store.requeue_items(&running);
-    pool.restart_after_requeue(&running).await.unwrap();
-    assert_eq!(store.queued, running);
-    assert_eq!(pool.failure_count(), 0);
-    assert_ne!(pool.worker_process_ids()[0], first_pid);
+    pool.shutdown().await.unwrap();
+    tokio::task::spawn_blocking(move || wait_for_process_exit(first_pid))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut pool = WorkerPool::start(config).await.unwrap();
+    assert_ne!(
+        pool.worker_process_ids()[0],
+        first_pid,
+        "新 Pool 必须使用新进程"
+    );
+    pool.dispatch(stage1_request("task-restarted", "item-restarted"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_event(&mut pool).await,
+        WorkerEvent::Completed { .. }
+    ));
 
     let crash_pid = pool.worker_process_ids()[0];
     let crash_source = media_fixture("video-12s.mp4");
@@ -98,6 +109,7 @@ async fn real_worker_process_supports_results_restart_crash_and_cancel() {
         WorkerEvent::Cancelled { ref item_id, .. } if item_id == "item-cancel"
     ));
     assert_eq!(pool.failure_count(), 1);
+    pool.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -322,17 +334,4 @@ fn runtime_fixture() -> Option<tempfile::TempDir> {
         std::fs::copy(source.join(name), ffmpeg.join(name)).unwrap();
     }
     Some(directory)
-}
-
-#[derive(Default)]
-/// 模拟 NodeStore 两阶段重启中唯一需要的重新排队动作。
-struct FakeStore {
-    queued: Vec<String>,
-}
-
-impl FakeStore {
-    /// 记录第一阶段返回且已在事务中改回 queued 的任务项。
-    fn requeue_items(&mut self, items: &[String]) {
-        self.queued.extend_from_slice(items);
-    }
 }

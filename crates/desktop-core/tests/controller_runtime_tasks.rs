@@ -2,7 +2,7 @@ use std::{
     net::IpAddr,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -226,6 +226,10 @@ struct RuntimeTaskHandler {
     detail_calls: Arc<AtomicUsize>,
     /// 每条管理连接各自订阅的运行任务终态广播。
     changes: broadcast::Sender<proto::RuntimeTaskChanged>,
+    /// 测试运行任务列表传输失败后不回填旧摘要。
+    fail_runtime_list: Arc<AtomicBool>,
+    /// 测试当前选中详情失败时保留详情并标记 stale。
+    fail_runtime_details: Arc<AtomicBool>,
 }
 
 impl NodeRequestHandler for RuntimeTaskHandler {
@@ -245,21 +249,35 @@ impl NodeRequestHandler for RuntimeTaskHandler {
             }
             Some(proto::envelope::Payload::ListRuntimeTasks(mut page)) => {
                 self.list_calls.fetch_add(1, Ordering::SeqCst);
-                page.tasks = vec![runtime_summary(self.machine_id.as_str())];
-                page.next_cursor.clear();
-                proto::envelope::Payload::ListRuntimeTasks(page)
+                if self.fail_runtime_list.load(Ordering::SeqCst) {
+                    proto::envelope::Payload::Error(proto::Error {
+                        code: proto::ErrorCode::Internal as i32,
+                        message: "模拟运行任务列表传输失败".into(),
+                    })
+                } else {
+                    page.tasks = vec![runtime_summary(self.machine_id.as_str())];
+                    page.next_cursor.clear();
+                    proto::envelope::Payload::ListRuntimeTasks(page)
+                }
             }
             Some(proto::envelope::Payload::GetRuntimeTaskDetails(mut response)) => {
                 self.detail_calls.fetch_add(1, Ordering::SeqCst);
-                response.details = Some(proto::RuntimeTaskDetails {
-                    summary: Some(runtime_summary(self.machine_id.as_str())),
-                    stages: Vec::new(),
-                    workers: Vec::new(),
-                    failures: Vec::new(),
-                    execution_config: None,
-                    pipeline_metrics: None,
-                });
-                proto::envelope::Payload::GetRuntimeTaskDetails(response)
+                if self.fail_runtime_details.load(Ordering::SeqCst) {
+                    proto::envelope::Payload::Error(proto::Error {
+                        code: proto::ErrorCode::Internal as i32,
+                        message: "模拟运行任务详情传输失败".into(),
+                    })
+                } else {
+                    response.details = Some(proto::RuntimeTaskDetails {
+                        summary: Some(runtime_summary(self.machine_id.as_str())),
+                        stages: Vec::new(),
+                        workers: Vec::new(),
+                        failures: Vec::new(),
+                        execution_config: None,
+                        pipeline_metrics: None,
+                    });
+                    proto::envelope::Payload::GetRuntimeTaskDetails(response)
+                }
             }
             _ => proto::envelope::Payload::Error(proto::Error {
                 code: proto::ErrorCode::InvalidRequest as i32,
@@ -285,6 +303,8 @@ async fn controller_refreshes_runtime_tasks_on_two_second_tick_and_terminal_even
     let machine_id = MachineId::from_sha256([0xe1; 32]);
     let list_calls = Arc::new(AtomicUsize::new(0));
     let detail_calls = Arc::new(AtomicUsize::new(0));
+    let fail_runtime_list = Arc::new(AtomicBool::new(false));
+    let fail_runtime_details = Arc::new(AtomicBool::new(false));
     let (changes, _) = broadcast::channel(8);
     let (shutdown_sender, shutdown) = oneshot::channel();
     let server = tokio::spawn(NodeServer::serve_until(
@@ -294,6 +314,8 @@ async fn controller_refreshes_runtime_tasks_on_two_second_tick_and_terminal_even
             list_calls: Arc::clone(&list_calls),
             detail_calls: Arc::clone(&detail_calls),
             changes: changes.clone(),
+            fail_runtime_list,
+            fail_runtime_details,
         },
         shutdown,
     ));
@@ -343,6 +365,84 @@ async fn controller_refreshes_runtime_tasks_on_two_second_tick_and_terminal_even
         }
     }
     assert!(observed_selected_details, "选中任务应立即发布详情状态");
+
+    app.send(UiCommand::Shutdown).await.unwrap();
+    shutdown_sender.send(()).unwrap();
+    server.await.unwrap().unwrap();
+}
+
+/// 列表传输失败不能把旧摘要当作当前任务；只有已选详情允许保留并 stale。
+#[tokio::test(start_paused = true)]
+async fn runtime_list_failure_removes_old_summary_and_only_selected_details_stale() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let machine_id = MachineId::from_sha256([0xe2; 32]);
+    let list_calls = Arc::new(AtomicUsize::new(0));
+    let detail_calls = Arc::new(AtomicUsize::new(0));
+    let fail_runtime_list = Arc::new(AtomicBool::new(false));
+    let fail_runtime_details = Arc::new(AtomicBool::new(false));
+    let (changes, _) = broadcast::channel(8);
+    let (shutdown_sender, shutdown) = oneshot::channel();
+    let server = tokio::spawn(NodeServer::serve_until(
+        listener,
+        RuntimeTaskHandler {
+            machine_id,
+            list_calls: Arc::clone(&list_calls),
+            detail_calls: Arc::clone(&detail_calls),
+            changes,
+            fail_runtime_list: Arc::clone(&fail_runtime_list),
+            fail_runtime_details: Arc::clone(&fail_runtime_details),
+        },
+        shutdown,
+    ));
+    let temp = TempDir::new().unwrap();
+    let config = DesktopConfig {
+        nodes: vec![NodeEndpoint {
+            ip: IpAddr::from([127, 0, 0, 1]),
+            port: address.port(),
+        }],
+        reconnect_interval_seconds: 30,
+        ..DesktopConfig::default()
+    };
+    let (app, mut events) = DesktopApp::start(config, desktop_paths(&temp));
+    wait_for_count(&list_calls, 1).await;
+    app.send(UiCommand::SelectRuntimeTask {
+        key: RuntimeTaskKey {
+            owner: RuntimeTaskOwner::Node { node_index: 0 },
+            id: "node-runtime".into(),
+        },
+    })
+    .await
+    .unwrap();
+    wait_for_count(&detail_calls, 1).await;
+
+    fail_runtime_list.store(true, Ordering::SeqCst);
+    fail_runtime_details.store(true, Ordering::SeqCst);
+    let expected_list_calls = list_calls.load(Ordering::SeqCst) + 1;
+    tokio::time::advance(Duration::from_secs(2)).await;
+    wait_for_count(&list_calls, expected_list_calls).await;
+    wait_for_count(&detail_calls, 2).await;
+
+    let failed = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let Some(UiEvent::RuntimeTasksChanged(state)) = events.recv().await
+                && state.summaries().is_empty()
+                && state.selected().is_some()
+                && state.details().is_some()
+                && state.is_stale()
+            {
+                return state;
+            }
+        }
+    })
+    .await
+    .expect("列表失败必须发布空摘要和 stale 的旧详情");
+    assert!(
+        failed
+            .error()
+            .is_some_and(|error| error.contains("详情失败")),
+        "stale 只能来自当前选中详情的独立失败"
+    );
 
     app.send(UiCommand::Shutdown).await.unwrap();
     shutdown_sender.send(()).unwrap();

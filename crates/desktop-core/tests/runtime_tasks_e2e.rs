@@ -42,13 +42,33 @@ async fn node_pipeline_reaches_desktop_details_and_restart_forgets_transient_tas
     }
 
     let machine_id = MachineId::from_sha256([0xd1; 32]);
-    seed_recovery_task(&database, machine_id.clone());
+    let old_task_id = seed_recovery_task(&database, machine_id.clone());
     let (first_workers, mut started, worker_control) = WorkerPool::controlled_batch_for_test(2);
     let (mut first_node, first_registry) =
         RunningNode::start(&database, &cache, machine_id.clone(), first_workers, None).await;
     assert!(
         first_registry.list().await.is_empty(),
         "启动清理后的首次运行任务列表必须为空，不能发布旧 SQLite 任务"
+    );
+    let observer = rusqlite::Connection::open(&database).unwrap();
+    let remaining_tasks: i64 = observer
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE task_id=?1",
+            [&old_task_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let remaining_items: i64 = observer
+        .query_row(
+            "SELECT COUNT(*) FROM task_items WHERE task_id=?1",
+            [&old_task_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(remaining_tasks, 0, "启动事务必须清除旧 running task 行");
+    assert_eq!(
+        remaining_items, 0,
+        "启动事务必须清除旧 running task_items 行"
     );
 
     let config = DesktopConfig {
@@ -225,11 +245,16 @@ impl RunningNode {
 }
 
 /// 在真实数据库中放入一个未完成任务，用于验证启动清理不会重新发布旧任务。
-fn seed_recovery_task(database: &Path, machine_id: MachineId) {
+fn seed_recovery_task(database: &Path, machine_id: MachineId) -> String {
     let mut store = NodeStore::open(database, machine_id).unwrap();
-    store
+    let task_id = store
         .create_task("scan", &[NewTaskItem::detached("queued")], 1)
         .unwrap();
+    store
+        .claim_next_item(task_id, 2)
+        .unwrap()
+        .expect("夹具任务必须进入 running");
+    task_id.as_uuid().to_string()
 }
 
 /// 返回 registry 当前唯一扫描运行 ID。

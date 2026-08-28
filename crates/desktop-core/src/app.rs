@@ -1151,7 +1151,6 @@ async fn refresh_runtime_tasks(
     sessions: &BTreeMap<usize, Arc<NodeSession>>,
     registry: &DesktopRuntimeTaskRegistry,
 ) {
-    let previous = view.summaries().to_vec();
     let mut summaries = registry.list();
     let mut errors = Vec::new();
     for (node_index, session) in sessions {
@@ -1159,12 +1158,6 @@ async fn refresh_runtime_tasks(
             Ok(mut tasks) => summaries.append(&mut tasks),
             Err(error) => {
                 errors.push(format!("节点 {node_index} 运行任务列表失败: {error}"));
-                summaries.extend(previous.iter().filter(|task| {
-                    matches!(
-                        task.key.owner,
-                        RuntimeTaskOwner::Node { node_index: current } if current == *node_index
-                    )
-                }).cloned());
             }
         }
     }

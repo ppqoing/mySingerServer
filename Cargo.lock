@@ -1164,6 +1164,7 @@ dependencies = [
  "dedup-protocol",
  "dedup-transport",
  "dedup-windows",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

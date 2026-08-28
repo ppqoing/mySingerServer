@@ -1,4 +1,4 @@
-//! 多 Worker 进程的串行 actor、异常替换、取消与两阶段计划重启。
+//! 多 Worker 进程的串行 actor、异常替换、取消与可等待关闭。
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
@@ -363,6 +363,8 @@ pub struct WorkerPool {
     commands: mpsc::Sender<PoolCommand>,
     events: mpsc::Receiver<WorkerEvent>,
     state: Arc<Mutex<PoolState>>,
+    /// 唯一池 actor 的收束句柄；关闭必须等待其释放所有 slot 和 Job。
+    actor: tokio::task::JoinHandle<()>,
 }
 
 /// 可克隆的 WorkerPool 控制面；唯一事件接收器仍由一个计算 owner 持有。
@@ -743,7 +745,7 @@ impl WorkerPool {
         let (events_tx, events_rx) = mpsc::channel(WORKER_EVENT_CAPACITY);
         let event_outbox = WorkerEventOutbox::new(events_tx);
         let actor_state = Arc::clone(&state);
-        tokio::spawn(run_pool(
+        let actor = tokio::spawn(run_pool(
             config,
             job,
             slots,
@@ -758,6 +760,7 @@ impl WorkerPool {
             commands: commands_tx,
             events: events_rx,
             state,
+            actor,
         })
     }
 
@@ -833,6 +836,26 @@ impl WorkerPool {
             .await
             .map_err(|_| WorkerPoolError::Closed)?;
         reply_rx.await.map_err(|_| WorkerPoolError::Closed)?
+    }
+
+    /// 终止全部 Worker 并等待 actor、slot 与 Job 全部释放；调用后不得继续使用旧 Pool。
+    pub async fn shutdown(self) -> Result<(), WorkerPoolError> {
+        let Self {
+            commands,
+            events,
+            state: _,
+            actor,
+        } = self;
+        // 丢弃外部接收器，关闭不必等待旧任务事件被业务消费者读取。
+        drop(events);
+        let (reply_tx, reply_rx) = oneshot::channel();
+        commands
+            .send(PoolCommand::Shutdown(reply_tx))
+            .await
+            .map_err(|_| WorkerPoolError::Closed)?;
+        reply_rx.await.map_err(|_| WorkerPoolError::Closed)?;
+        actor.await.map_err(|_| WorkerPoolError::Closed)?;
+        Ok(())
     }
 
     /// 等待下一条需由 NodeEngine 持久化的结果或进程事件。
@@ -947,7 +970,7 @@ impl WorkerPool {
         let cancel_gate: Arc<Mutex<Option<(Arc<Notify>, Arc<Notify>)>>> =
             Arc::new(Mutex::new(None));
         let actor_cancel_gate = Arc::clone(&cancel_gate);
-        tokio::spawn(async move {
+        let actor = tokio::spawn(async move {
             let mut queue = VecDeque::new();
             let mut idle = (0..worker_count).collect::<VecDeque<_>>();
             let mut active = HashMap::<String, (usize, WorkIdentity)>::new();
@@ -1035,6 +1058,18 @@ impl WorkerPool {
                                     .remove(&task_id);
                             }
                             PoolCommand::TerminateUnexpected(_, reply) => { let _ = reply.send(Ok(())); }
+                            PoolCommand::Shutdown(reply) => {
+                                queue.clear();
+                                active.clear();
+                                idle.clear();
+                                let mut state = actor_state.lock().unwrap();
+                                state.running.clear();
+                                state.process_ids.clear();
+                                state.cpu_in_use = 0;
+                                actor_available.store(0, Ordering::Release);
+                                let _ = reply.send(());
+                                break;
+                            }
                         }
                     }
                     control = control_rx.recv() => {
@@ -1161,6 +1196,7 @@ impl WorkerPool {
                 commands,
                 events: event_rx,
                 state: state.clone(),
+                actor,
             },
             started_rx,
             ControlledWorkerPool {
@@ -1201,7 +1237,7 @@ impl WorkerPool {
         let (commands, mut command_rx) = mpsc::channel(64);
         let (events, event_rx) = mpsc::channel(256);
         let (started, started_rx) = mpsc::channel(8);
-        tokio::spawn(async move {
+        let actor = tokio::spawn(async move {
             let mut active = None::<WorkIdentity>;
             while let Some(command) = command_rx.recv().await {
                 match command {
@@ -1265,6 +1301,14 @@ impl WorkerPool {
                     PoolCommand::TerminateUnexpected(_, reply) => {
                         let _ = reply.send(Ok(()));
                     }
+                    PoolCommand::Shutdown(reply) => {
+                        let mut state = actor_state.lock().unwrap();
+                        state.running.clear();
+                        state.process_ids.clear();
+                        state.cpu_in_use = 0;
+                        let _ = reply.send(());
+                        break;
+                    }
                 }
             }
         });
@@ -1273,6 +1317,7 @@ impl WorkerPool {
                 commands,
                 events: event_rx,
                 state,
+                actor,
             },
             started_rx,
         )
@@ -1608,6 +1653,8 @@ enum PoolCommand {
     Cancel(String, oneshot::Sender<Result<(), WorkerPoolError>>),
     CancelRollback(String),
     TerminateUnexpected(u32, oneshot::Sender<Result<(), WorkerPoolError>>),
+    /// 关闭命令独占 actor，完成全部 slot 退出后才回复。
+    Shutdown(oneshot::Sender<()>),
 }
 
 /// 一个已经 Ready 的槽位，只暴露 PID 与单向控制通道。
@@ -1777,6 +1824,11 @@ async fn run_pool_with_replacement<F, Fut>(
                             });
                         let _ = reply.send(result);
                     }
+                    PoolCommand::Shutdown(reply) => {
+                        shutdown_slots(&mut slots, &mut slot_events, &state).await;
+                        let _ = reply.send(());
+                        break;
+                    }
                 }
             }
             event = slot_events.recv() => {
@@ -1796,6 +1848,38 @@ async fn run_pool_with_replacement<F, Fut>(
             }
         }
     }
+}
+
+/// 终止并回收所有 slot；只有每个发送成功的 slot 报告 Exited 后才允许池 actor 退出。
+async fn shutdown_slots(
+    slots: &mut BTreeMap<usize, SlotHandle>,
+    slot_events: &mut mpsc::UnboundedReceiver<SlotEvent>,
+    state: &Arc<Mutex<PoolState>>,
+) {
+    let mut waiting = HashSet::new();
+    for (slot_id, slot) in slots.iter() {
+        if slot.commands.send(SlotCommand::Terminate).is_ok() {
+            waiting.insert(*slot_id);
+        }
+    }
+    while !waiting.is_empty() {
+        let Some(event) = slot_events.recv().await else {
+            break;
+        };
+        if let SlotEvent::Exited { slot_id, .. } = event
+            && waiting.remove(&slot_id)
+        {
+            slots.remove(&slot_id);
+            let mut locked = state.lock().unwrap();
+            release_running_work(&mut locked, slot_id);
+            locked.process_ids.remove(&slot_id);
+        }
+    }
+    slots.clear();
+    let mut locked = state.lock().unwrap();
+    locked.running.clear();
+    locked.process_ids.clear();
+    locked.cpu_in_use = 0;
 }
 
 /// 按空闲完成顺序 round-robin 派发等待项，并原子更新共享运行快照。
@@ -2735,7 +2819,7 @@ mod tests {
         let config = WorkerPoolConfig::new(WorkerLaunch::new("unused-worker.exe"), 1);
         let job = WorkerJob::create().expect("测试 actor 需要一个可用 Worker Job");
         let event_outbox = WorkerEventOutbox::new(events.clone());
-        tokio::spawn(run_pool(
+        let actor = tokio::spawn(run_pool(
             config,
             job,
             slots,
@@ -2751,6 +2835,7 @@ mod tests {
                 commands,
                 events: event_receiver,
                 state,
+                actor,
             },
             events,
             slot_receiver,
@@ -2786,7 +2871,7 @@ mod tests {
         let job = WorkerJob::create().expect("测试 actor 需要一个可用 Worker Job");
         let event_outbox = WorkerEventOutbox::new(events.clone());
         let inner = event_outbox.pending.clone();
-        tokio::spawn(run_pool(
+        let actor = tokio::spawn(run_pool(
             config,
             job,
             slots,
@@ -2802,6 +2887,7 @@ mod tests {
                 commands,
                 events: event_receiver,
                 state,
+                actor,
             },
             events,
             inner,
