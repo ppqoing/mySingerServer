@@ -8,6 +8,7 @@ mod delete;
 mod faults;
 mod features;
 mod groups;
+mod inventory;
 mod maintenance;
 mod open;
 mod outbox;
@@ -33,6 +34,7 @@ pub use groups::{
     GroupKind, GroupMemberPage, GroupMemberWrite, GroupPage, GroupWrite, StoredGroup,
     StoredGroupMember,
 };
+pub use inventory::{ResolvedScanFile, ScanFinalizeInput, ScanFinalizeResult};
 pub use open::{NodeStore, StoreError};
 pub use review::ReviewDecision;
 pub use rows::{
