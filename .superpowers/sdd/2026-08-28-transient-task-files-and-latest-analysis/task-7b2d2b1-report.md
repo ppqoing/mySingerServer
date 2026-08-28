@@ -11,7 +11,12 @@
 ## 实现
 
 - 使用 `TaskDispatchAdmission::hash_only()`；已知 MD5/Media 行不申请 Hash provider。
-- dispatcher 已取得的 permit 直接传给 `read_with_permit`，读取完成后释放，不二次 acquire。
+- dispatcher 已取得的 permit 直接传给 `read_with_permit`，不二次 acquire；每个读取
+  future 完成时立即释放 permit，缓存查询和 ACK 不占用读取额度。
+- Hash 事件循环以显式 `hash_capacity` 限制 `JoinSet` 在途读取数，同时轮询 dispatcher
+  和已完成的读取结果，避免等待下一 permit 时阻塞已经完成的文件。
+- pending 显式返回 `remaining_hash_rows` 与 `blocked_reason`；例如同 lane 的 Media
+  队首会返回 `MediaPending` 和剩余 Hash 数量，不把被阻塞误报为完成。
 - ContentKey 查询按最多 1000 项分批，保持 Hash 结果与查询返回顺序一致。
 - 完整缓存通过 `upsert_content_and_location` 生成 taskless persist ACK；只有 ACK 成功
   后才写任务文件 `C`、移除上下文并增加 resolved/cache-hit 统计。
@@ -23,7 +28,7 @@
 - `actor.rs` 仅补充既有 test-hooks 测试所缺的 `NormalizedPath` import；不改变生产逻辑，
   用于让本任务要求的 feature 聚焦测试可编译。
 
-生产实现约 498 行，行为测试约 444 行；Media Worker 尚未接入。
+生产实现约 604 行，行为测试约 631 行；Media Worker 尚未接入。
 
 ## TDD 与验证
 
@@ -32,22 +37,28 @@
 不会产生新的 publication 通知。修复为按 identity 的 `needs_md5` 计数控制 Hash 阶段，
 Hash 耗尽后立即进入 ACK 收束，未改变任务行的 ACK 门禁。
 
+本轮先加入两个 RED：两个可用额度的 Hash 必须在任一释放前同时进入读取；Media 队首
+阻塞同 lane 后必须保留 `remaining_hash_rows=1` 并报告 `MediaPending`。随后采用
+`JoinSet + tokio::select!` 最小实现：dispatcher 只负责交付 permit，在途读取独立推进，
+读取完成即释放 permit；结果按 dispatcher 序号恢复后继续最多 1000 项一次的 ContentKey
+批量查询。
+
 验证均使用 `CARGO_TARGET_DIR=C:\\tmp\\rust-v2-core-scope-target`、清除 CC/CXX/
 AR/RANLIB/CFLAGS/CXXFLAGS/RUSTFLAGS/RUSTC_WRAPPER，并串行运行：
 
 | 验证 | 结果 |
 |---|---:|
-| `cargo test -p dedup-node-engine --lib task_file_base_compute --features test-hooks --locked -- --test-threads=1` | 6/6 通过 |
+| `cargo test -p dedup-node-engine --lib task_file_base_compute --features test-hooks --locked -- --test-threads=1` | 8/8 通过 |
 | `cargo test -p dedup-node-engine --test base_task_producer --locked -- --test-threads=1` | 14/14 通过 |
 | `cargo test -p dedup-node-engine --test task_dispatch --locked -- --test-threads=1` | 27/27 通过 |
-| `cargo test -p dedup-node-engine --test pipeline_permit --locked -- --test-threads=1` | 6/6 通过 |
-| `cargo test -p dedup-node-engine --lib base_persistence --features test-hooks --locked -- --test-threads=1` | 5/5 通过 |
-| `cargo test -p dedup-node-engine --test transient_task_files --locked -- --test-threads=1` | 25/25 通过 |
-| `cargo test -p dedup-node-engine --lib --features test-hooks --locked -- --test-threads=1` | 78/78 通过 |
+| `cargo test -p dedup-node-engine --test pipeline_permit --locked -- --test-threads=1` | 6/6 通过（前序验证） |
+| `cargo test -p dedup-node-engine --lib base_persistence --features test-hooks --locked -- --test-threads=1` | 5/5 通过（前序验证） |
+| `cargo test -p dedup-node-engine --test transient_task_files --locked -- --test-threads=1` | 25/25 通过（前序验证） |
+| `cargo test -p dedup-node-engine --lib --features test-hooks --locked -- --test-threads=1` | 80/80 通过 |
 | `cargo fmt --all`、`git diff --check` | 通过 |
 
 测试期间未修改 `I:\\Tool`、生产目录或 SQLite schema；未执行真实媒体、打包和部署。
-最后一次重型测试后 C/D 可用空间约为 12.97/11.96 GiB，均未触发 10 GiB 停止线。
+最后一次测试后 C/D 可用空间约为 12.34/11.96 GiB，均未触发 10 GiB 停止线。
 
 ## 后续边界
 

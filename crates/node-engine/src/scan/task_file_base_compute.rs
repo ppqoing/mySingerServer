@@ -11,11 +11,9 @@ use std::{
 use dedup_core::{ContentKey, MediaKind};
 use dedup_node_store::ResolvedScanFile;
 use dedup_windows::ReadCancellationToken;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::{sync::mpsc::UnboundedReceiver, task::JoinSet};
 
-use super::{
-    BaseComputeDecision, BaseTaskManifest, BaseTaskProduction, HashPermitReader, ReadProduct,
-};
+use super::{BaseComputeDecision, BaseTaskManifest, BaseTaskProduction, HashPermitReader};
 use crate::{
     io::ReadFailure,
     scan::base_persistence::{
@@ -23,7 +21,8 @@ use crate::{
         BasePersistSendError, BaseStoreHandle,
     },
     task_dispatch::{
-        TaskDispatchAdmission, TaskDispatchError, TaskDispatchPoll, TaskLanePermitProvider,
+        TaskDispatchAdmission, TaskDispatchBlockReason, TaskDispatchError, TaskDispatchPoll,
+        TaskLanePermitProvider,
     },
     task_files::{TaskFileIdentity, TaskFileRecord, TaskWorkMask},
 };
@@ -39,6 +38,10 @@ pub(crate) struct TaskFileBaseComputePending<P: TaskLanePermitProvider> {
     pub(crate) contexts: BTreeMap<TaskFileIdentity, super::TaskFileBaseContext>,
     /// 当前扫描清单，包含 Hash ACK 后新增的 resolved 文件和命中数。
     pub(crate) manifest: BaseTaskManifest,
+    /// 尚未从 dispatcher 领取的 Hash 任务行数量；Media 阶段可据此继续处理。
+    pub(crate) remaining_hash_rows: usize,
+    /// 本轮 Hash admission 提前停止时的明确原因；正常耗尽为 `None`。
+    pub(crate) blocked_reason: Option<TaskDispatchBlockReason>,
 }
 
 impl<P: TaskLanePermitProvider> TaskFileBaseComputePending<P> {
@@ -49,10 +52,16 @@ impl<P: TaskLanePermitProvider> TaskFileBaseComputePending<P> {
             contexts,
             manifest,
         } = production;
+        let remaining_hash_rows = contexts
+            .keys()
+            .filter(|identity| identity.missing().needs_md5())
+            .count();
         Self {
             dispatcher,
             contexts,
             manifest,
+            remaining_hash_rows,
+            blocked_reason: None,
         }
     }
 
@@ -104,6 +113,18 @@ struct HashedTask {
     md5: [u8; 16],
 }
 
+/// 一个并发 Hash future 的顺序化结果；JoinSet 完成顺序不代表任务文件顺序。
+struct HashReadOutcome {
+    /// dispatcher 交付任务时分配的单调序号。
+    sequence: usize,
+    /// 读取任务的完整文件身份。
+    identity: TaskFileIdentity,
+    /// 读取任务的原始行记录。
+    record: TaskFileRecord,
+    /// 读取结果；成功读取在 future 内已释放 dispatcher 交付的 permit。
+    result: Result<[u8; 16], ReadFailure>,
+}
+
 /// 已投递但尚未收到 SQLite ACK 的持久化动作。
 enum PersistAction {
     /// 已有完整内容缓存，只需补当前位置并把任务行置 C。
@@ -132,6 +153,7 @@ struct PendingPersist {
 pub(crate) async fn run_task_file_base_compute<P, H>(
     production: BaseTaskProduction<P>,
     reader: H,
+    hash_capacity: usize,
     store: &BaseStoreHandle,
     acknowledgements: &mut UnboundedReceiver<BasePersistAck>,
     cancellation: ReadCancellationToken,
@@ -140,178 +162,274 @@ where
     P: TaskLanePermitProvider,
     H: HashPermitReader<Permit = P::Permit>,
 {
-    let mut pending = TaskFileBaseComputePending::from_production(production);
-    let mut persist_queue = VecDeque::<PendingPersist>::new();
-    let mut persist_in_flight = BTreeMap::<TaskFileIdentity, PersistAction>::new();
-    // Identity 的 needs_md5 位是生产端写入的唯一 Hash 工作计数；这样在最后一项
-    // 读取完成、但尚未收到 SQLite ACK 时也能结束 Hash 阶段，不向 dispatcher 等待
-    // 已经没有队首的任务文件发布通知。
-    let mut hash_rows_remaining = pending
-        .contexts
-        .keys()
-        .filter(|identity| identity.missing().needs_md5())
-        .count();
+    let TaskFileBaseComputePending {
+        dispatcher,
+        contexts,
+        manifest,
+        remaining_hash_rows,
+        blocked_reason,
+    } = TaskFileBaseComputePending::from_production(production);
+    if hash_capacity == 0 {
+        return Err(task_error(
+            TaskFileBaseComputePending {
+                dispatcher,
+                contexts,
+                manifest,
+                remaining_hash_rows,
+                blocked_reason,
+            },
+            "基础 Hash 读取容量必须大于 0",
+        ));
+    }
 
-    while hash_rows_remaining > 0 {
-        if cancellation.is_cancelled() {
-            return Err(task_error(pending, "基础 Hash 阶段已取消"));
-        }
+    // dispatcher 只负责按 lane 交付 permit；读取 future 放入 JoinSet 后，下一次
+    // permit 等待与已有文件读取会由同一个事件循环同时推进。
+    let mut dispatcher = dispatcher;
+    let contexts = contexts;
+    let manifest = manifest;
+    let mut reads = JoinSet::<HashReadOutcome>::new();
+    let mut outcomes = Vec::<HashReadOutcome>::new();
+    let mut next_sequence = 0_usize;
+    let mut stop_reason = blocked_reason;
+    let mut hash_rows_remaining = remaining_hash_rows;
+    let mut fatal_error = None;
 
-        let mut hashed = Vec::new();
-        let mut stop_after_batch = false;
-        while hash_rows_remaining > 0 && hashed.len() < MAX_HASH_LOOKUP_BATCH {
-            let dispatch = pending
-                .dispatcher
-                .next_with_admission(cancellation.clone(), TaskDispatchAdmission::hash_only())
-                .await;
-            match dispatch {
-                Ok(TaskDispatchPoll::Task(task)) => {
-                    if task.record.known_md5.is_some() || !task.record.missing.needs_md5() {
-                        return Err(task_error(pending, "Hash admission 派发了已知 MD5 任务"));
-                    }
-                    hash_rows_remaining -= 1;
-                    let identity = task.identity.clone();
-                    if !pending.contexts.contains_key(&identity) {
-                        return Err(task_error(pending, "Hash 任务缺少对应的内存上下文"));
-                    }
-                    let record = task.record.clone();
-                    let scanned = record.scanned.clone();
-                    let read = reader
-                        .read_with_permit(scanned.clone(), task.permit, cancellation.clone(), None)
-                        .await;
-                    match read {
-                        Ok(ReadProduct { md5, lease }) => {
-                            // Hash 读取完成后立即释放调度 permit，查询和 SQLite ACK 不占用读额度。
-                            drop(lease);
-                            hashed.push(HashedTask {
-                                identity,
-                                record,
-                                md5,
+    'event_loop: while hash_rows_remaining > 0 || !reads.is_empty() {
+        if stop_reason.is_none() && hash_rows_remaining > 0 && reads.len() < hash_capacity {
+            tokio::select! {
+                result = dispatcher.next_with_admission(
+                    cancellation.clone(),
+                    TaskDispatchAdmission::hash_only(),
+                ) => {
+                    match result {
+                        Ok(TaskDispatchPoll::Task(task)) => {
+                            if task.record.known_md5.is_some() || !task.record.missing.needs_md5() {
+                                fatal_error = Some("Hash admission 派发了已知 MD5 任务".into());
+                                break 'event_loop;
+                            }
+                            let identity = task.identity.clone();
+                            if !contexts.contains_key(&identity) {
+                                fatal_error = Some("Hash 任务缺少对应的内存上下文".into());
+                                break 'event_loop;
+                            }
+                            hash_rows_remaining -= 1;
+                            let record = task.record.clone();
+                            let scanned = record.scanned.clone();
+                            let sequence = next_sequence;
+                            next_sequence += 1;
+                            let reader = reader.clone();
+                            let cancellation = cancellation.clone();
+                            reads.spawn(async move {
+                                let result = reader
+                                    .read_with_permit(scanned, task.permit, cancellation, None)
+                                    .await
+                                    .map(|product| {
+                                        // 读取 future 完成后立刻释放许可，不让后续缓存查询和 ACK
+                                        // 占用磁盘读取额度。
+                                        let md5 = product.md5;
+                                        drop(product.lease);
+                                        md5
+                                    });
+                                HashReadOutcome { sequence, identity, record, result }
                             });
                         }
-                        Err(ReadFailure::Cancelled) => {
-                            return Err(task_error(pending, "基础 Hash 阶段已取消"));
+                        Ok(TaskDispatchPoll::Blocked(reason)) => {
+                            stop_reason = Some(reason);
+                        }
+                        Ok(TaskDispatchPoll::Drained) => {
+                            fatal_error = Some("Hash dispatcher 在剩余 Hash 行前耗尽".into());
+                            break 'event_loop;
                         }
                         Err(error) => {
-                            persist_queue.push_back(failed_persist(
-                                identity,
-                                scanned,
-                                error.to_string(),
-                            ));
-                            if let Err(message) = flush_persist_queue(
-                                &mut pending,
-                                &mut persist_queue,
-                                &mut persist_in_flight,
-                                store,
-                                acknowledgements,
-                            )
-                            .await
-                            {
-                                return Err(task_error(pending, message));
-                            }
+                            fatal_error = Some(dispatch_error_message(error));
+                            break 'event_loop;
                         }
                     }
                 }
-                Ok(TaskDispatchPoll::Drained) | Ok(TaskDispatchPoll::Blocked(_)) => {
-                    stop_after_batch = true;
-                    break;
-                }
-                Err(error) => {
-                    return Err(task_error(pending, dispatch_error_message(error)));
-                }
-            }
-        }
-
-        if !hashed.is_empty() {
-            let keys = hashed
-                .iter()
-                .map(|item| ContentKey::new(item.md5, item.record.scanned.file_size))
-                .collect::<Vec<_>>();
-            let cached = match store.lookup_base_cache_by_keys(&keys) {
-                Ok(records) => records,
-                Err(error) => return Err(task_error(pending, error.to_string())),
-            };
-            if cached.len() != hashed.len() {
-                return Err(task_error(pending, "内容缓存批量查询返回数量不一致"));
-            }
-            for (hashed, cached) in hashed.into_iter().zip(cached) {
-                let Some(context) = pending.contexts.get_mut(&hashed.identity) else {
-                    return Err(task_error(pending, "Hash 结果缺少对应的内存上下文"));
-                };
-                context.cached = cached.clone();
-                context.content_id = cached.as_ref().and_then(|record| record.content_id);
-                let decision = BaseComputeDecision::for_cache(
-                    cached.as_ref(),
-                    context.contact_sheet_valid,
-                    context.force_recompute,
-                );
-                if decision.missing_parts() == 0 {
-                    let Some(cached) = cached else {
-                        return Err(task_error(pending, "完整内容缓存缺少记录"));
-                    };
-                    let action = PersistAction::Complete {
-                        scanned: hashed.record.scanned.clone(),
-                        content_key: cached.content_key,
-                    };
-                    persist_queue.push_back(complete_persist(
-                        hashed.identity,
-                        hashed.record.scanned,
-                        hashed.md5,
-                        cached.media_kind,
-                        action,
-                    ));
-                } else {
-                    let Some(missing) = TaskWorkMask::for_base(false, decision.missing_parts())
-                    else {
-                        return Err(task_error(pending, "Hash 后基础缺失掩码无效"));
-                    };
-                    let media_record = TaskFileRecord {
-                        item_id: hashed.record.item_id,
-                        work_kind: hashed.record.work_kind,
-                        scanned: hashed.record.scanned,
-                        known_md5: Some(hashed.md5),
-                        missing,
-                    };
-                    if let Err(error) = pending
-                        .dispatcher
-                        .request_media_continuation(&hashed.identity, &media_record)
-                    {
-                        return Err(task_error(pending, error.to_string()));
+                joined = reads.join_next(), if !reads.is_empty() => {
+                    if let Err(message) = collect_hash_read(joined, &mut outcomes) {
+                        fatal_error = Some(message);
+                        break 'event_loop;
                     }
                 }
             }
-            if let Err(message) = flush_persist_queue(
-                &mut pending,
-                &mut persist_queue,
-                &mut persist_in_flight,
-                store,
-                acknowledgements,
-            )
-            .await
-            {
-                return Err(task_error(pending, message));
+        } else if let Some(joined) = reads.join_next().await {
+            if let Err(message) = collect_hash_read(Some(joined), &mut outcomes) {
+                fatal_error = Some(message);
+                break 'event_loop;
             }
-        }
-
-        if stop_after_batch {
+        } else {
             break;
         }
     }
 
-    while !persist_in_flight.is_empty() || !persist_queue.is_empty() {
-        if let Err(message) = flush_persist_queue(
-            &mut pending,
-            &mut persist_queue,
-            &mut persist_in_flight,
-            store,
-            acknowledgements,
-        )
-        .await
-        {
-            return Err(task_error(pending, message));
+    // 所有 dispatcher 轮询 future 已经释放，下面重新组合 pending 交给 ACK/Media
+    // 处理函数；这也确保任何事件循环错误都能携带完整所有权返回。
+    let mut pending = TaskFileBaseComputePending {
+        dispatcher,
+        contexts,
+        manifest,
+        remaining_hash_rows,
+        blocked_reason: stop_reason,
+    };
+    if let Some(message) = fatal_error {
+        return Err(task_error(pending, message));
+    }
+
+    // 读取完成顺序可能不同于 dispatcher 顺序；按派发序号恢复输入顺序后再做批量查询。
+    outcomes.sort_by_key(|outcome| outcome.sequence);
+    let mut persist_queue = VecDeque::<PendingPersist>::new();
+    let mut persist_in_flight = BTreeMap::<TaskFileIdentity, PersistAction>::new();
+    let mut hashed_batch = Vec::with_capacity(MAX_HASH_LOOKUP_BATCH);
+    for outcome in outcomes {
+        match outcome.result {
+            Ok(md5) => {
+                hashed_batch.push(HashedTask {
+                    identity: outcome.identity,
+                    record: outcome.record,
+                    md5,
+                });
+                if hashed_batch.len() == MAX_HASH_LOOKUP_BATCH {
+                    if let Err(message) = apply_hash_batch(
+                        &mut pending,
+                        &mut hashed_batch,
+                        &mut persist_queue,
+                        &mut persist_in_flight,
+                        store,
+                        acknowledgements,
+                    )
+                    .await
+                    {
+                        return Err(task_error(pending, message));
+                    }
+                }
+            }
+            Err(ReadFailure::Cancelled) => {
+                return Err(task_error(pending, "基础 Hash 阶段已取消"));
+            }
+            Err(error) => {
+                persist_queue.push_back(failed_persist(
+                    outcome.identity,
+                    outcome.record.scanned,
+                    error.to_string(),
+                ));
+            }
         }
     }
+    if let Err(message) = apply_hash_batch(
+        &mut pending,
+        &mut hashed_batch,
+        &mut persist_queue,
+        &mut persist_in_flight,
+        store,
+        acknowledgements,
+    )
+    .await
+    {
+        return Err(task_error(pending, message));
+    }
+    if let Err(message) = flush_persist_queue(
+        &mut pending,
+        &mut persist_queue,
+        &mut persist_in_flight,
+        store,
+        acknowledgements,
+    )
+    .await
+    {
+        return Err(task_error(pending, message));
+    }
+    pending.remaining_hash_rows = hash_rows_remaining;
+    pending.blocked_reason = stop_reason;
     Ok(pending)
+}
+
+/// 收集一个读取 future 的结果；JoinSet 异常必须升级为任务级错误。
+fn collect_hash_read(
+    joined: Option<Result<HashReadOutcome, tokio::task::JoinError>>,
+    outcomes: &mut Vec<HashReadOutcome>,
+) -> Result<(), String> {
+    let joined = joined.ok_or_else(|| "Hash 读取集合提前为空".to_owned())?;
+    let outcome = joined.map_err(|error| format!("Hash 读取 future 异常结束: {error}"))?;
+    outcomes.push(outcome);
+    Ok(())
+}
+
+/// 对一批已完成 Hash 的结果做一次 ContentKey 查询并登记后续动作。
+async fn apply_hash_batch<P: TaskLanePermitProvider>(
+    pending: &mut TaskFileBaseComputePending<P>,
+    hashed: &mut Vec<HashedTask>,
+    persist_queue: &mut VecDeque<PendingPersist>,
+    persist_in_flight: &mut BTreeMap<TaskFileIdentity, PersistAction>,
+    store: &BaseStoreHandle,
+    acknowledgements: &mut UnboundedReceiver<BasePersistAck>,
+) -> Result<(), String> {
+    if hashed.is_empty() {
+        return Ok(());
+    }
+    let batch = std::mem::take(hashed);
+    let keys = batch
+        .iter()
+        .map(|item| ContentKey::new(item.md5, item.record.scanned.file_size))
+        .collect::<Vec<_>>();
+    let cached = store
+        .lookup_base_cache_by_keys(&keys)
+        .map_err(|error| error.to_string())?;
+    if cached.len() != batch.len() {
+        return Err("内容缓存批量查询返回数量不一致".into());
+    }
+
+    for (hashed, cached) in batch.into_iter().zip(cached) {
+        let Some(context) = pending.contexts.get_mut(&hashed.identity) else {
+            return Err("Hash 结果缺少对应的内存上下文".into());
+        };
+        context.cached = cached.clone();
+        context.content_id = cached.as_ref().and_then(|record| record.content_id);
+        let decision = BaseComputeDecision::for_cache(
+            cached.as_ref(),
+            context.contact_sheet_valid,
+            context.force_recompute,
+        );
+        if decision.missing_parts() == 0 {
+            let Some(cached) = cached else {
+                return Err("完整内容缓存缺少记录".into());
+            };
+            let action = PersistAction::Complete {
+                scanned: hashed.record.scanned.clone(),
+                content_key: cached.content_key,
+            };
+            persist_queue.push_back(complete_persist(
+                hashed.identity,
+                hashed.record.scanned,
+                hashed.md5,
+                cached.media_kind,
+                action,
+            ));
+        } else {
+            let Some(missing) = TaskWorkMask::for_base(false, decision.missing_parts()) else {
+                return Err("Hash 后基础缺失掩码无效".into());
+            };
+            let media_record = TaskFileRecord {
+                item_id: hashed.record.item_id,
+                work_kind: hashed.record.work_kind,
+                scanned: hashed.record.scanned,
+                known_md5: Some(hashed.md5),
+                missing,
+            };
+            pending
+                .dispatcher
+                .request_media_continuation(&hashed.identity, &media_record)
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    flush_persist_queue(
+        pending,
+        persist_queue,
+        persist_in_flight,
+        store,
+        acknowledgements,
+    )
+    .await
 }
 
 /// 将单文件读取失败包装成只在 ACK 后写 F 的消息。
@@ -495,11 +613,13 @@ mod tests {
             Arc,
             atomic::{AtomicUsize, Ordering},
         },
+        time::Duration,
     };
 
     use dedup_core::{DisplayPath, MachineId, MediaKind, NormalizedPath};
     use dedup_node_store::{BaseCacheRecord, NodeStore, ScannedPath};
     use dedup_windows::{LocalDiskKind, PhysicalDiskId, ReadCancellationToken};
+    use tokio::sync::Barrier;
 
     use crate::{
         io::{DiskReadClass, ReadFailure},
@@ -507,7 +627,10 @@ mod tests {
             BaseTaskInput, BaseTaskProducer, BaseTaskProduction, HashPermitReader,
             PlannedScannedPath, ReadProduct, TaskDiskLane,
         },
-        task_dispatch::{TaskFileDispatcher, TaskLanePermitFuture, TaskLanePermitProvider},
+        task_dispatch::{
+            TaskDispatchBlockReason, TaskFileDispatcher, TaskLanePermitFuture,
+            TaskLanePermitProvider,
+        },
         task_files::TransientTaskFileSet,
     };
 
@@ -589,6 +712,53 @@ mod tests {
                     },
                     other => other,
                 })
+            })
+        }
+    }
+
+    /// 让两个真实 Hash future 在释放前都进入读取，用于验证显式并发上限。
+    #[derive(Clone)]
+    struct ConcurrentHashReader {
+        results: Arc<BTreeMap<String, [u8; 16]>>,
+        entered: Arc<AtomicUsize>,
+        barrier: Arc<Barrier>,
+    }
+
+    impl HashPermitReader for ConcurrentHashReader {
+        type Permit = TestPermit;
+
+        fn read_with_permit(
+            &self,
+            scanned: ScannedPath,
+            permit: Self::Permit,
+            _cancellation: ReadCancellationToken,
+            _started: Option<crate::scan::HashReadStartedSignal>,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<ReadProduct<Self::Permit>, ReadFailure>>
+                    + Send
+                    + 'static,
+            >,
+        > {
+            let key = scanned.normalized_path.as_str().to_owned();
+            let path = scanned.display_path.as_path().to_path_buf();
+            let result = self.results.get(&key).copied();
+            let entered = Arc::clone(&self.entered);
+            let barrier = Arc::clone(&self.barrier);
+            Box::pin(async move {
+                entered.fetch_add(1, Ordering::SeqCst);
+                barrier.wait().await;
+                match result {
+                    Some(md5) => Ok(ReadProduct { md5, lease: permit }),
+                    None => {
+                        let _ = permit;
+                        Err(ReadFailure::Io {
+                            path,
+                            block_offset: 0,
+                            source: std::io::Error::other("测试读取器缺少路径"),
+                        })
+                    }
+                }
             })
         }
     }
@@ -719,6 +889,7 @@ mod tests {
                 (r"C:\scan-first.bin", Ok(first.content_key.md5())),
                 (r"C:\scan-second.bin", Ok(second.content_key.md5())),
             ]),
+            1,
             &handle,
             &mut acknowledgements,
             ReadCancellationToken::new(),
@@ -730,6 +901,124 @@ mod tests {
         assert_eq!(pending.manifest.cache_hits, 2);
         assert!(pending.contexts.is_empty());
         pending.dispatcher.health().unwrap();
+        drop(handle);
+        drop(acknowledgements);
+        actor.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hash_reads_enter_concurrently_up_to_explicit_capacity() {
+        let root = tempfile::tempdir().unwrap();
+        let machine = MachineId::from_sha256([0x57; 32]);
+        let mut store = NodeStore::open_in_memory(machine).unwrap();
+        let first = seed_record(
+            &mut store,
+            r"C:\seed-concurrent-first.bin",
+            [8; 16],
+            18,
+            true,
+        );
+        let second = seed_record(
+            &mut store,
+            r"C:\seed-concurrent-second.bin",
+            [9; 16],
+            19,
+            true,
+        );
+        let entered = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(3));
+        let reader = ConcurrentHashReader {
+            results: Arc::new(BTreeMap::from([
+                (
+                    NormalizedPath::new(r"C:\scan-concurrent-first.bin")
+                        .unwrap()
+                        .as_str()
+                        .to_owned(),
+                    first.content_key.md5(),
+                ),
+                (
+                    NormalizedPath::new(r"C:\scan-concurrent-second.bin")
+                        .unwrap()
+                        .as_str()
+                        .to_owned(),
+                    second.content_key.md5(),
+                ),
+            ])),
+            entered: Arc::clone(&entered),
+            barrier: Arc::clone(&barrier),
+        };
+        let pending = production(
+            root.path(),
+            &[
+                input(scanned(r"C:\scan-concurrent-first.bin", 18), lane(), None),
+                input(scanned(r"C:\scan-concurrent-second.bin", 19), lane(), None),
+            ],
+            CountingPermitProvider::default(),
+        );
+        let (actor, handle, mut acknowledgements) =
+            super::super::base_persistence::BaseStoreActor::spawn(store, 4);
+        let handle_for_run = handle.clone();
+        let join = tokio::spawn(async move {
+            run_task_file_base_compute(
+                pending,
+                reader,
+                2,
+                &handle_for_run,
+                &mut acknowledgements,
+                ReadCancellationToken::new(),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while entered.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("两个 Hash 必须在任一释放前都进入读取");
+        barrier.wait().await;
+        let pending = join.await.unwrap().unwrap();
+        assert_eq!(pending.manifest.cache_hits, 2);
+        assert_eq!(pending.remaining_hash_rows, 0);
+        assert_eq!(pending.blocked_reason, None);
+        drop(handle);
+        actor.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn media_first_blocks_hash_and_reports_remaining_hash() {
+        let root = tempfile::tempdir().unwrap();
+        let machine = MachineId::from_sha256([0x58; 32]);
+        let mut store = NodeStore::open_in_memory(machine).unwrap();
+        let cached = seed_record(&mut store, r"C:\seed-media-first.bin", [10; 16], 20, false);
+        let provider = CountingPermitProvider::default();
+        let pending = production(
+            root.path(),
+            &[
+                input(scanned(r"C:\media-first.bin", 20), lane(), Some(cached)),
+                input(scanned(r"C:\hash-after-media.bin", 21), lane(), None),
+            ],
+            provider.clone(),
+        );
+        let (actor, handle, mut acknowledgements) =
+            super::super::base_persistence::BaseStoreActor::spawn(store, 4);
+        let pending = run_task_file_base_compute(
+            pending,
+            reader(&[(r"C:\hash-after-media.bin", Ok([11; 16]))]),
+            1,
+            &handle,
+            &mut acknowledgements,
+            ReadCancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(provider.acquires.load(Ordering::SeqCst), 0);
+        assert_eq!(pending.remaining_hash_rows, 1);
+        assert_eq!(
+            pending.blocked_reason,
+            Some(TaskDispatchBlockReason::MediaPending)
+        );
+        cleanup_pending(pending);
         drop(handle);
         drop(acknowledgements);
         actor.finish().await.unwrap();
@@ -764,6 +1053,7 @@ mod tests {
             run_task_file_base_compute(
                 pending,
                 reader,
+                1,
                 &handle_for_run,
                 &mut acknowledgements,
                 ReadCancellationToken::new(),
@@ -804,6 +1094,7 @@ mod tests {
         let pending = run_task_file_base_compute(
             pending,
             reader(&[(r"C:\scan-partial.bin", Ok(cached.content_key.md5()))]),
+            1,
             &handle,
             &mut acknowledgements,
             ReadCancellationToken::new(),
@@ -858,6 +1149,7 @@ mod tests {
             run_task_file_base_compute(
                 pending,
                 reader,
+                1,
                 &handle_for_run,
                 &mut acknowledgements,
                 ReadCancellationToken::new(),
@@ -897,6 +1189,7 @@ mod tests {
         let pending = run_task_file_base_compute(
             pending,
             TestHashReader::default(),
+            1,
             &handle,
             &mut acknowledgements,
             ReadCancellationToken::new(),
@@ -923,6 +1216,7 @@ mod tests {
         let error = match run_task_file_base_compute(
             pending,
             reader(&[(r"C:\store-error.bin", Ok([7; 16]))]),
+            1,
             &handle,
             &mut acknowledgements,
             ReadCancellationToken::new(),
