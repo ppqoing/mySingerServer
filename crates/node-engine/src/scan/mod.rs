@@ -3,6 +3,7 @@
 mod base_compute;
 mod base_flow_control;
 mod base_persistence;
+mod base_task_producer;
 mod cache_resolver;
 mod engine;
 mod enumerator;
@@ -21,6 +22,10 @@ pub use base_flow_control::HashReadStartedSignal;
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub use base_persistence::{BasePersistTestController, BasePersistTestWaiter};
+pub use base_task_producer::{
+    BaseTaskInput, BaseTaskManifest, BaseTaskProducer, BaseTaskProducerError, BaseTaskProduction,
+    MAX_BASE_TASK_BATCH,
+};
 pub use dedup_windows::WindowsWalker;
 pub use engine::{
     ScanEngine, ScanOptions, ScanSummary, Stage1BatchResult, Stage1ProcessError, Stage1Processor,
