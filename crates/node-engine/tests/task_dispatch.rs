@@ -1164,3 +1164,56 @@ fn hash_only_admission_cancellation_keeps_pending_row_as_p() {
     );
     assert_eq!(provider.started().len(), 1);
 }
+
+#[test]
+fn allowed_pending_media_prevents_false_hash_admission_block() {
+    let provider = FakeProvider::default();
+    provider.set_blocked(true);
+    let mut dispatcher = new_dispatcher(provider.clone());
+    let media_lane = lane(&[36], LocalDiskKind::Hdd, 1, 1);
+    let hash_lane = lane(&[37], LocalDiskKind::Hdd, 1, 1);
+    dispatcher.register_lane(&media_lane).unwrap();
+    dispatcher.register_lane(&hash_lane).unwrap();
+    dispatcher
+        .append_batch(
+            &media_lane,
+            std::slice::from_ref(&base_record("admitted-media.bin", Some([0x36; 16]))),
+        )
+        .unwrap();
+    dispatcher
+        .append_batch(
+            &hash_lane,
+            std::slice::from_ref(&base_record("blocked-hash.bin", None)),
+        )
+        .unwrap();
+    dispatcher.seal().unwrap();
+    let cancellation = ReadCancellationToken::new();
+
+    assert!(
+        poll_with_admission(
+            &mut dispatcher,
+            &cancellation,
+            TaskDispatchAdmission::media_only()
+        )
+        .is_pending(),
+        "允许的 Media future 尚未完成时必须继续等待，不能误报 HashPending"
+    );
+    assert_eq!(
+        provider.started().len(),
+        1,
+        "禁止 Hash 不得申请 provider future"
+    );
+
+    provider.release_all();
+    let media = match poll_with_admission(
+        &mut dispatcher,
+        &cancellation,
+        TaskDispatchAdmission::media_only(),
+    ) {
+        Poll::Ready(Ok(TaskDispatchPoll::Task(task))) => task,
+        other => panic!("允许的 Media future 完成后应正常派发，实际为 {other:?}"),
+    };
+    assert_eq!(media.class, DiskReadClass::MediaDecode);
+    dispatcher.mark_failed(&media.identity).unwrap();
+    drop(media);
+}

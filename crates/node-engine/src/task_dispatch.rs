@@ -509,6 +509,16 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
         &mut self,
         admission: TaskDispatchAdmission,
     ) -> Result<Option<TaskDispatchBlockReason>, TaskDispatchError> {
+        // 允许类别的 future 仍在等待 scheduler 时必须继续等待；否则禁止类别的队首
+        // 会把本应可继续的读取误报成 Blocked。已完成的 future 会在前面的 poll 中交付。
+        if self
+            .pending
+            .values()
+            .any(|pending| admission.allows(pending.class))
+        {
+            return Ok(None);
+        }
+
         let mut hash_pending = false;
         let mut media_pending = false;
 
