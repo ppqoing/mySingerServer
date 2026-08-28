@@ -1,56 +1,17 @@
-//! node.exe 父进程门禁与替代进程宿主生命周期。
+//! node.exe 启动时的默认配置初始化与只读 bootstrap 门禁。
 
 #[path = "../src/restart_lifecycle.rs"]
 mod restart_lifecycle;
 
 use std::{
-    ffi::OsString,
     fs,
-    net::TcpListener,
     path::PathBuf,
-    process::{Command, Stdio},
-    sync::mpsc,
-    thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
-use dedup_node_engine::host_control::{NodeHostControl, NodeHostControlError};
+use dedup_core::NodeConfig;
 use dedup_windows::AppLayout;
-use restart_lifecycle::{
-    NodeRestartHost, load_or_initialize_node_config, wait_for_requested_parent,
-};
-use tokio::sync::mpsc as tokio_mpsc;
-
-#[test]
-fn wait_for_parent_gate_prevents_database_and_listener_startup() {
-    let directory = TestDirectory::new("wait-gate");
-    let database = directory.path().join("node.db");
-    let mut parent = spawn_long_running_process();
-    let parent_pid = parent.id();
-    let (started, startup) = mpsc::sync_channel(1);
-    let database_for_start = database.clone();
-    let replacement = thread::spawn(move || {
-        wait_for_requested_parent([
-            OsString::from("--wait-for-parent"),
-            OsString::from(parent_pid.to_string()),
-        ])
-        .unwrap();
-        fs::write(&database_for_start, b"opened-after-parent-exit").unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        started.send(listener).unwrap();
-    });
-
-    assert!(startup.recv_timeout(Duration::from_millis(150)).is_err());
-    assert!(!database.exists());
-    parent.kill().unwrap();
-    parent.wait().unwrap();
-
-    let listener = startup.recv_timeout(Duration::from_secs(2)).unwrap();
-    assert!(database.exists());
-    assert_ne!(listener.local_addr().unwrap().port(), 0);
-    drop(listener);
-    replacement.join().unwrap();
-}
+use restart_lifecycle::load_or_initialize_node_config;
 
 #[test]
 fn first_start_creates_default_bootstrap_then_returns_resolved_paths() {
@@ -77,83 +38,49 @@ fn first_start_creates_default_bootstrap_then_returns_resolved_paths() {
     assert!(layout.node_config().exists());
 }
 
-#[tokio::test]
-async fn replacement_spawn_failure_keeps_the_old_runtime_unsignalled() {
-    let (shutdown, mut shutdown_receiver) = tokio_mpsc::channel(1);
-    let host = NodeRestartHost::new(
-        PathBuf::from(r"Z:\missing\node.exe"),
-        std::process::id(),
-        shutdown,
-    );
-
-    let error = host.prepare_replacement("saved-sha").unwrap_err();
-    assert!(matches!(error, NodeHostControlError::Failed(_)));
-    assert!(shutdown_receiver.try_recv().is_err());
-}
-
-#[tokio::test]
-async fn prepared_host_commits_orderly_shutdown_only_once() {
-    let directory = TestDirectory::new("host-commit");
-    let script = directory.path().join("replacement.cmd");
-    let arguments = directory.path().join("arguments.txt");
+#[test]
+fn existing_config_and_bootstrap_are_not_rewritten_on_start() {
+    let directory = TestDirectory::new("bootstrap-existing");
+    let executable = directory.path().join("node.exe");
+    let layout = AppLayout::from_executable(&executable).unwrap();
+    fs::create_dir_all(layout.node_root()).unwrap();
     fs::write(
-        &script,
-        format!("@echo off\r\n>\"{}\" echo %*\r\n", arguments.display()),
+        layout.node_config(),
+        NodeConfig::default().to_toml().unwrap(),
     )
     .unwrap();
-    let (shutdown, mut shutdown_receiver) = tokio_mpsc::channel(1);
-    let host = NodeRestartHost::new(script, 515_151, shutdown);
+    fs::write(
+        layout.node_bootstrap(),
+        b"config_path = \"data/node/config.toml\"\n# preserve this file\n",
+    )
+    .unwrap();
+    let config_bytes = fs::read(layout.node_config()).unwrap();
+    let bootstrap_bytes = fs::read(layout.node_bootstrap()).unwrap();
 
-    host.prepare_replacement("saved-sha").unwrap();
-    host.commit_exit_after_response().unwrap();
-    host.commit_exit_after_response().unwrap();
+    load_or_initialize_node_config(&layout).unwrap();
 
-    assert_eq!(shutdown_receiver.recv().await, Some(()));
-    assert!(shutdown_receiver.try_recv().is_err());
-    for _ in 0..40 {
-        if arguments.exists() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    assert_eq!(
-        fs::read_to_string(arguments).unwrap().trim(),
-        "--wait-for-parent 515151"
-    );
-}
-
-#[test]
-fn wait_for_parent_rejects_malformed_command_lines() {
-    assert!(wait_for_requested_parent([OsString::from("--wait-for-parent")]).is_err());
-    assert!(wait_for_requested_parent([OsString::from("--unknown")]).is_err());
-}
-
-fn spawn_long_running_process() -> std::process::Child {
-    Command::new("ping.exe")
-        .args(["-t", "127.0.0.1"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap()
+    assert_eq!(fs::read(layout.node_config()).unwrap(), config_bytes);
+    assert_eq!(fs::read(layout.node_bootstrap()).unwrap(), bootstrap_bytes);
 }
 
 struct TestDirectory(PathBuf);
 
 impl TestDirectory {
+    /// 创建测试专用的临时便携目录。
     fn new(label: &str) -> Self {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "mysingerserver-node-restart-{label}-{}-{nonce}",
+            "mysingerserver-node-config-{label}-{}-{nonce}",
             std::process::id()
         ));
         fs::create_dir_all(&path).unwrap();
         Self(path)
     }
 
+    /// 返回临时目录路径。
     fn path(&self) -> &std::path::Path {
         &self.0
     }

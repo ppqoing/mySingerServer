@@ -30,10 +30,7 @@ pub use delete::{
     CentralDeleteItem, CentralDeleteOutcome, CentralDeletePlan, CentralDeleteResult,
     CentralDeleteSelection,
 };
-pub use schema::{
-    CentralDatabaseDiagnostics, CentralTableDiagnostic, CentralTableStatus, inspect_database,
-    validate_schema,
-};
+pub use schema::{inspect_database, validate_schema};
 pub use stage2_cache::CentralStage2CacheEntry;
 pub use stages::{
     PersistentStageState, Stage2DispatchSnapshot, Stage2DispatchWrite, TaskStageSnapshot,

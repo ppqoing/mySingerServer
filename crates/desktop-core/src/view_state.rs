@@ -139,25 +139,17 @@ pub struct ActionAvailability {
     pub reason: String,
 }
 
-/// 远程 Node 配置保存与重连验证的严格阶段。
+/// 远程 Node 配置保存的生命周期。
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum NodeConfigSavePhase {
     /// 尚未保存或只完成了配置加载。
     #[default]
     Idle,
-    /// 正在 Desktop 边界验证待保存字段。
-    Validating,
-    /// 正在向冻结的旧会话发送版本化保存请求。
+    /// 正在向节点发送版本化保存请求。
     Saving,
-    /// Node 已接受保存并准备替代进程。
-    Restarting,
-    /// 旧会话已失效，按机器 ID 和原 endpoint 等待重连。
-    WaitingForReconnect,
-    /// 已重连同一机器，正在重新加载并核对新摘要。
-    Verifying,
-    /// 机器 ID 与保存摘要均验证一致。
+    /// 节点已保存配置；需要重启 Node 后生效。
     Completed,
-    /// 校验、保存、重连或验证失败，错误文本保留。
+    /// 校验或保存失败，错误文本保留。
     Failed,
 }
 
@@ -165,11 +157,8 @@ pub enum NodeConfigSavePhase {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct NodeConfigControllerState {
     selected_node_index: Option<usize>,
-    target_machine_id: Option<String>,
-    target_endpoint: Option<NodeEndpoint>,
     snapshot: Option<proto::NodeConfigSnapshot>,
     phase: NodeConfigSavePhase,
-    saved_version_sha256: Option<String>,
     error: Option<String>,
 }
 
@@ -191,73 +180,13 @@ impl NodeConfigControllerState {
 
     /// 返回是否处于不能切换节点或修改 endpoint 的非终态。
     pub const fn is_in_progress(&self) -> bool {
-        matches!(
-            self.phase,
-            NodeConfigSavePhase::Validating
-                | NodeConfigSavePhase::Saving
-                | NodeConfigSavePhase::Restarting
-                | NodeConfigSavePhase::WaitingForReconnect
-                | NodeConfigSavePhase::Verifying
-        )
-    }
-
-    /// 返回冻结的目标物理机器 ID。
-    pub fn target_machine_id(&self) -> Option<&str> {
-        self.target_machine_id.as_deref()
-    }
-
-    /// 返回冻结的手工 endpoint。
-    pub const fn target_endpoint(&self) -> Option<&NodeEndpoint> {
-        self.target_endpoint.as_ref()
-    }
-
-    /// 返回 Node 接受保存后报告的新版本摘要。
-    pub fn saved_version_sha256(&self) -> Option<&str> {
-        self.saved_version_sha256.as_deref()
+        matches!(self.phase, NodeConfigSavePhase::Saving)
     }
 
     /// 返回终态失败原因。
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
     }
-}
-
-/// 设置诊断页展示的一条已批准文件故障投影。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FileFaultView {
-    /// 物理机器 ID。
-    pub machine_id: String,
-    /// 规范路径。
-    pub normalized_path: String,
-    /// 实际显示路径。
-    pub display_path: String,
-    /// 文件大小。
-    pub file_size: u64,
-    /// `suspected_physical_read` 或 `worker_crash`。
-    pub fault_kind: String,
-    /// 故障阶段。
-    pub stage: String,
-    /// 可选 Windows 错误码。
-    pub error_code: Option<i32>,
-    /// 最近诊断文案。
-    pub message: String,
-}
-
-/// Node 进程内最近一次磁盘满清理摘要。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DiskFullCleanupSummaryView {
-    /// 触发 Unix 毫秒。
-    pub triggered_at_unix_ms: u64,
-    /// 删除文件数。
-    pub deleted_files: u64,
-    /// 删除字节数。
-    pub deleted_bytes: u64,
-    /// 活动租约跳过数。
-    pub skipped_active: u64,
-    /// 异盘跳过数。
-    pub skipped_other_disk: u64,
-    /// 失败文件数。
-    pub failed_files: u64,
 }
 
 /// 当前选中运行任务的详情来源；Node 保留握手机器身份以隔离过期会话。
@@ -372,25 +301,6 @@ impl RuntimeTaskControllerState {
     }
 }
 
-/// 设置诊断页当前节点、分页结果和内存清理摘要。
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct FileFaultDiagnosticsState {
-    /// 当前选择节点。
-    pub selected_node_index: Option<usize>,
-    /// 选择时冻结的机器身份；离线后保留以防跨节点结果混入。
-    pub selected_machine_id: Option<String>,
-    /// 当前已加载记录。
-    pub rows: Vec<FileFaultView>,
-    /// 空字符串表示没有下一页。
-    pub next_cursor: String,
-    /// Node 最近磁盘满清理摘要。
-    pub cleanup_summary: Option<DiskFullCleanupSummaryView>,
-    /// 是否正在加载或清除。
-    pub loading: bool,
-    /// 最近诊断命令错误。
-    pub error: Option<String>,
-}
-
 /// 手工编辑节点或保存设置时的唯一边界错误。
 #[derive(Debug, Error)]
 pub enum ViewStateError {
@@ -411,14 +321,6 @@ pub enum ViewStateError {
     Core(#[from] CoreError),
 }
 
-fn clear_file_fault_page(state: &mut FileFaultDiagnosticsState) {
-    state.rows.clear();
-    state.next_cursor.clear();
-    state.cleanup_summary = None;
-    state.loading = false;
-    state.error = None;
-}
-
 /// Slint UI 每次整体替换的管理端状态快照。
 #[derive(Clone, Debug, PartialEq)]
 pub struct DesktopViewState {
@@ -428,7 +330,6 @@ pub struct DesktopViewState {
     tasks: Vec<TaskView>,
     postgres: PostgresHealth,
     node_config: NodeConfigControllerState,
-    file_faults: FileFaultDiagnosticsState,
 }
 
 impl DesktopViewState {
@@ -447,7 +348,6 @@ impl DesktopViewState {
             tasks: Vec::new(),
             postgres,
             node_config: NodeConfigControllerState::default(),
-            file_faults: FileFaultDiagnosticsState::default(),
         }
     }
 
@@ -476,23 +376,6 @@ impl DesktopViewState {
         &self.node_config
     }
 
-    /// 返回设置页文件故障诊断状态。
-    pub const fn file_faults(&self) -> &FileFaultDiagnosticsState {
-        &self.file_faults
-    }
-
-    pub(crate) fn select_file_fault_node(&mut self, index: usize, machine_id: String) {
-        self.file_faults = FileFaultDiagnosticsState {
-            selected_node_index: Some(index),
-            selected_machine_id: Some(machine_id),
-            ..FileFaultDiagnosticsState::default()
-        };
-    }
-
-    pub(crate) fn set_file_faults(&mut self, state: FileFaultDiagnosticsState) {
-        self.file_faults = state;
-    }
-
     /// 切换设置页节点时立即清除旧表单、摘要和保存状态。
     pub(crate) fn select_node_config(&mut self, index: usize) {
         self.node_config = NodeConfigControllerState {
@@ -505,17 +388,14 @@ impl DesktopViewState {
     pub(crate) fn set_node_config_snapshot(
         &mut self,
         index: usize,
-        endpoint: NodeEndpoint,
-        machine_id: String,
+        _endpoint: NodeEndpoint,
+        _machine_id: String,
         snapshot: proto::NodeConfigSnapshot,
     ) {
         self.node_config = NodeConfigControllerState {
             selected_node_index: Some(index),
-            target_machine_id: Some(machine_id),
-            target_endpoint: Some(endpoint),
             snapshot: Some(snapshot),
             phase: NodeConfigSavePhase::Idle,
-            saved_version_sha256: None,
             error: None,
         };
     }
@@ -528,19 +408,7 @@ impl DesktopViewState {
         }
     }
 
-    /// 冻结保存目标及 Node 接受的新摘要。
-    pub(crate) fn set_node_config_save_target(
-        &mut self,
-        machine_id: String,
-        endpoint: NodeEndpoint,
-        saved_version_sha256: String,
-    ) {
-        self.node_config.target_machine_id = Some(machine_id);
-        self.node_config.target_endpoint = Some(endpoint);
-        self.node_config.saved_version_sha256 = Some(saved_version_sha256);
-    }
-
-    /// 用重连验证得到的新快照完成状态机。
+    /// 用节点返回的新配置快照完成保存状态。
     pub(crate) fn complete_node_config(&mut self, snapshot: proto::NodeConfigSnapshot) {
         self.node_config.snapshot = Some(snapshot);
         self.node_config.phase = NodeConfigSavePhase::Completed;
@@ -605,11 +473,6 @@ impl DesktopViewState {
                 node.error_text = None;
             }
         }
-        if self.file_faults.selected_node_index == Some(index)
-            && connection != NodeConnectionState::Online
-        {
-            clear_file_fault_page(&mut self.file_faults);
-        }
     }
 
     /// 保存握手取得的物理机器 ID；配置文件仍只保存手工 IP:port。
@@ -617,12 +480,6 @@ impl DesktopViewState {
         let machine_id = machine_id.into();
         if let Some(node) = self.nodes.get_mut(index) {
             node.machine_id = Some(machine_id.clone());
-        }
-        if self.file_faults.selected_node_index == Some(index)
-            && self.file_faults.selected_machine_id.as_deref() != Some(machine_id.as_str())
-        {
-            self.file_faults.selected_machine_id = Some(machine_id);
-            clear_file_fault_page(&mut self.file_faults);
         }
     }
 
@@ -632,9 +489,6 @@ impl DesktopViewState {
             node.connection = NodeConnectionState::Error;
             node.error_text = Some(message.into());
             node.stats = None;
-        }
-        if self.file_faults.selected_node_index == Some(index) {
-            clear_file_fault_page(&mut self.file_faults);
         }
     }
 

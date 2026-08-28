@@ -66,26 +66,6 @@ export struct UiRuntimeFailureRow {
     message: string,
 }
 
-export struct UiFileFaultRow {
-    machine-id: string,
-    normalized-path: string,
-    display-path: string,
-    file-size: string,
-    fault-kind: int,
-    fault-kind-text: string,
-    stage: string,
-    error-code: string,
-    message: string,
-}
-
-// 数据库表行只展示固定表名、检查状态和成功后的精确行数。
-export struct UiDatabaseTableRow {
-    name: string,
-    status: string,
-    status-color: color,
-    row-count: string,
-}
-
 export struct UiGroupRow {
     id: string,
     kind: string,

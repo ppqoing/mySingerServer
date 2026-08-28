@@ -7,22 +7,17 @@ use std::{
     cell::RefCell,
     env,
     io::{self, Write},
-    path::{Path, PathBuf},
+    path::Path,
     rc::Rc,
     sync::{Arc, Mutex, MutexGuard, mpsc as std_mpsc},
     thread,
 };
 
 use dedup_core::{NodeConfig, logging::SizeRotatingWriter};
-use dedup_node_engine::{
-    actor::{NodeRuntime, SmbiosIdentityProvider},
-    config_repository::ResolvedNodePaths,
-};
+use dedup_node_engine::actor::{NodeRuntime, SmbiosIdentityProvider};
 use dedup_windows::{AppLayout, open_folder};
 use node::{TrayAction, TrayCommand, TrayState};
-use restart_lifecycle::{
-    NodeRestartHost, load_or_initialize_node_config, wait_for_requested_parent,
-};
+use restart_lifecycle::load_or_initialize_node_config;
 use tokio::sync::mpsc;
 
 slint::include_modules!();
@@ -87,7 +82,6 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CloseableLogWriter {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    wait_for_requested_parent(env::args_os().skip(1))?;
     let executable = env::current_exe()?;
     let layout = AppLayout::from_executable(&executable)?;
     let loaded = load_or_initialize_node_config(&layout)?;
@@ -96,13 +90,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (ready_sender, ready_receiver) = std_mpsc::sync_channel(1);
     let runtime_layout = layout.clone();
     let runtime_thread = thread::spawn(move || {
-        run_runtime(
-            runtime_layout,
-            loaded.config,
-            loaded.resolved,
-            executable,
-            ready_sender,
-        )
+        run_runtime(runtime_layout, loaded.config, loaded.resolved, ready_sender)
     });
     let (listen_address, commands) = ready_receiver
         .recv()
@@ -142,8 +130,7 @@ fn initialize_file_log(logs_path: &Path) -> Result<CloseableLogWriter, Box<dyn s
 fn run_runtime(
     layout: AppLayout,
     config: NodeConfig,
-    paths: ResolvedNodePaths,
-    executable: PathBuf,
+    paths: dedup_node_engine::config_repository::ResolvedNodePaths,
     ready: std_mpsc::SyncSender<
         Result<(std::net::SocketAddr, mpsc::Sender<RuntimeCommand>), String>,
     >,
@@ -153,24 +140,17 @@ fn run_runtime(
         .build()
         .map_err(|error| error.to_string())?;
     runtime.block_on(async move {
-        let (host_shutdown, mut host_shutdown_receiver) = mpsc::channel(1);
-        let host = NodeRestartHost::new(executable, std::process::id(), host_shutdown);
-        let node = match NodeRuntime::start_with_host(
-            &layout,
-            &config,
-            &paths,
-            &SmbiosIdentityProvider,
-            host,
-        )
-        .await
-        {
-            Ok(node) => node,
-            Err(error) => {
-                let message = error.to_string();
-                let _ = ready.send(Err(message.clone()));
-                return Err(message);
-            }
-        };
+        let node =
+            match NodeRuntime::start_with_paths(&layout, &config, &paths, &SmbiosIdentityProvider)
+                .await
+            {
+                Ok(node) => node,
+                Err(error) => {
+                    let message = error.to_string();
+                    let _ = ready.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
         let (commands, mut command_receiver) = mpsc::channel(16);
         ready
             .send(Ok((node.listen_address(), commands)))
@@ -191,14 +171,6 @@ fn run_runtime(
                         }
                         RuntimeCommand::Shutdown => break,
                     }
-                }
-                remote_shutdown = host_shutdown_receiver.recv() => {
-                    if remote_shutdown.is_some() {
-                        let _ = slint::invoke_from_event_loop(|| {
-                            let _ = slint::quit_event_loop();
-                        });
-                    }
-                    break;
                 }
             }
         }

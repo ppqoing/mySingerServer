@@ -1443,7 +1443,7 @@ fn settings_workspace_stays_reachable_at_minimum_size() {
         .window()
         .take_snapshot()
         .expect("滚动后的日志与诊断应完成软件渲染");
-    for label in ["诊断路径卡", "诊断动作栏"] {
+    for label in ["诊断路径卡"] {
         let card = ElementHandle::find_by_accessible_label(&window, label)
             .next()
             .unwrap_or_else(|| panic!("日志与诊断必须公开 {label}"));
@@ -1491,7 +1491,7 @@ fn remote_node_config_scroll_reaches_all_fields_without_covering_settings_menu()
         menu.absolute_position().x + menu.size().width <= scroll.absolute_position().x,
         "Node 服务自己的 ScrollView 不得覆盖 190px 二级菜单",
     );
-    for label in ["远程节点选择", "加载配置", "保存并重启"] {
+    for label in ["远程节点选择", "加载配置", "保存配置"] {
         let element = accessible(&window, label);
         assert!(
             element.absolute_position().y >= scroll.absolute_position().y

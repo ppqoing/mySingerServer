@@ -10,22 +10,21 @@ use std::{
 
 use dedup_core::{
     AnalysisRunId, DeleteMode, DesktopConfig, EnumeratorKind, LocationKey, MachineId, NodeConfig,
-    NodeEndpoint, NormalizedPath, TaskId,
+    NormalizedPath, TaskId,
 };
 use dedup_protocol::proto;
 use tokio::{
     sync::mpsc,
     task::JoinHandle,
-    time::{Instant, Interval, MissedTickBehavior, interval},
+    time::{Interval, MissedTickBehavior, interval},
 };
 use uuid::Uuid;
 
 use crate::{
     analysis::{CrossAnalysisCoordinator, CrossNodeSelection, CrossPollReport},
     central::{
-        CentralAnalysisStatus, CentralDatabaseDiagnostics, CentralDeleteOutcome,
-        CentralDeleteResult, CentralDeleteSelection, CentralError, CentralReviewDecision,
-        CentralStore, inspect_database,
+        CentralAnalysisStatus, CentralDeleteOutcome, CentralDeleteResult, CentralDeleteSelection,
+        CentralError, CentralReviewDecision, CentralStore, inspect_database,
     },
     delete::{DeleteConfirmation, ReviewGroup},
     node_session::NodeSession,
@@ -43,14 +42,12 @@ use crate::{
         SyncTriggerSender, sync_trigger_channel,
     },
     view_state::{
-        DesktopPaths, DesktopViewState, DiskFullCleanupSummaryView, FileFaultDiagnosticsState,
-        FileFaultView, NodeConfigControllerState, NodeConfigSavePhase, NodeConnectionState,
-        NodeRuntimeStats, PostgresHealth, RuntimeTaskControllerState, RuntimeTaskDetailsView,
-        TaskView, ViewTaskState,
+        DesktopPaths, DesktopViewState, NodeConfigControllerState, NodeConfigSavePhase,
+        NodeConnectionState, NodeRuntimeStats, PostgresHealth, RuntimeTaskControllerState,
+        RuntimeTaskDetailsView, TaskView, ViewTaskState,
     },
 };
 
-const NODE_CONFIG_RECONNECT_ATTEMPTS: u64 = 3;
 const RUNTIME_TASK_REFRESH_SECONDS: u64 = 2;
 /// Node 主动运行事件桥的固定有界容量，发送方在满载时等待消费。
 const RUNTIME_EVENT_BRIDGE_CAPACITY: usize = 64;
@@ -188,37 +185,12 @@ pub enum UiCommand {
         /// 用户当前选择的节点列表索引。
         node_index: usize,
     },
-    /// 使用已加载摘要保存远程配置并等待同一机器重连验证。
-    SaveNodeConfigAndRestart {
+    /// 使用已加载摘要保存远程 Node 配置；新配置在重启 Node 后生效。
+    SaveNodeConfig {
         /// 用户发起操作时的节点列表索引。
         node_index: usize,
         /// 设置页提交的完整 wire 配置值。
         config: proto::NodeConfigValue,
-    },
-    /// 由 core 冻结诊断目标身份并立即清除旧页。
-    SelectFileFaultNode {
-        /// 手工节点索引。
-        node_index: usize,
-        /// 当前 UI 行观察到的机器身份。
-        machine_id: String,
-    },
-    /// 分页加载指定在线节点的文件故障。
-    LoadFileFaults {
-        /// 手工节点索引。
-        node_index: usize,
-        /// 空字符串表示第一页。
-        cursor: String,
-    },
-    /// 精确清除一条 `(机器,规范路径,类别)` 文件故障。
-    ClearFileFault {
-        /// 手工节点索引。
-        node_index: usize,
-        /// 物理机器 ID。
-        machine_id: String,
-        /// 规范路径。
-        normalized_path: String,
-        /// 稳定小写故障类别。
-        fault_kind: String,
     },
     /// 切换任务中心选中项并立即拉取其详情。
     SelectRuntimeTask {
@@ -227,7 +199,7 @@ pub enum UiCommand {
     },
     /// 保存完整配置；校验失败保持旧配置。
     SaveSettings(DesktopConfig),
-    /// 使用页面当前未保存的连接串测试 PostgreSQL 并读取固定表行数。
+    /// 使用页面当前未保存的连接串测试 PostgreSQL schema。
     TestDatabaseConnection {
         /// 由 UI 基础字段编码得到的临时连接串。
         url: String,
@@ -252,12 +224,10 @@ pub enum UiEvent {
     ViewChanged(Box<DesktopViewState>),
     /// 远程 Node 配置表单或保存阶段已经改变。
     NodeConfigChanged(NodeConfigControllerState),
-    /// 文件故障分页、选择和最近清理摘要已改变。
-    FileFaultsChanged(FileFaultDiagnosticsState),
     /// 运行任务摘要、选择、详情或 stale 状态已经改变。
     RuntimeTasksChanged(RuntimeTaskControllerState),
-    /// 临时数据库连接测试及固定表精确计数已经完成。
-    DatabaseDiagnosticsChanged(Result<CentralDatabaseDiagnostics, String>),
+    /// 临时数据库连接测试及固定 schema 校验已经完成。
+    DatabaseDiagnosticsChanged(Result<(), String>),
     /// 返回一页路径浏览结果。
     PathsChanged {
         /// 结果所属节点。
@@ -398,14 +368,6 @@ struct ActiveCrossAnalysis {
     node_count: usize,
 }
 
-#[derive(Clone)]
-struct PendingNodeConfigSave {
-    machine_id: String,
-    endpoint: NodeEndpoint,
-    saved_version_sha256: String,
-    deadline: Instant,
-}
-
 /// 一个节点独占的同步触发端和后台任务；丢弃时立即结束其 PG 连接与同步请求。
 struct NodeSyncWorker {
     id: Uuid,
@@ -495,7 +457,6 @@ async fn run_controller(
     let mut cross_analysis: Option<ActiveCrossAnalysis> = None;
     let mut loaded_members: Option<LoadedMembersContext> = None;
     let mut prepared_delete: Option<PreparedDeleteContext> = None;
-    let mut pending_node_config: Option<PendingNodeConfigSave> = None;
     let mut reconnect_ticks = repeating_interval(state.config().reconnect_interval_seconds);
     let mut catch_up_ticks = repeating_interval(AUTO_CATCH_UP_INTERVAL_SECONDS);
     let mut runtime_ticks = runtime_task_interval();
@@ -511,24 +472,11 @@ async fn run_controller(
                 None => break,
             },
             _ = reconnect_ticks.tick() => {
-                let pending_endpoint = pending_node_config
-                    .as_ref()
-                    .map(|pending| pending.endpoint.clone());
                 reconnect_and_sync(
                     &mut state,
                     &mut sessions,
                     &mut central,
                     &mut sync_workers,
-                    &sync_result_sender,
-                    pending_endpoint.as_ref(),
-                    &runtime_tasks,
-                ).await;
-                verify_reconnected_node_config(
-                    &mut state,
-                    &mut sessions,
-                    &mut sync_workers,
-                    &mut pending_node_config,
-                    &events,
                     &sync_result_sender,
                     &runtime_tasks,
                 ).await;
@@ -878,65 +826,23 @@ async fn run_controller(
                 if state.node_config().is_in_progress() {
                     Err(node_config_target_change_error())
                 } else {
-                    pending_node_config = None;
                     state.select_node_config(node_index);
                     publish_node_config(&events, &state).await;
                     load_node_config(node_index, &mut state, &sessions, &events).await
                 }
             }
-            UiCommand::SaveNodeConfigAndRestart { node_index, config } => {
+            UiCommand::SaveNodeConfig { node_index, config } => {
                 if state.node_config().is_in_progress() {
                     Err(node_config_target_change_error())
                 } else {
-                    let result = save_node_config_and_restart(
-                        node_index,
-                        config,
-                        &mut state,
-                        &mut sessions,
-                        &mut sync_workers,
-                        &events,
-                    )
-                    .await;
-                    match result {
-                        Ok(pending) => {
-                            pending_node_config = Some(pending);
-                            Ok(())
-                        }
-                        Err(error) => {
-                            state.fail_node_config(error.clone());
-                            publish_node_config(&events, &state).await;
-                            Err(error)
-                        }
+                    let result =
+                        save_node_config(node_index, config, &mut state, &sessions, &events).await;
+                    if let Err(error) = &result {
+                        state.fail_node_config(error.clone());
+                        publish_node_config(&events, &state).await;
                     }
+                    result
                 }
-            }
-            UiCommand::LoadFileFaults { node_index, cursor } => {
-                load_file_faults(node_index, &cursor, &mut state, &sessions, &events).await
-            }
-            UiCommand::SelectFileFaultNode {
-                node_index,
-                machine_id,
-            } => {
-                state.select_file_fault_node(node_index, machine_id);
-                publish(&events, &state).await;
-                Ok(())
-            }
-            UiCommand::ClearFileFault {
-                node_index,
-                machine_id,
-                normalized_path,
-                fault_kind,
-            } => {
-                clear_file_fault(
-                    node_index,
-                    &machine_id,
-                    &normalized_path,
-                    &fault_kind,
-                    &mut state,
-                    &sessions,
-                    &events,
-                )
-                .await
             }
             UiCommand::SelectRuntimeTask { key } => {
                 runtime_view.select(key);
@@ -954,7 +860,6 @@ async fn run_controller(
                         .and_then(|_| persist(&config_path, state.config()))
                 };
                 if result.is_ok() {
-                    pending_node_config = None;
                     sessions.clear();
                     sync_workers.clear();
                     central = connect_central(&mut state).await;
@@ -1268,21 +1173,11 @@ async fn connect_missing(
     state: &mut DesktopViewState,
     sessions: &mut BTreeMap<usize, Arc<NodeSession>>,
 ) -> Vec<usize> {
-    connect_missing_except(state, sessions, None).await
-}
-
-async fn connect_missing_except(
-    state: &mut DesktopViewState,
-    sessions: &mut BTreeMap<usize, Arc<NodeSession>>,
-    excluded_endpoint: Option<&NodeEndpoint>,
-) -> Vec<usize> {
     let endpoints = state
         .nodes()
         .iter()
         .enumerate()
-        .filter(|(index, node)| {
-            !sessions.contains_key(index) && excluded_endpoint != Some(&node.endpoint)
-        })
+        .filter(|(index, _)| !sessions.contains_key(index))
         .map(|(index, node)| (index, node.endpoint.clone()))
         .collect::<Vec<_>>();
     for (index, _) in &endpoints {
@@ -1641,7 +1536,6 @@ async fn reconnect_and_sync(
     central: &mut Option<CentralStore>,
     workers: &mut BTreeMap<usize, NodeSyncWorker>,
     results: &mpsc::UnboundedSender<NodeSyncEvent>,
-    excluded_endpoint: Option<&NodeEndpoint>,
     runtime_tasks: &DesktopRuntimeTaskRegistry,
 ) {
     let report = refresh_nodes(state, sessions, central.as_ref()).await;
@@ -1650,7 +1544,7 @@ async fn reconnect_and_sync(
     if central.is_none() && state.config().postgres_url.is_some() {
         *central = connect_central(state).await;
     }
-    let connected_nodes = connect_missing_except(state, sessions, excluded_endpoint).await;
+    let connected_nodes = connect_missing(state, sessions).await;
     let mut worker_indexes = connected_nodes.clone();
     worker_indexes.extend(completed_nodes.iter().copied());
     ensure_sync_workers(
@@ -1727,150 +1621,13 @@ async fn load_node_config(
     Ok(())
 }
 
-async fn load_file_faults(
-    node_index: usize,
-    cursor: &str,
-    state: &mut DesktopViewState,
-    sessions: &BTreeMap<usize, Arc<NodeSession>>,
-    events: &mpsc::Sender<UiEvent>,
-) -> Result<(), String> {
-    let session = sessions
-        .get(&node_index)
-        .ok_or_else(|| format!("节点 {node_index} 未连接，无法加载文件故障"))?;
-    if state.file_faults().selected_node_index != Some(node_index)
-        || state.file_faults().selected_machine_id.as_deref() != Some(session.machine_id().as_str())
-    {
-        return Err("文件故障加载目标与 core 冻结节点身份不一致".into());
-    }
-    let mut loading = state.file_faults().clone();
-    loading.selected_node_index = Some(node_index);
-    loading.loading = true;
-    loading.error = None;
-    state.set_file_faults(loading.clone());
-    let _ = events.send(UiEvent::FileFaultsChanged(loading)).await;
-    let page = match session.list_file_faults(cursor, 100).await {
-        Ok(page) => page,
-        Err(error) => {
-            let message = error.to_string();
-            fail_file_fault_diagnostics(state, events, &message).await;
-            return Err(message);
-        }
-    };
-    let mut rows = if cursor.is_empty() {
-        Vec::new()
-    } else {
-        state.file_faults().rows.clone()
-    };
-    for fault in page.faults {
-        let kind = match proto::FileFaultKind::try_from(fault.fault_kind) {
-            Ok(kind) => kind,
-            Err(_) => {
-                let message = "节点返回未知文件故障类别";
-                fail_file_fault_diagnostics(state, events, message).await;
-                return Err(message.into());
-            }
-        };
-        if kind == proto::FileFaultKind::Unspecified {
-            let message = "节点返回空文件故障类别";
-            fail_file_fault_diagnostics(state, events, message).await;
-            return Err(message.into());
-        }
-        rows.push(FileFaultView {
-            machine_id: fault.machine_id,
-            normalized_path: fault.normalized_path,
-            display_path: fault.display_path,
-            file_size: fault.file_size,
-            fault_kind: file_fault_kind_name(kind).into(),
-            stage: fault.stage,
-            error_code: fault.error_code,
-            message: fault.message,
-        });
-    }
-    let diagnostics = FileFaultDiagnosticsState {
-        selected_node_index: Some(node_index),
-        selected_machine_id: Some(session.machine_id().as_str().to_owned()),
-        rows,
-        next_cursor: page.next_cursor,
-        cleanup_summary: page
-            .cleanup_summary
-            .map(|summary| DiskFullCleanupSummaryView {
-                triggered_at_unix_ms: summary.triggered_at_unix_ms,
-                deleted_files: summary.deleted_files,
-                deleted_bytes: summary.deleted_bytes,
-                skipped_active: summary.skipped_active,
-                skipped_other_disk: summary.skipped_other_disk,
-                failed_files: summary.failed_files,
-            }),
-        loading: false,
-        error: None,
-    };
-    state.set_file_faults(diagnostics.clone());
-    let _ = events.send(UiEvent::FileFaultsChanged(diagnostics)).await;
-    Ok(())
-}
-
-async fn clear_file_fault(
-    node_index: usize,
-    machine_id: &str,
-    normalized_path: &str,
-    fault_kind: &str,
-    state: &mut DesktopViewState,
-    sessions: &BTreeMap<usize, Arc<NodeSession>>,
-    events: &mpsc::Sender<UiEvent>,
-) -> Result<(), String> {
-    let session = sessions
-        .get(&node_index)
-        .ok_or_else(|| format!("节点 {node_index} 未连接，无法清除文件故障"))?;
-    if state.file_faults().selected_node_index != Some(node_index)
-        || state.file_faults().selected_machine_id.as_deref() != Some(machine_id)
-        || session.machine_id().as_str() != machine_id
-    {
-        return Err("文件故障清除目标与 core 冻结节点身份不一致".into());
-    }
-    let kind = match fault_kind {
-        "suspected_physical_read" => proto::FileFaultKind::SuspectedPhysicalRead,
-        "worker_crash" => proto::FileFaultKind::WorkerCrash,
-        _ => return Err("文件故障类别无效".into()),
-    };
-    session
-        .clear_file_fault(machine_id, normalized_path, kind)
-        .await
-        .map_err(|error| error.to_string())?;
-    state.select_file_fault_node(node_index, machine_id.to_owned());
-    load_file_faults(node_index, "", state, sessions, events).await
-}
-
-async fn fail_file_fault_diagnostics(
-    state: &mut DesktopViewState,
-    events: &mpsc::Sender<UiEvent>,
-    message: &str,
-) {
-    let mut failed = state.file_faults().clone();
-    failed.rows.clear();
-    failed.next_cursor.clear();
-    failed.cleanup_summary = None;
-    failed.loading = false;
-    failed.error = Some(message.into());
-    state.set_file_faults(failed.clone());
-    let _ = events.send(UiEvent::FileFaultsChanged(failed)).await;
-}
-
-const fn file_fault_kind_name(kind: proto::FileFaultKind) -> &'static str {
-    match kind {
-        proto::FileFaultKind::SuspectedPhysicalRead => "suspected_physical_read",
-        proto::FileFaultKind::WorkerCrash => "worker_crash",
-        proto::FileFaultKind::Unspecified => "",
-    }
-}
-
-async fn save_node_config_and_restart(
+async fn save_node_config(
     node_index: usize,
     config: proto::NodeConfigValue,
     state: &mut DesktopViewState,
-    sessions: &mut BTreeMap<usize, Arc<NodeSession>>,
-    sync_workers: &mut BTreeMap<usize, NodeSyncWorker>,
+    sessions: &BTreeMap<usize, Arc<NodeSession>>,
     events: &mpsc::Sender<UiEvent>,
-) -> Result<PendingNodeConfigSave, String> {
+) -> Result<(), String> {
     let loaded = state.node_config();
     if loaded.selected_node_index() != Some(node_index) {
         return Err("保存目标与已加载远程配置不是同一节点".into());
@@ -1880,203 +1637,47 @@ async fn save_node_config_and_restart(
         .ok_or_else(|| "请先加载远程 Node 配置".to_owned())?
         .version_sha256
         .clone();
-    let loaded_machine_id = loaded
-        .target_machine_id()
-        .ok_or_else(|| "已加载配置缺少目标机器 ID".to_owned())?
-        .to_owned();
-    let loaded_endpoint = loaded
-        .target_endpoint()
-        .ok_or_else(|| "已加载配置缺少目标 endpoint".to_owned())?
-        .clone();
+    let previous_snapshot = loaded
+        .snapshot()
+        .cloned()
+        .ok_or_else(|| "请先加载远程 Node 配置".to_owned())?;
     let session = sessions
         .get(&node_index)
         .cloned()
         .ok_or_else(|| format!("节点 {node_index} 未连接，无法保存远程配置"))?;
-    if session.machine_id().as_str() != loaded_machine_id || session.endpoint() != &loaded_endpoint
-    {
-        return Err(format!(
-            "节点会话已变化：加载目标 {} / {}:{}，当前会话 {} / {}:{}",
-            loaded_machine_id,
-            loaded_endpoint.ip,
-            loaded_endpoint.port,
-            session.machine_id().as_str(),
-            session.endpoint().ip,
-            session.endpoint().port
-        ));
-    }
-    let machine_id = loaded_machine_id;
-    let endpoint = loaded_endpoint;
-
-    state.set_node_config_phase(NodeConfigSavePhase::Validating);
-    publish_node_config(events, state).await;
     NodeConfig::try_from(config.clone()).map_err(|error| error.to_string())?;
 
     state.set_node_config_phase(NodeConfigSavePhase::Saving);
     publish_node_config(events, state).await;
-    let accepted = session
-        .save_node_config_and_restart(&expected_version_sha256, config)
+    let saved_config = config.clone();
+    let saved = session
+        .save_node_config(&expected_version_sha256, config)
         .await
         .map_err(|error| error.to_string())?;
-    if accepted.machine_id != machine_id {
+    if saved.machine_id != session.machine_id().as_str() {
         return Err(format!(
-            "保存响应机器不匹配：目标 {machine_id}，响应 {}",
-            accepted.machine_id
+            "保存响应机器不匹配：目标 {}，响应 {}",
+            session.machine_id().as_str(),
+            saved.machine_id
         ));
     }
-    if accepted.saved_version_sha256.is_empty() {
+    if saved.saved_version_sha256.is_empty() {
         return Err("保存响应缺少新配置摘要".into());
     }
-
-    state.set_node_config_save_target(
-        machine_id.clone(),
-        endpoint.clone(),
-        accepted.saved_version_sha256.clone(),
-    );
-    state.set_node_config_phase(NodeConfigSavePhase::Restarting);
-    publish_node_config(events, state).await;
-
-    sessions.remove(&node_index);
-    sync_workers.remove(&node_index);
-    state.set_node_connection(node_index, NodeConnectionState::Offline, None);
-    state.set_node_config_phase(NodeConfigSavePhase::WaitingForReconnect);
-    publish_node_config(events, state).await;
-
-    let timeout_seconds = state
-        .config()
-        .reconnect_interval_seconds
-        .saturating_mul(NODE_CONFIG_RECONNECT_ATTEMPTS)
-        .max(1);
-    Ok(PendingNodeConfigSave {
-        machine_id,
-        endpoint,
-        saved_version_sha256: accepted.saved_version_sha256,
-        deadline: Instant::now() + Duration::from_secs(timeout_seconds),
-    })
-}
-
-async fn verify_reconnected_node_config(
-    state: &mut DesktopViewState,
-    sessions: &mut BTreeMap<usize, Arc<NodeSession>>,
-    sync_workers: &mut BTreeMap<usize, NodeSyncWorker>,
-    pending: &mut Option<PendingNodeConfigSave>,
-    events: &mpsc::Sender<UiEvent>,
-    sync_results: &mpsc::UnboundedSender<NodeSyncEvent>,
-    runtime_tasks: &DesktopRuntimeTaskRegistry,
-) {
-    let Some(target) = pending.clone() else {
-        return;
+    let snapshot = proto::NodeConfigSnapshot {
+        machine_id: saved.machine_id,
+        version_sha256: saved.saved_version_sha256,
+        config: Some(saved_config),
+        logical_cpu_count: previous_snapshot.logical_cpu_count,
+        effective_worker_count: previous_snapshot.effective_worker_count,
     };
-    if Instant::now() >= target.deadline {
-        state.fail_node_config(node_config_timeout_message(&target));
-        pending.take();
-        publish_node_config(events, state).await;
-        return;
-    }
-
-    let existing = sessions
-        .iter()
-        .find(|(_, session)| session.endpoint() == &target.endpoint)
-        .map(|(index, session)| (*index, Arc::clone(session)));
-    let (index, session) = if let Some(candidate) = existing {
-        candidate
-    } else {
-        let session = match NodeSession::connect(target.endpoint.clone()).await {
-            Ok(session) => Arc::new(session),
-            Err(_) => {
-                if Instant::now() >= target.deadline {
-                    state.fail_node_config(node_config_timeout_message(&target));
-                    pending.take();
-                    publish_node_config(events, state).await;
-                }
-                return;
-            }
-        };
-        if Instant::now() >= target.deadline {
-            state.fail_node_config(node_config_timeout_message(&target));
-            pending.take();
-            publish_node_config(events, state).await;
-            return;
-        }
-        let Some(index) = state
-            .nodes()
-            .iter()
-            .position(|node| node.endpoint == target.endpoint)
-        else {
-            state.fail_node_config("等待重连期间目标 endpoint 已从配置移除");
-            pending.take();
-            publish_node_config(events, state).await;
-            return;
-        };
-        (index, session)
-    };
-
-    if session.machine_id().as_str() != target.machine_id {
-        let message = format!(
-            "重连机器不匹配：目标 {}，实际 {}",
-            target.machine_id,
-            session.machine_id().as_str()
-        );
-        sessions.remove(&index);
-        sync_workers.remove(&index);
-        state.set_node_error(index, message.clone());
-        state.fail_node_config(message);
-        pending.take();
-        publish_node_config(events, state).await;
-        return;
-    }
-
-    state.set_node_config_phase(NodeConfigSavePhase::Verifying);
+    state.complete_node_config(snapshot);
     publish_node_config(events, state).await;
-    let result = session.get_node_config().await;
-    match result {
-        Ok(snapshot)
-            if snapshot.machine_id == target.machine_id
-                && snapshot.version_sha256 == target.saved_version_sha256 =>
-        {
-            state.set_node_identity(index, target.machine_id.clone());
-            state.set_node_connection(index, NodeConnectionState::Online, None);
-            sessions.insert(index, Arc::clone(&session));
-            state.complete_node_config(snapshot);
-            ensure_sync_workers(
-                &[index],
-                sessions,
-                state.config().postgres_url.as_deref(),
-                sync_workers,
-                sync_results,
-                runtime_tasks,
-            );
-            queue_automatic(&[index], sync_workers, AutomaticSyncCause::Connected).await;
-        }
-        Ok(snapshot) => {
-            let message = format!(
-                "重连配置验证失败：目标机器 {} / 摘要 {}，实际机器 {} / 摘要 {}",
-                target.machine_id,
-                target.saved_version_sha256,
-                snapshot.machine_id,
-                snapshot.version_sha256
-            );
-            state.set_node_error(index, message.clone());
-            state.fail_node_config(message);
-        }
-        Err(error) => {
-            let message = format!("重连后加载 Node 配置失败：{error}");
-            state.set_node_error(index, message.clone());
-            state.fail_node_config(message);
-        }
-    }
-    pending.take();
-    publish_node_config(events, state).await;
-}
-
-fn node_config_timeout_message(target: &PendingNodeConfigSave) -> String {
-    format!(
-        "等待机器 {} 在 {}:{} 重连超时",
-        target.machine_id, target.endpoint.ip, target.endpoint.port
-    )
+    Ok(())
 }
 
 fn node_config_target_change_error() -> String {
-    "远程 Node 配置重启验证进行中，不能切换、编辑或移除目标节点".into()
+    "远程 Node 配置保存进行中，不能切换、编辑或移除目标节点".into()
 }
 
 async fn publish_node_config(events: &mpsc::Sender<UiEvent>, state: &DesktopViewState) {

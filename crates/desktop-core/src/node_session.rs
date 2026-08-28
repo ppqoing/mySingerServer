@@ -155,72 +155,24 @@ impl NodeSession {
         }
     }
 
-    /// 携带加载时摘要请求节点原子保存配置并准备自重启。
-    pub async fn save_node_config_and_restart(
+    /// 携带加载时摘要请求节点原子保存配置；新配置在 Node 重启后生效。
+    pub async fn save_node_config(
         &self,
         expected_version_sha256: &str,
         config: proto::NodeConfigValue,
-    ) -> Result<proto::NodeRestartAccepted, SessionError> {
+    ) -> Result<proto::NodeConfigSaved, SessionError> {
         let response = self
             .connection
-            .request(proto::envelope::Payload::SaveNodeConfigAndRestart(
-                proto::SaveNodeConfigAndRestart {
+            .request(proto::envelope::Payload::SaveNodeConfig(
+                proto::SaveNodeConfig {
                     expected_version_sha256: expected_version_sha256.into(),
                     config: Some(config),
                 },
             ))
             .await?;
         match payload_or_error(response)? {
-            proto::envelope::Payload::NodeRestartAccepted(accepted) => Ok(accepted),
-            _ => Err(SessionError::UnexpectedResponse("NodeRestartAccepted")),
-        }
-    }
-
-    /// 分页读取节点持久文件故障和进程内最近磁盘满清理摘要。
-    pub async fn list_file_faults(
-        &self,
-        cursor: &str,
-        limit: u32,
-    ) -> Result<proto::ListFileFaults, SessionError> {
-        let response = self
-            .connection
-            .request(proto::envelope::Payload::ListFileFaults(
-                proto::ListFileFaults {
-                    cursor: cursor.into(),
-                    limit,
-                    faults: Vec::new(),
-                    next_cursor: String::new(),
-                    cleanup_summary: None,
-                },
-            ))
-            .await?;
-        match payload_or_error(response)? {
-            proto::envelope::Payload::ListFileFaults(page) => Ok(page),
-            _ => Err(SessionError::UnexpectedResponse("ListFileFaults")),
-        }
-    }
-
-    /// 按机器、规范路径和类别精确清除一条文件故障。
-    pub async fn clear_file_fault(
-        &self,
-        machine_id: &str,
-        normalized_path: &str,
-        fault_kind: proto::FileFaultKind,
-    ) -> Result<u32, SessionError> {
-        let response = self
-            .connection
-            .request(proto::envelope::Payload::ClearFileFault(
-                proto::ClearFileFault {
-                    machine_id: machine_id.into(),
-                    normalized_path: normalized_path.into(),
-                    fault_kind: fault_kind as i32,
-                    cleared: 0,
-                },
-            ))
-            .await?;
-        match payload_or_error(response)? {
-            proto::envelope::Payload::ClearFileFault(result) => Ok(result.cleared),
-            _ => Err(SessionError::UnexpectedResponse("ClearFileFault")),
+            proto::envelope::Payload::NodeConfigSaved(saved) => Ok(saved),
+            _ => Err(SessionError::UnexpectedResponse("NodeConfigSaved")),
         }
     }
 

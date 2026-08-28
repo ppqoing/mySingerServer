@@ -4,7 +4,6 @@ use std::fmt::Write as _;
 
 use dedup_desktop_core::{
     app::PathEntryView,
-    central::{CentralDatabaseDiagnostics, CentralTableStatus},
     results::{GroupKind, GroupPage, MemberPage},
     review::ReviewDecision,
     runtime_tasks::{
@@ -19,37 +18,9 @@ use dedup_protocol::proto;
 use slint::{Color, ModelRc, SharedString, VecModel};
 
 use crate::{
-    UiDatabaseTableRow, UiGroupRow, UiMemberRow, UiNodeRow, UiPathRow, UiRuntimeFailureRow,
-    UiRuntimeStageRow, UiRuntimeWorkerRow, UiTaskRow,
+    UiGroupRow, UiMemberRow, UiNodeRow, UiPathRow, UiRuntimeFailureRow, UiRuntimeStageRow,
+    UiRuntimeWorkerRow, UiTaskRow,
 };
-
-/// 把中心固定表诊断映射为数据库页面只读行。
-pub(crate) fn database_tables(
-    diagnostics: &CentralDatabaseDiagnostics,
-) -> ModelRc<UiDatabaseTableRow> {
-    let rows = diagnostics
-        .tables
-        .iter()
-        .map(|table| {
-            let (status, status_color) = match &table.status {
-                CentralTableStatus::Ready => ("正常".into(), rgb(34, 197, 94)),
-                CentralTableStatus::Missing => ("缺失".into(), rgb(248, 113, 113)),
-                CentralTableStatus::QueryFailed(error) => {
-                    (format!("查询失败：{error}").into(), rgb(248, 113, 113))
-                }
-            };
-            UiDatabaseTableRow {
-                name: table.name.clone().into(),
-                status,
-                status_color,
-                row_count: table
-                    .row_count
-                    .map_or_else(|| "—".into(), |count| count.to_string().into()),
-            }
-        })
-        .collect::<Vec<_>>();
-    ModelRc::new(VecModel::from(rows))
-}
 
 /// 一次 `RuntimeTasksChanged` 事件对应的全部 Slint 模型和详情摘要。
 pub(crate) struct RuntimeUiModels {

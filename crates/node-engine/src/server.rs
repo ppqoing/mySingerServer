@@ -14,8 +14,6 @@ use tokio::{
     task::JoinSet,
 };
 
-const RESPONSE_FLUSH_ATTEMPTS: usize = 2;
-
 /// 节点 TCP 监听循环的启动或协议错误。
 #[derive(Debug, Error)]
 pub enum ServerError {
@@ -28,14 +26,6 @@ pub enum ServerError {
 pub trait NodeRequestHandler: Clone + Send + Sync + 'static {
     /// 处理一个已握手连接上的请求，并保留原 request_id 返回响应。
     fn handle(&self, request: proto::Envelope) -> impl Future<Output = proto::Envelope> + Send;
-
-    /// 指定 request 的响应完整写入客户端后通知业务层；业务提交失败不重写响应。
-    fn response_flushed(
-        &self,
-        _request_id: u64,
-    ) -> impl Future<Output = Result<(), String>> + Send {
-        async { Ok(()) }
-    }
 
     /// 管理连接结束后释放该连接持有的快照等短生命周期资源。
     fn connection_closed(&self) -> impl Future<Output = ()> + Send {
@@ -114,7 +104,7 @@ where
 {
     let (read, write) = stream.into_split();
     if let Err(error) = serve_connection_io(read, write, handler).await {
-        eprintln!("节点连接在响应刷出后提交重启失败，连接已关闭: {error}");
+        eprintln!("节点连接已关闭: {error}");
     }
 }
 
@@ -168,7 +158,6 @@ where
 
     let (responses, mut response_reader) = mpsc::channel::<proto::Envelope>(64);
     let mut responses = Some(responses);
-    let writer_handler = handler.clone();
     let mut runtime_events = handler.subscribe_runtime_events();
     let mut writer_task = tokio::spawn(async move {
         loop {
@@ -179,7 +168,6 @@ where
                     if write_envelope(&mut writer, &response).await.is_err() {
                         return Ok(());
                     }
-                    retry_response_flushed(&writer_handler, response.request_id).await?;
                 }
                 event = receive_runtime_event(&mut runtime_events) => {
                     match event {
@@ -260,23 +248,6 @@ fn flatten_writer_result(
     result: Result<Result<(), String>, tokio::task::JoinError>,
 ) -> Result<(), String> {
     result.map_err(|error| format!("节点响应写任务异常终止: {error}"))?
-}
-
-async fn retry_response_flushed<H>(handler: &H, request_id: u64) -> Result<(), String>
-where
-    H: NodeRequestHandler,
-{
-    let mut last_error = None;
-    for _ in 0..RESPONSE_FLUSH_ATTEMPTS {
-        match handler.response_flushed(request_id).await {
-            Ok(()) => return Ok(()),
-            Err(error) => last_error = Some(error),
-        }
-    }
-    Err(format!(
-        "request_id {request_id} 响应刷出后的宿主提交连续失败 {RESPONSE_FLUSH_ATTEMPTS} 次: {}",
-        last_error.unwrap_or_else(|| "未知错误".to_owned())
-    ))
 }
 
 async fn read_envelope<R>(reader: &mut FrameReader<R>) -> Result<proto::Envelope, ConnectionError>

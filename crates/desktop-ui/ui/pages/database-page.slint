@@ -1,7 +1,7 @@
-// 数据库页编辑桌面 PostgreSQL 连接，并展示一次真实连接测试返回的固定表精确统计。
+// 数据库页编辑桌面 PostgreSQL 连接，并展示一次真实 schema 校验结果。
 
 import { LineEdit, ScrollView, SpinBox } from "std-widgets.slint";
-import { Theme, UiDatabaseTableRow } from "../theme.slint";
+import { Theme } from "../theme.slint";
 import { ActionButton } from "../components/action-button.slint";
 import { FluentCard } from "../components/fluent-card.slint";
 import { SectionHeader } from "../components/section-header.slint";
@@ -27,7 +27,6 @@ export component DatabasePage inherits Rectangle {
     in property <bool> testing;
     in property <string> test-status;
     in property <string> test-error;
-    in property <[UiDatabaseTableRow]> tables;
     callback test-connection();
     callback save-settings();
 
@@ -43,7 +42,7 @@ export component DatabasePage inherits Rectangle {
             height: 48px;
             vertical-stretch: 0;
             title: "数据库";
-            subtitle: "PostgreSQL 连接、Schema 状态与固定表精确统计";
+            subtitle: "PostgreSQL 连接与 Rust V2 schema 状态";
             icon: @image-url("../assets/icons/index.png");
             ActionButton {
                 y: 7px;
@@ -113,45 +112,18 @@ export component DatabasePage inherits Rectangle {
 
         FluentCard {
             vertical-stretch: 1;
+            accessible-role: AccessibleRole.groupbox;
+            accessible-label: "数据库 schema 校验结果";
             VerticalLayout {
-                padding: 6px;
-                spacing: 0px;
-                SectionHeader { height: 38px; vertical-stretch: 0; title: "数据库表状态"; subtitle: root.test-error; icon: @image-url("../assets/icons/index.png"); }
-                Rectangle {
-                    height: Theme.table-header-height;
+                padding: 14px;
+                spacing: 10px;
+                Text { text: "Schema 校验"; height: 24px; vertical-stretch: 0; color: Theme.text; font-size: 17px; font-weight: 700; }
+                Text {
+                    text: root.test-error == "" ? "仅校验 Rust V2 schema 标记和必需列，不读取业务表统计。" : root.test-error;
+                    color: root.test-error == "" ? Theme.muted : Theme.danger;
+                    font-size: 12px;
+                    wrap: word-wrap;
                     vertical-stretch: 0;
-                    background: Theme.panel-hover;
-                    HorizontalLayout {
-                        padding-left: 12px;
-                        padding-right: 12px;
-                        spacing: 12px;
-                        Text { horizontal-stretch: 1; text: "表名"; color: Theme.muted; font-size: 11px; vertical-alignment: center; }
-                        Text { width: 260px; text: "状态"; color: Theme.muted; font-size: 11px; vertical-alignment: center; }
-                        Text { width: 140px; text: "数据条数"; color: Theme.muted; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
-                    }
-                }
-                ScrollView {
-                    vertical-stretch: 1;
-                    accessible-role: AccessibleRole.groupbox;
-                    accessible-label: "数据库表列表滚动区";
-                    VerticalLayout {
-                        spacing: 0px;
-                        for table in root.tables : Rectangle {
-                            height: Theme.table-row-height;
-                            vertical-stretch: 0;
-                            background: transparent;
-                            accessible-role: AccessibleRole.list-item;
-                            accessible-label: "数据库表：" + table.name + "；" + table.status + "；" + table.row-count + " 行";
-                            HorizontalLayout {
-                                padding-left: 12px;
-                                padding-right: 12px;
-                                spacing: 12px;
-                                Text { horizontal-stretch: 1; text: table.name; color: Theme.text; font-size: 12px; overflow: elide; vertical-alignment: center; }
-                                Text { width: 260px; text: table.status; color: table.status-color; font-size: 12px; overflow: elide; vertical-alignment: center; }
-                                Text { width: 140px; text: table.row-count; color: Theme.text; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
-                            }
-                        }
-                    }
                 }
             }
         }

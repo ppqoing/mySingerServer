@@ -1,4 +1,4 @@
-//! Node 配置的 bootstrap 定位、路径验证、摘要与可恢复双文件事务边界。
+//! Node 配置的 bootstrap 只读定位、路径验证、摘要与单文件原子保存边界。
 
 use std::{
     collections::HashMap,
@@ -16,19 +16,9 @@ use thiserror::Error;
 use uuid::Uuid;
 
 const BOOTSTRAP_FILE: &str = "bootstrap.toml";
-const JOURNAL_FILE: &str = "config-transaction.toml";
 const LOCK_FILE: &str = "config.lock";
 
 static TRANSACTION_LOCKS: OnceLock<Mutex<HashMap<String, Weak<Mutex<()>>>>> = OnceLock::new();
-
-/// 保存流程中供集成测试模拟进程突然终止的固定阶段。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ConfigSaveFailpoint {
-    /// 新完整配置替换完成，但 bootstrap 尚未替换。
-    AfterConfigReplace,
-    /// bootstrap 替换完成，但事务 journal 尚未删除。
-    AfterBootstrapReplace,
-}
 
 /// Node 配置仓库读写失败的分类。
 #[derive(Debug, Error)]
@@ -51,18 +41,6 @@ pub enum ConfigRepositoryError {
     /// bootstrap TOML 无法被解析。
     #[error("bootstrap.toml 解析失败: {0}")]
     BootstrapToml(#[source] toml::de::Error),
-    /// bootstrap TOML 无法编码。
-    #[error("bootstrap.toml 编码失败: {0}")]
-    BootstrapEncode(#[source] toml::ser::Error),
-    /// 未提交事务 journal 无法被解析。
-    #[error("配置事务 journal 无效: {0}")]
-    InvalidJournal(&'static str),
-    /// journal TOML 无法解析。
-    #[error("配置事务 journal 解析失败: {0}")]
-    JournalToml(#[source] toml::de::Error),
-    /// journal TOML 无法编码。
-    #[error("配置事务 journal 编码失败: {0}")]
-    JournalEncode(#[source] toml::ser::Error),
     /// bootstrap 指向的原始路径与完整配置内部字段不一致。
     #[error("bootstrap config_path {bootstrap} 与配置 config_path {config} 不一致")]
     ConfigPathMismatch {
@@ -85,17 +63,6 @@ pub enum ConfigRepositoryError {
         /// 当前配置文件内容的摘要。
         actual: String,
     },
-    /// 测试固定失败点模拟了替换后尚未提交时的进程中断。
-    #[error("保存流程在 {0} 模拟中断")]
-    SimulatedInterruption(&'static str),
-    /// 运行期保存错误后旧状态恢复也失败；journal 被保留，后续加载不会暴露新配置。
-    #[error("配置保存失败 {original}，恢复旧状态失败 {recovery}")]
-    RecoveryFailed {
-        /// 触发立即恢复的原始错误。
-        original: Box<ConfigRepositoryError>,
-        /// 恢复旧 bootstrap 与配置时的错误。
-        recovery: Box<ConfigRepositoryError>,
-    },
 }
 
 /// 已加载的原始 Node 配置、版本摘要与仅供本机访问的解析路径。
@@ -107,8 +74,6 @@ pub struct LoadedNodeConfig {
     pub resolved: ResolvedNodePaths,
     /// 完整配置 TOML 文件内容的 SHA-256 小写十六进制摘要。
     pub version_sha256: String,
-    config_toml: String,
-    bootstrap_toml: String,
     bootstrap_config_path: String,
 }
 
@@ -128,7 +93,6 @@ pub struct ResolvedNodePaths {
 #[derive(Debug)]
 struct RepositoryState {
     transaction: Arc<Mutex<()>>,
-    failpoint: Mutex<Option<ConfigSaveFailpoint>>,
 }
 
 /// 固定在 `node.exe` 目录的 bootstrap 与实际 Node 配置文件仓库。
@@ -150,22 +114,13 @@ impl NodeConfigRepository {
             executable_dir: executable_dir.to_path_buf(),
             state: Arc::new(RepositoryState {
                 transaction: transaction_lock_for(executable_dir),
-                failpoint: Mutex::new(None),
             }),
         }
     }
 
-    /// 创建带一次性固定中断点的仓库，仅供事务恢复行为测试。
-    pub fn with_failpoint(executable_dir: &Path, failpoint: ConfigSaveFailpoint) -> Self {
-        let repository = Self::new(executable_dir);
-        *repository.lock_failpoint() = Some(failpoint);
-        repository
-    }
-
-    /// 读取 bootstrap 所指向的完整配置，并先恢复任何未提交事务。
+    /// 读取 bootstrap 所指向的完整配置；bootstrap 只作为只读定位文件。
     pub fn load(&self) -> Result<LoadedNodeConfig, ConfigRepositoryError> {
         let _transaction = self.lock_transaction();
-        self.recover_locked()?;
         self.load_locked()
     }
 
@@ -174,16 +129,14 @@ impl NodeConfigRepository {
         self.load()
     }
 
-    /// 仅在摘要仍匹配时保存完整配置；journal 删除是唯一提交点。
+    /// 仅在摘要仍匹配时原子替换现有 config.toml，bootstrap 永不写入。
     pub fn save_if_version(
         &self,
         expected_version_sha256: &str,
         config: &NodeConfig,
     ) -> Result<LoadedNodeConfig, ConfigRepositoryError> {
         let _transaction = self.lock_transaction();
-        self.recover_locked()?;
         config.validate()?;
-        let resolved = self.resolve_paths(config)?;
         let current = self.load_locked()?;
         if expected_version_sha256 != current.version_sha256 {
             return Err(ConfigRepositoryError::VersionConflict {
@@ -191,92 +144,19 @@ impl NodeConfigRepository {
                 actual: current.version_sha256,
             });
         }
-
-        let config_toml = config.to_toml()?;
-        let bootstrap_toml = bootstrap_toml(&config.paths.config_path)?;
-        self.replace_state_locked(
-            &current,
-            &resolved.config_path,
-            &config.paths.config_path,
-            &config_toml,
-            &bootstrap_toml,
-        )
-    }
-
-    /// 仅在当前版本仍为刚保存摘要时，用先前快照的原始字节精确补偿恢复。
-    pub fn restore_if_version(
-        &self,
-        expected_new_version_sha256: &str,
-        previous: &LoadedNodeConfig,
-    ) -> Result<LoadedNodeConfig, ConfigRepositoryError> {
-        let _transaction = self.lock_transaction();
-        self.recover_locked()?;
-        let current = self.load_locked()?;
-        if expected_new_version_sha256 != current.version_sha256 {
-            return Err(ConfigRepositoryError::VersionConflict {
-                expected: expected_new_version_sha256.to_owned(),
-                actual: current.version_sha256,
+        if config.paths.config_path != current.bootstrap_config_path {
+            return Err(ConfigRepositoryError::ConfigPathMismatch {
+                bootstrap: current.bootstrap_config_path,
+                config: config.paths.config_path.clone(),
             });
         }
-        let previous_path =
-            LocalNodePath::validate(&self.executable_dir, &previous.bootstrap_config_path)?;
-        self.reject_control_path(previous_path.resolved())?;
-        self.replace_state_locked(
-            &current,
-            previous_path.resolved(),
-            &previous.bootstrap_config_path,
-            &previous.config_toml,
-            &previous.bootstrap_toml,
-        )
-    }
+        let resolved = self.resolve_paths(config)?;
 
-    fn replace_state_locked(
-        &self,
-        current: &LoadedNodeConfig,
-        target_config_path: &Path,
-        target_config_path_raw: &str,
-        target_config_toml: &str,
-        target_bootstrap_toml: &str,
-    ) -> Result<LoadedNodeConfig, ConfigRepositoryError> {
-        let config_temp = write_synced_temp(target_config_path, target_config_toml.as_bytes())?;
-        let bootstrap_temp =
-            match write_synced_temp(&self.bootstrap_path(), target_bootstrap_toml.as_bytes()) {
-                Ok(path) => path,
-                Err(error) => {
-                    discard_repository_temp(&config_temp);
-                    return Err(error);
-                }
-            };
-        let journal = ConfigTransactionJournal::from_loaded(current, target_config_path_raw);
-        if let Err(error) = self.write_journal(&journal) {
+        let config_toml = config.to_toml()?;
+        let config_temp = write_synced_temp(&resolved.config_path, config_toml.as_bytes())?;
+        if let Err(error) = replace_file(&config_temp, &resolved.config_path) {
             discard_repository_temp(&config_temp);
-            discard_repository_temp(&bootstrap_temp);
-            return Err(error);
-        }
-
-        if let Err(error) = replace_file(&config_temp, target_config_path) {
-            discard_repository_temp(&config_temp);
-            discard_repository_temp(&bootstrap_temp);
-            return self.recover_after_error(self.io_error(target_config_path, error));
-        }
-        if self.consume_failpoint(ConfigSaveFailpoint::AfterConfigReplace) {
-            return Err(ConfigRepositoryError::SimulatedInterruption(
-                "config rename 后",
-            ));
-        }
-
-        if let Err(error) = replace_file(&bootstrap_temp, &self.bootstrap_path()) {
-            discard_repository_temp(&bootstrap_temp);
-            return self.recover_after_error(self.io_error(self.bootstrap_path(), error));
-        }
-        if self.consume_failpoint(ConfigSaveFailpoint::AfterBootstrapReplace) {
-            return Err(ConfigRepositoryError::SimulatedInterruption(
-                "bootstrap rename 后",
-            ));
-        }
-
-        if let Err(error) = fs::remove_file(self.journal_path()) {
-            return self.recover_after_error(self.io_error(self.journal_path(), error));
+            return Err(self.io_error(&resolved.config_path, error));
         }
         self.load_locked()
     }
@@ -302,64 +182,8 @@ impl NodeConfigRepository {
             version_sha256: config_sha256(&config_toml),
             config,
             resolved,
-            config_toml,
-            bootstrap_toml,
             bootstrap_config_path,
         })
-    }
-
-    fn recover_locked(&self) -> Result<(), ConfigRepositoryError> {
-        let journal_path = self.journal_path();
-        if !journal_path.exists() {
-            return Ok(());
-        }
-        let journal_toml = fs::read_to_string(&journal_path)
-            .map_err(|source| self.io_error(&journal_path, source))?;
-        let journal = ConfigTransactionJournal::parse(&journal_toml)?;
-        let old_config = LocalNodePath::validate(&self.executable_dir, &journal.old_config_path)?;
-        self.reject_control_path(old_config.resolved())?;
-
-        let config_temp =
-            write_synced_temp(old_config.resolved(), journal.old_config_toml.as_bytes())?;
-        if let Err(error) = replace_file(&config_temp, old_config.resolved()) {
-            discard_repository_temp(&config_temp);
-            return Err(self.io_error(old_config.resolved(), error));
-        }
-        let bootstrap_temp = write_synced_temp(
-            &self.bootstrap_path(),
-            journal.old_bootstrap_toml.as_bytes(),
-        )?;
-        if let Err(error) = replace_file(&bootstrap_temp, &self.bootstrap_path()) {
-            discard_repository_temp(&bootstrap_temp);
-            return Err(self.io_error(self.bootstrap_path(), error));
-        }
-        fs::remove_file(&journal_path).map_err(|source| self.io_error(&journal_path, source))
-    }
-
-    fn write_journal(
-        &self,
-        journal: &ConfigTransactionJournal,
-    ) -> Result<(), ConfigRepositoryError> {
-        let journal_path = self.journal_path();
-        let temporary = write_synced_temp(&journal_path, journal.to_toml()?.as_bytes())?;
-        if let Err(error) = replace_file(&temporary, &journal_path) {
-            discard_repository_temp(&temporary);
-            return Err(self.io_error(&journal_path, error));
-        }
-        Ok(())
-    }
-
-    fn recover_after_error<T>(
-        &self,
-        original: ConfigRepositoryError,
-    ) -> Result<T, ConfigRepositoryError> {
-        match self.recover_locked() {
-            Ok(()) => Err(original),
-            Err(recovery) => Err(ConfigRepositoryError::RecoveryFailed {
-                original: Box::new(original),
-                recovery: Box::new(recovery),
-            }),
-        }
     }
 
     fn resolve_paths(
@@ -381,7 +205,7 @@ impl NodeConfigRepository {
 
     fn reject_control_path(&self, path: &Path) -> Result<(), ConfigRepositoryError> {
         let normalized = lexical_windows_path(path);
-        if [self.bootstrap_path(), self.journal_path(), self.lock_path()]
+        if [self.bootstrap_path(), self.lock_path()]
             .iter()
             .map(|control| lexical_windows_path(control))
             .any(|control| paths_equal_ignore_ascii_case(&normalized, &control))
@@ -393,22 +217,8 @@ impl NodeConfigRepository {
         Ok(())
     }
 
-    fn consume_failpoint(&self, expected: ConfigSaveFailpoint) -> bool {
-        let mut failpoint = self.lock_failpoint();
-        if *failpoint == Some(expected) {
-            *failpoint = None;
-            true
-        } else {
-            false
-        }
-    }
-
     fn bootstrap_path(&self) -> PathBuf {
         self.executable_dir.join(BOOTSTRAP_FILE)
-    }
-
-    fn journal_path(&self) -> PathBuf {
-        self.executable_dir.join(JOURNAL_FILE)
     }
 
     fn lock_path(&self) -> PathBuf {
@@ -422,88 +232,12 @@ impl NodeConfigRepository {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn lock_failpoint(&self) -> MutexGuard<'_, Option<ConfigSaveFailpoint>> {
-        self.state
-            .failpoint
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
     fn io_error(&self, path: impl AsRef<Path>, source: io::Error) -> ConfigRepositoryError {
         ConfigRepositoryError::Io {
             path: path.as_ref().to_path_buf(),
             source,
         }
     }
-}
-
-#[derive(Debug)]
-struct ConfigTransactionJournal {
-    old_bootstrap_toml: String,
-    old_config_path: String,
-    old_config_toml: String,
-    target_config_path: String,
-}
-
-impl ConfigTransactionJournal {
-    fn from_loaded(current: &LoadedNodeConfig, target_config_path: &str) -> Self {
-        Self {
-            old_bootstrap_toml: current.bootstrap_toml.clone(),
-            old_config_path: current.bootstrap_config_path.clone(),
-            old_config_toml: current.config_toml.clone(),
-            target_config_path: target_config_path.to_owned(),
-        }
-    }
-
-    fn parse(text: &str) -> Result<Self, ConfigRepositoryError> {
-        let value: toml::Value =
-            toml::from_str(text).map_err(ConfigRepositoryError::JournalToml)?;
-        let table = value
-            .as_table()
-            .ok_or(ConfigRepositoryError::InvalidJournal("根节点必须是表"))?;
-        if table.len() != 4 {
-            return Err(ConfigRepositoryError::InvalidJournal("字段必须完整且唯一"));
-        }
-        Ok(Self {
-            old_bootstrap_toml: journal_string(table, "old_bootstrap_toml")?,
-            old_config_path: journal_string(table, "old_config_path")?,
-            old_config_toml: journal_string(table, "old_config_toml")?,
-            target_config_path: journal_string(table, "target_config_path")?,
-        })
-    }
-
-    fn to_toml(&self) -> Result<String, ConfigRepositoryError> {
-        let mut table = toml::map::Map::new();
-        table.insert(
-            "old_bootstrap_toml".to_owned(),
-            toml::Value::String(self.old_bootstrap_toml.clone()),
-        );
-        table.insert(
-            "old_config_path".to_owned(),
-            toml::Value::String(self.old_config_path.clone()),
-        );
-        table.insert(
-            "old_config_toml".to_owned(),
-            toml::Value::String(self.old_config_toml.clone()),
-        );
-        table.insert(
-            "target_config_path".to_owned(),
-            toml::Value::String(self.target_config_path.clone()),
-        );
-        toml::to_string_pretty(&toml::Value::Table(table))
-            .map_err(ConfigRepositoryError::JournalEncode)
-    }
-}
-
-fn journal_string(
-    table: &toml::map::Map<String, toml::Value>,
-    field: &'static str,
-) -> Result<String, ConfigRepositoryError> {
-    table
-        .get(field)
-        .and_then(toml::Value::as_str)
-        .map(str::to_owned)
-        .ok_or(ConfigRepositoryError::InvalidJournal(field))
 }
 
 fn parse_bootstrap(text: &str) -> Result<String, ConfigRepositoryError> {
@@ -523,16 +257,6 @@ fn parse_bootstrap(text: &str) -> Result<String, ConfigRepositoryError> {
         .ok_or(ConfigRepositoryError::InvalidBootstrap(
             "config_path 必须是字符串",
         ))
-}
-
-fn bootstrap_toml(config_path: &str) -> Result<String, ConfigRepositoryError> {
-    let mut table = toml::map::Map::new();
-    table.insert(
-        "config_path".to_owned(),
-        toml::Value::String(config_path.to_owned()),
-    );
-    toml::to_string_pretty(&toml::Value::Table(table))
-        .map_err(ConfigRepositoryError::BootstrapEncode)
 }
 
 fn config_sha256(text: &str) -> String {

@@ -1,6 +1,6 @@
 // desktop.exe 唯一主窗口；页面只通过属性与回调接触 Rust。
 
-import { Theme, UiDatabaseTableRow, UiFileFaultRow, UiGroupRow, UiMemberRow, UiNodeRow, UiPathRow, UiRuntimeFailureRow, UiRuntimeStageRow, UiRuntimeWorkerRow, UiScanRootRow, UiTaskRow } from "theme.slint";
+import { Theme, UiGroupRow, UiMemberRow, UiNodeRow, UiPathRow, UiRuntimeFailureRow, UiRuntimeStageRow, UiRuntimeWorkerRow, UiScanRootRow, UiTaskRow } from "theme.slint";
 import { DeleteDialog } from "components/delete-dialog.slint";
 import { PathPickerDialog } from "components/path-picker-dialog.slint";
 import { AppShell } from "layout/app-shell.slint";
@@ -50,7 +50,6 @@ export component MainWindow inherits Window {
     in-out property <bool> database-testing: false;
     in-out property <string> database-test-status;
     in-out property <string> database-test-error;
-    in-out property <[UiDatabaseTableRow]> database-tables;
     in property <string> data-path;
     in property <string> logs-path;
     in property <string> cache-path;
@@ -170,13 +169,6 @@ export component MainWindow inherits Window {
     in-out property <string> node-config-postgres-password;
     in-out property <int> node-config-postgres-timeout-seconds: 3;
 
-    in-out property <int> file-fault-selected-node: 0;
-    in-out property <bool> file-fault-node-online: false;
-    in-out property <bool> file-fault-loading: false;
-    in-out property <[UiFileFaultRow]> file-fault-rows;
-    in-out property <string> file-fault-next-cursor;
-    in-out property <string> file-fault-error;
-    in-out property <string> disk-cleanup-summary: "尚无磁盘满清理记录";
 
     callback add-node(string, int);
     callback edit-node(int, string, int);
@@ -207,11 +199,8 @@ export component MainWindow inherits Window {
     callback test-database-connection();
     callback select-node-config(int);
     callback load-node-config();
-    callback save-node-config-and-restart();
+    callback save-node-config();
     callback node-config-edited();
-    callback select-file-fault-node(int);
-    callback load-file-faults(bool);
-    callback clear-file-fault(int);
     callback navigate-to(int);
 
     navigate-to(index) => {
@@ -375,20 +364,10 @@ export component MainWindow inherits Window {
                     node-postgres-username <=> root.node-config-postgres-username;
                     node-postgres-password <=> root.node-config-postgres-password;
                     node-postgres-timeout-seconds <=> root.node-config-postgres-timeout-seconds;
-                    file-fault-selected-node <=> root.file-fault-selected-node;
-                    file-fault-node-online: root.file-fault-node-online;
-                    file-fault-loading: root.file-fault-loading;
-                    file-fault-rows: root.file-fault-rows;
-                    file-fault-next-cursor: root.file-fault-next-cursor;
-                    file-fault-error: root.file-fault-error;
-                    disk-cleanup-summary: root.disk-cleanup-summary;
                     select-node(index) => { root.select-node-config(index); }
                     load-node => { root.load-node-config(); }
-                    save-node => { root.save-node-config-and-restart(); }
+                    save-node => { root.save-node-config(); }
                     node-edited => { root.node-config-edited(); }
-                    select-file-fault-node(index) => { root.select-file-fault-node(index); }
-                    load-file-faults(next-page) => { root.load-file-faults(next-page); }
-                    clear-file-fault(index) => { root.clear-file-fault(index); }
                     save-settings => { root.save-settings(); }
                 }
                 if root.current-page == 8 : DatabasePage {
@@ -397,7 +376,7 @@ export component MainWindow inherits Window {
                     postgres-database <=> root.postgres-database; postgres-username <=> root.postgres-username;
                     postgres-password <=> root.postgres-password; reconnect-seconds <=> root.reconnect-seconds;
                     testing: root.database-testing; test-status: root.database-test-status;
-                    test-error: root.database-test-error; tables: root.database-tables;
+                    test-error: root.database-test-error;
                     test-connection => { root.test-database-connection(); }
                     save-settings => { root.save-settings(); }
                 }

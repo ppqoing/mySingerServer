@@ -12,11 +12,11 @@ use std::{
 
 use dedup_core::{
     AnalysisRunId, ContentKey, CoreError, DeleteMode, DiskReadConfig, DisplayPath, EnumeratorKind,
-    LocationKey, MachineId, NodeConfig, NodePostgresConfig, NormalizedPath, TaskId, Thresholds,
+    LocationKey, MachineId, NodeConfig, NodePostgresConfig, TaskId, Thresholds,
 };
 use dedup_node_store::{
-    AnalysisStatus, ConfirmedDeleteItem, DeleteBatchPlan, DeleteOutcome, FileFaultKind, GroupKind,
-    NodeStore, OwnedSnapshot, PersistentStageState as StorePersistentStageState, PlannedDeleteItem,
+    AnalysisStatus, ConfirmedDeleteItem, DeleteBatchPlan, DeleteOutcome, GroupKind, NodeStore,
+    OwnedSnapshot, PersistentStageState as StorePersistentStageState, PlannedDeleteItem,
     ReviewDecision, ScannedPath, StoreError, TaskSnapshot, TaskStageWrite, TaskStatus,
 };
 use dedup_protocol::proto;
@@ -28,7 +28,8 @@ use tokio::{
 use uuid::Uuid;
 
 use dedup_windows::{
-    AppLayout, ReadCancellationToken, machine_id_from_fields, read_physical_machine_fields,
+    AppLayout, LocalNodePath, ReadCancellationToken, machine_id_from_fields,
+    read_physical_machine_fields,
 };
 
 #[cfg(feature = "test-hooks")]
@@ -45,7 +46,6 @@ use crate::{
     },
     delete::DeleteEngine,
     disk_full_cleanup::{DiskFullCleaner, SystemArtifactDiskResolver},
-    host_control::NodeHostControl,
     preview::{PreviewKind, PreviewService},
     runtime_tasks::{
         RuntimeFailureUpdate, RuntimeProgressPublisher, RuntimeProgressUnit, RuntimeStage,
@@ -135,17 +135,6 @@ impl NodeEngineHandle {
     async fn connection_closed(&self) {
         let _ = self.commands.send(EngineCommand::ConnectionClosed).await;
     }
-
-    async fn response_flushed(&self, request_id: u64) -> Result<(), String> {
-        let (reply, response) = oneshot::channel();
-        self.commands
-            .send(EngineCommand::ResponseFlushed(request_id, reply))
-            .await
-            .map_err(|_| "节点计算引擎已经关闭".to_owned())?;
-        response
-            .await
-            .map_err(|_| "节点计算引擎没有返回刷出确认".to_owned())?
-    }
 }
 
 /// 供 actor 使用且不暴露仓库内部恢复字段的配置状态。
@@ -156,7 +145,6 @@ pub struct NodeConfigState {
     pub config: NodeConfig,
     /// 当前完整配置文件的 SHA-256 摘要。
     pub version_sha256: String,
-    repository_snapshot: Option<LoadedNodeConfig>,
 }
 
 impl NodeConfigState {
@@ -166,7 +154,6 @@ impl NodeConfigState {
         Self {
             config,
             version_sha256: version_sha256.into(),
-            repository_snapshot: None,
         }
     }
 
@@ -174,7 +161,6 @@ impl NodeConfigState {
         Self {
             config: loaded.config.clone(),
             version_sha256: loaded.version_sha256.clone(),
-            repository_snapshot: Some(loaded),
         }
     }
 }
@@ -191,13 +177,6 @@ pub trait NodeConfigRepositoryAccess: Send + Sync {
         expected_version_sha256: &str,
         config: &NodeConfig,
     ) -> Result<NodeConfigState, ConfigRepositoryError>;
-
-    /// 仅在当前仍为新摘要时恢复保存前冻结的完整状态。
-    fn restore_if_version(
-        &self,
-        expected_new_version_sha256: &str,
-        previous: &NodeConfigState,
-    ) -> Result<NodeConfigState, ConfigRepositoryError>;
 }
 
 impl NodeConfigRepositoryAccess for NodeConfigRepository {
@@ -211,22 +190,6 @@ impl NodeConfigRepositoryAccess for NodeConfigRepository {
         config: &NodeConfig,
     ) -> Result<NodeConfigState, ConfigRepositoryError> {
         NodeConfigRepository::save_if_version(self, expected_version_sha256, config)
-            .map(NodeConfigState::from_loaded)
-    }
-
-    fn restore_if_version(
-        &self,
-        expected_new_version_sha256: &str,
-        previous: &NodeConfigState,
-    ) -> Result<NodeConfigState, ConfigRepositoryError> {
-        let snapshot =
-            previous
-                .repository_snapshot
-                .as_ref()
-                .ok_or(ConfigRepositoryError::InvalidJournal(
-                    "配置快照缺少仓库恢复数据",
-                ))?;
-        NodeConfigRepository::restore_if_version(self, expected_new_version_sha256, snapshot)
             .map(NodeConfigState::from_loaded)
     }
 }
@@ -311,35 +274,21 @@ impl NodeRuntime {
     where
         I: IdentityProvider,
     {
-        let paths = ResolvedNodePaths {
-            data_path: layout.node_root().to_path_buf(),
-            config_path: layout.node_config(),
-            log_path: layout.node_logs(),
-            cache_path: layout.node_cache(),
-        };
-        Self::start_inner(layout, config, &paths, identity, None).await
+        let paths = resolve_runtime_paths(layout, config)?;
+        Self::start_inner(layout, config, &paths, identity).await
     }
 
-    /// 从仓库解析路径启动运行时，并注入应用入口拥有的替代进程宿主。
-    pub async fn start_with_host<I, H>(
+    /// 使用启动时已经解析并校验的配置路径启动 Node；生产入口应传入仓库快照中的路径。
+    pub async fn start_with_paths<I>(
         layout: &AppLayout,
         config: &NodeConfig,
         paths: &ResolvedNodePaths,
         identity: &I,
-        host_control: H,
     ) -> Result<Self, RuntimeError>
     where
         I: IdentityProvider,
-        H: NodeHostControl + 'static,
     {
-        Self::start_inner(
-            layout,
-            config,
-            paths,
-            identity,
-            Some(Box::new(host_control)),
-        )
-        .await
+        Self::start_inner(layout, config, paths, identity).await
     }
 
     async fn start_inner<I>(
@@ -347,7 +296,6 @@ impl NodeRuntime {
         config: &NodeConfig,
         paths: &ResolvedNodePaths,
         identity: &I,
-        host_control: Option<Box<dyn NodeHostControl>>,
     ) -> Result<Self, RuntimeError>
     where
         I: IdentityProvider,
@@ -388,7 +336,6 @@ impl NodeRuntime {
             config.postgres.clone(),
             effective_worker_count,
             Some(Box::new(repository)),
-            host_control,
             artifact_registry,
             disk_full_cleaner,
             Some(worker_pool_config),
@@ -405,7 +352,7 @@ impl NodeRuntime {
         })
     }
 
-    /// 返回供托盘与进程入口发送重启/关闭命令的 actor 句柄。
+    /// 返回供托盘与进程入口发送计算引擎重启/关闭命令的 actor 句柄。
     pub fn handle(&self) -> &NodeEngineHandle {
         &self.handle
     }
@@ -431,6 +378,23 @@ impl NodeRuntime {
     }
 }
 
+/// 把 Node 配置中的路径解析为实际 IO 使用的路径，避免回退到 AppLayout 默认目录。
+fn resolve_runtime_paths(
+    layout: &AppLayout,
+    config: &NodeConfig,
+) -> Result<ResolvedNodePaths, RuntimeError> {
+    let executable_dir = layout.executable_dir();
+    let resolve = |raw: &str| {
+        LocalNodePath::validate(executable_dir, raw).map(|path| path.resolved().to_path_buf())
+    };
+    Ok(ResolvedNodePaths {
+        data_path: resolve(&config.paths.data_path)?,
+        config_path: resolve(&config.paths.config_path)?,
+        log_path: resolve(&config.paths.log_path)?,
+        cache_path: resolve(&config.paths.cache_path)?,
+    })
+}
+
 impl NodeRequestHandler for NodeEngineHandle {
     fn handle(
         &self,
@@ -443,14 +407,6 @@ impl NodeRequestHandler for NodeEngineHandle {
     fn connection_closed(&self) -> impl std::future::Future<Output = ()> + Send {
         let handle = self.clone();
         async move { handle.connection_closed().await }
-    }
-
-    fn response_flushed(
-        &self,
-        request_id: u64,
-    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
-        let handle = self.clone();
-        async move { handle.response_flushed(request_id).await }
     }
 
     fn subscribe_runtime_events(
@@ -490,7 +446,6 @@ impl NodeEngine {
             NodePostgresConfig::default(),
             1,
             None,
-            None,
             artifact_registry,
             disk_full_cleaner,
             None,
@@ -498,14 +453,13 @@ impl NodeEngine {
         )
     }
 
-    /// 创建注入配置仓库和可选宿主控制器的测试 actor。
+    /// 创建注入配置仓库的测试 actor。
     #[doc(hidden)]
-    pub fn spawn_with_remote_config_for_test(
+    pub fn spawn_with_config_repository_for_test(
         store: NodeStore,
         listen_address: SocketAddr,
         cache_root: &Path,
         repository: Box<dyn NodeConfigRepositoryAccess>,
-        host_control: Option<Box<dyn NodeHostControl>>,
     ) -> (NodeEngineHandle, JoinHandle<()>) {
         let (artifact_registry, disk_full_cleaner) = test_artifact_cleanup(cache_root);
         spawn_actor(
@@ -518,7 +472,6 @@ impl NodeEngine {
             NodePostgresConfig::default(),
             1,
             Some(repository),
-            host_control,
             artifact_registry,
             disk_full_cleaner,
             None,
@@ -545,7 +498,6 @@ impl NodeEngine {
             DiskReadConfig::default(),
             NodePostgresConfig::default(),
             effective_worker_count,
-            None,
             None,
             artifact_registry,
             disk_full_cleaner,
@@ -577,7 +529,6 @@ impl NodeEngine {
             NodePostgresConfig::default(),
             effective_worker_count,
             None,
-            None,
             artifact_registry,
             disk_full_cleaner,
             None,
@@ -598,7 +549,6 @@ fn spawn_actor(
     postgres_config: NodePostgresConfig,
     effective_worker_count: usize,
     config_repository: Option<Box<dyn NodeConfigRepositoryAccess>>,
-    host_control: Option<Box<dyn NodeHostControl>>,
     artifact_registry: Arc<RegenerableArtifactRegistry>,
     disk_full_cleaner: DiskFullCleaner,
     // 生产 Node 重启时用于创建新 Pool 的不可变配置；可控测试池没有进程启动配置。
@@ -628,8 +578,6 @@ fn spawn_actor(
             active_job: None,
             commands: commands.downgrade(),
             config_repository,
-            host_control,
-            pending_restart_request_id: None,
             artifact_registry,
             disk_full_cleaner,
             worker_pool_config,
@@ -671,8 +619,6 @@ struct EngineState {
     active_job: Option<ActiveJob>,
     commands: mpsc::WeakSender<EngineCommand>,
     config_repository: Option<Box<dyn NodeConfigRepositoryAccess>>,
-    host_control: Option<Box<dyn NodeHostControl>>,
-    pending_restart_request_id: Option<u64>,
     artifact_registry: Arc<RegenerableArtifactRegistry>,
     disk_full_cleaner: DiskFullCleaner,
     runtime_tasks: RuntimeTaskRegistry,
@@ -684,7 +630,6 @@ struct EngineState {
 enum EngineCommand {
     Protocol(proto::Envelope, oneshot::Sender<proto::Envelope>),
     ConnectionClosed,
-    ResponseFlushed(u64, oneshot::Sender<Result<(), String>>),
     Restart(oneshot::Sender<Result<(), String>>),
     Shutdown(oneshot::Sender<()>),
     BackgroundFinished { identity: JobIdentity },
@@ -767,10 +712,6 @@ async fn run_actor(mut state: EngineState, mut commands: mpsc::Receiver<EngineCo
                 let _ = reply.send(state.handle_protocol(request).await);
             }
             EngineCommand::ConnectionClosed => state.snapshots.clear(),
-            EngineCommand::ResponseFlushed(request_id, reply) => {
-                let result = state.response_flushed(request_id);
-                let _ = reply.send(result);
-            }
             EngineCommand::Restart(reply) => {
                 let _ = reply.send(state.restart_engine().await);
             }
@@ -822,11 +763,7 @@ impl EngineState {
             Some(proto::envelope::Payload::ReadSnapshotPage(page)) => self.read_snapshot_page(page),
             Some(proto::envelope::Payload::ReadFile(read)) => self.read_file(read),
             Some(proto::envelope::Payload::GetNodeConfig(_)) => self.get_node_config(),
-            Some(proto::envelope::Payload::SaveNodeConfigAndRestart(save)) => {
-                self.save_node_config_and_restart(request_id, save)
-            }
-            Some(proto::envelope::Payload::ListFileFaults(query)) => self.list_file_faults(query),
-            Some(proto::envelope::Payload::ClearFileFault(clear)) => self.clear_file_fault(clear),
+            Some(proto::envelope::Payload::SaveNodeConfig(save)) => self.save_node_config(save),
             Some(proto::envelope::Payload::ListRuntimeTasks(query)) => {
                 self.list_runtime_tasks(query).await
             }
@@ -879,88 +816,7 @@ impl EngineState {
         ))
     }
 
-    fn list_file_faults(&self, query: proto::ListFileFaults) -> ProtocolResult {
-        let limit = usize::try_from(query.limit).map_err(invalid)?;
-        let page = self
-            .store
-            .page_file_faults(
-                (!query.cursor.is_empty()).then_some(query.cursor.as_str()),
-                limit,
-            )
-            .map_err(store_error)?;
-        let faults = page
-            .items
-            .into_iter()
-            .map(|fault| proto::FileFault {
-                machine_id: fault.machine_id.as_str().to_owned(),
-                normalized_path: fault.normalized_path.as_str().to_owned(),
-                display_path: fault.display_path.as_path().to_string_lossy().into_owned(),
-                file_size: fault.file_size,
-                fault_kind: wire_file_fault_kind(fault.kind) as i32,
-                stage: fault.stage,
-                error_code: fault.windows_error_code,
-                message: fault.message,
-            })
-            .collect();
-        let cleanup_summary =
-            self.disk_full_cleaner
-                .recent_summary()
-                .map(|summary| proto::DiskFullCleanupSummary {
-                    triggered_at_unix_ms: summary.triggered_at_unix_ms,
-                    deleted_files: summary.deleted_files.try_into().unwrap_or(u64::MAX),
-                    deleted_bytes: summary.deleted_bytes,
-                    skipped_active: summary.skipped_active.try_into().unwrap_or(u64::MAX),
-                    skipped_other_disk: summary.skipped_other_disk.try_into().unwrap_or(u64::MAX),
-                    failed_files: summary.failed_files.try_into().unwrap_or(u64::MAX),
-                });
-        Ok(proto::envelope::Payload::ListFileFaults(
-            proto::ListFileFaults {
-                cursor: query.cursor,
-                limit: query.limit,
-                faults,
-                next_cursor: page.next_cursor.unwrap_or_default(),
-                cleanup_summary,
-            },
-        ))
-    }
-
-    fn clear_file_fault(&mut self, request: proto::ClearFileFault) -> ProtocolResult {
-        let machine_id = MachineId::parse(&request.machine_id).map_err(invalid)?;
-        let normalized_path = NormalizedPath::new(&request.normalized_path).map_err(invalid)?;
-        let wire_kind = proto::FileFaultKind::try_from(request.fault_kind)
-            .map_err(|_| invalid("未知文件故障类别"))?;
-        let kind = store_file_fault_kind(wire_kind)?;
-        let cleared = self
-            .store
-            .clear_file_fault_kind(&machine_id, &normalized_path, kind)
-            .map_err(store_error)?;
-        Ok(proto::envelope::Payload::ClearFileFault(
-            proto::ClearFileFault {
-                machine_id: request.machine_id,
-                normalized_path: request.normalized_path,
-                fault_kind: request.fault_kind,
-                cleared: cleared.try_into().unwrap_or(u32::MAX),
-            },
-        ))
-    }
-
-    fn save_node_config_and_restart(
-        &mut self,
-        request_id: u64,
-        save: proto::SaveNodeConfigAndRestart,
-    ) -> ProtocolResult {
-        let host_control = self.host_control.as_ref().ok_or_else(|| {
-            (
-                proto::ErrorCode::Internal,
-                "节点宿主尚未支持远程配置重启".to_owned(),
-            )
-        })?;
-        if self.pending_restart_request_id.is_some() {
-            return Err((
-                proto::ErrorCode::Conflict,
-                "节点已有等待响应刷出的重启请求".to_owned(),
-            ));
-        }
+    fn save_node_config(&self, save: proto::SaveNodeConfig) -> ProtocolResult {
         let repository = self
             .config_repository
             .as_ref()
@@ -970,41 +826,15 @@ impl EngineState {
             .ok_or_else(|| invalid("保存请求缺少 config"))?
             .try_into()
             .map_err(invalid)?;
-        let previous = repository.snapshot().map_err(config_repository_error)?;
         let saved = repository
             .save_if_version(&save.expected_version_sha256, &config)
             .map_err(config_repository_error)?;
-        if let Err(prepare_error) = host_control.prepare_replacement(&saved.version_sha256) {
-            return match repository.restore_if_version(&saved.version_sha256, &previous) {
-                Ok(_) => Err(internal(prepare_error)),
-                Err(restore_error) => Err((
-                    proto::ErrorCode::Internal,
-                    format!("{prepare_error}; 配置回滚失败: {restore_error}; 已保存配置可能仍生效"),
-                )),
-            };
-        }
-        self.pending_restart_request_id = Some(request_id);
-        Ok(proto::envelope::Payload::NodeRestartAccepted(
-            proto::NodeRestartAccepted {
+        Ok(proto::envelope::Payload::NodeConfigSaved(
+            proto::NodeConfigSaved {
                 machine_id: self.store.machine_id().as_str().to_owned(),
                 saved_version_sha256: saved.version_sha256,
             },
         ))
-    }
-
-    fn response_flushed(&mut self, request_id: u64) -> Result<(), String> {
-        if self.pending_restart_request_id != Some(request_id) {
-            return Ok(());
-        }
-        let host_control = self
-            .host_control
-            .as_ref()
-            .ok_or_else(|| "节点宿主控制器已经不可用".to_owned())?;
-        host_control
-            .commit_exit_after_response()
-            .map_err(|error| error.to_string())?;
-        self.pending_restart_request_id = None;
-        Ok(())
     }
 
     fn node_status(&self) -> ProtocolResult {
@@ -2387,23 +2217,6 @@ const fn wire_media_kind(kind: dedup_core::MediaKind) -> proto::MediaKind {
     }
 }
 
-const fn wire_file_fault_kind(kind: FileFaultKind) -> proto::FileFaultKind {
-    match kind {
-        FileFaultKind::SuspectedPhysicalRead => proto::FileFaultKind::SuspectedPhysicalRead,
-        FileFaultKind::WorkerCrash => proto::FileFaultKind::WorkerCrash,
-    }
-}
-
-fn store_file_fault_kind(
-    kind: proto::FileFaultKind,
-) -> Result<FileFaultKind, (proto::ErrorCode, String)> {
-    match kind {
-        proto::FileFaultKind::SuspectedPhysicalRead => Ok(FileFaultKind::SuspectedPhysicalRead),
-        proto::FileFaultKind::WorkerCrash => Ok(FileFaultKind::WorkerCrash),
-        proto::FileFaultKind::Unspecified => Err(invalid("文件故障类别不能为空")),
-    }
-}
-
 const fn delete_outcome_name(outcome: DeleteOutcome) -> &'static str {
     match outcome {
         DeleteOutcome::Recycled => "recycled",
@@ -2545,6 +2358,32 @@ mod tests {
     use crate::DisabledRemoteFeatureCache;
     #[cfg(feature = "test-hooks")]
     use crate::{scan::BasePersistTestController, worker::BaseComputeOutput};
+
+    /// 自定义配置路径必须成为运行时实际目录，不能回退到 AppLayout 默认目录。
+    #[test]
+    fn runtime_paths_follow_configured_data_cache_and_log_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("portable/node.exe");
+        let layout = AppLayout::from_executable(&executable).unwrap();
+        let mut config = NodeConfig::default();
+        config.paths.data_path = "custom/data".into();
+        config.paths.config_path = "custom/config.toml".into();
+        config.paths.log_path = "custom/logs".into();
+        config.paths.cache_path = "custom/cache".into();
+
+        let paths = resolve_runtime_paths(&layout, &config).unwrap();
+
+        assert_eq!(paths.data_path, layout.executable_dir().join("custom/data"));
+        assert_eq!(
+            paths.config_path,
+            layout.executable_dir().join("custom/config.toml")
+        );
+        assert_eq!(paths.log_path, layout.executable_dir().join("custom/logs"));
+        assert_eq!(
+            paths.cache_path,
+            layout.executable_dir().join("custom/cache")
+        );
+    }
 
     /// 保存 shutdown 生命周期测试的结构化 tracing 输出。
     #[cfg(feature = "test-hooks")]

@@ -1,4 +1,4 @@
-//! 远程 Node 配置 V4 的 wire、转换与 descriptor 契约。
+//! 远程 Node 配置 V5 的 wire、转换与 descriptor 契约。
 
 use std::net::{IpAddr, Ipv4Addr};
 
@@ -66,7 +66,7 @@ fn unknown_config_enum_is_rejected_instead_of_silently_defaulting() {
 }
 
 #[test]
-fn config_messages_round_trip_snapshot_and_restart_values() {
+fn config_messages_round_trip_snapshot_and_save_values() {
     let config = proto::NodeConfigValue::try_from(&NodeConfig::default()).unwrap();
     let snapshot = proto::NodeConfigSnapshot {
         machine_id: "73bdb7a3377f81376a84f316b3ee1555e345afbfa87aa99c77b1bfcc364c4cae".into(),
@@ -79,20 +79,20 @@ fn config_messages_round_trip_snapshot_and_restart_values() {
     let decoded = proto::NodeConfigSnapshot::decode(bytes.as_slice()).unwrap();
     assert_eq!(decoded, snapshot);
 
-    let save = proto::SaveNodeConfigAndRestart {
+    let save = proto::SaveNodeConfig {
         expected_version_sha256: "b".repeat(64),
         config: Some(config),
     };
-    let accepted = proto::NodeRestartAccepted {
+    let accepted = proto::NodeConfigSaved {
         machine_id: snapshot.machine_id,
         saved_version_sha256: "c".repeat(64),
     };
     assert_eq!(
-        proto::SaveNodeConfigAndRestart::decode(save.encode_to_vec().as_slice()).unwrap(),
+        proto::SaveNodeConfig::decode(save.encode_to_vec().as_slice()).unwrap(),
         save
     );
     assert_eq!(
-        proto::NodeRestartAccepted::decode(accepted.encode_to_vec().as_slice()).unwrap(),
+        proto::NodeConfigSaved::decode(accepted.encode_to_vec().as_slice()).unwrap(),
         accepted
     );
 }
@@ -152,8 +152,8 @@ fn descriptor_contains_only_the_approved_config_messages_and_envelope_tags() {
     for name in [
         "GetNodeConfig",
         "NodeConfigSnapshot",
-        "SaveNodeConfigAndRestart",
-        "NodeRestartAccepted",
+        "SaveNodeConfig",
+        "NodeConfigSaved",
     ] {
         assert!(message(messages, name).is_some(), "descriptor 缺少 {name}");
     }
@@ -161,8 +161,8 @@ fn descriptor_contains_only_the_approved_config_messages_and_envelope_tags() {
     for (name, number) in [
         ("get_node_config", 37),
         ("node_config_snapshot", 38),
-        ("save_node_config_and_restart", 39),
-        ("node_restart_accepted", 40),
+        ("save_node_config", 39),
+        ("node_config_saved", 40),
     ] {
         assert!(
             envelope
@@ -176,8 +176,8 @@ fn descriptor_contains_only_the_approved_config_messages_and_envelope_tags() {
         "GetNodeConfig",
         "NodeConfigValue",
         "NodeConfigSnapshot",
-        "SaveNodeConfigAndRestart",
-        "NodeRestartAccepted",
+        "SaveNodeConfig",
+        "NodeConfigSaved",
     ]
     .into_iter()
     .map(|name| message(messages, name).unwrap())
@@ -196,6 +196,47 @@ fn descriptor_contains_only_the_approved_config_messages_and_envelope_tags() {
             );
         }
     }
+}
+
+#[test]
+fn descriptor_removes_legacy_management_payloads_without_changing_protocol_version() {
+    let descriptor = FileDescriptorSet::decode(FILE_DESCRIPTOR_SET).unwrap();
+    let file = descriptor
+        .file
+        .iter()
+        .find(|file| file.package.as_deref() == Some("mysingerserver.v2"))
+        .unwrap();
+    let messages = &file.message_type;
+    for name in [
+        "RetryDeleteItems",
+        "ListFileFaults",
+        "ClearFileFault",
+        "SaveNodeConfigAndRestart",
+        "NodeRestartAccepted",
+    ] {
+        assert!(
+            message(messages, name).is_none(),
+            "V5 descriptor 不得暴露已删除管理消息 {name}"
+        );
+    }
+    let envelope = message(messages, "Envelope").unwrap();
+    for field in envelope.field.iter() {
+        assert!(
+            !matches!(
+                field.name.as_deref(),
+                Some(
+                    "retry_delete_items"
+                        | "list_file_faults"
+                        | "clear_file_fault"
+                        | "save_node_config_and_restart"
+                        | "node_restart_accepted"
+                )
+            ),
+            "V5 Envelope 不得暴露已删除管理字段 {:?}",
+            field.name
+        );
+    }
+    assert_eq!(PROTOCOL_VERSION, 5);
 }
 
 #[test]

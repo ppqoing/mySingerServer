@@ -1,6 +1,6 @@
 use dedup_desktop_ui::{
-    MainWindow, UiDatabaseTableRow, UiFileFaultRow, UiGroupRow, UiMemberRow, UiNodeRow,
-    UiRuntimeFailureRow, UiRuntimeStageRow, UiRuntimeWorkerRow, UiScanRootRow, UiTaskRow,
+    MainWindow, UiGroupRow, UiMemberRow, UiNodeRow, UiRuntimeFailureRow, UiRuntimeStageRow,
+    UiRuntimeWorkerRow, UiScanRootRow, UiTaskRow,
 };
 use i_slint_backend_testing::ElementHandle;
 use slint::{
@@ -18,104 +18,6 @@ fn scan_defaults_to_everything_enumerator() {
         window.get_enumerator_index(),
         1,
         "新建扫描必须默认选择 Everything",
-    );
-}
-
-#[test]
-fn file_faults_diagnostics_show_only_approved_fields_and_disable_offline_actions() {
-    i_slint_backend_testing::init_no_event_loop();
-    let window = MainWindow::new().expect("应能构造真实 MainWindow");
-    window
-        .window()
-        .set_size(slint::PhysicalSize::new(1080, 700));
-    window.set_node_config_options(ModelRc::new(VecModel::from(vec![
-        "本机节点 · machine-online · 127.0.0.1:39091 · 在线".into(),
-        "离线节点 · machine-offline · 10.0.0.9:39091 · 离线".into(),
-    ])));
-    window.set_file_fault_node_online(true);
-    window.set_file_fault_rows(ModelRc::new(VecModel::from(vec![
-        UiFileFaultRow {
-            machine_id: "machine-online".into(),
-            normalized_path: r"d:\media\broken.mp4".into(),
-            display_path: r"D:\Media\broken.mp4".into(),
-            file_size: "4.00 KiB".into(),
-            fault_kind: 1,
-            fault_kind_text: "疑似物理读取故障".into(),
-            stage: "read".into(),
-            error_code: "23".into(),
-            message: "读取块重试耗尽".into(),
-        },
-        UiFileFaultRow {
-            machine_id: "machine-online".into(),
-            normalized_path: r"d:\media\crash.mp4".into(),
-            display_path: r"D:\Media\crash.mp4".into(),
-            file_size: "8.00 KiB".into(),
-            fault_kind: 2,
-            fault_kind_text: "Worker 崩溃".into(),
-            stage: "probe_stage1".into(),
-            error_code: "—".into(),
-            message: "Worker 意外退出".into(),
-        },
-    ])));
-    window.set_file_fault_next_cursor("next".into());
-    window.set_disk_cleanup_summary(
-        "最近磁盘满清理：1970-01-01 00:00:01 · 删除 3 个 / 8.00 KiB · 活动跳过 1 · 异盘跳过 2 · 失败 0".into(),
-    );
-    window.invoke_navigate_to(6);
-    accessible(&window, "日志与诊断").invoke_accessible_default_action();
-    accessible(&window, "诊断内容滚动区").scroll(0.0, -10000.0);
-    slint::platform::update_timers_and_animations();
-
-    assert_eq!(
-        accessible(&window, "加载文件故障").accessible_enabled(),
-        Some(true)
-    );
-    assert_eq!(
-        accessible(&window, "加载下一页").accessible_enabled(),
-        Some(true)
-    );
-    for label in [
-        "故障：疑似物理读取故障：D:\\Media\\broken.mp4",
-        "故障：Worker 崩溃：D:\\Media\\crash.mp4",
-        "最近磁盘满清理：1970-01-01 00:00:01 · 删除 3 个 / 8.00 KiB · 活动跳过 1 · 异盘跳过 2 · 失败 0",
-    ] {
-        assert!(
-            ElementHandle::find_by_accessible_label(&window, label)
-                .next()
-                .is_some(),
-            "诊断页必须展示 {label}"
-        );
-    }
-    for forbidden in [
-        "任务 ID",
-        "任务项 ID",
-        "读取块偏移",
-        "读取块大小",
-        "Worker PID",
-        "退出码",
-        "首次发生时间",
-        "最近发生时间",
-        "重复发生次数",
-    ] {
-        assert!(
-            ElementHandle::find_by_accessible_label(&window, forbidden)
-                .next()
-                .is_none(),
-            "未经批准的诊断字段不得出现：{forbidden}"
-        );
-    }
-
-    window.set_file_fault_node_online(false);
-    window.set_file_fault_selected_node(1);
-    assert_eq!(window.get_file_fault_selected_node(), 1);
-    assert_eq!(
-        accessible(&window, "加载文件故障").accessible_enabled(),
-        Some(false)
-    );
-    assert_eq!(
-        accessible(&window, "清除故障：d:\\media\\broken.mp4：疑似物理读取故障")
-            .accessible_enabled(),
-        Some(false)
     );
 }
 
@@ -147,23 +49,23 @@ fn remote_node_config_form_exposes_identity_actions_and_mode_gates() {
         Some(true)
     );
     assert_eq!(
-        accessible(&window, "保存并重启").accessible_enabled(),
+        accessible(&window, "保存配置").accessible_enabled(),
         Some(false),
         "加载前不得保存",
     );
     assert_eq!(
-        ElementHandle::find_by_accessible_label(&window, "保存并重启")
+        ElementHandle::find_by_accessible_label(&window, "保存配置")
             .filter(|element| element.accessible_enabled().is_some())
             .count(),
         1,
-        "Node 配置只能有一个保存并重启动作",
+        "Node 配置只能有一个保存配置动作",
     );
     window.set_node_config_phase("保存失败".into());
-    window.set_node_config_error("替代 Node 启动失败：拒绝访问 (os error 5)".into());
+    window.set_node_config_error("保存配置失败：拒绝访问 (os error 5)".into());
     assert!(
         ElementHandle::find_by_accessible_label(
             &window,
-            "Node 配置错误：替代 Node 启动失败：拒绝访问 (os error 5)",
+            "Node 配置错误：保存配置失败：拒绝访问 (os error 5)",
         )
         .next()
         .is_some(),
@@ -244,6 +146,29 @@ fn remote_node_config_form_exposes_identity_actions_and_mode_gates() {
             .next()
             .is_some(),
         "Desktop 保存设置动作必须保留",
+    );
+}
+
+#[test]
+fn remote_node_config_uses_plain_save_without_restart_semantics() {
+    i_slint_backend_testing::init_no_event_loop();
+
+    let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    window
+        .window()
+        .set_size(slint::PhysicalSize::new(1080, 700));
+    window.set_node_config_options(ModelRc::new(VecModel::from(vec![
+        "本机节点 · machine-local · 127.0.0.1:39091 · 在线".into(),
+    ])));
+    window.set_node_config_node_online(true);
+    window.invoke_navigate_to(6);
+    accessible(&window, "节点服务").invoke_accessible_default_action();
+
+    assert!(
+        ElementHandle::find_by_accessible_label(&window, "保存配置")
+            .next()
+            .is_some(),
+        "远程配置只能提供普通保存动作"
     );
 }
 
@@ -537,19 +462,13 @@ fn navigation_actions_preserve_page_mapping() {
 }
 
 #[test]
-fn database_page_exposes_actions_table_rows_and_overview_health() {
+fn database_page_exposes_schema_check_and_overview_health() {
     i_slint_backend_testing::init_no_event_loop();
 
     let window = MainWindow::new().expect("应能构造真实 MainWindow");
     window.set_postgres_status("PostgreSQL V2 schema 正常".into());
     window.set_postgres_color(Color::from_rgb_u8(34, 197, 94));
-    window.set_database_test_status("连接成功 · 1 / 1 张表正常".into());
-    window.set_database_tables(ModelRc::new(VecModel::from(vec![UiDatabaseTableRow {
-        name: "contents".into(),
-        status: "正常".into(),
-        status_color: Color::from_rgb_u8(34, 197, 94),
-        row_count: "42".into(),
-    }])));
+    window.set_database_test_status("连接成功 · Rust V2 schema 正常".into());
     let test_count = Rc::new(Cell::new(0));
     window.on_test_database_connection({
         let test_count = test_count.clone();
@@ -569,7 +488,7 @@ fn database_page_exposes_actions_table_rows_and_overview_health() {
     assert_eq!(test_count.get(), 1);
     assert_eq!(save_count.get(), 1);
     accessible(&window, "数据库页面");
-    accessible(&window, "数据库表：contents；正常；42 行");
+    accessible(&window, "数据库 schema 校验结果");
 
     window.invoke_navigate_to(0);
     accessible(&window, "数据库状态：PostgreSQL V2 schema 正常");

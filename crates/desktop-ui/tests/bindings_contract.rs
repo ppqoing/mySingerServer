@@ -3,7 +3,6 @@ use std::{io::Cursor, path::PathBuf, sync::Arc};
 use dedup_core::{DeleteMode, DesktopConfig, EnumeratorKind};
 use dedup_desktop_core::{
     app::{PathEntryView, UiCommand, UiEvent},
-    central::{CentralDatabaseDiagnostics, CentralTableDiagnostic, CentralTableStatus},
     results::GroupKind,
     review::{QuickReviewRule, ReviewDecision},
     view_state::{DesktopPaths, DesktopViewState, TaskView, ViewTaskState},
@@ -21,167 +20,6 @@ fn accessible(window: &MainWindow, label: &str) -> ElementHandle {
     ElementHandle::find_by_accessible_label(window, label)
         .next()
         .unwrap_or_else(|| panic!("应找到可访问元素：{label}"))
-}
-
-#[test]
-fn file_faults_callbacks_page_and_clear_the_selected_online_node_only() {
-    i_slint_backend_testing::init_no_event_loop();
-
-    let window = MainWindow::new().expect("应能构造真实 MainWindow");
-    let (sender, mut receiver) = mpsc::channel(16);
-    let binding = bind_commands(&window, sender, DesktopConfig::default());
-    let mut state = DesktopViewState::new(
-        DesktopConfig::default(),
-        DesktopPaths {
-            data: PathBuf::from(r"C:\fixture\desktop"),
-            logs: PathBuf::from(r"C:\fixture\desktop\logs"),
-            cache: PathBuf::from(r"C:\fixture\desktop\cache"),
-            config: PathBuf::from(r"C:\fixture\desktop\config.toml"),
-        },
-    );
-    state.set_node_identity(0, "machine-online");
-    state.set_node_connection(
-        0,
-        dedup_desktop_core::view_state::NodeConnectionState::Online,
-        None,
-    );
-    let offline = state.add_node("10.0.0.9", 39091).unwrap();
-    state.set_node_identity(offline, "machine-offline");
-    apply_event(&window, &binding, UiEvent::ViewChanged(Box::new(state)));
-    window.invoke_navigate_to(6);
-    accessible(&window, "日志与诊断").invoke_accessible_default_action();
-    accessible(&window, "诊断内容滚动区").scroll(0.0, -10000.0);
-    slint::platform::update_timers_and_animations();
-
-    window.invoke_select_file_fault_node(0);
-    assert!(matches!(
-        next(&mut receiver),
-        UiCommand::SelectFileFaultNode {
-            node_index: 0,
-            ref machine_id,
-        } if machine_id == "machine-online"
-    ));
-    accessible(&window, "加载文件故障").invoke_accessible_default_action();
-    assert!(matches!(
-        next(&mut receiver),
-        UiCommand::LoadFileFaults { node_index: 0, ref cursor } if cursor.is_empty()
-    ));
-
-    apply_event(
-        &window,
-        &binding,
-        UiEvent::FileFaultsChanged(dedup_desktop_core::view_state::FileFaultDiagnosticsState {
-            selected_node_index: Some(0),
-            selected_machine_id: Some("machine-online".into()),
-            rows: vec![dedup_desktop_core::view_state::FileFaultView {
-                machine_id: "machine-online".into(),
-                normalized_path: r"d:\media\broken.mp4".into(),
-                display_path: r"D:\Media\broken.mp4".into(),
-                file_size: 4096,
-                fault_kind: "suspected_physical_read".into(),
-                stage: "read".into(),
-                error_code: Some(23),
-                message: "读取块重试耗尽".into(),
-            }],
-            next_cursor: "next-page".into(),
-            cleanup_summary: Some(dedup_desktop_core::view_state::DiskFullCleanupSummaryView {
-                triggered_at_unix_ms: 1234,
-                deleted_files: 3,
-                deleted_bytes: 8192,
-                skipped_active: 1,
-                skipped_other_disk: 2,
-                failed_files: 0,
-            }),
-            loading: false,
-            error: None,
-        }),
-    );
-    assert_eq!(window.get_file_fault_rows().row_count(), 1);
-    accessible(&window, "加载下一页").invoke_accessible_default_action();
-    assert!(matches!(
-        next(&mut receiver),
-        UiCommand::LoadFileFaults { node_index: 0, ref cursor } if cursor == "next-page"
-    ));
-    window.invoke_clear_file_fault(0);
-    assert!(matches!(
-        next(&mut receiver),
-        UiCommand::ClearFileFault {
-            node_index: 0,
-            ref machine_id,
-            ref normalized_path,
-            ref fault_kind,
-        } if machine_id == "machine-online"
-            && normalized_path == r"d:\media\broken.mp4"
-            && fault_kind == "suspected_physical_read"
-    ));
-
-    window.invoke_select_file_fault_node(1);
-    assert!(matches!(
-        next(&mut receiver),
-        UiCommand::SelectFileFaultNode {
-            node_index: 1,
-            ref machine_id,
-        } if machine_id == "machine-offline"
-    ));
-    assert_eq!(window.get_file_fault_rows().row_count(), 0);
-    assert_eq!(window.get_file_fault_next_cursor(), "");
-    let mut periodic = DesktopViewState::new(
-        DesktopConfig::default(),
-        DesktopPaths {
-            data: PathBuf::from(r"C:\fixture\desktop"),
-            logs: PathBuf::from(r"C:\fixture\desktop\logs"),
-            cache: PathBuf::from(r"C:\fixture\desktop\cache"),
-            config: PathBuf::from(r"C:\fixture\desktop\config.toml"),
-        },
-    );
-    periodic.set_node_identity(0, "machine-online");
-    periodic.set_node_connection(
-        0,
-        dedup_desktop_core::view_state::NodeConnectionState::Online,
-        None,
-    );
-    let periodic_offline = periodic.add_node("10.0.0.9", 39091).unwrap();
-    periodic.set_node_identity(periodic_offline, "machine-offline");
-    apply_event(&window, &binding, UiEvent::ViewChanged(Box::new(periodic)));
-    assert_eq!(window.get_file_fault_selected_node(), 1);
-    assert_eq!(window.get_file_fault_rows().row_count(), 0);
-    window.invoke_load_file_faults(false);
-    window.invoke_clear_file_fault(0);
-    assert!(receiver.try_recv().is_err(), "离线节点诊断动作不得发送命令");
-
-    window.invoke_select_file_fault_node(0);
-    let _ = next(&mut receiver);
-    apply_event(
-        &window,
-        &binding,
-        UiEvent::FileFaultsChanged(dedup_desktop_core::view_state::FileFaultDiagnosticsState {
-            selected_node_index: Some(0),
-            selected_machine_id: Some("machine-online".into()),
-            rows: vec![dedup_desktop_core::view_state::FileFaultView {
-                machine_id: "machine-online".into(),
-                normalized_path: r"d:\media\unknown.bin".into(),
-                display_path: r"D:\Media\unknown.bin".into(),
-                file_size: 1,
-                fault_kind: "future_unknown_kind".into(),
-                stage: "read".into(),
-                error_code: None,
-                message: "unknown".into(),
-            }],
-            next_cursor: "must-clear".into(),
-            cleanup_summary: None,
-            loading: true,
-            error: None,
-        }),
-    );
-    assert!(!window.get_file_fault_loading());
-    assert_eq!(window.get_file_fault_rows().row_count(), 0);
-    assert_eq!(window.get_file_fault_next_cursor(), "");
-    assert!(window.get_file_fault_error().contains("未知文件故障类别"));
-    assert_eq!(
-        accessible(&window, "加载文件故障").accessible_enabled(),
-        Some(true),
-        "unknown 响应失败后必须允许重试"
-    );
 }
 
 #[test]
@@ -249,9 +87,9 @@ fn config_callbacks_draft_are_single_shot_and_switching_clears_remote_state() {
     window.set_node_config_worker_mode_index(0);
     window.set_node_config_reserved_cores(1);
     window.set_node_config_manual_workers(2);
-    accessible(&window, "保存并重启").invoke_accessible_default_action();
+    accessible(&window, "保存配置").invoke_accessible_default_action();
     match next(&mut receiver) {
-        UiCommand::SaveNodeConfigAndRestart { node_index, config } => {
+        UiCommand::SaveNodeConfig { node_index, config } => {
             assert_eq!(node_index, 0);
             assert_eq!(config.listen_ip, "0.0.0.0");
             assert_eq!(config.port, 39100);
@@ -347,12 +185,12 @@ fn config_callbacks_draft_are_single_shot_and_switching_clears_remote_state() {
         "离线节点必须禁用加载",
     );
     assert_eq!(
-        accessible(&window, "保存并重启").accessible_enabled(),
+        accessible(&window, "保存配置").accessible_enabled(),
         Some(false),
         "离线节点必须禁用保存",
     );
     accessible(&window, "加载配置").invoke_accessible_default_action();
-    accessible(&window, "保存并重启").invoke_accessible_default_action();
+    accessible(&window, "保存配置").invoke_accessible_default_action();
     assert!(receiver.try_recv().is_err(), "离线动作不得发送命令");
 
     window.invoke_save_settings();
@@ -924,7 +762,7 @@ fn postgres_connection_fields_load_from_the_existing_url() {
 }
 
 #[test]
-fn database_test_uses_unsaved_fields_and_applies_exact_table_counts() {
+fn database_test_uses_unsaved_fields_and_reports_schema_status() {
     i_slint_backend_testing::init_no_event_loop();
 
     let window = MainWindow::new().expect("应能构造真实 MainWindow");
@@ -948,39 +786,15 @@ fn database_test_uses_unsaved_fields_and_applies_exact_table_counts() {
     apply_event(
         &window,
         &binding,
-        UiEvent::DatabaseDiagnosticsChanged(Ok(CentralDatabaseDiagnostics {
-            schema_complete: false,
-            tables: vec![
-                CentralTableDiagnostic {
-                    name: "contents".into(),
-                    status: CentralTableStatus::Ready,
-                    row_count: Some(42),
-                },
-                CentralTableDiagnostic {
-                    name: "image_stage2".into(),
-                    status: CentralTableStatus::Missing,
-                    row_count: None,
-                },
-            ],
-        })),
+        UiEvent::DatabaseDiagnosticsChanged(Ok(())),
     );
 
     assert!(!window.get_database_testing());
     assert_eq!(
         window.get_database_test_status(),
-        "连接成功 · 1 / 2 张表正常"
+        "连接成功 · Rust V2 schema 正常"
     );
     assert_eq!(window.get_database_test_error(), "");
-    let rows = window.get_database_tables();
-    assert_eq!(rows.row_count(), 2);
-    let contents = rows.row_data(0).expect("应映射 contents 行");
-    assert_eq!(contents.name, "contents");
-    assert_eq!(contents.status, "正常");
-    assert_eq!(contents.row_count, "42");
-    let missing = rows.row_data(1).expect("应映射缺失表行");
-    assert_eq!(missing.name, "image_stage2");
-    assert_eq!(missing.status, "缺失");
-    assert_eq!(missing.row_count, "—");
 }
 
 #[test]
@@ -1177,9 +991,9 @@ fn remote_node_config_callbacks_map_identity_and_send_only_task6_commands() {
     window.set_node_config_postgres_username("node_user".into());
     window.set_node_config_postgres_password("node_secret".into());
     window.set_node_config_postgres_timeout_seconds(8);
-    find("保存并重启").invoke_accessible_default_action();
+    find("保存配置").invoke_accessible_default_action();
     match next(&mut receiver) {
-        UiCommand::SaveNodeConfigAndRestart { node_index, config } => {
+        UiCommand::SaveNodeConfig { node_index, config } => {
             assert_eq!(node_index, 0);
             assert_eq!(config.listen_ip, "0.0.0.0");
             assert_eq!(config.port, 39100);
@@ -1206,9 +1020,9 @@ fn remote_node_config_callbacks_map_identity_and_send_only_task6_commands() {
     assert!(!window.get_node_config_dirty());
     assert_eq!(window.get_scan_root(), "", "切换节点必须清除旧扫描路径");
     assert_eq!(find("加载配置").accessible_enabled(), Some(false));
-    assert_eq!(find("保存并重启").accessible_enabled(), Some(false));
+    assert_eq!(find("保存配置").accessible_enabled(), Some(false));
     find("加载配置").invoke_accessible_default_action();
-    find("保存并重启").invoke_accessible_default_action();
+    find("保存配置").invoke_accessible_default_action();
     assert!(receiver.try_recv().is_err(), "离线动作不得发送命令");
 
     window.invoke_save_settings();

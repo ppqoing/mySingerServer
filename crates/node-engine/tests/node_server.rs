@@ -1,8 +1,4 @@
-use std::{
-    net::SocketAddr,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{net::SocketAddr, time::Duration};
 
 use dedup_core::{MachineId, product_id};
 use dedup_node_engine::{
@@ -19,7 +15,7 @@ use dedup_transport::{ClientConnection, FrameClass, FrameReader, FrameWriter};
 use prost::Message;
 use tokio::{
     net::TcpStream,
-    sync::{Notify, broadcast, oneshot},
+    sync::{broadcast, oneshot},
 };
 
 #[derive(Clone)]
@@ -97,172 +93,6 @@ async fn single_manager_is_exclusive_but_one_connection_handles_concurrent_reque
 
     shutdown_tx.send(()).unwrap();
     server.await.unwrap().unwrap();
-}
-
-#[tokio::test]
-async fn restart_response_notifies_handler_only_after_full_frame_write() {
-    let (client, server_stream) = tokio::io::duplex(64);
-    let handler = RecordingHandler::new(4096, None, 0);
-    let state = Arc::clone(&handler.state);
-    let started = handler.started.clone();
-    let flushed = handler.flushed.clone();
-    let server = tokio::spawn(NodeServer::serve_stream_for_test(server_stream, handler));
-    let (client_read, client_write) = tokio::io::split(client);
-    let mut reader = FrameReader::new(client_read);
-    let mut writer = FrameWriter::new(client_write);
-
-    write_hello(&mut writer, 70).await;
-    let welcome = read_envelope(&mut reader).await;
-    assert!(matches!(
-        welcome.payload,
-        Some(proto::envelope::Payload::Hello(_))
-    ));
-
-    let started_wait = started.notified();
-    write_envelope(&mut writer, ping(71, 9)).await;
-    tokio::time::timeout(Duration::from_secs(1), started_wait)
-        .await
-        .unwrap();
-    tokio::task::yield_now().await;
-    assert!(state.lock().unwrap().flushed_ids.is_empty());
-
-    let flushed_wait = flushed.notified();
-    let response = read_envelope(&mut reader).await;
-    assert_eq!(response.request_id, 71);
-    tokio::time::timeout(Duration::from_secs(1), flushed_wait)
-        .await
-        .unwrap();
-    assert_eq!(state.lock().unwrap().flushed_ids, [71]);
-
-    drop(reader);
-    drop(writer);
-    tokio::time::timeout(Duration::from_secs(1), server)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-}
-
-#[tokio::test]
-async fn restart_response_write_failure_does_not_notify_handler() {
-    let (client, server_stream) = tokio::io::duplex(64);
-    let release = Arc::new(Notify::new());
-    let handler = RecordingHandler::new(4096, Some(Arc::clone(&release)), 0);
-    let state = Arc::clone(&handler.state);
-    let started = handler.started.clone();
-    let server = tokio::spawn(NodeServer::serve_stream_for_test(server_stream, handler));
-    let (client_read, client_write) = tokio::io::split(client);
-    let mut reader = FrameReader::new(client_read);
-    let mut writer = FrameWriter::new(client_write);
-
-    write_hello(&mut writer, 80).await;
-    let welcome = read_envelope(&mut reader).await;
-    assert!(matches!(
-        welcome.payload,
-        Some(proto::envelope::Payload::Hello(_))
-    ));
-
-    let started_wait = started.notified();
-    write_envelope(&mut writer, ping(81, 10)).await;
-    tokio::time::timeout(Duration::from_secs(1), started_wait)
-        .await
-        .unwrap();
-    drop(reader);
-    drop(writer);
-    release.notify_one();
-    tokio::time::timeout(Duration::from_secs(1), server)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    assert!(state.lock().unwrap().flushed_ids.is_empty());
-}
-
-#[tokio::test]
-async fn restart_response_retries_flush_without_rewriting_or_rehandling() {
-    let (client, server_stream) = tokio::io::duplex(64);
-    let handler = RecordingHandler::restart_accepted(1);
-    let state = Arc::clone(&handler.state);
-    let flushed = handler.flushed.clone();
-    let server = tokio::spawn(NodeServer::serve_stream_for_test(server_stream, handler));
-    let (client_read, client_write) = tokio::io::split(client);
-    let mut reader = FrameReader::new(client_read);
-    let mut writer = FrameWriter::new(client_write);
-
-    write_hello(&mut writer, 90).await;
-    read_envelope(&mut reader).await;
-
-    write_envelope(&mut writer, ping(91, 11)).await;
-    assert_eq!(
-        read_envelope(&mut reader).await,
-        proto::Envelope {
-            request_id: 91,
-            payload: Some(proto::envelope::Payload::NodeRestartAccepted(
-                proto::NodeRestartAccepted {
-                    machine_id: "machine-fixture".into(),
-                    saved_version_sha256: "saved-sha".into(),
-                },
-            )),
-        }
-    );
-    wait_for_flush_count(&state, &flushed, 2).await;
-    let state_guard = state.lock().unwrap();
-    assert_eq!(state_guard.handled_ids, [91]);
-    assert_eq!(state_guard.flushed_ids, [91, 91]);
-    drop(state_guard);
-    assert!(
-        tokio::time::timeout(Duration::from_millis(50), reader.read_frame())
-            .await
-            .is_err(),
-        "commit retry must not write a second response frame"
-    );
-
-    drop(reader);
-    drop(writer);
-    tokio::time::timeout(Duration::from_secs(1), server)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-}
-
-#[tokio::test]
-async fn restart_response_exhausted_flush_retries_return_observable_error() {
-    let (client, server_stream) = tokio::io::duplex(64);
-    let handler = RecordingHandler::restart_accepted(usize::MAX);
-    let state = Arc::clone(&handler.state);
-    let flushed = handler.flushed.clone();
-    let server = tokio::spawn(NodeServer::serve_stream_for_test(server_stream, handler));
-    let (client_read, client_write) = tokio::io::split(client);
-    let mut reader = FrameReader::new(client_read);
-    let mut writer = FrameWriter::new(client_write);
-
-    write_hello(&mut writer, 93).await;
-    read_envelope(&mut reader).await;
-    write_envelope(&mut writer, ping(94, 13)).await;
-    assert_eq!(read_envelope(&mut reader).await.request_id, 94);
-    wait_for_flush_count(&state, &flushed, 2).await;
-    let state_guard = state.lock().unwrap();
-    assert_eq!(state_guard.handled_ids, [94]);
-    assert_eq!(state_guard.flushed_ids, [94, 94]);
-    drop(state_guard);
-    let error = tokio::time::timeout(Duration::from_secs(1), server)
-        .await
-        .expect("server must stop without waiting for the client to disconnect")
-        .unwrap()
-        .expect_err("exhausted commit retries must remain observable");
-    assert!(error.contains("request_id 94"));
-    assert!(error.contains("2 次"));
-    assert!(error.contains("fixture flush failure"));
-    let eof = tokio::time::timeout(Duration::from_secs(1), reader.read_frame())
-        .await
-        .expect("server must close the client read side");
-    assert!(
-        eof.is_err(),
-        "client must observe EOF instead of another frame"
-    );
-    drop(reader);
-    drop(writer);
 }
 
 #[tokio::test]
@@ -373,12 +203,16 @@ async fn runtime_events_actor_lists_pages_details_and_pushes_terminal_once() {
     ));
 
     second.update_overall(1, Some(2), 0, 0).await.unwrap();
-    assert!(
-        tokio::time::timeout(Duration::from_millis(30), connection.next_event())
-            .await
-            .is_err(),
-        "running progress must not push an event"
-    );
+    let progress_event = tokio::time::timeout(Duration::from_secs(1), connection.next_event())
+        .await
+        .expect("首次运行进度应发布快照")
+        .unwrap();
+    assert!(matches!(
+        progress_event.payload,
+        Some(proto::envelope::Payload::RuntimeTaskChanged(
+            proto::RuntimeTaskChanged { runtime_task_id, state }
+        )) if runtime_task_id == second.id() && state == "running"
+    ));
     second.finish(RuntimeTaskState::Completed).await.unwrap();
     let event = connection.next_event().await.unwrap();
     assert_eq!(event.request_id, 0);
@@ -489,116 +323,6 @@ async fn hello_connection(connection: &ClientConnection) {
         response.payload,
         Some(proto::envelope::Payload::Hello(_))
     ));
-}
-
-#[derive(Default)]
-struct RecordingState {
-    handled_ids: Vec<u64>,
-    flushed_ids: Vec<u64>,
-    flush_failures_remaining: usize,
-}
-
-#[derive(Clone)]
-struct RecordingHandler {
-    state: Arc<Mutex<RecordingState>>,
-    started: Arc<Notify>,
-    flushed: Arc<Notify>,
-    release: Option<Arc<Notify>>,
-    response_bytes: Option<usize>,
-}
-
-impl RecordingHandler {
-    fn new(
-        response_bytes: usize,
-        release: Option<Arc<Notify>>,
-        flush_failures_remaining: usize,
-    ) -> Self {
-        Self {
-            state: Arc::new(Mutex::new(RecordingState {
-                handled_ids: Vec::new(),
-                flushed_ids: Vec::new(),
-                flush_failures_remaining,
-            })),
-            response_bytes: Some(response_bytes),
-            started: Arc::new(Notify::new()),
-            flushed: Arc::new(Notify::new()),
-            release,
-        }
-    }
-
-    fn restart_accepted(flush_failures_remaining: usize) -> Self {
-        Self {
-            state: Arc::new(Mutex::new(RecordingState {
-                handled_ids: Vec::new(),
-                flushed_ids: Vec::new(),
-                flush_failures_remaining,
-            })),
-            response_bytes: None,
-            started: Arc::new(Notify::new()),
-            flushed: Arc::new(Notify::new()),
-            release: None,
-        }
-    }
-}
-
-impl NodeRequestHandler for RecordingHandler {
-    async fn handle(&self, request: proto::Envelope) -> proto::Envelope {
-        self.state
-            .lock()
-            .unwrap()
-            .handled_ids
-            .push(request.request_id);
-        self.started.notify_one();
-        if let Some(release) = &self.release {
-            release.notified().await;
-        }
-        let payload = match self.response_bytes {
-            Some(response_bytes) => proto::envelope::Payload::Error(proto::Error {
-                code: proto::ErrorCode::Internal as i32,
-                message: "x".repeat(response_bytes),
-            }),
-            None => proto::envelope::Payload::NodeRestartAccepted(proto::NodeRestartAccepted {
-                machine_id: "machine-fixture".into(),
-                saved_version_sha256: "saved-sha".into(),
-            }),
-        };
-        proto::Envelope {
-            request_id: request.request_id,
-            payload: Some(payload),
-        }
-    }
-
-    async fn response_flushed(&self, request_id: u64) -> Result<(), String> {
-        let mut state = self.state.lock().unwrap();
-        state.flushed_ids.push(request_id);
-        let fail = state.flush_failures_remaining > 0;
-        state.flush_failures_remaining = state.flush_failures_remaining.saturating_sub(1);
-        drop(state);
-        self.flushed.notify_one();
-        if fail {
-            Err("fixture flush failure".into())
-        } else {
-            Ok(())
-        }
-    }
-}
-
-async fn wait_for_flush_count(
-    state: &Arc<Mutex<RecordingState>>,
-    flushed: &Arc<Notify>,
-    expected: usize,
-) {
-    tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            let notified = flushed.notified();
-            if state.lock().unwrap().flushed_ids.len() >= expected {
-                break;
-            }
-            notified.await;
-        }
-    })
-    .await
-    .unwrap();
 }
 
 async fn try_connect_and_hello(
