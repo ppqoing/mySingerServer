@@ -1106,6 +1106,7 @@ mod tests {
         let (identity, context) = pending.contexts.iter().next().unwrap();
         assert_eq!(context.content_id, cached.content_id);
         assert_eq!(context.cached, Some(cached));
+        assert_eq!(context.lane, lane());
         assert_eq!(first_status(&pending, &lane()), b'P');
         assert_eq!(identity.run_id(), RUN_ID);
         cleanup_pending(pending);

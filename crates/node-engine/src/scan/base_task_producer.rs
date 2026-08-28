@@ -51,6 +51,8 @@ pub struct BaseTaskManifest {
 /// 由生产端按完整 `TaskFileIdentity` 保存，Hash→Media 续算时继续使用同一上下文。
 #[derive(Clone, Debug, PartialEq)]
 pub struct TaskFileBaseContext {
+    /// 文件在首次枚举时冻结的物理盘 lane；Media 续算直接复用，不从文件名反解析。
+    pub lane: TaskDiskLane,
     /// 路径批量查询得到的本地内容 ID；未命中或尚未导入时为空。
     pub content_id: Option<ContentId>,
     /// 路径批量查询得到的基础缓存快照；未知内容时为空。
@@ -216,6 +218,7 @@ impl<Provider: TaskLanePermitProvider> BaseTaskProducer<Provider> {
                         missing,
                     });
                     batch.contexts.push(TaskFileBaseContext {
+                        lane: input.planned.lane.clone(),
                         content_id: input.cached.as_ref().and_then(|cached| cached.content_id),
                         cached: input.cached.clone(),
                         contact_sheet_valid: input.contact_sheet_valid,

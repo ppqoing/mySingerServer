@@ -206,6 +206,7 @@ async fn base_contexts_match_partial_and_missing_rows_by_identity() {
     assert_eq!(
         output.contexts.get(&rows[0].0),
         Some(&TaskFileBaseContext {
+            lane: lane.clone(),
             content_id: partial.content_id,
             cached: Some(partial),
             contact_sheet_valid: false,
@@ -216,6 +217,7 @@ async fn base_contexts_match_partial_and_missing_rows_by_identity() {
     assert_eq!(
         output.contexts.get(&rows[1].0),
         Some(&TaskFileBaseContext {
+            lane,
             content_id: None,
             cached: None,
             contact_sheet_valid: true,
