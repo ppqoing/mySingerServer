@@ -318,7 +318,7 @@ impl DiskReadScheduler {
             }))
             .await
             .map_err(|_| SchedulerError::Closed)?;
-        response.await.map_err(|_| SchedulerError::Closed)
+        response.await.map_err(|_| SchedulerError::Closed)?
     }
 
     #[doc(hidden)]
@@ -362,6 +362,17 @@ impl DiskReadScheduler {
             .map_err(|_| SchedulerError::Closed)?;
         response.await.map_err(|_| SchedulerError::Closed)
     }
+
+    /// 测试专用：让下一次队首交付模拟响应端已关闭，验证公平状态只在发送成功后提交。
+    #[cfg(test)]
+    pub(super) async fn drop_next_reply_for_test(&self) -> Result<(), SchedulerError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::DropNextReply(reply))
+            .await
+            .map_err(|_| SchedulerError::Closed)?;
+        response.await.map_err(|_| SchedulerError::Closed)
+    }
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -395,6 +406,8 @@ enum Command {
         disk_numbers: Vec<u32>,
         reply: oneshot::Sender<ActiveSnapshot>,
     },
+    #[cfg(test)]
+    DropNextReply(oneshot::Sender<()>),
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -420,7 +433,7 @@ struct Waiter {
     sequence: u64,
     /// 被更年轻且共享底层盘的请求成功绕过次数。
     conflicting_bypasses: u8,
-    reply: oneshot::Sender<DiskReadPermit>,
+    reply: oneshot::Sender<Result<DiskReadPermit, SchedulerError>>,
     _queue_slot: OwnedSemaphorePermit,
 }
 
@@ -452,6 +465,30 @@ impl LocationQueue {
     /// 返回两个类别均无等待项的状态。
     fn is_empty(&self) -> bool {
         self.hash_waiting.is_empty() && self.media_waiting.is_empty()
+    }
+
+    /// 判断当前位置是否仍有加权入口等待项。
+    fn has_weighted_waiter(&self) -> bool {
+        self.hash_waiting
+            .iter()
+            .chain(self.media_waiting.iter())
+            .any(|waiter| waiter.configured_weight.is_some())
+    }
+
+    /// 判断当前位置是否仍有旧入口等待项，用于在加权请求离队后重建等权占位。
+    fn has_legacy_waiter(&self) -> bool {
+        self.hash_waiting
+            .iter()
+            .chain(self.media_waiting.iter())
+            .any(|waiter| waiter.configured_weight.is_none())
+    }
+
+    /// 返回当前位置冻结的加权值；入队校验保证多个加权项值一致。
+    fn configured_weight(&self) -> Option<usize> {
+        self.hash_waiting
+            .iter()
+            .chain(self.media_waiting.iter())
+            .find_map(|waiter| waiter.configured_weight)
     }
 
     /// 清除已取消的两个类别队首，避免占住真实 FIFO 请求。
@@ -489,6 +526,8 @@ struct WeightedLaneState {
     configured_weight: usize,
     /// 尚未消费的任务单位，跨全局窗口保留以维持长期比例。
     deficit: usize,
+    /// 当前 lane 是否仍有带权等待项；false 表示仅为 legacy 等权入口占位。
+    has_weighted_waiter: bool,
 }
 
 /// 一次不含队首引用的加权选择结果，供 actor 在释放借用后提交亏欠变化。
@@ -513,6 +552,8 @@ struct WaiterSelection {
     class: DiskReadClass,
     /// 选中队首的稳定入队顺序。
     sequence: u64,
+    /// 加权状态更新；仅在响应发送成功后由 actor 应用。
+    weighted_choice: Option<WeightedChoice>,
 }
 
 #[derive(Clone, Copy)]
@@ -566,8 +607,13 @@ struct ActorState {
     next_sequence: u64,
     /// 全局唯一的老化保留身份。
     aged_reservation: Option<AgedReservation>,
+    /// 测试专用响应失败开关，不进入生产状态。
+    #[cfg(test)]
+    drop_next_reply: bool,
     /// 每个加权 lane 的唯一亏欠状态，和现有 active/老化状态同属 actor。
     weighted_lanes: BTreeMap<DiskKey, WeightedLaneState>,
+    /// 当前是否存在加权入口；纯旧入口为 false，保持原有等权选择路径。
+    weighted_mode: bool,
     /// 当前加权轮转游标；lane 消失后会清除，不累计历史突发额度。
     weighted_cursor: Option<DiskKey>,
 }
@@ -585,33 +631,80 @@ impl ActorState {
             in_rotation: BTreeSet::new(),
             next_sequence: 0,
             aged_reservation: None,
+            #[cfg(test)]
+            drop_next_reply: false,
             weighted_lanes: BTreeMap::new(),
+            weighted_mode: false,
             weighted_cursor: None,
         }
     }
 
     /// 按读取类别进入当前位置 FIFO，并注册复合位置的全部底层盘。
     fn enqueue(&mut self, mut waiter: Waiter) {
-        waiter.sequence = self.next_sequence;
-        self.next_sequence = self.next_sequence.wrapping_add(1);
         let key = waiter.key.clone();
         let observed_limit = waiter
             .per_disk_limit
             .unwrap_or_else(|| self.config.disk_limit(waiter.kind));
+
+        // 先验证本次冻结上限，避免异常数值进入 actor 后在 nominal 计算处 panic。
+        if nominal_seats(observed_limit, self.config.worker_count).is_err() {
+            let _ = waiter.reply.send(Err(SchedulerError::InvalidConfiguration(
+                "冻结的逐盘读取额度无法计算名义 seat",
+            )));
+            return;
+        }
+
+        // 同一物理盘的加权配置在本轮必须冻结；冲突请求直接失败且不进入队列。
         if let Some(configured_weight) = waiter.configured_weight {
-            self.weighted_lanes
+            if self
+                .queues
+                .get(&key)
+                .and_then(LocationQueue::configured_weight)
+                .is_some_and(|existing| existing != configured_weight)
+            {
+                let _ = waiter.reply.send(Err(SchedulerError::InvalidConfiguration(
+                    "同一物理盘的冻结调度权重不能变化",
+                )));
+                return;
+            }
+        }
+
+        waiter.sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.wrapping_add(1);
+        let had_weighted_waiter = self
+            .queues
+            .get(&key)
+            .is_some_and(LocationQueue::has_weighted_waiter);
+        if waiter.configured_weight.is_some() && !self.weighted_mode {
+            // 加权入口首次出现时，把已经排队的旧入口按等权 1 纳入同一个 actor 状态。
+            self.weighted_mode = true;
+            let existing_keys = self.queues.keys().cloned().collect::<Vec<_>>();
+            for existing_key in existing_keys {
+                self.weighted_lanes
+                    .entry(existing_key)
+                    .or_insert(WeightedLaneState {
+                        configured_weight: 1,
+                        deficit: 0,
+                        has_weighted_waiter: false,
+                    });
+            }
+        }
+        if self.weighted_mode {
+            let configured_weight = waiter.configured_weight.unwrap_or(1);
+            let lane = self
+                .weighted_lanes
                 .entry(key.clone())
-                .and_modify(|lane| {
-                    // 同一物理盘的根计划应共享同一权重；不一致时采用较小值，避免超额倾斜。
-                    if lane.configured_weight != configured_weight {
-                        lane.configured_weight = lane.configured_weight.min(configured_weight);
-                        lane.deficit = 0;
-                    }
-                })
                 .or_insert(WeightedLaneState {
                     configured_weight,
                     deficit: 0,
+                    has_weighted_waiter: false,
                 });
+            if waiter.configured_weight.is_some() && !had_weighted_waiter {
+                // 加权 lane 重新出现时从零开始，不能继承之前已经消费的突发额度。
+                lane.configured_weight = configured_weight;
+                lane.deficit = 0;
+                lane.has_weighted_waiter = true;
+            }
         }
         for disk_number in &key.0 {
             self.underlying_disks
@@ -658,6 +751,7 @@ impl ActorState {
                 key,
                 class,
                 sequence,
+                weighted_choice,
             } = selection;
             let waiter = self
                 .queues
@@ -686,11 +780,26 @@ impl ActorState {
                     notify: self.notify.clone(),
                 }),
             };
-            match waiter.reply.send(permit) {
-                Ok(()) => {
-                    self.note_successful_grant(&key, class, sequence, occupies_last_global_seat)
+            let delivered = {
+                #[cfg(test)]
+                if self.drop_next_reply {
+                    self.drop_next_reply = false;
+                    drop(waiter.reply);
+                    drop(permit);
+                    false
+                } else {
+                    waiter.reply.send(Ok(permit)).is_ok()
                 }
-                Err(returned) => drop(returned),
+                #[cfg(not(test))]
+                {
+                    waiter.reply.send(Ok(permit)).is_ok()
+                }
+            };
+            if delivered {
+                self.note_successful_grant(&key, class, sequence, occupies_last_global_seat);
+                if let Some(choice) = weighted_choice.as_ref() {
+                    self.apply_weighted_choice(choice);
+                }
             }
         }
     }
@@ -717,6 +826,25 @@ impl ActorState {
                 self.weighted_cursor = None;
             }
         }
+        // 加权项全部离开但 legacy 仍在排队时，保留一个全新的等权占位，
+        // 清掉旧 lane 的 deficit，避免后续重新出现加权请求继承历史突发。
+        let legacy_only = self
+            .queues
+            .iter()
+            .filter_map(|(key, queue)| {
+                (queue.has_legacy_waiter() && !queue.has_weighted_waiter()).then_some(key.clone())
+            })
+            .collect::<Vec<_>>();
+        for key in legacy_only {
+            if let Some(lane) = self.weighted_lanes.get_mut(&key) {
+                lane.configured_weight = 1;
+                lane.deficit = 0;
+                lane.has_weighted_waiter = false;
+            }
+        }
+        if self.weighted_lanes.is_empty() {
+            self.weighted_mode = false;
+        }
     }
 
     /// 按老化保留、T=1 轮换、活动 seat 压力和位置轮转选择原子队首。
@@ -739,7 +867,11 @@ impl ActorState {
                     && *class == reservation.class
                     && waiter.sequence == reservation.sequence
             }) {
-                return Some(self.make_selection(&heads[index]));
+                let mut selection = self.make_selection(&heads[index]);
+                // 老化直通也是一次真实授予；提交后清零该 lane 的 deficit，
+                // 避免保护性放行紧接着制造新的突发。
+                selection.weighted_choice = self.aged_weighted_choice(&heads, &grantable, index);
+                return Some(selection);
             }
             // 保留暂时不可授予时，只冻结真正相交或会占用最后全局 seat 的年轻请求。
             grantable
@@ -757,19 +889,18 @@ impl ActorState {
             return None;
         }
 
-        // 先保留每个同盘 T=1 争用组的代表，再让跨盘代表参加全局裁决。
-        let capacity_candidates = self.select_capacity_one_representatives(&heads, &eligible);
-        if let Some(choice) = self.select_weighted_lane(&heads, &capacity_candidates) {
+        // 先按物理 lane 权重选 lane，再在选中 lane 内执行 T=1 与类别裁决。
+        if let Some(choice) = self.select_weighted_lane(&heads, &eligible) {
             let selection = WaiterSelection {
                 key: choice.key.clone(),
                 class: choice.class,
                 sequence: choice.sequence,
+                weighted_choice: Some(choice),
             };
-            // 队首引用只在本次选择中借用；释放后才能更新 actor 内的亏欠状态。
-            drop(heads);
-            self.apply_weighted_choice(&choice);
             return Some(selection);
         }
+        // 旧等权入口仍沿用原有的 T=1 争用组压缩。
+        let capacity_candidates = self.select_capacity_one_representatives(&heads, &eligible);
         let index = self.select_pressure_or_rotation(&heads, &capacity_candidates);
         Some(self.make_selection(&heads[index]))
     }
@@ -780,15 +911,12 @@ impl ActorState {
         heads: &[(DiskKey, DiskReadClass, &Waiter)],
         candidates: &[usize],
     ) -> Option<WeightedChoice> {
+        if !self.weighted_mode {
+            return None;
+        }
         let keys = candidates
             .iter()
-            .filter_map(|index| {
-                heads[*index]
-                    .2
-                    .configured_weight
-                    .is_some()
-                    .then(|| heads[*index].0.clone())
-            })
+            .map(|index| heads[*index].0.clone())
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
@@ -801,15 +929,31 @@ impl ActorState {
             .weighted_cursor
             .as_ref()
             .and_then(|cursor| keys.iter().position(|key| key == cursor))
-            .unwrap_or(0);
+            .unwrap_or_else(|| {
+                // 新一轮从最高配置权重开始；之后仍由游标和剩余亏欠维持累计比例。
+                keys.iter()
+                    .enumerate()
+                    .max_by_key(|(_, key)| {
+                        self.weighted_lanes
+                            .get(*key)
+                            .map_or(0, |lane| lane.configured_weight)
+                    })
+                    .map_or(0, |(index, _)| index)
+            });
         for offset in 0..keys.len() {
             let key_index = (start + offset) % keys.len();
             let key = &keys[key_index];
             let Some(lane) = self.weighted_lanes.get(key) else {
                 continue;
             };
-            let deficit = if lane.deficit == 0 {
+            let configured_weight = if lane.has_weighted_waiter {
                 lane.configured_weight
+            } else {
+                // 加权请求暂时离队时，legacy 仍作为等权 1 参与外层轮转。
+                1
+            };
+            let deficit = if lane.deficit == 0 {
+                configured_weight
             } else {
                 lane.deficit
             };
@@ -828,7 +972,9 @@ impl ActorState {
                 .copied()
                 .filter(|index| heads[*index].0 == *key)
                 .collect::<Vec<_>>();
-            let index = self.select_pressure_or_rotation(heads, &lane_candidates);
+            let capacity_candidates =
+                self.select_capacity_one_representatives(heads, &lane_candidates);
+            let index = self.select_pressure_or_rotation(heads, &capacity_candidates);
             return Some(WeightedChoice {
                 key: key.clone(),
                 class: heads[index].1,
@@ -846,6 +992,34 @@ impl ActorState {
             lane.deficit = choice.remaining_deficit;
         }
         self.weighted_cursor = Some(choice.next_cursor.clone());
+    }
+
+    /// 为老化直通准备一次延迟提交的加权状态；不向该 lane 额外补发 deficit。
+    fn aged_weighted_choice(
+        &self,
+        heads: &[(DiskKey, DiskReadClass, &Waiter)],
+        candidates: &[usize],
+        selected: usize,
+    ) -> Option<WeightedChoice> {
+        if !self.weighted_mode {
+            return None;
+        }
+        let key = &heads[selected].0;
+        let keys = candidates
+            .iter()
+            .map(|index| heads[*index].0.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let key_index = keys.iter().position(|candidate| candidate == key)?;
+        Some(WeightedChoice {
+            key: key.clone(),
+            class: heads[selected].1,
+            sequence: heads[selected].2.sequence,
+            // 老化属于一次保护性成功，不把已积累的额度带入下一次轮转。
+            remaining_deficit: 0,
+            next_cursor: keys[(key_index + 1) % keys.len()].clone(),
+        })
     }
 
     /// 刷新唯一老化保留；取消或队首身份变化时清除旧身份。
@@ -1197,6 +1371,7 @@ impl ActorState {
             key: head.0.clone(),
             class: head.1,
             sequence: head.2.sequence,
+            weighted_choice: None,
         }
     }
 
@@ -1288,6 +1463,11 @@ async fn run_actor(
                 #[cfg(test)]
                 Some(Command::Snapshot { disk_numbers, reply }) => {
                     let _ = reply.send(state.active_snapshot(&disk_numbers));
+                }
+                #[cfg(test)]
+                Some(Command::DropNextReply(reply)) => {
+                    state.drop_next_reply = true;
+                    let _ = reply.send(());
                 }
                 Some(Command::Shutdown(reply)) => {
                     let _ = reply.send(());

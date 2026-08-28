@@ -174,6 +174,393 @@ async fn weighted_lanes_on_distinct_physical_disks_keep_independent_active_count
     drop(hdd);
 }
 
+#[tokio::test]
+async fn weighted_lane_choice_precedes_shared_t1_representative_compression() {
+    let mut config = DiskReadConfig::default();
+    config.total_threads = 1;
+    let scheduler = DiskReadScheduler::new(&config, 8).unwrap();
+    let low_weight_lane = weighted_lane(&[51], LocalDiskKind::Hdd, 1, 1);
+    let high_weight_lane = weighted_lane(&[51, 52], LocalDiskKind::Unknown, 1, 5);
+    let blocker = scheduler
+        .acquire_for_test(&[99], LocalDiskKind::Hdd, DiskReadClass::HashSequential)
+        .await
+        .unwrap();
+
+    let mut low = Box::pin(scheduler.acquire_lane(low_weight_lane, DiskReadClass::HashSequential));
+    let mut high =
+        Box::pin(scheduler.acquire_lane(high_weight_lane, DiskReadClass::HashSequential));
+    assert!(poll_once(low.as_mut()).is_pending());
+    assert!(poll_once(high.as_mut()).is_pending());
+    scheduler.barrier_for_test().await.unwrap();
+    drop(blocker);
+    scheduler.barrier_for_test().await.unwrap();
+
+    let high = match poll_once(high.as_mut()) {
+        Poll::Ready(result) => result.unwrap(),
+        Poll::Pending => panic!("高权重 lane 应先于共享 T=1 代表获得许可"),
+    };
+    assert_eq!(high.physical_disk_id(), "PhysicalDisk51+52");
+    assert!(poll_once(low.as_mut()).is_pending());
+    drop(high);
+    let low = low.await.unwrap();
+    drop(low);
+}
+
+#[tokio::test]
+async fn weighted_scheduler_keeps_legacy_requests_in_the_outer_lane_rotation() {
+    let mut config = DiskReadConfig::default();
+    config.total_threads = 1;
+    let scheduler = DiskReadScheduler::new(&config, 20).unwrap();
+    let weighted = weighted_lane(&[61], LocalDiskKind::Ssd, 8, 5);
+    let blocker = scheduler
+        .acquire_for_test(&[99], LocalDiskKind::Unknown, DiskReadClass::HashSequential)
+        .await
+        .unwrap();
+
+    let mut requests: Vec<Option<WeightedRequest>> = Vec::new();
+    for _ in 0..10 {
+        let scheduler = scheduler.clone();
+        let lane = weighted.clone();
+        requests.push(Some(Box::pin(async move {
+            scheduler
+                .acquire_lane(lane, DiskReadClass::HashSequential)
+                .await
+                .map(|permit| (0, permit))
+        })));
+    }
+    let scheduler_for_legacy = scheduler.clone();
+    requests.push(Some(Box::pin(async move {
+        scheduler_for_legacy
+            .acquire_for_test(&[62], LocalDiskKind::Hdd, DiskReadClass::HashSequential)
+            .await
+            .map(|permit| (1, permit))
+    })));
+    let scheduler_for_legacy = scheduler.clone();
+    requests.push(Some(Box::pin(async move {
+        scheduler_for_legacy
+            .acquire_for_test(&[62], LocalDiskKind::Hdd, DiskReadClass::HashSequential)
+            .await
+            .map(|permit| (1, permit))
+    })));
+
+    for request in &mut requests {
+        assert!(poll_once(request.as_mut().unwrap().as_mut()).is_pending());
+    }
+    scheduler.barrier_for_test().await.unwrap();
+    drop(blocker);
+    scheduler.barrier_for_test().await.unwrap();
+
+    let mut sequence = Vec::with_capacity(requests.len());
+    while requests.iter().any(Option::is_some) {
+        let ready = requests
+            .iter_mut()
+            .enumerate()
+            .find_map(|(index, request)| {
+                let request = request.as_mut()?;
+                match poll_once(request.as_mut()) {
+                    Poll::Ready(result) => Some((index, result.unwrap())),
+                    Poll::Pending => None,
+                }
+            })
+            .expect("全局许可释放后应存在下一个已交付请求");
+        let (index, (lane_index, permit)) = ready;
+        requests[index] = None;
+        sequence.push(lane_index);
+        drop(permit);
+        scheduler.barrier_for_test().await.unwrap();
+    }
+
+    assert_eq!(&sequence[..6], &[0, 0, 0, 0, 0, 1]);
+}
+
+#[tokio::test]
+async fn failed_weighted_reply_does_not_consume_lane_deficit() {
+    let mut config = DiskReadConfig::default();
+    config.total_threads = 1;
+    let scheduler = DiskReadScheduler::new(&config, 20).unwrap();
+    let weighted = weighted_lane(&[63], LocalDiskKind::Ssd, 8, 5);
+    let blocker = scheduler
+        .acquire_for_test(&[99], LocalDiskKind::Unknown, DiskReadClass::HashSequential)
+        .await
+        .unwrap();
+
+    let mut requests: Vec<Option<WeightedRequest>> = Vec::new();
+    for _ in 0..10 {
+        let scheduler = scheduler.clone();
+        let lane = weighted.clone();
+        requests.push(Some(Box::pin(async move {
+            scheduler
+                .acquire_lane(lane, DiskReadClass::HashSequential)
+                .await
+                .map(|permit| (0, permit))
+        })));
+    }
+    for _ in 0..2 {
+        let scheduler = scheduler.clone();
+        requests.push(Some(Box::pin(async move {
+            scheduler
+                .acquire_for_test(&[64], LocalDiskKind::Hdd, DiskReadClass::HashSequential)
+                .await
+                .map(|permit| (1, permit))
+        })));
+    }
+    for request in &mut requests {
+        assert!(poll_once(request.as_mut().unwrap().as_mut()).is_pending());
+    }
+    scheduler.barrier_for_test().await.unwrap();
+    scheduler.drop_next_reply_for_test().await.unwrap();
+    drop(blocker);
+    scheduler.barrier_for_test().await.unwrap();
+
+    let mut successful = Vec::new();
+    while requests.iter().any(Option::is_some) && successful.len() < 6 {
+        let ready = requests
+            .iter_mut()
+            .enumerate()
+            .find_map(|(index, request)| {
+                let request = request.as_mut()?;
+                match poll_once(request.as_mut()) {
+                    Poll::Ready(result) => Some((index, result)),
+                    Poll::Pending => None,
+                }
+            })
+            .expect("关闭一个响应后仍应有后续请求可观察");
+        let (index, result) = ready;
+        requests[index] = None;
+        match result {
+            Ok((lane_index, permit)) => {
+                successful.push(lane_index);
+                drop(permit);
+            }
+            Err(SchedulerError::Closed) => {}
+            Err(error) => panic!("测试响应关闭不应产生其他错误: {error:?}"),
+        }
+        scheduler.barrier_for_test().await.unwrap();
+    }
+    assert_eq!(&successful[..6], &[0, 0, 0, 0, 0, 1]);
+}
+
+#[tokio::test]
+async fn oversized_lane_limit_returns_invalid_configuration_without_panicking_actor() {
+    let scheduler = DiskReadScheduler::new(&DiskReadConfig::default(), 2).unwrap();
+    let oversized = weighted_lane(&[65], LocalDiskKind::Ssd, usize::MAX, 1);
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        scheduler.acquire_lane(oversized, DiskReadClass::HashSequential),
+    )
+    .await
+    .expect("无效额度应由 actor 快速返回");
+    assert!(matches!(
+        result,
+        Err(SchedulerError::InvalidConfiguration(
+            "冻结的逐盘读取额度无法计算名义 seat"
+        ))
+    ));
+
+    let permit = scheduler
+        .acquire_for_test(&[65], LocalDiskKind::Ssd, DiskReadClass::HashSequential)
+        .await
+        .expect("拒绝无效请求后 actor 仍应可服务合法请求");
+    drop(permit);
+}
+
+#[tokio::test]
+async fn conflicting_weighted_lane_returns_error_without_polluting_queue() {
+    let mut config = DiskReadConfig::default();
+    config.total_threads = 1;
+    let scheduler = DiskReadScheduler::new(&config, 8).unwrap();
+    let blocker = scheduler
+        .acquire_for_test(&[99], LocalDiskKind::Unknown, DiskReadClass::HashSequential)
+        .await
+        .unwrap();
+
+    let lane_weight_five = weighted_lane(&[66], LocalDiskKind::Ssd, 8, 5);
+    let mut first =
+        Box::pin(scheduler.acquire_lane(lane_weight_five, DiskReadClass::HashSequential));
+    assert!(poll_once(first.as_mut()).is_pending());
+    scheduler.barrier_for_test().await.unwrap();
+
+    let lane_weight_seven = weighted_lane(&[66], LocalDiskKind::Ssd, 8, 7);
+    let mut conflicting =
+        Box::pin(scheduler.acquire_lane(lane_weight_seven, DiskReadClass::HashSequential));
+    assert!(poll_once(conflicting.as_mut()).is_pending());
+    scheduler.barrier_for_test().await.unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_millis(200), &mut conflicting)
+        .await
+        .expect("权重冲突应立即返回");
+    assert!(matches!(
+        result,
+        Err(SchedulerError::InvalidConfiguration(
+            "同一物理盘的冻结调度权重不能变化"
+        ))
+    ));
+
+    drop(blocker);
+    let permit = first.await.expect("原权重请求不应被冲突项污染");
+    drop(permit);
+}
+
+#[tokio::test]
+async fn weighted_lane_reappearance_after_legacy_starts_without_old_deficit() {
+    let mut config = DiskReadConfig::default();
+    config.total_threads = 1;
+    let scheduler = DiskReadScheduler::new(&config, 8).unwrap();
+    let blocker = scheduler
+        .acquire_for_test(&[99], LocalDiskKind::Unknown, DiskReadClass::HashSequential)
+        .await
+        .unwrap();
+
+    let lane = weighted_lane(&[67], LocalDiskKind::Ssd, 8, 3);
+    let mut first = Box::pin(scheduler.acquire_lane(lane.clone(), DiskReadClass::HashSequential));
+    let mut legacy = Box::pin(scheduler.acquire_for_test(
+        &[67],
+        LocalDiskKind::Ssd,
+        DiskReadClass::HashSequential,
+    ));
+    let other = weighted_lane(&[68], LocalDiskKind::Hdd, 8, 1);
+    let mut other_request = Box::pin(scheduler.acquire_lane(other, DiskReadClass::HashSequential));
+    assert!(poll_once(first.as_mut()).is_pending());
+    assert!(poll_once(legacy.as_mut()).is_pending());
+    assert!(poll_once(other_request.as_mut()).is_pending());
+    scheduler.barrier_for_test().await.unwrap();
+
+    drop(blocker);
+    scheduler.barrier_for_test().await.unwrap();
+    let first = first.await.unwrap();
+
+    // 此时 legacy 仍在队首；新加权请求必须从已经清零的 lane 状态重新开始。
+    let mut second = Box::pin(scheduler.acquire_lane(lane.clone(), DiskReadClass::HashSequential));
+    let mut third = Box::pin(scheduler.acquire_lane(lane, DiskReadClass::HashSequential));
+    assert!(poll_once(second.as_mut()).is_pending());
+    assert!(poll_once(third.as_mut()).is_pending());
+    scheduler.barrier_for_test().await.unwrap();
+
+    drop(first);
+    let legacy = legacy.await.unwrap();
+    drop(legacy);
+    scheduler.barrier_for_test().await.unwrap();
+
+    let second = second.await.unwrap();
+    drop(second);
+    scheduler.barrier_for_test().await.unwrap();
+
+    let next = tokio::select! {
+        result = &mut third => {
+            drop(result.unwrap());
+            "reappeared weighted lane"
+        }
+        result = &mut other_request => {
+            drop(result.unwrap());
+            "other lane"
+        }
+    };
+    assert_eq!(next, "reappeared weighted lane");
+}
+
+#[tokio::test]
+async fn weighted_aging_bypasses_no_more_than_eight_and_does_not_create_burst() {
+    let mut config = DiskReadConfig::default();
+    config.total_threads = 1;
+    let scheduler = DiskReadScheduler::new(&config, 16).unwrap();
+    let low = weighted_lane(&[69], LocalDiskKind::Hdd, 8, 1);
+    let high = weighted_lane(&[70], LocalDiskKind::Ssd, 8, 100);
+    let blocker = scheduler
+        .acquire_for_test(&[99], LocalDiskKind::Unknown, DiskReadClass::HashSequential)
+        .await
+        .unwrap();
+
+    let mut requests: Vec<Option<WeightedRequest>> = Vec::new();
+    for _ in 0..2 {
+        let scheduler = scheduler.clone();
+        let lane = low.clone();
+        requests.push(Some(Box::pin(async move {
+            scheduler
+                .acquire_lane(lane, DiskReadClass::HashSequential)
+                .await
+                .map(|permit| (0, permit))
+        })));
+    }
+    for _ in 0..12 {
+        let scheduler = scheduler.clone();
+        let lane = high.clone();
+        requests.push(Some(Box::pin(async move {
+            scheduler
+                .acquire_lane(lane, DiskReadClass::HashSequential)
+                .await
+                .map(|permit| (1, permit))
+        })));
+    }
+    for request in &mut requests {
+        assert!(poll_once(request.as_mut().unwrap().as_mut()).is_pending());
+    }
+    scheduler.barrier_for_test().await.unwrap();
+    drop(blocker);
+    scheduler.barrier_for_test().await.unwrap();
+
+    let mut sequence = Vec::with_capacity(10);
+    while sequence.len() < 10 {
+        let ready = requests
+            .iter_mut()
+            .enumerate()
+            .find_map(|(index, request)| {
+                let request = request.as_mut()?;
+                match poll_once(request.as_mut()) {
+                    Poll::Ready(result) => Some((index, result.unwrap())),
+                    Poll::Pending => None,
+                }
+            })
+            .expect("每次释放全局许可后都应有请求交付");
+        let (index, (lane_index, permit)) = ready;
+        requests[index] = None;
+        sequence.push(lane_index);
+        drop(permit);
+        scheduler.barrier_for_test().await.unwrap();
+    }
+
+    let low_index = sequence
+        .iter()
+        .position(|lane_index| *lane_index == 0)
+        .expect("老化保护应最终放行低权重 lane");
+    assert!(low_index <= 8, "低权重 lane 被绕过超过八次: {sequence:?}");
+    assert_eq!(sequence.get(low_index + 1), Some(&1));
+}
+
+#[tokio::test]
+async fn cancelling_weighted_waiter_does_not_block_other_lane_or_leave_active_state() {
+    let mut config = DiskReadConfig::default();
+    config.total_threads = 1;
+    let scheduler = DiskReadScheduler::new(&config, 8).unwrap();
+    let blocker = scheduler
+        .acquire_for_test(&[99], LocalDiskKind::Unknown, DiskReadClass::HashSequential)
+        .await
+        .unwrap();
+
+    let lane = weighted_lane(&[71], LocalDiskKind::Ssd, 8, 5);
+    let mut cancelled = Box::pin(scheduler.acquire_lane(lane, DiskReadClass::HashSequential));
+    let mut survivor = Box::pin(scheduler.acquire_for_test(
+        &[72],
+        LocalDiskKind::Hdd,
+        DiskReadClass::HashSequential,
+    ));
+    assert!(poll_once(cancelled.as_mut()).is_pending());
+    assert!(poll_once(survivor.as_mut()).is_pending());
+    scheduler.barrier_for_test().await.unwrap();
+
+    drop(cancelled);
+    scheduler.barrier_for_test().await.unwrap();
+    drop(blocker);
+    let survivor = tokio::time::timeout(std::time::Duration::from_millis(200), &mut survivor)
+        .await
+        .expect("取消的加权队首不应阻塞其他 lane")
+        .unwrap();
+    drop(survivor);
+    scheduler.barrier_for_test().await.unwrap();
+    let snapshot = scheduler.active_snapshot_for_test(&[71, 72]).await.unwrap();
+    assert_eq!(snapshot.global_total, 0);
+    assert_eq!(snapshot.disks, vec![(71, 0, 0, 0), (72, 0, 0, 0)]);
+}
+
 fn poll_once<F>(future: Pin<&mut F>) -> Poll<F::Output>
 where
     F: Future + ?Sized,
