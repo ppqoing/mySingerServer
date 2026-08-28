@@ -115,9 +115,6 @@ impl Drop for DiskReadPermit {
         let Some(counters) = self.counters.take() else {
             return;
         };
-        if let Some(active) = counters.lane_active {
-            active.fetch_sub(1, Ordering::AcqRel);
-        }
         // 反向释放：先释放每盘类别与 total，再释放全局类别与 total。
         for disk in counters.disk_counters.iter().rev() {
             disk.class.fetch_sub(1, Ordering::AcqRel);
@@ -125,6 +122,10 @@ impl Drop for DiskReadPermit {
         }
         counters.global_class.fetch_sub(1, Ordering::AcqRel);
         counters.global_total.fetch_sub(1, Ordering::AcqRel);
+        // 只有实际磁盘和全局槽位都释放后才解除 lane 权重冻结，避免暴露中间状态。
+        if let Some(active) = counters.lane_active {
+            active.fetch_sub(1, Ordering::AcqRel);
+        }
         counters.notify.notify_one();
     }
 }

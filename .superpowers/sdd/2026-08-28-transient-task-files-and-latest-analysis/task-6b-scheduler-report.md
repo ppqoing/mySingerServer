@@ -72,3 +72,8 @@ weighted waiter 全部离开后 legacy 仍沿用加权路径；legacy 队首后�
 第二轮修复后的 `disk_scheduler` 全量为 42/42，`dedup-node-engine --lib` 为 66/66；本段
 两文件 rustfmt 与 diff-check 通过。活动配置、legacy 恢复和非队首取消三条新增测试均为
 1/1。未修改 `task_dispatch.rs`，未运行真实媒体、打包或部署。
+
+最后一次窄复审指出 permit Drop 的原子释放顺序存在中间窗口：旧代码会先解除 lane 权重
+冻结，再释放真实磁盘和全局计数。现已把 `lane_active` 递减移动到全部磁盘/全局计数释放
+之后、唤醒 actor 之前。控制 Agent 独立复跑 `disk_scheduler` 42/42、
+`dedup-node-engine --lib` 66/66，scheduler rustfmt 与 `git diff --check` 均通过。
