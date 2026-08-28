@@ -913,6 +913,11 @@ impl TransientTaskFileSet {
         self.change_epoch()
     }
 
+    /// 返回生产端是否已经封闭；封闭后 dispatcher 可以明确报告 admission 阻塞。
+    pub fn production_sealed(&self) -> bool {
+        self.sealed
+    }
+
     /// 返回运行目录是否已 seal、全部行已进入终态且没有在途 ACK。
     pub fn all_terminal(&self) -> bool {
         !self.discarded

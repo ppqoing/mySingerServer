@@ -18,8 +18,8 @@ use dedup_node_engine::{
     io::{DiskReadClass, DiskReadScheduler, ReadFailure},
     scan::TaskDiskLane,
     task_dispatch::{
-        DispatchedTask, SchedulerTaskLanePermitProvider, TaskDispatchError, TaskFileDispatcher,
-        TaskLanePermitProvider,
+        DispatchedTask, SchedulerTaskLanePermitProvider, TaskDispatchAdmission, TaskDispatchError,
+        TaskDispatchPoll, TaskFileDispatcher, TaskLanePermitProvider,
     },
     task_files::{TaskFileRecord, TaskWorkKind, TaskWorkMask, TransientTaskFileSet},
 };
@@ -200,6 +200,15 @@ fn poll_once<P: TaskLanePermitProvider>(
 ) -> Poll<Result<Option<DispatchedTask<P::Permit>>, TaskDispatchError>> {
     let mut context = Context::from_waker(Waker::noop());
     dispatcher.poll_next(cancellation, &mut context)
+}
+
+fn poll_with_admission<P: TaskLanePermitProvider>(
+    dispatcher: &mut TaskFileDispatcher<P>,
+    cancellation: &ReadCancellationToken,
+    admission: TaskDispatchAdmission,
+) -> Poll<Result<TaskDispatchPoll<P::Permit>, TaskDispatchError>> {
+    let mut context = Context::from_waker(Waker::noop());
+    dispatcher.poll_next_with_admission(cancellation, admission, &mut context)
 }
 
 struct TestDispatcher<P: TaskLanePermitProvider> {
@@ -882,4 +891,276 @@ fn record_mismatch_after_permit_keeps_the_head_retryable() {
         other => panic!("记录恢复后队首应可重新领取，实际为 {other:?}"),
     };
     dispatcher.mark_failed(&retried.identity).unwrap();
+}
+
+#[test]
+fn hash_only_admission_blocks_media_without_acquiring_a_permit() {
+    let provider = FakeProvider::default();
+    let mut dispatcher = new_dispatcher(provider.clone());
+    let task_lane = lane(&[28], LocalDiskKind::Hdd, 1, 1);
+    let row = base_record("media-only.bin", Some([0x28; 16]));
+    dispatcher.register_lane(&task_lane).unwrap();
+    dispatcher
+        .append_batch(&task_lane, std::slice::from_ref(&row))
+        .unwrap();
+    dispatcher.seal().unwrap();
+
+    let cancellation = ReadCancellationToken::new();
+    assert!(matches!(
+        poll_with_admission(
+            &mut dispatcher,
+            &cancellation,
+            TaskDispatchAdmission::hash_only()
+        ),
+        Poll::Ready(Ok(TaskDispatchPoll::Blocked(
+            dedup_node_engine::task_dispatch::TaskDispatchBlockReason::MediaPending
+        )))
+    ));
+    assert!(
+        provider.started().is_empty(),
+        "Hash-only 不得申请 Media permit"
+    );
+    assert_eq!(
+        std::fs::read(dispatcher.lane_path(&task_lane).unwrap()).unwrap()[0],
+        b'P'
+    );
+}
+
+#[test]
+fn hash_only_admission_dispatches_a_needs_md5_row() {
+    let provider = FakeProvider::default();
+    let mut dispatcher = new_dispatcher(provider.clone());
+    let task_lane = lane(&[29], LocalDiskKind::Hdd, 1, 1);
+    dispatcher.register_lane(&task_lane).unwrap();
+    dispatcher
+        .append_batch(
+            &task_lane,
+            std::slice::from_ref(&base_record("hash-only.bin", None)),
+        )
+        .unwrap();
+    dispatcher.seal().unwrap();
+
+    let cancellation = ReadCancellationToken::new();
+    let task = match poll_with_admission(
+        &mut dispatcher,
+        &cancellation,
+        TaskDispatchAdmission::hash_only(),
+    ) {
+        Poll::Ready(Ok(TaskDispatchPoll::Task(task))) => task,
+        other => panic!("Hash-only 应派发 Hash，实际为 {other:?}"),
+    };
+    assert_eq!(task.class, DiskReadClass::HashSequential);
+    dispatcher.mark_failed(&task.identity).unwrap();
+    drop(task);
+}
+
+#[test]
+fn hash_only_admission_dispatches_hash_then_reports_media_pending() {
+    let provider = FakeProvider::default();
+    let mut dispatcher = new_dispatcher(provider.clone());
+    let hash_lane = lane(&[30], LocalDiskKind::Hdd, 1, 1);
+    let media_lane = lane(&[31], LocalDiskKind::Hdd, 1, 1);
+    dispatcher.register_lane(&hash_lane).unwrap();
+    dispatcher.register_lane(&media_lane).unwrap();
+    dispatcher
+        .append_batch(
+            &hash_lane,
+            std::slice::from_ref(&base_record("hash-first.bin", None)),
+        )
+        .unwrap();
+    dispatcher
+        .append_batch(
+            &media_lane,
+            std::slice::from_ref(&base_record("media-later.bin", Some([0x31; 16]))),
+        )
+        .unwrap();
+    dispatcher.seal().unwrap();
+
+    let cancellation = ReadCancellationToken::new();
+    let hash = match poll_with_admission(
+        &mut dispatcher,
+        &cancellation,
+        TaskDispatchAdmission::hash_only(),
+    ) {
+        Poll::Ready(Ok(TaskDispatchPoll::Task(task))) => task,
+        other => panic!("Hash-only 首次应派发 Hash，实际为 {other:?}"),
+    };
+    assert_eq!(hash.class, DiskReadClass::HashSequential);
+    dispatcher.mark_completed(&hash.identity).unwrap();
+    drop(hash);
+
+    assert!(matches!(
+        poll_with_admission(
+            &mut dispatcher,
+            &cancellation,
+            TaskDispatchAdmission::hash_only()
+        ),
+        Poll::Ready(Ok(TaskDispatchPoll::Blocked(
+            dedup_node_engine::task_dispatch::TaskDispatchBlockReason::MediaPending
+        )))
+    ));
+    assert_eq!(
+        provider.started().len(),
+        1,
+        "不得在 Hash-only 下申请 Media permit"
+    );
+    assert_eq!(
+        std::fs::read(dispatcher.lane_path(&media_lane).unwrap()).unwrap()[0],
+        b'P'
+    );
+}
+
+#[tokio::test]
+async fn default_next_still_dispatches_media() {
+    let provider = FakeProvider::default();
+    let mut dispatcher = new_dispatcher(provider);
+    let task_lane = lane(&[32], LocalDiskKind::Hdd, 1, 1);
+    dispatcher.register_lane(&task_lane).unwrap();
+    dispatcher
+        .append_batch(
+            &task_lane,
+            std::slice::from_ref(&base_record("default-media.bin", Some([0x32; 16]))),
+        )
+        .unwrap();
+    dispatcher.seal().unwrap();
+
+    let task = dispatcher
+        .next(ReadCancellationToken::new())
+        .await
+        .unwrap()
+        .expect("默认 next 必须保留 Media 派发行为");
+    assert_eq!(task.class, DiskReadClass::MediaDecode);
+    dispatcher.mark_failed(&task.identity).unwrap();
+    drop(task);
+}
+
+#[test]
+fn switching_to_media_admission_releases_a_hash_only_block_without_losing_p() {
+    let provider = FakeProvider::default();
+    let mut dispatcher = new_dispatcher(provider.clone());
+    let task_lane = lane(&[33], LocalDiskKind::Hdd, 1, 1);
+    dispatcher.register_lane(&task_lane).unwrap();
+    dispatcher
+        .append_batch(
+            &task_lane,
+            std::slice::from_ref(&base_record("switch-media.bin", Some([0x33; 16]))),
+        )
+        .unwrap();
+    dispatcher.seal().unwrap();
+    let cancellation = ReadCancellationToken::new();
+
+    assert!(matches!(
+        poll_with_admission(
+            &mut dispatcher,
+            &cancellation,
+            TaskDispatchAdmission::hash_only()
+        ),
+        Poll::Ready(Ok(TaskDispatchPoll::Blocked(_)))
+    ));
+    assert_eq!(
+        std::fs::read(dispatcher.lane_path(&task_lane).unwrap()).unwrap()[0],
+        b'P'
+    );
+
+    let media =
+        match poll_with_admission(&mut dispatcher, &cancellation, TaskDispatchAdmission::all()) {
+            Poll::Ready(Ok(TaskDispatchPoll::Task(task))) => task,
+            other => panic!("切换为允许 Media 后应派发原 P 行，实际为 {other:?}"),
+        };
+    assert_eq!(media.class, DiskReadClass::MediaDecode);
+    assert_eq!(provider.started().len(), 1);
+    dispatcher.mark_failed(&media.identity).unwrap();
+    drop(media);
+}
+
+#[test]
+fn switching_admission_drops_forbidden_pending_future_and_retries_same_p_row() {
+    let provider = FakeProvider::default();
+    provider.set_blocked(true);
+    let mut dispatcher = new_dispatcher(provider.clone());
+    let task_lane = lane(&[35], LocalDiskKind::Hdd, 1, 1);
+    dispatcher.register_lane(&task_lane).unwrap();
+    dispatcher
+        .append_batch(
+            &task_lane,
+            std::slice::from_ref(&base_record("switch-pending.bin", Some([0x35; 16]))),
+        )
+        .unwrap();
+    dispatcher.seal().unwrap();
+    let cancellation = ReadCancellationToken::new();
+
+    assert!(
+        poll_with_admission(&mut dispatcher, &cancellation, TaskDispatchAdmission::all())
+            .is_pending()
+    );
+    assert_eq!(provider.started().len(), 1);
+
+    assert!(matches!(
+        poll_with_admission(
+            &mut dispatcher,
+            &cancellation,
+            TaskDispatchAdmission::hash_only()
+        ),
+        Poll::Ready(Ok(TaskDispatchPoll::Blocked(
+            dedup_node_engine::task_dispatch::TaskDispatchBlockReason::MediaPending
+        )))
+    ));
+    assert_eq!(
+        provider.started().len(),
+        1,
+        "切换 admission 不得重复启动 Media future"
+    );
+    assert_eq!(
+        std::fs::read(dispatcher.lane_path(&task_lane).unwrap()).unwrap()[0],
+        b'P'
+    );
+
+    provider.set_blocked(false);
+    let media =
+        match poll_with_admission(&mut dispatcher, &cancellation, TaskDispatchAdmission::all()) {
+            Poll::Ready(Ok(TaskDispatchPoll::Task(task))) => task,
+            other => panic!("切回允许 Media 后应重新申请同一 P 行，实际为 {other:?}"),
+        };
+    assert_eq!(provider.started().len(), 2);
+    dispatcher.mark_failed(&media.identity).unwrap();
+    drop(media);
+}
+
+#[test]
+fn hash_only_admission_cancellation_keeps_pending_row_as_p() {
+    let provider = FakeProvider::default();
+    provider.set_blocked(true);
+    let mut dispatcher = new_dispatcher(provider.clone());
+    let task_lane = lane(&[34], LocalDiskKind::Hdd, 1, 1);
+    dispatcher.register_lane(&task_lane).unwrap();
+    dispatcher
+        .append_batch(
+            &task_lane,
+            std::slice::from_ref(&base_record("cancel-hash.bin", None)),
+        )
+        .unwrap();
+    dispatcher.seal().unwrap();
+    let cancellation = ReadCancellationToken::new();
+    assert!(
+        poll_with_admission(
+            &mut dispatcher,
+            &cancellation,
+            TaskDispatchAdmission::hash_only()
+        )
+        .is_pending()
+    );
+    cancellation.cancel();
+    assert!(matches!(
+        poll_with_admission(
+            &mut dispatcher,
+            &cancellation,
+            TaskDispatchAdmission::hash_only()
+        ),
+        Poll::Ready(Err(TaskDispatchError::Read(ReadFailure::Cancelled)))
+    ));
+    assert_eq!(
+        std::fs::read(dispatcher.lane_path(&task_lane).unwrap()).unwrap()[0],
+        b'P'
+    );
+    assert_eq!(provider.started().len(), 1);
 }

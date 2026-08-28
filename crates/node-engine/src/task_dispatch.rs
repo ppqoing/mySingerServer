@@ -49,6 +49,78 @@ pub enum TaskDispatchError {
     Read(#[source] ReadFailure),
 }
 
+/// 当前 dispatcher 允许启动的读取阶段。
+///
+/// 该值只做阶段 admission，不保存也不复制 `DiskReadScheduler` 的公平状态；
+/// 真正的全局、物理盘和类别额度仍由 scheduler 的 permit 决定。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TaskDispatchAdmission {
+    /// 是否允许为需要 MD5 的任务申请 Hash 读取许可。
+    pub allow_hash: bool,
+    /// 是否允许为媒体字段或二筛任务申请 Media 读取许可。
+    pub allow_media: bool,
+}
+
+impl TaskDispatchAdmission {
+    /// 同时允许 Hash 与 Media，保持旧 `next/poll_next` 行为。
+    pub const fn all() -> Self {
+        Self {
+            allow_hash: true,
+            allow_media: true,
+        }
+    }
+
+    /// 只允许 Hash，供基础计算的 Hash 批处理使用。
+    pub const fn hash_only() -> Self {
+        Self {
+            allow_hash: true,
+            allow_media: false,
+        }
+    }
+
+    /// 只允许 Media，供基础计算的媒体续算或二筛使用。
+    pub const fn media_only() -> Self {
+        Self {
+            allow_hash: false,
+            allow_media: true,
+        }
+    }
+
+    /// 判断指定读取类别是否通过本轮 admission。
+    const fn allows(self, class: DiskReadClass) -> bool {
+        match class {
+            DiskReadClass::HashSequential => self.allow_hash,
+            DiskReadClass::MediaDecode => self.allow_media,
+        }
+    }
+}
+
+impl Default for TaskDispatchAdmission {
+    fn default() -> Self {
+        Self::all()
+    }
+}
+
+/// 任务文件已经封闭但当前 admission 无法继续时的阻塞原因。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaskDispatchBlockReason {
+    /// 仍有需要 Hash 的 `P` 行，但本轮不允许 Hash。
+    HashPending,
+    /// 仍有 Media `P` 行或 Hash→Media 续算，但本轮不允许 Media。
+    MediaPending,
+}
+
+/// 一次 admission 轮询的明确结果。
+#[derive(Debug)]
+pub enum TaskDispatchPoll<Permit> {
+    /// 已取得 permit 并精确领取一项任务。
+    Task(DispatchedTask<Permit>),
+    /// 任务文件已封闭且所有行都进入终态。
+    Drained,
+    /// 仍有任务，但它们都被当前 admission 阻止；任务行保持 `P`。
+    Blocked(TaskDispatchBlockReason),
+}
+
 impl From<io::Error> for TaskDispatchError {
     fn from(error: io::Error) -> Self {
         Self::File(error)
@@ -282,12 +354,39 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
         poll_fn(|context| self.poll_next(&cancellation, context)).await
     }
 
+    /// 按指定阶段 admission 异步等待下一项；被禁止的剩余任务会明确返回 `Blocked`。
+    pub async fn next_with_admission(
+        &mut self,
+        cancellation: ReadCancellationToken,
+        admission: TaskDispatchAdmission,
+    ) -> Result<TaskDispatchPoll<Provider::Permit>, TaskDispatchError> {
+        poll_fn(|context| self.poll_next_with_admission(&cancellation, admission, context)).await
+    }
+
     /// 非阻塞推进一次队首许可申请；生产循环可用它接入自身事件循环。
     pub fn poll_next(
         &mut self,
         cancellation: &ReadCancellationToken,
         context: &mut Context<'_>,
     ) -> Poll<Result<Option<DispatchedTask<Provider::Permit>>, TaskDispatchError>> {
+        match self.poll_next_with_admission(cancellation, TaskDispatchAdmission::all(), context) {
+            Poll::Ready(Ok(TaskDispatchPoll::Task(task))) => Poll::Ready(Ok(Some(task))),
+            Poll::Ready(Ok(TaskDispatchPoll::Drained)) => Poll::Ready(Ok(None)),
+            // 默认 admission 同时允许两类，只有调用者在所有任务仍在途时才可能
+            // 观察到该分支；保留旧 API 的 Pending 语义。
+            Poll::Ready(Ok(TaskDispatchPoll::Blocked(_))) => Poll::Pending,
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    /// 非阻塞推进指定阶段 admission；不会复制 scheduler 的公平状态。
+    pub fn poll_next_with_admission(
+        &mut self,
+        cancellation: &ReadCancellationToken,
+        admission: TaskDispatchAdmission,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<TaskDispatchPoll<Provider::Permit>, TaskDispatchError>> {
         loop {
             if cancellation.is_cancelled() {
                 // 取消只丢弃等待 future，磁盘文件仍保持 P，调用方可以在收束后整体删除 run。
@@ -299,14 +398,24 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
             if let Err(error) = self.files.health() {
                 return Poll::Ready(Err(error.into()));
             }
-            if let Err(error) = self.start_lane_requests(cancellation) {
+            if let Err(error) = self.start_lane_requests(cancellation, admission) {
                 return Poll::Ready(Err(error));
             }
             if let Poll::Ready(result) = self.poll_lane_requests(context) {
-                return Poll::Ready(result);
+                return Poll::Ready(result.map(|task| match task {
+                    Some(task) => TaskDispatchPoll::Task(task),
+                    None => TaskDispatchPoll::Drained,
+                }));
             }
             if self.files.all_terminal() {
-                return Poll::Ready(Ok(None));
+                return Poll::Ready(Ok(TaskDispatchPoll::Drained));
+            }
+            if self.files.production_sealed() {
+                if let Some(reason) = self.blocked_by_admission(admission)? {
+                    // 阶段切换后不能复用旧等待通知；下一轮 admission 应立即重新观察队首。
+                    self.publication_wait = None;
+                    return Poll::Ready(Ok(TaskDispatchPoll::Blocked(reason)));
+                }
             }
 
             let current_epoch = self.files.publication_epoch();
@@ -339,6 +448,7 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
     fn start_lane_requests(
         &mut self,
         cancellation: &ReadCancellationToken,
+        admission: TaskDispatchAdmission,
     ) -> Result<(), TaskDispatchError> {
         let heads = self
             .files
@@ -352,8 +462,13 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
                 .files
                 .lane_key(&lane)
                 .map_err(TaskDispatchError::File)?;
-            if self.pending.contains_key(&key) {
-                continue;
+            if let Some(pending) = self.pending.get(&key) {
+                if admission.allows(pending.class) {
+                    continue;
+                }
+                // 当前阶段禁止的 future 尚未向调用方交付 permit；丢弃它即可释放其
+                // 内部资源，任务文件仍保持 P，切回允许阶段时会按同一身份重试。
+                self.pending.remove(&key);
             }
             let (identity, record, class, continuation) = if let Some((identity, record)) = self
                 .continuations
@@ -369,6 +484,9 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
                 let class = dispatch_class(&head.record)?;
                 (head.identity.clone(), head.record.clone(), class, false)
             };
+            if !admission.allows(class) {
+                continue;
+            }
             let future = self
                 .provider
                 .acquire(lane.clone(), class, cancellation.clone());
@@ -384,6 +502,41 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
             );
         }
         Ok(())
+    }
+
+    /// 找出封闭任务中被当前 admission 阻止的队首或续算类别。
+    fn blocked_by_admission(
+        &mut self,
+        admission: TaskDispatchAdmission,
+    ) -> Result<Option<TaskDispatchBlockReason>, TaskDispatchError> {
+        let mut hash_pending = false;
+        let mut media_pending = false;
+
+        if !admission.allow_media && !self.continuations.is_empty() {
+            media_pending = true;
+        }
+        for pending in self.pending.values() {
+            match pending.class {
+                DiskReadClass::HashSequential if !admission.allow_hash => hash_pending = true,
+                DiskReadClass::MediaDecode if !admission.allow_media => media_pending = true,
+                _ => {}
+            }
+        }
+        for (_, head) in self.files.lane_heads()? {
+            match dispatch_class(&head.record)? {
+                DiskReadClass::HashSequential if !admission.allow_hash => hash_pending = true,
+                DiskReadClass::MediaDecode if !admission.allow_media => media_pending = true,
+                _ => {}
+            }
+        }
+
+        if hash_pending {
+            Ok(Some(TaskDispatchBlockReason::HashPending))
+        } else if media_pending {
+            Ok(Some(TaskDispatchBlockReason::MediaPending))
+        } else {
+            Ok(None)
+        }
     }
 
     fn poll_lane_requests(
