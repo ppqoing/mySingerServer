@@ -55,3 +55,20 @@
 `crates/node-engine/tests/task_dispatch.rs` 格式差异；本次没有修改该文件。C/D 盘在重型
 命令前约为 17.58/10.24 GiB，未触发清理。未运行真实媒体、打包、部署，也未触碰
 `I:\Tool`。
+
+## 第二轮复审修复
+
+第二轮先以确定性行为测试固定三条 RED：活动 weight=5 permit 存在时 weight=7 未被拒绝；
+weighted waiter 全部离开后 legacy 仍沿用加权路径；legacy 队首后取消的非队首 weighted
+项仍参与冻结权重冲突。修复后：
+
+- 每个 weighted lane 由 actor 持有活动 permit 原子计数；队列清空时只清理 deficit，
+  最后一个 permit 释放后才移除冻结配置；
+- `weighted_mode` 每轮从当前开放且未取消的 weighted waiter 计算，全部离开即恢复旧的
+  capacity-one/rotation 选择；
+- 两类 FIFO 清理改为 retain 存活项，任意位置取消项都会释放队列槽位，配置扫描忽略已关闭
+  的响应且保留其余存活项顺序。
+
+第二轮修复后的 `disk_scheduler` 全量为 42/42，`dedup-node-engine --lib` 为 66/66；本段
+两文件 rustfmt 与 diff-check 通过。活动配置、legacy 恢复和非队首取消三条新增测试均为
+1/1。未修改 `task_dispatch.rs`，未运行真实媒体、打包或部署。

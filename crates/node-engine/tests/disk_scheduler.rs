@@ -561,6 +561,127 @@ async fn cancelling_weighted_waiter_does_not_block_other_lane_or_leave_active_st
     assert_eq!(snapshot.disks, vec![(71, 0, 0, 0), (72, 0, 0, 0)]);
 }
 
+#[tokio::test]
+async fn active_weighted_permit_keeps_lane_weight_frozen_until_drop() {
+    let scheduler = DiskReadScheduler::new(&DiskReadConfig::default(), 8).unwrap();
+    let first = scheduler
+        .acquire_lane(
+            weighted_lane(&[73], LocalDiskKind::Ssd, 8, 5),
+            DiskReadClass::HashSequential,
+        )
+        .await
+        .unwrap();
+
+    let conflict = scheduler
+        .acquire_lane(
+            weighted_lane(&[73], LocalDiskKind::Ssd, 8, 7),
+            DiskReadClass::HashSequential,
+        )
+        .await;
+    assert!(matches!(
+        conflict,
+        Err(SchedulerError::InvalidConfiguration(
+            "同一物理盘的冻结调度权重不能变化"
+        ))
+    ));
+
+    drop(first);
+    scheduler.barrier_for_test().await.unwrap();
+    let replacement = scheduler
+        .acquire_lane(
+            weighted_lane(&[73], LocalDiskKind::Ssd, 8, 7),
+            DiskReadClass::HashSequential,
+        )
+        .await
+        .unwrap();
+    drop(replacement);
+}
+
+#[tokio::test]
+async fn legacy_selection_restores_after_all_weighted_waiters_leave() {
+    let mut config = DiskReadConfig::default();
+    config.total_threads = 1;
+    let scheduler = DiskReadScheduler::new(&config, 8).unwrap();
+    let blocker = scheduler
+        .acquire_for_test(&[99], LocalDiskKind::Unknown, DiskReadClass::HashSequential)
+        .await
+        .unwrap();
+
+    let mut weighted = Box::pin(scheduler.acquire_lane(
+        weighted_lane(&[80], LocalDiskKind::Ssd, 8, 5),
+        DiskReadClass::HashSequential,
+    ));
+    let mut first_legacy = Box::pin(scheduler.acquire_for_test(
+        &[78],
+        LocalDiskKind::Hdd,
+        DiskReadClass::HashSequential,
+    ));
+    let mut second_legacy = Box::pin(scheduler.acquire_for_test(
+        &[79],
+        LocalDiskKind::Hdd,
+        DiskReadClass::HashSequential,
+    ));
+    assert!(poll_once(weighted.as_mut()).is_pending());
+    assert!(poll_once(first_legacy.as_mut()).is_pending());
+    assert!(poll_once(second_legacy.as_mut()).is_pending());
+    scheduler.barrier_for_test().await.unwrap();
+
+    drop(blocker);
+    let weighted = weighted.await.unwrap();
+    drop(weighted);
+    scheduler.barrier_for_test().await.unwrap();
+
+    let first_legacy = tokio::select! {
+        result = &mut first_legacy => result.unwrap(),
+        result = &mut second_legacy => {
+            let _permit = result.unwrap();
+            panic!("legacy 路径应沿用入队轮转，不能先交付后入队的第二个 lane")
+        }
+    };
+    drop(first_legacy);
+    let second_legacy = second_legacy.await.unwrap();
+    drop(second_legacy);
+}
+
+#[tokio::test]
+async fn cancelled_non_head_weighted_waiter_does_not_freeze_conflicting_weight() {
+    let mut config = DiskReadConfig::default();
+    config.total_threads = 1;
+    let scheduler = DiskReadScheduler::new(&config, 8).unwrap();
+    let blocker = scheduler
+        .acquire_for_test(&[99], LocalDiskKind::Unknown, DiskReadClass::HashSequential)
+        .await
+        .unwrap();
+
+    let mut legacy = Box::pin(scheduler.acquire_for_test(
+        &[81],
+        LocalDiskKind::Hdd,
+        DiskReadClass::HashSequential,
+    ));
+    let mut cancelled = Box::pin(scheduler.acquire_lane(
+        weighted_lane(&[81], LocalDiskKind::Hdd, 8, 5),
+        DiskReadClass::HashSequential,
+    ));
+    assert!(poll_once(legacy.as_mut()).is_pending());
+    assert!(poll_once(cancelled.as_mut()).is_pending());
+    scheduler.barrier_for_test().await.unwrap();
+
+    drop(cancelled);
+    scheduler.barrier_for_test().await.unwrap();
+    let mut replacement = Box::pin(scheduler.acquire_lane(
+        weighted_lane(&[81], LocalDiskKind::Hdd, 8, 7),
+        DiskReadClass::HashSequential,
+    ));
+    assert!(poll_once(replacement.as_mut()).is_pending());
+    scheduler.barrier_for_test().await.unwrap();
+
+    drop(blocker);
+    let legacy = legacy.await.unwrap();
+    drop(legacy);
+    let replacement = replacement.await.unwrap();
+    drop(replacement);
+}
+
 fn poll_once<F>(future: Pin<&mut F>) -> Poll<F::Output>
 where
     F: Future + ?Sized,

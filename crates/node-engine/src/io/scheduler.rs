@@ -115,6 +115,9 @@ impl Drop for DiskReadPermit {
         let Some(counters) = self.counters.take() else {
             return;
         };
+        if let Some(active) = counters.lane_active {
+            active.fetch_sub(1, Ordering::AcqRel);
+        }
         // 反向释放：先释放每盘类别与 total，再释放全局类别与 total。
         for disk in counters.disk_counters.iter().rev() {
             disk.class.fetch_sub(1, Ordering::AcqRel);
@@ -132,6 +135,8 @@ struct PermitCounters {
     global_class: Arc<AtomicUsize>,
     /// 复合位置中每个底层盘的 total/class 计数。
     disk_counters: Vec<DiskPermitCounters>,
+    /// 该 lane 的活动许可计数，用于保持冻结配置直到最后一个 permit 释放。
+    lane_active: Option<Arc<AtomicUsize>>,
     notify: Arc<Notify>,
 }
 
@@ -472,6 +477,7 @@ impl LocationQueue {
         self.hash_waiting
             .iter()
             .chain(self.media_waiting.iter())
+            .filter(|waiter| !waiter.reply.is_closed())
             .any(|waiter| waiter.configured_weight.is_some())
     }
 
@@ -480,6 +486,7 @@ impl LocationQueue {
         self.hash_waiting
             .iter()
             .chain(self.media_waiting.iter())
+            .filter(|waiter| !waiter.reply.is_closed())
             .any(|waiter| waiter.configured_weight.is_none())
     }
 
@@ -488,25 +495,16 @@ impl LocationQueue {
         self.hash_waiting
             .iter()
             .chain(self.media_waiting.iter())
+            .filter(|waiter| !waiter.reply.is_closed())
             .find_map(|waiter| waiter.configured_weight)
     }
 
     /// 清除已取消的两个类别队首，避免占住真实 FIFO 请求。
     fn prune_closed_heads(&mut self) {
-        while self
-            .hash_waiting
-            .front()
-            .is_some_and(|waiter| waiter.reply.is_closed())
-        {
-            self.hash_waiting.pop_front();
-        }
-        while self
-            .media_waiting
-            .front()
-            .is_some_and(|waiter| waiter.reply.is_closed())
-        {
-            self.media_waiting.pop_front();
-        }
+        // retain 保持存活项的 FIFO 顺序，同时释放任意位置已经取消的队列槽位。
+        self.hash_waiting.retain(|waiter| !waiter.reply.is_closed());
+        self.media_waiting
+            .retain(|waiter| !waiter.reply.is_closed());
     }
 }
 
@@ -520,7 +518,7 @@ struct UnderlyingDiskState {
     media_streak: u8,
 }
 
-/// 单条物理盘 lane 的瞬态加权轮转状态；不保存 active 或许可所有权。
+/// 单条物理盘 lane 的加权轮转和冻结配置；permit 所有权仍由现有计数器持有。
 struct WeightedLaneState {
     /// 本轮配置提供的调度权重。
     configured_weight: usize,
@@ -528,6 +526,10 @@ struct WeightedLaneState {
     deficit: usize,
     /// 当前 lane 是否仍有带权等待项；false 表示仅为 legacy 等权入口占位。
     has_weighted_waiter: bool,
+    /// 是否已有真实 weighted 配置需要冻结；legacy 占位不设置该标志。
+    has_frozen_weight: bool,
+    /// 该 lane 当前持有的 permit 数；为零后才可释放冻结配置。
+    active_permits: Arc<AtomicUsize>,
 }
 
 /// 一次不含队首引用的加权选择结果，供 actor 在释放借用后提交亏欠变化。
@@ -656,10 +658,16 @@ impl ActorState {
 
         // 同一物理盘的加权配置在本轮必须冻结；冲突请求直接失败且不进入队列。
         if let Some(configured_weight) = waiter.configured_weight {
-            if self
+            let queued_weight = self
                 .queues
                 .get(&key)
-                .and_then(LocationQueue::configured_weight)
+                .and_then(LocationQueue::configured_weight);
+            let active_weight = self.weighted_lanes.get(&key).and_then(|lane| {
+                (lane.has_frozen_weight && lane.active_permits.load(Ordering::Acquire) > 0)
+                    .then_some(lane.configured_weight)
+            });
+            if queued_weight
+                .or(active_weight)
                 .is_some_and(|existing| existing != configured_weight)
             {
                 let _ = waiter.reply.send(Err(SchedulerError::InvalidConfiguration(
@@ -686,6 +694,8 @@ impl ActorState {
                         configured_weight: 1,
                         deficit: 0,
                         has_weighted_waiter: false,
+                        has_frozen_weight: false,
+                        active_permits: Arc::new(AtomicUsize::new(0)),
                     });
             }
         }
@@ -698,12 +708,15 @@ impl ActorState {
                     configured_weight,
                     deficit: 0,
                     has_weighted_waiter: false,
+                    has_frozen_weight: false,
+                    active_permits: Arc::new(AtomicUsize::new(0)),
                 });
             if waiter.configured_weight.is_some() && !had_weighted_waiter {
                 // 加权 lane 重新出现时从零开始，不能继承之前已经消费的突发额度。
                 lane.configured_weight = configured_weight;
                 lane.deficit = 0;
                 lane.has_weighted_waiter = true;
+                lane.has_frozen_weight = true;
             }
         }
         for disk_number in &key.0 {
@@ -763,6 +776,13 @@ impl ActorState {
             // 该授予是否填满最后一个 global seat，供老化 bypass 记录使用。
             let occupies_last_global_seat =
                 self.global_active.total.load(Ordering::Acquire) + 1 >= self.config.total_limit;
+            let lane_active = self
+                .weighted_lanes
+                .get(&key)
+                .map(|lane| lane.active_permits.clone());
+            if let Some(active) = &lane_active {
+                active.fetch_add(1, Ordering::AcqRel);
+            }
             let (global_class, disk_counters) = self.reserve_all(&key, class);
             let permit = DiskReadPermit {
                 physical_disk_id: format!(
@@ -777,6 +797,7 @@ impl ActorState {
                     global_total: self.global_active.total.clone(),
                     global_class,
                     disk_counters,
+                    lane_active,
                     notify: self.notify.clone(),
                 }),
             };
@@ -817,7 +838,18 @@ impl ActorState {
         for key in empty {
             self.rotation.retain(|queued| queued != &key);
             self.in_rotation.remove(&key);
-            self.weighted_lanes.remove(&key);
+            let release_frozen = self
+                .weighted_lanes
+                .get(&key)
+                .is_none_or(|lane| lane.active_permits.load(Ordering::Acquire) == 0);
+            if let Some(lane) = self.weighted_lanes.get_mut(&key) {
+                // 没有等待项时 deficit 已失去意义；冻结配置仍需等待活动 permit 归零。
+                lane.deficit = 0;
+                lane.has_weighted_waiter = false;
+            }
+            if release_frozen {
+                self.weighted_lanes.remove(&key);
+            }
             if self
                 .weighted_cursor
                 .as_ref()
@@ -837,13 +869,18 @@ impl ActorState {
             .collect::<Vec<_>>();
         for key in legacy_only {
             if let Some(lane) = self.weighted_lanes.get_mut(&key) {
-                lane.configured_weight = 1;
                 lane.deficit = 0;
                 lane.has_weighted_waiter = false;
+                if lane.active_permits.load(Ordering::Acquire) == 0 {
+                    lane.configured_weight = 1;
+                    lane.has_frozen_weight = false;
+                }
             }
         }
-        if self.weighted_lanes.is_empty() {
-            self.weighted_mode = false;
+        // weighted_mode 只反映当前仍开放的 weighted waiter，不由状态 map 是否为空决定。
+        self.weighted_mode = self.queues.values().any(LocationQueue::has_weighted_waiter);
+        if !self.weighted_mode {
+            self.weighted_cursor = None;
         }
     }
 
