@@ -350,7 +350,7 @@ fn opening_validates_and_initializes_library_revision_metadata() {
     drop(store);
     assert_eq!(raw_library_revision(&database), "0");
 
-    for invalid in ["-1", "1.5", "18446744073709551616"] {
+    for invalid in ["", "-1", "1.5", "18446744073709551616"] {
         let connection = Connection::open(&database).unwrap();
         connection
             .execute(
