@@ -78,3 +78,11 @@ git diff --check 通过
 本任务未运行真实媒体、未打包、未部署、未访问 `I:\Tool`。下一步由 Task 7B2 将该接口接入
 BaseCompute 的 TSV dispatcher；接入时必须把 dispatcher 交付的 permit 传给
 `HashPermitReader`，不得在读取前再次调用旧 Hash 读取入口。
+
+## Follow-up：取消测试资源收束
+
+审查指出取消测试必须把“任务终态写入”和“读取 permit 释放”分开验证。测试现按以下顺序
+执行：保存首项 identity → 取消并清空等待 → 释放首项 permit → 断言 `PhysicalDisk13` 的
+Hash `waiting=0`、`active=0`、`granted_total=1`、`released_total=1` → 最后调用
+`mark_failed(identity)`。这样不会用先写终态掩盖 permit 尚未释放的问题，且仍确认 TSV 字节
+保持原样的 `P`。

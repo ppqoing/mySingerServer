@@ -373,7 +373,8 @@ async fn cancelled_dispatch_wait_clears_metrics_and_keeps_tsv_rows_pending() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(first.identity, identities[0]);
+    let first_identity = first.identity.clone();
+    assert_eq!(first_identity, identities[0]);
 
     let mut context = std::task::Context::from_waker(std::task::Waker::noop());
     assert!(
@@ -403,19 +404,31 @@ async fn cancelled_dispatch_wait_clears_metrics_and_keeps_tsv_rows_pending() {
         before,
         "取消等待不能改写 TSV 的 P 状态"
     );
-    let released_wait = registry.details(&reporter_id).await.unwrap();
-    assert_eq!(
-        released_wait
-            .pipeline_metrics
-            .unwrap()
-            .disk_reads
-            .iter()
-            .find(|item| item.physical_disk_id == "PhysicalDisk13")
-            .map(|item| item.hash_waiting),
-        Some(Some(0))
-    );
-    dispatcher.mark_failed(&first.identity).unwrap();
     drop(first);
+    let released_wait = registry.details(&reporter_id).await.unwrap();
+    let disk = released_wait
+        .pipeline_metrics
+        .unwrap()
+        .disk_reads
+        .into_iter()
+        .find(|item| item.physical_disk_id == "PhysicalDisk13")
+        .expect("取消后应保留 PhysicalDisk13 的遥测条目");
+    assert_eq!(
+        (
+            disk.hash_waiting,
+            disk.hash_active,
+            disk.hash_granted_total,
+            disk.hash_released_total,
+        ),
+        (Some(0), Some(0), Some(1), Some(1)),
+        "取消等待和首个 permit 释放后，Hash 资源必须完全归零"
+    );
+    assert_eq!(
+        fs::read(dispatcher.lane_path(&task_lane).unwrap()).unwrap(),
+        before,
+        "释放 permit 也不能改写 TSV 的 P 状态"
+    );
+    dispatcher.mark_failed(&first_identity).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
