@@ -21,6 +21,7 @@ use tokio::sync::Notify;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use super::ScanError;
+use crate::task_files::TaskFileIdentity;
 
 /// actor 中执行的一次拥有型同步 Store 调用。
 type StoreCall = Box<dyn FnOnce(&mut NodeStore) -> bool + Send + 'static>;
@@ -133,6 +134,52 @@ impl BeforePersist for NoBeforePersist {
     fn before_persist(&mut self) {}
 }
 
+/// 基础计算持久化消息的拥有型身份。
+///
+/// `Legacy` 兼容尚未迁移的 SQLite 任务调用；`TaskFile` 保存 TSV 行的完整身份，
+/// 包括运行、物理盘 lane、行偏移、行长度、任务项和缺失掩码，绝不退化为单独的 item ID。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum BasePersistIdentity {
+    /// 旧任务表路径使用的任务项身份。
+    Legacy(TaskItemIdentity),
+    /// 瞬态任务文件路径使用的完整行身份。
+    TaskFile(TaskFileIdentity),
+}
+
+impl BasePersistIdentity {
+    /// 返回用于兼容旧日志和运行时 map 的任务项字符串。
+    pub(crate) fn item_id(&self) -> String {
+        match self {
+            Self::Legacy(identity) => identity.item_id.clone(),
+            Self::TaskFile(identity) => identity.item_id().to_string(),
+        }
+    }
+
+    /// 返回旧任务身份中的任务 ID；瞬态任务文件身份没有合成的任务 ID。
+    pub(crate) fn task_id(&self) -> Option<&TaskId> {
+        match self {
+            Self::Legacy(identity) => Some(&identity.task_id),
+            Self::TaskFile(_) => None,
+        }
+    }
+
+    /// 借用瞬态任务文件的完整行身份；旧身份返回 `None`。
+    pub(crate) fn task_file_identity(&self) -> Option<&TaskFileIdentity> {
+        match self {
+            Self::Legacy(_) => None,
+            Self::TaskFile(identity) => Some(identity),
+        }
+    }
+
+    /// 消费身份并取出瞬态任务文件的完整行身份；旧身份返回 `None`。
+    pub(crate) fn into_task_file(self) -> Option<TaskFileIdentity> {
+        match self {
+            Self::Legacy(_) => None,
+            Self::TaskFile(identity) => Some(identity),
+        }
+    }
+}
+
 #[cfg(feature = "test-hooks")]
 /// feature 专用首条 persist hook；后续消息不再检查控制状态。
 struct FirstPersistTestHook(Option<BasePersistTestWaiter>);
@@ -149,7 +196,7 @@ impl BeforePersist for FirstPersistTestHook {
 /// 一条不携带 Worker、CPU 或媒体许可的拥有型持久化消息。
 pub(crate) struct BasePersistMessage {
     /// 用于 ACK 精确归并的 task/item/content 身份。
-    pub(crate) identity: TaskItemIdentity,
+    pub(crate) identity: BasePersistIdentity,
     /// 协调器创建消息的单调时刻，用于计算真实持久化排队等待。
     enqueued_at: Instant,
     /// actor 独占 NodeStore 后执行的事务操作。
@@ -163,7 +210,19 @@ impl BasePersistMessage {
         F: FnOnce(&mut NodeStore) -> Result<BasePersistOutcome, String> + Send + 'static,
     {
         Self {
-            identity,
+            identity: BasePersistIdentity::Legacy(identity),
+            enqueued_at: Instant::now(),
+            operation: Box::new(operation),
+        }
+    }
+
+    /// 把瞬态任务文件的完整身份封装为单写操作，不追加或改写任务文件行。
+    pub(crate) fn new_task_file<F>(identity: TaskFileIdentity, operation: F) -> Self
+    where
+        F: FnOnce(&mut NodeStore) -> Result<BasePersistOutcome, String> + Send + 'static,
+    {
+        Self {
+            identity: BasePersistIdentity::TaskFile(identity),
             enqueued_at: Instant::now(),
             operation: Box::new(operation),
         }
@@ -205,7 +264,7 @@ impl BasePersistOutcome {
 /// actor 对一条持久化消息的完成回执。
 pub(crate) struct BasePersistAck {
     /// 回执对应的精确身份。
-    pub(crate) identity: TaskItemIdentity,
+    pub(crate) identity: BasePersistIdentity,
     /// 从协调器创建消息到 actor 取得消息的真实等待耗时。
     pub(crate) queue_wait: Duration,
     /// 不含测试 gate 的真实 SQLite 操作耗时。
@@ -218,8 +277,20 @@ pub(crate) struct BasePersistAck {
 mod tests {
     use dedup_core::{ContentKey, DisplayPath, MachineId, NormalizedPath};
     use dedup_node_store::{NodeStore, ScannedPath};
+    use dedup_windows::{LocalDiskKind, PhysicalDiskId};
+    use uuid::Uuid;
 
-    use super::{BasePersistOutcome, BaseStoreActor};
+    use crate::{
+        scan::TaskDiskLane,
+        task_files::{
+            TaskFileIdentity, TaskFileRecord, TaskWorkKind, TaskWorkMask, TransientTaskFileSet,
+        },
+    };
+
+    use super::{
+        BasePersistMessage, BasePersistOutcome, BasePersistSendError, BaseStoreActor,
+        BaseStoreHandle,
+    };
 
     /// ACK 的 Applied 与 Ignored 必须可区分，时延只记录 Applied 终态。
     #[test]
@@ -253,6 +324,153 @@ mod tests {
 
         drop(handle);
         actor.finish().await.unwrap();
+    }
+
+    /// 任务文件身份经过单写 actor 后必须完整回传，不能退化为只有 item_id。
+    #[tokio::test]
+    async fn task_file_persist_ack_preserves_full_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let run_id = Uuid::now_v7().to_string();
+        let lane = TaskDiskLane {
+            physical_disk_id: PhysicalDiskId::from_disk_numbers([7]).unwrap(),
+            physical_disk_numbers: vec![7],
+            disk_kind: LocalDiskKind::Hdd,
+            configured_weight: 1,
+            per_disk_limit: 1,
+        };
+        let path = std::path::PathBuf::from(r"C:\task-file-persist.bin");
+        let row = TaskFileRecord {
+            item_id: Uuid::now_v7(),
+            work_kind: TaskWorkKind::Base,
+            scanned: ScannedPath::new(
+                NormalizedPath::new(&path).unwrap(),
+                DisplayPath::new(&path).unwrap(),
+                17,
+            ),
+            known_md5: None,
+            missing: TaskWorkMask::from_bits(1 << 3).unwrap(),
+        };
+        let mut files = TransientTaskFileSet::create(root.path(), &run_id).unwrap();
+        let identity = files
+            .append_batch(&lane, std::slice::from_ref(&row))
+            .unwrap()[0]
+            .clone();
+        let (_, taken_record) = files.take_lane_exact(&identity, &row).unwrap().unwrap();
+        assert_eq!(taken_record, row);
+
+        let machine = MachineId::from_sha256([0xB3; 32]);
+        let store = NodeStore::open_in_memory(machine).unwrap();
+        let (actor, handle, mut acknowledgements) = BaseStoreActor::spawn(store, 1);
+        let expected = identity.clone();
+        assert!(
+            handle
+                .try_persist(BasePersistMessage::new_task_file(identity, |_store| {
+                    Ok(BasePersistOutcome::Ignored)
+                }))
+                .is_ok()
+        );
+
+        let acknowledgement = acknowledgements.recv().await.unwrap();
+        assert_eq!(
+            acknowledgement.identity.task_file_identity(),
+            Some(&expected)
+        );
+        assert_eq!(
+            acknowledgement.identity.item_id(),
+            expected.item_id().to_string()
+        );
+        assert_eq!(acknowledgement.identity.into_task_file(), Some(expected));
+
+        drop(handle);
+        actor.finish().await.unwrap();
+    }
+
+    /// 构造真实任务文件身份，供消息所有权和 ACK 测试复用。
+    fn task_file_identities(count: usize) -> (tempfile::TempDir, Vec<TaskFileIdentity>) {
+        let root = tempfile::tempdir().unwrap();
+        let run_id = Uuid::now_v7().to_string();
+        let lane = TaskDiskLane {
+            physical_disk_id: PhysicalDiskId::from_disk_numbers([9]).unwrap(),
+            physical_disk_numbers: vec![9],
+            disk_kind: LocalDiskKind::Hdd,
+            configured_weight: 1,
+            per_disk_limit: 1,
+        };
+        let mut files = TransientTaskFileSet::create(root.path(), &run_id).unwrap();
+        let rows = (0..count)
+            .map(|index| {
+                let path = std::path::PathBuf::from(format!(r"C:\task-file-{index}.bin"));
+                TaskFileRecord {
+                    item_id: Uuid::now_v7(),
+                    work_kind: TaskWorkKind::Base,
+                    scanned: ScannedPath::new(
+                        NormalizedPath::new(&path).unwrap(),
+                        DisplayPath::new(&path).unwrap(),
+                        17,
+                    ),
+                    known_md5: None,
+                    missing: TaskWorkMask::from_bits(1 << 3).unwrap(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let identities = files.append_batch(&lane, &rows).unwrap();
+        (root, identities)
+    }
+
+    /// 满队列归还的消息必须继续拥有完整任务文件身份，不能丢失行定位字段。
+    #[test]
+    fn full_persist_queue_returns_original_task_file_message() {
+        let (_root, identities) = task_file_identities(2);
+        let (call_tx, _call_rx) = std::sync::mpsc::sync_channel(1);
+        let (persist_tx, persist_rx) = std::sync::mpsc::sync_channel(1);
+        let handle = BaseStoreHandle {
+            calls: call_tx,
+            persists: persist_tx,
+            machine_id: MachineId::from_sha256([0xB4; 32]),
+        };
+        assert!(
+            handle
+                .try_persist(BasePersistMessage::new_task_file(
+                    identities[0].clone(),
+                    |_store| Ok(BasePersistOutcome::Ignored),
+                ))
+                .is_ok()
+        );
+
+        let returned = match handle.try_persist(BasePersistMessage::new_task_file(
+            identities[1].clone(),
+            |_store| Ok(BasePersistOutcome::Ignored),
+        )) {
+            Err(BasePersistSendError::Full(message)) => message,
+            Ok(()) => panic!("容量为 1 的持久化队列不应接受第二条消息"),
+            Err(BasePersistSendError::Closed(_)) => panic!("持久化队列不应提前关闭"),
+        };
+        assert_eq!(returned.identity.task_file_identity(), Some(&identities[1]));
+        drop(persist_rx);
+    }
+
+    /// 已关闭队列归还的消息也必须保留完整任务文件身份，供调用方诊断或清理。
+    #[test]
+    fn closed_persist_queue_returns_original_task_file_message() {
+        let (_root, identities) = task_file_identities(1);
+        let (call_tx, _call_rx) = std::sync::mpsc::sync_channel(1);
+        let (persist_tx, persist_rx) = std::sync::mpsc::sync_channel(1);
+        drop(persist_rx);
+        let handle = BaseStoreHandle {
+            calls: call_tx,
+            persists: persist_tx,
+            machine_id: MachineId::from_sha256([0xB5; 32]),
+        };
+
+        let returned = match handle.try_persist(BasePersistMessage::new_task_file(
+            identities[0].clone(),
+            |_store| Ok(BasePersistOutcome::Ignored),
+        )) {
+            Err(BasePersistSendError::Closed(message)) => message,
+            Ok(()) => panic!("已关闭持久化队列不应接受消息"),
+            Err(BasePersistSendError::Full(_)) => panic!("已关闭队列不应报告容量已满"),
+        };
+        assert_eq!(returned.identity.task_file_identity(), Some(&identities[0]));
     }
 }
 

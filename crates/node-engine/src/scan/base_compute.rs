@@ -65,6 +65,9 @@ use super::{
     },
 };
 
+#[cfg(test)]
+use super::base_persistence::BasePersistIdentity;
+
 /// 中心缓存批量查询的固定上限，避免一次 PostgreSQL 数组无限增长。
 const REMOTE_LOOKUP_BATCH_SIZE: usize = MAX_CACHE_BATCH_ITEMS;
 /// actor 同时保留的 path 上下文固定上限；不随通道容量乘法放大。
@@ -1691,7 +1694,7 @@ fn flush_persist_messages(
             Err(BasePersistSendError::Closed(message)) => {
                 return Err(ScanError::Stage1(format!(
                     "基础持久化 actor 已关闭: item_id={}",
-                    message.identity.item_id
+                    message.identity.item_id()
                 )));
             }
         }
@@ -1741,13 +1744,17 @@ async fn apply_persist_ack(
         )
         .map_err(runtime_error)?;
     let outcome = acknowledgement.result.map_err(|error| {
+        let task_id = acknowledgement.identity.task_id().map_or_else(
+            || "<task-file>".to_owned(),
+            |task_id| task_id.as_uuid().to_string(),
+        );
         ScanError::Stage1(format!(
             "基础持久化失败: task_id={}, item_id={}, error={error}",
-            acknowledgement.identity.task_id.as_uuid(),
-            acknowledgement.identity.item_id
+            task_id,
+            acknowledgement.identity.item_id()
         ))
     })?;
-    let started_at = item_started_at.remove(&acknowledgement.identity.item_id);
+    let started_at = item_started_at.remove(&acknowledgement.identity.item_id());
     if outcome.is_applied()
         && let Some(started_at) = started_at
     {
@@ -1826,9 +1833,13 @@ async fn apply_persist_ack(
             }
         }
         BasePersistOutcome::Ignored => {
+            let task_id = acknowledgement.identity.task_id().map_or_else(
+                || "<task-file>".to_owned(),
+                |task_id| task_id.as_uuid().to_string(),
+            );
             tracing::debug!(
-                task_id = %acknowledgement.identity.task_id.as_uuid(),
-                item_id = acknowledgement.identity.item_id,
+                task_id = %task_id,
+                item_id = %acknowledgement.identity.item_id(),
                 "忽略已经失活的基础持久化结果"
             );
         }
@@ -4330,10 +4341,10 @@ mod tests {
     };
 
     use super::{
-        ActiveBase, BaseComputeDecision, BasePersistAck, BasePersistOutcome, ContentOutputCredits,
-        ContentResolutionNeed, HashPhaseTracker, HashRefillController, MediaAcquirePhaseTracker,
-        ScanError, ScanSummary, TaskItemIdentity, WorkerEvent, WorkerFileIdentity,
-        apply_persist_ack, content_resolution_need, decode_credit_capacity,
+        ActiveBase, BaseComputeDecision, BasePersistAck, BasePersistIdentity, BasePersistOutcome,
+        ContentOutputCredits, ContentResolutionNeed, HashPhaseTracker, HashRefillController,
+        MediaAcquirePhaseTracker, ScanError, ScanSummary, TaskItemIdentity, WorkerEvent,
+        WorkerFileIdentity, apply_persist_ack, content_resolution_need, decode_credit_capacity,
         ensure_cache_wait_holds_no_compute_resource, handle_worker_event, log_worker_crash,
         update_pipeline_ownership,
     };
@@ -4810,11 +4821,11 @@ mod tests {
             item_started_at.insert(item_id.to_owned(), Instant::now());
             apply_persist_ack(
                 BasePersistAck {
-                    identity: TaskItemIdentity {
+                    identity: BasePersistIdentity::Legacy(TaskItemIdentity {
                         task_id,
                         item_id: item_id.to_owned(),
                         content_id: None,
-                    },
+                    }),
                     queue_wait: Duration::ZERO,
                     transaction_elapsed: Duration::ZERO,
                     result: Ok(outcome),
