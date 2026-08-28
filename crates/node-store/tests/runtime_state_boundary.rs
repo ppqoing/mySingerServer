@@ -53,10 +53,6 @@ fn stable_snapshot(connection: &Connection) -> Vec<String> {
             "sync_state",
             "singleton || '|' || acked_seq || '|' || pruned_through_seq",
         ),
-        (
-            "deletion_tombstones",
-            "machine_id || '|' || normalized_path || '|' || hex(md5) || '|' || file_size || '|' || outcome",
-        ),
     ];
     projections
         .into_iter()
@@ -89,6 +85,7 @@ fn transient_snapshot(connection: &Connection) -> Vec<String> {
         "review_marks",
         "delete_batches",
         "delete_items",
+        "deletion_tombstones",
     ];
     tables
         .into_iter()
@@ -295,6 +292,7 @@ fn reopening_discards_transient_runtime_rows_and_preserves_durable_facts() {
             "review_marks:0",
             "delete_batches:0",
             "delete_items:0",
+            "deletion_tombstones:0",
         ]
     );
     assert_eq!(stable_snapshot(&connection), before);

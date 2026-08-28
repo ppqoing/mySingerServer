@@ -199,11 +199,12 @@ fn initialize_or_validate(
 
 /// 在每次节点启动时原子删除不可恢复的任务、分析、复核和删除运行态。
 ///
-/// 内容、位置、媒体特征、文件故障、同步 outbox、同步游标和删除墓碑均不属于运行态，
-/// 因此不会由此事务修改。删除批次先于分析运行清理，避免保留不再存在的分析引用。
+/// 内容、位置、媒体特征、文件故障、同步 outbox 和同步游标均不属于运行态，
+/// 因此不会由此事务修改。删除批次和删除墓碑先于分析运行清理，避免保留旧运行引用。
 fn clear_transient_runtime_state(connection: &mut Connection) -> Result<(), StoreError> {
     let transaction = connection.transaction()?;
     transaction.execute("DELETE FROM delete_batches", [])?;
+    transaction.execute("DELETE FROM deletion_tombstones", [])?;
     transaction.execute("DELETE FROM analysis_runs", [])?;
     transaction.execute("DELETE FROM tasks", [])?;
     transaction.commit()?;
