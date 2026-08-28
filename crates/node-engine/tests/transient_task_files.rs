@@ -79,7 +79,7 @@ fn rejects_invalid_ids_masks_paths_and_cross_lane_duplicates_before_writing() {
     let root = runtime_root();
     let id = run_id();
     let first_lane = lane(&[7], LocalDiskKind::Hdd, 1);
-    let second_lane = lane(&[8, 5, 8], LocalDiskKind::Unknown, 2);
+    let second_lane = lane(&[5, 8], LocalDiskKind::Unknown, 2);
     let mut files = TransientTaskFileSet::create(root.path(), &id).unwrap();
 
     let empty_mask = record("empty.bin", TaskWorkMask::empty());
@@ -212,7 +212,7 @@ fn finite_prefetch_uses_twice_the_lane_limit_and_waits_for_seal() {
 fn composite_lane_and_unknown_kind_filename_only_use_disk_identity() {
     let root = runtime_root();
     let id = run_id();
-    let task_lane = lane(&[12, 5, 12], LocalDiskKind::Unknown, 1);
+    let task_lane = lane(&[5, 12], LocalDiskKind::Unknown, 1);
     let mut files = TransientTaskFileSet::create(root.path(), &id).unwrap();
     files
         .append_batch(
@@ -623,4 +623,92 @@ fn discard_requires_unique_owner_and_removes_only_its_exact_run_directory() {
     files.discard().unwrap();
     assert!(!run_dir.exists());
     assert!(files.all_terminal() == false);
+}
+
+#[test]
+fn failed_append_drops_buffer_before_set_drop_and_leaves_no_failed_batch() {
+    let root = runtime_root();
+    let id = run_id();
+    let task_lane = lane(&[7], LocalDiskKind::Hdd, 1);
+    let mut files = TransientTaskFileSet::create(root.path(), &id).unwrap();
+    let path = files.lane_path(&task_lane).unwrap();
+    files.fail_next_append_flush_for_test();
+    let row = record(
+        "must-not-reappear.jpg",
+        TaskWorkMask::from_bits(1 << 3).unwrap(),
+    );
+
+    assert!(files.append_batch(&task_lane, &[row]).is_err());
+    drop(files);
+    assert!(fs::read(path).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn lane_open_failure_poison_wakes_waiter_and_health_fails() {
+    let root = runtime_root();
+    let id = run_id();
+    let task_lane = lane(&[7], LocalDiskKind::Hdd, 1);
+    let mut files = TransientTaskFileSet::create(root.path(), &id).unwrap();
+    let publication = files.publication();
+    let observed = publication.epoch();
+    let waiter = tokio::spawn({
+        let publication = publication.clone();
+        async move { publication.wait_for_change(observed).await }
+    });
+    tokio::task::yield_now().await;
+    files.fail_next_lane_open_for_test();
+
+    assert!(files.register_lane(&task_lane).is_err());
+    let changed = tokio::time::timeout(Duration::from_secs(1), waiter)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(changed > observed);
+    assert!(files.is_poisoned());
+    assert!(files.health().is_err());
+}
+
+#[test]
+fn discard_failure_keeps_exact_path_for_same_owner_retry() {
+    let root = runtime_root();
+    let id = run_id();
+    let task_lane = lane(&[7], LocalDiskKind::Hdd, 1);
+    let run_dir = root.path().join(&id);
+    let mut files = TransientTaskFileSet::create(root.path(), &id).unwrap();
+    files.register_lane(&task_lane).unwrap();
+    files.fail_next_discard_remove_for_test();
+
+    assert!(files.discard().is_err());
+    assert!(run_dir.exists());
+    assert!(files.is_poisoned());
+    assert!(files.health().is_err());
+    assert!(files.seal().is_err());
+    assert!(
+        files
+            .append_batch(
+                &task_lane,
+                &[record(
+                    "after-discard-failure.jpg",
+                    TaskWorkMask::from_bits(1 << 3).unwrap(),
+                )],
+            )
+            .is_err()
+    );
+
+    files.discard().unwrap();
+    assert!(!run_dir.exists());
+    assert!(!files.all_terminal());
+}
+
+#[test]
+fn noncanonical_physical_disk_numbers_are_rejected_at_lane_boundary() {
+    let root = runtime_root();
+    let id = run_id();
+    let mut files = TransientTaskFileSet::create(root.path(), &id).unwrap();
+    let mut unsorted = lane(&[8, 7], LocalDiskKind::Hdd, 1);
+    unsorted.physical_disk_numbers = vec![8, 7];
+    assert!(files.register_lane(&unsorted).is_err());
+    let mut duplicated = lane(&[7], LocalDiskKind::Hdd, 1);
+    duplicated.physical_disk_numbers = vec![7, 7];
+    assert!(files.register_lane(&duplicated).is_err());
 }

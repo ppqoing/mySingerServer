@@ -24,13 +24,13 @@
 cargo test -p dedup-node-engine --test transient_task_files task_rows_are_fixed_tsv_without_json_or_bom --locked -- --test-threads=1
 ```
 
-实际失败为 `unresolved import dedup_node_engine::task_files`。审查补测先以旧实现实际固定以下 RED：损坏 P 行首次预读后修复仍取不到；新增毒化、publication、discard API 无法编译；旧 `peek_lane` 没有拥有型身份。修复后在固定 `C:\tmp\rust-v2-core-scope-target`、清除 MSVC 不兼容环境变量并关闭增量/debug 后验证：
+实际失败为 `unresolved import dedup_node_engine::task_files`。第一轮审查补测先以旧实现实际固定以下 RED：损坏 P 行首次预读后修复仍取不到；新增毒化、publication、discard API 无法编译；旧 `peek_lane` 没有拥有型身份。第二轮审查又以旧实现实际固定 append 失败后 set 析构重新刷回失败批次，以及新增 lane-open/discard-retry seam 缺失。修复后在固定 `C:\tmp\rust-v2-core-scope-target`、清除 MSVC 不兼容环境变量并关闭增量/debug 后验证：
 
-- `transient_task_files`：18/18 通过。
+- `transient_task_files`：22/22 通过。
 - `dedup-node-engine --lib`：66/66 通过；仅保留既有 scheduler dead-code warning。
 - `cargo fmt --all -- --check`：通过。
 - `git diff --check`：通过。
 
-测试覆盖固定字节、无 JSON/BOM/idx、UUID/mask/控制字符/非 UTF-8、复合和 Unknown 文件名、双 lane 重复项、sealed/published/有限预读、ACK 失败保持 P、ACK 成功 C、文件失败 F、行体字节不变、错误身份/offset/lane/run/mask、损坏行重试、append flush 失败毒化、write 成功但 sync 失败毒化、拥有型队首身份、lane 配置冻结、publication 追加/seal 唤醒、精确 discard、非法状态转换以及 terminal/inflight 边界。
+测试覆盖固定字节、无 JSON/BOM/idx、UUID/mask/控制字符/非 UTF-8、复合和 Unknown 文件名、双 lane 重复项、sealed/published/有限预读、ACK 失败保持 P、ACK 成功 C、文件失败 F、行体字节不变、错误身份/offset/lane/run/mask、损坏行重试、append flush 失败毒化且析构不复刷、write 成功但 sync 失败毒化、拥有型队首身份、lane 配置冻结、lane 打开 IO 失败唤醒并毒化、publication 追加/seal 唤醒、删除失败后的 cleanup_pending 重试、非规范盘号拒绝、精确 discard、非法状态转换以及 terminal/inflight 边界。
 
 本轮验证前后磁盘空间约为 C 盘 17.62 GiB、D 盘 10.23 GiB；未触发清理。未运行真实媒体、打包、部署，也未触碰 `I:\Tool`。

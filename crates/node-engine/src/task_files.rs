@@ -341,6 +341,7 @@ pub struct TransientTaskFileSet {
     physical_lanes: BTreeMap<dedup_windows::PhysicalDiskId, String>,
     sealed: bool,
     discarded: bool,
+    cleanup_pending: bool,
     poisoned: bool,
     poison_reason: Option<String>,
     change_epoch: Arc<AtomicU64>,
@@ -348,13 +349,15 @@ pub struct TransientTaskFileSet {
     owner_token: Arc<()>,
     fail_next_append_flush: bool,
     fail_next_status_sync: bool,
+    fail_next_lane_open: bool,
+    fail_next_discard_remove: bool,
 }
 
 struct LaneState {
     lane: TaskDiskLane,
-    writer: BufWriter<File>,
-    reader: File,
-    status_writer: File,
+    writer: Option<BufWriter<File>>,
+    reader: Option<File>,
+    status_writer: Option<File>,
     metadata: Vec<RowMeta>,
     prefetched: VecDeque<TaskLaneHead>,
     cursor: usize,
@@ -389,6 +392,7 @@ impl TransientTaskFileSet {
             physical_lanes: BTreeMap::new(),
             sealed: false,
             discarded: false,
+            cleanup_pending: false,
             poisoned: false,
             poison_reason: None,
             change_epoch: Arc::new(AtomicU64::new(0)),
@@ -396,6 +400,8 @@ impl TransientTaskFileSet {
             owner_token: Arc::new(()),
             fail_next_append_flush: false,
             fail_next_status_sync: false,
+            fail_next_lane_open: false,
+            fail_next_discard_remove: false,
         })
     }
 
@@ -438,6 +444,16 @@ impl TransientTaskFileSet {
         self.fail_next_status_sync = true;
     }
 
+    /// 注入下一次 lane 文件打开失败，仅供真实 IO seam 行为测试使用。
+    pub fn fail_next_lane_open_for_test(&mut self) {
+        self.fail_next_lane_open = true;
+    }
+
+    /// 注入下一次运行目录删除失败，仅供 cleanup_pending 重试测试使用。
+    pub fn fail_next_discard_remove_for_test(&mut self) {
+        self.fail_next_discard_remove = true;
+    }
+
     /// 关闭本集合句柄并删除创建时固定的唯一运行目录。
     ///
     /// 任何发布句柄仍存活时拒绝删除；目录校验通过后只删除 runtime 的直接子目录，
@@ -448,9 +464,27 @@ impl TransientTaskFileSet {
             return Err(invalid_input("任务文件仍有活动所有者，不能 discard"));
         }
         validate_exact_run_directory(&self.runtime_root, &self.run_dir, &self.run_id)?;
+        for lane in self.lanes.values_mut() {
+            lane.writer.take();
+            lane.reader.take();
+            lane.status_writer.take();
+        }
+        let remove_result = if self.fail_next_discard_remove {
+            self.fail_next_discard_remove = false;
+            Err(io::Error::other("注入任务运行目录删除失败"))
+        } else {
+            fs::remove_dir_all(&self.run_dir)
+        };
+        if let Err(error) = remove_result {
+            self.cleanup_pending = true;
+            self.poison_run(format!("任务运行目录删除失败: {error}"));
+            return Err(error);
+        }
         self.lanes.clear();
-        fs::remove_dir_all(&self.run_dir)?;
+        self.item_lanes.clear();
+        self.physical_lanes.clear();
         self.discarded = true;
+        self.cleanup_pending = false;
         self.advance_epoch();
         Ok(())
     }
@@ -467,7 +501,7 @@ impl TransientTaskFileSet {
             return Err(invalid_input("任务文件集合已经 seal，不能注册 lane"));
         }
         let key = lane_file_name(lane)?;
-        self.ensure_lane(lane, key)?;
+        self.ensure_lane_for_use(lane, key)?;
         self.advance_epoch();
         Ok(())
     }
@@ -522,30 +556,43 @@ impl TransientTaskFileSet {
         let inject_flush_failure = self.fail_next_append_flush;
         self.fail_next_append_flush = false;
         let write_error = {
-            let lane_state = self.ensure_lane(lane, key.clone())?;
+            self.ensure_lane_for_use(lane, key.clone())?;
+            let lane_state = self
+                .lanes
+                .get_mut(&key)
+                .ok_or_else(|| io::Error::other("任务 lane 创建后无法取得索引"))?;
             if lane_state.sealed || lane_state.poisoned {
                 return Err(invalid_input("任务 lane 已封闭或发生不可恢复的写入错误"));
             }
             if lane_state.published_len != starting_offset {
                 return Err(invalid_data("任务 lane 发布长度发生变化"));
             }
+            let writer = lane_state
+                .writer
+                .as_mut()
+                .ok_or_else(|| io::Error::other("任务 lane 写入句柄已关闭"))?;
             let write_result = (|| {
                 for bytes in &serialized {
-                    lane_state.writer.write_all(bytes)?;
+                    writer.write_all(bytes)?;
                 }
                 if inject_flush_failure {
                     return Err(io::Error::other("注入任务文件 flush 失败"));
                 }
-                lane_state.writer.flush()
+                writer.flush()
             })();
             if let Err(error) = write_result {
-                let _ = lane_state.writer.get_mut().set_len(starting_offset);
-                let _ = lane_state
-                    .writer
-                    .get_mut()
-                    .seek(SeekFrom::Start(starting_offset));
                 lane_state.poisoned = true;
-                Some(error)
+                let writer = lane_state
+                    .writer
+                    .take()
+                    .ok_or_else(|| io::Error::other("任务 lane 写入句柄已关闭"))?;
+                let (writer, rollback_error) = reset_failed_append(writer, starting_offset);
+                lane_state.writer = Some(writer);
+                Some(merge_io_errors(
+                    error,
+                    rollback_error,
+                    "任务文件追加回滚失败",
+                ))
             } else {
                 for (row, identity) in rows.iter().zip(identities.iter()) {
                     lane_state.metadata.push(RowMeta {
@@ -579,7 +626,14 @@ impl TransientTaskFileSet {
         }
         let mut flush_error = None;
         for lane in self.lanes.values_mut() {
-            if let Err(error) = lane.writer.flush() {
+            let writer = match lane.writer.as_mut() {
+                Some(writer) => writer,
+                None => {
+                    flush_error = Some(io::Error::other("任务 lane 写入句柄已关闭"));
+                    break;
+                }
+            };
+            if let Err(error) = writer.flush() {
                 lane.poisoned = true;
                 flush_error = Some(error);
                 break;
@@ -736,6 +790,7 @@ impl TransientTaskFileSet {
     /// 返回运行目录是否已 seal、全部行已进入终态且没有在途 ACK。
     pub fn all_terminal(&self) -> bool {
         !self.discarded
+            && !self.cleanup_pending
             && !self.poisoned
             && self.sealed
             && self.lanes.values().all(|lane| {
@@ -792,17 +847,21 @@ impl TransientTaskFileSet {
             return self
                 .lanes
                 .get_mut(&key)
-                .ok_or_else(|| invalid_input("任务 lane 不存在"));
+                .ok_or_else(|| io::Error::other("任务 lane 索引损坏"));
         }
         if let Some(existing_key) = self.physical_lanes.get(&lane.physical_disk_id) {
             let existing = self
                 .lanes
                 .get(existing_key)
-                .ok_or_else(|| invalid_input("物理盘 lane 索引损坏"))?;
+                .ok_or_else(|| io::Error::other("物理盘 lane 索引损坏"))?;
             if !same_lane_configuration(&existing.lane, lane) {
                 return Err(invalid_input("同一物理盘的 lane 配置已经冻结"));
             }
-            return Err(invalid_input("同一物理盘 lane 文件名不一致"));
+            return Err(io::Error::other("同一物理盘 lane 索引与文件名不一致"));
+        }
+        if self.fail_next_lane_open {
+            self.fail_next_lane_open = false;
+            return Err(io::Error::other("注入任务 lane 打开失败"));
         }
         let path = self.run_dir.join(&key);
         let writer_file = OpenOptions::new()
@@ -816,9 +875,9 @@ impl TransientTaskFileSet {
             key.clone(),
             LaneState {
                 lane: lane.clone(),
-                writer: BufWriter::new(writer_file),
-                reader,
-                status_writer,
+                writer: Some(BufWriter::new(writer_file)),
+                reader: Some(reader),
+                status_writer: Some(status_writer),
                 metadata: Vec::new(),
                 prefetched: VecDeque::new(),
                 cursor: 0,
@@ -832,7 +891,20 @@ impl TransientTaskFileSet {
             .insert(lane.physical_disk_id.clone(), key.clone());
         self.lanes
             .get_mut(&key)
-            .ok_or_else(|| invalid_input("任务 lane 创建失败"))
+            .ok_or_else(|| io::Error::other("任务 lane 创建后无法取得索引"))
+    }
+
+    fn ensure_lane_for_use(&mut self, lane: &TaskDiskLane, key: String) -> io::Result<()> {
+        let result = self.ensure_lane(lane, key).map(|_| ());
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if error.kind() != io::ErrorKind::InvalidInput {
+                    self.poison_run(format!("任务 lane IO 或内部一致性失败: {error}"));
+                }
+                Err(error)
+            }
+        }
     }
 
     fn mark_terminal(
@@ -850,7 +922,11 @@ impl TransientTaskFileSet {
             .lanes
             .get_mut(&identity.lane_file_name)
             .ok_or_else(|| invalid_input("任务身份 lane 不存在"))?;
-        if let Err(error) = lane_state.writer.flush() {
+        let writer = lane_state
+            .writer
+            .as_mut()
+            .ok_or_else(|| io::Error::other("任务 lane 写入句柄已关闭"))?;
+        if let Err(error) = writer.flush() {
             lane_state.poisoned = true;
             self.poison_run(format!("任务状态写入前 flush 失败: {error}"));
             return Err(error);
@@ -863,7 +939,10 @@ impl TransientTaskFileSet {
             return Err(invalid_input("任务身份越过 published 边界"));
         }
         let bytes = read_at(
-            &lane_state.reader,
+            lane_state
+                .reader
+                .as_ref()
+                .ok_or_else(|| io::Error::other("任务 lane 读取句柄已关闭"))?,
             identity.line_offset,
             identity.line_length,
         )?;
@@ -896,7 +975,10 @@ impl TransientTaskFileSet {
         }
 
         let write_result = write_status(
-            &lane_state.status_writer,
+            lane_state
+                .status_writer
+                .as_ref()
+                .ok_or_else(|| io::Error::other("任务 lane 状态句柄已关闭"))?,
             identity.line_offset,
             target.as_byte(),
             inject_sync_failure,
@@ -932,7 +1014,13 @@ fn refill_lane(run_id: &str, lane: &mut LaneState) -> io::Result<()> {
             lane.cursor += 1;
             continue;
         }
-        let bytes = read_at(&lane.reader, meta.offset, meta.length)?;
+        let bytes = read_at(
+            lane.reader
+                .as_ref()
+                .ok_or_else(|| io::Error::other("任务 lane 读取句柄已关闭"))?,
+            meta.offset,
+            meta.length,
+        )?;
         let parsed = parse_record(&bytes)?;
         if parsed.status != TaskLineStatus::Pending
             || parsed.record.item_id != meta.item_id
@@ -1171,15 +1259,45 @@ fn write_status(file: &File, offset: u64, byte: u8, fail_sync: bool) -> io::Resu
     Ok(())
 }
 
+fn reset_failed_append(
+    writer: BufWriter<File>,
+    batch_start: u64,
+) -> (BufWriter<File>, Option<io::Error>) {
+    let (mut file, pending) = writer.into_parts();
+    let mut first_error = pending
+        .err()
+        .map(|_| io::Error::other("BufWriter 拆分时发现内部写入异常"));
+    if let Err(error) = file.set_len(batch_start) {
+        if first_error.is_none() {
+            first_error = Some(error);
+        }
+    }
+    if let Err(error) = file.seek(SeekFrom::Start(batch_start)) {
+        if first_error.is_none() {
+            first_error = Some(error);
+        }
+    }
+    (BufWriter::new(file), first_error)
+}
+
+fn merge_io_errors(primary: io::Error, rollback: Option<io::Error>, context: &str) -> io::Error {
+    match rollback {
+        None => primary,
+        Some(rollback) => io::Error::other(format!("{primary}; {context}: {rollback}")),
+    }
+}
+
 fn lane_file_name(lane: &TaskDiskLane) -> io::Result<String> {
-    let mut numbers = lane.physical_disk_numbers.clone();
+    let numbers = lane.physical_disk_numbers.as_slice();
     if numbers.is_empty() {
         return Err(invalid_input("物理盘编号不能为空"));
     }
-    numbers.sort_unstable();
-    numbers.dedup();
-    if numbers != lane.physical_disk_id.disk_numbers() {
-        return Err(invalid_input("lane 的物理盘编号与物理盘身份不一致"));
+    if numbers != lane.physical_disk_id.disk_numbers()
+        || numbers.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return Err(invalid_input(
+            "lane 的物理盘编号必须与物理盘身份按规范排序去重",
+        ));
     }
     let kind = match lane.disk_kind {
         LocalDiskKind::Hdd => "hdd",
