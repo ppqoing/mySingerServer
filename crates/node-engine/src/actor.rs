@@ -6,7 +6,7 @@ use std::{
     future::Future,
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -85,7 +85,7 @@ impl NodeEngineHandle {
     pub fn runtime_tasks_for_test(&self) -> RuntimeTaskRegistry {
         self.runtime_tasks.clone()
     }
-    /// 严格执行 WorkerPool prepare、SQLite requeue、WorkerPool restart 三阶段重启。
+    /// 取消当前计算并等待 Worker 收束后重启计算引擎。
     pub async fn restart_engine(&self) -> Result<(), EngineError> {
         let (reply, response) = oneshot::channel();
         self.commands
@@ -357,21 +357,18 @@ impl NodeRuntime {
         fs::create_dir_all(&paths.cache_path)?;
         fs::create_dir_all(&paths.log_path)?;
         let machine_id = identity.machine_id()?;
-        let mut store = NodeStore::open(&paths.data_path.join("node.db"), machine_id)?;
-        let recovered_tasks = store.recover_active_computation_tasks(now_ms())?;
+        let store = NodeStore::open(&paths.data_path.join("node.db"), machine_id)?;
         let logical_cpu_count = std::thread::available_parallelism()
             .map(usize::from)
             .unwrap_or(1);
         let effective_worker_count = config.worker.effective_worker_count(logical_cpu_count);
         let effective_cpu_budget = config.worker.effective_cpu_budget(logical_cpu_count);
-        let worker_pool = WorkerPool::start(
-            WorkerPoolConfig::new(
-                WorkerLaunch::new(layout.executable_dir().join("worker.exe")),
-                effective_worker_count,
-            )
-            .with_cpu_budget(effective_cpu_budget),
+        let worker_pool_config = WorkerPoolConfig::new(
+            WorkerLaunch::new(layout.executable_dir().join("worker.exe")),
+            effective_worker_count,
         )
-        .await?;
+        .with_cpu_budget(effective_cpu_budget);
+        let worker_pool = WorkerPool::start(worker_pool_config.clone()).await?;
         let listener = tokio::net::TcpListener::bind((config.listen_ip, config.port)).await?;
         let listen_address = listener.local_addr()?;
         let repository = NodeConfigRepository::from_layout(layout);
@@ -394,7 +391,7 @@ impl NodeRuntime {
             host_control,
             artifact_registry,
             disk_full_cleaner,
-            recovered_tasks,
+            Some(worker_pool_config),
             ActorTestHooks::default(),
         );
         let (server_shutdown, shutdown) = oneshot::channel();
@@ -478,12 +475,11 @@ impl NodeEngine {
     /// 创建不启动 Worker 的测试 actor；协议、SQLite 和关闭路径与生产相同。
     #[doc(hidden)]
     pub fn spawn_for_test(
-        mut store: NodeStore,
+        store: NodeStore,
         listen_address: SocketAddr,
         cache_root: &Path,
     ) -> (NodeEngineHandle, JoinHandle<()>) {
         let (artifact_registry, disk_full_cleaner) = test_artifact_cleanup(cache_root);
-        let recovered_tasks = recover_for_actor(&mut store);
         spawn_actor(
             store,
             None,
@@ -497,7 +493,7 @@ impl NodeEngine {
             None,
             artifact_registry,
             disk_full_cleaner,
-            recovered_tasks,
+            None,
             ActorTestHooks::default(),
         )
     }
@@ -505,14 +501,13 @@ impl NodeEngine {
     /// 创建注入配置仓库和可选宿主控制器的测试 actor。
     #[doc(hidden)]
     pub fn spawn_with_remote_config_for_test(
-        mut store: NodeStore,
+        store: NodeStore,
         listen_address: SocketAddr,
         cache_root: &Path,
         repository: Box<dyn NodeConfigRepositoryAccess>,
         host_control: Option<Box<dyn NodeHostControl>>,
     ) -> (NodeEngineHandle, JoinHandle<()>) {
         let (artifact_registry, disk_full_cleaner) = test_artifact_cleanup(cache_root);
-        let recovered_tasks = recover_for_actor(&mut store);
         spawn_actor(
             store,
             None,
@@ -526,14 +521,14 @@ impl NodeEngine {
             host_control,
             artifact_registry,
             disk_full_cleaner,
-            recovered_tasks,
+            None,
             ActorTestHooks::default(),
         )
     }
 
     /// 创建持有真实 WorkerPool 的生产 actor。
     pub fn spawn(
-        mut store: NodeStore,
+        store: NodeStore,
         worker_pool: WorkerPool,
         listen_address: SocketAddr,
         cache_root: &Path,
@@ -541,7 +536,6 @@ impl NodeEngine {
     ) -> (NodeEngineHandle, JoinHandle<()>) {
         let effective_worker_count = worker_pool.worker_process_ids().len().max(1);
         let (artifact_registry, disk_full_cleaner) = test_artifact_cleanup(cache_root);
-        let recovered_tasks = recover_for_actor(&mut store);
         spawn_actor(
             store,
             Some(worker_pool),
@@ -555,7 +549,7 @@ impl NodeEngine {
             None,
             artifact_registry,
             disk_full_cleaner,
-            recovered_tasks,
+            None,
             ActorTestHooks::default(),
         )
     }
@@ -564,7 +558,7 @@ impl NodeEngine {
     #[doc(hidden)]
     /// 创建首条 Base persist 可暂停的真实 actor，只供 shutdown 生命周期测试。
     pub fn spawn_with_first_persist_gate_for_test(
-        mut store: NodeStore,
+        store: NodeStore,
         worker_pool: WorkerPool,
         listen_address: SocketAddr,
         cache_root: &Path,
@@ -573,7 +567,6 @@ impl NodeEngine {
     ) -> (NodeEngineHandle, JoinHandle<()>) {
         let effective_worker_count = worker_pool.worker_process_ids().len().max(1);
         let (artifact_registry, disk_full_cleaner) = test_artifact_cleanup(cache_root);
-        let recovered_tasks = recover_for_actor(&mut store);
         spawn_actor(
             store,
             Some(worker_pool),
@@ -587,7 +580,7 @@ impl NodeEngine {
             None,
             artifact_registry,
             disk_full_cleaner,
-            recovered_tasks,
+            None,
             ActorTestHooks {
                 first_persist_waiter: Some(first_persist_waiter),
             },
@@ -608,7 +601,8 @@ fn spawn_actor(
     host_control: Option<Box<dyn NodeHostControl>>,
     artifact_registry: Arc<RegenerableArtifactRegistry>,
     disk_full_cleaner: DiskFullCleaner,
-    recovered_tasks: Vec<TaskSnapshot>,
+    // 生产 Node 重启时用于创建新 Pool 的不可变配置；可控测试池没有进程启动配置。
+    worker_pool_config: Option<WorkerPoolConfig>,
     test_hooks: ActorTestHooks,
 ) -> (NodeEngineHandle, JoinHandle<()>) {
     let (commands, receiver) = mpsc::channel(64);
@@ -638,20 +632,13 @@ fn spawn_actor(
             pending_restart_request_id: None,
             artifact_registry,
             disk_full_cleaner,
+            worker_pool_config,
             runtime_tasks,
             test_hooks,
         },
         receiver,
-        recovered_tasks,
     ));
     (handle, actor)
-}
-
-/// 兼容不返回 `Result` 的旧工厂 API，并在 actor 启动前完成持久任务恢复。
-fn recover_for_actor(store: &mut NodeStore) -> Vec<TaskSnapshot> {
-    store
-        .recover_active_computation_tasks(now_ms())
-        .expect("Node actor 启动前必须能够恢复持久任务")
 }
 
 fn test_artifact_cleanup(cache_root: &Path) -> (Arc<RegenerableArtifactRegistry>, DiskFullCleaner) {
@@ -671,6 +658,8 @@ struct EngineState {
     store: NodeStore,
     worker_pool: Option<WorkerPool>,
     worker_control: Option<WorkerPoolHandle>,
+    /// 生产 Node 用于销毁旧 Pool 后创建替代 Pool 的启动参数。
+    worker_pool_config: Option<WorkerPoolConfig>,
     listen_address: SocketAddr,
     cache_root: std::path::PathBuf,
     enumerator: EnumeratorKind,
@@ -698,10 +687,7 @@ enum EngineCommand {
     ResponseFlushed(u64, oneshot::Sender<Result<(), String>>),
     Restart(oneshot::Sender<Result<(), String>>),
     Shutdown(oneshot::Sender<()>),
-    BackgroundFinished {
-        identity: JobIdentity,
-        worker_pool: WorkerPool,
-    },
+    BackgroundFinished { identity: JobIdentity },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -715,6 +701,8 @@ struct ActiveJob {
     /// `run_background_job` 已完整返回，包含 task-local writer join 与 Store 恢复。
     completion: oneshot::Receiver<()>,
     cancellation: Option<ReadCancellationToken>,
+    /// 后台任务收束后归还的唯一 Pool 所有权，只有 actor 可以取回。
+    returned_pool: Arc<Mutex<Option<WorkerPool>>>,
 }
 
 enum BackgroundJob {
@@ -758,30 +746,7 @@ impl BackgroundJob {
     }
 }
 
-async fn run_actor(
-    mut state: EngineState,
-    mut commands: mpsc::Receiver<EngineCommand>,
-    recovered_tasks: Vec<TaskSnapshot>,
-) {
-    let recovered_tasks = recovered_tasks
-        .into_iter()
-        .map(|task| {
-            let stages = match state.store.task_stages(task.task_id) {
-                Ok(stages) => stages,
-                Err(error) => {
-                    tracing::warn!(task_id = %task.task_id.as_uuid(), error = %error, "恢复持久任务阶段失败");
-                    Vec::new()
-                }
-            };
-            (task, stages)
-        })
-        .collect();
-    publish_recovery_runtime_tasks(
-        &state.runtime_tasks,
-        state.store.machine_id().clone(),
-        recovered_tasks,
-    )
-    .await;
+async fn run_actor(mut state: EngineState, mut commands: mpsc::Receiver<EngineCommand>) {
     let progress_publisher = RuntimeProgressPublisher::new(state.runtime_tasks.clone());
     let mut progress_tick = tokio::time::interval(Duration::from_secs(2));
     progress_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -810,40 +775,12 @@ async fn run_actor(
                 let _ = reply.send(state.restart_engine().await);
             }
             EngineCommand::Shutdown(reply) => {
-                state.stop_background_for_shutdown().await;
+                drop(state.stop_background_for_shutdown().await);
                 let _ = reply.send(());
                 break;
             }
-            EngineCommand::BackgroundFinished {
-                identity,
-                worker_pool,
-            } => state.finish_background(identity, worker_pool),
+            EngineCommand::BackgroundFinished { identity } => state.finish_background(identity),
         }
-    }
-}
-
-/// 使用原 SQLite 任务 ID 恢复每个活动持久任务及其阶段快照。
-async fn publish_recovery_runtime_tasks(
-    registry: &RuntimeTaskRegistry,
-    machine_id: MachineId,
-    recovered_tasks: Vec<(TaskSnapshot, Vec<dedup_node_store::TaskStageSnapshot>)>,
-) {
-    for (task, stages) in recovered_tasks {
-        let kind = match task.kind.as_str() {
-            "base_compute" | "scan" => RuntimeTaskKind::BaseCompute,
-            "stage2_compute" | "analysis_stage2" => RuntimeTaskKind::Stage2Compute,
-            _ => RuntimeTaskKind::Recovery,
-        };
-        registry
-            .begin_restored(
-                kind,
-                machine_id.clone(),
-                format!("恢复任务（{}）", task.kind),
-                &task,
-                &stages,
-                now_ms() as u64,
-            )
-            .await;
     }
 }
 
@@ -1175,7 +1112,8 @@ impl EngineState {
         initialize_base_task_stages(&mut self.store, task_id).map_err(internal)?;
         let runtime_reporter = self
             .runtime_tasks
-            .begin(
+            .begin_with_id(
+                task_id.as_uuid().to_string(),
                 RuntimeTaskKind::BaseCompute,
                 self.store.machine_id().clone(),
                 "基础计算",
@@ -1343,7 +1281,8 @@ impl EngineState {
             .map_err(internal)?;
         let runtime_reporter = self
             .runtime_tasks
-            .begin(
+            .begin_with_id(
+                run_id.as_uuid().to_string(),
                 RuntimeTaskKind::LocalAnalysis,
                 self.store.machine_id().clone(),
                 "重复文件清单",
@@ -1604,7 +1543,8 @@ impl EngineState {
         let task_id = plan.task_id;
         let runtime_reporter = self
             .runtime_tasks
-            .begin(
+            .begin_with_id(
+                task_id.as_uuid().to_string(),
                 RuntimeTaskKind::Stage2Compute,
                 self.store.machine_id().clone(),
                 "二次特征计算",
@@ -1731,7 +1671,8 @@ impl EngineState {
         };
         let runtime_reporter = self
             .runtime_tasks
-            .begin(
+            .begin_with_id(
+                plan.batch_id.clone(),
                 RuntimeTaskKind::Delete,
                 self.store.machine_id().clone(),
                 "删除",
@@ -1804,39 +1745,48 @@ impl EngineState {
             .upgrade()
             .ok_or_else(|| "节点计算引擎已经关闭".to_owned())?;
         let (completion_sender, completion) = oneshot::channel();
+        let returned_pool = Arc::new(Mutex::new(None));
+        let background_pool = Arc::clone(&returned_pool);
         tokio::spawn(async move {
             run_background_job(&mut store, &mut worker_pool, job).await;
             // 必须先确认 BaseStoreActor join、Store 恢复和终态发布全部结束，再触发 shutdown/归还 Pool。
+            *background_pool.lock().expect("后台 Pool 归还锁未中毒") = Some(worker_pool);
             let _ = completion_sender.send(());
             let _ = commands
-                .send(EngineCommand::BackgroundFinished {
-                    identity,
-                    worker_pool,
-                })
+                .send(EngineCommand::BackgroundFinished { identity })
                 .await;
         });
         self.active_job = Some(ActiveJob {
             identity,
             completion,
             cancellation,
+            returned_pool,
         });
         Ok(())
     }
 
-    fn finish_background(&mut self, identity: JobIdentity, worker_pool: WorkerPool) {
-        if self
+    fn finish_background(&mut self, identity: JobIdentity) {
+        let Some(active) = self
             .active_job
-            .as_ref()
-            .is_some_and(|active| active.identity == identity)
+            .take_if(|active| active.identity == identity)
+        else {
+            return;
+        };
+        if let Some(worker_pool) = active
+            .returned_pool
+            .lock()
+            .expect("后台 Pool 归还锁未中毒")
+            .take()
         {
-            self.active_job = None;
+            self.worker_control = Some(worker_pool.handle());
+            self.worker_pool = Some(worker_pool);
         }
-        self.worker_pool = Some(worker_pool);
     }
 
-    async fn stop_background_for_shutdown(&mut self) {
+    /// 取消活动任务并等待后台完全收束，返回被 actor 独占的旧 Pool。
+    async fn stop_background_for_shutdown(&mut self) -> Option<WorkerPool> {
         let Some(active) = self.active_job.take() else {
-            return;
+            return self.worker_pool.take();
         };
         let pool_task_id = match active.identity {
             JobIdentity::Task(task_id) => task_id.as_uuid().to_string(),
@@ -1874,30 +1824,41 @@ impl EngineState {
             // 发送端只会在后台 panic/异常销毁时消失；此处禁止伪造终态或指标清零。
             tracing::error!(task_id = %pool_task_id, "关机等待后台完整收束失败，未伪造运行终态");
         }
+        self.worker_control = None;
+        active
+            .returned_pool
+            .lock()
+            .expect("后台 Pool 归还锁未中毒")
+            .take()
     }
 
     async fn restart_engine(&mut self) -> Result<(), String> {
-        if self.active_job.is_some() {
-            return Err("节点仍有后台媒体任务，不能重启计算引擎".into());
-        }
         self.restarting = true;
-        let result = async {
-            let pool = self
-                .worker_control
-                .as_ref()
-                .ok_or_else(|| "测试节点没有 WorkerPool".to_owned())?;
-            let items = pool
-                .prepare_planned_restart()
-                .await
-                .map_err(|error| error.to_string())?;
-            self.store
-                .requeue_planned_items(&items, now_ms())
-                .map_err(|error| error.to_string())?;
-            pool.restart_after_requeue(&items)
-                .await
-                .map_err(|error| error.to_string())
-        }
-        .await;
+        // 活动任务先走与进程关闭相同的取消门禁，确保 Worker 事件和后台 Store 完整收束。
+        let old_pool = self.stop_background_for_shutdown().await;
+        self.worker_control = None;
+        let result = match self.worker_pool_config.clone() {
+            Some(config) => {
+                drop(old_pool);
+                match WorkerPool::start(config).await {
+                    Ok(worker_pool) => {
+                        self.worker_control = Some(worker_pool.handle());
+                        self.worker_pool = Some(worker_pool);
+                        Ok(())
+                    }
+                    Err(error) => Err(error.to_string()),
+                }
+            }
+            // 可控测试池没有可执行文件配置；仍通过已收束的同一测试池验证 actor 边界。
+            None => match old_pool {
+                Some(worker_pool) => {
+                    self.worker_control = Some(worker_pool.handle());
+                    self.worker_pool = Some(worker_pool);
+                    Ok(())
+                }
+                None => Err("测试节点没有可重建的 WorkerPool".into()),
+            },
+        };
         self.restarting = false;
         result
     }
@@ -3425,10 +3386,19 @@ mod tests {
         };
         assert_eq!(accepted.task_id, running_task_id);
 
-        let restart = tokio::time::timeout(Duration::from_secs(2), handle.restart_engine())
+        tokio::time::timeout(Duration::from_secs(2), handle.restart_engine())
             .await
-            .expect("运行中重启必须返回明确错误，不能排在长任务之后");
-        assert!(matches!(restart, Err(EngineError::Operation(_))));
+            .expect("运行中重启必须等待 Worker 收束")
+            .expect("运行中重启必须取消当前任务后继续重建计算引擎");
+        assert!(
+            handle
+                .runtime_tasks_for_test()
+                .list()
+                .await
+                .iter()
+                .all(|task| { task.runtime_task_id != running_task_id || task.state != "running" }),
+            "重启收束后不得遗留运行中的旧任务"
+        );
 
         tokio::time::timeout(Duration::from_secs(2), handle.shutdown())
             .await

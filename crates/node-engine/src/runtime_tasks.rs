@@ -7,7 +7,6 @@ use std::{
 };
 
 use dedup_core::{MachineId, MediaKind};
-use dedup_node_store::{PersistentStageState, TaskSnapshot, TaskStageSnapshot};
 use dedup_protocol::{MAX_RUNTIME_FAILURES, proto};
 use thiserror::Error;
 use tokio::sync::broadcast;
@@ -43,8 +42,6 @@ impl RuntimeTaskClock for SystemClock {
 /// Node 运行任务类别。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeTaskKind {
-    /// Node 重启后为未完成持久任务创建的临时恢复包装。
-    Recovery,
     /// 枚举、缓存查询和 Worker 基础特征计算。
     BaseCompute,
     /// 扫描与一筛。
@@ -62,7 +59,6 @@ pub enum RuntimeTaskKind {
 impl RuntimeTaskKind {
     const fn as_str(self) -> &'static str {
         match self {
-            Self::Recovery => "recovery",
             Self::BaseCompute => "base_compute",
             Self::Scan => "scan",
             Self::LocalAnalysis => "duplicate_list",
@@ -76,8 +72,6 @@ impl RuntimeTaskKind {
 /// 固定英文 ID 与中文显示名的运行阶段。
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum RuntimeStage {
-    /// 重启后校验并重新排队未完成持久任务。
-    RecoveryValidate,
     /// 基础任务完整枚举文件清单。
     EnumerateFiles,
     /// 基础任务查询 SQLite 和可选 PostgreSQL 缓存。
@@ -140,7 +134,6 @@ impl RuntimeStage {
     /// 稳定英文阶段 ID。
     pub const fn id(self) -> &'static str {
         match self {
-            Self::RecoveryValidate => "recovery_validate",
             Self::EnumerateFiles => "enumerate_files",
             Self::LookupBaseCache => "lookup_base_cache",
             Self::ComputeBaseFeatures => "compute_base_features",
@@ -175,7 +168,6 @@ impl RuntimeStage {
     /// 固定中文阶段名。
     pub const fn display_name(self) -> &'static str {
         match self {
-            Self::RecoveryValidate => "恢复与校验",
             Self::EnumerateFiles => "枚举文件",
             Self::LookupBaseCache => "查询基础缓存",
             Self::ComputeBaseFeatures => "计算基础特征",
@@ -207,10 +199,9 @@ impl RuntimeStage {
         }
     }
 
-    /// 从 SQLite 保存的稳定 ID 恢复运行阶段。
+    /// 从稳定阶段 ID 解析当前进程可显示的运行阶段。
     pub fn from_id(value: &str) -> Option<Self> {
         [
-            Self::RecoveryValidate,
             Self::EnumerateFiles,
             Self::LookupBaseCache,
             Self::ComputeBaseFeatures,
@@ -567,7 +558,21 @@ impl RuntimeTaskRegistry {
         machine_id: MachineId,
         title: impl Into<String>,
     ) -> RuntimeTaskReporter {
-        let task_id = Uuid::new_v4().to_string();
+        self.begin_with_id(Uuid::new_v4().to_string(), kind, machine_id, title)
+            .await
+    }
+
+    /// 用业务 ID 创建当前进程唯一的运行任务。
+    ///
+    /// 协议、任务中心和后台 reporter 共用该 ID，调用者不得保存业务 ID 到运行 ID 的映射。
+    pub async fn begin_with_id(
+        &self,
+        task_id: impl Into<String>,
+        kind: RuntimeTaskKind,
+        machine_id: MachineId,
+        title: impl Into<String>,
+    ) -> RuntimeTaskReporter {
+        let task_id = task_id.into();
         self.inner
             .tasks
             .write()
@@ -596,78 +601,6 @@ impl RuntimeTaskRegistry {
             registry: self.clone(),
             task_id,
         }
-    }
-
-    /// 使用 SQLite 任务 ID 和阶段快照重建 Node 重启后的运行详情。
-    pub async fn begin_restored(
-        &self,
-        kind: RuntimeTaskKind,
-        machine_id: MachineId,
-        title: impl Into<String>,
-        task: &TaskSnapshot,
-        stages: &[TaskStageSnapshot],
-        wall_now_ms: u64,
-    ) -> RuntimeTaskReporter {
-        let task_id = task.task_id.as_uuid().to_string();
-        let now = self.inner.clock.now();
-        let restored_stages = stages
-            .iter()
-            .filter_map(|stage| {
-                RuntimeStage::from_id(&stage.stage_id)
-                    .map(|kind| (kind, StageEntry::from_persisted(stage, now, wall_now_ms)))
-            })
-            .collect();
-        self.inner
-            .tasks
-            .write()
-            .expect("runtime registry lock poisoned")
-            .insert(
-                task_id.clone(),
-                TaskEntry {
-                    machine_id: machine_id.as_str().into(),
-                    kind,
-                    title: title.into(),
-                    state: RuntimeTaskState::Running,
-                    overall_completed: task.succeeded,
-                    overall_total: Some(task.total_items),
-                    overall_failed: task.failed,
-                    overall_skipped: task.cancelled,
-                    stages: restored_stages,
-                    workers: BTreeMap::new(),
-                    failures: VecDeque::new(),
-                    // 重启恢复只有持久阶段计数，没有上个进程的高频遥测。
-                    execution_config: None,
-                    pipeline_metrics: None,
-                    last_published_at: None,
-                    progress_dirty: false,
-                },
-            );
-        RuntimeTaskReporter {
-            registry: self.clone(),
-            task_id,
-        }
-    }
-
-    /// 为一个未完成持久任务创建全新恢复详情，不复用 SQLite 任务 ID 或旧历史。
-    pub async fn begin_recovery(
-        &self,
-        machine_id: MachineId,
-        title: impl Into<String>,
-        pending_items: u64,
-    ) -> RuntimeTaskReporter {
-        let reporter = self
-            .begin(RuntimeTaskKind::Recovery, machine_id, title)
-            .await;
-        let _ = reporter.update_overall(0, Some(pending_items), 0, 0).await;
-        let _ = reporter
-            .update_stage(RuntimeStageUpdate::running(
-                RuntimeStage::RecoveryValidate,
-                RuntimeProgressUnit::Items,
-                0,
-                Some(pending_items),
-            ))
-            .await;
-        reporter
     }
 
     /// 返回按 ID 稳定排列的摘要。
@@ -1768,7 +1701,7 @@ struct TaskEntry {
     stages: BTreeMap<RuntimeStage, StageEntry>,
     workers: BTreeMap<u32, WorkerEntry>,
     failures: VecDeque<RuntimeFailureUpdate>,
-    /// 当前进程实际采用的基础计算配置；旧任务或恢复任务保持缺失。
+    /// 当前进程实际采用的基础计算配置；未报告配置的任务保持缺失。
     execution_config: Option<proto::RuntimeExecutionConfig>,
     /// 当前进程内存指标；不会写入 SQLite 或 PostgreSQL。
     pipeline_metrics: Option<PipelineMetricsEntry>,
@@ -2717,29 +2650,6 @@ impl Default for StageEntry {
 }
 
 impl StageEntry {
-    /// 把墙钟持久时间折算为新进程中的累计耗时和实时起点。
-    fn from_persisted(stage: &TaskStageSnapshot, now: Duration, wall_now_ms: u64) -> Self {
-        let running = stage.state == PersistentStageState::Running;
-        let accumulated_ms = stage.started_at_ms.map_or(0, |started| {
-            stage
-                .finished_at_ms
-                .unwrap_or(wall_now_ms)
-                .saturating_sub(started)
-        });
-        Self {
-            state: persistent_stage_state(stage.state),
-            unit: RuntimeProgressUnit::Items,
-            completed: stage.completed,
-            total: stage.total,
-            failed: stage.failed,
-            skipped: stage.skipped,
-            started_at: running.then_some(now),
-            ended_at: None,
-            accumulated_elapsed: Duration::from_millis(accumulated_ms),
-            samples: VecDeque::new(),
-        }
-    }
-
     fn snapshot(&self, kind: RuntimeStage, now: Duration) -> proto::RuntimeStageDetails {
         let speed = self.speed();
         let eta_ms = self.total.and_then(|total| {
@@ -2783,17 +2693,6 @@ impl StageEntry {
         } else {
             finite_nonnegative((*last_value - *first_value) as f64 / seconds)
         }
-    }
-}
-
-/// 把 SQLite 阶段状态映射为运行详情协议状态。
-const fn persistent_stage_state(state: PersistentStageState) -> proto::RuntimeStageState {
-    match state {
-        PersistentStageState::Waiting => proto::RuntimeStageState::RuntimeStageWaiting,
-        PersistentStageState::Running => proto::RuntimeStageState::RuntimeStageRunning,
-        PersistentStageState::Completed => proto::RuntimeStageState::RuntimeStageCompleted,
-        PersistentStageState::Failed => proto::RuntimeStageState::RuntimeStageFailed,
-        PersistentStageState::Skipped => proto::RuntimeStageState::RuntimeStageSkipped,
     }
 }
 

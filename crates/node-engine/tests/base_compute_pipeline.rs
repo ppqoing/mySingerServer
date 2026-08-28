@@ -4339,10 +4339,10 @@ async fn item_completion_latency_starts_at_successful_claim_and_ends_at_applied_
     assert_eq!(throughput[0].bytes, expected_bytes);
 }
 
-/// 真实持久 running 项经权威恢复后由 BaseCompute 重新 claim；latency 起点不能来自 reserve。
+/// 当前进程排队项由 BaseCompute claim 后才开始统计 latency，不能来自 reserve。
 #[cfg(feature = "test-hooks")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn recovered_running_item_latency_starts_at_base_compute_claim() {
+async fn queued_item_latency_starts_at_base_compute_claim() {
     let fixture = tempdir().unwrap();
     let install_root = fixture.path().join("install");
     let cache_root = install_root.join("data/node/cache");
@@ -4357,35 +4357,13 @@ async fn recovered_running_item_latency_starts_at_base_compute_claim() {
         10,
     );
     let options = ScanOptions::new(vec![DisplayPath::new(&media_root).unwrap()]);
-    let task_id;
-    let item_id;
-    {
-        let mut initial_store = NodeStore::open(&database, machine.clone()).unwrap();
-        task_id = begin_scan_task(&mut initial_store, &options, 10).unwrap();
-        let reserved = initial_store
-            .reserve_scan_path(task_id, &scanned, 11)
-            .unwrap()
-            .unwrap();
-        initial_store.queue_scan_item_for_read(&reserved).unwrap();
-        let claimed = initial_store.claim_next_item(task_id, 12).unwrap().unwrap();
-        item_id = claimed.item_id;
-        assert_eq!(claimed.status, TaskItemStatus::Running);
-    }
-
-    // 通过 NodeStore 的启动恢复事务把真实 running 项原子退回 queued。
     let mut store = NodeStore::open(&database, machine.clone()).unwrap();
-    let recovered = store.recover_active_computation_tasks(12).unwrap();
-    assert_eq!(recovered.len(), 1);
-    assert_eq!(recovered[0].task_id, task_id);
-    assert_eq!(recovered[0].status, TaskStatus::Queued);
-    assert_eq!(
-        store.task_snapshot(task_id).unwrap().status,
-        TaskStatus::Queued
-    );
-    assert_eq!(
-        store.task_items(task_id).unwrap()[0].status,
-        TaskItemStatus::Queued
-    );
+    let task_id = begin_scan_task(&mut store, &options, 10).unwrap();
+    let item_id = store
+        .reserve_scan_path(task_id, &scanned, 11)
+        .unwrap()
+        .unwrap();
+    store.queue_scan_item_for_read(&item_id).unwrap();
 
     // rows 为空，避免 reserve_scan_path 参与；BaseCompute 只能从恢复后的 queued 项成功 claim。
     let (reader, hashes, active_media) = media_reader_for(

@@ -144,7 +144,7 @@ async fn unresolved_stage2_marks_final_compare_failed() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn local_analysis_real_pool_crash_is_persisted_before_next_dispatch_and_slot_recovers() {
+async fn local_analysis_real_pool_crash_is_persisted_and_slot_recovers() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("analysis-crash.db");
     let machine = MachineId::from_sha256([0x84; 32]);
@@ -159,9 +159,10 @@ async fn local_analysis_real_pool_crash_is_persisted_before_next_dispatch_and_sl
     let c = seed_image(&mut store, r"D:\crash-c.jpg", [10; 16], false);
     let task = completed_task(&mut store, &[a, b, c]);
     let run_id = LocalAnalysisEngine::begin(&mut store, &[task], Thresholds::default(), 6).unwrap();
+    // 控制协程复用当前进程的独立连接，不能误走启动清理入口。
+    let controller_store = store.reopen().unwrap();
     let (mut pool, mut started, control) = WorkerPool::controlled_batch_for_test(2);
     let controller_registry = registry.clone();
-    let controller_database = database.clone();
     let controller_reporter_id = reporter_id.clone();
     let controller = tokio::spawn(async move {
         let (task_id, first_item) = started.recv().await.unwrap();
@@ -194,15 +195,25 @@ async fn local_analysis_real_pool_crash_is_persisted_before_next_dispatch_and_sl
             .await;
 
         let (_, third_item) = started.recv().await.unwrap();
-        let reopened =
-            NodeStore::open(&controller_database, MachineId::from_sha256([0x84; 32])).unwrap();
-        let stage2_task = reopened
-            .page_tasks(None, 20)
-            .unwrap()
-            .items
-            .into_iter()
-            .find(|task| task.task_id.as_uuid().to_string() == task_id)
-            .unwrap();
+        // Pool 可在事件交给消费者后立即补槽；等待消费者提交两个已送达终态。
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        let stage2_task = loop {
+            let task = controller_store
+                .page_tasks(None, 20)
+                .unwrap()
+                .items
+                .into_iter()
+                .find(|task| task.task_id.as_uuid().to_string() == task_id)
+                .unwrap();
+            if task.cancelled == 1 && task.succeeded == 1 {
+                break task;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "Worker 终态必须在补槽后由二筛消费者持久化"
+            );
+            tokio::task::yield_now().await;
+        };
         assert_eq!(stage2_task.failed, 0, "Worker 崩溃项不应再次进入失败重试");
         assert_eq!(stage2_task.cancelled, 1, "Worker 崩溃项必须立即标记跳过");
         assert_eq!(stage2_task.succeeded, 1, "并行完成项必须独立写入成功终态");

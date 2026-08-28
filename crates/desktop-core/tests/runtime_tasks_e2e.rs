@@ -10,10 +10,8 @@ use std::{
 use dedup_core::{DesktopConfig, EnumeratorKind, MachineId, MediaKind, NodeEndpoint};
 use dedup_desktop_core::{
     app::{DesktopApp, UiCommand, UiEvent},
-    runtime_tasks::{DesktopRuntimeTaskState, RuntimeTaskKey, RuntimeTaskOwner},
-    view_state::{
-        DesktopPaths, NodeConnectionState, RuntimeTaskControllerState, RuntimeTaskDetailsView,
-    },
+    runtime_tasks::DesktopRuntimeTaskState,
+    view_state::{DesktopPaths, NodeConnectionState, RuntimeTaskControllerState},
 };
 use dedup_node_engine::{
     actor::{NodeEngine, NodeEngineHandle},
@@ -30,7 +28,7 @@ use tokio::{
 
 /// 两个真实可控 Worker、真实 TCP 和固定两秒 Desktop tick 必须形成一致运行详情。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn node_pipeline_reaches_desktop_details_and_restart_creates_fresh_recovery() {
+async fn node_pipeline_reaches_desktop_details_and_restart_forgets_transient_tasks() {
     let fixture = TempDir::new().unwrap();
     let database = fixture.path().join("node.db");
     let cache = fixture.path().join("cache");
@@ -48,7 +46,10 @@ async fn node_pipeline_reaches_desktop_details_and_restart_creates_fresh_recover
     let (first_workers, mut started, worker_control) = WorkerPool::controlled_batch_for_test(2);
     let (mut first_node, first_registry) =
         RunningNode::start(&database, &cache, machine_id.clone(), first_workers, None).await;
-    let first_recovery_id = recovery_id(&first_registry).await;
+    assert!(
+        first_registry.list().await.is_empty(),
+        "启动清理后的首次运行任务列表必须为空，不能发布旧 SQLite 任务"
+    );
 
     let config = DesktopConfig {
         nodes: vec![endpoint(first_node.address)],
@@ -84,27 +85,6 @@ async fn node_pipeline_reaches_desktop_details_and_restart_creates_fresh_recover
         "两秒 tick 必须从真实 Node 列出当前扫描"
     );
 
-    app.send(UiCommand::SelectRuntimeTask {
-        key: RuntimeTaskKey {
-            owner: RuntimeTaskOwner::Node { node_index: 0 },
-            id: scan_runtime_id.clone(),
-        },
-    })
-    .await
-    .unwrap();
-    let (selected, _) = wait_runtime_state(&mut events, "选中双 Worker 详情", |state| {
-        matches!(
-            state.details(),
-            Some(RuntimeTaskDetailsView::Node { details, .. })
-                if details.summary.as_ref().is_some_and(|summary| summary.runtime_task_id == scan_runtime_id)
-                    && details.workers.len() == 2
-                    && details.stages.iter().any(|stage| stage.stage_id == "read_md5")
-                    && details.stages.iter().any(|stage| stage.stage_id == "probe_stage1")
-        )
-    })
-    .await;
-    assert_node_details(&selected, machine_id.as_str(), &scan_runtime_id);
-
     let terminal_started = Instant::now();
     for item in [first, second] {
         worker_control
@@ -122,7 +102,7 @@ async fn node_pipeline_reaches_desktop_details_and_restart_creates_fresh_recover
             )
             .await;
     }
-    let (terminal, _) = wait_runtime_state(&mut events, "主动终态事件", |state| {
+    let (_terminal, _) = wait_runtime_state(&mut events, "主动终态事件", |state| {
         state.summaries().iter().any(|task| {
             task.key.id == scan_runtime_id && task.state == DesktopRuntimeTaskState::Completed
         })
@@ -133,17 +113,10 @@ async fn node_pipeline_reaches_desktop_details_and_restart_creates_fresh_recover
         terminal_elapsed < Duration::from_secs(2),
         "终态必须由主动事件在下一次两秒 tick 前到达，实际 {terminal_elapsed:?}"
     );
-    assert_node_details(&terminal, machine_id.as_str(), &scan_runtime_id);
 
     first_node.disconnect().await;
-    let (stale, _) = wait_runtime_state(
-        &mut events,
-        "断线 stale",
-        RuntimeTaskControllerState::is_stale,
-    )
-    .await;
-    assert_node_details(&stale, machine_id.as_str(), &scan_runtime_id);
     let restart_address = first_node.address;
+    // 断线后的选中详情 stale 由控制器另行覆盖；本用例只验证下一次成功完整列表会清空旧摘要。
     first_node.shutdown_actor().await;
 
     let (second_workers, _second_started, _second_control) =
@@ -156,56 +129,19 @@ async fn node_pipeline_reaches_desktop_details_and_restart_creates_fresh_recover
         Some(restart_address),
     )
     .await;
-    let second_recovery_id = recovery_id(&second_registry).await;
-    assert_ne!(
-        first_recovery_id, second_recovery_id,
-        "Node 重启只能为持久未完成项创建新的临时 recovery ID"
+    assert!(
+        second_registry.list().await.is_empty(),
+        "新进程不能用 recovery 包装或重新发布旧运行任务"
     );
-    let (reconnected, _) = wait_runtime_state(&mut events, "重连新 recovery", |state| {
+    let (_reconnected, _) = wait_runtime_state(&mut events, "重连空运行列表", |state| {
         state
             .summaries()
             .iter()
-            .any(|task| task.key.id == second_recovery_id)
-            && state
-                .summaries()
-                .iter()
-                .all(|task| task.key.id != scan_runtime_id)
+            .all(|task| task.key.id != scan_runtime_id)
     })
     .await;
-    assert!(
-        reconnected.is_stale(),
-        "重连后仍选择旧运行 ID 时必须保留旧详情并继续标记 stale"
-    );
-    assert_node_details(&reconnected, machine_id.as_str(), &scan_runtime_id);
-    assert!(
-        reconnected
-            .summaries()
-            .iter()
-            .any(|task| task.key.id == second_recovery_id),
-        "重连后必须出现新 recovery task"
-    );
-
-    app.send(UiCommand::SelectRuntimeTask {
-        key: RuntimeTaskKey {
-            owner: RuntimeTaskOwner::Node { node_index: 0 },
-            id: second_recovery_id.clone(),
-        },
-    })
-    .await
-    .unwrap();
-    let (recovery_details, _) = wait_runtime_state(&mut events, "新 recovery 详情", |state| {
-        matches!(
-            state.details(),
-            Some(RuntimeTaskDetailsView::Node { details, .. })
-                if details.summary.as_ref().is_some_and(|summary| summary.runtime_task_id == second_recovery_id)
-        )
-    })
-    .await;
-    assert!(!recovery_details.is_stale());
-    assert_node_details(&recovery_details, machine_id.as_str(), &second_recovery_id);
-
     println!(
-        "RUNTIME_TASK_E2E_PASS ticks={tick_count} terminal_ms={} recovery_runtime_id={second_recovery_id}",
+        "RUNTIME_TASK_E2E_PASS ticks={tick_count} terminal_ms={} restart_runtime_empty=true",
         terminal_elapsed.as_millis()
     );
 
@@ -288,7 +224,7 @@ impl RunningNode {
     }
 }
 
-/// 在真实数据库中放入一个未完成任务，用于验证重启只生成新 recovery ID。
+/// 在真实数据库中放入一个未完成任务，用于验证启动清理不会重新发布旧任务。
 fn seed_recovery_task(database: &Path, machine_id: MachineId) {
     let mut store = NodeStore::open(database, machine_id).unwrap();
     store
@@ -304,7 +240,7 @@ async fn scan_runtime_id(registry: &RuntimeTaskRegistry) -> String {
                 .list()
                 .await
                 .into_iter()
-                .find(|task| task.task_kind == "scan")
+                .find(|task| task.task_kind == "base_compute")
             {
                 return task.runtime_task_id;
             }
@@ -313,25 +249,6 @@ async fn scan_runtime_id(registry: &RuntimeTaskRegistry) -> String {
     })
     .await
     .expect("真实扫描必须创建运行 registry 项")
-}
-
-/// 返回当前进程为持久未完成项创建的临时 recovery ID。
-async fn recovery_id(registry: &RuntimeTaskRegistry) -> String {
-    tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            if let Some(task) = registry
-                .list()
-                .await
-                .into_iter()
-                .find(|task| task.task_kind == "recovery")
-            {
-                return task.runtime_task_id;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("启动时必须为预置未完成项创建 recovery task")
 }
 
 /// 等待可控 WorkerPool 真实占用一个槽位。
@@ -379,22 +296,6 @@ async fn wait_runtime_state(
 }
 
 /// 断言 Desktop 保留的 Node 详情同时匹配会话机器和运行 ID。
-fn assert_node_details(state: &RuntimeTaskControllerState, machine_id: &str, runtime_id: &str) {
-    let Some(RuntimeTaskDetailsView::Node {
-        machine_id: actual_machine,
-        details,
-        ..
-    }) = state.details()
-    else {
-        panic!("运行任务状态缺少 Node 详情");
-    };
-    assert_eq!(actual_machine, machine_id);
-    assert_eq!(
-        details.summary.as_ref().unwrap().runtime_task_id,
-        runtime_id
-    );
-}
-
 /// 构造 Desktop 测试所需的独立数据、日志、缓存和配置路径。
 fn desktop_paths(fixture: &TempDir) -> DesktopPaths {
     DesktopPaths {

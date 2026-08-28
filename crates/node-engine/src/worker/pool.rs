@@ -697,29 +697,6 @@ impl WorkerPoolHandle {
         reply_rx.await.map_err(|_| WorkerPoolError::Closed)?
     }
 
-    /// 第一阶段冻结调度并返回所有运行项；此调用不终止 Worker。
-    pub async fn prepare_planned_restart(&self) -> Result<Vec<String>, WorkerPoolError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.commands
-            .send(PoolCommand::PrepareRestart(reply_tx))
-            .await
-            .map_err(|_| WorkerPoolError::Closed)?;
-        reply_rx.await.map_err(|_| WorkerPoolError::Closed)?
-    }
-
-    /// 调用方写回 SQLite queued 后，执行 Worker 终止、补建和 Ready 等待。
-    pub async fn restart_after_requeue(
-        &self,
-        requeued_item_ids: &[String],
-    ) -> Result<(), WorkerPoolError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.commands
-            .send(PoolCommand::Restart(requeued_item_ids.to_vec(), reply_tx))
-            .await
-            .map_err(|_| WorkerPoolError::Closed)?;
-        reply_rx.await.map_err(|_| WorkerPoolError::Closed)?
-    }
-
     /// 返回按槽位排序的当前 Worker PID。
     pub fn worker_process_ids(&self) -> Vec<u32> {
         self.state
@@ -853,29 +830,6 @@ impl WorkerPool {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.commands
             .send(PoolCommand::Cancel(task_id.to_owned(), reply_tx))
-            .await
-            .map_err(|_| WorkerPoolError::Closed)?;
-        reply_rx.await.map_err(|_| WorkerPoolError::Closed)?
-    }
-
-    /// 第一阶段冻结调度并返回所有运行项；此调用不终止 Worker。
-    pub async fn prepare_planned_restart(&self) -> Result<Vec<String>, WorkerPoolError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.commands
-            .send(PoolCommand::PrepareRestart(reply_tx))
-            .await
-            .map_err(|_| WorkerPoolError::Closed)?;
-        reply_rx.await.map_err(|_| WorkerPoolError::Closed)?
-    }
-
-    /// 调用方把第一阶段返回项写回 SQLite queued 后，执行终止、补建和 Ready 等待。
-    pub async fn restart_after_requeue(
-        &self,
-        requeued_item_ids: &[String],
-    ) -> Result<(), WorkerPoolError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.commands
-            .send(PoolCommand::Restart(requeued_item_ids.to_vec(), reply_tx))
             .await
             .map_err(|_| WorkerPoolError::Closed)?;
         reply_rx.await.map_err(|_| WorkerPoolError::Closed)?
@@ -1079,47 +1033,6 @@ impl WorkerPool {
                                     .unwrap()
                                     .cancelling_tasks
                                     .remove(&task_id);
-                            }
-                            PoolCommand::PrepareRestart(reply) => {
-                                let mut state = actor_state.lock().unwrap();
-                                if state.restarting {
-                                    let _ = reply.send(Err(WorkerPoolError::Restarting));
-                                    continue;
-                                }
-                                state.restarting = true;
-                                let mut items = state
-                                    .running
-                                    .values()
-                                    .map(|work| work.item_id.clone())
-                                    .collect::<Vec<_>>();
-                                items.sort();
-                                state.restart_items = items.iter().cloned().collect();
-                                let _ = reply.send(Ok(items));
-                            }
-                            PoolCommand::Restart(items, reply) => {
-                                let expected = items.into_iter().collect::<HashSet<_>>();
-                                if expected != actor_state.lock().unwrap().restart_items {
-                                    let _ = reply.send(Err(WorkerPoolError::RequeueMismatch));
-                                    continue;
-                                }
-                                active.clear();
-                                idle = (0..worker_count).collect();
-                                {
-                                    let mut state = actor_state.lock().unwrap();
-                                    let slots = state.running.keys().copied().collect::<Vec<_>>();
-                                    for slot in slots {
-                                        release_running_work(&mut state, slot);
-                                    }
-                                    state.restarting = false;
-                                    state.restart_items.clear();
-                                }
-                                actor_available.store(idle.len(), Ordering::Release);
-                                controlled_schedule(
-                                    &mut queue, &mut idle, &mut active, &started,
-                                    &events, &actor_state, &actor_available,
-                                    &actor_started_base_commands, emit_started_events,
-                                );
-                                let _ = reply.send(Ok(()));
                             }
                             PoolCommand::TerminateUnexpected(_, reply) => { let _ = reply.send(Ok(())); }
                         }
@@ -1349,22 +1262,6 @@ impl WorkerPool {
                             .cancelling_tasks
                             .remove(&task_id);
                     }
-                    PoolCommand::PrepareRestart(reply) => {
-                        let items = active
-                            .iter()
-                            .map(|work| work.item_id.clone())
-                            .collect::<Vec<_>>();
-                        let _ = reply.send(Ok(items));
-                    }
-                    PoolCommand::Restart(_, reply) => {
-                        if active.take().is_some() {
-                            let mut state = actor_state.lock().unwrap();
-                            release_running_work(&mut state, 0);
-                            state.restarting = false;
-                            state.restart_items.clear();
-                        }
-                        let _ = reply.send(Ok(()));
-                    }
                     PoolCommand::TerminateUnexpected(_, reply) => {
                         let _ = reply.send(Ok(()));
                     }
@@ -1508,9 +1405,6 @@ pub enum WorkerPoolError {
     /// actor 已结束。
     #[error("WorkerPool 已关闭")]
     Closed,
-    /// 调度已被计划重启冻结。
-    #[error("WorkerPool 正在计划重启")]
-    Restarting,
     /// Envelope 不是三类 Worker 请求之一。
     #[error("不是有效的 Worker 请求")]
     InvalidRequest,
@@ -1536,9 +1430,6 @@ pub enum WorkerPoolError {
         /// 等待队列允许的最大项数。
         capacity: usize,
     },
-    /// 第二阶段提交的重新排队项与第一阶段快照不一致。
-    #[error("重新排队项与计划重启快照不一致")]
-    RequeueMismatch,
     /// 诊断请求指定的 PID 不属于当前池。
     #[error("Worker PID 不存在: {0}")]
     WorkerNotFound(u32),
@@ -1550,9 +1441,7 @@ struct PoolState {
     process_ids: BTreeMap<usize, u32>,
     cpu_budget: usize,
     cpu_in_use: usize,
-    restart_items: HashSet<String>,
     failure_count: u64,
-    restarting: bool,
     cancelled_tasks: HashSet<String>,
     cancelling_tasks: HashSet<String>,
 }
@@ -1566,9 +1455,7 @@ impl PoolState {
             process_ids: BTreeMap::new(),
             cpu_budget,
             cpu_in_use: 0,
-            restart_items: HashSet::new(),
             failure_count: 0,
-            restarting: false,
             cancelled_tasks: HashSet::new(),
             cancelling_tasks: HashSet::new(),
         }
@@ -1720,8 +1607,6 @@ enum PoolCommand {
     ),
     Cancel(String, oneshot::Sender<Result<(), WorkerPoolError>>),
     CancelRollback(String),
-    PrepareRestart(oneshot::Sender<Result<Vec<String>, WorkerPoolError>>),
-    Restart(Vec<String>, oneshot::Sender<Result<(), WorkerPoolError>>),
     TerminateUnexpected(u32, oneshot::Sender<Result<(), WorkerPoolError>>),
 }
 
@@ -1824,10 +1709,7 @@ async fn run_pool_with_replacement<F, Fut>(
                 let Some(command) = command else { break };
                 match command {
                     PoolCommand::Dispatch(envelope, guard, reply) => {
-                        let result = if state.lock().unwrap().restarting {
-                            Err(WorkerPoolError::Restarting)
-                        } else {
-                            match WorkItem::try_from(envelope) {
+                        let result = match WorkItem::try_from(envelope) {
                                 Ok(mut work) => {
                                     work.set_scan_guard(guard);
                                     let cpu_budget = state.lock().unwrap().cpu_budget;
@@ -1850,49 +1732,7 @@ async fn run_pool_with_replacement<F, Fut>(
                                     }
                                 }
                                 Err(error) => Err(error),
-                            }
-                        };
-                        let _ = reply.send(result);
-                    }
-                    PoolCommand::PrepareRestart(reply) => {
-                        let mut locked = state.lock().unwrap();
-                        if locked.restarting {
-                            let _ = reply.send(Err(WorkerPoolError::Restarting));
-                            continue;
-                        }
-                        locked.restarting = true;
-                        let mut items: Vec<_> = locked
-                            .running
-                            .values()
-                            .map(|work| work.item_id.clone())
-                            .collect();
-                        items.sort();
-                        locked.restart_items = items.iter().cloned().collect();
-                        let _ = reply.send(Ok(items));
-                    }
-                    PoolCommand::Restart(items, reply) => {
-                        let expected: HashSet<_> = items.into_iter().collect();
-                        if expected != state.lock().unwrap().restart_items {
-                            let _ = reply.send(Err(WorkerPoolError::RequeueMismatch));
-                            continue;
-                        }
-                        let result = restart_all(
-                            &config,
-                            job.as_ref(),
-                            &mut slots,
-                            &mut idle,
-                            &mut slot_events,
-                            &slot_events_tx,
-                            &state,
-                        ).await;
-                        if result.is_ok() {
-                            {
-                                let mut locked = state.lock().unwrap();
-                                locked.restarting = false;
-                                locked.restart_items.clear();
-                            }
-                            schedule(&mut queue, &mut idle, &slots, &actor_events, &state).await;
-                        }
+                            };
                         let _ = reply.send(result);
                     }
                     PoolCommand::Cancel(task_id, reply) => {
@@ -1970,11 +1810,7 @@ async fn schedule<E: WorkerEventSink>(
         Sent,
         Rejected(WorkIdentity),
         Retry(WorkItem),
-        Restarting(WorkItem),
         Cancelling(WorkItem),
-    }
-    if state.lock().unwrap().restarting {
-        return;
     }
     while !idle.is_empty() && !queue.is_empty() {
         let cpu_available = {
@@ -1999,24 +1835,19 @@ async fn schedule<E: WorkerEventSink>(
         };
         let decision = {
             let mut locked = state.lock().unwrap();
-            if locked.restarting {
-                DispatchDecision::Restarting(work)
+            if locked.cancelling_tasks.contains(&identity.task_id) {
+                DispatchDecision::Cancelling(work)
+            } else if locked.cancelled_tasks.contains(&identity.task_id) || !work.dispatch_allowed()
+            {
+                DispatchDecision::Rejected(identity.clone())
+            } else if let Err(error) = slot.commands.send(SlotCommand::Run(work)) {
+                let SlotCommand::Run(work) = error.0 else {
+                    unreachable!("schedule only sends Run")
+                };
+                DispatchDecision::Retry(work)
             } else {
-                if locked.cancelling_tasks.contains(&identity.task_id) {
-                    DispatchDecision::Cancelling(work)
-                } else if locked.cancelled_tasks.contains(&identity.task_id)
-                    || !work.dispatch_allowed()
-                {
-                    DispatchDecision::Rejected(identity.clone())
-                } else if let Err(error) = slot.commands.send(SlotCommand::Run(work)) {
-                    let SlotCommand::Run(work) = error.0 else {
-                        unreachable!("schedule only sends Run")
-                    };
-                    DispatchDecision::Retry(work)
-                } else {
-                    register_running_work(&mut locked, slot_id, identity.clone());
-                    DispatchDecision::Sent
-                }
+                register_running_work(&mut locked, slot_id, identity.clone());
+                DispatchDecision::Sent
             }
         };
         match decision {
@@ -2049,11 +1880,6 @@ async fn schedule<E: WorkerEventSink>(
             DispatchDecision::Retry(work) => {
                 // 命令接收端关闭表示该槽已失效；等待 Exited 统一移除并补建，不能再次进入 idle。
                 queue.push_front(work);
-            }
-            DispatchDecision::Restarting(work) => {
-                idle.push_back(slot_id);
-                queue.push_front(work);
-                return;
             }
             DispatchDecision::Cancelling(work) => {
                 idle.push_back(slot_id);
@@ -2310,17 +2136,15 @@ async fn handle_slot_event_with_replacement<E, F, Fut>(
                         update_work_stage(&mut phase_work, worker_phase_stage(phase));
                         locked.running.insert(slot_id, phase_work);
                     }
-                    if !state.lock().unwrap().restart_items.contains(&work.item_id) {
-                        events
-                            .send_event(WorkerEvent::PhaseChanged {
-                                task_id: work.task_id,
-                                item_id: work.item_id,
-                                slot: slot_id as u32,
-                                phase,
-                                request_elapsed_us,
-                            })
-                            .await;
-                    }
+                    events
+                        .send_event(WorkerEvent::PhaseChanged {
+                            task_id: work.task_id,
+                            item_id: work.item_id,
+                            slot: slot_id as u32,
+                            phase,
+                            request_elapsed_us,
+                        })
+                        .await;
                     return;
                 }
                 response = proto::WorkerEnvelope {
@@ -2337,16 +2161,14 @@ async fn handle_slot_event_with_replacement<E, F, Fut>(
             if let Some(worker_envelope::Payload::BaseSourceReadComplete(source)) =
                 response.payload.as_ref()
             {
-                if !state.lock().unwrap().restart_items.contains(&work.item_id) {
-                    events
-                        .send_event(WorkerEvent::BaseSourceReadComplete {
-                            task_id: work.task_id,
-                            item_id: work.item_id,
-                            slot: slot_id as u32,
-                            request_elapsed_us: source.request_elapsed_us,
-                        })
-                        .await;
-                }
+                events
+                    .send_event(WorkerEvent::BaseSourceReadComplete {
+                        task_id: work.task_id,
+                        item_id: work.item_id,
+                        slot: slot_id as u32,
+                        request_elapsed_us: source.request_elapsed_us,
+                    })
+                    .await;
                 return;
             }
             {
@@ -2354,15 +2176,13 @@ async fn handle_slot_event_with_replacement<E, F, Fut>(
                 release_running_work(&mut locked, slot_id);
             }
             idle.push_back(slot_id);
-            if !state.lock().unwrap().restart_items.contains(&work.item_id) {
-                events
-                    .send_event(WorkerEvent::Completed {
-                        task_id: work.task_id,
-                        item_id: work.item_id,
-                        response,
-                    })
-                    .await;
-            }
+            events
+                .send_event(WorkerEvent::Completed {
+                    task_id: work.task_id,
+                    item_id: work.item_id,
+                    response,
+                })
+                .await;
         }
         SlotEvent::Exited {
             slot_id,
@@ -2477,52 +2297,6 @@ async fn replace_slot_with_factory<E, F, Fut>(
                 .await;
         }
     }
-}
-
-/// 计划重启第二阶段：终止全部旧进程、等待退出、补建并等待 Ready。
-async fn restart_all(
-    config: &WorkerPoolConfig,
-    job: &WorkerJob,
-    slots: &mut BTreeMap<usize, SlotHandle>,
-    idle: &mut VecDeque<usize>,
-    slot_events: &mut mpsc::UnboundedReceiver<SlotEvent>,
-    slot_events_tx: &mpsc::UnboundedSender<SlotEvent>,
-    state: &Arc<Mutex<PoolState>>,
-) -> Result<(), WorkerPoolError> {
-    let mut expected: HashSet<usize> = slots.keys().copied().collect();
-    for slot in slots.values() {
-        let _ = slot.commands.send(SlotCommand::Terminate);
-    }
-    while !expected.is_empty() {
-        match slot_events.recv().await {
-            Some(SlotEvent::Exited { slot_id, .. }) => {
-                expected.remove(&slot_id);
-            }
-            Some(SlotEvent::Response { .. }) => {}
-            None => return Err(WorkerPoolError::Closed),
-        }
-    }
-    slots.clear();
-    idle.clear();
-    {
-        let mut locked = state.lock().unwrap();
-        let running_slots = locked.running.keys().copied().collect::<Vec<_>>();
-        for slot_id in running_slots {
-            release_running_work(&mut locked, slot_id);
-        }
-        locked.process_ids.clear();
-    }
-    for slot_id in 0..config.worker_count {
-        let slot = spawn_slot(slot_id, config, job, slot_events_tx.clone()).await?;
-        state
-            .lock()
-            .unwrap()
-            .process_ids
-            .insert(slot_id, slot.process_id);
-        idle.push_back(slot_id);
-        slots.insert(slot_id, slot);
-    }
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

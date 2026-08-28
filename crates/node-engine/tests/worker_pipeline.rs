@@ -731,23 +731,29 @@ async fn worker_crash_releases_cpu_weight_once_and_dispatches_waiter() {
 }
 
 #[tokio::test]
-async fn planned_restart_clears_cpu_weight_and_rebuilt_slots_can_dispatch() {
+async fn cancelling_active_work_releases_slots_before_a_new_pool_dispatches() {
     let (pool, mut started, control) = WorkerPool::controlled_batch_with_cpu_budget_for_test(2, 3);
     dispatch_weighted_base(&pool, "restart", "old", 1, 2, proto::MediaKind::MediaVideo)
         .await
         .unwrap();
     assert_eq!(started.recv().await.unwrap().1, "old");
-    let requeued = pool.prepare_planned_restart().await.unwrap();
-    assert_eq!(requeued, vec!["old".to_owned()]);
-
-    pool.restart_after_requeue(&requeued).await.unwrap();
+    pool.cancel_task("restart").await.unwrap();
     assert_eq!(control.cpu_in_use(), 0);
     assert_eq!(control.available_slots(), 2);
-    dispatch_weighted_base(&pool, "restart", "new", 1, 3, proto::MediaKind::MediaVideo)
-        .await
-        .unwrap();
-    assert_eq!(started.recv().await.unwrap().1, "new");
-    assert_eq!(control.cpu_in_use(), 3);
+    let (next_pool, mut next_started, next_control) =
+        WorkerPool::controlled_batch_with_cpu_budget_for_test(2, 3);
+    dispatch_weighted_base(
+        &next_pool,
+        "restart-next",
+        "new",
+        1,
+        3,
+        proto::MediaKind::MediaVideo,
+    )
+    .await
+    .unwrap();
+    assert_eq!(next_started.recv().await.unwrap().1, "new");
+    assert_eq!(next_control.cpu_in_use(), 3);
 }
 
 #[tokio::test]
