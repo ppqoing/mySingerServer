@@ -880,6 +880,17 @@ impl WorkerPool {
         self.events.try_recv().ok()
     }
 
+    /// 等待测试 actor 清空已入队的 slot 事件，供竞态行为测试建立确定边界。
+    #[cfg(test)]
+    async fn slot_event_barrier_for_test(&self) -> Result<(), WorkerPoolError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.commands
+            .send(PoolCommand::SlotEventBarrier(reply_tx))
+            .await
+            .map_err(|_| WorkerPoolError::Closed)?;
+        reply_rx.await.map_err(|_| WorkerPoolError::Closed)
+    }
+
     /// 返回按槽位排序的当前 Worker PID，供状态页和进程级测试使用。
     pub fn worker_process_ids(&self) -> Vec<u32> {
         self.state
@@ -1070,6 +1081,8 @@ impl WorkerPool {
                                     .remove(&task_id);
                             }
                             PoolCommand::TerminateUnexpected(_, reply) => { let _ = reply.send(Ok(())); }
+                            #[cfg(test)]
+                            PoolCommand::SlotEventBarrier(reply) => { let _ = reply.send(()); }
                             PoolCommand::Shutdown(reply) => {
                                 queue.clear();
                                 active.clear();
@@ -1312,6 +1325,10 @@ impl WorkerPool {
                     }
                     PoolCommand::TerminateUnexpected(_, reply) => {
                         let _ = reply.send(Ok(()));
+                    }
+                    #[cfg(test)]
+                    PoolCommand::SlotEventBarrier(reply) => {
+                        let _ = reply.send(());
                     }
                     PoolCommand::Shutdown(reply) => {
                         let mut state = actor_state.lock().unwrap();
@@ -1682,6 +1699,9 @@ enum PoolCommand {
     TerminateUnexpected(u32, oneshot::Sender<Result<(), WorkerPoolError>>),
     /// 关闭命令独占 actor，完成全部 slot 退出和 driver 收束后才回复。
     Shutdown(oneshot::Sender<Result<(), WorkerPoolError>>),
+    /// 仅测试：处理当前已入队的 slot 事件后回复，用于验证迟到事件不会复活槽位。
+    #[cfg(test)]
+    SlotEventBarrier(oneshot::Sender<()>),
 }
 
 /// 一个已经 Ready 的槽位，只暴露 PID 与单向控制通道。
@@ -1712,6 +1732,15 @@ enum SlotEvent {
         exit_code: Option<i32>,
         message: String,
     },
+}
+
+impl SlotEvent {
+    /// 返回事件所属 slot，供池 actor 丢弃已退休 slot 的迟到消息。
+    const fn slot_id(&self) -> usize {
+        match self {
+            Self::Response { slot_id, .. } | Self::Exited { slot_id, .. } => *slot_id,
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1777,6 +1806,8 @@ async fn run_pool_with_replacement<F, Fut>(
         config.worker_count,
     )));
     let actor_events = ActorWorkerEventSink::new(Arc::clone(&pending_events), events.clone());
+    // 取消异常后不补建的 slot 只在本 actor 内保留退休标记，迟到事件不得复活它。
+    let mut retired_slots = HashSet::new();
     loop {
         pending_events.try_flush(&events);
         tokio::select! {
@@ -1828,6 +1859,7 @@ async fn run_pool_with_replacement<F, Fut>(
                             &slot_events_tx,
                             &actor_events,
                             &state,
+                            &mut retired_slots,
                             &mut replacement_factory,
                         ).await;
                         schedule(&mut queue, &mut idle, &slots, &actor_events, &state).await;
@@ -1853,6 +1885,26 @@ async fn run_pool_with_replacement<F, Fut>(
                             });
                         let _ = reply.send(result);
                     }
+                    #[cfg(test)]
+                    PoolCommand::SlotEventBarrier(reply) => {
+                        while let Ok(event) = slot_events.try_recv() {
+                            if retired_slots.contains(&event.slot_id()) {
+                                continue;
+                            }
+                            handle_slot_event_and_schedule_with_replacement(
+                                event,
+                                &mut queue,
+                                &mut slots,
+                                &mut idle,
+                                &actor_events,
+                                &state,
+                                config.shutdown_timeout,
+                                &mut replacement_factory,
+                            )
+                            .await;
+                        }
+                        let _ = reply.send(());
+                    }
                     PoolCommand::Shutdown(reply) => {
                         let result = shutdown_slots(
                             &mut slots,
@@ -1868,6 +1920,9 @@ async fn run_pool_with_replacement<F, Fut>(
             }
             event = slot_events.recv() => {
                 let Some(event) = event else { break };
+                if retired_slots.contains(&event.slot_id()) {
+                    continue;
+                }
                 handle_slot_event_and_schedule_with_replacement(
                     event,
                     &mut queue,
@@ -2523,6 +2578,7 @@ async fn cancel_task_items<E, F, Fut>(
     slot_events_tx: &mpsc::UnboundedSender<SlotEvent>,
     events: &E,
     state: &Arc<Mutex<PoolState>>,
+    retired_slots: &mut HashSet<usize>,
     replacement_factory: &mut F,
 ) -> Result<(), WorkerPoolError>
 where
@@ -2617,18 +2673,26 @@ where
             .await;
     }
     if cancellation_error.is_none() {
-        for slot_id in target_slots {
-            let slot = replacement_factory(slot_id).await?;
+        for slot_id in &target_slots {
+            retired_slots.remove(slot_id);
+            let slot = replacement_factory(*slot_id).await?;
             state
                 .lock()
                 .unwrap()
                 .process_ids
-                .insert(slot_id, slot.process_id);
-            idle.push_back(slot_id);
-            slots.insert(slot_id, slot);
+                .insert(*slot_id, slot.process_id);
+            idle.push_back(*slot_id);
+            slots.insert(*slot_id, slot);
         }
     }
+    // 错误已确认时必须先登记全部退休 slot；deferred 里可能已有同一 slot 的重复 Exited。
+    if cancellation_error.is_some() {
+        retired_slots.extend(target_slots.iter().copied());
+    }
     for event in deferred {
+        if retired_slots.contains(&event.slot_id()) {
+            continue;
+        }
         handle_slot_event(
             event,
             config,
@@ -2918,35 +2982,82 @@ mod tests {
         let terminated = Arc::new(Notify::new());
         let driver_terminated = Arc::clone(&terminated);
         let timeout = Duration::from_secs(1);
-        let config = WorkerPoolConfig::new(WorkerLaunch::new("unused-worker.exe"), 1)
+        let config = WorkerPoolConfig::new(WorkerLaunch::new("unused-worker.exe"), 2)
             .with_shutdown_timeout(timeout);
-        let state = Arc::new(Mutex::new(PoolState::new(1)));
+        let state = Arc::new(Mutex::new(PoolState::new(2)));
         state.lock().unwrap().process_ids.insert(0, 1);
+        state.lock().unwrap().process_ids.insert(1, 2);
         let work = scheduler_work("cancel-timeout", 0).identity;
+        let work_second = scheduler_work("cancel-timeout-second", 1).identity;
         register_running_work(&mut state.lock().unwrap(), 0, work.clone());
+        register_running_work(&mut state.lock().unwrap(), 1, work_second);
+        let (slot_events, slot_events_receiver) = mpsc::unbounded_channel();
+        let late_events = slot_events.clone();
         let (slot_commands, mut slot_receiver) = mpsc::unbounded_channel();
+        let (second_commands, mut second_receiver) = mpsc::unbounded_channel();
+        let driver_events = slot_events.clone();
+        let driver_work = work.clone();
         let driver = tokio::spawn(async move {
             assert!(matches!(
                 slot_receiver.recv().await,
                 Some(SlotCommand::Terminate)
             ));
+            // 第一条满足取消等待，第二条会在 join 超时后落入 deferred，覆盖标记建立前的竞态。
+            for message in ["first exited", "duplicate exited"] {
+                driver_events
+                    .send(SlotEvent::Exited {
+                        slot_id: 0,
+                        work: Some(driver_work.clone()),
+                        process_id: Some(1),
+                        exit_code: Some(1),
+                        message: message.into(),
+                    })
+                    .unwrap();
+            }
             driver_terminated.notify_one();
             std::future::pending::<()>().await;
         });
-        let slots = BTreeMap::from([(
-            0,
-            SlotHandle {
-                process_id: 1,
-                commands: slot_commands,
-                driver,
-            },
-        )]);
-        let (slot_events, slot_events_receiver) = mpsc::unbounded_channel();
+        let second_driver = tokio::spawn(async move {
+            assert!(matches!(
+                second_receiver.recv().await,
+                Some(SlotCommand::Terminate)
+            ));
+            std::future::pending::<()>().await;
+        });
+        let slots = BTreeMap::from([
+            (
+                0,
+                SlotHandle {
+                    process_id: 1,
+                    commands: slot_commands,
+                    driver,
+                },
+            ),
+            (
+                1,
+                SlotHandle {
+                    process_id: 2,
+                    commands: second_commands,
+                    driver: second_driver,
+                },
+            ),
+        ]);
         let (commands, command_receiver) = mpsc::channel(8);
         let (events, event_receiver) = mpsc::channel(8);
-        let actor = tokio::spawn(run_pool(
+        let replacement_calls = Arc::new(AtomicUsize::new(0));
+        let replacement_counter = Arc::clone(&replacement_calls);
+        let replacement_commands = mpsc::unbounded_channel().0;
+        let replacement_factory = move |slot_id| {
+            replacement_counter.fetch_add(1, Ordering::AcqRel);
+            std::future::ready(Ok(SlotHandle {
+                process_id: slot_id as u32 + 10,
+                commands: replacement_commands.clone(),
+                driver: completed_slot_driver(),
+            }))
+        };
+        let actor = tokio::spawn(run_pool_with_replacement(
             config,
-            WorkerJob::create().expect("取消超时测试需要 Worker Job"),
+            Arc::new(WorkerJob::create().expect("取消超时测试需要 Worker Job")),
             slots,
             VecDeque::new(),
             command_receiver,
@@ -2954,6 +3065,7 @@ mod tests {
             slot_events,
             WorkerEventOutbox::new(events),
             Arc::clone(&state),
+            replacement_factory,
         ));
         let pool = WorkerPool {
             commands,
@@ -2974,6 +3086,38 @@ mod tests {
                 Err(WorkerPoolError::ShutdownTimeout { timeout: actual }) if actual == timeout
             ));
         }
+        // 旧 driver 即使在 abort 前已发出事件，也只能命中退休标记，不能复活 slot 或重复终态。
+        late_events
+            .send(SlotEvent::Exited {
+                slot_id: 0,
+                work: Some(work.clone()),
+                process_id: Some(1),
+                exit_code: Some(1),
+                message: "late exited after cancellation timeout".into(),
+            })
+            .unwrap();
+        late_events
+            .send(SlotEvent::Response {
+                slot_id: 0,
+                work: work.clone(),
+                response: proto::WorkerEnvelope {
+                    payload: Some(worker_envelope::Payload::WorkerFailure(
+                        proto::WorkerFailure {
+                            task_id: work.task_id.clone(),
+                            item_id: work.item_id.clone(),
+                            stage: "late".into(),
+                            message: "late response".into(),
+                        },
+                    )),
+                },
+            })
+            .unwrap();
+        pool.slot_event_barrier_for_test().await.unwrap();
+        assert_eq!(
+            replacement_calls.load(Ordering::Acquire),
+            0,
+            "取消失败后的迟到 Exited 不得补建 Worker"
+        );
         let locked = state.lock().unwrap();
         assert!(locked.running.is_empty());
         assert!(locked.process_ids.is_empty());

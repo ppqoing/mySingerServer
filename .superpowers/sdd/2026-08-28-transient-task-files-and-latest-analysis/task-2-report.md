@@ -119,3 +119,20 @@ Fix round 2：本提交（`fix: join worker drivers during shutdown`）。
 - 完整 `base_compute_pipeline` 的默认并行运行仍有 3 条既有时序断言失败；按该套件时序边界使用 `-- --test-threads=1` 串行运行后 59/59 通过。聚焦 reopen 回归也实际通过。
 
 Fix round 3：本提交（取消/driver 收束与测试 observer 适配）。
+
+## Fix round 4（取消后迟到 slot 事件）
+
+### RED / 修复
+
+- 审查发现：取消超时后旧 driver 可能已经把 `Exited` 或 `Response` 放入 `slot_events`。若主循环按普通退出处理，会错误补建 Worker，并在已经发布 Cancelled 后再发布 Crashed/Completed。
+- 将 `cancel_timeout_aborts_driver_and_keeps_pool_shutdown_reachable` 扩展为确定性两时序：两个取消目标中第一个 driver 连续发送两条 Exited（第二条在另一个目标仍等待时进入 deferred），随后超时；取消返回后再注入同一 slot 的 Exited 与 Response。测试通过唯一 actor 的 `SlotEventBarrier` 确认 replacement factory 调用次数为零，并继续成功关闭 Pool。
+- `run_pool_with_replacement` 现在唯一持有 `retired_slots`。取消错误路径在处理 deferred 前登记所有未补建目标，deferred 和主 slot-event 分支均按该集合丢弃迟到消息。正常取消补建时显式清除标记；当前错误路径不重用 slot ID。
+
+### Fix 验证
+
+- 扩展后的取消超时/迟到事件用例：1/1 通过。
+- `cargo test -p dedup-node-engine --lib --features test-hooks --locked`：64/64 通过。
+- `cargo test -p dedup-node-engine --test base_compute_pipeline --features test-hooks --locked -- --test-threads=1 --format terse`：59/59 通过。
+- `cargo test -p worker --test worker_pool --no-run --locked`：通过；运行 3/3 通过。
+
+Fix round 4：本提交（取消后迟到 slot 事件过滤）。
