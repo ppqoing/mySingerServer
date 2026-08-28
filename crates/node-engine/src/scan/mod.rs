@@ -12,6 +12,7 @@ mod hash;
 pub(crate) mod input_order;
 mod pipeline;
 mod root_plan;
+mod task_file_base_compute;
 
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]

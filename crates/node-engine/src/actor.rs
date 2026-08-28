@@ -2400,6 +2400,8 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
+    #[cfg(feature = "test-hooks")]
+    use dedup_core::NormalizedPath;
     use dedup_media::{ImageStage1, PdqHash};
     #[cfg(feature = "test-hooks")]
     use dedup_media_ffmpeg::MediaProbe;

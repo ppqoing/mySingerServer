@@ -5,6 +5,8 @@ use std::sync::{
     Arc, Condvar, Mutex,
     atomic::{AtomicBool, Ordering},
 };
+#[cfg(all(test, not(feature = "test-hooks")))]
+use std::sync::{Arc, Mutex};
 use std::{
     sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError},
     thread,
@@ -275,6 +277,8 @@ pub(crate) struct BasePersistAck {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use dedup_core::{ContentKey, DisplayPath, MachineId, NormalizedPath};
     use dedup_node_store::{NodeStore, ScannedPath};
     use dedup_windows::{LocalDiskKind, PhysicalDiskId};
@@ -427,6 +431,8 @@ mod tests {
             calls: call_tx,
             persists: persist_tx,
             machine_id: MachineId::from_sha256([0xB4; 32]),
+            #[cfg(test)]
+            key_lookup_batches: Arc::new(Mutex::new(Vec::new())),
         };
         assert!(
             handle
@@ -460,6 +466,8 @@ mod tests {
             calls: call_tx,
             persists: persist_tx,
             machine_id: MachineId::from_sha256([0xB5; 32]),
+            #[cfg(test)]
+            key_lookup_batches: Arc::new(Mutex::new(Vec::new())),
         };
 
         let returned = match handle.try_persist(BasePersistMessage::new_task_file(
@@ -488,6 +496,9 @@ pub(crate) struct BaseStoreHandle {
     calls: SyncSender<StoreCall>,
     persists: SyncSender<BasePersistMessage>,
     machine_id: MachineId,
+    /// 测试专用窄观测：记录每次 content-key 批量查询的输入大小。
+    #[cfg(test)]
+    key_lookup_batches: Arc<Mutex<Vec<usize>>>,
 }
 
 impl BaseStoreHandle {
@@ -558,8 +569,22 @@ impl BaseStoreHandle {
         &self,
         keys: &[ContentKey],
     ) -> Result<Vec<Option<BaseCacheRecord>>, StoreError> {
+        #[cfg(test)]
+        self.key_lookup_batches
+            .lock()
+            .expect("批量查询观测锁不应中毒")
+            .push(keys.len());
         let keys = keys.to_vec();
         self.call(move |store| store.lookup_base_cache_by_keys(&keys))
+    }
+
+    /// 返回测试期间实际提交的 content-key 批次大小，不影响生产执行路径。
+    #[cfg(test)]
+    pub(crate) fn lookup_key_batch_sizes_for_test(&self) -> Vec<usize> {
+        self.key_lookup_batches
+            .lock()
+            .expect("批量查询观测锁不应中毒")
+            .clone()
     }
 
     pub(crate) fn load_base_cache_record(
@@ -700,6 +725,8 @@ impl BaseStoreActor {
                 calls: call_tx,
                 persists: persist_tx,
                 machine_id,
+                #[cfg(test)]
+                key_lookup_batches: Arc::new(Mutex::new(Vec::new())),
             },
             ack_rx,
         )
