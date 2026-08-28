@@ -10,7 +10,7 @@ Task 5 已完成。节点在第一次 Everything/Windows Walker 枚举前，对�
 
 - 新增 `crates/node-engine/src/scan/root_plan.rs`：根计划、lane 合并、组件边界匹配和配置额度冻结。
 - 修改 `crates/node-engine/src/scan/mod.rs`、`actor.rs`：导出计划类型，并在生产枚举前建立计划、失败时跳过枚举。
-- 修改 `crates/node-engine/src/scan/pipeline.rs`：读取器消费冻结 lane；Hash/Stage1 使用只读物理盘身份接口，保留旧消费接口兼容但不再作为事实来源。
+- 修改 `crates/node-engine/src/scan/pipeline.rs`：读取器消费冻结 lane；Hash/Stage1 使用只读物理盘身份接口，读取期旧消费接口已经删除。
 - 修改 `crates/node-engine/src/scan/base_compute.rs`、`scan/engine.rs`：改用冻结 lane 身份，避免重复解析。
 - 修改 `crates/windows/src/storage_device.rs`：补充从已验证物理盘编号和类型构造调度位置的边界 API。
 - 修改 `crates/node-engine/tests/scan_roots.rs`：新增调用顺序、解析失败、根边界、同盘/复合/Unknown、配置额度和 Hash/Media 同 lane 行为测试。
@@ -19,7 +19,7 @@ Task 5 已完成。节点在第一次 Everything/Windows Walker 枚举前，对�
 
 ## TDD 与验证证据
 
-先在旧实现运行根计划测试，因计划类型不存在而真实失败（RED）；实现后首次 GREEN 通过。随后补充 Hash/Media 不增加 resolver 调用的行为测试。完整回归期间发现旧 `take_physical_disk_id` 消费语义被无状态实现破坏，定向测试真实失败；改为 `physical_disk_id` 只读接口并恢复旧接口兼容后，定向和全量均通过。
+先在旧实现运行根计划测试，因计划类型不存在而真实失败（RED）；实现后首次 GREEN 通过。随后补充 Hash/Media 不增加 resolver 调用的行为测试。完整回归期间发现旧 `take_physical_disk_id` 消费语义被无状态实现破坏，定向测试真实失败；最终改为 `physical_disk_id` 只读接口，并删除读取期旧消费接口，定向和全量均通过。
 
 使用 `CARGO_TARGET_DIR=C:\tmp\rust-v2-core-scope-target`、关闭增量和 debug info，并清除 MinGW 环境变量，结果如下：
 
