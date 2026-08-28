@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf};
+use std::{fs, path::PathBuf, time::Duration};
 
 use dedup_core::{DisplayPath, NormalizedPath};
 use dedup_node_engine::{
@@ -439,4 +439,188 @@ fn terminal_transitions_reject_opposite_status_and_published_overflow() {
     files.mark_failed(&second_identity).unwrap();
     assert!(files.mark_completed(&second_identity).is_err());
     assert!(files.all_terminal());
+}
+
+#[test]
+fn corrupted_pending_row_does_not_advance_prefetch_cursor() {
+    let root = runtime_root();
+    let id = run_id();
+    let task_lane = lane(&[7], LocalDiskKind::Hdd, 1);
+    let mut files = TransientTaskFileSet::create(root.path(), &id).unwrap();
+    let row = record("repair-me.jpg", TaskWorkMask::from_bits(1 << 3).unwrap());
+    let identity = files
+        .append_batch(&task_lane, std::slice::from_ref(&row))
+        .unwrap()
+        .remove(0);
+    let path = files.lane_path(&task_lane).unwrap();
+    let original = fs::read(&path).unwrap();
+    let damaged_offset = usize::try_from(identity.line_offset()).unwrap() + 2;
+    let mut damaged = original.clone();
+    damaged[damaged_offset] = b'X';
+    fs::write(&path, &damaged).unwrap();
+
+    assert!(files.peek_lane(&task_lane).is_err());
+    fs::write(&path, original).unwrap();
+    assert_eq!(
+        files.peek_lane(&task_lane).unwrap().unwrap().record.item_id,
+        row.item_id
+    );
+}
+
+#[test]
+fn append_flush_failure_poisoned_run_cannot_be_sealed_or_reused() {
+    let root = runtime_root();
+    let id = run_id();
+    let task_lane = lane(&[7], LocalDiskKind::Hdd, 1);
+    let mut files = TransientTaskFileSet::create(root.path(), &id).unwrap();
+    files.fail_next_append_flush_for_test();
+    let row = record(
+        "flush-failure.jpg",
+        TaskWorkMask::from_bits(1 << 3).unwrap(),
+    );
+
+    assert!(files.append_batch(&task_lane, &[row]).is_err());
+    assert!(files.is_poisoned());
+    assert!(files.poison_reason().is_some());
+    assert!(files.health().is_err());
+    assert_eq!(files.published_len(&task_lane).unwrap(), 0);
+    assert!(
+        files
+            .append_batch(
+                &task_lane,
+                &[record(
+                    "after-flush-failure.jpg",
+                    TaskWorkMask::from_bits(1 << 3).unwrap(),
+                )],
+            )
+            .is_err()
+    );
+    assert!(files.seal().is_err());
+    assert!(!files.all_terminal());
+}
+
+#[test]
+fn status_sync_failure_poisoned_run_never_reports_terminal_success() {
+    let root = runtime_root();
+    let id = run_id();
+    let task_lane = lane(&[7], LocalDiskKind::Hdd, 1);
+    let mut files = TransientTaskFileSet::create(root.path(), &id).unwrap();
+    let row = record("sync-failure.jpg", TaskWorkMask::from_bits(1 << 3).unwrap());
+    let identity = files
+        .append_batch(&task_lane, std::slice::from_ref(&row))
+        .unwrap()
+        .remove(0);
+    files.seal().unwrap();
+    files.take_lane(&identity).unwrap().unwrap();
+    files.fail_next_status_sync_for_test();
+
+    assert!(files.mark_completed(&identity).is_err());
+    assert_eq!(
+        fs::read(files.lane_path(&task_lane).unwrap()).unwrap()[0],
+        b'C'
+    );
+    assert!(files.is_poisoned());
+    assert!(files.health().is_err());
+    assert!(files.seal().is_err());
+    assert!(!files.all_terminal());
+}
+
+#[test]
+fn take_requires_owned_current_head_identity() {
+    let root = runtime_root();
+    let id = run_id();
+    let task_lane = lane(&[7], LocalDiskKind::Hdd, 1);
+    let mut files = TransientTaskFileSet::create(root.path(), &id).unwrap();
+    let first = record("first-head.jpg", TaskWorkMask::from_bits(1 << 3).unwrap());
+    let second = record("second-head.jpg", TaskWorkMask::from_bits(1 << 3).unwrap());
+    files.append_batch(&task_lane, &[first, second]).unwrap();
+    files.seal().unwrap();
+
+    let old_head = files.peek_lane(&task_lane).unwrap().unwrap();
+    let old_identity = old_head.identity.clone();
+    let taken = files.take_lane(&old_identity).unwrap().unwrap();
+    files.mark_completed(&taken.0).unwrap();
+    assert!(files.take_lane(&old_identity).is_err());
+}
+
+#[test]
+fn lane_identity_and_configuration_are_frozen_after_registration() {
+    let root = runtime_root();
+    let id = run_id();
+    let mut files = TransientTaskFileSet::create(root.path(), &id).unwrap();
+    let hdd = lane(&[7], LocalDiskKind::Hdd, 2);
+    files.register_lane(&hdd).unwrap();
+    files.register_lane(&hdd).unwrap();
+
+    let mut ssd = hdd.clone();
+    ssd.disk_kind = LocalDiskKind::Ssd;
+    assert!(files.register_lane(&ssd).is_err());
+    let mut different_weight = hdd.clone();
+    different_weight.configured_weight += 1;
+    assert!(files.register_lane(&different_weight).is_err());
+    let mut different_limit = hdd.clone();
+    different_limit.per_disk_limit += 1;
+    assert!(files.register_lane(&different_limit).is_err());
+    let mut different_numbers = hdd.clone();
+    different_numbers.physical_disk_numbers = vec![7, 8];
+    assert!(files.register_lane(&different_numbers).is_err());
+}
+
+#[tokio::test]
+async fn publication_wait_registers_before_rechecking_and_wakes_on_append_or_seal() {
+    let root = runtime_root();
+    let id = run_id();
+    let task_lane = lane(&[7], LocalDiskKind::Hdd, 1);
+    let empty_lane = lane(&[8], LocalDiskKind::Unknown, 1);
+    let mut files = TransientTaskFileSet::create(root.path(), &id).unwrap();
+    files.register_lane(&task_lane).unwrap();
+    files.register_lane(&empty_lane).unwrap();
+    let publication = files.publication();
+    let observed = publication.epoch();
+    let waiter = tokio::spawn({
+        let publication = publication.clone();
+        async move { publication.wait_for_change(observed).await }
+    });
+    tokio::task::yield_now().await;
+    files
+        .append_batch(
+            &task_lane,
+            &[record(
+                "publication.jpg",
+                TaskWorkMask::from_bits(1 << 3).unwrap(),
+            )],
+        )
+        .unwrap();
+    let after_append = tokio::time::timeout(Duration::from_secs(1), waiter)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(after_append > observed);
+
+    let observed = publication.epoch();
+    let waiter = tokio::spawn({
+        let publication = publication.clone();
+        async move { publication.wait_for_change(observed).await }
+    });
+    tokio::task::yield_now().await;
+    files.seal().unwrap();
+    let after_seal = tokio::time::timeout(Duration::from_secs(1), waiter)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(after_seal > observed);
+}
+
+#[test]
+fn discard_requires_unique_owner_and_removes_only_its_exact_run_directory() {
+    let root = runtime_root();
+    let id = run_id();
+    let run_dir = root.path().join(&id);
+    let mut files = TransientTaskFileSet::create(root.path(), &id).unwrap();
+    let publication = files.publication();
+    assert!(files.discard().is_err());
+    drop(publication);
+    files.discard().unwrap();
+    assert!(!run_dir.exists());
+    assert!(files.all_terminal() == false);
 }

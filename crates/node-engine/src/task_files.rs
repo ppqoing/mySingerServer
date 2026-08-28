@@ -8,6 +8,10 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, BufWriter, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 #[cfg(not(windows))]
@@ -296,47 +300,54 @@ pub struct TaskLaneHead {
     pub record: TaskFileRecord,
 }
 
-/// `take_lane` 的选择条件，可按 lane 取队首，也可按已保存身份精确领取。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum TaskLaneSelection {
-    /// 只指定 lane，由管理器取其当前队首。
-    Lane(TaskDiskLane),
-    /// 指定 dispatcher 观察到的精确身份。
-    Identity(TaskFileIdentity),
+/// 任务文件发布边界的拥有型通知句柄。
+///
+/// 句柄只携带原子序号、通知对象和所有权令牌，不暴露任何文件句柄或读取游标。
+#[derive(Clone)]
+pub struct TaskFilePublication {
+    epoch: Arc<AtomicU64>,
+    notify: Arc<tokio::sync::Notify>,
+    _owner_token: Arc<()>,
 }
 
-impl From<&TaskDiskLane> for TaskLaneSelection {
-    fn from(value: &TaskDiskLane) -> Self {
-        Self::Lane(value.clone())
+impl TaskFilePublication {
+    /// 返回当前发布变更序号。
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
     }
-}
 
-impl From<TaskDiskLane> for TaskLaneSelection {
-    fn from(value: TaskDiskLane) -> Self {
-        Self::Lane(value)
-    }
-}
-
-impl From<&TaskFileIdentity> for TaskLaneSelection {
-    fn from(value: &TaskFileIdentity) -> Self {
-        Self::Identity(value.clone())
-    }
-}
-
-impl From<TaskFileIdentity> for TaskLaneSelection {
-    fn from(value: TaskFileIdentity) -> Self {
-        Self::Identity(value)
+    /// 等待序号超过 `observed`；注册通知后再次检查，避免丢失唤醒。
+    pub async fn wait_for_change(&self, observed: u64) -> u64 {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let current = self.epoch.load(Ordering::Acquire);
+            if current != observed {
+                return current;
+            }
+            notified.await;
+        }
     }
 }
 
 /// 隐藏全部文件句柄、追加游标、状态偏移和有限预读的任务文件集合。
 pub struct TransientTaskFileSet {
     run_id: String,
+    runtime_root: PathBuf,
     run_dir: PathBuf,
     lanes: BTreeMap<String, LaneState>,
     item_lanes: BTreeMap<Uuid, String>,
+    physical_lanes: BTreeMap<dedup_windows::PhysicalDiskId, String>,
     sealed: bool,
-    change_epoch: u64,
+    discarded: bool,
+    poisoned: bool,
+    poison_reason: Option<String>,
+    change_epoch: Arc<AtomicU64>,
+    publication_notify: Arc<tokio::sync::Notify>,
+    owner_token: Arc<()>,
+    fail_next_append_flush: bool,
+    fail_next_status_sync: bool,
 }
 
 struct LaneState {
@@ -371,32 +382,77 @@ impl TransientTaskFileSet {
         fs::create_dir(&run_dir)?;
         Ok(Self {
             run_id,
+            runtime_root: runtime_root.to_path_buf(),
             run_dir,
             lanes: BTreeMap::new(),
             item_lanes: BTreeMap::new(),
+            physical_lanes: BTreeMap::new(),
             sealed: false,
-            change_epoch: 0,
+            discarded: false,
+            poisoned: false,
+            poison_reason: None,
+            change_epoch: Arc::new(AtomicU64::new(0)),
+            publication_notify: Arc::new(tokio::sync::Notify::new()),
+            owner_token: Arc::new(()),
+            fail_next_append_flush: false,
+            fail_next_status_sync: false,
         })
-    }
-
-    /// 精确删除一个已经结束或取消的旧运行目录；不会触碰 runtime 外的路径。
-    pub fn remove_run(runtime_root: &Path, run_id: impl ToString) -> io::Result<()> {
-        let run_id = canonical_run_id(&run_id.to_string())?;
-        let run_dir = runtime_root.join(run_id);
-        if run_dir.exists() {
-            fs::remove_dir_all(run_dir)?;
-        }
-        Ok(())
-    }
-
-    /// `remove_run` 的语义别名，供启动清理调用方使用。
-    pub fn cleanup_run(runtime_root: &Path, run_id: impl ToString) -> io::Result<()> {
-        Self::remove_run(runtime_root, run_id)
     }
 
     /// 返回本次运行的规范 UUID。
     pub fn run_id(&self) -> &str {
         &self.run_id
+    }
+
+    /// 返回任务文件发布通知句柄；句柄保持运行目录的活动所有权。
+    pub fn publication(&self) -> TaskFilePublication {
+        TaskFilePublication {
+            epoch: Arc::clone(&self.change_epoch),
+            notify: Arc::clone(&self.publication_notify),
+            _owner_token: Arc::clone(&self.owner_token),
+        }
+    }
+
+    /// 返回运行是否已经进入不可恢复的毒化状态。
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    /// 返回最近一次导致运行毒化的错误说明。
+    pub fn poison_reason(&self) -> Option<&str> {
+        self.poison_reason.as_deref()
+    }
+
+    /// 检查运行仍可继续使用；毒化或丢弃后所有生产操作都失败关闭。
+    pub fn health(&self) -> io::Result<()> {
+        self.ensure_active()
+    }
+
+    /// 注入下一次追加 flush 失败，仅供真实 IO seam 测试验证失败关闭语义。
+    pub fn fail_next_append_flush_for_test(&mut self) {
+        self.fail_next_append_flush = true;
+    }
+
+    /// 注入下一次状态同步失败，写入状态字节后再返回错误，仅供行为测试使用。
+    pub fn fail_next_status_sync_for_test(&mut self) {
+        self.fail_next_status_sync = true;
+    }
+
+    /// 关闭本集合句柄并删除创建时固定的唯一运行目录。
+    ///
+    /// 任何发布句柄仍存活时拒绝删除；目录校验通过后只删除 runtime 的直接子目录，
+    /// 不接受外部传入的任意路径或运行 ID。
+    pub fn discard(&mut self) -> io::Result<()> {
+        self.ensure_not_discarded()?;
+        if Arc::strong_count(&self.owner_token) != 1 {
+            return Err(invalid_input("任务文件仍有活动所有者，不能 discard"));
+        }
+        validate_exact_run_directory(&self.runtime_root, &self.run_dir, &self.run_id)?;
+        self.lanes.clear();
+        fs::remove_dir_all(&self.run_dir)?;
+        self.discarded = true;
+        self.advance_epoch();
+        Ok(())
     }
 
     /// 返回由 lane 身份计算出的文件路径；尚未追加时文件可能尚不存在。
@@ -406,11 +462,13 @@ impl TransientTaskFileSet {
 
     /// 注册一个空 lane 文件，便于 dispatcher 观察尚未有生产者写入的 lane。
     pub fn register_lane(&mut self, lane: &TaskDiskLane) -> io::Result<()> {
+        self.ensure_active()?;
         if self.sealed {
             return Err(invalid_input("任务文件集合已经 seal，不能注册 lane"));
         }
         let key = lane_file_name(lane)?;
         self.ensure_lane(lane, key)?;
+        self.advance_epoch();
         Ok(())
     }
 
@@ -420,6 +478,7 @@ impl TransientTaskFileSet {
         lane: &TaskDiskLane,
         rows: &[TaskFileRecord],
     ) -> io::Result<Vec<TaskFileIdentity>> {
+        self.ensure_active()?;
         if self.sealed {
             return Err(invalid_input("任务文件集合已经 seal，不能追加"));
         }
@@ -460,7 +519,9 @@ impl TransientTaskFileSet {
                 .ok_or_else(|| invalid_input("任务文件长度溢出"))?;
         }
 
-        {
+        let inject_flush_failure = self.fail_next_append_flush;
+        self.fail_next_append_flush = false;
+        let write_error = {
             let lane_state = self.ensure_lane(lane, key.clone())?;
             if lane_state.sealed || lane_state.poisoned {
                 return Err(invalid_input("任务 lane 已封闭或发生不可恢复的写入错误"));
@@ -472,6 +533,9 @@ impl TransientTaskFileSet {
                 for bytes in &serialized {
                     lane_state.writer.write_all(bytes)?;
                 }
+                if inject_flush_failure {
+                    return Err(io::Error::other("注入任务文件 flush 失败"));
+                }
                 lane_state.writer.flush()
             })();
             if let Err(error) = write_result {
@@ -481,43 +545,61 @@ impl TransientTaskFileSet {
                     .get_mut()
                     .seek(SeekFrom::Start(starting_offset));
                 lane_state.poisoned = true;
-                return Err(error);
+                Some(error)
+            } else {
+                for (row, identity) in rows.iter().zip(identities.iter()) {
+                    lane_state.metadata.push(RowMeta {
+                        item_id: row.item_id,
+                        missing: row.missing,
+                        offset: identity.line_offset,
+                        length: identity.line_length,
+                        status: TaskLineStatus::Pending,
+                    });
+                }
+                lane_state.published_len = offset;
+                None
             }
-
-            for (row, identity) in rows.iter().zip(identities.iter()) {
-                lane_state.metadata.push(RowMeta {
-                    item_id: row.item_id,
-                    missing: row.missing,
-                    offset: identity.line_offset,
-                    length: identity.line_length,
-                    status: TaskLineStatus::Pending,
-                });
-            }
-            lane_state.published_len = offset;
+        };
+        if let Some(error) = write_error {
+            self.poison_run(format!("任务文件追加失败: {error}"));
+            return Err(error);
         }
         for row in rows {
             self.item_lanes.insert(row.item_id, key.clone());
         }
-        self.change_epoch = self.change_epoch.wrapping_add(1);
+        self.advance_epoch();
         Ok(identities)
     }
 
     /// 刷新全部 lane 并封闭生产边界；seal 后不再接受追加。
     pub fn seal(&mut self) -> io::Result<()> {
+        self.ensure_active()?;
         if self.sealed {
             return Ok(());
         }
+        let mut flush_error = None;
         for lane in self.lanes.values_mut() {
-            lane.writer.flush()?;
+            if let Err(error) = lane.writer.flush() {
+                lane.poisoned = true;
+                flush_error = Some(error);
+                break;
+            }
+        }
+        if let Some(error) = flush_error {
+            self.poison_run(format!("任务文件 seal flush 失败: {error}"));
+            return Err(error);
+        }
+        for lane in self.lanes.values_mut() {
             lane.sealed = true;
         }
         self.sealed = true;
-        self.change_epoch = self.change_epoch.wrapping_add(1);
+        self.advance_epoch();
         Ok(())
     }
 
-    /// 返回 lane 当前队首的借用快照；只解析有限预读窗口。
-    pub fn peek_lane(&mut self, lane: &TaskDiskLane) -> io::Result<Option<&TaskFileRecord>> {
+    /// 返回 lane 当前队首的拥有型快照；只解析有限预读窗口。
+    pub fn peek_lane(&mut self, lane: &TaskDiskLane) -> io::Result<Option<TaskLaneHead>> {
+        self.ensure_active()?;
         let key = lane_file_name(lane)?;
         let set_run_id = self.run_id.clone();
         let lane_state = match self.lanes.get_mut(&key) {
@@ -525,11 +607,12 @@ impl TransientTaskFileSet {
             None => return Ok(None),
         };
         refill_lane(&set_run_id, lane_state)?;
-        Ok(lane_state.prefetched.front().map(|head| &head.record))
+        Ok(lane_state.prefetched.front().cloned())
     }
 
     /// 返回 lane 当前队首的拥有型快照，供异步 dispatcher 保存身份。
     pub fn owned_lane_head(&mut self, lane: &TaskDiskLane) -> io::Result<Option<TaskLaneHead>> {
+        self.ensure_active()?;
         let key = lane_file_name(lane)?;
         let set_run_id = self.run_id.clone();
         let lane_state = match self.lanes.get_mut(&key) {
@@ -569,21 +652,16 @@ impl TransientTaskFileSet {
             .collect()
     }
 
-    /// 领取一个队首任务；领取只移动内存所有权，文件首字节仍保持 `P`。
-    pub fn take_lane<S: Into<TaskLaneSelection>>(
+    /// 领取观察到的队首任务；只能使用完整身份，文件首字节仍保持 `P`。
+    pub fn take_lane(
         &mut self,
-        expected: S,
+        expected_identity: &TaskFileIdentity,
     ) -> io::Result<Option<(TaskFileIdentity, TaskFileRecord)>> {
-        let selection = expected.into();
-        let (key, expected_identity) = match selection {
-            TaskLaneSelection::Lane(lane) => (lane_file_name(&lane)?, None),
-            TaskLaneSelection::Identity(identity) => {
-                if identity.run_id != self.run_id {
-                    return Err(invalid_input("任务身份 run_id 不匹配"));
-                }
-                (identity.lane_file_name.clone(), Some(identity))
-            }
-        };
+        self.ensure_active()?;
+        if expected_identity.run_id != self.run_id {
+            return Err(invalid_input("任务身份 run_id 不匹配"));
+        }
+        let key = expected_identity.lane_file_name.clone();
         let set_run_id = self.run_id.clone();
         let lane_state = match self.lanes.get_mut(&key) {
             Some(value) => value,
@@ -597,10 +675,8 @@ impl TransientTaskFileSet {
             Some(value) => value,
             None => return Ok(None),
         };
-        if let Some(expected) = expected_identity {
-            if expected != head.identity {
-                return Err(invalid_input("任务队首身份已经变化"));
-            }
+        if expected_identity != &head.identity {
+            return Err(invalid_input("任务队首身份已经变化"));
         }
         let head = lane_state.prefetched.pop_front().expect("已确认队首存在");
         lane_state.in_flight = Some(head.identity.clone());
@@ -648,20 +724,23 @@ impl TransientTaskFileSet {
     }
 
     /// 返回发布或状态变化的单调通知序号，dispatcher 可用它避免忙等。
-    pub const fn change_epoch(&self) -> u64 {
-        self.change_epoch
+    pub fn change_epoch(&self) -> u64 {
+        self.change_epoch.load(Ordering::Acquire)
     }
 
     /// 返回发布边界或行状态变化的通知序号。
-    pub const fn publication_epoch(&self) -> u64 {
-        self.change_epoch
+    pub fn publication_epoch(&self) -> u64 {
+        self.change_epoch()
     }
 
     /// 返回运行目录是否已 seal、全部行已进入终态且没有在途 ACK。
     pub fn all_terminal(&self) -> bool {
-        self.sealed
+        !self.discarded
+            && !self.poisoned
+            && self.sealed
             && self.lanes.values().all(|lane| {
                 lane.sealed
+                    && !lane.poisoned
                     && lane.in_flight.is_none()
                     && lane.prefetched.is_empty()
                     && lane
@@ -671,15 +750,59 @@ impl TransientTaskFileSet {
             })
     }
 
+    fn ensure_not_discarded(&self) -> io::Result<()> {
+        if self.discarded {
+            Err(invalid_input("任务文件集合已经 discard"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn ensure_active(&self) -> io::Result<()> {
+        self.ensure_not_discarded()?;
+        if self.poisoned {
+            Err(io::Error::other(
+                self.poison_reason
+                    .as_deref()
+                    .unwrap_or("任务文件集合已经毒化"),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn poison_run(&mut self, reason: impl Into<String>) {
+        self.poisoned = true;
+        if self.poison_reason.is_none() {
+            self.poison_reason = Some(reason.into());
+        }
+        self.advance_epoch();
+    }
+
+    fn advance_epoch(&self) {
+        self.change_epoch.fetch_add(1, Ordering::AcqRel);
+        self.publication_notify.notify_waiters();
+    }
+
     fn ensure_lane(&mut self, lane: &TaskDiskLane, key: String) -> io::Result<&mut LaneState> {
         if let Some(existing) = self.lanes.get(&key) {
-            if !same_lane_identity(&existing.lane, lane) {
-                return Err(invalid_input("同名任务 lane 的物理盘身份不一致"));
+            if !same_lane_configuration(&existing.lane, lane) {
+                return Err(invalid_input("同名任务 lane 的物理盘配置不一致"));
             }
             return self
                 .lanes
                 .get_mut(&key)
                 .ok_or_else(|| invalid_input("任务 lane 不存在"));
+        }
+        if let Some(existing_key) = self.physical_lanes.get(&lane.physical_disk_id) {
+            let existing = self
+                .lanes
+                .get(existing_key)
+                .ok_or_else(|| invalid_input("物理盘 lane 索引损坏"))?;
+            if !same_lane_configuration(&existing.lane, lane) {
+                return Err(invalid_input("同一物理盘的 lane 配置已经冻结"));
+            }
+            return Err(invalid_input("同一物理盘 lane 文件名不一致"));
         }
         let path = self.run_dir.join(&key);
         let writer_file = OpenOptions::new()
@@ -705,6 +828,8 @@ impl TransientTaskFileSet {
                 poisoned: false,
             },
         );
+        self.physical_lanes
+            .insert(lane.physical_disk_id.clone(), key.clone());
         self.lanes
             .get_mut(&key)
             .ok_or_else(|| invalid_input("任务 lane 创建失败"))
@@ -715,14 +840,21 @@ impl TransientTaskFileSet {
         identity: &TaskFileIdentity,
         target: TaskLineStatus,
     ) -> io::Result<()> {
+        self.ensure_active()?;
         if identity.run_id != self.run_id {
             return Err(invalid_input("任务身份 run_id 不匹配"));
         }
+        let inject_sync_failure = self.fail_next_status_sync;
+        self.fail_next_status_sync = false;
         let lane_state = self
             .lanes
             .get_mut(&identity.lane_file_name)
             .ok_or_else(|| invalid_input("任务身份 lane 不存在"))?;
-        lane_state.writer.flush()?;
+        if let Err(error) = lane_state.writer.flush() {
+            lane_state.poisoned = true;
+            self.poison_run(format!("任务状态写入前 flush 失败: {error}"));
+            return Err(error);
+        }
         let line_end = identity
             .line_offset
             .checked_add(identity.line_length)
@@ -763,14 +895,20 @@ impl TransientTaskFileSet {
             return Err(invalid_input("任务行尚未被当前 dispatcher 领取"));
         }
 
-        write_status(
+        let write_result = write_status(
             &lane_state.status_writer,
             identity.line_offset,
             target.as_byte(),
-        )?;
+            inject_sync_failure,
+        );
+        if let Err(error) = write_result {
+            lane_state.poisoned = true;
+            self.poison_run(format!("任务状态写入或同步失败: {error}"));
+            return Err(error);
+        }
         meta.status = target;
         lane_state.in_flight = None;
-        self.change_epoch = self.change_epoch.wrapping_add(1);
+        self.advance_epoch();
         Ok(())
     }
 }
@@ -790,8 +928,8 @@ fn refill_lane(run_id: &str, lane: &mut LaneState) -> io::Result<()> {
     let window = lane.lane.per_disk_limit.saturating_mul(2).max(2);
     while lane.prefetched.len() < window && lane.cursor < lane.metadata.len() {
         let meta = lane.metadata[lane.cursor];
-        lane.cursor += 1;
         if meta.status != TaskLineStatus::Pending {
+            lane.cursor += 1;
             continue;
         }
         let bytes = read_at(&lane.reader, meta.offset, meta.length)?;
@@ -814,6 +952,7 @@ fn refill_lane(run_id: &str, lane: &mut LaneState) -> io::Result<()> {
             identity,
             record: parsed.record,
         });
+        lane.cursor += 1;
     }
     Ok(())
 }
@@ -1004,7 +1143,7 @@ fn read_at(file: &File, offset: u64, length: u64) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn write_status(file: &File, offset: u64, byte: u8) -> io::Result<()> {
+fn write_status(file: &File, offset: u64, byte: u8, fail_sync: bool) -> io::Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::FileExt;
@@ -1014,6 +1153,9 @@ fn write_status(file: &File, offset: u64, byte: u8) -> io::Result<()> {
                 "任务状态字节未完整写入",
             ));
         }
+        if fail_sync {
+            return Err(io::Error::other("注入任务状态 sync_data 失败"));
+        }
         file.sync_data()?;
     }
     #[cfg(not(windows))]
@@ -1021,6 +1163,9 @@ fn write_status(file: &File, offset: u64, byte: u8) -> io::Result<()> {
         let mut handle = file.try_clone()?;
         handle.seek(SeekFrom::Start(offset))?;
         handle.write_all(&[byte])?;
+        if fail_sync {
+            return Err(io::Error::other("注入任务状态 sync_data 失败"));
+        }
         handle.sync_data()?;
     }
     Ok(())
@@ -1049,18 +1194,47 @@ fn lane_file_name(lane: &TaskDiskLane) -> io::Result<String> {
     Ok(format!("PhysicalDisk{disk_numbers}-{kind}.tasks.tsv"))
 }
 
-fn same_lane_identity(left: &TaskDiskLane, right: &TaskDiskLane) -> bool {
+fn same_lane_configuration(left: &TaskDiskLane, right: &TaskDiskLane) -> bool {
     left.physical_disk_id == right.physical_disk_id
-        && normalized_numbers(left.physical_disk_numbers.as_slice())
-            == normalized_numbers(right.physical_disk_numbers.as_slice())
+        && left.physical_disk_numbers == right.physical_disk_numbers
         && left.disk_kind == right.disk_kind
+        && left.configured_weight == right.configured_weight
+        && left.per_disk_limit == right.per_disk_limit
 }
 
-fn normalized_numbers(numbers: &[u32]) -> Vec<u32> {
-    let mut normalized = numbers.to_vec();
-    normalized.sort_unstable();
-    normalized.dedup();
-    normalized
+fn validate_exact_run_directory(
+    runtime_root: &Path,
+    run_dir: &Path,
+    run_id: &str,
+) -> io::Result<()> {
+    validate_directory(runtime_root, "runtime 根目录")?;
+    validate_directory(run_dir, "任务运行目录")?;
+    if run_dir.parent() != Some(runtime_root)
+        || run_dir.file_name().and_then(|name| name.to_str()) != Some(run_id)
+    {
+        return Err(invalid_input("任务运行目录不是 runtime 根目录的直接子目录"));
+    }
+    Ok(())
+}
+
+fn validate_directory(path: &Path, label: &str) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_dir() {
+        return Err(invalid_input(format!("{label}不是目录")));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(invalid_input(format!("{label}不能是重解析点")));
+        }
+    }
+    #[cfg(not(windows))]
+    if metadata.file_type().is_symlink() {
+        return Err(invalid_input(format!("{label}不能是符号链接")));
+    }
+    Ok(())
 }
 
 fn invalid_input(message: impl Into<String>) -> io::Error {
