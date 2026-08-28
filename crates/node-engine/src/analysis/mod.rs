@@ -16,8 +16,9 @@ use dedup_core::{AnalysisRunId, ContentKey, MediaKind, TaskId, Thresholds};
 use dedup_media::ImageStage1;
 use dedup_node_store::{
     AnalysisMode, AnalysisStatus, CompleteStage1, NodeStore, PersistentStageState, StoreError,
-    TaskStageWrite, TaskStatus,
+    TaskStageWrite, TaskStatus, classify_cache_completeness,
 };
+use dedup_protocol::{BASE_MISSING_PROBE, BASE_MISSING_STAGE1};
 use thiserror::Error;
 
 use crate::NodeRemoteFeatureCache;
@@ -203,25 +204,31 @@ impl LocalAnalysisEngine {
         let mut keys = inputs.iter().map(|input| input.content).collect::<Vec<_>>();
         keys.sort();
         keys.dedup();
-        for key in keys {
-            let Some(content_id) = store.content_id_by_key(key)? else {
+        let cached_records = store.lookup_base_cache_by_keys(&keys)?;
+        if cached_records.len() != keys.len() {
+            return Err(AnalysisBlocked::InvalidState(
+                "分析基础缓存批量返回数量不匹配".into(),
+            ));
+        }
+        for (key, record) in keys.into_iter().zip(cached_records) {
+            let Some(record) = record else {
                 skipped_incomplete += 1;
                 continue;
             };
-            match store.content_media_kind(content_id)? {
-                MediaKind::Image => match store.load_complete_stage1(content_id)? {
-                    Some(CompleteStage1::Image(feature)) => {
-                        images.insert(key, feature);
-                    }
-                    _ => skipped_incomplete += 1,
-                },
-                MediaKind::Video => match store.load_complete_stage1(content_id)? {
-                    Some(CompleteStage1::Video(feature)) => {
-                        videos.insert(key, feature);
-                    }
-                    _ => skipped_incomplete += 1,
-                },
-                MediaKind::Other => {}
+            let completeness = classify_cache_completeness(&record, true);
+            if completeness.base_missing_parts & (BASE_MISSING_PROBE | BASE_MISSING_STAGE1) != 0 {
+                skipped_incomplete += 1;
+                continue;
+            }
+            match (record.media_kind, record.stage1) {
+                (MediaKind::Image, Some(CompleteStage1::Image(feature))) => {
+                    images.insert(key, feature);
+                }
+                (MediaKind::Video, Some(CompleteStage1::Video(feature))) => {
+                    videos.insert(key, feature);
+                }
+                (MediaKind::Other, None) => {}
+                _ => skipped_incomplete += 1,
             }
         }
         store.set_analysis_skipped_incomplete(run_id, skipped_incomplete, now_ms)?;

@@ -44,3 +44,39 @@
 
 - 联系表校验复用媒体 crate 的固定三列两行六槽 JPEG 解码规则；任意可解码但不符合联系表尺寸约束的 JPEG 仍会按缺失处理，这是当前联系表格式契约。
 - `scan/engine.rs` 也有最小接入改动，因为基础结果持久化和已有联系表检查必须遵守同一缺失掩码与 artifact 校验；没有引入物理盘 lane、TSV、任务恢复或协议/UI 行为。
+
+## Follow-up：审查 Important 修复
+
+本轮仍按先 RED、后 GREEN 执行，测试均为真实 SQLite/NodeEngine 行为断言，没有读取源码字符串。
+
+### RED
+
+- 中心二筛批次夹具先证明旧实现把已有 `[0,1,4,5]` 与请求成功槽 `[0,1,2,3,4,5]` 全量下发，观察到 Worker 请求 `[0,1,2,3,4,5]`，而不是只请求 `[2,3]`。
+- raw SQLite 把图片 stage1 的 `width` 改为 `0` 后，旧解码仍返回 `Some`，本地分析 `skipped_incomplete` 为 `0`。
+- 已有完整图片一筛再次提交 `ImageStage1Fields::default()` 时，旧 outbox 载荷把宽高、PDQ、Quality 编成空值，未反映 SQL 合并后的有效行。
+
+### GREEN
+
+- `run_stage2_batch_internal` 使用 `video_stage2_missing_slots` 与中心要求成功槽位的交集；phase2 的重发/派发与本地分析统一检查 `BASE_MISSING_PROBE | BASE_MISSING_STAGE1`，畸形或未完成基础记录只取消当前任务项，不启动 Worker。
+- `decode_stage1_fields` 拒绝零尺寸、Quality>100、错误 PDQ 长度；分析候选改用一次批量 `BaseCacheRecord` 查询和集中完整性分类，视频探测尺寸/时长不合法时跳过该内容。
+- 图片 stage1、视频元数据、视频槽位 stage1 的 outbox 编码均在同一 SQLite 事务中回读 SQL 合并结果，再生成同步载荷；中心无需新增兼容合并规则。
+- 为新门禁补齐一个既有 actor Worker 屏障测试夹具的 `base_complete` 前置，未放宽生产门禁。
+
+### Follow-up 验证
+
+所有 Cargo 命令均显式使用 `CARGO_TARGET_DIR=C:\tmp\rust-v2-core-scope-target`、`CARGO_INCREMENTAL=0`、dev/test debug=0，并清除 C/C++ 工具链和 wrapper 环境变量。各次重型命令前检查 C/D 空间；本轮记录 C=18.20--18.21 GiB、D=10.31 GiB，未触及 10 GiB 停止线。
+
+| 验证 | 结果 |
+|---|---|
+| `cargo test -p dedup-node-store --test content_cache --locked -- --test-threads=1` | 18/18 通过 |
+| `cargo test -p dedup-node-store --locked -- --test-threads=1` | 全量通过（含 4 个库测试与全部集成测试） |
+| `cargo test -p dedup-node-engine --test local_analysis --locked -- --test-threads=1` | 10/10 通过 |
+| `cargo test -p dedup-node-engine --test base_compute_pipeline --features test-hooks --locked -- --test-threads=1` | 59/59 通过 |
+| `cargo test -p dedup-node-engine --test worker_pipeline --locked -- --test-threads=1` | 23/23 通过 |
+| `cargo test -p dedup-node-engine --lib central_cache --locked -- --test-threads=1` | 1/1 通过 |
+| `cargo test -p dedup-central-store --locked -- --test-threads=1` | 3 通过，1 个 PostgreSQL 环境测试按要求忽略 |
+| `cargo test -p dedup-node-engine --lib --locked -- --test-threads=1` | 64/64 通过；含补齐夹具后的 actor 测试 |
+| `cargo fmt --all -- --check` | 通过 |
+| `git diff --check` | 通过 |
+
+未执行真实媒体、打包、部署、TSV/lane/任务恢复/协议/UI 改动，也未访问 `I:\Tool`。

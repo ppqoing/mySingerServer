@@ -593,6 +593,7 @@ fn malformed_batch_fields_are_missing_without_poisoning_neighbors() {
         .lookup_base_cache_by_paths(&[bad_path, good_path])
         .unwrap();
     let bad = results[0].as_ref().expect("损坏内容行本身仍应返回结构记录");
+    assert!(bad.stage1.is_none(), "非法一筛行不得成为可消费完整结构");
     let bad_completeness = classify_cache_completeness(bad, true);
     assert_ne!(bad_completeness.base_missing_parts, 0);
     assert!(bad_completeness.image_stage2_missing);
@@ -636,6 +637,104 @@ fn partial_stage1_failure_does_not_overwrite_existing_feature() {
         store.load_complete_stage1(content.id).unwrap(),
         Some(CompleteStage1::Image(feature)) if feature == original
     ));
+}
+
+/// 部分一筛写入发布的 outbox 必须携带事务提交后的合并字段，而不是输入占位值。
+#[test]
+fn partial_stage1_outbox_payload_preserves_existing_fields() {
+    let mut store = NodeStore::open_in_memory(machine()).unwrap();
+    let content = store
+        .upsert_content_and_location(
+            &scan(r"D:\outbox-preserve.jpg", 503),
+            [0x88; 16],
+            MediaKind::Image,
+        )
+        .unwrap();
+    let original = ImageStage1 {
+        width: 640,
+        height: 480,
+        pdq: PdqHash::from_bytes([8; 32]),
+        quality: 89,
+    };
+    store
+        .commit_feature_result(
+            content.id,
+            None,
+            FeatureWrite::ImageStage1(ImageStage1Fields::from(original)),
+        )
+        .unwrap();
+    store
+        .commit_feature_result(
+            content.id,
+            None,
+            FeatureWrite::ImageStage1(ImageStage1Fields::default()),
+        )
+        .unwrap();
+
+    let change = store
+        .pull_changes(0, 1000)
+        .unwrap()
+        .changes
+        .into_iter()
+        .filter(|change| change.entity_kind == "image_stage1")
+        .last()
+        .expect("部分写入必须发布一筛 outbox");
+    assert_eq!(decode_image_stage1_payload(&change.payload), original);
+}
+
+/// 解码 NodeStore 已提交的一筛载荷，验证对端看到的是合并后的有效结构。
+fn decode_image_stage1_payload(payload: &[u8]) -> ImageStage1 {
+    assert_eq!(payload.first().copied(), Some(1));
+    let mut at = 1;
+    let read_u8 = |payload: &[u8], at: &mut usize| {
+        let value = *payload.get(*at).expect("载荷字段完整");
+        *at += 1;
+        value
+    };
+    let read_u32 = |payload: &[u8], at: &mut usize| {
+        let end = (*at).checked_add(4).expect("载荷位置不溢出");
+        let bytes: [u8; 4] = payload
+            .get(*at..end)
+            .expect("载荷字段完整")
+            .try_into()
+            .unwrap();
+        *at = end;
+        u32::from_be_bytes(bytes)
+    };
+    let read_bytes = |payload: &[u8], at: &mut usize| {
+        let length = read_u32(payload, at) as usize;
+        let end = (*at).checked_add(length).expect("载荷长度不溢出");
+        let bytes = payload.get(*at..end).expect("载荷字段完整").to_vec();
+        *at = end;
+        bytes
+    };
+    let key_md5 = read_bytes(payload, &mut at);
+    assert_eq!(key_md5.len(), 16);
+    let _file_size = {
+        let end = at + 8;
+        let bytes: [u8; 8] = payload
+            .get(at..end)
+            .expect("内容键完整")
+            .try_into()
+            .unwrap();
+        at = end;
+        u64::from_be_bytes(bytes)
+    };
+    assert_eq!(read_u8(payload, &mut at), 1);
+    let width = read_u32(payload, &mut at);
+    assert_eq!(read_u8(payload, &mut at), 1);
+    let height = read_u32(payload, &mut at);
+    assert_eq!(read_u8(payload, &mut at), 1);
+    let pdq = read_bytes(payload, &mut at);
+    assert_eq!(read_u8(payload, &mut at), 1);
+    let quality = read_u8(payload, &mut at);
+    assert_eq!(at, payload.len());
+    ImageStage1 {
+        width,
+        height,
+        pdq: PdqHash::from_bytes(pdq.try_into().expect("PDQ 长度固定")),
+        quality,
+    }
 }
 
 /// Worker 返回非法零尺寸时只能保持缺失，不能覆盖已有有效一筛字段。

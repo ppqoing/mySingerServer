@@ -1,7 +1,10 @@
 use dedup_core::{DisplayPath, LocationKey, MachineId, MediaKind, NormalizedPath, Thresholds};
 use dedup_media::{ImageStage1, ImageStage2, PdqHash};
 use dedup_node_engine::{
-    analysis::{AnalysisBlocked, LocalAnalysisEngine, Stage2Processor, Stage2Request},
+    analysis::{
+        AnalysisBlocked, LocalAnalysisEngine, Stage2BatchItem, Stage2Processor, Stage2Request,
+        dispatch_stage2_batch,
+    },
     worker::{Stage2Frame, Stage2Output},
 };
 use dedup_node_store::{
@@ -9,6 +12,7 @@ use dedup_node_store::{
     ReviewDecision, ScannedPath, TaskItemCompletion, TaskStatus, VideoFrameStage1Fields,
     VideoFrameStage2Fields, VideoMetadataFields,
 };
+use rusqlite::Connection;
 
 #[derive(Default)]
 struct CountingStage2 {
@@ -254,6 +258,38 @@ async fn video_stage2_dispatches_only_missing_successful_slots() {
 }
 
 #[tokio::test]
+async fn explicit_stage2_batch_requests_only_missing_successful_video_slots() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("stage2-batch.db");
+    let machine = MachineId::parse(&"77".repeat(32)).unwrap();
+    let mut store = NodeStore::open(&database, machine).unwrap();
+    let seeded = seed_video_with_stage2_slots(
+        &mut store,
+        r"D:\central-partial.mp4",
+        [13; 16],
+        &[0, 1, 4, 5],
+    );
+    let cached = store.load_base_cache_record(seeded.2).unwrap();
+    let mut processor = CountingStage2::default();
+
+    dispatch_stage2_batch(
+        &mut store,
+        &[Stage2BatchItem {
+            content: cached.content_key,
+            source: seeded.1,
+            frame_slots: (0..6).collect(),
+        }],
+        &mut processor,
+        37,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(processor.calls, 1);
+    assert_eq!(processor.requested_slots, vec![vec![2, 3]]);
+}
+
+#[tokio::test]
 async fn incomplete_media_is_counted_and_never_enters_candidates() {
     let mut store = store();
     let incomplete = seed_content(
@@ -343,6 +379,46 @@ async fn completed_analysis_groups_members_and_review_survive_reopen() {
     );
 }
 
+#[tokio::test]
+async fn malformed_stage1_is_skipped_without_blocking_valid_content() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("malformed-analysis.db");
+    let machine = MachineId::parse(&"78".repeat(32)).unwrap();
+    let mut store = NodeStore::open(&database, machine).unwrap();
+    let bad = seed_image(&mut store, r"D:\malformed-analysis.jpg", [14; 16], true);
+    let good = seed_image(&mut store, r"D:\valid-analysis.jpg", [15; 16], true);
+    let bad_id = bad.2.as_i64();
+    let task = completed_task_with_file_failure(&mut store, &[bad, good], 60);
+
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute_batch("PRAGMA ignore_check_constraints=ON;")
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE image_stage1 SET width=0 WHERE content_id=?1",
+            [bad_id],
+        )
+        .unwrap();
+    drop(connection);
+
+    let mut store = store.reopen().unwrap();
+    let mut processor = CountingStage2::default();
+    let report = LocalAnalysisEngine::start(
+        &mut store,
+        &[task],
+        Thresholds::default(),
+        &mut processor,
+        61,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.skipped_incomplete, 1);
+    assert_eq!(report.image_groups, 0);
+    assert_eq!(processor.calls, 0);
+}
+
 type Seeded = (ScannedPath, LocationKey, dedup_node_store::ContentId);
 
 fn store() -> NodeStore {
@@ -350,7 +426,9 @@ fn store() -> NodeStore {
 }
 
 fn seed_other(store: &mut NodeStore, path: &str, md5: [u8; 16], size: u64) -> Seeded {
-    seed_content(store, path, md5, size, MediaKind::Other)
+    let seeded = seed_content(store, path, md5, size, MediaKind::Other);
+    store.mark_base_complete(seeded.2).unwrap();
+    seeded
 }
 
 fn seed_image(store: &mut NodeStore, path: &str, md5: [u8; 16], with_stage2: bool) -> Seeded {
@@ -367,6 +445,7 @@ fn seed_image(store: &mut NodeStore, path: &str, md5: [u8; 16], with_stage2: boo
             .commit_feature_result(seeded.2, None, FeatureWrite::ImageStage2(stage2()))
             .unwrap();
     }
+    store.mark_base_complete(seeded.2).unwrap();
     seeded
 }
 
@@ -422,6 +501,7 @@ fn seed_video_with_stage2_slots(
                 .unwrap();
         }
     }
+    store.mark_base_complete(seeded.2).unwrap();
     seeded
 }
 

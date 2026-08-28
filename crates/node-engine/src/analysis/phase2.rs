@@ -11,11 +11,12 @@ use dedup_core::{
 };
 use dedup_media::{VideoFrameFeatures, score_video_stage2, screen_image_stage2};
 use dedup_node_store::{
-    CandidateStatus, CandidateWrite, CompleteStage1, CompleteStage2, ContentId, FeatureWrite,
-    NewTaskItem, NodeStore, PairKind, PersistentStageState, TaskItemCompletion, TaskStageWrite,
-    VideoFrameStage2Fields, classify_cache_completeness,
+    BaseCacheRecord, CandidateStatus, CandidateWrite, CompleteStage1, CompleteStage2, ContentId,
+    FeatureWrite, NewTaskItem, NodeStore, PairKind, PersistentStageState, TaskItemCompletion,
+    TaskStageWrite, VideoFrameStage2Fields, classify_cache_completeness,
 };
 use dedup_protocol::proto::{self, worker_envelope};
+use dedup_protocol::{BASE_MISSING_PROBE, BASE_MISSING_STAGE1};
 
 use crate::contact_sheet_cache::ContactSheetCacheEntry;
 use crate::runtime_tasks::{
@@ -653,6 +654,16 @@ async fn run_stage2_batch_internal<P: Stage2Processor>(
             .find(|candidate| candidate.content_id == item_content)
             .ok_or_else(|| AnalysisBlocked::InvalidState("二筛任务项不属于当前批次".into()))?;
         let cached = cached_by_content.get(&expected.content_id);
+        if cached.is_some_and(|record| {
+            classify_cache_completeness(record, true).base_missing_parts
+                & (BASE_MISSING_PROBE | BASE_MISSING_STAGE1)
+                != 0
+        }) {
+            store.complete_item(&item.item_id, TaskItemCompletion::Cancelled, now_ms)?;
+            completed += 1;
+            skipped += 1;
+            continue;
+        }
         if cached.is_some_and(cached_stage2_is_complete)
             && store.republish_complete_stage2_from_cache(
                 cached.expect("缓存完整度判断已确认记录存在"),
@@ -668,6 +679,7 @@ async fn run_stage2_batch_internal<P: Stage2Processor>(
             completed += 1;
             continue;
         }
+        let frame_slots = missing_stage2_slots(expected, cached);
         let request = Stage2Request {
             task_id,
             item_id: item.item_id.clone(),
@@ -675,7 +687,7 @@ async fn run_stage2_batch_internal<P: Stage2Processor>(
             content_id: expected.content_id,
             display_path: expected.display_path.clone(),
             media_kind: expected.media_kind,
-            frame_slots: expected.frame_slots.clone(),
+            frame_slots,
             contact_sheet_path: contact_sheet_target(contact_sheet_root, expected),
         };
         pending.push((
@@ -970,7 +982,7 @@ pub(crate) async fn dispatch_missing<P: Stage2Processor>(
             continue;
         };
         let completeness = classify_cache_completeness(&record, true);
-        if record.stage1.is_none() {
+        if completeness.base_missing_parts & (BASE_MISSING_PROBE | BASE_MISSING_STAGE1) != 0 {
             continue;
         }
         let Some(content_id) = record.content_id else {
@@ -1069,10 +1081,7 @@ pub(crate) async fn dispatch_missing<P: Stage2Processor>(
             .ok_or_else(|| AnalysisBlocked::InvalidState("二筛任务项不属于当前批次".into()))?;
         if cached_by_content
             .get(&expected.content_id)
-            .is_some_and(|record| {
-                let completeness = classify_cache_completeness(record, true);
-                !completeness.image_stage2_missing && completeness.video_stage2_missing_slots == 0
-            })
+            .is_some_and(cached_stage2_is_complete)
             && store.republish_complete_stage2_from_cache(
                 cached_by_content
                     .get(&expected.content_id)
@@ -1206,9 +1215,35 @@ pub(crate) async fn dispatch_missing<P: Stage2Processor>(
 /// 判断批量缓存记录是否已经具备可直接重发的二次特征。
 fn cached_stage2_is_complete(record: &dedup_node_store::BaseCacheRecord) -> bool {
     let completeness = classify_cache_completeness(record, true);
-    record.stage1.is_some()
+    completeness.base_missing_parts & (BASE_MISSING_PROBE | BASE_MISSING_STAGE1) == 0
         && !completeness.image_stage2_missing
         && completeness.video_stage2_missing_slots == 0
+}
+
+/// 将中心要求的成功槽位与本机结构分类得到的二筛缺失掩码求交集。
+fn missing_stage2_slots(expected: &MissingWork, cached: Option<&BaseCacheRecord>) -> Vec<u8> {
+    if expected.media_kind != MediaKind::Video {
+        return Vec::new();
+    }
+    let missing_mask = cached
+        .filter(|record| {
+            classify_cache_completeness(record, true).base_missing_parts
+                & (BASE_MISSING_PROBE | BASE_MISSING_STAGE1)
+                == 0
+        })
+        .map(|record| classify_cache_completeness(record, true).video_stage2_missing_slots)
+        .unwrap_or_else(|| {
+            expected
+                .frame_slots
+                .iter()
+                .fold(0_u8, |mask, slot| mask | (1_u8 << slot))
+        });
+    expected
+        .frame_slots
+        .iter()
+        .copied()
+        .filter(|slot| missing_mask & (1_u8 << slot) != 0)
+        .collect()
 }
 
 /// 批量查询 PostgreSQL 二次缓存并导入 SQLite；失败只降级到本地计算。

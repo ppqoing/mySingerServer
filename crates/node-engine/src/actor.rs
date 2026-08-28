@@ -3203,6 +3203,7 @@ mod tests {
                 })),
             )
             .unwrap();
+        store.mark_base_complete(content.id).unwrap();
         let location =
             LocationKey::new(store.machine_id().clone(), scanned.normalized_path.clone());
         let (pool, mut started) = WorkerPool::controlled_for_test();

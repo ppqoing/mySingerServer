@@ -60,7 +60,8 @@ impl NodeStore {
                         fields.quality
                     ],
                 )?;
-                ("image_stage1", encode_image_stage1(key, fields))
+                let merged = read_image_stage1_fields(&transaction, content_id)?;
+                ("image_stage1", encode_image_stage1(key, merged))
             }
             FeatureWrite::ImageStage2(features) => {
                 ensure_finite(&features.sobel)?;
@@ -89,7 +90,8 @@ impl NodeStore {
                         fields.height
                     ],
                 )?;
-                ("video_metadata", encode_video_metadata(key, fields))
+                let merged = read_video_metadata_fields(&transaction, content_id)?;
+                ("video_metadata", encode_video_metadata(key, merged))
             }
             FeatureWrite::VideoFrameStage1(frame) => {
                 validate_slot(frame.slot)?;
@@ -115,7 +117,8 @@ impl NodeStore {
                         frame.quality
                     ],
                 )?;
-                ("video_frame_stage1", encode_video_frame_stage1(key, frame))
+                let merged = read_video_frame_stage1_fields(&transaction, content_id, frame.slot)?;
+                ("video_frame_stage1", encode_video_frame_stage1(key, merged))
             }
             FeatureWrite::VideoFrameStage2(frame) => {
                 validate_slot(frame.slot)?;
@@ -503,7 +506,8 @@ fn commit_scan_stage1_in_transaction(
                         fields.quality
                     ],
                 )?;
-                ("image_stage1", encode_image_stage1(key, fields))
+                let merged = read_image_stage1_fields(transaction, content_id)?;
+                ("image_stage1", encode_image_stage1(key, merged))
             }
             FeatureWrite::VideoMetadata(fields) => {
                 transaction.execute(
@@ -520,7 +524,8 @@ fn commit_scan_stage1_in_transaction(
                         fields.height
                     ],
                 )?;
-                ("video_metadata", encode_video_metadata(key, fields))
+                let merged = read_video_metadata_fields(transaction, content_id)?;
+                ("video_metadata", encode_video_metadata(key, merged))
             }
             FeatureWrite::VideoFrameStage1(frame) => {
                 validate_slot(frame.slot)?;
@@ -546,7 +551,8 @@ fn commit_scan_stage1_in_transaction(
                         frame.quality
                     ],
                 )?;
-                ("video_frame_stage1", encode_video_frame_stage1(key, frame))
+                let merged = read_video_frame_stage1_fields(transaction, content_id, frame.slot)?;
+                ("video_frame_stage1", encode_video_frame_stage1(key, merged))
             }
             FeatureWrite::ContactSheet(relative_path) => {
                 transaction.execute(
@@ -579,6 +585,90 @@ fn validate_slot(slot: u8) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// 从当前事务读取图片一筛的合并后字段，保证 outbox 与 SQLite 同值。
+fn read_image_stage1_fields(
+    transaction: &Transaction<'_>,
+    content_id: ContentId,
+) -> Result<ImageStage1Fields, StoreError> {
+    let row: (Option<i64>, Option<i64>, Option<Vec<u8>>, Option<i64>) = transaction.query_row(
+        "SELECT width,height,pdq,quality FROM image_stage1 WHERE content_id=?1",
+        [content_id.as_i64()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    Ok(ImageStage1Fields {
+        width: row.0.and_then(|value| u32::try_from(value).ok()),
+        height: row.1.and_then(|value| u32::try_from(value).ok()),
+        pdq: decode_pdq(row.2),
+        quality: row.3.and_then(|value| u8::try_from(value).ok()),
+    })
+}
+
+/// 从当前事务读取视频元数据的合并后字段，保留既有有效列。
+fn read_video_metadata_fields(
+    transaction: &Transaction<'_>,
+    content_id: ContentId,
+) -> Result<VideoMetadataFields, StoreError> {
+    let row: (Option<i64>, Option<i64>, Option<i64>) = transaction.query_row(
+        "SELECT duration_ms,width,height FROM video_metadata WHERE content_id=?1",
+        [content_id.as_i64()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    Ok(VideoMetadataFields {
+        duration_ms: row.0.and_then(|value| u64::try_from(value).ok()),
+        width: row.1.and_then(|value| u32::try_from(value).ok()),
+        height: row.2.and_then(|value| u32::try_from(value).ok()),
+    })
+}
+
+/// 从当前事务读取视频槽位的一筛合并后字段，保持失败槽位的旧时间和状态。
+fn read_video_frame_stage1_fields(
+    transaction: &Transaction<'_>,
+    content_id: ContentId,
+    slot: u8,
+) -> Result<VideoFrameStage1Fields, StoreError> {
+    let row: (
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<Vec<u8>>,
+        Option<i64>,
+    ) = transaction.query_row(
+        "SELECT time_ms,decoded,width,height,pdq,quality
+         FROM video_frame_stage1 WHERE content_id=?1 AND slot=?2",
+        params![content_id.as_i64(), slot],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        },
+    )?;
+    Ok(VideoFrameStage1Fields {
+        slot,
+        time_ms: row
+            .0
+            .and_then(|value| u64::try_from(value).ok())
+            .unwrap_or_default(),
+        decoded: row.1 == Some(1),
+        width: row.2.and_then(|value| u32::try_from(value).ok()),
+        height: row.3.and_then(|value| u32::try_from(value).ok()),
+        pdq: decode_pdq(row.4),
+        quality: row.5.and_then(|value| u8::try_from(value).ok()),
+    })
+}
+
+/// 仅将固定长度的 SQLite PDQ 字节转换为领域哈希。
+fn decode_pdq(bytes: Option<Vec<u8>>) -> Option<PdqHash> {
+    bytes
+        .and_then(|value| <[u8; 32]>::try_from(value).ok())
+        .map(PdqHash::from_bytes)
+}
+
 fn ensure_finite(sobel: &[f32; 128]) -> Result<(), StoreError> {
     if sobel.iter().any(|value| !value.is_finite()) {
         return Err(StoreError::NonFiniteSobel);
@@ -593,11 +683,17 @@ pub(crate) fn decode_stage1_fields(
     pdq: Option<Vec<u8>>,
     quality: Option<i64>,
 ) -> Option<ImageStage1> {
+    let width = u32::try_from(width?).ok()?;
+    let height = u32::try_from(height?).ok()?;
+    let quality = u8::try_from(quality?).ok()?;
+    if width == 0 || height == 0 || quality > 100 {
+        return None;
+    }
     Some(ImageStage1 {
-        width: u32::try_from(width?).ok()?,
-        height: u32::try_from(height?).ok()?,
+        width,
+        height,
         pdq: PdqHash::from_bytes(pdq?.try_into().ok()?),
-        quality: u8::try_from(quality?).ok()?,
+        quality,
     })
 }
 
