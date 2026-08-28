@@ -464,6 +464,9 @@ impl TransientTaskFileSet {
     /// 不接受外部传入的任意路径或运行 ID。
     pub fn discard(&mut self) -> io::Result<()> {
         self.ensure_not_discarded()?;
+        if self.lanes.values().any(|lane| lane.in_flight.is_some()) {
+            return Err(invalid_input("任务文件仍有已领取任务，不能 discard"));
+        }
         if Arc::strong_count(&self.owner_token) != 1 {
             return Err(invalid_input("任务文件仍有活动所有者，不能 discard"));
         }
@@ -715,6 +718,26 @@ impl TransientTaskFileSet {
         &mut self,
         expected_identity: &TaskFileIdentity,
     ) -> io::Result<Option<(TaskFileIdentity, TaskFileRecord)>> {
+        self.take_lane_checked(expected_identity, None)
+    }
+
+    /// 在原子领取边界校验完整任务记录，再把队首标记为在途。
+    ///
+    /// 许可 future 等待期间任务文件可能被外部写入；校验失败时不弹出预读队首，
+    /// 也不设置 `in_flight`，因此调用方释放许可后仍可重新观察并重试。
+    pub fn take_lane_exact(
+        &mut self,
+        expected_identity: &TaskFileIdentity,
+        expected_record: &TaskFileRecord,
+    ) -> io::Result<Option<(TaskFileIdentity, TaskFileRecord)>> {
+        self.take_lane_checked(expected_identity, Some(expected_record))
+    }
+
+    fn take_lane_checked(
+        &mut self,
+        expected_identity: &TaskFileIdentity,
+        expected_record: Option<&TaskFileRecord>,
+    ) -> io::Result<Option<(TaskFileIdentity, TaskFileRecord)>> {
         self.ensure_active()?;
         if expected_identity.run_id != self.run_id {
             return Err(invalid_input("任务身份 run_id 不匹配"));
@@ -735,6 +758,29 @@ impl TransientTaskFileSet {
         };
         if expected_identity != &head.identity {
             return Err(invalid_input("任务队首身份已经变化"));
+        }
+        if let Some(expected_record) = expected_record {
+            if head.record != *expected_record {
+                return Err(invalid_data("任务预读记录已经变化"));
+            }
+            let current_bytes = read_at(
+                lane_state
+                    .reader
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("任务 lane 读取句柄已关闭"))?,
+                head.identity.line_offset,
+                head.identity.line_length,
+            )?;
+            let current = parse_record(&current_bytes)?;
+            if current.status != TaskLineStatus::Pending
+                || current.record.item_id != head.identity.item_id
+                || current.record.missing != head.identity.missing
+            {
+                return Err(invalid_data("任务队首状态或身份已经变化"));
+            }
+            if current.record != *expected_record {
+                return Err(invalid_data("任务队首记录已经变化"));
+            }
         }
         let head = lane_state.prefetched.pop_front().expect("已确认队首存在");
         lane_state.in_flight = Some(head.identity.clone());

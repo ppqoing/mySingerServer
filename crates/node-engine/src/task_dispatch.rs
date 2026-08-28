@@ -292,7 +292,9 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
                         .pending
                         .remove(&key)
                         .expect("已轮询的队首请求必须仍存在");
-                    let taken = self.files.take_lane(&pending.identity)?;
+                    let taken = self
+                        .files
+                        .take_lane_exact(&pending.identity, &pending.record)?;
                     let Some((identity, record)) = taken else {
                         // permit 未能与精确队首绑定时立即释放，禁止把它交给错误任务。
                         return Poll::Ready(Err(io::Error::other(
@@ -300,13 +302,6 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
                         )
                         .into()));
                     };
-                    if record != pending.record {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "读取许可成功后任务记录发生变化",
-                        )
-                        .into()));
-                    }
                     return Poll::Ready(Ok(Some(DispatchedTask {
                         identity,
                         record,
@@ -316,11 +311,7 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
                 }
             }
         }
-        if self.pending.is_empty() {
-            Poll::Pending
-        } else {
-            Poll::Pending
-        }
+        Poll::Pending
     }
 }
 

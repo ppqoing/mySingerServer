@@ -2,6 +2,7 @@
 
 use std::{
     future::Future,
+    io::{self, Seek, SeekFrom, Write},
     ops::{Deref, DerefMut},
     pin::Pin,
     sync::{
@@ -476,4 +477,81 @@ fn discard_after_waiting_is_clean_and_does_not_leak_the_temp_directory() {
     let cancellation = ReadCancellationToken::new();
     assert!(poll_once(&mut dispatcher, &cancellation).is_pending());
     dispatcher.discard().unwrap();
+}
+
+#[test]
+fn discard_rejects_an_unacknowledged_dispatched_task() {
+    let provider = FakeProvider::default();
+    let mut dispatcher = new_dispatcher(provider);
+    let task_lane = lane(&[20], LocalDiskKind::Hdd, 1, 1);
+    let row = base_record("discard-in-flight.bin", None);
+    dispatcher.register_lane(&task_lane).unwrap();
+    dispatcher
+        .append_batch(&task_lane, std::slice::from_ref(&row))
+        .unwrap();
+    dispatcher.seal().unwrap();
+
+    let cancellation = ReadCancellationToken::new();
+    let task = match poll_once(&mut dispatcher, &cancellation) {
+        Poll::Ready(Ok(Some(task))) => task,
+        other => panic!("已发布任务应可派发，实际为 {other:?}"),
+    };
+    let error = dispatcher
+        .discard()
+        .expect_err("未 ACK 的任务不能删除运行目录");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert!(dispatcher.lane_path(&task_lane).unwrap().exists());
+
+    dispatcher.mark_completed(&task.identity).unwrap();
+    drop(task);
+    dispatcher.discard().unwrap();
+}
+
+fn rewrite_task_file(path: &std::path::Path, bytes: &[u8]) {
+    let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.seek(SeekFrom::Start(0)).unwrap();
+    file.write_all(bytes).unwrap();
+    file.flush().unwrap();
+}
+
+#[test]
+fn record_mismatch_after_permit_keeps_the_head_retryable() {
+    let provider = FakeProvider::default();
+    provider.set_blocked(true);
+    let mut dispatcher = new_dispatcher(provider.clone());
+    let task_lane = lane(&[21], LocalDiskKind::Hdd, 1, 1);
+    dispatcher.register_lane(&task_lane).unwrap();
+    dispatcher
+        .append_batch(
+            &task_lane,
+            std::slice::from_ref(&base_record("mismatch.bin", None)),
+        )
+        .unwrap();
+
+    let cancellation = ReadCancellationToken::new();
+    assert!(poll_once(&mut dispatcher, &cancellation).is_pending());
+    let path = dispatcher.lane_path(&task_lane).unwrap();
+    let original = std::fs::read(&path).unwrap();
+    let mut changed = original.clone();
+    let marker = changed
+        .windows(5)
+        .position(|window| window == b"media")
+        .expect("测试任务行应包含可替换的路径片段");
+    changed[marker] = b'n';
+    rewrite_task_file(&path, &changed);
+    provider.release_all();
+
+    assert!(matches!(
+        poll_once(&mut dispatcher, &cancellation),
+        Poll::Ready(Err(TaskDispatchError::File(_)))
+    ));
+    assert_eq!(provider.active_permits(), 0, "领取失败后许可必须自动释放");
+
+    rewrite_task_file(&path, &original);
+    provider.set_blocked(false);
+    let retried = match poll_once(&mut dispatcher, &cancellation) {
+        Poll::Ready(Ok(Some(task))) => task,
+        other => panic!("记录恢复后队首应可重新领取，实际为 {other:?}"),
+    };
+    dispatcher.mark_failed(&retried.identity).unwrap();
 }
