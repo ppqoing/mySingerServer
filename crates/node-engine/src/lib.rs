@@ -32,6 +32,8 @@ pub mod runtime_tasks;
 pub mod scan;
 /// 单管理连接 TCP 服务和连接内请求复用。
 pub mod server;
+/// 按任务文件队首向唯一磁盘 scheduler 申请读取许可。
+pub mod task_dispatch;
 /// 按物理磁盘保存瞬态计算任务的固定 TSV 文件和原位状态。
 pub mod task_files;
 /// 隔离媒体计算的 Worker 流水线与进程池。

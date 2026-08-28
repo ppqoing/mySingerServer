@@ -158,7 +158,11 @@ impl TaskWorkMask {
         }
     }
 
-    fn validate_for(self, work_kind: TaskWorkKind, known_md5: Option<[u8; 16]>) -> io::Result<()> {
+    pub(crate) fn validate_for(
+        self,
+        work_kind: TaskWorkKind,
+        known_md5: Option<[u8; 16]>,
+    ) -> io::Result<()> {
         if self.0 == 0 || self.0 & !TASK_KNOWN_BITS != 0 {
             return Err(invalid_input("缺失字段掩码不能为空且不能包含未知位"));
         }
