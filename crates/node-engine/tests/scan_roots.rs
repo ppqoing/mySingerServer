@@ -11,11 +11,12 @@ use std::{
 
 use dedup_core::{DiskReadConfig, DisplayPath, MachineId, MediaKind, NormalizedPath};
 use dedup_node_engine::{
+    actor::enumerate_with_frozen_plan_for_test,
     io::{BlockReadError, ReadFailure},
     scan::{
-        FileEnumerator, PipelineFileReader, ResolvedScanRootStorage, ScanDiskPlan, ScanEngine,
-        ScanError, ScanOptions, ScanRootStorageResolver, ScheduledFileReader, Stage1Processor,
-        Stage1Request, SystemMd5,
+        FileEnumerator, PipelineFileReader, PlannedScannedPath, ResolvedScanRootStorage,
+        ScanDiskPlan, ScanEngine, ScanError, ScanOptions, ScanRootStorageResolver,
+        ScheduledFileReader, Stage1Processor, Stage1Request, SystemMd5, TaskDiskLane,
     },
     worker::Stage1Output,
 };
@@ -107,6 +108,19 @@ struct Rows(Vec<ScannedPath>);
 impl FileEnumerator for Rows {
     fn enumerate(&self, _roots: &[DisplayPath]) -> Result<Vec<ScannedPath>, ScanError> {
         Ok(self.0.clone())
+    }
+}
+
+#[derive(Clone)]
+struct TraceEnumerator {
+    trace: Arc<Mutex<Vec<String>>>,
+    rows: Vec<ScannedPath>,
+}
+
+impl FileEnumerator for TraceEnumerator {
+    fn enumerate(&self, _roots: &[DisplayPath]) -> Result<Vec<ScannedPath>, ScanError> {
+        self.trace.lock().unwrap().push("enumerate".into());
+        Ok(self.rows.clone())
     }
 }
 
@@ -233,18 +247,33 @@ fn physical_storage_is_frozen_before_first_enumerator_call() {
         (r"I:\tmp", (vec![12], LocalDiskKind::Ssd)),
     ]);
     let roots = vec![root(r"I:\tmp"), root(r"H:\media")];
-    let plan = ScanDiskPlan::build(&roots, &config(3, 7, 2), &resolver).unwrap();
-    resolver.trace.lock().unwrap().push("enumerate".into());
+    let enumerator = TraceEnumerator {
+        trace: Arc::clone(&resolver.trace),
+        rows: vec![row(r"H:\media\a.jpg")],
+    };
+    let (rows, planned_rows) =
+        enumerate_with_frozen_plan_for_test(&enumerator, &roots, &config(3, 7, 2), &resolver)
+            .unwrap();
 
-    assert!(plan.assign(row(r"H:\media\a.jpg")).is_ok());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(planned_rows.len(), 1);
     assert_eq!(resolver.trace(), ["resolve:H", "resolve:I", "enumerate"]);
 }
 
 #[test]
 fn storage_resolution_failure_never_reaches_enumerator() {
     let resolver = TraceResolver::failing(r"H:\missing");
-    let error =
-        ScanDiskPlan::build(&[root(r"H:\missing")], &config(3, 7, 2), &resolver).unwrap_err();
+    let enumerator = TraceEnumerator {
+        trace: Arc::clone(&resolver.trace),
+        rows: Vec::new(),
+    };
+    let error = enumerate_with_frozen_plan_for_test(
+        &enumerator,
+        &[root(r"H:\missing")],
+        &config(3, 7, 2),
+        &resolver,
+    )
+    .unwrap_err();
 
     assert!(
         error
@@ -403,21 +432,23 @@ async fn hash_and_media_consume_frozen_lane_without_second_storage_resolution() 
     let resolver = CountingStorageResolver {
         calls: Arc::clone(&calls),
     };
-    let plan = Arc::new(ScanDiskPlan::build(&[root_path], &config(3, 7, 2), &resolver).unwrap());
+    let plan = ScanDiskPlan::build(&[root_path], &config(3, 7, 2), &resolver).unwrap();
     assert_eq!(calls.load(Ordering::Acquire), 1);
 
-    let (reader, _) = ScheduledFileReader::controlled_with_plan_for_test(
-        &config(3, 7, 2),
-        1,
-        FixedBlockReader,
-        plan,
-    )
-    .unwrap();
     let scanned = ScannedPath::new(
         NormalizedPath::new(&path).unwrap(),
         DisplayPath::new(&path).unwrap(),
         6,
     );
+    let planned_rows = Arc::new(vec![plan.assign(scanned.clone()).unwrap()]);
+
+    let (reader, _) = ScheduledFileReader::controlled_with_planned_rows_for_test(
+        &config(3, 7, 2),
+        1,
+        FixedBlockReader,
+        planned_rows,
+    )
+    .unwrap();
     let product = reader
         .read(scanned.clone(), dedup_windows::ReadCancellationToken::new())
         .await
@@ -433,4 +464,106 @@ async fn hash_and_media_consume_frozen_lane_without_second_storage_resolution() 
         .unwrap();
     drop(permit);
     assert_eq!(calls.load(Ordering::Acquire), 1);
+}
+
+#[tokio::test]
+async fn mixed_lane_enforces_the_frozen_minimum_before_releasing_the_next_permit() {
+    let resolver = TraceResolver::new([
+        (r"H:\hdd", (vec![5, 12], LocalDiskKind::Hdd)),
+        (r"H:\ssd", (vec![12, 5], LocalDiskKind::Ssd)),
+    ]);
+    let read_config = config(9, 5, 20);
+    let plan =
+        ScanDiskPlan::build(&[root(r"H:\hdd"), root(r"H:\ssd")], &read_config, &resolver).unwrap();
+    let lane = plan.assign(row(r"H:\hdd\file.bin")).unwrap().lane;
+    assert_eq!(lane.per_disk_limit, 5);
+    let planned_rows = Arc::new(
+        (0..6)
+            .map(|index| {
+                plan.assign(row(&format!(r"H:\hdd\file-{index}.bin")))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>(),
+    );
+
+    let (reader, _) = ScheduledFileReader::controlled_with_planned_rows_for_test(
+        &read_config,
+        8,
+        FixedBlockReader,
+        planned_rows,
+    )
+    .unwrap();
+    let mut waits = Vec::new();
+    for index in 0..6 {
+        let task_reader = reader.clone();
+        waits.push(tokio::spawn(async move {
+            task_reader
+                .acquire_media_permit(
+                    row(&format!(r"H:\hdd\file-{index}.bin")),
+                    dedup_windows::ReadCancellationToken::new(),
+                )
+                .await
+        }));
+    }
+
+    let mut permits = Vec::new();
+    for wait in waits.iter_mut().take(5) {
+        let permit = tokio::time::timeout(Duration::from_secs(1), wait)
+            .await
+            .expect("冻结的五个媒体许可应在一分钟内取得")
+            .unwrap()
+            .unwrap();
+        permits.push(permit);
+    }
+    let mut sixth = waits.pop().expect("必须存在第六个等待项");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut sixth)
+            .await
+            .is_err(),
+        "混合 lane 不得使用 Unknown=20 越过 HDD/SSD 最小上限 5"
+    );
+    drop(permits);
+    let released = tokio::time::timeout(Duration::from_secs(1), &mut sixth)
+        .await
+        .expect("释放一个许可后第六个等待项应被唤醒")
+        .unwrap()
+        .unwrap();
+    drop(released);
+}
+
+#[tokio::test]
+async fn reader_uses_the_exact_planned_lane_without_reassigning_the_root() {
+    let read_config = config(9, 5, 20);
+    let planned_path = row(r"H:\root\nested\file.bin");
+    let planned_lane = TaskDiskLane {
+        physical_disk_id: PhysicalDiskId::from_disk_numbers([5]).unwrap(),
+        physical_disk_numbers: vec![5],
+        disk_kind: LocalDiskKind::Hdd,
+        configured_weight: 9,
+        per_disk_limit: 9,
+    };
+    let planned_rows = Arc::new(vec![PlannedScannedPath {
+        scanned: planned_path.clone(),
+        lane: planned_lane,
+    }]);
+    let (reader, _) = ScheduledFileReader::controlled_with_planned_rows_for_test(
+        &read_config,
+        8,
+        FixedBlockReader,
+        planned_rows,
+    )
+    .unwrap();
+
+    let permit = reader
+        .acquire_media_permit(
+            planned_path.clone(),
+            dedup_windows::ReadCancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        reader.physical_disk_id(planned_path.display_path.as_path()),
+        "PhysicalDisk5"
+    );
+    drop(permit);
 }

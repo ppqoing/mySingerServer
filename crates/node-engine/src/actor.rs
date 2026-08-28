@@ -52,10 +52,11 @@ use crate::{
         RuntimeTaskKind, RuntimeTaskRegistry, RuntimeTaskReporter, RuntimeTaskState,
     },
     scan::{
-        BaseComputeEngine, FileEnumerator, PipelineFileReader, PipelineLimits,
-        PreferredEverythingEnumerator, ScanDiskPlan, ScanError, ScanOptions, ScanSummary,
-        ScheduledFileReader, SystemScanRootStorageResolver, WindowsWalker, begin_scan_task,
-        ensure_everything_ready, input_order::interleave_rows_by_root,
+        BaseComputeEngine, FileEnumerator, PipelineFileReader, PipelineLimits, PlannedScannedPath,
+        PreferredEverythingEnumerator, ScanDiskPlan, ScanError, ScanOptions,
+        ScanRootStorageResolver, ScanSummary, ScheduledFileReader, SystemScanRootStorageResolver,
+        WindowsWalker, begin_scan_task, ensure_everything_ready,
+        input_order::interleave_rows_by_root,
     },
     server::{NodeRequestHandler, NodeServer, ServerError},
     worker::{WorkerLaunch, WorkerPool, WorkerPoolConfig, WorkerPoolError, WorkerPoolHandle},
@@ -1873,6 +1874,40 @@ where
     .await
 }
 
+/// 先冻结全部根的物理盘 lane，再调用一次枚举器并保留逐行 lane 所有权。
+fn enumerate_with_frozen_plan<F>(
+    roots: &[DisplayPath],
+    read_config: &DiskReadConfig,
+    resolver: &dyn ScanRootStorageResolver,
+    enumerate: F,
+) -> Result<(Vec<ScannedPath>, Arc<Vec<PlannedScannedPath>>), ScanError>
+where
+    F: FnOnce(&[DisplayPath]) -> Result<Vec<ScannedPath>, ScanError>,
+{
+    let plan = ScanDiskPlan::build(roots, read_config, resolver)?;
+    let planned_rows = plan.assign_all(enumerate(roots)?)?;
+    let planned_rows = Arc::new(planned_rows);
+    let rows = planned_rows
+        .iter()
+        .map(|planned| planned.scanned.clone())
+        .collect();
+    Ok((rows, planned_rows))
+}
+
+/// 受控测试使用的真实“先建计划、再枚举”生产边界。
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub fn enumerate_with_frozen_plan_for_test<E: FileEnumerator>(
+    enumerator: &E,
+    roots: &[DisplayPath],
+    read_config: &DiskReadConfig,
+    resolver: &dyn ScanRootStorageResolver,
+) -> Result<(Vec<ScannedPath>, Arc<Vec<PlannedScannedPath>>), ScanError> {
+    enumerate_with_frozen_plan(roots, read_config, resolver, |roots| {
+        enumerator.enumerate(roots)
+    })
+}
+
 async fn run_background_job(
     store: &mut NodeStore,
     worker_pool: &mut WorkerPool,
@@ -1914,24 +1949,23 @@ async fn run_background_job(
             let enumerator =
                 resolve_scan_enumerator_with(enumerator, ensure_everything_ready).await;
             // 物理存储计划必须先于第一次 Everything/Walker enumerate 建立；失败时不枚举。
-            let scan_plan =
-                ScanDiskPlan::build(&options.roots, &read_config, &SystemScanRootStorageResolver);
-            let scan_plan_for_reader = scan_plan.as_ref().ok().cloned().map(Arc::new);
-            let rows = match scan_plan {
-                Ok(scan_plan) => {
-                    let rows = match enumerator {
-                        EnumeratorKind::WindowsWalker => WindowsWalker.enumerate(&options.roots),
-                        EnumeratorKind::Everything => {
-                            PreferredEverythingEnumerator.enumerate(&options.roots)
-                        }
-                    };
-                    rows.and_then(|rows| {
-                        scan_plan
-                            .assign_all(rows)
-                            .map(|planned| planned.into_iter().map(|row| row.scanned).collect())
-                    })
-                }
-                Err(error) => Err(error),
+            let enumerated = match enumerator {
+                EnumeratorKind::WindowsWalker => enumerate_with_frozen_plan(
+                    &options.roots,
+                    &read_config,
+                    &SystemScanRootStorageResolver,
+                    |roots| WindowsWalker.enumerate(roots),
+                ),
+                EnumeratorKind::Everything => enumerate_with_frozen_plan(
+                    &options.roots,
+                    &read_config,
+                    &SystemScanRootStorageResolver,
+                    |roots| PreferredEverythingEnumerator.enumerate(roots),
+                ),
+            };
+            let (rows, planned_rows_for_reader) = match enumerated {
+                Ok((rows, planned_rows)) => (Ok(rows), Some(planned_rows)),
+                Err(error) => (Err(error), None),
             };
             let result = run_enumerated_scan_to_base_compute(
                 store,
@@ -1943,13 +1977,13 @@ async fn run_background_job(
                 &contact_sheets,
                 || NodeRemoteFeatureCache::from_config(&postgres_config),
                 || async {
-                    let Some(scan_plan) = scan_plan_for_reader else {
+                    let Some(planned_rows) = planned_rows_for_reader else {
                         return Err(ScanError::Stage1("扫描根计划缺失，不能创建读取器".into()));
                     };
-                    ScheduledFileReader::new_with_plan(
+                    ScheduledFileReader::new_with_planned_rows(
                         &read_config,
                         effective_worker_count,
-                        scan_plan,
+                        planned_rows,
                     )
                     .map(|(reader, limits)| {
                         (

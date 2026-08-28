@@ -203,20 +203,6 @@ impl ScanDiskPlan {
         rows.into_iter().map(|row| self.assign(row)).collect()
     }
 
-    /// 按路径查询已经冻结的 lane，不触发任何 Windows 存储解析。
-    pub(crate) fn lane_for_path(&self, path: &NormalizedPath) -> Result<TaskDiskLane, ScanError> {
-        let root = self
-            .roots
-            .iter()
-            .filter(|root| path.is_within(&root.normalized_root))
-            .min_by(|left, right| compare_root_specificity(left, right))
-            .ok_or_else(|| ScanError::InvalidResult(format!("路径不属于扫描根: {path}")))?;
-        self.lanes
-            .get(root.lane_index)
-            .cloned()
-            .ok_or_else(|| ScanError::InvalidResult("扫描根 lane 索引无效".into()))
-    }
-
     /// 返回本计划内冻结的所有 lane，供调度器建立只读视图。
     pub fn lanes(&self) -> &[TaskDiskLane] {
         &self.lanes

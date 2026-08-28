@@ -35,3 +35,13 @@ Task 5 已完成。节点在第一次 Everything/Windows Walker 枚举前，对�
 | `git diff --check` | 通过 |
 
 验证期间 C 盘约 17.68 GiB、D 盘约 10.24 GiB 可用，未触发清理停止线。
+
+## Follow-up 审查修复
+
+针对审查反馈补齐了三项边界：
+
+1. `DiskReadScheduler` 新增带冻结逐盘额度的许可入口。混合类型 lane 即使对外表现为 `Unknown`，也会把 HDD/SSD/Unknown 配置的最小值传入唯一 scheduler；复合盘的每个底层物理盘都用该有效上限。真实测试持有前五个 permit 时第六个阻塞，释放后才放行。
+2. 删除读取器的 `LaneSource::System`、普通 `ScheduledFileReader::new` 和读取期 `resolve_storage_location(path)`。生产读取器只能从枚举行生成的冻结 lane 映射创建；受控 resolver 仅保留在命名明确的测试构造中。
+3. actor 共用“先建立计划、再调用枚举器”的边界，把 `PlannedScannedPath` 列表交给读取器建立不可变的 `NormalizedPath → TaskDiskLane` 精确索引。Hash 和 Media 都只查该索引，不重新按根归属匹配。
+
+Follow-up 验证：scan_roots 11/11、storage_device 5/5、enumerators 4/4、disk_scheduler 27/27、base_compute_pipeline 59/59、node-engine lib 66/66；格式和 diff 检查通过。混合复合盘 permit、exact planned lane 及 resolver/枚举真实顺序测试均通过。

@@ -1,6 +1,7 @@
 //! 有界枚举生产器与按物理盘调度的生产 MD5 读取适配器。
 
 use std::{
+    collections::HashMap,
     future::Future,
     io,
     path::{Path, PathBuf},
@@ -9,11 +10,9 @@ use std::{
     time::Instant,
 };
 
-use dedup_core::{DiskReadConfig, NodeConfig};
+use dedup_core::{DiskReadConfig, NodeConfig, NormalizedPath};
 use dedup_node_store::ScannedPath;
-use dedup_windows::{
-    LocalDiskKind, PhysicalDiskId, ReadCancellationToken, StorageLocation, resolve_storage_location,
-};
+use dedup_windows::{LocalDiskKind, PhysicalDiskId, ReadCancellationToken, StorageLocation};
 use tokio::{sync::mpsc, task::JoinHandle};
 
 use crate::{
@@ -27,7 +26,7 @@ use crate::{
 };
 
 use super::base_flow_control::HashReadStartedSignal;
-use super::{FileEnumerator, ScanDiskPlan, ScanError, TaskDiskLane};
+use super::{FileEnumerator, PlannedScannedPath, ScanError, TaskDiskLane};
 
 /// 扫描阶段内存队列的产品级硬上限，防止配置乘法放大所有权窗口。
 const MAX_PIPELINE_CHANNEL_CAPACITY: usize = 4_096;
@@ -122,11 +121,6 @@ pub trait PipelineFileReader: Clone + Send + Sync + 'static {
 
     /// 根据冻结计划取得路径的物理盘显示身份，不建立可变路径缓存。
     fn physical_disk_id(&self, _path: &Path) -> String {
-        String::new()
-    }
-
-    /// 兼容旧调用者的消费接口；冻结 lane 不需要二次消费身份。
-    fn take_physical_disk_id(&self, _path: &Path) -> String {
         String::new()
     }
 }
@@ -263,19 +257,18 @@ impl<R: BlockReader + Send + Sync> Md5ReadBackend for RetryingFileReader<R> {
 
 #[derive(Clone)]
 enum LaneSource {
-    /// 生产扫描在枚举前建立的只读物理盘计划。
-    Frozen(Arc<ScanDiskPlan>),
-    /// 兼容没有根计划的旧内部调用；生产 actor 不使用此分支。
-    System,
+    /// 生产扫描为每条枚举行建立的只读精确 lane 映射。
+    Frozen(Arc<HashMap<NormalizedPath, TaskDiskLane>>),
     /// 仅供已有受控读取器测试注入位置，生产不会启用。
     Injected(Arc<dyn Fn(&Path) -> (Vec<u32>, LocalDiskKind) + Send + Sync>),
 }
 
 impl ScheduledFileReader {
-    /// 从已验证读取配置和实际 Worker 数创建生产读取器及统一有界容量。
-    pub fn new(
+    /// 从已验证读取配置、Worker 数和枚举行冻结 lane 创建生产读取器。
+    pub fn new_with_planned_rows(
         read_config: &DiskReadConfig,
         effective_worker_count: usize,
+        planned_rows: Arc<Vec<PlannedScannedPath>>,
     ) -> Result<(Self, PipelineLimits), ScanError> {
         let scheduler = DiskReadScheduler::new(read_config, effective_worker_count)
             .map_err(|error| ScanError::Stage1(error.to_string()))?;
@@ -283,6 +276,7 @@ impl ScheduledFileReader {
         node_config.read = read_config.clone();
         let reader = RetryingFileReader::system(&node_config)
             .map_err(|error| ScanError::Stage1(error.to_string()))?;
+        let lane_map = freeze_lane_map(&planned_rows)?;
         let capacity = read_config
             .total_threads
             .checked_mul(4)
@@ -297,23 +291,12 @@ impl ScheduledFileReader {
             Self {
                 scheduler,
                 reader: Arc::new(reader),
-                lane_source: LaneSource::System,
+                lane_source: LaneSource::Frozen(Arc::new(lane_map)),
                 read_config: read_config.clone(),
                 reporter: None,
             },
             PipelineLimits::new(capacity, read_config.total_threads),
         ))
-    }
-
-    /// 使用枚举前冻结的根计划创建生产读取器。
-    pub fn new_with_plan(
-        read_config: &DiskReadConfig,
-        effective_worker_count: usize,
-        plan: Arc<ScanDiskPlan>,
-    ) -> Result<(Self, PipelineLimits), ScanError> {
-        let (mut reader, limits) = Self::new(read_config, effective_worker_count)?;
-        reader.lane_source = LaneSource::Frozen(plan);
-        Ok((reader, limits))
     }
 
     /// 使用真实 scheduler/retrying reader 与测试物理盘 resolver 装配可控 reader。
@@ -356,13 +339,13 @@ impl ScheduledFileReader {
         ))
     }
 
-    /// 使用冻结根计划装配可控读取器，验证 Hash 与 Media 共用同一 lane。
+    /// 使用已规划枚举行装配可控读取器，验证 Hash 与 Media 共用同一 lane。
     #[doc(hidden)]
-    pub fn controlled_with_plan_for_test<R>(
+    pub fn controlled_with_planned_rows_for_test<R>(
         read_config: &DiskReadConfig,
         effective_worker_count: usize,
         block_reader: R,
-        plan: Arc<ScanDiskPlan>,
+        planned_rows: Arc<Vec<PlannedScannedPath>>,
     ) -> Result<(Self, PipelineLimits), ScanError>
     where
         R: BlockReader + Send + Sync + 'static,
@@ -373,6 +356,7 @@ impl ScheduledFileReader {
         config.read = read_config.clone();
         let reader = RetryingFileReader::new(block_reader, &config)
             .map_err(|error| ScanError::Stage1(error.to_string()))?;
+        let lane_map = freeze_lane_map(&planned_rows)?;
         let capacity = read_config
             .total_threads
             .checked_mul(4)
@@ -387,7 +371,7 @@ impl ScheduledFileReader {
             Self {
                 scheduler,
                 reader: Arc::new(reader),
-                lane_source: LaneSource::Frozen(plan),
+                lane_source: LaneSource::Frozen(Arc::new(lane_map)),
                 read_config: read_config.clone(),
                 reporter: None,
             },
@@ -411,17 +395,14 @@ impl ScheduledFileReader {
     /// 按冻结 lane 取得实际 scheduler 位置；生产路径不再访问 Windows 存储 API。
     fn resolve_lane(&self, path: &Path) -> io::Result<(TaskDiskLane, Option<StorageLocation>)> {
         match &self.lane_source {
-            LaneSource::Frozen(plan) => {
+            LaneSource::Frozen(lanes) => {
                 let normalized = dedup_core::NormalizedPath::new(path).map_err(io::Error::other)?;
-                let lane = plan.lane_for_path(&normalized).map_err(io::Error::other)?;
+                let lane = lanes.get(&normalized).cloned().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "路径没有对应的冻结物理盘 lane")
+                })?;
                 let location =
                     StorageLocation::from_parts(lane.physical_disk_id.clone(), lane.disk_kind);
                 Ok((lane, Some(location)))
-            }
-            LaneSource::System => {
-                let storage = resolve_storage_location(path)?;
-                let lane = lane_from_storage(&self.read_config, &storage)?;
-                Ok((lane, Some(storage)))
             }
             LaneSource::Injected(resolver) => {
                 let (numbers, kind) = resolver(path);
@@ -471,7 +452,11 @@ impl ScheduledFileReader {
         )
         .map_err(|error| telemetry_failure(&path, error))?;
         let lease = match system_location {
-            Some(storage) => self.scheduler.acquire(storage, class).await,
+            Some(storage) => {
+                self.scheduler
+                    .acquire_with_limit(storage, class, lane.per_disk_limit)
+                    .await
+            }
             None => {
                 self.scheduler
                     .acquire_for_test(&lane.physical_disk_numbers, lane.disk_kind, class)
@@ -557,11 +542,6 @@ impl PipelineFileReader for ScheduledFileReader {
                 .join("+")
         )
     }
-
-    /// 保留旧接口但不重复返回已归属的物理盘身份。
-    fn take_physical_disk_id(&self, _path: &Path) -> String {
-        String::new()
-    }
 }
 
 impl ScheduledFileReader {
@@ -602,24 +582,23 @@ impl ScheduledFileReader {
     }
 }
 
-/// 把系统 resolver 返回的稳定位置转换为本轮读取 lane。
-fn lane_from_storage(
-    read_config: &DiskReadConfig,
-    storage: &StorageLocation,
-) -> io::Result<TaskDiskLane> {
-    let physical_disk_id = storage.physical_disk_id().clone();
-    let physical_disk_numbers = physical_disk_id.disk_numbers().to_vec();
-    if physical_disk_numbers.is_empty() {
-        return Err(io::Error::other("物理盘身份不能为空"));
+/// 为生产读取器建立路径到冻结 lane 的只读精确索引。
+fn freeze_lane_map(
+    planned_rows: &[PlannedScannedPath],
+) -> Result<HashMap<NormalizedPath, TaskDiskLane>, ScanError> {
+    let mut lanes = HashMap::with_capacity(planned_rows.len());
+    for planned in planned_rows {
+        let path = planned.scanned.normalized_path.clone();
+        if let Some(existing) = lanes.get(&path)
+            && existing != &planned.lane
+        {
+            return Err(ScanError::InvalidResult(format!(
+                "同一枚举路径关联多个冻结物理盘 lane: {path}"
+            )));
+        }
+        lanes.entry(path).or_insert_with(|| planned.lane.clone());
     }
-    let per_disk_limit = configured_limit(read_config, storage.disk_kind());
-    Ok(TaskDiskLane {
-        physical_disk_id,
-        physical_disk_numbers,
-        disk_kind: storage.disk_kind(),
-        configured_weight: per_disk_limit,
-        per_disk_limit,
-    })
+    Ok(lanes)
 }
 
 /// 返回指定介质类型对应的已验证逐盘读取额度。

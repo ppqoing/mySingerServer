@@ -1423,11 +1423,6 @@ async fn scheduled_reader_limits_hashing_by_read_threads_not_single_worker() {
         |_| (vec![7], LocalDiskKind::Ssd),
     )
     .unwrap();
-    let location_probe = reader.clone();
-    let row_paths = rows
-        .iter()
-        .map(|row| row.display_path.as_path().to_path_buf())
-        .collect::<Vec<_>>();
     let (mut pool, mut started_workers, controller) = WorkerPool::controlled_batch_for_test(1);
     let registry = RuntimeTaskRegistry::new();
     let reporter = registry
@@ -1500,13 +1495,6 @@ async fn scheduled_reader_limits_hashing_by_read_threads_not_single_worker() {
     };
     let (summary, ()) = tokio::join!(run, drive);
     assert_eq!(summary.unwrap().hashed, 4);
-    for path in row_paths {
-        assert_eq!(
-            location_probe.take_physical_disk_id(&path),
-            "",
-            "媒体许可二次解析不得重新污染 Hash 物理盘身份 map"
-        );
-    }
 }
 
 #[tokio::test]

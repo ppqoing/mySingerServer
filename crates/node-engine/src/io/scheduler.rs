@@ -214,6 +214,28 @@ impl DiskReadScheduler {
             DiskKey::new(location.physical_disk_id().disk_numbers())?,
             location.disk_kind(),
             class,
+            None,
+        )
+        .await
+    }
+
+    /// 按调用方冻结的逐盘上限取得许可；同一 scheduler 仍统一维护全局和逐盘状态。
+    pub async fn acquire_with_limit(
+        &self,
+        location: StorageLocation,
+        class: DiskReadClass,
+        per_disk_limit: usize,
+    ) -> Result<DiskReadPermit, SchedulerError> {
+        if per_disk_limit == 0 {
+            return Err(SchedulerError::InvalidConfiguration(
+                "冻结的逐盘读取额度必须大于零",
+            ));
+        }
+        self.acquire_key(
+            DiskKey::new(location.physical_disk_id().disk_numbers())?,
+            location.disk_kind(),
+            class,
+            Some(per_disk_limit),
         )
         .await
     }
@@ -233,6 +255,7 @@ impl DiskReadScheduler {
         key: DiskKey,
         kind: LocalDiskKind,
         class: DiskReadClass,
+        per_disk_limit: Option<usize>,
     ) -> Result<DiskReadPermit, SchedulerError> {
         let queue_slot = self
             .queue_slots
@@ -245,6 +268,7 @@ impl DiskReadScheduler {
             .send(Command::Acquire(Waiter {
                 key,
                 kind,
+                per_disk_limit,
                 class,
                 sequence: 0,
                 conflicting_bypasses: 0,
@@ -263,7 +287,7 @@ impl DiskReadScheduler {
         kind: LocalDiskKind,
         class: DiskReadClass,
     ) -> Result<DiskReadPermit, SchedulerError> {
-        self.acquire_key(DiskKey::new(disk_numbers)?, kind, class)
+        self.acquire_key(DiskKey::new(disk_numbers)?, kind, class, None)
             .await
     }
 
@@ -345,6 +369,8 @@ pub(super) struct ActiveSnapshot {
 struct Waiter {
     key: DiskKey,
     kind: LocalDiskKind,
+    /// 可选的本轮冻结逐盘上限；缺失时使用调度器默认介质配置。
+    per_disk_limit: Option<usize>,
     /// 请求进入 actor 的读取类别。
     class: DiskReadClass,
     /// 跨位置、跨类别单调递增的入队顺序。
@@ -498,7 +524,9 @@ impl ActorState {
         waiter.sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.wrapping_add(1);
         let key = waiter.key.clone();
-        let observed_limit = self.config.disk_limit(waiter.kind);
+        let observed_limit = waiter
+            .per_disk_limit
+            .unwrap_or_else(|| self.config.disk_limit(waiter.kind));
         for disk_number in &key.0 {
             self.underlying_disks
                 .entry(*disk_number)
