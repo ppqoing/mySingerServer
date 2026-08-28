@@ -44,3 +44,11 @@ Task 3 已完成。本任务把配置、协议和桌面诊断边界收敛到主�
 ## 未包含
 
 本任务未改变 NodeStore 的故障记录生产写入、扫描/计算/同步/分析主链路，也未加入任务恢复或重启恢复逻辑；未运行真实媒体、打包、部署或触碰 `I:\Tool`。历史设计文档中的旧架构描述由上层任务统一更新。
+
+## Fix round 1：保存前机器身份校验
+
+独立审查发现配置快照按节点索引保存；同一索引断线重连到另一物理机器时，即使版本摘要相同，旧快照也可能被发送到新会话。新增真实 TCP 重连行为测试：先加载机器 A，再让同一 endpoint 重连机器 B，断言保存失败且 B 未收到 `SaveNodeConfig`。
+
+- RED：`cargo test -p dedup-desktop-core --test node_config_controller save_rejects_same_index_after_reconnect_to_another_machine --locked -- --test-threads=1`，稳定失败于 `Completed` 而非预期 `Failed`。
+- 修复：`save_node_config` 在发起请求前比较快照 `machine_id` 与当前 `NodeSession` 的机器 ID；不一致时返回包含两端身份的明确错误，不进入 Saving 请求，不写入新节点。
+- GREEN：上述定向测试 1/1 通过，B 端保存请求为 0；`node_config_controller` 4/4、`node_config_e2e` 2/2、`cargo check -p dedup-desktop-core --locked`、`cargo fmt --all -- --check`、`git diff --check` 均通过。

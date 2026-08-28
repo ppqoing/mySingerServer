@@ -244,6 +244,70 @@ async fn mismatched_save_response_is_rejected() {
     server.await.unwrap().unwrap();
 }
 
+#[tokio::test]
+async fn save_rejects_same_index_after_reconnect_to_another_machine() {
+    let first_machine = "d4".repeat(32);
+    let second_machine = "e4".repeat(32);
+    let first_handler = ConfigHandler::new(&first_machine);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (first_shutdown_sender, first_shutdown) = oneshot::channel();
+    let first_server = tokio::spawn(NodeServer::serve_until(
+        listener,
+        first_handler,
+        first_shutdown,
+    ));
+
+    let temp = TempDir::new().unwrap();
+    let (app, mut events) = DesktopApp::start(config(address, 1), desktop_paths(&temp));
+    wait_until_online_with_machine(&mut events, &first_machine).await;
+    app.send(UiCommand::LoadNodeConfig { node_index: 0 })
+        .await
+        .unwrap();
+    let loaded = wait_for_config_state(&mut events, |state| state.snapshot().is_some()).await;
+    assert_eq!(loaded.snapshot().unwrap().machine_id, first_machine);
+    assert_eq!(loaded.snapshot().unwrap().version_sha256, "old-sha");
+
+    first_shutdown_sender.send(()).unwrap();
+    first_server.await.unwrap().unwrap();
+    wait_until_error(&mut events).await;
+
+    let second_handler = ConfigHandler::new(&second_machine);
+    let second_state = Arc::clone(&second_handler.state);
+    let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+    let (second_shutdown_sender, second_shutdown) = oneshot::channel();
+    let second_server = tokio::spawn(NodeServer::serve_until(
+        listener,
+        second_handler,
+        second_shutdown,
+    ));
+    wait_until_online_with_machine(&mut events, &second_machine).await;
+
+    app.send(UiCommand::SaveNodeConfig {
+        node_index: 0,
+        config: config_value(39203),
+    })
+    .await
+    .unwrap();
+    let terminal = wait_for_config_state(&mut events, |state| {
+        matches!(
+            state.phase(),
+            NodeConfigSavePhase::Completed | NodeConfigSavePhase::Failed
+        )
+    })
+    .await;
+    assert_eq!(terminal.phase(), NodeConfigSavePhase::Failed);
+    let failed = terminal;
+    assert!(failed.error().unwrap().contains("机器身份已变化"));
+    assert!(failed.error().unwrap().contains(&first_machine));
+    assert!(failed.error().unwrap().contains(&second_machine));
+    assert!(second_state.lock().unwrap().saves.is_empty());
+
+    app.send(UiCommand::Shutdown).await.unwrap();
+    second_shutdown_sender.send(()).unwrap();
+    second_server.await.unwrap().unwrap();
+}
+
 async fn start_server(
     handler: ConfigHandler,
 ) -> (
@@ -264,6 +328,44 @@ async fn wait_until_online(events: &mut tokio::sync::mpsc::Receiver<UiEvent>, in
             if let Some(UiEvent::ViewChanged(state)) = events.recv().await
                 && state.nodes()[index].connection
                     == dedup_desktop_core::view_state::NodeConnectionState::Online
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
+
+async fn wait_until_online_with_machine(
+    events: &mut tokio::sync::mpsc::Receiver<UiEvent>,
+    machine_id: &str,
+) {
+    tokio::time::timeout(Duration::from_secs(6), async {
+        loop {
+            if let Some(UiEvent::ViewChanged(state)) = events.recv().await {
+                let Some(node) = state.nodes().first() else {
+                    continue;
+                };
+                if node.connection == dedup_desktop_core::view_state::NodeConnectionState::Online
+                    && node.machine_id.as_deref() == Some(machine_id)
+                {
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
+
+async fn wait_until_error(events: &mut tokio::sync::mpsc::Receiver<UiEvent>) {
+    tokio::time::timeout(Duration::from_secs(6), async {
+        loop {
+            if let Some(UiEvent::ViewChanged(state)) = events.recv().await
+                && state.nodes().first().is_some_and(|node| {
+                    node.connection == dedup_desktop_core::view_state::NodeConnectionState::Error
+                })
             {
                 break;
             }

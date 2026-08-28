@@ -1645,6 +1645,13 @@ async fn save_node_config(
         .get(&node_index)
         .cloned()
         .ok_or_else(|| format!("节点 {node_index} 未连接，无法保存远程配置"))?;
+    let current_machine_id = session.machine_id().as_str().to_owned();
+    if previous_snapshot.machine_id != current_machine_id {
+        return Err(format!(
+            "保存目标机器身份已变化：已加载机器 {}，当前会话机器 {}，请重新加载配置",
+            previous_snapshot.machine_id, current_machine_id
+        ));
+    }
     NodeConfig::try_from(config.clone()).map_err(|error| error.to_string())?;
 
     state.set_node_config_phase(NodeConfigSavePhase::Saving);
