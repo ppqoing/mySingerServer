@@ -6438,8 +6438,9 @@ async fn lookup_cache_reports_each_completed_thousand_file_batch() {
     std::fs::create_dir_all(&cache_root).unwrap();
     let machine = MachineId::from_sha256([0x43; 32]);
     let database = install_root.join("data/node/node.sqlite3");
-    let observer_machine = machine.clone();
     let mut store = NodeStore::open(&database, machine.clone()).unwrap();
+    // 同进程观察者只读取已提交阶段，不能再次触发 Node 启动期的 transient 清理。
+    let observer = store.reopen().unwrap();
     let root = DisplayPath::new(install_root.join("media")).unwrap();
     let options = ScanOptions::new(vec![root]);
     let task_id = begin_scan_task(&mut store, &options, 10).unwrap();
@@ -6506,8 +6507,7 @@ async fn lookup_cache_reports_each_completed_thousand_file_batch() {
             .expect("应发布基础缓存查询阶段");
         assert_eq!(lookup.completed, 1_000, "第一批查询完成后应立即更新进度");
         assert_eq!(lookup.total, 1_001);
-        let persisted = NodeStore::open(&database, observer_machine)
-            .unwrap()
+        let persisted = observer
             .task_stages(task_id)
             .unwrap()
             .into_iter()

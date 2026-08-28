@@ -99,3 +99,23 @@ Fix round 1：`cf7e3664`（`fix: await worker pool shutdown before restart`）�
 - `cargo fmt --all -- --check`、`git diff --check` 通过；`rg` 未发现 `prepare_planned_restart`、`restart_after_requeue`、`begin_restored`、`begin_recovery` 产品调用。
 
 Fix round 2：本提交（`fix: join worker drivers during shutdown`）。
+
+## Fix round 3（取消路径 driver 收束与同进程观察）
+
+### RED / 修复
+
+- 独立复现 `cargo test -p dedup-node-engine --test base_compute_pipeline lookup_cache_reports_each_completed_thousand_file_batch --features test-hooks --locked`：退出 1，`SQLite 应保存基础缓存查询阶段`。根因是测试观察协程在同一进程以 `NodeStore::open` 打开第二连接，误触 Task 1 已定义的启动期 transient 清理；并非该测试要验证的启动行为。
+- 独立审查还指出：取消路径等待 `Exited` 没有 deadline，且普通 Exited/取消路径直接 Drop `SlotHandle` 会 detach driver。新增 `exited_event_waits_for_driver_before_installing_replacement`：旧 driver 在 Exited 后受 gate 阻塞时 replacement 计数保持零，释放 gate 后才安装。
+- 新增 `cancel_timeout_aborts_driver_and_keeps_pool_shutdown_reachable`：运行 slot 接收 Terminate 后不回 Exited；虚拟时间推进固定上限后取消返回 `ShutdownTimeout`，旧 driver 被 abort+await、共享运行/PID/CPU 清空，并继续完成 Pool 关闭。这是 actor 重启前“取消 → 收束旧 Pool → 关闭/新建”调用链的无进程夹具证据。
+- `lookup_cache_reports_each_completed_thousand_file_batch` 现在在交出 `store` 前创建 `store.reopen()` 只读 observer；删除错误的 `observer_machine`/二次 `open`。产品代码未改。
+- 普通 Exited 与取消路径均把被移除的 `SlotHandle` 移交给 join helper；正常情况等待 driver 返回，deadline/driver 异常时 abort+await 后才清状态或安装 replacement。取消命令等待 Exited 使用同一固定上限，不再在该 Pool actor 内无界等待。
+
+### Fix 验证
+
+- `lookup_cache_reports_each_completed_thousand_file_batch`：1/1 通过。
+- 新增 gate 与取消超时测试：各 1/1 通过；`cargo test -p dedup-node-engine --lib --features test-hooks --locked`：64/64 通过。
+- `cargo test -p worker --test worker_pool --no-run --locked`：通过；运行 3/3 通过。
+- `controller_runtime_tasks`：7/7 通过；`runtime_tasks_e2e`：1/1 通过。
+- 完整 `base_compute_pipeline` 的默认并行运行仍有 3 条既有时序断言失败；按该套件时序边界使用 `-- --test-threads=1` 串行运行后 59/59 通过。聚焦 reopen 回归也实际通过。
+
+Fix round 3：本提交（取消/driver 收束与测试 observer 适配）。
