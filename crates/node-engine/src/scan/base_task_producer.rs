@@ -13,7 +13,7 @@ use uuid::Uuid;
 use super::{BaseComputeDecision, PlannedScannedPath, TaskDiskLane};
 use crate::{
     task_dispatch::{TaskFileDispatcher, TaskLanePermitProvider},
-    task_files::{TaskFileRecord, TaskWorkKind, TaskWorkMask},
+    task_files::{TaskFileRecord, TaskWorkKind, TaskWorkMask, validate_task_file_record},
 };
 
 /// 单次缓存分类允许接收的最大输入行数。
@@ -90,7 +90,7 @@ struct LaneBatch {
 
 /// 基础缓存分类到瞬态任务文件的唯一生产者。
 pub struct BaseTaskProducer<Provider: TaskLanePermitProvider> {
-    dispatcher: TaskFileDispatcher<Provider>,
+    dispatcher: Option<TaskFileDispatcher<Provider>>,
     seen_paths: BTreeMap<NormalizedPath, SeenPathState>,
     resolved_files: BTreeMap<NormalizedPath, ResolvedScanFile>,
     cache_hits: usize,
@@ -102,7 +102,7 @@ impl<Provider: TaskLanePermitProvider> BaseTaskProducer<Provider> {
     /// 创建一个拥有任务文件 dispatcher 的基础任务生产者。
     pub fn new(dispatcher: TaskFileDispatcher<Provider>) -> Self {
         Self {
-            dispatcher,
+            dispatcher: Some(dispatcher),
             seen_paths: BTreeMap::new(),
             resolved_files: BTreeMap::new(),
             cache_hits: 0,
@@ -115,6 +115,11 @@ impl<Provider: TaskLanePermitProvider> BaseTaskProducer<Provider> {
     /// 输入校验和去重在任何文件发布前完成，因此未导入缓存、路径冲突和超大批次都
     /// 不会产生部分任务行。只有真正需要计算的行才会创建对应 lane 文件。
     pub fn append_batch(&mut self, inputs: &[BaseTaskInput]) -> Result<(), BaseTaskProducerError> {
+        if self.dispatcher.is_none() {
+            return Err(BaseTaskProducerError::InvalidInput(
+                "基础任务生产器已经结束或 discard".into(),
+            ));
+        }
         if inputs.len() > MAX_BASE_TASK_BATCH {
             return Err(BaseTaskProducerError::InvalidInput(format!(
                 "基础缓存批次不能超过 {MAX_BASE_TASK_BATCH} 行"
@@ -189,9 +194,21 @@ impl<Provider: TaskLanePermitProvider> BaseTaskProducer<Provider> {
             }
         }
 
+        // 先校验全部 lane 的行，避免前一个 lane 已发布后才发现后一个 lane 的路径字段非法。
+        for batch in staged_batches.values() {
+            for row in &batch.rows {
+                validate_task_file_record(row).map_err(|error| {
+                    BaseTaskProducerError::InvalidInput(format!("任务行字段无效: {error}"))
+                })?;
+            }
+        }
+
         // BTreeMap 保证 lane 文件名顺序稳定；每个非空 lane 只调用一次 append_batch。
         for (lane_key, batch) in staged_batches {
-            self.dispatcher.append_batch(&batch.lane, &batch.rows)?;
+            self.dispatcher
+                .as_mut()
+                .expect("生产器在 append_batch 期间保持 dispatcher 所有权")
+                .append_batch(&batch.lane, &batch.rows)?;
             self.lane_configs.entry(lane_key).or_insert(batch.lane);
         }
 
@@ -206,17 +223,38 @@ impl<Provider: TaskLanePermitProvider> BaseTaskProducer<Provider> {
     }
 
     /// 封闭所有任务文件，并把 dispatcher 和稳定清单一起移交给后续主循环。
-    pub fn seal(mut self) -> Result<BaseTaskProduction<Provider>, BaseTaskProducerError> {
-        self.dispatcher.seal()?;
+    pub fn seal(&mut self) -> Result<BaseTaskProduction<Provider>, BaseTaskProducerError> {
+        self.dispatcher
+            .as_mut()
+            .ok_or_else(|| {
+                BaseTaskProducerError::InvalidInput("基础任务生产器已经结束或 discard".into())
+            })?
+            .seal()?;
+        let dispatcher = self
+            .dispatcher
+            .take()
+            .expect("seal 成功后 dispatcher 必须仍由生产器拥有");
         let manifest = BaseTaskManifest {
-            seen_paths: self.seen_paths.into_keys().collect(),
-            resolved_files: self.resolved_files.into_values().collect(),
+            seen_paths: std::mem::take(&mut self.seen_paths).into_keys().collect(),
+            resolved_files: std::mem::take(&mut self.resolved_files)
+                .into_values()
+                .collect(),
             cache_hits: self.cache_hits,
         };
         Ok(BaseTaskProduction {
-            dispatcher: self.dispatcher,
+            dispatcher,
             manifest,
         })
+    }
+
+    /// 在追加或 seal 失败后删除本次运行的精确任务目录，保留 owner 直到删除完成。
+    pub fn discard(&mut self) -> Result<(), BaseTaskProducerError> {
+        let dispatcher = self.dispatcher.as_mut().ok_or_else(|| {
+            BaseTaskProducerError::InvalidInput("基础任务生产器已经结束或 discard".into())
+        })?;
+        dispatcher.discard()?;
+        self.dispatcher = None;
+        Ok(())
     }
 }
 

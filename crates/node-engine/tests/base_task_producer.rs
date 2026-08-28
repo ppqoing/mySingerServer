@@ -1,4 +1,11 @@
-use std::{path::Path, time::Duration};
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+#[cfg(windows)]
+use std::os::windows::ffi::OsStringExt;
 
 use dedup_core::{DisplayPath, MachineId, MediaKind, NormalizedPath};
 use dedup_media::{ImageStage1, ImageStage2, PdqHash};
@@ -9,6 +16,8 @@ use dedup_node_engine::{
 };
 use dedup_node_store::{BaseCacheRecord, CompleteStage1, NodeStore, ScannedPath};
 use dedup_windows::{LocalDiskKind, PhysicalDiskId, ReadCancellationToken};
+
+const RUN_ID: &str = "01900000-0000-7000-8000-000000000001";
 
 #[derive(Clone, Copy, Debug, Default)]
 struct ImmediatePermitProvider;
@@ -60,8 +69,19 @@ fn input(path: ScannedPath, lane: TaskDiskLane, cached: Option<BaseCacheRecord>)
 }
 
 fn producer(root: &Path) -> BaseTaskProducer<ImmediatePermitProvider> {
-    let files = TransientTaskFileSet::create(root, "01900000-0000-7000-8000-000000000001").unwrap();
+    let files = TransientTaskFileSet::create(root, RUN_ID).unwrap();
     BaseTaskProducer::new(TaskFileDispatcher::new(files, ImmediatePermitProvider))
+}
+
+#[cfg(windows)]
+fn invalid_utf8_display_path(normalized: &str, file_size: u64) -> ScannedPath {
+    let mut display = PathBuf::from(r"C:\media");
+    display.push(OsString::from_wide(&[0xD800]));
+    ScannedPath::new(
+        NormalizedPath::new(normalized).unwrap(),
+        DisplayPath::new(display).unwrap(),
+        file_size,
+    )
 }
 
 fn imported_record(path: &ScannedPath, md5: [u8; 16], complete: bool) -> BaseCacheRecord {
@@ -330,4 +350,78 @@ async fn batches_over_one_thousand_are_rejected_without_partial_publish() {
     let output = producer.seal().unwrap();
     assert!(output.manifest.seen_paths.is_empty());
     assert!(!output.dispatcher.lane_path(&lane).unwrap().exists());
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn invalid_later_lane_is_rejected_before_any_lane_is_published() {
+    let root = tempfile::tempdir().unwrap();
+    let first_lane = lane(&[7], LocalDiskKind::Hdd, 1);
+    let later_lane = lane(&[8], LocalDiskKind::Ssd, 1);
+    let valid = scanned(r"C:\media\valid.bin", 42);
+    let invalid = invalid_utf8_display_path(r"D:\media\invalid.bin", 42);
+    let mut producer = producer(root.path());
+
+    assert!(
+        producer
+            .append_batch(&[
+                input(valid, first_lane.clone(), None),
+                input(invalid, later_lane.clone(), None),
+            ])
+            .is_err()
+    );
+    assert!(
+        !root
+            .path()
+            .join(RUN_ID)
+            .join("PhysicalDisk7-hdd.tasks.tsv")
+            .exists()
+    );
+    let output = producer.seal().unwrap();
+    assert!(output.manifest.seen_paths.is_empty());
+}
+
+#[tokio::test]
+async fn append_failure_keeps_owner_for_exact_discard() {
+    let root = tempfile::tempdir().unwrap();
+    let lane = lane(&[7], LocalDiskKind::Hdd, 1);
+    let files = {
+        let mut files = TransientTaskFileSet::create(root.path(), RUN_ID).unwrap();
+        files.fail_next_append_flush_for_test();
+        files
+    };
+    let mut producer =
+        BaseTaskProducer::new(TaskFileDispatcher::new(files, ImmediatePermitProvider));
+    assert!(
+        producer
+            .append_batch(&[input(
+                scanned(r"C:\media\append-failure.bin", 42),
+                lane,
+                None
+            )])
+            .is_err()
+    );
+    producer.discard().unwrap();
+    assert!(!root.path().join(RUN_ID).exists());
+}
+
+#[tokio::test]
+async fn seal_failure_keeps_owner_for_exact_discard() {
+    let root = tempfile::tempdir().unwrap();
+    let lane = lane(&[7], LocalDiskKind::Hdd, 1);
+    let files = {
+        let mut files = TransientTaskFileSet::create(root.path(), RUN_ID).unwrap();
+        files.fail_next_append_flush_for_test();
+        files
+    };
+    let mut producer =
+        BaseTaskProducer::new(TaskFileDispatcher::new(files, ImmediatePermitProvider));
+    assert!(
+        producer
+            .append_batch(&[input(scanned(r"C:\media\seal-failure.bin", 42), lane, None)])
+            .is_err()
+    );
+    assert!(producer.seal().is_err());
+    producer.discard().unwrap();
+    assert!(!root.path().join(RUN_ID).exists());
 }

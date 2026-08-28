@@ -23,6 +23,21 @@ exit 1
 特征、重复路径去重、未导入缓存拒绝、ContentKey 冲突、文件大小/lane 冲突和超过 1,000
 项拒绝。测试通过真实 `TaskFileDispatcher` 读取行，不直接检查实现源码。
 
+## 窄审查修复
+
+复审新增两项 Important 后继续按 RED→GREEN 执行：
+
+- 原 `seal(self)` 在封闭失败时消费整个生产器，且没有生产端 discard 入口。新增可选的
+  dispatcher 所有权槽，改为 `seal(&mut self)`；只有 seal 成功才移交 dispatcher，失败时仍由
+  生产器持有，并可调用 `discard` 删除精确运行目录。
+- 原生产器只在逐 lane 的 `append_batch` 内校验行，后续 lane 的非法 UTF-8 显示路径会让前一
+  lane 先发布。`TransientTaskFileSet` 暴露 crate 内复用的完整任务行校验，生产器在任何 lane
+  写入前预校验本批全部行。
+
+新增真实测试：后一个 lane 含非法 UTF-8 时所有 lane 均没有发布；append 失败和 seal 失败后
+均可由同一 owner 精确 discard。旧实现分别以缺少 `discard` 接口编译失败和前一 lane 已存在
+任务文件的运行断言固定 RED；修复后 focused 测试为 11/11 通过。
+
 ## 实现结果
 
 - `BaseTaskInput` 固定携带 `PlannedScannedPath`、缓存记录、联系表有效性和强制重算标记；
@@ -42,9 +57,10 @@ exit 1
 
 | 文件 | SHA-256 |
 |---|---|
-| `crates/node-engine/src/scan/base_task_producer.rs` | `84ECC5005880FB30B87F956316B73147E97742940E2ADD6AE3B2E31BC4D388B9` |
+| `crates/node-engine/src/scan/base_task_producer.rs` | `97C36795C098F4304ED5537031A4C2AF82E8F162EF7AFEDC7ECD8F963A26AB04` |
 | `crates/node-engine/src/scan/mod.rs` | `BF5FC3A83447BC5151BE82CCAB15712A486B47D7E1C61E1D8350575839FBE88A` |
-| `crates/node-engine/tests/base_task_producer.rs` | `45B53F42A003C2350612EE218606F7EAACE2C1B37D17D495A2A5D1C9137AF597` |
+| `crates/node-engine/src/task_files.rs` | `47857F52F0278080779FB52F9CDC7DED111A740BF17AFF00F9DA7943A1CAD5A8` |
+| `crates/node-engine/tests/base_task_producer.rs` | `B5233378631D426C89C64EDEC6EBF84B7B3255E0B71857C4174B0A0E1E0C78F4` |
 
 ## 验证
 
@@ -53,7 +69,7 @@ exit 1
 
 | 验证 | 结果 |
 |---|---:|
-| `cargo test -p dedup-node-engine --test base_task_producer --locked -- --test-threads=1` | 8/8 通过 |
+| `cargo test -p dedup-node-engine --test base_task_producer --locked -- --test-threads=1` | 11/11 通过 |
 | `cargo test -p dedup-node-engine --test task_dispatch --locked -- --test-threads=1` | 18/18 通过 |
 | `cargo test -p dedup-node-engine --test transient_task_files --locked -- --test-threads=1` | 25/25 通过 |
 | `cargo test -p dedup-node-engine --lib --locked -- --test-threads=1` | 66/66 通过；仅有既有 dead-code 警告 |

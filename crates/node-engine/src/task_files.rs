@@ -537,7 +537,7 @@ impl TransientTaskFileSet {
         let mut batch_ids = BTreeSet::new();
         let mut serialized = Vec::with_capacity(rows.len());
         for row in rows {
-            validate_record(row)?;
+            validate_task_file_record(row)?;
             if !batch_ids.insert(row.item_id) || self.item_lanes.contains_key(&row.item_id) {
                 return Err(invalid_input("任务项 UUID 在运行中重复"));
             }
@@ -1228,7 +1228,8 @@ fn parse_record(bytes: &[u8]) -> io::Result<ParsedRecord> {
     })
 }
 
-fn validate_record(record: &TaskFileRecord) -> io::Result<()> {
+/// 校验即将追加到 TSV 的完整任务行；生产器可在跨 lane 发布前复用该边界。
+pub(crate) fn validate_task_file_record(record: &TaskFileRecord) -> io::Result<()> {
     validate_item_id(record.item_id)?;
     record
         .missing
