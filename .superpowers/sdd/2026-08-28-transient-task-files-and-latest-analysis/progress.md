@@ -1,0 +1,72 @@
+# SDD ledger — plan: D:/code/mySingerServer/docs/superpowers/plans/2026-08-28-transient-task-files-and-latest-analysis.md
+
+Workspace: `D:/code/mySingerServer/.worktrees/core-scope-transient-runtime`
+Branch: `codex/core-scope-transient-runtime`
+Merge base: `d097aed91da1176303618e64164d1ba35bdce112`
+Spec: `D:/code/mySingerServer/docs/superpowers/specs/2026-08-28-transient-task-files-and-latest-analysis-design.md`
+
+## Preflight self-consistency
+
+| Task | Tests against implementation | Files and outputs | Result |
+|---|---|---|---|
+| 1 | Runtime-state boundary tests exercise real SQLite reopen and retained long-term facts | NodeStore runtime tables/APIs | API deletion is coupled to Task 2; ruling below |
+| 2 | Real Node startup, WorkerPool restart and Desktop list replacement | Registry, actor, pool, Desktop task model | Consistent |
+| 3 | Descriptor, config repository and real UI behavior tests | Protocol, actor/server, config, settings UI | Consistent; protocol removals must precede Task 9 final protocol shape |
+| 4 | SQL trace/cache fixtures and disk scheduler behavior | Cache resolver, enumerators, scheduler | Consistent |
+| 5 | Real TSV, BaseCompute and disk scheduler tests | Shared task file for base and stage2 | Consistent; Task 6 consumes sealed output |
+| 6 | Real scan finalization/outbox/snapshot behavior | Success manifest and completed-scan metadata | Consistent |
+| 7 | Real local analysis/result/window UI behavior | Latest result TSV and in-memory run state | Consistent |
+| 8 | Real cross-analysis and sync tests | Desktop coordinator, central facts, snapshot | Consistent; must preserve sync recovery mechanisms |
+| 9 | Real delete queue/filesystem/store behavior | Delete TSV, current file fact, protocol/UI | Consistent |
+| 10 | Contract, harness and one real-media acceptance | Telemetry/report/evidence | Consistent; no repeated A/B |
+| 11 | Final review, actual-state AGENTS update and package verifier | Docs/evidence/package | Consistent; AGENTS must not be updated early |
+
+## Shared-file and interface scan
+
+| Tasks | Producer → consumer | Finding |
+|---|---|---|
+| 1 → 2 | NodeStore runtime boundary → Node actor startup | Removing recovery APIs in Task 1 would break NodeEngine before Task 2 |
+| 2 → 3 | Actor/server task identity → simplified protocol and config | Task 3 must build on direct business Task ID |
+| 2 → 7 | `RuntimeTaskRegistry` → completed scan catalog | Task 2 does not prebuild a catalog; the base TSV finalizer creates the single process-local owner together with its first valid snapshot |
+| 3 → 9 | Protocol pruning → final delete queue protocol | Task 3 removes retry/history messages; Task 9 keeps one-shot create/query behavior |
+| 4 → 5 | Cache missing masks and disk lanes → TSV producer/dispatcher | Exact mask and lane types must remain single-source |
+| 5 → 6 | Base persistence ACK and sealed task files → scan finalizer | Finalize only after all C/F and ACK drain |
+| 5 → 7 | Shared stage2 task file → local analysis phase2 | Task 7 cannot recreate SQLite task persistence |
+| 6 → 7 | Success manifest metadata → local analysis input freeze | Analysis validates revision, manifest hash and current active facts |
+| 7 → 8 | Local result ownership → Desktop cross-result ownership | No Node local result crosses into Desktop coordinator |
+| 8 → 9 | Current-file active sync → successful deletion outbox | No tombstone history; inactive file snapshot remains authoritative |
+| 9 → 10 | Delete/task/result telemetry → acceptance report | Acceptance observes final shape only |
+| 10 → 11 | Verification evidence → AGENTS and package | Design book records only verified implementation |
+
+## Rulings
+
+- Task 1: Ruling: retain call-compatible NodeStore recovery APIs temporarily but stop startup recovery and add boundary tests; Task 2 removes all callers and then deletes the APIs — every intermediate commit remains compilable — cost if wrong: Task 1 alone does not yet satisfy the final no-recovery API surface.
+- Task 1 plan-gap review: the first brief omitted `library_revision`; Task 1 is not complete until schema 3 initialization/strict parsing, `NodeStore::library_revision()` and the transaction-only bump helper are implemented and independently verified.
+- Preflight: Ruling: the approved plan/spec in the dirty main checkout are the binding inputs for task briefs; copy their final versions into this feature branch during Task 11 before updating AGENTS — this protects unrelated main changes — cost if wrong: losing the main checkout would require reconstructing the approved documents from the SDD artifacts.
+
+## Baseline
+
+- Build environment root cause: inherited `CC/CXX` pointed to MinGW while Rust target was MSVC, producing `___chkstk_ms/__isnan` link failures in bundled SQLite. Cleared those variables for Cargo commands and rebuilt only this plan's target cache.
+- `cargo test -p dedup-node-store --locked -- --test-threads=1`: 43 passed, 0 failed (baseline `d097aed9`).
+
+## Read-only dependency maps
+
+- Task 2: `.superpowers/sdd/2026-08-28-transient-task-files-and-latest-analysis/task-2-map.md` — direct TaskId registry, empty-list replacement, no recovery task, simple WorkerPool rebuild.
+- Task 3: `.superpowers/sdd/2026-08-28-transient-task-files-and-latest-analysis/task-3-map.md` — remove retry/fault-management/restart-confirmation chains while retaining schema availability and necessary config.
+
+## Review ledger
+
+- Task 1 initial review: Critical — `deletion_tombstones` was incorrectly retained across startup.
+- Task 1 fix round 1: commit `61f05792`; scoped re-review Approved. Startup now clears tombstones in the same transaction and the real SQLite boundary test classifies them as transient.
+- Task 1 plan-gap round 2: commit `ff8d2da0`; implemented strict `library_revision` initialization/read/bump boundary. Review found only missing empty-string coverage.
+- Task 1 fix round 3: commit `b434de67`; empty-string SQLite metadata case covered; scoped re-review PASS.
+- Task 1 final controller verification: `cargo test -p dedup-node-store --locked -- --test-threads=1` passed (4 unit + 40 integration, 0 failed); `cargo fmt --all -- --check`, range `git diff --check`, and clean worktree passed. Accepted range: `d097aed9..b434de67`.
+- Plan consistency review: current SDD sequencing is usable only after restoring omitted formal-plan boundaries. Adopt the 11-step sequence: SQLite boundary+revision; runtime single fact; protocol/config/UI slimming; cache completeness; pre-enumeration lane freeze; TSV substrate; base TSV+finalize+snapshot; stage2 TSV+catalog; latest analysis TSV+in-memory analysis; reader/wire/Slint window; delete zero-history+acceptance/docs.
+- Task 2 accepted range: `b434de67..35094db6`. Runtime registry now uses business IDs only; Node startup publishes no recovered task; Desktop replaces a node's full task list; planned requeue/recovery APIs are removed; Worker restart cancels the active job, joins every slot driver with a bounded deadline, releases the old Job, then rebuilds from preserved production config.
+- Task 2 review rounds closed: stale Desktop rows, detached driver ownership, unbounded cancel, and late retired-slot events were each reproduced by behavior tests and fixed. Final independent review Approved with no Critical/Important/Minor findings.
+- Task 2 final controller verification on `35094db6`: NodeEngine lib 64/64, serial `base_compute_pipeline` 59/59, real worker fixture 3/3, Desktop controller 7/7, Desktop runtime e2e 1/1, NodeStore 44/44, UI bindings 16/16, `cargo fmt --all -- --check`, `git diff --check`, and clean worktree all passed. The report retains the non-gating default-parallel timing failures instead of claiming that run passed.
+- Task 3 protocol ruling: keep `PROTOCOL_VERSION=5`. Replace only the old restart-coupled config request/response names with ordinary save semantics in the existing config payload slots; remove retry/fault-management payloads; do not allocate result-window tag 46 until the later window task.
+- Task 3 accepted range: `35094db6..196575c3`. V5 keeps tags 39/40 for ordinary `SaveNodeConfig/NodeConfigSaved`; retry/file-fault management and restart/reconnect confirmation chains are removed while runtime failures, NodeStore file faults, central schema validation/sync/cross-machine analysis, resolved Node paths and tray compute-engine restart remain. Independent review found one machine-identity race; `196575c3` added the real A-to-B same-index reconnect gate and scoped re-review Approved.
+- Task 3 final controller verification: protocol 21 tests, config repository 8/8, Node actor 7/7, server 3/3, Desktop config controller 4/4 and e2e 2/2, Node lifecycle 2/2, UI bindings 15/15, offscreen layout 16/16, window contract 21/21, central store 3 passed with one environment-gated PostgreSQL test ignored, formatting and diff checks all passed.
+- Task 4 brief: `.superpowers/sdd/2026-08-28-transient-task-files-and-latest-analysis/task-4-brief.md`. It binds one structural completeness classifier, fixed-count 1,000-row batch SELECTs, legal zero-valued hits, per-slot video stage2 masks, decodable MD5-derived contact sheets and no failure placeholders.
+- Task 4 acceptance: `CacheCompleteness` now classifies structural base/stage2 gaps; path/key batches preserve order, duplicates and size while using three traced SELECTs per 1,000-item batch; video masks, local MD5-derived contact-sheet validation, remote thin adaptation, no-placeholder/field-preservation writes and phase2 missing-slot consumption are covered by behavior tests. Final Task 4 regression: NodeStore 50 tests, content cache 17/17, base pipeline 59/59, local analysis 8/8, worker pipeline 23/23, formatting and diff checks passed.

@@ -345,6 +345,9 @@ fn convert_entry(entry: CentralBaseCacheEntry) -> BaseCacheRecord {
             CentralBaseStage1::Image(feature) => CompleteStage1::Image(feature),
             CentralBaseStage1::Video(frames) => CompleteStage1::Video(frames),
         }),
+        image_stage2: None,
+        video_stage2: Box::new([None; 6]),
+        contact_sheet_relative_path: None,
     }
 }
 

@@ -14,21 +14,31 @@ use dedup_node_store::{
 struct CountingStage2 {
     calls: usize,
     fail_next: bool,
+    requested_slots: Vec<Vec<u8>>,
 }
 
 impl Stage2Processor for CountingStage2 {
-    async fn process(&mut self, _request: Stage2Request) -> Result<Stage2Output, String> {
+    async fn process(&mut self, request: Stage2Request) -> Result<Stage2Output, String> {
         self.calls += 1;
+        self.requested_slots.push(request.frame_slots.clone());
         if self.fail_next {
             self.fail_next = false;
             return Err("fixture worker failure".into());
         }
+        let slots = if request.media_kind == MediaKind::Video {
+            request.frame_slots
+        } else {
+            vec![0]
+        };
         Ok(Stage2Output {
-            frames: vec![Stage2Frame {
-                slot: 0,
-                feature: Some(stage2()),
-                error: None,
-            }],
+            frames: slots
+                .into_iter()
+                .map(|slot| Stage2Frame {
+                    slot,
+                    feature: Some(stage2()),
+                    error: None,
+                })
+                .collect(),
             regenerated_contact_sheet_jpeg: None,
         })
     }
@@ -218,6 +228,32 @@ async fn complete_six_slot_videos_use_average_and_cached_stage_two() {
 }
 
 #[tokio::test]
+async fn video_stage2_dispatches_only_missing_successful_slots() {
+    let mut store = store();
+    let left =
+        seed_video_with_stage2_slots(&mut store, r"D:\partial-left.mp4", [11; 16], &[0, 1, 4, 5]);
+    let right =
+        seed_video_with_stage2_slots(&mut store, r"D:\partial-right.mp4", [12; 16], &[0, 1, 4, 5]);
+    let task = completed_task_with_file_failure(&mut store, &[left, right], 35);
+    let mut processor = CountingStage2::default();
+
+    let report = LocalAnalysisEngine::start(
+        &mut store,
+        &[task],
+        Thresholds::default(),
+        &mut processor,
+        36,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(processor.calls, 2);
+    assert_eq!(processor.requested_slots, vec![vec![2, 3], vec![2, 3]]);
+    assert_eq!(report.status, AnalysisStatus::Completed);
+    assert_eq!(report.video_groups, 1);
+}
+
+#[tokio::test]
 async fn incomplete_media_is_counted_and_never_enters_candidates() {
     let mut store = store();
     let incomplete = seed_content(
@@ -253,34 +289,32 @@ async fn completed_analysis_groups_members_and_review_survive_reopen() {
     let report;
     let group_id;
     let reviewed;
-    {
-        let mut store = NodeStore::open(&database, machine.clone()).unwrap();
-        let left = seed_image(&mut store, r"D:\persist-left.jpg", [9; 16], true);
-        let right = seed_image(&mut store, r"D:\persist-right.jpg", [10; 16], true);
-        let task = completed_task_with_file_failure(&mut store, &[left, right], 50);
-        report = LocalAnalysisEngine::start(
-            &mut store,
-            &[task],
-            Thresholds::default(),
-            &mut CountingStage2::default(),
-            51,
-        )
-        .await
+    let mut store = NodeStore::open(&database, machine).unwrap();
+    let left = seed_image(&mut store, r"D:\persist-left.jpg", [9; 16], true);
+    let right = seed_image(&mut store, r"D:\persist-right.jpg", [10; 16], true);
+    let task = completed_task_with_file_failure(&mut store, &[left, right], 50);
+    report = LocalAnalysisEngine::start(
+        &mut store,
+        &[task],
+        Thresholds::default(),
+        &mut CountingStage2::default(),
+        51,
+    )
+    .await
+    .unwrap();
+    let group = store.page_groups(report.run_id, None, 1).unwrap().items[0].clone();
+    group_id = group.group_id;
+    reviewed = store
+        .page_group_members(report.run_id, &group_id, None, 1)
+        .unwrap()
+        .items[0]
+        .location
+        .clone();
+    store
+        .save_review_mark(report.run_id, &group_id, &reviewed, ReviewDecision::Keep)
         .unwrap();
-        let group = store.page_groups(report.run_id, None, 1).unwrap().items[0].clone();
-        group_id = group.group_id;
-        reviewed = store
-            .page_group_members(report.run_id, &group_id, None, 1)
-            .unwrap()
-            .items[0]
-            .location
-            .clone();
-        store
-            .save_review_mark(report.run_id, &group_id, &reviewed, ReviewDecision::Keep)
-            .unwrap();
-    }
 
-    let store = NodeStore::open(&database, machine).unwrap();
+    let store = store.reopen().unwrap();
     assert_eq!(
         store.analysis_run_snapshot(report.run_id).unwrap().status,
         AnalysisStatus::Completed
@@ -337,6 +371,15 @@ fn seed_image(store: &mut NodeStore, path: &str, md5: [u8; 16], with_stage2: boo
 }
 
 fn seed_video(store: &mut NodeStore, path: &str, md5: [u8; 16]) -> Seeded {
+    seed_video_with_stage2_slots(store, path, md5, &[0, 1, 2, 3, 4, 5])
+}
+
+fn seed_video_with_stage2_slots(
+    store: &mut NodeStore,
+    path: &str,
+    md5: [u8; 16],
+    stage2_slots: &[u8],
+) -> Seeded {
     let seeded = seed_content(store, path, md5, 200, MediaKind::Video);
     store
         .commit_feature_result(
@@ -366,16 +409,18 @@ fn seed_video(store: &mut NodeStore, path: &str, md5: [u8; 16]) -> Seeded {
                 }),
             )
             .unwrap();
-        store
-            .commit_feature_result(
-                seeded.2,
-                None,
-                FeatureWrite::VideoFrameStage2(VideoFrameStage2Fields {
-                    slot,
-                    features: stage2(),
-                }),
-            )
-            .unwrap();
+        if stage2_slots.contains(&slot) {
+            store
+                .commit_feature_result(
+                    seeded.2,
+                    None,
+                    FeatureWrite::VideoFrameStage2(VideoFrameStage2Fields {
+                        slot,
+                        features: stage2(),
+                    }),
+                )
+                .unwrap();
+        }
     }
     seeded
 }

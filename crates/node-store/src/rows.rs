@@ -80,7 +80,7 @@ pub struct ContentRecord {
 }
 
 /// SQLite 或中心缓存提供的一份基础媒体计算快照。
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct BaseCacheRecord {
     /// SQLite 本地内容 ID；中心导入前为 `None`。
     pub content_id: Option<ContentId>,
@@ -98,6 +98,12 @@ pub struct BaseCacheRecord {
     pub duration_ms: Option<u64>,
     /// 完整一筛；部分特征不会伪装成完整命中。
     pub stage1: Option<CompleteStage1>,
+    /// 图片二筛的原始结构；`None` 表示缺少任一必需字段。
+    pub image_stage2: Option<ImageStage2>,
+    /// 视频六个固定槽位的二筛结构；缺失槽位保留为 `None`。
+    pub video_stage2: Box<[Option<ImageStage2>; 6]>,
+    /// SQLite 中记录的联系表相对路径；远端导入值不伪造本机引用。
+    pub contact_sheet_relative_path: Option<String>,
 }
 
 /// 预览和删除边界读取的当前活动文件身份。

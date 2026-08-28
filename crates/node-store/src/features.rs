@@ -5,11 +5,11 @@ use dedup_media::{ImageStage1, ImageStage2, PdqHash, phash_parts_to_blob};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
 use crate::{
-    CompleteStage1, CompleteStage2, ContentId, FeatureWrite, ImageStage1Fields, NodeStore,
-    StoreError, TaskItemApplyResult, TaskItemCompletion, TaskItemIdentity, VideoFrameStage1Fields,
-    VideoFrameStage2Fields, VideoMetadataFields,
+    BaseCacheRecord, CompleteStage1, CompleteStage2, ContentId, FeatureWrite, ImageStage1Fields,
+    NodeStore, StoreError, TaskItemApplyResult, TaskItemCompletion, TaskItemIdentity,
+    VideoFrameStage1Fields, VideoFrameStage2Fields, VideoMetadataFields,
     content::{content_key_in_transaction, encode_content},
-    open::{fixed_bytes, sqlite_integer},
+    open::sqlite_integer,
     outbox::append_sync_change,
     rows::RowEncoder,
     tasks::{TaskItemIdentityState, classify_task_item_identity, complete_item_in_transaction},
@@ -48,8 +48,10 @@ impl NodeStore {
                     "INSERT INTO image_stage1(content_id,width,height,pdq,quality)
                      VALUES(?1,?2,?3,?4,?5)
                      ON CONFLICT(content_id) DO UPDATE SET
-                       width=excluded.width,height=excluded.height,
-                       pdq=excluded.pdq,quality=excluded.quality",
+                       width=CASE WHEN excluded.width > 0 THEN excluded.width ELSE image_stage1.width END,
+                       height=CASE WHEN excluded.height > 0 THEN excluded.height ELSE image_stage1.height END,
+                       pdq=COALESCE(excluded.pdq,image_stage1.pdq),
+                       quality=COALESCE(excluded.quality,image_stage1.quality)",
                     params![
                         content_id.as_i64(),
                         fields.width,
@@ -77,7 +79,9 @@ impl NodeStore {
                     "INSERT INTO video_metadata(content_id,duration_ms,width,height)
                      VALUES(?1,?2,?3,?4)
                      ON CONFLICT(content_id) DO UPDATE SET
-                       duration_ms=excluded.duration_ms,width=excluded.width,height=excluded.height",
+                       duration_ms=CASE WHEN excluded.duration_ms > 0 THEN excluded.duration_ms ELSE video_metadata.duration_ms END,
+                       width=CASE WHEN excluded.width > 0 THEN excluded.width ELSE video_metadata.width END,
+                       height=CASE WHEN excluded.height > 0 THEN excluded.height ELSE video_metadata.height END",
                     params![
                         content_id.as_i64(),
                         fields.duration_ms.map(sqlite_integer).transpose()?,
@@ -94,9 +98,12 @@ impl NodeStore {
                        content_id,slot,time_ms,decoded,width,height,pdq,quality)
                      VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
                      ON CONFLICT(content_id,slot) DO UPDATE SET
-                       time_ms=excluded.time_ms,decoded=excluded.decoded,
-                       width=excluded.width,height=excluded.height,
-                       pdq=excluded.pdq,quality=excluded.quality",
+                       time_ms=COALESCE(excluded.time_ms,video_frame_stage1.time_ms),
+                       decoded=CASE WHEN excluded.decoded=1 THEN 1 ELSE video_frame_stage1.decoded END,
+                       width=CASE WHEN excluded.width > 0 THEN excluded.width ELSE video_frame_stage1.width END,
+                       height=CASE WHEN excluded.height > 0 THEN excluded.height ELSE video_frame_stage1.height END,
+                       pdq=COALESCE(excluded.pdq,video_frame_stage1.pdq),
+                       quality=COALESCE(excluded.quality,video_frame_stage1.quality)",
                     params![
                         content_id.as_i64(),
                         frame.slot,
@@ -240,13 +247,7 @@ impl NodeStore {
         &self,
         content_id: ContentId,
     ) -> Result<Option<CompleteStage2>, StoreError> {
-        match self.content_media_kind(content_id)? {
-            MediaKind::Image => self
-                .load_image_stage2(content_id)
-                .map(|value| value.map(Box::new).map(CompleteStage2::Image)),
-            MediaKind::Video => self.load_video_stage2(content_id),
-            MediaKind::Other => Ok(None),
-        }
+        self.load_complete_stage2_from_cache(content_id)
     }
 
     /// 把本机已经完整保存的联合二筛特征重新写入 outbox，供中心缓存缺口按需补同步。
@@ -254,51 +255,67 @@ impl NodeStore {
     /// 返回 `false` 表示本机缓存也不完整，调用方随后才需要启动 Worker；已有结果不会
     /// 重新解码媒体。视频会重新发布每个一筛成功槽位，保持中心完整性判定不变。
     pub fn republish_complete_stage2(&mut self, content_id: ContentId) -> Result<bool, StoreError> {
-        let Some(features) = self.load_complete_stage2(content_id)? else {
+        let cached = self.load_base_cache_record(content_id)?;
+        self.republish_complete_stage2_from_cache(&cached)
+    }
+
+    /// 直接使用批量查询得到的二筛原始结构重发 outbox，不再逐内容读取 SQLite。
+    pub fn republish_complete_stage2_from_cache(
+        &mut self,
+        cached: &BaseCacheRecord,
+    ) -> Result<bool, StoreError> {
+        let Some(content_id) = cached.content_id else {
             return Ok(false);
         };
-        match features {
-            CompleteStage2::Image(feature) => {
-                self.commit_feature_result(content_id, None, FeatureWrite::ImageStage2(*feature))?;
+        match cached.media_kind {
+            MediaKind::Image => {
+                let Some(feature) = cached.image_stage2 else {
+                    return Ok(false);
+                };
+                self.commit_feature_result(content_id, None, FeatureWrite::ImageStage2(feature))?;
             }
-            CompleteStage2::Video(frames) => {
-                for (slot, feature) in frames.iter().enumerate() {
-                    if let Some(feature) = feature {
+            MediaKind::Video => {
+                let Some(CompleteStage1::Video(stage1)) = cached.stage1.as_ref() else {
+                    return Ok(false);
+                };
+                if stage1
+                    .iter()
+                    .enumerate()
+                    .any(|(slot, feature)| feature.is_some() && cached.video_stage2[slot].is_none())
+                {
+                    return Ok(false);
+                }
+                for (slot, feature) in cached.video_stage2.iter().enumerate() {
+                    if stage1[slot].is_some() {
                         self.commit_feature_result(
                             content_id,
                             None,
                             FeatureWrite::VideoFrameStage2(VideoFrameStage2Fields {
                                 slot: slot as u8,
-                                features: *feature,
+                                features: feature.expect("上方已确认成功视频槽位二筛完整"),
                             }),
                         )?;
                     }
                 }
             }
+            MediaKind::Other => return Ok(false),
         }
         Ok(true)
     }
 
     fn load_image_stage1(&self, content_id: ContentId) -> Result<Option<ImageStage1>, StoreError> {
-        let row: Option<(u32, u32, Vec<u8>, u8)> = self
+        let row: Option<(Option<i64>, Option<i64>, Option<Vec<u8>>, Option<i64>)> = self
             .connection
             .query_row(
                 "SELECT width,height,pdq,quality FROM image_stage1
-                 WHERE content_id=?1 AND width IS NOT NULL AND height IS NOT NULL
-                   AND pdq IS NOT NULL AND quality IS NOT NULL",
+                 WHERE content_id=?1",
                 [content_id.as_i64()],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?;
-        row.map(|(width, height, pdq, quality)| {
-            Ok(ImageStage1 {
-                width,
-                height,
-                pdq: PdqHash::from_bytes(fixed_bytes(pdq, "image_stage1.pdq")?),
-                quality,
-            })
-        })
-        .transpose()
+        Ok(row.and_then(|(width, height, pdq, quality)| {
+            decode_stage1_fields(width, height, pdq, quality)
+        }))
     }
 
     fn load_video_stage1(
@@ -306,12 +323,12 @@ impl NodeStore {
         content_id: ContentId,
     ) -> Result<Option<CompleteStage1>, StoreError> {
         type FrameRow = (
-            u8,
-            bool,
-            Option<u32>,
-            Option<u32>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
             Option<Vec<u8>>,
-            Option<u8>,
+            Option<i64>,
         );
         let mut statement = self.connection.prepare_cached(
             "SELECT slot,decoded,width,height,pdq,quality FROM video_frame_stage1
@@ -333,26 +350,27 @@ impl NodeStore {
             || rows
                 .iter()
                 .enumerate()
-                .any(|(slot, row)| row.0 as usize != slot)
+                .any(|(slot, row)| row.0 != Some(slot as i64))
         {
             return Ok(None);
         }
         let mut frames = [None; 6];
         for (slot, decoded, width, height, pdq, quality) in rows {
-            if !decoded {
-                continue;
-            }
-            let (Some(width), Some(height), Some(pdq), Some(quality)) =
-                (width, height, pdq, quality)
-            else {
+            let (Some(slot), Some(decoded)) = (slot, decoded) else {
                 return Ok(None);
             };
-            frames[slot as usize] = Some(ImageStage1 {
-                width,
-                height,
-                pdq: PdqHash::from_bytes(fixed_bytes(pdq, "video_frame_stage1.pdq")?),
-                quality,
-            });
+            let Ok(slot) = usize::try_from(slot) else {
+                return Ok(None);
+            };
+            match decoded {
+                0 => continue,
+                1 => {}
+                _ => return Ok(None),
+            }
+            let Some(feature) = decode_stage1_fields(width, height, pdq, quality) else {
+                return Ok(None);
+            };
+            frames[slot] = Some(feature);
         }
         if frames.iter().flatten().count() < 4 {
             return Ok(None);
@@ -360,48 +378,83 @@ impl NodeStore {
         Ok(Some(CompleteStage1::Video(Box::new(frames))))
     }
 
-    fn load_image_stage2(&self, content_id: ContentId) -> Result<Option<ImageStage2>, StoreError> {
-        let row: Option<(Vec<u8>, Vec<u8>)> = self
+    /// 读取图片二筛的逐字段原始缓存；任一长度或浮点非法时只返回缺失。
+    pub(crate) fn load_image_stage2_for_cache(
+        &self,
+        content_id: ContentId,
+    ) -> Result<Option<ImageStage2>, StoreError> {
+        let row: Option<(Option<Vec<u8>>, Option<Vec<u8>>)> = self
             .connection
             .query_row(
-                "SELECT phash_parts,sobel FROM image_stage2
-                 WHERE content_id=?1 AND phash_parts IS NOT NULL AND sobel IS NOT NULL",
+                "SELECT phash_parts,sobel FROM image_stage2 WHERE content_id=?1",
                 [content_id.as_i64()],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        row.map(|(phash, sobel)| decode_stage2(phash, sobel))
-            .transpose()
+        Ok(row
+            .and_then(|(phash, sobel)| decode_stage2_if_valid(phash.as_deref(), sobel.as_deref())))
     }
 
-    fn load_video_stage2(
+    /// 读取视频六个二筛槽位，缺失或非法槽位保留为 `None`。
+    pub(crate) fn load_video_stage2_for_cache(
+        &self,
+        content_id: ContentId,
+    ) -> Result<[Option<ImageStage2>; 6], StoreError> {
+        let mut output = [None; 6];
+        let mut statement = self.connection.prepare_cached(
+            "SELECT slot,phash_parts,sobel FROM video_frame_stage2
+             WHERE content_id=?1 ORDER BY slot",
+        )?;
+        let rows = statement.query_map([content_id.as_i64()], |row| {
+            Ok((
+                row.get::<_, Option<i64>>(0)?,
+                row.get::<_, Option<Vec<u8>>>(1)?,
+                row.get::<_, Option<Vec<u8>>>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (Some(slot), phash, sobel) = row? else {
+                continue;
+            };
+            let Ok(slot) = usize::try_from(slot) else {
+                continue;
+            };
+            if slot >= output.len() {
+                continue;
+            }
+            output[slot] = decode_stage2_if_valid(phash.as_deref(), sobel.as_deref());
+        }
+        Ok(output)
+    }
+
+    /// 只返回 pHash 与有限 Sobel 同时存在的图片或视频槽位联合二筛。
+    pub(crate) fn load_complete_stage2_from_cache(
         &self,
         content_id: ContentId,
     ) -> Result<Option<CompleteStage2>, StoreError> {
-        let Some(CompleteStage1::Video(stage1)) = self.load_complete_stage1(content_id)? else {
-            return Ok(None);
-        };
-        let mut frames = [None; 6];
-        let mut statement = self.connection.prepare_cached(
-            "SELECT phash_parts,sobel FROM video_frame_stage2
-             WHERE content_id=?1 AND slot=?2
-               AND phash_parts IS NOT NULL AND sobel IS NOT NULL",
-        )?;
-        for slot in 0..6 {
-            if stage1[slot].is_none() {
-                continue;
+        match self.content_media_kind(content_id)? {
+            MediaKind::Image => self
+                .load_image_stage2_for_cache(content_id)
+                .map(|value| value.map(|value| CompleteStage2::Image(Box::new(value)))),
+            MediaKind::Video => {
+                let Some(CompleteStage1::Video(stage1)) = self.load_complete_stage1(content_id)?
+                else {
+                    return Ok(None);
+                };
+                let frames = self.load_video_stage2_for_cache(content_id)?;
+                if stage1
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(slot, feature)| feature.as_ref().map(|_| slot))
+                    .all(|slot| frames[slot].is_some())
+                {
+                    Ok(Some(CompleteStage2::Video(Box::new(frames))))
+                } else {
+                    Ok(None)
+                }
             }
-            let row: Option<(Vec<u8>, Vec<u8>)> = statement
-                .query_row(params![content_id.as_i64(), slot as i64], |row| {
-                    Ok((row.get(0)?, row.get(1)?))
-                })
-                .optional()?;
-            let Some((phash, sobel)) = row else {
-                return Ok(None);
-            };
-            frames[slot] = Some(decode_stage2(phash, sobel)?);
+            MediaKind::Other => Ok(None),
         }
-        Ok(Some(CompleteStage2::Video(Box::new(frames))))
     }
 }
 
@@ -438,8 +491,10 @@ fn commit_scan_stage1_in_transaction(
                     "INSERT INTO image_stage1(content_id,width,height,pdq,quality)
                      VALUES(?1,?2,?3,?4,?5)
                      ON CONFLICT(content_id) DO UPDATE SET
-                       width=excluded.width,height=excluded.height,
-                       pdq=excluded.pdq,quality=excluded.quality",
+                       width=CASE WHEN excluded.width > 0 THEN excluded.width ELSE image_stage1.width END,
+                       height=CASE WHEN excluded.height > 0 THEN excluded.height ELSE image_stage1.height END,
+                       pdq=COALESCE(excluded.pdq,image_stage1.pdq),
+                       quality=COALESCE(excluded.quality,image_stage1.quality)",
                     params![
                         content_id.as_i64(),
                         fields.width,
@@ -455,7 +510,9 @@ fn commit_scan_stage1_in_transaction(
                     "INSERT INTO video_metadata(content_id,duration_ms,width,height)
                      VALUES(?1,?2,?3,?4)
                      ON CONFLICT(content_id) DO UPDATE SET
-                       duration_ms=excluded.duration_ms,width=excluded.width,height=excluded.height",
+                       duration_ms=CASE WHEN excluded.duration_ms > 0 THEN excluded.duration_ms ELSE video_metadata.duration_ms END,
+                       width=CASE WHEN excluded.width > 0 THEN excluded.width ELSE video_metadata.width END,
+                       height=CASE WHEN excluded.height > 0 THEN excluded.height ELSE video_metadata.height END",
                     params![
                         content_id.as_i64(),
                         fields.duration_ms.map(sqlite_integer).transpose()?,
@@ -472,9 +529,12 @@ fn commit_scan_stage1_in_transaction(
                        content_id,slot,time_ms,decoded,width,height,pdq,quality)
                      VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
                      ON CONFLICT(content_id,slot) DO UPDATE SET
-                       time_ms=excluded.time_ms,decoded=excluded.decoded,
-                       width=excluded.width,height=excluded.height,
-                       pdq=excluded.pdq,quality=excluded.quality",
+                       time_ms=COALESCE(excluded.time_ms,video_frame_stage1.time_ms),
+                       decoded=CASE WHEN excluded.decoded=1 THEN 1 ELSE video_frame_stage1.decoded END,
+                       width=CASE WHEN excluded.width > 0 THEN excluded.width ELSE video_frame_stage1.width END,
+                       height=CASE WHEN excluded.height > 0 THEN excluded.height ELSE video_frame_stage1.height END,
+                       pdq=COALESCE(excluded.pdq,video_frame_stage1.pdq),
+                       quality=COALESCE(excluded.quality,video_frame_stage1.quality)",
                     params![
                         content_id.as_i64(),
                         frame.slot,
@@ -526,6 +586,21 @@ fn ensure_finite(sobel: &[f32; 128]) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// 从 SQLite 原始列解码一筛字段；非法尺寸、长度或 Quality 只返回结构缺失。
+pub(crate) fn decode_stage1_fields(
+    width: Option<i64>,
+    height: Option<i64>,
+    pdq: Option<Vec<u8>>,
+    quality: Option<i64>,
+) -> Option<ImageStage1> {
+    Some(ImageStage1 {
+        width: u32::try_from(width?).ok()?,
+        height: u32::try_from(height?).ok()?,
+        pdq: PdqHash::from_bytes(pdq?.try_into().ok()?),
+        quality: u8::try_from(quality?).ok()?,
+    })
+}
+
 fn encode_sobel(sobel: &[f32; 128]) -> [u8; 512] {
     let mut bytes = [0_u8; 512];
     for (index, value) in sobel.iter().enumerate() {
@@ -534,22 +609,28 @@ fn encode_sobel(sobel: &[f32; 128]) -> [u8; 512] {
     bytes
 }
 
-fn decode_stage2(phash: Vec<u8>, sobel: Vec<u8>) -> Result<ImageStage2, StoreError> {
-    let phash = fixed_bytes::<72>(phash, "stage2.phash_parts")?;
+/// 从 SQLite 原始列解码二筛字段；长度错误或非有限 Sobel 只返回结构缺失。
+pub(crate) fn decode_stage2_if_valid(
+    phash: Option<&[u8]>,
+    sobel: Option<&[u8]>,
+) -> Option<ImageStage2> {
+    let phash: [u8; 72] = phash?.try_into().ok()?;
     let mut phash_parts = [0_u64; 9];
     for (index, part) in phash.chunks_exact(8).enumerate() {
         phash_parts[index] = u64::from_le_bytes(part.try_into().expect("固定八字节分块"));
     }
-    let sobel = fixed_bytes::<512>(sobel, "stage2.sobel")?;
+    let sobel: [u8; 512] = sobel?.try_into().ok()?;
     let mut histogram = [0.0_f32; 128];
     for (index, value) in sobel.chunks_exact(4).enumerate() {
         histogram[index] = f32::from_le_bytes(value.try_into().expect("固定四字节浮点"));
     }
-    ensure_finite(&histogram)?;
-    Ok(ImageStage2 {
-        phash_parts,
-        sobel: histogram,
-    })
+    histogram
+        .iter()
+        .all(|value| value.is_finite())
+        .then_some(ImageStage2 {
+            phash_parts,
+            sobel: histogram,
+        })
 }
 
 fn encode_key(encoder: RowEncoder, key: dedup_core::ContentKey) -> RowEncoder {

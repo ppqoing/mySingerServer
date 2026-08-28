@@ -16,6 +16,7 @@ use dedup_node_store::{
     VideoMetadataFields,
 };
 use dedup_protocol::proto::{self, worker_envelope};
+use dedup_protocol::{BASE_MISSING_CONTACT_SHEET, BASE_MISSING_PROBE, BASE_MISSING_STAGE1};
 use dedup_windows::ReadCancellationToken;
 use thiserror::Error;
 use tokio::task::JoinSet;
@@ -1289,7 +1290,9 @@ where
                 stage: "probe_stage1".into(),
                 content_id: content.id,
                 physical_disk_id,
-                generate_contact_sheet: !contact_sheet.exists(),
+                generate_contact_sheet: !ContactSheetCacheEntry::is_valid_file(
+                    contact_sheet.final_path(),
+                ),
             },
             lease: Some(lease),
             contact_sheet,
@@ -1359,7 +1362,9 @@ where
             stage: "probe_stage1".into(),
             content_id,
             physical_disk_id: String::new(),
-            generate_contact_sheet: !contact_sheet.exists(),
+            generate_contact_sheet: !ContactSheetCacheEntry::is_valid_file(
+                contact_sheet.final_path(),
+            ),
         };
         match processor.process(request).await {
             Ok(output) => {
@@ -1475,7 +1480,7 @@ where
         } else {
             let target = work.contact_sheet.clone();
             groups.push(ContactSheetBatchGroup {
-                ready: target.exists(),
+                ready: ContactSheetCacheEntry::is_valid_file(target.final_path()),
                 target,
                 pending: VecDeque::from([work]),
             });
@@ -1565,6 +1570,7 @@ where
                         store,
                         &request.item_id,
                         &contact_sheet,
+                        BASE_MISSING_PROBE | BASE_MISSING_STAGE1 | BASE_MISSING_CONTACT_SHEET,
                         request.generate_contact_sheet,
                         artifact_registry,
                         disk_full_cleaner,
@@ -1608,7 +1614,8 @@ where
                             1,
                         );
                     }
-                    contact_ready = media_kind != MediaKind::Video || contact_sheet.exists();
+                    contact_ready = media_kind != MediaKind::Video
+                        || ContactSheetCacheEntry::is_valid_file(contact_sheet.final_path());
                 }
                 Err(Stage1ProcessError::WorkerCrash { identity, message }) => {
                     if store.task_snapshot(request.task_id)?.status != TaskStatus::Cancelled {
@@ -1770,7 +1777,8 @@ fn persist_stage1(
         store,
         &format!("legacy-{}", content_id.as_i64()),
         &contact_sheet,
-        !contact_sheet.exists(),
+        BASE_MISSING_PROBE | BASE_MISSING_STAGE1 | BASE_MISSING_CONTACT_SHEET,
+        !ContactSheetCacheEntry::is_valid_file(contact_sheet.final_path()),
         artifact_registry,
         disk_full_cleaner,
         output,
@@ -1914,6 +1922,7 @@ pub(super) fn prepare_stage1_writes(
     store: &mut NodeStore,
     item_id: &str,
     contact_sheet: &ContactSheetCacheEntry,
+    missing_parts: u32,
     generate_contact_sheet: bool,
     artifact_registry: Option<&Arc<RegenerableArtifactRegistry>>,
     disk_full_cleaner: Option<&DiskFullCleaner>,
@@ -1925,67 +1934,76 @@ pub(super) fn prepare_stage1_writes(
     match media_kind {
         MediaKind::Other => {}
         MediaKind::Image => {
-            let fields = output
-                .frames
-                .first()
-                .and_then(|frame| frame.feature)
-                .map(ImageStage1Fields::from)
-                .unwrap_or_default();
-            writes.push(FeatureWrite::ImageStage1(fields));
+            if missing_parts & BASE_MISSING_STAGE1 != 0 {
+                if let Some(fields) = output
+                    .frames
+                    .first()
+                    .and_then(|frame| frame.feature)
+                    .map(ImageStage1Fields::from)
+                {
+                    writes.push(FeatureWrite::ImageStage1(fields));
+                }
+            }
         }
         MediaKind::Video => {
-            writes.push(FeatureWrite::VideoMetadata(VideoMetadataFields {
-                duration_ms: output.duration_ms,
-                width: Some(output.width),
-                height: Some(output.height),
-            }));
-            let positions =
-                sample_positions(Duration::from_millis(output.duration_ms.unwrap_or(0)));
-            for slot in 0..6_u8 {
-                let frame = output.frames.iter().find(|frame| frame.slot == slot);
-                let feature = frame.and_then(|frame| frame.feature);
-                writes.push(FeatureWrite::VideoFrameStage1(VideoFrameStage1Fields {
-                    slot,
-                    time_ms: positions[slot as usize].as_millis() as u64,
-                    decoded: feature.is_some(),
-                    width: feature.map(|value| value.width),
-                    height: feature.map(|value| value.height),
-                    pdq: feature.map(|value| value.pdq),
-                    quality: feature.map(|value| value.quality),
+            if missing_parts & BASE_MISSING_PROBE != 0 {
+                writes.push(FeatureWrite::VideoMetadata(VideoMetadataFields {
+                    duration_ms: output.duration_ms,
+                    width: Some(output.width),
+                    height: Some(output.height),
                 }));
             }
-            if let Some(jpeg) = output.contact_sheet_jpeg {
-                let (temp_path, registry, artifact_lease) =
-                    match (artifact_registry, disk_full_cleaner) {
-                        (Some(registry), Some(cleaner)) => {
-                            let (path, lease) = contact_sheet
-                                .write_partial_with_disk_full_cleanup(
-                                    item_id, &jpeg, registry, cleaner, store,
-                                )?;
-                            (path, Some(Arc::clone(registry)), Some(lease))
-                        }
-                        _ => (contact_sheet.write_partial(item_id, &jpeg)?, None, None),
-                    };
-                contact = Some(PendingContactSheet {
-                    temp_path: Some(temp_path),
-                    final_path: contact_sheet.final_path().to_path_buf(),
-                    relative_path: contact_sheet.relative_path().to_owned(),
-                    registry,
-                    artifact_lease,
-                });
-            } else if !generate_contact_sheet {
-                let (registry, artifact_lease) = register_and_lease(
-                    artifact_registry,
-                    contact_sheet.final_path(),
-                    ArtifactKind::ContactSheet,
-                )?;
-                contact = Some(PendingContactSheet {
-                    temp_path: None,
-                    final_path: contact_sheet.final_path().to_path_buf(),
-                    relative_path: contact_sheet.relative_path().to_owned(),
-                    registry,
-                    artifact_lease,
-                });
+            if missing_parts & BASE_MISSING_STAGE1 != 0 {
+                let positions =
+                    sample_positions(Duration::from_millis(output.duration_ms.unwrap_or(0)));
+                for slot in 0..6_u8 {
+                    let frame = output.frames.iter().find(|frame| frame.slot == slot);
+                    let feature = frame.and_then(|frame| frame.feature);
+                    writes.push(FeatureWrite::VideoFrameStage1(VideoFrameStage1Fields {
+                        slot,
+                        time_ms: positions[slot as usize].as_millis() as u64,
+                        decoded: feature.is_some(),
+                        width: feature.map(|value| value.width),
+                        height: feature.map(|value| value.height),
+                        pdq: feature.map(|value| value.pdq),
+                        quality: feature.map(|value| value.quality),
+                    }));
+                }
+            }
+            if missing_parts & BASE_MISSING_CONTACT_SHEET != 0 {
+                if let Some(jpeg) = output.contact_sheet_jpeg {
+                    let (temp_path, registry, artifact_lease) =
+                        match (artifact_registry, disk_full_cleaner) {
+                            (Some(registry), Some(cleaner)) => {
+                                let (path, lease) = contact_sheet
+                                    .write_partial_with_disk_full_cleanup(
+                                        item_id, &jpeg, registry, cleaner, store,
+                                    )?;
+                                (path, Some(Arc::clone(registry)), Some(lease))
+                            }
+                            _ => (contact_sheet.write_partial(item_id, &jpeg)?, None, None),
+                        };
+                    contact = Some(PendingContactSheet {
+                        temp_path: Some(temp_path),
+                        final_path: contact_sheet.final_path().to_path_buf(),
+                        relative_path: contact_sheet.relative_path().to_owned(),
+                        registry,
+                        artifact_lease,
+                    });
+                } else if !generate_contact_sheet {
+                    let (registry, artifact_lease) = register_and_lease(
+                        artifact_registry,
+                        contact_sheet.final_path(),
+                        ArtifactKind::ContactSheet,
+                    )?;
+                    contact = Some(PendingContactSheet {
+                        temp_path: None,
+                        final_path: contact_sheet.final_path().to_path_buf(),
+                        relative_path: contact_sheet.relative_path().to_owned(),
+                        registry,
+                        artifact_lease,
+                    });
+                }
             }
         }
     }

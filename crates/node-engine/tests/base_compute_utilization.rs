@@ -160,6 +160,9 @@ fn incomplete_media_record(content_key: ContentKey, media_kind: MediaKind) -> Ba
         height: None,
         duration_ms: None,
         stage1: None,
+        image_stage2: None,
+        video_stage2: Box::new([None; 6]),
+        contact_sheet_relative_path: None,
     }
 }
 
@@ -185,6 +188,9 @@ impl MixedRemoteCache {
             height: None,
             duration_ms: None,
             stage1: None,
+            image_stage2: None,
+            video_stage2: Box::new([None; 6]),
+            contact_sheet_relative_path: None,
         }
     }
 }

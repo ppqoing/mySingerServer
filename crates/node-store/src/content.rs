@@ -3,7 +3,7 @@
 use std::{fmt::Write as _, time::Duration};
 
 use dedup_core::{ContentKey, LocationKey, MediaKind};
-use dedup_media::{ImageStage1, PdqHash, sample_positions};
+use dedup_media::sample_positions;
 use rusqlite::types::Value;
 use rusqlite::{OptionalExtension, Transaction, limits::Limit, params, params_from_iter};
 
@@ -11,6 +11,7 @@ use crate::{
     ActiveFile, BaseCacheRecord, CacheLookup, CompleteStage1, ContentId, ContentRecord,
     FeatureWrite, ImageStage1Fields, NodeStore, ScannedPath, StoreError, VideoFrameStage1Fields,
     VideoMetadataFields,
+    features::{decode_stage1_fields, decode_stage2_if_valid},
     open::{fixed_bytes, sqlite_integer},
     outbox::append_sync_change,
     rows::RowEncoder,
@@ -112,7 +113,7 @@ impl NodeStore {
         Ok(batch_limit)
     }
 
-    /// 执行一个路径子批的两条查询，并按请求序号组装基础缓存记录。
+    /// 执行一个路径子批的固定三条查询，并按请求序号组装基础缓存记录。
     fn lookup_path_cache_batch(
         &self,
         scanned_paths: &[ScannedPath],
@@ -122,13 +123,16 @@ impl NodeStore {
             "WITH request_rows(ordinal, normalized_path, file_size) AS (VALUES {values})
              SELECT r.ordinal,c.content_id,c.md5,c.file_size,c.media_kind,c.base_complete,
                     i.width,i.height,i.pdq,i.quality,
-                    vm.width,vm.height,vm.duration_ms
+                    vm.width,vm.height,vm.duration_ms,
+                    i2.phash_parts,i2.sobel,cs.relative_path
              FROM request_rows r
              LEFT JOIN files f ON f.machine_id=?1 AND f.normalized_path=r.normalized_path
                               AND f.file_size=r.file_size AND f.active=1
              LEFT JOIN contents c ON c.content_id=f.content_id
              LEFT JOIN image_stage1 i ON i.content_id=c.content_id
              LEFT JOIN video_metadata vm ON vm.content_id=c.content_id
+             LEFT JOIN image_stage2 i2 ON i2.content_id=c.content_id
+             LEFT JOIN contact_sheets cs ON cs.content_id=c.content_id
              ORDER BY r.ordinal"
         );
         let mut first_params = Vec::with_capacity(1 + scanned_paths.len() * 3);
@@ -171,10 +175,36 @@ impl NodeStore {
             .query_map(params_from_iter(frame_params), read_video_frame_row)?
             .collect::<Result<Vec<_>, _>>()?;
         apply_video_frame_rows(&mut records, frame_rows)?;
+
+        let stage2_values = values_rows(scanned_paths.len(), 2);
+        let stage2_sql = format!(
+            "WITH request_rows(ordinal, normalized_path, file_size) AS (VALUES {stage2_values})
+             SELECT r.ordinal,vf.slot,vf.phash_parts,vf.sobel
+             FROM request_rows r
+             JOIN files f ON f.machine_id=?1 AND f.normalized_path=r.normalized_path
+                          AND f.file_size=r.file_size AND f.active=1
+             JOIN contents c ON c.content_id=f.content_id AND c.media_kind='video'
+             JOIN video_frame_stage2 vf ON vf.content_id=c.content_id
+             ORDER BY r.ordinal,vf.slot"
+        );
+        let mut stage2_params = Vec::with_capacity(1 + scanned_paths.len() * 3);
+        stage2_params.push(Value::Text(self.machine_id().as_str().to_owned()));
+        for (ordinal, scanned) in scanned_paths.iter().enumerate() {
+            stage2_params.push(Value::Integer(i64::try_from(ordinal).map_err(|_| {
+                StoreError::InvalidState("基础缓存请求序号超出 SQLite 范围".into())
+            })?));
+            stage2_params.push(Value::Text(scanned.normalized_path.as_str().to_owned()));
+            stage2_params.push(Value::Integer(sqlite_integer(scanned.file_size)?));
+        }
+        let mut statement = self.connection.prepare(&stage2_sql)?;
+        let stage2_rows = statement
+            .query_map(params_from_iter(stage2_params), read_video_stage2_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        apply_video_stage2_rows(&mut records, stage2_rows)?;
         Ok(records)
     }
 
-    /// 执行一个内容键子批的两条查询，并按请求序号组装基础缓存记录。
+    /// 执行一个内容键子批的固定三条查询，并按请求序号组装基础缓存记录。
     fn lookup_key_cache_batch(
         &self,
         keys: &[ContentKey],
@@ -184,11 +214,14 @@ impl NodeStore {
             "WITH request_rows(ordinal, md5, file_size) AS (VALUES {values})
              SELECT r.ordinal,c.content_id,c.md5,c.file_size,c.media_kind,c.base_complete,
                     i.width,i.height,i.pdq,i.quality,
-                    vm.width,vm.height,vm.duration_ms
+                    vm.width,vm.height,vm.duration_ms,
+                    i2.phash_parts,i2.sobel,cs.relative_path
              FROM request_rows r
              LEFT JOIN contents c ON c.md5=r.md5 AND c.file_size=r.file_size
              LEFT JOIN image_stage1 i ON i.content_id=c.content_id
              LEFT JOIN video_metadata vm ON vm.content_id=c.content_id
+             LEFT JOIN image_stage2 i2 ON i2.content_id=c.content_id
+             LEFT JOIN contact_sheets cs ON cs.content_id=c.content_id
              ORDER BY r.ordinal"
         );
         let mut first_params = Vec::with_capacity(keys.len() * 3);
@@ -228,6 +261,30 @@ impl NodeStore {
             .query_map(params_from_iter(frame_params), read_video_frame_row)?
             .collect::<Result<Vec<_>, _>>()?;
         apply_video_frame_rows(&mut records, frame_rows)?;
+
+        let stage2_values = values_rows(keys.len(), 1);
+        let stage2_sql = format!(
+            "WITH request_rows(ordinal, md5, file_size) AS (VALUES {stage2_values})
+             SELECT r.ordinal,vf.slot,vf.phash_parts,vf.sobel
+             FROM request_rows r
+             JOIN contents c ON c.md5=r.md5 AND c.file_size=r.file_size
+                            AND c.media_kind='video'
+             JOIN video_frame_stage2 vf ON vf.content_id=c.content_id
+             ORDER BY r.ordinal,vf.slot"
+        );
+        let mut stage2_params = Vec::with_capacity(keys.len() * 3);
+        for (ordinal, key) in keys.iter().enumerate() {
+            stage2_params.push(Value::Integer(i64::try_from(ordinal).map_err(|_| {
+                StoreError::InvalidState("基础缓存请求序号超出 SQLite 范围".into())
+            })?));
+            stage2_params.push(Value::Blob(key.md5().to_vec()));
+            stage2_params.push(Value::Integer(sqlite_integer(key.file_size())?));
+        }
+        let mut statement = self.connection.prepare(&stage2_sql)?;
+        let stage2_rows = statement
+            .query_map(params_from_iter(stage2_params), read_video_stage2_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        apply_video_stage2_rows(&mut records, stage2_rows)?;
         Ok(records)
     }
 
@@ -534,6 +591,9 @@ impl NodeStore {
             height,
             duration_ms,
             stage1: self.load_complete_stage1(content_id)?,
+            image_stage2: self.load_image_stage2_for_cache(content_id)?,
+            video_stage2: Box::new(self.load_video_stage2_for_cache(content_id)?),
+            contact_sheet_relative_path: self.contact_sheet_path(content_id)?,
         })
     }
 
@@ -615,25 +675,36 @@ struct RawBaseCacheRow {
     md5: Option<Vec<u8>>,
     file_size: Option<i64>,
     media_kind: Option<String>,
-    base_complete: Option<bool>,
-    image_width: Option<u32>,
-    image_height: Option<u32>,
+    base_complete: Option<i64>,
+    image_width: Option<i64>,
+    image_height: Option<i64>,
     image_pdq: Option<Vec<u8>>,
-    image_quality: Option<u8>,
-    video_width: Option<u32>,
-    video_height: Option<u32>,
+    image_quality: Option<i64>,
+    video_width: Option<i64>,
+    video_height: Option<i64>,
     video_duration_ms: Option<i64>,
+    image_stage2_phash: Option<Vec<u8>>,
+    image_stage2_sobel: Option<Vec<u8>>,
+    contact_sheet_relative_path: Option<String>,
 }
 
 /// 视频第二条查询返回的单个槽位，按请求序号暂存后还原固定六槽位数组。
 struct RawVideoFrameRow {
     ordinal: i64,
-    slot: u8,
-    decoded: bool,
-    width: Option<u32>,
-    height: Option<u32>,
+    slot: Option<i64>,
+    decoded: Option<i64>,
+    width: Option<i64>,
+    height: Option<i64>,
     pdq: Option<Vec<u8>>,
-    quality: Option<u8>,
+    quality: Option<i64>,
+}
+
+/// 视频二筛批量查询返回的单个槽位原始行。
+struct RawVideoStage2Row {
+    ordinal: i64,
+    slot: Option<i64>,
+    phash: Option<Vec<u8>>,
+    sobel: Option<Vec<u8>>,
 }
 
 /// 生成带连续绑定参数的 VALUES 行，避免把输入数据拼接进 SQL。
@@ -671,6 +742,9 @@ fn read_base_cache_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawBaseCache
         video_width: row.get(10)?,
         video_height: row.get(11)?,
         video_duration_ms: row.get(12)?,
+        image_stage2_phash: row.get(13)?,
+        image_stage2_sobel: row.get(14)?,
+        contact_sheet_relative_path: row.get(15)?,
     })
 }
 
@@ -684,6 +758,16 @@ fn read_video_frame_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawVideoFra
         height: row.get(4)?,
         pdq: row.get(5)?,
         quality: row.get(6)?,
+    })
+}
+
+/// 解码视频二筛原始行，保留非法字段供统一缺失分类器处理。
+fn read_video_stage2_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawVideoStage2Row> {
+    Ok(RawVideoStage2Row {
+        ordinal: row.get(0)?,
+        slot: row.get(1)?,
+        phash: row.get(2)?,
+        sobel: row.get(3)?,
     })
 }
 
@@ -721,42 +805,40 @@ fn decode_base_cache_row(row: RawBaseCacheRow) -> Result<Option<BaseCacheRecord>
     let (Some(md5), Some(file_size), Some(media_kind), Some(base_complete)) =
         (row.md5, row.file_size, row.media_kind, row.base_complete)
     else {
-        return Err(StoreError::InvalidState(
-            "基础缓存内容行缺少必需字段".into(),
-        ));
+        return Ok(None);
     };
-    let media_kind = parse_media_kind(&media_kind)?;
-    let content_key = ContentKey::new(
-        fixed_bytes(md5, "contents.md5")?,
-        u64::try_from(file_size)
-            .map_err(|_| StoreError::InvalidState("内容文件大小不能为负数".into()))?,
-    );
+    let Ok(md5) = md5.try_into() else {
+        return Ok(None);
+    };
+    let Ok(file_size) = u64::try_from(file_size) else {
+        return Ok(None);
+    };
+    let Ok(media_kind) = parse_media_kind(&media_kind) else {
+        return Ok(None);
+    };
+    let content_key = ContentKey::new(md5, file_size);
+    let base_complete = base_complete == 1;
     let (width, height, duration_ms, stage1) = match media_kind {
         MediaKind::Image => {
-            let stage1 = match (
+            let width = row.image_width.and_then(|value| u32::try_from(value).ok());
+            let height = row.image_height.and_then(|value| u32::try_from(value).ok());
+            let stage1 = decode_stage1_fields(
                 row.image_width,
                 row.image_height,
                 row.image_pdq,
                 row.image_quality,
-            ) {
-                (Some(width), Some(height), Some(pdq), Some(quality)) => {
-                    Some(CompleteStage1::Image(ImageStage1 {
-                        width,
-                        height,
-                        pdq: PdqHash::from_bytes(fixed_bytes(pdq, "image_stage1.pdq")?),
-                        quality,
-                    }))
-                }
-                _ => None,
-            };
-            (row.image_width, row.image_height, None, stage1)
+            )
+            .map(CompleteStage1::Image);
+            (width, height, None, stage1)
         }
-        MediaKind::Video => (
-            row.video_width,
-            row.video_height,
-            row.video_duration_ms.map(|value| value as u64),
-            None,
-        ),
+        MediaKind::Video => {
+            let width = row.video_width.and_then(|value| u32::try_from(value).ok());
+            let height = row.video_height.and_then(|value| u32::try_from(value).ok());
+            let duration_ms = row
+                .video_duration_ms
+                .and_then(|value| u64::try_from(value).ok());
+            (width, height, duration_ms, None)
+        }
         MediaKind::Other => (None, None, None, None),
     };
     Ok(Some(BaseCacheRecord {
@@ -768,6 +850,12 @@ fn decode_base_cache_row(row: RawBaseCacheRow) -> Result<Option<BaseCacheRecord>
         height,
         duration_ms,
         stage1,
+        image_stage2: decode_stage2_if_valid(
+            row.image_stage2_phash.as_deref(),
+            row.image_stage2_sobel.as_deref(),
+        ),
+        video_stage2: Box::new([None; 6]),
+        contact_sheet_relative_path: row.contact_sheet_relative_path,
     }))
 }
 
@@ -795,37 +883,76 @@ fn apply_video_frame_rows(
         if record.media_kind != MediaKind::Video {
             continue;
         }
-        let frame_rows = &grouped[ordinal];
+        let frame_rows = std::mem::take(&mut grouped[ordinal]);
         if frame_rows.len() != 6
-            || frame_rows
-                .iter()
-                .enumerate()
-                .any(|(slot, row)| row.slot as usize != slot)
+            || frame_rows.iter().any(|row| {
+                row.slot
+                    .and_then(|slot| usize::try_from(slot).ok())
+                    .is_none_or(|slot| slot >= 6)
+            })
         {
             continue;
         }
         let mut frames = [None; 6];
+        let mut seen = [false; 6];
         let mut complete = true;
         for row in frame_rows {
-            if !row.decoded {
-                continue;
-            }
-            let (Some(width), Some(height), Some(pdq), Some(quality)) =
-                (row.width, row.height, row.pdq.as_ref(), row.quality)
-            else {
+            let Some(slot) = row.slot.and_then(|slot| usize::try_from(slot).ok()) else {
                 complete = false;
                 break;
             };
-            frames[row.slot as usize] = Some(ImageStage1 {
-                width,
-                height,
-                pdq: PdqHash::from_bytes(fixed_bytes(pdq.clone(), "video_frame_stage1.pdq")?),
-                quality,
-            });
+            if seen[slot] {
+                complete = false;
+                break;
+            }
+            seen[slot] = true;
+            match row.decoded {
+                Some(0) => {}
+                Some(1) => {
+                    let Some(feature) =
+                        decode_stage1_fields(row.width, row.height, row.pdq, row.quality)
+                    else {
+                        complete = false;
+                        break;
+                    };
+                    frames[slot] = Some(feature);
+                }
+                _ => {
+                    complete = false;
+                    break;
+                }
+            }
         }
-        if complete && frames.iter().flatten().count() >= 4 {
+        if complete && seen.iter().all(|seen| *seen) && frames.iter().flatten().count() >= 4 {
             record.stage1 = Some(CompleteStage1::Video(Box::new(frames)));
         }
+    }
+    Ok(())
+}
+
+/// 把视频二筛批量原始行按请求序号写回六槽位数组，非法项只保留为缺失。
+fn apply_video_stage2_rows(
+    records: &mut [Option<BaseCacheRecord>],
+    rows: Vec<RawVideoStage2Row>,
+) -> Result<(), StoreError> {
+    for row in rows {
+        let Ok(ordinal) = usize::try_from(row.ordinal) else {
+            continue;
+        };
+        let Some(record) = records.get_mut(ordinal).and_then(Option::as_mut) else {
+            continue;
+        };
+        if record.media_kind != MediaKind::Video {
+            continue;
+        }
+        let Some(slot) = row.slot.and_then(|slot| usize::try_from(slot).ok()) else {
+            continue;
+        };
+        if slot >= record.video_stage2.len() {
+            continue;
+        }
+        record.video_stage2[slot] =
+            decode_stage2_if_valid(row.phash.as_deref(), row.sobel.as_deref());
     }
     Ok(())
 }
@@ -917,9 +1044,9 @@ mod tests {
         }
     }
 
-    /// 旧路径缓存查询对一千个输入逐项执行 SQL；批量契约要求同一批固定两条 SELECT。
+    /// 路径缓存查询对一千个输入只执行固定三条业务 SELECT，不随项数逐项增长。
     #[test]
-    fn base_cache_batch_uses_two_business_selects() {
+    fn base_cache_batch_uses_three_business_selects() {
         let _trace_guard = TRACE_TEST_LOCK.lock().unwrap();
         let mut store = NodeStore::open_in_memory(
             dedup_core::MachineId::parse(
@@ -957,14 +1084,20 @@ mod tests {
             .filter(|sql| sql.contains("WITH request_rows"))
             .count();
         assert_eq!(
-            lookup_count, 2,
+            lookup_count, 3,
             "批量查询实际执行了 {lookup_count} 条业务 SELECT"
+        );
+        assert!(
+            traced.iter().all(|sql| !sql.starts_with("INSERT")
+                && !sql.starts_with("UPDATE")
+                && !sql.starts_with("DELETE")),
+            "批量查询不应写任务或其他业务表"
         );
     }
 
-    /// 内容键批量查询同样必须对一千个输入只执行两条业务 SELECT。
+    /// 内容键批量查询同样必须对一千个输入只执行固定三条业务 SELECT。
     #[test]
-    fn base_cache_key_batch_uses_two_business_selects() {
+    fn base_cache_key_batch_uses_three_business_selects() {
         let _trace_guard = TRACE_TEST_LOCK.lock().unwrap();
         let mut store = NodeStore::open_in_memory(
             dedup_core::MachineId::parse(
@@ -1002,8 +1135,14 @@ mod tests {
             .filter(|sql| sql.contains("WITH request_rows"))
             .count();
         assert_eq!(
-            lookup_count, 2,
+            lookup_count, 3,
             "内容键批量查询实际执行了 {lookup_count} 条业务 SELECT"
+        );
+        assert!(
+            traced.iter().all(|sql| !sql.starts_with("INSERT")
+                && !sql.starts_with("UPDATE")
+                && !sql.starts_with("DELETE")),
+            "批量查询不应写任务或其他业务表"
         );
     }
 
@@ -1044,7 +1183,7 @@ mod tests {
                 .iter()
                 .filter(|sql| sql.contains("WITH request_rows"))
                 .count(),
-            6
+            9
         );
 
         store

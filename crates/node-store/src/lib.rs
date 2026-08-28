@@ -2,6 +2,7 @@
 #![warn(missing_docs)]
 
 mod analysis;
+mod cache_integrity;
 mod content;
 mod delete;
 mod faults;
@@ -23,6 +24,7 @@ pub use analysis::{
     AnalysisInput, AnalysisMode, AnalysisRunSnapshot, AnalysisStatus, CandidateStatus,
     CandidateWrite, PairKind,
 };
+pub use cache_integrity::{CacheCompleteness, classify_cache_completeness};
 pub use delete::{
     ConfirmedDeleteItem, DeleteBatchPlan, DeleteOutcome, DeleteResult, PlannedDeleteItem,
 };

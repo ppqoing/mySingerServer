@@ -14,9 +14,9 @@ use std::sync::{Mutex, OnceLock};
 
 use dedup_core::{ContentKey, DiskReadConfig, MediaKind, TaskId};
 use dedup_node_store::{
-    BaseCacheRecord, ClaimedTaskItem, CompleteStage1, ContentId, FileFaultKind, FileFaultRecord,
-    NodeStore, PersistentStageState, ScannedPath, TaskItemApplyResult, TaskItemCompletion,
-    TaskItemIdentity, TaskStageWrite, TaskStatus,
+    BaseCacheRecord, ClaimedTaskItem, ContentId, FileFaultKind, FileFaultRecord, NodeStore,
+    PersistentStageState, ScannedPath, TaskItemApplyResult, TaskItemCompletion, TaskItemIdentity,
+    TaskStageWrite, TaskStatus, classify_cache_completeness,
 };
 use dedup_protocol::{
     BASE_MISSING_CONTACT_SHEET, BASE_MISSING_PROBE, BASE_MISSING_STAGE1, proto,
@@ -100,7 +100,7 @@ pub struct BaseComputeDecision {
 }
 
 impl BaseComputeDecision {
-    /// 根据本地/中心缓存、联系表文件和强制重算开关生成固定缺失掩码。
+    /// 将统一缓存完整性结果转换为既有基础计算缺失位。
     pub fn for_cache(
         cached: Option<&BaseCacheRecord>,
         contact_sheet_exists: bool,
@@ -115,35 +115,10 @@ impl BaseComputeDecision {
             };
         }
         let cached = cached.expect("上方已处理无缓存分支");
-        let probe_complete = match cached.media_kind {
-            MediaKind::Image => cached.width.is_some() && cached.height.is_some(),
-            MediaKind::Video => {
-                cached.width.is_some() && cached.height.is_some() && cached.duration_ms.is_some()
-            }
-            MediaKind::Other => true,
-        };
-        let stage1_complete = matches!(
-            (&cached.media_kind, &cached.stage1),
-            (MediaKind::Image, Some(CompleteStage1::Image(_)))
-                | (MediaKind::Video, Some(CompleteStage1::Video(_)))
-                | (MediaKind::Other, None)
-        );
-        let mut missing_parts = 0;
-        if !cached.base_complete {
-            missing_parts |= BASE_MISSING_PROBE | BASE_MISSING_STAGE1;
-        }
-        if !probe_complete {
-            missing_parts |= BASE_MISSING_PROBE;
-        }
-        if !stage1_complete {
-            missing_parts |= BASE_MISSING_STAGE1;
-        }
-        if cached.media_kind == MediaKind::Video && !contact_sheet_exists {
-            missing_parts |= BASE_MISSING_CONTACT_SHEET;
-        }
+        let completeness = classify_cache_completeness(cached, contact_sheet_exists);
         Self {
             media_kind: cached.media_kind,
-            missing_parts,
+            missing_parts: completeness.base_missing_parts,
         }
     }
 
@@ -2061,9 +2036,7 @@ fn apply_path_context(
         let content = store.import_base_cache_record(&context.reserved.scanned, record)?;
         cached = Some(store.load_base_cache_record(content.id)?);
     }
-    let contact_exists = cached.as_ref().is_some_and(|cached| {
-        ContactSheetCacheEntry::from_md5(contact_sheet_root, cached.content_key.md5()).exists()
-    });
+    let contact_exists = contact_sheet_valid_for_record(contact_sheet_root, cached.as_ref());
     let decision =
         BaseComputeDecision::for_cache(cached.as_ref(), contact_exists, options.force_recompute);
     if decision.missing_parts() == 0 {
@@ -2318,7 +2291,7 @@ fn prepare_content_batch(
             let need = content_resolution_need(
                 local,
                 None,
-                ContactSheetCacheEntry::from_md5(contact_sheet_root, hashed_view.md5).exists(),
+                contact_sheet_valid_for_record(contact_sheet_root, local),
                 options.force_recompute,
             );
             let decode_credit = match need {
@@ -2580,8 +2553,11 @@ fn process_next_content_resolution(
     let context_view = content_contexts
         .get(&item_view.key)
         .ok_or_else(|| ScanError::Stage1("content 缓存结果缺少 actor 上下文".into()))?;
-    let contact_exists =
-        ContactSheetCacheEntry::from_md5(contact_sheet_root, context_view.hashed.md5).exists();
+    let contact_exists = selected_contact_sheet_valid(
+        contact_sheet_root,
+        context_view.local.as_ref(),
+        item_view.remote.as_ref(),
+    );
     let need = content_resolution_need(
         context_view.local.as_ref(),
         item_view.remote.as_ref(),
@@ -2650,7 +2626,11 @@ fn content_cursor_has_admission(
     let need = content_resolution_need(
         context.local.as_ref(),
         item.remote.as_ref(),
-        ContactSheetCacheEntry::from_md5(contact_sheet_root, context.hashed.md5).exists(),
+        selected_contact_sheet_valid(
+            contact_sheet_root,
+            context.local.as_ref(),
+            item.remote.as_ref(),
+        ),
         force_recompute,
     );
     matches!(need, ContentResolutionNeed::CacheHit) || decode_credits.available_permits() > 0
@@ -2671,7 +2651,7 @@ fn resolve_content_context(
     let planned_need = content_resolution_need(
         context.local.as_ref(),
         remote.as_ref(),
-        ContactSheetCacheEntry::from_md5(contact_sheet_root, context.hashed.md5).exists(),
+        selected_contact_sheet_valid(contact_sheet_root, context.local.as_ref(), remote.as_ref()),
         options.force_recompute,
     );
     match (planned_need, decode_credit.is_some()) {
@@ -2705,7 +2685,7 @@ fn resolve_content_context(
             .upsert_content_and_location(&hashed.scanned, hashed.md5, MediaKind::Other)?
             .id
     };
-    let contact_exists = ContactSheetCacheEntry::from_md5(contact_sheet_root, hashed.md5).exists();
+    let contact_exists = contact_sheet_valid_for_record(contact_sheet_root, cached.as_ref());
     let decision =
         BaseComputeDecision::for_cache(cached.as_ref(), contact_exists, options.force_recompute);
     debug_assert_eq!(
@@ -3728,6 +3708,7 @@ fn persist_base_result(
                     store,
                     &identity.item_id,
                     &contact,
+                    decision.missing_parts(),
                     decision.missing_parts() & BASE_MISSING_CONTACT_SHEET != 0,
                     Some(artifact_registry),
                     Some(disk_full_cleaner),
@@ -3891,6 +3872,30 @@ fn cache_rank(cached: Option<&BaseCacheRecord>) -> u8 {
         1 + u8::from(decision.missing_parts() & BASE_MISSING_PROBE == 0)
             + u8::from(decision.missing_parts() & BASE_MISSING_STAGE1 == 0)
     })
+}
+
+/// 只把本机缓存记录中与 MD5 派生路径完全一致且可解码的联系表视为命中。
+fn contact_sheet_valid_for_record(
+    contact_sheet_root: &std::path::Path,
+    cached: Option<&BaseCacheRecord>,
+) -> bool {
+    cached.is_some_and(|record| {
+        ContactSheetCacheEntry::from_md5(contact_sheet_root, record.content_key.md5())
+            .is_valid(record.contact_sheet_relative_path.as_deref())
+    })
+}
+
+/// 选择完整度更高的缓存；中心记录没有本机 artifact，按可导入字段作薄适配。
+fn selected_contact_sheet_valid(
+    contact_sheet_root: &std::path::Path,
+    local: Option<&BaseCacheRecord>,
+    remote: Option<&BaseCacheRecord>,
+) -> bool {
+    if remote.is_some_and(|record| cache_rank(Some(record)) > cache_rank(local)) {
+        // 远端只提供可导入字段，本机联系表必须由本机路径和文件重新验证。
+        return false;
+    }
+    contact_sheet_valid_for_record(contact_sheet_root, local)
 }
 
 /// 计算固定的 2W 解码等待容量；零 Worker 和 usize 溢出都必须显式失败。
@@ -4354,6 +4359,9 @@ mod tests {
             height: None,
             duration_ms: None,
             stage1: None,
+            image_stage2: None,
+            video_stage2: Box::new([None; 6]),
+            contact_sheet_relative_path: None,
         };
         assert_eq!(
             content_resolution_need(Some(&cached), None, true, false),

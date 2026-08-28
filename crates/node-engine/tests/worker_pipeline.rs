@@ -160,6 +160,40 @@ fn stage_two_rebuilds_missing_contact_sheet_before_feature_compute() {
 }
 
 #[test]
+/// 联系表文件存在但 JPEG 已损坏时，二筛必须回退原视频并重建真实 artifact。
+fn stage_two_rebuilds_damaged_contact_sheet_before_feature_compute() {
+    let directory = tempfile::tempdir().unwrap();
+    let contact_path = directory.path().join("damaged.jpg");
+    std::fs::write(&contact_path, b"damaged-jpeg").unwrap();
+    let decoder = FakeDecoder::video();
+    let calls = Arc::clone(&decoder.calls);
+
+    let response = handle_worker_request(
+        &WorkerPipeline::new(decoder),
+        proto::WorkerEnvelope {
+            payload: Some(worker_envelope::Payload::ComputeStage2(
+                proto::ComputeStage2 {
+                    task_id: "task-contact-damaged".into(),
+                    item_id: "item-contact-damaged".into(),
+                    display_path: r"D:\clip.mp4".into(),
+                    frame_slots: vec![1, 4],
+                    contact_sheet_path: contact_path.to_string_lossy().into_owned(),
+                    generate_contact_sheet_if_missing: true,
+                },
+            )),
+        },
+    );
+
+    let Some(worker_envelope::Payload::Stage2Result(result)) = response.payload else {
+        panic!("expected Stage2Result");
+    };
+    let output = decode_stage2_payload(&result.payload).unwrap();
+    assert_eq!(output.frames.len(), 2);
+    assert!(output.regenerated_contact_sheet_jpeg.is_some());
+    assert_eq!(*calls.lock().unwrap(), normalized_positions().to_vec());
+}
+
+#[test]
 /// 内部 Protobuf 必须无损携带数据库持久化所需的全部数组。
 fn worker_payloads_round_trip_all_persisted_features() {
     let pipeline = WorkerPipeline::new(FakeDecoder::video());

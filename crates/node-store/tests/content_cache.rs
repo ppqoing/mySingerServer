@@ -3,10 +3,10 @@
 use dedup_core::{ContentKey, DisplayPath, MachineId, MediaKind, NormalizedPath};
 use dedup_media::{ImageStage1, ImageStage2, PdqHash};
 use dedup_node_store::{
-    CompleteStage1, CompleteStage2, FeatureWrite, ImageStage1Fields, NodeStore, ScannedPath,
-    StoreError, VideoFrameStage1Fields,
+    CacheCompleteness, CompleteStage1, CompleteStage2, FeatureWrite, ImageStage1Fields, NodeStore,
+    ScannedPath, StoreError, VideoFrameStage1Fields, classify_cache_completeness,
 };
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 use tempfile::TempDir;
 
 fn machine() -> MachineId {
@@ -324,4 +324,359 @@ fn base_cache_batch_empty_input_is_empty() {
     let store = NodeStore::open_in_memory(machine()).unwrap();
     assert!(store.lookup_base_cache_by_paths(&[]).unwrap().is_empty());
     assert!(store.lookup_base_cache_by_keys(&[]).unwrap().is_empty());
+}
+
+/// 结构完整性分类器必须先区分完整缓存与结构性缺失，而不是依赖字段数值。
+#[test]
+fn valid_zero_features_are_hits_but_structural_gaps_are_missing() {
+    let mut store = NodeStore::open_in_memory(machine()).unwrap();
+    let content = store
+        .upsert_content_and_location(&scan(r"D:\zero.jpg", 99), [0x73; 16], MediaKind::Image)
+        .unwrap();
+    store
+        .commit_feature_result(
+            content.id,
+            None,
+            FeatureWrite::ImageStage1(ImageStage1Fields {
+                width: Some(100),
+                height: Some(80),
+                pdq: Some(PdqHash::from_bytes([0; 32])),
+                quality: Some(0),
+            }),
+        )
+        .unwrap();
+    store
+        .commit_feature_result(
+            content.id,
+            None,
+            FeatureWrite::ImageStage2(ImageStage2 {
+                phash_parts: [0; 9],
+                sobel: [0.0; 128],
+            }),
+        )
+        .unwrap();
+    store.mark_base_complete(content.id).unwrap();
+
+    let record = store.load_base_cache_record(content.id).unwrap();
+    assert_eq!(
+        classify_cache_completeness(&record, true),
+        CacheCompleteness::complete()
+    );
+}
+
+/// 基础缓存批量入口同时还原图片二筛和视频逐槽二筛，重复键保持同一原始结构。
+#[test]
+fn base_cache_batch_loads_stage2_fields_and_video_slots() {
+    let mut store = NodeStore::open_in_memory(machine()).unwrap();
+    let image = store
+        .upsert_content_and_location(
+            &scan(r"D:\batch-image.jpg", 101),
+            [0x81; 16],
+            MediaKind::Image,
+        )
+        .unwrap();
+    store
+        .commit_feature_result(
+            image.id,
+            None,
+            FeatureWrite::ImageStage1(ImageStage1Fields::from(ImageStage1 {
+                width: 100,
+                height: 80,
+                pdq: PdqHash::from_bytes([0; 32]),
+                quality: 0,
+            })),
+        )
+        .unwrap();
+    store
+        .commit_feature_result(
+            image.id,
+            None,
+            FeatureWrite::ImageStage2(ImageStage2 {
+                phash_parts: [0; 9],
+                sobel: [0.0; 128],
+            }),
+        )
+        .unwrap();
+
+    let video = store
+        .upsert_content_and_location(
+            &scan(r"D:\batch-video.mp4", 202),
+            [0x82; 16],
+            MediaKind::Video,
+        )
+        .unwrap();
+    store
+        .commit_feature_result(
+            video.id,
+            None,
+            FeatureWrite::VideoMetadata(dedup_node_store::VideoMetadataFields {
+                duration_ms: Some(12_000),
+                width: Some(1920),
+                height: Some(1080),
+            }),
+        )
+        .unwrap();
+    for slot in 0..6 {
+        store
+            .commit_feature_result(
+                video.id,
+                None,
+                FeatureWrite::VideoFrameStage1(successful_video_frame(slot)),
+            )
+            .unwrap();
+    }
+    for slot in [1_u8, 4] {
+        store
+            .commit_feature_result(
+                video.id,
+                None,
+                FeatureWrite::VideoFrameStage2(dedup_node_store::VideoFrameStage2Fields {
+                    slot,
+                    features: ImageStage2 {
+                        phash_parts: [slot as u64; 9],
+                        sobel: [0.0; 128],
+                    },
+                }),
+            )
+            .unwrap();
+    }
+
+    let results = store
+        .lookup_base_cache_by_keys(&[image.key, video.key, image.key])
+        .unwrap();
+    assert_eq!(results.len(), 3);
+    assert!(results[0].as_ref().unwrap().image_stage2.is_some());
+    assert_eq!(results[0], results[2]);
+    let video_record = results[1].as_ref().unwrap();
+    assert!(video_record.video_stage2[1].is_some());
+    assert!(video_record.video_stage2[4].is_some());
+    assert!(video_record.video_stage2[0].is_none());
+}
+
+/// 视频二筛缺失掩码只覆盖一筛成功槽位，不把明确失败槽位伪装成待计算。
+#[test]
+fn video_stage2_mask_only_covers_successful_stage1_slots() {
+    let mut store = NodeStore::open_in_memory(machine()).unwrap();
+    let content = store
+        .upsert_content_and_location(&scan(r"D:\masked.mp4", 303), [0x83; 16], MediaKind::Video)
+        .unwrap();
+    store
+        .commit_feature_result(
+            content.id,
+            None,
+            FeatureWrite::VideoMetadata(dedup_node_store::VideoMetadataFields {
+                duration_ms: Some(12_000),
+                width: Some(1920),
+                height: Some(1080),
+            }),
+        )
+        .unwrap();
+    for slot in 0..6 {
+        let frame = if slot < 4 {
+            successful_video_frame(slot)
+        } else {
+            failed_video_frame(slot)
+        };
+        store
+            .commit_feature_result(content.id, None, FeatureWrite::VideoFrameStage1(frame))
+            .unwrap();
+    }
+    for slot in [0_u8, 1] {
+        store
+            .commit_feature_result(
+                content.id,
+                None,
+                FeatureWrite::VideoFrameStage2(dedup_node_store::VideoFrameStage2Fields {
+                    slot,
+                    features: ImageStage2 {
+                        phash_parts: [0; 9],
+                        sobel: [0.0; 128],
+                    },
+                }),
+            )
+            .unwrap();
+    }
+    store.mark_base_complete(content.id).unwrap();
+
+    let record = store.load_base_cache_record(content.id).unwrap();
+    assert_eq!(
+        classify_cache_completeness(&record, true).video_stage2_missing_slots,
+        (1_u8 << 2) | (1_u8 << 3)
+    );
+}
+
+/// 非法尺寸和错误长度只使当前缓存项缺失，批量中的邻项仍可正常返回。
+#[test]
+fn malformed_batch_fields_are_missing_without_poisoning_neighbors() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("malformed-cache.db");
+    let (bad_id, bad_path, good_path);
+    {
+        let mut store = NodeStore::open(&database, machine()).unwrap();
+        let bad = store
+            .upsert_content_and_location(&scan(r"D:\bad.jpg", 401), [0x84; 16], MediaKind::Image)
+            .unwrap();
+        bad_id = bad.id.as_i64();
+        bad_path = scan(r"D:\bad.jpg", 401);
+        store
+            .commit_feature_result(
+                bad.id,
+                None,
+                FeatureWrite::ImageStage1(ImageStage1Fields::from(ImageStage1 {
+                    width: 100,
+                    height: 80,
+                    pdq: PdqHash::from_bytes([1; 32]),
+                    quality: 80,
+                })),
+            )
+            .unwrap();
+        store
+            .commit_feature_result(
+                bad.id,
+                None,
+                FeatureWrite::ImageStage2(ImageStage2 {
+                    phash_parts: [1; 9],
+                    sobel: [0.0; 128],
+                }),
+            )
+            .unwrap();
+        store.mark_base_complete(bad.id).unwrap();
+
+        let good = store
+            .upsert_content_and_location(&scan(r"D:\good.jpg", 402), [0x85; 16], MediaKind::Image)
+            .unwrap();
+        good_path = scan(r"D:\good.jpg", 402);
+        store
+            .commit_feature_result(
+                good.id,
+                None,
+                FeatureWrite::ImageStage1(ImageStage1Fields::from(ImageStage1 {
+                    width: 100,
+                    height: 80,
+                    pdq: PdqHash::from_bytes([2; 32]),
+                    quality: 80,
+                })),
+            )
+            .unwrap();
+        store
+            .commit_feature_result(
+                good.id,
+                None,
+                FeatureWrite::ImageStage2(ImageStage2 {
+                    phash_parts: [2; 9],
+                    sobel: [0.0; 128],
+                }),
+            )
+            .unwrap();
+        store.mark_base_complete(good.id).unwrap();
+    }
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute_batch("PRAGMA ignore_check_constraints=ON;")
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE image_stage1 SET width=0 WHERE content_id=?1",
+            [bad_id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE image_stage2 SET sobel=?1 WHERE content_id=?2",
+            params![vec![0_u8], bad_id],
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = NodeStore::open(&database, machine()).unwrap();
+    let results = store
+        .lookup_base_cache_by_paths(&[bad_path, good_path])
+        .unwrap();
+    let bad = results[0].as_ref().expect("损坏内容行本身仍应返回结构记录");
+    let bad_completeness = classify_cache_completeness(bad, true);
+    assert_ne!(bad_completeness.base_missing_parts, 0);
+    assert!(bad_completeness.image_stage2_missing);
+    let good = results[1].as_ref().expect("邻项不应被损坏项拖垮");
+    assert!(!classify_cache_completeness(good, true).image_stage2_missing);
+}
+
+/// Worker 的部分失败结果只能补充空字段，不能覆盖已有有效一筛字段。
+#[test]
+fn partial_stage1_failure_does_not_overwrite_existing_feature() {
+    let mut store = NodeStore::open_in_memory(machine()).unwrap();
+    let content = store
+        .upsert_content_and_location(&scan(r"D:\preserve.jpg", 501), [0x86; 16], MediaKind::Image)
+        .unwrap();
+    let original = ImageStage1 {
+        width: 640,
+        height: 480,
+        pdq: PdqHash::from_bytes([9; 32]),
+        quality: 90,
+    };
+    store
+        .commit_feature_result(
+            content.id,
+            None,
+            FeatureWrite::ImageStage1(ImageStage1Fields::from(original)),
+        )
+        .unwrap();
+    store
+        .commit_feature_result(
+            content.id,
+            None,
+            FeatureWrite::ImageStage1(ImageStage1Fields {
+                width: None,
+                height: None,
+                pdq: None,
+                quality: None,
+            }),
+        )
+        .unwrap();
+    assert!(matches!(
+        store.load_complete_stage1(content.id).unwrap(),
+        Some(CompleteStage1::Image(feature)) if feature == original
+    ));
+}
+
+/// Worker 返回非法零尺寸时只能保持缺失，不能覆盖已有有效一筛字段。
+#[test]
+fn invalid_stage1_dimensions_do_not_overwrite_existing_feature() {
+    let mut store = NodeStore::open_in_memory(machine()).unwrap();
+    let content = store
+        .upsert_content_and_location(
+            &scan(r"D:\preserve-zero.jpg", 502),
+            [0x87; 16],
+            MediaKind::Image,
+        )
+        .unwrap();
+    let original = ImageStage1 {
+        width: 640,
+        height: 480,
+        pdq: PdqHash::from_bytes([9; 32]),
+        quality: 90,
+    };
+    store
+        .commit_feature_result(
+            content.id,
+            None,
+            FeatureWrite::ImageStage1(ImageStage1Fields::from(original)),
+        )
+        .unwrap();
+    store
+        .commit_feature_result(
+            content.id,
+            None,
+            FeatureWrite::ImageStage1(ImageStage1Fields {
+                width: Some(0),
+                height: Some(0),
+                pdq: None,
+                quality: None,
+            }),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        store.load_complete_stage1(content.id).unwrap(),
+        Some(CompleteStage1::Image(feature)) if feature == original
+    ));
 }

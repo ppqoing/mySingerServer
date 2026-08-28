@@ -7,6 +7,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use dedup_media::decode_contact_sheet;
 use dedup_node_store::{ContentId, FeatureWrite, NodeStore};
 
 use crate::{
@@ -37,8 +38,31 @@ impl ContactSheetCacheEntry {
         }
     }
 
-    pub(crate) fn exists(&self) -> bool {
-        self.final_path.is_file()
+    /// 校验 SQLite 引用、根目录边界和固定六槽 JPEG，避免仅凭文件存在误判命中。
+    pub(crate) fn is_valid(&self, stored_relative_path: Option<&str>) -> bool {
+        stored_relative_path == Some(self.relative_path.as_str())
+            && self
+                .final_path
+                .parent()
+                .and_then(Path::parent)
+                .is_some_and(|root| {
+                    let Ok(canonical_root) = fs::canonicalize(root) else {
+                        return false;
+                    };
+                    let Ok(canonical_file) = fs::canonicalize(&self.final_path) else {
+                        return false;
+                    };
+                    canonical_file.starts_with(canonical_root)
+                })
+            && Self::is_valid_file(&self.final_path)
+    }
+
+    /// 判断文件是可解码的固定联系表 JPEG；损坏或非 JPEG 均视为缺失。
+    pub(crate) fn is_valid_file(path: &Path) -> bool {
+        fs::read(path)
+            .ok()
+            .and_then(|bytes| decode_contact_sheet(&bytes).ok())
+            .is_some()
     }
 
     pub(crate) fn same_target(&self, other: &Self) -> bool {
@@ -131,7 +155,7 @@ impl ContactSheetCacheEntry {
         store: &mut NodeStore,
         content_id: ContentId,
     ) -> io::Result<()> {
-        if !self.exists() {
+        if !Self::is_valid_file(&self.final_path) {
             return Err(io::Error::new(io::ErrorKind::NotFound, "联系表文件不存在"));
         }
         store
@@ -174,4 +198,44 @@ fn write_jpeg(path: &Path, jpeg: &[u8]) -> io::Result<()> {
     partial.write_all(jpeg)?;
     partial.flush()?;
     partial.sync_all()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dedup_media::{Rgb24Image, encode_contact_sheet};
+    use tempfile::tempdir;
+
+    /// 生成固定尺寸的可解码联系表，作为本地 artifact 校验夹具。
+    fn valid_jpeg() -> Vec<u8> {
+        let frames: [Option<Rgb24Image>; 6] = std::array::from_fn(|slot| {
+            Some(Rgb24Image::new(8, 8, vec![slot as u8; 8 * 8 * 3]).unwrap())
+        });
+        encode_contact_sheet(&frames, 320, 180).unwrap()
+    }
+
+    /// 联系表命中必须同时满足派生相对路径和可解码 JPEG。
+    #[test]
+    fn validates_derived_path_and_jpeg_contents() {
+        let directory = tempdir().unwrap();
+        let entry = ContactSheetCacheEntry::from_md5(directory.path(), [0xAB; 16]);
+        fs::create_dir_all(entry.final_path().parent().unwrap()).unwrap();
+        fs::write(entry.final_path(), valid_jpeg()).unwrap();
+        assert!(entry.is_valid(Some(entry.relative_path())));
+        assert!(!entry.is_valid(Some("contact-sheets/ab/not-the-md5.jpg")));
+
+        fs::write(entry.final_path(), b"damaged-jpeg").unwrap();
+        assert!(!entry.is_valid(Some(entry.relative_path())));
+    }
+
+    /// 联系表目录中的派生文件缺失时不能被空路径或普通文件误判为命中。
+    #[test]
+    fn missing_or_empty_contact_sheet_is_not_valid() {
+        let directory = tempdir().unwrap();
+        let entry = ContactSheetCacheEntry::from_md5(directory.path(), [0xCD; 16]);
+        assert!(!entry.is_valid(Some(entry.relative_path())));
+        fs::create_dir_all(entry.final_path().parent().unwrap()).unwrap();
+        fs::write(entry.final_path(), []).unwrap();
+        assert!(!entry.is_valid(Some(entry.relative_path())));
+    }
 }

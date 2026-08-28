@@ -1,6 +1,7 @@
 //! 联合二筛缓存复用、持久任务派发和最终判定。
 
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -12,7 +13,7 @@ use dedup_media::{VideoFrameFeatures, score_video_stage2, screen_image_stage2};
 use dedup_node_store::{
     CandidateStatus, CandidateWrite, CompleteStage1, CompleteStage2, ContentId, FeatureWrite,
     NewTaskItem, NodeStore, PairKind, PersistentStageState, TaskItemCompletion, TaskStageWrite,
-    VideoFrameStage2Fields,
+    VideoFrameStage2Fields, classify_cache_completeness,
 };
 use dedup_protocol::proto::{self, worker_envelope};
 
@@ -53,7 +54,7 @@ impl Stage2Request {
     pub fn source(&self) -> Stage2Source {
         match (self.media_kind, self.contact_sheet_path.as_ref()) {
             (MediaKind::Image, _) => Stage2Source::ImageFile(self.display_path.clone()),
-            (MediaKind::Video, Some(target)) if target.is_file() => {
+            (MediaKind::Video, Some(target)) if ContactSheetCacheEntry::is_valid_file(target) => {
                 Stage2Source::VideoContactSheet(target.clone())
             }
             (MediaKind::Video, Some(target)) => Stage2Source::VideoFallback {
@@ -611,6 +612,18 @@ async fn run_stage2_batch_internal<P: Stage2Processor>(
             message: format!("警告: {warning}"),
         });
     }
+    let cached_records = store
+        .lookup_base_cache_by_keys(&work.iter().map(|item| item.content).collect::<Vec<_>>())?;
+    if cached_records.len() != work.len() {
+        return Err(AnalysisBlocked::InvalidState(
+            "二筛任务基础缓存批量返回数量不匹配".into(),
+        ));
+    }
+    let cached_by_content = cached_records
+        .into_iter()
+        .flatten()
+        .filter_map(|record| record.content_id.map(|id| (id, record)))
+        .collect::<HashMap<_, _>>();
     if let Some(reporter) = reporter {
         let _ = reporter.update_overall_nowait(0, Some(work.len() as u64), 0, 0);
     }
@@ -639,7 +652,12 @@ async fn run_stage2_batch_internal<P: Stage2Processor>(
             .iter()
             .find(|candidate| candidate.content_id == item_content)
             .ok_or_else(|| AnalysisBlocked::InvalidState("二筛任务项不属于当前批次".into()))?;
-        if store.republish_complete_stage2(expected.content_id)? {
+        let cached = cached_by_content.get(&expected.content_id);
+        if cached.is_some_and(cached_stage2_is_complete)
+            && store.republish_complete_stage2_from_cache(
+                cached.expect("缓存完整度判断已确认记录存在"),
+            )?
+        {
             store.complete_item(
                 &item.item_id,
                 TaskItemCompletion::Succeeded {
@@ -940,26 +958,47 @@ pub(crate) async fn dispatch_missing<P: Stage2Processor>(
         .collect::<Vec<_>>();
     keys.sort();
     keys.dedup();
+    let cached_records = store.lookup_base_cache_by_keys(&keys)?;
+    if cached_records.len() != keys.len() {
+        return Err(AnalysisBlocked::InvalidState(
+            "二筛基础缓存批量返回数量不匹配".into(),
+        ));
+    }
     let mut work = Vec::new();
-    for content in keys {
-        let Some(content_id) = store.content_id_by_key(content)? else {
+    for (content, record) in keys.into_iter().zip(cached_records) {
+        let Some(record) = record else {
             continue;
         };
-        if store.load_complete_stage2(content_id)?.is_some() {
+        let completeness = classify_cache_completeness(&record, true);
+        if record.stage1.is_none() {
             continue;
         }
+        let Some(content_id) = record.content_id else {
+            continue;
+        };
         let Some((location, display_path)) = store.active_location_for_content(content_id)? else {
             continue;
         };
-        let media_kind = store.content_media_kind(content_id)?;
-        let frame_slots = match store.load_complete_stage1(content_id)? {
-            Some(CompleteStage1::Image(_)) => Vec::new(),
-            Some(CompleteStage1::Video(frames)) => frames
-                .iter()
-                .enumerate()
-                .filter_map(|(slot, frame)| frame.map(|_| slot as u8))
-                .collect(),
-            None => continue,
+        let (media_kind, frame_slots) = match record.media_kind {
+            MediaKind::Image if completeness.image_stage2_missing => (MediaKind::Image, Vec::new()),
+            MediaKind::Image => continue,
+            MediaKind::Video if completeness.video_stage2_missing_slots != 0 => {
+                let Some(CompleteStage1::Video(frames)) = record.stage1.as_ref() else {
+                    continue;
+                };
+                let frame_slots = frames
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(slot, frame)| {
+                        (completeness.video_stage2_missing_slots & (1_u8 << slot) != 0)
+                            .then_some(frame.map(|_| slot as u8))
+                            .flatten()
+                    })
+                    .collect();
+                (MediaKind::Video, frame_slots)
+            }
+            MediaKind::Video => continue,
+            MediaKind::Other => continue,
         };
         work.push(MissingWork {
             content,
@@ -974,6 +1013,18 @@ pub(crate) async fn dispatch_missing<P: Stage2Processor>(
         return Ok(MissingDispatchReport::default());
     }
     let _ = resolve_remote_stage2(store, &work, remote).await?;
+    let refreshed_records = store
+        .lookup_base_cache_by_keys(&work.iter().map(|item| item.content).collect::<Vec<_>>())?;
+    if refreshed_records.len() != work.len() {
+        return Err(AnalysisBlocked::InvalidState(
+            "二筛远端导入后的基础缓存批量返回数量不匹配".into(),
+        ));
+    }
+    let cached_by_content = refreshed_records
+        .into_iter()
+        .flatten()
+        .filter_map(|record| record.content_id.map(|id| (id, record)))
+        .collect::<HashMap<_, _>>();
     let total = work.len() as u64;
     let mut completed = 0_u64;
     let mut failed = 0_u64;
@@ -1016,7 +1067,18 @@ pub(crate) async fn dispatch_missing<P: Stage2Processor>(
             .iter()
             .find(|candidate| candidate.content_id == item_content)
             .ok_or_else(|| AnalysisBlocked::InvalidState("二筛任务项不属于当前批次".into()))?;
-        if store.republish_complete_stage2(expected.content_id)? {
+        if cached_by_content
+            .get(&expected.content_id)
+            .is_some_and(|record| {
+                let completeness = classify_cache_completeness(record, true);
+                !completeness.image_stage2_missing && completeness.video_stage2_missing_slots == 0
+            })
+            && store.republish_complete_stage2_from_cache(
+                cached_by_content
+                    .get(&expected.content_id)
+                    .expect("缓存完整度判断已确认记录存在"),
+            )?
+        {
             store.complete_item(
                 &item.item_id,
                 TaskItemCompletion::Succeeded {
@@ -1141,6 +1203,14 @@ pub(crate) async fn dispatch_missing<P: Stage2Processor>(
     })
 }
 
+/// 判断批量缓存记录是否已经具备可直接重发的二次特征。
+fn cached_stage2_is_complete(record: &dedup_node_store::BaseCacheRecord) -> bool {
+    let completeness = classify_cache_completeness(record, true);
+    record.stage1.is_some()
+        && !completeness.image_stage2_missing
+        && completeness.video_stage2_missing_slots == 0
+}
+
 /// 批量查询 PostgreSQL 二次缓存并导入 SQLite；失败只降级到本地计算。
 async fn resolve_remote_stage2(
     store: &mut NodeStore,
@@ -1151,16 +1221,10 @@ async fn resolve_remote_stage2(
         return Ok(None);
     };
     let startup_warning = remote.startup_warning().map(str::to_owned);
-    let mut missing = Vec::new();
-    for item in work {
-        if store.load_complete_stage2(item.content_id)?.is_none() {
-            missing.push(item);
-        }
-    }
-    if missing.is_empty() {
+    if work.is_empty() {
         return Ok(startup_warning);
     }
-    let requests = missing
+    let requests = work
         .iter()
         .map(|item| Stage2CacheLookup {
             content: item.content,
@@ -1181,7 +1245,7 @@ async fn resolve_remote_stage2(
             return Ok(Some(format!("PostgreSQL 二筛缓存降级: {error}")));
         }
     };
-    for (item, hit) in missing.into_iter().zip(hits) {
+    for (item, hit) in work.iter().zip(hits) {
         let Some(hit) = hit else { continue };
         persist_cached_stage2(store, item.content_id, hit)?;
     }
@@ -1242,7 +1306,7 @@ fn persist_stage2(
             target
                 .publish_rebuilt(item_id, jpeg, store, work.content_id)
                 .map_err(|error| AnalysisBlocked::InvalidState(error.to_string()))?;
-        } else if target.exists() {
+        } else if ContactSheetCacheEntry::is_valid_file(target.final_path()) {
             target
                 .repair_reference(store, work.content_id)
                 .map_err(|error| AnalysisBlocked::InvalidState(error.to_string()))?;

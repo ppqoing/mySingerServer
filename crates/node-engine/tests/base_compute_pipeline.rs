@@ -1028,6 +1028,9 @@ impl RemoteFeatureCache for CompleteContentCache {
                     height: None,
                     duration_ms: None,
                     stage1: None,
+                    image_stage2: None,
+                    video_stage2: Box::new([None; 6]),
+                    contact_sheet_relative_path: None,
                 })
             })
             .collect())
@@ -1086,6 +1089,9 @@ impl RemoteFeatureCache for FirstMissThenCompleteBatchCache {
                     height: None,
                     duration_ms: None,
                     stage1: None,
+                    image_stage2: None,
+                    video_stage2: Box::new([None; 6]),
+                    contact_sheet_relative_path: None,
                 })
             })
             .collect())
@@ -1137,6 +1143,9 @@ impl RemoteFeatureCache for MixedBatchContentCache {
                     height: None,
                     duration_ms: None,
                     stage1: None,
+                    image_stage2: None,
+                    video_stage2: Box::new([None; 6]),
+                    contact_sheet_relative_path: None,
                 })
             })
             .collect())
@@ -1260,6 +1269,9 @@ fn complete_video() -> BaseCacheRecord {
         height: Some(1080),
         duration_ms: Some(30_000),
         stage1: Some(CompleteStage1::Video(Box::new([Some(frame); 6]))),
+        image_stage2: None,
+        video_stage2: Box::new([None; 6]),
+        contact_sheet_relative_path: None,
     }
 }
 
