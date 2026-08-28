@@ -1841,25 +1841,36 @@ impl EngineState {
         // 活动任务先走与进程关闭相同的取消门禁，确保 Worker 事件和后台 Store 完整收束。
         let old_pool = self.stop_background_for_shutdown().await;
         self.worker_control = None;
-        let shutdown = match old_pool {
+        // 关闭失败也代表旧 Job 已释放；仍要尝试用保留的配置恢复新的计算引擎。
+        let shutdown_error = match old_pool {
             Some(pool) => pool.shutdown().await.map_err(|error| error.to_string()),
             None => Ok(()),
-        };
-        if let Err(error) = shutdown {
-            self.restarting = false;
-            return Err(error);
         }
+        .err();
         let result = match self.worker_pool_config.clone() {
             Some(config) => match WorkerPool::start(config).await {
                 Ok(worker_pool) => {
                     self.worker_control = Some(worker_pool.handle());
                     self.worker_pool = Some(worker_pool);
-                    Ok(())
+                    match shutdown_error {
+                        Some(error) => Err(format!(
+                            "旧 WorkerPool 关闭异常但新计算引擎已经重建: {error}"
+                        )),
+                        None => Ok(()),
+                    }
                 }
-                Err(error) => Err(error.to_string()),
+                Err(error) => match shutdown_error {
+                    Some(shutdown) => Err(format!(
+                        "旧 WorkerPool 关闭异常且新计算引擎启动失败: {shutdown}; {error}"
+                    )),
+                    None => Err(error.to_string()),
+                },
             },
             // 可控测试池已经关闭，不能冒充生产重建；测试只验证取消和收束边界。
-            None => Err("测试节点没有可重建的 WorkerPool".into()),
+            None => match shutdown_error {
+                Some(error) => Err(format!("测试 WorkerPool 关闭异常: {error}")),
+                None => Err("测试节点没有可重建的 WorkerPool".into()),
+            },
         };
         self.restarting = false;
         result

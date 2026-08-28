@@ -24,6 +24,8 @@ use super::{
 };
 
 const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(15);
+/// 关闭 Pool 等待 slot 退出和 driver 收束的最大时间。
+const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 /// 等待项被其他任务绕过达到该次数后，为最老任务保留后续 CPU 预算。
 const CPU_AGING_BYPASS_LIMIT: usize = 8;
 /// 对外 WorkerEvent 通道和内部待发送事件队列的固定容量，避免事件无界增长。
@@ -223,6 +225,8 @@ pub struct WorkerPoolConfig {
     cpu_budget: usize,
     ready_timeout: Duration,
     result_read_delay: Duration,
+    /// 关闭时等待每个 slot 退出和 driver join 的统一上限。
+    shutdown_timeout: Duration,
 }
 
 impl WorkerPoolConfig {
@@ -234,6 +238,7 @@ impl WorkerPoolConfig {
             cpu_budget: worker_count,
             ready_timeout: DEFAULT_READY_TIMEOUT,
             result_read_delay: Duration::ZERO,
+            shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
         }
     }
 
@@ -253,6 +258,13 @@ impl WorkerPoolConfig {
     /// 生产配置保持默认零延迟。
     pub const fn with_result_read_delay(mut self, delay: Duration) -> Self {
         self.result_read_delay = delay;
+        self
+    }
+
+    /// 覆盖关闭收束上限，只供生命周期故障测试缩短虚拟时间。
+    #[doc(hidden)]
+    pub const fn with_shutdown_timeout(mut self, timeout: Duration) -> Self {
+        self.shutdown_timeout = timeout;
         self
     }
 }
@@ -849,13 +861,13 @@ impl WorkerPool {
         // 丢弃外部接收器，关闭不必等待旧任务事件被业务消费者读取。
         drop(events);
         let (reply_tx, reply_rx) = oneshot::channel();
-        commands
-            .send(PoolCommand::Shutdown(reply_tx))
-            .await
-            .map_err(|_| WorkerPoolError::Closed)?;
-        reply_rx.await.map_err(|_| WorkerPoolError::Closed)?;
-        actor.await.map_err(|_| WorkerPoolError::Closed)?;
-        Ok(())
+        let shutdown_result = match commands.send(PoolCommand::Shutdown(reply_tx)).await {
+            Ok(()) => reply_rx.await.unwrap_or(Err(WorkerPoolError::Closed)),
+            Err(_) => Err(WorkerPoolError::Closed),
+        };
+        // 无论关闭过程是否报错，都必须等待池 actor 返回，保证 Job 和残余 driver 已释放。
+        let actor_result = actor.await.map_err(|_| WorkerPoolError::Closed);
+        shutdown_result.and(actor_result)
     }
 
     /// 等待下一条需由 NodeEngine 持久化的结果或进程事件。
@@ -1067,7 +1079,7 @@ impl WorkerPool {
                                 state.process_ids.clear();
                                 state.cpu_in_use = 0;
                                 actor_available.store(0, Ordering::Release);
-                                let _ = reply.send(());
+                                let _ = reply.send(Ok(()));
                                 break;
                             }
                         }
@@ -1306,7 +1318,7 @@ impl WorkerPool {
                         state.running.clear();
                         state.process_ids.clear();
                         state.cpu_in_use = 0;
-                        let _ = reply.send(());
+                        let _ = reply.send(Ok(()));
                         break;
                     }
                 }
@@ -1432,7 +1444,7 @@ fn controlled_schedule(
     }
 }
 
-/// Worker 池启动、请求或两阶段重启错误。
+/// Worker 池启动、请求或关闭收束错误。
 #[derive(Debug, Error)]
 pub enum WorkerPoolError {
     /// 配置至少需要一个 Worker。
@@ -1478,6 +1490,21 @@ pub enum WorkerPoolError {
     /// 诊断请求指定的 PID 不属于当前池。
     #[error("Worker PID 不存在: {0}")]
     WorkerNotFound(u32),
+    /// 关闭时等待 slot 的退出事件或 driver 收束超过上限。
+    #[error("WorkerPool 关闭超时: {timeout:?}")]
+    ShutdownTimeout {
+        /// 固定关闭上限，超时后会终止全部残余 driver。
+        timeout: Duration,
+    },
+    /// slot 控制通道已经关闭，无法发送终止命令。
+    #[error("Worker slot 控制通道已关闭: slot={slot_id}")]
+    ShutdownSlotClosed {
+        /// 无法正常停止的槽位编号。
+        slot_id: usize,
+    },
+    /// slot driver 异常退出或 join 失败。
+    #[error("Worker slot driver 收束失败: {0}")]
+    ShutdownDriver(String),
 }
 
 /// actor 与只读状态 API 共享的最小运行快照；所有写入仍只发生在 actor 中。
@@ -1653,14 +1680,16 @@ enum PoolCommand {
     Cancel(String, oneshot::Sender<Result<(), WorkerPoolError>>),
     CancelRollback(String),
     TerminateUnexpected(u32, oneshot::Sender<Result<(), WorkerPoolError>>),
-    /// 关闭命令独占 actor，完成全部 slot 退出后才回复。
-    Shutdown(oneshot::Sender<()>),
+    /// 关闭命令独占 actor，完成全部 slot 退出和 driver 收束后才回复。
+    Shutdown(oneshot::Sender<Result<(), WorkerPoolError>>),
 }
 
 /// 一个已经 Ready 的槽位，只暴露 PID 与单向控制通道。
 struct SlotHandle {
     process_id: u32,
     commands: mpsc::UnboundedSender<SlotCommand>,
+    /// 唯一 driver 任务；Pool 关闭必须等待它返回，不能只依赖 Exited 事件。
+    driver: tokio::task::JoinHandle<()>,
 }
 
 /// actor 发给单个 Worker 驱动任务的命令。
@@ -1825,8 +1854,14 @@ async fn run_pool_with_replacement<F, Fut>(
                         let _ = reply.send(result);
                     }
                     PoolCommand::Shutdown(reply) => {
-                        shutdown_slots(&mut slots, &mut slot_events, &state).await;
-                        let _ = reply.send(());
+                        let result = shutdown_slots(
+                            &mut slots,
+                            &mut slot_events,
+                            &state,
+                            config.shutdown_timeout,
+                        )
+                        .await;
+                        let _ = reply.send(result);
                         break;
                     }
                 }
@@ -1850,36 +1885,68 @@ async fn run_pool_with_replacement<F, Fut>(
     }
 }
 
-/// 终止并回收所有 slot；只有每个发送成功的 slot 报告 Exited 后才允许池 actor 退出。
+/// 终止并回收所有 slot；必须同时收到退出事件并 join driver，才允许池 actor 退出。
 async fn shutdown_slots(
     slots: &mut BTreeMap<usize, SlotHandle>,
     slot_events: &mut mpsc::UnboundedReceiver<SlotEvent>,
     state: &Arc<Mutex<PoolState>>,
-) {
+    timeout: Duration,
+) -> Result<(), WorkerPoolError> {
+    let mut retiring = std::mem::take(slots);
+    let deadline = tokio::time::Instant::now() + timeout;
     let mut waiting = HashSet::new();
-    for (slot_id, slot) in slots.iter() {
+    let mut result = Ok(());
+    for (slot_id, slot) in &retiring {
         if slot.commands.send(SlotCommand::Terminate).is_ok() {
             waiting.insert(*slot_id);
-        }
-    }
-    while !waiting.is_empty() {
-        let Some(event) = slot_events.recv().await else {
+        } else {
+            result = Err(WorkerPoolError::ShutdownSlotClosed { slot_id: *slot_id });
             break;
-        };
-        if let SlotEvent::Exited { slot_id, .. } = event
-            && waiting.remove(&slot_id)
-        {
-            slots.remove(&slot_id);
-            let mut locked = state.lock().unwrap();
-            release_running_work(&mut locked, slot_id);
-            locked.process_ids.remove(&slot_id);
         }
     }
-    slots.clear();
+    while result.is_ok() && !waiting.is_empty() {
+        match tokio::time::timeout_at(deadline, slot_events.recv()).await {
+            Ok(Some(SlotEvent::Exited { slot_id, .. })) if waiting.remove(&slot_id) => {
+                let mut locked = state.lock().unwrap();
+                release_running_work(&mut locked, slot_id);
+                locked.process_ids.remove(&slot_id);
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => result = Err(WorkerPoolError::Closed),
+            Err(_) => result = Err(WorkerPoolError::ShutdownTimeout { timeout }),
+        }
+    }
+    let slot_ids = retiring.keys().copied().collect::<Vec<_>>();
+    for slot_id in slot_ids {
+        if result.is_err() {
+            break;
+        }
+        let joined = {
+            let slot = retiring.get_mut(&slot_id).expect("待关闭 slot 必须存在");
+            tokio::time::timeout_at(deadline, &mut slot.driver).await
+        };
+        match joined {
+            Ok(Ok(())) => {
+                retiring.remove(&slot_id);
+            }
+            Ok(Err(error)) => result = Err(WorkerPoolError::ShutdownDriver(error.to_string())),
+            Err(_) => result = Err(WorkerPoolError::ShutdownTimeout { timeout }),
+        }
+    }
+    // 异常路径不能留下 detached driver：先中止，再等待每个 JoinHandle 收束。
+    if result.is_err() {
+        for slot in retiring.values() {
+            slot.driver.abort();
+        }
+    }
+    for (_, slot) in retiring {
+        let _ = slot.driver.await;
+    }
     let mut locked = state.lock().unwrap();
     locked.running.clear();
     locked.process_ids.clear();
     locked.cpu_in_use = 0;
+    result
 }
 
 /// 按空闲完成顺序 round-robin 派发等待项，并原子更新共享运行快照。
@@ -1993,7 +2060,7 @@ async fn spawn_slot(
         .map_err(|error| WorkerPoolError::Process(error.to_string()))?;
     let process_id = process.process_id();
     let (commands_tx, commands_rx) = mpsc::unbounded_channel();
-    tokio::spawn(run_slot(
+    let driver = tokio::spawn(run_slot(
         slot_id,
         process,
         commands_rx,
@@ -2003,6 +2070,7 @@ async fn spawn_slot(
     Ok(SlotHandle {
         process_id,
         commands: commands_tx,
+        driver,
     })
 }
 
@@ -2559,6 +2627,127 @@ impl TryFrom<proto::WorkerEnvelope> for WorkItem {
 mod tests {
     use super::*;
 
+    /// 构造已完成的假 driver，使纯调度测试仍遵守每个 slot 必须拥有 JoinHandle 的所有权。
+    fn completed_slot_driver() -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async {})
+    }
+
+    /// 创建带一个可控 driver 的真实 pool actor，专门验证关闭的事件与 join 双重门禁。
+    fn spawn_shutdown_test_pool<F>(
+        config: WorkerPoolConfig,
+        driver_factory: F,
+    ) -> (WorkerPool, Arc<Mutex<PoolState>>)
+    where
+        F: FnOnce(
+            mpsc::UnboundedReceiver<SlotCommand>,
+            mpsc::UnboundedSender<SlotEvent>,
+        ) -> tokio::task::JoinHandle<()>,
+    {
+        let state = Arc::new(Mutex::new(PoolState::new(1)));
+        state.lock().unwrap().process_ids.insert(0, 1);
+        let (slot_commands, slot_receiver) = mpsc::unbounded_channel();
+        let (slot_events, slot_events_receiver) = mpsc::unbounded_channel();
+        let driver = driver_factory(slot_receiver, slot_events.clone());
+        let slots = BTreeMap::from([(
+            0,
+            SlotHandle {
+                process_id: 1,
+                commands: slot_commands,
+                driver,
+            },
+        )]);
+        let (commands, command_receiver) = mpsc::channel(8);
+        let (events, event_receiver) = mpsc::channel(8);
+        let job = WorkerJob::create().expect("关闭测试需要可用 Worker Job");
+        let actor = tokio::spawn(run_pool(
+            config,
+            job,
+            slots,
+            VecDeque::from([0]),
+            command_receiver,
+            slot_events_receiver,
+            slot_events,
+            WorkerEventOutbox::new(events),
+            Arc::clone(&state),
+        ));
+        (
+            WorkerPool {
+                commands,
+                events: event_receiver,
+                state: Arc::clone(&state),
+                actor,
+            },
+            state,
+        )
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_driver_join_after_exited_event() {
+        let exited = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let driver_exited = Arc::clone(&exited);
+        let driver_release = Arc::clone(&release);
+        let config = WorkerPoolConfig::new(WorkerLaunch::new("unused-worker.exe"), 1)
+            .with_shutdown_timeout(Duration::from_secs(1));
+        let (pool, _state) = spawn_shutdown_test_pool(config, move |mut commands, events| {
+            tokio::spawn(async move {
+                assert!(matches!(
+                    commands.recv().await,
+                    Some(SlotCommand::Terminate)
+                ));
+                events
+                    .send(SlotEvent::Exited {
+                        slot_id: 0,
+                        work: None,
+                        process_id: Some(1),
+                        exit_code: Some(0),
+                        message: "test exited before driver returns".into(),
+                    })
+                    .unwrap();
+                driver_exited.notify_one();
+                driver_release.notified().await;
+            })
+        });
+        let shutdown = tokio::spawn(pool.shutdown());
+        exited.notified().await;
+        assert!(
+            !shutdown.is_finished(),
+            "仅收到 Exited 不能越过仍被 gate 阻塞的 driver"
+        );
+        release.notify_one();
+        assert!(shutdown.await.unwrap().is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_timeout_aborts_driver_and_clears_runtime_state() {
+        let terminated = Arc::new(Notify::new());
+        let driver_terminated = Arc::clone(&terminated);
+        let timeout = Duration::from_secs(1);
+        let config = WorkerPoolConfig::new(WorkerLaunch::new("unused-worker.exe"), 1)
+            .with_shutdown_timeout(timeout);
+        let (pool, state) = spawn_shutdown_test_pool(config, move |mut commands, _events| {
+            tokio::spawn(async move {
+                assert!(matches!(
+                    commands.recv().await,
+                    Some(SlotCommand::Terminate)
+                ));
+                driver_terminated.notify_one();
+                std::future::pending::<()>().await;
+            })
+        });
+        let shutdown = tokio::spawn(pool.shutdown());
+        terminated.notified().await;
+        tokio::time::advance(timeout).await;
+        assert!(matches!(
+            shutdown.await.unwrap(),
+            Err(WorkerPoolError::ShutdownTimeout { timeout: actual }) if actual == timeout
+        ));
+        let locked = state.lock().unwrap();
+        assert!(locked.running.is_empty());
+        assert!(locked.process_ids.is_empty());
+        assert_eq!(locked.cpu_in_use, 0);
+    }
+
     /// 构造只占一个 CPU 权重的调度项，供关闭槽位行为测试直接驱动生产调度函数。
     fn scheduler_work(item_id: &str, enqueue_sequence: u64) -> WorkItem {
         let envelope = proto::WorkerEnvelope {
@@ -2602,6 +2791,7 @@ mod tests {
                 SlotHandle {
                     process_id: 100,
                     commands: closed_commands,
+                    driver: completed_slot_driver(),
                 },
             ),
             (
@@ -2609,6 +2799,7 @@ mod tests {
                 SlotHandle {
                     process_id: 101,
                     commands: healthy_commands,
+                    driver: completed_slot_driver(),
                 },
             ),
         ]);
@@ -2642,6 +2833,7 @@ mod tests {
             SlotHandle {
                 process_id: 102,
                 commands: stale_commands,
+                driver: completed_slot_driver(),
             },
         )]);
         let mut replacement_idle = VecDeque::from([2]);
@@ -2671,6 +2863,7 @@ mod tests {
             std::future::ready(Ok(SlotHandle {
                 process_id: 202,
                 commands: replacement_commands.clone(),
+                driver: completed_slot_driver(),
             }))
         };
         handle_slot_event_and_schedule_with_replacement(
@@ -2810,6 +3003,7 @@ mod tests {
             SlotHandle {
                 process_id: 1,
                 commands: slot_commands,
+                driver: completed_slot_driver(),
             },
         )]);
         let (slot_events, slot_events_receiver) = mpsc::unbounded_channel();
@@ -2861,6 +3055,7 @@ mod tests {
             SlotHandle {
                 process_id: 1,
                 commands: slot_commands,
+                driver: completed_slot_driver(),
             },
         )]);
         let (slot_events, slot_events_receiver) = mpsc::unbounded_channel();
@@ -3191,6 +3386,7 @@ mod tests {
                 SlotHandle {
                     process_id: slot as u32 + 1,
                     commands,
+                    driver: completed_slot_driver(),
                 },
             );
         }
@@ -3225,6 +3421,7 @@ mod tests {
             std::future::ready(Ok::<SlotHandle, WorkerPoolError>(SlotHandle {
                 process_id: slot_id as u32 + 10_000,
                 commands: replacement_commands.clone(),
+                driver: completed_slot_driver(),
             }))
         };
         let actor_state = Arc::clone(&state);

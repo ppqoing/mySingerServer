@@ -76,4 +76,26 @@ GREEN：
 
 此前报告中“`cargo test -p dedup-desktop-core --locked` 全量通过”不成立：该命令在 `node_config_controller` 子测试挂起，随后被停止，不能计为通过。本轮只报告上述实际退出的 desktop-core 聚焦测试；未重新运行该可能挂起的全量命令。
 
-本轮 fix：`fix: await worker pool shutdown before restart`（当前 HEAD）。
+Fix round 1：`cf7e3664`（`fix: await worker pool shutdown before restart`）。
+
+## Fix round 2（关闭 join 与超时收束）
+
+### RED / 修复
+
+- 审查复现：旧实现的 slot driver 是 detached `tokio::spawn`；它可先发布 `Exited`、后继续执行，Pool actor 因而可能在 driver 和 Job 资源尚未收束时回复关闭；若永远不发布 `Exited`，重启可永久等待。
+- 新增 `shutdown_waits_for_driver_join_after_exited_event`：driver 先发送 `Exited` 后受 `Notify` gate 阻塞；未释放 gate 时关闭 future 不得完成，释放后才通过。
+- 新增 `shutdown_timeout_aborts_driver_and_clears_runtime_state`：driver 接收 `Terminate` 后永不发送 `Exited`；暂停 Tokio 时间推进固定 1 秒上限，关闭返回 `ShutdownTimeout`，并断言 running/PID/CPU 快照均为空。
+- `SlotHandle` 现在唯一持有 driver `JoinHandle`。关闭使用统一 deadline 先等所有 `Exited`，再逐一 join；超时、关闭通道或 join 异常时中止并 await 全部残余 driver，随后 actor 返回、Job drop。`WorkerPool::shutdown` 即使收到关闭错误也总会 await pool actor。
+- `restart_engine` 在旧 Pool 已完成资源释放但报告关闭异常时，仍以保留的 `WorkerPoolConfig` 尝试创建并安装新 Pool；新 Pool 成功时返回清晰诊断错误但引擎可用，新启动失败时配置仍保留供下一次重试。可控 actor 夹具没有真实 worker 启动配置，继续只作为活动任务取消/收束证据，不宣称它验证生产重建。
+
+### Fix 验证
+
+- `cargo test -p dedup-node-engine shutdown_ --lib --features test-hooks --locked`：5/5 通过，含两条新增关闭行为测试。
+- `cargo test -p dedup-node-engine stage2_create_and_shutdown_stay_responsive_while_worker_is_held --lib --features test-hooks --locked`：1/1 通过。
+- `cargo test -p worker --test worker_pool --no-run --locked`：通过；运行：3/3 通过。
+- `cargo test -p dedup-desktop-core --test controller_runtime_tasks --locked`：7/7 通过；`runtime_tasks_e2e`：1/1 通过。
+- `cargo test -p dedup-node-store --locked`：44/44 通过；`cargo test -p dedup-desktop-ui --test bindings_contract --locked`：16/16 通过。
+- `cargo test -p dedup-node-engine --features test-hooks --locked`：未通过；库单元 62/62、多个集成套件通过，但 `base_compute_pipeline` 为 55/59，四个已有的流水线时序断言失败。逐项复跑中前三项通过；`lookup_cache_reports_each_completed_thousand_file_batch` 仍在 `SQLite 应保存基础缓存查询阶段` 失败，未触碰该路径，未把该全量命令计为通过。
+- `cargo fmt --all -- --check`、`git diff --check` 通过；`rg` 未发现 `prepare_planned_restart`、`restart_after_requeue`、`begin_restored`、`begin_recovery` 产品调用。
+
+Fix round 2：本提交（`fix: join worker drivers during shutdown`）。
