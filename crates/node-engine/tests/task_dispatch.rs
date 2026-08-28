@@ -186,6 +186,14 @@ fn base_record(name: &str, known_md5: Option<[u8; 16]>) -> TaskFileRecord {
     }
 }
 
+/// 将 Hash 阶段原始记录派生为仍需媒体字段的内存记录。
+fn derived_media_record(record: &TaskFileRecord) -> TaskFileRecord {
+    let mut derived = record.clone();
+    derived.known_md5 = Some([0x5a; 16]);
+    derived.missing = TaskWorkMask::for_base(false, 1).unwrap();
+    derived
+}
+
 fn poll_once<P: TaskLanePermitProvider>(
     dispatcher: &mut TaskFileDispatcher<P>,
     cancellation: &ReadCancellationToken,
@@ -467,7 +475,7 @@ fn hash_task_can_continue_as_media_with_same_identity_and_one_tsv_row() {
     };
     assert_eq!(hash.class, DiskReadClass::HashSequential);
     let identity = hash.identity.clone();
-    let record = hash.record.clone();
+    let record = derived_media_record(&hash.record);
     drop(hash);
 
     dispatcher
@@ -500,6 +508,57 @@ fn hash_task_can_continue_as_media_with_same_identity_and_one_tsv_row() {
 }
 
 #[test]
+fn hash_continuation_accepts_derived_md5_and_media_mask_without_rewriting_tsv() {
+    let provider = FakeProvider::default();
+    let mut dispatcher = new_dispatcher(provider.clone());
+    let task_lane = lane(&[27], LocalDiskKind::Hdd, 1, 1);
+    let row = base_record("derived-media.bin", None);
+    dispatcher.register_lane(&task_lane).unwrap();
+    dispatcher
+        .append_batch(&task_lane, std::slice::from_ref(&row))
+        .unwrap();
+    dispatcher.seal().unwrap();
+    let lane_path = dispatcher.lane_path(&task_lane).unwrap();
+    let original_bytes = std::fs::read(&lane_path).unwrap();
+    let cancellation = ReadCancellationToken::new();
+    let hash = match poll_once(&mut dispatcher, &cancellation) {
+        Poll::Ready(Ok(Some(task))) => task,
+        other => panic!("Hash 任务应先取得许可，实际为 {other:?}"),
+    };
+    assert_eq!(hash.class, DiskReadClass::HashSequential);
+    let identity = hash.identity.clone();
+    let original_record = hash.record.clone();
+    let mut derived_record = original_record.clone();
+    derived_record.known_md5 = Some([0x5a; 16]);
+    derived_record.missing = TaskWorkMask::for_base(false, 0b101).unwrap();
+    drop(hash);
+
+    dispatcher
+        .request_media_continuation(&identity, &derived_record)
+        .unwrap();
+    let media = match poll_once(&mut dispatcher, &cancellation) {
+        Poll::Ready(Ok(Some(task))) => task,
+        other => panic!("Hash 后应取得同身份 Media 许可，实际为 {other:?}"),
+    };
+    assert_eq!(media.class, DiskReadClass::MediaDecode);
+    assert!(media.is_continuation());
+    assert_eq!(media.identity, identity);
+    assert_eq!(media.record, derived_record);
+    assert_eq!(provider.started().len(), 2);
+    assert_eq!(provider.started()[0].1, DiskReadClass::HashSequential);
+    assert_eq!(provider.started()[1].1, DiskReadClass::MediaDecode);
+
+    let before_complete = std::fs::read(&lane_path).unwrap();
+    assert_eq!(before_complete, original_bytes);
+    dispatcher.mark_completed(&media.identity).unwrap();
+    drop(media);
+    let mut expected_completed = original_bytes;
+    expected_completed[0] = b'C';
+    assert_eq!(std::fs::read(&lane_path).unwrap(), expected_completed);
+    assert_eq!(original_record.known_md5, None);
+}
+
+#[test]
 fn media_continuation_is_prioritized_over_the_next_same_lane_head() {
     let provider = FakeProvider::default();
     let mut dispatcher = new_dispatcher(provider);
@@ -517,7 +576,7 @@ fn media_continuation_is_prioritized_over_the_next_same_lane_head() {
         other => panic!("Hash 任务应先取得许可，实际为 {other:?}"),
     };
     let identity = hash.identity.clone();
-    let record = hash.record.clone();
+    let record = derived_media_record(&hash.record);
     drop(hash);
     dispatcher
         .request_media_continuation(&identity, &record)
@@ -558,7 +617,7 @@ fn failed_media_continuation_keeps_intent_for_retry_and_cancel_keeps_pending_sta
         other => panic!("Hash 任务应先取得许可，实际为 {other:?}"),
     };
     let identity = hash.identity.clone();
-    let record = hash.record.clone();
+    let record = derived_media_record(&hash.record);
     drop(hash);
 
     dispatcher
@@ -611,7 +670,7 @@ fn abandon_after_cancellation_allows_exact_run_discard() {
         other => panic!("任务应取得许可，实际为 {other:?}"),
     };
     let identity = task.identity.clone();
-    let record = task.record.clone();
+    let record = derived_media_record(&task.record);
     drop(task);
 
     provider.set_blocked(true);

@@ -821,6 +821,9 @@ impl TransientTaskFileSet {
     }
 
     /// 校验 Hash→Media 续算仍绑定原始 `P` 行；不修改任务文件或在途集合。
+    ///
+    /// `expected_record` 是 Hash 后的内存派生记录，只允许更新 `known_md5` 和
+    /// Media 缺失掩码；TSV 中的原始记录必须仍保持未知 MD5 的完整 Base 行。
     pub(crate) fn validate_media_continuation(
         &mut self,
         identity: &TaskFileIdentity,
@@ -831,11 +834,15 @@ impl TransientTaskFileSet {
             return Err(invalid_input("任务身份 run_id 不匹配"));
         }
         if expected_record.work_kind != TaskWorkKind::Base
-            || !expected_record.missing.needs_md5()
-            || expected_record.known_md5.is_some()
+            || expected_record.known_md5.is_none()
+            || expected_record.missing.needs_md5()
+            || expected_record.missing.base_missing_parts() == 0
         {
-            return Err(invalid_input("续算只允许仍需 MD5 的基础任务原始记录"));
+            return Err(invalid_input("续算必须携带已知 MD5 和真实媒体缺失位"));
         }
+        // 只验证派生记录的通用字段和掩码；已知 MD5 与 Media 缺失位由上面的
+        // 续算专用边界约束，不能把它们写回任务文件。
+        validate_task_file_record(expected_record)?;
         let lane_state = self
             .lanes
             .get_mut(&identity.lane_file_name)
@@ -855,7 +862,10 @@ impl TransientTaskFileSet {
         if parsed.status != TaskLineStatus::Pending
             || parsed.record.item_id != identity.item_id
             || parsed.record.missing != identity.missing
-            || parsed.record != *expected_record
+            || parsed.record.work_kind != TaskWorkKind::Base
+            || parsed.record.known_md5.is_some()
+            || parsed.record.scanned != expected_record.scanned
+            || parsed.record.item_id != expected_record.item_id
         {
             return Err(invalid_data("续算原始任务行已经变化"));
         }

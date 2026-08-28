@@ -65,7 +65,7 @@ impl From<ReadFailure> for TaskDispatchError {
 pub struct DispatchedTask<Permit> {
     /// 任务文件返回的完整行身份；结果提交必须原样回传。
     pub identity: TaskFileIdentity,
-    /// 任务文件中的计算记录。
+    /// 任务文件记录，或 Hash 后仅在内存中派生的 Media 记录。
     pub record: TaskFileRecord,
     /// 本次读取所属的 Hash 或媒体阶段。
     pub class: DiskReadClass,
@@ -172,8 +172,9 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
 
     /// 登记同一基础任务的 Hash→Media 续算；不改写 TSV，也不追加第二行。
     ///
-    /// 入口只接受仍在途、仍为 `P` 且带 `needs_md5` 的原始 Base 行。普通队首若正在
-    /// 等待许可会被撤下，续算意图优先；被撤下的普通队首仍保持 `P`，后续会重新观察。
+    /// 入口接受仍在途、仍为 `P` 的原始 Base 行及其 Hash 后的 Media 派生记录。
+    /// 普通队首若正在等待许可会被撤下，续算意图优先；被撤下的普通队首仍保持
+    /// `P`，后续会重新观察。
     pub fn request_media_continuation(
         &mut self,
         identity: &TaskFileIdentity,
