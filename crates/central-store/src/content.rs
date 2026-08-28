@@ -210,8 +210,8 @@ enum DecodedChange {
     },
     ImageStage2 {
         key: ContentKey,
-        phash_parts: Vec<u8>,
-        sobel: Vec<u8>,
+        phash_parts: Option<Vec<u8>>,
+        sobel: Option<Vec<u8>>,
     },
     VideoMetadata {
         key: ContentKey,
@@ -232,8 +232,8 @@ enum DecodedChange {
     VideoFrameStage2 {
         key: ContentKey,
         slot: u8,
-        phash_parts: Vec<u8>,
-        sobel: Vec<u8>,
+        phash_parts: Option<Vec<u8>>,
+        sobel: Option<Vec<u8>>,
     },
     DeletionTombstone {
         machine_id: String,
@@ -260,7 +260,8 @@ async fn apply_change(
                 .execute(
                     "INSERT INTO contents(md5,file_size,media_kind,base_complete) VALUES($1,$2,$3,$4)
                      ON CONFLICT(md5,file_size) DO UPDATE SET
-                       media_kind=excluded.media_kind,base_complete=excluded.base_complete",
+                       media_kind=excluded.media_kind,
+                       base_complete=contents.base_complete OR excluded.base_complete",
                     &[
                         &key.md5().as_slice(),
                         &pg_i64(key.file_size(), "文件大小")?,
@@ -314,13 +315,17 @@ async fn apply_change(
                 .execute(
                     "INSERT INTO image_stage1(content_id,width,height,pdq,quality)
                      VALUES($1,$2,$3,$4,$5) ON CONFLICT(content_id) DO UPDATE SET
-                       width=excluded.width,height=excluded.height,pdq=excluded.pdq,quality=excluded.quality",
+                       width=CASE WHEN excluded.width > 0 THEN excluded.width ELSE image_stage1.width END,
+                       height=CASE WHEN excluded.height > 0 THEN excluded.height ELSE image_stage1.height END,
+                       pdq=COALESCE(excluded.pdq,image_stage1.pdq),
+                       quality=CASE WHEN excluded.quality BETWEEN 0 AND 100
+                                    THEN excluded.quality ELSE image_stage1.quality END",
                     &[
                         &content_id,
                         &width.map(|value| value as i32),
                         &height.map(|value| value as i32),
                         pdq,
-                        &quality.map(i16::from),
+                        &quality.filter(|value| *value <= 100).map(i16::from),
                     ],
                 )
                 .await?;
@@ -335,7 +340,8 @@ async fn apply_change(
                 .execute(
                     "INSERT INTO image_stage2(content_id,phash_parts,sobel) VALUES($1,$2,$3)
                      ON CONFLICT(content_id) DO UPDATE SET
-                       phash_parts=excluded.phash_parts,sobel=excluded.sobel",
+                       phash_parts=COALESCE(excluded.phash_parts,image_stage2.phash_parts),
+                       sobel=COALESCE(excluded.sobel,image_stage2.sobel)",
                     &[&content_id, phash_parts, sobel],
                 )
                 .await?;
@@ -351,7 +357,10 @@ async fn apply_change(
                 .execute(
                     "INSERT INTO video_metadata(content_id,duration_ms,width,height)
                      VALUES($1,$2,$3,$4) ON CONFLICT(content_id) DO UPDATE SET
-                       duration_ms=excluded.duration_ms,width=excluded.width,height=excluded.height",
+                       duration_ms=CASE WHEN excluded.duration_ms > 0
+                                       THEN excluded.duration_ms ELSE video_metadata.duration_ms END,
+                       width=CASE WHEN excluded.width > 0 THEN excluded.width ELSE video_metadata.width END,
+                       height=CASE WHEN excluded.height > 0 THEN excluded.height ELSE video_metadata.height END",
                     &[
                         &content_id,
                         &duration_ms
@@ -380,8 +389,13 @@ async fn apply_change(
                        content_id,slot,time_ms,decoded,width,height,pdq,quality)
                      VALUES($1,$2,$3,$4,$5,$6,$7,$8)
                      ON CONFLICT(content_id,slot) DO UPDATE SET
-                       time_ms=excluded.time_ms,decoded=excluded.decoded,width=excluded.width,
-                       height=excluded.height,pdq=excluded.pdq,quality=excluded.quality",
+                       time_ms=COALESCE(excluded.time_ms,video_frame_stage1.time_ms),
+                       decoded=CASE WHEN excluded.decoded THEN TRUE ELSE video_frame_stage1.decoded END,
+                       width=CASE WHEN excluded.width > 0 THEN excluded.width ELSE video_frame_stage1.width END,
+                       height=CASE WHEN excluded.height > 0 THEN excluded.height ELSE video_frame_stage1.height END,
+                       pdq=COALESCE(excluded.pdq,video_frame_stage1.pdq),
+                       quality=CASE WHEN excluded.quality BETWEEN 0 AND 100
+                                    THEN excluded.quality ELSE video_frame_stage1.quality END",
                     &[
                         &content_id,
                         &i16::from(*slot),
@@ -390,7 +404,7 @@ async fn apply_change(
                         &width.map(|value| value as i32),
                         &height.map(|value| value as i32),
                         pdq,
-                        &quality.map(i16::from),
+                        &quality.filter(|value| *value <= 100).map(i16::from),
                     ],
                 )
                 .await?;
@@ -406,7 +420,8 @@ async fn apply_change(
                 .execute(
                     "INSERT INTO video_frame_stage2(content_id,slot,phash_parts,sobel)
                      VALUES($1,$2,$3,$4) ON CONFLICT(content_id,slot) DO UPDATE SET
-                       phash_parts=excluded.phash_parts,sobel=excluded.sobel",
+                       phash_parts=COALESCE(excluded.phash_parts,video_frame_stage2.phash_parts),
+                       sobel=COALESCE(excluded.sobel,video_frame_stage2.sobel)",
                     &[&content_id, &i16::from(*slot), phash_parts, sobel],
                 )
                 .await?;
@@ -496,8 +511,8 @@ fn decode_change(change: &proto::SyncChange) -> Result<DecodedChange, CentralErr
         },
         "image_stage2" => DecodedChange::ImageStage2 {
             key: reader.content_key()?,
-            phash_parts: reader.bytes()?,
-            sobel: reader.bytes()?,
+            phash_parts: optional_blob(reader.bytes()?),
+            sobel: optional_blob(reader.bytes()?),
         },
         "video_metadata" => DecodedChange::VideoMetadata {
             key: reader.content_key()?,
@@ -518,8 +533,8 @@ fn decode_change(change: &proto::SyncChange) -> Result<DecodedChange, CentralErr
         "video_frame_stage2" => DecodedChange::VideoFrameStage2 {
             key: reader.content_key()?,
             slot: reader.u8()?,
-            phash_parts: reader.bytes()?,
-            sobel: reader.bytes()?,
+            phash_parts: optional_blob(reader.bytes()?),
+            sobel: optional_blob(reader.bytes()?),
         },
         "deletion_tombstone" => DecodedChange::DeletionTombstone {
             machine_id: reader.text()?,
@@ -535,6 +550,11 @@ fn decode_change(change: &proto::SyncChange) -> Result<DecodedChange, CentralErr
     };
     reader.finish()?;
     Ok(decoded)
+}
+
+/// 把空的二筛字节字段视为未完成，避免部分同步清空中心已有特征。
+fn optional_blob(bytes: Vec<u8>) -> Option<Vec<u8>> {
+    (!bytes.is_empty()).then_some(bytes)
 }
 
 fn snapshot_entity_kind(table_name: &str) -> Result<&'static str, CentralError> {

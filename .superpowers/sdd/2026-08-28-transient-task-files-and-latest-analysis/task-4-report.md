@@ -167,3 +167,51 @@ SQLite、outbox、任务状态和 Worker 调用，不使用源码字符串匹配
 | `git diff --check` | 通过 |
 
 NodeEngine 全量初次回归曾因图片请求的既有空 `frame_slots` 夹具未到 Worker 屏障；已将“空交集直接完成”收窄为视频路径，图片行为测试和随后 64/64 全量均通过。未执行真实媒体、打包、部署、TSV/lane/任务恢复/协议/UI 改动，也未访问 `I:\Tool`。
+
+## Follow-up 4：中心特征合并与 phase2 正式载荷校验
+
+本轮针对复审剩余的中心 UPSERT 和 phase2 outbox 断言继续执行真实行为测试优先、最小实现；
+没有使用源码字符串作为行为测试。
+
+### RED 与环境边界
+
+- 新增 `crates/central-store/tests/content_upsert.rs` 表级 PostgreSQL 行为夹具：先写完整图片、
+  视频元数据、视频槽位一筛/二筛，再发送 NULL、空二筛字段、`decoded=false`、非法 Quality
+  `101/255` 和 `base_complete=false`，同时覆盖初次部分行后续完整补齐与合法 Quality `0`。
+- 本机未设置 `DEDUP_TEST_POSTGRES_URL`，且 5432 无 PostgreSQL 服务；该真实表级测试按现有契约
+  保持 `ignored`，没有将环境缺失伪报为 RED/GREEN 或 PASS。测试体在环境存在时实际调用
+  `CentralStore::connect`、`apply_sync_batch` 和 SQL 查询，不是源码扫描测试。
+- 原 phase2 测试只读取 payload 固定偏移，属于断言缺口；已先替换为正式载荷解码器并使用不同本地/远端
+  特征值，保留两个精确一次场景的行为边界。
+
+### GREEN 实现
+
+- 中心 `contents.base_complete` 只允许从 false 变 true；图片 stage1 的尺寸、PDQ、Quality，
+  视频元数据的时长/尺寸，视频 frame stage1 的尺寸、PDQ、Quality 均使用条件合并或旧值保护；
+  非法 Quality 先转为缺失，合法 `0` 保留，`decoded=false` 不覆盖旧的 true。
+- 图片与视频 frame stage2 的空字节载荷解码为缺失并通过 `COALESCE` 保留旧列；初次空二筛行
+  可保存，后续完整 payload 可补齐。中心仍由数据库固定长度约束保护真实特征长度。
+- phase2 outbox 测试按版本、MD5、文件大小、槽位、长度和完整字段解码；预存槽使用本地特征，远端
+  导入槽使用不同特征，断言 expected 槽各且仅一次，未请求槽不产生载荷。
+
+### Follow-up 4 验证
+
+所有 Cargo 命令在同一 PowerShell 命令中显式设置 `CARGO_TARGET_DIR=C:\tmp\rust-v2-core-scope-target`、
+`CARGO_INCREMENTAL=0`、dev/test debug=0，并清除 `CC/CXX/AR/RANLIB/CFLAGS/CXXFLAGS/RUSTFLAGS/RUSTC_WRAPPER`；
+每条重型命令前检查 C/D，记录 C=17.95 GiB、D=10.31 GiB，未低于 10 GiB 停止线。
+
+| 验证 | 结果 |
+|---|---|
+| `cargo test -p dedup-central-store --test content_upsert --locked -- --test-threads=1` | 编译通过，1 个 PostgreSQL 集成测试因环境变量缺失 ignored |
+| `cargo test -p dedup-central-store --locked -- --test-threads=1` | 3 通过，2 个 PostgreSQL 集成测试按契约 ignored |
+| `cargo test -p dedup-node-engine --lib analysis::phase2::tests::remote_stage2 --locked -- --test-threads=1` | 2/2 通过 |
+| `cargo test -p dedup-node-store --test content_cache --locked -- --test-threads=1` | 22/22 通过 |
+| `cargo test -p dedup-node-store --locked -- --test-threads=1` | 全量通过 |
+| `cargo test -p dedup-node-engine --test local_analysis --locked -- --test-threads=1` | 11/11 通过 |
+| `cargo test -p dedup-node-engine --features test-hooks --test base_compute_pipeline --locked -- --test-threads=1` | 59/59 通过 |
+| `cargo test -p dedup-node-engine --test worker_pipeline --locked -- --test-threads=1` | 23/23 通过 |
+| `cargo test -p dedup-node-engine --lib --locked -- --test-threads=1` | 66/66 通过 |
+| `cargo fmt --all -- --check` | 通过 |
+| `git diff --check` | 通过 |
+
+未执行真实媒体、打包、部署、TSV/lane/任务恢复/协议/UI 改动，也未访问 `I:\Tool`。

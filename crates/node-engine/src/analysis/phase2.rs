@@ -1692,8 +1692,13 @@ mod tests {
             TaskStatus::Completed
         );
         assert_eq!(
-            video_stage2_slots(&store.pull_changes(before, 100).unwrap().changes),
-            vec![0]
+            decode_video_stage2_changes(&store.pull_changes(before, 100).unwrap().changes),
+            vec![DecodedVideoStage2 {
+                key: content,
+                slot: 0,
+                phash_parts: encoded_stage2(&remote_stage2()).0,
+                sobel: encoded_stage2(&remote_stage2()).1,
+            }]
         );
     }
 
@@ -1734,9 +1739,27 @@ mod tests {
             store.task_snapshot(task_id).unwrap().status,
             TaskStatus::Completed
         );
+        let mut changes =
+            decode_video_stage2_changes(&store.pull_changes(before, 100).unwrap().changes);
+        changes.sort_by_key(|change| change.slot);
+        assert_eq!(changes.len(), 2);
         assert_eq!(
-            video_stage2_slots(&store.pull_changes(before, 100).unwrap().changes),
-            vec![0, 1]
+            changes[0],
+            DecodedVideoStage2 {
+                key: content,
+                slot: 0,
+                phash_parts: encoded_stage2(&local_stage2()).0,
+                sobel: encoded_stage2(&local_stage2()).1,
+            }
+        );
+        assert_eq!(
+            changes[1],
+            DecodedVideoStage2 {
+                key: content,
+                slot: 1,
+                phash_parts: encoded_stage2(&remote_stage2()).0,
+                sobel: encoded_stage2(&remote_stage2()).1,
+            }
         );
     }
 
@@ -1809,7 +1832,7 @@ mod tests {
                         None,
                         FeatureWrite::VideoFrameStage2(VideoFrameStage2Fields {
                             slot,
-                            features: stage2(),
+                            features: local_stage2(),
                         }),
                     )
                     .unwrap();
@@ -1821,7 +1844,7 @@ mod tests {
     }
 
     fn full_stage2_frames() -> [Option<ImageStage2>; 6] {
-        std::array::from_fn(|_| Some(stage2()))
+        std::array::from_fn(|_| Some(remote_stage2()))
     }
 
     fn stage1() -> ImageStage1 {
@@ -1833,20 +1856,108 @@ mod tests {
         }
     }
 
-    fn stage2() -> ImageStage2 {
+    fn local_stage2() -> ImageStage2 {
         ImageStage2 {
-            phash_parts: [0; 9],
-            sobel: [0.0; 128],
+            phash_parts: [0x1111_1111_1111_1111; 9],
+            sobel: [0.25; 128],
         }
     }
 
-    fn video_stage2_slots(changes: &[proto::SyncChange]) -> Vec<u8> {
-        let mut slots = changes
+    fn remote_stage2() -> ImageStage2 {
+        ImageStage2 {
+            phash_parts: [0x2222_2222_2222_2222; 9],
+            sobel: [0.5; 128],
+        }
+    }
+
+    fn encoded_stage2(features: &ImageStage2) -> (Vec<u8>, Vec<u8>) {
+        let phash_parts = features
+            .phash_parts
+            .iter()
+            .flat_map(|part| part.to_le_bytes())
+            .collect();
+        let sobel = features
+            .sobel
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        (phash_parts, sobel)
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct DecodedVideoStage2 {
+        key: ContentKey,
+        slot: u8,
+        phash_parts: Vec<u8>,
+        sobel: Vec<u8>,
+    }
+
+    fn decode_video_stage2_changes(changes: &[proto::SyncChange]) -> Vec<DecodedVideoStage2> {
+        changes
             .iter()
             .filter(|change| change.entity_kind == "video_frame_stage2")
-            .map(|change| change.payload[29])
-            .collect::<Vec<_>>();
-        slots.sort_unstable();
-        slots
+            .map(decode_video_stage2_change)
+            .collect()
+    }
+
+    fn decode_video_stage2_change(change: &proto::SyncChange) -> DecodedVideoStage2 {
+        assert_eq!(change.entity_kind, "video_frame_stage2");
+        assert_eq!(change.payload.len(), 622);
+        let mut reader = PayloadReader::new(&change.payload);
+        assert_eq!(reader.u8(), 1);
+        let md5 = reader.bytes();
+        assert_eq!(md5.len(), 16);
+        let key = ContentKey::new(md5.try_into().unwrap(), reader.u64());
+        let slot = reader.u8();
+        let phash_parts = reader.bytes();
+        let sobel = reader.bytes();
+        assert_eq!(phash_parts.len(), 72);
+        assert_eq!(sobel.len(), 512);
+        assert_eq!(reader.remaining(), 0);
+        DecodedVideoStage2 {
+            key,
+            slot,
+            phash_parts,
+            sobel,
+        }
+    }
+
+    struct PayloadReader<'a> {
+        bytes: &'a [u8],
+        offset: usize,
+    }
+
+    impl<'a> PayloadReader<'a> {
+        fn new(bytes: &'a [u8]) -> Self {
+            Self { bytes, offset: 0 }
+        }
+
+        fn u8(&mut self) -> u8 {
+            let value = *self.bytes.get(self.offset).unwrap();
+            self.offset += 1;
+            value
+        }
+
+        fn u64(&mut self) -> u64 {
+            let end = self.offset + 8;
+            let value = u64::from_be_bytes(self.bytes[self.offset..end].try_into().unwrap());
+            self.offset = end;
+            value
+        }
+
+        fn bytes(&mut self) -> Vec<u8> {
+            let end = self.offset + 4;
+            let length =
+                u32::from_be_bytes(self.bytes[self.offset..end].try_into().unwrap()) as usize;
+            self.offset = end;
+            let end = self.offset + length;
+            let value = self.bytes[self.offset..end].to_vec();
+            self.offset = end;
+            value
+        }
+
+        fn remaining(&self) -> usize {
+            self.bytes.len() - self.offset
+        }
     }
 }
