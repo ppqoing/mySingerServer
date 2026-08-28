@@ -491,6 +491,11 @@ pub(crate) fn begin_stage2_batch(
                 "视频二筛槽位必须位于 0..=5".into(),
             ));
         }
+        if active.media_kind == MediaKind::Video && frame_slots.is_empty() {
+            return Err(AnalysisBlocked::InvalidState(
+                "视频二筛至少需要一个成功槽位".into(),
+            ));
+        }
         work.push(MissingWork {
             content: requested.content,
             content_id: active.content_id,
@@ -680,6 +685,35 @@ async fn run_stage2_batch_internal<P: Stage2Processor>(
             continue;
         }
         let frame_slots = missing_stage2_slots(expected, cached);
+        let existing_slots = expected
+            .frame_slots
+            .iter()
+            .copied()
+            .filter(|slot| !frame_slots.contains(slot))
+            .collect::<Vec<_>>();
+        if !existing_slots.is_empty() {
+            let Some(cached) = cached else {
+                return Err(AnalysisBlocked::InvalidState(
+                    "二筛已有槽位缺少本机缓存记录".into(),
+                ));
+            };
+            if !store.republish_stage2_slots_from_cache(cached, &existing_slots)? {
+                return Err(AnalysisBlocked::InvalidState(
+                    "二筛已有槽位缓存不完整".into(),
+                ));
+            }
+        }
+        if expected.media_kind == MediaKind::Video && frame_slots.is_empty() {
+            store.complete_item(
+                &item.item_id,
+                TaskItemCompletion::Succeeded {
+                    content_id: Some(expected.content_id),
+                },
+                now_ms,
+            )?;
+            completed += 1;
+            continue;
+        }
         let request = Stage2Request {
             task_id,
             item_id: item.item_id.clone(),

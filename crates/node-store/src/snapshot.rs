@@ -305,7 +305,7 @@ impl SnapshotReader<'_> {
                     payload: encode_video_metadata(
                         content_key,
                         VideoMetadataFields {
-                            duration_ms: duration.map(|value| value as u64),
+                            duration_ms: duration.and_then(|value| u64::try_from(value).ok()),
                             width,
                             height,
                         },
@@ -359,7 +359,9 @@ impl SnapshotReader<'_> {
                             content_key,
                             VideoFrameStage1Fields {
                                 slot,
-                                time_ms: time as u64,
+                                time_ms: u64::try_from(time).map_err(|_| {
+                                    StoreError::InvalidState("视频槽位时间不能为负数".into())
+                                })?,
                                 decoded,
                                 width,
                                 height,

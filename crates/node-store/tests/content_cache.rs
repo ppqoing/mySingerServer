@@ -4,7 +4,8 @@ use dedup_core::{ContentKey, DisplayPath, MachineId, MediaKind, NormalizedPath};
 use dedup_media::{ImageStage1, ImageStage2, PdqHash};
 use dedup_node_store::{
     CacheCompleteness, CompleteStage1, CompleteStage2, FeatureWrite, ImageStage1Fields, NodeStore,
-    ScannedPath, StoreError, VideoFrameStage1Fields, classify_cache_completeness,
+    ScannedPath, StoreError, VideoFrameStage1Fields, VideoFrameStage2Fields, VideoMetadataFields,
+    classify_cache_completeness,
 };
 use rusqlite::{Connection, params};
 use tempfile::TempDir;
@@ -682,6 +683,236 @@ fn partial_stage1_outbox_payload_preserves_existing_fields() {
     assert_eq!(decode_image_stage1_payload(&change.payload), original);
 }
 
+/// 图片一筛的非法 Quality 不得覆盖旧值，且 outbox 必须继续发布旧合法字段。
+#[test]
+fn invalid_image_quality_preserves_existing_feature_and_outbox() {
+    let mut store = NodeStore::open_in_memory(machine()).unwrap();
+    let content = store
+        .upsert_content_and_location(
+            &scan(r"D:\quality-preserve.jpg", 504),
+            [0x89; 16],
+            MediaKind::Image,
+        )
+        .unwrap();
+    let original = ImageStage1 {
+        width: 640,
+        height: 480,
+        pdq: PdqHash::from_bytes([7; 32]),
+        quality: 90,
+    };
+    store
+        .commit_feature_result(
+            content.id,
+            None,
+            FeatureWrite::ImageStage1(ImageStage1Fields::from(original)),
+        )
+        .unwrap();
+    let before = store.outbox_high_seq().unwrap();
+    store
+        .commit_feature_result(
+            content.id,
+            None,
+            FeatureWrite::ImageStage1(ImageStage1Fields {
+                width: None,
+                height: None,
+                pdq: None,
+                quality: Some(101),
+            }),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        store.load_complete_stage1(content.id).unwrap(),
+        Some(CompleteStage1::Image(feature)) if feature == original
+    ));
+    let change = store
+        .pull_changes(before, 10)
+        .unwrap()
+        .changes
+        .into_iter()
+        .find(|change| change.entity_kind == "image_stage1")
+        .expect("非法 Quality 仍需发布合并后的完整一筛");
+    assert_eq!(decode_image_stage1_payload(&change.payload), original);
+}
+
+/// 视频槽位的非法 Quality 不得覆盖旧值，且 outbox 载荷仍保留旧合法 Quality。
+#[test]
+fn invalid_video_frame_quality_preserves_existing_feature_and_outbox() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("quality-preserve-video.db");
+    let mut store = NodeStore::open(&database, machine()).unwrap();
+    let content = store
+        .upsert_content_and_location(
+            &scan(r"D:\quality-preserve.mp4", 505),
+            [0x8a; 16],
+            MediaKind::Video,
+        )
+        .unwrap();
+    let original = successful_video_frame(0);
+    store
+        .commit_feature_result(content.id, None, FeatureWrite::VideoFrameStage1(original))
+        .unwrap();
+    let before = store.outbox_high_seq().unwrap();
+    store
+        .commit_feature_result(
+            content.id,
+            None,
+            FeatureWrite::VideoFrameStage1(VideoFrameStage1Fields {
+                slot: 0,
+                time_ms: original.time_ms,
+                decoded: true,
+                width: None,
+                height: None,
+                pdq: None,
+                quality: Some(255),
+            }),
+        )
+        .unwrap();
+
+    let connection = Connection::open(&database).unwrap();
+    let row: (i64, i64) = connection
+        .query_row(
+            "SELECT quality,time_ms FROM video_frame_stage1 WHERE content_id=?1 AND slot=0",
+            [content.id.as_i64()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(row, (80, original.time_ms as i64));
+    let change = store
+        .pull_changes(before, 10)
+        .unwrap()
+        .changes
+        .into_iter()
+        .find(|change| change.entity_kind == "video_frame_stage1")
+        .expect("非法 Quality 仍需发布合并后的槽位一筛");
+    assert_eq!(decode_video_frame_stage1_quality(&change.payload), 80);
+}
+
+/// 公开二筛重发入口必须拒绝 stage1 结构损坏的图片，不得新增 outbox。
+#[test]
+fn republish_complete_stage2_rejects_invalid_image_stage1() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("republish-invalid-image.db");
+    let machine_id = machine();
+    let mut store = NodeStore::open(&database, machine_id.clone()).unwrap();
+    let content = store
+        .upsert_content_and_location(
+            &scan(r"D:\republish-invalid.jpg", 506),
+            [0x8b; 16],
+            MediaKind::Image,
+        )
+        .unwrap();
+    store
+        .commit_feature_result(
+            content.id,
+            None,
+            FeatureWrite::ImageStage1(ImageStage1Fields::from(ImageStage1 {
+                width: 640,
+                height: 480,
+                pdq: PdqHash::from_bytes([6; 32]),
+                quality: 90,
+            })),
+        )
+        .unwrap();
+    store
+        .commit_feature_result(
+            content.id,
+            None,
+            FeatureWrite::ImageStage2(ImageStage2 {
+                phash_parts: [0; 9],
+                sobel: [0.0; 128],
+            }),
+        )
+        .unwrap();
+    store.mark_base_complete(content.id).unwrap();
+    let before = store.outbox_high_seq().unwrap();
+
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute_batch("PRAGMA ignore_check_constraints=ON;")
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE image_stage1 SET width=0 WHERE content_id=?1",
+            [content.id.as_i64()],
+        )
+        .unwrap();
+    drop(connection);
+
+    assert!(!store.republish_complete_stage2(content.id).unwrap());
+    assert_eq!(store.outbox_high_seq().unwrap(), before);
+}
+
+/// 负视频时长必须保持探测缺失，不能转换成巨大的合法无符号时长或重发二筛。
+#[test]
+fn negative_video_duration_is_missing_and_blocks_stage2_republish() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("republish-invalid-video.db");
+    let machine_id = machine();
+    let mut store = NodeStore::open(&database, machine_id.clone()).unwrap();
+    let content = store
+        .upsert_content_and_location(
+            &scan(r"D:\republish-invalid.mp4", 507),
+            [0x8c; 16],
+            MediaKind::Video,
+        )
+        .unwrap();
+    store
+        .commit_feature_result(
+            content.id,
+            None,
+            FeatureWrite::VideoMetadata(VideoMetadataFields {
+                duration_ms: Some(12_000),
+                width: Some(1920),
+                height: Some(1080),
+            }),
+        )
+        .unwrap();
+    for slot in 0..6 {
+        store
+            .commit_feature_result(
+                content.id,
+                None,
+                FeatureWrite::VideoFrameStage1(successful_video_frame(slot)),
+            )
+            .unwrap();
+        store
+            .commit_feature_result(
+                content.id,
+                None,
+                FeatureWrite::VideoFrameStage2(VideoFrameStage2Fields {
+                    slot,
+                    features: ImageStage2 {
+                        phash_parts: [slot as u64; 9],
+                        sobel: [0.0; 128],
+                    },
+                }),
+            )
+            .unwrap();
+    }
+    store.mark_base_complete(content.id).unwrap();
+    let before = store.outbox_high_seq().unwrap();
+
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute(
+            "UPDATE video_metadata SET duration_ms=-1 WHERE content_id=?1",
+            [content.id.as_i64()],
+        )
+        .unwrap();
+    drop(connection);
+
+    let record = store.load_base_cache_record(content.id).unwrap();
+    assert_eq!(record.duration_ms, None);
+    assert_ne!(
+        classify_cache_completeness(&record, true).base_missing_parts
+            & dedup_protocol::BASE_MISSING_PROBE,
+        0
+    );
+    assert!(!store.republish_complete_stage2(content.id).unwrap());
+    assert_eq!(store.outbox_high_seq().unwrap(), before);
+}
+
 /// 解码 NodeStore 已提交的一筛载荷，验证对端看到的是合并后的有效结构。
 fn decode_image_stage1_payload(payload: &[u8]) -> ImageStage1 {
     assert_eq!(payload.first().copied(), Some(1));
@@ -735,6 +966,49 @@ fn decode_image_stage1_payload(payload: &[u8]) -> ImageStage1 {
         pdq: PdqHash::from_bytes(pdq.try_into().expect("PDQ 长度固定")),
         quality,
     }
+}
+
+/// 解码视频槽位一筛载荷的 Quality，验证 outbox 使用事务合并值。
+fn decode_video_frame_stage1_quality(payload: &[u8]) -> u8 {
+    assert_eq!(payload.first().copied(), Some(1));
+    let mut at = 1;
+    let read_u8 = |payload: &[u8], at: &mut usize| {
+        let value = *payload.get(*at).expect("载荷字段完整");
+        *at += 1;
+        value
+    };
+    let read_u32 = |payload: &[u8], at: &mut usize| {
+        let end = (*at).checked_add(4).expect("载荷位置不溢出");
+        let bytes: [u8; 4] = payload
+            .get(*at..end)
+            .expect("载荷字段完整")
+            .try_into()
+            .unwrap();
+        *at = end;
+        u32::from_be_bytes(bytes)
+    };
+    let skip_bytes = |payload: &[u8], at: &mut usize| {
+        let length = read_u32(payload, at) as usize;
+        *at = (*at).checked_add(length).expect("载荷长度不溢出");
+        assert!(*at <= payload.len(), "载荷字段完整");
+    };
+    skip_bytes(payload, &mut at);
+    at = at.checked_add(8).expect("内容键完整");
+    assert_eq!(read_u8(payload, &mut at), 0);
+    at = at.checked_add(8).expect("时间字段完整");
+    assert_eq!(read_u8(payload, &mut at), 1);
+    for _ in 0..2 {
+        if read_u8(payload, &mut at) == 1 {
+            at = at.checked_add(4).expect("尺寸字段完整");
+        }
+    }
+    if read_u8(payload, &mut at) == 1 {
+        skip_bytes(payload, &mut at);
+    }
+    assert_eq!(read_u8(payload, &mut at), 1);
+    let quality = read_u8(payload, &mut at);
+    assert_eq!(at, payload.len());
+    quality
 }
 
 /// Worker 返回非法零尺寸时只能保持缺失，不能覆盖已有有效一筛字段。

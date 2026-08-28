@@ -290,6 +290,51 @@ async fn explicit_stage2_batch_requests_only_missing_successful_video_slots() {
 }
 
 #[tokio::test]
+async fn explicit_stage2_batch_republishes_requested_cached_slot_without_worker() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("stage2-existing-slot.db");
+    let machine = MachineId::parse(&"79".repeat(32)).unwrap();
+    let mut store = NodeStore::open(&database, machine).unwrap();
+    let seeded = seed_video_with_stage2_slots(
+        &mut store,
+        r"D:\central-existing.mp4",
+        [16; 16],
+        &[0, 1, 4, 5],
+    );
+    let content_key = store.load_base_cache_record(seeded.2).unwrap().content_key;
+    let before = store.outbox_high_seq().unwrap();
+    let mut processor = CountingStage2::default();
+
+    let task_id = dispatch_stage2_batch(
+        &mut store,
+        &[Stage2BatchItem {
+            content: content_key,
+            source: seeded.1,
+            frame_slots: vec![0],
+        }],
+        &mut processor,
+        38,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(processor.calls, 0);
+    assert_eq!(
+        store
+            .pull_changes(before, 100)
+            .unwrap()
+            .changes
+            .into_iter()
+            .filter(|change| change.entity_kind == "video_frame_stage2")
+            .count(),
+        1
+    );
+    let task = store.task_snapshot(task_id).unwrap();
+    assert_eq!(task.status, TaskStatus::Completed);
+    assert_eq!(task.succeeded, 1);
+}
+
+#[tokio::test]
 async fn incomplete_media_is_counted_and_never_enters_candidates() {
     let mut store = store();
     let incomplete = seed_content(

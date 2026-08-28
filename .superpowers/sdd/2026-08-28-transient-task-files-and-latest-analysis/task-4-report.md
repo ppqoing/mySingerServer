@@ -80,3 +80,41 @@
 | `git diff --check` | 通过 |
 
 未执行真实媒体、打包、部署、TSV/lane/任务恢复/协议/UI 改动，也未访问 `I:\Tool`。
+
+## Follow-up 2：阶段二空交集、Quality 覆盖与重发门禁
+
+本轮针对复审指出的三个 Important 继续按真实行为测试先 RED、再最小 GREEN；测试只观察
+SQLite、outbox、任务状态和 Worker 调用，不使用源码字符串匹配。
+
+### RED
+
+- 中心仅请求视频槽 `[0]`、本机已有 `[0,1,4,5]` 时，旧 phase2 先将交集算为空但仍创建一个 Worker 请求；行为测试观察到 `calls=1`，期望为 `0`。
+- 已有合法图片/视频槽位 Quality 分别为 `90/80` 时，传入 `101/255` 直接触发 SQLite Quality CHECK，批次不能完成；负视频时长被 `as u64` 解码为 `18446744073709551615`；畸形图片 stage1 仍能通过公开二筛重发入口新增 outbox。
+
+### GREEN
+
+- phase2 先以集中 `CacheCompleteness::video_stage2_missing_slots` 与中心请求槽位求交集；对交集为空但请求槽已在本机完整的情况，通过 `republish_stage2_slots_from_cache` 只重发这些请求槽，再成功提交任务项，不启动 Worker。视频空槽请求在批次入口拒绝；图片空槽仍保留既有图片 Worker 请求语义。
+- `republish_complete_stage2_from_cache` 和按槽重发入口统一经过完整性分类，非法尺寸、Quality、BLOB、Sobel、视频探测字段和缺失槽位均拒绝重发。
+- 图片与视频槽位 stage1 的 SQL 合并使用 Quality `CASE`，写入参数先将 `>100` 变为缺失；合法 `0` 仍可写入。事务提交前回读合并行后编码 outbox，因此旧合法 Quality 不会被部分输入降级。
+- 单条内容加载和只读快照均拒绝把负视频时长/槽位时间转换成巨大无符号值；负 duration 作为探测缺失，负 frame time 使快照读取返回明确存储错误。
+
+### Follow-up 验证
+
+所有 Cargo 命令均在同一 PowerShell 命令中显式使用 `CARGO_TARGET_DIR=C:\tmp\rust-v2-core-scope-target`、`CARGO_INCREMENTAL=0`、dev/test debug=0，并清除 `CC/CXX/AR/RANLIB/CFLAGS/CXXFLAGS/RUSTFLAGS/RUSTC_WRAPPER`；每条重型命令前检查 C/D 空间。本轮记录 C=18.06--18.17 GiB、D=10.31 GiB，未触及 10 GiB 停止线。
+
+| 验证 | 结果 |
+|---|---|
+| 复审 RED：旧实现中心已有槽空交集行为测试 | `calls=1`，期望 `0` |
+| 复审 RED：旧实现 `content_cache` | 22 个测试中 4 个失败（Quality CHECK×2、负 duration 转换、畸形重发门禁） |
+| `cargo test -p dedup-node-store --test content_cache --locked -- --test-threads=1` | 22/22 通过 |
+| `cargo test -p dedup-node-store --locked -- --test-threads=1` | 55/55 通过 |
+| `cargo test -p dedup-node-engine --test base_compute_pipeline --features test-hooks --locked -- --test-threads=1` | 59/59 通过 |
+| `cargo test -p dedup-node-engine --test local_analysis --locked -- --test-threads=1` | 11/11 通过 |
+| `cargo test -p dedup-node-engine --test worker_pipeline --locked -- --test-threads=1` | 23/23 通过 |
+| `cargo test -p dedup-node-engine --lib central_cache --locked -- --test-threads=1` | 1/1 通过 |
+| `cargo test -p dedup-node-engine --lib --locked -- --test-threads=1` | 64/64 通过 |
+| `cargo test -p dedup-central-store --locked -- --test-threads=1` | 3 通过，1 个 PostgreSQL 环境测试忽略 |
+| `cargo fmt --all -- --check` | 通过 |
+| `git diff --check` | 通过 |
+
+NodeEngine 全量初次回归曾因图片请求的既有空 `frame_slots` 夹具未到 Worker 屏障；已将“空交集直接完成”收窄为视频路径，图片行为测试和随后 64/64 全量均通过。未执行真实媒体、打包、部署、TSV/lane/任务恢复/协议/UI 改动，也未访问 `I:\Tool`。

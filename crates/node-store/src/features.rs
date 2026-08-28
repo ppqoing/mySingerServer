@@ -8,6 +8,7 @@ use crate::{
     BaseCacheRecord, CompleteStage1, CompleteStage2, ContentId, FeatureWrite, ImageStage1Fields,
     NodeStore, StoreError, TaskItemApplyResult, TaskItemCompletion, TaskItemIdentity,
     VideoFrameStage1Fields, VideoFrameStage2Fields, VideoMetadataFields,
+    cache_integrity::classify_cache_completeness,
     content::{content_key_in_transaction, encode_content},
     open::sqlite_integer,
     outbox::append_sync_change,
@@ -51,13 +52,14 @@ impl NodeStore {
                        width=CASE WHEN excluded.width > 0 THEN excluded.width ELSE image_stage1.width END,
                        height=CASE WHEN excluded.height > 0 THEN excluded.height ELSE image_stage1.height END,
                        pdq=COALESCE(excluded.pdq,image_stage1.pdq),
-                       quality=COALESCE(excluded.quality,image_stage1.quality)",
+                       quality=CASE WHEN excluded.quality BETWEEN 0 AND 100
+                                    THEN excluded.quality ELSE image_stage1.quality END",
                     params![
                         content_id.as_i64(),
                         fields.width,
                         fields.height,
                         fields.pdq.map(|hash| hash.as_bytes().to_vec()),
-                        fields.quality
+                        fields.quality.filter(|quality| *quality <= 100)
                     ],
                 )?;
                 let merged = read_image_stage1_fields(&transaction, content_id)?;
@@ -105,7 +107,8 @@ impl NodeStore {
                        width=CASE WHEN excluded.width > 0 THEN excluded.width ELSE video_frame_stage1.width END,
                        height=CASE WHEN excluded.height > 0 THEN excluded.height ELSE video_frame_stage1.height END,
                        pdq=COALESCE(excluded.pdq,video_frame_stage1.pdq),
-                       quality=COALESCE(excluded.quality,video_frame_stage1.quality)",
+                       quality=CASE WHEN excluded.quality BETWEEN 0 AND 100
+                                    THEN excluded.quality ELSE video_frame_stage1.quality END",
                     params![
                         content_id.as_i64(),
                         frame.slot,
@@ -114,7 +117,7 @@ impl NodeStore {
                         frame.width,
                         frame.height,
                         frame.pdq.map(|hash| hash.as_bytes().to_vec()),
-                        frame.quality
+                        frame.quality.filter(|quality| *quality <= 100)
                     ],
                 )?;
                 let merged = read_video_frame_stage1_fields(&transaction, content_id, frame.slot)?;
@@ -270,6 +273,9 @@ impl NodeStore {
         let Some(content_id) = cached.content_id else {
             return Ok(false);
         };
+        if !classify_cache_completeness(cached, true).is_complete() {
+            return Ok(false);
+        }
         match cached.media_kind {
             MediaKind::Image => {
                 let Some(feature) = cached.image_stage2 else {
@@ -281,27 +287,65 @@ impl NodeStore {
                 let Some(CompleteStage1::Video(stage1)) = cached.stage1.as_ref() else {
                     return Ok(false);
                 };
-                if stage1
+                let slots = stage1
                     .iter()
                     .enumerate()
-                    .any(|(slot, feature)| feature.is_some() && cached.video_stage2[slot].is_none())
-                {
-                    return Ok(false);
-                }
-                for (slot, feature) in cached.video_stage2.iter().enumerate() {
-                    if stage1[slot].is_some() {
-                        self.commit_feature_result(
-                            content_id,
-                            None,
-                            FeatureWrite::VideoFrameStage2(VideoFrameStage2Fields {
-                                slot: slot as u8,
-                                features: feature.expect("上方已确认成功视频槽位二筛完整"),
-                            }),
-                        )?;
-                    }
-                }
+                    .filter_map(|(slot, feature)| feature.as_ref().map(|_| slot as u8))
+                    .collect::<Vec<_>>();
+                return self.republish_stage2_slots_from_cache(cached, &slots);
             }
             MediaKind::Other => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    /// 只重发指定的完整视频槽位，供中心只请求本机已有槽位时闭合缓存同步。
+    pub fn republish_stage2_slots_from_cache(
+        &mut self,
+        cached: &BaseCacheRecord,
+        slots: &[u8],
+    ) -> Result<bool, StoreError> {
+        let Some(content_id) = cached.content_id else {
+            return Ok(false);
+        };
+        if slots.is_empty() {
+            return Ok(false);
+        }
+        let completeness = classify_cache_completeness(cached, true);
+        if completeness.base_missing_parts != 0 || cached.media_kind != MediaKind::Video {
+            return Ok(false);
+        }
+        let Some(CompleteStage1::Video(stage1)) = cached.stage1.as_ref() else {
+            return Ok(false);
+        };
+        let mut selected = [false; 6];
+        for &slot in slots {
+            validate_slot(slot)?;
+            let index = usize::from(slot);
+            if selected[index] {
+                continue;
+            }
+            selected[index] = true;
+            if stage1[index].is_none()
+                || completeness.video_stage2_missing_slots & (1_u8 << index) != 0
+            {
+                return Ok(false);
+            }
+        }
+        for (index, selected) in selected.into_iter().enumerate() {
+            if selected {
+                let Some(features) = cached.video_stage2[index] else {
+                    return Ok(false);
+                };
+                self.commit_feature_result(
+                    content_id,
+                    None,
+                    FeatureWrite::VideoFrameStage2(VideoFrameStage2Fields {
+                        slot: index as u8,
+                        features,
+                    }),
+                )?;
+            }
         }
         Ok(true)
     }
@@ -497,13 +541,14 @@ fn commit_scan_stage1_in_transaction(
                        width=CASE WHEN excluded.width > 0 THEN excluded.width ELSE image_stage1.width END,
                        height=CASE WHEN excluded.height > 0 THEN excluded.height ELSE image_stage1.height END,
                        pdq=COALESCE(excluded.pdq,image_stage1.pdq),
-                       quality=COALESCE(excluded.quality,image_stage1.quality)",
+                       quality=CASE WHEN excluded.quality BETWEEN 0 AND 100
+                                    THEN excluded.quality ELSE image_stage1.quality END",
                     params![
                         content_id.as_i64(),
                         fields.width,
                         fields.height,
                         fields.pdq.map(|hash| hash.as_bytes().to_vec()),
-                        fields.quality
+                        fields.quality.filter(|quality| *quality <= 100)
                     ],
                 )?;
                 let merged = read_image_stage1_fields(transaction, content_id)?;
@@ -539,7 +584,8 @@ fn commit_scan_stage1_in_transaction(
                        width=CASE WHEN excluded.width > 0 THEN excluded.width ELSE video_frame_stage1.width END,
                        height=CASE WHEN excluded.height > 0 THEN excluded.height ELSE video_frame_stage1.height END,
                        pdq=COALESCE(excluded.pdq,video_frame_stage1.pdq),
-                       quality=COALESCE(excluded.quality,video_frame_stage1.quality)",
+                       quality=CASE WHEN excluded.quality BETWEEN 0 AND 100
+                                    THEN excluded.quality ELSE video_frame_stage1.quality END",
                     params![
                         content_id.as_i64(),
                         frame.slot,
@@ -548,7 +594,7 @@ fn commit_scan_stage1_in_transaction(
                         frame.width,
                         frame.height,
                         frame.pdq.map(|hash| hash.as_bytes().to_vec()),
-                        frame.quality
+                        frame.quality.filter(|quality| *quality <= 100)
                     ],
                 )?;
                 let merged = read_video_frame_stage1_fields(transaction, content_id, frame.slot)?;

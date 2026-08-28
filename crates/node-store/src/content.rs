@@ -574,7 +574,11 @@ impl NodeStore {
                 )
                 .optional()?
                 .map_or((None, None, None), |(width, height, duration)| {
-                    (width, height, duration.map(|value| value as u64))
+                    (
+                        width,
+                        height,
+                        duration.and_then(|value| u64::try_from(value).ok()),
+                    )
                 }),
             MediaKind::Other => (None, None, None),
         };
