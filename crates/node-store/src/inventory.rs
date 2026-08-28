@@ -1,14 +1,14 @@
 //! 扫描清单的瞬态收尾：在一个 SQLite 事务内合并位置并失活未见文件。
 
 use dedup_core::{ContentKey, NormalizedPath};
-use rusqlite::{OptionalExtension, Transaction, params};
+use rusqlite::{Statement, Transaction, params};
 
 use crate::{
     NodeStore, ScannedPath, StoreError,
-    content::{content_key_in_transaction, encode_file},
+    content::encode_file,
     maintenance::bump_library_revision,
     open::{fixed_bytes, sqlite_integer},
-    outbox::{append_sync_change, outbox_high_seq_from},
+    outbox::outbox_high_seq_from,
 };
 
 const MAX_TEMP_ROWS: usize = 1_000;
@@ -65,99 +65,8 @@ impl NodeStore {
         let machine_id = self.machine_id().clone();
         let transaction = self.connection.transaction()?;
         insert_temp_manifest(&transaction, &manifest)?;
-        let resolved_rows = read_resolved_temp_rows(&transaction)?;
-        for (normalized_path, display_path, file_size, md5) in resolved_rows {
-            let content_key = ContentKey::new(md5, file_size);
-            let content_id: Option<i64> = transaction
-                .query_row(
-                    "SELECT content_id FROM contents
-                     WHERE md5=?1 AND file_size=?2 AND base_complete=1",
-                    params![content_key.md5().as_slice(), sqlite_integer(file_size)?],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            let Some(content_id) = content_id else {
-                return Err(StoreError::InvalidState(format!(
-                    "解析清单引用了不存在或未完成的内容: {normalized_path}"
-                )));
-            };
-
-            let scanned = ScannedPath::new(
-                NormalizedPath::new(&normalized_path)?,
-                dedup_core::DisplayPath::new(display_path)?,
-                file_size,
-            );
-            let file_size = sqlite_integer(scanned.file_size)?;
-            let display_path = scanned.display_path.as_path().to_string_lossy();
-            let existing: Option<(String, i64, i64, i64)> = transaction
-                .query_row(
-                    "SELECT display_path,file_size,content_id,active FROM files
-                     WHERE machine_id=?1 AND normalized_path=?2",
-                    params![machine_id.as_str(), scanned.normalized_path.as_str()],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                )
-                .optional()?;
-            let unchanged = existing.is_some_and(|(old_display, old_size, old_content, active)| {
-                old_display == display_path
-                    && old_size == file_size
-                    && old_content == content_id
-                    && active == 1
-            });
-            if !unchanged {
-                transaction.execute(
-                    "INSERT INTO files(machine_id,normalized_path,display_path,file_size,content_id,active)
-                     VALUES(?1,?2,?3,?4,?5,1)
-                     ON CONFLICT(machine_id,normalized_path) DO UPDATE SET
-                       display_path=excluded.display_path,
-                       file_size=excluded.file_size,
-                       content_id=excluded.content_id,
-                       active=1",
-                    params![
-                        machine_id.as_str(),
-                        scanned.normalized_path.as_str(),
-                        display_path.as_ref(),
-                        file_size,
-                        content_id,
-                    ],
-                )?;
-                append_sync_change(
-                    &transaction,
-                    "file",
-                    encode_file(machine_id.as_str(), &scanned, content_key, true),
-                )?;
-            }
-        }
-
-        let stale_rows = read_stale_rows(&transaction, machine_id.as_str())?;
-        for (normalized_path, display_path, file_size, content_id) in stale_rows {
-            let normalized_path_value = NormalizedPath::new(&normalized_path)?;
-            if !manifest
-                .roots
-                .iter()
-                .any(|root| normalized_path_value.is_within(root))
-            {
-                continue;
-            }
-            transaction.execute(
-                "UPDATE files SET active=0
-                 WHERE machine_id=?1 AND normalized_path=?2 AND active=1",
-                params![machine_id.as_str(), normalized_path],
-            )?;
-            let file_size = u64::try_from(file_size)
-                .map_err(|_| StoreError::InvalidState("文件库中的大小不能为负数".into()))?;
-            let scanned = ScannedPath::new(
-                normalized_path_value,
-                dedup_core::DisplayPath::new(display_path)?,
-                file_size,
-            );
-            let content_key =
-                content_key_in_transaction(&transaction, crate::ContentId::from_i64(content_id))?;
-            append_sync_change(
-                &transaction,
-                "file",
-                encode_file(machine_id.as_str(), &scanned, content_key, false),
-            )?;
-        }
+        apply_resolved_files(&transaction, machine_id.as_str())?;
+        deactivate_stale_files(&transaction, machine_id.as_str())?;
 
         let library_revision = bump_library_revision(&transaction)?;
         let outbox_high_seq = outbox_high_seq_from(&transaction)?;
@@ -171,7 +80,10 @@ impl NodeStore {
     /// 确保当前连接拥有扫描收尾所需的临时表；数据刷新由业务事务完成。
     fn ensure_temp_manifest_tables(&self) -> Result<(), StoreError> {
         self.connection.execute_batch(
-            "CREATE TEMP TABLE IF NOT EXISTS scan_finalize_seen_paths(
+            "CREATE TEMP TABLE IF NOT EXISTS scan_finalize_roots(
+                 normalized_path TEXT PRIMARY KEY
+             );
+             CREATE TEMP TABLE IF NOT EXISTS scan_finalize_seen_paths(
                  normalized_path TEXT PRIMARY KEY
              );
              CREATE TEMP TABLE IF NOT EXISTS scan_finalize_resolved_files(
@@ -191,9 +103,19 @@ fn insert_temp_manifest(
     manifest: &NormalizedManifest,
 ) -> Result<(), StoreError> {
     transaction.execute_batch(
-        "DELETE FROM scan_finalize_seen_paths;
+        "DELETE FROM scan_finalize_roots;
+         DELETE FROM scan_finalize_seen_paths;
          DELETE FROM scan_finalize_resolved_files;",
     )?;
+
+    let mut root_statement = transaction
+        .prepare_cached("INSERT INTO scan_finalize_roots(normalized_path) VALUES(?1)")?;
+    for chunk in manifest.roots.chunks(MAX_TEMP_ROWS) {
+        for root in chunk {
+            root_statement.execute([root.as_str()])?;
+        }
+    }
+    drop(root_statement);
 
     let mut seen_statement = transaction
         .prepare_cached("INSERT INTO scan_finalize_seen_paths(normalized_path) VALUES(?1)")?;
@@ -310,50 +232,448 @@ fn normalize_manifest(input: &ScanFinalizeInput) -> Result<NormalizedManifest, S
     })
 }
 
-/// 读取临时解析表，保留已验证的显示路径和内容键。
-fn read_resolved_temp_rows(
-    transaction: &Transaction<'_>,
-) -> Result<Vec<(String, String, u64, [u8; 16])>, StoreError> {
-    let mut statement = transaction.prepare(
-        "SELECT normalized_path,display_path,file_size,md5
-         FROM temp.scan_finalize_resolved_files ORDER BY normalized_path",
-    )?;
-    statement
-        .query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-        })?
-        .map(|row| {
-            let (path, display, file_size, md5): (String, String, i64, Vec<u8>) = row?;
-            let file_size = u64::try_from(file_size)
-                .map_err(|_| StoreError::InvalidState("临时解析清单大小不能为负数".into()))?;
-            Ok((
-                path,
-                display,
-                file_size,
-                fixed_bytes(md5, "scan_finalize.md5")?,
-            ))
-        })
-        .collect()
+/// JOIN 后的一条解析项，包含内容完整性和已有位置关系，避免逐项 SELECT。
+struct ResolvedManifestRow {
+    normalized_path: String,
+    display_path: String,
+    file_size: i64,
+    md5: Vec<u8>,
+    content_id: Option<i64>,
+    base_complete: Option<i64>,
+    existing_display_path: Option<String>,
+    existing_file_size: Option<i64>,
+    existing_content_id: Option<i64>,
+    existing_active: Option<i64>,
 }
 
-/// 读取当前机器所有未被本轮见到的活动位置，根组件边界在调用方确认。
-fn read_stale_rows(
+/// 一条待失活位置，内容键随 JOIN 一并读出，避免逐项查询内容表。
+struct StaleFileRow {
+    normalized_path: String,
+    display_path: String,
+    file_size: i64,
+    md5: Vec<u8>,
+    content_file_size: i64,
+}
+
+/// 分批读取并应用解析项；SQLite SELECT 数量只随千行批次增长。
+fn apply_resolved_files(transaction: &Transaction<'_>, machine_id: &str) -> Result<(), StoreError> {
+    let mut upsert_statement = transaction.prepare(
+        "INSERT INTO files(
+             machine_id,normalized_path,display_path,file_size,content_id,active
+         ) VALUES(?1,?2,?3,?4,?5,1)
+         ON CONFLICT(machine_id,normalized_path) DO UPDATE SET
+             display_path=excluded.display_path,
+             file_size=excluded.file_size,
+             content_id=excluded.content_id,
+             active=1",
+    )?;
+    let mut outbox_statement =
+        transaction.prepare("INSERT INTO sync_outbox(entity_kind,payload) VALUES(?1,?2)")?;
+    let mut after_path = None;
+    loop {
+        let batch = read_resolved_batch(transaction, machine_id, after_path.as_deref())?;
+        let Some(last_path) = batch.last().map(|row| row.normalized_path.clone()) else {
+            break;
+        };
+        apply_resolved_batch(
+            transaction,
+            machine_id,
+            &batch,
+            &mut upsert_statement,
+            &mut outbox_statement,
+        )?;
+        after_path = Some(last_path);
+    }
+    Ok(())
+}
+
+/// 以规范路径游标分批读取 resolved JOIN，单批最多一千行。
+fn read_resolved_batch(
     transaction: &Transaction<'_>,
     machine_id: &str,
-) -> Result<Vec<(String, String, i64, i64)>, StoreError> {
+    after_path: Option<&str>,
+) -> Result<Vec<ResolvedManifestRow>, StoreError> {
     let mut statement = transaction.prepare(
-        "SELECT normalized_path,display_path,file_size,content_id
-         FROM files
-         WHERE machine_id=?1 AND active=1
+        "SELECT r.normalized_path,r.display_path,r.file_size,r.md5,
+                c.content_id,c.base_complete,
+                f.display_path,f.file_size,f.content_id,f.active
+         FROM temp.scan_finalize_resolved_files r
+         LEFT JOIN contents c ON c.md5=r.md5 AND c.file_size=r.file_size
+         LEFT JOIN files f ON f.machine_id=?1 AND f.normalized_path=r.normalized_path
+         WHERE (?2 IS NULL OR r.normalized_path>?2)
+         ORDER BY r.normalized_path
+         LIMIT ?3",
+    )?;
+    let mut rows = statement.query(params![machine_id, after_path, MAX_TEMP_ROWS as i64])?;
+    let mut batch = Vec::with_capacity(MAX_TEMP_ROWS);
+    while let Some(row) = rows.next()? {
+        batch.push(ResolvedManifestRow {
+            normalized_path: row.get(0)?,
+            display_path: row.get(1)?,
+            file_size: row.get(2)?,
+            md5: row.get(3)?,
+            content_id: row.get(4)?,
+            base_complete: row.get(5)?,
+            existing_display_path: row.get(6)?,
+            existing_file_size: row.get(7)?,
+            existing_content_id: row.get(8)?,
+            existing_active: row.get(9)?,
+        });
+    }
+    Ok(batch)
+}
+
+/// 应用一个 resolved 批次；缺内容或无变化均在此边界处理。
+fn apply_resolved_batch(
+    transaction: &Transaction<'_>,
+    machine_id: &str,
+    batch: &[ResolvedManifestRow],
+    upsert_statement: &mut Statement<'_>,
+    outbox_statement: &mut Statement<'_>,
+) -> Result<(), StoreError> {
+    for row in batch {
+        let Some(content_id) = row.content_id else {
+            return Err(StoreError::InvalidState(format!(
+                "解析清单引用了不存在的内容: {}",
+                row.normalized_path
+            )));
+        };
+        if row.base_complete != Some(1) {
+            return Err(StoreError::InvalidState(format!(
+                "解析清单引用了未完成的内容: {}",
+                row.normalized_path
+            )));
+        }
+        let file_size = u64::try_from(row.file_size)
+            .map_err(|_| StoreError::InvalidState("临时解析清单大小不能为负数".into()))?;
+        let content_key = ContentKey::new(
+            fixed_bytes(row.md5.clone(), "scan_finalize.md5")?,
+            file_size,
+        );
+        let scanned = ScannedPath::new(
+            NormalizedPath::new(&row.normalized_path)?,
+            dedup_core::DisplayPath::new(&row.display_path)?,
+            file_size,
+        );
+        let display_path = scanned
+            .display_path
+            .as_path()
+            .to_string_lossy()
+            .into_owned();
+        let file_size_sql = sqlite_integer(file_size)?;
+        let unchanged = row.existing_display_path.as_deref() == Some(display_path.as_str())
+            && row.existing_file_size == Some(file_size_sql)
+            && row.existing_content_id == Some(content_id)
+            && row.existing_active == Some(1);
+        if unchanged {
+            continue;
+        }
+        upsert_statement.execute(params![
+            machine_id,
+            scanned.normalized_path.as_str(),
+            display_path,
+            file_size_sql,
+            content_id,
+        ])?;
+        append_prepared_sync_change(
+            transaction,
+            outbox_statement,
+            "file",
+            encode_file(machine_id, &scanned, content_key, true),
+        )?;
+    }
+    Ok(())
+}
+
+/// 在一个已准备的 INSERT 上追加 outbox，避免每条位置重新解析 SQL。
+fn append_prepared_sync_change(
+    transaction: &Transaction<'_>,
+    statement: &mut Statement<'_>,
+    entity_kind: &str,
+    payload: Vec<u8>,
+) -> Result<u64, StoreError> {
+    statement.execute(params![entity_kind, payload])?;
+    Ok(transaction.last_insert_rowid() as u64)
+}
+
+/// 按根组件和 seen 表在 SQL 侧过滤活动位置，并以路径游标流式处理。
+fn deactivate_stale_files(
+    transaction: &Transaction<'_>,
+    machine_id: &str,
+) -> Result<(), StoreError> {
+    let mut update_statement = transaction.prepare(
+        "UPDATE files SET active=0
+         WHERE machine_id=?1 AND normalized_path=?2 AND active=1",
+    )?;
+    let mut outbox_statement =
+        transaction.prepare("INSERT INTO sync_outbox(entity_kind,payload) VALUES(?1,?2)")?;
+    let mut after_path = None;
+    loop {
+        let batch = read_stale_batch(transaction, machine_id, after_path.as_deref())?;
+        let Some(last_path) = batch.last().map(|row| row.normalized_path.clone()) else {
+            break;
+        };
+        for row in &batch {
+            let file_size = u64::try_from(row.file_size)
+                .map_err(|_| StoreError::InvalidState("文件库中的大小不能为负数".into()))?;
+            let content_file_size = u64::try_from(row.content_file_size)
+                .map_err(|_| StoreError::InvalidState("内容库中的大小不能为负数".into()))?;
+            let scanned = ScannedPath::new(
+                NormalizedPath::new(&row.normalized_path)?,
+                dedup_core::DisplayPath::new(&row.display_path)?,
+                file_size,
+            );
+            update_statement.execute(params![machine_id, row.normalized_path])?;
+            append_prepared_sync_change(
+                transaction,
+                &mut outbox_statement,
+                "file",
+                encode_file(
+                    machine_id,
+                    &scanned,
+                    ContentKey::new(
+                        fixed_bytes(row.md5.clone(), "contents.md5")?,
+                        content_file_size,
+                    ),
+                    false,
+                ),
+            )?;
+        }
+        after_path = Some(last_path);
+    }
+    Ok(())
+}
+
+/// 以路径游标读取一个根范围内的失活批次；SQL 不使用 LIKE，避免通配符误匹配。
+fn read_stale_batch(
+    transaction: &Transaction<'_>,
+    machine_id: &str,
+    after_path: Option<&str>,
+) -> Result<Vec<StaleFileRow>, StoreError> {
+    let mut statement = transaction.prepare(
+        "SELECT f.normalized_path,f.display_path,f.file_size,c.md5,c.file_size
+         FROM files f
+         JOIN contents c ON c.content_id=f.content_id
+         WHERE f.machine_id=?1 AND f.active=1
+           AND (?2 IS NULL OR f.normalized_path>?2)
            AND NOT EXISTS (
              SELECT 1 FROM temp.scan_finalize_seen_paths seen
-             WHERE seen.normalized_path=files.normalized_path
-           )",
+             WHERE seen.normalized_path=f.normalized_path
+           )
+           AND EXISTS (
+             SELECT 1 FROM temp.scan_finalize_roots root
+             WHERE f.normalized_path=root.normalized_path
+                OR (
+                   substr(root.normalized_path,-1)=char(92)
+                   AND substr(f.normalized_path,1,length(root.normalized_path))=root.normalized_path
+                )
+                OR (
+                   substr(root.normalized_path,-1)<>char(92)
+                   AND substr(f.normalized_path,1,length(root.normalized_path)+1)=
+                       root.normalized_path||char(92)
+                )
+           )
+         ORDER BY f.normalized_path
+         LIMIT ?3",
     )?;
-    statement
-        .query_map([machine_id], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-        })?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(StoreError::from)
+    let mut rows = statement.query(params![machine_id, after_path, MAX_TEMP_ROWS as i64])?;
+    let mut batch = Vec::with_capacity(MAX_TEMP_ROWS);
+    while let Some(row) = rows.next()? {
+        batch.push(StaleFileRow {
+            normalized_path: row.get(0)?,
+            display_path: row.get(1)?,
+            file_size: row.get(2)?,
+            md5: row.get(3)?,
+            content_file_size: row.get(4)?,
+        });
+    }
+    Ok(batch)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{LazyLock, Mutex};
+
+    use dedup_core::{DisplayPath, MachineId};
+    use rusqlite::{
+        params,
+        trace::{TraceEvent, TraceEventCodes},
+    };
+
+    use super::*;
+
+    static TRACE_ROWS: LazyLock<Mutex<usize>> = LazyLock::new(|| Mutex::new(0));
+    static TRACE_SELECTS: LazyLock<Mutex<usize>> = LazyLock::new(|| Mutex::new(0));
+    static TRACE_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    /// 统计收尾事务执行的 SELECT 和返回行数，避免性能测试依赖源代码文本。
+    fn trace_inventory(event: TraceEvent<'_>) {
+        match event {
+            TraceEvent::Stmt(_, sql) if sql.trim_start().starts_with("SELECT") => {
+                *TRACE_SELECTS.lock().unwrap() += 1;
+            }
+            TraceEvent::Row(_) => *TRACE_ROWS.lock().unwrap() += 1,
+            _ => {}
+        }
+    }
+
+    /// 返回行为测试固定使用的物理机器身份。
+    fn test_machine() -> MachineId {
+        MachineId::parse("73bdb7a3377f81376a84f316b3ee1555e345afbfa87aa99c77b1bfcc364c4cae")
+            .unwrap()
+    }
+
+    /// 在同一事务中创建已完成内容和活动位置，减少测试夹具自身的 SQL 噪声。
+    fn seed_files(store: &mut NodeStore, paths: impl IntoIterator<Item = String>) {
+        let transaction = store.connection.transaction().unwrap();
+        let machine_id = test_machine();
+        for (index, path) in paths.into_iter().enumerate() {
+            let md5 = (index as u128).to_le_bytes();
+            let normalized = NormalizedPath::new(&path).unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO contents(md5,file_size,media_kind,base_complete)
+                     VALUES(?1,?2,'other',1)",
+                    params![md5.as_slice(), (index + 1) as i64],
+                )
+                .unwrap();
+            let content_id = transaction.last_insert_rowid();
+            transaction
+                .execute(
+                    "INSERT INTO files(
+                         machine_id,normalized_path,display_path,file_size,content_id,active
+                     ) VALUES(?1,?2,?3,?4,?5,1)",
+                    params![
+                        machine_id.as_str(),
+                        normalized.as_str(),
+                        path,
+                        (index + 1) as i64,
+                        content_id
+                    ],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+    }
+
+    /// 清空本轮 SQLite trace 计数。
+    fn reset_trace() {
+        *TRACE_ROWS.lock().unwrap() = 0;
+        *TRACE_SELECTS.lock().unwrap() = 0;
+    }
+
+    /// 大量根外活动位置应由 SQL 根范围先过滤，不能先物化整机结果。
+    #[test]
+    fn stale_manifest_filters_large_external_set_before_materializing_rows() {
+        let _test_lock = TRACE_TEST_LOCK.lock().unwrap();
+        let mut store = NodeStore::open_in_memory(test_machine()).unwrap();
+        let mut paths = (0..2_001)
+            .map(|index| format!(r"D:\AB\outside-{index:04}.bin"))
+            .collect::<Vec<_>>();
+        paths.push(r"D:\A%\target.bin".into());
+        assert!(
+            !NormalizedPath::new(r"D:\AB\outside-0000.bin")
+                .unwrap()
+                .is_within(&NormalizedPath::new(r"D:\A%").unwrap())
+        );
+        seed_files(&mut store, paths);
+
+        reset_trace();
+        store.connection.trace_v2(
+            TraceEventCodes::SQLITE_TRACE_STMT | TraceEventCodes::SQLITE_TRACE_ROW,
+            Some(trace_inventory),
+        );
+        store
+            .finalize_scan_manifest(
+                &ScanFinalizeInput {
+                    roots: vec![NormalizedPath::new(r"D:\A%").unwrap()],
+                    seen_paths: Vec::new(),
+                    resolved_files: Vec::new(),
+                },
+                100,
+            )
+            .unwrap();
+        store.connection.trace_v2(TraceEventCodes::empty(), None);
+
+        assert!(
+            !store
+                .is_location_active(&NormalizedPath::new(r"D:\A%\target.bin").unwrap())
+                .unwrap()
+        );
+        assert!(
+            store
+                .is_location_active(&NormalizedPath::new(r"D:\AB\outside-0000.bin").unwrap())
+                .unwrap()
+        );
+        assert!(
+            *TRACE_ROWS.lock().unwrap() < 100,
+            "根外位置不应进入收尾查询结果，实际返回 {} 行",
+            *TRACE_ROWS.lock().unwrap()
+        );
+    }
+
+    /// 超过一千条解析项仍应按批次 JOIN 查询，不能对每项追加内容和位置 SELECT。
+    #[test]
+    fn resolved_manifest_uses_bounded_join_queries_without_n_plus_one_selects() {
+        let _test_lock = TRACE_TEST_LOCK.lock().unwrap();
+        let mut store = NodeStore::open_in_memory(test_machine()).unwrap();
+        let count = 1_001;
+        let mut seen_paths = Vec::with_capacity(count);
+        let mut resolved_files = Vec::with_capacity(count);
+        let transaction = store.connection.transaction().unwrap();
+        for index in 0..count {
+            let path = format!(r"D:\Resolved\file-{index:04}.bin");
+            let md5 = (index as u128).to_le_bytes();
+            let file_size = (index + 1) as i64;
+            transaction
+                .execute(
+                    "INSERT INTO contents(md5,file_size,media_kind,base_complete)
+                     VALUES(?1,?2,'other',1)",
+                    params![md5.as_slice(), file_size],
+                )
+                .unwrap();
+            seen_paths.push(NormalizedPath::new(&path).unwrap());
+            resolved_files.push(ResolvedScanFile {
+                scanned: ScannedPath::new(
+                    NormalizedPath::new(&path).unwrap(),
+                    DisplayPath::new(&path).unwrap(),
+                    (index + 1) as u64,
+                ),
+                content: ContentKey::new(md5, (index + 1) as u64),
+            });
+        }
+        transaction.commit().unwrap();
+
+        reset_trace();
+        store
+            .connection
+            .trace_v2(TraceEventCodes::SQLITE_TRACE_STMT, Some(trace_inventory));
+        let result = store
+            .finalize_scan_manifest(
+                &ScanFinalizeInput {
+                    roots: vec![NormalizedPath::new(r"D:\Resolved").unwrap()],
+                    seen_paths,
+                    resolved_files,
+                },
+                100,
+            )
+            .unwrap();
+        store.connection.trace_v2(TraceEventCodes::empty(), None);
+
+        assert_eq!(result.library_revision, 1);
+        assert!(
+            *TRACE_SELECTS.lock().unwrap() < 32,
+            "resolved JOIN 不应产生 N+1 SELECT，实际执行 {} 条",
+            *TRACE_SELECTS.lock().unwrap()
+        );
+        let resolved_count: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE machine_id=?1 AND active=1",
+                [test_machine().as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(resolved_count, count as i64);
+    }
 }
