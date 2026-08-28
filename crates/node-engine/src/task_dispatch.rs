@@ -4,7 +4,7 @@
 //! 亏欠、活动计数、类别公平和老化保护全部留在 `DiskReadScheduler` 中。
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     future::{Future, poll_fn},
     io,
     pin::Pin,
@@ -71,6 +71,15 @@ pub struct DispatchedTask<Permit> {
     pub class: DiskReadClass,
     /// 必须持有到源文件读取结束的唯一许可。
     pub permit: Permit,
+    /// 是否为同一基础任务 Hash 完成后的 Media 续算许可。
+    pub continuation: bool,
+}
+
+impl<Permit> DispatchedTask<Permit> {
+    /// 返回本次任务是否沿用同一 TSV 行进入 Media 阶段。
+    pub const fn is_continuation(&self) -> bool {
+        self.continuation
+    }
 }
 
 impl<Permit> std::fmt::Debug for DispatchedTask<Permit> {
@@ -88,6 +97,8 @@ struct PendingPermit<Permit> {
     identity: TaskFileIdentity,
     record: TaskFileRecord,
     class: DiskReadClass,
+    /// 标记该等待项是否是同一 TSV 行的 Media 续算。
+    continuation: bool,
     future: TaskLanePermitFuture<Permit>,
 }
 
@@ -99,6 +110,10 @@ pub struct TaskFileDispatcher<Provider: TaskLanePermitProvider> {
     files: TransientTaskFileSet,
     provider: Provider,
     pending: BTreeMap<String, PendingPermit<Provider::Permit>>,
+    /// 已登记但尚未取得 Media 许可的同身份续算意图；失败后保留以便重试。
+    continuations: BTreeMap<TaskFileIdentity, TaskFileRecord>,
+    /// 已经消费过 Hash→Media 入口的身份，防止重复续算。
+    continuation_claimed: BTreeSet<TaskFileIdentity>,
     observed_epoch: u64,
     publication_wait: Option<Pin<Box<dyn Future<Output = u64> + Send>>>,
 }
@@ -111,6 +126,8 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
             files,
             provider,
             pending: BTreeMap::new(),
+            continuations: BTreeMap::new(),
+            continuation_claimed: BTreeSet::new(),
             observed_epoch,
             publication_wait: None,
         }
@@ -137,20 +154,98 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
 
     /// 在 SQLite 成功确认后把已领取行标记为完成。
     pub fn mark_completed(&mut self, identity: &TaskFileIdentity) -> io::Result<()> {
-        self.files.mark_completed(identity)
+        self.ensure_identity_not_waiting(identity)?;
+        self.files.mark_completed(identity)?;
+        self.continuations.remove(identity);
+        self.continuation_claimed.remove(identity);
+        Ok(())
     }
 
     /// 在单文件读取或 Worker 失败后把已领取行标记为失败。
     pub fn mark_failed(&mut self, identity: &TaskFileIdentity) -> io::Result<()> {
-        self.files.mark_failed(identity)
+        self.ensure_identity_not_waiting(identity)?;
+        self.files.mark_failed(identity)?;
+        self.continuations.remove(identity);
+        self.continuation_claimed.remove(identity);
+        Ok(())
+    }
+
+    /// 登记同一基础任务的 Hash→Media 续算；不改写 TSV，也不追加第二行。
+    ///
+    /// 入口只接受仍在途、仍为 `P` 且带 `needs_md5` 的原始 Base 行。普通队首若正在
+    /// 等待许可会被撤下，续算意图优先；被撤下的普通队首仍保持 `P`，后续会重新观察。
+    pub fn request_media_continuation(
+        &mut self,
+        identity: &TaskFileIdentity,
+        record: &TaskFileRecord,
+    ) -> Result<(), TaskDispatchError> {
+        if self.continuation_claimed.contains(identity) || self.continuations.contains_key(identity)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "同一任务身份不能重复请求 Media 续算",
+            )
+            .into());
+        }
+        self.files
+            .validate_media_continuation(identity, record)
+            .map_err(TaskDispatchError::File)?;
+        let lane_key = identity.lane_file_name().to_owned();
+        if self
+            .pending
+            .get(&lane_key)
+            .is_some_and(|pending| !pending.continuation)
+        {
+            // 取消正在等待的普通队首许可，让同 lane 续算先行；队首仍是 P。
+            self.pending.remove(&lane_key);
+        }
+        self.continuation_claimed.insert(identity.clone());
+        self.continuations.insert(identity.clone(), record.clone());
+        Ok(())
+    }
+
+    /// 检查身份是否仍有等待中的续算或许可，避免提前写入终态。
+    fn ensure_identity_not_waiting(&self, identity: &TaskFileIdentity) -> io::Result<()> {
+        if self
+            .pending
+            .values()
+            .any(|pending| pending.identity == *identity)
+            || self.continuations.contains_key(identity)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "任务仍有等待中的读取或续算许可",
+            ));
+        }
+        Ok(())
+    }
+
+    /// 在取消收束后放弃一项精确在途任务，不写入 `F`。
+    ///
+    /// 调用方应先用已取消的令牌轮询一次以收束等待 future；本方法随后一并清理同
+    /// 身份的续算意图，再释放在途身份。
+    pub fn abandon_in_flight(&mut self, identity: &TaskFileIdentity) -> io::Result<()> {
+        let lane_key = identity.lane_file_name().to_owned();
+        if self.pending.contains_key(&lane_key) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "同 lane 仍有读取许可请求在途，不能 abandon",
+            ));
+        }
+        self.files.abandon_in_flight(identity)?;
+        // 取消轮询已经丢弃等待 future；此处同时收掉同身份的续算意图，
+        // 使调用方可以在保持 P 的前提下精确结束整个任务 run。
+        self.continuations.remove(identity);
+        self.continuation_claimed.remove(identity);
+        Ok(())
     }
 
     /// 删除本次运行创建的任务文件目录。
     pub fn discard(&mut self) -> io::Result<()> {
-        if !self.pending.is_empty() {
+        if !self.pending.is_empty() || !self.continuations.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "仍有读取许可请求在途，不能 discard 任务文件",
+                "仍有读取许可或续算请求在途，不能 discard 任务文件",
             ));
         }
         // 内部等待 future 也持有 publication owner；删除前先解除，避免自身阻止清理。
@@ -244,22 +339,45 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
         &mut self,
         cancellation: &ReadCancellationToken,
     ) -> Result<(), TaskDispatchError> {
-        // lane_heads 只返回每条 lane 的一个拥有型队首，不会把文件预读为全量 Vec。
-        for (lane, head) in self.files.lane_heads()? {
-            let key = head.identity.lane_file_name().to_owned();
+        let heads = self
+            .files
+            .lane_heads()?
+            .into_iter()
+            .map(|(lane, head)| (head.identity.lane_file_name().to_owned(), (lane, head)))
+            .collect::<BTreeMap<_, _>>();
+        // 每个 lane 至多保留一个等待 scheduler 的 future；续算优先于普通队首。
+        for lane in self.files.lanes() {
+            let key = self
+                .files
+                .lane_key(&lane)
+                .map_err(TaskDispatchError::File)?;
             if self.pending.contains_key(&key) {
                 continue;
             }
-            let class = dispatch_class(&head.record)?;
+            let (identity, record, class, continuation) = if let Some((identity, record)) = self
+                .continuations
+                .iter()
+                .find(|(identity, _)| identity.lane_file_name() == key)
+                .map(|(identity, record)| (identity.clone(), record.clone()))
+            {
+                (identity, record, DiskReadClass::MediaDecode, true)
+            } else {
+                let Some((_, head)) = heads.get(&key) else {
+                    continue;
+                };
+                let class = dispatch_class(&head.record)?;
+                (head.identity.clone(), head.record.clone(), class, false)
+            };
             let future = self
                 .provider
                 .acquire(lane.clone(), class, cancellation.clone());
             self.pending.insert(
                 key,
                 PendingPermit {
-                    identity: head.identity,
-                    record: head.record,
+                    identity,
+                    record,
                     class,
+                    continuation,
                     future,
                 },
             );
@@ -292,21 +410,30 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
                         .pending
                         .remove(&key)
                         .expect("已轮询的队首请求必须仍存在");
-                    let taken = self
-                        .files
-                        .take_lane_exact(&pending.identity, &pending.record)?;
-                    let Some((identity, record)) = taken else {
-                        // permit 未能与精确队首绑定时立即释放，禁止把它交给错误任务。
-                        return Poll::Ready(Err(io::Error::other(
-                            "读取许可成功后任务队首无法按身份领取",
-                        )
-                        .into()));
+                    let (identity, record) = if pending.continuation {
+                        self.files
+                            .validate_media_continuation(&pending.identity, &pending.record)?;
+                        self.continuations.remove(&pending.identity);
+                        (pending.identity, pending.record)
+                    } else {
+                        let taken = self
+                            .files
+                            .take_lane_exact(&pending.identity, &pending.record)?;
+                        let Some((identity, record)) = taken else {
+                            // permit 未能与精确队首绑定时立即释放，禁止把它交给错误任务。
+                            return Poll::Ready(Err(io::Error::other(
+                                "读取许可成功后任务队首无法按身份领取",
+                            )
+                            .into()));
+                        };
+                        (identity, record)
                     };
                     return Poll::Ready(Ok(Some(DispatchedTask {
                         identity,
                         record,
                         class: pending.class,
                         permit,
+                        continuation: pending.continuation,
                     })));
                 }
             }

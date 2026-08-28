@@ -10,6 +10,7 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     task::{Context, Poll, Waker},
+    time::Duration,
 };
 
 use dedup_core::{DisplayPath, NormalizedPath};
@@ -335,6 +336,95 @@ fn completed_task_is_returned_once_and_then_dispatcher_finishes() {
 }
 
 #[test]
+fn one_lane_dispatches_two_permits_before_either_ack() {
+    let provider = FakeProvider::default();
+    let mut dispatcher = new_dispatcher(provider.clone());
+    let task_lane = lane(&[22], LocalDiskKind::Hdd, 2, 1);
+    let rows = [
+        base_record("parallel-first.bin", None),
+        base_record("parallel-second.bin", None),
+    ];
+    dispatcher.register_lane(&task_lane).unwrap();
+    dispatcher.append_batch(&task_lane, &rows).unwrap();
+    dispatcher.seal().unwrap();
+    let cancellation = ReadCancellationToken::new();
+
+    let first = match poll_once(&mut dispatcher, &cancellation) {
+        Poll::Ready(Ok(Some(task))) => task,
+        other => panic!("第一项应取得许可，实际为 {other:?}"),
+    };
+    let second = match poll_once(&mut dispatcher, &cancellation) {
+        Poll::Ready(Ok(Some(task))) => task,
+        other => panic!("同 lane 第二项应在第一项 ACK 前取得许可，实际为 {other:?}"),
+    };
+    assert_ne!(first.identity, second.identity);
+    assert_eq!(provider.active_permits(), 2);
+
+    // 故意乱序 ACK，验证 dispatcher 不以单个 in-flight 槽位覆盖另一项。
+    dispatcher.mark_completed(&second.identity).unwrap();
+    dispatcher.mark_completed(&first.identity).unwrap();
+    drop(second);
+    drop(first);
+    assert!(matches!(
+        poll_once(&mut dispatcher, &cancellation),
+        Poll::Ready(Ok(None))
+    ));
+}
+
+#[tokio::test]
+async fn scheduler_holds_the_sixth_same_lane_permit_until_one_of_five_drops() {
+    let mut config = dedup_core::DiskReadConfig::default();
+    config.hdd_threads_per_disk = 5;
+    config.total_threads = 5;
+    let scheduler = DiskReadScheduler::new(&config, 5).unwrap();
+    let provider = SchedulerTaskLanePermitProvider::new(scheduler);
+    let mut dispatcher = new_dispatcher(provider);
+    let task_lane = lane(&[27], LocalDiskKind::Hdd, 5, 1);
+    let rows = (0..6)
+        .map(|index| base_record(&format!("scheduler-{index}.bin"), None))
+        .collect::<Vec<_>>();
+    dispatcher.register_lane(&task_lane).unwrap();
+    dispatcher.append_batch(&task_lane, &rows).unwrap();
+    dispatcher.seal().unwrap();
+    let token = ReadCancellationToken::new();
+    let mut active = Vec::new();
+    for _ in 0..5 {
+        active.push(
+            dispatcher
+                .next(token.clone())
+                .await
+                .unwrap()
+                .expect("前五项应由真实 scheduler 授予许可"),
+        );
+    }
+    assert_eq!(active.len(), 5);
+
+    let waited =
+        tokio::time::timeout(Duration::from_millis(100), dispatcher.next(token.clone())).await;
+    assert!(waited.is_err(), "第六项必须等待真实 scheduler 额度");
+
+    // 超时只会丢掉本次 poll；用取消令牌让 dispatcher 丢弃内部等待 future，保持 P。
+    token.cancel();
+    assert!(matches!(
+        dispatcher.next(token.clone()).await,
+        Err(TaskDispatchError::Read(ReadFailure::Cancelled))
+    ));
+    for task in &active {
+        dispatcher.mark_completed(&task.identity).unwrap();
+    }
+    drop(active);
+
+    let sixth = dispatcher
+        .next(ReadCancellationToken::new())
+        .await
+        .unwrap()
+        .expect("前五项释放后第六项应继续派发");
+    assert!(!sixth.is_continuation());
+    dispatcher.mark_completed(&sixth.identity).unwrap();
+    drop(sixth);
+}
+
+#[test]
 fn base_without_md5_uses_hash_and_never_fabricates_second_task_line() {
     let provider = FakeProvider::default();
     let mut dispatcher = new_dispatcher(provider.clone());
@@ -357,6 +447,185 @@ fn base_without_md5_uses_hash_and_never_fabricates_second_task_line() {
         poll_once(&mut dispatcher, &cancellation),
         Poll::Ready(Ok(None))
     ));
+}
+
+#[test]
+fn hash_task_can_continue_as_media_with_same_identity_and_one_tsv_row() {
+    let provider = FakeProvider::default();
+    let mut dispatcher = new_dispatcher(provider.clone());
+    let task_lane = lane(&[23], LocalDiskKind::Hdd, 1, 1);
+    let row = base_record("hash-to-media.bin", None);
+    dispatcher.register_lane(&task_lane).unwrap();
+    dispatcher
+        .append_batch(&task_lane, std::slice::from_ref(&row))
+        .unwrap();
+    dispatcher.seal().unwrap();
+    let cancellation = ReadCancellationToken::new();
+    let hash = match poll_once(&mut dispatcher, &cancellation) {
+        Poll::Ready(Ok(Some(task))) => task,
+        other => panic!("Hash 任务应先取得许可，实际为 {other:?}"),
+    };
+    assert_eq!(hash.class, DiskReadClass::HashSequential);
+    let identity = hash.identity.clone();
+    let record = hash.record.clone();
+    drop(hash);
+
+    dispatcher
+        .request_media_continuation(&identity, &record)
+        .unwrap();
+    assert!(
+        dispatcher
+            .request_media_continuation(&identity, &record)
+            .is_err()
+    );
+    assert!(
+        dispatcher.mark_completed(&identity).is_err(),
+        "续算许可尚未交付时不能提前写入终态"
+    );
+    let media = match poll_once(&mut dispatcher, &cancellation) {
+        Poll::Ready(Ok(Some(task))) => task,
+        other => panic!("Hash 后应取得同身份 Media 许可，实际为 {other:?}"),
+    };
+    assert_eq!(media.class, DiskReadClass::MediaDecode);
+    assert!(media.is_continuation());
+    assert_eq!(media.identity, identity);
+    assert_eq!(media.record, record);
+    assert_eq!(provider.started().len(), 2);
+    assert_eq!(provider.started()[0].1, DiskReadClass::HashSequential);
+    assert_eq!(provider.started()[1].1, DiskReadClass::MediaDecode);
+    let bytes = std::fs::read(dispatcher.lane_path(&task_lane).unwrap()).unwrap();
+    assert_eq!(bytes.iter().filter(|byte| **byte == b'\n').count(), 1);
+    dispatcher.mark_completed(&media.identity).unwrap();
+    drop(media);
+}
+
+#[test]
+fn media_continuation_is_prioritized_over_the_next_same_lane_head() {
+    let provider = FakeProvider::default();
+    let mut dispatcher = new_dispatcher(provider);
+    let task_lane = lane(&[26], LocalDiskKind::Hdd, 2, 1);
+    let hash_row = base_record("priority-hash.bin", None);
+    let next_row = base_record("priority-next.bin", Some([0x44; 16]));
+    dispatcher.register_lane(&task_lane).unwrap();
+    dispatcher
+        .append_batch(&task_lane, &[hash_row, next_row])
+        .unwrap();
+    dispatcher.seal().unwrap();
+    let token = ReadCancellationToken::new();
+    let hash = match poll_once(&mut dispatcher, &token) {
+        Poll::Ready(Ok(Some(task))) => task,
+        other => panic!("Hash 任务应先取得许可，实际为 {other:?}"),
+    };
+    let identity = hash.identity.clone();
+    let record = hash.record.clone();
+    drop(hash);
+    dispatcher
+        .request_media_continuation(&identity, &record)
+        .unwrap();
+
+    let continuation = match poll_once(&mut dispatcher, &token) {
+        Poll::Ready(Ok(Some(task))) => task,
+        other => panic!("续算应优先于普通队首，实际为 {other:?}"),
+    };
+    assert!(continuation.is_continuation());
+    assert_eq!(continuation.identity, identity);
+    dispatcher.mark_completed(&continuation.identity).unwrap();
+    drop(continuation);
+
+    let next = match poll_once(&mut dispatcher, &token) {
+        Poll::Ready(Ok(Some(task))) => task,
+        other => panic!("续算完成后普通队首应继续派发，实际为 {other:?}"),
+    };
+    assert!(!next.is_continuation());
+    dispatcher.mark_completed(&next.identity).unwrap();
+    drop(next);
+}
+
+#[test]
+fn failed_media_continuation_keeps_intent_for_retry_and_cancel_keeps_pending_status() {
+    let provider = FakeProvider::default();
+    let mut dispatcher = new_dispatcher(provider.clone());
+    let task_lane = lane(&[24], LocalDiskKind::Hdd, 1, 1);
+    let row = base_record("retry-media.bin", None);
+    dispatcher.register_lane(&task_lane).unwrap();
+    dispatcher
+        .append_batch(&task_lane, std::slice::from_ref(&row))
+        .unwrap();
+    dispatcher.seal().unwrap();
+    let token = ReadCancellationToken::new();
+    let hash = match poll_once(&mut dispatcher, &token) {
+        Poll::Ready(Ok(Some(task))) => task,
+        other => panic!("Hash 任务应先取得许可，实际为 {other:?}"),
+    };
+    let identity = hash.identity.clone();
+    let record = hash.record.clone();
+    drop(hash);
+
+    dispatcher
+        .request_media_continuation(&identity, &record)
+        .unwrap();
+    provider.fail_next();
+    assert!(matches!(
+        poll_once(&mut dispatcher, &token),
+        Poll::Ready(Err(TaskDispatchError::Read(ReadFailure::Cancelled)))
+    ));
+    assert_eq!(
+        std::fs::read(dispatcher.lane_path(&task_lane).unwrap()).unwrap()[0],
+        b'P'
+    );
+
+    token.cancel();
+    assert!(matches!(
+        poll_once(&mut dispatcher, &token),
+        Poll::Ready(Err(TaskDispatchError::Read(ReadFailure::Cancelled)))
+    ));
+    assert_eq!(
+        std::fs::read(dispatcher.lane_path(&task_lane).unwrap()).unwrap()[0],
+        b'P'
+    );
+
+    let retry_token = ReadCancellationToken::new();
+    let media = match poll_once(&mut dispatcher, &retry_token) {
+        Poll::Ready(Ok(Some(task))) => task,
+        other => panic!("失败/取消后续算意图应可重试，实际为 {other:?}"),
+    };
+    assert!(media.is_continuation());
+    dispatcher.mark_failed(&media.identity).unwrap();
+    drop(media);
+}
+
+#[test]
+fn abandon_after_cancellation_allows_exact_run_discard() {
+    let provider = FakeProvider::default();
+    let mut dispatcher = new_dispatcher(provider.clone());
+    let task_lane = lane(&[25], LocalDiskKind::Hdd, 1, 1);
+    let row = base_record("cancel-abandon.bin", None);
+    dispatcher.register_lane(&task_lane).unwrap();
+    dispatcher
+        .append_batch(&task_lane, std::slice::from_ref(&row))
+        .unwrap();
+    dispatcher.seal().unwrap();
+    let token = ReadCancellationToken::new();
+    let task = match poll_once(&mut dispatcher, &token) {
+        Poll::Ready(Ok(Some(task))) => task,
+        other => panic!("任务应取得许可，实际为 {other:?}"),
+    };
+    let identity = task.identity.clone();
+    let record = task.record.clone();
+    drop(task);
+
+    provider.set_blocked(true);
+    dispatcher
+        .request_media_continuation(&identity, &record)
+        .unwrap();
+    assert!(poll_once(&mut dispatcher, &token).is_pending());
+    token.cancel();
+    assert!(matches!(
+        poll_once(&mut dispatcher, &token),
+        Poll::Ready(Err(TaskDispatchError::Read(ReadFailure::Cancelled)))
+    ));
+    dispatcher.abandon_in_flight(&identity).unwrap();
+    dispatcher.discard().unwrap();
 }
 
 /// 只接收一次通知的测试唤醒器，用来验证 publication 没有漏唤醒。

@@ -94,7 +94,7 @@ impl TaskWorkKind {
 ///
 /// bits 0..=2 保留基础缺失字段，bit 3 表示需要 MD5，bit 4 表示图片二筛，
 /// bits 5..=10 表示视频二筛槽位 0..5。未知位和零值不能写入任务文件。
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TaskWorkMask(u64);
 
 impl TaskWorkMask {
@@ -225,7 +225,7 @@ pub struct TaskFileRecord {
 ///
 /// 字段保持私有，调用方只能保存并回传由任务文件管理器产生的身份；状态更新时会
 /// 重新读取完整行，核对 run、lane、偏移、长度、item 和掩码后才允许原位写入。
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TaskFileIdentity {
     run_id: String,
     lane_file_name: String,
@@ -367,7 +367,8 @@ struct LaneState {
     cursor: usize,
     published_len: u64,
     sealed: bool,
-    in_flight: Option<TaskFileIdentity>,
+    /// 已经取得读取许可但尚未完成 ACK 的完整身份集合；读取并发额度由 scheduler 管理。
+    in_flight: BTreeSet<TaskFileIdentity>,
     poisoned: bool,
 }
 
@@ -464,7 +465,7 @@ impl TransientTaskFileSet {
     /// 不接受外部传入的任意路径或运行 ID。
     pub fn discard(&mut self) -> io::Result<()> {
         self.ensure_not_discarded()?;
-        if self.lanes.values().any(|lane| lane.in_flight.is_some()) {
+        if self.lanes.values().any(|lane| !lane.in_flight.is_empty()) {
             return Err(invalid_input("任务文件仍有已领取任务，不能 discard"));
         }
         if Arc::strong_count(&self.owner_token) != 1 {
@@ -499,6 +500,11 @@ impl TransientTaskFileSet {
     /// 返回由 lane 身份计算出的文件路径；尚未追加时文件可能尚不存在。
     pub fn lane_path(&self, lane: &TaskDiskLane) -> io::Result<PathBuf> {
         Ok(self.run_dir.join(lane_file_name(lane)?))
+    }
+
+    /// 返回冻结 lane 对应的任务文件名，供 dispatcher 建立同一 lane 的等待状态。
+    pub(crate) fn lane_key(&self, lane: &TaskDiskLane) -> io::Result<String> {
+        lane_file_name(lane)
     }
 
     /// 注册一个空 lane 文件，便于 dispatcher 观察尚未有生产者写入的 lane。
@@ -748,9 +754,6 @@ impl TransientTaskFileSet {
             Some(value) => value,
             None => return Ok(None),
         };
-        if lane_state.in_flight.is_some() {
-            return Ok(None);
-        }
         refill_lane(&set_run_id, lane_state)?;
         let head = match lane_state.prefetched.front() {
             Some(value) => value,
@@ -783,7 +786,7 @@ impl TransientTaskFileSet {
             }
         }
         let head = lane_state.prefetched.pop_front().expect("已确认队首存在");
-        lane_state.in_flight = Some(head.identity.clone());
+        lane_state.in_flight.insert(head.identity.clone());
         Ok(Some((head.identity, head.record)))
     }
 
@@ -795,6 +798,68 @@ impl TransientTaskFileSet {
     /// 在单文件读取或 Worker 失败后，把指定任务行从 `P` 原位改为 `F`。
     pub fn mark_failed(&mut self, identity: &TaskFileIdentity) -> io::Result<()> {
         self.mark_terminal(identity, TaskLineStatus::Failed)
+    }
+
+    /// 在取消收束后精确放弃一项在途任务，只清理内存身份并保持文件首字节为 `P`。
+    ///
+    /// 调用方必须先确保对应 permit、续算意图和等待 future 都已经释放；本方法不把
+    /// 取消伪装成单文件失败，也不改变任务文件中的任何持久字节。
+    pub fn abandon_in_flight(&mut self, identity: &TaskFileIdentity) -> io::Result<()> {
+        self.ensure_active()?;
+        if identity.run_id != self.run_id {
+            return Err(invalid_input("任务身份 run_id 不匹配"));
+        }
+        let lane_state = self
+            .lanes
+            .get_mut(&identity.lane_file_name)
+            .ok_or_else(|| invalid_input("任务身份 lane 不存在"))?;
+        if !lane_state.in_flight.remove(identity) {
+            return Err(invalid_input("任务身份不在途，不能 abandon"));
+        }
+        self.advance_epoch();
+        Ok(())
+    }
+
+    /// 校验 Hash→Media 续算仍绑定原始 `P` 行；不修改任务文件或在途集合。
+    pub(crate) fn validate_media_continuation(
+        &mut self,
+        identity: &TaskFileIdentity,
+        expected_record: &TaskFileRecord,
+    ) -> io::Result<()> {
+        self.ensure_active()?;
+        if identity.run_id != self.run_id {
+            return Err(invalid_input("任务身份 run_id 不匹配"));
+        }
+        if expected_record.work_kind != TaskWorkKind::Base
+            || !expected_record.missing.needs_md5()
+            || expected_record.known_md5.is_some()
+        {
+            return Err(invalid_input("续算只允许仍需 MD5 的基础任务原始记录"));
+        }
+        let lane_state = self
+            .lanes
+            .get_mut(&identity.lane_file_name)
+            .ok_or_else(|| invalid_input("任务身份 lane 不存在"))?;
+        if !lane_state.in_flight.contains(identity) {
+            return Err(invalid_input("续算任务不在途"));
+        }
+        let bytes = read_at(
+            lane_state
+                .reader
+                .as_ref()
+                .ok_or_else(|| io::Error::other("任务 lane 读取句柄已关闭"))?,
+            identity.line_offset,
+            identity.line_length,
+        )?;
+        let parsed = parse_record(&bytes)?;
+        if parsed.status != TaskLineStatus::Pending
+            || parsed.record.item_id != identity.item_id
+            || parsed.record.missing != identity.missing
+            || parsed.record != *expected_record
+        {
+            return Err(invalid_data("续算原始任务行已经变化"));
+        }
+        Ok(())
     }
 
     /// 返回只包含已发布边界的预读对象数量，便于验证内存上限。
@@ -847,7 +912,7 @@ impl TransientTaskFileSet {
             && self.lanes.values().all(|lane| {
                 lane.sealed
                     && !lane.poisoned
-                    && lane.in_flight.is_none()
+                    && lane.in_flight.is_empty()
                     && lane.prefetched.is_empty()
                     && lane
                         .metadata
@@ -934,7 +999,7 @@ impl TransientTaskFileSet {
                 cursor: 0,
                 published_len: 0,
                 sealed: false,
-                in_flight: None,
+                in_flight: BTreeSet::new(),
                 poisoned: false,
             },
         );
@@ -1021,7 +1086,7 @@ impl TransientTaskFileSet {
         if parsed.status != TaskLineStatus::Pending || meta.status != TaskLineStatus::Pending {
             return Err(invalid_input("任务行只允许从 P 转换为目标终态"));
         }
-        if lane_state.in_flight.as_ref() != Some(identity) {
+        if !lane_state.in_flight.contains(identity) {
             return Err(invalid_input("任务行尚未被当前 dispatcher 领取"));
         }
 
@@ -1040,7 +1105,7 @@ impl TransientTaskFileSet {
             return Err(error);
         }
         meta.status = target;
-        lane_state.in_flight = None;
+        lane_state.in_flight.remove(identity);
         self.advance_epoch();
         Ok(())
     }
@@ -1055,9 +1120,6 @@ fn lane_status(lane: &LaneState, identity: &TaskFileIdentity) -> io::Result<Task
 }
 
 fn refill_lane(run_id: &str, lane: &mut LaneState) -> io::Result<()> {
-    if lane.in_flight.is_some() {
-        return Ok(());
-    }
     let window = lane.lane.per_disk_limit.saturating_mul(2).max(2);
     while lane.prefetched.len() < window && lane.cursor < lane.metadata.len() {
         let meta = lane.metadata[lane.cursor];

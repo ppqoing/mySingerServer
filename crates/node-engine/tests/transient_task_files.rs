@@ -160,6 +160,100 @@ fn append_seal_take_and_ack_change_only_the_status_byte() {
 }
 
 #[test]
+fn one_lane_tracks_multiple_inflight_and_allows_out_of_order_ack() {
+    let root = runtime_root();
+    let id = run_id();
+    let task_lane = lane(&[7], LocalDiskKind::Hdd, 2);
+    let mut files = TransientTaskFileSet::create(root.path(), &id).unwrap();
+    let rows = (0..3)
+        .map(|index| {
+            record(
+                &format!("concurrent-{index}.jpg"),
+                TaskWorkMask::from_bits(1 << 3).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let identities = files.append_batch(&task_lane, &rows).unwrap();
+    files.seal().unwrap();
+
+    let first = files.take_lane(&identities[0]).unwrap().unwrap();
+    let second = files.take_lane(&identities[1]).unwrap().unwrap();
+    assert_eq!(first.1, rows[0]);
+    assert_eq!(second.1, rows[1]);
+    // 文件 owner 只记录精确身份；活跃读取上限由统一 scheduler permit 控制。
+    let third = files.take_lane(&identities[2]).unwrap().unwrap();
+    assert_eq!(third.1, rows[2]);
+
+    // ACK 顺序不要求与领取顺序相同；文件 owner 仍保留另外两项的精确身份。
+    files.mark_completed(&identities[1]).unwrap();
+    files.mark_failed(&identities[0]).unwrap();
+    files.mark_completed(&third.0).unwrap();
+    assert!(files.all_terminal());
+}
+
+#[test]
+fn refill_continues_while_another_identity_is_inflight() {
+    let root = runtime_root();
+    let id = run_id();
+    let task_lane = lane(&[7], LocalDiskKind::Hdd, 1);
+    let mut files = TransientTaskFileSet::create(root.path(), &id).unwrap();
+    let rows = (0..4)
+        .map(|index| {
+            record(
+                &format!("refill-{index}.jpg"),
+                TaskWorkMask::from_bits(1 << 3).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let identities = files.append_batch(&task_lane, &rows).unwrap();
+    files.seal().unwrap();
+
+    // limit=1 只把两个任务放进窗口；第二次领取时必须在第一项仍在途时继续补读。
+    files.take_lane(&identities[0]).unwrap().unwrap();
+    files.take_lane(&identities[1]).unwrap().unwrap();
+    files.take_lane(&identities[2]).unwrap().unwrap();
+    assert_eq!(files.prefetched_len(&task_lane).unwrap(), 1);
+
+    files.mark_completed(&identities[2]).unwrap();
+    files.mark_completed(&identities[0]).unwrap();
+    files.mark_completed(&identities[1]).unwrap();
+    let fourth = files.take_lane(&identities[3]).unwrap().unwrap();
+    files.mark_completed(&fourth.0).unwrap();
+    assert!(files.all_terminal());
+}
+
+#[test]
+fn abandon_inflight_removes_only_the_exact_identity_without_writing_failure() {
+    let root = runtime_root();
+    let id = run_id();
+    let task_lane = lane(&[7], LocalDiskKind::Hdd, 2);
+    let mut files = TransientTaskFileSet::create(root.path(), &id).unwrap();
+    let rows = [
+        record(
+            "abandon-first.jpg",
+            TaskWorkMask::from_bits(1 << 3).unwrap(),
+        ),
+        record(
+            "abandon-second.jpg",
+            TaskWorkMask::from_bits(1 << 3).unwrap(),
+        ),
+    ];
+    let identities = files.append_batch(&task_lane, &rows).unwrap();
+    files.seal().unwrap();
+    files.take_lane(&identities[0]).unwrap().unwrap();
+    files.take_lane(&identities[1]).unwrap().unwrap();
+
+    files.abandon_in_flight(&identities[0]).unwrap();
+    assert_eq!(
+        fs::read(files.lane_path(&task_lane).unwrap()).unwrap()[0],
+        b'P'
+    );
+    assert!(files.mark_completed(&identities[0]).is_err());
+    assert!(files.mark_completed(&identities[1]).is_ok());
+    assert!(!files.all_terminal(), "被 abandon 的 P 行仍不是终态");
+}
+
+#[test]
 fn failed_item_is_marked_f_and_inflight_blocks_terminal_state() {
     let root = runtime_root();
     let id = run_id();
