@@ -749,6 +749,7 @@ impl TransientTaskFileSet {
 
     /// 返回只包含已发布边界的预读对象数量，便于验证内存上限。
     pub fn prefetched_len(&mut self, lane: &TaskDiskLane) -> io::Result<usize> {
+        self.ensure_active()?;
         let key = lane_file_name(lane)?;
         let set_run_id = self.run_id.clone();
         let lane_state = self

@@ -34,3 +34,7 @@ cargo test -p dedup-node-engine --test transient_task_files task_rows_are_fixed_
 测试覆盖固定字节、无 JSON/BOM/idx、UUID/mask/控制字符/非 UTF-8、复合和 Unknown 文件名、双 lane 重复项、sealed/published/有限预读、ACK 失败保持 P、ACK 成功 C、文件失败 F、行体字节不变、错误身份/offset/lane/run/mask、损坏行重试、append flush 失败毒化且析构不复刷、write 成功但 sync 失败毒化、拥有型队首身份、lane 配置冻结、lane 打开 IO 失败唤醒并毒化、publication 追加/seal 唤醒、删除失败后的 cleanup_pending 重试、非规范盘号拒绝、精确 discard、非法状态转换以及 terminal/inflight 边界。
 
 本轮验证前后磁盘空间约为 C 盘 17.62 GiB、D 盘 10.23 GiB；未触发清理。未运行真实媒体、打包、部署，也未触碰 `I:\Tool`。
+
+## 独立审查
+
+三轮独立审查最终 Approved。游标、poison、状态同步、精确身份、lane 配置、publication 和 owner-only discard 边界均已关闭；最后一个 Minor 是 `prefetched_len` 在 poisoned/cleanup-pending 后缺少活动状态门禁，已统一调用 `ensure_active`。控制 Agent 在当前代码上重跑 `transient_task_files`，22/22 通过，格式和 diff 检查通过。
