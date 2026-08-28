@@ -5,6 +5,7 @@ CREATE TABLE metadata (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 ) STRICT;
+INSERT INTO metadata(key,value) VALUES('library_revision','0');
 
 CREATE TABLE contents (
     content_id INTEGER PRIMARY KEY,

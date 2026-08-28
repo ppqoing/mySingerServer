@@ -7,6 +7,7 @@ mod delete;
 mod faults;
 mod features;
 mod groups;
+mod maintenance;
 mod open;
 mod outbox;
 mod review;

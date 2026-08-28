@@ -1,7 +1,7 @@
 //! 启动边界只丢弃运行态，并保留媒体与同步长期事实的行为测试。
 
 use dedup_core::MachineId;
-use dedup_node_store::{NewTaskItem, NodeStore};
+use dedup_node_store::{NewTaskItem, NodeStore, StoreError};
 use rusqlite::{Connection, params};
 
 /// 返回固定机器身份，保证重开时通过同一数据库绑定校验。
@@ -106,7 +106,9 @@ fn reopening_discards_transient_runtime_rows_and_preserves_durable_facts() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("runtime-boundary.db");
     let machine = machine();
-    drop(NodeStore::open(&database, machine.clone()).unwrap());
+    let store = NodeStore::open(&database, machine.clone()).unwrap();
+    assert_eq!(store.library_revision().unwrap(), 0);
+    drop(store);
 
     let connection = Connection::open(&database).unwrap();
     let machine_id = machine.as_str();
@@ -312,4 +314,54 @@ fn background_reopen_keeps_current_runtime_rows() {
 
     assert_eq!(store.task_snapshot(task).unwrap().total_items, 1);
     assert_eq!(observer.task_snapshot(task).unwrap().total_items, 1);
+}
+
+/// 读取文件数据库中已经持久化的 library revision 原始字段。
+fn raw_library_revision(database: &std::path::Path) -> String {
+    let connection = Connection::open(database).unwrap();
+    connection
+        .query_row(
+            "SELECT value FROM metadata WHERE key='library_revision'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// 新库初始化 revision，合法旧库补齐缺失 key，并拒绝非法 revision 元数据。
+#[test]
+fn opening_validates_and_initializes_library_revision_metadata() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("library-revision.db");
+    let machine = machine();
+
+    let store = NodeStore::open(&database, machine.clone()).unwrap();
+    assert_eq!(store.library_revision().unwrap(), 0);
+    drop(store);
+    assert_eq!(raw_library_revision(&database), "0");
+
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute("DELETE FROM metadata WHERE key='library_revision'", [])
+        .unwrap();
+    drop(connection);
+    let store = NodeStore::open(&database, machine.clone()).unwrap();
+    assert_eq!(store.library_revision().unwrap(), 0);
+    drop(store);
+    assert_eq!(raw_library_revision(&database), "0");
+
+    for invalid in ["-1", "1.5", "18446744073709551616"] {
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute(
+                "UPDATE metadata SET value=?1 WHERE key='library_revision'",
+                [invalid],
+            )
+            .unwrap();
+        drop(connection);
+        assert!(matches!(
+            NodeStore::open(&database, machine.clone()),
+            Err(StoreError::IncompatibleSchema)
+        ));
+    }
 }

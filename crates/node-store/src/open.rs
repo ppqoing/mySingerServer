@@ -9,6 +9,8 @@ use dedup_core::{CoreError, MachineId, product_id};
 use rusqlite::{Connection, OptionalExtension};
 use thiserror::Error;
 
+use crate::maintenance::{ensure_library_revision, read_library_revision};
+
 const SCHEMA: &str = include_str!("schema.sql");
 
 /// 节点持久化边界返回的错误。
@@ -123,6 +125,11 @@ impl NodeStore {
         )?)
     }
 
+    /// 返回当前文件库的单调版本；仅接受严格的 `u64` 十进制 metadata 值。
+    pub fn library_revision(&self) -> Result<u64, StoreError> {
+        read_library_revision(&self.connection)
+    }
+
     /// 返回数据库绑定的物理机器身份。
     pub const fn machine_id(&self) -> &MachineId {
         &self.machine_id
@@ -187,6 +194,7 @@ fn initialize_or_validate(
         }
         configure(&connection, file_backed)?;
     }
+    ensure_library_revision(&connection)?;
     if clear_runtime_state {
         clear_transient_runtime_state(&mut connection)?;
     }
