@@ -234,6 +234,29 @@ impl NodeStore {
         Ok(result)
     }
 
+    /// 在不创建任务表记录的情况下原子提交一筛、内容状态和同步 outbox。
+    ///
+    /// 该入口供瞬时 TSV 任务使用；任务状态只由内存运行时维护，SQLite 只保存最终缓存。
+    /// 返回本次事务最后写入的 outbox 序号。
+    pub fn commit_scan_stage1_taskless(
+        &mut self,
+        content_id: ContentId,
+        media_kind: MediaKind,
+        writes: Vec<FeatureWrite>,
+    ) -> Result<u64, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let sequence = commit_scan_stage1_features_in_transaction(
+            &transaction,
+            content_id,
+            media_kind,
+            writes,
+        )?;
+        transaction.commit()?;
+        Ok(sequence)
+    }
+
     /// 只返回图片完整四字段，或六槽位记录且至少四个成功帧字段完整的视频一筛。
     pub fn load_complete_stage1(
         &self,
@@ -514,6 +537,24 @@ fn commit_scan_stage1_in_transaction(
     writes: Vec<FeatureWrite>,
     now_ms: i64,
 ) -> Result<crate::TaskEvent, StoreError> {
+    commit_scan_stage1_features_in_transaction(transaction, content_id, media_kind, writes)?;
+    complete_item_in_transaction(
+        transaction,
+        item_id,
+        TaskItemCompletion::Succeeded {
+            content_id: Some(content_id),
+        },
+        now_ms,
+    )
+}
+
+/// 在既有事务中按固定顺序写入内容、一筛和 outbox，不触碰任务表。
+fn commit_scan_stage1_features_in_transaction(
+    transaction: &Transaction<'_>,
+    content_id: ContentId,
+    media_kind: MediaKind,
+    writes: Vec<FeatureWrite>,
+) -> Result<u64, StoreError> {
     transaction.execute(
         "UPDATE contents SET media_kind=?2,base_complete=1 WHERE content_id=?1",
         params![
@@ -526,7 +567,7 @@ fn commit_scan_stage1_in_transaction(
         ],
     )?;
     let key = content_key_in_transaction(transaction, content_id)?;
-    append_sync_change(
+    let mut sequence = append_sync_change(
         transaction,
         "content",
         encode_content(key, media_kind, true),
@@ -612,16 +653,9 @@ fn commit_scan_stage1_in_transaction(
                 return Err(StoreError::InvalidFeature("扫描一筛事务不能写入二筛结果"));
             }
         };
-        append_sync_change(transaction, entity_kind, payload)?;
+        sequence = append_sync_change(transaction, entity_kind, payload)?;
     }
-    complete_item_in_transaction(
-        transaction,
-        item_id,
-        TaskItemCompletion::Succeeded {
-            content_id: Some(content_id),
-        },
-        now_ms,
-    )
+    Ok(sequence)
 }
 
 fn validate_slot(slot: u8) -> Result<(), StoreError> {
