@@ -1,7 +1,12 @@
 //! SQLite outbox ACK、裁剪、SnapshotRequired 与只读快照测试。
 
 use dedup_core::{DisplayPath, MachineId, MediaKind, NormalizedPath};
-use dedup_node_store::{NodeStore, ScannedPath, StoreError, SyncState};
+use dedup_node_store::{
+    FeatureWrite, NodeStore, ScannedPath, StoreError, SyncState, VideoFrameStage1Fields,
+    VideoMetadataFields,
+};
+use rusqlite::{Connection, params};
+use tempfile::tempdir;
 
 fn machine() -> MachineId {
     MachineId::parse("73bdb7a3377f81376a84f316b3ee1555e345afbfa87aa99c77b1bfcc364c4cae").unwrap()
@@ -115,4 +120,104 @@ fn owned_snapshot_keeps_one_read_transaction_across_pages() {
         snapshot.read_page("contact_sheets", "", 1000),
         Err(StoreError::InvalidSnapshotTable(_))
     ));
+}
+
+/// 快照跳过单条畸形视频元数据和槽位，仍按有效邻居推进游标并最终完成。
+#[test]
+fn snapshot_skips_malformed_video_rows_without_null_overwrite() {
+    let directory = tempdir().unwrap();
+    let database = directory.path().join("snapshot-malformed-video.db");
+    let mut store = NodeStore::open(&database, machine()).unwrap();
+    let mut content_ids = Vec::new();
+    for (index, md5) in [[1_u8; 16], [2_u8; 16], [3_u8; 16]].into_iter().enumerate() {
+        let content = store
+            .upsert_content_and_location(
+                &scan(&format!(r"D:\snapshot-{index}.mp4"), 100 + index as u64),
+                md5,
+                MediaKind::Video,
+            )
+            .unwrap();
+        store
+            .commit_feature_result(
+                content.id,
+                None,
+                FeatureWrite::VideoMetadata(VideoMetadataFields {
+                    duration_ms: Some(1_000),
+                    width: Some(640),
+                    height: Some(480),
+                }),
+            )
+            .unwrap();
+        store
+            .commit_feature_result(
+                content.id,
+                None,
+                FeatureWrite::VideoFrameStage1(VideoFrameStage1Fields {
+                    slot: 0,
+                    time_ms: 500,
+                    decoded: false,
+                    width: None,
+                    height: None,
+                    pdq: None,
+                    quality: None,
+                }),
+            )
+            .unwrap();
+        content_ids.push(content.id);
+    }
+
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute_batch("PRAGMA ignore_check_constraints=ON;")
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE video_metadata SET duration_ms=-1 WHERE content_id=?1",
+            params![content_ids[0].as_i64()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE video_frame_stage1 SET time_ms=-1 WHERE content_id=?1 AND slot=0",
+            params![content_ids[0].as_i64()],
+        )
+        .unwrap();
+    drop(connection);
+
+    let snapshot = store.begin_snapshot().unwrap();
+    let metadata_first = snapshot
+        .read_page("video_metadata", "", 1)
+        .expect("畸形 metadata 不得阻断快照");
+    assert_eq!(metadata_first.rows.len(), 1);
+    assert!(metadata_first.rows[0].key.starts_with("0202"));
+    assert!(!metadata_first.done);
+    let metadata_second = snapshot
+        .read_page(
+            "video_metadata",
+            metadata_first.next_cursor.as_deref().unwrap(),
+            1,
+        )
+        .unwrap();
+    assert_eq!(metadata_second.rows.len(), 1);
+    assert!(metadata_second.rows[0].key.starts_with("0303"));
+    assert!(metadata_second.done);
+    assert!(metadata_second.next_cursor.is_none());
+
+    let frame_first = snapshot
+        .read_page("video_frame_stage1", "", 1)
+        .expect("畸形视频槽位不应降级整页");
+    assert_eq!(frame_first.rows.len(), 1);
+    assert!(frame_first.rows[0].key.starts_with("0202"));
+    assert!(!frame_first.done);
+    let frame_second = snapshot
+        .read_page(
+            "video_frame_stage1",
+            frame_first.next_cursor.as_deref().unwrap(),
+            1,
+        )
+        .unwrap();
+    assert_eq!(frame_second.rows.len(), 1);
+    assert!(frame_second.rows[0].key.starts_with("0303"));
+    assert!(frame_second.done);
+    assert!(frame_second.next_cursor.is_none());
 }

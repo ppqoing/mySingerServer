@@ -133,6 +133,12 @@ pub enum NodeRemoteFeatureCache {
     },
     /// 多机模式，复用一个已校验 PostgreSQL 连接。
     Postgres(PostgresFeatureCache),
+    /// 单元测试使用的中心缓存响应；只模拟二筛读取，不访问网络。
+    #[cfg(test)]
+    Test {
+        /// 按请求顺序返回预设的完整二筛结果。
+        hits: Vec<Option<CompleteStage2>>,
+    },
 }
 
 /// Node 批量查询二次特征缓存所需的内容类型与视频槽位。
@@ -178,6 +184,8 @@ impl NodeRemoteFeatureCache {
         match self {
             Self::Disabled { warning, .. } => warning.as_deref(),
             Self::Postgres(_) => None,
+            #[cfg(test)]
+            Self::Test { .. } => None,
         }
     }
 
@@ -186,6 +194,14 @@ impl NodeRemoteFeatureCache {
         &self,
         requests: &[Stage2CacheLookup],
     ) -> Result<Vec<Option<CompleteStage2>>, RemoteCacheError> {
+        #[cfg(test)]
+        if let Self::Test { hits } = self {
+            return Ok(requests
+                .iter()
+                .enumerate()
+                .map(|(index, _)| hits.get(index).cloned().flatten())
+                .collect());
+        }
         let Self::Postgres(cache) = self else {
             return Ok(vec![None; requests.len()]);
         };
@@ -213,6 +229,12 @@ impl NodeRemoteFeatureCache {
             })
             .collect())
     }
+
+    /// 构造只供二筛行为测试使用的远端响应缓存。
+    #[cfg(test)]
+    pub(crate) fn test_with_stage2(hits: Vec<Option<CompleteStage2>>) -> Self {
+        Self::Test { hits }
+    }
 }
 
 impl RemoteFeatureCache for NodeRemoteFeatureCache {
@@ -228,6 +250,8 @@ impl RemoteFeatureCache for NodeRemoteFeatureCache {
         match self {
             Self::Disabled { cache, .. } => cache.lookup_paths(machine_id, paths).await,
             Self::Postgres(cache) => cache.lookup_paths(machine_id, paths).await,
+            #[cfg(test)]
+            Self::Test { .. } => Ok(vec![None; paths.len()]),
         }
     }
 
@@ -238,6 +262,8 @@ impl RemoteFeatureCache for NodeRemoteFeatureCache {
         match self {
             Self::Disabled { cache, .. } => cache.lookup_contents(keys).await,
             Self::Postgres(cache) => cache.lookup_contents(keys).await,
+            #[cfg(test)]
+            Self::Test { .. } => Ok(vec![None; keys.len()]),
         }
     }
 
@@ -249,6 +275,8 @@ impl RemoteFeatureCache for NodeRemoteFeatureCache {
         match self {
             Self::Disabled { cache, .. } => cache.publish_outbox(machine_id, batch).await,
             Self::Postgres(cache) => cache.publish_outbox(machine_id, batch).await,
+            #[cfg(test)]
+            Self::Test { .. } => Ok(0),
         }
     }
 }

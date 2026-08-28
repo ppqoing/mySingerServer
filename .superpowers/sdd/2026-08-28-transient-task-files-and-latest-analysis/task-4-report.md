@@ -81,6 +81,55 @@
 
 未执行真实媒体、打包、部署、TSV/lane/任务恢复/协议/UI 改动，也未访问 `I:\Tool`。
 
+## Follow-up 3：快照畸形行与远端二筛精确一次
+
+本轮针对复审剩余两个 Important 继续遵循真实行为 RED→最小 GREEN；断言只观察
+SQLite 快照、任务状态、Worker 调用和 outbox 实体/槽位，不使用源码字符串匹配。
+
+### RED
+
+- 快照 raw SQLite 夹具把一个视频元数据的 `duration_ms` 和一个视频槽位的 `time_ms` 改为负数。
+  旧实现先把负 duration 编为缺失字段，负 frame time 再直接返回错误；分页无法稳定跳过该内容，
+  `snapshot_skips_malformed_video_rows_without_null_overwrite` 真实失败于首个有效邻居断言。
+- 中心二筛测试缓存返回完整六槽，而本机仅请求 `[0]` 或请求 `[0,1]` 且预存槽 0。旧实现
+  将六槽全部写入 outbox，并在缓存完整后再次全量重发，真实观察到
+  `[0,1,2,3,4,5,0,1,2,3,4,5]`，违反 Worker=0、请求交集和精确一次。
+
+### GREEN
+
+- `snapshot.rs` 在视频元数据和视频一筛槽位读取边界过滤负 duration/time；畸形 raw 行不进入
+  payload、不以 `None` 覆盖中心旧值，稳定游标仍可分页发出有效邻居并完成。其他快照表和协议
+  载荷保持不变。
+- phase2 在远端查询前冻结每个内容的本地有效图片二筛或请求视频槽位掩码；远端完整六槽返回
+  只按 `expected ∩ missing` 持久化，选择性重发只按冻结的 preexisting 集合执行，导入结果不会
+  再次被当成本地旧缓存重发。`dispatch_missing` 保留全部成功一筛槽位作为中心要求，刷新后
+  仍只把集中缺失掩码交给 Worker。
+- 增加真实 NodeStore outbox 类型/槽位/计数行为测试：仅请求槽 0 时 Worker 调用为 0 且只产生
+  一个 `video_frame_stage2` 槽 0；预存槽 0、导入槽 1 时两槽各一次且不产生槽 2..5。
+
+### Follow-up 3 验证
+
+所有 Cargo 命令均在同一 PowerShell 命令中显式使用
+`CARGO_TARGET_DIR=C:\tmp\rust-v2-core-scope-target`、`CARGO_INCREMENTAL=0`、dev/test debug=0，
+并清除 `CC/CXX/AR/RANLIB/CFLAGS/CXXFLAGS/RUSTFLAGS/RUSTC_WRAPPER`；每条重型命令前检查 C/D
+空间。本轮记录 C 约 18.2 GiB、D 约 10.3 GiB，均未低于 10 GiB 停止线。
+
+| 验证 | 结果 |
+|---|---|
+| 快照畸形行定向 `cargo test -p dedup-node-store --test outbox snapshot_skips_malformed_video_rows_without_null_overwrite --locked -- --test-threads=1` | 1/1 通过 |
+| 远端导入/选择性重发定向 `cargo test -p dedup-node-engine --lib remote_stage2_ --locked -- --test-threads=1` | 2/2 通过 |
+| `cargo test -p dedup-node-store --test content_cache --locked -- --test-threads=1` | 22/22 通过 |
+| `cargo test -p dedup-node-store --locked -- --test-threads=1` | 全量通过 |
+| `cargo test -p dedup-node-engine --test local_analysis --locked -- --test-threads=1` | 11/11 通过 |
+| `cargo test -p dedup-node-engine --test base_compute_pipeline --features test-hooks --locked -- --test-threads=1` | 59/59 通过 |
+| `cargo test -p dedup-node-engine --test worker_pipeline --locked -- --test-threads=1` | 23/23 通过 |
+| `cargo test -p dedup-node-engine --lib --locked -- --test-threads=1` | 66/66 通过 |
+| `cargo test -p dedup-central-store --locked -- --test-threads=1` | 3 通过，1 个 PostgreSQL 环境测试忽略 |
+| `cargo fmt --all -- --check` | 通过 |
+| `git diff --check` | 通过 |
+
+未执行真实媒体、打包、部署、TSV/lane/任务恢复/协议/UI 改动，也未访问 `I:\Tool`。
+
 ## Follow-up 2：阶段二空交集、Quality 覆盖与重发门禁
 
 本轮针对复审指出的三个 Important 继续按真实行为测试先 RED、再最小 GREEN；测试只观察

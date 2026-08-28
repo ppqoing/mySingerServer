@@ -423,6 +423,15 @@ struct MissingWork {
     frame_slots: Vec<u8>,
 }
 
+/// 远端导入前冻结的本机二筛缓存；只允许重发调用前已存在的字段。
+#[derive(Clone, Copy, Debug, Default)]
+struct PreexistingStage2 {
+    /// 本机已有完整图片二筛。
+    image: bool,
+    /// 本机已有完整视频槽位的六位掩码。
+    video_slots: u8,
+}
+
 /// 中心协调器派给一个节点的唯一内容及固定来源位置。
 #[derive(Clone, Debug)]
 pub struct Stage2BatchItem {
@@ -588,7 +597,26 @@ async fn run_stage2_batch_internal<P: Stage2Processor>(
         None,
         None,
     )?;
-    let cache_warning = resolve_remote_stage2(store, &work, remote).await?;
+    let initial_records = store
+        .lookup_base_cache_by_keys(&work.iter().map(|item| item.content).collect::<Vec<_>>())?;
+    if initial_records.len() != work.len() {
+        return Err(AnalysisBlocked::InvalidState(
+            "二筛远端导入前的基础缓存批量返回数量不匹配".into(),
+        ));
+    }
+    let preexisting_by_content = work
+        .iter()
+        .zip(initial_records.iter())
+        .filter_map(|(item, record)| {
+            record.as_ref().and_then(|record| {
+                record
+                    .content_id
+                    .map(|content_id| (content_id, preexisting_stage2(item, record)))
+            })
+        })
+        .collect::<HashMap<_, _>>();
+    let cache_warning =
+        resolve_remote_stage2(store, &work, remote, &preexisting_by_content).await?;
     report_stage2_stage(
         reporter,
         RuntimeStage::LookupStage2Cache,
@@ -669,11 +697,21 @@ async fn run_stage2_batch_internal<P: Stage2Processor>(
             skipped += 1;
             continue;
         }
-        if cached.is_some_and(cached_stage2_is_complete)
-            && store.republish_complete_stage2_from_cache(
-                cached.expect("缓存完整度判断已确认记录存在"),
-            )?
+        let preexisting = preexisting_by_content
+            .get(&expected.content_id)
+            .copied()
+            .unwrap_or_default();
+        if expected.media_kind == MediaKind::Image
+            && cached.is_some_and(|record| stage2_complete_for_expected(expected, record))
         {
+            if preexisting.image {
+                let cached = cached.expect("图片二筛完整度判断已确认记录存在");
+                if !store.republish_complete_stage2_from_cache(cached)? {
+                    return Err(AnalysisBlocked::InvalidState(
+                        "图片已有二筛缓存但无法重发".into(),
+                    ));
+                }
+            }
             store.complete_item(
                 &item.item_id,
                 TaskItemCompletion::Succeeded {
@@ -689,7 +727,7 @@ async fn run_stage2_batch_internal<P: Stage2Processor>(
             .frame_slots
             .iter()
             .copied()
-            .filter(|slot| !frame_slots.contains(slot))
+            .filter(|slot| preexisting.video_slots & (1_u8 << slot) != 0)
             .collect::<Vec<_>>();
         if !existing_slots.is_empty() {
             let Some(cached) = cached else {
@@ -1011,6 +1049,7 @@ pub(crate) async fn dispatch_missing<P: Stage2Processor>(
         ));
     }
     let mut work = Vec::new();
+    let mut preexisting_by_content = HashMap::new();
     for (content, record) in keys.into_iter().zip(cached_records) {
         let Some(record) = record else {
             continue;
@@ -1032,33 +1071,33 @@ pub(crate) async fn dispatch_missing<P: Stage2Processor>(
                 let Some(CompleteStage1::Video(frames)) = record.stage1.as_ref() else {
                     continue;
                 };
+                // 保留全部成功槽位作为本次中心要求；远端导入前据此冻结已有槽位，
+                // 真正交给 Worker 的集合仍在刷新缓存后由缺失掩码计算。
                 let frame_slots = frames
                     .iter()
                     .enumerate()
-                    .filter_map(|(slot, frame)| {
-                        (completeness.video_stage2_missing_slots & (1_u8 << slot) != 0)
-                            .then_some(frame.map(|_| slot as u8))
-                            .flatten()
-                    })
+                    .filter_map(|(slot, frame)| frame.map(|_| slot as u8))
                     .collect();
                 (MediaKind::Video, frame_slots)
             }
             MediaKind::Video => continue,
             MediaKind::Other => continue,
         };
-        work.push(MissingWork {
+        let item = MissingWork {
             content,
             content_id,
             location,
             display_path,
             media_kind,
             frame_slots,
-        });
+        };
+        preexisting_by_content.insert(content_id, preexisting_stage2(&item, &record));
+        work.push(item);
     }
     if work.is_empty() {
         return Ok(MissingDispatchReport::default());
     }
-    let _ = resolve_remote_stage2(store, &work, remote).await?;
+    let _ = resolve_remote_stage2(store, &work, remote, &preexisting_by_content).await?;
     let refreshed_records = store
         .lookup_base_cache_by_keys(&work.iter().map(|item| item.content).collect::<Vec<_>>())?;
     if refreshed_records.len() != work.len() {
@@ -1113,15 +1152,38 @@ pub(crate) async fn dispatch_missing<P: Stage2Processor>(
             .iter()
             .find(|candidate| candidate.content_id == item_content)
             .ok_or_else(|| AnalysisBlocked::InvalidState("二筛任务项不属于当前批次".into()))?;
-        if cached_by_content
+        let cached = cached_by_content.get(&expected.content_id);
+        let preexisting = preexisting_by_content
             .get(&expected.content_id)
-            .is_some_and(cached_stage2_is_complete)
-            && store.republish_complete_stage2_from_cache(
-                cached_by_content
-                    .get(&expected.content_id)
-                    .expect("缓存完整度判断已确认记录存在"),
-            )?
-        {
+            .copied()
+            .unwrap_or_default();
+        if cached.is_some_and(|record| stage2_complete_for_expected(expected, record)) {
+            if expected.media_kind == MediaKind::Image && preexisting.image {
+                if !store.republish_complete_stage2_from_cache(
+                    cached.expect("图片二筛完整度判断已确认记录存在"),
+                )? {
+                    return Err(AnalysisBlocked::InvalidState(
+                        "图片已有二筛缓存但无法重发".into(),
+                    ));
+                }
+            } else if expected.media_kind == MediaKind::Video {
+                let existing_slots = expected
+                    .frame_slots
+                    .iter()
+                    .copied()
+                    .filter(|slot| preexisting.video_slots & (1_u8 << slot) != 0)
+                    .collect::<Vec<_>>();
+                if !existing_slots.is_empty()
+                    && !store.republish_stage2_slots_from_cache(
+                        cached.expect("视频二筛完整度判断已确认记录存在"),
+                        &existing_slots,
+                    )?
+                {
+                    return Err(AnalysisBlocked::InvalidState(
+                        "视频已有二筛槽位但无法重发".into(),
+                    ));
+                }
+            }
             store.complete_item(
                 &item.item_id,
                 TaskItemCompletion::Succeeded {
@@ -1143,6 +1205,7 @@ pub(crate) async fn dispatch_missing<P: Stage2Processor>(
             }
             continue;
         }
+        let frame_slots = missing_stage2_slots(expected, cached);
         let request = Stage2Request {
             task_id,
             item_id: item.item_id.clone(),
@@ -1150,7 +1213,7 @@ pub(crate) async fn dispatch_missing<P: Stage2Processor>(
             content_id: expected.content_id,
             display_path: expected.display_path.clone(),
             media_kind: expected.media_kind,
-            frame_slots: expected.frame_slots.clone(),
+            frame_slots,
             contact_sheet_path: contact_sheet_target(contact_sheet_root, expected),
         };
         pending.push((
@@ -1246,14 +1309,6 @@ pub(crate) async fn dispatch_missing<P: Stage2Processor>(
     })
 }
 
-/// 判断批量缓存记录是否已经具备可直接重发的二次特征。
-fn cached_stage2_is_complete(record: &dedup_node_store::BaseCacheRecord) -> bool {
-    let completeness = classify_cache_completeness(record, true);
-    completeness.base_missing_parts & (BASE_MISSING_PROBE | BASE_MISSING_STAGE1) == 0
-        && !completeness.image_stage2_missing
-        && completeness.video_stage2_missing_slots == 0
-}
-
 /// 将中心要求的成功槽位与本机结构分类得到的二筛缺失掩码求交集。
 fn missing_stage2_slots(expected: &MissingWork, cached: Option<&BaseCacheRecord>) -> Vec<u8> {
     if expected.media_kind != MediaKind::Video {
@@ -1280,11 +1335,45 @@ fn missing_stage2_slots(expected: &MissingWork, cached: Option<&BaseCacheRecord>
         .collect()
 }
 
+/// 冻结远端导入前已经存在且可重新发布的二筛字段。
+fn preexisting_stage2(expected: &MissingWork, cached: &BaseCacheRecord) -> PreexistingStage2 {
+    let completeness = classify_cache_completeness(cached, true);
+    if completeness.base_missing_parts & (BASE_MISSING_PROBE | BASE_MISSING_STAGE1) != 0 {
+        return PreexistingStage2::default();
+    }
+    match expected.media_kind {
+        MediaKind::Image => PreexistingStage2 {
+            image: !completeness.image_stage2_missing,
+            video_slots: 0,
+        },
+        MediaKind::Video => PreexistingStage2 {
+            image: false,
+            video_slots: expected
+                .frame_slots
+                .iter()
+                .filter(|slot| completeness.video_stage2_missing_slots & (1_u8 << *slot) == 0)
+                .fold(0, |mask, slot| mask | (1_u8 << *slot)),
+        },
+        MediaKind::Other => PreexistingStage2::default(),
+    }
+}
+
+/// 判断缓存是否已经覆盖当前批次要求的图片或视频槽位。
+fn stage2_complete_for_expected(expected: &MissingWork, cached: &BaseCacheRecord) -> bool {
+    let completeness = classify_cache_completeness(cached, true);
+    match expected.media_kind {
+        MediaKind::Image => !completeness.image_stage2_missing,
+        MediaKind::Video => missing_stage2_slots(expected, Some(cached)).is_empty(),
+        MediaKind::Other => false,
+    }
+}
+
 /// 批量查询 PostgreSQL 二次缓存并导入 SQLite；失败只降级到本地计算。
 async fn resolve_remote_stage2(
     store: &mut NodeStore,
     work: &[MissingWork],
     remote: Option<&mut NodeRemoteFeatureCache>,
+    preexisting_by_content: &HashMap<ContentId, PreexistingStage2>,
 ) -> Result<Option<String>, AnalysisBlocked> {
     let Some(remote) = remote else {
         return Ok(None);
@@ -1316,30 +1405,44 @@ async fn resolve_remote_stage2(
     };
     for (item, hit) in work.iter().zip(hits) {
         let Some(hit) = hit else { continue };
-        persist_cached_stage2(store, item.content_id, hit)?;
+        let preexisting = preexisting_by_content
+            .get(&item.content_id)
+            .copied()
+            .unwrap_or_default();
+        persist_cached_stage2(store, item, hit, preexisting)?;
     }
     Ok(startup_warning)
 }
 
-/// 把一份完整中心二次缓存写入 SQLite 与 outbox。
+/// 把中心二次缓存的请求槽位写入 SQLite 与 outbox，跳过导入前已存在的字段。
 fn persist_cached_stage2(
     store: &mut NodeStore,
-    content_id: ContentId,
+    item: &MissingWork,
     cached: CompleteStage2,
+    preexisting: PreexistingStage2,
 ) -> Result<(), AnalysisBlocked> {
     match cached {
         CompleteStage2::Image(feature) => {
-            store.commit_feature_result(content_id, None, FeatureWrite::ImageStage2(*feature))?;
+            if !preexisting.image {
+                store.commit_feature_result(
+                    item.content_id,
+                    None,
+                    FeatureWrite::ImageStage2(*feature),
+                )?;
+            }
         }
         CompleteStage2::Video(frames) => {
-            for (slot, feature) in frames.iter().enumerate() {
-                if let Some(feature) = feature {
+            for slot in item.frame_slots.iter().copied() {
+                let index = usize::from(slot);
+                if preexisting.video_slots & (1_u8 << slot) == 0
+                    && let Some(feature) = frames[index]
+                {
                     store.commit_feature_result(
-                        content_id,
+                        item.content_id,
                         None,
                         FeatureWrite::VideoFrameStage2(VideoFrameStage2Fields {
-                            slot: slot as u8,
-                            features: *feature,
+                            slot,
+                            features: feature,
                         }),
                     )?;
                 }
@@ -1538,5 +1641,212 @@ fn incomplete(candidate: CandidateWrite) -> CandidateWrite {
         stage2_score: None,
         status: CandidateStatus::Incomplete,
         ..candidate
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dedup_core::{DisplayPath, LocationKey, MachineId, NormalizedPath};
+    use dedup_media::{ImageStage1, ImageStage2, PdqHash};
+    use dedup_node_store::{
+        FeatureWrite, ScannedPath, TaskStatus, VideoFrameStage1Fields, VideoFrameStage2Fields,
+        VideoMetadataFields,
+    };
+
+    #[tokio::test]
+    async fn remote_stage2_import_only_publishes_requested_video_slot() {
+        let mut store = test_store();
+        let (content, source, _) = seed_video(&mut store, [1; 16], &[], 100);
+        let before = store.outbox_high_seq().unwrap();
+        let plan = begin_stage2_batch(
+            &mut store,
+            &[Stage2BatchItem {
+                content,
+                source,
+                frame_slots: vec![0],
+            }],
+            101,
+        )
+        .unwrap();
+        let mut remote = crate::NodeRemoteFeatureCache::test_with_stage2(vec![Some(
+            CompleteStage2::Video(Box::new(full_stage2_frames())),
+        )]);
+        let mut processor = CountingStage2::default();
+
+        let task_id = run_stage2_batch_internal(
+            &mut store,
+            plan,
+            &mut processor,
+            None,
+            Some(&mut remote),
+            None,
+            102,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(processor.calls, 0);
+        assert_eq!(
+            store.task_snapshot(task_id).unwrap().status,
+            TaskStatus::Completed
+        );
+        assert_eq!(
+            video_stage2_slots(&store.pull_changes(before, 100).unwrap().changes),
+            vec![0]
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_stage2_import_and_selective_republish_are_each_once() {
+        let mut store = test_store();
+        let (content, source, _) = seed_video(&mut store, [2; 16], &[0], 200);
+        let before = store.outbox_high_seq().unwrap();
+        let plan = begin_stage2_batch(
+            &mut store,
+            &[Stage2BatchItem {
+                content,
+                source,
+                frame_slots: vec![0, 1],
+            }],
+            201,
+        )
+        .unwrap();
+        let mut remote = crate::NodeRemoteFeatureCache::test_with_stage2(vec![Some(
+            CompleteStage2::Video(Box::new(full_stage2_frames())),
+        )]);
+        let mut processor = CountingStage2::default();
+
+        let task_id = run_stage2_batch_internal(
+            &mut store,
+            plan,
+            &mut processor,
+            None,
+            Some(&mut remote),
+            None,
+            202,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(processor.calls, 0);
+        assert_eq!(
+            store.task_snapshot(task_id).unwrap().status,
+            TaskStatus::Completed
+        );
+        assert_eq!(
+            video_stage2_slots(&store.pull_changes(before, 100).unwrap().changes),
+            vec![0, 1]
+        );
+    }
+
+    #[derive(Default)]
+    struct CountingStage2 {
+        calls: usize,
+    }
+
+    impl Stage2Processor for CountingStage2 {
+        async fn process(&mut self, _request: Stage2Request) -> Result<Stage2Output, String> {
+            self.calls += 1;
+            Ok(Stage2Output {
+                frames: Vec::new(),
+                regenerated_contact_sheet_jpeg: None,
+            })
+        }
+    }
+
+    fn test_store() -> NodeStore {
+        NodeStore::open_in_memory(MachineId::parse(&"ab".repeat(32)).unwrap()).unwrap()
+    }
+
+    fn seed_video(
+        store: &mut NodeStore,
+        md5: [u8; 16],
+        stage2_slots: &[u8],
+        size: u64,
+    ) -> (ContentKey, LocationKey, ContentId) {
+        let path = format!(r"D:\remote-{}.mp4", md5[0]);
+        let scanned = ScannedPath::new(
+            NormalizedPath::new(&path).unwrap(),
+            DisplayPath::new(&path).unwrap(),
+            size,
+        );
+        let content = store
+            .upsert_content_and_location(&scanned, md5, MediaKind::Video)
+            .unwrap();
+        store
+            .commit_feature_result(
+                content.id,
+                None,
+                FeatureWrite::VideoMetadata(VideoMetadataFields {
+                    duration_ms: Some(12_000),
+                    width: Some(100),
+                    height: Some(100),
+                }),
+            )
+            .unwrap();
+        for slot in 0..6 {
+            let feature = stage1();
+            store
+                .commit_feature_result(
+                    content.id,
+                    None,
+                    FeatureWrite::VideoFrameStage1(VideoFrameStage1Fields {
+                        slot,
+                        time_ms: u64::from(slot) * 2_000 + 1_000,
+                        decoded: true,
+                        width: Some(feature.width),
+                        height: Some(feature.height),
+                        pdq: Some(feature.pdq),
+                        quality: Some(feature.quality),
+                    }),
+                )
+                .unwrap();
+            if stage2_slots.contains(&slot) {
+                store
+                    .commit_feature_result(
+                        content.id,
+                        None,
+                        FeatureWrite::VideoFrameStage2(VideoFrameStage2Fields {
+                            slot,
+                            features: stage2(),
+                        }),
+                    )
+                    .unwrap();
+            }
+        }
+        store.mark_base_complete(content.id).unwrap();
+        let location = LocationKey::new(store.machine_id().clone(), scanned.normalized_path);
+        (content.key, location, content.id)
+    }
+
+    fn full_stage2_frames() -> [Option<ImageStage2>; 6] {
+        std::array::from_fn(|_| Some(stage2()))
+    }
+
+    fn stage1() -> ImageStage1 {
+        ImageStage1 {
+            width: 100,
+            height: 100,
+            pdq: PdqHash::from_bytes([0; 32]),
+            quality: 100,
+        }
+    }
+
+    fn stage2() -> ImageStage2 {
+        ImageStage2 {
+            phash_parts: [0; 9],
+            sobel: [0.0; 128],
+        }
+    }
+
+    fn video_stage2_slots(changes: &[proto::SyncChange]) -> Vec<u8> {
+        let mut slots = changes
+            .iter()
+            .filter(|change| change.entity_kind == "video_frame_stage2")
+            .map(|change| change.payload[29])
+            .collect::<Vec<_>>();
+        slots.sort_unstable();
+        slots
     }
 }

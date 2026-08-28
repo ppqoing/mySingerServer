@@ -283,6 +283,7 @@ impl SnapshotReader<'_> {
                     f.duration_ms,f.width,f.height
              FROM video_metadata f JOIN contents c ON c.content_id=f.content_id
              WHERE hex(c.md5)||':'||printf('%020d',c.file_size)>?1
+               AND (f.duration_ms IS NULL OR f.duration_ms>=0)
              ORDER BY c.md5,c.file_size LIMIT ?2",
         )?;
         let raw = statement
@@ -325,6 +326,7 @@ impl SnapshotReader<'_> {
                     c.md5,c.file_size,f.slot,f.time_ms,f.decoded,f.width,f.height,f.pdq,f.quality
              FROM video_frame_stage1 f JOIN contents c ON c.content_id=f.content_id
              WHERE hex(c.md5)||':'||printf('%020d',c.file_size)||':'||printf('%01d',f.slot)>?1
+               AND f.time_ms>=0
              ORDER BY c.md5,c.file_size,f.slot LIMIT ?2",
         )?;
         let raw = statement
