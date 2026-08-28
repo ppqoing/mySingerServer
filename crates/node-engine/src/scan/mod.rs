@@ -24,7 +24,7 @@ pub use base_flow_control::HashReadStartedSignal;
 pub use base_persistence::{BasePersistTestController, BasePersistTestWaiter};
 pub use base_task_producer::{
     BaseTaskInput, BaseTaskManifest, BaseTaskProducer, BaseTaskProducerError, BaseTaskProduction,
-    MAX_BASE_TASK_BATCH,
+    MAX_BASE_TASK_BATCH, TaskFileBaseContext,
 };
 pub use dedup_windows::WindowsWalker;
 pub use engine::{

@@ -10,9 +10,11 @@ use std::os::windows::ffi::OsStringExt;
 use dedup_core::{DisplayPath, MachineId, MediaKind, NormalizedPath};
 use dedup_media::{ImageStage1, ImageStage2, PdqHash};
 use dedup_node_engine::{
-    scan::{BaseTaskInput, BaseTaskProducer, PlannedScannedPath, TaskDiskLane},
+    scan::{
+        BaseTaskInput, BaseTaskProducer, PlannedScannedPath, TaskDiskLane, TaskFileBaseContext,
+    },
     task_dispatch::{TaskFileDispatcher, TaskLanePermitFuture, TaskLanePermitProvider},
-    task_files::{TaskFileRecord, TransientTaskFileSet},
+    task_files::{TaskFileIdentity, TaskFileRecord, TransientTaskFileSet},
 };
 use dedup_node_store::{BaseCacheRecord, CompleteStage1, NodeStore, ScannedPath};
 use dedup_windows::{LocalDiskKind, PhysicalDiskId, ReadCancellationToken};
@@ -57,14 +59,24 @@ fn scanned(path: &str, file_size: u64) -> ScannedPath {
 }
 
 fn input(path: ScannedPath, lane: TaskDiskLane, cached: Option<BaseCacheRecord>) -> BaseTaskInput {
+    input_with_flags(path, lane, cached, true, false)
+}
+
+fn input_with_flags(
+    path: ScannedPath,
+    lane: TaskDiskLane,
+    cached: Option<BaseCacheRecord>,
+    contact_sheet_valid: bool,
+    force_recompute: bool,
+) -> BaseTaskInput {
     BaseTaskInput {
         planned: PlannedScannedPath {
             scanned: path,
             lane,
         },
         cached,
-        contact_sheet_valid: true,
-        force_recompute: false,
+        contact_sheet_valid,
+        force_recompute,
     }
 }
 
@@ -136,6 +148,139 @@ async fn collect_records(
         dispatcher.mark_completed(&identity).unwrap();
     }
     records
+}
+
+async fn collect_identity_records(
+    dispatcher: &mut TaskFileDispatcher<ImmediatePermitProvider>,
+) -> Vec<(TaskFileIdentity, TaskFileRecord)> {
+    let cancellation = ReadCancellationToken::new();
+    let mut records = Vec::new();
+    loop {
+        let task = tokio::time::timeout(
+            Duration::from_secs(1),
+            dispatcher.next(cancellation.clone()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let Some(task) = task else {
+            break;
+        };
+        let identity = task.identity.clone();
+        let record = task.record.clone();
+        drop(task.permit);
+        dispatcher.mark_completed(&identity).unwrap();
+        records.push((identity, record));
+    }
+    records
+}
+
+#[tokio::test]
+async fn base_contexts_match_partial_and_missing_rows_by_identity() {
+    let root = tempfile::tempdir().unwrap();
+    let lane = lane(&[7], LocalDiskKind::Hdd, 1);
+    let partial_path = scanned(r"C:\media\context-partial.bin", 42);
+    let miss_path = scanned(r"C:\media\context-miss.bin", 43);
+    let partial = imported_record(&partial_path, [0x31; 16], false);
+    let mut producer = producer(root.path());
+    producer
+        .append_batch(&[
+            input_with_flags(
+                partial_path.clone(),
+                lane.clone(),
+                Some(partial.clone()),
+                false,
+                true,
+            ),
+            input(miss_path.clone(), lane.clone(), None),
+        ])
+        .unwrap();
+    let mut output = producer.seal().unwrap();
+    let rows = collect_identity_records(&mut output.dispatcher).await;
+    assert_eq!(rows.len(), 2);
+
+    assert_eq!(
+        rows[0].1.scanned.normalized_path,
+        partial_path.normalized_path
+    );
+    assert_eq!(
+        output.contexts.get(&rows[0].0),
+        Some(&TaskFileBaseContext {
+            content_id: partial.content_id,
+            cached: Some(partial),
+            contact_sheet_valid: false,
+            force_recompute: true,
+        })
+    );
+    assert_eq!(rows[1].1.scanned.normalized_path, miss_path.normalized_path);
+    assert_eq!(
+        output.contexts.get(&rows[1].0),
+        Some(&TaskFileBaseContext {
+            content_id: None,
+            cached: None,
+            contact_sheet_valid: true,
+            force_recompute: false,
+        })
+    );
+}
+
+#[tokio::test]
+async fn full_cache_hits_have_no_task_file_context() {
+    let root = tempfile::tempdir().unwrap();
+    let lane = lane(&[7], LocalDiskKind::Hdd, 1);
+    let path = scanned(r"C:\media\context-hit.bin", 42);
+    let mut producer = producer(root.path());
+    producer
+        .append_batch(&[input(
+            path.clone(),
+            lane,
+            Some(imported_record(&path, [0x32; 16], true)),
+        )])
+        .unwrap();
+    let output = producer.seal().unwrap();
+    assert!(output.contexts.is_empty());
+}
+
+#[tokio::test]
+async fn contexts_keep_their_original_lane_identity() {
+    let root = tempfile::tempdir().unwrap();
+    let hdd = lane(&[7], LocalDiskKind::Hdd, 1);
+    let ssd = lane(&[8], LocalDiskKind::Ssd, 1);
+    let hdd_path = scanned(r"C:\media\lane-hdd.bin", 42);
+    let ssd_path = scanned(r"D:\media\lane-ssd.bin", 43);
+    let mut producer = producer(root.path());
+    producer
+        .append_batch(&[
+            input(
+                hdd_path.clone(),
+                hdd,
+                Some(imported_record(&hdd_path, [0x33; 16], false)),
+            ),
+            input(ssd_path.clone(), ssd, None),
+        ])
+        .unwrap();
+    let mut output = producer.seal().unwrap();
+    let rows = collect_identity_records(&mut output.dispatcher).await;
+    assert_eq!(rows.len(), 2);
+    for (identity, record) in rows {
+        let context = output
+            .contexts
+            .get(&identity)
+            .expect("每个任务行都有上下文");
+        if record.scanned.normalized_path == hdd_path.normalized_path {
+            assert_eq!(identity.lane_file_name(), "PhysicalDisk7-hdd.tasks.tsv");
+            assert_eq!(
+                context.cached.as_ref().unwrap().content_id,
+                context.content_id
+            );
+        } else if record.scanned.normalized_path == ssd_path.normalized_path {
+            assert_eq!(identity.lane_file_name(), "PhysicalDisk8-ssd.tasks.tsv");
+            assert_eq!(context.content_id, None);
+            assert_eq!(context.cached, None);
+        } else {
+            panic!("unexpected path: {}", record.scanned.normalized_path);
+        }
+    }
 }
 
 #[tokio::test]

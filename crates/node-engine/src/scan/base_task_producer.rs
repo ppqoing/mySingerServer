@@ -6,14 +6,16 @@
 use std::{collections::BTreeMap, io};
 
 use dedup_core::{ContentKey, NormalizedPath};
-use dedup_node_store::{BaseCacheRecord, ResolvedScanFile};
+use dedup_node_store::{BaseCacheRecord, ContentId, ResolvedScanFile};
 use thiserror::Error;
 use uuid::Uuid;
 
 use super::{BaseComputeDecision, PlannedScannedPath, TaskDiskLane};
 use crate::{
     task_dispatch::{TaskFileDispatcher, TaskLanePermitProvider},
-    task_files::{TaskFileRecord, TaskWorkKind, TaskWorkMask, validate_task_file_record},
+    task_files::{
+        TaskFileIdentity, TaskFileRecord, TaskWorkKind, TaskWorkMask, validate_task_file_record,
+    },
 };
 
 /// 单次缓存分类允许接收的最大输入行数。
@@ -43,12 +45,30 @@ pub struct BaseTaskManifest {
     pub cache_hits: usize,
 }
 
+/// 一条瞬态任务文件行对应的基础计算上下文。
+///
+/// 任务文件只保存需要计算的路径和缺失掩码；缓存快照、联系表校验和强制重算标记
+/// 由生产端按完整 `TaskFileIdentity` 保存，Hash→Media 续算时继续使用同一上下文。
+#[derive(Clone, Debug, PartialEq)]
+pub struct TaskFileBaseContext {
+    /// 路径批量查询得到的本地内容 ID；未命中或尚未导入时为空。
+    pub content_id: Option<ContentId>,
+    /// 路径批量查询得到的基础缓存快照；未知内容时为空。
+    pub cached: Option<BaseCacheRecord>,
+    /// 现有联系表是否已通过校验。
+    pub contact_sheet_valid: bool,
+    /// 是否忽略已有缓存并强制重新计算。
+    pub force_recompute: bool,
+}
+
 /// 生产端封闭后交给主循环的 dispatcher 和清单。
 pub struct BaseTaskProduction<Provider: TaskLanePermitProvider> {
     /// 继续从已封闭任务文件取得唯一读取许可的 dispatcher。
     pub dispatcher: TaskFileDispatcher<Provider>,
     /// 当前扫描的稳定清单统计。
     pub manifest: BaseTaskManifest,
+    /// 任务文件行到缓存判定上下文的稳定映射，续算不得改用模糊 item_id。
+    pub contexts: BTreeMap<TaskFileIdentity, TaskFileBaseContext>,
 }
 
 /// 缓存分类或任务文件发布失败。
@@ -86,6 +106,7 @@ enum ClassifiedOutcome {
 struct LaneBatch {
     lane: TaskDiskLane,
     rows: Vec<TaskFileRecord>,
+    contexts: Vec<TaskFileBaseContext>,
 }
 
 /// 基础缓存分类到瞬态任务文件的唯一生产者。
@@ -93,6 +114,7 @@ pub struct BaseTaskProducer<Provider: TaskLanePermitProvider> {
     dispatcher: Option<TaskFileDispatcher<Provider>>,
     seen_paths: BTreeMap<NormalizedPath, SeenPathState>,
     resolved_files: BTreeMap<NormalizedPath, ResolvedScanFile>,
+    pending_contexts: BTreeMap<TaskFileIdentity, TaskFileBaseContext>,
     cache_hits: usize,
     /// 已发布 lane 的完整配置，防止同一任务文件名对应两份配置。
     lane_configs: BTreeMap<String, TaskDiskLane>,
@@ -105,6 +127,7 @@ impl<Provider: TaskLanePermitProvider> BaseTaskProducer<Provider> {
             dispatcher: Some(dispatcher),
             seen_paths: BTreeMap::new(),
             resolved_files: BTreeMap::new(),
+            pending_contexts: BTreeMap::new(),
             cache_hits: 0,
             lane_configs: BTreeMap::new(),
         }
@@ -129,6 +152,7 @@ impl<Provider: TaskLanePermitProvider> BaseTaskProducer<Provider> {
         let mut staged_seen = BTreeMap::<NormalizedPath, SeenPathState>::new();
         let mut staged_resolved = BTreeMap::<NormalizedPath, ResolvedScanFile>::new();
         let mut staged_batches = BTreeMap::<String, LaneBatch>::new();
+        let mut staged_contexts = BTreeMap::new();
         let mut staged_lane_configs = BTreeMap::<String, TaskDiskLane>::new();
         let mut staged_hits = 0_usize;
 
@@ -182,6 +206,7 @@ impl<Provider: TaskLanePermitProvider> BaseTaskProducer<Provider> {
                     let batch = staged_batches.entry(lane_key).or_insert_with(|| LaneBatch {
                         lane: input.planned.lane.clone(),
                         rows: Vec::new(),
+                        contexts: Vec::new(),
                     });
                     batch.rows.push(TaskFileRecord {
                         item_id: Uuid::now_v7(),
@@ -189,6 +214,12 @@ impl<Provider: TaskLanePermitProvider> BaseTaskProducer<Provider> {
                         scanned: scanned.clone(),
                         known_md5,
                         missing,
+                    });
+                    batch.contexts.push(TaskFileBaseContext {
+                        content_id: input.cached.as_ref().and_then(|cached| cached.content_id),
+                        cached: input.cached.clone(),
+                        contact_sheet_valid: input.contact_sheet_valid,
+                        force_recompute: input.force_recompute,
                     });
                 }
             }
@@ -205,10 +236,19 @@ impl<Provider: TaskLanePermitProvider> BaseTaskProducer<Provider> {
 
         // BTreeMap 保证 lane 文件名顺序稳定；每个非空 lane 只调用一次 append_batch。
         for (lane_key, batch) in staged_batches {
-            self.dispatcher
+            let identities = self
+                .dispatcher
                 .as_mut()
                 .expect("生产器在 append_batch 期间保持 dispatcher 所有权")
                 .append_batch(&batch.lane, &batch.rows)?;
+            if identities.len() != batch.contexts.len() {
+                return Err(BaseTaskProducerError::InvalidInput(
+                    "任务文件身份与基础计算上下文数量不一致".into(),
+                ));
+            }
+            for (identity, context) in identities.into_iter().zip(batch.contexts) {
+                staged_contexts.insert(identity, context);
+            }
             self.lane_configs.entry(lane_key).or_insert(batch.lane);
         }
 
@@ -219,6 +259,9 @@ impl<Provider: TaskLanePermitProvider> BaseTaskProducer<Provider> {
             self.resolved_files.insert(path, resolved);
         }
         self.cache_hits += staged_hits;
+        // 所有 lane 的追加都成功后再提交身份上下文，避免留下无法定位的半成品。
+        // 这里不能使用路径作为 key，因为同一路径只是一种显示属性，续算需要完整行身份。
+        self.pending_contexts.extend(staged_contexts);
         Ok(())
     }
 
@@ -244,6 +287,7 @@ impl<Provider: TaskLanePermitProvider> BaseTaskProducer<Provider> {
         Ok(BaseTaskProduction {
             dispatcher,
             manifest,
+            contexts: std::mem::take(&mut self.pending_contexts),
         })
     }
 
