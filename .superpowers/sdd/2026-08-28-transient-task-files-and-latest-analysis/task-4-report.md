@@ -215,3 +215,15 @@ NodeEngine 全量初次回归曾因图片请求的既有空 `frame_slots` 夹具
 | `git diff --check` | 通过 |
 
 未执行真实媒体、打包、部署、TSV/lane/任务恢复/协议/UI 改动，也未访问 `I:\Tool`。
+
+## Follow-up 5：PostgreSQL 测试数据隔离与失败后清理
+
+本轮只修改中心 PostgreSQL 行为测试和验收文档，没有改动产品源码。
+
+- 测试每次以 UUID 派生唯一 `MachineId`、四个 `ContentKey` 和 `LocationKey` 路径，不再跨运行复用固定键。
+- 核心同步/查询断言收敛到返回 `Result` 的异步 case；查询使用 `try_get`，失败通过错误返回，外层清理守卫随后再报告原始 case 错误，避免断言 panic 跳过清理。
+- 清理守卫以独立连接和事务按外键顺序删除测试墓碑、文件位置、五类特征表、内容、同步游标和节点；测试新增文件位置行并验证唯一位置，确保关联边界也被覆盖。
+
+### Follow-up 5 验证
+
+两次连续执行 `cargo test -p dedup-central-store --test content_upsert --locked -- --test-threads=1` 均编译成功且明确显示 `1 ignored, requires DEDUP_TEST_POSTGRES_URL`；本机缺少该环境变量及 PostgreSQL 服务，因此未伪报实际数据库 PASS。`cargo test -p dedup-central-store --locked -- --test-threads=1` 为 3 通过、2 ignored；`cargo fmt --all -- --check` 与 `git diff --check` 通过。每条 Cargo 命令显式使用 C:\tmp target、关闭增量/debug 并清空继承工具链变量；执行前 C=17.79 GiB、D=10.23 GiB，未低于停止线。
