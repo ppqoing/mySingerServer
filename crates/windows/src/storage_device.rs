@@ -45,6 +45,15 @@ impl PhysicalDiskId {
         Self { disk_numbers }
     }
 
+    /// 从测试或已验证的 Windows extent 编号创建稳定物理盘身份。
+    pub fn from_disk_numbers(disk_numbers: impl IntoIterator<Item = u32>) -> io::Result<Self> {
+        let identity = Self::new(disk_numbers.into_iter().collect());
+        if identity.disk_numbers.is_empty() {
+            return Err(unsupported("物理盘编号不能为空"));
+        }
+        Ok(identity)
+    }
+
     /// 返回按编号排序去重的底层物理磁盘集合。
     pub fn disk_numbers(&self) -> &[u32] {
         &self.disk_numbers
@@ -77,6 +86,14 @@ pub struct StorageLocation {
 }
 
 impl StorageLocation {
+    /// 从已经验证的物理盘身份和介质类型创建调度器位置。
+    pub fn from_parts(physical_disk_id: PhysicalDiskId, disk_kind: LocalDiskKind) -> Self {
+        Self {
+            physical_disk_id,
+            disk_kind,
+        }
+    }
+
     /// 返回调度器使用的稳定物理磁盘身份。
     pub const fn physical_disk_id(&self) -> &PhysicalDiskId {
         &self.physical_disk_id

@@ -1,18 +1,19 @@
 //! 有界枚举生产器与按物理盘调度的生产 MD5 读取适配器。
 
 use std::{
-    collections::BTreeMap,
     future::Future,
     io,
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::Instant,
 };
 
 use dedup_core::{DiskReadConfig, NodeConfig};
 use dedup_node_store::ScannedPath;
-use dedup_windows::{LocalDiskKind, ReadCancellationToken, resolve_storage_location};
+use dedup_windows::{
+    LocalDiskKind, PhysicalDiskId, ReadCancellationToken, StorageLocation, resolve_storage_location,
+};
 use tokio::{sync::mpsc, task::JoinHandle};
 
 use crate::{
@@ -26,7 +27,7 @@ use crate::{
 };
 
 use super::base_flow_control::HashReadStartedSignal;
-use super::{FileEnumerator, ScanError};
+use super::{FileEnumerator, ScanDiskPlan, ScanError, TaskDiskLane};
 
 /// 扫描阶段内存队列的产品级硬上限，防止配置乘法放大所有权窗口。
 const MAX_PIPELINE_CHANNEL_CAPACITY: usize = 4_096;
@@ -119,7 +120,12 @@ pub trait PipelineFileReader: Clone + Send + Sync + 'static {
         Box::pin(async { Ok(None) })
     }
 
-    /// 返回最近一次为路径解析的物理盘显示身份。
+    /// 根据冻结计划取得路径的物理盘显示身份，不建立可变路径缓存。
+    fn physical_disk_id(&self, _path: &Path) -> String {
+        String::new()
+    }
+
+    /// 兼容旧调用者的消费接口；冻结 lane 不需要二次消费身份。
     fn take_physical_disk_id(&self, _path: &Path) -> String {
         String::new()
     }
@@ -130,8 +136,7 @@ pub trait PipelineFileReader: Clone + Send + Sync + 'static {
 pub struct ScheduledFileReader {
     scheduler: DiskReadScheduler,
     reader: Arc<dyn Md5ReadBackend>,
-    resolver: LocationResolver,
-    locations: Arc<Mutex<BTreeMap<PathBuf, String>>>,
+    lane_source: LaneSource,
     /// 冻结本 reader 的逐盘配置，用于按本次解析介质类型发布观察容量。
     read_config: DiskReadConfig,
     /// 可选任务内存指标；未配置的旧扫描保持无遥测路径。
@@ -257,8 +262,12 @@ impl<R: BlockReader + Send + Sync> Md5ReadBackend for RetryingFileReader<R> {
 }
 
 #[derive(Clone)]
-enum LocationResolver {
+enum LaneSource {
+    /// 生产扫描在枚举前建立的只读物理盘计划。
+    Frozen(Arc<ScanDiskPlan>),
+    /// 兼容没有根计划的旧内部调用；生产 actor 不使用此分支。
     System,
+    /// 仅供已有受控读取器测试注入位置，生产不会启用。
     Injected(Arc<dyn Fn(&Path) -> (Vec<u32>, LocalDiskKind) + Send + Sync>),
 }
 
@@ -288,13 +297,23 @@ impl ScheduledFileReader {
             Self {
                 scheduler,
                 reader: Arc::new(reader),
-                resolver: LocationResolver::System,
-                locations: Arc::new(Mutex::new(BTreeMap::new())),
+                lane_source: LaneSource::System,
                 read_config: read_config.clone(),
                 reporter: None,
             },
             PipelineLimits::new(capacity, read_config.total_threads),
         ))
+    }
+
+    /// 使用枚举前冻结的根计划创建生产读取器。
+    pub fn new_with_plan(
+        read_config: &DiskReadConfig,
+        effective_worker_count: usize,
+        plan: Arc<ScanDiskPlan>,
+    ) -> Result<(Self, PipelineLimits), ScanError> {
+        let (mut reader, limits) = Self::new(read_config, effective_worker_count)?;
+        reader.lane_source = LaneSource::Frozen(plan);
+        Ok((reader, limits))
     }
 
     /// 使用真实 scheduler/retrying reader 与测试物理盘 resolver 装配可控 reader。
@@ -329,8 +348,46 @@ impl ScheduledFileReader {
             Self {
                 scheduler,
                 reader: Arc::new(reader),
-                resolver: LocationResolver::Injected(Arc::new(resolver)),
-                locations: Arc::new(Mutex::new(BTreeMap::new())),
+                lane_source: LaneSource::Injected(Arc::new(resolver)),
+                read_config: read_config.clone(),
+                reporter: None,
+            },
+            PipelineLimits::new(capacity, read_config.total_threads),
+        ))
+    }
+
+    /// 使用冻结根计划装配可控读取器，验证 Hash 与 Media 共用同一 lane。
+    #[doc(hidden)]
+    pub fn controlled_with_plan_for_test<R>(
+        read_config: &DiskReadConfig,
+        effective_worker_count: usize,
+        block_reader: R,
+        plan: Arc<ScanDiskPlan>,
+    ) -> Result<(Self, PipelineLimits), ScanError>
+    where
+        R: BlockReader + Send + Sync + 'static,
+    {
+        let scheduler = DiskReadScheduler::new(read_config, effective_worker_count)
+            .map_err(|error| ScanError::Stage1(error.to_string()))?;
+        let mut config = NodeConfig::default();
+        config.read = read_config.clone();
+        let reader = RetryingFileReader::new(block_reader, &config)
+            .map_err(|error| ScanError::Stage1(error.to_string()))?;
+        let capacity = read_config
+            .total_threads
+            .checked_mul(4)
+            .and_then(|total| {
+                effective_worker_count
+                    .checked_mul(2)
+                    .map(|workers| total.max(workers))
+            })
+            .ok_or_else(|| ScanError::Stage1("扫描管道容量溢出".into()))?
+            .min(MAX_PIPELINE_CHANNEL_CAPACITY);
+        Ok((
+            Self {
+                scheduler,
+                reader: Arc::new(reader),
+                lane_source: LaneSource::Frozen(plan),
                 read_config: read_config.clone(),
                 reporter: None,
             },
@@ -351,56 +408,57 @@ impl ScheduledFileReader {
         self.scheduler.shutdown().await
     }
 
-    /// 按本次解析到的介质类型返回 registry 应观察的单盘硬容量。
-    fn observed_disk_capacity(&self, kind: LocalDiskKind) -> u64 {
-        let capacity = match kind {
-            LocalDiskKind::Hdd => self.read_config.hdd_threads_per_disk,
-            LocalDiskKind::Ssd => self.read_config.ssd_threads_per_disk,
-            LocalDiskKind::Unknown => self.read_config.unknown_threads_per_disk,
-        };
-        u64::try_from(capacity).expect("已验证的逐盘读取容量必须可表示为 u64")
+    /// 按冻结 lane 取得实际 scheduler 位置；生产路径不再访问 Windows 存储 API。
+    fn resolve_lane(&self, path: &Path) -> io::Result<(TaskDiskLane, Option<StorageLocation>)> {
+        match &self.lane_source {
+            LaneSource::Frozen(plan) => {
+                let normalized = dedup_core::NormalizedPath::new(path).map_err(io::Error::other)?;
+                let lane = plan.lane_for_path(&normalized).map_err(io::Error::other)?;
+                let location =
+                    StorageLocation::from_parts(lane.physical_disk_id.clone(), lane.disk_kind);
+                Ok((lane, Some(location)))
+            }
+            LaneSource::System => {
+                let storage = resolve_storage_location(path)?;
+                let lane = lane_from_storage(&self.read_config, &storage)?;
+                Ok((lane, Some(storage)))
+            }
+            LaneSource::Injected(resolver) => {
+                let (numbers, kind) = resolver(path);
+                let disk_id =
+                    PhysicalDiskId::from_disk_numbers(numbers).map_err(io::Error::other)?;
+                let lane = TaskDiskLane {
+                    physical_disk_numbers: disk_id.disk_numbers().to_vec(),
+                    physical_disk_id: disk_id,
+                    disk_kind: kind,
+                    configured_weight: configured_limit(&self.read_config, kind),
+                    per_disk_limit: configured_limit(&self.read_config, kind),
+                };
+                Ok((lane, None))
+            }
+        }
     }
 
-    /// 按指定类别取得文件所在物理盘许可，并按需记住 Hash 阶段解析出的盘身份。
+    /// 按冻结 lane 取得指定类别的文件许可。
     async fn acquire_scheduled_permit(
         &self,
         scanned: &ScannedPath,
         cancellation: &ReadCancellationToken,
         class: DiskReadClass,
-        remember_location: bool,
     ) -> Result<ScheduledReadPermit, ReadFailure> {
         let wait_started = Instant::now();
         let path = scanned.display_path.as_path().to_path_buf();
         if cancellation.is_cancelled() {
             return Err(ReadFailure::Cancelled);
         }
-        let (mut disk_numbers, kind, system_location) = match &self.resolver {
-            LocationResolver::System => {
-                let resolved_path = path.clone();
-                let storage =
-                    tokio::task::spawn_blocking(move || resolve_storage_location(&resolved_path))
-                        .await
-                        .map_err(|error| join_failure(&path, error.to_string()))?
-                        .map_err(|source| ReadFailure::Io {
-                            path: path.clone(),
-                            block_offset: 0,
-                            source,
-                        })?;
-                let numbers = storage.physical_disk_id().disk_numbers().to_vec();
-                let kind = storage.disk_kind();
-                (numbers, kind, Some(storage))
-            }
-            LocationResolver::Injected(resolver) => {
-                let (numbers, kind) = resolver(&path);
-                (numbers, kind, None)
-            }
-        };
-        disk_numbers.sort_unstable();
-        disk_numbers.dedup();
-        if disk_numbers.is_empty() {
-            return Err(join_failure(&path, "物理盘身份不能为空".into()));
-        }
-        let disk_ids = disk_numbers
+        let (lane, system_location) =
+            self.resolve_lane(&path).map_err(|source| ReadFailure::Io {
+                path: path.clone(),
+                block_offset: 0,
+                source,
+            })?;
+        let disk_ids = lane
+            .physical_disk_numbers
             .iter()
             .map(|disk_number| format!("PhysicalDisk{disk_number}"))
             .collect::<Vec<_>>();
@@ -409,14 +467,14 @@ impl ScheduledFileReader {
             self.reporter.clone(),
             disk_ids.clone(),
             runtime_class,
-            self.observed_disk_capacity(kind),
+            u64::try_from(lane.per_disk_limit).expect("已验证的逐盘读取容量必须可表示为 u64"),
         )
         .map_err(|error| telemetry_failure(&path, error))?;
         let lease = match system_location {
             Some(storage) => self.scheduler.acquire(storage, class).await,
             None => {
                 self.scheduler
-                    .acquire_for_test(&disk_numbers, kind, class)
+                    .acquire_for_test(&lane.physical_disk_numbers, lane.disk_kind, class)
                     .await
             }
         }
@@ -428,20 +486,6 @@ impl ScheduledFileReader {
         wait_guard
             .mark_acquired()
             .map_err(|error| telemetry_failure(&path, error))?;
-        let physical_disk_id = format!(
-            "PhysicalDisk{}",
-            disk_numbers
-                .iter()
-                .map(u32::to_string)
-                .collect::<Vec<_>>()
-                .join("+")
-        );
-        if remember_location {
-            self.locations
-                .lock()
-                .unwrap()
-                .insert(path, physical_disk_id);
-        }
         let resource = match class {
             DiskReadClass::HashSequential => RuntimePipelineResource::HashIo,
             DiskReadClass::MediaDecode => RuntimePipelineResource::MediaIo,
@@ -483,7 +527,7 @@ impl PipelineFileReader for ScheduledFileReader {
         self.read_scheduled(scanned, cancellation, Some(started))
     }
 
-    // acquire_media_permit/take_physical_disk_id 的既有实现位于同一 trait impl，签名和语义不变。
+    // acquire_media_permit/physical_disk_id 的实现位于同一 trait impl，读取和媒体阶段共用冻结 lane。
     fn acquire_media_permit(
         &self,
         scanned: ScannedPath,
@@ -493,24 +537,30 @@ impl PipelineFileReader for ScheduledFileReader {
         let permit_reader = self.clone();
         Box::pin(async move {
             permit_reader
-                .acquire_scheduled_permit(
-                    &scanned,
-                    &cancellation,
-                    DiskReadClass::MediaDecode,
-                    false,
-                )
+                .acquire_scheduled_permit(&scanned, &cancellation, DiskReadClass::MediaDecode)
                 .await
                 .map(Some)
         })
     }
 
-    /// 取出 Hash 读取阶段解析出的物理盘显示身份并从缓存中移除。
-    fn take_physical_disk_id(&self, path: &Path) -> String {
-        self.locations
-            .lock()
-            .unwrap()
-            .remove(path)
-            .unwrap_or_default()
+    /// 从冻结 lane 计算物理盘显示身份，不访问 Windows 存储解析器或建立路径缓存。
+    fn physical_disk_id(&self, path: &Path) -> String {
+        let Ok((lane, _)) = self.resolve_lane(path) else {
+            return String::new();
+        };
+        format!(
+            "PhysicalDisk{}",
+            lane.physical_disk_numbers
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join("+")
+        )
+    }
+
+    /// 保留旧接口但不重复返回已归属的物理盘身份。
+    fn take_physical_disk_id(&self, _path: &Path) -> String {
+        String::new()
     }
 }
 
@@ -533,12 +583,7 @@ impl ScheduledFileReader {
         Box::pin(async move {
             let path = scanned.display_path.as_path().to_path_buf();
             let lease = permit_reader
-                .acquire_scheduled_permit(
-                    &scanned,
-                    &cancellation,
-                    DiskReadClass::HashSequential,
-                    true,
-                )
+                .acquire_scheduled_permit(&scanned, &cancellation, DiskReadClass::HashSequential)
                 .await?;
             if let Some(started) = started {
                 started.mark_reading();
@@ -554,6 +599,35 @@ impl ScheduledFileReader {
             let md5 = md5?;
             Ok(ReadProduct { md5, lease })
         })
+    }
+}
+
+/// 把系统 resolver 返回的稳定位置转换为本轮读取 lane。
+fn lane_from_storage(
+    read_config: &DiskReadConfig,
+    storage: &StorageLocation,
+) -> io::Result<TaskDiskLane> {
+    let physical_disk_id = storage.physical_disk_id().clone();
+    let physical_disk_numbers = physical_disk_id.disk_numbers().to_vec();
+    if physical_disk_numbers.is_empty() {
+        return Err(io::Error::other("物理盘身份不能为空"));
+    }
+    let per_disk_limit = configured_limit(read_config, storage.disk_kind());
+    Ok(TaskDiskLane {
+        physical_disk_id,
+        physical_disk_numbers,
+        disk_kind: storage.disk_kind(),
+        configured_weight: per_disk_limit,
+        per_disk_limit,
+    })
+}
+
+/// 返回指定介质类型对应的已验证逐盘读取额度。
+fn configured_limit(read_config: &DiskReadConfig, kind: LocalDiskKind) -> usize {
+    match kind {
+        LocalDiskKind::Hdd => read_config.hdd_threads_per_disk,
+        LocalDiskKind::Ssd => read_config.ssd_threads_per_disk,
+        LocalDiskKind::Unknown => read_config.unknown_threads_per_disk,
     }
 }
 

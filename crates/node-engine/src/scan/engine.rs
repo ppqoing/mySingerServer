@@ -1230,7 +1230,7 @@ where
         R: PipelineFileReader,
     {
         let ReservedScan { scanned, item_id } = reserved;
-        let physical_disk_id = reader.take_physical_disk_id(scanned.display_path.as_path());
+        let physical_disk_id = reader.physical_disk_id(scanned.display_path.as_path());
         let ReadProduct { md5, lease } = match result {
             Ok(value) => value,
             Err(ReadFailure::Cancelled) => return Err(ScanError::Cancelled),

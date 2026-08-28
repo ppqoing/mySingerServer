@@ -10,6 +10,7 @@ mod everything;
 mod hash;
 pub(crate) mod input_order;
 mod pipeline;
+mod root_plan;
 
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
@@ -33,6 +34,10 @@ pub use hash::{FileHasher, SystemMd5, md5_bytes, md5_file};
 #[doc(hidden)]
 pub use input_order::interleave_rows_by_root_for_test;
 pub use pipeline::{PipelineFileReader, PipelineLimits, ReadProduct, ScheduledFileReader};
+pub use root_plan::{
+    PlannedScannedPath, ResolvedScanRootStorage, ScanDiskPlan, ScanRootStorageResolver,
+    SystemScanRootStorageResolver, TaskDiskLane,
+};
 
 use thiserror::Error;
 
@@ -57,4 +62,12 @@ pub enum ScanError {
     /// Worker 一筛结果与请求不匹配。
     #[error("一筛处理失败: {0}")]
     Stage1(String),
+    /// 扫描根在枚举前无法解析到稳定的本机物理存储位置。
+    #[error("SCAN_ROOT_STORAGE_RESOLVE_FAILED: {root}: {message}")]
+    ScanRootStorageResolveFailed {
+        /// 无法解析的用户显示扫描根。
+        root: String,
+        /// Windows 存储查询返回的原因。
+        message: String,
+    },
 }

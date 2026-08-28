@@ -2875,7 +2875,6 @@ async fn hash_one<F: PipelineFileReader>(
     {
         Ok(product) => product,
         Err(error) => {
-            let _ = reader.take_physical_disk_id(scanned.display_path.as_path());
             return Err(HashReadFailure {
                 error,
                 output_credit,
@@ -2884,7 +2883,7 @@ async fn hash_one<F: PipelineFileReader>(
     };
     let ReadProduct { md5, lease } = product;
     drop(lease);
-    let physical_disk_id = reader.take_physical_disk_id(scanned.display_path.as_path());
+    let physical_disk_id = reader.physical_disk_id(scanned.display_path.as_path());
     Ok(HashedBaseItem {
         task_id,
         item_id: String::new(),

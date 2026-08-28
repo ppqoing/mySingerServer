@@ -53,9 +53,9 @@ use crate::{
     },
     scan::{
         BaseComputeEngine, FileEnumerator, PipelineFileReader, PipelineLimits,
-        PreferredEverythingEnumerator, ScanError, ScanOptions, ScanSummary, ScheduledFileReader,
-        WindowsWalker, begin_scan_task, ensure_everything_ready,
-        input_order::interleave_rows_by_root,
+        PreferredEverythingEnumerator, ScanDiskPlan, ScanError, ScanOptions, ScanSummary,
+        ScheduledFileReader, SystemScanRootStorageResolver, WindowsWalker, begin_scan_task,
+        ensure_everything_ready, input_order::interleave_rows_by_root,
     },
     server::{NodeRequestHandler, NodeServer, ServerError},
     worker::{WorkerLaunch, WorkerPool, WorkerPoolConfig, WorkerPoolError, WorkerPoolHandle},
@@ -1913,11 +1913,25 @@ async fn run_background_job(
             );
             let enumerator =
                 resolve_scan_enumerator_with(enumerator, ensure_everything_ready).await;
-            let rows = match enumerator {
-                EnumeratorKind::WindowsWalker => WindowsWalker.enumerate(&options.roots),
-                EnumeratorKind::Everything => {
-                    PreferredEverythingEnumerator.enumerate(&options.roots)
+            // 物理存储计划必须先于第一次 Everything/Walker enumerate 建立；失败时不枚举。
+            let scan_plan =
+                ScanDiskPlan::build(&options.roots, &read_config, &SystemScanRootStorageResolver);
+            let scan_plan_for_reader = scan_plan.as_ref().ok().cloned().map(Arc::new);
+            let rows = match scan_plan {
+                Ok(scan_plan) => {
+                    let rows = match enumerator {
+                        EnumeratorKind::WindowsWalker => WindowsWalker.enumerate(&options.roots),
+                        EnumeratorKind::Everything => {
+                            PreferredEverythingEnumerator.enumerate(&options.roots)
+                        }
+                    };
+                    rows.and_then(|rows| {
+                        scan_plan
+                            .assign_all(rows)
+                            .map(|planned| planned.into_iter().map(|row| row.scanned).collect())
+                    })
                 }
+                Err(error) => Err(error),
             };
             let result = run_enumerated_scan_to_base_compute(
                 store,
@@ -1929,14 +1943,20 @@ async fn run_background_job(
                 &contact_sheets,
                 || NodeRemoteFeatureCache::from_config(&postgres_config),
                 || async {
-                    ScheduledFileReader::new(&read_config, effective_worker_count).map(
-                        |(reader, limits)| {
-                            (
-                                reader.with_runtime_reporter(runtime_reporter.clone()),
-                                limits,
-                            )
-                        },
+                    let Some(scan_plan) = scan_plan_for_reader else {
+                        return Err(ScanError::Stage1("扫描根计划缺失，不能创建读取器".into()));
+                    };
+                    ScheduledFileReader::new_with_plan(
+                        &read_config,
+                        effective_worker_count,
+                        scan_plan,
                     )
+                    .map(|(reader, limits)| {
+                        (
+                            reader.with_runtime_reporter(runtime_reporter.clone()),
+                            limits,
+                        )
+                    })
                 },
                 &read_config,
                 cancellation,
