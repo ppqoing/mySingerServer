@@ -4,4 +4,6 @@ mod retrying_reader;
 mod scheduler;
 
 pub use retrying_reader::{BlockReadError, BlockReader, ReadFailure, RetryingFileReader};
-pub use scheduler::{DiskReadClass, DiskReadPermit, DiskReadScheduler, SchedulerError};
+pub use scheduler::{
+    DiskReadClass, DiskReadLane, DiskReadPermit, DiskReadScheduler, SchedulerError,
+};

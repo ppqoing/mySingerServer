@@ -7,17 +7,176 @@ use std::{
 };
 
 use dedup_core::DiskReadConfig;
-use dedup_windows::LocalDiskKind;
+use dedup_windows::{LocalDiskKind, PhysicalDiskId, StorageLocation};
 
 #[allow(dead_code)]
 #[path = "../src/io/scheduler.rs"]
 mod scheduler;
 
-use scheduler::{DiskReadClass, DiskReadPermit, DiskReadScheduler, SchedulerError};
+use scheduler::{DiskReadClass, DiskReadLane, DiskReadPermit, DiskReadScheduler, SchedulerError};
+
+fn weighted_lane(
+    disk_numbers: &[u32],
+    kind: LocalDiskKind,
+    effective_limit: usize,
+    configured_weight: usize,
+) -> DiskReadLane {
+    DiskReadLane {
+        location: StorageLocation::from_parts(
+            PhysicalDiskId::from_disk_numbers(disk_numbers.iter().copied()).unwrap(),
+            kind,
+        ),
+        effective_limit,
+        configured_weight,
+    }
+}
+
+type WeightedRequest =
+    Pin<Box<dyn Future<Output = Result<(usize, DiskReadPermit), SchedulerError>> + Send>>;
+
+/// 在唯一全局席位上收集两个 lane 的真实交付顺序，避免把队列入队顺序当作公平结果。
+async fn collect_weighted_sequence(
+    high_weight: usize,
+    low_weight: usize,
+    high_items: usize,
+    low_items: usize,
+) -> Vec<usize> {
+    let mut config = DiskReadConfig::default();
+    config.total_threads = 1;
+    let scheduler = DiskReadScheduler::new(&config, 20).unwrap();
+    let high = weighted_lane(&[1], LocalDiskKind::Ssd, 8, high_weight);
+    let low = weighted_lane(&[2], LocalDiskKind::Hdd, 8, low_weight);
+    let blocker = scheduler
+        .acquire_for_test(&[99], LocalDiskKind::Unknown, DiskReadClass::HashSequential)
+        .await
+        .unwrap();
+
+    let mut requests: Vec<Option<WeightedRequest>> = Vec::new();
+    for _ in 0..high_items {
+        let scheduler = scheduler.clone();
+        let lane = high.clone();
+        requests.push(Some(Box::pin(async move {
+            scheduler
+                .acquire_lane(lane, DiskReadClass::HashSequential)
+                .await
+                .map(|permit| (0, permit))
+        })));
+    }
+    for _ in 0..low_items {
+        let scheduler = scheduler.clone();
+        let lane = low.clone();
+        requests.push(Some(Box::pin(async move {
+            scheduler
+                .acquire_lane(lane, DiskReadClass::HashSequential)
+                .await
+                .map(|permit| (1, permit))
+        })));
+    }
+
+    for request in &mut requests {
+        assert!(poll_once(request.as_mut().unwrap().as_mut()).is_pending());
+    }
+    scheduler.barrier_for_test().await.unwrap();
+    drop(blocker);
+    scheduler.barrier_for_test().await.unwrap();
+
+    let mut sequence = Vec::with_capacity(requests.len());
+    while requests.iter().any(Option::is_some) {
+        let ready = requests
+            .iter_mut()
+            .enumerate()
+            .find_map(|(index, request)| {
+                let request = request.as_mut()?;
+                match poll_once(request.as_mut()) {
+                    Poll::Ready(result) => Some((index, result.unwrap())),
+                    Poll::Pending => None,
+                }
+            })
+            .expect("全局许可释放后应存在下一个已交付请求");
+        let (index, (lane_index, permit)) = ready;
+        requests[index] = None;
+        sequence.push(lane_index);
+        drop(permit);
+        scheduler.barrier_for_test().await.unwrap();
+    }
+    sequence
+}
+
+#[tokio::test]
+async fn configured_weight_five_to_one_is_used_by_real_scheduler_actor() {
+    let sequence = collect_weighted_sequence(5, 1, 10, 2).await;
+    assert_eq!(&sequence[..6], &[0, 0, 0, 0, 0, 1]);
+    assert_eq!(&sequence[6..], &[0, 0, 0, 0, 0, 1]);
+}
+
+#[tokio::test]
+async fn configured_weight_seven_to_two_is_not_a_hardcoded_five_to_one_ratio() {
+    let sequence = collect_weighted_sequence(7, 2, 7, 2).await;
+    assert_eq!(sequence, vec![0, 0, 0, 0, 0, 0, 0, 1, 1]);
+}
+
+#[tokio::test]
+async fn configured_weight_does_not_raise_the_frozen_per_disk_limit() {
+    let mut config = DiskReadConfig::default();
+    config.total_threads = 3;
+    let scheduler = DiskReadScheduler::new(&config, 3).unwrap();
+    let high_weight_lane = weighted_lane(&[31], LocalDiskKind::Ssd, 1, 7);
+    let other_lane = weighted_lane(&[32], LocalDiskKind::Hdd, 3, 2);
+
+    let high_first = scheduler
+        .acquire_lane(high_weight_lane.clone(), DiskReadClass::HashSequential)
+        .await
+        .unwrap();
+    let mut high_second =
+        Box::pin(scheduler.acquire_lane(high_weight_lane, DiskReadClass::HashSequential));
+    assert!(poll_once(high_second.as_mut()).is_pending());
+    scheduler.barrier_for_test().await.unwrap();
+
+    let other_first = scheduler
+        .acquire_lane(other_lane.clone(), DiskReadClass::HashSequential)
+        .await
+        .unwrap();
+    let other_second = scheduler
+        .acquire_lane(other_lane, DiskReadClass::HashSequential)
+        .await
+        .unwrap();
+    let snapshot = scheduler.active_snapshot_for_test(&[31, 32]).await.unwrap();
+    assert_eq!(snapshot.disks, vec![(31, 1, 1, 0), (32, 2, 2, 0)]);
+
+    drop(high_first);
+    drop(other_first);
+    drop(other_second);
+    let high_second = high_second.await.unwrap();
+    drop(high_second);
+}
+
+#[tokio::test]
+async fn weighted_lanes_on_distinct_physical_disks_keep_independent_active_counts() {
+    let mut config = DiskReadConfig::default();
+    config.total_threads = 2;
+    let scheduler = DiskReadScheduler::new(&config, 2).unwrap();
+    let ssd_lane = weighted_lane(&[41], LocalDiskKind::Ssd, 1, 5);
+    let hdd_lane = weighted_lane(&[42], LocalDiskKind::Hdd, 1, 1);
+
+    let ssd = scheduler
+        .acquire_lane(ssd_lane, DiskReadClass::MediaDecode)
+        .await
+        .unwrap();
+    let hdd = scheduler
+        .acquire_lane(hdd_lane, DiskReadClass::HashSequential)
+        .await
+        .unwrap();
+    let snapshot = scheduler.active_snapshot_for_test(&[41, 42]).await.unwrap();
+    assert_eq!(snapshot.global_total, 2);
+    assert_eq!(snapshot.disks, vec![(41, 1, 0, 1), (42, 1, 1, 0)]);
+
+    drop(ssd);
+    drop(hdd);
+}
 
 fn poll_once<F>(future: Pin<&mut F>) -> Poll<F::Output>
 where
-    F: Future,
+    F: Future + ?Sized,
 {
     let mut context = Context::from_waker(Waker::noop());
     future.poll(&mut context)

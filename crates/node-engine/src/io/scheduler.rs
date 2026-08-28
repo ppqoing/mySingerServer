@@ -23,6 +23,17 @@ pub enum DiskReadClass {
     MediaDecode,
 }
 
+/// 本轮任务冻结的一条物理盘读取 lane；额度和权重分别控制硬上限与调度比例。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiskReadLane {
+    /// 已在枚举前解析并冻结的物理盘身份与介质类型。
+    pub location: StorageLocation,
+    /// 该 lane 可同时持有的读取许可上限。
+    pub effective_limit: usize,
+    /// 全局额度不足时用于加权轮转的配置权重。
+    pub configured_weight: usize,
+}
+
 /// 同盘 Hash 与媒体均可推进时，连续优先媒体读取的次数。
 const MEDIA_WEIGHT: u8 = 3;
 /// 老请求被年轻冲突请求绕过后进入保护模式的次数阈值。
@@ -215,6 +226,7 @@ impl DiskReadScheduler {
             location.disk_kind(),
             class,
             None,
+            None,
         )
         .await
     }
@@ -236,6 +248,33 @@ impl DiskReadScheduler {
             location.disk_kind(),
             class,
             Some(per_disk_limit),
+            None,
+        )
+        .await
+    }
+
+    /// 按任务文件冻结的 lane 申请许可；权重只进入同一个 scheduler actor。
+    pub async fn acquire_lane(
+        &self,
+        lane: DiskReadLane,
+        class: DiskReadClass,
+    ) -> Result<DiskReadPermit, SchedulerError> {
+        if lane.effective_limit == 0 {
+            return Err(SchedulerError::InvalidConfiguration(
+                "冻结的逐盘读取额度必须大于零",
+            ));
+        }
+        if lane.configured_weight == 0 {
+            return Err(SchedulerError::InvalidConfiguration(
+                "冻结的物理盘调度权重必须大于零",
+            ));
+        }
+        self.acquire_key(
+            DiskKey::new(lane.location.physical_disk_id().disk_numbers())?,
+            lane.location.disk_kind(),
+            class,
+            Some(lane.effective_limit),
+            Some(lane.configured_weight),
         )
         .await
     }
@@ -256,6 +295,7 @@ impl DiskReadScheduler {
         kind: LocalDiskKind,
         class: DiskReadClass,
         per_disk_limit: Option<usize>,
+        configured_weight: Option<usize>,
     ) -> Result<DiskReadPermit, SchedulerError> {
         let queue_slot = self
             .queue_slots
@@ -269,6 +309,7 @@ impl DiskReadScheduler {
                 key,
                 kind,
                 per_disk_limit,
+                configured_weight,
                 class,
                 sequence: 0,
                 conflicting_bypasses: 0,
@@ -287,7 +328,7 @@ impl DiskReadScheduler {
         kind: LocalDiskKind,
         class: DiskReadClass,
     ) -> Result<DiskReadPermit, SchedulerError> {
-        self.acquire_key(DiskKey::new(disk_numbers)?, kind, class, None)
+        self.acquire_key(DiskKey::new(disk_numbers)?, kind, class, None, None)
             .await
     }
 
@@ -371,6 +412,8 @@ struct Waiter {
     kind: LocalDiskKind,
     /// 可选的本轮冻结逐盘上限；缺失时使用调度器默认介质配置。
     per_disk_limit: Option<usize>,
+    /// 可选的本轮冻结调度权重；缺失时保留旧的等权入口语义。
+    configured_weight: Option<usize>,
     /// 请求进入 actor 的读取类别。
     class: DiskReadClass,
     /// 跨位置、跨类别单调递增的入队顺序。
@@ -440,6 +483,28 @@ struct UnderlyingDiskState {
     media_streak: u8,
 }
 
+/// 单条物理盘 lane 的瞬态加权轮转状态；不保存 active 或许可所有权。
+struct WeightedLaneState {
+    /// 本轮配置提供的调度权重。
+    configured_weight: usize,
+    /// 尚未消费的任务单位，跨全局窗口保留以维持长期比例。
+    deficit: usize,
+}
+
+/// 一次不含队首引用的加权选择结果，供 actor 在释放借用后提交亏欠变化。
+struct WeightedChoice {
+    /// 被选中的物理盘 lane。
+    key: DiskKey,
+    /// 被选中的读取类别。
+    class: DiskReadClass,
+    /// 被选队首的稳定入队序号。
+    sequence: u64,
+    /// 消费一个任务单位后的 lane 亏欠。
+    remaining_deficit: usize,
+    /// 当前 lane 额度耗尽后应检查的下一游标。
+    next_cursor: DiskKey,
+}
+
 /// 一次队首选择；sequence 用于在压力比例相同时保持年龄优先。
 struct WaiterSelection {
     /// 被选中的复合磁盘身份。
@@ -501,6 +566,10 @@ struct ActorState {
     next_sequence: u64,
     /// 全局唯一的老化保留身份。
     aged_reservation: Option<AgedReservation>,
+    /// 每个加权 lane 的唯一亏欠状态，和现有 active/老化状态同属 actor。
+    weighted_lanes: BTreeMap<DiskKey, WeightedLaneState>,
+    /// 当前加权轮转游标；lane 消失后会清除，不累计历史突发额度。
+    weighted_cursor: Option<DiskKey>,
 }
 
 impl ActorState {
@@ -516,6 +585,8 @@ impl ActorState {
             in_rotation: BTreeSet::new(),
             next_sequence: 0,
             aged_reservation: None,
+            weighted_lanes: BTreeMap::new(),
+            weighted_cursor: None,
         }
     }
 
@@ -527,6 +598,21 @@ impl ActorState {
         let observed_limit = waiter
             .per_disk_limit
             .unwrap_or_else(|| self.config.disk_limit(waiter.kind));
+        if let Some(configured_weight) = waiter.configured_weight {
+            self.weighted_lanes
+                .entry(key.clone())
+                .and_modify(|lane| {
+                    // 同一物理盘的根计划应共享同一权重；不一致时采用较小值，避免超额倾斜。
+                    if lane.configured_weight != configured_weight {
+                        lane.configured_weight = lane.configured_weight.min(configured_weight);
+                        lane.deficit = 0;
+                    }
+                })
+                .or_insert(WeightedLaneState {
+                    configured_weight,
+                    deficit: 0,
+                });
+        }
         for disk_number in &key.0 {
             self.underlying_disks
                 .entry(*disk_number)
@@ -622,6 +708,14 @@ impl ActorState {
         for key in empty {
             self.rotation.retain(|queued| queued != &key);
             self.in_rotation.remove(&key);
+            self.weighted_lanes.remove(&key);
+            if self
+                .weighted_cursor
+                .as_ref()
+                .is_some_and(|cursor| cursor == &key)
+            {
+                self.weighted_cursor = None;
+            }
         }
     }
 
@@ -665,8 +759,93 @@ impl ActorState {
 
         // 先保留每个同盘 T=1 争用组的代表，再让跨盘代表参加全局裁决。
         let capacity_candidates = self.select_capacity_one_representatives(&heads, &eligible);
+        if let Some(choice) = self.select_weighted_lane(&heads, &capacity_candidates) {
+            let selection = WaiterSelection {
+                key: choice.key.clone(),
+                class: choice.class,
+                sequence: choice.sequence,
+            };
+            // 队首引用只在本次选择中借用；释放后才能更新 actor 内的亏欠状态。
+            drop(heads);
+            self.apply_weighted_choice(&choice);
+            return Some(selection);
+        }
         let index = self.select_pressure_or_rotation(&heads, &capacity_candidates);
         Some(self.make_selection(&heads[index]))
+    }
+
+    /// 在真实可授予的 lane 之间按配置权重消费亏欠，再在选中 lane 内沿用类别规则。
+    fn select_weighted_lane(
+        &self,
+        heads: &[(DiskKey, DiskReadClass, &Waiter)],
+        candidates: &[usize],
+    ) -> Option<WeightedChoice> {
+        let keys = candidates
+            .iter()
+            .filter_map(|index| {
+                heads[*index]
+                    .2
+                    .configured_weight
+                    .is_some()
+                    .then(|| heads[*index].0.clone())
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if keys.is_empty() {
+            return None;
+        }
+
+        // 游标指向仍有亏欠的 lane；当前候选不可运行时顺序扫描其他 lane。
+        let start = self
+            .weighted_cursor
+            .as_ref()
+            .and_then(|cursor| keys.iter().position(|key| key == cursor))
+            .unwrap_or(0);
+        for offset in 0..keys.len() {
+            let key_index = (start + offset) % keys.len();
+            let key = &keys[key_index];
+            let Some(lane) = self.weighted_lanes.get(key) else {
+                continue;
+            };
+            let deficit = if lane.deficit == 0 {
+                lane.configured_weight
+            } else {
+                lane.deficit
+            };
+            if deficit == 0 {
+                continue;
+            }
+            let remaining_deficit = deficit - 1;
+            let next_cursor = if remaining_deficit == 0 {
+                keys[(key_index + 1) % keys.len()].clone()
+            } else {
+                key.clone()
+            };
+
+            let lane_candidates = candidates
+                .iter()
+                .copied()
+                .filter(|index| heads[*index].0 == *key)
+                .collect::<Vec<_>>();
+            let index = self.select_pressure_or_rotation(heads, &lane_candidates);
+            return Some(WeightedChoice {
+                key: key.clone(),
+                class: heads[index].1,
+                sequence: heads[index].2.sequence,
+                remaining_deficit,
+                next_cursor,
+            });
+        }
+        None
+    }
+
+    /// 应用一次已经完成队首判定的加权选择，避免在借用队首时修改 actor。
+    fn apply_weighted_choice(&mut self, choice: &WeightedChoice) {
+        if let Some(lane) = self.weighted_lanes.get_mut(&choice.key) {
+            lane.deficit = choice.remaining_deficit;
+        }
+        self.weighted_cursor = Some(choice.next_cursor.clone());
     }
 
     /// 刷新唯一老化保留；取消或队首身份变化时清除旧身份。
