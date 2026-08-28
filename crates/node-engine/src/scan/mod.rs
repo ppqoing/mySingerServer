@@ -33,7 +33,10 @@ pub use hash::{FileHasher, SystemMd5, md5_bytes, md5_file};
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub use input_order::interleave_rows_by_root_for_test;
-pub use pipeline::{PipelineFileReader, PipelineLimits, ReadProduct, ScheduledFileReader};
+pub use pipeline::{
+    HashPermitReader, PipelineFileReader, PipelineLimits, ReadProduct, ScheduledFileReader,
+    ScheduledReadPermit,
+};
 pub use root_plan::{
     PlannedScannedPath, ResolvedScanRootStorage, ScanDiskPlan, ScanRootStorageResolver,
     SystemScanRootStorageResolver, TaskDiskLane,

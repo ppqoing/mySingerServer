@@ -23,6 +23,7 @@ use crate::{
     runtime_tasks::{
         RuntimeDiskReadClass, RuntimePipelineResource, RuntimeTaskError, RuntimeTaskReporter,
     },
+    task_dispatch::{TaskLanePermitFuture, TaskLanePermitProvider},
 };
 
 use super::base_flow_control::HashReadStartedSignal;
@@ -123,6 +124,23 @@ pub trait PipelineFileReader: Clone + Send + Sync + 'static {
     fn physical_disk_id(&self, _path: &Path) -> String {
         String::new()
     }
+}
+
+/// 消费外部已经取得的 Hash 读取许可；读取器不得在该入口再次申请 scheduler 许可。
+pub trait HashPermitReader: Clone + Send + Sync + 'static {
+    /// 外部 dispatcher 交付的读取许可类型。
+    type Permit: Send + 'static;
+
+    /// 持有传入许可完成完整 MD5；返回的 `ReadProduct` 由调用方在确认结果后显式释放。
+    fn read_with_permit(
+        &self,
+        scanned: ScannedPath,
+        permit: Self::Permit,
+        cancellation: ReadCancellationToken,
+        started: Option<HashReadStartedSignal>,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<ReadProduct<Self::Permit>, ReadFailure>> + Send + 'static>,
+    >;
 }
 
 /// 生产路径使用的物理盘调度、OVERLAPPED 重试 MD5 组合。
@@ -427,7 +445,6 @@ impl ScheduledFileReader {
         cancellation: &ReadCancellationToken,
         class: DiskReadClass,
     ) -> Result<ScheduledReadPermit, ReadFailure> {
-        let wait_started = Instant::now();
         let path = scanned.display_path.as_path().to_path_buf();
         if cancellation.is_cancelled() {
             return Err(ReadFailure::Cancelled);
@@ -438,6 +455,21 @@ impl ScheduledFileReader {
                 block_offset: 0,
                 source,
             })?;
+        self.acquire_permit_for_lane(&lane, cancellation, class, path, system_location, false)
+            .await
+    }
+
+    /// 按已冻结 lane 取得一次读取许可；任务文件 dispatcher 直接调用此入口。
+    async fn acquire_permit_for_lane(
+        &self,
+        lane: &TaskDiskLane,
+        cancellation: &ReadCancellationToken,
+        class: DiskReadClass,
+        path: PathBuf,
+        system_location: Option<StorageLocation>,
+        use_frozen_scheduler_lane: bool,
+    ) -> Result<ScheduledReadPermit, ReadFailure> {
+        let wait_started = Instant::now();
         let disk_ids = lane
             .physical_disk_numbers
             .iter()
@@ -451,16 +483,32 @@ impl ScheduledFileReader {
             u64::try_from(lane.per_disk_limit).expect("已验证的逐盘读取容量必须可表示为 u64"),
         )
         .map_err(|error| telemetry_failure(&path, error))?;
-        let lease = match system_location {
-            Some(storage) => {
-                self.scheduler
-                    .acquire_with_limit(storage, class, lane.per_disk_limit)
-                    .await
-            }
-            None => {
-                self.scheduler
-                    .acquire_for_test(&lane.physical_disk_numbers, lane.disk_kind, class)
-                    .await
+        let lease = if use_frozen_scheduler_lane {
+            self.scheduler
+                .acquire_lane(
+                    crate::io::DiskReadLane {
+                        location: StorageLocation::from_parts(
+                            lane.physical_disk_id.clone(),
+                            lane.disk_kind,
+                        ),
+                        effective_limit: lane.per_disk_limit,
+                        configured_weight: lane.configured_weight,
+                    },
+                    class,
+                )
+                .await
+        } else {
+            match system_location {
+                Some(storage) => {
+                    self.scheduler
+                        .acquire_with_limit(storage, class, lane.per_disk_limit)
+                        .await
+                }
+                None => {
+                    self.scheduler
+                        .acquire_for_test(&lane.physical_disk_numbers, lane.disk_kind, class)
+                        .await
+                }
             }
         }
         .map_err(|error| ReadFailure::Io {
@@ -468,6 +516,10 @@ impl ScheduledFileReader {
             block_offset: 0,
             source: io::Error::other(error.to_string()),
         })?;
+        if cancellation.is_cancelled() {
+            drop(lease);
+            return Err(ReadFailure::Cancelled);
+        }
         wait_guard
             .mark_acquired()
             .map_err(|error| telemetry_failure(&path, error))?;
@@ -485,6 +537,43 @@ impl ScheduledFileReader {
             disk_ids,
             class: runtime_class,
             acquired_at: Instant::now(),
+        })
+    }
+
+    /// 仅消费调用方交付的 permit 完成 Hash；本函数不触碰 scheduler。
+    fn read_hash_with_permit(
+        &self,
+        scanned: ScannedPath,
+        permit: ScheduledReadPermit,
+        cancellation: ReadCancellationToken,
+        started: Option<HashReadStartedSignal>,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<ReadProduct<ScheduledReadPermit>, ReadFailure>>
+                + Send
+                + 'static,
+        >,
+    > {
+        let reader = self.reader.clone();
+        Box::pin(async move {
+            let path = scanned.display_path.as_path().to_path_buf();
+            if cancellation.is_cancelled() {
+                drop(permit);
+                return Err(ReadFailure::Cancelled);
+            }
+            if let Some(started) = started {
+                started.mark_reading();
+            }
+            let read_path = path.clone();
+            let read_cancellation = cancellation.clone();
+            let (md5, permit) = tokio::task::spawn_blocking(move || {
+                let result = reader.read(&read_path, &read_cancellation, &mut |_| Ok(()));
+                (result, permit)
+            })
+            .await
+            .map_err(|error| join_failure(&path, error.to_string()))?;
+            let md5 = md5?;
+            Ok(ReadProduct { md5, lease: permit })
         })
     }
 }
@@ -558,26 +647,58 @@ impl ScheduledFileReader {
                 + 'static,
         >,
     > {
-        let reader = self.reader.clone();
         let permit_reader = self.clone();
         Box::pin(async move {
-            let path = scanned.display_path.as_path().to_path_buf();
             let lease = permit_reader
                 .acquire_scheduled_permit(&scanned, &cancellation, DiskReadClass::HashSequential)
                 .await?;
-            if let Some(started) = started {
-                started.mark_reading();
-            }
-            let read_path = path.clone();
-            let read_cancellation = cancellation.clone();
-            let (md5, lease) = tokio::task::spawn_blocking(move || {
-                let result = reader.read(&read_path, &read_cancellation, &mut |_| Ok(()));
-                (result, lease)
-            })
-            .await
-            .map_err(|error| join_failure(&path, error.to_string()))?;
-            let md5 = md5?;
-            Ok(ReadProduct { md5, lease })
+            permit_reader
+                .read_hash_with_permit(scanned, lease, cancellation, started)
+                .await
+        })
+    }
+}
+
+impl HashPermitReader for ScheduledFileReader {
+    type Permit = ScheduledReadPermit;
+
+    fn read_with_permit(
+        &self,
+        scanned: ScannedPath,
+        permit: Self::Permit,
+        cancellation: ReadCancellationToken,
+        started: Option<HashReadStartedSignal>,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<ReadProduct<Self::Permit>, ReadFailure>> + Send + 'static>,
+    > {
+        self.read_hash_with_permit(scanned, permit, cancellation, started)
+    }
+}
+
+impl TaskLanePermitProvider for ScheduledFileReader {
+    type Permit = ScheduledReadPermit;
+
+    fn acquire(
+        &self,
+        lane: TaskDiskLane,
+        class: DiskReadClass,
+        cancellation: ReadCancellationToken,
+    ) -> TaskLanePermitFuture<Self::Permit> {
+        let reader = self.clone();
+        let path = PathBuf::from(format!(
+            "PhysicalDisk{}",
+            lane.physical_disk_numbers
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join("+")
+        ));
+        Box::pin(async move {
+            let location =
+                StorageLocation::from_parts(lane.physical_disk_id.clone(), lane.disk_kind);
+            reader
+                .acquire_permit_for_lane(&lane, &cancellation, class, path, Some(location), true)
+                .await
         })
     }
 }
