@@ -7,7 +7,7 @@
 并把状态迁移严格放在 SQLite ACK 之后。本阶段不接 actor 主循环、Worker 派发、
 外层 Hash/Media 交错协调或任务 finalize。
 
-新增模块当前生产逻辑约 739 行，行为测试约 684 行；`scan/mod.rs` 只增加模块声明和
+新增模块当前生产逻辑约 737 行，行为测试约 902 行；`scan/mod.rs` 只增加模块声明和
 窄 re-export，没有修改 SQLite schema、任务表或 actor 生产逻辑。
 
 ## 实现
@@ -28,6 +28,10 @@
   剩余行保持 `P`。
 - 联系表 partial 发布不再因旧 final 存在而丢弃新结果：旧文件先移到本轮备份，
   新文件再 rename 到 final；提交确认删除备份，事务失败则删除新文件并恢复旧文件。
+- Worker Completed 的缺失位按实际 `probe.media_kind` 解释：Image 只要求合法单槽
+  stage1，Video 才要求联系表，Other 合法接受空 stage1/联系表。首次无缓存的通用
+  `PROBE|STAGE1|CONTACT` 掩码和图片强制重算不会再因不适用的字段被误判为失败；仍拒绝
+  媒体类型不一致、非法结构和未请求的额外字段。
 - 只有收到并校验对应 identity、worker slot、ContentKey、媒体类型和文件大小的
   ACK，才调用 dispatcher 的 `mark_completed/mark_failed`；成功项登记稳定排序的
   `ResolvedScanFile`，不增加 `cache_hits`。ACK 前 TSV、上下文和 dispatcher 状态均
@@ -40,6 +44,8 @@
 
 | 行为 | 结果 |
 |---|---:|
+| 旧校验：首次无缓存 Image、Other 与图片强制重算的合法结果 | RED，3 项均误置 F |
+| 修复后：首次无缓存 Image/Other 与图片强制重算 ACK 后完成 | 通过 |
 | 图片成功：ACK 前 TSV 为 P，ACK 后为 C、登记 resolved、旧任务表为空 | 通过 |
 | 同批一项成功、一项失败：ACK 后仅各自迁移为 C/F | 通过 |
 | Worker/协议 MD5 不匹配转当前项 F | 通过 |
@@ -48,8 +54,8 @@
 | 视频联系表成功 publish，ACK 后确认并保存缓存路径 | 通过 |
 | 损坏 final 被有效 partial 替换；引用失败回滚恢复旧文件 | 通过 |
 | 联系表/Store 错误返回 pending，TSV 保持 P | 通过 |
-| `cargo test -p dedup-node-engine --lib task_file_media_persistence --locked -- --test-threads=1` | 8/8 通过 |
-| `cargo test -p dedup-node-engine --features test-hooks --lib task_file_media_persistence --locked -- --test-threads=1` | 9/9 通过 |
+| `cargo test -p dedup-node-engine --lib task_file_media_persistence --locked -- --test-threads=1` | 11/11 通过 |
+| `cargo test -p dedup-node-engine --features test-hooks --lib task_file_media_persistence --locked -- --test-threads=1` | 12/12 通过 |
 | `cargo test -p dedup-node-engine --features test-hooks --lib task_file_media_compute --locked -- --test-threads=1` | 7/7 通过 |
 | `cargo test -p dedup-node-engine --features test-hooks --lib task_file_base_compute --locked -- --test-threads=1` | 8/8 通过 |
 | `cargo test -p dedup-node-engine --features test-hooks --lib base_persistence --locked -- --test-threads=1` | 5/5 通过 |

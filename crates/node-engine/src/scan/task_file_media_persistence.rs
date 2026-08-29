@@ -397,9 +397,6 @@ fn validate_completed_response(
     if missing_parts & BASE_MISSING_PROBE != 0 && output.probe.is_none() {
         return Err("Worker 基础结果缺少 probe".into());
     }
-    if missing_parts & BASE_MISSING_STAGE1 != 0 && output.stage1_frames.is_none() {
-        return Err("Worker 基础结果缺少 stage1 payload".into());
-    }
     validate_completed_output(item, &output, missing_parts)?;
     Ok(output)
 }
@@ -432,8 +429,11 @@ fn validate_completed_output(
     }
 
     let stage1_requested = missing_parts & BASE_MISSING_STAGE1 != 0;
-    if output.stage1_frames.is_some() != stage1_requested {
-        return Err(if stage1_requested {
+    // 通用缺失掩码对首次探测使用同一组位，但 Other 不会产生 stage1；实际
+    // probe 类型决定该字段是否应该出现，不能把掩码位直接当成所有媒体的协议要求。
+    let stage1_expected = !matches!(probe.media_kind, MediaKind::Other) && stage1_requested;
+    if output.stage1_frames.is_some() != stage1_expected {
+        return Err(if stage1_expected {
             "Worker 基础结果缺少已请求的 stage1 字段"
         } else {
             "Worker 返回了未请求的 stage1 字段"
@@ -441,8 +441,11 @@ fn validate_completed_output(
         .into());
     }
     let contact_requested = missing_parts & BASE_MISSING_CONTACT_SHEET != 0;
-    if output.contact_sheet_jpeg.is_some() != contact_requested {
-        return Err(if contact_requested {
+    // 联系表只属于 Video。Image/Other 在通用初始掩码带有 CONTACT 位时仍应
+    // 接受没有联系表的合法结果，同时继续拒绝它们额外返回联系表。
+    let contact_expected = matches!(probe.media_kind, MediaKind::Video) && contact_requested;
+    if output.contact_sheet_jpeg.is_some() != contact_expected {
+        return Err(if contact_expected {
             "Worker 基础结果缺少已请求的联系表"
         } else {
             "Worker 返回了未请求的联系表"
@@ -454,9 +457,6 @@ fn validate_completed_output(
         MediaKind::Image => {
             if probe.width == 0 || probe.height == 0 || probe.duration_ms.is_some() {
                 return Err("图片 probe 的尺寸或时长无效".into());
-            }
-            if contact_requested {
-                return Err("图片不能返回视频联系表".into());
             }
             if let Some(frames) = output.stage1_frames.as_ref() {
                 if frames.len() != 1 {
@@ -503,9 +503,6 @@ fn validate_completed_output(
         MediaKind::Other => {
             if probe.duration_ms.is_some() {
                 return Err("其他文件 probe 不应包含视频时长".into());
-            }
-            if stage1_requested || contact_requested {
-                return Err("其他文件不能返回媒体特征或联系表".into());
             }
         }
     }
@@ -747,7 +744,10 @@ mod tests {
     };
     use dedup_media_ffmpeg::MediaProbe;
     use dedup_node_store::{BaseCacheRecord, NodeStore, ScannedPath};
-    use dedup_protocol::{BASE_MISSING_CONTACT_SHEET, proto, proto::worker_envelope};
+    use dedup_protocol::{
+        BASE_MISSING_CONTACT_SHEET, BASE_MISSING_PROBE, BASE_MISSING_STAGE1, proto,
+        proto::worker_envelope,
+    };
     use dedup_windows::{LocalDiskKind, PhysicalDiskId, ReadCancellationToken};
 
     use crate::{
@@ -839,6 +839,27 @@ mod tests {
         cached: BaseCacheRecord,
         contact_sheet_valid: bool,
     ) -> TaskFileBaseComputePending<TestProvider> {
+        production_with_options(
+            root,
+            path,
+            _md5,
+            file_size,
+            cached,
+            contact_sheet_valid,
+            false,
+        )
+    }
+
+    /// 创建可控制强制重算标记的 Media pending，便于覆盖缓存快照和实际 probe 的组合。
+    fn production_with_options(
+        root: &Path,
+        path: &str,
+        _md5: [u8; 16],
+        file_size: u64,
+        cached: BaseCacheRecord,
+        contact_sheet_valid: bool,
+        force_recompute: bool,
+    ) -> TaskFileBaseComputePending<TestProvider> {
         let files = TransientTaskFileSet::create(root, RUN_ID).unwrap();
         let mut producer = BaseTaskProducer::new(TaskFileDispatcher::new(files, TestProvider));
         producer
@@ -849,7 +870,7 @@ mod tests {
                 },
                 cached: Some(cached),
                 contact_sheet_valid,
-                force_recompute: false,
+                force_recompute,
             }])
             .unwrap();
         TaskFileBaseComputePending::from_production(producer.seal().unwrap())
@@ -902,6 +923,20 @@ mod tests {
         }
     }
 
+    /// 生成合法的 Other probe；Other 不产生图片 stage1 或视频联系表。
+    fn other_output() -> BaseComputeOutput {
+        BaseComputeOutput {
+            probe: Some(MediaProbe {
+                media_kind: MediaKind::Other,
+                width: 0,
+                height: 0,
+                duration_ms: None,
+            }),
+            stage1_frames: None,
+            contact_sheet_jpeg: None,
+        }
+    }
+
     /// 生成可由联系表缓存边界解码的固定六槽视频结果。
     fn video_output() -> BaseComputeOutput {
         let frames = (0..6)
@@ -946,6 +981,196 @@ mod tests {
                 },
             )),
         }
+    }
+
+    #[tokio::test]
+    async fn first_uncached_image_with_generic_mask_completes_without_contact_sheet() {
+        let root = tempfile::tempdir().unwrap();
+        let md5 = [0xE1; 16];
+        let machine = MachineId::from_sha256([0xE2; 32]);
+        let mut store = NodeStore::open_in_memory(machine).unwrap();
+        let cached = seed_partial_kind(
+            &mut store,
+            r"C:\seed-first-image.bin",
+            md5,
+            10,
+            MediaKind::Other,
+        );
+        let (mut pending, identity, record) = take_media_task(production_with_options(
+            root.path(),
+            r"C:\first-image.bin",
+            md5,
+            10,
+            cached,
+            true,
+            true,
+        ))
+        .await;
+        assert_eq!(
+            record.missing.base_missing_parts(),
+            BASE_MISSING_PROBE | BASE_MISSING_STAGE1 | BASE_MISSING_CONTACT_SHEET
+        );
+        // Hash 已经关联 content_id，但没有可复用的缓存快照，模拟首次无缓存续算。
+        pending.contexts.get_mut(&identity).unwrap().cached = None;
+        let context = pending.contexts.get(&identity).unwrap().clone();
+        let content_id = context.content_id.unwrap();
+        let task_path = pending.dispatcher.lane_path(&lane(7)).unwrap();
+        let media = MediaPassResult {
+            pending,
+            completed: vec![TaskFileMediaCompleted {
+                identity: identity.clone(),
+                record,
+                context,
+                response: completed_response(&identity, md5, image_output()),
+                worker_slot: Some(7),
+            }],
+            file_failures: Vec::new(),
+            blocked_reason: None,
+            remaining_hash_rows: 0,
+            cancelled: false,
+        };
+        let (actor, handle, mut acknowledgements) = BaseStoreActor::spawn(store, 2);
+        let result = persist_task_file_media_results(
+            media,
+            &handle,
+            &mut acknowledgements,
+            TaskFileMediaPersistenceOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(task_path).unwrap()[0], b'C');
+        assert!(result.contexts.is_empty());
+        drop(handle);
+        let store = actor.finish().await.unwrap();
+        assert!(
+            store
+                .load_base_cache_record(content_id)
+                .unwrap()
+                .base_complete
+        );
+        assert!(store.page_file_faults(None, 10).unwrap().items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn first_uncached_other_with_generic_mask_completes_without_features() {
+        let root = tempfile::tempdir().unwrap();
+        let md5 = [0xE3; 16];
+        let machine = MachineId::from_sha256([0xE4; 32]);
+        let mut store = NodeStore::open_in_memory(machine).unwrap();
+        let cached = seed_partial_kind(
+            &mut store,
+            r"C:\seed-first-other.bin",
+            md5,
+            10,
+            MediaKind::Other,
+        );
+        let (mut pending, identity, record) = take_media_task(production_with_options(
+            root.path(),
+            r"C:\first-other.bin",
+            md5,
+            10,
+            cached,
+            true,
+            true,
+        ))
+        .await;
+        assert_eq!(
+            record.missing.base_missing_parts(),
+            BASE_MISSING_PROBE | BASE_MISSING_STAGE1 | BASE_MISSING_CONTACT_SHEET
+        );
+        pending.contexts.get_mut(&identity).unwrap().cached = None;
+        let context = pending.contexts.get(&identity).unwrap().clone();
+        let content_id = context.content_id.unwrap();
+        let task_path = pending.dispatcher.lane_path(&lane(7)).unwrap();
+        let media = MediaPassResult {
+            pending,
+            completed: vec![TaskFileMediaCompleted {
+                identity: identity.clone(),
+                record,
+                context,
+                response: completed_response(&identity, md5, other_output()),
+                worker_slot: Some(8),
+            }],
+            file_failures: Vec::new(),
+            blocked_reason: None,
+            remaining_hash_rows: 0,
+            cancelled: false,
+        };
+        let (actor, handle, mut acknowledgements) = BaseStoreActor::spawn(store, 2);
+        let result = persist_task_file_media_results(
+            media,
+            &handle,
+            &mut acknowledgements,
+            TaskFileMediaPersistenceOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(task_path).unwrap()[0], b'C');
+        assert!(result.contexts.is_empty());
+        drop(handle);
+        let store = actor.finish().await.unwrap();
+        assert!(
+            store
+                .load_base_cache_record(content_id)
+                .unwrap()
+                .base_complete
+        );
+        assert!(store.page_file_faults(None, 10).unwrap().items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn forced_image_recompute_accepts_stage1_without_contact_sheet() {
+        let root = tempfile::tempdir().unwrap();
+        let md5 = [0xE5; 16];
+        let machine = MachineId::from_sha256([0xE6; 32]);
+        let mut store = NodeStore::open_in_memory(machine).unwrap();
+        let cached = seed_partial_kind(
+            &mut store,
+            r"C:\seed-force-image.bin",
+            md5,
+            10,
+            MediaKind::Image,
+        );
+        let (pending, identity, record) = take_media_task(production_with_options(
+            root.path(),
+            r"C:\force-image.bin",
+            md5,
+            10,
+            cached,
+            true,
+            true,
+        ))
+        .await;
+        let context = pending.contexts.get(&identity).unwrap().clone();
+        let task_path = pending.dispatcher.lane_path(&lane(7)).unwrap();
+        let media = MediaPassResult {
+            pending,
+            completed: vec![TaskFileMediaCompleted {
+                identity: identity.clone(),
+                record,
+                context,
+                response: completed_response(&identity, md5, image_output()),
+                worker_slot: Some(9),
+            }],
+            file_failures: Vec::new(),
+            blocked_reason: None,
+            remaining_hash_rows: 0,
+            cancelled: false,
+        };
+        let (actor, handle, mut acknowledgements) = BaseStoreActor::spawn(store, 2);
+        let result = persist_task_file_media_results(
+            media,
+            &handle,
+            &mut acknowledgements,
+            TaskFileMediaPersistenceOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(task_path).unwrap()[0], b'C');
+        assert!(result.contexts.is_empty());
+        drop(handle);
+        let store = actor.finish().await.unwrap();
+        assert!(store.page_file_faults(None, 10).unwrap().items.is_empty());
     }
 
     #[cfg(feature = "test-hooks")]
