@@ -116,3 +116,6 @@ Spec: `D:/code/mySingerServer/docs/superpowers/specs/2026-08-28-transient-task-f
 - Task 8E3B：提交 `1b95a0df`。外部 Stage2 background job 使用瞬态 runtime、唯一读取调度器与 task-file runner；RuntimeTask 终态延后到 Pool、SQLite actor、TSV 与真实 outbox 高水位收束后发布，旧任务表保持空。Actor 16/16、NodeEngine lib 141/141、Desktop cross phase2 3/3、fmt/diff 通过。
 - Task 8E3B fix round 1/5：独立审查发现成功扫描与 Restart/Shutdown 交错时可能先发布 Completed 却丢失 `latest_completed_scan`；提交 `7d6188af` 将扫描快照和终态合并为只能消费一次的 `BackgroundOutcome`，正常完成与停止路径均先安装快照再发布终态。定向交错 RED→GREEN，Actor 17/17、NodeEngine lib 142/142、fmt/diff 通过；定向复审确认 1 项 addressed、0 项 open。
 - Task 8E3B complete (commits `4072b530..7d6188af`, review clean)。
+- Task 9：提交 `ff220933`。新增 Windows 同目录 `MoveFileExW(REPLACE_EXISTING|WRITE_THROUGH)` 原子替换，以及固定 H/M/F 的 UTF-8/LF 最近分析结果 writer/校验器；旧结果在 partial 写入、显式 discard、格式失败和替换失败期间保持不变。原子文件 4/4、结果文件 3/3、Windows 23 通过/1 ignored、NodeEngine test-hooks lib 142/142、fmt/diff 通过。
+- Task 9 fix round 1/5：独立审查发现未显式 discard 的 writer 会遗留 partial，且发布元数据缺少直达 `run_id/library_revision/group_count`；提交 `8d946cf3` 增加未完成 writer 的 best-effort Drop 精确清理、唯一组计数及锁定旧 result 的 writer 层失败证据。结果文件 6/6、原子文件 4/4、Windows 23 通过/1 ignored、NodeEngine test-hooks lib 142/142、fmt/diff 通过；定向复审确认 2 项 addressed、0 项 open。
+- Task 9 complete (commits `6b6731dd..8d946cf3`, review clean)。
