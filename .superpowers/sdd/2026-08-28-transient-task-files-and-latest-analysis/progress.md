@@ -128,3 +128,9 @@ Spec: `D:/code/mySingerServer/docs/superpowers/specs/2026-08-28-transient-task-f
 - Task 10C complete (commits `3ec6868..70d2886`, focused review findings closed)。
 - Task 11/12 Ruling: Node 保留最近本地结果的只读窗口协议，但 Desktop 不实现或调用 Node 本地 analysis 窗口；Task11 只落 Node reader/actor/wire，Task12 只把 PostgreSQL 中心结果改成 UI 滑动窗口并删除旧本地分支 — 直接用户约束“desktop 不需要 node 的 analysis 结果”晚于旧计划，且这样不会复制两套结果事实 — 若判断错误，代价是未来 Node 本地管理界面需要另加一个协议客户端。
 - Task 11 Ruling: `ReadLocalResultWindow.group_kind` 使用新 message 的 field 12，保留草案 fields 1..11，不让客户端读取全量后过滤 — 原计划接口要求 `Groups(GroupKind)`，但 proto 草案漏字段 — 若判断错误，代价仅是尚未发布的新 tag 46 消息字段布局需要在发布前调整。
+- Task 11：提交 `cfadb360`。最近成功 TSV 通过顺序 H/M/F 校验建立进程内组摘要和成员 `u64` 偏移，窗口 seek 不创建 `.idx`；V5 新增 tag 46、显式 `group_kind` 和 `GroupMember.display_path=12`，Desktop 未接入 Node 本地结果。
+- Task 11 review：发现两项阻塞问题：损坏结果被降为 Internal/NotFound；reader 按固定路径重开导致替换到 actor 安装之间读错文件且安装失败会丢旧磁盘结果。
+- Task 11 fix round 1/5：提交 `78170400`。`InvalidResult=7` 与启动 Invalid 状态已解决第一项；第二项仍因原子替换后 `bind_prepared` 重新打开路径而未闭环，scoped re-review 为 1 addressed、1 open。
+- Task 11 fix round 2/5：提交 `7a237c39`。替换前完整验证产生并持有稳定文件句柄，Windows 原子替换直接移动同一文件身份，替换后不再执行 fallible open/bind；scoped re-review 为 1 addressed、0 open，无新 Critical/Important。
+- Task 11 controller verification：analysis_result_window 7/7、analysis_result_file 6/6、dedup-protocol 24 项、dedup-windows atomic_file 5/5、NodeEngine test-hooks lib 155/155、`cargo fmt --all -- --check`、`git diff --check` 全通过；C/D 可用空间 22.82/16.05 GiB。
+- Task 11 complete (commits `dcf9c37..7a237c39`, review clean)。
