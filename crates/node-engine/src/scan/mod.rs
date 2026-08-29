@@ -18,6 +18,7 @@ mod task_file_cache;
 mod task_file_media_compute;
 mod task_file_media_persistence;
 mod task_file_scan_run;
+mod task_file_stage2_compute;
 pub(crate) use task_file_base_coordinator::{
     TaskFileBaseCoordinatorError, TaskFileBaseCoordinatorOptions, TaskFileBaseCoordinatorResult,
     TaskFileBaseCoordinatorSummary, run_task_file_base_coordinator,
@@ -36,6 +37,10 @@ pub(crate) use task_file_media_persistence::{
 pub(crate) use task_file_scan_run::{
     CompletedScanSnapshot, ScanRunResult, TaskFileScanRunOptions, run_task_file_scan,
     run_task_file_scan_with_runtime,
+};
+pub(crate) use task_file_stage2_compute::{
+    Stage2TaskComputeError, Stage2TaskInput, Stage2TaskProducerError, Stage2TaskProduction,
+    Stage2TaskRunResult, build_stage2_task_production, run_task_file_stage2,
 };
 
 #[cfg(feature = "test-hooks")]
