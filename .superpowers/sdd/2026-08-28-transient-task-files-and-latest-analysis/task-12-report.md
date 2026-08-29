@@ -88,14 +88,14 @@ C:\tmp\rust-v2-core-scope-target-task7b2d2c1
 | `cargo test -p dedup-desktop-core --test delete_scope --locked -- --test-threads=1` | 1 passed |
 | `cargo test -p dedup-desktop-core --test local_node_e2e --locked -- --test-threads=1` | 1 ignored；缺少真实测试包 |
 | `cargo test -p dedup-desktop-core --test cross_phase2 --locked -- --test-threads=1` | 3 passed |
-| `cargo test -p dedup-desktop-core --lib --locked -- --test-threads=1` | 4 passed |
+| `cargo test -p dedup-desktop-core --lib --locked -- --test-threads=1` | 6 passed |
 | `cargo test -p dedup-desktop-ui --test bindings_contract --locked -- --test-threads=1` | 15 passed |
 | `cargo test -p dedup-desktop-ui --test window_contract --locked -- --test-threads=1` | 21 passed |
 | `cargo test -p dedup-desktop-ui --test offscreen_layout --locked -- --test-threads=1` | 20 passed |
 | `cargo fmt --all -- --check` | passed |
 | `git diff --check` | passed |
 
-合计 71 项通过、0 项失败、1 项因未提供 `DEDUP_TEST_PACKAGE_ROOT` 或 release staging 明确 ignored。ignored 项没有计为通过。
+合计 73 项通过、0 项失败、1 项因未提供 `DEDUP_TEST_PACKAGE_ROOT` 或 release staging 明确 ignored。ignored 项没有计为通过。
 
 ## 审查修复
 
@@ -103,7 +103,8 @@ C:\tmp\rust-v2-core-scope-target-task7b2d2c1
 
 - 滚动请求增加 80 毫秒单次防抖，只提交最新可见窗口；永久去重键同时包含运行、类别和组，切换上下文后相同窗口仍会重新查询。旧实现的真实 MainWindow 行为记录到 3 次连续请求，修复后只发最后 1 次。
 - Core 为组和成员请求保存完整作用域。成员请求在查询前、查询后都核对运行、类别、组和请求身份；删除成功立即使组/成员窗口及在途请求失效。旧实现中 R1 的迟到成员响应会在切换 R2 后继续发布，修复后不再发布旧响应。
-- 两项修复合并后重新运行 Desktop Core/UI 相关套件，共 71 项通过；格式和差异检查通过。
+- 第一轮修复后复审确认迟到响应已经关闭，但指出 80 毫秒 UI 防抖不能阻止慢 PostgreSQL 查询期间继续填满公共 64 槽通道。最终修复在 Core 前增加持续排空的轻量命令路由：组窗口和成员窗口各自只有一个 latest-only 槽，普通命令保持独立顺序通道。控制循环暂停时分别发送 96 条组窗口和 96 条成员窗口，真实行为测试证明公共通道不阻塞、每类只执行最后一条，Refresh 和 SaveReview 均未丢失。
+- 最终合并后重新运行 Desktop Core/UI 相关套件，共 73 项通过；格式和差异检查通过。
 
 ## 文件清单
 

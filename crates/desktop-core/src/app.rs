@@ -4,7 +4,7 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -14,7 +14,7 @@ use dedup_core::{
 };
 use dedup_protocol::proto;
 use tokio::{
-    sync::mpsc,
+    sync::{Notify, mpsc},
     task::JoinHandle,
     time::{Interval, MissedTickBehavior, interval},
 };
@@ -283,11 +283,22 @@ impl DesktopApp {
         let state = DesktopViewState::new(config, paths);
         let runtime_tasks = DesktopRuntimeTaskRegistry::new();
         let (commands, command_receiver) = mpsc::channel(64);
+        let (control_sender, control_receiver) = mpsc::unbounded_channel();
+        let (groups_sender, groups_receiver) = LatestWindowSlot::pair();
+        let (members_sender, members_receiver) = LatestWindowSlot::pair();
         let (events, event_receiver) = mpsc::channel(64);
+        tokio::spawn(route_ui_commands(
+            command_receiver,
+            control_sender,
+            groups_sender,
+            members_sender,
+        ));
         tokio::spawn(run_controller(
             state,
             config_path,
-            command_receiver,
+            control_receiver,
+            groups_receiver,
+            members_receiver,
             events,
             runtime_tasks.clone(),
         ));
@@ -402,6 +413,149 @@ impl ActiveWindowRequest {
     }
 }
 
+/// 结果窗口命令的合并作用域；不同运行或成员组不能互相覆盖。
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum WindowCommandScope {
+    /// 同一中心运行和结果类别的组窗口。
+    Groups {
+        /// 中心分析运行 UUID 文本。
+        analysis_run_id: String,
+        /// 结果类别。
+        kind: GroupKind,
+    },
+    /// 同一中心运行、结果类别和持久组的成员窗口。
+    Members {
+        /// 中心分析运行 UUID 文本。
+        analysis_run_id: String,
+        /// 结果类别。
+        kind: GroupKind,
+        /// 持久组 ID。
+        group_id: String,
+    },
+}
+
+/// 返回窗口命令的合并键；非窗口命令返回 None，必须原样保留顺序。
+fn window_command_scope(command: &UiCommand) -> Option<WindowCommandScope> {
+    match command {
+        UiCommand::RequestGroupWindow { request } => Some(WindowCommandScope::Groups {
+            analysis_run_id: request.analysis_run_id.clone(),
+            kind: request.kind,
+        }),
+        UiCommand::RequestMemberWindow { request, group_id } => Some(WindowCommandScope::Members {
+            analysis_run_id: request.analysis_run_id.clone(),
+            kind: request.kind,
+            group_id: group_id.clone(),
+        }),
+        _ => None,
+    }
+}
+
+/// 单个窗口类型的最新请求槽；控制循环暂停时也不会堆积旧窗口。
+#[derive(Clone)]
+struct LatestWindowSlot {
+    /// 槽位值及关闭标记。
+    state: Arc<LatestWindowSlotState>,
+}
+
+struct LatestWindowSlotState {
+    /// 以互斥锁保护最新请求，发送方不会等待控制循环。
+    value: Mutex<LatestWindowSlotValue>,
+    /// 请求更新或槽位关闭时唤醒接收方。
+    notify: Notify,
+}
+
+struct LatestWindowSlotValue {
+    /// 尚未开始执行的最新窗口请求。
+    command: Option<UiCommand>,
+    /// 路由器停止后不再接收请求。
+    closed: bool,
+}
+
+impl LatestWindowSlot {
+    /// 创建一对共享同一最新值的发送端与接收端。
+    fn pair() -> (Self, Self) {
+        let state = Arc::new(LatestWindowSlotState {
+            value: Mutex::new(LatestWindowSlotValue {
+                command: None,
+                closed: false,
+            }),
+            notify: Notify::new(),
+        });
+        (
+            Self {
+                state: state.clone(),
+            },
+            Self { state },
+        )
+    }
+
+    /// 替换尚未开始的窗口请求，并唤醒控制循环。
+    fn replace(&self, command: UiCommand) {
+        let should_notify = {
+            let mut value = self.state.value.lock().expect("窗口槽锁不应中毒");
+            if value.closed {
+                false
+            } else {
+                value.command = Some(command);
+                true
+            }
+        };
+        if should_notify {
+            self.state.notify.notify_one();
+        }
+    }
+
+    /// 关闭槽位并唤醒等待中的控制循环。
+    fn close(&self) {
+        {
+            let mut value = self.state.value.lock().expect("窗口槽锁不应中毒");
+            value.closed = true;
+        }
+        self.state.notify.notify_waiters();
+    }
+
+    /// 取出当前最新窗口；新请求到达时旧请求已被替换。
+    async fn recv(&self) -> Option<UiCommand> {
+        loop {
+            let notified = self.state.notify.notified();
+            let (command, closed) = {
+                let mut value = self.state.value.lock().expect("窗口槽锁不应中毒");
+                (value.command.take(), value.closed)
+            };
+            if let Some(command) = command {
+                return Some(command);
+            }
+            if closed {
+                return None;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// 持续排空公共命令通道：窗口只保留最新值，普通命令原样进入控制通道。
+async fn route_ui_commands(
+    mut commands: mpsc::Receiver<UiCommand>,
+    control: mpsc::UnboundedSender<UiCommand>,
+    groups: LatestWindowSlot,
+    members: LatestWindowSlot,
+) {
+    while let Some(command) = commands.recv().await {
+        match window_command_scope(&command) {
+            Some(WindowCommandScope::Groups { .. }) => groups.replace(command),
+            Some(WindowCommandScope::Members { .. }) => members.replace(command),
+            None => {
+                let shutdown = matches!(&command, UiCommand::Shutdown);
+                if control.send(command).is_err() || shutdown {
+                    break;
+                }
+            }
+        }
+    }
+    groups.close();
+    members.close();
+}
+
 /// 一个节点独占的同步触发端和后台任务；丢弃时立即结束其 PG 连接与同步请求。
 struct NodeSyncWorker {
     id: Uuid,
@@ -477,7 +631,9 @@ enum NodeRuntimeEventOutcome {
 async fn run_controller(
     mut state: DesktopViewState,
     config_path: PathBuf,
-    mut commands: mpsc::Receiver<UiCommand>,
+    mut control_commands: mpsc::UnboundedReceiver<UiCommand>,
+    group_commands: LatestWindowSlot,
+    member_commands: LatestWindowSlot,
     events: mpsc::Sender<UiEvent>,
     runtime_tasks: DesktopRuntimeTaskRegistry,
 ) {
@@ -503,6 +659,9 @@ async fn run_controller(
     let mut reconnect_ticks = repeating_interval(state.config().reconnect_interval_seconds);
     let mut catch_up_ticks = repeating_interval(AUTO_CATCH_UP_INTERVAL_SECONDS);
     let mut runtime_ticks = runtime_task_interval();
+    // 路由器关闭后只停用对应窗口分支，仍要让控制通道处理 Shutdown。
+    let mut group_commands_open = true;
+    let mut member_commands_open = true;
     catch_up_ticks.tick().await;
     runtime_ticks.tick().await;
     // 先发布统一运行任务所有者的空快照，再发布普通视图，避免 UI 启动时出现第二个任务来源。
@@ -510,9 +669,23 @@ async fn run_controller(
     publish(&events, &state).await;
     loop {
         let command = tokio::select! {
-            command = commands.recv() => match command {
+            command = control_commands.recv() => match command {
                 Some(command) => command,
                 None => break,
+            },
+            command = group_commands.recv(), if group_commands_open => match command {
+                Some(command) => command,
+                None => {
+                    group_commands_open = false;
+                    continue;
+                }
+            },
+            command = member_commands.recv(), if member_commands_open => match command {
+                Some(command) => command,
+                None => {
+                    member_commands_open = false;
+                    continue;
+                }
             },
             _ = reconnect_ticks.tick() => {
                 let result_lost = reconnect_and_sync(
@@ -2753,6 +2926,128 @@ mod tests {
             !active.member_scope_is_current(&scope),
             "组范围改变后迟到成员结果必须静默丢弃"
         );
+    }
+
+    /// 模拟控制循环暂停期间的窗口洪峰，路由器必须不受公共 64 槽通道限制。
+    #[tokio::test]
+    async fn paused_controller_keeps_latest_window_and_control_commands() {
+        let (sender, receiver) = mpsc::channel(64);
+        let (control_sender, mut control_receiver) = mpsc::unbounded_channel();
+        let (groups_sender, groups_receiver) = LatestWindowSlot::pair();
+        let (members_sender, members_receiver) = LatestWindowSlot::pair();
+        let router = tokio::spawn(route_ui_commands(
+            receiver,
+            control_sender,
+            groups_sender,
+            members_sender,
+        ));
+        let run_id = AnalysisRunId::new().as_uuid().to_string();
+        for start_index in 0..96 {
+            sender
+                .send(UiCommand::RequestGroupWindow {
+                    request: ResultWindowRequest::new(
+                        run_id.clone(),
+                        GroupKind::Exact,
+                        start_index,
+                        20,
+                    ),
+                })
+                .await
+                .unwrap();
+        }
+        sender.send(UiCommand::Refresh).await.unwrap();
+        let latest = ResultWindowRequest::new(run_id, GroupKind::Exact, 95, 20);
+        // Refresh 与所有窗口共用同一条路由顺序；先收到它即可确认 96 个窗口均已路由。
+        assert!(matches!(
+            control_receiver.recv().await,
+            Some(UiCommand::Refresh)
+        ));
+        let selected = groups_receiver.recv().await.expect("路由器应保留组窗口");
+        assert!(
+            matches!(
+                selected,
+                UiCommand::RequestGroupWindow { request } if request == latest
+            ),
+            "慢查询期间只应保留最新组窗口"
+        );
+
+        for start_index in 0..96 {
+            sender
+                .send(UiCommand::RequestMemberWindow {
+                    request: ResultWindowRequest::new(
+                        latest.analysis_run_id.clone(),
+                        GroupKind::Exact,
+                        start_index,
+                        20,
+                    ),
+                    group_id: "group-1".into(),
+                })
+                .await
+                .unwrap();
+        }
+        sender
+            .send(UiCommand::SaveReview {
+                machine_id: "machine-1".into(),
+                normalized_path: "C:\\media\\one.jpg".into(),
+                decision: ReviewDecision::Keep,
+            })
+            .await
+            .unwrap();
+        let member_latest =
+            ResultWindowRequest::new(latest.analysis_run_id.clone(), GroupKind::Exact, 95, 20);
+        assert!(
+            matches!(
+                control_receiver.recv().await,
+                Some(UiCommand::SaveReview {
+                    decision: ReviewDecision::Keep,
+                    ..
+                })
+            ),
+            "普通复核命令必须原样保留"
+        );
+        let selected = members_receiver.recv().await.expect("路由器应保留成员窗口");
+        assert!(
+            matches!(
+                selected,
+                UiCommand::RequestMemberWindow { request, group_id }
+                    if request == member_latest && group_id == "group-1"
+            ),
+            "慢查询期间只应保留最新成员窗口"
+        );
+
+        router.abort();
+    }
+
+    /// 路由器因 Shutdown 关闭窗口槽时，控制循环仍必须消费并发布关闭完成事件。
+    #[tokio::test]
+    async fn shutdown_is_not_lost_when_window_slots_close() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = DesktopConfig {
+            nodes: Vec::new(),
+            postgres_url: None,
+            ..DesktopConfig::default()
+        };
+        let (app, mut events) = DesktopApp::start(config, test_desktop_paths(temp.path()));
+        let request = ResultWindowRequest::new(
+            AnalysisRunId::new().as_uuid().to_string(),
+            GroupKind::Exact,
+            0,
+            20,
+        );
+        app.send(UiCommand::RequestGroupWindow { request })
+            .await
+            .unwrap();
+        app.send(UiCommand::Shutdown).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(events.recv().await, Some(UiEvent::ShutdownComplete)) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("窗口槽关闭时 Shutdown 不应丢失");
     }
 
     /// 构造带明确运行状态的 Node 主动事件。
