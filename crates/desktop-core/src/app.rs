@@ -1,7 +1,7 @@
 //! Slint 回调与异步节点/中心服务之间的单向命令和事件通道。
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -22,15 +22,12 @@ use uuid::Uuid;
 
 use crate::{
     analysis::{CrossAnalysisCoordinator, CrossNodeSelection, CrossPollReport},
-    central::{
-        CentralAnalysisStatus, CentralDeleteOutcome, CentralDeleteResult, CentralDeleteSelection,
-        CentralError, CentralReviewDecision, CentralStore, inspect_database,
-    },
+    central::{CentralAnalysisStatus, CentralError, CentralStore, inspect_database},
     delete::{DeleteConfirmation, ReviewGroup},
     node_session::NodeSession,
     results::{
-        CentralResultWindowCache, GroupKind, MemberView, ResultScope, ResultWindowRequest,
-        ResultWindowState, load_preview,
+        CentralResultWindowCache, GroupKind, MemberView, ResultWindowRequest, ResultWindowState,
+        load_preview,
     },
     review::{QuickReviewRule, ReviewBoard, ReviewDecision},
     runtime_tasks::{
@@ -328,7 +325,6 @@ impl DesktopApp {
 }
 
 struct LoadedMembersContext {
-    scope: ResultScope,
     kind: GroupKind,
     group_id: String,
     /// 当前中心窗口对应的运行身份，便于迟到响应门禁。
@@ -341,7 +337,6 @@ struct LoadedMembersContext {
 }
 
 struct PreparedDeleteContext {
-    scope: ResultScope,
     group_id: String,
     confirmation: DeleteConfirmation,
     items: Vec<MemberView>,
@@ -1053,7 +1048,6 @@ async fn run_controller(
                                     member.review = board.decision(&member.location);
                                 }
                                 let context = LoadedMembersContext {
-                                    scope: ResultScope::Central { run_id },
                                     kind: request.kind,
                                     group_id: group_id.clone(),
                                     run_id,
@@ -1110,7 +1104,6 @@ async fn run_controller(
                         decision,
                         loaded_members.as_mut(),
                         &mut review_boards,
-                        central.as_ref(),
                         &events,
                     )
                     .await
@@ -1125,14 +1118,8 @@ async fn run_controller(
                 ) {
                     Err(error)
                 } else {
-                    apply_quick_review(
-                        rule,
-                        loaded_members.as_mut(),
-                        &mut review_boards,
-                        central.as_ref(),
-                        &events,
-                    )
-                    .await
+                    apply_quick_review(rule, loaded_members.as_mut(), &mut review_boards, &events)
+                        .await
                 }
             }
             UiCommand::LoadPreview {
@@ -1176,13 +1163,7 @@ async fn run_controller(
                 ) {
                     Err(error)
                 } else {
-                    confirm_delete(
-                        prepared_delete.as_ref(),
-                        &sessions,
-                        central.as_mut(),
-                        &events,
-                    )
-                    .await
+                    confirm_delete(prepared_delete.as_ref(), &sessions, &events).await
                 };
                 if result.is_ok() {
                     prepared_delete = None;
@@ -2365,7 +2346,6 @@ async fn save_one_review(
     decision: ReviewDecision,
     context: Option<&mut LoadedMembersContext>,
     review_boards: &mut BTreeMap<(AnalysisRunId, String), ReviewBoard>,
-    central: Option<&CentralStore>,
     events: &mpsc::Sender<UiEvent>,
 ) -> Result<(), String> {
     let context = context.ok_or_else(|| "尚未载入重复组成员".to_owned())?;
@@ -2375,7 +2355,6 @@ async fn save_one_review(
     }
     let run_id = context.run_id;
     let group_id = context.group_id.clone();
-    persist_central_review(central, run_id, &group_id, &location, decision).await?;
     context.review_board.set(location.clone(), decision);
     review_boards.insert((run_id, group_id), context.review_board.clone());
     if let Some(member) = context
@@ -2392,7 +2371,6 @@ async fn apply_quick_review(
     rule: QuickReviewRule,
     context: Option<&mut LoadedMembersContext>,
     review_boards: &mut BTreeMap<(AnalysisRunId, String), ReviewBoard>,
-    central: Option<&CentralStore>,
     events: &mpsc::Sender<UiEvent>,
 ) -> Result<(), String> {
     let context = context.ok_or_else(|| "尚未载入重复组成员".to_owned())?;
@@ -2400,16 +2378,6 @@ async fn apply_quick_review(
     let changes = next_board.apply_quick_rule(&context.items, rule);
     if changes.is_empty() {
         return Err("当前组没有满足快捷规则的活动成员".into());
-    }
-    for change in &changes {
-        persist_central_review(
-            central,
-            context.run_id,
-            &context.group_id,
-            &change.location,
-            change.decision,
-        )
-        .await?;
     }
     context.review_board = next_board;
     review_boards.insert(
@@ -2420,21 +2388,6 @@ async fn apply_quick_review(
         member.review = context.review_board.decision(&member.location);
     }
     publish_members(events, context).await
-}
-
-/// 暂时保留中心复核持久化兼容调用；Task13 再移除该边界。
-async fn persist_central_review(
-    central: Option<&CentralStore>,
-    run_id: AnalysisRunId,
-    group_id: &str,
-    location: &LocationKey,
-    decision: ReviewDecision,
-) -> Result<(), String> {
-    central
-        .ok_or_else(|| "PostgreSQL 中心模式未启用".to_owned())?
-        .save_review_mark(run_id, group_id, location, central_review(decision))
-        .await
-        .map_err(|error| error.to_string())
 }
 
 async fn load_member_preview(
@@ -2509,7 +2462,6 @@ async fn prepare_delete(
     );
     runtime.mark_delete_prepared();
     *prepared = Some(PreparedDeleteContext {
-        scope: context.scope,
         group_id: context.group_id.clone(),
         confirmation: confirmation.clone(),
         items,
@@ -2544,7 +2496,6 @@ async fn load_complete_review_group(
 async fn confirm_delete(
     prepared: Option<&PreparedDeleteContext>,
     sessions: &BTreeMap<usize, Arc<NodeSession>>,
-    central: Option<&mut CentralStore>,
     events: &mpsc::Sender<UiEvent>,
 ) -> Result<(), String> {
     let prepared = prepared.ok_or_else(|| "请先生成并检查删除确认摘要".to_owned())?;
@@ -2553,12 +2504,10 @@ async fn confirm_delete(
     }
     let executed: Result<Vec<proto::DeleteItem>, String> = async {
         execute_central_delete(
-            prepared.scope.run_id(),
             &prepared.group_id,
             &prepared.items,
             prepared.confirmation.mode,
             sessions,
-            central.ok_or_else(|| "PostgreSQL 中心模式未启用".to_owned())?,
         )
         .await
     }
@@ -2588,39 +2537,149 @@ async fn confirm_delete(
     }
 }
 
-async fn execute_central_delete(
-    run_id: AnalysisRunId,
+/// Desktop 当前进程生成的一次临时删除批次；不写入 PostgreSQL。
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DesktopDeletePlan {
+    /// 本次确认的批次标识，供各节点响应回传。
+    batch_id: String,
+    /// 按物理机器稳定排序后的删除项。
+    by_machine: BTreeMap<MachineId, Vec<DesktopDeleteItem>>,
+}
+
+/// 一项携带完整位置与内容身份的临时删除请求。
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DesktopDeleteItem {
+    /// 批次内按稳定顺序生成的项标识。
+    item_id: String,
+    /// 当前结果组标识，仅用于节点进度显示。
+    group_id: String,
+    /// 需要节点复核的物理位置。
+    location: LocationKey,
+    /// 用户确认时看到的内容身份。
+    expected: dedup_core::ContentKey,
+}
+
+/// 按位置排序并按物理机器分组，生成不依赖中心写入的删除计划。
+fn plan_desktop_delete(
+    batch_id: &str,
     group_id: &str,
     confirmed: &[MemberView],
-    mode: DeleteMode,
-    sessions: &BTreeMap<usize, Arc<NodeSession>>,
-    central: &mut CentralStore,
-) -> Result<Vec<proto::DeleteItem>, String> {
-    let selected = confirmed
-        .iter()
-        .map(|member| {
-            CentralDeleteSelection::new(
-                group_id.to_owned(),
-                member.location.clone(),
-                member.content,
-            )
-        })
-        .collect::<Vec<_>>();
-    let plan = central
-        .create_delete_plan(run_id, &selected, mode)
-        .await
-        .map_err(|error| error.to_string())?;
-    let mut by_machine = BTreeMap::<MachineId, Vec<_>>::new();
-    for item in &plan.items {
+) -> Result<DesktopDeletePlan, String> {
+    if batch_id.trim().is_empty() {
+        return Err("删除批次 ID 不能为空".into());
+    }
+    if confirmed.is_empty() {
+        return Err("删除批次没有确认项".into());
+    }
+    let mut members = confirmed.to_vec();
+    members.sort_by(|left, right| left.location.cmp(&right.location));
+    let mut by_machine = BTreeMap::<MachineId, Vec<DesktopDeleteItem>>::new();
+    let mut locations = BTreeSet::new();
+    for (index, member) in members.into_iter().enumerate() {
+        let item = DesktopDeleteItem {
+            item_id: format!("{batch_id}:{:08}", index + 1),
+            group_id: group_id.to_owned(),
+            location: member.location,
+            expected: member.content,
+        };
+        if !locations.insert(item.location.clone()) {
+            return Err("删除批次包含重复位置".into());
+        }
         by_machine
             .entry(item.location.machine_id().clone())
             .or_default()
             .push(item);
     }
+    Ok(DesktopDeletePlan {
+        batch_id: batch_id.to_owned(),
+        by_machine,
+    })
+}
+
+/// 校验节点返回的删除项是否仍与 Desktop 冻结的请求逐项一致。
+fn validate_delete_response_items(
+    expected: &[DesktopDeleteItem],
+    actual: &[proto::DeleteItem],
+) -> Result<Vec<proto::DeleteItem>, String> {
+    if expected.len() != actual.len() {
+        return Err(format!(
+            "节点删除响应数量不一致：请求 {} 项，返回 {} 项",
+            expected.len(),
+            actual.len()
+        ));
+    }
+    let mut expected_by_id = BTreeMap::new();
+    for item in expected {
+        if expected_by_id.insert(item.item_id.as_str(), item).is_some() {
+            return Err("Desktop 删除计划包含重复 item ID".into());
+        }
+    }
+    let mut actual_by_id = BTreeMap::new();
+    for item in actual {
+        let expected_item = expected_by_id
+            .get(item.delete_item_id.as_str())
+            .ok_or_else(|| format!("节点返回未知 item ID：{}", item.delete_item_id))?;
+        if !matches!(
+            item.outcome.as_str(),
+            "recycled" | "deleted" | "skipped" | "failed"
+        ) {
+            return Err(format!("节点返回未知删除结果：{}", item.outcome));
+        }
+        let location: LocationKey = item
+            .location
+            .clone()
+            .ok_or_else(|| format!("节点返回项缺少位置：{}", item.delete_item_id))?
+            .try_into()
+            .map_err(|_| format!("节点返回位置无效：{}", item.delete_item_id))?;
+        if location != expected_item.location {
+            return Err(format!("节点替换了冻结位置：{}", item.delete_item_id));
+        }
+        let content: dedup_core::ContentKey = item
+            .expected_content
+            .clone()
+            .ok_or_else(|| format!("节点返回项缺少内容身份：{}", item.delete_item_id))?
+            .try_into()
+            .map_err(|_| format!("节点返回内容身份无效：{}", item.delete_item_id))?;
+        if content != expected_item.expected {
+            return Err(format!("节点替换了冻结内容身份：{}", item.delete_item_id));
+        }
+        if item.group_id != expected_item.group_id {
+            return Err(format!("节点替换了冻结组 ID：{}", item.delete_item_id));
+        }
+        if actual_by_id
+            .insert(item.delete_item_id.clone(), item.clone())
+            .is_some()
+        {
+            return Err(format!("节点重复返回 item ID：{}", item.delete_item_id));
+        }
+    }
+    expected
+        .iter()
+        .map(|item| {
+            actual_by_id
+                .remove(&item.item_id)
+                .ok_or_else(|| format!("节点响应缺少 item ID：{}", item.item_id))
+        })
+        .collect()
+}
+
+/// 将确认集合按节点发送临时删除批次，并只汇总节点返回结果。
+async fn execute_central_delete(
+    group_id: &str,
+    confirmed: &[MemberView],
+    mode: DeleteMode,
+    sessions: &BTreeMap<usize, Arc<NodeSession>>,
+) -> Result<Vec<proto::DeleteItem>, String> {
+    let plan = plan_desktop_delete(&Uuid::now_v7().to_string(), group_id, confirmed)?;
+    let DesktopDeletePlan {
+        batch_id,
+        by_machine,
+    } = plan;
     let mut all_items = Vec::new();
     for (machine, items) in by_machine {
         let session = session_by_machine(sessions, &machine)
             .ok_or_else(|| format!("节点 {} 当前未连接", machine.as_str()))?;
+        let expected_items = items.clone();
         let wire = items
             .into_iter()
             .map(|item| proto::DeleteItem {
@@ -2633,36 +2692,16 @@ async fn execute_central_delete(
             })
             .collect();
         let response = session
-            .execute_central_delete_batch(&plan.batch_id, wire, mode)
+            .execute_central_delete_batch(&batch_id, wire, mode)
             .await
             .map_err(|error| error.to_string())?;
-        let results = response
-            .items
-            .iter()
-            .map(central_delete_result)
-            .collect::<Result<Vec<_>, String>>()?;
-        central
-            .apply_delete_results(&plan.batch_id, &results)
-            .await
-            .map_err(|error| error.to_string())?;
-        all_items.extend(response.items);
+        if response.delete_batch_id != batch_id {
+            return Err("节点返回批次 ID 与请求不一致".into());
+        }
+        let validated = validate_delete_response_items(&expected_items, &response.items)?;
+        all_items.extend(validated);
     }
     Ok(all_items)
-}
-
-fn central_delete_result(item: &proto::DeleteItem) -> Result<CentralDeleteResult, String> {
-    let outcome = match item.outcome.as_str() {
-        "recycled" => CentralDeleteOutcome::Recycled,
-        "deleted" => CentralDeleteOutcome::Deleted,
-        "skipped" => CentralDeleteOutcome::Skipped,
-        "failed" => CentralDeleteOutcome::Failed,
-        _ => return Err("节点返回未知删除结果".into()),
-    };
-    Ok(CentralDeleteResult {
-        item_id: item.delete_item_id.clone(),
-        outcome,
-        message: (!item.message.is_empty()).then(|| item.message.clone()),
-    })
 }
 
 fn summarize_delete_items(items: &[proto::DeleteItem]) -> String {
@@ -2749,14 +2788,6 @@ fn session_by_machine<'a>(
         .values()
         .find(|session| session.machine_id() == machine)
         .map(Arc::as_ref)
-}
-
-const fn central_review(decision: ReviewDecision) -> CentralReviewDecision {
-    match decision {
-        ReviewDecision::Undecided => CentralReviewDecision::Undecided,
-        ReviewDecision::Keep => CentralReviewDecision::Keep,
-        ReviewDecision::Delete => CentralReviewDecision::Delete,
-    }
 }
 
 async fn connect_central(state: &mut DesktopViewState) -> Option<CentralStore> {
@@ -2901,6 +2932,217 @@ mod tests {
             active.begin_member_scope(&request, "r1-group").is_none(),
             "删除成功后旧成员请求不得重新启动"
         );
+    }
+
+    #[test]
+    fn desktop_delete_plan_groups_members_without_central_persistence() {
+        let group_id = "group-local";
+        let left_machine = MachineId::parse(&"11".repeat(32)).unwrap();
+        let right_machine = MachineId::parse(&"22".repeat(32)).unwrap();
+        let left = MemberView::new(
+            LocationKey::new(
+                left_machine,
+                NormalizedPath::new("C:\\media\\left.jpg").unwrap(),
+            ),
+            dedup_core::ContentKey::new([0x11; 16], 11),
+            false,
+            true,
+        );
+        let right = MemberView::new(
+            LocationKey::new(
+                right_machine,
+                NormalizedPath::new("D:\\media\\right.jpg").unwrap(),
+            ),
+            dedup_core::ContentKey::new([0x22; 16], 22),
+            false,
+            true,
+        );
+        let left_location = left.location.clone();
+        let left_content = left.content;
+        let right_location = right.location.clone();
+        let right_content = right.content;
+
+        let first =
+            plan_desktop_delete("batch-stable", group_id, &[right.clone(), left.clone()]).unwrap();
+        let second = plan_desktop_delete("batch-stable", group_id, &[right, left]).unwrap();
+
+        assert_eq!(first, second, "相同确认集合必须生成稳定的本地删除计划");
+        assert_eq!(first.by_machine.len(), 2, "删除项必须按物理机器分组");
+        assert_eq!(first.by_machine.values().map(Vec::len).sum::<usize>(), 2);
+        for item in first.by_machine.values().flatten() {
+            assert_eq!(item.group_id, group_id);
+            assert!(item.item_id.starts_with(&format!("{}:", first.batch_id)));
+        }
+        let left_item = first
+            .by_machine
+            .get(left_location.machine_id())
+            .and_then(|items| items.first())
+            .unwrap();
+        assert_eq!(left_item.location, left_location);
+        assert_eq!(left_item.expected, left_content);
+        let right_item = first
+            .by_machine
+            .get(right_location.machine_id())
+            .and_then(|items| items.first())
+            .unwrap();
+        assert_eq!(right_item.location, right_location);
+        assert_eq!(right_item.expected, right_content);
+    }
+
+    #[test]
+    fn tampered_node_delete_response_is_rejected() {
+        let group_id = "group-response";
+        let first = MemberView::new(
+            LocationKey::new(
+                MachineId::parse(&"44".repeat(32)).unwrap(),
+                NormalizedPath::new("C:\\media\\first.jpg").unwrap(),
+            ),
+            dedup_core::ContentKey::new([0x44; 16], 44),
+            false,
+            true,
+        );
+        let second = MemberView::new(
+            LocationKey::new(
+                MachineId::parse(&"55".repeat(32)).unwrap(),
+                NormalizedPath::new("D:\\media\\second.jpg").unwrap(),
+            ),
+            dedup_core::ContentKey::new([0x55; 16], 55),
+            false,
+            true,
+        );
+        let plan = plan_desktop_delete("batch-response", group_id, &[second, first]).unwrap();
+        let expected = plan
+            .by_machine
+            .values()
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>();
+        let valid = expected
+            .iter()
+            .map(|item| proto::DeleteItem {
+                delete_item_id: item.item_id.clone(),
+                group_id: item.group_id.clone(),
+                location: Some((&item.location).into()),
+                expected_content: Some((&item.expected).into()),
+                outcome: "recycled".into(),
+                message: String::new(),
+            })
+            .collect::<Vec<_>>();
+
+        assert!(validate_delete_response_items(&expected, &valid).is_ok());
+        let baseline = valid.clone();
+
+        let mut unknown = baseline.clone();
+        unknown[0].outcome = "unknown".into();
+        assert!(
+            validate_delete_response_items(&expected, &unknown).is_err(),
+            "未知 outcome 不得被当作成功结果"
+        );
+
+        let missing = baseline[..1].to_vec();
+        assert!(
+            validate_delete_response_items(&expected, &missing).is_err(),
+            "缺少节点返回项必须报错"
+        );
+
+        let mut extra = baseline.clone();
+        extra.push(baseline[0].clone());
+        assert!(
+            validate_delete_response_items(&expected, &extra).is_err(),
+            "节点返回额外项必须报错"
+        );
+
+        let mut duplicate = baseline.clone();
+        duplicate[1].delete_item_id = duplicate[0].delete_item_id.clone();
+        assert!(
+            validate_delete_response_items(&expected, &duplicate).is_err(),
+            "节点返回重复 item ID 必须报错"
+        );
+
+        let replacement = LocationKey::new(
+            expected[0].location.machine_id().clone(),
+            NormalizedPath::new("C:\\media\\replacement.jpg").unwrap(),
+        );
+        let mut replaced_location = baseline.clone();
+        replaced_location[0].location = Some((&replacement).into());
+        assert!(
+            validate_delete_response_items(&expected, &replaced_location).is_err(),
+            "节点不得替换冻结的位置"
+        );
+
+        let mut replaced_content = baseline.clone();
+        replaced_content[0].expected_content =
+            Some((&dedup_core::ContentKey::new([0xaa; 16], 999)).into());
+        assert!(
+            validate_delete_response_items(&expected, &replaced_content).is_err(),
+            "节点不得替换冻结的内容身份"
+        );
+
+        let mut replaced_group = baseline;
+        replaced_group[0].group_id = "other-group".into();
+        assert!(
+            validate_delete_response_items(&expected, &replaced_group).is_err(),
+            "节点不得替换冻结的组 ID"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_commands_update_only_the_current_memory_board() {
+        let run_id = AnalysisRunId::new();
+        let machine = "33".repeat(32);
+        let member = MemberView::new(
+            LocationKey::new(
+                MachineId::parse(&machine).unwrap(),
+                NormalizedPath::new("C:\\media\\one.jpg").unwrap(),
+            ),
+            dedup_core::ContentKey::new([0x33; 16], 33),
+            false,
+            true,
+        );
+        let board = ReviewBoard::for_central(run_id, "group-memory", std::slice::from_ref(&member));
+        let mut context = LoadedMembersContext {
+            kind: GroupKind::Exact,
+            group_id: "group-memory".into(),
+            run_id,
+            items: vec![member.clone()],
+            review_board: board,
+            window: ResultWindowState {
+                start_index: 0,
+                total_rows: 1,
+                items: vec![member],
+                loading: false,
+                stale: false,
+            },
+        };
+        let mut review_boards = BTreeMap::new();
+        let (events, mut received) = mpsc::channel(1);
+
+        save_one_review(
+            &machine,
+            "C:\\media\\one.jpg",
+            ReviewDecision::Keep,
+            Some(&mut context),
+            &mut review_boards,
+            &events,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            context.review_board.decision(&context.items[0].location),
+            ReviewDecision::Keep
+        );
+        assert_eq!(
+            review_boards
+                .get(&(run_id, "group-memory".into()))
+                .unwrap()
+                .decision(&context.items[0].location),
+            ReviewDecision::Keep
+        );
+        assert!(matches!(
+            received.recv().await,
+            Some(UiEvent::ReviewChanged(_))
+        ));
     }
 
     #[test]
