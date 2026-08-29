@@ -1,21 +1,21 @@
-//! 结果摘要导出验收工具；固定四个参数，不进入正式发布包。
+//! 结果摘要导出验收工具；只读 SQLite/cache，并输出固定 `result-summary.tsv`。
 
 use std::{env, ffi::OsString, path::PathBuf, process::ExitCode};
 
 use dedup_node_store::result_summary::{
-    ResultSummaryError, export_scan_result_summary, validate_result_summary_pair,
+    ResultSummaryError, export_scan_result_summary, validate_result_summary,
 };
 
-/// 命令行固定参数，避免测试工具依赖额外解析器或隐式默认值。
-#[derive(Debug)]
+/// 命令行参数；`--media-root` 可重复，至少需要一项。
+#[derive(Debug, PartialEq, Eq)]
 struct CliArguments {
     database: PathBuf,
     cache_root: PathBuf,
-    task_id: String,
+    media_roots: Vec<PathBuf>,
     output: PathBuf,
 }
 
-/// CLI 参数或库执行失败；参数错误永远映射同一个稳定 code。
+/// CLI 参数错误或导出失败；错误码保持稳定供 PowerShell 读取。
 #[derive(Debug)]
 enum CliError {
     InvalidArgument,
@@ -23,7 +23,7 @@ enum CliError {
 }
 
 impl CliError {
-    /// 返回 stderr 使用的稳定错误码，不暴露动态中文诊断。
+    /// 返回 stderr 使用的稳定错误码，不泄露动态路径诊断。
     fn code(&self) -> &'static str {
         match self {
             Self::InvalidArgument => "INVALID_ARGUMENT",
@@ -32,7 +32,7 @@ impl CliError {
     }
 }
 
-/// 解析 `--database/--cache-root/--task-id/--output` 四组参数。
+/// 解析固定参数；每个 `--media-root value` 都追加到根列表，其他选项不可重复。
 fn parse_arguments<I>(arguments: I) -> Result<CliArguments, CliError>
 where
     I: IntoIterator<Item = OsString>,
@@ -46,16 +46,16 @@ where
     }
     let mut database = None;
     let mut cache_root = None;
-    let mut task_id = None;
+    let mut media_roots = Vec::new();
     let mut output = None;
     for pair in values.chunks_exact(2) {
-        let value = pair[1].clone();
+        let value = PathBuf::from(&pair[1]);
         match pair[0].as_str() {
-            "--database" if database.is_none() => database = Some(PathBuf::from(value)),
-            "--cache-root" if cache_root.is_none() => cache_root = Some(PathBuf::from(value)),
-            "--task-id" if task_id.is_none() => task_id = Some(value),
-            "--output" if output.is_none() => output = Some(PathBuf::from(value)),
-            "--database" | "--cache-root" | "--task-id" | "--output" => {
+            "--database" if database.is_none() => database = Some(value),
+            "--cache-root" if cache_root.is_none() => cache_root = Some(value),
+            "--media-root" => media_roots.push(value),
+            "--output" if output.is_none() => output = Some(value),
+            "--database" | "--cache-root" | "--output" => {
                 return Err(CliError::InvalidArgument);
             }
             _ => return Err(CliError::InvalidArgument),
@@ -64,7 +64,11 @@ where
     Ok(CliArguments {
         database: database.ok_or(CliError::InvalidArgument)?,
         cache_root: cache_root.ok_or(CliError::InvalidArgument)?,
-        task_id: task_id.ok_or(CliError::InvalidArgument)?,
+        media_roots: if media_roots.is_empty() {
+            return Err(CliError::InvalidArgument);
+        } else {
+            media_roots
+        },
         output: output.ok_or(CliError::InvalidArgument)?,
     })
 }
@@ -74,26 +78,24 @@ fn error_code(error: &ResultSummaryError) -> &'static str {
     match error {
         ResultSummaryError::Sqlite(_) => "SQLITE_ERROR",
         ResultSummaryError::Io(_) => "IO_ERROR",
-        ResultSummaryError::Json(_) => "JSON_ERROR",
         ResultSummaryError::InvalidArgument(_) => "INVALID_ARGUMENT",
-        ResultSummaryError::OutputCommitIncomplete => "OUTPUT_COMMIT_INCOMPLETE",
+        ResultSummaryError::InvalidOutput(_) => "INVALID_OUTPUT",
         ResultSummaryError::UnsupportedFileIdentity => "UNSUPPORTED_FILE_IDENTITY",
         ResultSummaryError::UnsafeArtifactPath => "UNSAFE_ARTIFACT_PATH",
     }
 }
 
-/// 执行固定导出并在 stdout 输出稳定字段顺序。
+/// 执行只读导出并输出固定字段，绝不输出 task ID 或 JSON metadata。
 fn run() -> Result<(), CliError> {
     let arguments = parse_arguments(env::args_os().skip(1))?;
     let result = export_scan_result_summary(
         &arguments.database,
         &arguments.cache_root,
-        &arguments.task_id,
+        &arguments.media_roots,
         &arguments.output,
     )
     .map_err(CliError::Export)?;
-    // CLI 打印结果前再次验证三件套，避免消费者只拿到单独 canonical。
-    validate_result_summary_pair(&result.output_path).map_err(CliError::Export)?;
+    validate_result_summary(&result.output_path).map_err(CliError::Export)?;
     println!("RESULT_SUMMARY_STATUS={}", result.status.as_str());
     println!("RESULT_SUMMARY_PATH={}", result.output_path.display());
     println!("RESULT_SUMMARY_SHA256={}", result.sha256);
@@ -103,11 +105,10 @@ fn run() -> Result<(), CliError> {
         "RESULT_SUMMARY_INCONCLUSIVE_COUNT={}",
         result.inconclusive_count
     );
-    println!("RESULT_SUMMARY_TASK_ID={}", result.task_id);
     Ok(())
 }
 
-/// CLI 入口；错误只输出稳定 code 并返回非零状态，不伪造摘要。
+/// CLI 入口；失败只打印稳定码并返回非零状态。
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -122,51 +123,64 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
 
-    /// 构造四个参数的有效前缀，单项测试只替换一个错误。
-    fn valid_arguments() -> Vec<OsString> {
-        [
+    /// 构造两个媒体根，确认重复参数按出现顺序保留。
+    #[test]
+    fn repeated_media_root_arguments_are_preserved() {
+        let arguments = [
             "--database",
             "node.db",
             "--cache-root",
             "cache",
-            "--task-id",
-            "task",
+            "--media-root",
+            r"C:\Media",
+            "--media-root",
+            r"D:\Media",
             "--output",
-            "result.jsonl",
+            "result-summary.tsv",
         ]
         .into_iter()
-        .map(OsString::from)
-        .collect()
+        .map(OsString::from);
+        let parsed = parse_arguments(arguments).expect("重复 media-root 应接受");
+        assert_eq!(
+            parsed.media_roots,
+            [PathBuf::from(r"C:\Media"), PathBuf::from(r"D:\Media")]
+        );
     }
 
-    /// 在当前平台构造无法转成 UTF-8 的命令行参数。
-    fn invalid_utf8_argument() -> OsString {
-        #[cfg(windows)]
-        {
-            use std::os::windows::ffi::OsStringExt;
-            return OsString::from_wide(&[0xD800]);
-        }
-        #[cfg(not(windows))]
-        {
-            use std::os::unix::ffi::OsStringExt;
-            return OsString::from_vec(vec![0xFF]);
-        }
-    }
-
+    /// 缺少 media root、重复单值参数和未知参数都使用同一稳定错误码。
     #[test]
-    fn invalid_cli_arguments_all_use_one_stable_code() {
-        let mut missing = valid_arguments();
-        missing.truncate(6);
-        let mut duplicate = valid_arguments();
-        duplicate.extend([OsString::from("--database"), OsString::from("again.db")]);
-        let mut unknown = valid_arguments();
-        unknown[0] = OsString::from("--unknown");
-        let mut non_utf8 = valid_arguments();
-        non_utf8[1] = invalid_utf8_argument();
-
-        for arguments in [missing, duplicate, unknown, non_utf8] {
-            let error = parse_arguments(arguments).expect_err("非法参数必须拒绝");
-            assert_eq!(error.code(), "INVALID_ARGUMENT");
+    fn invalid_cli_arguments_use_one_stable_code() {
+        let cases = [
+            vec![
+                "--database",
+                "node.db",
+                "--cache-root",
+                "cache",
+                "--output",
+                "result-summary.tsv",
+            ],
+            vec![
+                "--database",
+                "node.db",
+                "--database",
+                "again.db",
+                "--cache-root",
+                "cache",
+                "--media-root",
+                r"C:\Media",
+                "--output",
+                "result-summary.tsv",
+            ],
+            vec!["--unknown", "value"],
+        ];
+        for values in cases {
+            let arguments = values.into_iter().map(OsString::from);
+            assert_eq!(
+                parse_arguments(arguments)
+                    .expect_err("非法参数必须拒绝")
+                    .code(),
+                "INVALID_ARGUMENT"
+            );
         }
     }
 }

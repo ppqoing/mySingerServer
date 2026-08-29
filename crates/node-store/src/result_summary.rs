@@ -1,8 +1,6 @@
-//! 停止 Node 后从 SQLite 只读导出规范结果摘要。
+//! 读取节点长期缓存并导出固定 TSV 结果摘要；不读取或写入任何任务运行态表。
 
 use std::{
-    collections::HashSet,
-    ffi::OsString,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -12,25 +10,24 @@ use std::{
 #[cfg(feature = "acceptance-tools")]
 use std::sync::{Mutex, OnceLock};
 
+use dedup_core::NormalizedPath;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-/// 单次导出的证据完整性状态。
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+/// 一次只读结果导出的整体状态。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResultSummaryStatus {
-    /// 任务、内容、基础特征和必需 artifact 均完整。
+    /// 所有活动文件的内容和必需基础特征均完整。
     Pass,
-    /// 数据库可读，但任务、内容或预期 artifact 不存在。
+    /// 没有匹配媒体根的活动文件，或存在缺失内容/特征/artifact。
     Missing,
-    /// 数据存在互相矛盾、任务未终态或基础特征不完整。
+    /// 数据库字段或特征 payload 互相矛盾，无法裁决结果。
     Inconclusive,
 }
 
 impl ResultSummaryStatus {
-    /// 返回 CLI 和 metadata 使用的稳定大写状态名。
+    /// 返回 CLI 和 TSV 诊断使用的稳定大写状态名。
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Pass => "PASS",
@@ -40,56 +37,84 @@ impl ResultSummaryStatus {
     }
 }
 
-/// 导出文件及整体哈希的稳定返回值。
+/// 导出结果文件及固定 footer 的统计信息。
 #[derive(Debug)]
 pub struct ResultSummaryExport {
-    /// 调用方请求的任务 ID；仅用于诊断 metadata。
-    pub task_id: String,
-    /// SQLite 中的任务状态，任务不存在时为 `missing`。
-    pub task_status: String,
-    /// canonical JSONL 行数。
-    pub row_count: u64,
-    /// 缺少内容或 artifact 的行数。
-    pub missing_count: u64,
-    /// 任务/特征状态不确定的行数。
-    pub inconclusive_count: u64,
-    /// 本次导出的完整性状态。
+    /// 本次导出的整体状态。
     pub status: ResultSummaryStatus,
-    /// canonical JSONL 路径。
+    /// TSV 中 `R` 数据行数。
+    pub row_count: u64,
+    /// 状态为 `MISSING` 的数据行数。
+    pub missing_count: u64,
+    /// 状态为 `INCONCLUSIVE` 的数据行数。
+    pub inconclusive_count: u64,
+    /// 固定 `result-summary.tsv` 输出路径。
     pub output_path: PathBuf,
-    /// 诊断 metadata 路径；不参与 canonical hash。
-    pub metadata_path: PathBuf,
-    /// 包含最终 LF 的 canonical JSONL SHA-256。
+    /// 完整 TSV 文件（包含 footer 和最终 LF）的 SHA-256。
     pub sha256: String,
 }
 
-/// 导出器只报告数据库、文件、JSON、参数和路径安全错误。
+/// 导出器的只读数据库、文件、参数和 TSV 校验错误。
 #[derive(Debug, Error)]
 pub enum ResultSummaryError {
-    /// SQLite 只读连接、查询或 pragma 错误。
+    /// SQLite 只读连接、事务或查询失败。
     #[error("SQLite 读取失败: {0}")]
     Sqlite(#[from] rusqlite::Error),
-    /// 输入数据库、artifact 或输出文件读写错误。
+    /// 数据库、artifact 或输出文件读写失败。
     #[error("文件读取或写入失败: {0}")]
     Io(#[from] std::io::Error),
-    /// canonical 行或 metadata 的紧凑 JSON 编码错误。
-    #[error("JSON 编码失败: {0}")]
-    Json(#[from] serde_json::Error),
-    /// canonical 与 metadata 未能作为一个可消费 pair 完成提交。
-    #[error("成对摘要提交不完整")]
-    OutputCommitIncomplete,
-    /// 当前平台没有可证明替换关系的文件身份 API。
-    #[error("当前平台不支持文件身份校验")]
-    UnsupportedFileIdentity,
-    /// 调用方参数为空或输出父目录不存在等参数边界错误。
+    /// 输出路径、媒体根或数据库边界无效。
     #[error("导出参数无效: {0}")]
     InvalidArgument(String),
-    /// contact sheet 路径不是 cache root 内的普通相对路径。
+    /// 输出 TSV 不是固定格式或 footer 校验失败。
+    #[error("结果 TSV 校验失败: {0}")]
+    InvalidOutput(String),
+    /// 当前平台无法证明 artifact 文件身份。
+    #[error("当前平台不支持文件身份校验")]
+    UnsupportedFileIdentity,
+    /// 联系表路径越出隔离缓存根或包含重解析点。
     #[error("联系表路径越出隔离缓存根")]
     UnsafeArtifactPath,
 }
 
-/// 以 SQLite 只读、无 mutex 的方式打开数据库，并固定查询参数。
+const TSV_COLUMNS: [&str; 29] = [
+    "record_type",
+    "status",
+    "machine_id",
+    "normalized_path",
+    "display_path",
+    "file_size",
+    "md5",
+    "media_type",
+    "base_complete",
+    "feature_payload_sha256",
+    "image_stage1_sha256",
+    "image_stage2_sha256",
+    "video_metadata_sha256",
+    "video_frame_stage1_0_sha256",
+    "video_frame_stage1_1_sha256",
+    "video_frame_stage1_2_sha256",
+    "video_frame_stage1_3_sha256",
+    "video_frame_stage1_4_sha256",
+    "video_frame_stage1_5_sha256",
+    "video_frame_stage2_0_sha256",
+    "video_frame_stage2_1_sha256",
+    "video_frame_stage2_2_sha256",
+    "video_frame_stage2_3_sha256",
+    "video_frame_stage2_4_sha256",
+    "video_frame_stage2_5_sha256",
+    "thumbnail_sha256",
+    "thumbnail_state",
+    "contact_sheet_sha256",
+    "status_reason",
+];
+
+/// 固定 TSV 头行；字段顺序是对外协议的一部分。
+fn tsv_header() -> String {
+    format!("{}\n", TSV_COLUMNS.join("\t"))
+}
+
+/// 只读打开 SQLite；打开动作先完成，随后才捕获 WAL/SHM 快照。
 fn open_read_only_database(path: &Path) -> Result<Connection, ResultSummaryError> {
     let connection = Connection::open_with_flags(
         path,
@@ -99,25 +124,16 @@ fn open_read_only_database(path: &Path) -> Result<Connection, ResultSummaryError
     Ok(connection)
 }
 
-/// 在同一只读连接上建立事务并预读任务头，先完成 SQLite WAL/SHM 初始化。
-fn begin_result_summary_read_snapshot(
-    connection: &Connection,
-    task_id: &str,
-) -> Result<Option<TaskHeader>, ResultSummaryError> {
-    connection.execute_batch("BEGIN;")?;
-    load_task_header(connection, task_id)
-}
-
-/// acceptance-tools 可控读取阶段；正式构建不会暴露或执行这些测试注入点。
+/// acceptance-tools 可控制的读取阶段，验证首次 SQLite 打开不会误报 sidecar 变化。
 #[cfg(feature = "acceptance-tools")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum ResultSummaryReadTestHook {
     /// 不注入 sidecar 变化。
     None = 0,
-    /// SQLite 只读连接已建立，但 WAL/SHM 尚未冻结。
+    /// 只读连接建立后、sidecar 快照建立前。
     AfterDatabaseOpenBeforeSidecarCapture = 1,
-    /// WAL/SHM 已冻结，查询与提交尚未开始。
+    /// sidecar 快照建立后、数据库查询前。
     AfterSidecarCapture = 2,
 }
 
@@ -127,20 +143,20 @@ static RESULT_SUMMARY_READ_TEST_HOOK: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "acceptance-tools")]
 static RESULT_SUMMARY_READ_TEST_CALLBACK: OnceLock<Mutex<Option<fn(&Path)>>> = OnceLock::new();
 
-/// 设置下一次导出使用的一次性读取阶段测试注入点。
+/// 设置下一次导出的一次性读取阶段测试 hook。
 #[cfg(feature = "acceptance-tools")]
 pub fn set_result_summary_read_test_hook(hook: ResultSummaryReadTestHook) {
     RESULT_SUMMARY_READ_TEST_HOOK.store(hook as u64, Ordering::SeqCst);
 }
 
-/// 注册仅由验收测试调用的 sidecar 变化回调，生产构建不包含该 API。
+/// 注册仅由验收测试使用的 sidecar 变化回调。
 #[cfg(feature = "acceptance-tools")]
 pub fn set_result_summary_read_test_callback(callback: Option<fn(&Path)>) {
     let slot = RESULT_SUMMARY_READ_TEST_CALLBACK.get_or_init(|| Mutex::new(None));
     *slot.lock().expect("测试回调锁不应中毒") = callback;
 }
 
-/// 只消费匹配读取阶段，确保单次故障注入不会泄漏到之后的导出。
+/// 只消费匹配读取阶段，避免测试故障泄漏到下一次导出。
 #[cfg(feature = "acceptance-tools")]
 fn run_result_summary_read_test_hook(hook: ResultSummaryReadTestHook, database_path: &Path) {
     if RESULT_SUMMARY_READ_TEST_HOOK
@@ -159,7 +175,13 @@ fn run_result_summary_read_test_hook(hook: ResultSummaryReadTestHook, database_p
     }
 }
 
-/// 记录 SQLite 主库及 WAL/SHM sidecar 的存在性和内容哈希。
+/// 返回 SQLite 主库和 WAL/SHM sidecar 路径；不存在的 sidecar 保留为 None。
+#[cfg(feature = "acceptance-tools")]
+pub fn sidecar_paths_for_acceptance(database_path: &Path) -> [PathBuf; 2] {
+    sqlite_sidecar_paths(database_path)
+}
+
+/// SQLite 主库及 WAL/SHM 的内容快照。
 #[derive(Debug)]
 struct SidecarSnapshot {
     database_path: PathBuf,
@@ -167,7 +189,7 @@ struct SidecarSnapshot {
     entries: Vec<(PathBuf, Option<String>)>,
 }
 
-/// 返回 SQLite 的两个 sidecar 文件路径；不存在的文件仍记录为 None。
+/// 组合 SQLite sidecar 文件名而不经过 UTF-8 重编码。
 fn sqlite_sidecar_paths(database_path: &Path) -> [PathBuf; 2] {
     let mut wal = database_path.as_os_str().to_os_string();
     wal.push("-wal");
@@ -176,13 +198,7 @@ fn sqlite_sidecar_paths(database_path: &Path) -> [PathBuf; 2] {
     [PathBuf::from(wal), PathBuf::from(shm)]
 }
 
-/// acceptance-tools 测试使用的 sidecar 路径封装，保持原始 OsString 字节/宽字符。
-#[cfg(feature = "acceptance-tools")]
-pub fn sidecar_paths_for_acceptance(database_path: &Path) -> [PathBuf; 2] {
-    sqlite_sidecar_paths(database_path)
-}
-
-/// 读取一个 sidecar 的 SHA；NotFound 才表示不存在，其余错误必须向上传递。
+/// 读取 sidecar 内容 hash；只有 NotFound 才表示 sidecar 不存在。
 fn sidecar_hash(path: &Path) -> Result<Option<String>, ResultSummaryError> {
     match sha256_file_path(path) {
         Ok(hash) => Ok(Some(hash)),
@@ -193,31 +209,28 @@ fn sidecar_hash(path: &Path) -> Result<Option<String>, ResultSummaryError> {
     }
 }
 
-/// 在只读连接已建立后捕获 sidecar，读错误不得被静默忽略。
+/// 在只读连接建立之后捕获数据库和 sidecar 内容。
 fn capture_sidecars(database_path: &Path) -> Result<SidecarSnapshot, ResultSummaryError> {
-    let database_hash = sha256_file_path(database_path)?;
     let entries = sqlite_sidecar_paths(database_path)
         .into_iter()
         .map(|path| Ok((path.clone(), sidecar_hash(&path)?)))
         .collect::<Result<Vec<_>, ResultSummaryError>>()?;
     Ok(SidecarSnapshot {
         database_path: database_path.to_owned(),
-        database_hash,
+        database_hash: sha256_file_path(database_path)?,
         entries,
     })
 }
 
-/// 确认 SQLite 只读打开期间没有创建、删除或修改 WAL/SHM。
+/// 只读查询期间复核主库和 WAL/SHM 内容未被外部修改。
 fn verify_sidecars(snapshot: &SidecarSnapshot) -> Result<(), ResultSummaryError> {
-    let actual_database_hash = sha256_file_path(&snapshot.database_path)?;
-    if actual_database_hash != snapshot.database_hash {
+    if sha256_file_path(&snapshot.database_path)? != snapshot.database_hash {
         return Err(ResultSummaryError::InvalidArgument(
             "SQLite 主数据库在只读导出期间发生变化".into(),
         ));
     }
     for (path, expected_hash) in &snapshot.entries {
-        let actual_hash = sidecar_hash(path)?;
-        if &actual_hash != expected_hash {
+        if &sidecar_hash(path)? != expected_hash {
             return Err(ResultSummaryError::InvalidArgument(
                 "SQLite WAL/SHM sidecar 在只读导出期间发生变化".into(),
             ));
@@ -226,110 +239,14 @@ fn verify_sidecars(snapshot: &SidecarSnapshot) -> Result<(), ResultSummaryError>
     Ok(())
 }
 
-/// 用标准库元数据提取跨平台文件身份，供 artifact TOCTOU 复核使用。
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-struct FileIdentity {
-    first: u64,
-    second: u64,
-}
-
-/// Windows GetFileInformationByHandle 的标准 Win32 返回结构。
-#[cfg(windows)]
-#[repr(C)]
-struct WindowsByHandleFileInformation {
-    file_attributes: u32,
-    creation_time_low: u32,
-    creation_time_high: u32,
-    last_access_time_low: u32,
-    last_access_time_high: u32,
-    last_write_time_low: u32,
-    last_write_time_high: u32,
-    volume_serial_number: u32,
-    file_size_high: u32,
-    file_size_low: u32,
-    number_of_links: u32,
-    file_index_high: u32,
-    file_index_low: u32,
-}
-
-// 通过标准 Windows API 查询已打开句柄的卷与 file index。
-#[cfg(windows)]
-unsafe extern "system" {
-    fn GetFileInformationByHandle(
-        handle: std::os::windows::io::RawHandle,
-        information: *mut WindowsByHandleFileInformation,
-    ) -> i32;
-}
-
-/// 从已打开句柄读取文件身份；Windows 使用卷序列号和 file index。
-fn file_identity(file: &File) -> Result<FileIdentity, ResultSummaryError> {
-    #[cfg(any(unix, not(any(windows, unix))))]
-    let metadata = file.metadata()?;
-    #[cfg(windows)]
-    {
-        use std::os::windows::io::AsRawHandle;
-        let mut information = WindowsByHandleFileInformation {
-            file_attributes: 0,
-            creation_time_low: 0,
-            creation_time_high: 0,
-            last_access_time_low: 0,
-            last_access_time_high: 0,
-            last_write_time_low: 0,
-            last_write_time_high: 0,
-            volume_serial_number: 0,
-            file_size_high: 0,
-            file_size_low: 0,
-            number_of_links: 0,
-            file_index_high: 0,
-            file_index_low: 0,
-        };
-        let succeeded =
-            unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) };
-        if succeeded == 0 {
-            return Err(ResultSummaryError::Io(std::io::Error::last_os_error()));
-        }
-        Ok(FileIdentity {
-            first: information.volume_serial_number as u64,
-            second: ((information.file_index_high as u64) << 32)
-                | information.file_index_low as u64,
-        })
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        Ok(FileIdentity {
-            first: metadata.dev(),
-            second: metadata.ino(),
-        })
-    }
-    #[cfg(not(any(windows, unix)))]
-    {
-        let _ = metadata;
-        Err(ResultSummaryError::UnsupportedFileIdentity)
-    }
-}
-
-/// 通过当前路径重新打开文件并读取其标准库文件身份。
-fn path_file_identity(path: &Path) -> Result<FileIdentity, ResultSummaryError> {
-    let file = OpenOptions::new().read(true).open(path)?;
-    file_identity(&file)
-}
-
-/// 停止 Node 后导出稳定 canonical JSONL 和独立诊断 metadata。
+/// 以一个或多个规范媒体根导出固定 TSV；不会读取 task/task_items，也不会写 SQLite。
 pub fn export_scan_result_summary(
     database_path: &Path,
     cache_root: &Path,
-    task_id: &str,
+    media_roots: &[PathBuf],
     output_path: &Path,
 ) -> Result<ResultSummaryExport, ResultSummaryError> {
-    let metadata_path = metadata_path(output_path);
-    validate_arguments(
-        database_path,
-        cache_root,
-        task_id,
-        output_path,
-        &metadata_path,
-    )?;
+    let roots = validate_arguments(database_path, cache_root, media_roots, output_path)?;
     let canonical_cache_root = canonical_cache_root(cache_root)?;
     let connection = open_read_only_database(database_path)?;
     #[cfg(feature = "acceptance-tools")]
@@ -337,221 +254,165 @@ pub fn export_scan_result_summary(
         ResultSummaryReadTestHook::AfterDatabaseOpenBeforeSidecarCapture,
         database_path,
     );
-    let task = begin_result_summary_read_snapshot(&connection, task_id)?;
+    // 先启动只读事务，让 SQLite 完成首次 WAL-index 初始化，再冻结 sidecar。
+    connection.execute_batch("BEGIN;")?;
+    // 先执行一次真实 schema 读取；仅 BEGIN 不一定触发 WAL-index 完整初始化。
+    connection.query_row("SELECT COUNT(*) FROM files WHERE active=1", [], |row| {
+        row.get::<_, i64>(0)
+    })?;
     let sidecars = capture_sidecars(database_path)?;
     #[cfg(feature = "acceptance-tools")]
     run_result_summary_read_test_hook(
         ResultSummaryReadTestHook::AfterSidecarCapture,
         database_path,
     );
-    let (task, rows, diagnostics, missing_count, inconclusive_count) = {
-        let mut diagnostics = Vec::new();
-        let mut rows = Vec::new();
-        let mut seen_paths = HashSet::new();
-        let mut missing_count = 0_u64;
-        let mut inconclusive_count = 0_u64;
 
-        let raw_items = load_task_items(&connection, task_id)?;
-        for raw_item in raw_items {
-            let normalized_path = raw_item
-                .normalized_path
-                .as_deref()
-                .filter(|path| !path.is_empty())
-                .ok_or_else(|| {
-                    ResultSummaryError::InvalidArgument(
-                        "任务项 normalized_path 不能为空或 NULL".into(),
-                    )
-                })?;
-            if !seen_paths.insert(normalized_path.to_owned()) {
-                return Err(ResultSummaryError::InvalidArgument(
-                    "任务含重复 normalized_path，拒绝生成摘要".into(),
-                ));
-            }
-            let (row, disposition) =
-                build_canonical_row(&connection, &canonical_cache_root, &raw_item)?;
-            if disposition.missing {
-                missing_count += 1;
-            }
-            if disposition.inconclusive {
-                inconclusive_count += 1;
-            }
-            diagnostics.extend(disposition.diagnostics);
-            rows.push(row);
-        }
+    let mut rows = load_active_files(&connection)?;
+    rows.retain(|row| {
+        NormalizedPath::new(&row.normalized_path)
+            .map(|path| roots.iter().any(|root| path.is_within(root)))
+            .unwrap_or(false)
+    });
+    rows.sort_by(|left, right| {
+        left.normalized_path
+            .cmp(&right.normalized_path)
+            .then_with(|| left.machine_id.cmp(&right.machine_id))
+            .then_with(|| left.display_path.cmp(&right.display_path))
+    });
 
-        if task_has_inconclusive_state(task.as_ref(), &rows) && !rows.is_empty() {
-            // missing/inconclusive 均定义为“受影响 item 数”，任务级不确定覆盖全部行。
-            inconclusive_count = inconclusive_count.max(rows.len() as u64);
+    let header = tsv_header();
+    let mut data_bytes = header.into_bytes();
+
+    let mut row_count = 0_u64;
+    let mut missing_count = 0_u64;
+    let mut inconclusive_count = 0_u64;
+    for file in &rows {
+        let row = build_result_row(&connection, &canonical_cache_root, file)?;
+        match row.status.as_str() {
+            "MISSING" => missing_count += 1,
+            "INCONCLUSIVE" => inconclusive_count += 1,
+            _ => {}
         }
-        if let Some(task) = task.as_ref()
-            && task_has_inconclusive_state(Some(task), &rows)
-        {
-            diagnostics.push(SummaryDiagnostic {
-                kind: "task_state",
-                item_id: None,
-                machine_id: None,
-                normalized_path: None,
-                display_path: None,
-                file_size: None,
-                stage: None,
-                error: None,
-                content_id: None,
-                message: format!(
-                    "任务状态或计数不可裁决: status={}, total_items={}, row_count={}",
-                    task.status,
-                    task.total_items,
-                    rows.len()
-                ),
-            });
-        }
-        (task, rows, diagnostics, missing_count, inconclusive_count)
-    };
+        let line = row.to_tsv_line();
+        data_bytes.extend_from_slice(line.as_bytes());
+        row_count += 1;
+    }
+    connection.execute_batch("COMMIT;")?;
     drop(connection);
     verify_sidecars(&sidecars)?;
-    let (task_status, status) = classify_summary(
-        task.as_ref(),
-        rows.len() as u64,
-        missing_count,
-        inconclusive_count,
-        &rows,
-    );
-    let canonical_bytes = encode_canonical_jsonl(&rows)?;
-    let sha256 = sha256_hex(&canonical_bytes);
-    let lease_token = new_pair_lease_token();
-    let metadata = SummaryMetadata {
-        schema_version: 1,
-        lease_token: lease_token.clone(),
-        canonical_sha256: sha256.clone(),
-        task_id: task_id.to_owned(),
-        task_status: task_status.clone(),
-        status,
-        row_count: rows.len() as u64,
-        count_definition: "item_count",
-        missing_count,
-        inconclusive_count,
-        diagnostics,
-    };
-    let mut metadata_bytes = serde_json::to_vec(&metadata)?;
-    metadata_bytes.push(b'\n');
-    let lease = atomic_write_pair(
-        output_path,
-        &metadata_path,
-        &canonical_bytes,
-        &metadata_bytes,
-        &lease_token,
-        status,
-    )?;
-    validate_result_summary_pair(output_path)?;
-    drop(lease);
 
+    let data_hash = sha256_hex(&data_bytes);
+    let footer = format!("F\t{row_count}\t{data_hash}\n");
+    let mut output_bytes = data_bytes;
+    output_bytes.extend_from_slice(footer.as_bytes());
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output_path)?;
+    file.write_all(&output_bytes)?;
+    file.sync_all()?;
+    drop(file);
+
+    validate_result_summary(output_path)?;
+    let status = if inconclusive_count > 0 {
+        ResultSummaryStatus::Inconclusive
+    } else if missing_count > 0 || row_count == 0 {
+        ResultSummaryStatus::Missing
+    } else {
+        ResultSummaryStatus::Pass
+    };
     Ok(ResultSummaryExport {
-        task_id: task_id.to_owned(),
-        task_status,
-        row_count: rows.len() as u64,
+        status,
+        row_count,
         missing_count,
         inconclusive_count,
-        status,
         output_path: output_path.to_owned(),
-        metadata_path,
-        sha256,
+        sha256: sha256_hex(&output_bytes),
     })
 }
 
-/// 检查不会改变数据库的输入边界，并确保输出不会隐式创建目录。
+/// 校验媒体根、只读数据库和固定输出文件边界，并返回规范根。
 fn validate_arguments(
     database_path: &Path,
     cache_root: &Path,
-    task_id: &str,
+    media_roots: &[PathBuf],
     output_path: &Path,
-    metadata_path: &Path,
-) -> Result<(), ResultSummaryError> {
+) -> Result<Vec<NormalizedPath>, ResultSummaryError> {
     if database_path.as_os_str().is_empty() {
         return Err(ResultSummaryError::InvalidArgument(
             "database path 不能为空".into(),
         ));
     }
-    if cache_root.as_os_str().is_empty() {
+    if media_roots.is_empty() {
         return Err(ResultSummaryError::InvalidArgument(
-            "cache root 不能为空".into(),
+            "至少需要一个 media root".into(),
         ));
     }
-    if task_id.trim().is_empty() {
+    let mut roots = media_roots
+        .iter()
+        .map(|root| {
+            NormalizedPath::new(root).map_err(|_| {
+                ResultSummaryError::InvalidArgument(format!(
+                    "media root 不是规范绝对路径: {}",
+                    root.display()
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    roots.sort();
+    roots.dedup();
+
+    let cache_root = canonical_cache_root(cache_root)?;
+    let canonical_database = fs::canonicalize(database_path)?;
+    if output_path.file_name().and_then(|name| name.to_str()) != Some("result-summary.tsv") {
         return Err(ResultSummaryError::InvalidArgument(
-            "task id 不能为空".into(),
-        ));
-    }
-    if output_path.as_os_str().is_empty() {
-        return Err(ResultSummaryError::InvalidArgument(
-            "output path 不能为空".into(),
+            "输出文件名必须是 result-summary.tsv".into(),
         ));
     }
     let parent = output_path
         .parent()
-        .ok_or_else(|| ResultSummaryError::InvalidArgument("output path 必须包含父目录".into()))?;
+        .ok_or_else(|| ResultSummaryError::InvalidArgument("输出必须包含父目录".into()))?;
     match fs::metadata(parent) {
         Ok(metadata) if metadata.is_dir() => {}
         Ok(_) => {
             return Err(ResultSummaryError::InvalidArgument(
-                "output path 父级必须是目录".into(),
+                "输出父级必须是目录".into(),
             ));
         }
         Err(error) => return Err(ResultSummaryError::Io(error)),
     }
-    if output_path == metadata_path {
-        return Err(ResultSummaryError::InvalidArgument(
-            "canonical 与 metadata 输出不能是同一路径".into(),
-        ));
-    }
-    let canonical_cache_root = canonical_cache_root(cache_root)?;
-    let canonical_database = fs::canonicalize(database_path)?;
     let canonical_output = canonical_target_path(output_path)?;
-    let canonical_metadata = canonical_target_path(metadata_path)?;
-    for (kind, path) in [
-        ("canonical", &canonical_output),
-        ("metadata", &canonical_metadata),
-    ] {
-        if path.starts_with(&canonical_cache_root) {
-            return Err(ResultSummaryError::InvalidArgument(format!(
-                "{kind} 输出不能位于 cache root 或 artifact 内"
-            )));
-        }
-        if path == &canonical_database {
-            return Err(ResultSummaryError::InvalidArgument(format!(
-                "{kind} 输出不能与 database 相同"
-            )));
-        }
-    }
-    if canonical_output == canonical_metadata {
+    if canonical_output.starts_with(&cache_root) {
         return Err(ResultSummaryError::InvalidArgument(
-            "canonical 与 metadata 输出不能互为别名".into(),
+            "输出不能位于 cache root 内".into(),
         ));
     }
-    for (kind, path) in [("canonical", output_path), ("metadata", metadata_path)] {
-        match fs::symlink_metadata(path) {
-            Ok(_) => {
-                return Err(ResultSummaryError::InvalidArgument(format!(
-                    "{kind} 输出文件已存在，拒绝覆盖"
-                )));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(ResultSummaryError::Io(error)),
-        }
+    if canonical_output == canonical_database {
+        return Err(ResultSummaryError::InvalidArgument(
+            "输出不能覆盖 database".into(),
+        ));
     }
-    Ok(())
+    match fs::symlink_metadata(output_path) {
+        Ok(_) => Err(ResultSummaryError::InvalidArgument(
+            "输出文件已存在，拒绝覆盖".into(),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(roots),
+        Err(error) => Err(ResultSummaryError::Io(error)),
+    }
 }
 
-/// 解析“可能尚不存在”的输出路径，仅规范化其已存在父目录。
+/// 规范化尚不存在的输出路径，仅解析已经存在的父级目录。
 fn canonical_target_path(path: &Path) -> Result<PathBuf, ResultSummaryError> {
     let parent = path
         .parent()
-        .ok_or_else(|| ResultSummaryError::InvalidArgument("输出路径必须包含父目录".into()))?;
+        .ok_or_else(|| ResultSummaryError::InvalidArgument("输出必须包含父级".into()))?;
     let file_name = path
         .file_name()
-        .ok_or_else(|| ResultSummaryError::InvalidArgument("输出路径必须包含文件名".into()))?;
+        .ok_or_else(|| ResultSummaryError::InvalidArgument("输出必须包含文件名".into()))?;
     Ok(fs::canonicalize(parent)?.join(file_name))
 }
 
-/// 把 cache root 解析为真实目录，同时拒绝 root 自身是 reparse/symlink。
+/// 解析 cache root 并拒绝 root 自身是重解析点。
 fn canonical_cache_root(cache_root: &Path) -> Result<PathBuf, ResultSummaryError> {
     let metadata = fs::symlink_metadata(cache_root)?;
     if is_reparse_point(&metadata) {
@@ -565,138 +426,79 @@ fn canonical_cache_root(cache_root: &Path) -> Result<PathBuf, ResultSummaryError
     Ok(fs::canonicalize(cache_root)?)
 }
 
-/// 任务头的稳定计数；不写入 canonical，只用于诊断状态。
+/// SQLite active file 与 contents 的单行只读投影；不含任何任务 ID。
 #[derive(Clone, Debug)]
-struct TaskHeader {
-    status: String,
-    total_items: i64,
-    succeeded: i64,
-    failed: i64,
-    cancelled: i64,
-}
-
-/// 主查询返回的任务项；本地 ID 只留在 metadata 诊断边界。
-#[derive(Clone, Debug)]
-struct RawTaskItem {
-    item_id: String,
-    machine_id: Option<String>,
-    normalized_path: Option<String>,
-    display_path: Option<String>,
-    file_size: Option<i64>,
+struct ActiveFile {
+    machine_id: String,
+    normalized_path: String,
+    display_path: String,
+    file_size: i64,
     content_id: Option<i64>,
-    content_row_exists: Option<i64>,
     content_md5: Option<Vec<u8>>,
     content_file_size: Option<i64>,
-    content_media_kind: Option<String>,
-    content_base_complete: Option<i64>,
-    status: String,
-    stage: Option<String>,
-    error: Option<String>,
+    media_kind: Option<String>,
+    base_complete: Option<i64>,
 }
 
-/// 一行结果的诊断计数和可追踪原因。
-#[derive(Default)]
-struct ItemDisposition {
-    missing: bool,
-    inconclusive: bool,
-    diagnostics: Vec<SummaryDiagnostic>,
-}
-
-/// 读取任务头，任务不存在通过 `None` 进入 MISSING 而不是伪造错误。
-fn load_task_header(
-    connection: &Connection,
-    task_id: &str,
-) -> Result<Option<TaskHeader>, ResultSummaryError> {
-    connection
-        .query_row(
-            "SELECT status,total_items,succeeded,failed_items,cancelled
-             FROM tasks WHERE task_id=?1",
-            [task_id],
-            |row| {
-                Ok(TaskHeader {
-                    status: row.get(0)?,
-                    total_items: row.get(1)?,
-                    succeeded: row.get(2)?,
-                    failed: row.get(3)?,
-                    cancelled: row.get(4)?,
-                })
-            },
-        )
-        .optional()
-        .map_err(Into::into)
-}
-
-/// 按 normalized_path、machine_id、item_id 的 SQLite BINARY 顺序读取任务项。
-fn load_task_items(
-    connection: &Connection,
-    task_id: &str,
-) -> Result<Vec<RawTaskItem>, ResultSummaryError> {
+/// 读取所有 active 文件；根筛选在 Rust 中按路径组件完成，避免 LIKE 前缀误匹配。
+fn load_active_files(connection: &Connection) -> Result<Vec<ActiveFile>, ResultSummaryError> {
     let mut statement = connection.prepare(
-        "SELECT
-            ti.item_id,
-            ti.machine_id,
-            ti.normalized_path,
-            ti.display_path,
-            ti.file_size,
-            ti.content_id,
-            ti.status,
-            ti.stage,
-            ti.error,
-            c.content_id,
-            c.md5,
-            c.file_size,
-            c.media_kind,
-            c.base_complete
-         FROM task_items ti
-         LEFT JOIN contents c ON c.content_id = ti.content_id
-         WHERE ti.task_id = ?1
-         ORDER BY ti.normalized_path COLLATE BINARY,
-                  ti.machine_id COLLATE BINARY,
-                  ti.item_id COLLATE BINARY",
+        "SELECT f.machine_id, f.normalized_path, f.display_path, f.file_size,
+                c.content_id, c.md5, c.file_size, c.media_kind, c.base_complete
+         FROM files AS f
+         LEFT JOIN contents AS c ON c.content_id=f.content_id
+         WHERE f.active=1
+         ORDER BY f.normalized_path COLLATE BINARY,
+                  f.machine_id COLLATE BINARY,
+                  f.display_path COLLATE BINARY",
     )?;
     statement
-        .query_map([task_id], |row| {
-            Ok(RawTaskItem {
-                item_id: row.get(0)?,
-                machine_id: row.get(1)?,
-                normalized_path: row.get(2)?,
-                display_path: row.get(3)?,
-                file_size: row.get(4)?,
-                content_id: row.get(5)?,
-                status: row.get(6)?,
-                stage: row.get(7)?,
-                error: row.get(8)?,
-                content_row_exists: row.get(9)?,
-                content_md5: row.get(10)?,
-                content_file_size: row.get(11)?,
-                content_media_kind: row.get(12)?,
-                content_base_complete: row.get(13)?,
+        .query_map([], |row| {
+            Ok(ActiveFile {
+                machine_id: row.get(0)?,
+                normalized_path: row.get(1)?,
+                display_path: row.get(2)?,
+                file_size: row.get(3)?,
+                content_id: row.get(4)?,
+                content_md5: row.get(5)?,
+                content_file_size: row.get(6)?,
+                media_kind: row.get(7)?,
+                base_complete: row.get(8)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()
         .map_err(Into::into)
 }
 
-/// canonical 比较使用的稳定行；不包含任务 ID、item ID、PID、时间或本地 ID。
-#[derive(Serialize)]
-struct CanonicalResultRow {
-    schema_version: u32,
-    normalized_path: String,
-    status: String,
-    file_size: Option<u64>,
-    md5: Option<String>,
-    media_type: Option<String>,
-    base_complete: Option<bool>,
-    feature_payloads: FeaturePayloadHashes,
-    feature_payload_sha256: Option<String>,
-    contact_sheet_sha256: Option<String>,
-    thumbnail_sha256: Option<String>,
-    thumbnail_state: &'static str,
+/// 结果行的状态严重度；INCONCLUSIVE 覆盖 MISSING，避免不确定值被当成缺失。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RowStatus {
+    Pass,
+    Missing,
+    Inconclusive,
 }
 
-/// 每类数据库 payload 的独立 SHA-256；视频数组固定六个槽位。
-#[derive(Serialize)]
-struct FeaturePayloadHashes {
+impl RowStatus {
+    /// 返回固定 TSV 状态值。
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "PASS",
+            Self::Missing => "MISSING",
+            Self::Inconclusive => "INCONCLUSIVE",
+        }
+    }
+
+    /// 合并一个新的缺失或不确定原因。
+    fn add_issue(&mut self, issue: Self) {
+        if issue == Self::Inconclusive || (*self == Self::Pass && issue == Self::Missing) {
+            *self = issue;
+        }
+    }
+}
+
+/// 每个内容表/槽位的独立 SHA-256；None 表示对应表行不存在。
+#[derive(Clone, Debug, Default)]
+struct FeatureHashes {
     image_stage1: Option<String>,
     image_stage2: Option<String>,
     video_metadata: Option<String>,
@@ -704,211 +506,185 @@ struct FeaturePayloadHashes {
     video_frame_stage2: [Option<String>; 6],
 }
 
-/// metadata 的单条诊断；canonical 行不携带这些本地和错误信息。
-#[derive(Serialize)]
-struct SummaryDiagnostic {
-    kind: &'static str,
-    item_id: Option<String>,
-    machine_id: Option<String>,
-    normalized_path: Option<String>,
-    display_path: Option<String>,
+impl FeatureHashes {
+    /// 将所有独立 payload hash 按固定顺序聚合，避免依赖 JSON 序列化。
+    fn aggregate(&self) -> Option<String> {
+        let mut bytes = Vec::new();
+        let mut append = |value: &Option<String>| {
+            if let Some(value) = value {
+                bytes.extend_from_slice(value.as_bytes());
+            }
+            bytes.push(0);
+        };
+        append(&self.image_stage1);
+        append(&self.image_stage2);
+        append(&self.video_metadata);
+        for value in &self.video_frame_stage1 {
+            append(value);
+        }
+        for value in &self.video_frame_stage2 {
+            append(value);
+        }
+        bytes
+            .iter()
+            .any(|byte| *byte != 0)
+            .then(|| sha256_hex(&bytes))
+    }
+}
+
+/// 固定 TSV 的一条文件结果；不含 SQLite content_id 或任务 ID。
+struct ResultRow {
+    status: RowStatus,
+    machine_id: String,
+    normalized_path: String,
+    display_path: String,
     file_size: Option<i64>,
-    stage: Option<String>,
-    error: Option<String>,
-    content_id: Option<i64>,
-    message: String,
+    md5: Option<String>,
+    media_type: Option<String>,
+    base_complete: Option<bool>,
+    feature_hashes: FeatureHashes,
+    thumbnail_sha256: Option<String>,
+    thumbnail_state: &'static str,
+    contact_sheet_sha256: Option<String>,
+    reason: String,
 }
 
-/// metadata 独立于 canonical JSONL 保存任务诊断和计数。
-#[derive(Serialize)]
-struct SummaryMetadata {
-    schema_version: u32,
-    /// 与同目录持久 pair manifest 对应的一次性提交 token。
-    lease_token: String,
-    /// canonical JSONL 实际字节（含最终 LF）的 SHA-256。
-    canonical_sha256: String,
-    task_id: String,
-    task_status: String,
-    status: ResultSummaryStatus,
-    row_count: u64,
-    /// 两个计数均按“受影响 item 数”统计；同一 item 可同时出现在两类证据计数。
-    count_definition: &'static str,
-    missing_count: u64,
-    inconclusive_count: u64,
-    diagnostics: Vec<SummaryDiagnostic>,
+impl ResultRow {
+    /// 编码为固定列数、UTF-8、无 CR 的 TSV 数据行。
+    fn to_tsv_line(&self) -> String {
+        let mut fields = Vec::with_capacity(TSV_COLUMNS.len());
+        fields.push("R".into());
+        fields.push(self.status.as_str().into());
+        fields.push(escape_tsv(&self.machine_id));
+        fields.push(escape_tsv(&self.normalized_path));
+        fields.push(escape_tsv(&self.display_path));
+        fields.push(
+            self.file_size
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+        );
+        fields.push(self.md5.clone().unwrap_or_default());
+        fields.push(self.media_type.clone().unwrap_or_default());
+        fields.push(
+            self.base_complete
+                .map(|value| if value { "1" } else { "0" })
+                .unwrap_or_default()
+                .into(),
+        );
+        fields.push(self.feature_hashes.aggregate().unwrap_or_default());
+        fields.push(self.feature_hashes.image_stage1.clone().unwrap_or_default());
+        fields.push(self.feature_hashes.image_stage2.clone().unwrap_or_default());
+        fields.push(
+            self.feature_hashes
+                .video_metadata
+                .clone()
+                .unwrap_or_default(),
+        );
+        fields.extend(
+            self.feature_hashes
+                .video_frame_stage1
+                .iter()
+                .map(|value| value.clone().unwrap_or_default()),
+        );
+        fields.extend(
+            self.feature_hashes
+                .video_frame_stage2
+                .iter()
+                .map(|value| value.clone().unwrap_or_default()),
+        );
+        fields.push(self.thumbnail_sha256.clone().unwrap_or_default());
+        fields.push(self.thumbnail_state.into());
+        fields.push(self.contact_sheet_sha256.clone().unwrap_or_default());
+        fields.push(escape_tsv(&self.reason));
+        format!("{}\n", fields.join("\t"))
+    }
 }
 
-/// 读取内容和各媒体特征，构造不携带本地 ID 的 canonical 行。
-fn build_canonical_row(
+/// 读取一条 active file 的内容、所有已存在特征和联系表。
+fn build_result_row(
     connection: &Connection,
     cache_root: &Path,
-    item: &RawTaskItem,
-) -> Result<(CanonicalResultRow, ItemDisposition), ResultSummaryError> {
-    let mut disposition = ItemDisposition::default();
-    let normalized_path = item
-        .normalized_path
-        .clone()
-        .filter(|path| !path.is_empty())
-        .ok_or_else(|| {
-            ResultSummaryError::InvalidArgument("任务项 normalized_path 不能为空或 NULL".into())
-        })?;
-
-    let mut row = CanonicalResultRow {
-        schema_version: 1,
-        normalized_path,
-        status: item.status.clone(),
+    file: &ActiveFile,
+) -> Result<ResultRow, ResultSummaryError> {
+    let mut status = RowStatus::Pass;
+    let mut reasons: Vec<String> = Vec::new();
+    let mut row = ResultRow {
+        status,
+        machine_id: file.machine_id.clone(),
+        normalized_path: file.normalized_path.clone(),
+        display_path: file.display_path.clone(),
         file_size: None,
         md5: None,
         media_type: None,
         base_complete: None,
-        feature_payloads: empty_feature_payload_hashes(),
-        feature_payload_sha256: None,
-        contact_sheet_sha256: None,
+        feature_hashes: FeatureHashes::default(),
         thumbnail_sha256: None,
         thumbnail_state: "unsupported_no_thumbnail_artifact",
+        contact_sheet_sha256: None,
+        reason: String::new(),
     };
 
-    if item.status != "succeeded" {
-        // 非成功项只保留稳定身份和状态；content、feature、错误只进入 metadata。
-        mark_inconclusive(
-            &mut disposition,
-            item,
-            &format!("任务项状态为 {}", item.status),
-            "item_status",
-        );
-        return Ok((row, disposition));
+    if file.file_size < 0 {
+        status.add_issue(RowStatus::Inconclusive);
+        reasons.push("file_size_invalid".into());
+    } else {
+        row.file_size = Some(file.file_size);
+    }
+    let Some(content_id) = file.content_id else {
+        status.add_issue(RowStatus::Missing);
+        reasons.push("missing_content".into());
+        row.status = status;
+        row.reason = reasons.join(";");
+        return Ok(row);
+    };
+    let (Some(content_md5), Some(content_file_size), Some(media_type), Some(base_complete_raw)) = (
+        file.content_md5.as_ref(),
+        file.content_file_size,
+        file.media_kind.as_ref(),
+        file.base_complete,
+    ) else {
+        status.add_issue(RowStatus::Missing);
+        reasons.push("missing_content".into());
+        row.status = status;
+        row.reason = reasons.join(";");
+        return Ok(row);
+    };
+    if content_file_size < 0 || file.file_size != content_file_size {
+        status.add_issue(RowStatus::Inconclusive);
+        reasons.push("content_size_mismatch".into());
+    }
+    if content_md5.len() != 16 {
+        status.add_issue(RowStatus::Inconclusive);
+        reasons.push("md5_invalid".into());
+    } else {
+        row.md5 = Some(lower_hex(content_md5));
+    }
+    let valid_media_type = matches!(media_type.as_str(), "image" | "video" | "other");
+    if !valid_media_type {
+        status.add_issue(RowStatus::Inconclusive);
+        reasons.push("media_type_invalid".into());
+    } else {
+        row.media_type = Some(media_type.clone());
+    }
+    match base_complete_raw {
+        0 => {
+            status.add_issue(RowStatus::Missing);
+            reasons.push("base_features_missing".into());
+            row.base_complete = Some(false);
+        }
+        1 => row.base_complete = Some(true),
+        _ => {
+            status.add_issue(RowStatus::Inconclusive);
+            reasons.push("base_complete_invalid".into());
+        }
     }
 
-    let Some(content_id) = item.content_id else {
-        mark_missing(
-            &mut disposition,
-            item,
-            "任务项未引用 contents",
-            "missing_content",
-        );
-        return Ok((row, disposition));
-    };
-    if item.content_row_exists.is_none() {
-        mark_missing(
-            &mut disposition,
-            item,
-            "contents 行不存在",
-            "missing_content",
-        );
-        return Ok((row, disposition));
-    }
-    let Some(item_file_size) = item.file_size else {
-        mark_inconclusive(
-            &mut disposition,
-            item,
-            "task_items.file_size 不能为 NULL",
-            "invalid_content",
-        );
-        return Ok((row, disposition));
-    };
-    let Some(content_file_size) = item.content_file_size else {
-        mark_inconclusive(
-            &mut disposition,
-            item,
-            "contents.file_size 不能为 NULL",
-            "invalid_content",
-        );
-        return Ok((row, disposition));
-    };
-    let Some(md5) = item.content_md5.clone() else {
-        mark_inconclusive(
-            &mut disposition,
-            item,
-            "contents.md5 不能为 NULL",
-            "invalid_content",
-        );
-        return Ok((row, disposition));
-    };
-    let Some(media_kind) = item.content_media_kind.clone() else {
-        mark_inconclusive(
-            &mut disposition,
-            item,
-            "contents.media_kind 不能为 NULL",
-            "invalid_content",
-        );
-        return Ok((row, disposition));
-    };
-    let Some(base_complete_raw) = item.content_base_complete else {
-        mark_inconclusive(
-            &mut disposition,
-            item,
-            "contents.base_complete 不能为 NULL",
-            "invalid_content",
-        );
-        return Ok((row, disposition));
-    };
-    if item_file_size < 0 || content_file_size < 0 {
-        mark_inconclusive(
-            &mut disposition,
-            item,
-            "task_items.file_size 和 contents.file_size 必须为非负数",
-            "invalid_content",
-        );
-        return Ok((row, disposition));
-    }
-    if item_file_size != content_file_size {
-        mark_inconclusive(
-            &mut disposition,
-            item,
-            "task_items.file_size 与 contents.file_size 不一致",
-            "invalid_content",
-        );
-        return Ok((row, disposition));
-    }
-    let base_complete = match base_complete_raw {
-        0 => false,
-        1 => true,
-        _ => {
-            mark_inconclusive(
-                &mut disposition,
-                item,
-                "contents.base_complete 只能是 0 或 1",
-                "invalid_content",
-            );
-            return Ok((row, disposition));
-        }
-    };
-    let media_type = match media_kind.as_str() {
-        "image" | "video" | "other" => media_kind,
-        _ => {
-            mark_inconclusive(
-                &mut disposition,
-                item,
-                "contents.media_kind 无效",
-                "invalid_content",
-            );
-            return Ok((row, disposition));
-        }
-    };
-    if md5.len() != 16 {
-        mark_inconclusive(
-            &mut disposition,
-            item,
-            "contents.md5 必须为 16 字节",
-            "invalid_content",
-        );
-        return Ok((row, disposition));
-    }
-    row.file_size = Some(item_file_size as u64);
-    row.md5 = Some(lower_hex(&md5));
-    row.media_type = Some(media_type.clone());
-    row.base_complete = Some(base_complete);
-    let (feature_payloads, has_required_base) =
-        load_feature_payloads(connection, content_id, &media_type)?;
-    row.feature_payload_sha256 = Some(hash_serialized(&feature_payloads)?);
-    row.feature_payloads = feature_payloads;
-    if !base_complete || !has_required_base {
-        mark_inconclusive(
-            &mut disposition,
-            item,
-            "基础完成标记或必需特征不完整",
-            "incomplete_base_features",
-        );
+    if valid_media_type {
+        let (feature_hashes, feature_status, feature_reasons) =
+            load_feature_payloads(connection, content_id, media_type)?;
+        row.feature_hashes = feature_hashes;
+        status.add_issue(feature_status);
+        reasons.extend(feature_reasons);
     }
 
     let contact_sheet = load_contact_sheet(connection, content_id)?;
@@ -916,48 +692,37 @@ fn build_canonical_row(
         Some(relative_path) => match read_safe_artifact(cache_root, &relative_path)? {
             ArtifactState::Present(hash) => row.contact_sheet_sha256 = Some(hash),
             ArtifactState::Missing => {
-                mark_missing(
-                    &mut disposition,
-                    item,
-                    "联系表 artifact 不存在",
-                    "missing_artifact",
-                );
+                status.add_issue(RowStatus::Missing);
+                reasons.push("contact_sheet_missing".into());
             }
         },
         None if media_type == "video" => {
-            mark_missing(
-                &mut disposition,
-                item,
-                "视频联系表引用不存在",
-                "missing_artifact",
-            );
+            status.add_issue(RowStatus::Missing);
+            reasons.push("contact_sheet_missing".into());
         }
         None => {}
     }
-    Ok((row, disposition))
+    row.status = status;
+    row.reason = if reasons.is_empty() {
+        "complete".into()
+    } else {
+        reasons.join(";")
+    };
+    Ok(row)
 }
 
-/// 返回六槽位空值，防止不同媒体类型产生可变数组长度。
-fn empty_feature_payload_hashes() -> FeaturePayloadHashes {
-    FeaturePayloadHashes {
-        image_stage1: None,
-        image_stage2: None,
-        video_metadata: None,
-        video_frame_stage1: [None, None, None, None, None, None],
-        video_frame_stage2: [None, None, None, None, None, None],
-    }
-}
-
-/// 读取所有图片/视频原始字段并计算独立 payload hash。
+/// 特征 payload 查询结果，状态只反映必需基础数据，不强制已有二筛。
 fn load_feature_payloads(
     connection: &Connection,
     content_id: i64,
-    media_kind: &str,
-) -> Result<(FeaturePayloadHashes, bool), ResultSummaryError> {
-    let mut payloads = empty_feature_payload_hashes();
-    let required = match media_kind {
+    media_type: &str,
+) -> Result<(FeatureHashes, RowStatus, Vec<String>), ResultSummaryError> {
+    let mut hashes = FeatureHashes::default();
+    let mut status = RowStatus::Pass;
+    let mut reasons = Vec::new();
+    match media_type {
         "image" => {
-            let image_stage1: Option<(Option<i64>, Option<i64>, Option<Vec<u8>>, Option<i64>)> =
+            let stage1: Option<(Option<i64>, Option<i64>, Option<Vec<u8>>, Option<i64>)> =
                 connection
                     .query_row(
                         "SELECT width,height,pdq,quality FROM image_stage1 WHERE content_id=?1",
@@ -965,22 +730,41 @@ fn load_feature_payloads(
                         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                     )
                     .optional()?;
-            if let Some((width, height, pdq, quality)) = image_stage1 {
-                payloads.image_stage1 = Some(hash_serialized(&ImageStage1Payload {
-                    width,
-                    height,
-                    pdq: pdq.as_deref().map(lower_hex),
-                    quality,
-                })?);
-                let complete = width.is_some()
-                    && height.is_some()
-                    && quality.is_some()
-                    && pdq.as_ref().is_some_and(|bytes| bytes.len() == 32);
-                Some(complete)
-            } else {
-                None
+            match stage1 {
+                Some((width, height, pdq, quality)) => {
+                    hashes.image_stage1 =
+                        Some(hash_image_stage1(width, height, pdq.as_deref(), quality));
+                    if width.is_none()
+                        || height.is_none()
+                        || quality.is_none()
+                        || pdq.as_ref().is_none_or(|value| value.len() != 32)
+                    {
+                        status.add_issue(RowStatus::Inconclusive);
+                        reasons.push("image_stage1_incomplete".into());
+                    }
+                }
+                None => {
+                    status.add_issue(RowStatus::Missing);
+                    reasons.push("image_stage1_missing".into());
+                }
             }
-            .unwrap_or(false)
+            let stage2: Option<(Option<Vec<u8>>, Option<Vec<u8>>)> = connection
+                .query_row(
+                    "SELECT phash_parts,sobel FROM image_stage2 WHERE content_id=?1",
+                    [content_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if let Some((phash_parts, sobel)) = stage2 {
+                hashes.image_stage2 =
+                    Some(hash_image_stage2(phash_parts.as_deref(), sobel.as_deref()));
+                if phash_parts.as_ref().is_some_and(|value| value.len() != 72)
+                    || sobel.as_ref().is_some_and(|value| value.len() != 512)
+                {
+                    status.add_issue(RowStatus::Inconclusive);
+                    reasons.push("image_stage2_invalid".into());
+                }
+            }
         }
         "video" => {
             let metadata: Option<(Option<i64>, Option<i64>, Option<i64>)> = connection
@@ -990,19 +774,20 @@ fn load_feature_payloads(
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()?;
-            let metadata_complete = if let Some((duration_ms, width, height)) = metadata {
-                payloads.video_metadata = Some(hash_serialized(&VideoMetadataPayload {
-                    duration_ms,
-                    width,
-                    height,
-                })?);
-                width.is_some() && height.is_some() && duration_ms.is_some()
-            } else {
-                false
-            };
-            let mut stage1_count = 0_usize;
-            let mut slots_complete = true;
-            let mut slot_evidence_valid = true;
+            match metadata {
+                Some((duration_ms, width, height)) => {
+                    hashes.video_metadata = Some(hash_video_metadata(duration_ms, width, height));
+                    if duration_ms.is_none() || width.is_none() || height.is_none() {
+                        status.add_issue(RowStatus::Inconclusive);
+                        reasons.push("video_metadata_incomplete".into());
+                    }
+                }
+                None => {
+                    status.add_issue(RowStatus::Missing);
+                    reasons.push("video_metadata_missing".into());
+                }
+            }
+            let mut decoded_count = 0_usize;
             for slot in 0_i64..6 {
                 let frame: Option<(
                     i64,
@@ -1028,54 +813,42 @@ fn load_feature_payloads(
                         },
                     )
                     .optional()?;
-                if let Some((time_ms, decoded_raw, width, height, pdq, quality)) = frame {
-                    payloads.video_frame_stage1[slot as usize] =
-                        Some(hash_serialized(&VideoFrameStage1Payload {
+                match frame {
+                    Some((time_ms, decoded, width, height, pdq, quality)) => {
+                        hashes.video_frame_stage1[slot as usize] = Some(hash_video_frame_stage1(
                             slot,
                             time_ms,
-                            decoded: decoded_raw,
+                            decoded,
                             width,
                             height,
-                            pdq: pdq.as_deref().map(lower_hex),
+                            pdq.as_deref(),
                             quality,
-                        })?);
-                    if decoded_raw == 1 {
-                        stage1_count += 1;
-                        slots_complete &= width.is_some()
-                            && height.is_some()
-                            && quality.is_some()
-                            && pdq.as_ref().is_some_and(|bytes| bytes.len() == 32);
-                    } else if decoded_raw != 0 {
-                        slot_evidence_valid = false;
-                        slots_complete = false;
+                        ));
+                        if decoded == 1 {
+                            decoded_count += 1;
+                            if width.is_none()
+                                || height.is_none()
+                                || quality.is_none()
+                                || pdq.as_ref().is_none_or(|value| value.len() != 32)
+                            {
+                                status.add_issue(RowStatus::Inconclusive);
+                                reasons.push(format!("video_frame_stage1_{slot}_incomplete"));
+                            }
+                        } else if decoded != 0 {
+                            status.add_issue(RowStatus::Inconclusive);
+                            reasons.push(format!("video_frame_stage1_{slot}_invalid"));
+                        }
                     }
-                } else {
-                    slots_complete = false;
+                    None => {
+                        status.add_issue(RowStatus::Missing);
+                        reasons.push(format!("video_frame_stage1_{slot}_missing"));
+                    }
                 }
             }
-            metadata_complete && slots_complete && stage1_count >= 4 && slot_evidence_valid
-        }
-        "other" => true,
-        _ => false,
-    };
-
-    match media_kind {
-        "image" => {
-            let image_stage2: Option<(Option<Vec<u8>>, Option<Vec<u8>>)> = connection
-                .query_row(
-                    "SELECT phash_parts,sobel FROM image_stage2 WHERE content_id=?1",
-                    [content_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?;
-            if let Some((phash_parts, sobel)) = image_stage2 {
-                payloads.image_stage2 = Some(hash_serialized(&ImageStage2Payload {
-                    phash_parts: phash_parts.as_deref().map(lower_hex),
-                    sobel: sobel.as_deref().map(lower_hex),
-                })?);
+            if decoded_count < 4 {
+                status.add_issue(RowStatus::Missing);
+                reasons.push("video_stage1_success_count_low".into());
             }
-        }
-        "video" => {
             for slot in 0_i64..6 {
                 let frame: Option<(Option<Vec<u8>>, Option<Vec<u8>>)> = connection
                     .query_row(
@@ -1086,65 +859,138 @@ fn load_feature_payloads(
                     )
                     .optional()?;
                 if let Some((phash_parts, sobel)) = frame {
-                    payloads.video_frame_stage2[slot as usize] =
-                        Some(hash_serialized(&VideoFrameStage2Payload {
-                            slot,
-                            phash_parts: phash_parts.as_deref().map(lower_hex),
-                            sobel: sobel.as_deref().map(lower_hex),
-                        })?);
+                    hashes.video_frame_stage2[slot as usize] = Some(hash_video_frame_stage2(
+                        slot,
+                        phash_parts.as_deref(),
+                        sobel.as_deref(),
+                    ));
+                    if phash_parts.as_ref().is_some_and(|value| value.len() != 72)
+                        || sobel.as_ref().is_some_and(|value| value.len() != 512)
+                    {
+                        status.add_issue(RowStatus::Inconclusive);
+                        reasons.push(format!("video_frame_stage2_{slot}_invalid"));
+                    }
                 }
             }
         }
-        _ => {}
+        "other" => {}
+        _ => unreachable!("调用方已校验媒体类型"),
     }
-    Ok((payloads, required))
+    Ok((hashes, status, reasons))
 }
 
-/// 图片一筛原始字段的固定序列化形状。
-#[derive(Serialize)]
-struct ImageStage1Payload {
+/// 固定字段编码，避免 JSON 序列化和解析成本。
+fn payload_bytes(tag: &[u8], fields: &[PayloadField<'_>]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(tag);
+    bytes.push(0);
+    for field in fields {
+        match field {
+            PayloadField::Int(value) => match value {
+                Some(value) => {
+                    bytes.push(1);
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                }
+                None => bytes.push(0),
+            },
+            PayloadField::Bytes(value) => match value {
+                Some(value) => {
+                    bytes.push(1);
+                    bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
+                    bytes.extend_from_slice(value);
+                }
+                None => bytes.push(0),
+            },
+        }
+    }
+    bytes
+}
+
+/// payload 的可选整数或原始 BLOB 字段。
+enum PayloadField<'a> {
+    Int(Option<i64>),
+    Bytes(Option<&'a [u8]>),
+}
+
+/// 计算图片一筛 payload hash。
+fn hash_image_stage1(
     width: Option<i64>,
     height: Option<i64>,
-    pdq: Option<String>,
+    pdq: Option<&[u8]>,
     quality: Option<i64>,
+) -> String {
+    sha256_hex(&payload_bytes(
+        b"image_stage1",
+        &[
+            PayloadField::Int(width),
+            PayloadField::Int(height),
+            PayloadField::Bytes(pdq),
+            PayloadField::Int(quality),
+        ],
+    ))
 }
 
-/// 图片二筛原始 BLOB 字段的固定序列化形状。
-#[derive(Serialize)]
-struct ImageStage2Payload {
-    phash_parts: Option<String>,
-    sobel: Option<String>,
+/// 计算图片二筛 payload hash。
+fn hash_image_stage2(phash_parts: Option<&[u8]>, sobel: Option<&[u8]>) -> String {
+    sha256_hex(&payload_bytes(
+        b"image_stage2",
+        &[PayloadField::Bytes(phash_parts), PayloadField::Bytes(sobel)],
+    ))
 }
 
-/// 视频整体 metadata 原始字段的固定序列化形状。
-#[derive(Serialize)]
-struct VideoMetadataPayload {
+/// 计算视频 metadata payload hash。
+fn hash_video_metadata(
     duration_ms: Option<i64>,
     width: Option<i64>,
     height: Option<i64>,
+) -> String {
+    sha256_hex(&payload_bytes(
+        b"video_metadata",
+        &[
+            PayloadField::Int(duration_ms),
+            PayloadField::Int(width),
+            PayloadField::Int(height),
+        ],
+    ))
 }
 
-/// 视频一筛槽位原始字段的固定序列化形状。
-#[derive(Serialize)]
-struct VideoFrameStage1Payload {
+/// 计算视频一筛槽位 payload hash。
+fn hash_video_frame_stage1(
     slot: i64,
     time_ms: i64,
     decoded: i64,
     width: Option<i64>,
     height: Option<i64>,
-    pdq: Option<String>,
+    pdq: Option<&[u8]>,
     quality: Option<i64>,
+) -> String {
+    sha256_hex(&payload_bytes(
+        b"video_frame_stage1",
+        &[
+            PayloadField::Int(Some(slot)),
+            PayloadField::Int(Some(time_ms)),
+            PayloadField::Int(Some(decoded)),
+            PayloadField::Int(width),
+            PayloadField::Int(height),
+            PayloadField::Bytes(pdq),
+            PayloadField::Int(quality),
+        ],
+    ))
 }
 
-/// 视频二筛槽位原始 BLOB 字段的固定序列化形状。
-#[derive(Serialize)]
-struct VideoFrameStage2Payload {
-    slot: i64,
-    phash_parts: Option<String>,
-    sobel: Option<String>,
+/// 计算视频二筛槽位 payload hash。
+fn hash_video_frame_stage2(slot: i64, phash_parts: Option<&[u8]>, sobel: Option<&[u8]>) -> String {
+    sha256_hex(&payload_bytes(
+        b"video_frame_stage2",
+        &[
+            PayloadField::Int(Some(slot)),
+            PayloadField::Bytes(phash_parts),
+            PayloadField::Bytes(sobel),
+        ],
+    ))
 }
 
-/// 读取联系表相对路径；路径字符串本身不进入 canonical payload。
+/// 读取 contact sheet 关联路径。
 fn load_contact_sheet(
     connection: &Connection,
     content_id: i64,
@@ -1159,13 +1005,13 @@ fn load_contact_sheet(
         .map_err(Into::into)
 }
 
-/// 联系表读取结果，Missing 只表示 artifact 不存在，不伪造内容 hash。
+/// 联系表读取状态；缺失不伪造 hash。
 enum ArtifactState {
     Present(String),
     Missing,
 }
 
-/// 校验相对路径、reparse 组件和 canonical containment 后读取联系表。
+/// 校验 cache root 内的相对 artifact 路径并流式读取 hash。
 fn read_safe_artifact(
     cache_root: &Path,
     relative_path: &str,
@@ -1174,18 +1020,15 @@ fn read_safe_artifact(
         return Err(ResultSummaryError::UnsafeArtifactPath);
     }
     let candidate = cache_root.join(relative_path);
-    // 逐个检查现有组件；symlink_metadata 的非 NotFound 错误不能被 exists() 吞掉。
     let mut component = candidate.clone();
-    let mut missing = false;
     loop {
         match fs::symlink_metadata(&component) {
-            Ok(metadata) => {
-                if is_reparse_point(&metadata) {
-                    return Err(ResultSummaryError::UnsafeArtifactPath);
-                }
+            Ok(metadata) if is_reparse_point(&metadata) => {
+                return Err(ResultSummaryError::UnsafeArtifactPath);
             }
+            Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                missing = true;
+                return Ok(ArtifactState::Missing);
             }
             Err(error) => return Err(ResultSummaryError::Io(error)),
         }
@@ -1193,78 +1036,32 @@ fn read_safe_artifact(
             break;
         }
     }
-    if missing {
-        return Ok(ArtifactState::Missing);
-    }
     let canonical_candidate = fs::canonicalize(&candidate)?;
     if !canonical_candidate.starts_with(cache_root) {
         return Err(ResultSummaryError::UnsafeArtifactPath);
     }
-    let mut file = match File::open(&candidate) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(ResultSummaryError::UnsafeArtifactPath);
-        }
-        Err(error) => return Err(ResultSummaryError::Io(error)),
-    };
-    let opened_metadata = file.metadata()?;
-    if !opened_metadata.is_file() || is_reparse_point(&opened_metadata) {
+    let metadata = fs::metadata(&candidate)?;
+    if !metadata.is_file() {
         return Err(ResultSummaryError::UnsafeArtifactPath);
     }
-    let opened_identity = file_identity(&file)?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-
-    // 读取完成后再次走安全路径和句柄身份核对，覆盖替换、重解析和竞态越界。
-    let mut current_component = candidate.clone();
-    loop {
-        match fs::symlink_metadata(&current_component) {
-            Ok(metadata) => {
-                if is_reparse_point(&metadata) {
-                    return Err(ResultSummaryError::UnsafeArtifactPath);
-                }
-            }
-            Err(error) => {
-                return Err(if error.kind() == std::io::ErrorKind::NotFound {
-                    ResultSummaryError::UnsafeArtifactPath
-                } else {
-                    ResultSummaryError::Io(error)
-                });
-            }
-        }
-        if current_component == *cache_root || !current_component.pop() {
-            break;
-        }
-    }
-    let current_canonical = fs::canonicalize(&candidate)?;
-    if !current_canonical.starts_with(cache_root) {
-        return Err(ResultSummaryError::UnsafeArtifactPath);
-    }
-    let current_identity = path_file_identity(&candidate)?;
-    if current_identity != opened_identity {
-        return Err(ResultSummaryError::UnsafeArtifactPath);
-    }
-    Ok(ArtifactState::Present(sha256_hex(&bytes)))
+    Ok(ArtifactState::Present(sha256_file_path(&candidate)?))
 }
 
-/// 拒绝绝对、父级和跨平台等价的路径组件，避免 lexical 绕过。
+/// 拒绝绝对路径、父级组件和盘符绕过。
 fn has_unsafe_relative_component(relative_path: &str) -> bool {
-    let slash_normalized = relative_path.replace('\\', "/");
+    let normalized = relative_path.replace('\\', "/");
     if Path::new(relative_path).is_absolute()
-        || slash_normalized.starts_with('/')
-        || slash_normalized.starts_with("//")
-        || (slash_normalized.len() >= 2
-            && slash_normalized.as_bytes()[1] == b':'
-            && slash_normalized.as_bytes()[0].is_ascii_alphabetic())
+        || normalized.starts_with('/')
+        || (normalized.len() >= 2
+            && normalized.as_bytes()[1] == b':'
+            && normalized.as_bytes()[0].is_ascii_alphabetic())
     {
         return true;
     }
-    slash_normalized
-        .split('/')
-        .any(|component| component == "..")
+    normalized.split('/').any(|part| part == "..")
 }
 
-/// 判断文件系统元数据是否包含 symlink/junction/reparse 标记。
+/// 判断路径是否带有 Windows reparse point 或 Unix symlink。
 fn is_reparse_point(metadata: &fs::Metadata) -> bool {
     #[cfg(windows)]
     {
@@ -1278,573 +1075,96 @@ fn is_reparse_point(metadata: &fs::Metadata) -> bool {
     }
 }
 
-/// 根据指定输出名推导稳定 metadata 文件名。
-fn metadata_path(output_path: &Path) -> PathBuf {
-    if output_path.file_name().and_then(|name| name.to_str()) == Some("result-summary.jsonl") {
-        return output_path.with_file_name("result-summary-meta.json");
-    }
-    let stem = output_path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("result-summary");
-    output_path.with_file_name(format!("{stem}-meta.json"))
-}
-
-/// 对 canonical 行逐行紧凑编码，并保证每行恰好一个 LF。
-fn encode_canonical_jsonl(rows: &[CanonicalResultRow]) -> Result<Vec<u8>, ResultSummaryError> {
-    let mut bytes = Vec::new();
-    for row in rows {
-        serde_json::to_writer(&mut bytes, row)?;
-        bytes.push(b'\n');
-    }
-    Ok(bytes)
-}
-
-/// 进程内序号；只用于生成唯一 token、run evidence 目录和 staged 文件名。
-static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// 生成不进入 canonical 的一次性 pair token，跨并发导出保持可区分。
-fn new_pair_lease_token() -> String {
-    let sequence = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{}-{sequence}", std::process::id())
-}
-
-/// acceptance-tools 可控提交边界；正式构建不会暴露或触发这些分支。
-#[cfg(feature = "acceptance-tools")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u8)]
-pub enum ResultSummaryCommitTestHook {
-    /// 不注入外部竞争。
-    None = 0,
-    /// metadata 发布后、canonical 发布前注入外部抢占文件。
-    BeforeCanonicalExternal = 1,
-    /// canonical 发布后注入外部替换，交给 validator 检测。
-    AfterCanonicalExternal = 2,
-}
-
-#[cfg(feature = "acceptance-tools")]
-static RESULT_SUMMARY_COMMIT_TEST_HOOK: AtomicU64 = AtomicU64::new(0);
-
-#[cfg(feature = "acceptance-tools")]
-static RESULT_SUMMARY_COMMIT_TEST_CALLBACK: OnceLock<Mutex<Option<fn(&Path)>>> = OnceLock::new();
-
-/// 设置下一次 pair 提交使用的一次性外部竞争阶段。
-#[cfg(feature = "acceptance-tools")]
-pub fn set_result_summary_commit_test_hook(hook: ResultSummaryCommitTestHook) {
-    RESULT_SUMMARY_COMMIT_TEST_HOOK.store(hook as u64, Ordering::SeqCst);
-}
-
-/// 注册只由验收测试执行的外部路径替换回调，生产构建不包含该 API。
-#[cfg(feature = "acceptance-tools")]
-pub fn set_result_summary_commit_test_callback(callback: Option<fn(&Path)>) {
-    let slot = RESULT_SUMMARY_COMMIT_TEST_CALLBACK.get_or_init(|| Mutex::new(None));
-    *slot.lock().expect("测试回调锁不应中毒") = callback;
-}
-
-/// 只消费匹配阶段，避免故障注入泄漏到其它导出调用。
-#[cfg(feature = "acceptance-tools")]
-fn take_result_summary_commit_test_hook(
-    hook: ResultSummaryCommitTestHook,
-    output_path: &Path,
-) -> bool {
-    let is_targeted_output = output_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with("hook-"));
-    if !is_targeted_output {
-        return false;
-    }
-    RESULT_SUMMARY_COMMIT_TEST_HOOK
-        .compare_exchange(
-            hook as u64,
-            ResultSummaryCommitTestHook::None as u64,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        )
-        .is_ok()
-}
-
-/// 消费测试回调；路径修改由测试代码承担，导出器不删除或替换 final。
-#[cfg(feature = "acceptance-tools")]
-fn take_result_summary_commit_test_callback() -> Option<fn(&Path)> {
-    RESULT_SUMMARY_COMMIT_TEST_CALLBACK
-        .get()
-        .and_then(|slot| slot.lock().expect("测试回调锁不应中毒").take())
-}
-
-/// 返回 pair 同目录 lease 路径；OsString 文件名不经过 UTF-8 转换。
-fn pair_commit_lease_path_internal(output_path: &Path) -> PathBuf {
-    let mut name = output_path
-        .file_name()
-        .map(OsString::from)
-        .unwrap_or_else(|| OsString::from("result-summary"));
-    name.push(".pair.lock");
-    output_path.with_file_name(name)
-}
-
-/// acceptance-tools 测试读取持久 manifest 路径，验证合作 exporter 的互斥边界。
-#[cfg(feature = "acceptance-tools")]
-pub fn pair_commit_lease_path(output_path: &Path) -> PathBuf {
-    pair_commit_lease_path_internal(output_path)
-}
-
-/// 持久 pair manifest；成功和失败都保留，validator 以它确认提交身份。
-#[derive(Debug, Deserialize, Serialize)]
-struct PairLeaseManifest {
-    /// manifest 自身版本，防止未来字段解释漂移。
-    schema_version: u32,
-    /// 与 metadata marker 对齐的一次性提交 token。
-    lease_token: String,
-    /// staged canonical hard-link 发布后应保持的文件身份。
-    expected_canonical_identity: FileIdentity,
-    /// staged metadata hard-link 发布后应保持的文件身份。
-    expected_metadata_identity: FileIdentity,
-    /// 预序列化 canonical 的完整字节 SHA-256。
-    expected_canonical_sha256: String,
-    /// canonical JSONL 行数，供 validator 复核。
-    expected_row_count: u64,
-    /// 导出状态，防止 metadata marker 被单独改写。
-    expected_status: ResultSummaryStatus,
-    /// 保存 staged 文件的唯一 run evidence 目录名。
-    run_evidence_dir: String,
-}
-
-/// 成对提交期间持有的同目录 manifest，阻止合作 exporter 并发写同一 pair。
-struct PairCommitLease {
-    _file: File,
-}
-
-impl PairCommitLease {
-    /// create_new 创建 manifest，写 token/预期身份并同步；文件不会按路径删除。
-    fn acquire(
-        output_path: &Path,
-        lease_token: &str,
-        canonical_identity: FileIdentity,
-        metadata_identity: FileIdentity,
-        canonical_sha256: &str,
-        row_count: u64,
-        status: ResultSummaryStatus,
-        run_evidence_dir: &Path,
-    ) -> Result<Self, ResultSummaryError> {
-        let path = pair_commit_lease_path_internal(output_path);
-        let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Err(ResultSummaryError::OutputCommitIncomplete);
-            }
-            Err(error) => return Err(ResultSummaryError::Io(error)),
-        };
-        let manifest = PairLeaseManifest {
-            schema_version: 1,
-            lease_token: lease_token.to_owned(),
-            expected_canonical_identity: canonical_identity,
-            expected_metadata_identity: metadata_identity,
-            expected_canonical_sha256: canonical_sha256.to_owned(),
-            expected_row_count: row_count,
-            expected_status: status,
-            run_evidence_dir: run_evidence_dir
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("non-utf8-run-evidence")
-                .to_owned(),
-        };
-        let mut bytes = serde_json::to_vec(&manifest)?;
-        bytes.push(b'\n');
-        file.write_all(&bytes)?;
-        file.flush()?;
-        file.sync_all()?;
-        Ok(Self { _file: file })
-    }
-}
-
-/// 创建同目录唯一 run evidence 目录；失败后目录和 staged 证据不原地清理。
-fn create_run_evidence_dir(output_path: &Path) -> Result<PathBuf, ResultSummaryError> {
-    let parent = output_path
-        .parent()
-        .ok_or_else(|| ResultSummaryError::InvalidArgument("输出路径必须包含父目录".into()))?;
-    let output_name = output_path
-        .file_name()
-        .map(OsString::from)
-        .unwrap_or_else(|| OsString::from("result-summary"));
-    for _ in 0..64 {
-        let sequence = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut name = OsString::from(".");
-        name.push(output_name.clone());
-        name.push(format!(".run-{}-{sequence}", std::process::id()));
-        let directory = parent.join(name);
-        match fs::create_dir(&directory) {
-            Ok(()) => return Ok(directory),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(ResultSummaryError::Io(error)),
+/// 对 TSV 字段中的控制字符做固定转义，保持一行一条记录。
+fn escape_tsv(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\t' => escaped.push_str("\\x09"),
+            '\r' => escaped.push_str("\\x0d"),
+            '\n' => escaped.push_str("\\x0a"),
+            '\0' => escaped.push_str("\\x00"),
+            _ => escaped.push(character),
         }
     }
-    Err(ResultSummaryError::InvalidArgument(
-        "无法创建唯一 run evidence 目录".into(),
-    ))
+    escaped
 }
 
-/// 在 run evidence 目录内 create_new 写入并同步 staged 文件，失败也保留证据。
-fn write_temp_file(
-    run_evidence_dir: &Path,
-    role: &str,
-    bytes: &[u8],
-) -> Result<PathBuf, ResultSummaryError> {
-    for _ in 0..64 {
-        let sequence = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let temporary = run_evidence_dir.join(format!(
-            ".stage-{role}-{}-{sequence}.tmp",
-            std::process::id()
-        ));
-        let mut file = match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-        {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(ResultSummaryError::Io(error)),
-        };
-        file.write_all(bytes)?;
-        file.flush()?;
-        file.sync_all()?;
-        return Ok(temporary);
-    }
-    Err(ResultSummaryError::InvalidArgument(
-        "无法创建唯一 staged 摘要文件".into(),
-    ))
-}
-
-/// 以不可覆盖硬链接发布一个 staged 文件；成功后不删除 staged 名称。
-fn commit_temp_file(temporary: &Path, target: &Path) -> Result<(), ResultSummaryError> {
-    match fs::hard_link(temporary, target) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            Err(ResultSummaryError::OutputCommitIncomplete)
-        }
-        Err(error) => Err(ResultSummaryError::Io(error)),
-    }
-}
-
-/// 以句柄、身份和重解析点复核一个 pair 文件，避免路径别名冒充普通文件。
-fn open_verified_pair_file(path: &Path) -> Result<(File, FileIdentity), ResultSummaryError> {
-    let path_metadata = fs::symlink_metadata(path)?;
-    if !path_metadata.is_file() || is_reparse_point(&path_metadata) {
-        return Err(ResultSummaryError::UnsafeArtifactPath);
-    }
-    let file = OpenOptions::new().read(true).open(path)?;
-    let opened_metadata = file.metadata()?;
-    if !opened_metadata.is_file() || is_reparse_point(&opened_metadata) {
-        return Err(ResultSummaryError::UnsafeArtifactPath);
-    }
-    let opened_identity = file_identity(&file)?;
-    let current_identity = path_file_identity(path)?;
-    if current_identity != opened_identity {
-        return Err(ResultSummaryError::UnsafeArtifactPath);
-    }
-    let current_metadata = fs::symlink_metadata(path)?;
-    if !current_metadata.is_file() || is_reparse_point(&current_metadata) {
-        return Err(ResultSummaryError::UnsafeArtifactPath);
-    }
-    let final_identity = path_file_identity(path)?;
-    if final_identity != opened_identity {
-        return Err(ResultSummaryError::UnsafeArtifactPath);
-    }
-    Ok((file, opened_identity))
-}
-
-/// validator 将缺失、替换、JSON 损坏统一归为不可消费；平台身份能力单独保留。
-fn pair_validation_error(error: ResultSummaryError) -> ResultSummaryError {
-    match error {
-        ResultSummaryError::UnsupportedFileIdentity => ResultSummaryError::UnsupportedFileIdentity,
-        _ => ResultSummaryError::OutputCommitIncomplete,
-    }
-}
-
-/// metadata 中必须存在的提交 marker 字段；诊断字段不参与消费判定。
-#[derive(Debug, Deserialize)]
-struct MetadataCommitMarker {
-    /// metadata schema 版本。
-    schema_version: u32,
-    /// 与持久 manifest 对齐的 token。
-    lease_token: String,
-    /// canonical 实际字节 hash。
-    canonical_sha256: String,
-    /// canonical JSONL 行数。
-    row_count: u64,
-    /// 导出完整性状态。
-    status: ResultSummaryStatus,
-}
-
-/// 校验 canonical JSONL 的 UTF-8/LF/JSON 行数，供 pair marker 复核使用。
-fn canonical_row_count(bytes: &[u8]) -> Result<u64, ResultSummaryError> {
-    if bytes.is_empty() {
-        return Ok(0);
+/// 校验固定 TSV 的 UTF-8、列数、footer 行数和前置数据 hash。
+pub fn validate_result_summary(output_path: &Path) -> Result<(), ResultSummaryError> {
+    let bytes = fs::read(output_path)?;
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        return Err(ResultSummaryError::InvalidOutput("禁止 UTF-8 BOM".into()));
     }
     if !bytes.ends_with(b"\n") || bytes.windows(2).any(|pair| pair == b"\r\n") {
-        return Err(ResultSummaryError::OutputCommitIncomplete);
+        return Err(ResultSummaryError::InvalidOutput(
+            "TSV 必须使用 LF 且包含最终换行".into(),
+        ));
     }
-    let mut row_count = 0_u64;
-    for line in bytes.split(|byte| *byte == b'\n') {
-        if line.is_empty() {
-            continue;
-        }
-        serde_json::from_slice::<serde_json::Value>(line)
-            .map_err(|_| ResultSummaryError::OutputCommitIncomplete)?;
-        row_count += 1;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| ResultSummaryError::InvalidOutput("TSV 不是 UTF-8".into()))?;
+    let mut lines = text.split('\n').collect::<Vec<_>>();
+    lines.pop();
+    if lines.is_empty() || lines[0] != TSV_COLUMNS.join("\t") {
+        return Err(ResultSummaryError::InvalidOutput("TSV 头行不匹配".into()));
     }
-    Ok(row_count)
-}
-
-/// 验证 canonical、metadata 和持久 lease 三件套，单个 JSONL 永远不可单独消费。
-pub fn validate_result_summary_pair(output_path: &Path) -> Result<(), ResultSummaryError> {
-    let metadata_path = metadata_path(output_path);
-    let lease_path = pair_commit_lease_path_internal(output_path);
-    let (mut lease_file, _lease_identity) =
-        open_verified_pair_file(&lease_path).map_err(pair_validation_error)?;
-    let mut lease_bytes = Vec::new();
-    lease_file
-        .read_to_end(&mut lease_bytes)
-        .map_err(|error| pair_validation_error(ResultSummaryError::Io(error)))?;
-    let lease_manifest: PairLeaseManifest = serde_json::from_slice(&lease_bytes)
-        .map_err(|_| ResultSummaryError::OutputCommitIncomplete)?;
-    if lease_manifest.schema_version != 1 || lease_manifest.lease_token.is_empty() {
-        return Err(ResultSummaryError::OutputCommitIncomplete);
+    let footer = lines
+        .pop()
+        .ok_or_else(|| ResultSummaryError::InvalidOutput("缺少 footer".into()))?;
+    let footer_fields = footer.split('\t').collect::<Vec<_>>();
+    if footer_fields.len() != 3 || footer_fields[0] != "F" {
+        return Err(ResultSummaryError::InvalidOutput("footer 列不匹配".into()));
     }
-
-    let (mut metadata_file, metadata_identity) =
-        open_verified_pair_file(&metadata_path).map_err(pair_validation_error)?;
-    if metadata_identity != lease_manifest.expected_metadata_identity {
-        return Err(ResultSummaryError::OutputCommitIncomplete);
-    }
-    let mut metadata_bytes = Vec::new();
-    metadata_file
-        .read_to_end(&mut metadata_bytes)
-        .map_err(|error| pair_validation_error(ResultSummaryError::Io(error)))?;
-    let marker: MetadataCommitMarker = serde_json::from_slice(&metadata_bytes)
-        .map_err(|_| ResultSummaryError::OutputCommitIncomplete)?;
-    if marker.schema_version != 1
-        || marker.lease_token != lease_manifest.lease_token
-        || marker.canonical_sha256 != lease_manifest.expected_canonical_sha256
-        || marker.row_count != lease_manifest.expected_row_count
-        || marker.status != lease_manifest.expected_status
-        || marker.canonical_sha256.len() != 64
-        || !marker
-            .canonical_sha256
+    let expected_rows = footer_fields[1]
+        .parse::<u64>()
+        .map_err(|_| ResultSummaryError::InvalidOutput("footer row_count 无效".into()))?;
+    if footer_fields[2].len() != 64
+        || !footer_fields[2]
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit())
     {
-        return Err(ResultSummaryError::OutputCommitIncomplete);
+        return Err(ResultSummaryError::InvalidOutput(
+            "footer SHA-256 无效".into(),
+        ));
     }
-    let _status = marker.status;
-
-    let (mut canonical_file, canonical_identity) =
-        open_verified_pair_file(output_path).map_err(pair_validation_error)?;
-    if canonical_identity != lease_manifest.expected_canonical_identity {
-        return Err(ResultSummaryError::OutputCommitIncomplete);
+    let mut data_rows = 0_u64;
+    for line in &lines[1..] {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() != TSV_COLUMNS.len() || fields[0] != "R" {
+            return Err(ResultSummaryError::InvalidOutput(
+                "数据行记录类型或列数无效".into(),
+            ));
+        }
+        if !matches!(fields[1], "PASS" | "MISSING" | "INCONCLUSIVE") {
+            return Err(ResultSummaryError::InvalidOutput("数据行状态无效".into()));
+        }
+        data_rows += 1;
     }
-    let mut canonical_bytes = Vec::new();
-    canonical_file
-        .read_to_end(&mut canonical_bytes)
-        .map_err(|error| pair_validation_error(ResultSummaryError::Io(error)))?;
-    let actual_hash = sha256_hex(&canonical_bytes);
-    let actual_row_count = canonical_row_count(&canonical_bytes)?;
-    if actual_hash != marker.canonical_sha256 || actual_row_count != marker.row_count {
-        return Err(ResultSummaryError::OutputCommitIncomplete);
+    if data_rows != expected_rows {
+        return Err(ResultSummaryError::InvalidOutput(
+            "footer row_count 与数据行不一致".into(),
+        ));
+    }
+    let footer_start = bytes[..bytes.len() - 1]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map(|position| position + 1)
+        .ok_or_else(|| ResultSummaryError::InvalidOutput("footer 起点无效".into()))?;
+    let actual_data_hash = sha256_hex(&bytes[..footer_start]);
+    if actual_data_hash != footer_fields[2] {
+        return Err(ResultSummaryError::InvalidOutput(
+            "footer 数据 hash 不匹配".into(),
+        ));
     }
     Ok(())
 }
 
-/// 成对提交 metadata 后 canonical；返回仍持有的 lease，调用方验证后再结束函数。
-fn atomic_write_pair(
-    output_path: &Path,
-    metadata_path: &Path,
-    canonical_bytes: &[u8],
-    metadata_bytes: &[u8],
-    lease_token: &str,
-    status: ResultSummaryStatus,
-) -> Result<PairCommitLease, ResultSummaryError> {
-    let run_evidence_dir = create_run_evidence_dir(output_path)?;
-    let canonical_temp = write_temp_file(&run_evidence_dir, "canonical", canonical_bytes)?;
-    let metadata_temp = write_temp_file(&run_evidence_dir, "metadata", metadata_bytes)?;
-    let expected_canonical_identity = path_file_identity(&canonical_temp)?;
-    let expected_metadata_identity = path_file_identity(&metadata_temp)?;
-    let canonical_sha256 = sha256_hex(canonical_bytes);
-    let row_count = canonical_row_count(canonical_bytes)?;
-    let lease = PairCommitLease::acquire(
-        output_path,
-        lease_token,
-        expected_canonical_identity,
-        expected_metadata_identity,
-        &canonical_sha256,
-        row_count,
-        status,
-        &run_evidence_dir,
-    )?;
-    atomic_write_pair_with_lease(
-        output_path,
-        metadata_path,
-        &canonical_temp,
-        &metadata_temp,
-        expected_canonical_identity,
-        expected_metadata_identity,
-    )?;
-    Ok(lease)
+/// 保留旧调用名，但现在只校验一个固定 TSV，不创建 pair/JSON metadata。
+pub fn validate_result_summary_pair(output_path: &Path) -> Result<(), ResultSummaryError> {
+    validate_result_summary(output_path)
 }
 
-/// 在持久 lease 内按 metadata→canonical 顺序发布，并且不按路径回滚任何文件。
-fn atomic_write_pair_with_lease(
-    output_path: &Path,
-    metadata_path: &Path,
-    canonical_temp: &Path,
-    metadata_temp: &Path,
-    expected_canonical_identity: FileIdentity,
-    expected_metadata_identity: FileIdentity,
-) -> Result<(), ResultSummaryError> {
-    commit_temp_file(metadata_temp, metadata_path)?;
-    let metadata_identity = path_file_identity(metadata_path).map_err(pair_validation_error)?;
-    if metadata_identity != expected_metadata_identity {
-        return Err(ResultSummaryError::OutputCommitIncomplete);
-    }
-
-    #[cfg(feature = "acceptance-tools")]
-    if take_result_summary_commit_test_hook(
-        ResultSummaryCommitTestHook::BeforeCanonicalExternal,
-        output_path,
-    ) {
-        if let Some(callback) = take_result_summary_commit_test_callback() {
-            callback(output_path);
-        }
-    }
-
-    commit_temp_file(canonical_temp, output_path)?;
-    let canonical_identity = path_file_identity(output_path).map_err(pair_validation_error)?;
-    if canonical_identity != expected_canonical_identity {
-        return Err(ResultSummaryError::OutputCommitIncomplete);
-    }
-
-    #[cfg(feature = "acceptance-tools")]
-    if take_result_summary_commit_test_hook(
-        ResultSummaryCommitTestHook::AfterCanonicalExternal,
-        output_path,
-    ) {
-        if let Some(callback) = take_result_summary_commit_test_callback() {
-            callback(output_path);
-        }
-    }
-    Ok(())
-}
-
-/// 在诊断 metadata 中标记缺失内容或 artifact。
-fn mark_missing(
-    disposition: &mut ItemDisposition,
-    item: &RawTaskItem,
-    message: &str,
-    kind: &'static str,
-) {
-    disposition.missing = true;
-    disposition.diagnostics.push(SummaryDiagnostic {
-        kind,
-        item_id: Some(item.item_id.clone()),
-        machine_id: item.machine_id.clone(),
-        normalized_path: item.normalized_path.clone(),
-        display_path: item.display_path.clone(),
-        file_size: item.file_size,
-        stage: item.stage.clone(),
-        error: item.error.clone(),
-        content_id: item.content_id,
-        message: message.into(),
-    });
-}
-
-/// 在诊断 metadata 中标记任务状态、计数或特征矛盾。
-fn mark_inconclusive(
-    disposition: &mut ItemDisposition,
-    item: &RawTaskItem,
-    message: &str,
-    kind: &'static str,
-) {
-    disposition.inconclusive = true;
-    disposition.diagnostics.push(SummaryDiagnostic {
-        kind,
-        item_id: Some(item.item_id.clone()),
-        machine_id: item.machine_id.clone(),
-        normalized_path: item.normalized_path.clone(),
-        display_path: item.display_path.clone(),
-        file_size: item.file_size,
-        stage: item.stage.clone(),
-        error: item.error.clone(),
-        content_id: item.content_id,
-        message: message.into(),
-    });
-}
-
-/// 综合任务终态、计数和每行诊断，严格选择 PASS/MISSING/INCONCLUSIVE。
-fn classify_summary(
-    task: Option<&TaskHeader>,
-    row_count: u64,
-    missing_count: u64,
-    inconclusive_count: u64,
-    rows: &[CanonicalResultRow],
-) -> (String, ResultSummaryStatus) {
-    let Some(task) = task else {
-        return ("missing".into(), ResultSummaryStatus::Missing);
-    };
-    if task.status != "completed" {
-        return (task.status.clone(), ResultSummaryStatus::Inconclusive);
-    }
-    if row_count == 0 {
-        if task.total_items == 0 && task.succeeded == 0 && task.failed == 0 && task.cancelled == 0 {
-            return (task.status.clone(), ResultSummaryStatus::Missing);
-        }
-        return (task.status.clone(), ResultSummaryStatus::Inconclusive);
-    }
-    let succeeded = rows.iter().filter(|row| row.status == "succeeded").count() as i64;
-    let failed = rows.iter().filter(|row| row.status == "failed").count() as i64;
-    let cancelled = rows.iter().filter(|row| row.status == "cancelled").count() as i64;
-    let counts_match = task.total_items == row_count as i64
-        && task.succeeded == succeeded
-        && task.failed == failed
-        && task.cancelled == cancelled;
-    if !counts_match || rows.iter().any(|row| row.status != "succeeded") || inconclusive_count > 0 {
-        return (task.status.clone(), ResultSummaryStatus::Inconclusive);
-    }
-    if missing_count > 0 {
-        return (task.status.clone(), ResultSummaryStatus::Missing);
-    }
-    (task.status.clone(), ResultSummaryStatus::Pass)
-}
-
-/// 判断任务级状态是否已经使非空结果集合不可裁决。
-fn task_has_inconclusive_state(task: Option<&TaskHeader>, rows: &[CanonicalResultRow]) -> bool {
-    let Some(task) = task else {
-        return false;
-    };
-    if task.status != "completed" {
-        return true;
-    }
-    if task.total_items != rows.len() as i64 {
-        return true;
-    }
-    let succeeded = rows.iter().filter(|row| row.status == "succeeded").count() as i64;
-    let failed = rows.iter().filter(|row| row.status == "failed").count() as i64;
-    let cancelled = rows.iter().filter(|row| row.status == "cancelled").count() as i64;
-    task.succeeded != succeeded
-        || task.failed != failed
-        || task.cancelled != cancelled
-        || rows.iter().any(|row| row.status != "succeeded")
-}
-
-/// 对任意稳定 serde payload 做紧凑 JSON SHA-256。
-fn hash_serialized<T: Serialize>(value: &T) -> Result<String, ResultSummaryError> {
-    Ok(sha256_hex(&serde_json::to_vec(value)?))
-}
-
-/// 对原始字节计算全小写 SHA-256 十六进制。
-fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
-}
-
-/// 以固定小缓冲区流式计算文件 SHA-256，避免把数据库整体载入内存。
+/// 流式计算文件 SHA-256，避免把数据库或媒体 artifact 整体放入内存。
 fn sha256_file_path(path: &Path) -> Result<String, ResultSummaryError> {
     let mut file = File::open(path)?;
     let mut digest = Sha256::new();
@@ -1856,10 +1176,24 @@ fn sha256_file_path(path: &Path) -> Result<String, ResultSummaryError> {
         }
         digest.update(&buffer[..read]);
     }
-    Ok(format!("{:x}", digest.finalize()))
+    Ok(hex_digest(digest.finalize()))
 }
 
-/// 把 SQLite BLOB 以不丢失原始字节的全小写十六进制表示写入 JSON payload。
+/// 计算字节的全小写十六进制 SHA-256。
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex_digest(Sha256::digest(bytes))
+}
+
+/// 将 digest 统一编码为小写十六进制。
+fn hex_digest(digest: impl AsRef<[u8]>) -> String {
+    digest
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// 把 SQLite BLOB 编码为固定小写十六进制。
 fn lower_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len() * 2);
@@ -1874,18 +1208,10 @@ fn lower_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    /// 验证 Windows/Unix 使用真实平台身份，其他平台明确拒绝而不降级为长度/mtime。
+    /// 文件身份相关平台边界只要求当前平台能正常读出自身 executable。
     #[test]
-    fn file_identity_platform_contract() {
+    fn executable_hash_is_readable() {
         let executable = std::env::current_exe().expect("测试进程路径");
-        let file = File::open(executable).expect("打开测试进程");
-        let result = file_identity(&file);
-        #[cfg(any(windows, unix))]
-        assert!(result.is_ok(), "受支持平台必须提供文件身份");
-        #[cfg(not(any(windows, unix)))]
-        assert!(matches!(
-            result,
-            Err(ResultSummaryError::UnsupportedFileIdentity)
-        ));
+        assert!(sha256_file_path(&executable).is_ok());
     }
 }
