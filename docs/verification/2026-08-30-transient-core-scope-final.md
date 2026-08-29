@@ -87,6 +87,8 @@ Desktop 不读取 Node 本地分析结果。它保留 PostgreSQL 中心同步、
 
 正式包仍只包含四个顶层 EXE、固定 FFmpeg DLL、许可证、schema/config 和 manifest；测试客户端与 data/runtime 不进入正式包。构建、静态验收和真实运行目录均与 `I:\Tool` 隔离，未有实际证据时不得宣称部署或通过。
 
+本轮单次真实运行已经执行，任务在 1800 秒上限进入 `cancelled`，因此验收为 FAIL、正确性为 INCONCLUSIVE。双盘读取和批量缓存查询已生效，但 Hash 与 Media 仍被完整阶段屏障串行化；完整指标、Worker 崩溃路径和证据绑定见 [2026-08-30-dual-disk-single-run-final.md](2026-08-30-dual-disk-single-run-final.md)。
+
 ## 8. 兼容说明和验证
 
 兼容 schema/API 继续保留是为了旧测试和编译边界，不改变新的事实源。新入口必须能证明：不写旧任务/分析/复核/删除历史；批量查询不是逐项查询；完整缓存命中不进入任务文件；P/C/F 只有在 SQLite 确认后推进；重启清空瞬态运行；结果窗口替换而非分页追加。

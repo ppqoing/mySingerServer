@@ -151,12 +151,15 @@ function Write-JsonLines {
         [switch] $MissingSecondDisk,
         [switch] $CapacityExceeded,
         [switch] $MissingOwnership,
-        [switch] $RuntimeGap
+        [switch] $RuntimeGap,
+        [switch] $OmitTerminalSample,
+        [int] $WorkerCrashCount = 0
     )
 
     $runtime = [Collections.Generic.List[string]]::new()
     $machine = '1' * 64
-    for ($elapsed = 0; $elapsed -le $TerminalAtSeconds; $elapsed++) {
+    $lastSampleSecond = if ($OmitTerminalSample) { $TerminalAtSeconds - 1 } else { $TerminalAtSeconds }
+    for ($elapsed = 0; $elapsed -le $lastSampleSecond; $elapsed++) {
         $terminal = $elapsed -eq $TerminalAtSeconds
         $workers = if ($terminal) {
             @()
@@ -169,6 +172,38 @@ function Write-JsonLines {
         }
         $metrics = New-PipelineMetrics -Terminal:$terminal -CapacityExceeded:$CapacityExceeded -MissingOwnership:$MissingOwnership
         if ($MissingSecondDisk) { $metrics.disk_reads = @($metrics.disk_reads[0]) }
+        $sampleFailures = if (-not $terminal -and $WorkerCrashCount -gt 0) {
+            @(1..$WorkerCrashCount | ForEach-Object {
+                    $identity = [int]$_
+                    $stageId = 'compute_base_features'
+                    $displayPath = "H:\pik\00000000000\crash-$identity.jpg"
+                    $failurePid = $identity + 2000
+                    if ($identity -eq 20) {
+                        $displayPath = 'H:\pik\00000000000\dir-a\same.jpg'
+                    }
+                    elseif ($identity -eq 21) {
+                        # 同文件名、不同完整目录，验证不能只按文件名去重。
+                        $displayPath = 'H:\pik\00000000000\dir-b\same.jpg'
+                        $failurePid = 2020
+                    }
+                    elseif ($identity -eq 22) {
+                        # 同完整路径、不同消息，验证消息属于失败身份。
+                        $displayPath = 'H:\pik\00000000000\dir-a\same.jpg'
+                    }
+                    elseif ($identity -eq 23) {
+                        # 同完整路径和消息、不同阶段，验证阶段属于失败身份。
+                        $stageId = 'compute_stage2_features'
+                        $displayPath = 'H:\pik\00000000000\dir-a\same.jpg'
+                        $failurePid = 2020
+                    }
+                    [ordered]@{
+                        stage_id = $stageId
+                        display_path = $displayPath
+                        message = "Worker 崩溃: pid=Some($failurePid), exit_code=Some(-1073740940): Worker 管道分帧失败"
+                    }
+                })
+        }
+        else { @() }
         $runtimeObject = [ordered]@{
             record_type = 'runtime_sample'; utc_unix_ms = 1787356800000 + ($elapsed * 1000)
             elapsed_seconds = $elapsed; sample_interval_ms = if ($elapsed -eq 0) { 0 } else { 1000 }
@@ -176,7 +211,7 @@ function Write-JsonLines {
             state = if ($terminal) { $TerminalState } else { 'running' }
             overall_completed = if ($terminal) { 2 } else { $elapsed }
             overall_total = 2; overall_total_known = $true; overall_failed = if ($TerminalState -eq 'failed') { 1 } else { 0 }
-            overall_skipped = 0; stale = $false; workers = $workers; failures = @()
+            overall_skipped = 0; stale = $false; workers = $workers; failures = $sampleFailures
             execution_config = [ordered]@{
                 hash_tasks = 12; path_cache_queue_capacity = 24; content_cache_queue_capacity = 48
                 decode_queue_capacity = 24; persist_queue_capacity = 48; worker_slots = 20; cpu_budget = 20
@@ -193,10 +228,11 @@ function Write-JsonLines {
         }
         [void]$runtime.Add(($runtimeObject | ConvertTo-Json -Depth 12 -Compress))
     }
+    $runtimeSampleCount = [Math]::Max(0, $lastSampleSecond + 1)
     $result = [ordered]@{
-        record_type = 'runtime_result'; duration_seconds = $TerminalAtSeconds; sample_count = $TerminalAtSeconds + 1
+        record_type = 'runtime_result'; duration_seconds = $TerminalAtSeconds; sample_count = $runtimeSampleCount
         scans_started = 1; failed_scans = if ($TerminalState -eq 'failed') { 1 } else { 0 }
-        cancelled_at_deadline = $false; correctness = if ($TerminalState -eq 'completed') { 'PASS' } else { 'FAIL' }
+        cancelled_at_deadline = [bool]($OmitTerminalSample -and $TerminalState -eq 'cancelled'); correctness = if ($TerminalState -eq 'completed') { 'PASS' } else { 'FAIL' }
         media_roots = @('H:\pik\00000000000', 'I:\tmp'); single_run = $true
         scan_tasks = @([ordered]@{ persistent_task_id = 'runtime-only-task'; runtime_task_id = 'runtime-transient-1'; terminal_state = $TerminalState })
     }
@@ -239,13 +275,16 @@ function Write-Fixture {
         [switch] $RuntimeGap,
         [switch] $MediaChanged,
         [switch] $NodeUnexpectedExit,
-        [switch] $WrongMediaRoot
+        [switch] $WrongMediaRoot,
+        [switch] $DeadlineCancelledNoTerminalSample,
+        [int] $WorkerCrashCount = 0
     )
 
     New-Item -ItemType Directory -Path $Root -Force | Out-Null
     Write-JsonLines -Root $Root -TerminalState $TerminalState -TerminalAtSeconds $TerminalAtSeconds `
         -MissingSecondDisk:$MissingSecondDisk -CapacityExceeded:$CapacityExceeded `
-        -MissingOwnership:$MissingOwnership -RuntimeGap:$RuntimeGap
+        -MissingOwnership:$MissingOwnership -RuntimeGap:$RuntimeGap `
+        -OmitTerminalSample:$DeadlineCancelledNoTerminalSample -WorkerCrashCount $WorkerCrashCount
     $before = [ordered]@{
         Schema = 'rust-v2-media-manifest/v2'; Roots = @('H:\pik\00000000000', 'I:\tmp'); FileCount = 2; TotalBytes = 2048
         Files = @(
@@ -270,18 +309,18 @@ function Write-Fixture {
     }
     $mapPath = Join-Path $Root 'physical-disk-map.json'
     Write-Utf8NoBom -Path $mapPath -Text ($map | ConvertTo-Json -Depth 10)
-    $summary = if ($MissingSummary) { $null } else { Write-ResultSummaryTsv -Root $Root -BrokenFooter:$BrokenFooter }
+    $summary = if ($MissingSummary -or $DeadlineCancelledNoTerminalSample) { $null } else { Write-ResultSummaryTsv -Root $Root -BrokenFooter:$BrokenFooter }
     $harness = [ordered]@{
         schema_version = 3; run_status = if ($TerminalState -eq 'completed') { 'PASS' } else { 'FAIL' }
-        media_unchanged = [bool](-not $MediaChanged.IsPresent); node_unexpected_exit = [bool]$NodeUnexpectedExit.IsPresent; exporter_exit_code = if ($MissingSummary) { 2 } else { 0 }
+        media_unchanged = [bool](-not $MediaChanged.IsPresent); node_unexpected_exit = [bool]$NodeUnexpectedExit.IsPresent; exporter_exit_code = if ($DeadlineCancelledNoTerminalSample) { -1 } elseif ($MissingSummary) { 2 } else { 0 }
         media_roots = @('H:\pik\00000000000', 'I:\tmp'); enumerator = 'everything'; complete_when_task_terminal = $true
         effective_worker_count = if ($ConfigMismatch) { 19 } else { 20 }
         read_total_threads = if ($ConfigMismatch) { 11 } else { 12 }
         hdd_threads_per_disk = 1; ssd_threads_per_disk = 5; unknown_threads_per_disk = 1; reserved_cores = 1
         physical_disk_map_path = $mapPath; physical_disk_map_sha256 = (Get-FileHash -LiteralPath $mapPath -Algorithm SHA256).Hash.ToLowerInvariant()
         result_summary_path = Join-Path $Root 'result-summary.tsv'
-        result_summary_sha256 = if ($summary) { $summary.Sha256 } else { ('0' * 64) }
-        result_summary_status = if ($summary) { $summary.Status } else { 'MISSING' }
+        result_summary_sha256 = if ($summary) { $summary.Sha256 } else { $null }
+        result_summary_status = if ($summary) { $summary.Status } else { 'INCONCLUSIVE' }
         result_summary_row_count = if ($summary) { $summary.RowCount } else { 0 }
         result_summary_missing_count = 0; result_summary_inconclusive_count = 0
         source_revision = 'fixture-revision'; source_tree_sha256 = ('a' * 64); package_path = 'C:\tmp\fixture-package.zip'; package_sha256 = ('b' * 64)
@@ -348,7 +387,8 @@ try {
     $missingRoot = Join-Path $fixtureRoot 'missing-tsv'
     Write-Fixture -Root $missingRoot -MissingSummary
     $missingText = Invoke-Report -Root $missingRoot
-    if ($missingText -notmatch '结论：INCONCLUSIVE' -or $missingText -notmatch 'TSV') {
+    if ($missingText -notmatch '结论：INCONCLUSIVE' -or
+        $missingText -notmatch 'TSV 状态：INCONCLUSIVE' -or $missingText -notmatch 'TSV') {
         throw '缺少 result-summary.tsv 必须是 INCONCLUSIVE'
     }
 
@@ -413,6 +453,34 @@ try {
     $nodeExitText = Invoke-Report -Root $nodeExitRoot
     if ($nodeExitText -notmatch '结论：FAIL' -or $nodeExitText -notmatch '非预期退出') {
         throw 'Node 非预期退出必须是 FAIL'
+    }
+
+    $cancelledNoTerminalRoot = Join-Path $fixtureRoot 'deadline-cancelled-without-terminal-sample'
+    Write-Fixture -Root $cancelledNoTerminalRoot -TerminalState cancelled -TerminalAtSeconds 3 -DeadlineCancelledNoTerminalSample
+    $cancelledNoTerminalText = Invoke-Report -Root $cancelledNoTerminalRoot
+    if ($cancelledNoTerminalText -notmatch '结论：FAIL' -or
+        $cancelledNoTerminalText -notmatch '终态样本缺失' -or
+        $cancelledNoTerminalText -notmatch '非空闲 Worker 峰值：2' -or
+        $cancelledNoTerminalText -notmatch '\| worker \|' -or
+        $cancelledNoTerminalText -notmatch '\| 10 H: \|' -or
+        $cancelledNoTerminalText -notmatch '结果 exporter 未执行：任务未完成（终态=cancelled）' -or
+        $cancelledNoTerminalText -match '结果 exporter 未正常退出：-1' -or
+        $cancelledNoTerminalText -notmatch 'TSV 状态：INCONCLUSIVE' -or
+        $cancelledNoTerminalText -notmatch '终态 ownership 归零：INCONCLUSIVE（终态样本缺失）' -or
+        $cancelledNoTerminalText -match '缺少 exporter_exit_code|缺少 result_summary_sha256|TSV 状态与 harness 不一致') {
+        throw "deadline cancelled 无终态样本必须保留资源汇总且是 FAIL，实际报告：$cancelledNoTerminalText"
+    }
+
+    $workerCrashRoot = Join-Path $fixtureRoot 'repeated-worker-crashes'
+    Write-Fixture -Root $workerCrashRoot -WorkerCrashCount 23
+    $workerCrashText = Invoke-Report -Root $workerCrashRoot
+    if ($workerCrashText -notmatch 'Worker 崩溃独立项：23' -or
+        $workerCrashText -notmatch [regex]::Escape('H:\pik\00000000000\dir-a\same.jpg') -or
+        $workerCrashText -notmatch [regex]::Escape('H:\pik\00000000000\dir-b\same.jpg') -or
+        $workerCrashText -notmatch 'pid=Some\(2022\)' -or
+        $workerCrashText -notmatch 'compute_stage2_features' -or
+        $workerCrashText -match 'Worker 崩溃观察样本：46') {
+        throw 'Worker 崩溃必须按完整身份去重并列出全部路径，不能按快照重复计数或截断前20项'
     }
 
     $wrongMediaRoot = Join-Path $fixtureRoot 'wrong-media-root'

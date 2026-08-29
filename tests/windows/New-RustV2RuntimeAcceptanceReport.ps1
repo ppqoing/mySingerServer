@@ -78,6 +78,15 @@ function Get-IntegerOrNull {
     }
 }
 
+function Get-SignedIntegerOrNull {
+    <# 将可为负的整数转换为 long，供进程退出码等状态值使用。 #>
+    param($Value)
+
+    if ($null -eq $Value) { return $null }
+    try { [int64]$Value }
+    catch { $null }
+}
+
 function Get-Sha256Bytes {
     <# 计算字节数组 SHA-256，固定输出小写十六进制。 #>
     param([byte[]] $Bytes)
@@ -390,7 +399,8 @@ function Get-ResultSummaryTsv {
             [void]$errors.Add("TSV 读取或 UTF-8 校验失败：$($_.Exception.Message)")
         }
     }
-    if ($inconclusiveCount -gt 0) {
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or $inconclusiveCount -gt 0) {
+        # exporter 未产出 TSV 时，报告状态是证据不确定，而不是把缺文件当作普通缺失项。
         $derivedStatus = 'INCONCLUSIVE'
     }
     elseif ($missingCount -gt 0 -or $rowCount -eq 0) {
@@ -399,9 +409,13 @@ function Get-ResultSummaryTsv {
     else {
         $derivedStatus = 'PASS'
     }
-    $expectedSha = [string](Get-OptionalProperty -Object $Harness -Name 'result_summary_sha256')
+    $expectedStatus = [string](Get-OptionalProperty -Object $Harness -Name 'result_summary_status')
+    $expectedShaProperty = $Harness.PSObject.Properties['result_summary_sha256']
+    $expectedSha = if ($null -ne $expectedShaProperty) { [string]$expectedShaProperty.Value } else { '' }
     if ([string]::IsNullOrWhiteSpace($expectedSha)) {
-        [void]$errors.Add('harness 缺少 result_summary_sha256')
+        if ($null -eq $expectedShaProperty -or $null -ne $fullSha) {
+            [void]$errors.Add('harness 缺少 result_summary_sha256')
+        }
     }
     elseif ($null -ne $fullSha -and $expectedSha -notmatch '^[0-9a-fA-F]{64}$') {
         [void]$errors.Add('harness result_summary_sha256 格式无效')
@@ -409,7 +423,6 @@ function Get-ResultSummaryTsv {
     elseif ($null -ne $fullSha -and $fullSha -cne $expectedSha.ToLowerInvariant()) {
         [void]$errors.Add('TSV 完整文件 SHA 与 harness 不一致')
     }
-    $expectedStatus = [string](Get-OptionalProperty -Object $Harness -Name 'result_summary_status')
     if (-not [string]::IsNullOrWhiteSpace($expectedStatus) -and
         $expectedStatus.ToUpperInvariant() -cne $derivedStatus) {
         [void]$errors.Add('TSV 状态与 harness 不一致')
@@ -491,7 +504,7 @@ function Get-RuntimeTerminalEvidence {
             [string](Get-OptionalProperty -Object $_ -Name 'state') -in @('completed', 'failed', 'cancelled')
         })
     if ($terminalSamples.Count -eq 0) {
-        [void]$errors.Add('runtime_sample 没有任务终态样本')
+        [void]$errors.Add('终态样本缺失：runtime_sample 没有任务终态样本；资源汇总使用最后一条运行样本，不进行终态归零判定')
     }
     elseif ($terminalState -and [string](Get-OptionalProperty -Object $terminalSamples[-1] -Name 'state') -ne $terminalState) {
         [void]$errors.Add('runtime_sample 与 scan_tasks 终态不一致')
@@ -518,6 +531,8 @@ function Get-RuntimeTerminalEvidence {
         ScanTasks = @($scanTasks)
         TerminalSamples = @($terminalSamples)
         TerminalSample = if ($terminalSamples.Count -gt 0) { $terminalSamples[-1] } else { $null }
+        ResourceSample = if ($terminalSamples.Count -gt 0) { $terminalSamples[-1] } elseif ($RuntimeSamples.Count -gt 0) { $RuntimeSamples[-1] } else { $null }
+        TerminalSampleMissing = $terminalSamples.Count -eq 0
         TerminalState = $terminalState
         FailedScans = $failedScans
         Correctness = $correctness
@@ -725,7 +740,8 @@ function Get-PipelineEvidence {
     <# 汇总队列、资源和 ownership，并检查容量、守恒与终态归零。 #>
     param(
         [Parameter(Mandatory)] [object[]] $RuntimeSamples,
-        [Parameter(Mandatory)] $TerminalSample
+        [Parameter(Mandatory)] [AllowNull()] $TerminalSample,
+        [bool] $TerminalSampleIsActual = $true
     )
 
     $errors = [Collections.Generic.List[string]]::new()
@@ -864,7 +880,7 @@ function Get-PipelineEvidence {
     foreach ($name in @($ownershipCapacityViolations)) { [void]$failures.Add("ownership 容量越界：$name") }
     $terminalNonZero = [Collections.Generic.List[string]]::new()
     $terminalToken = $null
-    if ($null -ne $TerminalSample) {
+    if ($TerminalSampleIsActual -and $null -ne $TerminalSample) {
         $terminalPipeline = Get-OptionalProperty -Object $TerminalSample -Name 'pipeline_metrics'
         foreach ($field in @($ownershipFields | Where-Object { $_ -ne 'hash_refill_token_available' })) {
             $value = Get-NumberOrNull (Get-OptionalProperty -Object (Get-OptionalProperty -Object $terminalPipeline -Name $field) -Name 'current')
@@ -888,6 +904,7 @@ function Get-PipelineEvidence {
         OwnershipDisplays = $ownershipDisplays
         TerminalNonZero = @($terminalNonZero)
         TerminalToken = $terminalToken
+        TerminalSampleIsActual = $TerminalSampleIsActual
         LatencyPresent = $latencyRows.Count -gt 0
     }
 }
@@ -1036,12 +1053,18 @@ function Get-WorkerAndSystemSummary {
     if ($diskLines.Count -eq 0) { $diskLines = @('| — | — | — | — |') }
     $failures = @($RuntimeSamples | ForEach-Object { Get-PropertyArray -Object $_ -Name 'failures' } |
         Where-Object { $null -ne $_ -and $null -ne $_.PSObject.Properties['message'] })
-    $failureLines = @($failures | Group-Object {
+    # Runtime 快照会重复携带最近失败；按阶段、完整路径和消息组成的身份去重，全部列出而不截断。
+    $failureGroups = @($failures | Group-Object {
             "$(Get-OptionalProperty -Object $_ -Name 'stage_id') / $(Get-OptionalProperty -Object $_ -Name 'display_path') / $(Get-OptionalProperty -Object $_ -Name 'message')"
-        } | Sort-Object Count -Descending | Select-Object -First 20 | ForEach-Object { "- $($_.Name)（$($_.Count) 次）" })
+        } | Sort-Object Name)
+    $failureLines = @($failureGroups | ForEach-Object { "- $($_.Name)（在 $($_.Count) 条快照中出现）" })
     if ($failureLines.Count -eq 0) { $failureLines = @('- 本次未记录文件级失败。') }
-    $physicalFaults = @($failures | Where-Object { [string](Get-OptionalProperty -Object $_ -Name 'message') -match '物理|timeout|超时|读取' }).Count
-    $workerCrashes = @($failures | Where-Object { [string](Get-OptionalProperty -Object $_ -Name 'message') -match 'Worker|崩溃|exit' }).Count
+    $physicalFaults = @($failureGroups | Where-Object {
+            [string](Get-OptionalProperty -Object $_.Group[0] -Name 'message') -match '物理|timeout|超时|读取'
+        }).Count
+    $workerCrashes = @($failureGroups | Where-Object {
+            [string](Get-OptionalProperty -Object $_.Group[0] -Name 'message') -match 'Worker|崩溃|exit'
+        }).Count
     $skipCount = @($SystemSamples | ForEach-Object { Get-PropertyArray -Object $_ -Name 'process_sample_skips' }).Count
     [pscustomobject]@{
         ActiveWorkers = @($activeWorkers); PeakWorkers = $peakWorkers; AverageWorkers = $averageWorkers
@@ -1114,9 +1137,13 @@ try {
         elseif ([bool]$nodeUnexpectedExit) {
             [void]$failReasons.Add('Node 或 Worker 发生非预期退出')
         }
-        $exporterExitCode = Get-IntegerOrNull (Get-OptionalProperty -Object $harness -Name 'exporter_exit_code')
+        $exporterExitCode = Get-SignedIntegerOrNull (Get-OptionalProperty -Object $harness -Name 'exporter_exit_code')
         if ($null -eq $exporterExitCode) {
             [void]$inconclusiveReasons.Add('harness 缺少 exporter_exit_code')
+        }
+        elseif ($exporterExitCode -eq -1 -and $terminal.TerminalState -ne 'completed') {
+            # -1 是 Measure 在任务未完成、因此未启动 exporter 时写入的哨兵值，不是子进程退出码。
+            [void]$inconclusiveReasons.Add("结果 exporter 未执行：任务未完成（终态=$($terminal.TerminalState)）")
         }
         elseif ($exporterExitCode -ne 0) {
             [void]$inconclusiveReasons.Add("结果 exporter 未正常退出：$exporterExitCode")
@@ -1144,7 +1171,8 @@ try {
         $config = Get-ConfigurationEvidence -Harness $harness -RuntimeSamples $runtimeSamples
         $config.Errors | ForEach-Object { [void]$inconclusiveReasons.Add([string]$_) }
         $config.Failures | ForEach-Object { [void]$failReasons.Add([string]$_) }
-        $pipeline = Get-PipelineEvidence -RuntimeSamples $runtimeSamples -TerminalSample $terminal.TerminalSample
+        $pipeline = Get-PipelineEvidence -RuntimeSamples $runtimeSamples -TerminalSample $terminal.ResourceSample `
+            -TerminalSampleIsActual:(-not $terminal.TerminalSampleMissing)
         $pipeline.Errors | ForEach-Object { [void]$inconclusiveReasons.Add([string]$_) }
         $pipeline.Failures | ForEach-Object { [void]$failReasons.Add([string]$_) }
         $pipeline.CapacityViolations | ForEach-Object { [void]$failReasons.Add("队列/资源容量越界：$($_)") }
@@ -1199,6 +1227,15 @@ $resultRowsText = if ($null -ne $summary) { $summary.RowCount } else { '—' }
 $resultMissingText = if ($null -ne $summary) { $summary.MissingCount } else { '—' }
 $resultInconclusiveText = if ($null -ne $summary) { $summary.InconclusiveCount } else { '—' }
 $terminalStateText = if ($null -ne $terminal) { $terminal.TerminalState } else { '—' }
+$terminalSampleText = if ($null -eq $terminal) {
+    '—'
+}
+elseif ($terminal.TerminalSampleMissing) {
+    '缺失（资源汇总使用最后一条运行样本，未执行终态归零判定）'
+}
+else {
+    '已记录'
+}
 $mediaRootsText = if ($null -ne $media -and $media.BeforeRoots.Count -gt 0) { ($media.BeforeRoots | ForEach-Object { "- 媒体根：$_" }) -join "`n" } else { '- 媒体根证据不可用。' }
 $mapText = if ($null -ne $media -and $media.Entries.Count -gt 0) {
     @($media.Entries | ForEach-Object {
@@ -1238,8 +1275,15 @@ $ownershipPeakSum = if ($null -ne $pipeline) {
         } | Measure-Object -Sum).Sum
 } else { 0 }
 $terminalOwnershipPass = $false
+$terminalOwnershipText = 'FAIL/—'
 if ($null -ne $pipeline) {
-    $terminalOwnershipPass = ($pipeline.TerminalNonZero.Count -eq 0 -and $null -ne $pipeline.TerminalToken -and $pipeline.TerminalToken -eq 0)
+    if (-not $pipeline.TerminalSampleIsActual) {
+        $terminalOwnershipText = 'INCONCLUSIVE（终态样本缺失）'
+    }
+    else {
+        $terminalOwnershipPass = ($pipeline.TerminalNonZero.Count -eq 0 -and $null -ne $pipeline.TerminalToken -and $pipeline.TerminalToken -eq 0)
+        $terminalOwnershipText = if ($terminalOwnershipPass) { 'PASS' } else { 'FAIL' }
+    }
 }
 $report = @"
 # Rust V2 单次真实媒体运行验收
@@ -1250,6 +1294,7 @@ $report = @"
 
 - 运行模式：任务进入终态后结束；最大持续时间只作为上限，不要求等待满上限。
 - 任务终态：$terminalStateText
+- 终态样本：$terminalSampleText
 - 实际最后任务快照 elapsed：$(Format-Optional $lastElapsed ' 秒')；runtime_result duration：$(Format-Optional $duration ' 秒')
 - 任务快照：$runtimeCount 条；$runtimeTargetText；最大相邻间隔：$runtimeGapText
 - 系统采样：$systemCount 条；$systemTargetText；最大相邻间隔：$systemGapText
@@ -1320,7 +1365,7 @@ $metricLinesText
 
 - 非 control ownership 当前峰值和：$(' {0:N0}' -f $ownershipCurrentSum)；历史峰值和：$(' {0:N0}' -f $ownershipPeakSum)
 - 缺失字段：$ownershipMissingText
-- 终态 ownership 归零：$(if ($terminalOwnershipPass) { 'PASS' } else { 'FAIL/—' })
+- 终态 ownership 归零：$terminalOwnershipText
 - 协议未暴露的 P/C/F 与缓存命中明细：—（不反推）
 
 ## 逐物理盘读取许可
@@ -1348,8 +1393,8 @@ $systemDiskText
 ## 文件级失败观察
 
 $failureText
-- 疑似物理读取故障样本：$(if ($null -ne $system) { $system.PhysicalFaults } else { '—' })
-- Worker 崩溃观察样本：$(if ($null -ne $system) { $system.WorkerCrashes } else { '—' })
+- 疑似物理读取故障独立项：$(if ($null -ne $system) { $system.PhysicalFaults } else { '—' })
+- Worker 崩溃独立项：$(if ($null -ne $system) { $system.WorkerCrashes } else { '—' })
 
 ## 媒体未修改证明
 
