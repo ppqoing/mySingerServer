@@ -68,3 +68,42 @@ git diff --check
 
 该入口已可被 Actor 使用，但按照任务限制没有把现有 `DispatchStage2`/本地分析调用接到它；
 这一接线由后续 7E3B 负责。
+
+## Fix round 1：writer 收束后的瞬态目录清理
+
+审查指出成功与 runner 失败路径曾在 `BaseStoreActor::finish()` 前调用
+`production.discard()`。现已统一为：runner 返回 owner 后先 drop `BaseStoreHandle` 与 ACK
+receiver，再调用 `finish()` 归还或终结 Store actor；成功路径在已归还 Store 上读取实际
+`outbox_high_seq`，最后才精确删除当前 run 目录。若 writer join 或 highwater 读取失败，也在
+actor owner 已结束后尽力执行同一精确清理，并在原始 runner/writer 错误后附加清理诊断。
+
+新增两条真实行为测试，均使用 task-file runner、受控 WorkerPool、`BaseStoreActor` 与其已有
+join 观测，不使用源码字符串断言：
+
+- 成功 ACK 路径确认 `discard` 触发时 writer 已真实 join，当前 run 目录仍存在，随后只删除该目录。
+- 运行中取消路径确认同一顺序，且 writer 收束成功时错误仍归还 Store。
+
+### RED / GREEN 证据
+
+所有 Cargo 命令均沿用本报告前述已清理环境变量和固定 target。首次可编译的 RED：
+
+```powershell
+cargo test -p dedup-node-engine --features test-hooks production_task_file_stage2_finishes_writer_before_discarding --locked -- --test-threads=1
+```
+
+旧顺序结果为 2 failed、0 passed；成功和取消路径均在
+`“必须先真实 join SQLite writer，最后才 discard”` 断言失败，实际证明 `discard` 先于
+writer 收束。
+
+最小顺序修复后重跑同一命令：2 passed、0 failed。
+
+### 本轮验证
+
+```powershell
+cargo test -p dedup-node-engine --features test-hooks --lib --locked -- --test-threads=1
+cargo fmt --all -- --check
+git diff --check
+```
+
+完整 lib 为 137 passed、0 failed；格式和 diff 检查通过。Cargo 仍输出既有未使用导入和测试
+hook 警告，未在本轮扩大范围处理。工作树中的 `progress.md` 是既有外部未提交修改，未触碰。

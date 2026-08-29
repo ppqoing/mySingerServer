@@ -7,6 +7,9 @@ use std::{
     sync::Arc,
 };
 
+#[cfg(all(test, feature = "test-hooks"))]
+use std::sync::Mutex;
+
 use dedup_core::{
     ContentKey, DiskReadConfig, DisplayPath, LocationKey, MediaKind, ScreeningOutcome, TaskId,
     Thresholds,
@@ -36,6 +39,9 @@ use crate::{
         Stage2TaskInput, build_stage2_task_production, run_task_file_stage2,
     },
 };
+
+#[cfg(all(test, feature = "test-hooks"))]
+use crate::scan::BasePersistTestWaiter;
 
 use super::AnalysisBlocked;
 use super::stage2_planner::{
@@ -484,6 +490,12 @@ pub(crate) struct Stage2TaskFileRunOptions<'a> {
     /// 单元测试在首次缓存查询处观察已完成的来源解析；生产构建不保留测试状态。
     #[cfg(test)]
     cache_lookup_observer: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// 测试仅将首条 SQLite 持久化暂停，以观测 discard 前 writer 是否已真实 join。
+    #[cfg(all(test, feature = "test-hooks"))]
+    first_persist_waiter: Option<Arc<Mutex<Option<BasePersistTestWaiter>>>>,
+    /// 测试仅在精确 discard 前记录 actor 收束与运行目录状态。
+    #[cfg(all(test, feature = "test-hooks"))]
+    before_discard_observer: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl<'a> Stage2TaskFileRunOptions<'a> {
@@ -508,6 +520,10 @@ impl<'a> Stage2TaskFileRunOptions<'a> {
             resolver,
             #[cfg(test)]
             cache_lookup_observer: None,
+            #[cfg(all(test, feature = "test-hooks"))]
+            first_persist_waiter: None,
+            #[cfg(all(test, feature = "test-hooks"))]
+            before_discard_observer: None,
         }
     }
 
@@ -516,6 +532,26 @@ impl<'a> Stage2TaskFileRunOptions<'a> {
     fn with_cache_lookup_observer(mut self, observer: Arc<dyn Fn() + Send + Sync>) -> Self {
         self.cache_lookup_observer = Some(observer);
         self
+    }
+
+    /// 仅单元测试：把现有 writer join 观测与 discard 前窄观察器接到同一次生产运行。
+    #[cfg(all(test, feature = "test-hooks"))]
+    fn with_task_file_lifecycle_observer(
+        mut self,
+        first_persist_waiter: BasePersistTestWaiter,
+        before_discard_observer: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        self.first_persist_waiter = Some(Arc::new(Mutex::new(Some(first_persist_waiter))));
+        self.before_discard_observer = Some(before_discard_observer);
+        self
+    }
+
+    /// 仅单元测试：在当前 run 目录删除前执行窄观察，不改变生产构建状态。
+    #[cfg(all(test, feature = "test-hooks"))]
+    fn observe_before_discard(&self) {
+        if let Some(observer) = &self.before_discard_observer {
+            observer();
+        }
     }
 }
 
@@ -704,6 +740,23 @@ pub(crate) async fn run_stage2_batch_production(
             ));
         }
     };
+    #[cfg(all(test, feature = "test-hooks"))]
+    let first_persist_waiter = options.first_persist_waiter.as_ref().and_then(|waiter| {
+        waiter
+            .lock()
+            .expect("二筛测试 writer waiter 锁不应中毒")
+            .take()
+    });
+    #[cfg(all(test, feature = "test-hooks"))]
+    let (store_actor, store_handle, mut acknowledgements) = match first_persist_waiter {
+        Some(waiter) => BaseStoreActor::spawn_with_first_persist_waiter(
+            store,
+            options.persist_capacity.max(1),
+            waiter,
+        ),
+        None => BaseStoreActor::spawn(store, options.persist_capacity.max(1)),
+    };
+    #[cfg(not(all(test, feature = "test-hooks")))]
     let (store_actor, store_handle, mut acknowledgements) =
         BaseStoreActor::spawn(store, options.persist_capacity.max(1));
     let run = run_task_file_stage2(
@@ -721,12 +774,18 @@ pub(crate) async fn run_stage2_batch_production(
             let stage_completed = run.completed;
             let stage_failed = run.failed;
             let mut production = run.production;
-            let cleanup = production.discard().err().map(|error| error.to_string());
             drop(store_handle);
             drop(acknowledgements);
             let store = match store_actor.finish().await {
                 Ok(store) => store,
                 Err(error) => {
+                    // actor owner 已结束；即使 join 失败也只尽力删除当前 run 目录。
+                    #[cfg(all(test, feature = "test-hooks"))]
+                    options.observe_before_discard();
+                    let cleanup = production
+                        .discard()
+                        .err()
+                        .map(|cleanup| cleanup.to_string());
                     return Err(Stage2TaskFileRunError {
                         store: None,
                         message: merge_task_file_failure(
@@ -737,16 +796,32 @@ pub(crate) async fn run_stage2_batch_production(
                     });
                 }
             };
+            let outbox_high_seq = match store.outbox_high_seq() {
+                Ok(highwater) => highwater,
+                Err(error) => {
+                    // 已归还 Store 后仍需按当前 run 身份尽力清理。
+                    #[cfg(all(test, feature = "test-hooks"))]
+                    options.observe_before_discard();
+                    let cleanup = production
+                        .discard()
+                        .err()
+                        .map(|cleanup| cleanup.to_string());
+                    return Err(task_file_run_error(
+                        store,
+                        merge_task_file_failure(&error.to_string(), cleanup, String::new()),
+                    ));
+                }
+            };
+            // Store、ACK 和真实 highwater 全部收束后，才可精确删除本轮瞬态目录。
+            #[cfg(all(test, feature = "test-hooks"))]
+            options.observe_before_discard();
+            let cleanup = production.discard().err().map(|error| error.to_string());
             if let Some(cleanup) = cleanup {
                 return Err(task_file_run_error(
                     store,
                     format!("二筛任务目录清理失败: {cleanup}"),
                 ));
             }
-            let outbox_high_seq = match store.outbox_high_seq() {
-                Ok(highwater) => highwater,
-                Err(error) => return Err(task_file_run_error(store, error.to_string())),
-            };
             Ok(Stage2TaskFileRunResult {
                 store,
                 run_id: task_id,
@@ -758,18 +833,35 @@ pub(crate) async fn run_stage2_batch_production(
         Err(error) => {
             let message = error.to_string();
             let mut production = error.into_production();
-            let cleanup = production.discard().err().map(|error| error.to_string());
             drop(store_handle);
             drop(acknowledgements);
             match store_actor.finish().await {
-                Ok(store) => Err(task_file_run_error(
-                    store,
-                    merge_task_file_failure(&message, cleanup, String::new()),
-                )),
-                Err(writer) => Err(Stage2TaskFileRunError {
-                    store: None,
-                    message: merge_task_file_failure(&message, cleanup, writer.to_string()),
-                }),
+                Ok(store) => {
+                    // 失败 runner 的 actor 也必须先归还 Store，之后才能清理瞬态目录。
+                    #[cfg(all(test, feature = "test-hooks"))]
+                    options.observe_before_discard();
+                    let cleanup = production
+                        .discard()
+                        .err()
+                        .map(|cleanup| cleanup.to_string());
+                    Err(task_file_run_error(
+                        store,
+                        merge_task_file_failure(&message, cleanup, String::new()),
+                    ))
+                }
+                Err(writer) => {
+                    // join 失败后 actor owner 已被消费，保留原始 runner/writer/清理诊断。
+                    #[cfg(all(test, feature = "test-hooks"))]
+                    options.observe_before_discard();
+                    let cleanup = production
+                        .discard()
+                        .err()
+                        .map(|cleanup| cleanup.to_string());
+                    Err(Stage2TaskFileRunError {
+                        store: None,
+                        message: merge_task_file_failure(&message, cleanup, writer.to_string()),
+                    })
+                }
             }
         }
     }
@@ -2063,7 +2155,7 @@ mod tests {
     use std::{
         sync::{
             Arc,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::Duration,
     };
@@ -2078,7 +2170,7 @@ mod tests {
     use dedup_windows::{LocalDiskKind, PhysicalDiskId, ReadCancellationToken};
 
     use crate::{
-        scan::{ResolvedScanRootStorage, ScanRootStorageResolver},
+        scan::{BasePersistTestController, ResolvedScanRootStorage, ScanRootStorageResolver},
         worker::Stage2Frame,
     };
 
@@ -2141,6 +2233,186 @@ mod tests {
                 .load_complete_stage2(content_id)
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[tokio::test]
+    async fn production_task_file_stage2_finishes_writer_before_discarding_successful_run() {
+        let runtime = tempfile::tempdir().unwrap();
+        let mut store = test_store();
+        let (content, source, content_id) = seed_image(&mut store, [0x67; 16], 67, false);
+        let plan = begin_stage2_batch(
+            &mut store,
+            &[Stage2BatchItem {
+                content,
+                source,
+                frame_slots: Vec::new(),
+            }],
+            67,
+        )
+        .unwrap();
+        let run_id = plan.task_id;
+        let run_directory = runtime.path().join(run_id.as_uuid().to_string());
+        let resolver = FixedLaneResolver::new(1);
+        let read_config = DiskReadConfig::default();
+        let (persist_control, persist_waiter) = BasePersistTestController::new();
+        let persist_control = Arc::new(persist_control);
+        let observed_control = Arc::clone(&persist_control);
+        let discard_seen = Arc::new(AtomicBool::new(false));
+        let joined_at_discard = Arc::new(AtomicBool::new(false));
+        let directory_alive_at_discard = Arc::new(AtomicBool::new(false));
+        let observed_discard = Arc::clone(&discard_seen);
+        let observed_joined = Arc::clone(&joined_at_discard);
+        let observed_directory = Arc::clone(&directory_alive_at_discard);
+        let options = Stage2TaskFileRunOptions::new(
+            runtime.path(),
+            runtime.path(),
+            &read_config,
+            1,
+            2,
+            ReadCancellationToken::new(),
+            &resolver,
+        )
+        .with_task_file_lifecycle_observer(
+            persist_waiter,
+            Arc::new(move || {
+                observed_discard.store(true, Ordering::SeqCst);
+                observed_joined.store(observed_control.writer_joined(), Ordering::SeqCst);
+                observed_directory.store(run_directory.exists(), Ordering::SeqCst);
+            }),
+        );
+        let (mut pool, mut started, worker_control) = WorkerPool::controlled_batch_for_test(1);
+        let run = run_stage2_batch_production(store, plan, &mut pool, None, &options);
+        let control = async {
+            let (task_id, item_id) = started.recv().await.unwrap();
+            worker_control
+                .stage2_source_read_complete(task_id.clone(), item_id.clone())
+                .await;
+            worker_control
+                .complete_stage2(task_id, item_id, stage2_output(9))
+                .await;
+            persist_control.wait_until_entered().await;
+            persist_control.release();
+        };
+        let (result, ()) =
+            tokio::time::timeout(Duration::from_secs(2), async { tokio::join!(run, control) })
+                .await
+                .expect("成功二筛必须在有限时间内收束 writer 并删除运行目录");
+        pool.shutdown().await.unwrap();
+        let result = result.unwrap();
+
+        assert!(
+            discard_seen.load(Ordering::SeqCst),
+            "成功路径必须精确 discard 本轮目录"
+        );
+        assert!(
+            joined_at_discard.load(Ordering::SeqCst),
+            "成功路径必须先真实 join SQLite writer，最后才 discard"
+        );
+        assert!(
+            directory_alive_at_discard.load(Ordering::SeqCst),
+            "discard 前当前 run 目录必须仍存在，避免观察到其他目录"
+        );
+        assert!(
+            !runtime
+                .path()
+                .join(result.run_id.as_uuid().to_string())
+                .exists(),
+            "writer 收束后的 discard 只能删除当前 run 目录"
+        );
+        assert!(
+            result
+                .store
+                .load_complete_stage2(content_id)
+                .unwrap()
+                .is_some(),
+            "真实 SQLite ACK 必须在 writer 收束前已提交二筛结果"
+        );
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[tokio::test]
+    async fn production_task_file_stage2_finishes_writer_before_discarding_failed_run() {
+        let runtime = tempfile::tempdir().unwrap();
+        let mut store = test_store();
+        let (content, source, _) = seed_image(&mut store, [0x68; 16], 68, false);
+        let plan = begin_stage2_batch(
+            &mut store,
+            &[Stage2BatchItem {
+                content,
+                source,
+                frame_slots: Vec::new(),
+            }],
+            68,
+        )
+        .unwrap();
+        let run_id = plan.task_id;
+        let run_directory = runtime.path().join(run_id.as_uuid().to_string());
+        let resolver = FixedLaneResolver::new(1);
+        let read_config = DiskReadConfig::default();
+        let (persist_control, persist_waiter) = BasePersistTestController::new();
+        let persist_control = Arc::new(persist_control);
+        let observed_control = Arc::clone(&persist_control);
+        let discard_seen = Arc::new(AtomicBool::new(false));
+        let joined_at_discard = Arc::new(AtomicBool::new(false));
+        let directory_alive_at_discard = Arc::new(AtomicBool::new(false));
+        let observed_discard = Arc::clone(&discard_seen);
+        let observed_joined = Arc::clone(&joined_at_discard);
+        let observed_directory = Arc::clone(&directory_alive_at_discard);
+        let cancellation = ReadCancellationToken::new();
+        let options = Stage2TaskFileRunOptions::new(
+            runtime.path(),
+            runtime.path(),
+            &read_config,
+            1,
+            2,
+            cancellation.clone(),
+            &resolver,
+        )
+        .with_task_file_lifecycle_observer(
+            persist_waiter,
+            Arc::new(move || {
+                observed_discard.store(true, Ordering::SeqCst);
+                observed_joined.store(observed_control.writer_joined(), Ordering::SeqCst);
+                observed_directory.store(run_directory.exists(), Ordering::SeqCst);
+            }),
+        );
+        let (mut pool, mut started, _worker_control) = WorkerPool::controlled_batch_for_test(1);
+        let run = run_stage2_batch_production(store, plan, &mut pool, None, &options);
+        let cancel = async {
+            let _ = started.recv().await.unwrap();
+            cancellation.cancel();
+        };
+        let (error, ()) =
+            tokio::time::timeout(Duration::from_secs(2), async { tokio::join!(run, cancel) })
+                .await
+                .expect("取消二筛必须在有限时间内收束 writer 并删除运行目录");
+        pool.shutdown().await.unwrap();
+        let error = match error {
+            Ok(_) => panic!("取消运行中的二筛必须返回任务级错误"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.into_store().is_some(),
+            "runner 失败后 writer 收束成功时必须归还 Store"
+        );
+        assert!(
+            discard_seen.load(Ordering::SeqCst),
+            "失败路径必须精确 discard 本轮目录"
+        );
+        assert!(
+            joined_at_discard.load(Ordering::SeqCst),
+            "失败路径必须先真实 join SQLite writer，最后才 discard"
+        );
+        assert!(
+            directory_alive_at_discard.load(Ordering::SeqCst),
+            "失败 discard 前当前 run 目录必须仍存在"
+        );
+        assert!(
+            !runtime.path().join(run_id.as_uuid().to_string()).exists(),
+            "失败清理只能删除当前 run 目录"
         );
     }
 
