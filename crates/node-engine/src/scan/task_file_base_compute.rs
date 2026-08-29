@@ -64,15 +64,6 @@ impl<P: TaskLanePermitProvider> TaskFileBaseComputePending<P> {
             blocked_reason: None,
         }
     }
-
-    /// 把 pending 状态重新交回基础任务生产结果所有权。
-    pub(crate) fn into_production(self) -> BaseTaskProduction<P> {
-        BaseTaskProduction {
-            dispatcher: self.dispatcher,
-            manifest: self.manifest,
-            contexts: self.contexts,
-        }
-    }
 }
 
 /// Hash 阶段发生任务级错误时携带剩余任务文件所有权。
@@ -162,13 +153,43 @@ where
     P: TaskLanePermitProvider,
     H: HashPermitReader<Permit = P::Permit>,
 {
+    run_task_file_hash_pass(
+        TaskFileBaseComputePending::from_production(production),
+        reader,
+        hash_capacity,
+        store,
+        acknowledgements,
+        cancellation,
+    )
+    .await
+}
+
+/// 运行一个已存在 pending 的 Hash pass；不会把 Hash→Media 续算重新计入 Hash。
+///
+/// 每次调用都从 pending 的 `remaining_hash_rows` 开始，并清除上轮 admission 阻塞原因。
+/// 遇到取消或任务级错误时，先取消并等待所有在途 Hash future，再把完整所有权返回给调用方。
+pub(crate) async fn run_task_file_hash_pass<P, H>(
+    pending: TaskFileBaseComputePending<P>,
+    reader: H,
+    hash_capacity: usize,
+    store: &BaseStoreHandle,
+    acknowledgements: &mut UnboundedReceiver<BasePersistAck>,
+    cancellation: ReadCancellationToken,
+) -> Result<TaskFileBaseComputePending<P>, TaskFileBaseComputeError<P>>
+where
+    P: TaskLanePermitProvider,
+    H: HashPermitReader<Permit = P::Permit>,
+{
+    let mut pending = pending;
+    // pending 可能来自上一轮 Media 阶段；Hash pass 必须重新观察 dispatcher，不能沿用旧阻塞原因。
+    pending.blocked_reason = None;
     let TaskFileBaseComputePending {
         dispatcher,
         contexts,
         manifest,
         remaining_hash_rows,
-        blocked_reason,
-    } = TaskFileBaseComputePending::from_production(production);
+        blocked_reason: _,
+    } = pending;
     if hash_capacity == 0 {
         return Err(task_error(
             TaskFileBaseComputePending {
@@ -176,7 +197,7 @@ where
                 contexts,
                 manifest,
                 remaining_hash_rows,
-                blocked_reason,
+                blocked_reason: None,
             },
             "基础 Hash 读取容量必须大于 0",
         ));
@@ -190,7 +211,7 @@ where
     let mut reads = JoinSet::<HashReadOutcome>::new();
     let mut outcomes = Vec::<HashReadOutcome>::new();
     let mut next_sequence = 0_usize;
-    let mut stop_reason = blocked_reason;
+    let mut stop_reason = None;
     let mut hash_rows_remaining = remaining_hash_rows;
     let mut fatal_error = None;
 
@@ -265,6 +286,9 @@ where
 
     // 所有 dispatcher 轮询 future 已经释放，下面重新组合 pending 交给 ACK/Media
     // 处理函数；这也确保任何事件循环错误都能携带完整所有权返回。
+    if fatal_error.is_some() {
+        cancel_and_join_hash_reads(&mut reads, &cancellation).await;
+    }
     let mut pending = TaskFileBaseComputePending {
         dispatcher,
         contexts,
@@ -342,6 +366,18 @@ where
     pending.remaining_hash_rows = hash_rows_remaining;
     pending.blocked_reason = stop_reason;
     Ok(pending)
+}
+
+/// 取消并等待所有在途 Hash future，确保读取许可在返回 pending 前已经释放。
+async fn cancel_and_join_hash_reads(
+    reads: &mut JoinSet<HashReadOutcome>,
+    cancellation: &ReadCancellationToken,
+) {
+    if reads.is_empty() {
+        return;
+    }
+    cancellation.cancel();
+    while reads.join_next().await.is_some() {}
 }
 
 /// 收集一个读取 future 的结果；JoinSet 异常必须升级为任务级错误。
@@ -607,11 +643,11 @@ mod tests {
     use std::{
         collections::BTreeMap,
         future::Future,
-        path::Path,
+        path::{Path, PathBuf},
         pin::Pin,
         sync::{
             Arc,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicIsize, AtomicUsize, Ordering},
         },
         time::Duration,
     };
@@ -634,7 +670,7 @@ mod tests {
         task_files::TransientTaskFileSet,
     };
 
-    use super::{TaskFileBaseComputePending, run_task_file_base_compute};
+    use super::{TaskFileBaseComputePending, run_task_file_base_compute, run_task_file_hash_pass};
 
     const RUN_ID: &str = "01900000-0000-7000-8000-000000000101";
 
@@ -763,6 +799,97 @@ mod tests {
         }
     }
 
+    /// 取消感知的阻塞读取器，用于确认 Hash pass 返回前已收束所有读取 future。
+    #[derive(Clone)]
+    struct CancellationAwareHashReader {
+        entered: Arc<AtomicUsize>,
+        cancellation_seen: Arc<AtomicUsize>,
+        slow_sequence: Option<usize>,
+    }
+
+    impl HashPermitReader for CancellationAwareHashReader {
+        type Permit = TrackedPermit;
+
+        fn read_with_permit(
+            &self,
+            _scanned: ScannedPath,
+            permit: Self::Permit,
+            cancellation: ReadCancellationToken,
+            _started: Option<crate::scan::HashReadStartedSignal>,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<ReadProduct<Self::Permit>, ReadFailure>>
+                    + Send
+                    + 'static,
+            >,
+        > {
+            let sequence = self.entered.fetch_add(1, Ordering::SeqCst);
+            let cancellation_seen = Arc::clone(&self.cancellation_seen);
+            let slow = self.slow_sequence == Some(sequence);
+            Box::pin(async move {
+                loop {
+                    if cancellation.is_cancelled() {
+                        cancellation_seen.fetch_add(1, Ordering::SeqCst);
+                        drop(permit);
+                        return Err(ReadFailure::Cancelled);
+                    }
+                    tokio::time::sleep(if slow {
+                        Duration::from_millis(150)
+                    } else {
+                        Duration::from_millis(2)
+                    })
+                    .await;
+                }
+            })
+        }
+    }
+
+    /// 只在前两次取得许可，第三次返回任务级读取错误的 provider。
+    #[derive(Clone)]
+    struct ErrorAfterPermitProvider {
+        attempts: Arc<AtomicUsize>,
+        active: Arc<AtomicIsize>,
+        successful_acquires: usize,
+    }
+
+    impl TaskLanePermitProvider for ErrorAfterPermitProvider {
+        type Permit = TrackedPermit;
+
+        fn acquire(
+            &self,
+            _lane: TaskDiskLane,
+            _class: DiskReadClass,
+            _cancellation: ReadCancellationToken,
+        ) -> TaskLanePermitFuture<Self::Permit> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+            let active = Arc::clone(&self.active);
+            let successful_acquires = self.successful_acquires;
+            Box::pin(async move {
+                if attempt >= successful_acquires {
+                    return Err(ReadFailure::Io {
+                        path: PathBuf::from(r"C:\hash-dispatch-error.bin"),
+                        block_offset: 0,
+                        source: std::io::Error::other("测试 dispatcher 读取许可失败"),
+                    });
+                }
+                active.fetch_add(1, Ordering::SeqCst);
+                Ok(TrackedPermit { active })
+            })
+        }
+    }
+
+    /// 能观察 permit 是否已在 Hash future 结束时释放的读取许可。
+    #[derive(Clone)]
+    struct TrackedPermit {
+        active: Arc<AtomicIsize>,
+    }
+
+    impl Drop for TrackedPermit {
+        fn drop(&mut self) {
+            self.active.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
     fn lane() -> TaskDiskLane {
         TaskDiskLane {
             physical_disk_id: PhysicalDiskId::from_disk_numbers([7]).unwrap(),
@@ -797,11 +924,11 @@ mod tests {
         }
     }
 
-    fn production(
+    fn production<P: TaskLanePermitProvider>(
         root: &Path,
         inputs: &[BaseTaskInput],
-        provider: CountingPermitProvider,
-    ) -> BaseTaskProduction<CountingPermitProvider> {
+        provider: P,
+    ) -> BaseTaskProduction<P> {
         let files = TransientTaskFileSet::create(root, RUN_ID).unwrap();
         let mut producer = BaseTaskProducer::new(TaskFileDispatcher::new(files, provider));
         producer.append_batch(inputs).unwrap();
@@ -852,7 +979,7 @@ mod tests {
             .unwrap()
     }
 
-    fn cleanup_pending(mut pending: TaskFileBaseComputePending<CountingPermitProvider>) {
+    fn cleanup_pending<P: TaskLanePermitProvider>(mut pending: TaskFileBaseComputePending<P>) {
         let identities = pending.contexts.keys().cloned().collect::<Vec<_>>();
         for identity in identities {
             let _ = pending.dispatcher.abandon_in_flight(&identity);
@@ -903,6 +1030,175 @@ mod tests {
         pending.dispatcher.health().unwrap();
         drop(handle);
         drop(acknowledgements);
+        actor.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hash_pass_does_not_rehash_existing_media_continuation() {
+        let root = tempfile::tempdir().unwrap();
+        let machine = MachineId::from_sha256([0x59; 32]);
+        let mut store = NodeStore::open_in_memory(machine).unwrap();
+        let cached = seed_record(&mut store, r"C:\seed-continuation.bin", [12; 16], 22, false);
+        let provider = CountingPermitProvider::default();
+        let pending = production(
+            root.path(),
+            &[input(scanned(r"C:\continuation.bin", 22), lane(), None)],
+            provider.clone(),
+        );
+        let (actor, handle, mut acknowledgements) =
+            super::super::base_persistence::BaseStoreActor::spawn(store, 4);
+        let pending = run_task_file_base_compute(
+            pending,
+            reader(&[(r"C:\continuation.bin", Ok(cached.content_key.md5()))]),
+            1,
+            &handle,
+            &mut acknowledgements,
+            ReadCancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(pending.remaining_hash_rows, 0);
+        assert_eq!(pending.contexts.len(), 1);
+
+        let mut pending = pending;
+        pending.blocked_reason = Some(TaskDispatchBlockReason::MediaPending);
+        let pending = run_task_file_hash_pass(
+            pending,
+            TestHashReader::default(),
+            1,
+            &handle,
+            &mut acknowledgements,
+            ReadCancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(provider.acquires.load(Ordering::SeqCst), 1);
+        assert_eq!(pending.remaining_hash_rows, 0);
+        assert_eq!(pending.blocked_reason, None);
+        cleanup_pending(pending);
+        drop(handle);
+        drop(acknowledgements);
+        actor.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hash_pass_joins_in_flight_reads_before_cancellation_returns() {
+        let root = tempfile::tempdir().unwrap();
+        let provider_active = Arc::new(AtomicIsize::new(0));
+        let provider = ErrorAfterPermitProvider {
+            attempts: Arc::new(AtomicUsize::new(0)),
+            active: Arc::clone(&provider_active),
+            successful_acquires: 4,
+        };
+        let pending = production(
+            root.path(),
+            &[
+                input(scanned(r"C:\cancel-first.bin", 31), lane(), None),
+                input(scanned(r"C:\cancel-second.bin", 32), lane(), None),
+                input(scanned(r"C:\cancel-third.bin", 33), lane(), None),
+            ],
+            provider,
+        );
+        let store = NodeStore::open_in_memory(MachineId::from_sha256([0x5A; 32])).unwrap();
+        let (actor, handle, mut acknowledgements) =
+            super::super::base_persistence::BaseStoreActor::spawn(store, 4);
+        let entered = Arc::new(AtomicUsize::new(0));
+        let cancellation_seen = Arc::new(AtomicUsize::new(0));
+        let reader = CancellationAwareHashReader {
+            entered: Arc::clone(&entered),
+            cancellation_seen: Arc::clone(&cancellation_seen),
+            slow_sequence: Some(1),
+        };
+        let cancellation = ReadCancellationToken::new();
+        let cancellation_for_run = cancellation.clone();
+        let join = tokio::spawn(async move {
+            run_task_file_hash_pass(
+                TaskFileBaseComputePending::from_production(pending),
+                reader,
+                2,
+                &handle,
+                &mut acknowledgements,
+                cancellation_for_run,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while entered.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("取消测试必须先启动两个 Hash 读取");
+        cancellation.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(2), join)
+            .await
+            .expect("取消后的 Hash pass 必须收束")
+            .unwrap();
+        let error = match result {
+            Ok(_) => panic!("取消必须返回任务级错误"),
+            Err(error) => error,
+        };
+        let pending = error.into_pending();
+        assert_eq!(provider_active.load(Ordering::SeqCst), 0);
+        assert_eq!(cancellation_seen.load(Ordering::SeqCst), 2);
+        cleanup_pending(pending);
+        actor.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hash_pass_joins_in_flight_reads_before_dispatch_error_returns() {
+        let root = tempfile::tempdir().unwrap();
+        let active = Arc::new(AtomicIsize::new(0));
+        let provider = ErrorAfterPermitProvider {
+            attempts: Arc::new(AtomicUsize::new(0)),
+            active: Arc::clone(&active),
+            successful_acquires: 2,
+        };
+        let pending = production(
+            root.path(),
+            &[
+                input(scanned(r"C:\error-first.bin", 41), lane(), None),
+                input(scanned(r"C:\error-second.bin", 42), lane(), None),
+                input(scanned(r"C:\error-third.bin", 43), lane(), None),
+            ],
+            provider,
+        );
+        let store = NodeStore::open_in_memory(MachineId::from_sha256([0x5B; 32])).unwrap();
+        let (actor, handle, mut acknowledgements) =
+            super::super::base_persistence::BaseStoreActor::spawn(store, 4);
+        let entered = Arc::new(AtomicUsize::new(0));
+        let cancellation_seen = Arc::new(AtomicUsize::new(0));
+        let entered_for_reader = Arc::clone(&entered);
+        let cancellation_seen_for_reader = Arc::clone(&cancellation_seen);
+        let join = tokio::spawn(async move {
+            run_task_file_hash_pass(
+                TaskFileBaseComputePending::from_production(pending),
+                CancellationAwareHashReader {
+                    entered: entered_for_reader,
+                    cancellation_seen: cancellation_seen_for_reader,
+                    slow_sequence: None,
+                },
+                3,
+                &handle,
+                &mut acknowledgements,
+                ReadCancellationToken::new(),
+            )
+            .await
+        });
+        let result = tokio::time::timeout(Duration::from_secs(2), join)
+            .await
+            .expect("dispatcher 错误必须返回")
+            .unwrap();
+        let error = match result {
+            Ok(_) => panic!("第三次许可失败必须返回任务级错误"),
+            Err(error) => error,
+        };
+        let pending = error.into_pending();
+        assert_eq!(entered.load(Ordering::SeqCst), 2);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(cancellation_seen.load(Ordering::SeqCst), 2);
+        cleanup_pending(pending);
         actor.finish().await.unwrap();
     }
 
