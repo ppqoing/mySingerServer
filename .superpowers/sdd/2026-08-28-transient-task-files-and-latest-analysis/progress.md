@@ -126,3 +126,5 @@ Spec: `D:/code/mySingerServer/docs/superpowers/specs/2026-08-28-transient-task-f
 - Task 10B2 complete (commits `ee1708f4..3ec6868`, review clean)。
 - Task 10C：提交 `70d2886`。Node actor 已改用当前进程 `latest_completed_scan` 与内存分析状态；缓存命中直接发布最近结果 TSV，确有二筛缺失时才进入瞬态任务文件、唯一读取调度器、Worker 与 taskless SQLite ACK。取消在最终发布前再次核对，不覆盖旧结果；Stage2 运行目录删除首次失败时由同一 production owner 重试，未清理完成不发布成功。旧 queued/running 任务行不参与新入口门禁，旧任务/分析表保持不变。控制 Agent 当前验证 NodeEngine test-hooks lib 153/153、local_analysis 11/11、representative_grouping 3/3、NodeStore analysis_state 6/6、fmt/diff-check 全通过；详见 `task-10c-report.md`。
 - Task 10C complete (commits `3ec6868..70d2886`, focused review findings closed)。
+- Task 11/12 Ruling: Node 保留最近本地结果的只读窗口协议，但 Desktop 不实现或调用 Node 本地 analysis 窗口；Task11 只落 Node reader/actor/wire，Task12 只把 PostgreSQL 中心结果改成 UI 滑动窗口并删除旧本地分支 — 直接用户约束“desktop 不需要 node 的 analysis 结果”晚于旧计划，且这样不会复制两套结果事实 — 若判断错误，代价是未来 Node 本地管理界面需要另加一个协议客户端。
+- Task 11 Ruling: `ReadLocalResultWindow.group_kind` 使用新 message 的 field 12，保留草案 fields 1..11，不让客户端读取全量后过滤 — 原计划接口要求 `Groups(GroupKind)`，但 proto 草案漏字段 — 若判断错误，代价仅是尚未发布的新 tag 46 消息字段布局需要在发布前调整。
