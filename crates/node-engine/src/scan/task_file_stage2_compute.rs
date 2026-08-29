@@ -16,7 +16,7 @@ use dedup_node_store::{
     BaseCacheRecord, FeatureWrite, FileFaultKind, FileFaultRecord, VideoFrameStage2Fields,
     classify_cache_completeness,
 };
-use dedup_protocol::{proto, proto::worker_envelope};
+use dedup_protocol::{BASE_MISSING_PROBE, BASE_MISSING_STAGE1, proto, proto::worker_envelope};
 use dedup_windows::{LocalDiskKind, ReadCancellationToken};
 use thiserror::Error;
 use tokio::{sync::mpsc::UnboundedReceiver, time::Duration};
@@ -24,6 +24,7 @@ use uuid::Uuid;
 
 use super::{PlannedScannedPath, TaskDiskLane};
 use crate::{
+    analysis::stage2_planner::{Stage2Selection, Stage2WorkItem},
     io::{DiskReadClass, ReadFailure},
     scan::base_persistence::{
         BasePersistAck, BasePersistIdentity, BasePersistMessage, BasePersistOutcome,
@@ -46,8 +47,33 @@ pub(crate) struct Stage2TaskInput {
     pub(crate) planned: PlannedScannedPath,
     /// 已由 SQLite 或中心缓存验证的基础快照。
     pub(crate) cached: BaseCacheRecord,
+    /// 计划器在缓存查询后冻结的图片或视频槽位选择。
+    pub(crate) selection: Stage2Selection,
+    /// 计划器为该选择生成的精确缺失掩码；构建器会再次与缓存实际缺口求交集。
+    pub(crate) missing: TaskWorkMask,
     /// 视频可复用的本地联系表；不存在时由 Worker 回退原视频。
     pub(crate) contact_sheet_path: Option<PathBuf>,
+}
+
+impl Stage2TaskInput {
+    /// 把计划器工作项转换为任务文件输入，保留其已冻结的路径和物理盘 lane。
+    pub(crate) fn from_planner_work(
+        work: &Stage2WorkItem,
+        cached: BaseCacheRecord,
+        contact_sheet_path: Option<PathBuf>,
+    ) -> Self {
+        let source = work.source();
+        Self {
+            planned: PlannedScannedPath {
+                scanned: source.scanned.clone(),
+                lane: source.lane.clone(),
+            },
+            cached,
+            selection: work.selection(),
+            missing: work.missing(),
+            contact_sheet_path,
+        }
+    }
 }
 
 /// 二筛任务文件生产失败；失败前不会留下部分可执行的输入映射。
@@ -120,6 +146,14 @@ where
                 planned.scanned.normalized_path
             )));
         }
+        validate_stage2_input(cached.media_kind, input.selection, input.missing).map_err(
+            |message| {
+                Stage2TaskProducerError::InvalidInput(format!(
+                    "路径 {} 的二筛计划无效: {message}",
+                    planned.scanned.normalized_path
+                ))
+            },
+        )?;
         let contact_sheet_valid = input
             .contact_sheet_path
             .as_deref()
@@ -127,18 +161,22 @@ where
         let completeness = classify_cache_completeness(cached, contact_sheet_valid);
 
         // 基础字段未完整时，二筛没有合法输入；该文件留给基础阶段，不在此处伪造 P。
-        if completeness.base_missing_parts != 0 {
+        if completeness.base_missing_parts & (BASE_MISSING_PROBE | BASE_MISSING_STAGE1) != 0 {
             continue;
         }
-        let (work_kind, missing, frame_slots) = match cached.media_kind {
-            MediaKind::Image if completeness.image_stage2_missing => (
+        let (work_kind, missing, frame_slots) = match (cached.media_kind, input.selection) {
+            (MediaKind::Image, Stage2Selection::Image) if completeness.image_stage2_missing => (
                 TaskWorkKind::ImageStage2,
                 TaskWorkMask::for_image_stage2(),
                 Vec::new(),
             ),
-            MediaKind::Image => continue,
-            MediaKind::Video if completeness.video_stage2_missing_slots != 0 => {
-                let slots = completeness.video_stage2_missing_slots;
+            (MediaKind::Image, Stage2Selection::Image) => continue,
+            (MediaKind::Video, Stage2Selection::VideoSlots(requested_slots)) => {
+                // 计划器只允许处理候选槽位；缓存若已补齐其中一部分，本轮只保留交集。
+                let slots = requested_slots & completeness.video_stage2_missing_slots;
+                if slots == 0 {
+                    continue;
+                }
                 let mask = TaskWorkMask::for_video_stage2(slots).ok_or_else(|| {
                     Stage2TaskProducerError::InvalidInput(format!(
                         "路径 {} 的视频二筛槽位掩码无效",
@@ -151,8 +189,7 @@ where
                     (0..6).filter(|slot| slots & (1_u8 << slot) != 0).collect(),
                 )
             }
-            MediaKind::Video => continue,
-            MediaKind::Other => continue,
+            _ => continue,
         };
         let content_id = cached.content_id.ok_or_else(|| {
             Stage2TaskProducerError::InvalidInput(format!(
@@ -208,6 +245,28 @@ where
         dispatcher,
         contexts,
     })
+}
+
+/// 校验计划器选择与缺失掩码一致，避免任务文件扩大到候选范围之外。
+fn validate_stage2_input(
+    media_kind: MediaKind,
+    selection: Stage2Selection,
+    missing: TaskWorkMask,
+) -> Result<(), &'static str> {
+    let expected = match (media_kind, selection) {
+        (MediaKind::Image, Stage2Selection::Image) => TaskWorkMask::for_image_stage2(),
+        (MediaKind::Video, Stage2Selection::VideoSlots(slots)) => {
+            TaskWorkMask::for_video_stage2(slots).ok_or("视频选择槽位为空或超出 0..=5")?
+        }
+        (MediaKind::Other, _) => return Err("Other 文件不能执行二筛"),
+        (MediaKind::Image, Stage2Selection::VideoSlots(_)) => {
+            return Err("图片二筛不能携带视频槽位");
+        }
+        (MediaKind::Video, Stage2Selection::Image) => return Err("视频二筛必须携带视频槽位"),
+    };
+    (missing == expected)
+        .then_some(())
+        .ok_or("计划选择与缺失掩码不一致")
 }
 
 /// 二筛执行的统计结果；调用方可对返回的 production 执行 discard。
@@ -1041,7 +1100,7 @@ fn file_fault(
 #[cfg(test)]
 mod tests {
     use std::{
-        path::Path,
+        path::{Path, PathBuf},
         sync::{
             Arc,
             atomic::{AtomicIsize, Ordering},
@@ -1052,8 +1111,11 @@ mod tests {
     use std::time::Duration;
 
     use dedup_core::{DisplayPath, MachineId, MediaKind, NormalizedPath};
-    use dedup_media::{ImageStage1, ImageStage2, PdqHash};
-    use dedup_node_store::{FeatureWrite, ImageStage1Fields, NodeStore, ScannedPath};
+    use dedup_media::{ImageStage1, ImageStage2, PdqHash, Rgb24Image, encode_contact_sheet};
+    use dedup_node_store::{
+        FeatureWrite, ImageStage1Fields, NodeStore, ScannedPath, VideoFrameStage1Fields,
+        VideoFrameStage2Fields, VideoMetadataFields,
+    };
     use dedup_windows::{LocalDiskKind, PhysicalDiskId, ReadCancellationToken};
 
     use super::*;
@@ -1165,14 +1227,111 @@ mod tests {
         lane: TaskDiskLane,
         cached: BaseCacheRecord,
     ) -> Stage2TaskInput {
+        let selection = if cached.media_kind == MediaKind::Image {
+            Stage2Selection::Image
+        } else {
+            Stage2Selection::VideoSlots(0b11_1111)
+        };
+        input_with_selection(path, file_size, lane, cached, selection)
+    }
+
+    /// 构造携带 planner 精确选择的测试输入。
+    fn input_with_selection(
+        path: &str,
+        file_size: u64,
+        lane: TaskDiskLane,
+        cached: BaseCacheRecord,
+        selection: Stage2Selection,
+    ) -> Stage2TaskInput {
+        let missing = match selection {
+            Stage2Selection::Image => TaskWorkMask::for_image_stage2(),
+            Stage2Selection::VideoSlots(slots) => TaskWorkMask::for_video_stage2(slots).unwrap(),
+        };
         Stage2TaskInput {
             planned: PlannedScannedPath {
                 scanned: scanned(path, file_size),
                 lane,
             },
             cached,
+            selection,
+            missing,
             contact_sheet_path: None,
         }
+    }
+
+    /// 为视频缓存写入完整的一筛，并按给定槽位预置二筛特征。
+    fn seed_video_cache(
+        store: &mut NodeStore,
+        path: &str,
+        md5: [u8; 16],
+        file_size: u64,
+        stage2_slots: &[u8],
+    ) -> BaseCacheRecord {
+        let scanned = scanned(path, file_size);
+        let content = store
+            .upsert_content_and_location(&scanned, md5, MediaKind::Video)
+            .unwrap();
+        store
+            .commit_feature_result(
+                content.id,
+                None,
+                FeatureWrite::VideoMetadata(VideoMetadataFields {
+                    duration_ms: Some(12_000),
+                    width: Some(100),
+                    height: Some(100),
+                }),
+            )
+            .unwrap();
+        for slot in 0..6 {
+            let feature = ImageStage1 {
+                width: 100,
+                height: 100,
+                pdq: PdqHash::from_bytes([slot; 32]),
+                quality: 80,
+            };
+            store
+                .commit_feature_result(
+                    content.id,
+                    None,
+                    FeatureWrite::VideoFrameStage1(VideoFrameStage1Fields {
+                        slot,
+                        time_ms: u64::from(slot) * 2_000 + 1_000,
+                        decoded: true,
+                        width: Some(feature.width),
+                        height: Some(feature.height),
+                        pdq: Some(feature.pdq),
+                        quality: Some(feature.quality),
+                    }),
+                )
+                .unwrap();
+            if stage2_slots.contains(&slot) {
+                store
+                    .commit_feature_result(
+                        content.id,
+                        None,
+                        FeatureWrite::VideoFrameStage2(VideoFrameStage2Fields {
+                            slot,
+                            features: ImageStage2 {
+                                phash_parts: [u64::from(slot); 9],
+                                sobel: [f32::from(slot); 128],
+                            },
+                        }),
+                    )
+                    .unwrap();
+            }
+        }
+        store.mark_base_complete(content.id).unwrap();
+        store.load_base_cache_record(content.id).unwrap()
+    }
+
+    /// 生成联系表文件，使视频缓存被视为基础数据完整。
+    fn write_valid_contact_sheet(root: &Path) -> PathBuf {
+        let path = root.join("contact-sheet.jpg");
+        let frames: [Option<Rgb24Image>; 6] = std::array::from_fn(|slot| {
+            Some(Rgb24Image::new(8, 8, vec![slot as u8; 8 * 8 * 3]).unwrap())
+        });
+        std::fs::write(&path, encode_contact_sheet(&frames, 320, 180).unwrap()).unwrap();
+        path
     }
 
     #[cfg(feature = "test-hooks")]
@@ -1197,6 +1356,93 @@ mod tests {
             .filter(|line| !line.is_empty())
             .map(|line| line[0])
             .collect()
+    }
+
+    /// planner 只选择部分视频槽位时，任务文件不能把缓存中其他缺口一并写入。
+    #[test]
+    fn video_stage2_selection_intersects_cached_missing_slots() {
+        let root = tempfile::tempdir().unwrap();
+        let machine = MachineId::from_sha256([0x70; 32]);
+        let mut store = NodeStore::open_in_memory(machine).unwrap();
+        let cached = seed_video_cache(
+            &mut store,
+            r"C:\stage2-partial.mp4",
+            [0x10; 16],
+            10,
+            &[0, 1],
+        );
+        let disk = lane(6);
+        let selected = (1_u8 << 2) | (1_u8 << 4);
+        let mut task_input = input_with_selection(
+            r"C:\stage2-partial.mp4",
+            10,
+            disk.clone(),
+            cached,
+            Stage2Selection::VideoSlots(selected),
+        );
+        task_input.contact_sheet_path = Some(write_valid_contact_sheet(root.path()));
+
+        let provider = TrackingProvider {
+            live: Arc::new(AtomicIsize::new(0)),
+        };
+        let mut production =
+            build_stage2_task_production(root.path(), RUN_ID, provider, &[task_input]).unwrap();
+        let context = production.contexts.values().next().unwrap();
+        assert_eq!(
+            context.frame_slots,
+            vec![2, 4],
+            "任务文件只能保留 planner 选择与缓存缺口的交集"
+        );
+        assert_eq!(context.frame_slots.len(), 2);
+        let lane_path = production.dispatcher.lane_path(&disk).unwrap();
+        assert_eq!(statuses(&lane_path), vec![b'P']);
+        production.discard().unwrap();
+    }
+
+    /// 视频基础字段完整但联系表缺失时，仍应生成二筛任务并允许 Worker 回退原视频。
+    #[test]
+    fn video_stage2_missing_contact_sheet_still_creates_selected_work() {
+        let root = tempfile::tempdir().unwrap();
+        let machine = MachineId::from_sha256([0x74; 32]);
+        let mut store = NodeStore::open_in_memory(machine).unwrap();
+        let cached = seed_video_cache(
+            &mut store,
+            r"C:\stage2-contact-missing.mp4",
+            [0x14; 16],
+            14,
+            &[0, 1],
+        );
+        let disk = lane(10);
+        let selected = (1_u8 << 2) | (1_u8 << 4);
+        let mut task_input = input_with_selection(
+            r"C:\stage2-contact-missing.mp4",
+            14,
+            disk.clone(),
+            cached,
+            Stage2Selection::VideoSlots(selected),
+        );
+        task_input.contact_sheet_path = Some(root.path().join("missing-contact.jpg"));
+
+        let provider = TrackingProvider {
+            live: Arc::new(AtomicIsize::new(0)),
+        };
+        let mut production =
+            build_stage2_task_production(root.path(), RUN_ID, provider, &[task_input]).unwrap();
+        let context = production
+            .contexts
+            .values()
+            .next()
+            .expect("联系表缺失不能把基础完整视频过滤掉");
+        assert_eq!(context.frame_slots, vec![2, 4]);
+        assert!(
+            context
+                .contact_sheet_path
+                .as_deref()
+                .is_some_and(|path| path.ends_with("missing-contact.jpg"))
+        );
+        let lane_path = production.dispatcher.lane_path(&disk).unwrap();
+        assert_eq!(statuses(&lane_path), vec![b'P']);
+        production.discard().unwrap();
     }
 
     /// 只有基础完整且确实缺二筛的内容才生成 P 行，完整二筛命中不进入 TSV。

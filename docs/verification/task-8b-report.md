@@ -31,6 +31,11 @@
 
 测试使用受控 WorkerPool、RAII permit 计数和真实 SQLite 单写 actor，不通过源码字符串匹配推断行为。
 
+后续补充两项输入边界回归：
+
+- `video_stage2_selection_intersects_cached_missing_slots`：视频任务只保留计划器选择与 SQLite 当前缺失槽位的交集；交集为空时不写 TSV、不启动 Worker。
+- `video_stage2_missing_contact_sheet_still_creates_selected_work`：联系表缺失或损坏不阻断 probe/一筛已经完整的视频；所选槽位仍进入任务文件，Worker 可回退原视频并按目标路径重建联系表。
+
 ## 当前验证结果
 
 - `rustfmt --edition 2024 --check crates/node-engine/src/scan/task_file_stage2_compute.rs`：通过。
@@ -39,6 +44,7 @@
 - 清空外部 `CC/CXX/AR/RANLIB/CFLAGS/CXXFLAGS/RUSTFLAGS/RUSTC_WRAPPER` 后，执行
   `cargo test -p dedup-node-engine --features test-hooks --lib task_file_stage2_compute --locked -- --test-threads=1`：3/3 通过。
 - `cargo test -p dedup-node-engine --features test-hooks --lib --locked -- --test-threads=1`：128/128 通过，覆盖本模块、WorkerPool、瞬态扫描和当前任务查询协议。
+- 上述两项补充回归由主代理串行复跑，均为 1/1 通过；`cargo fmt --all -- --check` 与 `git diff --check` 通过。
 
 首次定向测试曾继承 MinGW `CC/CXX`，导致 `libsqlite3-sys` 在 MSVC 链接阶段报告
 `___chkstk_ms`、`__isnan` 未解析；清空这些外部环境变量后原命令正常链接并通过，故该错误不计为产品失败。
