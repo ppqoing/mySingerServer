@@ -437,8 +437,13 @@ fn plan_source(
         MediaKind::Other => return Ok(vec![Stage2PlanAction::IncompleteBase]),
     };
 
+    let Some(mut remaining) = missing_selection else {
+        return Ok(existing_selection
+            .into_iter()
+            .map(|selection| Stage2PlanAction::RepublishLocal { selection })
+            .collect());
+    };
     let mut actions = Vec::new();
-    let mut remaining = missing_selection.expect("缺失选择存在时才会进入二筛计划");
     if let Some(existing_selection) = existing_selection {
         actions.push(Stage2PlanAction::RepublishLocal {
             selection: existing_selection,

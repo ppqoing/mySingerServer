@@ -303,3 +303,41 @@ fn local_complete_ignores_remote_and_work_item_keeps_frozen_lane() {
     assert_eq!(work.source().lane, task_lane);
     assert_eq!(work.task_record().missing.bits(), 1 << 4);
 }
+
+#[test]
+fn complete_video_cache_hit_republishes_existing_slots_without_compute() {
+    let mut store = NodeStore::open_in_memory(machine()).unwrap();
+    let (content, content_id) = add_content(&mut store, r"H:\complete.mp4", 24, [7; 16]);
+    let active = active_source(
+        content,
+        content_id,
+        r"H:\complete.mp4",
+        MediaKind::Video,
+        vec![0, 1, 2, 3],
+        lane(&[12], LocalDiskKind::Hdd, 1),
+    );
+    let frozen = Stage2TransientPlanner::freeze(&[input(active)]).unwrap();
+    let local = vec![Some(video_record(
+        content,
+        content_id,
+        &[
+            (0, stage2(40)),
+            (1, stage2(41)),
+            (2, stage2(42)),
+            (3, stage2(43)),
+        ],
+        true,
+    ))];
+
+    let plan = Stage2TransientPlanner::plan(&frozen, &local, None).unwrap();
+
+    assert!(matches!(
+        &plan.items()[0].actions()[..],
+        [Stage2PlanAction::RepublishLocal {
+            selection: dedup_node_engine::analysis::stage2_planner::Stage2Selection::VideoSlots(
+                slots
+            )
+        }] if *slots == 0b1111
+    ));
+    assert_eq!(plan.worker_items().len(), 0);
+}

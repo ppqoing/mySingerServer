@@ -22,6 +22,8 @@
 
 测试先于实现写入，但受串行 Cargo 约束，没有取得旧实现的独立 RED 运行证据，不能把静态缺失当作已执行 RED。主代理随后使用唯一 target `C:\tmp\rust-v2-core-scope-target-task7b2d2c1` 运行 `cargo test -p dedup-node-engine --test stage2_transient_planner --locked -- --test-threads=1`，3/3 PASS；`rustfmt --edition 2024 --check` 与 `git diff --check` 通过。
 
+后续补充了完整视频缓存命中回归：旧实现会在没有缺失槽位时触发 `缺失选择存在时才会进入二筛计划` panic；修复后只对候选的已有槽位生成 `RepublishLocal`，Worker 工作项为零。主代理重新运行同一计划器测试，4/4 PASS。
+
 ## 文件边界
 
 - `crates/node-engine/src/analysis/stage2_planner.rs`：独立瞬态分类计划器。
