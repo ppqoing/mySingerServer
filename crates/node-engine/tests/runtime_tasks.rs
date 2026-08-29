@@ -242,6 +242,39 @@ async fn terminal_transition_writes_one_structured_log() {
 }
 
 #[tokio::test]
+async fn terminal_outbox_highwater_is_consistent_and_not_restored() {
+    let registry = RuntimeTaskRegistry::new();
+    let task = registry
+        .begin(
+            RuntimeTaskKind::BaseCompute,
+            MachineId::from_sha256([0x85; 32]),
+            "终态高水位",
+        )
+        .await;
+    let mut events = registry.subscribe();
+
+    let running = registry.details(task.id()).await.unwrap();
+    assert_eq!(running.summary.unwrap().outbox_high_seq, None);
+
+    task.finish_with_outbox_high_seq(RuntimeTaskState::Completed, 42)
+        .await
+        .unwrap();
+
+    let listed = registry.list().await;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].outbox_high_seq, Some(42));
+    let detailed = registry.details(task.id()).await.unwrap();
+    assert_eq!(detailed.summary.unwrap().outbox_high_seq, Some(42));
+    let event = events.recv().await.unwrap();
+    assert_eq!(event.runtime_task_id, task.id());
+    assert_eq!(event.state, "completed");
+    assert_eq!(event.outbox_high_seq, Some(42));
+
+    let restarted = RuntimeTaskRegistry::new();
+    assert!(restarted.details(task.id()).await.is_none());
+}
+
+#[tokio::test]
 async fn pipeline_metrics_use_fixed_histogram_buckets_and_exact_peaks() {
     let registry = RuntimeTaskRegistry::new();
     let task = registry

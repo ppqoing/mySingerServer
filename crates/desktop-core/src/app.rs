@@ -2510,6 +2510,7 @@ mod tests {
             outcome: NodeRuntimeEventOutcome::Changed(proto::RuntimeTaskChanged {
                 runtime_task_id: format!("task-{index}"),
                 state: state.into(),
+                ..Default::default()
             }),
         }
     }

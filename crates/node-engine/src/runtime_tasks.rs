@@ -588,6 +588,7 @@ impl RuntimeTaskRegistry {
                     overall_total: None,
                     overall_failed: 0,
                     overall_skipped: 0,
+                    outbox_high_seq: None,
                     stages: BTreeMap::new(),
                     workers: BTreeMap::new(),
                     failures: VecDeque::new(),
@@ -648,6 +649,7 @@ impl RuntimeTaskRegistry {
                 Some(proto::RuntimeTaskChanged {
                     runtime_task_id: task_id.into(),
                     state: task.state.as_str().into(),
+                    outbox_high_seq: task.outbox_high_seq,
                 })
             } else {
                 task.progress_dirty = true;
@@ -681,6 +683,7 @@ impl RuntimeTaskRegistry {
                         proto::RuntimeTaskChanged {
                             runtime_task_id: task_id.clone(),
                             state: task.state.as_str().into(),
+                            outbox_high_seq: task.outbox_high_seq,
                         }
                     })
                 })
@@ -1623,6 +1626,24 @@ impl RuntimeTaskReporter {
 
     /// 进入一次不可逆终态并广播一次。
     pub async fn finish(&self, state: RuntimeTaskState) -> Result<(), RuntimeTaskError> {
+        self.finish_with_optional_outbox_high_seq(state, None)
+    }
+
+    /// 带 SQLite outbox 真实高水位进入终态，并与终态事件原子发布。
+    pub async fn finish_with_outbox_high_seq(
+        &self,
+        state: RuntimeTaskState,
+        outbox_high_seq: u64,
+    ) -> Result<(), RuntimeTaskError> {
+        self.finish_with_optional_outbox_high_seq(state, Some(outbox_high_seq))
+    }
+
+    /// 在同一 registry 写锁内更新终态和可选 outbox 高水位。
+    fn finish_with_optional_outbox_high_seq(
+        &self,
+        state: RuntimeTaskState,
+        outbox_high_seq: Option<u64>,
+    ) -> Result<(), RuntimeTaskError> {
         if !state.is_terminal() {
             return Err(RuntimeTaskError::NotTerminal);
         }
@@ -1654,6 +1675,7 @@ impl RuntimeTaskReporter {
         // 正常路径应已完成逐项释放；这里仅保证关机强制中止也不会发布自相矛盾的终态。
         task.clear_current_ownership();
         task.state = state;
+        task.outbox_high_seq = outbox_high_seq;
         task.progress_dirty = false;
         task.last_published_at = Some(now);
         let overall_completed = task.overall_completed;
@@ -1673,6 +1695,7 @@ impl RuntimeTaskReporter {
         let _ = self.registry.inner.events.send(proto::RuntimeTaskChanged {
             runtime_task_id: self.task_id.clone(),
             state: state.as_str().into(),
+            outbox_high_seq,
         });
         Ok(())
     }
@@ -1698,6 +1721,8 @@ struct TaskEntry {
     overall_total: Option<u64>,
     overall_failed: u64,
     overall_skipped: u64,
+    /// 终态时由调用方提供的真实 SQLite outbox 高水位；普通终态保持缺失。
+    outbox_high_seq: Option<u64>,
     stages: BTreeMap<RuntimeStage, StageEntry>,
     workers: BTreeMap<u32, WorkerEntry>,
     failures: VecDeque<RuntimeFailureUpdate>,
@@ -1797,6 +1822,7 @@ impl TaskEntry {
             overall_total_known: self.overall_total.is_some(),
             overall_failed: self.overall_failed,
             overall_skipped: self.overall_skipped,
+            outbox_high_seq: self.outbox_high_seq,
         }
     }
 

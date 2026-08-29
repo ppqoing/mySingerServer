@@ -140,6 +140,7 @@ impl AcceptanceSession for FakeSession {
                     overall_total_known: true,
                     overall_failed: 0,
                     overall_skipped: 0,
+                    ..Default::default()
                 })
                 .collect())
         })
@@ -184,6 +185,7 @@ impl AcceptanceSession for FakeSession {
                 overall_total_known: true,
                 overall_failed: u64::from(failed),
                 overall_skipped: 0,
+                ..Default::default()
             };
             let details = proto::RuntimeTaskDetails {
                 summary: (!missing_summary).then_some(summary),
@@ -1029,6 +1031,7 @@ fn runtime_sample_preserves_pipeline_metrics_and_worker_phase() {
             overall_total_known: true,
             overall_failed: 0,
             overall_skipped: 0,
+            ..Default::default()
         }),
         stages: Vec::new(),
         workers: vec![proto::RuntimeWorkerDetails {

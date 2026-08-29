@@ -109,6 +109,7 @@ fn node_summary_uses_handshake_machine_identity_and_unified_key() {
             overall_total_known: true,
             overall_failed: 0,
             overall_skipped: 0,
+            ..Default::default()
         },
     );
     assert_eq!(

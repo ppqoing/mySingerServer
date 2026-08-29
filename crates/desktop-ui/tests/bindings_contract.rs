@@ -1279,6 +1279,7 @@ fn runtime_task_details_map_unknown_totals_workers_failures_and_selection_once()
                 overall_total_known: false,
                 overall_failed: 2,
                 overall_skipped: 1,
+                ..Default::default()
             }),
             stages: vec![dedup_protocol::proto::RuntimeStageDetails {
                 stage_id: "read_md5".into(),

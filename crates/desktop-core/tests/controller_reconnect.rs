@@ -511,6 +511,7 @@ fn reconnect_runtime_summary(machine_id: &str) -> proto::RuntimeTaskSummary {
         overall_total_known: true,
         overall_failed: 0,
         overall_skipped: 0,
+        ..Default::default()
     }
 }
 

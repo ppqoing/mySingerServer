@@ -354,6 +354,7 @@ async fn controller_refreshes_runtime_tasks_on_two_second_tick_and_terminal_even
         .send(proto::RuntimeTaskChanged {
             runtime_task_id: "node-runtime".into(),
             state: "completed".into(),
+            ..Default::default()
         })
         .unwrap();
     wait_for_count(&list_calls, before_event + 1).await;
@@ -721,6 +722,7 @@ fn runtime_summary(machine_id: &str) -> proto::RuntimeTaskSummary {
         overall_total_known: true,
         overall_failed: 0,
         overall_skipped: 0,
+        ..Default::default()
     }
 }
 

@@ -210,7 +210,11 @@ async fn runtime_events_actor_lists_pages_details_and_pushes_terminal_once() {
     assert!(matches!(
         progress_event.payload,
         Some(proto::envelope::Payload::RuntimeTaskChanged(
-            proto::RuntimeTaskChanged { runtime_task_id, state }
+            proto::RuntimeTaskChanged {
+                runtime_task_id,
+                state,
+                ..
+            }
         )) if runtime_task_id == second.id() && state == "running"
     ));
     second.finish(RuntimeTaskState::Completed).await.unwrap();
@@ -219,7 +223,11 @@ async fn runtime_events_actor_lists_pages_details_and_pushes_terminal_once() {
     assert!(matches!(
         event.payload,
         Some(proto::envelope::Payload::RuntimeTaskChanged(
-            proto::RuntimeTaskChanged { runtime_task_id, state }
+            proto::RuntimeTaskChanged {
+                runtime_task_id,
+                state,
+                ..
+            }
         )) if runtime_task_id == second.id() && state == "completed"
     ));
     assert!(second.finish(RuntimeTaskState::Failed).await.is_err());
@@ -282,6 +290,7 @@ async fn runtime_events_lagged_subscriber_keeps_responses_and_disconnect_cleanup
         let _ = events.send(proto::RuntimeTaskChanged {
             runtime_task_id: format!("runtime-{index}"),
             state: "completed".into(),
+            ..Default::default()
         });
     }
     write_envelope(&mut writer, ping(501, 501)).await;

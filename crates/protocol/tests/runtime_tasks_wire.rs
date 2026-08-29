@@ -18,6 +18,8 @@ fn runtime_task_messages_round_trip_parallel_stages_workers_and_failures() {
         overall_total_known: true,
         overall_failed: 1,
         overall_skipped: 2,
+        outbox_high_seq: Some(42),
+        ..Default::default()
     };
     let details = proto::RuntimeTaskDetails {
         summary: Some(summary.clone()),
@@ -175,8 +177,17 @@ fn descriptor_exposes_runtime_details_after_fault_tags_without_polluting_task_su
             "overall_total_known",
             "overall_failed",
             "overall_skipped",
+            "outbox_high_seq",
         ],
     );
+    let changed = message(messages, "RuntimeTaskChanged").unwrap();
+    assert_fields(changed, &["runtime_task_id", "state", "outbox_high_seq"]);
+    let changed_highwater = changed
+        .field
+        .iter()
+        .find(|field| field.name.as_deref() == Some("outbox_high_seq"))
+        .unwrap();
+    assert_eq!(changed_highwater.number, Some(3));
     assert_fields(
         message(messages, "RuntimeStageDetails").unwrap(),
         &[
