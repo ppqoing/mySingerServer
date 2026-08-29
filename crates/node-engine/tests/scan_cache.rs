@@ -1,6 +1,7 @@
 use std::{fs, future::Future, path::Path, pin::Pin};
 
 use dedup_core::{DisplayPath, MachineId, MediaKind, NormalizedPath};
+use dedup_media::{Rgb24Image, encode_contact_sheet};
 use dedup_node_engine::{
     scan::{
         FileEnumerator, FileHasher, PipelineFileReader, PipelineLimits, ReadProduct, ScanEngine,
@@ -112,6 +113,14 @@ struct VideoContactSheetProcessor {
     failed_generations: usize,
 }
 
+/// 生成与生产联系表边界一致的可解码 JPEG 测试数据。
+fn valid_contact_sheet_jpeg() -> Vec<u8> {
+    let frames: [Option<Rgb24Image>; 6] = std::array::from_fn(|slot| {
+        Some(Rgb24Image::new(8, 8, vec![slot as u8; 8 * 8 * 3]).unwrap())
+    });
+    encode_contact_sheet(&frames, 320, 180).unwrap()
+}
+
 impl Stage1Processor for VideoContactSheetProcessor {
     async fn process(&mut self, request: Stage1Request) -> Result<Stage1Output, String> {
         self.calls += 1;
@@ -126,7 +135,7 @@ impl Stage1Processor for VideoContactSheetProcessor {
         }
         let contact_sheet_jpeg = request.generate_contact_sheet.then(|| {
             self.encodes += 1;
-            b"generated-jpeg".to_vec()
+            valid_contact_sheet_jpeg()
         });
         Ok(Stage1Output {
             media_kind: MediaKind::Video,
@@ -213,7 +222,7 @@ async fn contact_sheet_md5_coalesces_same_digest_to_one_batch_leader() {
         vec![vec![true], vec![false]],
         "follower 必须等 leader 发布后才以不编码请求进入下一波"
     );
-    assert_eq!(fs::read(&target).unwrap(), b"generated-jpeg");
+    assert_eq!(fs::read(&target).unwrap(), valid_contact_sheet_jpeg());
     let items = store.task_items(summary.task_id).unwrap();
     assert_eq!(items.len(), 2);
     assert!(
@@ -294,7 +303,7 @@ async fn contact_sheet_md5_promotes_follower_after_leader_failure() {
             .count(),
         1
     );
-    assert_eq!(fs::read(&target).unwrap(), b"generated-jpeg");
+    assert_eq!(fs::read(&target).unwrap(), valid_contact_sheet_jpeg());
 }
 
 #[tokio::test]
@@ -312,7 +321,7 @@ async fn contact_sheet_md5_path_reuses_existing_file_and_repairs_reference() {
         .join(&existing_hex[..2])
         .join(format!("{existing_hex}.jpg"));
     fs::create_dir_all(existing_target.parent().unwrap()).unwrap();
-    fs::write(&existing_target, b"existing-jpeg").unwrap();
+    fs::write(&existing_target, valid_contact_sheet_jpeg()).unwrap();
     let mut engine = ScanEngine::new(FixedEnumerator, CountingHasher::default(), &contact_root);
     let mut processor = VideoContactSheetProcessor::default();
 
@@ -334,7 +343,10 @@ async fn contact_sheet_md5_path_reuses_existing_file_and_repairs_reference() {
     assert_eq!(processor.calls, 1, "强制重算仍须执行 probe 和一筛");
     assert_eq!(processor.encodes, 0, "已有 MD5 联系表不得重复编码");
     assert_eq!(processor.generation_requests, vec![false]);
-    assert_eq!(fs::read(&existing_target).unwrap(), b"existing-jpeg");
+    assert_eq!(
+        fs::read(&existing_target).unwrap(),
+        valid_contact_sheet_jpeg()
+    );
     let existing_relative = format!("contact-sheets/{}/{}.jpg", &existing_hex[..2], existing_hex);
     assert_eq!(
         store
@@ -363,7 +375,10 @@ async fn contact_sheet_md5_path_reuses_existing_file_and_repairs_reference() {
         .await
         .unwrap();
     assert_eq!(processor.encodes, 1, "缺少目标时只编码一次");
-    assert_eq!(fs::read(&generated_target).unwrap(), b"generated-jpeg");
+    assert_eq!(
+        fs::read(&generated_target).unwrap(),
+        valid_contact_sheet_jpeg()
+    );
     assert!(
         generated_target
             .parent()
