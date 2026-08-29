@@ -11,13 +11,14 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use super::{
     BaseTaskManifest, BaseTaskProduction, HashPermitReader,
     base_persistence::{BasePersistAck, BaseStoreHandle},
-    task_file_base_compute::{TaskFileBaseComputePending, run_task_file_hash_pass},
+    task_file_base_compute::{TaskFileBaseComputePending, run_task_file_hash_pass_with_remote},
     task_file_media_compute::run_task_file_media_compute,
     task_file_media_persistence::{
         TaskFileMediaPersistenceOptions, persist_task_file_media_results,
     },
 };
 use crate::{
+    RemoteFeatureCache,
     task_dispatch::{TaskDispatchAdmission, TaskDispatchPoll, TaskLanePermitProvider},
     worker::WorkerPool,
 };
@@ -105,6 +106,42 @@ where
     P: TaskLanePermitProvider,
     H: HashPermitReader<Permit = P::Permit>,
 {
+    let remote = crate::DisabledRemoteFeatureCache;
+    let mut remote_available = false;
+    let mut warning = None;
+    run_task_file_base_coordinator_with_remote(
+        production,
+        reader,
+        worker_pool,
+        store,
+        acknowledgements,
+        options,
+        cancellation,
+        &remote,
+        &mut remote_available,
+        &mut warning,
+    )
+    .await
+}
+
+/// 运行支持可选远端缓存的瞬态基础任务协调循环。
+pub(crate) async fn run_task_file_base_coordinator_with_remote<P, H, R>(
+    production: BaseTaskProduction<P>,
+    reader: H,
+    worker_pool: &mut WorkerPool,
+    store: &BaseStoreHandle,
+    acknowledgements: &mut UnboundedReceiver<BasePersistAck>,
+    options: TaskFileBaseCoordinatorOptions,
+    cancellation: ReadCancellationToken,
+    remote: &R,
+    remote_available: &mut bool,
+    warning: &mut Option<String>,
+) -> Result<TaskFileBaseCoordinatorResult<P>, TaskFileBaseCoordinatorError<P>>
+where
+    P: TaskLanePermitProvider,
+    H: HashPermitReader<Permit = P::Permit>,
+    R: RemoteFeatureCache,
+{
     let TaskFileBaseCoordinatorOptions {
         hash_capacity,
         worker_capacity,
@@ -170,13 +207,16 @@ where
         }
 
         if pending.remaining_hash_rows > 0 {
-            pending = match run_task_file_hash_pass(
+            pending = match run_task_file_hash_pass_with_remote(
                 pending,
                 reader.clone(),
                 hash_capacity,
                 store,
                 acknowledgements,
                 cancellation.clone(),
+                remote,
+                remote_available,
+                warning,
             )
             .await
             {

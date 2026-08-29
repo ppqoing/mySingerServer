@@ -3876,7 +3876,7 @@ fn cache_fully_computed(cached: Option<&BaseCacheRecord>) -> bool {
 }
 
 /// 比较两份缓存的可复用完整度，中心更完整时才覆盖本地部分缓存。
-fn cache_rank(cached: Option<&BaseCacheRecord>) -> u8 {
+pub(crate) fn cache_rank(cached: Option<&BaseCacheRecord>) -> u8 {
     cached.map_or(0, |cached| {
         let decision = BaseComputeDecision::for_cache(Some(cached), true, false);
         1 + u8::from(decision.missing_parts() & BASE_MISSING_PROBE == 0)

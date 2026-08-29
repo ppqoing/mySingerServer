@@ -14,11 +14,16 @@ mod pipeline;
 mod root_plan;
 mod task_file_base_compute;
 mod task_file_base_coordinator;
+mod task_file_cache;
 mod task_file_media_compute;
 mod task_file_media_persistence;
 pub(crate) use task_file_base_coordinator::{
     TaskFileBaseCoordinatorError, TaskFileBaseCoordinatorOptions, TaskFileBaseCoordinatorResult,
     TaskFileBaseCoordinatorSummary, run_task_file_base_coordinator,
+    run_task_file_base_coordinator_with_remote,
+};
+pub(crate) use task_file_cache::{
+    TaskFileCacheError, TaskFileCacheResult, resolve_task_file_cache,
 };
 pub(crate) use task_file_media_compute::{
     MediaPassResult, TaskFileMediaCompleted, TaskFileMediaComputeError, TaskFileMediaFailure,

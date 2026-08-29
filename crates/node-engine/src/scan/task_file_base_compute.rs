@@ -6,15 +6,20 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     fmt,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use dedup_core::{ContentKey, MediaKind};
-use dedup_node_store::ResolvedScanFile;
+use dedup_node_store::{FileFaultKind, FileFaultRecord, ResolvedScanFile};
 use dedup_windows::ReadCancellationToken;
 use tokio::{sync::mpsc::UnboundedReceiver, task::JoinSet};
 
-use super::{BaseComputeDecision, BaseTaskManifest, BaseTaskProduction, HashPermitReader};
+use super::{
+    BaseComputeDecision, BaseTaskManifest, BaseTaskProduction, HashPermitReader,
+    base_compute::cache_rank,
+};
 use crate::{
+    RemoteFeatureCache,
     io::ReadFailure,
     scan::base_persistence::{
         BasePersistAck, BasePersistIdentity, BasePersistMessage, BasePersistOutcome,
@@ -180,6 +185,48 @@ where
     P: TaskLanePermitProvider,
     H: HashPermitReader<Permit = P::Permit>,
 {
+    let remote = crate::DisabledRemoteFeatureCache;
+    let mut remote_available = false;
+    let mut warning = None;
+    run_task_file_hash_pass_with_remote(
+        pending,
+        reader,
+        hash_capacity,
+        store,
+        acknowledgements,
+        cancellation,
+        &remote,
+        &mut remote_available,
+        &mut warning,
+    )
+    .await
+}
+
+/// 运行支持可选远端内容缓存的 Hash pass；旧入口保持 SQLite-only 行为。
+pub(crate) async fn run_task_file_hash_pass_with_remote<P, H, R>(
+    pending: TaskFileBaseComputePending<P>,
+    reader: H,
+    hash_capacity: usize,
+    store: &BaseStoreHandle,
+    acknowledgements: &mut UnboundedReceiver<BasePersistAck>,
+    cancellation: ReadCancellationToken,
+    remote: &R,
+    remote_available: &mut bool,
+    warning: &mut Option<String>,
+) -> Result<TaskFileBaseComputePending<P>, TaskFileBaseComputeError<P>>
+where
+    P: TaskLanePermitProvider,
+    H: HashPermitReader<Permit = P::Permit>,
+    R: RemoteFeatureCache,
+{
+    if *remote_available {
+        if let Some(startup_warning) = remote.startup_warning() {
+            *remote_available = false;
+            if warning.is_none() {
+                *warning = Some(startup_warning.to_owned());
+            }
+        }
+    }
     let mut pending = pending;
     // pending 可能来自上一轮 Media 阶段；Hash pass 必须重新观察 dispatcher，不能沿用旧阻塞原因。
     pending.blocked_reason = None;
@@ -321,6 +368,9 @@ where
                         &mut persist_in_flight,
                         store,
                         acknowledgements,
+                        Some(remote),
+                        remote_available,
+                        warning,
                     )
                     .await
                     {
@@ -335,7 +385,7 @@ where
                 persist_queue.push_back(failed_persist(
                     outcome.identity,
                     outcome.record.scanned,
-                    error.to_string(),
+                    error,
                 ));
             }
         }
@@ -347,6 +397,9 @@ where
         &mut persist_in_flight,
         store,
         acknowledgements,
+        Some(remote),
+        remote_available,
+        warning,
     )
     .await
     {
@@ -391,15 +444,22 @@ fn collect_hash_read(
     Ok(())
 }
 
-/// 对一批已完成 Hash 的结果做一次 ContentKey 查询并登记后续动作。
-async fn apply_hash_batch<P: TaskLanePermitProvider>(
+/// 对一批已完成 Hash 的结果做本地/远端一次批量查询并登记后续动作。
+async fn apply_hash_batch<P, R>(
     pending: &mut TaskFileBaseComputePending<P>,
     hashed: &mut Vec<HashedTask>,
     persist_queue: &mut VecDeque<PendingPersist>,
     persist_in_flight: &mut BTreeMap<TaskFileIdentity, PersistAction>,
     store: &BaseStoreHandle,
     acknowledgements: &mut UnboundedReceiver<BasePersistAck>,
-) -> Result<(), String> {
+    remote: Option<&R>,
+    remote_available: &mut bool,
+    warning: &mut Option<String>,
+) -> Result<(), String>
+where
+    P: TaskLanePermitProvider,
+    R: RemoteFeatureCache,
+{
     if hashed.is_empty() {
         return Ok(());
     }
@@ -408,11 +468,83 @@ async fn apply_hash_batch<P: TaskLanePermitProvider>(
         .iter()
         .map(|item| ContentKey::new(item.md5, item.record.scanned.file_size))
         .collect::<Vec<_>>();
-    let cached = store
+    let mut cached = store
         .lookup_base_cache_by_keys(&keys)
         .map_err(|error| error.to_string())?;
     if cached.len() != batch.len() {
         return Err("内容缓存批量查询返回数量不一致".into());
+    }
+
+    // 只把本地仍缺少基础字段的项送入一次远端批量查询；完整本地命中不占用网络请求。
+    let mut remote_indexes = Vec::new();
+    if let Some(remote) = remote.filter(|_| *remote_available) {
+        for (index, (hashed, local)) in batch.iter().zip(&cached).enumerate() {
+            let context = pending
+                .contexts
+                .get(&hashed.identity)
+                .ok_or_else(|| "Hash 结果缺少对应的内存上下文".to_owned())?;
+            let decision = BaseComputeDecision::for_cache(
+                local.as_ref(),
+                context.contact_sheet_valid,
+                context.force_recompute,
+            );
+            if !context.force_recompute && decision.missing_parts() != 0 {
+                remote_indexes.push(index);
+            }
+        }
+        if !remote_indexes.is_empty() {
+            let remote_keys = remote_indexes
+                .iter()
+                .map(|&index| keys[index])
+                .collect::<Vec<_>>();
+            match remote.lookup_contents(&remote_keys).await {
+                Ok(remote_records)
+                    if remote_records.len() == remote_keys.len()
+                        && remote_records
+                            .iter()
+                            .zip(&remote_keys)
+                            .all(|(record, key)| {
+                                record
+                                    .as_ref()
+                                    .is_none_or(|record| record.content_key == *key)
+                            }) =>
+                {
+                    let mut imported = false;
+                    for (&index, remote_record) in remote_indexes.iter().zip(remote_records) {
+                        if remote_record.as_ref().is_some_and(|record| {
+                            cache_rank(Some(record)) > cache_rank(cached[index].as_ref())
+                        }) {
+                            store
+                                .import_base_cache_record(
+                                    &batch[index].record.scanned,
+                                    remote_record.as_ref().expect("上方已检查 Some"),
+                                )
+                                .map_err(|error| error.to_string())?;
+                            imported = true;
+                        }
+                    }
+                    if imported {
+                        // 远端批量导入完成后只重新查询一次，取得本地 content_id 和合并字段。
+                        cached = store
+                            .lookup_base_cache_by_keys(&keys)
+                            .map_err(|error| error.to_string())?;
+                        if cached.len() != batch.len() {
+                            return Err("导入后的内容缓存批量查询返回数量不一致".into());
+                        }
+                    }
+                }
+                Ok(_) => note_remote_failure(
+                    remote_available,
+                    warning,
+                    "远端内容缓存返回数量或内容键不一致".into(),
+                ),
+                Err(error) => note_remote_failure(
+                    remote_available,
+                    warning,
+                    format!("远端内容缓存查询失败，本轮降级为 SQLite-only: {error}"),
+                ),
+            }
+        }
     }
 
     for (hashed, cached) in batch.into_iter().zip(cached) {
@@ -468,12 +600,40 @@ async fn apply_hash_batch<P: TaskLanePermitProvider>(
     .await
 }
 
+/// 记录远端失败并一次性关闭本轮远端入口，后续批次继续 SQLite-only。
+fn note_remote_failure(remote_available: &mut bool, warning: &mut Option<String>, message: String) {
+    *remote_available = false;
+    if warning.is_none() {
+        *warning = Some(message);
+    }
+}
+
 /// 将单文件读取失败包装成只在 ACK 后写 F 的消息。
 fn failed_persist(
     identity: TaskFileIdentity,
     scanned: dedup_node_store::ScannedPath,
-    message: String,
+    error: ReadFailure,
 ) -> PendingPersist {
+    let message = error.to_string();
+    let fault_normalized_path = scanned.normalized_path.clone();
+    let fault_display_path = scanned.display_path.clone();
+    let fault_file_size = scanned.file_size;
+    let (windows_error_code, read_offset, read_size) = match error {
+        ReadFailure::SuspectedPhysical {
+            block_offset,
+            block_len,
+            raw_os_error,
+            ..
+        } => (raw_os_error, Some(block_offset), Some(block_len as u64)),
+        ReadFailure::Io {
+            block_offset,
+            source,
+            ..
+        } => (source.raw_os_error(), Some(block_offset), None),
+        ReadFailure::Cancelled => (None, None, None),
+    };
+    let fault_message = message.clone();
+    let fault_seen_at_ms = now_ms();
     let display_path = scanned
         .display_path
         .as_path()
@@ -481,6 +641,25 @@ fn failed_persist(
         .into_owned();
     let operation_message = message.clone();
     let operation = BasePersistMessage::new_task_file(identity.clone(), move |_store| {
+        _store
+            .upsert_file_fault(&FileFaultRecord {
+                machine_id: _store.machine_id().clone(),
+                normalized_path: fault_normalized_path,
+                display_path: fault_display_path,
+                file_size: fault_file_size,
+                kind: FileFaultKind::SuspectedPhysicalRead,
+                stage: "base".to_owned(),
+                windows_error_code,
+                read_offset,
+                read_size,
+                worker_pid: None,
+                worker_exit_code: None,
+                first_seen_at_ms: fault_seen_at_ms,
+                last_seen_at_ms: fault_seen_at_ms,
+                occurrence_count: 1,
+                message: fault_message,
+            })
+            .map_err(|error| error.to_string())?;
         Ok(BasePersistOutcome::Failed {
             display_path,
             message: operation_message,
@@ -493,6 +672,16 @@ fn failed_persist(
         message: operation,
         action: PersistAction::Failed,
     }
+}
+
+/// 返回用于故障表的当前毫秒时间戳。
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 /// 将完整内容缓存命中包装成 taskless upsert 消息。
@@ -652,12 +841,13 @@ mod tests {
         time::Duration,
     };
 
-    use dedup_core::{DisplayPath, MachineId, MediaKind, NormalizedPath};
+    use dedup_core::{ContentKey, DisplayPath, MachineId, MediaKind, NormalizedPath};
     use dedup_node_store::{BaseCacheRecord, NodeStore, ScannedPath};
     use dedup_windows::{LocalDiskKind, PhysicalDiskId, ReadCancellationToken};
     use tokio::sync::Barrier;
 
     use crate::{
+        RemoteCacheError, RemoteFeatureCache,
         io::{DiskReadClass, ReadFailure},
         scan::{
             BaseTaskInput, BaseTaskProducer, BaseTaskProduction, HashPermitReader,
@@ -699,6 +889,42 @@ mod tests {
     #[derive(Clone, Default)]
     struct TestHashReader {
         results: Arc<BTreeMap<String, Result<[u8; 16], String>>>,
+    }
+
+    #[derive(Clone)]
+    struct TestContentRemote {
+        calls: Arc<AtomicUsize>,
+        hit: Option<BaseCacheRecord>,
+        fail: bool,
+    }
+
+    impl RemoteFeatureCache for TestContentRemote {
+        async fn lookup_paths(
+            &self,
+            _machine_id: &MachineId,
+            paths: &[ScannedPath],
+        ) -> Result<Vec<Option<BaseCacheRecord>>, RemoteCacheError> {
+            Ok(vec![None; paths.len()])
+        }
+
+        async fn lookup_contents(
+            &self,
+            keys: &[ContentKey],
+        ) -> Result<Vec<Option<BaseCacheRecord>>, RemoteCacheError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                return Err(RemoteCacheError::ConnectTimeout);
+            }
+            Ok(keys.iter().map(|_| self.hit.clone()).collect())
+        }
+
+        async fn publish_outbox(
+            &mut self,
+            _machine_id: &MachineId,
+            _batch: &dedup_protocol::proto::SyncChangeBatch,
+        ) -> Result<u64, RemoteCacheError> {
+            Ok(0)
+        }
     }
 
     impl HashPermitReader for TestHashReader {
@@ -1028,6 +1254,109 @@ mod tests {
         assert_eq!(pending.manifest.cache_hits, 2);
         assert!(pending.contexts.is_empty());
         pending.dispatcher.health().unwrap();
+        drop(handle);
+        drop(acknowledgements);
+        actor.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn complete_remote_content_hit_uses_one_lookup_and_marks_row_completed() {
+        let root = tempfile::tempdir().unwrap();
+        let machine = MachineId::from_sha256([0x5C; 32]);
+        let store = NodeStore::open_in_memory(machine).unwrap();
+        let remote_record = BaseCacheRecord {
+            content_id: None,
+            content_key: ContentKey::new([0xAA; 16], 23),
+            media_kind: MediaKind::Other,
+            base_complete: true,
+            width: None,
+            height: None,
+            duration_ms: None,
+            stage1: None,
+            image_stage2: None,
+            video_stage2: Box::new([None; 6]),
+            contact_sheet_relative_path: None,
+        };
+        let remote = TestContentRemote {
+            calls: Arc::new(AtomicUsize::new(0)),
+            hit: Some(remote_record.clone()),
+            fail: false,
+        };
+        let pending = production(
+            root.path(),
+            &[input(scanned(r"C:\remote-hit.bin", 23), lane(), None)],
+            CountingPermitProvider::default(),
+        );
+        let (actor, handle, mut acknowledgements) =
+            super::super::base_persistence::BaseStoreActor::spawn(store, 4);
+        let mut remote_available = true;
+        let mut warning = None;
+        let pending = super::run_task_file_hash_pass_with_remote(
+            TaskFileBaseComputePending::from_production(pending),
+            reader(&[(r"C:\remote-hit.bin", Ok([0xAA; 16]))]),
+            1,
+            &handle,
+            &mut acknowledgements,
+            ReadCancellationToken::new(),
+            &remote,
+            &mut remote_available,
+            &mut warning,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(remote.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(handle.lookup_key_batch_sizes_for_test(), vec![1, 1]);
+        assert!(remote_available);
+        assert!(warning.is_none());
+        assert_eq!(pending.manifest.cache_hits, 1);
+        assert!(pending.contexts.is_empty());
+        assert_eq!(first_status(&pending, &lane()), b'C');
+
+        drop(handle);
+        drop(acknowledgements);
+        actor.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_content_failure_falls_back_to_media_with_warning() {
+        let root = tempfile::tempdir().unwrap();
+        let machine = MachineId::from_sha256([0x5D; 32]);
+        let store = NodeStore::open_in_memory(machine).unwrap();
+        let remote = TestContentRemote {
+            calls: Arc::new(AtomicUsize::new(0)),
+            hit: None,
+            fail: true,
+        };
+        let pending = production(
+            root.path(),
+            &[input(scanned(r"C:\remote-fallback.bin", 24), lane(), None)],
+            CountingPermitProvider::default(),
+        );
+        let (actor, handle, mut acknowledgements) =
+            super::super::base_persistence::BaseStoreActor::spawn(store, 4);
+        let mut remote_available = true;
+        let mut warning = None;
+        let pending = super::run_task_file_hash_pass_with_remote(
+            TaskFileBaseComputePending::from_production(pending),
+            reader(&[(r"C:\remote-fallback.bin", Ok([0xAB; 16]))]),
+            1,
+            &handle,
+            &mut acknowledgements,
+            ReadCancellationToken::new(),
+            &remote,
+            &mut remote_available,
+            &mut warning,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(remote.calls.load(Ordering::SeqCst), 1);
+        assert!(!remote_available);
+        assert!(warning.is_some());
+        assert_eq!(pending.contexts.len(), 1);
+        assert_eq!(first_status(&pending, &lane()), b'P');
+        cleanup_pending(pending);
         drop(handle);
         drop(acknowledgements);
         actor.finish().await.unwrap();
@@ -1465,7 +1794,17 @@ mod tests {
         let second_line = bytes.iter().position(|byte| *byte == b'\n').unwrap() + 1;
         assert_eq!(bytes[second_line], b'C');
         drop(handle);
-        actor.finish().await.unwrap();
+        let persisted_store = actor.finish().await.unwrap();
+        let faults = persisted_store.page_file_faults(None, 10).unwrap();
+        assert_eq!(faults.items.len(), 1);
+        assert_eq!(
+            faults.items[0].kind,
+            dedup_node_store::FileFaultKind::SuspectedPhysicalRead
+        );
+        assert_eq!(
+            faults.items[0].normalized_path.as_str(),
+            r"C:\SCAN-FAILURE.BIN"
+        );
     }
 
     #[tokio::test]
