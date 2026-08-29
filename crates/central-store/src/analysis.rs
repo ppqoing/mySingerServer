@@ -120,7 +120,7 @@ pub struct CentralGroupMember {
     pub phash_passed_parts: Option<u8>,
     /// 与代表文件直接比较的联合二筛得分。
     pub stage2_score: Option<f64>,
-    /// 从中心复核表恢复的决定；新分组写入时使用 Undecided。
+    /// 当前中心窗口的进程内复核决定；中心不会从历史表恢复该字段。
     pub review: CentralReviewDecision,
     /// 图片或视频宽度；写分组时可为 None。
     pub width: Option<u32>,
@@ -516,15 +516,12 @@ impl CentralStore {
                  SELECT gm.machine_id,gm.normalized_path,gm.md5,gm.file_size,
                         (gm.current_active=TRUE AND gm.current_rank=1),
                         gm.stage1_score,gm.phash_passed_parts,gm.stage2_score,
-                        COALESCE(rm.decision,'undecided'),COALESCE(i.width,v.width),
+                        'undecided',COALESCE(i.width,v.width),
                         COALESCE(i.height,v.height),i.quality,gm.current_active
                  FROM ranked_members gm
                  LEFT JOIN contents c ON c.md5=gm.md5 AND c.file_size=gm.file_size
                  LEFT JOIN image_stage1 i ON i.content_id=c.content_id
                  LEFT JOIN video_metadata v ON v.content_id=c.content_id
-                 LEFT JOIN review_marks rm ON rm.analysis_run_id=gm.analysis_run_id
-                   AND rm.group_id=gm.group_id AND rm.machine_id=gm.machine_id
-                   AND rm.normalized_path=gm.normalized_path
                  WHERE (
                    $3::text IS NULL OR gm.machine_id>$3 OR
                    (gm.machine_id=$3 AND gm.normalized_path>$4))
@@ -575,7 +572,7 @@ impl CentralStore {
         Ok(CentralGroupMemberPage { items, next_cursor })
     }
 
-    /// UPSERT 一个组成员的未决定、保留或删除复核标记。
+    /// 兼容旧中心调用方写入复核标记；当前产品路径改由 Desktop 进程内状态管理。
     pub async fn save_review_mark(
         &self,
         run_id: AnalysisRunId,

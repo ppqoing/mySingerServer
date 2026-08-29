@@ -134,12 +134,6 @@ impl CentralStore {
                 &[&machine_id.as_str(), &pg_i64(high_seq, "快照高水位")?],
             )
             .await?;
-        transaction
-            .execute(
-                "DELETE FROM deletion_tombstones WHERE machine_id=$1",
-                &[&machine_id.as_str()],
-            )
-            .await?;
         Ok(CentralSnapshot {
             transaction,
             machine_id: machine_id.clone(),
@@ -244,12 +238,22 @@ enum DecodedChange {
     ContactSheet,
 }
 
+impl DecodedChange {
+    /// 判断同步项是否属于当前事实；历史墓碑和联系表只保留协议兼容解码。
+    fn writes_current_fact(&self) -> bool {
+        !matches!(self, Self::DeletionTombstone { .. } | Self::ContactSheet)
+    }
+}
+
 async fn apply_change(
     transaction: &Transaction<'_>,
     source_machine: &MachineId,
     sequence: u64,
     change: &DecodedChange,
 ) -> Result<(), CentralError> {
+    if !change.writes_current_fact() {
+        return Ok(());
+    }
     match change {
         DecodedChange::Content {
             key,
@@ -432,27 +436,8 @@ async fn apply_change(
             key,
             outcome,
         } => {
-            if machine_id != source_machine.as_str() {
-                return Err(invalid_payload("删除墓碑 machine_id 与同步来源不一致"));
-            }
-            transaction
-                .execute(
-                    "INSERT INTO deletion_tombstones(
-                       machine_id,normalized_path,md5,file_size,outcome,updated_seq)
-                     VALUES($1,$2,$3,$4,$5,$6)
-                     ON CONFLICT(machine_id,normalized_path) DO UPDATE SET
-                       md5=excluded.md5,file_size=excluded.file_size,outcome=excluded.outcome,
-                       updated_seq=excluded.updated_seq",
-                    &[
-                        machine_id,
-                        normalized_path,
-                        &key.md5().as_slice(),
-                        &pg_i64(key.file_size(), "删除墓碑文件大小")?,
-                        outcome,
-                        &pg_i64(sequence, "删除墓碑同步序号")?,
-                    ],
-                )
-                .await?;
+            // 旧节点仍可能发送墓碑载荷；当前事实只由 file(active=false) 表达。
+            let _ = (machine_id, normalized_path, key, outcome);
         }
         DecodedChange::ContactSheet => {}
     }
@@ -684,5 +669,40 @@ impl<'a> PayloadReader<'a> {
         } else {
             Err(invalid_payload("载荷尾部有多余字节"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DecodedChange, decode_change};
+    use dedup_protocol::proto;
+
+    /// 生成旧版本删除墓碑载荷，验证兼容解码不会把历史写入当前事实。
+    fn legacy_tombstone_change() -> proto::SyncChange {
+        let mut payload = vec![1_u8];
+        append_bytes(&mut payload, b"machine");
+        append_bytes(&mut payload, br"C:\legacy\removed.bin");
+        append_bytes(&mut payload, &[0x11; 16]);
+        payload.extend_from_slice(&42_u64.to_be_bytes());
+        append_bytes(&mut payload, b"deleted");
+        proto::SyncChange {
+            seq: 1,
+            entity_kind: "deletion_tombstone".into(),
+            payload,
+        }
+    }
+
+    /// 追加一个大端长度前缀字节串。
+    fn append_bytes(target: &mut Vec<u8>, value: &[u8]) {
+        target.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        target.extend_from_slice(value);
+    }
+
+    /// 旧墓碑仍可解码，但同步投影不能生成当前事实写入。
+    #[test]
+    fn legacy_tombstone_is_not_a_current_fact_mutation() {
+        let decoded = decode_change(&legacy_tombstone_change()).expect("旧墓碑应保持协议兼容");
+        assert!(matches!(decoded, DecodedChange::DeletionTombstone { .. }));
+        assert!(!decoded.writes_current_fact());
     }
 }
