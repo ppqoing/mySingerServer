@@ -66,7 +66,7 @@ pub struct TaskStageWrite {
     pub warning_text: Option<String>,
 }
 
-/// 从中心数据库恢复的一个分析阶段快照。
+/// 从中心数据库读取的一个分析阶段快照。
 pub type TaskStageSnapshot = TaskStageWrite;
 
 /// 一项二次特征内容派发的幂等写入字段。
@@ -84,7 +84,7 @@ pub struct Stage2DispatchWrite {
     pub updated_at_ms: u64,
 }
 
-/// 从中心数据库恢复的一项二次特征派发快照。
+/// 从中心数据库读取的一项二次特征派发快照。
 pub type Stage2DispatchSnapshot = Stage2DispatchWrite;
 
 impl CentralStore {
@@ -127,7 +127,7 @@ impl CentralStore {
         Ok(())
     }
 
-    /// 按首次插入顺序恢复中心清单任务的全部阶段。
+    /// 按首次插入顺序读取中心分析运行的全部阶段。
     pub async fn analysis_stages(
         &self,
         run_id: AnalysisRunId,
@@ -196,7 +196,7 @@ impl CentralStore {
         Ok(())
     }
 
-    /// 按机器和内容键稳定恢复一个分析运行的全部二次特征派发。
+    /// 按机器和内容键稳定读取一个分析运行的全部二次特征派发。
     pub async fn stage2_dispatches(
         &self,
         run_id: AnalysisRunId,

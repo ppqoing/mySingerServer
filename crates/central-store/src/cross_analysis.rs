@@ -3,8 +3,7 @@
 use std::collections::BTreeMap;
 
 use dedup_core::{
-    AnalysisRunId, ContentKey, LocationKey, MachineId, MediaKind, NormalizedPath, TaskId,
-    Thresholds,
+    AnalysisRunId, ContentKey, LocationKey, MachineId, MediaKind, NormalizedPath, Thresholds,
 };
 use dedup_media::{ImageStage1, ImageStage2, PdqHash};
 
@@ -15,7 +14,7 @@ use super::{
     CentralCandidateStatus, CentralError, CentralPairKind, CentralStore, pg_i64,
 };
 
-/// 中心协调器恢复当前运行阶段和不可变阈值所需的最小快照。
+/// 中心协调器读取当前运行阶段和不可变阈值所需的最小快照。
 #[derive(Clone, Debug, PartialEq)]
 pub struct CentralRunSnapshot {
     /// 已提交的分析状态。
@@ -76,39 +75,6 @@ impl CentralStore {
             return Err(CentralError::InvalidState("中心分析节点任务不存在".into()));
         }
         Ok(())
-    }
-
-    /// 返回一次运行记录的全部 stage1 与 phase2 节点任务，供协调器重建门禁状态。
-    pub async fn analysis_node_tasks(
-        &self,
-        run_id: AnalysisRunId,
-    ) -> Result<Vec<CentralAnalysisNode>, CentralError> {
-        let rows = self
-            .client
-            .query(
-                "SELECT machine_id,task_id,task_highwater,sync_highwater,task_status
-                 FROM analysis_run_nodes WHERE analysis_run_id=$1
-                 ORDER BY machine_id,task_id",
-                &[&run_id.as_uuid().to_string()],
-            )
-            .await?;
-        rows.into_iter()
-            .map(|row| {
-                let machine: String = row.get(0);
-                let task: String = row.get(1);
-                Ok(CentralAnalysisNode {
-                    machine_id: MachineId::parse(machine.trim_end())?,
-                    task_id: TaskId::from_uuid(
-                        uuid::Uuid::parse_str(&task).map_err(|_| {
-                            CentralError::InvalidState("中心任务 ID 不是 UUID".into())
-                        })?,
-                    ),
-                    task_highwater: non_negative(row.get(2), "任务高水位")?,
-                    sync_highwater: non_negative(row.get(3), "同步高水位")?,
-                    task_status: row.get(4),
-                })
-            })
-            .collect()
     }
 
     /// 为 phase2 追加一个节点任务；同一运行允许同节点在重试时产生多个新任务。

@@ -189,6 +189,15 @@ async fn coordinator_freezes_syncs_screens_and_finalizes_through_real_tcp_and_po
     assert_eq!(groups.items.len(), 1);
     assert_eq!(groups.items[0].kind, CentralGroupKind::Image);
 
+    let fresh = CrossAnalysisCoordinator::start(
+        &mut central,
+        &[CrossNodeSelection::new(&session, scan_task)],
+        Thresholds::default(),
+    )
+    .await
+    .unwrap();
+    assert_ne!(fresh.run_id(), report.run_id);
+
     drop(session);
     shutdown_tx.send(()).unwrap();
     server.await.unwrap().unwrap();

@@ -112,7 +112,9 @@ pub struct CrossAnalysisCoordinator {
 }
 
 impl CrossAnalysisCoordinator {
-    /// 查询所选任务初始状态，并创建 `collecting_stage1` 中心运行。
+    /// 查询所选任务初始状态，并为本次调用创建新的 `collecting_stage1` 中心运行。
+    ///
+    /// 每次调用都会从所选节点任务重新开始，不读取或恢复旧的中心分析运行。
     pub async fn start(
         central: &mut CentralStore,
         selections: &[CrossNodeSelection<'_>],
@@ -167,49 +169,6 @@ impl CrossAnalysisCoordinator {
     /// 返回当前中心运行 ID，供 UI、分页和复核操作复用。
     pub const fn run_id(&self) -> AnalysisRunId {
         self.run_id
-    }
-
-    /// 从 PostgreSQL 恢复一次未完成清单任务，不依赖原 Desktop 进程仍存活。
-    pub async fn resume(
-        central: &CentralStore,
-        run_id: AnalysisRunId,
-    ) -> Result<Self, CrossAnalysisError> {
-        let snapshot = central.analysis_run_snapshot(run_id).await?;
-        let dispatches = central.stage2_dispatches(run_id).await?;
-        let phase2_keys = dispatches
-            .iter()
-            .filter_map(|dispatch| {
-                dispatch
-                    .node_task_id
-                    .map(|task_id| (dispatch.machine_id.clone(), task_id))
-            })
-            .collect::<BTreeSet<_>>();
-        let tasks = central.analysis_node_tasks(run_id).await?;
-        let selected = tasks
-            .iter()
-            .filter(|task| !phase2_keys.contains(&(task.machine_id.clone(), task.task_id)))
-            .map(|task| SelectedTask {
-                machine_id: task.machine_id.clone(),
-                task_id: task.task_id,
-            })
-            .collect();
-        let phase2_tasks = tasks
-            .into_iter()
-            .filter(|task| phase2_keys.contains(&(task.machine_id.clone(), task.task_id)))
-            .map(|task| SelectedTask {
-                machine_id: task.machine_id,
-                task_id: task.task_id,
-            })
-            .collect();
-        Ok(Self {
-            run_id,
-            thresholds: snapshot.thresholds,
-            selected,
-            phase2_tasks,
-            availability: Vec::new(),
-            skipped_incomplete: 0,
-            sync_engine: SyncEngine::new(),
-        })
     }
 
     /// 推进当前运行，直到遇到未满足门禁或到达 Completed/Partial。
@@ -304,18 +263,15 @@ impl CrossAnalysisCoordinator {
                             ),
                         )
                         .await?;
-                    self.restore_phase2_tasks(central).await?;
-                    if self.phase2_tasks.is_empty() {
-                        let online = online_machines(sessions);
-                        let batches = plan_stage2_batches(
-                            &candidates,
-                            &features,
-                            &self.availability,
-                            &online,
-                            STAGE2_BATCH_SIZE,
-                        );
-                        self.dispatch_batches(central, sessions, batches).await?;
-                    }
+                    let online = online_machines(sessions);
+                    let batches = plan_stage2_batches(
+                        &candidates,
+                        &features,
+                        &self.availability,
+                        &online,
+                        STAGE2_BATCH_SIZE,
+                    );
+                    self.dispatch_batches(central, sessions, batches).await?;
                     if self.phase2_tasks.is_empty() {
                         central
                             .save_analysis_stage(
@@ -349,7 +305,11 @@ impl CrossAnalysisCoordinator {
                     ));
                 }
                 CentralAnalysisStatus::Phase2Dispatched => {
-                    self.restore_phase2_tasks(central).await?;
+                    if self.phase2_tasks.is_empty() {
+                        return Err(CrossAnalysisError::InvalidState(
+                            "当前协调器没有本次运行的二筛任务，请重新开始跨机器分析".into(),
+                        ));
+                    }
                     let dispatch_started = wall_clock_ms();
                     let Some(states) = self
                         .refresh_tasks(central, sessions, &self.phase2_tasks.clone())
@@ -671,50 +631,6 @@ impl CrossAnalysisCoordinator {
         Ok(())
     }
 
-    async fn restore_phase2_tasks(
-        &mut self,
-        central: &CentralStore,
-    ) -> Result<(), CrossAnalysisError> {
-        if !self.phase2_tasks.is_empty() {
-            return Ok(());
-        }
-        let dispatches = central.stage2_dispatches(self.run_id).await?;
-        let task_keys = dispatches
-            .iter()
-            .filter_map(|dispatch| {
-                dispatch
-                    .node_task_id
-                    .map(|task_id| (dispatch.machine_id.clone(), task_id))
-            })
-            .collect::<BTreeSet<_>>();
-        if !task_keys.is_empty() {
-            self.phase2_tasks = task_keys
-                .into_iter()
-                .map(|(machine_id, task_id)| SelectedTask {
-                    machine_id,
-                    task_id,
-                })
-                .collect();
-            return Ok(());
-        }
-        let selected = self
-            .selected
-            .iter()
-            .map(|task| task.task_id)
-            .collect::<BTreeSet<_>>();
-        self.phase2_tasks = central
-            .analysis_node_tasks(self.run_id)
-            .await?
-            .into_iter()
-            .filter(|task| !selected.contains(&task.task_id))
-            .map(|task| SelectedTask {
-                machine_id: task.machine_id,
-                task_id: task.task_id,
-            })
-            .collect();
-        Ok(())
-    }
-
     /// 以每个内容项的持久派发状态更新二次特征阶段，而不是按批次数计数。
     async fn save_dispatch_progress(
         &self,
@@ -842,7 +758,7 @@ fn online_machines(sessions: &[&NodeSession]) -> BTreeSet<MachineId> {
         .collect()
 }
 
-/// 返回当前墙钟毫秒时间，供跨进程恢复后的阶段计时继续使用。
+/// 返回当前墙钟毫秒时间，供本次协调器的阶段计时使用。
 fn wall_clock_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
