@@ -45,3 +45,11 @@ passed
 ```
 
 默认 feature 的 `cargo test -p dedup-node-engine --lib --locked -- --test-threads=1` 也已尝试，但在本任务未修改代码的既有测试夹具配置差异处失败：`analysis/phase2.rs` 导入受 `test-hooks` feature 限制的 `crate::scan::BasePersistTestController`（E0432）。按既有正确组合启用 `test-hooks` 后 142 项通过；未对该范围外问题作修改。
+
+## 修复轮 1：析构清理与结果元数据
+
+- direct-drop RED：`dropping_unfinished_writer_removes_partial_and_keeps_previous_result` 在修复前失败于 `assertion failed: !partial.exists()`。
+- group-count RED：Published/Verified 缺少 `run_id`、`library_revision`、`group_count`，编译报 E0609。
+- Writer 现在在未完成时 best-effort 清理唯一 partial；成功 publish 和显式 discard 设为完成，不触碰 result。
+- Published/Verified 均提供直接的运行 ID、库 revision 和唯一分组数；Writer 与 verifier 用 `BTreeSet` 覆盖非连续重复组 ID。
+- 增加锁定旧 result 的真实 Windows `CreateFileW` share=0 测试：publish 返回 IO 错误，旧字节不变、partial 被清理。该清理路径在本轮前已有实现，测试在补齐 node-engine 的 `windows` dev-dependency 后直接通过。

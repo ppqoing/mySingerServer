@@ -1,6 +1,7 @@
 //! 最近一次本地分析结果的版本化 TSV 发布与校验边界。
 
 use std::{
+    collections::BTreeSet,
     fs::{self, File},
     io::{self, BufWriter, Write},
     path::{Path, PathBuf},
@@ -140,10 +141,16 @@ pub struct AnalysisResultRow {
 pub struct PublishedAnalysisResult {
     /// 唯一的最近成功结果路径。
     pub path: PathBuf,
+    /// 本次分析运行的进程内标识。
+    pub run_id: AnalysisRunId,
+    /// 冻结分析输入时的文件库版本。
+    pub library_revision: u64,
     /// 已发布的头记录。
     pub header: AnalysisResultHeader,
     /// 已发布成员行数。
     pub member_count: u64,
+    /// 已发布成员所属的唯一分组数。
+    pub group_count: u64,
     /// H/M 全部字节的 SHA-256。
     pub sha256: [u8; 32],
 }
@@ -151,10 +158,16 @@ pub struct PublishedAnalysisResult {
 /// 通过格式和摘要校验后得到的结果元数据。
 #[derive(Clone, Debug, PartialEq)]
 pub struct VerifiedAnalysisResult {
+    /// 本次分析运行的进程内标识。
+    pub run_id: AnalysisRunId,
+    /// 冻结分析输入时的文件库版本。
+    pub library_revision: u64,
     /// 已校验的头记录。
     pub header: AnalysisResultHeader,
     /// 已校验成员行数。
     pub member_count: u64,
+    /// 已校验成员所属的唯一分组数。
+    pub group_count: u64,
     /// 已校验的 H/M 字节 SHA-256。
     pub sha256: [u8; 32],
 }
@@ -167,6 +180,8 @@ pub struct AnalysisResultWriter {
     writer: Option<BufWriter<File>>,
     hasher: Sha256,
     member_count: u64,
+    group_ids: BTreeSet<String>,
+    finished: bool,
 }
 
 impl AnalysisResultWriter {
@@ -193,6 +208,8 @@ impl AnalysisResultWriter {
             )?)),
             hasher: Sha256::new(),
             member_count: 0,
+            group_ids: BTreeSet::new(),
+            finished: false,
         };
         let line = encode_header(header);
         if let Err(error) = writer.write_hashed_line(&line) {
@@ -216,6 +233,7 @@ impl AnalysisResultWriter {
             return Err(error);
         }
         self.member_count += 1;
+        self.group_ids.insert(row.group_id.clone());
         Ok(())
     }
 
@@ -239,10 +257,14 @@ impl AnalysisResultWriter {
             self.close_and_remove_partial();
             return Err(error);
         }
+        self.finished = true;
         Ok(PublishedAnalysisResult {
-            path: self.result_path,
-            header: self.header,
+            path: self.result_path.clone(),
+            run_id: self.header.analysis_id,
+            library_revision: self.header.library_revision,
+            header: self.header.clone(),
             member_count: self.member_count,
+            group_count: self.group_ids.len() as u64,
             sha256,
         })
     }
@@ -251,6 +273,7 @@ impl AnalysisResultWriter {
     pub fn discard(mut self) -> Result<(), AnalysisResultError> {
         self.writer.take();
         remove_file_if_exists(&self.partial_path)?;
+        self.finished = true;
         Ok(())
     }
 
@@ -269,6 +292,15 @@ impl AnalysisResultWriter {
         writer.write_all(line.as_bytes())?;
         self.hasher.update(line.as_bytes());
         Ok(())
+    }
+}
+
+impl Drop for AnalysisResultWriter {
+    /// 调用方提前退出时尽力清理本次 partial，绝不触碰已发布 result。
+    fn drop(&mut self) {
+        if !self.finished {
+            self.close_and_remove_partial();
+        }
     }
 }
 
@@ -315,8 +347,9 @@ pub fn verify_result_file(path: &Path) -> Result<VerifiedAnalysisResult, Analysi
             "尾记录成员数不匹配".into(),
         ));
     }
+    let mut group_ids = BTreeSet::new();
     for line in &lines[1..lines.len() - 1] {
-        parse_member(line)?;
+        group_ids.insert(parse_member(line)?.to_owned());
     }
     let footer_start = bytes
         .windows(3)
@@ -330,8 +363,11 @@ pub fn verify_result_file(path: &Path) -> Result<VerifiedAnalysisResult, Analysi
         ));
     }
     Ok(VerifiedAnalysisResult {
+        run_id: header.analysis_id,
+        library_revision: header.library_revision,
         header,
         member_count,
+        group_count: group_ids.len() as u64,
         sha256: actual_sha256,
     })
 }
@@ -447,7 +483,7 @@ fn parse_header(line: &str) -> Result<AnalysisResultHeader, AnalysisResultError>
 }
 
 /// 验证 M 固定列，结果读取方后续可在不加载全部行时复用该校验。
-fn parse_member(line: &str) -> Result<(), AnalysisResultError> {
+fn parse_member(line: &str) -> Result<&str, AnalysisResultError> {
     let fields = line.split('\t').collect::<Vec<_>>();
     if fields.len() != 14 || fields[0] != "M" {
         return Err(AnalysisResultError::InvalidFormat(
@@ -480,7 +516,7 @@ fn parse_member(line: &str) -> Result<(), AnalysisResultError> {
     if !fields[13].is_empty() {
         parse_f64(fields[13], "二筛分数")?;
     }
-    Ok(())
+    Ok(fields[2])
 }
 
 /// 验证头记录的固定格式版本和九项阈值。

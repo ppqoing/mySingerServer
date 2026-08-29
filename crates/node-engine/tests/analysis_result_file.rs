@@ -1,6 +1,6 @@
 //! 最近一次分析结果 TSV 的发布和验真行为测试。
 
-use std::fs;
+use std::{fs, os::windows::ffi::OsStrExt, path::Path};
 
 use dedup_core::{AnalysisRunId, ContentKey, LocationKey, MachineId, NormalizedPath, Thresholds};
 use dedup_node_engine::analysis::{
@@ -8,6 +8,13 @@ use dedup_node_engine::analysis::{
     AnalysisResultRow, AnalysisResultWriter, verify_result_file,
 };
 use tempfile::tempdir;
+use windows::{
+    Win32::{
+        Foundation::{CloseHandle, GENERIC_READ, HANDLE},
+        Storage::FileSystem::{CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_MODE, OPEN_EXISTING},
+    },
+    core::PCWSTR,
+};
 
 /// 防止发布结果缺失 H/M/F 固定记录，或尾部校验覆盖错误字节范围。
 #[test]
@@ -48,6 +55,67 @@ fn discarding_new_partial_keeps_previous_published_result() {
             .join("latest-analysis.partial.tsv")
             .exists()
     );
+}
+
+/// 防止调用方提前返回且漏调 discard 时把未完成 partial 留给下次分析。
+#[test]
+fn dropping_unfinished_writer_removes_partial_and_keeps_previous_result() {
+    let directory = tempdir().unwrap();
+    let result = directory.path().join("latest-analysis.result.tsv");
+    let partial = directory.path().join("latest-analysis.partial.tsv");
+    fs::write(&result, b"previous-good-result").unwrap();
+
+    let writer = AnalysisResultWriter::begin(directory.path(), &fixture_header()).unwrap();
+    assert!(partial.exists());
+    drop(writer);
+
+    assert!(!partial.exists());
+    assert_eq!(fs::read(&result).unwrap(), b"previous-good-result");
+}
+
+/// 防止非连续成员重复同一组时把可供 UI 直取的分组计数算错。
+#[test]
+fn published_and_verified_metadata_expose_unique_group_count() {
+    let directory = tempdir().unwrap();
+    let header = fixture_header();
+    let mut rows = fixture_rows();
+    rows[0].group_id = "group-a".into();
+    rows[1].group_id = "group-b".into();
+    rows[2].group_id = "group-a".into();
+    let mut writer = AnalysisResultWriter::begin(directory.path(), &header).unwrap();
+    for row in &rows {
+        writer.write_member(row).unwrap();
+    }
+
+    let published = writer.publish().unwrap();
+    let verified = verify_result_file(&published.path).unwrap();
+
+    assert_eq!(published.run_id, header.analysis_id);
+    assert_eq!(published.library_revision, 42);
+    assert_eq!(published.group_count, 2);
+    assert_eq!(verified.run_id, header.analysis_id);
+    assert_eq!(verified.library_revision, 42);
+    assert_eq!(verified.group_count, 2);
+}
+
+/// 防止旧 result 被独占读取时发布失败后遗留 partial 或覆盖旧字节。
+#[test]
+fn locked_previous_result_makes_publish_remove_partial_and_keep_old_bytes() {
+    let directory = tempdir().unwrap();
+    let result = directory.path().join("latest-analysis.result.tsv");
+    let partial = directory.path().join("latest-analysis.partial.tsv");
+    fs::write(&result, b"previous-good-result").unwrap();
+    let mut writer = AnalysisResultWriter::begin(directory.path(), &fixture_header()).unwrap();
+    writer.write_member(&fixture_rows()[0]).unwrap();
+    let handle = open_without_sharing(&result);
+
+    assert!(matches!(writer.publish(), Err(AnalysisResultError::Io(_))));
+
+    unsafe {
+        CloseHandle(handle).unwrap();
+    }
+    assert!(!partial.exists());
+    assert_eq!(fs::read(&result).unwrap(), b"previous-good-result");
 }
 
 /// 防止损坏、非有限分数和带 TSV 控制字符的显示路径作为可用结果被接收。
@@ -171,4 +239,25 @@ fn sha256_before_footer(bytes: &[u8]) -> [u8; 32] {
         .rposition(|window| window == b"\nF\t")
         .map_or(0, |index| index + 1);
     Sha256::digest(&bytes[..footer_start]).into()
+}
+
+/// 使用 share=0 模拟 UI 或杀毒软件独占打开上一次成功结果的场景。
+fn open_without_sharing(path: &Path) -> HANDLE {
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    unsafe {
+        CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            GENERIC_READ.0,
+            FILE_SHARE_MODE(0),
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+        .unwrap()
+    }
 }
