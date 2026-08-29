@@ -12,6 +12,9 @@ pub use generated::{FILE_DESCRIPTOR_SET, proto};
 /// 当前 Rust V2 节点与管理端握手使用的固定协议版本。
 pub const PROTOCOL_VERSION: u32 = 5;
 
+/// Node 本地结果窗口单次允许返回的最大行数。
+pub const MAX_LOCAL_RESULT_WINDOW_ROWS: u32 = 1_000;
+
 /// 基础计算缺失掩码：需要探测媒体元数据。
 pub const BASE_MISSING_PROBE: u32 = 1;
 /// 基础计算缺失掩码：需要计算一阶段媒体特征。

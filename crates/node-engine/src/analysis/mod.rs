@@ -7,6 +7,7 @@ mod image;
 pub mod model;
 mod phase2;
 mod result_file;
+mod result_reader;
 /// 本地和跨机二筛的瞬态缓存分类计划。
 pub mod stage2_planner;
 mod transient;
@@ -55,6 +56,9 @@ pub use result_file::{
     AnalysisResultError, AnalysisResultGroupKind, AnalysisResultHeader, AnalysisResultMode,
     AnalysisResultRow, AnalysisResultWriter, PublishedAnalysisResult, VerifiedAnalysisResult,
     verify_result_file,
+};
+pub use result_reader::{
+    LatestAnalysisReader, LocalResultGroup, LocalResultWindow, LocalResultWindowKind,
 };
 #[allow(unused_imports)]
 pub(crate) use transient::{

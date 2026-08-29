@@ -19,7 +19,9 @@ use dedup_node_store::{
     OwnedSnapshot, PersistentStageState as StorePersistentStageState, PlannedDeleteItem,
     ReviewDecision, ScannedPath, StoreError, TaskStageWrite, classify_cache_completeness,
 };
-use dedup_protocol::{BASE_MISSING_PROBE, BASE_MISSING_STAGE1, proto};
+use dedup_protocol::{
+    BASE_MISSING_PROBE, BASE_MISSING_STAGE1, MAX_LOCAL_RESULT_WINDOW_ROWS, proto,
+};
 use thiserror::Error;
 #[cfg(feature = "test-hooks")]
 use tokio::sync::Notify;
@@ -40,10 +42,10 @@ use crate::{
     NodeRemoteFeatureCache, RemoteFeatureCache,
     analysis::model::LocalAnalysisRun,
     analysis::{
-        AnalysisBlocked, LocalAnalysisReport, PublishedAnalysisResult, Stage2BatchItem,
-        Stage2BatchPlan, Stage2TaskFileRunOptions, begin_stage2_batch, evaluate_candidates,
-        missing_stage2_items, prepare_current_scan_analysis, publish_local_analysis_result,
-        run_stage2_batch_production,
+        AnalysisBlocked, LatestAnalysisReader, LocalAnalysisReport, LocalResultWindowKind,
+        Stage2BatchItem, Stage2BatchPlan, Stage2TaskFileRunOptions, begin_stage2_batch,
+        evaluate_candidates, missing_stage2_items, prepare_current_scan_analysis,
+        publish_local_analysis_result, run_stage2_batch_production,
     },
     artifact_registry::RegenerableArtifactRegistry,
     config_repository::{
@@ -957,7 +959,7 @@ fn spawn_actor(
             active_job: None,
             latest_completed_scan: None,
             active_analysis: None,
-            latest_analysis: None,
+            latest_analysis: load_latest_analysis(runtime_root),
             commands: commands.downgrade(),
             config_repository,
             artifact_registry,
@@ -1063,16 +1065,16 @@ struct AnalysisRuntimeSummary {
 
 /// 最近一次成功结果及其查询摘要；失败和取消不会替换它。
 struct LatestAnalysis {
-    /// 成功发布后得到的结果文件元数据。
-    published: PublishedAnalysisResult,
-    /// 与结果文件对应的进程内摘要。
-    summary: AnalysisRuntimeSummary,
+    /// 最近一次结果文件的进程内偏移读取器。
+    reader: LatestAnalysisReader,
+    /// 同一进程本地分析的摘要；重启恢复的结果没有该摘要。
+    summary: Option<AnalysisRuntimeSummary>,
 }
 
 /// 后台成功发布本地分析后交给 actor 安装的拥有型元数据。
 struct BackgroundAnalysisOutcome {
-    /// 原子替换后的结果文件元数据。
-    published: PublishedAnalysisResult,
+    /// 发布前完成顺序校验的结果读取器。
+    reader: LatestAnalysisReader,
     /// 最终分析报告及分组计数。
     report: LocalAnalysisReport,
     /// 冻结输入位置数。
@@ -1237,6 +1239,9 @@ impl EngineState {
             }
             Some(proto::envelope::Payload::QueryAnalysisRun(query)) => {
                 self.query_analysis_run(query)
+            }
+            Some(proto::envelope::Payload::ReadLocalResultWindow(query)) => {
+                self.read_local_result_window(query)
             }
             Some(proto::envelope::Payload::ListGroups(query)) => self.list_groups(query),
             Some(proto::envelope::Payload::ListGroupMembers(query)) => {
@@ -1777,8 +1782,8 @@ impl EngineState {
             .or_else(|| {
                 self.latest_analysis
                     .as_ref()
-                    .filter(|latest| latest.published.run_id == run_id)
-                    .map(|latest| latest.summary)
+                    .filter(|latest| latest.reader.metadata().run_id == run_id)
+                    .and_then(|latest| latest.summary)
             })
             .ok_or_else(|| not_found(format!("当前进程分析不存在: {}", request.analysis_run_id)))?;
         Ok(proto::envelope::Payload::QueryAnalysisRun(
@@ -1788,6 +1793,134 @@ impl EngineState {
                 input_count: summary.input_count,
                 candidate_count: summary.candidate_count,
                 error_text: String::new(),
+            },
+        ))
+    }
+
+    /// 从当前进程最近结果读取一个只读组或成员窗口。
+    fn read_local_result_window(
+        &mut self,
+        request: proto::ReadLocalResultWindow,
+    ) -> ProtocolResult {
+        if request.visible_count > MAX_LOCAL_RESULT_WINDOW_ROWS {
+            return Err(invalid(format!(
+                "本地结果窗口最多返回 {MAX_LOCAL_RESULT_WINDOW_ROWS} 行"
+            )));
+        }
+        let run_id = parse_analysis_id(&request.analysis_run_id)?;
+        let latest = self
+            .latest_analysis
+            .as_mut()
+            .ok_or_else(|| not_found("当前进程没有最近一次成功结果"))?;
+        if latest.reader.metadata().run_id != run_id {
+            return Err(not_found("分析结果不存在或已被替换"));
+        }
+        let kind = match proto::LocalResultWindowKind::try_from(request.kind) {
+            Ok(proto::LocalResultWindowKind::LocalResultWindowGroups) => {
+                LocalResultWindowKind::Groups(required_group_kind(request.group_kind)?)
+            }
+            Ok(proto::LocalResultWindowKind::LocalResultWindowMembers) => {
+                if request.group_id.is_empty() {
+                    return Err(invalid("成员窗口必须指定组 ID"));
+                }
+                LocalResultWindowKind::Members {
+                    group_id: request.group_id.clone(),
+                }
+            }
+            _ => return Err(invalid("本地结果窗口类型无效")),
+        };
+        let window = latest
+            .reader
+            .read_window(kind, request.start_index, request.visible_count)
+            .map_err(|error| match error {
+                crate::analysis::AnalysisResultError::Io(error) => {
+                    (proto::ErrorCode::Internal, error.to_string())
+                }
+                crate::analysis::AnalysisResultError::InvalidHeader(message)
+                | crate::analysis::AnalysisResultError::InvalidRow(message)
+                | crate::analysis::AnalysisResultError::InvalidFormat(message) => {
+                    (proto::ErrorCode::Internal, message)
+                }
+            })?;
+        let current_revision = self.store.library_revision().map_err(store_error)?;
+        let metadata = latest.reader.metadata();
+        let is_group_window =
+            request.kind == proto::LocalResultWindowKind::LocalResultWindowGroups as i32;
+        let (groups, members) = if is_group_window {
+            (
+                window
+                    .groups
+                    .into_iter()
+                    .map(|group| proto::DuplicateGroup {
+                        group_id: group.group_id,
+                        kind: wire_group_kind(group.kind) as i32,
+                        representative: Some((&group.representative).into()),
+                        member_count: group.member_count,
+                        reclaimable_bytes: group.reclaimable_bytes,
+                    })
+                    .collect(),
+                Vec::new(),
+            )
+        } else {
+            let keys = window
+                .members
+                .iter()
+                .map(|member| member.content)
+                .collect::<BTreeSet<_>>();
+            let keys = keys.into_iter().collect::<Vec<_>>();
+            let records = self
+                .store
+                .lookup_base_cache_by_keys(&keys)
+                .map_err(store_error)?;
+            if records.len() != keys.len() {
+                return Err(internal("本地结果窗口基础缓存返回长度不匹配"));
+            }
+            let cache = keys.into_iter().zip(records).collect::<BTreeMap<_, _>>();
+            let members = window
+                .members
+                .into_iter()
+                .map(|member| {
+                    let cached = cache.get(&member.content).and_then(Option::as_ref);
+                    proto::GroupMember {
+                        location: Some((&member.location).into()),
+                        content: Some((&member.content).into()),
+                        representative: member.representative,
+                        stage1_score: member.stage1_score as f32,
+                        phash_passed_parts: member.phash_passed_parts.map_or(0, u32::from),
+                        stage2_score: member.stage2_score.unwrap_or_default() as f32,
+                        review: proto::ReviewDecision::ReviewUndecided as i32,
+                        active: true,
+                        width: cached.and_then(|record| record.width).unwrap_or_default(),
+                        height: cached.and_then(|record| record.height).unwrap_or_default(),
+                        quality: cached
+                            .and_then(|record| record.stage1.as_ref())
+                            .and_then(|stage1| match stage1 {
+                                dedup_node_store::CompleteStage1::Image(image) => {
+                                    Some(image.quality)
+                                }
+                                dedup_node_store::CompleteStage1::Video(_) => None,
+                            })
+                            .map_or(0, u32::from),
+                        display_path: member.display_path,
+                    }
+                })
+                .collect();
+            (Vec::new(), members)
+        };
+        Ok(proto::envelope::Payload::ReadLocalResultWindow(
+            proto::ReadLocalResultWindow {
+                analysis_run_id: request.analysis_run_id,
+                kind: request.kind,
+                group_id: request.group_id,
+                start_index: request.start_index,
+                visible_count: request.visible_count,
+                total_rows: window.total_rows,
+                stale: metadata.library_revision != current_revision,
+                result_revision: metadata.library_revision,
+                current_revision,
+                groups,
+                members,
+                group_kind: request.group_kind,
             },
         ))
     }
@@ -1855,6 +1988,7 @@ impl EngineState {
                     width: member.width.unwrap_or_default(),
                     height: member.height.unwrap_or_default(),
                     quality: member.quality.map_or(0, u32::from),
+                    display_path: member.location.normalized_path().as_str().into(),
                 })
             })
             .collect::<Result<Vec<_>, (proto::ErrorCode, String)>>()?;
@@ -2296,8 +2430,8 @@ impl EngineState {
             // 先安装成功结果和摘要，再向 RuntimeTaskReporter 发布 completed 事件。
             self.active_analysis = Some(summary);
             self.latest_analysis = Some(LatestAnalysis {
-                published: analysis.published,
-                summary,
+                reader: analysis.reader,
+                summary: Some(summary),
             });
             #[cfg(feature = "test-hooks")]
             if let Some(waiter) = analysis_publish_waiter {
@@ -2836,7 +2970,11 @@ async fn run_background_job(
                                         Err(AnalysisBlocked::InvalidState("本地分析已取消".into()))
                                     } else {
                                         publish_local_analysis_result(&store, run, &results_root)
-                                            .map(|(published, report)| (published, report))
+                                            .and_then(|(published, report)| {
+                                                LatestAnalysisReader::open_verified(&published.path)
+                                                    .map(|reader| (report, reader))
+                                                    .map_err(AnalysisBlocked::ResultFile)
+                                            })
                                     }
                                 }
                                 Err(error) => Err(error),
@@ -2863,8 +3001,13 @@ async fn run_background_job(
                             } else if cancellation.is_cancelled() {
                                 Err(AnalysisBlocked::InvalidState("本地分析已取消".into()))
                             } else {
-                                publish_local_analysis_result(&store, run, &results_root)
-                                    .map(|(published, report)| (published, report))
+                                publish_local_analysis_result(&store, run, &results_root).and_then(
+                                    |(published, report)| {
+                                        LatestAnalysisReader::open_verified(&published.path)
+                                            .map(|reader| (report, reader))
+                                            .map_err(AnalysisBlocked::ResultFile)
+                                    },
+                                )
                             }
                         }
                         Err(error) => Err(error),
@@ -2872,7 +3015,7 @@ async fn run_background_job(
                 }
             };
             match result {
-                Ok((published, report)) => {
+                Ok((report, reader)) => {
                     let _ = runtime_reporter.update_overall_nowait(
                         input_count,
                         Some(input_count),
@@ -2882,7 +3025,7 @@ async fn run_background_job(
                     BackgroundOutcome {
                         completed_scan: None,
                         analysis: Some(BackgroundAnalysisOutcome {
-                            published,
+                            reader,
                             report,
                             input_count,
                             candidate_count,
@@ -3110,6 +3253,11 @@ fn group_filter(value: i32) -> Result<Option<GroupKind>, (proto::ErrorCode, Stri
     }
 }
 
+/// 将窗口请求中的组类型解析为必填的 Node 分组枚举。
+fn required_group_kind(value: i32) -> Result<GroupKind, (proto::ErrorCode, String)> {
+    group_filter(value)?.ok_or_else(|| invalid("组窗口必须指定分组类型"))
+}
+
 const fn wire_group_kind(kind: GroupKind) -> proto::GroupKind {
     match kind {
         GroupKind::Exact => proto::GroupKind::GroupExact,
@@ -3200,6 +3348,26 @@ fn results_root_from_runtime(runtime_root: &Path) -> Result<PathBuf, &'static st
         .ok_or("瞬态运行目录必须存在结果目录父级")
 }
 
+/// 启动时校验并恢复最近结果读取器；损坏文件只禁用窗口，不回退旧分组表。
+fn load_latest_analysis(runtime_root: &Path) -> Option<LatestAnalysis> {
+    let result_path = results_root_from_runtime(runtime_root)
+        .ok()?
+        .join("latest-analysis.result.tsv");
+    if !result_path.is_file() {
+        return None;
+    }
+    match LatestAnalysisReader::open_verified(&result_path) {
+        Ok(reader) => Some(LatestAnalysis {
+            reader,
+            summary: None,
+        }),
+        Err(error) => {
+            tracing::warn!(path = %result_path.display(), %error, "最近本地分析结果校验失败");
+            None
+        }
+    }
+}
+
 /// 初始化基础计算固定三阶段，保证刚创建的任务即可完整展示。
 fn initialize_base_task_stages(store: &mut NodeStore, task_id: TaskId) -> Result<(), StoreError> {
     for stage in [
@@ -3286,9 +3454,124 @@ mod tests {
     use super::*;
     #[cfg(feature = "test-hooks")]
     use crate::DisabledRemoteFeatureCache;
+    use crate::analysis::{
+        AnalysisResultGroupKind, AnalysisResultHeader, AnalysisResultMode, AnalysisResultRow,
+        AnalysisResultWriter,
+    };
     use crate::worker::{Stage1Frame, Stage2Frame, Stage2Output};
     #[cfg(feature = "test-hooks")]
     use crate::{scan::BasePersistTestController, worker::BaseComputeOutput};
+
+    #[tokio::test]
+    async fn actor_loads_latest_result_reader_and_serves_window() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache_root = directory.path().join("cache");
+        let results_root = cache_root.join("results");
+        fs::create_dir_all(&results_root).unwrap();
+        let machine = MachineId::parse(&"ab".repeat(32)).unwrap();
+        let header = AnalysisResultHeader {
+            format_version: 1,
+            analysis_id: AnalysisRunId::new(),
+            library_revision: 42,
+            analysis_mode: AnalysisResultMode::Local,
+            created_at_ms: 1,
+            thresholds: Thresholds::default(),
+        };
+        let mut writer = AnalysisResultWriter::begin(&results_root, &header).unwrap();
+        writer
+            .write_member(&AnalysisResultRow {
+                group_kind: AnalysisResultGroupKind::Exact,
+                group_id: "group-1".into(),
+                representative: true,
+                representative_content: ContentKey::new([1; 16], 1),
+                location: LocationKey::new(
+                    machine.clone(),
+                    NormalizedPath::new(r"D:\Media\one.bin").unwrap(),
+                ),
+                display_path: r"D:\Media\one.bin".into(),
+                content: ContentKey::new([1; 16], 1),
+                stage1_score: 1.0,
+                phash_passed_parts: None,
+                stage2_score: None,
+            })
+            .unwrap();
+        let published = writer.publish().unwrap();
+        let (handle, actor) = NodeEngine::spawn_for_test(
+            NodeStore::open_in_memory(machine).unwrap(),
+            "127.0.0.1:39091".parse().unwrap(),
+            &cache_root,
+        );
+
+        let response = handle
+            .handle(proto::Envelope {
+                request_id: 1,
+                payload: Some(proto::envelope::Payload::ReadLocalResultWindow(
+                    proto::ReadLocalResultWindow {
+                        analysis_run_id: published.run_id.as_uuid().to_string(),
+                        kind: proto::LocalResultWindowKind::LocalResultWindowGroups as i32,
+                        start_index: 0,
+                        visible_count: 10,
+                        group_kind: proto::GroupKind::GroupExact as i32,
+                        ..Default::default()
+                    },
+                )),
+            })
+            .await;
+        let Some(proto::envelope::Payload::ReadLocalResultWindow(window)) = response.payload else {
+            panic!("最近结果窗口必须返回窗口响应");
+        };
+        assert_eq!(window.total_rows, 1);
+        assert!(window.stale);
+        assert_eq!(window.groups[0].group_id, "group-1");
+        assert_eq!(window.result_revision, 42);
+        assert_eq!(window.current_revision, 0);
+
+        let member_response = handle
+            .handle(proto::Envelope {
+                request_id: 3,
+                payload: Some(proto::envelope::Payload::ReadLocalResultWindow(
+                    proto::ReadLocalResultWindow {
+                        analysis_run_id: published.run_id.as_uuid().to_string(),
+                        kind: proto::LocalResultWindowKind::LocalResultWindowMembers as i32,
+                        group_id: "group-1".into(),
+                        visible_count: 10,
+                        ..Default::default()
+                    },
+                )),
+            })
+            .await;
+        let Some(proto::envelope::Payload::ReadLocalResultWindow(member_window)) =
+            member_response.payload
+        else {
+            panic!("最近结果成员窗口必须返回窗口响应");
+        };
+        assert_eq!(member_window.total_rows, 1);
+        assert_eq!(member_window.members[0].display_path, r"D:\Media\one.bin");
+
+        let missing = handle
+            .handle(proto::Envelope {
+                request_id: 2,
+                payload: Some(proto::envelope::Payload::ReadLocalResultWindow(
+                    proto::ReadLocalResultWindow {
+                        analysis_run_id: AnalysisRunId::new().as_uuid().to_string(),
+                        kind: proto::LocalResultWindowKind::LocalResultWindowGroups as i32,
+                        group_kind: proto::GroupKind::GroupExact as i32,
+                        ..Default::default()
+                    },
+                )),
+            })
+            .await;
+        assert!(matches!(
+            missing.payload,
+            Some(proto::envelope::Payload::Error(proto::Error {
+                code,
+                ..
+            })) if code == proto::ErrorCode::NotFound as i32
+        ));
+
+        handle.shutdown().await.unwrap();
+        actor.await.unwrap();
+    }
 
     /// 自定义配置路径必须成为运行时实际目录，不能回退到 AppLayout 默认目录。
     #[test]
