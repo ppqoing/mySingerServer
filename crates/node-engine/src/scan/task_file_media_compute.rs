@@ -153,6 +153,10 @@ where
         let can_dispatch = !stop_dispatch && media_candidates > 0 && active.len() < worker_capacity;
         if !can_dispatch && active.is_empty() {
             if media_candidates > 0 {
+                // Hash 队首尚未满足读取条件时，Media pass 只返回阻塞状态；保留两类行交给下一轮 Hash/Media 协调。
+                if blocked_reason == Some(TaskDispatchBlockReason::HashPending) {
+                    break;
+                }
                 return fail_media_pass(
                     pending,
                     worker_pool,
@@ -1166,6 +1170,71 @@ mod tests {
         assert!(!result.cancelled);
         assert_eq!(result.pending.contexts.len(), 2);
         assert_eq!(live.load(Ordering::SeqCst), 0);
+        drop(handle);
+        drop(acknowledgements);
+        actor.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn media_blocked_by_hash_head_returns_blocked_without_worker() {
+        let root = tempfile::tempdir().unwrap();
+        let machine = MachineId::from_sha256([0x67; 32]);
+        let mut store = NodeStore::open_in_memory(machine).unwrap();
+        let cached = seed_record(&mut store, r"C:\seed-media-behind-hash.bin", [0x71; 16], 16);
+        let live = Arc::new(AtomicIsize::new(0));
+        let pending =
+            super::super::task_file_base_compute::TaskFileBaseComputePending::from_production(
+                production(
+                    root.path(),
+                    &[
+                        input(scanned(r"C:\hash-head.bin", 15), lane(7), None),
+                        input(
+                            scanned(r"C:\media-behind-hash.bin", 16),
+                            lane(7),
+                            Some(cached),
+                        ),
+                    ],
+                    TestProvider {
+                        live: Arc::clone(&live),
+                    },
+                ),
+            );
+        let (actor, handle, acknowledgements) =
+            super::super::base_persistence::BaseStoreActor::spawn(store, 4);
+        let (mut pool, mut started, _controller) = WorkerPool::controlled_batch_for_test(1);
+        let mut result = run_task_file_media_compute(
+            pending,
+            &mut pool,
+            &handle,
+            &DiskReadConfig::default(),
+            1,
+            ReadCancellationToken::new(),
+        )
+        .await
+        .expect("Hash 队首阻塞时 Media pass 必须返回正常阻塞结果");
+        assert_eq!(
+            result.blocked_reason,
+            Some(crate::task_dispatch::TaskDispatchBlockReason::HashPending)
+        );
+        assert!(!result.cancelled);
+        assert!(result.completed.is_empty());
+        assert!(result.file_failures.is_empty());
+        assert_eq!(result.pending.contexts.len(), 2);
+        assert_eq!(live.load(Ordering::SeqCst), 0);
+        assert!(
+            started.try_recv().is_err(),
+            "Hash 队首阻塞时不得启动 Media Worker"
+        );
+        let lane_path = result.pending.dispatcher.lane_path(&lane(7)).unwrap();
+        assert!(
+            std::fs::read(lane_path)
+                .unwrap()
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .all(|line| line[0] == b'P')
+        );
+        result.pending.dispatcher.discard().unwrap();
+        assert!(pool.shutdown().await.is_ok());
         drop(handle);
         drop(acknowledgements);
         actor.finish().await.unwrap();
