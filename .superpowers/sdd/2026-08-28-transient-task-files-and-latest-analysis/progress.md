@@ -105,3 +105,11 @@ Spec: `D:/code/mySingerServer/docs/superpowers/specs/2026-08-28-transient-task-f
 - Task 7D3B：提交 `dddaac0a`。Node actor 的 `CreateScan` 已切到瞬态扫描运行器和 `data/runtime`，不写 `tasks/task_items/task_stages`；取消、关机和失败不走旧任务表。成功路径先安装唯一 `latest_completed_scan`，再发布 RuntimeTask Completed，保证完成事件观察到同一快照。actor 12/12、NodeEngine lib(test-hooks) 122/122、base pipeline 59/59、Desktop controller 9/9、fmt/diff-check 通过；既有 `cross_phase2` 高水位失败明确留给 Stage2 迁移。
 - Task 8A1：提交 `affbbec6`。协议 V5 新增 tag 29 的 `Stage2SourceReadComplete`；WorkerPool 将其作为身份校验后的非终态事件，保留 slot/CPU，直到 `Stage2Result` 才释放。protocol wire 7/7、WorkerPool 定向 3/3、fmt/diff-check 通过；真实 Worker 发送点留给 Task 8A2。
 - Task 8B1：提交 `529023d1`。新增 `NodeStore::commit_stage2_taskless`，图片/视频二筛与 outbox 在同一事务提交，不写任务表；非法结果整体回滚，结构完整的合法全零特征仍有效。taskless Stage2 6/6、NodeStore 全量 74/74、fmt/diff-check 通过；任务文件执行与 actor/分析接入留给后续 Task 8 子项。
+- Task 8A2：提交 `3d2882b4`。Worker 在二筛源文件或联系表读取结束后发布 `Stage2SourceReadComplete`，后续计算只消费拥有型内存帧；协议进程 RED 为旧实现等待事件超时，GREEN 输出 `WORKER_PROTOCOL_PROCESS_PASS`。详见 `task-8a2-report.md`。
+- Task 8C/8B2：提交 `3449b313` 与 `f711cbdc`。二筛先冻结真实缺失选择，再由按物理盘 TSV、唯一读取许可、Stage2 SourceReadComplete 和 taskless SQLite ACK 执行；完整命中零 Worker，视频只计算缺失槽位。随后 `d8fe877b` 修复完整视频命中重发，`83a92f94` 保留精确选择和联系表回退边界。
+- Task 8E1：提交 `48277497` 与 `58dbd61f`。RuntimeTask 终态携带真实 outbox 高水位，并提供当前进程完成扫描快照查询；重启不恢复旧 ID。
+- Task 8E2：提交 `c547896`。外部 Stage2 batch 改为瞬态内存工作集合，不再创建或推进 `tasks/task_items/task_stages`；本地/远端批量缓存、重发和 RuntimeTask 阶段保留，生产 TSV/唯一 scheduler/actor 接线留给 E3。
+- Task 8E3 ruling：先拆成 E3A Phase2 生产编排、再做 E3B Actor 接线，禁止两个实现 Agent 并行修改 `phase2.rs/actor.rs` 共享边界；理由是单一 `NodeStore`、WorkerPool 和取消所有权必须串行定型；若判断错误，代价是多一次集成提交，但不会产生双调度器或双写者。Superpowers `sdd-workspace/task-brief` 在当前 Git Bash 缺少 `basename/dirname`，使用同一 SDD 目录内的等价窄 brief `task-7e3a-brief.md` 继续，保留原 Task 7 为权威。
+- Task 8E3A：提交 `4e4895c8`。Phase2 在第一次本地/远端缓存查询前冻结全部来源 lane，完整命中零 TSV/Worker，Compute 只进入唯一 `ScheduledFileReader`、Stage2 task-file runner 与 taskless SQLite ACK；返回恢复后的 Store、内容统计和真实 outbox 高水位。定向 Phase2 通过、NodeEngine lib 135/135、fmt/diff 通过。
+- Task 8E3A fix round 1/5：独立审查发现 runtime 目录先于 `BaseStoreActor::finish` 被删除；提交 `8a8f9e27` 以真实 join/discard 顺序 RED 修复成功、runner 失败、writer/highwater 失败路径。复审确认 1 项 addressed、0 项 open；Phase2 9/9、NodeEngine lib 137/137、fmt/diff 通过。
+- Task 8E3A complete (commits `c5478969..8a8f9e27`, review clean)。
