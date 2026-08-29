@@ -231,6 +231,46 @@ pub struct Stage2Output {
     pub regenerated_contact_sheet_jpeg: Option<Vec<u8>>,
 }
 
+/// 二筛源读取结束后保留的一个拥有型 RGB 槽位；后续特征阶段不再访问路径。
+struct PreparedStage2Frame {
+    /// 图片固定为 0；视频为请求的六帧槽位。
+    slot: u8,
+    /// 已从原图或联系表读取到内存的 RGB 数据。
+    frame: Option<Rgb24Image>,
+    /// 该槽位读取失败时保留的文件级错误。
+    error: Option<String>,
+}
+
+/// 二筛源读取阶段的完整拥有型输出，交给后续纯 CPU 特征阶段。
+struct PreparedStage2Input {
+    /// 已完成读取的请求槽位。
+    frames: Vec<PreparedStage2Frame>,
+    /// 缺失联系表时在源读取阶段重建的 JPEG。
+    regenerated_contact_sheet_jpeg: Option<Vec<u8>>,
+}
+
+/// 协议循环在 `Stage2SourceReadComplete` 前后传递的二筛请求。
+pub struct PreparedStage2Compute {
+    /// 原请求任务身份。
+    task_id: String,
+    /// 原请求任务项身份。
+    item_id: String,
+    /// 已关闭源路径后的拥有型输入。
+    prepared: PreparedStage2Input,
+}
+
+impl PreparedStage2Compute {
+    /// 返回协议事件使用的任务身份。
+    pub fn task_id(&self) -> &str {
+        &self.task_id
+    }
+
+    /// 返回协议事件使用的任务项身份。
+    pub fn item_id(&self) -> &str {
+        &self.item_id
+    }
+}
+
 /// 把一筛结果编码为 `Stage1Result.payload` 使用的内部 Protobuf。
 pub fn encode_stage1_payload(output: &Stage1Output) -> Vec<u8> {
     Stage1Wire::from(output).encode_to_vec()
@@ -333,11 +373,58 @@ where
         media_kind: MediaKind,
         frame_slots: &[u8],
     ) -> Result<Stage2Output, WorkerPipelineError> {
+        self.finish_stage2_input(self.prepare_stage2_input(
+            path,
+            media_kind,
+            frame_slots,
+            None,
+            false,
+        )?)
+    }
+
+    /// 一次解码联系表 JPEG，并从请求槽位生成视频二筛联合特征。
+    pub fn compute_stage2_from_contact_sheet(
+        &self,
+        jpeg: &[u8],
+        frame_slots: &[u8],
+    ) -> Result<Stage2Output, WorkerPipelineError> {
+        self.finish_stage2_input(self.prepare_contact_sheet_input(jpeg, frame_slots)?)
+    }
+
+    /// 只执行二筛所需的原图/联系表读取，并返回关闭路径后的拥有型帧。
+    fn prepare_stage2_input(
+        &self,
+        path: &Path,
+        media_kind: MediaKind,
+        frame_slots: &[u8],
+        contact_sheet_path: Option<&Path>,
+        generate_contact_sheet_if_missing: bool,
+    ) -> Result<PreparedStage2Input, WorkerPipelineError> {
         let slots: Vec<u8> = match media_kind {
             MediaKind::Image => vec![0],
             MediaKind::Video => frame_slots.to_vec(),
             MediaKind::Other => return Err(WorkerPipelineError::UnsupportedMedia),
         };
+        if let Some(contact_sheet_path) = contact_sheet_path
+            && media_kind == MediaKind::Video
+            && !contact_sheet_path.as_os_str().is_empty()
+        {
+            if let Ok(jpeg) = std::fs::read(contact_sheet_path)
+                && let Ok(input) = self.prepare_contact_sheet_input(&jpeg, &slots)
+            {
+                return Ok(input);
+            }
+            if !generate_contact_sheet_if_missing {
+                return Err(WorkerPipelineError::ContactSheet(
+                    "联系表缺失或损坏，且未允许重建".into(),
+                ));
+            }
+            let jpeg = self.build_contact_sheet(path, &[])?;
+            let mut input = self.prepare_contact_sheet_input(&jpeg, &slots)?;
+            input.regenerated_contact_sheet_jpeg = Some(jpeg);
+            return Ok(input);
+        }
+
         let positions = normalized_sample_positions();
         let mut frames = Vec::with_capacity(slots.len());
         for slot in slots {
@@ -348,36 +435,31 @@ where
                     .ok_or(WorkerPipelineError::InvalidFrameSlot(slot))?,
                 MediaKind::Other => unreachable!("other media returned before slot loop"),
             };
-            let result = self.decoder.decode_frame_at(path, position);
-            match result {
-                Ok(frame) => {
-                    let rgb = decoded_rgb(frame)?;
-                    let gray = rgb24_to_gray(&rgb);
-                    frames.push(Stage2Frame {
-                        slot,
-                        feature: Some(compute_image_stage2(&gray)),
-                        error: None,
-                    });
-                }
-                Err(error) => frames.push(Stage2Frame {
+            match self.decoder.decode_frame_at(path, position) {
+                Ok(frame) => frames.push(PreparedStage2Frame {
                     slot,
-                    feature: None,
+                    frame: Some(decoded_rgb(frame)?),
+                    error: None,
+                }),
+                Err(error) => frames.push(PreparedStage2Frame {
+                    slot,
+                    frame: None,
                     error: Some(error),
                 }),
             }
         }
-        Ok(Stage2Output {
+        Ok(PreparedStage2Input {
             frames,
             regenerated_contact_sheet_jpeg: None,
         })
     }
 
-    /// 一次解码联系表 JPEG，并从请求槽位生成视频二筛联合特征。
-    pub fn compute_stage2_from_contact_sheet(
+    /// 将联系表字节解码为拥有型 RGB 槽位，不在此阶段计算二筛特征。
+    fn prepare_contact_sheet_input(
         &self,
         jpeg: &[u8],
         frame_slots: &[u8],
-    ) -> Result<Stage2Output, WorkerPipelineError> {
+    ) -> Result<PreparedStage2Input, WorkerPipelineError> {
         let decoded = decode_contact_sheet_slots(jpeg, frame_slots)
             .map_err(|error| WorkerPipelineError::ContactSheet(error.to_string()))?;
         if decoded.iter().any(|(_, frame)| {
@@ -387,17 +469,43 @@ where
                 "联系表必须为固定 960x360 画布".into(),
             ));
         }
-        let frames = decoded
+        Ok(PreparedStage2Input {
+            frames: decoded
+                .into_iter()
+                .map(|(slot, frame)| PreparedStage2Frame {
+                    slot,
+                    frame: Some(frame),
+                    error: None,
+                })
+                .collect(),
+            regenerated_contact_sheet_jpeg: None,
+        })
+    }
+
+    /// 在源路径已关闭后计算全部二筛特征，只消费拥有型 RGB 帧。
+    fn finish_stage2_input(
+        &self,
+        prepared: PreparedStage2Input,
+    ) -> Result<Stage2Output, WorkerPipelineError> {
+        let frames = prepared
+            .frames
             .into_iter()
-            .map(|(slot, rgb)| Stage2Frame {
-                slot,
-                feature: Some(compute_image_stage2(&rgb24_to_gray(&rgb))),
-                error: None,
+            .map(|frame| match frame.frame {
+                Some(rgb) => Stage2Frame {
+                    slot: frame.slot,
+                    feature: Some(compute_image_stage2(&rgb24_to_gray(&rgb))),
+                    error: None,
+                },
+                None => Stage2Frame {
+                    slot: frame.slot,
+                    feature: None,
+                    error: frame.error,
+                },
             })
             .collect();
         Ok(Stage2Output {
             frames,
-            regenerated_contact_sheet_jpeg: None,
+            regenerated_contact_sheet_jpeg: prepared.regenerated_contact_sheet_jpeg,
         })
     }
 
@@ -711,6 +819,57 @@ where
             Err(error) => failure(task_id, item_id, "base_compute", error),
         }
     }
+
+    /// 执行二筛源读取并关闭全部路径，交给协议循环在事件后进行 CPU 特征计算。
+    pub fn prepare_stage2(
+        &self,
+        command: proto::ComputeStage2,
+    ) -> Result<PreparedStage2Compute, proto::WorkerEnvelope> {
+        let task_id = command.task_id.clone();
+        let item_id = command.item_id.clone();
+        let result = (|| {
+            let slots = parse_slots(&command.frame_slots)?;
+            let media_kind = if slots.is_empty() {
+                MediaKind::Image
+            } else {
+                MediaKind::Video
+            };
+            let contact_sheet_path = (!command.contact_sheet_path.is_empty())
+                .then(|| Path::new(&command.contact_sheet_path));
+            let prepared = self.pipeline.prepare_stage2_input(
+                Path::new(&command.display_path),
+                media_kind,
+                &slots,
+                contact_sheet_path,
+                command.generate_contact_sheet_if_missing,
+            )?;
+            Ok(PreparedStage2Compute {
+                task_id: task_id.clone(),
+                item_id: item_id.clone(),
+                prepared,
+            })
+        })();
+        match result {
+            Ok(prepared) => Ok(prepared),
+            Err(error) => Err(failure(task_id, item_id, "stage2", error)),
+        }
+    }
+
+    /// 在二筛源读取事件发出后只消费内存帧，编码唯一终态结果。
+    pub fn finish_stage2_features(&self, prepared: PreparedStage2Compute) -> proto::WorkerEnvelope {
+        let task_id = prepared.task_id;
+        let item_id = prepared.item_id;
+        match self.pipeline.finish_stage2_input(prepared.prepared) {
+            Ok(output) => response(worker_envelope::Payload::Stage2Result(
+                proto::Stage2Result {
+                    task_id,
+                    item_id,
+                    payload: encode_stage2_payload(&output),
+                },
+            )),
+            Err(error) => failure(task_id, item_id, "stage2", error),
+        }
+    }
 }
 
 /// 校验一次性基础计算跨进程所需的任务、文件和调度身份字段。
@@ -763,49 +922,35 @@ where
             }
         }
         Some(worker_envelope::Payload::ComputeStage2(command)) => {
-            let slots = parse_slots(&command.frame_slots);
-            let result = slots.and_then(|slots| {
+            let task_id = command.task_id.clone();
+            let item_id = command.item_id.clone();
+            let result = parse_slots(&command.frame_slots).and_then(|slots| {
                 let media_kind = if slots.is_empty() {
                     MediaKind::Image
                 } else {
                     MediaKind::Video
                 };
-                if media_kind == MediaKind::Image || command.contact_sheet_path.is_empty() {
-                    return pipeline.compute_stage2(
+                let contact_sheet_path = (!command.contact_sheet_path.is_empty())
+                    .then(|| Path::new(&command.contact_sheet_path));
+                pipeline
+                    .prepare_stage2_input(
                         Path::new(&command.display_path),
                         media_kind,
                         &slots,
-                    );
-                }
-                let cached = std::fs::read(&command.contact_sheet_path)
-                    .ok()
-                    .and_then(|jpeg| {
-                        pipeline
-                            .compute_stage2_from_contact_sheet(&jpeg, &slots)
-                            .ok()
-                    });
-                if let Some(output) = cached {
-                    return Ok(output);
-                }
-                if !command.generate_contact_sheet_if_missing {
-                    return Err(WorkerPipelineError::ContactSheet(
-                        "联系表缺失或损坏，且未允许重建".into(),
-                    ));
-                }
-                let jpeg = pipeline.build_contact_sheet(Path::new(&command.display_path), &[])?;
-                let mut output = pipeline.compute_stage2_from_contact_sheet(&jpeg, &slots)?;
-                output.regenerated_contact_sheet_jpeg = Some(jpeg);
-                Ok(output)
+                        contact_sheet_path,
+                        command.generate_contact_sheet_if_missing,
+                    )
+                    .and_then(|prepared| pipeline.finish_stage2_input(prepared))
             });
             match result {
                 Ok(output) => response(worker_envelope::Payload::Stage2Result(
                     proto::Stage2Result {
-                        task_id: command.task_id,
-                        item_id: command.item_id,
+                        task_id,
+                        item_id,
                         payload: encode_stage2_payload(&output),
                     },
                 )),
-                Err(error) => failure(command.task_id, command.item_id, "stage2", error),
+                Err(error) => failure(task_id, item_id, "stage2", error),
             }
         }
         Some(worker_envelope::Payload::BuildContactSheet(command)) => {

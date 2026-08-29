@@ -11,7 +11,7 @@ use dedup_core::{DisplayPath, MachineId, MediaKind, NormalizedPath};
 use dedup_media_ffmpeg::{DecodedFrame, MediaProbe};
 use dedup_node_engine::worker::{
     MediaDecoder, WorkerEvent, WorkerFileIdentity, WorkerLaunch, WorkerPipeline, WorkerPool,
-    WorkerPoolConfig, WorkerRequestHandler,
+    WorkerPoolConfig, WorkerRequestHandler, decode_stage2_payload,
 };
 use dedup_protocol::BASE_MISSING_PROBE;
 use dedup_protocol::proto::{self, worker_envelope};
@@ -26,6 +26,10 @@ const CHILD_FILE_NAME: &str = "worker-protocol-child.exe";
 struct ProtocolTestDecoder {
     entered: Option<PathBuf>,
     release: Option<PathBuf>,
+    /// 二筛解码开始后通知父进程的 gate 文件。
+    stage2_entered: Option<PathBuf>,
+    /// 允许二筛解码返回并继续发送源读取完成事件的 gate 文件。
+    stage2_release: Option<PathBuf>,
 }
 
 impl ProtocolTestDecoder {
@@ -34,6 +38,8 @@ impl ProtocolTestDecoder {
         Self {
             entered: env::var_os("DEDUP_WORKER_PHASE_ENTERED").map(PathBuf::from),
             release: env::var_os("DEDUP_WORKER_PHASE_RELEASE").map(PathBuf::from),
+            stage2_entered: env::var_os("DEDUP_WORKER_STAGE2_ENTERED").map(PathBuf::from),
+            stage2_release: env::var_os("DEDUP_WORKER_STAGE2_RELEASE").map(PathBuf::from),
         }
     }
 }
@@ -43,8 +49,26 @@ impl MediaDecoder for ProtocolTestDecoder {
         Err("missing_parts=0 不应探测媒体".into())
     }
 
-    fn decode_frame_at(&self, _: &Path, _: f64) -> Result<DecodedFrame, String> {
-        Err("missing_parts=0 不应解码媒体".into())
+    fn decode_frame_at(&self, path: &Path, _: f64) -> Result<DecodedFrame, String> {
+        let entered = self
+            .stage2_entered
+            .as_ref()
+            .ok_or("缺少 stage2 entered gate")?;
+        let release = self
+            .stage2_release
+            .as_ref()
+            .ok_or("缺少 stage2 release gate")?;
+        fs::write(entered, b"entered").map_err(|error| error.to_string())?;
+        while !release.exists() {
+            thread::sleep(Duration::from_millis(2));
+        }
+        // 读取阶段必须在 SourceReadComplete 之前完成；事件后测试会删除该路径。
+        let _ = fs::read(path).map_err(|error| format!("事件前读取源文件失败: {error}"))?;
+        Ok(DecodedFrame {
+            width: 8,
+            height: 8,
+            rgb24: vec![0x31; 8 * 8 * 3],
+        })
     }
 
     fn probe_source(
@@ -108,6 +132,15 @@ async fn run_parent_assertions(
         env::set_var("DEDUP_WORKER_PHASE_ENTERED", &entered);
         env::set_var("DEDUP_WORKER_PHASE_RELEASE", &release);
     }
+    // 二筛测试源文件在收到 SourceReadComplete 后删除，验证后续只消费内存帧。
+    let stage2_source = directory.path().join("stage2-image.bin");
+    fs::write(&stage2_source, b"stage2-source")?;
+    let stage2_entered = directory.path().join("stage2-entered.gate");
+    let stage2_release = directory.path().join("stage2-release.gate");
+    unsafe {
+        env::set_var("DEDUP_WORKER_STAGE2_ENTERED", &stage2_entered);
+        env::set_var("DEDUP_WORKER_STAGE2_RELEASE", &stage2_release);
+    }
 
     let config = WorkerPoolConfig::new(WorkerLaunch::new(child), 1)
         .with_ready_timeout(Duration::from_secs(10));
@@ -116,6 +149,7 @@ async fn run_parent_assertions(
     let second_pid = run_one_item(&mut pool, &source, "item-2", [0x32; 16]).await?;
     assert_eq!(second_pid, first_pid, "终态后应复用同一 Worker slot 进程");
     run_blocked_source_item(&mut pool, &source, &entered, &release).await?;
+    run_stage2_source_item(&mut pool, &stage2_source, &stage2_entered, &stage2_release).await?;
     Ok(())
 }
 
@@ -250,6 +284,83 @@ async fn run_blocked_source_item(
     Ok(())
 }
 
+/// 证明真实二筛进程在源路径读取结束后发出事件，事件后仅使用已拥有的内存帧。
+async fn run_stage2_source_item(
+    pool: &mut WorkerPool,
+    source: &Path,
+    entered: &Path,
+    release: &Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let item_id = "item-stage2-source";
+    pool.dispatch_runtime(stage2_request(source, item_id), stage2_identity(source))
+        .await?;
+    assert!(matches!(
+        next_event(pool).await?,
+        WorkerEvent::Started {
+            task_id,
+            item_id: actual_item,
+            ..
+        } if task_id == "task-stage2" && actual_item == item_id
+    ));
+    assert_phase_for_task(
+        next_event(pool).await?,
+        "task-stage2",
+        item_id,
+        proto::RuntimeWorkerPhase::RuntimeWorkerDecode,
+    );
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !entered.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| "二筛解码器未进入源读取 gate")?;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), pool.next_event())
+            .await
+            .is_err(),
+        "二筛源读取阻塞时不得提前收到 SourceComplete/FEATURE/terminal"
+    );
+    fs::write(release, b"release")?;
+    assert!(matches!(
+        next_event(pool).await?,
+        WorkerEvent::Stage2SourceReadComplete {
+            task_id,
+            item_id: actual_item,
+            request_elapsed_us: Some(_),
+            ..
+        } if task_id == "task-stage2" && actual_item == item_id
+    ));
+    fs::remove_file(source)?;
+    assert_eq!(pool.busy_workers(), 1, "二筛源读取事件不得释放 Worker slot");
+    assert_phase_for_task(
+        next_event(pool).await?,
+        "task-stage2",
+        item_id,
+        proto::RuntimeWorkerPhase::RuntimeWorkerFeature,
+    );
+    assert_phase_for_task(
+        next_event(pool).await?,
+        "task-stage2",
+        item_id,
+        proto::RuntimeWorkerPhase::RuntimeWorkerResultWait,
+    );
+    let WorkerEvent::Completed { response, .. } = next_event(pool).await? else {
+        panic!("二筛源事件后必须返回 Stage2Result 终态");
+    };
+    let Some(worker_envelope::Payload::Stage2Result(result)) = response.payload else {
+        panic!("二筛源事件后必须返回 Stage2Result 终态");
+    };
+    let output = decode_stage2_payload(&result.payload)?;
+    assert_eq!(output.frames.len(), 1);
+    assert!(
+        output.frames[0].feature.is_some(),
+        "事件后必须完成二筛 CPU 特征"
+    );
+    assert_eq!(pool.busy_workers(), 0, "二筛终态结果必须释放 Worker slot");
+    Ok(())
+}
+
 /// 断言一个即时 Worker 阶段事件及其身份。
 fn assert_phase(event: WorkerEvent, item_id: &str, phase: proto::RuntimeWorkerPhase) {
     assert!(matches!(
@@ -261,6 +372,25 @@ fn assert_phase(event: WorkerEvent, item_id: &str, phase: proto::RuntimeWorkerPh
             request_elapsed_us: Some(_),
             ..
         } if task_id == "task-v5" && actual_item == item_id && actual_phase == phase
+    ));
+}
+
+/// 断言指定任务的 Worker 阶段，避免二筛测试误接收其他请求的同名事件。
+fn assert_phase_for_task(
+    event: WorkerEvent,
+    task_id: &str,
+    item_id: &str,
+    phase: proto::RuntimeWorkerPhase,
+) {
+    assert!(matches!(
+        event,
+        WorkerEvent::PhaseChanged {
+            task_id: actual_task,
+            item_id: actual_item,
+            phase: actual_phase,
+            request_elapsed_us: Some(_),
+            ..
+        } if actual_task == task_id && actual_item == item_id && actual_phase == phase
     ));
 }
 
@@ -318,5 +448,33 @@ fn worker_identity(source: &Path) -> WorkerFileIdentity {
         file_size: std::fs::metadata(source).unwrap().len(),
         stage: "base_compute".into(),
         physical_disk_id: "disk-v5".into(),
+    }
+}
+
+/// 构造使用真实协议循环的图片二筛请求，源读取结束后才允许释放文件路径。
+fn stage2_request(source: &Path, item_id: &str) -> proto::WorkerEnvelope {
+    proto::WorkerEnvelope {
+        payload: Some(worker_envelope::Payload::ComputeStage2(
+            proto::ComputeStage2 {
+                task_id: "task-stage2".into(),
+                item_id: item_id.into(),
+                display_path: source.to_string_lossy().into_owned(),
+                frame_slots: Vec::new(),
+                contact_sheet_path: String::new(),
+                generate_contact_sheet_if_missing: false,
+            },
+        )),
+    }
+}
+
+/// 构造二筛 Worker 身份，让 WorkerPool 按二筛阶段保留同一槽位。
+fn stage2_identity(source: &Path) -> WorkerFileIdentity {
+    WorkerFileIdentity {
+        machine_id: MachineId::from_sha256([0x73; 32]),
+        normalized_path: NormalizedPath::new(source).unwrap(),
+        display_path: DisplayPath::new(source).unwrap(),
+        file_size: fs::metadata(source).unwrap().len(),
+        stage: "compute_stage2_features".into(),
+        physical_disk_id: "disk-stage2-process".into(),
     }
 }

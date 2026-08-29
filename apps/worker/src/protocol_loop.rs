@@ -46,11 +46,83 @@ where
             Some(worker_envelope::Payload::ComputeBaseFeatures(command)) => {
                 run_base_compute(&mut writer, handler, command).await?;
             }
+            Some(worker_envelope::Payload::ComputeStage2(command)) => {
+                run_stage2_compute(&mut writer, handler, command).await?;
+            }
             payload => {
                 for response in handler.handle(proto::WorkerEnvelope { payload }) {
                     write_envelope(&mut writer, response).await?;
                 }
             }
+        }
+    }
+}
+
+/// 在真实读取完成后先发送二筛源事件，再执行只消费内存帧的 CPU 特征阶段。
+async fn run_stage2_compute<W, D>(
+    writer: &mut FrameWriter<W>,
+    handler: &WorkerRequestHandler<D>,
+    command: proto::ComputeStage2,
+) -> Result<(), FrameError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    D: MediaDecoder,
+{
+    let task_id = command.task_id.clone();
+    let item_id = command.item_id.clone();
+    let request_started = Instant::now();
+    write_phase(
+        writer,
+        &task_id,
+        &item_id,
+        proto::RuntimeWorkerPhase::RuntimeWorkerDecode,
+        request_started,
+    )
+    .await?;
+    match handler.prepare_stage2(command) {
+        Ok(prepared) => {
+            write_envelope(
+                writer,
+                proto::WorkerEnvelope {
+                    payload: Some(worker_envelope::Payload::Stage2SourceReadComplete(
+                        proto::Stage2SourceReadComplete {
+                            task_id: prepared.task_id().into(),
+                            item_id: prepared.item_id().into(),
+                            request_elapsed_us: Some(elapsed_us(request_started)),
+                        },
+                    )),
+                },
+            )
+            .await?;
+            write_phase(
+                writer,
+                &task_id,
+                &item_id,
+                proto::RuntimeWorkerPhase::RuntimeWorkerFeature,
+                request_started,
+            )
+            .await?;
+            let terminal = handler.finish_stage2_features(prepared);
+            write_phase(
+                writer,
+                &task_id,
+                &item_id,
+                proto::RuntimeWorkerPhase::RuntimeWorkerResultWait,
+                request_started,
+            )
+            .await?;
+            write_envelope(writer, terminal).await
+        }
+        Err(terminal) => {
+            write_phase(
+                writer,
+                &task_id,
+                &item_id,
+                proto::RuntimeWorkerPhase::RuntimeWorkerResultWait,
+                request_started,
+            )
+            .await?;
+            write_envelope(writer, terminal).await
         }
     }
 }
