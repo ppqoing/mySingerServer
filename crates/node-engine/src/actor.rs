@@ -17,8 +17,7 @@ use dedup_core::{
 use dedup_node_store::{
     AnalysisStatus, ConfirmedDeleteItem, DeleteBatchPlan, DeleteOutcome, GroupKind, NodeStore,
     OwnedSnapshot, PersistentStageState as StorePersistentStageState, PlannedDeleteItem,
-    ReviewDecision, ScannedPath, StoreError, TaskStageWrite, TaskStatus,
-    classify_cache_completeness,
+    ReviewDecision, ScannedPath, StoreError, TaskStageWrite, classify_cache_completeness,
 };
 use dedup_protocol::{BASE_MISSING_PROBE, BASE_MISSING_STAGE1, proto};
 use thiserror::Error;
@@ -38,8 +37,8 @@ use crate::scan::BasePersistTestWaiter;
 use crate::{
     NodeRemoteFeatureCache, RemoteFeatureCache,
     analysis::{
-        LocalAnalysisEngine, Stage2BatchItem, Stage2BatchPlan, WorkerPoolStage2Processor,
-        begin_stage2_batch, run_stage2_batch_with_runtime_cache,
+        LocalAnalysisEngine, Stage2BatchItem, Stage2BatchPlan, Stage2TaskFileRunOptions,
+        WorkerPoolStage2Processor, begin_stage2_batch, run_stage2_batch_production,
     },
     artifact_registry::RegenerableArtifactRegistry,
     config_repository::{
@@ -695,8 +694,6 @@ enum EngineCommand {
         identity: JobIdentity,
         /// 瞬态扫描在清单事务和精确 run 清理成功后才带回快照。
         completed_scan: Option<crate::scan::CompletedScanSnapshot>,
-        /// 成功扫描的运行 reporter 延后到 actor 保存快照后再发布终态。
-        runtime_reporter: Option<RuntimeTaskReporter>,
     },
 }
 
@@ -704,9 +701,19 @@ enum EngineCommand {
 enum JobIdentity {
     /// 基础扫描只存在于当前进程，不对应 SQLite task 表。
     TransientScan(TaskId),
-    /// 二筛等仍使用 SQLite task 表的持久任务。
-    Task(TaskId),
+    /// 外部二筛只存在于当前进程，不对应 SQLite task 表。
+    TransientStage2(TaskId),
     Analysis(AnalysisRunId),
+}
+
+/// 后台任务资源收束后交给 actor 发布的一次终态，避免状态与高水位错位。
+struct BackgroundTerminal {
+    /// 对应当前运行 ID 的唯一进程内状态入口。
+    reporter: RuntimeTaskReporter,
+    /// 任务的不可逆终态。
+    state: RuntimeTaskState,
+    /// 仅成功完成时携带的真实 SQLite outbox 高水位。
+    outbox_high_seq: Option<u64>,
 }
 
 struct ActiveJob {
@@ -716,6 +723,8 @@ struct ActiveJob {
     cancellation: Option<ReadCancellationToken>,
     /// 后台任务收束后归还的唯一 Pool 所有权，只有 actor 可以取回。
     returned_pool: Arc<Mutex<Option<WorkerPool>>>,
+    /// 后台任务收束后待 actor 发布的唯一终态，关机路径也从此处取走。
+    terminal: Arc<Mutex<Option<BackgroundTerminal>>>,
 }
 
 enum BackgroundJob {
@@ -748,6 +757,14 @@ enum BackgroundJob {
         runtime_reporter: RuntimeTaskReporter,
         contact_sheets: PathBuf,
         postgres_config: NodePostgresConfig,
+        /// 当前 Node 进程的瞬态 task-file 根目录。
+        runtime_root: PathBuf,
+        /// 本次二筛冻结的磁盘读取额度。
+        read_config: DiskReadConfig,
+        /// 当前 WorkerPool 的有效并发槽位。
+        effective_worker_count: usize,
+        /// 外部取消和关闭共享的唯一取消令牌。
+        cancellation: ReadCancellationToken,
     },
 }
 
@@ -756,7 +773,7 @@ impl BackgroundJob {
         match self {
             Self::Scan { task_id, .. } => JobIdentity::TransientScan(*task_id),
             Self::LocalAnalysis { run_id, .. } => JobIdentity::Analysis(*run_id),
-            Self::Stage2 { plan, .. } => JobIdentity::Task(plan.task_id),
+            Self::Stage2 { plan, .. } => JobIdentity::TransientStage2(plan.task_id),
         }
     }
 }
@@ -801,11 +818,8 @@ async fn run_actor(mut state: EngineState, mut commands: mpsc::Receiver<EngineCo
             EngineCommand::BackgroundFinished {
                 identity,
                 completed_scan,
-                runtime_reporter,
             } => {
-                state
-                    .finish_background(identity, completed_scan, runtime_reporter)
-                    .await;
+                state.finish_background(identity, completed_scan).await;
             }
         }
     }
@@ -1082,11 +1096,13 @@ impl EngineState {
             .worker_control
             .as_ref()
             .map(|pool| pool.begin_task_cancel(&request.task_id));
-        let is_transient_scan = self
-            .active_job
-            .as_ref()
-            .is_some_and(|active| active.identity == JobIdentity::TransientScan(task_id));
-        if !is_transient_scan {
+        let is_transient = self.active_job.as_ref().is_some_and(|active| {
+            matches!(
+                active.identity,
+                JobIdentity::TransientScan(id) | JobIdentity::TransientStage2(id) if id == task_id
+            )
+        });
+        if !is_transient {
             if let Err(error) = self.store.cancel_task(task_id, now_ms()) {
                 if let Some(cancel_gate) = cancel_gate {
                     cancel_gate.rollback();
@@ -1100,7 +1116,7 @@ impl EngineState {
         if let Some(active) = &self.active_job
             && matches!(
                 active.identity,
-                JobIdentity::TransientScan(id) | JobIdentity::Task(id) if id == task_id
+                JobIdentity::TransientScan(id) | JobIdentity::TransientStage2(id) if id == task_id
             )
         {
             if let Some(cancellation) = &active.cancellation {
@@ -1131,16 +1147,16 @@ impl EngineState {
         let is_latest_completed = latest_completed_scan
             .as_ref()
             .is_some_and(|scan| scan.task_id == task_id && summary.state == "completed");
-        if summary.state != "running" && !is_latest_completed {
+        let has_runtime_highwater = summary.outbox_high_seq.is_some();
+        if summary.state != "running" && !is_latest_completed && !has_runtime_highwater {
             return Err(not_found(format!("运行任务不存在: {}", request.task_id)));
         }
-        let outbox_high_seq = if is_latest_completed {
+        let outbox_high_seq = summary.outbox_high_seq.unwrap_or_else(|| {
             latest_completed_scan
                 .as_ref()
+                .filter(|scan| scan.task_id == task_id)
                 .map_or(0, |scan| scan.outbox_high_seq)
-        } else {
-            0
-        };
+        });
         Ok(proto::envelope::Payload::QueryTask(proto::QueryTask {
             task_id: request.task_id,
             task: Some(runtime_task_summary(summary, outbox_high_seq)),
@@ -1173,13 +1189,15 @@ impl EngineState {
             .iter()
             .cloned()
             .map(|summary| {
-                let outbox_high_seq = latest_completed_scan
-                    .as_ref()
-                    .filter(|scan| {
-                        scan.task_id.as_uuid().to_string() == summary.runtime_task_id
-                            && summary.state == "completed"
-                    })
-                    .map_or(0, |scan| scan.outbox_high_seq);
+                let outbox_high_seq = summary.outbox_high_seq.unwrap_or_else(|| {
+                    latest_completed_scan
+                        .as_ref()
+                        .filter(|scan| {
+                            scan.task_id.as_uuid().to_string() == summary.runtime_task_id
+                                && summary.state == "completed"
+                        })
+                        .map_or(0, |scan| scan.outbox_high_seq)
+                });
                 runtime_task_summary(summary, outbox_high_seq)
             })
             .collect::<Vec<_>>();
@@ -1552,13 +1570,17 @@ impl EngineState {
             )
             .await;
         let runtime_failure = runtime_reporter.clone();
+        let cancellation = ReadCancellationToken::new();
         if let Err(error) = self.start_background(BackgroundJob::Stage2 {
             plan,
             runtime_reporter,
             contact_sheets: self.cache_root.join("contact-sheets"),
             postgres_config: self.postgres_config.clone(),
+            runtime_root: self.runtime_root.clone(),
+            read_config: self.read_config.clone(),
+            effective_worker_count: self.effective_worker_count,
+            cancellation,
         }) {
-            let _ = self.store.fail_task(task_id, now_ms());
             let _ = runtime_failure.finish(RuntimeTaskState::Failed).await;
             return Err(internal(error));
         }
@@ -1738,7 +1760,8 @@ impl EngineState {
             .ok_or_else(|| "后台 WorkerPool owner 不可用".to_owned())?;
         let identity = job.identity();
         let cancellation = match &job {
-            BackgroundJob::Scan { cancellation, .. } => Some(cancellation.clone()),
+            BackgroundJob::Scan { cancellation, .. }
+            | BackgroundJob::Stage2 { cancellation, .. } => Some(cancellation.clone()),
             _ => None,
         };
         let commands = self
@@ -1748,17 +1771,18 @@ impl EngineState {
         let (completion_sender, completion) = oneshot::channel();
         let returned_pool = Arc::new(Mutex::new(None));
         let background_pool = Arc::clone(&returned_pool);
+        let terminal = Arc::new(Mutex::new(None));
+        let background_terminal = Arc::clone(&terminal);
         tokio::spawn(async move {
-            let (completed_scan, runtime_reporter) =
-                run_background_job(store, &mut worker_pool, job).await;
+            let (completed_scan, terminal) = run_background_job(store, &mut worker_pool, job).await;
             // 必须先确认 BaseStoreActor join、Store 恢复和终态准备全部结束，再触发 shutdown/归还 Pool。
             *background_pool.lock().expect("后台 Pool 归还锁未中毒") = Some(worker_pool);
+            *background_terminal.lock().expect("后台终态归还锁未中毒") = terminal;
             let _ = completion_sender.send(());
             let _ = commands
                 .send(EngineCommand::BackgroundFinished {
                     identity,
                     completed_scan,
-                    runtime_reporter,
                 })
                 .await;
         });
@@ -1767,6 +1791,7 @@ impl EngineState {
             completion,
             cancellation,
             returned_pool,
+            terminal,
         });
         Ok(())
     }
@@ -1775,7 +1800,6 @@ impl EngineState {
         &mut self,
         identity: JobIdentity,
         completed_scan: Option<crate::scan::CompletedScanSnapshot>,
-        runtime_reporter: Option<RuntimeTaskReporter>,
     ) {
         let Some(active) = self
             .active_job
@@ -1797,9 +1821,22 @@ impl EngineState {
         {
             self.latest_completed_scan = Some(completed_scan);
         }
-        // 成功快照已经由 actor 接管，随后才广播 RuntimeTask Completed。
-        if let Some(runtime_reporter) = runtime_reporter {
-            let _ = runtime_reporter.finish(RuntimeTaskState::Completed).await;
+        let terminal = active.terminal.lock().expect("后台终态归还锁未中毒").take();
+        Self::publish_background_terminal(terminal).await;
+    }
+
+    /// Pool、Store 和可选快照已回到 actor 后，才允许广播唯一运行终态。
+    async fn publish_background_terminal(terminal: Option<BackgroundTerminal>) {
+        if let Some(terminal) = terminal {
+            let _ = match terminal.outbox_high_seq {
+                Some(highwater) => {
+                    terminal
+                        .reporter
+                        .finish_with_outbox_high_seq(terminal.state, highwater)
+                        .await
+                }
+                None => terminal.reporter.finish(terminal.state).await,
+            };
         }
     }
 
@@ -1809,21 +1846,13 @@ impl EngineState {
             return self.worker_pool.take();
         };
         let pool_task_id = match active.identity {
-            JobIdentity::TransientScan(task_id) | JobIdentity::Task(task_id) => {
+            JobIdentity::TransientScan(task_id) | JobIdentity::TransientStage2(task_id) => {
                 task_id.as_uuid().to_string()
             }
             JobIdentity::Analysis(run_id) => run_id.as_uuid().to_string(),
         };
         match active.identity {
-            JobIdentity::TransientScan(_) => {}
-            JobIdentity::Task(task_id) => {
-                finish_running_task_stages(
-                    &mut self.store,
-                    task_id,
-                    StorePersistentStageState::Skipped,
-                );
-                let _ = self.store.cancel_task(task_id, now_ms());
-            }
+            JobIdentity::TransientScan(_) | JobIdentity::TransientStage2(_) => {}
             JobIdentity::Analysis(run_id) => {
                 finish_running_analysis_stages(
                     &mut self.store,
@@ -1848,11 +1877,14 @@ impl EngineState {
             tracing::error!(task_id = %pool_task_id, "关机等待后台完整收束失败，未伪造运行终态");
         }
         self.worker_control = None;
-        active
+        let worker_pool = active
             .returned_pool
             .lock()
             .expect("后台 Pool 归还锁未中毒")
-            .take()
+            .take();
+        let terminal = active.terminal.lock().expect("后台终态归还锁未中毒").take();
+        Self::publish_background_terminal(terminal).await;
+        worker_pool
     }
 
     async fn restart_engine(&mut self) -> Result<(), String> {
@@ -2102,7 +2134,7 @@ async fn run_background_job(
     job: BackgroundJob,
 ) -> (
     Option<crate::scan::CompletedScanSnapshot>,
-    Option<RuntimeTaskReporter>,
+    Option<BackgroundTerminal>,
 ) {
     match job {
         BackgroundJob::Scan {
@@ -2239,10 +2271,19 @@ async fn run_background_job(
                 Err(ScanError::Cancelled) => RuntimeTaskState::Cancelled,
                 Err(_) => RuntimeTaskState::Failed,
             };
-            // 失败/取消没有可保存快照，后台收束后可直接发布终态；成功则交给 actor
-            // 先保存 latest_completed_scan，再发布 RuntimeTask Completed。
+            // 成功扫描由 actor 先安装最新快照，再发布带真实高水位的 Completed。
             match result {
-                Ok(result) => (Some(result.completed), Some(runtime_reporter)),
+                Ok(result) => {
+                    let completed = result.completed;
+                    (
+                        Some(completed.clone()),
+                        Some(BackgroundTerminal {
+                            reporter: runtime_reporter,
+                            state: RuntimeTaskState::Completed,
+                            outbox_high_seq: Some(completed.outbox_high_seq),
+                        }),
+                    )
+                }
                 Err(_) => {
                     let _ = runtime_reporter.finish(runtime_state).await;
                     (None, None)
@@ -2290,57 +2331,71 @@ async fn run_background_job(
             runtime_reporter,
             contact_sheets,
             postgres_config,
+            runtime_root,
+            read_config,
+            effective_worker_count,
+            cancellation,
         } => {
-            let task_id = plan.task_id;
-            let mut processor = WorkerPoolStage2Processor::new(worker_pool)
-                .with_runtime_reporter(runtime_reporter.clone(), store.machine_id().clone());
-            let (mut remote, _) = NodeRemoteFeatureCache::from_config(&postgres_config).await;
-            let result = run_stage2_batch_with_runtime_cache(
-                &mut store,
-                plan,
-                &mut processor,
-                &runtime_reporter,
-                &mut remote,
+            let (remote, _) = NodeRemoteFeatureCache::from_config(&postgres_config).await;
+            let options = Stage2TaskFileRunOptions::new(
+                &runtime_root,
                 &contact_sheets,
-                now_ms(),
+                &read_config,
+                effective_worker_count,
+                MAX_BASE_TASK_BATCH.saturating_add(effective_worker_count),
+                cancellation.clone(),
+                &SystemScanRootStorageResolver,
             )
-            .await;
-            let completed = result.is_ok()
-                && store.task_snapshot(task_id).is_ok_and(|snapshot| {
-                    snapshot.status == TaskStatus::Completed && snapshot.failed == 0
-                });
-            let _ = runtime_reporter
-                .finish(if completed {
-                    RuntimeTaskState::Completed
-                } else {
-                    RuntimeTaskState::Failed
-                })
-                .await;
-            if result.is_err() {
-                finish_running_task_stages(&mut store, task_id, StorePersistentStageState::Failed);
-                let _ = store.fail_task(task_id, now_ms());
+            .with_runtime_reporter(&runtime_reporter);
+            let result =
+                run_stage2_batch_production(store, plan, worker_pool, Some(&remote), &options)
+                    .await;
+            match result {
+                Ok(result) => {
+                    let completed = result.completed as u64;
+                    let failed = result.failed as u64;
+                    let highwater = result.outbox_high_seq;
+                    let _ = result.run_id;
+                    // 先释放 task-file runner 归还的独占连接，再记录终态前的最终统计。
+                    drop(result.store);
+                    let _ = runtime_reporter.update_overall_nowait(
+                        completed,
+                        Some(completed.saturating_add(failed)),
+                        failed,
+                        0,
+                    );
+                    (
+                        None,
+                        Some(BackgroundTerminal {
+                            reporter: runtime_reporter,
+                            state: RuntimeTaskState::Completed,
+                            outbox_high_seq: Some(highwater),
+                        }),
+                    )
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    let _ = error.into_store();
+                    let _ = runtime_reporter.record_failure_nowait(RuntimeFailureUpdate {
+                        stage: RuntimeStage::ComputeStage2Features,
+                        display_path: String::new(),
+                        message,
+                    });
+                    (
+                        None,
+                        Some(BackgroundTerminal {
+                            reporter: runtime_reporter,
+                            state: if cancellation.is_cancelled() {
+                                RuntimeTaskState::Cancelled
+                            } else {
+                                RuntimeTaskState::Failed
+                            },
+                            outbox_high_seq: None,
+                        }),
+                    )
+                }
             }
-            (None, None)
         }
-    }
-}
-
-/// 把异常退出时仍运行的 Node 任务阶段关闭，避免重启后持续显示旧计时器。
-fn finish_running_task_stages(
-    store: &mut NodeStore,
-    task_id: TaskId,
-    state: StorePersistentStageState,
-) {
-    let Ok(stages) = store.task_stages(task_id) else {
-        return;
-    };
-    for mut stage in stages
-        .into_iter()
-        .filter(|stage| stage.state == StorePersistentStageState::Running)
-    {
-        stage.state = state;
-        stage.finished_at_ms = Some(now_ms() as u64);
-        let _ = store.save_task_stage(task_id, stage);
     }
 }
 
@@ -2637,7 +2692,7 @@ mod tests {
 
     #[cfg(feature = "test-hooks")]
     use dedup_core::NormalizedPath;
-    use dedup_media::{ImageStage1, PdqHash};
+    use dedup_media::{ImageStage1, ImageStage2, PdqHash};
     #[cfg(feature = "test-hooks")]
     use dedup_media_ffmpeg::MediaProbe;
     use dedup_node_store::{FeatureWrite, ImageStage1Fields, ScannedPath};
@@ -2647,6 +2702,7 @@ mod tests {
     use super::*;
     #[cfg(feature = "test-hooks")]
     use crate::DisabledRemoteFeatureCache;
+    use crate::worker::{Stage2Frame, Stage2Output};
     #[cfg(feature = "test-hooks")]
     use crate::{scan::BasePersistTestController, worker::BaseComputeOutput};
 
@@ -2734,6 +2790,21 @@ mod tests {
             .lines()
             .filter(|line| line.contains("运行任务进入终态") && line.contains(runtime_task_id))
             .count()
+    }
+
+    /// 构造受控 Worker 可提交的完整图片二筛结果。
+    fn stage2_success_output(seed: u64) -> Stage2Output {
+        Stage2Output {
+            frames: vec![Stage2Frame {
+                slot: 0,
+                feature: Some(ImageStage2 {
+                    phash_parts: [seed; 9],
+                    sobel: [seed as f32; 128],
+                }),
+                error: None,
+            }],
+            regenerated_contact_sheet_jpeg: None,
+        }
     }
 
     /// 构造枚举错误的 actor 边界夹具，确认基础计算依赖不会提前创建。
@@ -3732,6 +3803,486 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_stage2_uses_transient_task_files_and_publishes_runtime_highwater() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("node.db");
+        let cache_root = directory.path().join("cache");
+        let runtime_root = directory.path().join("data/node/runtime");
+        let machine = MachineId::parse(&"c8".repeat(32)).unwrap();
+        let mut store = NodeStore::open(&database, machine).unwrap();
+        let media_path = directory.path().join("stage2.jpg");
+        fs::write(&media_path, b"stage2 fixture").unwrap();
+        let scanned = ScannedPath::new(
+            NormalizedPath::new(&media_path).unwrap(),
+            DisplayPath::new(&media_path).unwrap(),
+            14,
+        );
+        let content = store
+            .upsert_content_and_location(&scanned, [0x81; 16], dedup_core::MediaKind::Image)
+            .unwrap();
+        store
+            .commit_feature_result(
+                content.id,
+                None,
+                FeatureWrite::ImageStage1(ImageStage1Fields::from(ImageStage1 {
+                    width: 10,
+                    height: 10,
+                    pdq: PdqHash::from_bytes([0; 32]),
+                    quality: 100,
+                })),
+            )
+            .unwrap();
+        store.mark_base_complete(content.id).unwrap();
+        let before_highwater = store.outbox_high_seq().unwrap();
+        let location = LocationKey::new(store.machine_id().clone(), scanned.normalized_path);
+        let observer = store.reopen().unwrap();
+        let (pool, mut started, controller) = WorkerPool::controlled_batch_for_test(1);
+        let (handle, actor) = NodeEngine::spawn_with_runtime_root_for_test(
+            store,
+            pool,
+            "127.0.0.1:39091".parse().unwrap(),
+            &cache_root,
+            &runtime_root,
+            EnumeratorKind::WindowsWalker,
+        );
+        let registry = handle.runtime_tasks_for_test();
+
+        let response = handle
+            .handle(proto::Envelope {
+                request_id: 70,
+                payload: Some(proto::envelope::Payload::DispatchStage2(
+                    proto::DispatchStage2 {
+                        analysis_run_id: AnalysisRunId::new().as_uuid().to_string(),
+                        items: vec![proto::Stage2WorkItem {
+                            content: Some((&content.key).into()),
+                            source: Some((&location).into()),
+                            frame_slots: Vec::new(),
+                        }],
+                    },
+                )),
+            })
+            .await;
+        let Some(proto::envelope::Payload::TaskAccepted(accepted)) = response.payload else {
+            panic!("外部二筛必须返回瞬态运行 ID");
+        };
+        let (worker_task_id, item_id) =
+            tokio::time::timeout(Duration::from_secs(2), started.recv())
+                .await
+                .expect("外部二筛必须进入 task-file Worker")
+                .expect("可控 Worker 不应提前关闭");
+        assert_eq!(worker_task_id, accepted.task_id);
+        let run_directory = runtime_root.join(&accepted.task_id);
+        assert!(run_directory.is_dir(), "Worker 持有时必须保留本轮 TSV 目录");
+        assert!(
+            observer.page_tasks(None, 100).unwrap().items.is_empty(),
+            "外部二筛不得写入旧 tasks/task_items/task_stages"
+        );
+
+        controller
+            .stage2_source_read_complete(accepted.task_id.clone(), item_id.clone())
+            .await;
+        controller
+            .complete_stage2(accepted.task_id.clone(), item_id, stage2_success_output(8))
+            .await;
+        let details = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let details = registry.details(&accepted.task_id).await.unwrap();
+                if details
+                    .summary
+                    .as_ref()
+                    .is_some_and(|summary| summary.state == "completed")
+                {
+                    break details;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Worker、SQLite 与 TSV 收束后必须发布 Completed");
+        let runtime_highwater = details
+            .summary
+            .and_then(|summary| summary.outbox_high_seq)
+            .expect("Completed 必须携带真实 outbox 高水位");
+        assert!(runtime_highwater > before_highwater);
+        assert!(
+            !run_directory.exists(),
+            "Completed 前必须精确删除本轮 TSV 目录"
+        );
+        assert!(observer.page_tasks(None, 100).unwrap().items.is_empty());
+
+        let query = handle
+            .handle(proto::Envelope {
+                request_id: 71,
+                payload: Some(proto::envelope::Payload::QueryTask(proto::QueryTask {
+                    task_id: accepted.task_id.clone(),
+                    task: None,
+                })),
+            })
+            .await;
+        assert!(matches!(
+            query.payload,
+            Some(proto::envelope::Payload::QueryTask(proto::QueryTask {
+                task: Some(proto::TaskSummary { state, outbox_high_seq, .. }),
+                ..
+            })) if state == proto::TaskState::TaskCompleted as i32
+                && outbox_high_seq == runtime_highwater
+        ));
+        let list = handle
+            .handle(proto::Envelope {
+                request_id: 72,
+                payload: Some(proto::envelope::Payload::ListTasks(proto::ListTasks {
+                    cursor: String::new(),
+                    limit: 100,
+                    tasks: Vec::new(),
+                    next_cursor: String::new(),
+                })),
+            })
+            .await;
+        assert!(matches!(
+            list.payload,
+            Some(proto::envelope::Payload::ListTasks(proto::ListTasks { tasks, .. }))
+                if tasks.iter().any(|task| task.task_id == accepted.task_id
+                    && task.state == proto::TaskState::TaskCompleted as i32
+                    && task.outbox_high_seq == runtime_highwater)
+        ));
+
+        handle.shutdown().await.unwrap();
+        actor.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dispatch_stage2_cache_hit_finishes_without_worker_or_runtime_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("node.db");
+        let cache_root = directory.path().join("cache");
+        let runtime_root = directory.path().join("data/node/runtime");
+        let machine = MachineId::parse(&"c9".repeat(32)).unwrap();
+        let mut store = NodeStore::open(&database, machine).unwrap();
+        let media_path = directory.path().join("cached-stage2.jpg");
+        fs::write(&media_path, b"cached stage2").unwrap();
+        let scanned = ScannedPath::new(
+            NormalizedPath::new(&media_path).unwrap(),
+            DisplayPath::new(&media_path).unwrap(),
+            13,
+        );
+        let content = store
+            .upsert_content_and_location(&scanned, [0x82; 16], dedup_core::MediaKind::Image)
+            .unwrap();
+        store
+            .commit_feature_result(
+                content.id,
+                None,
+                FeatureWrite::ImageStage1(ImageStage1Fields::from(ImageStage1 {
+                    width: 10,
+                    height: 10,
+                    pdq: PdqHash::from_bytes([0; 32]),
+                    quality: 100,
+                })),
+            )
+            .unwrap();
+        store
+            .commit_feature_result(
+                content.id,
+                None,
+                FeatureWrite::ImageStage2(ImageStage2 {
+                    phash_parts: [9; 9],
+                    sobel: [9.0; 128],
+                }),
+            )
+            .unwrap();
+        store.mark_base_complete(content.id).unwrap();
+        let before_highwater = store.outbox_high_seq().unwrap();
+        let location = LocationKey::new(store.machine_id().clone(), scanned.normalized_path);
+        let observer = store.reopen().unwrap();
+        let (pool, mut started, _) = WorkerPool::controlled_batch_for_test(1);
+        let (handle, actor) = NodeEngine::spawn_with_runtime_root_for_test(
+            store,
+            pool,
+            "127.0.0.1:39091".parse().unwrap(),
+            &cache_root,
+            &runtime_root,
+            EnumeratorKind::WindowsWalker,
+        );
+        let registry = handle.runtime_tasks_for_test();
+
+        let response = handle
+            .handle(proto::Envelope {
+                request_id: 73,
+                payload: Some(proto::envelope::Payload::DispatchStage2(
+                    proto::DispatchStage2 {
+                        analysis_run_id: AnalysisRunId::new().as_uuid().to_string(),
+                        items: vec![proto::Stage2WorkItem {
+                            content: Some((&content.key).into()),
+                            source: Some((&location).into()),
+                            frame_slots: Vec::new(),
+                        }],
+                    },
+                )),
+            })
+            .await;
+        let Some(proto::envelope::Payload::TaskAccepted(accepted)) = response.payload else {
+            panic!("缓存重发必须返回瞬态运行 ID");
+        };
+        let details = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let details = registry.details(&accepted.task_id).await.unwrap();
+                if details
+                    .summary
+                    .as_ref()
+                    .is_some_and(|summary| summary.state == "completed")
+                {
+                    break details;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("完整缓存命中仍必须以 Completed 收束");
+        let highwater = details
+            .summary
+            .and_then(|summary| summary.outbox_high_seq)
+            .expect("缓存重发 Completed 必须携带真实高水位");
+        assert!(highwater > before_highwater);
+        assert!(started.try_recv().is_err(), "完整缓存命中不得启动 Worker");
+        assert!(
+            !runtime_root.join(&accepted.task_id).exists(),
+            "完整缓存命中不得创建瞬态任务目录"
+        );
+        assert!(observer.page_tasks(None, 100).unwrap().items.is_empty());
+
+        handle.shutdown().await.unwrap();
+        actor.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_stage2_waits_for_transient_run_cleanup_without_legacy_task_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("node.db");
+        let cache_root = directory.path().join("cache");
+        let runtime_root = directory.path().join("data/node/runtime");
+        let machine = MachineId::parse(&"ca".repeat(32)).unwrap();
+        let mut store = NodeStore::open(&database, machine).unwrap();
+        let media_path = directory.path().join("cancel-stage2.jpg");
+        fs::write(&media_path, b"cancel stage2").unwrap();
+        let scanned = ScannedPath::new(
+            NormalizedPath::new(&media_path).unwrap(),
+            DisplayPath::new(&media_path).unwrap(),
+            13,
+        );
+        let content = store
+            .upsert_content_and_location(&scanned, [0x83; 16], dedup_core::MediaKind::Image)
+            .unwrap();
+        store
+            .commit_feature_result(
+                content.id,
+                None,
+                FeatureWrite::ImageStage1(ImageStage1Fields::from(ImageStage1 {
+                    width: 10,
+                    height: 10,
+                    pdq: PdqHash::from_bytes([0; 32]),
+                    quality: 100,
+                })),
+            )
+            .unwrap();
+        store.mark_base_complete(content.id).unwrap();
+        let location = LocationKey::new(store.machine_id().clone(), scanned.normalized_path);
+        let observer = store.reopen().unwrap();
+        let (pool, mut started, _controller) = WorkerPool::controlled_batch_for_test(1);
+        let (handle, actor) = NodeEngine::spawn_with_runtime_root_for_test(
+            store,
+            pool,
+            "127.0.0.1:39091".parse().unwrap(),
+            &cache_root,
+            &runtime_root,
+            EnumeratorKind::WindowsWalker,
+        );
+        let registry = handle.runtime_tasks_for_test();
+
+        let response = handle
+            .handle(proto::Envelope {
+                request_id: 74,
+                payload: Some(proto::envelope::Payload::DispatchStage2(
+                    proto::DispatchStage2 {
+                        analysis_run_id: AnalysisRunId::new().as_uuid().to_string(),
+                        items: vec![proto::Stage2WorkItem {
+                            content: Some((&content.key).into()),
+                            source: Some((&location).into()),
+                            frame_slots: Vec::new(),
+                        }],
+                    },
+                )),
+            })
+            .await;
+        let Some(proto::envelope::Payload::TaskAccepted(accepted)) = response.payload else {
+            panic!("可取消二筛必须返回瞬态运行 ID");
+        };
+        let _ = tokio::time::timeout(Duration::from_secs(2), started.recv())
+            .await
+            .expect("可取消二筛必须进入 Worker")
+            .expect("可控 Worker 不应提前关闭");
+        let run_directory = runtime_root.join(&accepted.task_id);
+        assert!(run_directory.is_dir());
+
+        let cancel = handle
+            .handle(proto::Envelope {
+                request_id: 75,
+                payload: Some(proto::envelope::Payload::CancelTask(proto::CancelTask {
+                    task_id: accepted.task_id.clone(),
+                })),
+            })
+            .await;
+        assert!(matches!(
+            cancel.payload,
+            Some(proto::envelope::Payload::CancelTask(_))
+        ));
+        let details = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let details = registry.details(&accepted.task_id).await.unwrap();
+                if details
+                    .summary
+                    .as_ref()
+                    .is_some_and(|summary| summary.state == "cancelled")
+                {
+                    break details;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("取消必须在 Worker、permit、writer 与 TSV 收束后发布 Cancelled");
+        assert!(
+            details
+                .summary
+                .is_some_and(|summary| summary.outbox_high_seq.is_none()),
+            "取消不得伪造 outbox 高水位"
+        );
+        assert!(!run_directory.exists());
+        assert!(observer.page_tasks(None, 100).unwrap().items.is_empty());
+
+        handle.shutdown().await.unwrap();
+        actor.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dispatch_stage2_keeps_batch_completed_when_one_file_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("node.db");
+        let cache_root = directory.path().join("cache");
+        let runtime_root = directory.path().join("data/node/runtime");
+        let machine = MachineId::parse(&"cb".repeat(32)).unwrap();
+        let mut store = NodeStore::open(&database, machine).unwrap();
+        let mut items = Vec::new();
+        for (name, md5) in [
+            ("failed-stage2.jpg", [0x84; 16]),
+            ("next-stage2.jpg", [0x85; 16]),
+        ] {
+            let media_path = directory.path().join(name);
+            fs::write(&media_path, b"stage2 fixture").unwrap();
+            let scanned = ScannedPath::new(
+                NormalizedPath::new(&media_path).unwrap(),
+                DisplayPath::new(&media_path).unwrap(),
+                14,
+            );
+            let content = store
+                .upsert_content_and_location(&scanned, md5, dedup_core::MediaKind::Image)
+                .unwrap();
+            store
+                .commit_feature_result(
+                    content.id,
+                    None,
+                    FeatureWrite::ImageStage1(ImageStage1Fields::from(ImageStage1 {
+                        width: 10,
+                        height: 10,
+                        pdq: PdqHash::from_bytes([0; 32]),
+                        quality: 100,
+                    })),
+                )
+                .unwrap();
+            store.mark_base_complete(content.id).unwrap();
+            items.push(proto::Stage2WorkItem {
+                content: Some((&content.key).into()),
+                source: Some(
+                    (&LocationKey::new(store.machine_id().clone(), scanned.normalized_path)).into(),
+                ),
+                frame_slots: Vec::new(),
+            });
+        }
+        let observer = store.reopen().unwrap();
+        let (pool, mut started, controller) = WorkerPool::controlled_batch_for_test(1);
+        let (handle, actor) = NodeEngine::spawn_with_runtime_root_for_test(
+            store,
+            pool,
+            "127.0.0.1:39091".parse().unwrap(),
+            &cache_root,
+            &runtime_root,
+            EnumeratorKind::WindowsWalker,
+        );
+        let registry = handle.runtime_tasks_for_test();
+
+        let response = handle
+            .handle(proto::Envelope {
+                request_id: 76,
+                payload: Some(proto::envelope::Payload::DispatchStage2(
+                    proto::DispatchStage2 {
+                        analysis_run_id: AnalysisRunId::new().as_uuid().to_string(),
+                        items,
+                    },
+                )),
+            })
+            .await;
+        let Some(proto::envelope::Payload::TaskAccepted(accepted)) = response.payload else {
+            panic!("含单文件失败的二筛必须返回瞬态运行 ID");
+        };
+        let (failed_task_id, failed_item_id) =
+            tokio::time::timeout(Duration::from_secs(2), started.recv())
+                .await
+                .expect("首个二筛必须进入 Worker")
+                .expect("可控 Worker 不应提前关闭");
+        controller
+            .crash(
+                failed_task_id,
+                failed_item_id,
+                "测试二筛 Worker 崩溃".into(),
+            )
+            .await;
+        let (next_task_id, next_item_id) =
+            tokio::time::timeout(Duration::from_secs(2), started.recv())
+                .await
+                .expect("首个文件失败后下一项必须继续")
+                .expect("可控 Worker 不应提前关闭");
+        controller
+            .stage2_source_read_complete(next_task_id.clone(), next_item_id.clone())
+            .await;
+        controller
+            .complete_stage2(next_task_id, next_item_id, stage2_success_output(10))
+            .await;
+        let details = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let details = registry.details(&accepted.task_id).await.unwrap();
+                if details
+                    .summary
+                    .as_ref()
+                    .is_some_and(|summary| summary.state == "completed")
+                {
+                    break details;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("单文件 F 不得将整个瞬态二筛伪装为 Failed");
+        let summary = details.summary.unwrap();
+        assert_eq!(summary.overall_total, 2);
+        assert_eq!(summary.overall_completed, 1);
+        assert_eq!(summary.overall_failed, 1);
+        assert!(summary.outbox_high_seq.is_some());
+        assert!(observer.page_tasks(None, 100).unwrap().items.is_empty());
+
+        handle.shutdown().await.unwrap();
+        actor.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn stage2_create_and_shutdown_stay_responsive_while_worker_is_held() {
         let directory = tempfile::tempdir().unwrap();
         let machine = MachineId::parse(&"c2".repeat(32)).unwrap();
@@ -3761,6 +4312,7 @@ mod tests {
         store.mark_base_complete(content.id).unwrap();
         let location =
             LocationKey::new(store.machine_id().clone(), scanned.normalized_path.clone());
+        let observer = store.reopen().unwrap();
         let (pool, mut started) = WorkerPool::controlled_for_test();
         let (handle, actor) = NodeEngine::spawn(
             store,
@@ -3809,15 +4361,16 @@ mod tests {
             matches!(restart, Err(EngineError::Operation(_))),
             "可控测试池必须在收束后明确拒绝冒充生产 Pool 重建"
         );
-        assert!(
-            handle
-                .runtime_tasks_for_test()
-                .list()
-                .await
-                .iter()
-                .all(|task| { task.runtime_task_id != running_task_id || task.state != "running" }),
-            "重启收束后不得遗留运行中的旧任务"
-        );
+        let task = handle
+            .runtime_tasks_for_test()
+            .list()
+            .await
+            .into_iter()
+            .find(|task| task.runtime_task_id == running_task_id)
+            .expect("重启收束后必须保留瞬态任务终态");
+        assert_eq!(task.state, "cancelled");
+        assert!(task.outbox_high_seq.is_none());
+        assert!(observer.page_tasks(None, 100).unwrap().items.is_empty());
 
         tokio::time::timeout(Duration::from_secs(2), handle.shutdown())
             .await

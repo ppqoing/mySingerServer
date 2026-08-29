@@ -410,9 +410,11 @@ where
                 match dispatched {
                     Ok(TaskDispatchPoll::Task(task)) => {
                         let identity = task.identity.clone();
-                        match start_stage2_task(
-                            &production,
+                        // 在跨 await 派发 Worker 前复制冻结上下文，避免借用含 permit future 的 production。
+                        let context = production.contexts.get(&identity).cloned();
+                        match start_stage2_task::<P>(
                             task,
+                            context,
                             worker_pool,
                             &cancellation,
                             store.machine_id(),
@@ -455,8 +457,8 @@ where
 
 /// 把 dispatcher 交付的二筛任务发送给 Worker，并把许可放进 active owner。
 async fn start_stage2_task<P>(
-    production: &Stage2TaskProduction<P>,
     task: DispatchedTask<P::Permit>,
+    context: Option<Stage2TaskContext>,
     worker_pool: &WorkerPool,
     cancellation: &ReadCancellationToken,
     machine_id: &dedup_core::MachineId,
@@ -473,7 +475,7 @@ where
     {
         return Err("二筛 dispatcher 返回了无效任务行".into());
     }
-    let Some(context) = production.contexts.get(&task.identity).cloned() else {
+    let Some(context) = context else {
         return Err("二筛任务缺少精确上下文".into());
     };
     if task.record.known_md5 != Some(context.content.md5())

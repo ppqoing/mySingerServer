@@ -12,12 +12,12 @@ use dedup_desktop_core::{
     },
     central::{CentralCandidate, CentralCandidateStatus, CentralPairKind},
 };
-use dedup_media::ImageStage2;
+use dedup_media::{ImageStage1, ImageStage2, PdqHash};
 use dedup_node_engine::{
-    analysis::{Stage2BatchItem, Stage2Processor, Stage2Request, dispatch_stage2_batch},
+    analysis::{Stage2Processor, Stage2Request},
     worker::Stage2Output,
 };
-use dedup_node_store::{FeatureWrite, NodeStore, ScannedPath, TaskStatus};
+use dedup_node_store::{FeatureWrite, ImageStage1Fields, NodeStore, ScannedPath};
 
 #[derive(Default)]
 struct CountingWorker {
@@ -103,28 +103,30 @@ async fn node_cache_is_republished_without_worker_computation() {
         )
         .unwrap();
     store
+        .commit_feature_result(
+            record.id,
+            None,
+            FeatureWrite::ImageStage1(ImageStage1Fields::from(ImageStage1 {
+                width: 10,
+                height: 10,
+                pdq: PdqHash::from_bytes([0; 32]),
+                quality: 100,
+            })),
+        )
+        .unwrap();
+    store
         .commit_feature_result(record.id, None, FeatureWrite::ImageStage2(stage2()))
         .unwrap();
+    store.mark_base_complete(record.id).unwrap();
     let before = store.outbox_high_seq().unwrap();
-    let mut worker = CountingWorker::default();
+    let worker = CountingWorker::default();
 
-    let task_id = dispatch_stage2_batch(
-        &mut store,
-        &[Stage2BatchItem {
-            content: record.key,
-            source: LocationKey::new(machine_id, path),
-            frame_slots: Vec::new(),
-        }],
-        &mut worker,
-        10,
-    )
-    .await
-    .unwrap();
+    // 完整缓存重发只触及特征 outbox，不创建旧持久二筛任务或 Worker 计算。
+    assert!(store.republish_complete_stage2(record.id).unwrap());
 
     assert_eq!(worker.calls, 0);
-    let task = store.task_snapshot(task_id).unwrap();
-    assert_eq!(task.status, TaskStatus::Completed);
-    assert!(task.outbox_high_seq > before);
+    assert!(store.outbox_high_seq().unwrap() > before);
+    assert!(store.page_tasks(None, 100).unwrap().items.is_empty());
 }
 
 fn content(byte: u8) -> ContentKey {

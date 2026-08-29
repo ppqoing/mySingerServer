@@ -487,6 +487,8 @@ pub(crate) struct Stage2TaskFileRunOptions<'a> {
     cancellation: ReadCancellationToken,
     /// 只在缓存查询前建立 ScanDiskPlan 时调用的物理盘解析边界。
     resolver: &'a dyn ScanRootStorageResolver,
+    /// 外部瞬态二筛的运行详情；本地分析旧路径保持不注入。
+    runtime_reporter: Option<&'a RuntimeTaskReporter>,
     /// 单元测试在首次缓存查询处观察已完成的来源解析；生产构建不保留测试状态。
     #[cfg(test)]
     cache_lookup_observer: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -518,6 +520,7 @@ impl<'a> Stage2TaskFileRunOptions<'a> {
             persist_capacity,
             cancellation,
             resolver,
+            runtime_reporter: None,
             #[cfg(test)]
             cache_lookup_observer: None,
             #[cfg(all(test, feature = "test-hooks"))]
@@ -525,6 +528,12 @@ impl<'a> Stage2TaskFileRunOptions<'a> {
             #[cfg(all(test, feature = "test-hooks"))]
             before_discard_observer: None,
         }
+    }
+
+    /// 绑定当前进程唯一的运行任务详情，不创建第二份二筛状态机。
+    pub(crate) fn with_runtime_reporter(mut self, reporter: &'a RuntimeTaskReporter) -> Self {
+        self.runtime_reporter = Some(reporter);
+        self
     }
 
     /// 仅单元测试：在首个本地批量缓存查询前检查来源物理盘冻结顺序。
@@ -609,6 +618,16 @@ pub(crate) async fn run_stage2_batch_production(
     options: &Stage2TaskFileRunOptions<'_>,
 ) -> Result<Stage2TaskFileRunResult, Stage2TaskFileRunError> {
     let Stage2BatchPlan { task_id, work } = plan;
+    let total = work.len() as u64;
+    report_stage2_stage(
+        options.runtime_reporter,
+        RuntimeStage::LookupStage2Cache,
+        proto::RuntimeStageState::RuntimeStageRunning,
+        0,
+        total,
+        0,
+        0,
+    );
     let (frozen, planned_rows) = match freeze_task_file_sources(&work, options) {
         Ok(value) => value,
         Err(error) => return Err(task_file_run_error(store, error)),
@@ -700,12 +719,33 @@ pub(crate) async fn run_stage2_batch_production(
             completed += 1;
         }
     }
-
+    report_stage2_stage(
+        options.runtime_reporter,
+        RuntimeStage::LookupStage2Cache,
+        proto::RuntimeStageState::RuntimeStageCompleted,
+        total,
+        total,
+        0,
+        0,
+    );
     if inputs.is_empty() {
         let outbox_high_seq = match store.outbox_high_seq() {
             Ok(highwater) => highwater,
             Err(error) => return Err(task_file_run_error(store, error.to_string())),
         };
+        report_stage2_stage(
+            options.runtime_reporter,
+            RuntimeStage::ComputeStage2Features,
+            if failed == 0 {
+                proto::RuntimeStageState::RuntimeStageCompleted
+            } else {
+                proto::RuntimeStageState::RuntimeStageFailed
+            },
+            completed as u64,
+            total,
+            failed as u64,
+            0,
+        );
         return Ok(Stage2TaskFileRunResult {
             store,
             run_id: task_id,
@@ -723,6 +763,15 @@ pub(crate) async fn run_stage2_batch_production(
         Ok((reader, _)) => reader,
         Err(error) => return Err(task_file_run_error(store, error.to_string())),
     };
+    report_stage2_stage(
+        options.runtime_reporter,
+        RuntimeStage::ComputeStage2Features,
+        proto::RuntimeStageState::RuntimeStageRunning,
+        completed as u64,
+        total,
+        failed as u64,
+        0,
+    );
     let production = match build_stage2_task_production(
         options.runtime_root,
         task_id.as_uuid(),
@@ -822,11 +871,26 @@ pub(crate) async fn run_stage2_batch_production(
                     format!("二筛任务目录清理失败: {cleanup}"),
                 ));
             }
+            let completed = completed + stage_completed;
+            let failed = failed + stage_failed;
+            report_stage2_stage(
+                options.runtime_reporter,
+                RuntimeStage::ComputeStage2Features,
+                if failed == 0 {
+                    proto::RuntimeStageState::RuntimeStageCompleted
+                } else {
+                    proto::RuntimeStageState::RuntimeStageFailed
+                },
+                completed as u64,
+                total,
+                failed as u64,
+                0,
+            );
             Ok(Stage2TaskFileRunResult {
                 store,
                 run_id: task_id,
-                completed: completed + stage_completed,
-                failed: failed + stage_failed,
+                completed,
+                failed,
                 outbox_high_seq,
             })
         }
