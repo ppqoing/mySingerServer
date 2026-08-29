@@ -449,6 +449,264 @@ async fn runtime_list_failure_removes_old_summary_and_only_selected_details_stal
     server.await.unwrap().unwrap();
 }
 
+/// CreateScan 已接受后只等待 RuntimeTask 列表，不应再查询旧 SQLite 任务详情。
+#[tokio::test]
+async fn create_scan_uses_runtime_task_snapshot_without_querying_legacy_task() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let machine_id = MachineId::from_sha256([0xe3; 32]);
+    let query_calls = Arc::new(AtomicUsize::new(0));
+    let create_calls = Arc::new(AtomicUsize::new(0));
+    let runtime_list_calls = Arc::new(AtomicUsize::new(0));
+    let created = Arc::new(AtomicBool::new(false));
+    let (shutdown_sender, shutdown) = oneshot::channel();
+    let server = tokio::spawn(NodeServer::serve_until(
+        listener,
+        CreateScanRuntimeHandler {
+            machine_id: machine_id.clone(),
+            query_calls: Arc::clone(&query_calls),
+            create_calls: Arc::clone(&create_calls),
+            runtime_list_calls: Arc::clone(&runtime_list_calls),
+            created: Arc::clone(&created),
+        },
+        shutdown,
+    ));
+    let temp = TempDir::new().unwrap();
+    let config = DesktopConfig {
+        nodes: vec![NodeEndpoint {
+            ip: IpAddr::from([127, 0, 0, 1]),
+            port: address.port(),
+        }],
+        reconnect_interval_seconds: 30,
+        ..DesktopConfig::default()
+    };
+    let (app, mut events) = DesktopApp::start(config, desktop_paths(&temp));
+    wait_for_count(&runtime_list_calls, 1).await;
+
+    app.send(UiCommand::CreateScan {
+        node_index: 0,
+        roots: vec![r"D:\Media".into()],
+        force_recalculate: false,
+        enumerator: dedup_core::EnumeratorKind::Everything,
+    })
+    .await
+    .unwrap();
+    wait_for_count(&create_calls, 1).await;
+    created.store(true, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(
+        query_calls.load(Ordering::SeqCst),
+        0,
+        "CreateScan 成功后不得查询旧持久任务详情"
+    );
+
+    let observed = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(UiEvent::RuntimeTasksChanged(state)) = events.recv().await
+                && state
+                    .summaries()
+                    .iter()
+                    .any(|summary| summary.key.id == "accepted-runtime")
+            {
+                return state;
+            }
+        }
+    })
+    .await
+    .expect("CreateScan 后必须从 RuntimeTask 列表观察到已接受任务");
+    assert_eq!(observed.summaries().len(), 1);
+    assert_eq!(query_calls.load(Ordering::SeqCst), 0);
+
+    app.send(UiCommand::Shutdown).await.unwrap();
+    shutdown_sender.send(()).unwrap();
+    server.await.unwrap().unwrap();
+}
+
+/// 节点刷新不能再读取持久任务列表，任务中心只能接受 RuntimeTask 快照。
+#[tokio::test]
+async fn refresh_does_not_read_legacy_task_list_or_overwrite_runtime_snapshot() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let machine_id = MachineId::from_sha256([0xe4; 32]);
+    let legacy_list_calls = Arc::new(AtomicUsize::new(0));
+    let runtime_list_calls = Arc::new(AtomicUsize::new(0));
+    let status_calls = Arc::new(AtomicUsize::new(0));
+    let (shutdown_sender, shutdown) = oneshot::channel();
+    let server = tokio::spawn(NodeServer::serve_until(
+        listener,
+        RefreshRuntimeHandler {
+            machine_id: machine_id.clone(),
+            legacy_list_calls: Arc::clone(&legacy_list_calls),
+            runtime_list_calls: Arc::clone(&runtime_list_calls),
+            status_calls: Arc::clone(&status_calls),
+        },
+        shutdown,
+    ));
+    let temp = TempDir::new().unwrap();
+    let config = DesktopConfig {
+        nodes: vec![NodeEndpoint {
+            ip: IpAddr::from([127, 0, 0, 1]),
+            port: address.port(),
+        }],
+        reconnect_interval_seconds: 30,
+        ..DesktopConfig::default()
+    };
+    let (app, mut events) = DesktopApp::start(config, desktop_paths(&temp));
+    wait_for_count(&runtime_list_calls, 1).await;
+    app.send(UiCommand::Refresh).await.unwrap();
+    wait_for_count(&status_calls, 3).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        legacy_list_calls.load(Ordering::SeqCst),
+        0,
+        "刷新节点不得读取旧持久任务列表"
+    );
+
+    let observed = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(UiEvent::RuntimeTasksChanged(state)) = events.recv().await
+                && state
+                    .summaries()
+                    .iter()
+                    .any(|summary| summary.key.id == "runtime-only")
+            {
+                return state;
+            }
+        }
+    })
+    .await
+    .expect("刷新必须发布 RuntimeTask 快照");
+    assert_eq!(observed.summaries().len(), 1);
+
+    app.send(UiCommand::Shutdown).await.unwrap();
+    shutdown_sender.send(()).unwrap();
+    server.await.unwrap().unwrap();
+}
+
+/// 为 CreateScan 只返回 TaskAccepted 并暴露当前进程运行任务的真实节点处理器。
+#[derive(Clone)]
+struct CreateScanRuntimeHandler {
+    /// 揭示是否错误访问旧持久任务详情接口。
+    query_calls: Arc<AtomicUsize>,
+    /// 揭示 CreateScan 是否已经收到。
+    create_calls: Arc<AtomicUsize>,
+    /// 揭示 Desktop 是否持续从 RuntimeTask 列表刷新。
+    runtime_list_calls: Arc<AtomicUsize>,
+    /// 节点握手取得的物理机器 ID。
+    machine_id: MachineId,
+    /// CreateScan 接受后由运行时列表返回任务。
+    created: Arc<AtomicBool>,
+}
+
+impl NodeRequestHandler for CreateScanRuntimeHandler {
+    async fn handle(&self, request: proto::Envelope) -> proto::Envelope {
+        let payload = match request.payload {
+            Some(proto::envelope::Payload::NodeStatus(_)) => {
+                proto::envelope::Payload::NodeStatus(proto::NodeStatus {
+                    machine_id: self.machine_id.as_str().into(),
+                    listen_address: "127.0.0.1".into(),
+                    ..Default::default()
+                })
+            }
+            Some(proto::envelope::Payload::CreateScan(_)) => {
+                self.create_calls.fetch_add(1, Ordering::SeqCst);
+                self.created.store(true, Ordering::SeqCst);
+                proto::envelope::Payload::TaskAccepted(proto::TaskAccepted {
+                    task_id: "11111111-1111-7111-8111-111111111111".into(),
+                })
+            }
+            Some(proto::envelope::Payload::QueryTask(_)) => {
+                self.query_calls.fetch_add(1, Ordering::SeqCst);
+                proto::envelope::Payload::Error(proto::Error {
+                    code: proto::ErrorCode::InvalidRequest as i32,
+                    message: "不应查询旧持久任务详情".into(),
+                })
+            }
+            Some(proto::envelope::Payload::ListRuntimeTasks(mut page)) => {
+                self.runtime_list_calls.fetch_add(1, Ordering::SeqCst);
+                page.tasks = if self.created.load(Ordering::SeqCst) {
+                    vec![proto::RuntimeTaskSummary {
+                        runtime_task_id: "accepted-runtime".into(),
+                        machine_id: self.machine_id.as_str().into(),
+                        task_kind: "scan".into(),
+                        title: "运行时扫描".into(),
+                        state: "running".into(),
+                        overall_total_known: false,
+                        ..Default::default()
+                    }]
+                } else {
+                    Vec::new()
+                };
+                page.next_cursor.clear();
+                proto::envelope::Payload::ListRuntimeTasks(page)
+            }
+            _ => proto::envelope::Payload::Error(proto::Error {
+                code: proto::ErrorCode::InvalidRequest as i32,
+                message: "测试节点只提供 CreateScan 与 RuntimeTask 查询".into(),
+            }),
+        };
+        proto::Envelope {
+            request_id: request.request_id,
+            payload: Some(payload),
+        }
+    }
+}
+
+/// 为刷新测试同时暴露旧任务列表探针与唯一 RuntimeTask 列表的节点处理器。
+#[derive(Clone)]
+struct RefreshRuntimeHandler {
+    /// 揭示控制器是否仍访问持久任务列表。
+    legacy_list_calls: Arc<AtomicUsize>,
+    /// 揭示控制器是否刷新运行任务快照。
+    runtime_list_calls: Arc<AtomicUsize>,
+    /// 揭示显式 Refresh 命令已完成状态请求。
+    status_calls: Arc<AtomicUsize>,
+    /// 节点握手取得的物理机器 ID。
+    machine_id: MachineId,
+}
+
+impl NodeRequestHandler for RefreshRuntimeHandler {
+    async fn handle(&self, request: proto::Envelope) -> proto::Envelope {
+        let payload = match request.payload {
+            Some(proto::envelope::Payload::NodeStatus(_)) => {
+                self.status_calls.fetch_add(1, Ordering::SeqCst);
+                proto::envelope::Payload::NodeStatus(proto::NodeStatus {
+                    machine_id: self.machine_id.as_str().into(),
+                    listen_address: "127.0.0.1".into(),
+                    ..Default::default()
+                })
+            }
+            Some(proto::envelope::Payload::ListTasks(mut page)) => {
+                self.legacy_list_calls.fetch_add(1, Ordering::SeqCst);
+                page.tasks.clear();
+                page.next_cursor.clear();
+                proto::envelope::Payload::ListTasks(page)
+            }
+            Some(proto::envelope::Payload::ListRuntimeTasks(mut page)) => {
+                self.runtime_list_calls.fetch_add(1, Ordering::SeqCst);
+                page.tasks = vec![proto::RuntimeTaskSummary {
+                    runtime_task_id: "runtime-only".into(),
+                    machine_id: self.machine_id.as_str().into(),
+                    task_kind: "scan".into(),
+                    title: "运行时任务".into(),
+                    state: "running".into(),
+                    ..Default::default()
+                }];
+                page.next_cursor.clear();
+                proto::envelope::Payload::ListRuntimeTasks(page)
+            }
+            _ => proto::envelope::Payload::Error(proto::Error {
+                code: proto::ErrorCode::InvalidRequest as i32,
+                message: "刷新测试只提供状态与任务列表".into(),
+            }),
+        };
+        proto::Envelope {
+            request_id: request.request_id,
+            payload: Some(payload),
+        }
+    }
+}
+
 /// 返回一个稳定 Node 运行任务摘要。
 fn runtime_summary(machine_id: &str) -> proto::RuntimeTaskSummary {
     proto::RuntimeTaskSummary {

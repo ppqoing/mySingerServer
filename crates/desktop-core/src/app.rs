@@ -44,7 +44,7 @@ use crate::{
     view_state::{
         DesktopPaths, DesktopViewState, NodeConfigControllerState, NodeConfigSavePhase,
         NodeConnectionState, NodeRuntimeStats, PostgresHealth, RuntimeTaskControllerState,
-        RuntimeTaskDetailsView, TaskView, ViewTaskState,
+        RuntimeTaskDetailsView,
     },
 };
 
@@ -636,8 +636,9 @@ async fn run_controller(
                     roots,
                     force_recalculate,
                     enumerator,
-                    &mut state,
                     &sessions,
+                    &mut runtime_view,
+                    &runtime_tasks,
                 )
                 .await
             }
@@ -1023,8 +1024,18 @@ async fn apply_runtime_event(
     }
 
     match event.outcome {
-        NodeRuntimeEventOutcome::Changed(_changed) => {
+        NodeRuntimeEventOutcome::Changed(changed) => {
+            let completed = changed.state == "completed";
             refresh_runtime_tasks(view, sessions, registry).await;
+            if completed {
+                // 任务终态由 RuntimeTask 事件提供；不再从旧持久任务列表推断完成。
+                queue_automatic(
+                    &[event.node_index],
+                    sync_workers,
+                    AutomaticSyncCause::TaskCompleted,
+                )
+                .await;
+            }
         }
         NodeRuntimeEventOutcome::Disconnected(message) => {
             sessions.remove(&event.node_index);
@@ -1220,13 +1231,11 @@ async fn connect_missing(
 struct RefreshReport {
     /// 状态请求失败、必须丢弃旧 TCP 会话的节点索引。
     failed_sessions: Vec<usize>,
-    /// 本轮首次观察到任务完成、应立即走自动同步路径的节点索引。
-    completed_nodes: Vec<usize>,
     /// 中心 cursor 查询失败；控制器必须丢弃旧 PG client，等待下一次重连。
     central_error: Option<String>,
 }
 
-/// 查询所有活动会话的节点状态与持久任务，并归并进唯一桌面视图。
+/// 查询所有活动会话的节点状态；运行任务由独立 RuntimeTask 控制器刷新。
 async fn refresh_nodes(
     state: &mut DesktopViewState,
     sessions: &BTreeMap<usize, Arc<NodeSession>>,
@@ -1252,21 +1261,6 @@ async fn refresh_nodes(
                     NodeConnectionState::Online,
                     Some(runtime_stats(status, sync)),
                 );
-                if let Ok(page) = session.list_tasks("", 1000).await {
-                    for task in page.tasks {
-                        if let Ok(task) = task_view(*index, task) {
-                            let became_completed = task.state == ViewTaskState::Completed
-                                && !state.tasks().iter().any(|current| {
-                                    current.task_id == task.task_id
-                                        && current.state == ViewTaskState::Completed
-                                });
-                            state.upsert_task(task);
-                            if became_completed && !report.completed_nodes.contains(index) {
-                                report.completed_nodes.push(*index);
-                            }
-                        }
-                    }
-                }
             }
             Err(error) => {
                 state.set_node_error(*index, error.to_string());
@@ -1529,7 +1523,7 @@ async fn apply_sync_result(
     }
 }
 
-/// 固定重连 tick：清除已断会话、重试节点/中心，并给新连接或刚完成任务排队。
+/// 固定重连 tick：清除已断会话并重试节点/中心；任务终态由 RuntimeTask 事件触发同步。
 async fn reconnect_and_sync(
     state: &mut DesktopViewState,
     sessions: &mut BTreeMap<usize, Arc<NodeSession>>,
@@ -1539,16 +1533,13 @@ async fn reconnect_and_sync(
     runtime_tasks: &DesktopRuntimeTaskRegistry,
 ) {
     let report = refresh_nodes(state, sessions, central.as_ref()).await;
-    let completed_nodes = report.completed_nodes.clone();
     apply_refresh_report(report, state, sessions, central, workers);
     if central.is_none() && state.config().postgres_url.is_some() {
         *central = connect_central(state).await;
     }
     let connected_nodes = connect_missing(state, sessions).await;
-    let mut worker_indexes = connected_nodes.clone();
-    worker_indexes.extend(completed_nodes.iter().copied());
     ensure_sync_workers(
-        &worker_indexes,
+        &connected_nodes,
         sessions,
         state.config().postgres_url.as_deref(),
         workers,
@@ -1556,7 +1547,6 @@ async fn reconnect_and_sync(
         runtime_tasks,
     );
     queue_automatic(&connected_nodes, workers, AutomaticSyncCause::Connected).await;
-    queue_automatic(&completed_nodes, workers, AutomaticSyncCause::TaskCompleted).await;
 }
 
 /// 固定五秒追赶 tick：刷新任务后只排队，不等待任一节点完成同步。
@@ -1569,7 +1559,6 @@ async fn catch_up_and_refresh(
     runtime_tasks: &DesktopRuntimeTaskRegistry,
 ) {
     let report = refresh_nodes(state, sessions, central.as_ref()).await;
-    let completed_nodes = report.completed_nodes.clone();
     apply_refresh_report(report, state, sessions, central, workers);
     let indexes = sessions.keys().copied().collect::<Vec<_>>();
     ensure_sync_workers(
@@ -1580,12 +1569,7 @@ async fn catch_up_and_refresh(
         results,
         runtime_tasks,
     );
-    queue_automatic(&completed_nodes, workers, AutomaticSyncCause::TaskCompleted).await;
-    let catch_up_nodes = indexes
-        .into_iter()
-        .filter(|index| !completed_nodes.contains(index))
-        .collect::<Vec<_>>();
-    queue_automatic(&catch_up_nodes, workers, AutomaticSyncCause::CatchUp).await;
+    queue_automatic(&indexes, workers, AutomaticSyncCause::CatchUp).await;
 }
 
 /// 创建错过 tick 后从当前时刻继续计时的固定间隔，避免恢复时突发补跑。
@@ -1698,8 +1682,9 @@ async fn create_scan(
     roots: Vec<String>,
     force_recalculate: bool,
     enumerator: EnumeratorKind,
-    state: &mut DesktopViewState,
     sessions: &BTreeMap<usize, Arc<NodeSession>>,
+    runtime_view: &mut RuntimeTaskControllerState,
+    runtime_tasks: &DesktopRuntimeTaskRegistry,
 ) -> Result<(), String> {
     let session = sessions
         .get(&node_index)
@@ -1708,15 +1693,12 @@ async fn create_scan(
         EnumeratorKind::WindowsWalker => "windows_walker",
         EnumeratorKind::Everything => "everything",
     };
-    let task_id = session
+    session
         .create_scan(roots, force_recalculate, enumerator)
         .await
         .map_err(|error| error.to_string())?;
-    let task = session
-        .query_task(task_id)
-        .await
-        .map_err(|error| error.to_string())?;
-    state.upsert_task(task_view(node_index, task)?);
+    // CreateScan 只返回接受结果；任务详情统一从当前进程 RuntimeTask 快照读取。
+    refresh_runtime_tasks(runtime_view, sessions, runtime_tasks).await;
     Ok(())
 }
 
@@ -2502,28 +2484,6 @@ fn runtime_stats(status: proto::NodeStatus, sync_high_seq: u64) -> NodeRuntimeSt
         outbox_high_seq: status.outbox_high_seq,
         sync_high_seq,
     }
-}
-
-fn task_view(node_index: usize, task: proto::TaskSummary) -> Result<TaskView, String> {
-    let state = match proto::TaskState::try_from(task.state).unwrap_or_default() {
-        proto::TaskState::TaskQueued => ViewTaskState::Queued,
-        proto::TaskState::TaskRunning => ViewTaskState::Running,
-        proto::TaskState::TaskCompleted => ViewTaskState::Completed,
-        proto::TaskState::TaskFailed => ViewTaskState::Failed,
-        proto::TaskState::TaskCancelled => ViewTaskState::Cancelled,
-        proto::TaskState::Unspecified => return Err("节点任务状态未指定".into()),
-    };
-    Ok(TaskView {
-        task_id: task.task_id,
-        node_index,
-        title: task.task_kind,
-        stage: "节点任务".into(),
-        state,
-        completed_items: task.completed_items,
-        total_items: task.total_items,
-        failed_items: task.failed_items,
-        skipped_incomplete: task.skipped_items,
-    })
 }
 
 fn persist(path: &Path, config: &DesktopConfig) -> Result<(), String> {
