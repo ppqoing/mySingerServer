@@ -6,10 +6,12 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     fmt,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use dedup_core::{ContentKey, MediaKind};
-use dedup_node_store::ResolvedScanFile;
+use dedup_media::decode_contact_sheet;
+use dedup_node_store::{FileFaultKind, FileFaultRecord, ResolvedScanFile};
 use dedup_protocol::{
     BASE_MISSING_CONTACT_SHEET, BASE_MISSING_PROBE, BASE_MISSING_STAGE1, proto::worker_envelope,
 };
@@ -29,7 +31,7 @@ use crate::{
     disk_full_cleanup::DiskFullCleaner,
     task_dispatch::TaskLanePermitProvider,
     task_files::TaskFileIdentity,
-    worker::{BaseComputeOutput, Stage1Output, decode_base_compute_payload},
+    worker::{BaseComputeOutput, Stage1Frame, Stage1Output, decode_base_compute_payload},
 };
 
 /// Media taskless 持久化调用所需的本机 artifact 和联系表配置。
@@ -202,8 +204,23 @@ fn validate_context<P: TaskLanePermitProvider>(
     Ok(())
 }
 
-/// 构造失败动作；失败只写 taskless ACK，不写历史故障表。
+/// 返回用于故障表的单调毫秒时间戳。
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+/// 构造失败动作；故障表写入和失败 ACK 必须处于同一个 actor 操作边界。
 fn build_failure_message(item: TaskFileMediaFailure) -> PendingMediaPersist {
+    let fault_normalized_path = item.record.scanned.normalized_path.clone();
+    let fault_display_path = item.record.scanned.display_path.clone();
+    let fault_file_size = item.record.scanned.file_size;
+    let fault_message = item.message.clone();
+    let fault_first_seen_at_ms = now_ms();
     let display_path = item
         .record
         .scanned
@@ -215,7 +232,26 @@ fn build_failure_message(item: TaskFileMediaFailure) -> PendingMediaPersist {
     let operation_message = item.message;
     let worker_slot = item.worker_slot;
     let identity = item.identity;
-    let operation = BasePersistMessage::new_task_file(identity.clone(), move |_store| {
+    let operation = BasePersistMessage::new_task_file(identity.clone(), move |store| {
+        store
+            .upsert_file_fault(&FileFaultRecord {
+                machine_id: store.machine_id().clone(),
+                normalized_path: fault_normalized_path,
+                display_path: fault_display_path,
+                file_size: fault_file_size,
+                kind: FileFaultKind::WorkerCrash,
+                stage: "base".to_owned(),
+                windows_error_code: None,
+                read_offset: None,
+                read_size: None,
+                worker_pid: None,
+                worker_exit_code: None,
+                first_seen_at_ms: fault_first_seen_at_ms,
+                last_seen_at_ms: fault_first_seen_at_ms,
+                occurrence_count: 1,
+                message: fault_message,
+            })
+            .map_err(|error| error.to_string())?;
         Ok(BasePersistOutcome::Failed {
             display_path: operation_display_path,
             message: operation_message,
@@ -364,7 +400,136 @@ fn validate_completed_response(
     if missing_parts & BASE_MISSING_STAGE1 != 0 && output.stage1_frames.is_none() {
         return Err("Worker 基础结果缺少 stage1 payload".into());
     }
+    validate_completed_output(item, &output, missing_parts)?;
     Ok(output)
+}
+
+/// 校验 Worker 输出的媒体类型、请求字段、尺寸、槽位和联系表。
+fn validate_completed_output(
+    item: &TaskFileMediaCompleted,
+    output: &BaseComputeOutput,
+    missing_parts: u32,
+) -> Result<(), String> {
+    if missing_parts == 0 {
+        if output.probe.is_some()
+            || output.stage1_frames.is_some()
+            || output.contact_sheet_jpeg.is_some()
+        {
+            return Err("Worker 返回了未请求的基础字段".into());
+        }
+        return Ok(());
+    }
+
+    let probe = output
+        .probe
+        .as_ref()
+        .ok_or_else(|| "Worker 基础结果缺少媒体 probe".to_owned())?;
+    if let Some(cached) = item.context.cached.as_ref()
+        && matches!(cached.media_kind, MediaKind::Image | MediaKind::Video)
+        && cached.media_kind != probe.media_kind
+    {
+        return Err("Worker 媒体类型与已有缓存不一致".into());
+    }
+
+    let stage1_requested = missing_parts & BASE_MISSING_STAGE1 != 0;
+    if output.stage1_frames.is_some() != stage1_requested {
+        return Err(if stage1_requested {
+            "Worker 基础结果缺少已请求的 stage1 字段"
+        } else {
+            "Worker 返回了未请求的 stage1 字段"
+        }
+        .into());
+    }
+    let contact_requested = missing_parts & BASE_MISSING_CONTACT_SHEET != 0;
+    if output.contact_sheet_jpeg.is_some() != contact_requested {
+        return Err(if contact_requested {
+            "Worker 基础结果缺少已请求的联系表"
+        } else {
+            "Worker 返回了未请求的联系表"
+        }
+        .into());
+    }
+
+    match probe.media_kind {
+        MediaKind::Image => {
+            if probe.width == 0 || probe.height == 0 || probe.duration_ms.is_some() {
+                return Err("图片 probe 的尺寸或时长无效".into());
+            }
+            if contact_requested {
+                return Err("图片不能返回视频联系表".into());
+            }
+            if let Some(frames) = output.stage1_frames.as_ref() {
+                if frames.len() != 1 {
+                    return Err("图片 stage1 必须只有一个槽位".into());
+                }
+                let frame = &frames[0];
+                if frame.slot != 0 {
+                    return Err("图片 stage1 槽位必须为 0".into());
+                }
+                validate_stage1_frame(frame, "图片")?;
+            }
+        }
+        MediaKind::Video => {
+            if probe.width == 0 || probe.height == 0 || probe.duration_ms.unwrap_or(0) == 0 {
+                return Err("视频 probe 的尺寸或正时长无效".into());
+            }
+            if let Some(frames) = output.stage1_frames.as_ref() {
+                if frames.len() != 6 {
+                    return Err("视频 stage1 必须包含六个槽位".into());
+                }
+                let mut seen = [false; 6];
+                for frame in frames {
+                    if frame.slot > 5 || seen[usize::from(frame.slot)] {
+                        return Err("视频 stage1 槽位必须唯一且位于 0..=5".into());
+                    }
+                    seen[usize::from(frame.slot)] = true;
+                    validate_stage1_frame(frame, "视频")?;
+                }
+                if seen.iter().any(|present| !present) {
+                    return Err("视频 stage1 必须覆盖 0..=5 全部槽位".into());
+                }
+            }
+            if let Some(jpeg) = output.contact_sheet_jpeg.as_ref() {
+                let cells = decode_contact_sheet(jpeg)
+                    .map_err(|error| format!("联系表 JPEG 无法解码: {error}"))?;
+                if cells
+                    .iter()
+                    .any(|cell| cell.width() != 320 || cell.height() != 180)
+                {
+                    return Err("联系表必须为固定 960x360 画布".into());
+                }
+            }
+        }
+        MediaKind::Other => {
+            if probe.duration_ms.is_some() {
+                return Err("其他文件 probe 不应包含视频时长".into());
+            }
+            if stage1_requested || contact_requested {
+                return Err("其他文件不能返回媒体特征或联系表".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 校验一个图片或视频槽位恰好只有成功特征或失败诊断，并拒绝无效范围。
+fn validate_stage1_frame(frame: &Stage1Frame, media_label: &str) -> Result<(), String> {
+    if frame.feature.is_some() == frame.error.is_some() {
+        return Err(format!(
+            "{media_label} stage1 槽位必须恰好包含 feature 或 error"
+        ));
+    }
+    if let Some(feature) = frame.feature.as_ref()
+        && (feature.width == 0 || feature.height == 0 || feature.quality > 100)
+    {
+        return Err(format!("{media_label} stage1 特征尺寸或 Quality 无效"));
+    }
+    if let Some(error) = frame.error.as_ref()
+        && error.trim().is_empty()
+    {
+        return Err(format!("{media_label} stage1 失败诊断不能为空"));
+    }
+    Ok(())
 }
 
 /// 在单写 actor 中准备联系表、提交 taskless stage1，并按事务结果确认或回滚。
@@ -577,7 +742,9 @@ mod tests {
     use std::path::Path;
 
     use dedup_core::{DisplayPath, MachineId, MediaKind, NormalizedPath};
-    use dedup_media::{ImageStage1, PdqHash, Rgb24Image, encode_contact_sheet};
+    use dedup_media::{
+        ImageStage1, PdqHash, Rgb24Image, decode_contact_sheet, encode_contact_sheet,
+    };
     use dedup_media_ffmpeg::MediaProbe;
     use dedup_node_store::{BaseCacheRecord, NodeStore, ScannedPath};
     use dedup_protocol::{BASE_MISSING_CONTACT_SHEET, proto, proto::worker_envelope};
@@ -588,6 +755,7 @@ mod tests {
         scan::{
             BaseTaskInput, BaseTaskProducer, PlannedScannedPath, TaskDiskLane,
             base_persistence::BaseStoreActor,
+            publish_contact_sheet_for_test,
             task_file_base_compute::TaskFileBaseComputePending,
             task_file_media_compute::{
                 MediaPassResult, TaskFileMediaCompleted, TaskFileMediaFailure,
@@ -884,6 +1052,125 @@ mod tests {
         drop(handle);
         let store = actor.finish().await.unwrap();
         assert!(store.page_tasks(None, 100).unwrap().items.is_empty());
+        let faults = store.page_file_faults(None, 10).unwrap().items;
+        assert_eq!(faults.len(), 1);
+        assert_eq!(faults[0].kind, dedup_node_store::FileFaultKind::WorkerCrash);
+        assert_eq!(faults[0].stage, "base");
+    }
+
+    #[tokio::test]
+    async fn invalid_worker_quality_becomes_file_fault_and_never_completes_base() {
+        let root = tempfile::tempdir().unwrap();
+        let md5 = [0xB6; 16];
+        let machine = MachineId::from_sha256([0xB7; 32]);
+        let mut store = NodeStore::open_in_memory(machine).unwrap();
+        let cached = seed_partial_kind(
+            &mut store,
+            r"C:\seed-invalid-quality.bin",
+            md5,
+            10,
+            MediaKind::Image,
+        );
+        let (pending, identity, record) = take_media_task(production(
+            root.path(),
+            r"C:\media-invalid-quality.bin",
+            md5,
+            10,
+            cached,
+            true,
+        ))
+        .await;
+        let task_path = pending.dispatcher.lane_path(&lane(7)).unwrap();
+        let context = pending.contexts.get(&identity).unwrap().clone();
+        let content_id = context.content_id.unwrap();
+        let mut output = image_output();
+        output
+            .stage1_frames
+            .as_mut()
+            .unwrap()
+            .first_mut()
+            .unwrap()
+            .feature
+            .as_mut()
+            .unwrap()
+            .quality = 101;
+        let media = MediaPassResult {
+            pending,
+            completed: vec![TaskFileMediaCompleted {
+                identity: identity.clone(),
+                record,
+                context,
+                response: completed_response(&identity, md5, output),
+                worker_slot: Some(6),
+            }],
+            file_failures: Vec::new(),
+            blocked_reason: None,
+            remaining_hash_rows: 0,
+            cancelled: false,
+        };
+        let (actor, handle, mut acknowledgements) = BaseStoreActor::spawn(store, 2);
+        let result = persist_task_file_media_results(
+            media,
+            &handle,
+            &mut acknowledgements,
+            TaskFileMediaPersistenceOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(task_path).unwrap()[0], b'F');
+        assert!(result.contexts.is_empty());
+        drop(handle);
+        let store = actor.finish().await.unwrap();
+        let faults = store.page_file_faults(None, 10).unwrap().items;
+        assert_eq!(faults.len(), 1);
+        assert_eq!(faults[0].kind, dedup_node_store::FileFaultKind::WorkerCrash);
+        assert_eq!(faults[0].stage, "base");
+        assert_eq!(
+            faults[0].normalized_path.as_str(),
+            r"C:\MEDIA-INVALID-QUALITY.BIN"
+        );
+        assert!(
+            !store
+                .load_base_cache_record(content_id)
+                .unwrap()
+                .base_complete
+        );
+    }
+
+    #[test]
+    fn damaged_existing_contact_sheet_is_replaced_by_valid_partial() {
+        let root = tempfile::tempdir().unwrap();
+        let temp = root.path().join("new.partial");
+        let final_path = root.path().join("content.jpg");
+        let valid = video_output().contact_sheet_jpeg.unwrap();
+        std::fs::write(&final_path, b"damaged-jpeg").unwrap();
+        std::fs::write(&temp, &valid).unwrap();
+
+        publish_contact_sheet_for_test(&temp, &final_path, || Ok(())).unwrap();
+
+        assert_eq!(std::fs::read(&final_path).unwrap(), valid);
+        assert!(decode_contact_sheet(&std::fs::read(&final_path).unwrap()).is_ok());
+        assert!(!temp.exists());
+    }
+
+    #[test]
+    fn contact_sheet_replacement_rollback_restores_previous_file() {
+        let root = tempfile::tempdir().unwrap();
+        let temp = root.path().join("rollback.partial");
+        let final_path = root.path().join("content.jpg");
+        let previous = b"previous-valid-or-damaged".to_vec();
+        let replacement = video_output().contact_sheet_jpeg.unwrap();
+        std::fs::write(&final_path, &previous).unwrap();
+        std::fs::write(&temp, &replacement).unwrap();
+
+        let error = publish_contact_sheet_for_test(&temp, &final_path, || {
+            Err(crate::scan::ScanError::Stage1("模拟引用失败".into()))
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("模拟引用失败"));
+        assert_eq!(std::fs::read(&final_path).unwrap(), previous);
+        assert!(!temp.exists());
     }
 
     #[tokio::test]

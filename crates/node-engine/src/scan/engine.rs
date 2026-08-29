@@ -1816,6 +1816,8 @@ pub(super) struct PublishedContactSheet {
     final_lease: Option<ArtifactLease>,
     /// 仅本轮从 partial rename 出来的最终文件允许失败补偿删除。
     owned_final: bool,
+    /// 被替换的旧最终文件；事务确认后删除，事务失败时恢复。
+    previous_final: Option<PathBuf>,
 }
 
 impl PendingContactSheet {
@@ -1839,10 +1841,8 @@ impl PendingContactSheet {
             mut artifact_lease,
         } = self;
         if let Some(temp_path) = temp_path {
-            let mut owned_final = false;
             let mut final_lease = None;
-            publish_contact_sheet(&temp_path, &final_path, |published_here| {
-                owned_final = published_here;
+            let publish_state = publish_contact_sheet(&temp_path, &final_path, |published_here| {
                 drop(artifact_lease.take());
                 if let Some(registry) = &registry {
                     registry.unregister(&temp_path)?;
@@ -1864,7 +1864,8 @@ impl PendingContactSheet {
                 relative_path,
                 registry,
                 final_lease,
-                owned_final,
+                owned_final: publish_state.owned_final,
+                previous_final: publish_state.previous_final,
             });
         }
         if !final_path.is_file() {
@@ -1879,6 +1880,7 @@ impl PendingContactSheet {
             registry,
             final_lease: artifact_lease,
             owned_final: false,
+            previous_final: None,
         })
     }
 }
@@ -1892,6 +1894,9 @@ impl PublishedContactSheet {
     /// guarded 事务 Applied 后确认文件归属，释放临时租约即可。
     pub(super) fn confirm(self) {
         drop(self.final_lease);
+        if let Some(previous_final) = self.previous_final {
+            let _ = fs::remove_file(previous_final);
+        }
     }
 
     /// guarded 忽略、身份错配或事务错误时补偿本轮拥有的 final。
@@ -1907,12 +1912,16 @@ impl PublishedContactSheet {
             registry_error = Some(error.to_string());
         }
         let file_error = fs::remove_file(&self.final_path).err();
-        match (registry_error, file_error) {
-            (None, None) => Ok(()),
-            (registry, file) => Err(ScanError::Stage1(format!(
-                "联系表事务失败补偿不完整: registry={}, file={}",
+        let restore_error = self
+            .previous_final
+            .and_then(|previous_final| fs::rename(previous_final, &self.final_path).err());
+        match (registry_error, file_error, restore_error) {
+            (None, None, None) => Ok(()),
+            (registry, file, restore) => Err(ScanError::Stage1(format!(
+                "联系表事务失败补偿不完整: registry={}, file={}, restore={}",
                 registry.unwrap_or_else(|| "ok".into()),
-                file.map_or_else(|| "ok".into(), |error| error.to_string())
+                file.map_or_else(|| "ok".into(), |error| error.to_string()),
+                restore.map_or_else(|| "ok".into(), |error| error.to_string())
             ))),
         }
     }
@@ -2036,32 +2045,73 @@ pub(super) fn commit_contact_sheet(
     }
 }
 
+/// 一次联系表发布的文件所有权变化，供提交确认或失败回滚使用。
+struct ContactSheetPublishState {
+    /// 本轮是否创建了新的最终文件。
+    owned_final: bool,
+    /// 被新文件替换的旧最终文件备份路径。
+    previous_final: Option<PathBuf>,
+}
+
+/// 原子替换联系表并在引用提交失败时恢复旧文件。
 fn publish_contact_sheet(
     temp_path: &Path,
     final_path: &Path,
     commit_reference: impl FnOnce(bool) -> Result<(), ScanError>,
-) -> Result<(), ScanError> {
-    let owned_final = if final_path.exists() {
-        fs::remove_file(temp_path)?;
-        false
-    } else {
-        if let Err(error) = fs::rename(temp_path, final_path) {
-            let _ = fs::remove_file(temp_path);
-            return Err(error.into());
+) -> Result<ContactSheetPublishState, ScanError> {
+    if !temp_path.is_file() {
+        return Err(ScanError::Stage1(format!(
+            "联系表 partial 文件不存在: {}",
+            temp_path.display()
+        )));
+    }
+    let previous_final = if final_path.exists() {
+        if !final_path.is_file() {
+            return Err(ScanError::Stage1(format!(
+                "联系表最终路径不是文件: {}",
+                final_path.display()
+            )));
         }
-        true
+        let backup = final_path.with_file_name(format!(
+            ".{}.previous",
+            temp_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("contact-sheet")
+        ));
+        if backup.exists() {
+            fs::remove_file(&backup)?;
+        }
+        fs::rename(final_path, &backup)?;
+        Some(backup)
+    } else {
+        None
     };
-    if let Err(error) = commit_reference(owned_final) {
-        if owned_final {
-            if let Err(cleanup) = fs::remove_file(final_path) {
-                return Err(ScanError::Stage1(format!(
-                    "{error}; 联系表引用失败后的本轮文件补偿也失败: {cleanup}"
-                )));
-            }
+    if let Err(error) = fs::rename(temp_path, final_path) {
+        let _ = fs::remove_file(temp_path);
+        if let Some(previous_final) = previous_final.as_ref() {
+            let _ = fs::rename(previous_final, final_path);
+        }
+        return Err(error.into());
+    }
+    if let Err(error) = commit_reference(true) {
+        let cleanup = fs::remove_file(final_path).err();
+        let restore = previous_final
+            .as_ref()
+            .and_then(|previous_final| fs::rename(previous_final, final_path).err());
+        if cleanup.is_some() || restore.is_some() {
+            return Err(ScanError::Stage1(format!(
+                "{error}; 联系表引用失败后的文件补偿不完整: cleanup={}, restore={}",
+                cleanup.map_or_else(|| "ok".into(), |value| value.to_string()),
+                restore.map_or_else(|| "ok".into(), |value| value.to_string())
+            )));
         }
         return Err(error);
     }
-    Ok(())
+    Ok(ContactSheetPublishState {
+        owned_final: true,
+        previous_final,
+    })
 }
 
 /// 只供直接行为测试验证联系表发布与引用失败补偿。
@@ -2071,7 +2121,7 @@ pub fn publish_contact_sheet_for_test(
     final_path: &Path,
     commit_reference: impl FnOnce() -> Result<(), ScanError>,
 ) -> Result<(), ScanError> {
-    publish_contact_sheet(temp_path, final_path, |_| commit_reference())
+    publish_contact_sheet(temp_path, final_path, |_| commit_reference()).map(|_| ())
 }
 
 fn register_and_lease(
