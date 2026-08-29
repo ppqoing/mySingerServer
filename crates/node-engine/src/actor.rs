@@ -1,7 +1,7 @@
 //! 节点业务 actor：网络和托盘只发送命令，SQLite 与 WorkerPool 保持单一所有者。
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     future::Future,
     net::SocketAddr,
@@ -17,9 +17,10 @@ use dedup_core::{
 use dedup_node_store::{
     AnalysisStatus, ConfirmedDeleteItem, DeleteBatchPlan, DeleteOutcome, GroupKind, NodeStore,
     OwnedSnapshot, PersistentStageState as StorePersistentStageState, PlannedDeleteItem,
-    ReviewDecision, ScannedPath, StoreError, TaskSnapshot, TaskStageWrite, TaskStatus,
+    ReviewDecision, ScannedPath, StoreError, TaskStageWrite, TaskStatus,
+    classify_cache_completeness,
 };
-use dedup_protocol::proto;
+use dedup_protocol::{BASE_MISSING_PROBE, BASE_MISSING_STAGE1, proto};
 use thiserror::Error;
 use tokio::{
     sync::{mpsc, oneshot},
@@ -818,8 +819,16 @@ impl EngineState {
             Some(proto::envelope::Payload::NodeStatus(_)) => self.node_status(),
             Some(proto::envelope::Payload::CreateScan(scan)) => self.create_scan(scan).await,
             Some(proto::envelope::Payload::CancelTask(cancel)) => self.cancel_task(cancel).await,
-            Some(proto::envelope::Payload::QueryTask(query)) => self.query_task(query),
-            Some(proto::envelope::Payload::ListTasks(query)) => self.list_tasks(query),
+            Some(proto::envelope::Payload::QueryTask(query)) => {
+                let runtime_tasks = self.runtime_tasks.clone();
+                let latest_completed_scan = self.latest_completed_scan.clone();
+                Self::query_task(runtime_tasks, latest_completed_scan, query).await
+            }
+            Some(proto::envelope::Payload::ListTasks(query)) => {
+                let runtime_tasks = self.runtime_tasks.clone();
+                let latest_completed_scan = self.latest_completed_scan.clone();
+                Self::list_tasks(runtime_tasks, latest_completed_scan, query).await
+            }
             Some(proto::envelope::Payload::BrowsePaths(query)) => browse_paths(query),
             Some(proto::envelope::Payload::CreateLocalAnalysis(create)) => {
                 self.create_local_analysis(create).await
@@ -1104,27 +1113,86 @@ impl EngineState {
         Ok(proto::envelope::Payload::CancelTask(request))
     }
 
-    fn query_task(&self, request: proto::QueryTask) -> ProtocolResult {
-        let snapshot = self
-            .store
-            .task_snapshot(parse_task_id(&request.task_id)?)
-            .map_err(store_error)?;
+    /// 查询当前进程仍可见的运行扫描或最近一次完成扫描，不读取 SQLite 任务表。
+    async fn query_task(
+        runtime_tasks: RuntimeTaskRegistry,
+        latest_completed_scan: Option<crate::scan::CompletedScanSnapshot>,
+        request: proto::QueryTask,
+    ) -> ProtocolResult {
+        let task_id = parse_task_id(&request.task_id)?;
+        let task_id_text = task_id.as_uuid().to_string();
+        let details = runtime_tasks
+            .details(&task_id_text)
+            .await
+            .ok_or_else(|| not_found(format!("运行任务不存在: {}", request.task_id)))?;
+        let summary = details
+            .summary
+            .ok_or_else(|| not_found("运行任务摘要不存在"))?;
+        let is_latest_completed = latest_completed_scan
+            .as_ref()
+            .is_some_and(|scan| scan.task_id == task_id && summary.state == "completed");
+        if summary.state != "running" && !is_latest_completed {
+            return Err(not_found(format!("运行任务不存在: {}", request.task_id)));
+        }
+        let outbox_high_seq = if is_latest_completed {
+            latest_completed_scan
+                .as_ref()
+                .map_or(0, |scan| scan.outbox_high_seq)
+        } else {
+            0
+        };
         Ok(proto::envelope::Payload::QueryTask(proto::QueryTask {
             task_id: request.task_id,
-            task: Some(task_summary(snapshot)),
+            task: Some(runtime_task_summary(summary, outbox_high_seq)),
         }))
     }
 
-    fn list_tasks(&self, request: proto::ListTasks) -> ProtocolResult {
-        let page = self
-            .store
-            .page_tasks(cursor(&request.cursor), request.limit as usize)
-            .map_err(store_error)?;
+    /// 列出当前进程 registry 中的运行任务，保留原协议分页字段但不查询 SQLite 任务表。
+    async fn list_tasks(
+        runtime_tasks: RuntimeTaskRegistry,
+        latest_completed_scan: Option<crate::scan::CompletedScanSnapshot>,
+        request: proto::ListTasks,
+    ) -> ProtocolResult {
+        let runtime_tasks = runtime_tasks.list().await;
+        let start = if request.cursor.is_empty() {
+            0
+        } else {
+            runtime_tasks
+                .iter()
+                .position(|task| task.runtime_task_id == request.cursor)
+                .map(|index| index + 1)
+                .ok_or_else(|| invalid("任务分页游标不存在"))?
+        };
+        let limit = if request.limit == 0 {
+            100
+        } else {
+            request.limit.min(1_000) as usize
+        };
+        let end = start.saturating_add(limit).min(runtime_tasks.len());
+        let tasks = runtime_tasks[start..end]
+            .iter()
+            .cloned()
+            .map(|summary| {
+                let outbox_high_seq = latest_completed_scan
+                    .as_ref()
+                    .filter(|scan| {
+                        scan.task_id.as_uuid().to_string() == summary.runtime_task_id
+                            && summary.state == "completed"
+                    })
+                    .map_or(0, |scan| scan.outbox_high_seq);
+                runtime_task_summary(summary, outbox_high_seq)
+            })
+            .collect::<Vec<_>>();
+        let next_cursor = if end < runtime_tasks.len() {
+            runtime_tasks[end - 1].runtime_task_id.clone()
+        } else {
+            String::new()
+        };
         Ok(proto::envelope::Payload::ListTasks(proto::ListTasks {
             cursor: request.cursor,
             limit: request.limit,
-            tasks: page.items.into_iter().map(task_summary).collect(),
-            next_cursor: page.next_cursor.unwrap_or_default(),
+            tasks,
+            next_cursor,
         }))
     }
 
@@ -1368,24 +1436,33 @@ impl EngineState {
         Ok(proto::envelope::Payload::SaveReviewMark(request))
     }
 
+    /// 从当前进程最近完成扫描的快照批量构造分析输入，不读取历史任务或分析输入表。
     fn prepare_analysis_input(&self, request: proto::PrepareAnalysisInput) -> ProtocolResult {
-        let rows = if request.scan_task_ids.is_empty() {
-            let run_id = parse_analysis_id(&request.analysis_run_id)?;
-            self.store.analysis_inputs(run_id).map_err(store_error)?
-        } else {
-            let tasks = request
-                .scan_task_ids
-                .iter()
-                .map(|task_id| parse_task_id(task_id))
-                .collect::<Result<Vec<_>, _>>()?;
-            self.store
-                .analysis_inputs_for_tasks(&tasks)
-                .map_err(store_error)?
-        };
-        let mut grouped = BTreeMap::<ContentKey, Vec<LocationKey>>::new();
-        for row in rows {
-            grouped.entry(row.content).or_default().push(row.location);
+        if request.scan_task_ids.len() != 1 {
+            return Err(invalid("分析输入必须且只能选择最近一次完成扫描"));
         }
+        let requested_task_id = parse_task_id(&request.scan_task_ids[0])?;
+        let snapshot = self
+            .latest_completed_scan
+            .as_ref()
+            .filter(|snapshot| snapshot.task_id == requested_task_id)
+            .ok_or_else(|| not_found("最近一次完成扫描不存在"))?;
+
+        let mut grouped = BTreeMap::<ContentKey, BTreeSet<LocationKey>>::new();
+        for resolved in &snapshot.resolved_files {
+            grouped
+                .entry(resolved.content)
+                .or_default()
+                .insert(LocationKey::new(
+                    self.store.machine_id().clone(),
+                    resolved.scanned.normalized_path.clone(),
+                ));
+        }
+        let keys = grouped.keys().copied().collect::<Vec<_>>();
+        let records = self
+            .store
+            .lookup_base_cache_by_keys(&keys)
+            .map_err(store_error)?;
         let start = if request.cursor.is_empty() {
             0
         } else {
@@ -1395,30 +1472,27 @@ impl EngineState {
         let entries = grouped.into_iter().collect::<Vec<_>>();
         let end = start.saturating_add(limit).min(entries.len());
         let mut inputs = Vec::with_capacity(end.saturating_sub(start));
-        for (content, locations) in &entries[start..end] {
-            let content_id = self
-                .store
-                .content_id_by_key(*content)
-                .map_err(store_error)?
-                .ok_or_else(|| internal("分析输入内容不存在"))?;
-            let kind = self
-                .store
-                .content_media_kind(content_id)
-                .map_err(store_error)?;
+        for (index, (content, locations)) in entries[start..end].iter().enumerate() {
+            let cached = records
+                .get(start + index)
+                .and_then(Option::as_ref)
+                .ok_or_else(|| internal("分析输入内容缓存不存在"))?;
+            let completeness = classify_cache_completeness(cached, true);
+            let stage1_complete =
+                completeness.base_missing_parts & (BASE_MISSING_PROBE | BASE_MISSING_STAGE1) == 0;
+            let stage2_complete = match cached.media_kind {
+                dedup_core::MediaKind::Image => !completeness.image_stage2_missing,
+                dedup_core::MediaKind::Video => {
+                    stage1_complete && completeness.video_stage2_missing_slots == 0
+                }
+                dedup_core::MediaKind::Other => false,
+            };
             inputs.push(proto::AnalysisInput {
                 content: Some(content.into()),
                 locations: locations.iter().map(Into::into).collect(),
-                media_kind: wire_media_kind(kind) as i32,
-                stage1_complete: self
-                    .store
-                    .load_complete_stage1(content_id)
-                    .map_err(store_error)?
-                    .is_some(),
-                stage2_complete: self
-                    .store
-                    .load_complete_stage2(content_id)
-                    .map_err(store_error)?
-                    .is_some(),
+                media_kind: wire_media_kind(cached.media_kind) as i32,
+                stage1_complete,
+                stage2_complete,
             });
         }
         Ok(proto::envelope::Payload::PrepareAnalysisInput(
@@ -2330,6 +2404,11 @@ fn invalid(error: impl std::fmt::Display) -> (proto::ErrorCode, String) {
     (proto::ErrorCode::InvalidRequest, error.to_string())
 }
 
+/// 返回协议层统一的“当前进程不存在该任务”错误。
+fn not_found(error: impl std::fmt::Display) -> (proto::ErrorCode, String) {
+    (proto::ErrorCode::NotFound, error.to_string())
+}
+
 fn internal(error: impl std::fmt::Display) -> (proto::ErrorCode, String) {
     (proto::ErrorCode::Internal, error.to_string())
 }
@@ -2350,26 +2429,32 @@ fn cursor(value: &str) -> Option<&str> {
     (!value.is_empty()).then_some(value)
 }
 
-fn task_summary(task: TaskSnapshot) -> proto::TaskSummary {
+/// 把当前进程 registry 的运行摘要转换为旧任务查询协议，避免重新读取 SQLite 任务表。
+fn runtime_task_summary(
+    summary: proto::RuntimeTaskSummary,
+    outbox_high_seq: u64,
+) -> proto::TaskSummary {
+    let state = wire_runtime_task_status(&summary.state);
     proto::TaskSummary {
-        task_id: task.task_id.as_uuid().to_string(),
-        task_kind: task.kind,
-        state: wire_task_status(task.status) as i32,
-        total_items: task.total_items,
-        completed_items: task.succeeded + task.failed + task.cancelled,
-        failed_items: task.failed,
-        skipped_items: 0,
-        outbox_high_seq: task.outbox_high_seq,
+        task_id: summary.runtime_task_id,
+        task_kind: summary.task_kind,
+        state: state as i32,
+        total_items: summary.overall_total,
+        completed_items: summary.overall_completed,
+        failed_items: summary.overall_failed,
+        skipped_items: summary.overall_skipped,
+        outbox_high_seq,
     }
 }
 
-const fn wire_task_status(status: TaskStatus) -> proto::TaskState {
-    match status {
-        TaskStatus::Queued => proto::TaskState::TaskQueued,
-        TaskStatus::Running => proto::TaskState::TaskRunning,
-        TaskStatus::Completed => proto::TaskState::TaskCompleted,
-        TaskStatus::Failed => proto::TaskState::TaskFailed,
-        TaskStatus::Cancelled => proto::TaskState::TaskCancelled,
+/// 把 registry 的运行态字符串转换为兼容的任务状态枚举。
+fn wire_runtime_task_status(state: &str) -> proto::TaskState {
+    match state {
+        "running" => proto::TaskState::TaskRunning,
+        "completed" => proto::TaskState::TaskCompleted,
+        "failed" => proto::TaskState::TaskFailed,
+        "cancelled" => proto::TaskState::TaskCancelled,
+        _ => proto::TaskState::Unspecified,
     }
 }
 
@@ -2818,6 +2903,7 @@ mod tests {
             panic!("CreateScan 必须返回真实任务 ID");
         };
         assert_eq!(accepted.task_id, running_task_id);
+        let registry = handle.runtime_tasks_for_test();
 
         let busy = handle
             .handle(proto::Envelope {
@@ -2846,8 +2932,28 @@ mod tests {
             .await;
         assert!(matches!(
             query.payload,
-            Some(proto::envelope::Payload::Error(proto::Error { code, .. }))
-                if code == proto::ErrorCode::Internal as i32
+            Some(proto::envelope::Payload::QueryTask(proto::QueryTask {
+                task: Some(proto::TaskSummary { state, .. }),
+                ..
+            })) if state == proto::TaskState::TaskRunning as i32
+        ));
+
+        let list = handle
+            .handle(proto::Envelope {
+                request_id: 6,
+                payload: Some(proto::envelope::Payload::ListTasks(proto::ListTasks {
+                    cursor: String::new(),
+                    limit: 100,
+                    tasks: Vec::new(),
+                    next_cursor: String::new(),
+                })),
+            })
+            .await;
+        assert!(matches!(
+            list.payload,
+            Some(proto::envelope::Payload::ListTasks(proto::ListTasks { tasks, .. }))
+                if tasks.iter().any(|task| task.task_id == running_task_id
+                    && task.state == proto::TaskState::TaskRunning as i32)
         ));
 
         let cancel = tokio::time::timeout(
@@ -2866,6 +2972,25 @@ mod tests {
             Some(proto::envelope::Payload::CancelTask(_))
         ));
 
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let finished = registry
+                    .details(&accepted.task_id)
+                    .await
+                    .is_some_and(|details| {
+                        details
+                            .summary
+                            .is_some_and(|summary| summary.state != "running")
+                    });
+                if finished {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("取消后运行任务必须进入终态");
+
         let final_query = handle
             .handle(proto::Envelope {
                 request_id: 4,
@@ -2878,7 +3003,7 @@ mod tests {
         assert!(matches!(
             final_query.payload,
             Some(proto::envelope::Payload::Error(proto::Error { code, .. }))
-                if code == proto::ErrorCode::Internal as i32
+                if code == proto::ErrorCode::NotFound as i32
         ));
 
         handle.shutdown().await.unwrap();
@@ -3009,6 +3134,9 @@ mod tests {
             .expect("扫描必须进入真实 Worker")
             .expect("可控 Worker 不应提前关闭");
         controller
+            .base_source_read_complete(accepted.task_id.clone(), item_id.clone())
+            .await;
+        controller
             .complete_base(
                 accepted.task_id.clone(),
                 item_id,
@@ -3046,6 +3174,65 @@ mod tests {
             .expect("completed 事件可见时 actor 必须已经保存扫描快照");
         assert_eq!(snapshot.task_id.as_uuid().to_string(), accepted.task_id);
         assert_eq!(snapshot.roots.len(), 1);
+
+        let query = handle
+            .handle(proto::Envelope {
+                request_id: 63,
+                payload: Some(proto::envelope::Payload::QueryTask(proto::QueryTask {
+                    task_id: accepted.task_id.clone(),
+                    task: None,
+                })),
+            })
+            .await;
+        assert!(matches!(
+            query.payload,
+            Some(proto::envelope::Payload::QueryTask(proto::QueryTask {
+                task: Some(proto::TaskSummary {
+                    state,
+                    outbox_high_seq,
+                    ..
+                }),
+                ..
+            })) if state == proto::TaskState::TaskCompleted as i32
+                && outbox_high_seq == snapshot.outbox_high_seq
+        ));
+
+        let analysis_input = handle
+            .handle(proto::Envelope {
+                request_id: 64,
+                payload: Some(proto::envelope::Payload::PrepareAnalysisInput(
+                    proto::PrepareAnalysisInput {
+                        analysis_run_id: AnalysisRunId::new().as_uuid().to_string(),
+                        cursor: String::new(),
+                        limit: 100,
+                        inputs: Vec::new(),
+                        next_cursor: String::new(),
+                        scan_task_ids: vec![accepted.task_id.clone()],
+                    },
+                )),
+            })
+            .await;
+        let Some(proto::envelope::Payload::PrepareAnalysisInput(analysis_input)) =
+            analysis_input.payload
+        else {
+            panic!("最新完成扫描必须可用于分析输入");
+        };
+        assert_eq!(analysis_input.inputs.len(), 1);
+
+        let stale_query = handle
+            .handle(proto::Envelope {
+                request_id: 65,
+                payload: Some(proto::envelope::Payload::QueryTask(proto::QueryTask {
+                    task_id: TaskId::new().as_uuid().to_string(),
+                    task: None,
+                })),
+            })
+            .await;
+        assert!(matches!(
+            stale_query.payload,
+            Some(proto::envelope::Payload::Error(proto::Error { code, .. }))
+                if code == proto::ErrorCode::NotFound as i32
+        ));
 
         handle.shutdown().await.unwrap();
         actor.await.unwrap();
