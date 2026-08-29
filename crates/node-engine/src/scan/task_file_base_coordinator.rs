@@ -19,6 +19,7 @@ use super::{
 };
 use crate::{
     RemoteFeatureCache,
+    runtime_tasks::RuntimeTaskReporter,
     task_dispatch::{TaskDispatchAdmission, TaskDispatchPoll, TaskLanePermitProvider},
     worker::WorkerPool,
 };
@@ -142,6 +143,76 @@ where
     H: HashPermitReader<Permit = P::Permit>,
     R: RemoteFeatureCache,
 {
+    run_task_file_base_coordinator_inner(
+        production,
+        reader,
+        worker_pool,
+        store,
+        acknowledgements,
+        options,
+        cancellation,
+        remote,
+        remote_available,
+        warning,
+        None,
+    )
+    .await
+}
+
+/// 运行带 Worker 运行时遥测的瞬态基础协调循环；底层状态机与 SQLite ACK 不变。
+pub(crate) async fn run_task_file_base_coordinator_with_runtime<P, H, R>(
+    production: BaseTaskProduction<P>,
+    reader: H,
+    worker_pool: &mut WorkerPool,
+    store: &BaseStoreHandle,
+    acknowledgements: &mut UnboundedReceiver<BasePersistAck>,
+    options: TaskFileBaseCoordinatorOptions,
+    cancellation: ReadCancellationToken,
+    remote: &R,
+    remote_available: &mut bool,
+    warning: &mut Option<String>,
+    reporter: &RuntimeTaskReporter,
+) -> Result<TaskFileBaseCoordinatorResult<P>, TaskFileBaseCoordinatorError<P>>
+where
+    P: TaskLanePermitProvider,
+    H: HashPermitReader<Permit = P::Permit>,
+    R: RemoteFeatureCache,
+{
+    run_task_file_base_coordinator_inner(
+        production,
+        reader,
+        worker_pool,
+        store,
+        acknowledgements,
+        options,
+        cancellation,
+        remote,
+        remote_available,
+        warning,
+        Some(reporter),
+    )
+    .await
+}
+
+/// 共享瞬态基础协调循环；报告器只增加运行时投影，不改变任务文件所有权。
+async fn run_task_file_base_coordinator_inner<P, H, R>(
+    production: BaseTaskProduction<P>,
+    reader: H,
+    worker_pool: &mut WorkerPool,
+    store: &BaseStoreHandle,
+    acknowledgements: &mut UnboundedReceiver<BasePersistAck>,
+    options: TaskFileBaseCoordinatorOptions,
+    cancellation: ReadCancellationToken,
+    remote: &R,
+    remote_available: &mut bool,
+    warning: &mut Option<String>,
+    reporter: Option<&RuntimeTaskReporter>,
+) -> Result<TaskFileBaseCoordinatorResult<P>, TaskFileBaseCoordinatorError<P>>
+where
+    P: TaskLanePermitProvider,
+    H: HashPermitReader<Permit = P::Permit>,
+    R: RemoteFeatureCache,
+{
     let TaskFileBaseCoordinatorOptions {
         hash_capacity,
         worker_capacity,
@@ -156,16 +227,28 @@ where
         }
 
         // 每一轮先让已知 MD5 的 Media 前进；Hash 队首阻塞时由 Media pass 明确交回 Hash。
-        let media = match run_task_file_media_compute(
-            pending,
-            worker_pool,
-            store,
-            &read_config,
-            worker_capacity,
-            cancellation.clone(),
-        )
-        .await
-        {
+        let media = match if let Some(reporter) = reporter {
+            super::task_file_media_compute::run_task_file_media_compute_with_runtime(
+                pending,
+                worker_pool,
+                store,
+                &read_config,
+                worker_capacity,
+                cancellation.clone(),
+                reporter,
+            )
+            .await
+        } else {
+            run_task_file_media_compute(
+                pending,
+                worker_pool,
+                store,
+                &read_config,
+                worker_capacity,
+                cancellation.clone(),
+            )
+            .await
+        } {
             Ok(media) => media,
             Err(error) => {
                 let message = error.to_string();

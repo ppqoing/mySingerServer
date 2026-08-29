@@ -70,7 +70,7 @@ impl PipelineLimits {
         self.channel_capacity
     }
 
-    pub(super) const fn max_read_tasks(self) -> usize {
+    pub(crate) const fn max_read_tasks(self) -> usize {
         self.max_read_tasks
     }
 }

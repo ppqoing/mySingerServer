@@ -17,6 +17,7 @@ use tokio::time::sleep;
 use super::{TaskFileBaseContext, task_file_base_compute::TaskFileBaseComputePending};
 use crate::{
     io::{DiskReadClass, ReadFailure},
+    runtime_tasks::{RuntimeFailureUpdate, RuntimeStage, RuntimeTaskReporter, RuntimeWorkerUpdate},
     scan::base_persistence::BaseStoreHandle,
     task_dispatch::{
         TaskDispatchAdmission, TaskDispatchBlockReason, TaskDispatchError, TaskDispatchPoll,
@@ -118,12 +119,62 @@ impl<P: TaskLanePermitProvider> fmt::Debug for TaskFileMediaComputeError<P> {
 
 /// 运行一轮已知 MD5 的 Media Worker 派发；不在本阶段写入任务文件终态。
 pub(crate) async fn run_task_file_media_compute<P>(
+    pending: TaskFileBaseComputePending<P>,
+    worker_pool: &mut WorkerPool,
+    store: &BaseStoreHandle,
+    read_config: &DiskReadConfig,
+    worker_capacity: usize,
+    cancellation: ReadCancellationToken,
+) -> Result<MediaPassResult<P>, TaskFileMediaComputeError<P>>
+where
+    P: TaskLanePermitProvider,
+{
+    run_task_file_media_compute_inner(
+        pending,
+        worker_pool,
+        store,
+        read_config,
+        worker_capacity,
+        cancellation,
+        None,
+    )
+    .await
+}
+
+/// 运行带 Worker 运行时遥测的 Media 派发；Node actor 使用该入口更新 Worker 状态。
+pub(crate) async fn run_task_file_media_compute_with_runtime<P>(
+    pending: TaskFileBaseComputePending<P>,
+    worker_pool: &mut WorkerPool,
+    store: &BaseStoreHandle,
+    read_config: &DiskReadConfig,
+    worker_capacity: usize,
+    cancellation: ReadCancellationToken,
+    reporter: &RuntimeTaskReporter,
+) -> Result<MediaPassResult<P>, TaskFileMediaComputeError<P>>
+where
+    P: TaskLanePermitProvider,
+{
+    run_task_file_media_compute_inner(
+        pending,
+        worker_pool,
+        store,
+        read_config,
+        worker_capacity,
+        cancellation,
+        Some(reporter),
+    )
+    .await
+}
+
+/// 共享 Media 派发逻辑；报告器只影响运行时投影，不改变任务文件状态机。
+async fn run_task_file_media_compute_inner<P>(
     mut pending: TaskFileBaseComputePending<P>,
     worker_pool: &mut WorkerPool,
     store: &BaseStoreHandle,
     read_config: &DiskReadConfig,
     worker_capacity: usize,
     cancellation: ReadCancellationToken,
+    reporter: Option<&RuntimeTaskReporter>,
 ) -> Result<MediaPassResult<P>, TaskFileMediaComputeError<P>>
 where
     P: TaskLanePermitProvider,
@@ -180,6 +231,11 @@ where
             biased;
             event = worker_pool.next_event(), if !active.is_empty() => {
                 if let Some(event) = event {
+                    let telemetry_event = event.clone();
+                    if let Some(reporter) = reporter {
+                        // 运行时遥测是旁路投影，失败不能改变 Worker/任务文件主状态机。
+                        report_media_event(&telemetry_event, reporter, &active).await;
+                    }
                     if let Err(message) = handle_media_event(
                         event,
                         &mut active,
@@ -287,6 +343,143 @@ where
         remaining_hash_rows,
         cancelled: false,
     })
+}
+
+/// 将匹配当前 Media 活动项的 Worker 事件投影到进程内运行任务。
+async fn report_media_event<P: TaskLanePermitProvider>(
+    event: &WorkerEvent,
+    reporter: &RuntimeTaskReporter,
+    active: &BTreeMap<TaskFileIdentity, ActiveMedia<P>>,
+) {
+    match event {
+        WorkerEvent::Started {
+            task_id,
+            item_id,
+            identity,
+            slot,
+            process_id,
+            cpu_weight,
+            decoder_threads,
+            ..
+        } => {
+            let Some(key) = find_active_identity(active, task_id, item_id) else {
+                return;
+            };
+            let Some(work) = active.get(&key) else {
+                return;
+            };
+            if !same_worker_identity(&work.worker_identity, identity, true) {
+                return;
+            }
+            let _ = reporter
+                .worker_started(RuntimeWorkerUpdate {
+                    slot: *slot,
+                    process_id: *process_id,
+                    item_id: item_id.clone(),
+                    stage: RuntimeStage::ComputeBaseFeatures,
+                    display_path: identity
+                        .display_path
+                        .as_path()
+                        .to_string_lossy()
+                        .into_owned(),
+                    physical_disk_id: identity.physical_disk_id.clone(),
+                    completed_files: 0,
+                    speed_per_second: 0.0,
+                    current_step: "等待 Worker 阶段事件".into(),
+                    cache_detail: String::new(),
+                    phase: None,
+                    cpu_weight: Some(*cpu_weight),
+                    decoder_threads: *decoder_threads,
+                })
+                .await;
+        }
+        WorkerEvent::PhaseChanged {
+            task_id,
+            item_id,
+            slot,
+            phase,
+            request_elapsed_us,
+        } => {
+            let Some(key) = find_active_identity(active, task_id, item_id) else {
+                return;
+            };
+            if active
+                .get(&key)
+                .is_some_and(|work| work.worker_slot == Some(*slot))
+            {
+                let _ = reporter.worker_phase_nowait(
+                    *slot,
+                    item_id,
+                    *phase,
+                    request_elapsed_us.map(Duration::from_micros),
+                );
+            }
+        }
+        WorkerEvent::BaseSourceReadComplete {
+            task_id,
+            item_id,
+            slot,
+            request_elapsed_us,
+        } => {
+            let Some(key) = find_active_identity(active, task_id, item_id) else {
+                return;
+            };
+            if active
+                .get(&key)
+                .is_some_and(|work| work.worker_slot == Some(*slot))
+            {
+                let _ = reporter.worker_source_read_complete_nowait(
+                    *slot,
+                    item_id,
+                    request_elapsed_us.map(Duration::from_micros),
+                );
+            }
+        }
+        WorkerEvent::Completed {
+            task_id, item_id, ..
+        } => {
+            let Some(key) = find_active_identity(active, task_id, item_id) else {
+                return;
+            };
+            if let Some(slot) = active.get(&key).and_then(|work| work.worker_slot) {
+                let _ = reporter.worker_completed(slot).await;
+                let _ = reporter.worker_released_nowait(slot, item_id);
+            }
+        }
+        WorkerEvent::Crashed {
+            task_id,
+            item_id,
+            identity,
+            process_id,
+            exit_code,
+            message,
+        } => {
+            let Some(key) = find_active_identity(active, task_id, item_id) else {
+                return;
+            };
+            let Some(work) = active.get(&key) else {
+                return;
+            };
+            if !same_worker_identity(&work.worker_identity, identity, false) {
+                return;
+            }
+            let _ = reporter.record_failure_nowait(RuntimeFailureUpdate {
+                stage: RuntimeStage::ComputeBaseFeatures,
+                display_path: identity
+                    .display_path
+                    .as_path()
+                    .to_string_lossy()
+                    .into_owned(),
+                message: format!(
+                    "Worker 崩溃: pid={process_id:?}, exit_code={exit_code:?}: {message}"
+                ),
+            });
+            if let Some(slot) = work.worker_slot {
+                let _ = reporter.worker_released_nowait(slot, item_id);
+            }
+        }
+        WorkerEvent::Cancelled { .. } | WorkerEvent::InfrastructureFailure { .. } => {}
+    }
 }
 
 /// 把一项 dispatcher 任务转换为 V5 Media 请求并交给 WorkerPool。

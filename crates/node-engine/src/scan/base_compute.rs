@@ -690,25 +690,16 @@ impl BaseComputeEngine {
         if worker_capacity == 0 {
             return Err(ScanError::Stage1("WorkerPool 没有可用 Worker".into()));
         }
+        configure_base_compute_runtime(
+            reporter,
+            worker_capacity,
+            worker_pool.cpu_budget(),
+            limits,
+            read_config,
+        )?;
         let hash_capacity = limits.max_read_tasks();
         let queue_capacity = limits.channel_capacity();
         let decode_ownership_capacity = decode_credit_capacity(worker_capacity)?;
-        let persist_ownership_capacity = MAX_CACHE_BATCH_ITEMS.saturating_add(worker_capacity);
-        reporter
-            .configure_pipeline_nowait(RuntimeExecutionConfigUpdate {
-                hash_tasks: runtime_u32(hash_capacity),
-                path_cache_queue_capacity: runtime_u32(PATH_REMOTE_SLOTS),
-                content_cache_queue_capacity: runtime_u32(queue_capacity),
-                decode_queue_capacity: runtime_u32(decode_ownership_capacity),
-                persist_queue_capacity: runtime_u32(persist_ownership_capacity),
-                worker_slots: runtime_u32(worker_capacity),
-                cpu_budget: runtime_u32(worker_pool.cpu_budget()),
-                global_disk_permits: runtime_u32(read_config.total_threads),
-                hdd_per_disk_permits: runtime_u32(read_config.hdd_threads_per_disk),
-                ssd_per_disk_permits: runtime_u32(read_config.ssd_threads_per_disk),
-                unknown_per_disk_permits: runtime_u32(read_config.unknown_threads_per_disk),
-            })
-            .map_err(runtime_error)?;
         reporter
             .freeze_base_compute_totals_nowait(runtime_u64(total_files))
             .map_err(runtime_error)?;
@@ -1438,6 +1429,36 @@ impl BaseComputeEngine {
         )?;
         Ok(summary)
     }
+}
+
+/// 配置基础计算的运行时资源快照，供持久任务和瞬态任务共用同一容量语义。
+pub(crate) fn configure_base_compute_runtime(
+    reporter: &RuntimeTaskReporter,
+    worker_capacity: usize,
+    cpu_budget: usize,
+    limits: PipelineLimits,
+    read_config: &DiskReadConfig,
+) -> Result<(), ScanError> {
+    if worker_capacity == 0 {
+        return Err(ScanError::Stage1("WorkerPool 没有可用 Worker".into()));
+    }
+    let decode_ownership_capacity = decode_credit_capacity(worker_capacity)?;
+    let persist_ownership_capacity = MAX_CACHE_BATCH_ITEMS.saturating_add(worker_capacity);
+    reporter
+        .configure_pipeline_nowait(RuntimeExecutionConfigUpdate {
+            hash_tasks: runtime_u32(limits.max_read_tasks()),
+            path_cache_queue_capacity: runtime_u32(PATH_REMOTE_SLOTS),
+            content_cache_queue_capacity: runtime_u32(limits.channel_capacity()),
+            decode_queue_capacity: runtime_u32(decode_ownership_capacity),
+            persist_queue_capacity: runtime_u32(persist_ownership_capacity),
+            worker_slots: runtime_u32(worker_capacity),
+            cpu_budget: runtime_u32(cpu_budget),
+            global_disk_permits: runtime_u32(read_config.total_threads),
+            hdd_per_disk_permits: runtime_u32(read_config.hdd_threads_per_disk),
+            ssd_per_disk_permits: runtime_u32(read_config.ssd_threads_per_disk),
+            unknown_per_disk_permits: runtime_u32(read_config.unknown_threads_per_disk),
+        })
+        .map_err(runtime_error)
 }
 
 /// 已在 SQLite 保留的枚举行。

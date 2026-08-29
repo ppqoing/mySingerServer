@@ -7,14 +7,18 @@ use dedup_node_store::{NodeStore, ResolvedScanFile, ScanFinalizeInput};
 use dedup_protocol::proto;
 use dedup_windows::ReadCancellationToken;
 
+#[cfg(feature = "test-hooks")]
+use super::base_persistence::BasePersistTestWaiter;
 use super::{
     BaseTaskProducer, HashPermitReader, MAX_BASE_TASK_BATCH, PlannedScannedPath, ScanError,
     TaskFileBaseCoordinatorOptions, TaskFileBaseCoordinatorResult, TaskFileBaseCoordinatorSummary,
     base_persistence::BaseStoreActor, resolve_task_file_cache,
-    run_task_file_base_coordinator_with_remote, task_file_base_compute::TaskFileBaseComputePending,
+    run_task_file_base_coordinator_with_remote, run_task_file_base_coordinator_with_runtime,
+    task_file_base_compute::TaskFileBaseComputePending,
 };
 use crate::{
     RemoteFeatureCache,
+    runtime_tasks::{RuntimeProgressUnit, RuntimeStage, RuntimeStageUpdate, RuntimeTaskReporter},
     task_dispatch::{TaskFileDispatcher, TaskLanePermitProvider},
     task_files::TransientTaskFileSet,
     worker::WorkerPool,
@@ -69,6 +73,9 @@ pub(crate) struct TaskFileScanRunOptions {
     pub(crate) now_ms: i64,
     /// 本轮开始时中心缓存是否可用。
     pub(crate) remote_available: bool,
+    /// 仅测试暂停首条 taskless SQLite 写入，不进入生产结构。
+    #[cfg(feature = "test-hooks")]
+    pub(crate) first_persist_waiter: Option<BasePersistTestWaiter>,
 }
 
 /// 运行完整的瞬态基础扫描；该入口拥有后台 SQLite 连接，结束前必须 join writer。
@@ -86,6 +93,64 @@ where
     H: HashPermitReader<Permit = P::Permit>,
     R: RemoteFeatureCache,
 {
+    run_task_file_scan_inner(
+        store,
+        worker_pool,
+        provider,
+        reader,
+        remote,
+        options,
+        cancellation,
+        None,
+    )
+    .await
+}
+
+/// 运行带阶段遥测的瞬态扫描；Node actor 使用该入口维护真实阶段边界。
+pub(crate) async fn run_task_file_scan_with_runtime<P, H, R>(
+    store: NodeStore,
+    worker_pool: &mut WorkerPool,
+    provider: P,
+    reader: H,
+    remote: &mut R,
+    options: TaskFileScanRunOptions,
+    cancellation: ReadCancellationToken,
+    runtime_reporter: &RuntimeTaskReporter,
+) -> Result<ScanRunResult, ScanError>
+where
+    P: TaskLanePermitProvider,
+    H: HashPermitReader<Permit = P::Permit>,
+    R: RemoteFeatureCache,
+{
+    run_task_file_scan_inner(
+        store,
+        worker_pool,
+        provider,
+        reader,
+        remote,
+        options,
+        cancellation,
+        Some(runtime_reporter),
+    )
+    .await
+}
+
+/// 共享瞬态扫描执行逻辑；阶段报告器可选以保持底层 task-file 单元测试纯粹。
+async fn run_task_file_scan_inner<P, H, R>(
+    store: NodeStore,
+    worker_pool: &mut WorkerPool,
+    provider: P,
+    reader: H,
+    remote: &mut R,
+    options: TaskFileScanRunOptions,
+    cancellation: ReadCancellationToken,
+    runtime_reporter: Option<&RuntimeTaskReporter>,
+) -> Result<ScanRunResult, ScanError>
+where
+    P: TaskLanePermitProvider,
+    H: HashPermitReader<Permit = P::Permit>,
+    R: RemoteFeatureCache,
+{
     let TaskFileScanRunOptions {
         task_id,
         roots,
@@ -96,15 +161,31 @@ where
         persist_capacity,
         now_ms,
         remote_available,
+        #[cfg(feature = "test-hooks")]
+        first_persist_waiter,
     } = options;
     let task_files = TransientTaskFileSet::create(&runtime_root, task_id.as_uuid())?;
     let dispatcher = TaskFileDispatcher::new(task_files, provider);
     let mut producer = BaseTaskProducer::new(dispatcher);
+    #[cfg(feature = "test-hooks")]
+    let (store_actor, store_handle, mut acknowledgements) = match first_persist_waiter {
+        Some(waiter) => {
+            BaseStoreActor::spawn_with_first_persist_waiter(store, persist_capacity.max(1), waiter)
+        }
+        None => BaseStoreActor::spawn(store, persist_capacity.max(1)),
+    };
+    #[cfg(not(feature = "test-hooks"))]
     let (store_actor, store_handle, mut acknowledgements) =
         BaseStoreActor::spawn(store, persist_capacity.max(1));
     let machine_id = store_handle.machine_id().clone();
     let mut warning = remote.startup_warning().map(str::to_owned);
     let mut remote_available = remote_available && warning.is_none();
+
+    if let Some(reporter) = runtime_reporter {
+        // 遥测是运行时投影，失败不能越过后续 producer/store actor 的清理路径。
+        let _ =
+            reporter.start_stage_nowait(RuntimeStage::LookupBaseCache, RuntimeProgressUnit::Files);
+    }
 
     let preparation = async {
         if cancellation.is_cancelled() {
@@ -135,12 +216,31 @@ where
             producer
                 .append_batch(&cache.inputs)
                 .map_err(|error| ScanError::Stage1(error.to_string()))?;
+            if let Some(reporter) = runtime_reporter {
+                let _ = reporter.advance_stage_nowait(
+                    RuntimeStage::LookupBaseCache,
+                    RuntimeProgressUnit::Files,
+                    batch.len() as u64,
+                );
+            }
         }
         Ok(())
     }
     .await;
 
     if let Err(error) = preparation {
+        if let Some(reporter) = runtime_reporter {
+            let state = if matches!(&error, ScanError::Cancelled) {
+                proto::RuntimeStageState::RuntimeStageSkipped
+            } else {
+                proto::RuntimeStageState::RuntimeStageFailed
+            };
+            let _ = reporter.finish_stage_nowait(
+                RuntimeStage::LookupBaseCache,
+                state,
+                Some(planned.len() as u64),
+            );
+        }
         let cleanup = producer.discard().map_err(|cleanup| cleanup.to_string());
         drop(store_handle);
         drop(acknowledgements);
@@ -152,6 +252,13 @@ where
         Ok(production) => production,
         Err(error) => {
             let primary = ScanError::Stage1(error.to_string());
+            if let Some(reporter) = runtime_reporter {
+                let _ = reporter.finish_stage_nowait(
+                    RuntimeStage::LookupBaseCache,
+                    proto::RuntimeStageState::RuntimeStageFailed,
+                    Some(planned.len() as u64),
+                );
+            }
             let cleanup = producer.discard().map_err(|cleanup| cleanup.to_string());
             drop(store_handle);
             drop(acknowledgements);
@@ -160,26 +267,66 @@ where
         }
     };
 
+    if let Some(reporter) = runtime_reporter {
+        let _ = reporter.finish_stage_nowait(
+            RuntimeStage::LookupBaseCache,
+            proto::RuntimeStageState::RuntimeStageCompleted,
+            Some(planned.len() as u64),
+        );
+        let _ = reporter.start_stage_nowait(
+            RuntimeStage::ComputeBaseFeatures,
+            RuntimeProgressUnit::Files,
+        );
+    }
+
     // 协调器消费 cancellation clone；原 token 保留到清单提交前，关闭末端取消竞态。
     let finalization_cancellation = cancellation.clone();
-    let completed = match run_task_file_base_coordinator_with_remote(
-        production,
-        reader,
-        worker_pool,
-        &store_handle,
-        &mut acknowledgements,
-        coordinator,
-        cancellation,
-        &*remote,
-        &mut remote_available,
-        &mut warning,
-    )
-    .await
-    {
+    let completed = match if let Some(reporter) = runtime_reporter {
+        run_task_file_base_coordinator_with_runtime(
+            production,
+            reader,
+            worker_pool,
+            &store_handle,
+            &mut acknowledgements,
+            coordinator,
+            cancellation,
+            &*remote,
+            &mut remote_available,
+            &mut warning,
+            reporter,
+        )
+        .await
+    } else {
+        run_task_file_base_coordinator_with_remote(
+            production,
+            reader,
+            worker_pool,
+            &store_handle,
+            &mut acknowledgements,
+            coordinator,
+            cancellation,
+            &*remote,
+            &mut remote_available,
+            &mut warning,
+        )
+        .await
+    } {
         Ok(completed) => completed,
         Err(error) => {
             let cancelled = error.is_cancelled();
             let message = error.to_string();
+            if let Some(reporter) = runtime_reporter {
+                let state = if cancelled {
+                    proto::RuntimeStageState::RuntimeStageSkipped
+                } else {
+                    proto::RuntimeStageState::RuntimeStageFailed
+                };
+                let _ = reporter.finish_stage_nowait(
+                    RuntimeStage::ComputeBaseFeatures,
+                    state,
+                    Some(planned.len() as u64),
+                );
+            }
             let cleanup = discard_incomplete_scan(error.into_pending())
                 .map_err(|cleanup| cleanup.to_string());
             drop(store_handle);
@@ -200,6 +347,28 @@ where
     let (mut store, completed) =
         accept_completed_after_writer(writer, completed, &finalization_cancellation)?;
     let mut result = finalize_completed_scan(&mut store, task_id, roots, completed, now_ms)?;
+    if let Some(reporter) = runtime_reporter {
+        let resolved = result.completed.resolved_files.len() as u64;
+        let failed = result.summary.file_failures as u64;
+        let total = planned.len() as u64;
+        // 清单已由 SQLite 收尾事务提交，使用真实 resolved 数量补齐 Compute 阶段进度。
+        let _ = reporter.update_overall_nowait(resolved, Some(total), failed, 0);
+        let _ = reporter.update_stage_nowait(RuntimeStageUpdate {
+            stage: RuntimeStage::ComputeBaseFeatures,
+            state: proto::RuntimeStageState::RuntimeStageRunning,
+            unit: RuntimeProgressUnit::Files,
+            completed: resolved,
+            total: Some(total),
+            failed,
+            skipped: 0,
+        });
+        // finalize 已提交后，阶段遥测失败也不能把成功结果伪装成可重试失败。
+        let _ = reporter.finish_stage_nowait(
+            RuntimeStage::ComputeBaseFeatures,
+            proto::RuntimeStageState::RuntimeStageCompleted,
+            Some(planned.len() as u64),
+        );
+    }
     publish_final_outbox(&mut store, remote, &mut remote_available, &mut warning).await;
     result.warning = warning;
     Ok(result)
@@ -630,6 +799,8 @@ mod tests {
                 persist_capacity: 1,
                 now_ms: 100,
                 remote_available: false,
+                #[cfg(feature = "test-hooks")]
+                first_persist_waiter: None,
             },
             ReadCancellationToken::new(),
         )
@@ -692,6 +863,8 @@ mod tests {
                 persist_capacity: 1,
                 now_ms: 100,
                 remote_available: false,
+                #[cfg(feature = "test-hooks")]
+                first_persist_waiter: None,
             },
             cancellation,
         )

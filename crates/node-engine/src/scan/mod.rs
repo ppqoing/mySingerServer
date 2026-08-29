@@ -21,7 +21,7 @@ mod task_file_scan_run;
 pub(crate) use task_file_base_coordinator::{
     TaskFileBaseCoordinatorError, TaskFileBaseCoordinatorOptions, TaskFileBaseCoordinatorResult,
     TaskFileBaseCoordinatorSummary, run_task_file_base_coordinator,
-    run_task_file_base_coordinator_with_remote,
+    run_task_file_base_coordinator_with_remote, run_task_file_base_coordinator_with_runtime,
 };
 pub(crate) use task_file_cache::{
     TaskFileCacheError, TaskFileCacheResult, resolve_task_file_cache,
@@ -33,11 +33,15 @@ pub(crate) use task_file_media_compute::{
 pub(crate) use task_file_media_persistence::{
     TaskFileMediaPersistenceError, TaskFileMediaPersistenceOptions, persist_task_file_media_results,
 };
-pub(crate) use task_file_scan_run::{CompletedScanSnapshot, ScanRunResult};
+pub(crate) use task_file_scan_run::{
+    CompletedScanSnapshot, ScanRunResult, TaskFileScanRunOptions, run_task_file_scan,
+    run_task_file_scan_with_runtime,
+};
 
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub use base_compute::BaseComputeJoinObservationHooks;
+pub(crate) use base_compute::configure_base_compute_runtime;
 pub use base_compute::{BaseComputeDecision, BaseComputeEngine};
 /// 生产读取器在真实 Hash 磁盘许可边界发布的阶段信号。
 pub use base_flow_control::HashReadStartedSignal;

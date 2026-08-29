@@ -12,7 +12,7 @@ use std::{
 
 use dedup_core::{
     AnalysisRunId, ContentKey, CoreError, DeleteMode, DiskReadConfig, DisplayPath, EnumeratorKind,
-    LocationKey, MachineId, NodeConfig, NodePostgresConfig, TaskId, Thresholds,
+    LocationKey, MachineId, NodeConfig, NodePostgresConfig, NormalizedPath, TaskId, Thresholds,
 };
 use dedup_node_store::{
     AnalysisStatus, ConfirmedDeleteItem, DeleteBatchPlan, DeleteOutcome, GroupKind, NodeStore,
@@ -52,11 +52,12 @@ use crate::{
         RuntimeTaskKind, RuntimeTaskRegistry, RuntimeTaskReporter, RuntimeTaskState,
     },
     scan::{
-        BaseComputeEngine, FileEnumerator, PipelineFileReader, PipelineLimits, PlannedScannedPath,
-        PreferredEverythingEnumerator, ScanDiskPlan, ScanError, ScanOptions,
+        BaseComputeEngine, FileEnumerator, MAX_BASE_TASK_BATCH, PipelineFileReader, PipelineLimits,
+        PlannedScannedPath, PreferredEverythingEnumerator, ScanDiskPlan, ScanError, ScanOptions,
         ScanRootStorageResolver, ScanSummary, ScheduledFileReader, SystemScanRootStorageResolver,
-        WindowsWalker, begin_scan_task, ensure_everything_ready,
-        input_order::interleave_rows_by_root,
+        TaskFileBaseCoordinatorOptions, TaskFileMediaPersistenceOptions, TaskFileScanRunOptions,
+        WindowsWalker, begin_scan_task, configure_base_compute_runtime, ensure_everything_ready,
+        input_order::interleave_rows_by_root, run_task_file_scan_with_runtime,
     },
     server::{NodeRequestHandler, NodeServer, ServerError},
     worker::{WorkerLaunch, WorkerPool, WorkerPoolConfig, WorkerPoolError, WorkerPoolHandle},
@@ -86,6 +87,18 @@ impl NodeEngineHandle {
     pub fn runtime_tasks_for_test(&self) -> RuntimeTaskRegistry {
         self.runtime_tasks.clone()
     }
+
+    /// 返回 actor 当前进程最近一次完成扫描，仅用于验证终态发布顺序。
+    #[cfg(feature = "test-hooks")]
+    async fn latest_completed_scan_for_test(&self) -> Option<crate::scan::CompletedScanSnapshot> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(EngineCommand::LatestCompletedScanForTest(reply))
+            .await
+            .ok()?;
+        response.await.ok().flatten()
+    }
+
     /// 取消当前计算并等待 Worker 收束后重启计算引擎。
     pub async fn restart_engine(&self) -> Result<(), EngineError> {
         let (reply, response) = oneshot::channel();
@@ -332,6 +345,7 @@ impl NodeRuntime {
             Some(worker_pool),
             listen_address,
             &paths.cache_path,
+            &paths.data_path.join("runtime"),
             config.enumerator,
             config.read.clone(),
             config.postgres.clone(),
@@ -442,6 +456,7 @@ impl NodeEngine {
             None,
             listen_address,
             cache_root,
+            &cache_root.join("runtime"),
             EnumeratorKind::WindowsWalker,
             DiskReadConfig::default(),
             NodePostgresConfig::default(),
@@ -468,6 +483,7 @@ impl NodeEngine {
             None,
             listen_address,
             cache_root,
+            &cache_root.join("runtime"),
             EnumeratorKind::WindowsWalker,
             DiskReadConfig::default(),
             NodePostgresConfig::default(),
@@ -495,6 +511,7 @@ impl NodeEngine {
             Some(worker_pool),
             listen_address,
             cache_root,
+            &cache_root.join("runtime"),
             enumerator,
             DiskReadConfig::default(),
             NodePostgresConfig::default(),
@@ -525,6 +542,7 @@ impl NodeEngine {
             Some(worker_pool),
             listen_address,
             cache_root,
+            &cache_root.join("runtime"),
             enumerator,
             DiskReadConfig::default(),
             NodePostgresConfig::default(),
@@ -538,6 +556,36 @@ impl NodeEngine {
             },
         )
     }
+
+    /// 使用独立数据运行目录创建受控 actor，验证瞬态任务不会落入缓存目录。
+    #[doc(hidden)]
+    pub fn spawn_with_runtime_root_for_test(
+        store: NodeStore,
+        worker_pool: WorkerPool,
+        listen_address: SocketAddr,
+        cache_root: &Path,
+        runtime_root: &Path,
+        enumerator: EnumeratorKind,
+    ) -> (NodeEngineHandle, JoinHandle<()>) {
+        let effective_worker_count = worker_pool.worker_process_ids().len().max(1);
+        let (artifact_registry, disk_full_cleaner) = test_artifact_cleanup(cache_root);
+        spawn_actor(
+            store,
+            Some(worker_pool),
+            listen_address,
+            cache_root,
+            runtime_root,
+            enumerator,
+            DiskReadConfig::default(),
+            NodePostgresConfig::default(),
+            effective_worker_count,
+            None,
+            artifact_registry,
+            disk_full_cleaner,
+            None,
+            ActorTestHooks::default(),
+        )
+    }
 }
 
 fn spawn_actor(
@@ -545,6 +593,7 @@ fn spawn_actor(
     worker_pool: Option<WorkerPool>,
     listen_address: SocketAddr,
     cache_root: &Path,
+    runtime_root: &Path,
     enumerator: EnumeratorKind,
     read_config: DiskReadConfig,
     postgres_config: NodePostgresConfig,
@@ -570,6 +619,7 @@ fn spawn_actor(
             worker_control,
             listen_address,
             cache_root: cache_root.to_path_buf(),
+            runtime_root: runtime_root.to_path_buf(),
             enumerator,
             read_config,
             postgres_config,
@@ -577,6 +627,7 @@ fn spawn_actor(
             restarting: false,
             snapshots: BTreeMap::new(),
             active_job: None,
+            latest_completed_scan: None,
             commands: commands.downgrade(),
             config_repository,
             artifact_registry,
@@ -611,6 +662,7 @@ struct EngineState {
     worker_pool_config: Option<WorkerPoolConfig>,
     listen_address: SocketAddr,
     cache_root: std::path::PathBuf,
+    runtime_root: std::path::PathBuf,
     enumerator: EnumeratorKind,
     read_config: DiskReadConfig,
     postgres_config: NodePostgresConfig,
@@ -618,6 +670,8 @@ struct EngineState {
     restarting: bool,
     snapshots: BTreeMap<String, OwnedSnapshot>,
     active_job: Option<ActiveJob>,
+    /// 当前进程最近一次成功收尾的扫描快照；失败和取消不会覆盖它。
+    latest_completed_scan: Option<crate::scan::CompletedScanSnapshot>,
     commands: mpsc::WeakSender<EngineCommand>,
     config_repository: Option<Box<dyn NodeConfigRepositoryAccess>>,
     artifact_registry: Arc<RegenerableArtifactRegistry>,
@@ -633,11 +687,23 @@ enum EngineCommand {
     ConnectionClosed,
     Restart(oneshot::Sender<Result<(), String>>),
     Shutdown(oneshot::Sender<()>),
-    BackgroundFinished { identity: JobIdentity },
+    /// 返回当前进程完成扫描快照，仅供行为测试观察 actor 内部提交顺序。
+    #[cfg(feature = "test-hooks")]
+    LatestCompletedScanForTest(oneshot::Sender<Option<crate::scan::CompletedScanSnapshot>>),
+    BackgroundFinished {
+        identity: JobIdentity,
+        /// 瞬态扫描在清单事务和精确 run 清理成功后才带回快照。
+        completed_scan: Option<crate::scan::CompletedScanSnapshot>,
+        /// 成功扫描的运行 reporter 延后到 actor 保存快照后再发布终态。
+        runtime_reporter: Option<RuntimeTaskReporter>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum JobIdentity {
+    /// 基础扫描只存在于当前进程，不对应 SQLite task 表。
+    TransientScan(TaskId),
+    /// 二筛等仍使用 SQLite task 表的持久任务。
     Task(TaskId),
     Analysis(AnalysisRunId),
 }
@@ -664,6 +730,8 @@ enum BackgroundJob {
         runtime_reporter: RuntimeTaskReporter,
         artifact_registry: Arc<RegenerableArtifactRegistry>,
         disk_full_cleaner: DiskFullCleaner,
+        /// 当前 Node 进程的瞬态任务目录根，不与缓存目录混用。
+        runtime_root: PathBuf,
         /// 仅 feature 测试暂停首条 SQLite persist。
         #[cfg(feature = "test-hooks")]
         first_persist_waiter: Option<BasePersistTestWaiter>,
@@ -685,7 +753,7 @@ enum BackgroundJob {
 impl BackgroundJob {
     const fn identity(&self) -> JobIdentity {
         match self {
-            Self::Scan { task_id, .. } => JobIdentity::Task(*task_id),
+            Self::Scan { task_id, .. } => JobIdentity::TransientScan(*task_id),
             Self::LocalAnalysis { run_id, .. } => JobIdentity::Analysis(*run_id),
             Self::Stage2 { plan, .. } => JobIdentity::Task(plan.task_id),
         }
@@ -725,7 +793,19 @@ async fn run_actor(mut state: EngineState, mut commands: mpsc::Receiver<EngineCo
                 let _ = reply.send(());
                 break;
             }
-            EngineCommand::BackgroundFinished { identity } => state.finish_background(identity),
+            #[cfg(feature = "test-hooks")]
+            EngineCommand::LatestCompletedScanForTest(reply) => {
+                let _ = reply.send(state.latest_completed_scan.clone());
+            }
+            EngineCommand::BackgroundFinished {
+                identity,
+                completed_scan,
+                runtime_reporter,
+            } => {
+                state
+                    .finish_background(identity, completed_scan, runtime_reporter)
+                    .await;
+            }
         }
     }
 }
@@ -932,6 +1012,9 @@ impl EngineState {
             .map(DisplayPath::new)
             .collect::<Result<Vec<_>, _>>()
             .map_err(invalid)?;
+        if roots.is_empty() {
+            return Err(invalid("扫描任务至少需要一个根目录"));
+        }
         let mut options = ScanOptions::new(roots);
         if request.force_recalculate {
             options = options.force_recompute();
@@ -943,8 +1026,8 @@ impl EngineState {
             _ => return Err(invalid("未知文件枚举器")),
         };
         let contact_sheets = self.cache_root.join("contact-sheets");
-        let task_id = begin_scan_task(&mut self.store, &options, now_ms()).map_err(internal)?;
-        initialize_base_task_stages(&mut self.store, task_id).map_err(internal)?;
+        let task_id = TaskId::new();
+        let runtime_root = self.runtime_root.clone();
         let runtime_reporter = self
             .runtime_tasks
             .begin_with_id(
@@ -970,10 +1053,10 @@ impl EngineState {
             runtime_reporter,
             artifact_registry: Arc::clone(&self.artifact_registry),
             disk_full_cleaner: self.disk_full_cleaner.clone(),
+            runtime_root,
             #[cfg(feature = "test-hooks")]
             first_persist_waiter,
         }) {
-            let _ = self.store.fail_task(task_id, now_ms());
             let _ = runtime_failure.finish(RuntimeTaskState::Failed).await;
             return Err(internal(error));
         }
@@ -990,17 +1073,26 @@ impl EngineState {
             .worker_control
             .as_ref()
             .map(|pool| pool.begin_task_cancel(&request.task_id));
-        if let Err(error) = self.store.cancel_task(task_id, now_ms()) {
-            if let Some(cancel_gate) = cancel_gate {
-                cancel_gate.rollback();
+        let is_transient_scan = self
+            .active_job
+            .as_ref()
+            .is_some_and(|active| active.identity == JobIdentity::TransientScan(task_id));
+        if !is_transient_scan {
+            if let Err(error) = self.store.cancel_task(task_id, now_ms()) {
+                if let Some(cancel_gate) = cancel_gate {
+                    cancel_gate.rollback();
+                }
+                return Err(store_error(error));
             }
-            return Err(store_error(error));
         }
         if let Some(cancel_gate) = cancel_gate {
             cancel_gate.commit();
         }
         if let Some(active) = &self.active_job
-            && active.identity == JobIdentity::Task(task_id)
+            && matches!(
+                active.identity,
+                JobIdentity::TransientScan(id) | JobIdentity::Task(id) if id == task_id
+            )
         {
             if let Some(cancellation) = &active.cancellation {
                 cancellation.cancel();
@@ -1565,7 +1657,7 @@ impl EngineState {
         if self.active_job.is_some() {
             return Err("节点已有媒体任务正在后台运行".into());
         }
-        let mut store = self.store.reopen().map_err(|error| error.to_string())?;
+        let store = self.store.reopen().map_err(|error| error.to_string())?;
         let mut worker_pool = self
             .worker_pool
             .take()
@@ -1583,12 +1675,17 @@ impl EngineState {
         let returned_pool = Arc::new(Mutex::new(None));
         let background_pool = Arc::clone(&returned_pool);
         tokio::spawn(async move {
-            run_background_job(&mut store, &mut worker_pool, job).await;
-            // 必须先确认 BaseStoreActor join、Store 恢复和终态发布全部结束，再触发 shutdown/归还 Pool。
+            let (completed_scan, runtime_reporter) =
+                run_background_job(store, &mut worker_pool, job).await;
+            // 必须先确认 BaseStoreActor join、Store 恢复和终态准备全部结束，再触发 shutdown/归还 Pool。
             *background_pool.lock().expect("后台 Pool 归还锁未中毒") = Some(worker_pool);
             let _ = completion_sender.send(());
             let _ = commands
-                .send(EngineCommand::BackgroundFinished { identity })
+                .send(EngineCommand::BackgroundFinished {
+                    identity,
+                    completed_scan,
+                    runtime_reporter,
+                })
                 .await;
         });
         self.active_job = Some(ActiveJob {
@@ -1600,7 +1697,12 @@ impl EngineState {
         Ok(())
     }
 
-    fn finish_background(&mut self, identity: JobIdentity) {
+    async fn finish_background(
+        &mut self,
+        identity: JobIdentity,
+        completed_scan: Option<crate::scan::CompletedScanSnapshot>,
+        runtime_reporter: Option<RuntimeTaskReporter>,
+    ) {
         let Some(active) = self
             .active_job
             .take_if(|active| active.identity == identity)
@@ -1616,6 +1718,15 @@ impl EngineState {
             self.worker_control = Some(worker_pool.handle());
             self.worker_pool = Some(worker_pool);
         }
+        if matches!(identity, JobIdentity::TransientScan(_))
+            && let Some(completed_scan) = completed_scan
+        {
+            self.latest_completed_scan = Some(completed_scan);
+        }
+        // 成功快照已经由 actor 接管，随后才广播 RuntimeTask Completed。
+        if let Some(runtime_reporter) = runtime_reporter {
+            let _ = runtime_reporter.finish(RuntimeTaskState::Completed).await;
+        }
     }
 
     /// 取消活动任务并等待后台完全收束，返回被 actor 独占的旧 Pool。
@@ -1624,10 +1735,13 @@ impl EngineState {
             return self.worker_pool.take();
         };
         let pool_task_id = match active.identity {
-            JobIdentity::Task(task_id) => task_id.as_uuid().to_string(),
+            JobIdentity::TransientScan(task_id) | JobIdentity::Task(task_id) => {
+                task_id.as_uuid().to_string()
+            }
             JobIdentity::Analysis(run_id) => run_id.as_uuid().to_string(),
         };
         match active.identity {
+            JobIdentity::TransientScan(_) => {}
             JobIdentity::Task(task_id) => {
                 finish_running_task_stages(
                     &mut self.store,
@@ -1909,9 +2023,12 @@ pub fn enumerate_with_frozen_plan_for_test<E: FileEnumerator>(
 }
 
 async fn run_background_job(
-    store: &mut NodeStore,
+    mut store: NodeStore,
     worker_pool: &mut WorkerPool,
     job: BackgroundJob,
+) -> (
+    Option<crate::scan::CompletedScanSnapshot>,
+    Option<RuntimeTaskReporter>,
 ) {
     match job {
         BackgroundJob::Scan {
@@ -1926,26 +2043,12 @@ async fn run_background_job(
             runtime_reporter,
             artifact_registry,
             disk_full_cleaner,
+            runtime_root,
             #[cfg(feature = "test-hooks")]
             first_persist_waiter,
         } => {
-            let enumerate_started = now_ms() as u64;
             let _ = runtime_reporter
                 .start_stage_nowait(RuntimeStage::EnumerateFiles, RuntimeProgressUnit::Files);
-            let _ = store.save_task_stage(
-                task_id,
-                stored_stage(
-                    RuntimeStage::EnumerateFiles,
-                    StorePersistentStageState::Running,
-                    0,
-                    None,
-                    0,
-                    0,
-                    Some(enumerate_started),
-                    None,
-                    None,
-                ),
-            );
             let enumerator =
                 resolve_scan_enumerator_with(enumerator, ensure_everything_ready).await;
             // 物理存储计划必须先于第一次 Everything/Walker enumerate 建立；失败时不枚举。
@@ -1963,44 +2066,89 @@ async fn run_background_job(
                     |roots| PreferredEverythingEnumerator.enumerate(roots),
                 ),
             };
-            let (rows, planned_rows_for_reader) = match enumerated {
-                Ok((rows, planned_rows)) => (Ok(rows), Some(planned_rows)),
-                Err(error) => (Err(error), None),
-            };
-            let result = run_enumerated_scan_to_base_compute(
-                store,
-                worker_pool,
-                task_id,
-                options,
-                rows,
-                enumerate_started,
-                &contact_sheets,
-                || NodeRemoteFeatureCache::from_config(&postgres_config),
-                || async {
-                    let Some(planned_rows) = planned_rows_for_reader else {
-                        return Err(ScanError::Stage1("扫描根计划缺失，不能创建读取器".into()));
-                    };
-                    ScheduledFileReader::new_with_planned_rows(
-                        &read_config,
-                        effective_worker_count,
-                        planned_rows,
-                    )
-                    .map(|(reader, limits)| {
-                        (
-                            reader.with_runtime_reporter(runtime_reporter.clone()),
-                            limits,
-                        )
-                    })
-                },
-                &read_config,
-                cancellation,
-                &runtime_reporter,
-                &artifact_registry,
-                &disk_full_cleaner,
-                now_ms(),
-                #[cfg(feature = "test-hooks")]
-                first_persist_waiter,
-            )
+            let result = async {
+                let (_, planned_rows) = match enumerated {
+                    Ok(enumerated) => enumerated,
+                    Err(error) => {
+                        let state = if cancellation.is_cancelled() {
+                            proto::RuntimeStageState::RuntimeStageSkipped
+                        } else {
+                            proto::RuntimeStageState::RuntimeStageFailed
+                        };
+                        let _ = runtime_reporter.finish_stage_nowait(
+                            RuntimeStage::EnumerateFiles,
+                            state,
+                            None,
+                        );
+                        return Err(error);
+                    }
+                };
+                let roots = options
+                    .roots
+                    .iter()
+                    .map(|root| NormalizedPath::new(root.as_path()))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| ScanError::InvalidResult(error.to_string()))?;
+                let planned = Arc::try_unwrap(planned_rows)
+                    .unwrap_or_else(|planned_rows| planned_rows.as_ref().clone());
+                if cancellation.is_cancelled() {
+                    let _ = runtime_reporter.finish_stage_nowait(
+                        RuntimeStage::EnumerateFiles,
+                        proto::RuntimeStageState::RuntimeStageSkipped,
+                        Some(planned.len() as u64),
+                    );
+                    return Err(ScanError::Cancelled);
+                }
+                let _ = runtime_reporter.freeze_base_compute_totals_nowait(planned.len() as u64);
+                let (reader, limits) = ScheduledFileReader::new_with_planned_rows(
+                    &read_config,
+                    effective_worker_count,
+                    Arc::new(planned.clone()),
+                )?;
+                configure_base_compute_runtime(
+                    &runtime_reporter,
+                    worker_pool.worker_process_ids().len(),
+                    worker_pool.cpu_budget(),
+                    limits,
+                    &read_config,
+                )?;
+                let reader = reader.with_runtime_reporter(runtime_reporter.clone());
+                let (mut remote, remote_available) =
+                    NodeRemoteFeatureCache::from_config(&postgres_config).await;
+                run_task_file_scan_with_runtime(
+                    store,
+                    worker_pool,
+                    reader.clone(),
+                    reader,
+                    &mut remote,
+                    TaskFileScanRunOptions {
+                        task_id,
+                        roots,
+                        planned,
+                        runtime_root,
+                        force_recompute: options.force_recompute,
+                        coordinator: TaskFileBaseCoordinatorOptions {
+                            hash_capacity: limits.max_read_tasks(),
+                            worker_capacity: effective_worker_count,
+                            read_config: read_config.clone(),
+                            persistence: TaskFileMediaPersistenceOptions {
+                                contact_sheet_root: contact_sheets,
+                                artifact_registry: Some(artifact_registry),
+                                disk_full_cleaner: Some(disk_full_cleaner),
+                            },
+                        },
+                        persist_capacity: MAX_BASE_TASK_BATCH
+                            .saturating_add(effective_worker_count),
+                        now_ms: now_ms(),
+                        remote_available,
+                        #[cfg(feature = "test-hooks")]
+                        first_persist_waiter,
+                    },
+                    cancellation,
+                    &runtime_reporter,
+                )
+                .await
+            }
             .await;
             if let Err(error) = &result
                 && !matches!(error, ScanError::Cancelled)
@@ -2017,19 +2165,15 @@ async fn run_background_job(
                 Err(ScanError::Cancelled) => RuntimeTaskState::Cancelled,
                 Err(_) => RuntimeTaskState::Failed,
             };
+            // 失败/取消没有可保存快照，后台收束后可直接发布终态；成功则交给 actor
+            // 先保存 latest_completed_scan，再发布 RuntimeTask Completed。
             match result {
-                Ok(_) => {}
-                Err(ScanError::Cancelled) => {
-                    finish_running_task_stages(store, task_id, StorePersistentStageState::Skipped);
-                    let _ = store.cancel_task(task_id, now_ms());
-                }
+                Ok(result) => (Some(result.completed), Some(runtime_reporter)),
                 Err(_) => {
-                    finish_running_task_stages(store, task_id, StorePersistentStageState::Failed);
-                    let _ = store.fail_task(task_id, now_ms());
+                    let _ = runtime_reporter.finish(runtime_state).await;
+                    (None, None)
                 }
             }
-            // Base、WorkerPool、SQLite task-local writer 和持久阶段全部收束后才冻结终态。
-            let _ = runtime_reporter.finish(runtime_state).await;
         }
         BackgroundJob::LocalAnalysis {
             run_id,
@@ -2041,7 +2185,7 @@ async fn run_background_job(
                 .with_runtime_reporter(runtime_reporter.clone(), store.machine_id().clone());
             let (mut remote, _) = NodeRemoteFeatureCache::from_config(&postgres_config).await;
             let result = LocalAnalysisEngine::run_existing_with_runtime_cache(
-                store,
+                &mut store,
                 run_id,
                 &mut processor,
                 &runtime_reporter,
@@ -2058,9 +2202,14 @@ async fn run_background_job(
             };
             let _ = runtime_reporter.finish(state).await;
             if result.is_err() {
-                finish_running_analysis_stages(store, run_id, StorePersistentStageState::Failed);
+                finish_running_analysis_stages(
+                    &mut store,
+                    run_id,
+                    StorePersistentStageState::Failed,
+                );
                 let _ = store.transition_analysis_run(run_id, AnalysisStatus::Partial, now_ms());
             }
+            (None, None)
         }
         BackgroundJob::Stage2 {
             plan,
@@ -2073,7 +2222,7 @@ async fn run_background_job(
                 .with_runtime_reporter(runtime_reporter.clone(), store.machine_id().clone());
             let (mut remote, _) = NodeRemoteFeatureCache::from_config(&postgres_config).await;
             let result = run_stage2_batch_with_runtime_cache(
-                store,
+                &mut store,
                 plan,
                 &mut processor,
                 &runtime_reporter,
@@ -2094,9 +2243,10 @@ async fn run_background_job(
                 })
                 .await;
             if result.is_err() {
-                finish_running_task_stages(store, task_id, StorePersistentStageState::Failed);
+                finish_running_task_stages(&mut store, task_id, StorePersistentStageState::Failed);
                 let _ = store.fail_task(task_id, now_ms());
             }
+            (None, None)
         }
     }
 }
@@ -2631,6 +2781,7 @@ mod tests {
         fs::write(scan_root.join("held.bin"), b"held worker input").unwrap();
         let machine = MachineId::parse(&"c1".repeat(32)).unwrap();
         let store = NodeStore::open(&directory.path().join("node.db"), machine).unwrap();
+        let observer = store.reopen().unwrap();
         let (pool, mut started) = WorkerPool::controlled_for_test();
         let (handle, actor) = NodeEngine::spawn(
             store,
@@ -2693,13 +2844,11 @@ mod tests {
                 })),
             })
             .await;
-        let Some(proto::envelope::Payload::QueryTask(query)) = query.payload else {
-            panic!("持久任务必须可查询");
-        };
-        assert_eq!(
-            query.task.unwrap().state,
-            proto::TaskState::TaskRunning as i32
-        );
+        assert!(matches!(
+            query.payload,
+            Some(proto::envelope::Payload::Error(proto::Error { code, .. }))
+                if code == proto::ErrorCode::Internal as i32
+        ));
 
         let cancel = tokio::time::timeout(
             Duration::from_secs(2),
@@ -2726,13 +2875,177 @@ mod tests {
                 })),
             })
             .await;
-        let Some(proto::envelope::Payload::QueryTask(final_query)) = final_query.payload else {
-            panic!("取消后的任务必须可查询");
-        };
-        assert_eq!(
-            final_query.task.unwrap().state,
-            proto::TaskState::TaskCancelled as i32
+        assert!(matches!(
+            final_query.payload,
+            Some(proto::envelope::Payload::Error(proto::Error { code, .. }))
+                if code == proto::ErrorCode::Internal as i32
+        ));
+
+        handle.shutdown().await.unwrap();
+        actor.await.unwrap();
+        assert!(observer.page_tasks(None, 100).unwrap().items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_scan_uses_transient_runtime_and_does_not_write_task_tables() {
+        let directory = tempfile::tempdir().unwrap();
+        let scan_root = directory.path().join("scan");
+        fs::create_dir(&scan_root).unwrap();
+        fs::write(scan_root.join("held.mp4"), b"held worker input").unwrap();
+        let database = directory.path().join("node.db");
+        let cache_root = directory.path().join("cache");
+        let data_root = directory.path().join("data");
+        let runtime_root = data_root.join("runtime");
+        let machine = MachineId::parse(&"c6".repeat(32)).unwrap();
+        let store = NodeStore::open(&database, machine).unwrap();
+        let observer = store.reopen().unwrap();
+        let (pool, mut started) = WorkerPool::controlled_for_test();
+        let (handle, actor) = NodeEngine::spawn_with_runtime_root_for_test(
+            store,
+            pool,
+            "127.0.0.1:39091".parse().unwrap(),
+            &cache_root,
+            &runtime_root,
+            EnumeratorKind::WindowsWalker,
         );
+
+        let response = handle
+            .handle(proto::Envelope {
+                request_id: 60,
+                payload: Some(proto::envelope::Payload::CreateScan(proto::CreateScan {
+                    roots: vec![scan_root.to_string_lossy().into_owned()],
+                    force_recalculate: false,
+                    enumerator: "windows_walker".into(),
+                })),
+            })
+            .await;
+        let Some(proto::envelope::Payload::TaskAccepted(accepted)) = response.payload else {
+            panic!("瞬态扫描必须返回业务任务 ID");
+        };
+        if tokio::time::timeout(Duration::from_secs(2), started.recv())
+            .await
+            .is_err()
+        {
+            let tasks = handle.runtime_tasks_for_test().list().await;
+            let details = match tasks.first() {
+                Some(task) => {
+                    handle
+                        .runtime_tasks_for_test()
+                        .details(&task.runtime_task_id)
+                        .await
+                }
+                None => None,
+            };
+            panic!(
+                "扫描必须进入可控 Worker: tasks={tasks:?}, details={details:?}, runtime={:?}",
+                runtime_root
+            );
+        }
+
+        assert!(observer.page_tasks(None, 100).unwrap().items.is_empty());
+        let run_id = TaskId::from_uuid(Uuid::parse_str(&accepted.task_id).unwrap());
+        assert!(runtime_root.join(run_id.as_uuid().to_string()).is_dir());
+        assert!(!cache_root.join(run_id.as_uuid().to_string()).exists());
+        assert!(
+            !cache_root
+                .join("runtime")
+                .join(run_id.as_uuid().to_string())
+                .exists()
+        );
+
+        let cancel = handle
+            .handle(proto::Envelope {
+                request_id: 61,
+                payload: Some(proto::envelope::Payload::CancelTask(proto::CancelTask {
+                    task_id: accepted.task_id,
+                })),
+            })
+            .await;
+        assert!(matches!(
+            cancel.payload,
+            Some(proto::envelope::Payload::CancelTask(_))
+        ));
+        handle.shutdown().await.unwrap();
+        actor.await.unwrap();
+        assert!(observer.page_tasks(None, 100).unwrap().items.is_empty());
+        assert!(!runtime_root.join(run_id.as_uuid().to_string()).exists());
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[tokio::test]
+    async fn completed_event_is_published_after_latest_scan_snapshot_is_saved() {
+        let directory = tempfile::tempdir().unwrap();
+        let scan_root = directory.path().join("scan");
+        fs::create_dir(&scan_root).unwrap();
+        fs::write(scan_root.join("completed.bin"), b"abc").unwrap();
+        let machine = MachineId::parse(&"c7".repeat(32)).unwrap();
+        let store = NodeStore::open(&directory.path().join("node.db"), machine).unwrap();
+        let (pool, mut started, controller) = WorkerPool::controlled_batch_for_test(1);
+        let (handle, actor) = NodeEngine::spawn(
+            store,
+            pool,
+            "127.0.0.1:39091".parse().unwrap(),
+            directory.path(),
+            EnumeratorKind::WindowsWalker,
+        );
+        let registry = handle.runtime_tasks_for_test();
+        let mut events = registry.subscribe();
+
+        let accepted = handle
+            .handle(proto::Envelope {
+                request_id: 62,
+                payload: Some(proto::envelope::Payload::CreateScan(proto::CreateScan {
+                    roots: vec![scan_root.to_string_lossy().into_owned()],
+                    force_recalculate: false,
+                    enumerator: "windows_walker".into(),
+                })),
+            })
+            .await;
+        let Some(proto::envelope::Payload::TaskAccepted(accepted)) = accepted.payload else {
+            panic!("瞬态扫描必须返回业务任务 ID");
+        };
+        let (_, item_id) = tokio::time::timeout(Duration::from_secs(2), started.recv())
+            .await
+            .expect("扫描必须进入真实 Worker")
+            .expect("可控 Worker 不应提前关闭");
+        controller
+            .complete_base(
+                accepted.task_id.clone(),
+                item_id,
+                [
+                    0x90, 0x01, 0x50, 0x98, 0x3c, 0xd2, 0x4f, 0xb0, 0xd6, 0x96, 0x3f, 0x7d, 0x28,
+                    0xe1, 0x7f, 0x72,
+                ],
+                BaseComputeOutput {
+                    probe: Some(MediaProbe {
+                        media_kind: dedup_core::MediaKind::Other,
+                        width: 0,
+                        height: 0,
+                        duration_ms: None,
+                    }),
+                    stage1_frames: Some(Vec::new()),
+                    contact_sheet_jpeg: None,
+                },
+            )
+            .await;
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = events.recv().await.expect("运行任务事件通道不应关闭");
+                if event.runtime_task_id == accepted.task_id && event.state == "completed" {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("扫描成功必须发布 completed 终态");
+
+        let snapshot = handle
+            .latest_completed_scan_for_test()
+            .await
+            .expect("completed 事件可见时 actor 必须已经保存扫描快照");
+        assert_eq!(snapshot.task_id.as_uuid().to_string(), accepted.task_id);
+        assert_eq!(snapshot.roots.len(), 1);
 
         handle.shutdown().await.unwrap();
         actor.await.unwrap();
@@ -2746,6 +3059,7 @@ mod tests {
         fs::write(scan_root.join("held.mp4"), b"held worker input").unwrap();
         let machine = MachineId::parse(&"c2".repeat(32)).unwrap();
         let store = NodeStore::open(&directory.path().join("node.db"), machine).unwrap();
+        let observer = store.reopen().unwrap();
         let (pool, mut started, controller) = WorkerPool::controlled_batch_for_test(1);
         let (handle, actor) = NodeEngine::spawn(
             store,
@@ -2873,6 +3187,7 @@ mod tests {
 
         handle.shutdown().await.unwrap();
         actor.await.unwrap();
+        assert!(observer.page_tasks(None, 100).unwrap().items.is_empty());
     }
 
     #[tokio::test]
@@ -2883,6 +3198,7 @@ mod tests {
         fs::write(scan_root.join("shutdown.mp4"), b"shutdown worker input").unwrap();
         let machine = MachineId::parse(&"c4".repeat(32)).unwrap();
         let store = NodeStore::open(&directory.path().join("node.db"), machine).unwrap();
+        let observer = store.reopen().unwrap();
         let (pool, mut started, controller) = WorkerPool::controlled_batch_for_test(1);
         let (handle, actor) = NodeEngine::spawn(
             store,
@@ -2937,6 +3253,7 @@ mod tests {
             0,
             "关闭后的可控 Pool 不得保留旧 slot"
         );
+        assert!(observer.page_tasks(None, 100).unwrap().items.is_empty());
         let details = registry.details(&runtime_id).await.unwrap();
         assert_eq!(details.summary.unwrap().state, "cancelled");
         assert_eq!(
@@ -3127,11 +3444,7 @@ mod tests {
                 assert_eq!(current, Some(0));
             }
             let terminal_after_release = drain_terminal_events(&mut events);
-            let persisted = observer
-                .task_snapshot(TaskId::from_uuid(
-                    Uuid::parse_str(&accepted.task_id).unwrap(),
-                ))
-                .unwrap();
+            let persisted_tasks = observer.page_tasks(None, 100).unwrap();
 
             assert!(
                 shutdown_was_pending,
@@ -3150,7 +3463,7 @@ mod tests {
                 before_resource_peaks, after_resource_peaks,
                 "资源峰值必须保留"
             );
-            assert_eq!(persisted.status, TaskStatus::Cancelled);
+            assert!(persisted_tasks.items.is_empty());
             assert!(controller.running_files().is_empty());
             assert_eq!(controller.cpu_in_use(), 0);
             assert_eq!(
@@ -3174,10 +3487,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scan_background_error_is_persisted_as_failed() {
+    async fn scan_background_error_is_runtime_failed_without_persisted_task() {
         let directory = tempfile::tempdir().unwrap();
         let machine = MachineId::parse(&"c3".repeat(32)).unwrap();
         let store = NodeStore::open(&directory.path().join("node.db"), machine).unwrap();
+        let observer = store.reopen().unwrap();
         let (pool, _) = WorkerPool::controlled_for_test();
         let (handle, actor) = NodeEngine::spawn(
             store,
@@ -3203,33 +3517,31 @@ mod tests {
             })
             .await;
         let Some(proto::envelope::Payload::TaskAccepted(accepted)) = response.payload else {
-            panic!("后台枚举失败前必须先返回持久任务 ID");
+            panic!("后台枚举失败前必须先返回运行任务 ID");
         };
-
-        let mut state = proto::TaskState::TaskQueued as i32;
-        for request_id in 21..1021 {
-            let response = handle
-                .handle(proto::Envelope {
-                    request_id,
-                    payload: Some(proto::envelope::Payload::QueryTask(proto::QueryTask {
-                        task_id: accepted.task_id.clone(),
-                        task: None,
-                    })),
-                })
-                .await;
-            let Some(proto::envelope::Payload::QueryTask(query)) = response.payload else {
-                panic!("失败任务必须保持可查询");
-            };
-            state = query.task.unwrap().state;
-            if state == proto::TaskState::TaskFailed as i32 {
-                break;
+        let registry = handle.runtime_tasks_for_test();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let Some(details) = registry.details(&accepted.task_id).await else {
+                    tokio::task::yield_now().await;
+                    continue;
+                };
+                if details
+                    .summary
+                    .as_ref()
+                    .is_some_and(|summary| summary.state == "failed")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(state, proto::TaskState::TaskFailed as i32);
+        })
+        .await
+        .expect("后台枚举失败必须发布运行任务 failed 终态");
 
         handle.shutdown().await.unwrap();
         actor.await.unwrap();
+        assert!(observer.page_tasks(None, 100).unwrap().items.is_empty());
     }
 
     #[tokio::test]
