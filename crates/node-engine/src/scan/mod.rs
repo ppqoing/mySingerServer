@@ -17,6 +17,7 @@ mod task_file_base_coordinator;
 mod task_file_cache;
 mod task_file_media_compute;
 mod task_file_media_persistence;
+mod task_file_scan_run;
 pub(crate) use task_file_base_coordinator::{
     TaskFileBaseCoordinatorError, TaskFileBaseCoordinatorOptions, TaskFileBaseCoordinatorResult,
     TaskFileBaseCoordinatorSummary, run_task_file_base_coordinator,
@@ -32,6 +33,7 @@ pub(crate) use task_file_media_compute::{
 pub(crate) use task_file_media_persistence::{
     TaskFileMediaPersistenceError, TaskFileMediaPersistenceOptions, persist_task_file_media_results,
 };
+pub(crate) use task_file_scan_run::{CompletedScanSnapshot, ScanRunResult};
 
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
