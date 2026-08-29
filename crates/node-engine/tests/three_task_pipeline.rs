@@ -11,6 +11,7 @@ use dedup_node_store::{
     AnalysisStatus, FeatureWrite, GroupKind, NewTaskItem, NodeStore, ScannedPath,
     TaskItemCompletion, VideoFrameStage1Fields, VideoFrameStage2Fields, VideoMetadataFields,
 };
+use rusqlite::Connection;
 
 /// 记录重复文件清单是否仍向 Worker 派发二次计算。
 #[derive(Default)]
@@ -26,14 +27,15 @@ impl Stage2Processor for RejectingStage2 {
     }
 }
 
-/// 基础缓存、联系表、二次缓存和最终清单在重启后都应直接复用。
+/// 重启清空旧运行态后，新任务仍应复用完整基础缓存、联系表和二次缓存。
 #[tokio::test]
-async fn three_task_pipeline_reuses_base_and_stage2_results_across_restart() {
+async fn three_task_pipeline_creates_new_task_and_reuses_cache_after_restart() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("node.db");
     let contact_root = directory.path().join("cache/contact-sheets");
     let machine_id = MachineId::from_sha256([0xa7; 32]);
     let scan_task;
+    let first_run_id;
     let first_group_shape;
 
     {
@@ -54,15 +56,47 @@ async fn three_task_pipeline_reuses_base_and_stage2_results_across_restart() {
 
         assert_eq!(stage2.calls, 0, "首次清单也应复用已经存在的二次特征");
         assert_eq!(report.status, AnalysisStatus::Completed);
+        first_run_id = report.run_id;
         first_group_shape = group_shape(&store, report.run_id);
     }
 
     let mut reopened = NodeStore::open(&database, machine_id).unwrap();
-    let scanned = [
+    let restart_connection = Connection::open(&database).unwrap();
+    for table in [
+        "tasks",
+        "task_items",
+        "task_scan_roots",
+        "task_stages",
+        "analysis_runs",
+        "analysis_run_stages",
+        "analysis_run_inputs",
+        "candidate_pairs",
+        "duplicate_groups",
+        "group_members",
+        "review_marks",
+    ] {
+        let count: i64 = restart_connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "重启后不应恢复旧运行态表 {table}");
+    }
+    drop(restart_connection);
+    assert!(
+        reopened.task_snapshot(scan_task).is_err(),
+        "重启后旧基础任务不得恢复"
+    );
+    assert!(
+        reopened.analysis_run_snapshot(first_run_id).is_err(),
+        "重启后旧分析运行不得恢复"
+    );
+
+    let scanned_paths = [
         scanned(r"D:\Media\left.mp4"),
         scanned(r"D:\Media\right.mp4"),
     ];
-    let path_hits = reopened.lookup_scanned_paths(&scanned).unwrap();
+    let path_hits = reopened.lookup_scanned_paths(&scanned_paths).unwrap();
     for hit in &path_hits {
         let content_id = hit.content_id.expect("完整路径缓存必须指向内容");
         let cached = reopened.load_base_cache_record(content_id).unwrap();
@@ -80,13 +114,30 @@ async fn three_task_pipeline_reuses_base_and_stage2_results_across_restart() {
         assert!(reopened.load_complete_stage2(content_id).unwrap().is_some());
     }
 
+    let restarted_contents = path_hits
+        .iter()
+        .map(|hit| {
+            let location = LocationKey::new(
+                reopened.machine_id().clone(),
+                hit.scanned.normalized_path.clone(),
+            );
+            (
+                hit.scanned.clone(),
+                location,
+                hit.content_id.expect("重启后路径缓存必须保留内容 ID"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let restarted_scan_task = completed_base_task(&mut reopened, &restarted_contents, 300);
+    assert_ne!(restarted_scan_task, scan_task, "重启后必须创建新的运行任务");
+
     let mut stage2 = RejectingStage2::default();
     let second = LocalAnalysisEngine::start(
         &mut reopened,
-        &[scan_task],
+        &[restarted_scan_task],
         Thresholds::default(),
         &mut stage2,
-        300,
+        400,
     )
     .await
     .unwrap();
