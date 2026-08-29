@@ -9,6 +9,7 @@ mod phase2;
 mod result_file;
 /// 本地和跨机二筛的瞬态缓存分类计划。
 pub mod stage2_planner;
+mod transient;
 mod video;
 
 use std::{
@@ -54,6 +55,8 @@ pub use result_file::{
     AnalysisResultRow, AnalysisResultWriter, PublishedAnalysisResult, VerifiedAnalysisResult,
     verify_result_file,
 };
+#[allow(unused_imports)]
+pub(crate) use transient::{prepare_current_scan_analysis, publish_local_analysis_result};
 
 use model::{from_store_candidate, from_store_input, to_store_candidates, to_store_groups};
 use video::video_candidates_with_runtime;
@@ -80,6 +83,31 @@ pub enum AnalysisBlocked {
         /// 持久化任务状态。
         status: TaskStatus,
     },
+    /// 当前进程只接受 actor 明确传入的唯一最近完成扫描任务。
+    #[error("当前扫描任务必须唯一且等于 {expected:?}，收到 {selected:?}")]
+    CurrentScanTaskMismatch {
+        /// actor 传入的当前完成扫描任务。
+        expected: TaskId,
+        /// 调用方实际选择的任务集合。
+        selected: Vec<TaskId>,
+    },
+    /// 分析开始前文件库 revision 已经不再等于扫描快照。
+    #[error("当前扫描快照 revision {expected} 已过期，数据库当前 revision 为 {actual}")]
+    LibraryRevisionChanged {
+        /// 扫描快照记录的 revision。
+        expected: u64,
+        /// 当前 SQLite 中的 revision。
+        actual: u64,
+    },
+    /// 候选仍有一筛后尚未完成的联合二筛，不能把缺失当作拒绝发布。
+    #[error("本地分析仍有 {unresolved} 个候选缺少完整二筛，暂不能发布结果")]
+    Stage2Incomplete {
+        /// 尚未得到完整联合二筛的候选数量。
+        unresolved: usize,
+    },
+    /// 最近分析结果文件无法完成安全发布。
+    #[error(transparent)]
+    ResultFile(#[from] AnalysisResultError),
     /// 分析内部状态与已提交数据不一致。
     #[error("本地分析状态无效: {0}")]
     InvalidState(String),

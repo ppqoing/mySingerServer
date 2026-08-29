@@ -1,6 +1,6 @@
 //! 本地分析在当前进程内使用的输入、候选、分组和成员运行模型。
 
-use dedup_core::{ContentKey, DisplayPath, LocationKey, MediaKind};
+use dedup_core::{AnalysisRunId, ContentKey, DisplayPath, LocationKey, MediaKind, Thresholds};
 use dedup_node_store::{
     AnalysisInput, CandidateStatus, CandidateWrite, GroupKind, GroupMemberWrite, GroupWrite,
     PairKind,
@@ -17,6 +17,25 @@ pub struct ScanAnalysisInput {
     pub display_path: DisplayPath,
     /// Worker 实际探测出的媒体类型。
     pub media_kind: MediaKind,
+}
+
+/// 当前扫描快照对应的进程内本地分析运行；候选和输入只在本次进程中持有。
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct LocalAnalysisRun {
+    /// 本次运行的 UUID v7 标识，仅用于结果头和进程内关联。
+    pub(crate) run_id: AnalysisRunId,
+    /// 创建运行时确认的文件库版本。
+    pub(crate) library_revision: u64,
+    /// 创建运行时的 Unix 毫秒时间。
+    pub(crate) created_at_ms: u64,
+    /// 本次运行冻结的完整筛选阈值。
+    pub(crate) thresholds: Thresholds,
+    /// 当前扫描成功项按内容和位置排序去重后的输入。
+    pub(crate) inputs: Vec<ScanAnalysisInput>,
+    /// 当前进程内的一筛候选和后续二筛结果。
+    pub(crate) candidates: Vec<AnalysisCandidate>,
+    /// 因基础缓存不完整而跳过的唯一内容数。
+    pub(crate) skipped_incomplete: usize,
 }
 
 /// 本地相似候选的媒体种类。
