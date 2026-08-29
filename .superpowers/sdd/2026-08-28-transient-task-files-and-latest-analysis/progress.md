@@ -124,3 +124,5 @@ Spec: `D:/code/mySingerServer/docs/superpowers/specs/2026-08-28-transient-task-f
 - Task 10B1 complete (commits `7a063e95..ee1708f4`, review clean)。
 - Task 10B2：提交 `3ec6868`。二筛缺失项按唯一 ContentKey 和结构完整性批量准备，合法全零特征保持缓存命中；最终候选判定一次批量读取全部唯一内容后在内存完成，删除了逐候选 SQLite 查询。控制 Agent 验证新增行为 2/2、local_analysis 11/11、representative_grouping 3/3、NodeEngine test-hooks lib 148/148、fmt/diff 通过；独立聚焦审查无 Critical/Important/Minor。
 - Task 10B2 complete (commits `ee1708f4..3ec6868`, review clean)。
+- Task 10C：提交 `70d2886`。Node actor 已改用当前进程 `latest_completed_scan` 与内存分析状态；缓存命中直接发布最近结果 TSV，确有二筛缺失时才进入瞬态任务文件、唯一读取调度器、Worker 与 taskless SQLite ACK。取消在最终发布前再次核对，不覆盖旧结果；Stage2 运行目录删除首次失败时由同一 production owner 重试，未清理完成不发布成功。旧 queued/running 任务行不参与新入口门禁，旧任务/分析表保持不变。控制 Agent 当前验证 NodeEngine test-hooks lib 153/153、local_analysis 11/11、representative_grouping 3/3、NodeStore analysis_state 6/6、fmt/diff-check 全通过；详见 `task-10c-report.md`。
+- Task 10C complete (commits `3ec6868..70d2886`, focused review findings closed)。
