@@ -8,7 +8,7 @@ use std::{
         Arc, Condvar, Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use dedup_core::{DisplayPath, MachineId, MediaKind, NormalizedPath};
@@ -37,14 +37,28 @@ struct GateState {
     all_released: bool,
 }
 impl ReadGate {
-    /// 等待指定文件已经进入真实块读取，用于稳定观察上游枚举状态。
-    fn wait_started(&self, path: &Path) {
+    /// 在有界时间内等待文件进入真实块读取，避免失败断言遗留永不结束的阻塞线程。
+    fn wait_started_for(&self, path: &Path, timeout: Duration) -> bool {
         let key = path.file_name().unwrap().to_string_lossy().into_owned();
+        let deadline = Instant::now() + timeout;
         let (lock, cv) = &*self.0;
         let mut state = lock.lock().unwrap();
         while !state.started.contains(&key) {
-            state = cv.wait(state).unwrap();
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            let (next_state, result) = cv.wait_timeout(state, remaining).unwrap();
+            state = next_state;
+            if result.timed_out() && !state.started.contains(&key) {
+                return false;
+            }
         }
+        true
+    }
+
+    /// 返回当前已经进入真实块读取的文件名，帮助定位调度或测试门未推进的边界。
+    fn started_keys(&self) -> Vec<String> {
+        self.0.0.lock().unwrap().started.iter().cloned().collect()
     }
 
     fn release(&self, path: &Path) {
@@ -185,12 +199,22 @@ struct CancelAfterTopCheck {
     cancellation: ReadCancellationToken,
 }
 impl CancelAfterTopCheck {
-    fn wait_entered(&self) {
+    /// 在有界时间内等待枚举器通过主检查点，避免前置失败留下永不结束的阻塞线程。
+    fn wait_entered_for(&self, timeout: Duration) -> bool {
         let (lock, cv) = &*self.state;
+        let deadline = Instant::now() + timeout;
         let mut state = lock.lock().unwrap();
         while !state.0 {
-            state = cv.wait(state).unwrap();
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            let (next_state, result) = cv.wait_timeout(state, remaining).unwrap();
+            state = next_state;
+            if result.timed_out() && !state.0 {
+                return false;
+            }
         }
+        true
     }
     fn release(&self) {
         let (lock, cv) = &*self.state;
@@ -410,6 +434,21 @@ async fn materialized_enumeration_completes_before_bounded_row_delivery() {
             "物化枚举完成边界",
         )
         .await;
+    reporter
+        .configure_pipeline_nowait(RuntimeExecutionConfigUpdate {
+            hash_tasks: 1,
+            path_cache_queue_capacity: 1,
+            content_cache_queue_capacity: 1,
+            decode_queue_capacity: 1,
+            persist_queue_capacity: 1,
+            worker_slots: 1,
+            cpu_budget: 1,
+            global_disk_permits: config.total_threads as u32,
+            hdd_per_disk_permits: config.hdd_threads_per_disk as u32,
+            ssd_per_disk_permits: config.ssd_threads_per_disk as u32,
+            unknown_per_disk_permits: config.unknown_threads_per_disk as u32,
+        })
+        .unwrap();
     let runtime_id = reporter.id().to_owned();
     let run_reporter = reporter.clone();
     let root = DisplayPath::new(directory.path()).unwrap();
@@ -433,9 +472,20 @@ async fn materialized_enumeration_completes_before_bounded_row_delivery() {
 
     let wait_gate = gate.clone();
     let blocked_path = paths[0].clone();
-    tokio::task::spawn_blocking(move || wait_gate.wait_started(&blocked_path))
-        .await
-        .unwrap();
+    let started = tokio::time::timeout(
+        Duration::from_secs(3),
+        tokio::task::spawn_blocking(move || {
+            wait_gate.wait_started_for(&blocked_path, Duration::from_secs(2))
+        }),
+    )
+    .await
+    .expect("首项读取必须进入真实读取门")
+    .expect("读取门等待线程不应失败");
+    assert!(
+        started,
+        "首项未进入真实读取门，当前已开始: {:?}",
+        gate.started_keys()
+    );
     let blocked = registry.details(&runtime_id).await.unwrap();
     gate.release_all();
     tokio::time::timeout(Duration::from_secs(3), run)
@@ -604,9 +654,20 @@ async fn scheduled_reader_reports_real_hash_and_media_permit_lifetimes() {
     );
     let wait_gate = gate.clone();
     let wait_path = path.clone();
-    tokio::task::spawn_blocking(move || wait_gate.wait_started(&wait_path))
-        .await
-        .unwrap();
+    let started = tokio::time::timeout(
+        Duration::from_secs(3),
+        tokio::task::spawn_blocking(move || {
+            wait_gate.wait_started_for(&wait_path, Duration::from_secs(2))
+        }),
+    )
+    .await
+    .expect("Hash 读取必须进入真实读取门")
+    .expect("读取门等待线程不应失败");
+    assert!(
+        started,
+        "Hash 读取未进入真实读取门，当前已开始: {:?}",
+        gate.started_keys()
+    );
 
     let held = registry.details(reporter.id()).await.unwrap();
     let hash_io = held.pipeline_metrics.unwrap().hash_io.unwrap();
@@ -692,6 +753,21 @@ async fn read_md5_progress_starts_with_cache_hits_then_counts_completed_files() 
             "缓存命中起始进度",
         )
         .await;
+    reporter
+        .configure_pipeline_nowait(RuntimeExecutionConfigUpdate {
+            hash_tasks: config.total_threads as u32,
+            path_cache_queue_capacity: config.total_threads.saturating_mul(4) as u32,
+            content_cache_queue_capacity: config.total_threads as u32,
+            decode_queue_capacity: 1,
+            persist_queue_capacity: 1,
+            worker_slots: 1,
+            cpu_budget: 1,
+            global_disk_permits: config.total_threads as u32,
+            hdd_per_disk_permits: config.hdd_threads_per_disk as u32,
+            ssd_per_disk_permits: config.ssd_threads_per_disk as u32,
+            unknown_per_disk_permits: config.unknown_threads_per_disk as u32,
+        })
+        .unwrap();
     let runtime_id = reporter.id().to_owned();
     let run_reporter = reporter.clone();
     let root = DisplayPath::new(directory.path()).unwrap();
@@ -719,9 +795,20 @@ async fn read_md5_progress_starts_with_cache_hits_then_counts_completed_files() 
 
     let wait_gate = gate.clone();
     let missing_path = paths[1].clone();
-    tokio::task::spawn_blocking(move || wait_gate.wait_started(&missing_path))
-        .await
-        .unwrap();
+    let started = tokio::time::timeout(
+        Duration::from_secs(3),
+        tokio::task::spawn_blocking(move || {
+            wait_gate.wait_started_for(&missing_path, Duration::from_secs(2))
+        }),
+    )
+    .await
+    .expect("缓存未命中项必须进入真实读取门")
+    .expect("读取门等待线程不应失败");
+    assert!(
+        started,
+        "缓存未命中项未进入真实读取门，当前已开始: {:?}",
+        gate.started_keys()
+    );
     let initial = registry.details(&runtime_id).await.unwrap();
     let read_md5 = initial
         .stages
@@ -829,6 +916,21 @@ async fn controlled_two_disks_and_actual_two_worker_slots_expose_live_known_tota
             "双盘",
         )
         .await;
+    reporter
+        .configure_pipeline_nowait(RuntimeExecutionConfigUpdate {
+            hash_tasks: config.total_threads as u32,
+            path_cache_queue_capacity: config.total_threads.saturating_mul(4) as u32,
+            content_cache_queue_capacity: config.total_threads as u32,
+            decode_queue_capacity: 2,
+            persist_queue_capacity: 2,
+            worker_slots: 2,
+            cpu_budget: 2,
+            global_disk_permits: config.total_threads as u32,
+            hdd_per_disk_permits: config.hdd_threads_per_disk as u32,
+            ssd_per_disk_permits: config.ssd_threads_per_disk as u32,
+            unknown_per_disk_permits: config.unknown_threads_per_disk as u32,
+        })
+        .unwrap();
     let reader = reader.with_runtime_reporter(reporter.clone());
     let (pool, mut started, control) = WorkerPool::controlled_batch_for_test(2);
     let (first_started_tx, first_started_rx) = tokio::sync::oneshot::channel();
@@ -921,13 +1023,20 @@ async fn controlled_two_disks_and_actual_two_worker_slots_expose_live_known_tota
     for path in &paths[..2] {
         let wait_gate = gate.clone();
         let wait_path = path.clone();
-        tokio::time::timeout(
+        let started = tokio::time::timeout(
             Duration::from_secs(3),
-            tokio::task::spawn_blocking(move || wait_gate.wait_started(&wait_path)),
+            tokio::task::spawn_blocking(move || {
+                wait_gate.wait_started_for(&wait_path, Duration::from_secs(2))
+            }),
         )
         .await
         .expect("两盘首批读取必须先进入真实读取门")
         .expect("读取门等待线程不应失败");
+        assert!(
+            started,
+            "指定文件未进入真实读取门，当前已开始: {:?}",
+            gate.started_keys()
+        );
     }
     gate.release(&paths[0]);
     gate.release(&paths[1]);
@@ -1101,6 +1210,21 @@ async fn cancel_after_successful_enumerator_join_during_read_barrier_returns_cle
             "取消",
         )
         .await;
+    reporter
+        .configure_pipeline_nowait(RuntimeExecutionConfigUpdate {
+            hash_tasks: config.total_threads as u32,
+            path_cache_queue_capacity: config.total_threads.saturating_mul(4) as u32,
+            content_cache_queue_capacity: config.total_threads as u32,
+            decode_queue_capacity: 1,
+            persist_queue_capacity: 1,
+            worker_slots: 1,
+            cpu_budget: 1,
+            global_disk_permits: config.total_threads as u32,
+            hdd_per_disk_permits: config.hdd_threads_per_disk as u32,
+            ssd_per_disk_permits: config.ssd_threads_per_disk as u32,
+            unknown_per_disk_permits: config.unknown_threads_per_disk as u32,
+        })
+        .unwrap();
     let reader = reader.with_runtime_reporter(reporter.clone());
     let cancellation = ReadCancellationToken::new();
     let run_cancel = cancellation.clone();
@@ -1229,6 +1353,8 @@ async fn producer_cancel_after_main_top_check_never_turns_cancelled_task_failed(
     let reporter = registry
         .begin(RuntimeTaskKind::Scan, machine.clone(), "取消竞态")
         .await;
+    // 该测试需要在同一运行期间使用独立控制连接；reopen 不会重复清理瞬态任务表。
+    let mut control_store = store.reopen().unwrap();
     let run_reporter = reporter.clone();
     let run_cancel = cancellation.clone();
     let run = tokio::spawn(async move {
@@ -1249,10 +1375,14 @@ async fn producer_cancel_after_main_top_check_never_turns_cancelled_task_failed(
         (store, result)
     });
     let wait = barrier.clone();
-    tokio::task::spawn_blocking(move || wait.wait_entered())
-        .await
-        .unwrap();
-    let mut control_store = NodeStore::open(&database, machine).unwrap();
+    let entered = tokio::time::timeout(
+        Duration::from_secs(3),
+        tokio::task::spawn_blocking(move || wait.wait_entered_for(Duration::from_secs(2))),
+    )
+    .await
+    .expect("取消竞态枚举器必须进入主检查点")
+    .expect("取消竞态屏障等待线程不应失败");
+    assert!(entered, "取消竞态枚举器未进入主检查点");
     control_store.cancel_task(task_id, 3).unwrap();
     cancellation.cancel();
     barrier.release();
