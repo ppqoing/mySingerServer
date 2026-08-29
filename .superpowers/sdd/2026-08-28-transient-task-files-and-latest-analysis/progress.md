@@ -113,3 +113,6 @@ Spec: `D:/code/mySingerServer/docs/superpowers/specs/2026-08-28-transient-task-f
 - Task 8E3A：提交 `4e4895c8`。Phase2 在第一次本地/远端缓存查询前冻结全部来源 lane，完整命中零 TSV/Worker，Compute 只进入唯一 `ScheduledFileReader`、Stage2 task-file runner 与 taskless SQLite ACK；返回恢复后的 Store、内容统计和真实 outbox 高水位。定向 Phase2 通过、NodeEngine lib 135/135、fmt/diff 通过。
 - Task 8E3A fix round 1/5：独立审查发现 runtime 目录先于 `BaseStoreActor::finish` 被删除；提交 `8a8f9e27` 以真实 join/discard 顺序 RED 修复成功、runner 失败、writer/highwater 失败路径。复审确认 1 项 addressed、0 项 open；Phase2 9/9、NodeEngine lib 137/137、fmt/diff 通过。
 - Task 8E3A complete (commits `c5478969..8a8f9e27`, review clean)。
+- Task 8E3B：提交 `1b95a0df`。外部 Stage2 background job 使用瞬态 runtime、唯一读取调度器与 task-file runner；RuntimeTask 终态延后到 Pool、SQLite actor、TSV 与真实 outbox 高水位收束后发布，旧任务表保持空。Actor 16/16、NodeEngine lib 141/141、Desktop cross phase2 3/3、fmt/diff 通过。
+- Task 8E3B fix round 1/5：独立审查发现成功扫描与 Restart/Shutdown 交错时可能先发布 Completed 却丢失 `latest_completed_scan`；提交 `7d6188af` 将扫描快照和终态合并为只能消费一次的 `BackgroundOutcome`，正常完成与停止路径均先安装快照再发布终态。定向交错 RED→GREEN，Actor 17/17、NodeEngine lib 142/142、fmt/diff 通过；定向复审确认 1 项 addressed、0 项 open。
+- Task 8E3B complete (commits `4072b530..7d6188af`, review clean)。
