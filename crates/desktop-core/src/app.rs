@@ -357,6 +357,51 @@ struct ActiveWindowRequest {
     members: Option<(String, ResultWindowRequest)>,
 }
 
+/// 成员查询绑定的运行、类别和组范围快照；用于查询前后丢弃迟到结果。
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MemberWindowScope {
+    /// 成员所属的持久组 ID。
+    group_id: String,
+    /// 成员窗口请求及其分页范围。
+    request: ResultWindowRequest,
+}
+
+impl ActiveWindowRequest {
+    /// 仅接受与当前组运行和类别一致的成员请求，并记录其当前组代次。
+    fn begin_member_scope(
+        &mut self,
+        request: &ResultWindowRequest,
+        group_id: &str,
+    ) -> Option<MemberWindowScope> {
+        let groups = self.groups.as_ref()?;
+        if groups.analysis_run_id != request.analysis_run_id || groups.kind != request.kind {
+            return None;
+        }
+        let scope = MemberWindowScope {
+            group_id: group_id.to_owned(),
+            request: request.clone(),
+        };
+        self.members = Some((scope.group_id.clone(), scope.request.clone()));
+        Some(scope)
+    }
+
+    /// 查询返回时再次核对组运行、类别、组 ID 和完整成员窗口请求。
+    fn member_scope_is_current(&self, scope: &MemberWindowScope) -> bool {
+        self.groups.as_ref().is_some_and(|groups| {
+            groups.analysis_run_id == scope.request.analysis_run_id
+                && groups.kind == scope.request.kind
+        }) && self.members.as_ref().is_some_and(|(group_id, request)| {
+            group_id == &scope.group_id && request == &scope.request
+        })
+    }
+
+    /// 删除成功后同时失效组与成员请求，阻止旧队列结果重新填充窗口。
+    fn invalidate_after_delete(&mut self) {
+        self.groups = None;
+        self.members = None;
+    }
+}
+
 /// 一个节点独占的同步触发端和后台任务；丢弃时立即结束其 PG 连接与同步请求。
 struct NodeSyncWorker {
     id: Uuid,
@@ -783,11 +828,13 @@ async fn run_controller(
             }
             UiCommand::RequestMemberWindow { request, group_id } => {
                 async {
+                    let previous = active_window_request.members.clone();
+                    let Some(scope) = active_window_request.begin_member_scope(&request, &group_id)
+                    else {
+                        return Ok(());
+                    };
                     // 成员范围变化后，旧确认快照不再与当前窗口绑定。
                     prepared_delete = None;
-                    let previous = active_window_request
-                        .members
-                        .replace((group_id.clone(), request.clone()));
                     let context_changed = previous.as_ref().is_some_and(|(old_group, old)| {
                         old_group != &group_id
                             || old.analysis_run_id != request.analysis_run_id
@@ -816,9 +863,7 @@ async fn run_controller(
                         central.as_ref(),
                     )
                     .await;
-                    if active_window_request.members.as_ref()
-                        != Some(&(group_id.clone(), request.clone()))
-                    {
+                    if !active_window_request.member_scope_is_current(&scope) {
                         Ok(())
                     } else {
                         match result {
@@ -975,6 +1020,7 @@ async fn run_controller(
                             review_boards.retain(|(id, _), _| *id != run_id);
                         }
                     }
+                    active_window_request.invalidate_after_delete();
                     group_window_state = ResultWindowState::empty();
                     member_window_state = ResultWindowState::empty();
                     let _ = send_event(
@@ -2587,6 +2633,127 @@ async fn publish(events: &mpsc::Sender<UiEvent>, state: &DesktopViewState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 构造不连接节点或中心的 Desktop 测试路径。
+    fn test_desktop_paths(root: &Path) -> DesktopPaths {
+        DesktopPaths {
+            data: root.to_path_buf(),
+            logs: root.join("logs"),
+            cache: root.join("cache"),
+            config: root.join("config.toml"),
+        }
+    }
+
+    /// 等待一个命令处理完成后的统一视图事件。
+    async fn wait_for_view_after_error(events: &mut mpsc::Receiver<UiEvent>) {
+        let mut error_seen = false;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = events.recv().await.expect("Desktop 控制循环应持续发布事件");
+                match event {
+                    UiEvent::Error(_) => error_seen = true,
+                    UiEvent::ViewChanged(_) if error_seen => break,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("等待 Desktop 命令完成超时");
+    }
+
+    #[tokio::test]
+    async fn rejects_member_request_from_previous_group_scope_before_query() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = DesktopConfig {
+            nodes: Vec::new(),
+            postgres_url: None,
+            ..DesktopConfig::default()
+        };
+        let (app, mut events) = DesktopApp::start(config, test_desktop_paths(temp.path()));
+        let run_r2 = AnalysisRunId::new();
+        let run_r1 = AnalysisRunId::new();
+
+        app.send(UiCommand::RequestGroupWindow {
+            request: ResultWindowRequest::new(run_r2.as_uuid().to_string(), GroupKind::Exact, 0, 1),
+        })
+        .await
+        .unwrap();
+        wait_for_view_after_error(&mut events).await;
+
+        app.send(UiCommand::RequestMemberWindow {
+            request: ResultWindowRequest::new(run_r1.as_uuid().to_string(), GroupKind::Exact, 0, 1),
+            group_id: "r1-group".into(),
+        })
+        .await
+        .unwrap();
+        app.send(UiCommand::Shutdown).await.unwrap();
+
+        let mut member_events = 0;
+        let mut command_errors = 0;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match events.recv().await.expect("Desktop 应返回关闭事件") {
+                    UiEvent::MembersChanged { .. } => member_events += 1,
+                    UiEvent::Error(_) => command_errors += 1,
+                    UiEvent::ShutdownComplete => break,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("等待 Desktop 关闭超时");
+
+        assert_eq!(
+            member_events, 0,
+            "旧运行的成员请求不得发起查询或发布加载状态"
+        );
+        assert_eq!(command_errors, 0, "旧运行的成员请求必须静默丢弃");
+    }
+
+    #[test]
+    fn delete_success_invalidates_active_group_and_member_requests() {
+        let run_id = AnalysisRunId::new();
+        let request =
+            ResultWindowRequest::new(run_id.as_uuid().to_string(), GroupKind::Exact, 0, 1);
+        let mut active = ActiveWindowRequest {
+            groups: Some(request.clone()),
+            members: Some(("r1-group".into(), request.clone())),
+        };
+
+        active.invalidate_after_delete();
+
+        assert!(active.groups.is_none(), "删除成功后旧组请求必须失效");
+        assert!(active.members.is_none(), "删除成功后旧成员请求必须失效");
+        assert!(
+            active.begin_member_scope(&request, "r1-group").is_none(),
+            "删除成功后旧成员请求不得重新启动"
+        );
+    }
+
+    #[test]
+    fn late_member_result_is_rejected_after_group_scope_changes() {
+        let run_r1 = AnalysisRunId::new();
+        let run_r2 = AnalysisRunId::new();
+        let request_r1 =
+            ResultWindowRequest::new(run_r1.as_uuid().to_string(), GroupKind::Exact, 0, 1);
+        let request_r2 =
+            ResultWindowRequest::new(run_r2.as_uuid().to_string(), GroupKind::Exact, 0, 1);
+        let mut active = ActiveWindowRequest {
+            groups: Some(request_r1.clone()),
+            members: None,
+        };
+        let scope = active
+            .begin_member_scope(&request_r1, "r1-group")
+            .expect("当前组范围应能启动成员查询");
+        assert!(active.member_scope_is_current(&scope));
+
+        active.groups = Some(request_r2);
+
+        assert!(
+            !active.member_scope_is_current(&scope),
+            "组范围改变后迟到成员结果必须静默丢弃"
+        );
+    }
 
     /// 构造带明确运行状态的 Node 主动事件。
     fn runtime_event(index: usize, state: &str) -> NodeRuntimeEvent {

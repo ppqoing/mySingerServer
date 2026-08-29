@@ -88,14 +88,22 @@ C:\tmp\rust-v2-core-scope-target-task7b2d2c1
 | `cargo test -p dedup-desktop-core --test delete_scope --locked -- --test-threads=1` | 1 passed |
 | `cargo test -p dedup-desktop-core --test local_node_e2e --locked -- --test-threads=1` | 1 ignored；缺少真实测试包 |
 | `cargo test -p dedup-desktop-core --test cross_phase2 --locked -- --test-threads=1` | 3 passed |
-| `cargo test -p dedup-desktop-core --lib --locked -- --test-threads=1` | 1 passed |
+| `cargo test -p dedup-desktop-core --lib --locked -- --test-threads=1` | 4 passed |
 | `cargo test -p dedup-desktop-ui --test bindings_contract --locked -- --test-threads=1` | 15 passed |
 | `cargo test -p dedup-desktop-ui --test window_contract --locked -- --test-threads=1` | 21 passed |
-| `cargo test -p dedup-desktop-ui --test offscreen_layout --locked -- --test-threads=1` | 19 passed |
+| `cargo test -p dedup-desktop-ui --test offscreen_layout --locked -- --test-threads=1` | 20 passed |
 | `cargo fmt --all -- --check` | passed |
 | `git diff --check` | passed |
 
-合计 67 项通过、0 项失败、1 项因未提供 `DEDUP_TEST_PACKAGE_ROOT` 或 release staging 明确 ignored。ignored 项没有计为通过。
+合计 71 项通过、0 项失败、1 项因未提供 `DEDUP_TEST_PACKAGE_ROOT` 或 release staging 明确 ignored。ignored 项没有计为通过。
+
+## 审查修复
+
+初次聚焦审查没有 Critical，发现两项 Important：滚动事件会立即排队中心查询，可能挤满串行命令通道；旧运行的成员窗口响应也可能在切换运行或删除成功后覆盖新状态。
+
+- 滚动请求增加 80 毫秒单次防抖，只提交最新可见窗口；永久去重键同时包含运行、类别和组，切换上下文后相同窗口仍会重新查询。旧实现的真实 MainWindow 行为记录到 3 次连续请求，修复后只发最后 1 次。
+- Core 为组和成员请求保存完整作用域。成员请求在查询前、查询后都核对运行、类别、组和请求身份；删除成功立即使组/成员窗口及在途请求失效。旧实现中 R1 的迟到成员响应会在切换 R2 后继续发布，修复后不再发布旧响应。
+- 两项修复合并后重新运行 Desktop Core/UI 相关套件，共 71 项通过；格式和差异检查通过。
 
 ## 文件清单
 

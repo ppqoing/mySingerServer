@@ -1416,6 +1416,215 @@ fn result_scroll_requests_positive_group_and_member_windows() {
 }
 
 #[test]
+fn result_scroll_requests_debounce_to_latest_window_without_delaying_manual_actions() {
+    install_testing_backend();
+
+    let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    let groups = (0..100)
+        .map(|index| UiGroupRow {
+            id: format!("group-{index:03}").into(),
+            kind: "相似图片".into(),
+            md5: format!("{index:032x}").into(),
+            size: "8.0 MiB".into(),
+            members: 2,
+            reclaimable: "8.0 MiB".into(),
+        })
+        .collect::<Vec<_>>();
+    let members = (0..100)
+        .map(|index| UiMemberRow {
+            machine_id: "machine-a".into(),
+            path: format!(r"D:\Media\photo-{index:03}.jpg").into(),
+            md5: format!("{index:032x}").into(),
+            size: "8.0 MiB".into(),
+            representative: index == 0,
+            stage1: "0.99".into(),
+            phash: "4".into(),
+            stage2: "0.96".into(),
+            metadata: "1920×1080 · JPEG".into(),
+            review: "未决定".into(),
+            review_color: Color::from_rgb_u8(107, 114, 128),
+            online: true,
+            preview_enabled: true,
+            delete_enabled: true,
+        })
+        .collect::<Vec<_>>();
+    window.set_groups(ModelRc::new(VecModel::from(groups)));
+    window.set_members(ModelRc::new(VecModel::from(members)));
+    window.set_result_total_rows(1_000);
+    window.set_member_total_rows(1_000);
+    window.set_result_run_id("00000000-0000-7000-8000-000000000001".into());
+    window.set_selected_group_id("group-000".into());
+
+    let group_requests = Rc::new(RefCell::new(Vec::<(i32, i32)>::new()));
+    let captured_group_requests = group_requests.clone();
+    window.on_request_group_window(move |_, _, start, count| {
+        captured_group_requests.borrow_mut().push((start, count));
+    });
+    let member_requests = Rc::new(RefCell::new(Vec::<(i32, i32)>::new()));
+    let captured_member_requests = member_requests.clone();
+    window.on_request_member_window(move |_, _, _, start, count| {
+        captured_member_requests.borrow_mut().push((start, count));
+    });
+
+    window.invoke_navigate_to(4);
+    window
+        .window()
+        .set_size(slint::PhysicalSize::new(1440, 900));
+    window.show().expect("应能显示真实重复工作区");
+    window
+        .window()
+        .take_snapshot()
+        .expect("重复工作区应能完成软件渲染");
+
+    // 手工加载和选择组必须继续立即转发首个窗口请求，不受滚动防抖影响。
+    accessible(&window, "加载结果").invoke_accessible_default_action();
+    assert_eq!(
+        group_requests.borrow().as_slice(),
+        &[(0, 100)],
+        "手工加载结果必须立即请求首个组窗口",
+    );
+    accessible(&window, "重复组：group-000").invoke_accessible_default_action();
+    assert_eq!(
+        member_requests.borrow().as_slice(),
+        &[(0, 100)],
+        "选择组必须立即请求首个成员窗口",
+    );
+    group_requests.borrow_mut().clear();
+    member_requests.borrow_mut().clear();
+
+    let group_scroll = accessible(&window, "重复组表")
+        .query_descendants()
+        .match_inherits("ScrollView")
+        .find_first()
+        .expect("组表必须拥有独立滚动区");
+    let member_scroll = accessible(&window, "成员表")
+        .query_descendants()
+        .match_inherits("ScrollView")
+        .find_first()
+        .expect("成员表必须拥有独立滚动区");
+
+    // 连续滚轮事件发生在同一个短防抖窗口内，期间不应访问中心。
+    for delta in [-800.0, -800.0, -800.0] {
+        group_scroll.scroll(0.0, delta);
+        i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(10));
+    }
+    for delta in [-800.0, -800.0, -800.0] {
+        member_scroll.scroll(0.0, delta);
+        i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        group_requests.borrow().is_empty(),
+        "防抖窗口到达前组表不得发送请求，实际={:?}",
+        group_requests.borrow().as_slice(),
+    );
+    assert!(
+        member_requests.borrow().is_empty(),
+        "防抖窗口到达前成员表不得发送请求，实际={:?}",
+        member_requests.borrow().as_slice(),
+    );
+
+    i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(20));
+    assert!(
+        group_requests.borrow().is_empty() && member_requests.borrow().is_empty(),
+        "短于防抖时长时两张表都不得发送请求，组={:?}，成员={:?}",
+        group_requests.borrow().as_slice(),
+        member_requests.borrow().as_slice(),
+    );
+
+    // 最后一次滚轮位置只产生一个最新正数窗口，重复范围不再次发送。
+    i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(100));
+    assert_eq!(
+        group_requests.borrow().len(),
+        1,
+        "组表连续滚动在防抖后只能发送一次，实际={:?}",
+        group_requests.borrow().as_slice(),
+    );
+    assert_eq!(
+        member_requests.borrow().len(),
+        1,
+        "成员表连续滚动在防抖后只能发送一次，实际={:?}",
+        member_requests.borrow().as_slice(),
+    );
+    assert!(
+        group_requests.borrow()[0].0 > 0 && group_requests.borrow()[0].1 > 0,
+        "组表必须发送最后的正数范围，实际={:?}",
+        group_requests.borrow().as_slice(),
+    );
+    assert!(
+        member_requests.borrow()[0].0 > 0 && member_requests.borrow()[0].1 > 0,
+        "成员表必须发送最后的正数范围，实际={:?}",
+        member_requests.borrow().as_slice(),
+    );
+
+    // 小幅滚动仍落在同一范围，必须经过真实 scrolled 事件验证去重，而不是依赖零增量。
+    group_scroll.scroll(0.0, -1.0);
+    member_scroll.scroll(0.0, -1.0);
+    i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(100));
+    assert_eq!(
+        group_requests.borrow().len(),
+        1,
+        "相同组表 start/count 不得重复发送",
+    );
+    assert_eq!(
+        member_requests.borrow().len(),
+        1,
+        "相同成员表 start/count 不得重复发送",
+    );
+
+    // 新运行仍落在同一滚动范围时，手工加载的 0 窗口不能吞掉后续同范围请求。
+    let initial_group_range = group_requests.borrow()[0];
+    window.set_result_run_id("00000000-0000-7000-8000-000000000002".into());
+    accessible(&window, "加载结果").invoke_accessible_default_action();
+    let group_count_after_manual_load = group_requests.borrow().len();
+    assert_eq!(
+        group_requests.borrow().last(),
+        Some(&(0, 100)),
+        "切换运行后的手工加载必须立即请求首个组窗口",
+    );
+    group_scroll.scroll(0.0, -1.0);
+    i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(100));
+    assert_eq!(
+        group_requests.borrow().len(),
+        group_count_after_manual_load + 1,
+        "切换 result_run_id 后相同组表 start/count 仍必须请求一次",
+    );
+    assert_eq!(
+        group_requests.borrow().last(),
+        Some(&initial_group_range),
+        "新运行的组表请求必须保留滚动得到的范围",
+    );
+
+    // 选择新组会立即请求成员 0 窗口；相同滚动范围仍属于新的成员上下文。
+    let initial_member_range = member_requests.borrow()[0];
+    window.set_selected_group_id("group-001".into());
+    window.invoke_request_member_window(
+        "00000000-0000-7000-8000-000000000002".into(),
+        "group-001".into(),
+        0,
+        0,
+        100,
+    );
+    let member_count_after_group_selection = member_requests.borrow().len();
+    assert_eq!(
+        member_requests.borrow().last(),
+        Some(&(0, 100)),
+        "切换组后的手工选择必须立即请求首个成员窗口",
+    );
+    member_scroll.scroll(0.0, -1.0);
+    i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(100));
+    assert_eq!(
+        member_requests.borrow().len(),
+        member_count_after_group_selection + 1,
+        "切换 selected_group_id 后相同成员 start/count 仍必须请求一次",
+    );
+    assert_eq!(
+        member_requests.borrow().last(),
+        Some(&initial_member_range),
+        "新组的成员请求必须保留滚动得到的范围",
+    );
+}
+
+#[test]
 fn result_workspace_does_not_expose_cursor_pagination_controls() {
     install_testing_backend();
 

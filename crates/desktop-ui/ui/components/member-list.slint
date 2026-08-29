@@ -56,11 +56,43 @@ export component MemberList inherits Rectangle {
     in property <int> total-rows;
     in property <bool> loading;
     in property <bool> stale;
+    // 运行、结果类别与组组成去重上下文，避免跨组复用旧滚动范围。
+    in property <string> context-key;
     in property <bool> review-enabled: true;
     callback preview(string, string);
     callback review(string, string, int);
     callback request-window(int, int);
     private property <string> selected-path;
+
+    // 滚动只保留最新窗口；短计时器到期后再把范围交给串行 Core。
+    private property <int> pending-start: -1;
+    private property <int> pending-count: 0;
+    private property <int> last-request-start: -1;
+    private property <int> last-request-count: -1;
+    private property <string> last-request-context: "";
+    // 由嵌套滚动区调用，重新开始同一个防抖计时器。
+    function restart-scroll-debounce() {
+        if (scroll-debounce.running) {
+            scroll-debounce.restart();
+        } else {
+            scroll-debounce.start();
+        }
+    }
+    scroll-debounce := Timer {
+        interval: 80ms;
+        running: false;
+        triggered => {
+            self.running = false;
+            if root.pending-start != root.last-request-start
+                    || root.pending-count != root.last-request-count
+                    || root.context-key != root.last-request-context {
+                root.last-request-start = root.pending-start;
+                root.last-request-count = root.pending-count;
+                root.last-request-context = root.context-key;
+                root.request-window(root.pending-start, root.pending-count);
+            }
+        }
+    }
 
     background: Theme.panel;
     min-width: 50px;
@@ -198,7 +230,9 @@ export component MemberList inherits Rectangle {
         scrolled => {
             // viewport-y 向下滚动时为负值；扣除表头后换算全局成员行并保留半窗预读。
             let next-start = max(0, round(max(0px, -result-scroll.viewport-y - Theme.table-header-height) / Theme.member-row-height) - root.members.length / 2);
-            root.request-window(next-start, max(1, root.members.length));
+            root.pending-start = next-start;
+            root.pending-count = max(1, root.members.length);
+            root.restart-scroll-debounce();
         }
     }
 }

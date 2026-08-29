@@ -40,6 +40,10 @@ export component DuplicateWorkspace inherits Rectangle {
     // 跨机器结果仍只选择现有 0/1/2 类型，绝不引入第四种 GroupKind。
     property <int> cross-result-kind: 0;
     property <int> query-kind: root.duplicate-tab < 3 ? root.duplicate-tab : root.cross-result-kind;
+    // 用固定文本编码类别，供表格只在同一运行/类别/组内去重滚动请求。
+    property <string> query-kind-key: root.query-kind == 0 ? "0"
+        : root.query-kind == 1 ? "1"
+        : root.query-kind == 2 ? "2" : "3";
     property <int> group-visible-count: 100;
     property <int> member-visible-count: 100;
     property <string> result-title: root.duplicate-tab == 0 ? "精确重复结果"
@@ -146,6 +150,7 @@ export component DuplicateWorkspace inherits Rectangle {
                         vertical-stretch: 1;
                         groups: root.groups;
                         selected-id: root.selected-group-id;
+                        context-key: root.run-id + ":" + root.query-kind-key;
                         start-index: root.result-start-index;
                         total-rows: root.result-total-rows;
                         loading: root.result-loading;
@@ -174,6 +179,7 @@ export component DuplicateWorkspace inherits Rectangle {
                     MemberList {
                         vertical-stretch: 1;
                         members: root.members;
+                        context-key: root.run-id + ":" + root.query-kind-key + ":" + root.selected-group-id;
                         start-index: root.member-start-index;
                         total-rows: root.member-total-rows;
                         loading: root.result-loading;
