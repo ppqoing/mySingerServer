@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use dedup_core::{DiskReadConfig, MediaKind};
+use dedup_core::{ContentKey, DiskReadConfig, MediaKind};
 use dedup_protocol::{proto, proto::worker_envelope};
 use dedup_windows::ReadCancellationToken;
 use tokio::time::sleep;
@@ -317,18 +317,31 @@ where
         .cached
         .as_ref()
         .map_or(MediaKind::Other, |record| record.media_kind);
-    if context.content_id.is_none() {
-        let content = match store.upsert_content_and_location(&task.record.scanned, md5, media_kind)
-        {
-            Ok(content) => content,
-            Err(error) => return Err((pending, format!("Media 内容位置写入失败: {error}"))),
-        };
-        context.content_id = Some(content.id);
-        if let Some(cached) = context.cached.as_mut() {
-            cached.content_id = Some(content.id);
-        }
-        pending.contexts.insert(identity.clone(), context.clone());
+    let expected_key = ContentKey::new(md5, task.record.scanned.file_size);
+    if context
+        .cached
+        .as_ref()
+        .is_some_and(|cached| cached.content_key != expected_key)
+    {
+        return Err((pending, "Media 缓存上下文 ContentKey 与任务行不一致".into()));
     }
+    // 每个 Media 行都幂等补写当前位置；context 中的 content_id 只是快照，不能代替
+    // 本次路径归属写入，否则 Hash 命中旧内容后换路径会漏掉 files 行。
+    let content = match store.upsert_content_and_location(&task.record.scanned, md5, media_kind) {
+        Ok(content) => content,
+        Err(error) => return Err((pending, format!("Media 内容位置写入失败: {error}"))),
+    };
+    if content.key != expected_key {
+        return Err((
+            pending,
+            "Media Store 返回的 ContentKey 与任务行不一致".into(),
+        ));
+    }
+    context.content_id = Some(content.id);
+    if let Some(cached) = context.cached.as_mut() {
+        cached.content_id = Some(content.id);
+    }
+    pending.contexts.insert(identity.clone(), context.clone());
     let physical_disk_id = physical_disk_display(&context.lane);
     let worker_identity = WorkerFileIdentity {
         machine_id: store.machine_id().clone(),
@@ -637,7 +650,9 @@ mod tests {
         time::Duration,
     };
 
-    use dedup_core::{DiskReadConfig, DisplayPath, MachineId, MediaKind, NormalizedPath};
+    use dedup_core::{
+        ContentKey, DiskReadConfig, DisplayPath, LocationKey, MachineId, MediaKind, NormalizedPath,
+    };
     use dedup_node_store::{BaseCacheRecord, NodeStore, ScannedPath};
     use dedup_windows::{LocalDiskKind, PhysicalDiskId, ReadCancellationToken};
 
@@ -801,7 +816,7 @@ mod tests {
     async fn media_permit_is_held_until_matching_source_read_complete() {
         let root = tempfile::tempdir().unwrap();
         let machine = MachineId::from_sha256([0x61; 32]);
-        let mut store = NodeStore::open_in_memory(machine).unwrap();
+        let mut store = NodeStore::open_in_memory(machine.clone()).unwrap();
         let cached = seed_record(&mut store, r"C:\seed-media.bin", [0x11; 16], 42);
         let live = Arc::new(AtomicIsize::new(0));
         let pending =
@@ -864,7 +879,20 @@ mod tests {
         assert_eq!(std::fs::read(path).unwrap()[0], b'P');
         drop(handle);
         drop(acknowledgements);
-        actor.finish().await.unwrap();
+        let store = actor.finish().await.unwrap();
+        let location = LocationKey::new(
+            machine.clone(),
+            NormalizedPath::new(r"C:\media.bin").unwrap(),
+        );
+        let active = store
+            .active_file(&location)
+            .unwrap()
+            .expect("Media 派发必须幂等补写当前路径位置");
+        assert_eq!(
+            active.content_key,
+            ContentKey::new([0x11; 16], 42),
+            "补写的位置必须绑定任务行的 ContentKey"
+        );
     }
 
     #[tokio::test]

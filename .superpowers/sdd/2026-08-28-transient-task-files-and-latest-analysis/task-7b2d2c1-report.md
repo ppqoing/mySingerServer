@@ -27,6 +27,16 @@ Completed/Crashed 事件和取消收束；完成/失败结果以拥有型对象�
   保持 `P` 并返回可 discard 的 pending。Hash 行存在时，Media-first 运行返回明确
   `HashPending` 与剩余 Hash 数量，不把阻塞当成完成。
 
+## 审查修复
+
+- Worker 槽位退出时先等待旧 driver 收束并尝试安装 replacement；driver 或 replacement
+  失败只发送任务级 `InfrastructureFailure`，不先发送 `Crashed`，避免上层先把当前项
+  错误置为 `F` 后又收到基础设施错误。replacement 工厂现在返回错误，由统一事件边界
+  决定事件顺序。
+- 每个 Media 行都通过 `upsert_content_and_location` 幂等补写当前位置，即使上下文已有
+  `content_id` 也不跳过；返回的 `ContentKey` 必须与任务行的 MD5/文件大小一致，并把
+  返回的内容 ID 更新回上下文。
+
 ## TDD 与验证
 
 先以缺少 `run_task_file_media_compute` 的编译失败固定 RED，随后实现最小边界并增加真实
@@ -41,7 +51,11 @@ Completed/Crashed 事件和取消收束；完成/失败结果以拥有型对象�
 | Worker 崩溃只影响当前项、另一 lane 继续完成 | 通过 |
 | foreign/mismatched Started/SourceComplete 不释放 permit | 通过 |
 | 取消保持 P 且 pending 可 discard | 通过 |
+| replacement 失败先发 InfrastructureFailure，不发送 Crashed | 通过 |
+| 已有 content_id 的 Media 行仍补写当前 files 位置并校验 ContentKey | 通过 |
 | `cargo test -p dedup-node-engine --lib task_file_media_compute --features test-hooks --locked -- --test-threads=1` | 6/6 通过 |
+| `cargo test -p dedup-node-engine --lib worker::pool::tests --locked -- --test-threads=1` | 12/12 通过 |
+| `cargo test -p dedup-node-engine --lib --locked -- --test-threads=1` | 82/82 通过 |
 | `cargo fmt --all -- --check` | 通过 |
 | `git diff --check` | 通过 |
 

@@ -2459,6 +2459,20 @@ async fn handle_slot_event_with_replacement<E, F, Fut>(
                 locked.process_ids.remove(&slot_id);
                 locked.failure_count += 1;
             }
+            // 先完成旧 driver 收束和新槽位安装；基础设施失败必须先于业务崩溃事件，
+            // 否则上层会先把当前项标成 F，随后才收到任务级错误而破坏 P 语义。
+            let replacement_error =
+                replace_slot_with_factory(slot_id, slots, idle, state, replacement_factory)
+                    .await
+                    .err();
+            if let Some(error) = driver_error.or(replacement_error) {
+                events
+                    .send_event(WorkerEvent::InfrastructureFailure {
+                        message: format!("Worker 槽位收束或替换失败: {error}"),
+                    })
+                    .await;
+                return;
+            }
             if let Some(work) = work {
                 if let Some(identity) = work.file_identity {
                     events
@@ -2482,15 +2496,6 @@ async fn handle_slot_event_with_replacement<E, F, Fut>(
                         .await;
                 }
             }
-            if let Some(error) = driver_error {
-                events
-                    .send_event(WorkerEvent::InfrastructureFailure {
-                        message: format!("Worker driver 收束异常: {error}"),
-                    })
-                    .await;
-            }
-            replace_slot_with_factory(slot_id, slots, idle, events, state, replacement_factory)
-                .await;
         }
     }
 }
@@ -2532,37 +2537,27 @@ fn valid_worker_phase(value: i32) -> Option<proto::RuntimeWorkerPhase> {
 }
 
 #[allow(clippy::too_many_arguments)]
-/// 通过生产或测试工厂创建替代槽并原子安装；失败只报告基础设施事件。
-async fn replace_slot_with_factory<E, F, Fut>(
+/// 通过生产或测试工厂创建替代槽并原子安装；失败交由上层先报告基础设施错误。
+async fn replace_slot_with_factory<F, Fut>(
     slot_id: usize,
     slots: &mut BTreeMap<usize, SlotHandle>,
     idle: &mut VecDeque<usize>,
-    events: &E,
     state: &Arc<Mutex<PoolState>>,
     replacement_factory: &mut F,
-) where
-    E: WorkerEventSink,
+) -> Result<(), WorkerPoolError>
+where
     F: FnMut(usize) -> Fut,
     Fut: Future<Output = Result<SlotHandle, WorkerPoolError>>,
 {
-    match replacement_factory(slot_id).await {
-        Ok(slot) => {
-            state
-                .lock()
-                .unwrap()
-                .process_ids
-                .insert(slot_id, slot.process_id);
-            idle.push_back(slot_id);
-            slots.insert(slot_id, slot);
-        }
-        Err(error) => {
-            events
-                .send_event(WorkerEvent::InfrastructureFailure {
-                    message: error.to_string(),
-                })
-                .await;
-        }
-    }
+    let slot = replacement_factory(slot_id).await?;
+    state
+        .lock()
+        .unwrap()
+        .process_ids
+        .insert(slot_id, slot.process_id);
+    idle.push_back(slot_id);
+    slots.insert(slot_id, slot);
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3282,6 +3277,64 @@ mod tests {
         assert_eq!(locked.process_ids.get(&2), Some(&202));
         assert_eq!(locked.cpu_in_use, 1);
         assert_eq!(locked.running.get(&2).unwrap().item_id, "retained");
+    }
+
+    #[tokio::test]
+    async fn replacement_failure_precedes_crashed_event_for_active_work() {
+        let state = Arc::new(Mutex::new(PoolState::new(1)));
+        let (commands, _receiver) = mpsc::unbounded_channel();
+        let work = WorkIdentity {
+            task_id: "replacement-failure".into(),
+            item_id: "item-1".into(),
+            cpu_weight: 1,
+            decoder_threads: Some(1),
+            file_identity: Some(WorkerFileIdentity {
+                machine_id: MachineId::from_sha256([0xA7; 32]),
+                normalized_path: NormalizedPath::new(r"I:\replacement-failure.bin").unwrap(),
+                display_path: DisplayPath::new(r"I:\replacement-failure.bin").unwrap(),
+                file_size: 4_096,
+                stage: "base_compute".into(),
+                physical_disk_id: "PhysicalDisk7".into(),
+            }),
+        };
+        register_running_work(&mut state.lock().unwrap(), 0, work.clone());
+        let mut slots = BTreeMap::from([(
+            0,
+            SlotHandle {
+                process_id: 707,
+                commands,
+                driver: completed_slot_driver(),
+            },
+        )]);
+        let mut idle = VecDeque::new();
+        let (events, mut event_receiver) = mpsc::channel(4);
+        let mut replacement_factory = |_| std::future::ready(Err(WorkerPoolError::Closed));
+
+        handle_slot_event_with_replacement(
+            SlotEvent::Exited {
+                slot_id: 0,
+                work: Some(work),
+                process_id: Some(707),
+                exit_code: Some(1),
+                message: "worker exited".into(),
+            },
+            &mut slots,
+            &mut idle,
+            &events,
+            &state,
+            DEFAULT_SHUTDOWN_TIMEOUT,
+            &mut replacement_factory,
+        )
+        .await;
+
+        assert!(matches!(
+            event_receiver.recv().await,
+            Some(WorkerEvent::InfrastructureFailure { .. })
+        ));
+        assert!(
+            event_receiver.try_recv().is_err(),
+            "替换失败不能再发送 Crashed"
+        );
     }
 
     #[tokio::test]
