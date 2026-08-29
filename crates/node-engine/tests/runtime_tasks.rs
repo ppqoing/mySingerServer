@@ -242,6 +242,33 @@ async fn terminal_transition_writes_one_structured_log() {
 }
 
 #[tokio::test]
+async fn activity_counts_use_only_current_non_terminal_runtime_tasks() {
+    let registry = RuntimeTaskRegistry::new();
+    let first = registry
+        .begin(
+            RuntimeTaskKind::BaseCompute,
+            MachineId::from_sha256([0x91; 32]),
+            "活动任务一",
+        )
+        .await;
+    let second = registry
+        .begin(
+            RuntimeTaskKind::LocalAnalysis,
+            MachineId::from_sha256([0x92; 32]),
+            "活动任务二",
+        )
+        .await;
+
+    // 瞬态 registry 不建 queued 状态；当前进程中的两个非终态任务各计一个 running。
+    assert_eq!(registry.activity_counts(), (0, 2));
+
+    first.finish(RuntimeTaskState::Completed).await.unwrap();
+    second.finish(RuntimeTaskState::Cancelled).await.unwrap();
+    // Completed/Cancelled 都是终态，不应继续出现在 NodeStatus 活动计数中。
+    assert_eq!(registry.activity_counts(), (0, 0));
+}
+
+#[tokio::test]
 async fn terminal_outbox_highwater_is_consistent_and_not_restored() {
     let registry = RuntimeTaskRegistry::new();
     let task = registry

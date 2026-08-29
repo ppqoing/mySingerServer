@@ -615,6 +615,25 @@ impl RuntimeTaskRegistry {
             .collect()
     }
 
+    /// 返回 NodeStatus 兼容的当前进程活动计数。
+    ///
+    /// 运行任务 registry 只记录当前进程已经接收的瞬态任务，不建立持久化的
+    /// `queued` 项状态，因此 `queued` 固定为零；每个非终态运行任务计一个
+    /// `running`，Completed/Failed/Cancelled 均不计入。该规则避免从旧 SQLite
+    /// 任务表读到已经不属于当前进程的活动项。
+    pub fn activity_counts(&self) -> (u64, u64) {
+        let tasks = self
+            .inner
+            .tasks
+            .read()
+            .expect("runtime registry lock poisoned");
+        let running = tasks
+            .values()
+            .filter(|task| !task.state.is_terminal())
+            .count() as u64;
+        (0, running)
+    }
+
     /// 返回单个运行任务完整详情。
     pub async fn details(&self, task_id: &str) -> Option<proto::RuntimeTaskDetails> {
         let now = self.inner.clock.now();

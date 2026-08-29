@@ -13,7 +13,8 @@ use dedup_node_engine::{
     server::NodeRequestHandler,
 };
 use dedup_node_store::{
-    AnalysisMode, GroupKind, GroupMemberWrite, GroupWrite, NodeStore, ScannedPath,
+    AnalysisMode, GroupKind, GroupMemberWrite, GroupWrite, NewTaskItem, NodeStore, ScannedPath,
+    TaskStatus,
 };
 use dedup_protocol::proto;
 
@@ -80,6 +81,120 @@ async fn protocol_requests_cross_the_actor_and_ack_persisted_outbox() {
 
     handle.shutdown().await.unwrap();
     actor.await.unwrap();
+}
+
+#[tokio::test]
+async fn node_status_uses_current_runtime_registry_not_legacy_task_items() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_path = directory.path().join("node.db");
+    let machine = MachineId::parse(&"8b".repeat(32)).unwrap();
+    let mut store = NodeStore::open(&database_path, machine.clone()).unwrap();
+    let legacy_task = store
+        .create_task("legacy", &[NewTaskItem::detached("legacy")], 1)
+        .unwrap();
+    store.claim_next_item(legacy_task, 2).unwrap().unwrap();
+    assert_eq!(store.task_activity_counts().unwrap(), (0, 1));
+    // 独立连接使用 reopen，避免 NodeStore::open 的启动清理改变被观察的旧任务行。
+    let observer = store.reopen().unwrap();
+
+    let (handle, actor) = NodeEngine::spawn_for_test(
+        store,
+        "127.0.0.1:39091".parse().unwrap(),
+        &directory.path().join("cache"),
+    );
+
+    let status = handle
+        .handle(envelope(
+            1,
+            proto::envelope::Payload::NodeStatus(Default::default()),
+        ))
+        .await;
+    let Some(proto::envelope::Payload::NodeStatus(status)) = status.payload else {
+        panic!("expected node status");
+    };
+    assert_eq!(status.queued_items, 0);
+    assert_eq!(
+        status.running_items, 0,
+        "旧 SQLite running 项不能冒充当前进程活动任务"
+    );
+
+    let runtime_task = handle
+        .runtime_tasks_for_test()
+        .begin(
+            dedup_node_engine::runtime_tasks::RuntimeTaskKind::BaseCompute,
+            machine.clone(),
+            "当前任务",
+        )
+        .await;
+    let status = handle
+        .handle(envelope(
+            2,
+            proto::envelope::Payload::NodeStatus(Default::default()),
+        ))
+        .await;
+    let Some(proto::envelope::Payload::NodeStatus(status)) = status.payload else {
+        panic!("expected node status");
+    };
+    assert_eq!((status.queued_items, status.running_items), (0, 1));
+
+    runtime_task
+        .finish(dedup_node_engine::runtime_tasks::RuntimeTaskState::Completed)
+        .await
+        .unwrap();
+    let status = handle
+        .handle(envelope(
+            3,
+            proto::envelope::Payload::NodeStatus(Default::default()),
+        ))
+        .await;
+    let Some(proto::envelope::Payload::NodeStatus(status)) = status.payload else {
+        panic!("expected node status");
+    };
+    assert_eq!((status.queued_items, status.running_items), (0, 0));
+
+    handle.shutdown().await.unwrap();
+    actor.await.unwrap();
+
+    assert_eq!(observer.task_activity_counts().unwrap(), (0, 1));
+    assert_eq!(
+        observer.task_snapshot(legacy_task).unwrap().status,
+        TaskStatus::Running
+    );
+}
+
+#[tokio::test]
+async fn cancel_task_rejects_legacy_persistent_id_without_mutation() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_path = directory.path().join("node.db");
+    let machine = MachineId::parse(&"8c".repeat(32)).unwrap();
+    let mut store = NodeStore::open(&database_path, machine.clone()).unwrap();
+    let legacy_task = store
+        .create_task("legacy", &[NewTaskItem::detached("legacy")], 1)
+        .unwrap();
+    let observer = store.reopen().unwrap();
+
+    let (handle, actor) = NodeEngine::spawn_for_test(
+        store,
+        "127.0.0.1:39091".parse().unwrap(),
+        &directory.path().join("cache"),
+    );
+    let response = handle
+        .handle(envelope(
+            1,
+            proto::envelope::Payload::CancelTask(proto::CancelTask {
+                task_id: legacy_task.as_uuid().to_string(),
+            }),
+        ))
+        .await;
+    assert_error_code(response, proto::ErrorCode::NotFound);
+
+    handle.shutdown().await.unwrap();
+    actor.await.unwrap();
+    assert_eq!(
+        observer.task_snapshot(legacy_task).unwrap().status,
+        TaskStatus::Queued
+    );
+    assert_eq!(observer.task_activity_counts().unwrap(), (1, 0));
 }
 
 #[tokio::test]
@@ -156,7 +271,7 @@ async fn actor_holds_snapshot_until_last_table_or_connection_close() {
 }
 
 #[tokio::test]
-async fn actor_reports_current_member_activity_in_result_pages() {
+async fn legacy_group_queries_are_rejected_in_favor_of_local_result_window() {
     let machine = MachineId::parse(&"8a".repeat(32)).unwrap();
     let mut store = NodeStore::open_in_memory(machine.clone()).unwrap();
     let paths = [
@@ -240,11 +355,11 @@ async fn actor_reports_current_member_activity_in_result_pages() {
             }),
         ))
         .await;
-    let Some(proto::envelope::Payload::ListGroups(groups)) = groups.payload else {
-        panic!("expected group page");
+    let Some(proto::envelope::Payload::Error(error)) = groups.payload else {
+        panic!("旧分组查询不得返回 SQLite 历史结果");
     };
-    assert_eq!(groups.groups[0].member_count, 2);
-    assert_eq!(groups.groups[0].reclaimable_bytes, 103);
+    assert_eq!(error.code, proto::ErrorCode::InvalidRequest as i32);
+    assert!(error.message.contains("ReadLocalResultWindow"));
 
     let members = handle
         .handle(envelope(
@@ -259,17 +374,11 @@ async fn actor_reports_current_member_activity_in_result_pages() {
             }),
         ))
         .await;
-    let Some(proto::envelope::Payload::ListGroupMembers(members)) = members.payload else {
-        panic!("expected member page");
+    let Some(proto::envelope::Payload::Error(error)) = members.payload else {
+        panic!("旧分组成员查询不得返回 SQLite 历史结果");
     };
-    assert_eq!(
-        members
-            .members
-            .iter()
-            .map(|member| member.active)
-            .collect::<Vec<_>>(),
-        [true, false, true]
-    );
+    assert_eq!(error.code, proto::ErrorCode::InvalidRequest as i32);
+    assert!(error.message.contains("ReadLocalResultWindow"));
 
     handle.shutdown().await.unwrap();
     actor.await.unwrap();

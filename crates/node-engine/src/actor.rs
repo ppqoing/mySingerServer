@@ -348,8 +348,7 @@ impl NodeRuntime {
             layout.executable_dir(),
             &paths.cache_path,
         )?);
-        let disk_full_cleaner =
-            DiskFullCleaner::new(Arc::clone(&artifact_registry), SystemArtifactDiskResolver);
+        // 生产 Node 不启用磁盘满自动清理；写入失败按普通持久化错误返回。
         let (handle, actor_task) = spawn_actor(
             store,
             Some(worker_pool),
@@ -362,7 +361,7 @@ impl NodeRuntime {
             effective_worker_count,
             Some(Box::new(repository)),
             artifact_registry,
-            disk_full_cleaner,
+            None,
             Some(worker_pool_config),
             ActorTestHooks::default(),
         );
@@ -682,7 +681,7 @@ impl NodeEngine {
             1,
             None,
             artifact_registry,
-            disk_full_cleaner,
+            Some(disk_full_cleaner),
             None,
             ActorTestHooks::default(),
         )
@@ -709,7 +708,7 @@ impl NodeEngine {
             1,
             Some(repository),
             artifact_registry,
-            disk_full_cleaner,
+            Some(disk_full_cleaner),
             None,
             ActorTestHooks::default(),
         )
@@ -724,7 +723,7 @@ impl NodeEngine {
         enumerator: EnumeratorKind,
     ) -> (NodeEngineHandle, JoinHandle<()>) {
         let effective_worker_count = worker_pool.worker_process_ids().len().max(1);
-        let (artifact_registry, disk_full_cleaner) = test_artifact_cleanup(cache_root);
+        let artifact_registry = test_artifact_registry(cache_root);
         spawn_actor(
             store,
             Some(worker_pool),
@@ -737,7 +736,7 @@ impl NodeEngine {
             effective_worker_count,
             None,
             artifact_registry,
-            disk_full_cleaner,
+            None,
             None,
             ActorTestHooks::default(),
         )
@@ -768,7 +767,7 @@ impl NodeEngine {
             effective_worker_count,
             None,
             artifact_registry,
-            disk_full_cleaner,
+            Some(disk_full_cleaner),
             None,
             ActorTestHooks {
                 first_persist_waiter: Some(first_persist_waiter),
@@ -805,7 +804,7 @@ impl NodeEngine {
             effective_worker_count,
             None,
             artifact_registry,
-            disk_full_cleaner,
+            Some(disk_full_cleaner),
             None,
             ActorTestHooks {
                 first_persist_waiter: None,
@@ -842,7 +841,7 @@ impl NodeEngine {
             effective_worker_count,
             None,
             artifact_registry,
-            disk_full_cleaner,
+            Some(disk_full_cleaner),
             None,
             ActorTestHooks {
                 first_persist_waiter: None,
@@ -879,7 +878,7 @@ impl NodeEngine {
             effective_worker_count,
             None,
             artifact_registry,
-            disk_full_cleaner,
+            Some(disk_full_cleaner),
             None,
             ActorTestHooks {
                 first_persist_waiter: None,
@@ -914,7 +913,7 @@ impl NodeEngine {
             effective_worker_count,
             None,
             artifact_registry,
-            disk_full_cleaner,
+            Some(disk_full_cleaner),
             None,
             ActorTestHooks::default(),
         )
@@ -933,7 +932,7 @@ fn spawn_actor(
     effective_worker_count: usize,
     config_repository: Option<Box<dyn NodeConfigRepositoryAccess>>,
     artifact_registry: Arc<RegenerableArtifactRegistry>,
-    disk_full_cleaner: DiskFullCleaner,
+    disk_full_cleaner: Option<DiskFullCleaner>,
     // 生产 Node 重启时用于创建新 Pool 的不可变配置；可控测试池没有进程启动配置。
     worker_pool_config: Option<WorkerPoolConfig>,
     test_hooks: ActorTestHooks,
@@ -977,15 +976,20 @@ fn spawn_actor(
     (handle, actor)
 }
 
-fn test_artifact_cleanup(cache_root: &Path) -> (Arc<RegenerableArtifactRegistry>, DiskFullCleaner) {
+/// 创建测试用 artifact 注册表；不隐式启用生产磁盘满清理。
+fn test_artifact_registry(cache_root: &Path) -> Arc<RegenerableArtifactRegistry> {
     fs::create_dir_all(cache_root).expect("Node test cache root must be creatable");
     let install_root = cache_root
         .parent()
         .expect("Node test cache root must have a distinct install parent");
-    let registry = Arc::new(
+    Arc::new(
         RegenerableArtifactRegistry::new(install_root, cache_root)
             .expect("Node test artifact roots must be absolute and nested"),
-    );
+    )
+}
+
+fn test_artifact_cleanup(cache_root: &Path) -> (Arc<RegenerableArtifactRegistry>, DiskFullCleaner) {
+    let registry = test_artifact_registry(cache_root);
     let cleaner = DiskFullCleaner::new(Arc::clone(&registry), SystemArtifactDiskResolver);
     (registry, cleaner)
 }
@@ -1017,7 +1021,7 @@ struct EngineState {
     commands: mpsc::WeakSender<EngineCommand>,
     config_repository: Option<Box<dyn NodeConfigRepositoryAccess>>,
     artifact_registry: Arc<RegenerableArtifactRegistry>,
-    disk_full_cleaner: DiskFullCleaner,
+    disk_full_cleaner: Option<DiskFullCleaner>,
     runtime_tasks: RuntimeTaskRegistry,
     /// 默认构建为空的测试注入点。
     #[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
@@ -1131,7 +1135,8 @@ enum BackgroundJob {
         cancellation: ReadCancellationToken,
         runtime_reporter: RuntimeTaskReporter,
         artifact_registry: Arc<RegenerableArtifactRegistry>,
-        disk_full_cleaner: DiskFullCleaner,
+        /// 测试可注入磁盘满清理器；生产入口保持为空。
+        disk_full_cleaner: Option<DiskFullCleaner>,
         /// 当前 Node 进程的瞬态任务目录根，不与缓存目录混用。
         runtime_root: PathBuf,
         /// 仅 feature 测试暂停首条 SQLite persist。
@@ -1349,8 +1354,8 @@ impl EngineState {
     }
 
     fn node_status(&self) -> ProtocolResult {
-        let (queued_items, running_items) =
-            self.store.task_activity_counts().map_err(store_error)?;
+        // NodeStatus 只反映本进程 registry；旧 SQLite 任务行不再代表当前活动任务。
+        let (queued_items, running_items) = self.runtime_tasks.activity_counts();
         let worker_count = self
             .worker_control
             .as_ref()
@@ -1499,50 +1504,33 @@ impl EngineState {
 
     async fn cancel_task(&mut self, request: proto::CancelTask) -> ProtocolResult {
         let task_id = parse_task_id(&request.task_id)?;
-        let analysis_id = AnalysisRunId::from_uuid(*task_id.as_uuid());
-        let active_identity = self.active_job.as_ref().map(|active| active.identity);
-        if matches!(
-            active_identity,
-            Some(JobIdentity::Analysis(run_id)) if run_id == analysis_id
-        ) {
+        let Some(active) = self.active_job.as_ref() else {
+            return Err(not_found("当前进程没有可取消的瞬态任务"));
+        };
+        let active_identity = active.identity;
+        let matches_active = match active_identity {
+            JobIdentity::TransientScan(id) | JobIdentity::TransientStage2(id) => id == task_id,
+            JobIdentity::Analysis(run_id) => run_id.as_uuid() == task_id.as_uuid(),
+        };
+        if !matches_active {
+            return Err(not_found("任务不属于当前进程或已经结束"));
+        }
+
+        // 取消只作用于当前进程确实持有的瞬态任务，绝不回写旧 tasks 表。
+        if let Some(cancellation) = &active.cancellation {
+            cancellation.cancel();
+        }
+        if matches!(active_identity, JobIdentity::Analysis(_)) {
             // 本地分析只有进程内取消令牌；二筛 runner 会按自身 task_id 清理 Worker。
-            if let Some(active) = &self.active_job
-                && let Some(cancellation) = &active.cancellation
-            {
-                cancellation.cancel();
-            }
             return Ok(proto::envelope::Payload::CancelTask(request));
         }
+
         let cancel_gate = self
             .worker_control
             .as_ref()
             .map(|pool| pool.begin_task_cancel(&request.task_id));
-        let is_transient = active_identity.is_some_and(|identity| {
-            matches!(
-                identity,
-                JobIdentity::TransientScan(id) | JobIdentity::TransientStage2(id) if id == task_id
-            )
-        });
-        if !is_transient {
-            if let Err(error) = self.store.cancel_task(task_id, now_ms()) {
-                if let Some(cancel_gate) = cancel_gate {
-                    cancel_gate.rollback();
-                }
-                return Err(store_error(error));
-            }
-        }
         if let Some(cancel_gate) = cancel_gate {
             cancel_gate.commit();
-        }
-        if let Some(active) = &self.active_job
-            && matches!(
-                active.identity,
-                JobIdentity::TransientScan(id) | JobIdentity::TransientStage2(id) if id == task_id
-            )
-        {
-            if let Some(cancellation) = &active.cancellation {
-                cancellation.cancel();
-            }
         }
         if let Some(pool) = &self.worker_control {
             pool.cancel_task(&request.task_id).await.map_err(internal)?;
@@ -1955,82 +1943,15 @@ impl EngineState {
         ))
     }
 
-    fn list_groups(&self, request: proto::ListGroups) -> ProtocolResult {
-        let kind = group_filter(request.group_kind)?;
-        let page = self
-            .store
-            .page_groups_filtered(
-                parse_analysis_id(&request.analysis_run_id)?,
-                kind,
-                cursor(&request.cursor),
-                request.limit as usize,
-            )
-            .map_err(store_error)?;
-        Ok(proto::envelope::Payload::ListGroups(proto::ListGroups {
-            analysis_run_id: request.analysis_run_id,
-            group_kind: request.group_kind,
-            cursor: request.cursor,
-            limit: request.limit,
-            groups: page
-                .items
-                .into_iter()
-                .map(|group| proto::DuplicateGroup {
-                    group_id: group.group_id,
-                    kind: wire_group_kind(group.kind) as i32,
-                    representative: Some((&group.representative).into()),
-                    member_count: group.member_count,
-                    reclaimable_bytes: group.reclaimable_bytes,
-                })
-                .collect(),
-            next_cursor: page.next_cursor.unwrap_or_default(),
-        }))
+    fn list_groups(&self, _request: proto::ListGroups) -> ProtocolResult {
+        // 结果组只从当前进程的本地结果窗口读取，禁止回查旧 SQLite 分组历史。
+        Err(invalid("旧分组查询已停用，请使用 ReadLocalResultWindow"))
     }
 
-    fn list_group_members(&self, request: proto::ListGroupMembers) -> ProtocolResult {
-        let run_id = parse_analysis_id(&request.analysis_run_id)?;
-        let page = self
-            .store
-            .page_group_members(
-                run_id,
-                &request.group_id,
-                cursor(&request.cursor),
-                request.limit as usize,
-            )
-            .map_err(store_error)?;
-        let members = page
-            .items
-            .into_iter()
-            .map(|member| {
-                let review = self
-                    .store
-                    .review_mark(run_id, &request.group_id, &member.location)
-                    .map_err(store_error)?
-                    .map_or(proto::ReviewDecision::ReviewUndecided, wire_review);
-                Ok(proto::GroupMember {
-                    location: Some((&member.location).into()),
-                    content: Some((&member.content).into()),
-                    representative: member.representative,
-                    stage1_score: member.stage1_score as f32,
-                    phash_passed_parts: member.phash_passed_parts.map_or(0, u32::from),
-                    stage2_score: member.stage2_score.unwrap_or_default() as f32,
-                    review: review as i32,
-                    active: member.active,
-                    width: member.width.unwrap_or_default(),
-                    height: member.height.unwrap_or_default(),
-                    quality: member.quality.map_or(0, u32::from),
-                    display_path: member.location.normalized_path().as_str().into(),
-                })
-            })
-            .collect::<Result<Vec<_>, (proto::ErrorCode, String)>>()?;
-        Ok(proto::envelope::Payload::ListGroupMembers(
-            proto::ListGroupMembers {
-                group_id: request.group_id,
-                cursor: request.cursor,
-                limit: request.limit,
-                members,
-                next_cursor: page.next_cursor.unwrap_or_default(),
-                analysis_run_id: request.analysis_run_id,
-            },
+    fn list_group_members(&self, _request: proto::ListGroupMembers) -> ProtocolResult {
+        // 组成员同样只通过本地结果窗口提供，避免暴露旧 SQLite review/group 表。
+        Err(invalid(
+            "旧分组成员查询已停用，请使用 ReadLocalResultWindow",
         ))
     }
 
@@ -3078,7 +2999,7 @@ async fn run_background_job(
                             persistence: TaskFileMediaPersistenceOptions {
                                 contact_sheet_root: contact_sheets,
                                 artifact_registry: Some(artifact_registry),
-                                disk_full_cleaner: Some(disk_full_cleaner),
+                                disk_full_cleaner,
                             },
                         },
                         persist_capacity: MAX_BASE_TASK_BATCH
@@ -3582,9 +3503,12 @@ fn results_root_from_runtime(runtime_root: &Path) -> Result<PathBuf, &'static st
         .ok_or("瞬态运行目录必须存在结果目录父级")
 }
 
-/// 启动前精确清空当前 Node 的 transient runtime 根，不触碰旁侧 results 目录。
+/// 启动前精确清空当前 Node 的 transient runtime 根，并删除唯一的未完成分析文件。
+///
+/// 这里只删除 `latest-analysis.partial.tsv`，保留已经验证过的
+/// `latest-analysis.result.tsv`，也不递归触碰 results 目录中的其它内容。
 fn reset_transient_runtime_root(runtime_root: &Path) -> std::io::Result<()> {
-    match fs::symlink_metadata(runtime_root) {
+    let reset_result = match fs::symlink_metadata(runtime_root) {
         Ok(metadata) => {
             if !metadata.is_dir() {
                 return Err(std::io::Error::new(
@@ -3616,6 +3540,15 @@ fn reset_transient_runtime_root(runtime_root: &Path) -> std::io::Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             fs::create_dir_all(runtime_root)
         }
+        Err(error) => Err(error),
+    };
+    reset_result?;
+
+    let results_root = results_root_from_runtime(runtime_root)
+        .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
+    match fs::remove_file(results_root.join("latest-analysis.partial.tsv")) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
 }
@@ -3938,12 +3871,17 @@ mod tests {
         fs::create_dir_all(runtime_root.join("old-run")).unwrap();
         fs::create_dir_all(&results_root).unwrap();
         fs::write(results_root.join("latest-analysis.result.tsv"), b"latest").unwrap();
+        fs::write(results_root.join("latest-analysis.partial.tsv"), b"partial").unwrap();
         fs::write(runtime_root.join("old-run/delete.tasks.tsv"), b"old").unwrap();
 
         reset_transient_runtime_root(&runtime_root).unwrap();
 
         assert!(runtime_root.is_dir());
         assert!(!runtime_root.join("old-run").exists());
+        assert!(
+            !results_root.join("latest-analysis.partial.tsv").exists(),
+            "启动清理必须删除未完成分析 staging 文件"
+        );
         assert_eq!(
             fs::read(results_root.join("latest-analysis.result.tsv")).unwrap(),
             b"latest"
