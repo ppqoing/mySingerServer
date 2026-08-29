@@ -7,6 +7,8 @@ use std::{
     sync::Arc,
 };
 
+#[cfg(test)]
+use std::cell::RefCell;
 #[cfg(all(test, feature = "test-hooks"))]
 use std::sync::Mutex;
 
@@ -14,7 +16,7 @@ use dedup_core::{
     ContentKey, DiskReadConfig, DisplayPath, LocationKey, MediaKind, ScreeningOutcome, TaskId,
     Thresholds,
 };
-use dedup_media::{VideoFrameFeatures, score_video_stage2, screen_image_stage2};
+use dedup_media::{ImageStage2, VideoFrameFeatures, score_video_stage2, screen_image_stage2};
 use dedup_node_store::{
     BaseCacheRecord, CompleteStage1, CompleteStage2, ContentId, FeatureWrite, NewTaskItem,
     NodeStore, PersistentStageState, ScannedPath, TaskItemCompletion, TaskStageWrite,
@@ -49,6 +51,30 @@ use super::stage2_planner::{
     FrozenStage2Batch, Stage2ActiveSource, Stage2PlanAction, Stage2PlanningInput, Stage2Selection,
     Stage2TransientPlanner,
 };
+
+#[cfg(test)]
+thread_local! {
+    /// 记录当前测试线程实际提交的二筛缓存批次，验证生产入口没有回退逐候选查询。
+    static EVALUATE_LOOKUP_BATCHES: RefCell<Vec<Vec<ContentKey>>> = const { RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+/// 记录一次候选判定实际提交的缓存键批次。
+fn record_evaluate_lookup_batch(keys: &[ContentKey]) {
+    EVALUATE_LOOKUP_BATCHES.with(|batches| batches.borrow_mut().push(keys.to_vec()));
+}
+
+#[cfg(test)]
+/// 清除候选判定批量查询的测试记录。
+fn clear_evaluate_lookup_batches() {
+    EVALUATE_LOOKUP_BATCHES.with(|batches| batches.borrow_mut().clear());
+}
+
+#[cfg(test)]
+/// 取出并清空候选判定批量查询的测试记录。
+fn take_evaluate_lookup_batches() -> Vec<Vec<ContentKey>> {
+    EVALUATE_LOOKUP_BATCHES.with(|batches| std::mem::take(&mut *batches.borrow_mut()))
+}
 
 /// 一个唯一内容的当前进程二筛请求。
 #[derive(Clone, Debug)]
@@ -454,7 +480,7 @@ struct PreexistingStage2 {
 }
 
 /// 中心协调器派给一个节点的唯一内容及固定来源位置。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Stage2BatchItem {
     /// 需要联合二筛的跨数据库内容键。
     pub content: ContentKey,
@@ -2112,45 +2138,68 @@ pub(crate) fn evaluate_candidates(
     candidates: &[AnalysisCandidate],
     thresholds: &Thresholds,
 ) -> Result<(Vec<AnalysisCandidate>, usize), AnalysisBlocked> {
-    let mut output = Vec::with_capacity(candidates.len());
-    let mut unresolved = 0;
-    for candidate in candidates {
-        let left_id = store.content_id_by_key(candidate.left)?;
-        let right_id = store.content_id_by_key(candidate.right)?;
-        let evaluated = match (left_id, right_id) {
-            (Some(left_id), Some(right_id)) => match candidate.kind {
-                AnalysisPairKind::Image => {
-                    evaluate_image(store, *candidate, left_id, right_id, thresholds)?
-                }
-                AnalysisPairKind::Video => {
-                    evaluate_video(store, *candidate, left_id, right_id, thresholds)?
-                }
-            },
-            _ => incomplete(*candidate),
-        };
-        if evaluated.status == AnalysisCandidateStatus::Incomplete {
-            unresolved += 1;
-        }
-        output.push(evaluated);
+    let mut keys = candidates
+        .iter()
+        .flat_map(|candidate| [candidate.left, candidate.right])
+        .collect::<Vec<_>>();
+    keys.sort();
+    keys.dedup();
+    #[cfg(test)]
+    record_evaluate_lookup_batch(&keys);
+    let records = store.lookup_base_cache_by_keys(&keys)?;
+    if records.len() != keys.len() {
+        return Err(AnalysisBlocked::InvalidState(
+            "候选判定基础缓存批量返回数量不匹配".into(),
+        ));
     }
+    let cached_by_key = keys
+        .into_iter()
+        .zip(records)
+        .filter_map(|(key, record)| record.map(|record| (key, record)))
+        .collect::<HashMap<_, _>>();
+
+    let mut unresolved = 0;
+    let output = candidates
+        .iter()
+        .map(|candidate| {
+            let evaluated = match candidate.kind {
+                AnalysisPairKind::Image => evaluate_image(
+                    *candidate,
+                    cached_by_key.get(&candidate.left),
+                    cached_by_key.get(&candidate.right),
+                    thresholds,
+                ),
+                AnalysisPairKind::Video => evaluate_video(
+                    *candidate,
+                    cached_by_key.get(&candidate.left),
+                    cached_by_key.get(&candidate.right),
+                    thresholds,
+                ),
+            };
+            if evaluated.status == AnalysisCandidateStatus::Incomplete {
+                unresolved += 1;
+            }
+            evaluated
+        })
+        .collect();
     Ok((output, unresolved))
 }
 
 fn evaluate_image(
-    store: &NodeStore,
     candidate: AnalysisCandidate,
-    left_id: ContentId,
-    right_id: ContentId,
+    left: Option<&BaseCacheRecord>,
+    right: Option<&BaseCacheRecord>,
     thresholds: &Thresholds,
-) -> Result<AnalysisCandidate, AnalysisBlocked> {
-    let (Some(CompleteStage2::Image(left)), Some(CompleteStage2::Image(right))) = (
-        store.load_complete_stage2(left_id)?,
-        store.load_complete_stage2(right_id)?,
-    ) else {
-        return Ok(incomplete(candidate));
+) -> AnalysisCandidate {
+    let (Some(left), Some(right)) = (left, right) else {
+        return incomplete(candidate);
     };
-    let score = screen_image_stage2(&left, &right, thresholds);
-    Ok(AnalysisCandidate {
+    let (Some(left), Some(right)) = (complete_image_stage2(left), complete_image_stage2(right))
+    else {
+        return incomplete(candidate);
+    };
+    let score = screen_image_stage2(left, right, thresholds);
+    AnalysisCandidate {
         phash_passed_parts: Some(score.phash_passed_parts),
         stage2_score: Some(f64::from(score.sobel_score)),
         status: if score.passed {
@@ -2159,51 +2208,74 @@ fn evaluate_image(
             AnalysisCandidateStatus::Rejected
         },
         ..candidate
-    })
+    }
 }
 
 fn evaluate_video(
-    store: &NodeStore,
     candidate: AnalysisCandidate,
-    left_id: ContentId,
-    right_id: ContentId,
+    left: Option<&BaseCacheRecord>,
+    right: Option<&BaseCacheRecord>,
     thresholds: &Thresholds,
-) -> Result<AnalysisCandidate, AnalysisBlocked> {
-    let (
-        Some(CompleteStage1::Video(left_stage1)),
-        Some(CompleteStage1::Video(right_stage1)),
-        Some(CompleteStage2::Video(left_stage2)),
-        Some(CompleteStage2::Video(right_stage2)),
-    ) = (
-        store.load_complete_stage1(left_id)?,
-        store.load_complete_stage1(right_id)?,
-        store.load_complete_stage2(left_id)?,
-        store.load_complete_stage2(right_id)?,
-    )
-    else {
-        return Ok(incomplete(candidate));
+) -> AnalysisCandidate {
+    let (Some(left), Some(right)) = (left, right) else {
+        return incomplete(candidate);
     };
-    let left = std::array::from_fn(|slot| VideoFrameFeatures {
-        stage1: left_stage1[slot],
-        stage2: left_stage2[slot],
-    });
-    let right = std::array::from_fn(|slot| VideoFrameFeatures {
-        stage1: right_stage1[slot],
-        stage2: right_stage2[slot],
-    });
+    let (Some(left), Some(right)) = (
+        complete_video_features(left),
+        complete_video_features(right),
+    ) else {
+        return incomplete(candidate);
+    };
     let score = score_video_stage2(&left, &right, thresholds);
     let status = match score.outcome {
         ScreeningOutcome::Passed => AnalysisCandidateStatus::Passed,
         ScreeningOutcome::Rejected => AnalysisCandidateStatus::Rejected,
         ScreeningOutcome::Incomplete => AnalysisCandidateStatus::Incomplete,
     };
-    Ok(AnalysisCandidate {
+    AnalysisCandidate {
         phash_passed_parts: None,
         stage2_score: (status != AnalysisCandidateStatus::Incomplete)
             .then_some(f64::from(score.average)),
         status,
         ..candidate
-    })
+    }
+}
+
+/// 返回结构完整的图片二筛，错误媒体类型和基础缺口均保持缺失。
+fn complete_image_stage2(record: &BaseCacheRecord) -> Option<&ImageStage2> {
+    if record.media_kind != MediaKind::Image {
+        return None;
+    }
+    let completeness = classify_cache_completeness(record, true);
+    if completeness.base_missing_parts & (BASE_MISSING_PROBE | BASE_MISSING_STAGE1) != 0
+        || completeness.image_stage2_missing
+    {
+        return None;
+    }
+    match record.stage1.as_ref() {
+        Some(CompleteStage1::Image(_)) => record.image_stage2.as_ref(),
+        _ => None,
+    }
+}
+
+/// 返回结构完整的视频六槽特征，失败槽位不进入二筛评分分母。
+fn complete_video_features(record: &BaseCacheRecord) -> Option<[VideoFrameFeatures; 6]> {
+    if record.media_kind != MediaKind::Video {
+        return None;
+    }
+    let completeness = classify_cache_completeness(record, true);
+    if completeness.base_missing_parts & (BASE_MISSING_PROBE | BASE_MISSING_STAGE1) != 0
+        || completeness.video_stage2_missing_slots != 0
+    {
+        return None;
+    }
+    let Some(CompleteStage1::Video(stage1)) = record.stage1.as_ref() else {
+        return None;
+    };
+    Some(std::array::from_fn(|slot| VideoFrameFeatures {
+        stage1: stage1[slot],
+        stage2: record.video_stage2[slot],
+    }))
 }
 
 fn incomplete(candidate: AnalysisCandidate) -> AnalysisCandidate {
@@ -2300,6 +2372,124 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    /// 候选判定按唯一内容批量取缓存，并保留图片、视频的评分证据和顺序。
+    #[test]
+    fn candidate_evaluation_batches_unique_contents_and_preserves_scoring() {
+        let mut store = test_store();
+        let image_pass_left = seed_image(&mut store, [0x81; 16], 181, true);
+        let image_pass_right = seed_image(&mut store, [0x82; 16], 182, true);
+        let image_reject_right = seed_image(&mut store, [0x83; 16], 183, true);
+        store
+            .commit_feature_result(
+                image_reject_right.2,
+                None,
+                FeatureWrite::ImageStage2(ImageStage2 {
+                    phash_parts: [0; 9],
+                    sobel: [0.0; 128],
+                }),
+            )
+            .unwrap();
+        let image_incomplete = seed_image(&mut store, [0x84; 16], 184, false);
+
+        let video_pass_left = seed_video(&mut store, [0x85; 16], &[0, 1, 2, 3, 4, 5], 185);
+        let video_pass_right = seed_video(&mut store, [0x86; 16], &[0, 1, 2, 3, 4, 5], 186);
+        let video_reject_left = seed_video(&mut store, [0x87; 16], &[0, 1, 2, 3, 4, 5], 187);
+        let video_reject_right = seed_video(&mut store, [0x88; 16], &[0, 1, 2, 3, 4, 5], 188);
+        let rejected_stage2 = ImageStage2 {
+            phash_parts: [0; 9],
+            sobel: [0.0; 128],
+        };
+        for slot in 0..6 {
+            store
+                .commit_feature_result(
+                    video_reject_right.2,
+                    None,
+                    FeatureWrite::VideoFrameStage2(VideoFrameStage2Fields {
+                        slot,
+                        features: rejected_stage2,
+                    }),
+                )
+                .unwrap();
+        }
+        let video_incomplete_left = seed_video(&mut store, [0x89; 16], &[0, 1, 2], 189);
+        let video_incomplete_right = seed_video(&mut store, [0x8a; 16], &[0, 1, 2], 190);
+
+        let candidates = vec![
+            evaluation_candidate(
+                AnalysisPairKind::Image,
+                image_pass_left.0,
+                image_pass_right.0,
+            ),
+            evaluation_candidate(
+                AnalysisPairKind::Video,
+                video_reject_left.0,
+                video_reject_right.0,
+            ),
+            // 两端内容分别在其他候选中复用，不能导致逐候选读取。
+            evaluation_candidate(
+                AnalysisPairKind::Image,
+                image_pass_left.0,
+                image_reject_right.0,
+            ),
+            evaluation_candidate(
+                AnalysisPairKind::Video,
+                video_pass_left.0,
+                video_pass_right.0,
+            ),
+            evaluation_candidate(
+                AnalysisPairKind::Image,
+                image_incomplete.0,
+                image_pass_right.0,
+            ),
+            evaluation_candidate(
+                AnalysisPairKind::Video,
+                video_incomplete_left.0,
+                video_incomplete_right.0,
+            ),
+        ];
+
+        clear_evaluate_lookup_batches();
+        let (evaluated, unresolved) =
+            evaluate_candidates(&store, &candidates, &Thresholds::default()).unwrap();
+        let lookup_batches = take_evaluate_lookup_batches();
+
+        assert_eq!(evaluated.len(), candidates.len());
+        assert_eq!(unresolved, 2);
+        assert_eq!(lookup_batches.len(), 1);
+        let mut unique_keys = candidates
+            .iter()
+            .flat_map(|candidate| [candidate.left, candidate.right])
+            .collect::<Vec<_>>();
+        unique_keys.sort();
+        unique_keys.dedup();
+        assert_eq!(lookup_batches[0], unique_keys);
+        assert_eq!(
+            evaluated
+                .iter()
+                .map(|candidate| candidate.kind)
+                .collect::<Vec<_>>(),
+            candidates
+                .iter()
+                .map(|candidate| candidate.kind)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(evaluated[0].status, AnalysisCandidateStatus::Passed);
+        assert_eq!(evaluated[0].phash_passed_parts, Some(9));
+        assert!((evaluated[0].stage2_score.unwrap() - 1.0).abs() < f64::EPSILON);
+        assert_eq!(evaluated[1].status, AnalysisCandidateStatus::Rejected);
+        assert_eq!(evaluated[1].phash_passed_parts, None);
+        assert!(evaluated[1].stage2_score.is_some());
+        assert_eq!(evaluated[2].status, AnalysisCandidateStatus::Rejected);
+        assert_eq!(evaluated[2].phash_passed_parts, Some(0));
+        assert_eq!(evaluated[3].status, AnalysisCandidateStatus::Passed);
+        assert_eq!(evaluated[3].phash_passed_parts, None);
+        assert!(evaluated[3].stage2_score.is_some());
+        assert_eq!(evaluated[4].status, AnalysisCandidateStatus::Incomplete);
+        assert_eq!(evaluated[4].stage2_score, None);
+        assert_eq!(evaluated[5].status, AnalysisCandidateStatus::Incomplete);
+        assert_eq!(evaluated[5].stage2_score, None);
     }
 
     #[cfg(feature = "test-hooks")]
@@ -3016,6 +3206,23 @@ mod tests {
             height: 100,
             pdq: PdqHash::from_bytes([0; 32]),
             quality: 100,
+        }
+    }
+
+    /// 构造一条等待联合二筛判定的内容候选。
+    fn evaluation_candidate(
+        kind: AnalysisPairKind,
+        left: ContentKey,
+        right: ContentKey,
+    ) -> AnalysisCandidate {
+        AnalysisCandidate {
+            kind,
+            left,
+            right,
+            stage1_score: 0.95,
+            phash_passed_parts: None,
+            stage2_score: None,
+            status: AnalysisCandidateStatus::Stage1Passed,
         }
     }
 

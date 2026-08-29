@@ -5,7 +5,9 @@ use std::{collections::BTreeMap, path::Path};
 use dedup_core::{AnalysisRunId, LocationKey, MediaKind, TaskId, Thresholds};
 use dedup_media::ImageStage1;
 use dedup_node_store::{CompleteStage1, NodeStore, ResolvedScanFile, classify_cache_completeness};
+use dedup_protocol::{BASE_MISSING_PROBE, BASE_MISSING_STAGE1};
 
+use super::phase2::Stage2BatchItem;
 use super::video::video_candidates;
 use super::{
     AnalysisBlocked, AnalysisCandidateStatus, AnalysisGroupKind, AnalysisResultGroupKind,
@@ -111,6 +113,93 @@ pub(crate) fn prepare_current_scan_analysis(
     })
 }
 
+/// 从当前瞬态运行收集结构上缺失的唯一二筛内容和冻结来源。
+pub(crate) fn missing_stage2_items(
+    store: &NodeStore,
+    run: &LocalAnalysisRun,
+) -> Result<Vec<Stage2BatchItem>, AnalysisBlocked> {
+    let mut requested = BTreeMap::<dedup_core::ContentKey, Option<super::AnalysisPairKind>>::new();
+    for candidate in run
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.status == AnalysisCandidateStatus::Stage1Passed)
+    {
+        for content in [candidate.left, candidate.right] {
+            requested
+                .entry(content)
+                .and_modify(|kind| {
+                    if kind.is_some_and(|current| current != candidate.kind) {
+                        *kind = None;
+                    }
+                })
+                .or_insert(Some(candidate.kind));
+        }
+    }
+    let keys = requested.keys().copied().collect::<Vec<_>>();
+    let records = store.lookup_base_cache_by_keys(&keys)?;
+    if records.len() != keys.len() {
+        return Err(AnalysisBlocked::InvalidState(
+            "瞬态二筛基础缓存批量返回数量不匹配".into(),
+        ));
+    }
+
+    let mut items = Vec::new();
+    for ((content, expected_kind), record) in requested.into_iter().zip(records) {
+        let Some(expected_kind) = expected_kind else {
+            continue;
+        };
+        let Some(record) = record else {
+            continue;
+        };
+        let Some(source) = run
+            .inputs
+            .iter()
+            .filter(|input| input.content == content)
+            .min_by(|left, right| left.location.cmp(&right.location))
+        else {
+            continue;
+        };
+        let completeness = classify_cache_completeness(&record, true);
+        if completeness.base_missing_parts & (BASE_MISSING_PROBE | BASE_MISSING_STAGE1) != 0 {
+            continue;
+        }
+        let frame_slots = match (expected_kind, record.media_kind) {
+            (super::AnalysisPairKind::Image, MediaKind::Image) => {
+                if completeness.image_stage2_missing {
+                    Vec::new()
+                } else {
+                    continue;
+                }
+            }
+            (super::AnalysisPairKind::Video, MediaKind::Video) => {
+                let Some(CompleteStage1::Video(stage1)) = record.stage1.as_ref() else {
+                    continue;
+                };
+                stage1
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(slot, feature)| {
+                        feature.and_then(|_| {
+                            (completeness.video_stage2_missing_slots & (1_u8 << slot) != 0)
+                                .then_some(slot as u8)
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            }
+            _ => continue,
+        };
+        if expected_kind == super::AnalysisPairKind::Video && frame_slots.is_empty() {
+            continue;
+        }
+        items.push(Stage2BatchItem {
+            content,
+            source: source.location.clone(),
+            frame_slots,
+        });
+    }
+    Ok(items)
+}
+
 /// 在库版本仍匹配且候选已经是终态时，把当前运行原子发布为最近一次结果 TSV。
 pub(crate) fn publish_local_analysis_result(
     store: &NodeStore,
@@ -194,14 +283,25 @@ pub(crate) fn publish_local_analysis_result(
 
 #[cfg(test)]
 mod tests {
-    use dedup_core::{ContentKey, DisplayPath, MachineId, NormalizedPath, TaskId, Thresholds};
-    use dedup_node_store::{AnalysisStatus, NewTaskItem, NodeStore, ResolvedScanFile, ScannedPath};
+    use dedup_core::{
+        ContentKey, DisplayPath, LocationKey, MachineId, MediaKind, NormalizedPath, TaskId,
+        Thresholds,
+    };
+    use dedup_media::{ImageStage1, ImageStage2, PdqHash};
+    use dedup_node_store::{
+        AnalysisStatus, FeatureWrite, ImageStage1Fields, NewTaskItem, NodeStore, ResolvedScanFile,
+        ScannedPath, VideoFrameStage1Fields, VideoFrameStage2Fields, VideoMetadataFields,
+    };
     use rusqlite::Connection;
     use tempfile::tempdir;
 
     use super::super::model::LocalAnalysisRun;
     use super::super::result_file::verify_result_file;
-    use super::super::{prepare_current_scan_analysis, publish_local_analysis_result};
+    use super::super::{
+        AnalysisCandidate, AnalysisCandidateStatus, AnalysisPairKind, ScanAnalysisInput,
+        Stage2BatchItem, missing_stage2_items, prepare_current_scan_analysis,
+        publish_local_analysis_result,
+    };
     use super::*;
 
     /// 第一个瞬态分析 RED：当前基线还没有拥有型运行对象和当前扫描入口。
@@ -415,6 +515,333 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(count, 0, "旧任务门禁不应写入 {table}");
+        }
+    }
+
+    /// 二筛批次只包含结构缺口的唯一内容，并且完全不创建旧任务表行。
+    #[test]
+    fn missing_stage2_items_are_unique_and_only_structural_gaps() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("missing-stage2.db");
+        let machine = MachineId::parse(&"15".repeat(32)).unwrap();
+        let mut store = NodeStore::open(&database, machine.clone()).unwrap();
+
+        let missing_image = seed_b2_image(&mut store, r"D:\z\missing.jpg", [21; 16], 121, false);
+        // 该活动位置故意不放进 run.inputs，验证来源只来自冻结输入而不是活动位置查询。
+        seed_b2_image(&mut store, r"D:\0\not-in-run.jpg", [21; 16], 121, false);
+        let missing_image_input = ScanAnalysisInput {
+            content: missing_image.0,
+            location: missing_image.1.clone(),
+            display_path: DisplayPath::new(r"D:\z\frozen-spelling.jpg").unwrap(),
+            media_kind: MediaKind::Image,
+        };
+        let missing_image_alt =
+            seed_b2_image(&mut store, r"D:\a\also-in-run.jpg", [21; 16], 121, false);
+        let missing_image_alt_input = ScanAnalysisInput {
+            content: missing_image_alt.0,
+            location: missing_image_alt.1.clone(),
+            display_path: DisplayPath::new(r"D:\a\frozen-spelling.jpg").unwrap(),
+            media_kind: MediaKind::Image,
+        };
+        let complete_image = seed_b2_image(&mut store, r"D:\complete.jpg", [22; 16], 122, true);
+        let partial_video = seed_b2_video(
+            &mut store,
+            r"D:\partial.mp4",
+            [23; 16],
+            123,
+            &[0, 2, 5],
+            &[0, 1, 2, 3, 4, 5],
+        );
+        let failed_slot_video = seed_b2_video(
+            &mut store,
+            r"D:\failed-slot.mp4",
+            [24; 16],
+            124,
+            &[0, 1, 4, 5],
+            &[0, 1, 2, 4, 5],
+        );
+        let complete_video = seed_b2_video(
+            &mut store,
+            r"D:\complete.mp4",
+            [25; 16],
+            125,
+            &[0, 1, 2, 3, 4, 5],
+            &[0, 1, 2, 3, 4, 5],
+        );
+        let malformed_image = seed_b2_image(&mut store, r"D:\malformed.jpg", [26; 16], 126, false);
+        let ignored_status =
+            seed_b2_image(&mut store, r"D:\ignored-status.jpg", [27; 16], 127, false);
+        let mismatch_video = seed_b2_video(
+            &mut store,
+            r"D:\mismatch.mp4",
+            [28; 16],
+            128,
+            &[0, 1, 2, 3],
+            &[0, 1, 2, 3],
+        );
+        let no_source = seed_b2_image(&mut store, r"D:\no-source.jpg", [29; 16], 129, false);
+        // 通过真实 SQLite 行构造损坏的一筛结构，确认结构缺口不会伪造二筛项。
+        let malformed_id = store
+            .content_id_by_key(malformed_image.0)
+            .unwrap()
+            .expect("损坏图片内容必须存在");
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch("PRAGMA ignore_check_constraints=ON;")
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE image_stage1 SET width=0 WHERE content_id=?1",
+                [malformed_id.as_i64()],
+            )
+            .unwrap();
+
+        let mut inputs = vec![
+            missing_image_alt_input,
+            missing_image_input,
+            input_for(&complete_image),
+            input_for(&partial_video),
+            input_for(&failed_slot_video),
+            input_for(&complete_video),
+            input_for(&malformed_image),
+            input_for(&ignored_status),
+            input_for(&mismatch_video),
+        ];
+        inputs.sort_by(|left, right| {
+            left.content
+                .cmp(&right.content)
+                .then_with(|| left.location.cmp(&right.location))
+        });
+
+        let candidates = vec![
+            candidate(
+                AnalysisPairKind::Image,
+                missing_image.0,
+                complete_image.0,
+                AnalysisCandidateStatus::Stage1Passed,
+            ),
+            // 同一个缺失图片重复出现在另一对候选中，结果仍只能有一项。
+            candidate(
+                AnalysisPairKind::Image,
+                missing_image.0,
+                malformed_image.0,
+                AnalysisCandidateStatus::Stage1Passed,
+            ),
+            candidate(
+                AnalysisPairKind::Video,
+                partial_video.0,
+                complete_video.0,
+                AnalysisCandidateStatus::Stage1Passed,
+            ),
+            candidate(
+                AnalysisPairKind::Video,
+                failed_slot_video.0,
+                complete_video.0,
+                AnalysisCandidateStatus::Stage1Passed,
+            ),
+            // 媒体类型不匹配时不能为视频伪造图片二筛项。
+            candidate(
+                AnalysisPairKind::Image,
+                mismatch_video.0,
+                complete_image.0,
+                AnalysisCandidateStatus::Stage1Passed,
+            ),
+            // 非 Stage1Passed 候选不应触发二筛批次。
+            candidate(
+                AnalysisPairKind::Image,
+                ignored_status.0,
+                complete_image.0,
+                AnalysisCandidateStatus::Passed,
+            ),
+            // 缺少冻结来源时不能回退到 store 的活动位置。
+            candidate(
+                AnalysisPairKind::Image,
+                no_source.0,
+                complete_image.0,
+                AnalysisCandidateStatus::Stage1Passed,
+            ),
+        ];
+        let run = LocalAnalysisRun {
+            run_id: dedup_core::AnalysisRunId::new(),
+            library_revision: 0,
+            created_at_ms: 1,
+            thresholds: Thresholds::default(),
+            inputs,
+            candidates,
+            skipped_incomplete: 0,
+        };
+
+        let items = missing_stage2_items(&store, &run).unwrap();
+
+        assert_eq!(
+            items,
+            vec![
+                Stage2BatchItem {
+                    content: missing_image.0,
+                    source: missing_image_alt.1,
+                    frame_slots: Vec::new(),
+                },
+                Stage2BatchItem {
+                    content: partial_video.0,
+                    source: partial_video.1,
+                    frame_slots: vec![1, 3, 4],
+                },
+                Stage2BatchItem {
+                    content: failed_slot_video.0,
+                    source: failed_slot_video.1,
+                    frame_slots: vec![2],
+                },
+            ]
+        );
+
+        drop(store);
+        let connection = Connection::open(&database).unwrap();
+        for table in ["tasks", "task_items", "task_stages"] {
+            let count: i64 = connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "缺失二筛准备不能写入 {table}");
+        }
+    }
+
+    /// 构造一个基础完整度可控的图片缓存记录。
+    fn seed_b2_image(
+        store: &mut NodeStore,
+        path: &str,
+        md5: [u8; 16],
+        size: u64,
+        with_stage2: bool,
+    ) -> (ContentKey, LocationKey) {
+        let scanned = scanned(path, size);
+        let content = store
+            .upsert_content_and_location(&scanned, md5, MediaKind::Image)
+            .unwrap();
+        store
+            .commit_feature_result(
+                content.id,
+                None,
+                FeatureWrite::ImageStage1(ImageStage1Fields::from(b2_stage1())),
+            )
+            .unwrap();
+        if with_stage2 {
+            store
+                .commit_feature_result(content.id, None, FeatureWrite::ImageStage2(b2_stage2()))
+                .unwrap();
+        }
+        store.mark_base_complete(content.id).unwrap();
+        (
+            content.key,
+            LocationKey::new(store.machine_id().clone(), scanned.normalized_path),
+        )
+    }
+
+    /// 构造一个带指定一筛成功槽位和二筛槽位的视频缓存记录。
+    fn seed_b2_video(
+        store: &mut NodeStore,
+        path: &str,
+        md5: [u8; 16],
+        size: u64,
+        stage2_slots: &[u8],
+        stage1_slots: &[u8],
+    ) -> (ContentKey, LocationKey) {
+        let scanned = scanned(path, size);
+        let content = store
+            .upsert_content_and_location(&scanned, md5, MediaKind::Video)
+            .unwrap();
+        store
+            .commit_feature_result(
+                content.id,
+                None,
+                FeatureWrite::VideoMetadata(VideoMetadataFields {
+                    duration_ms: Some(12_000),
+                    width: Some(100),
+                    height: Some(100),
+                }),
+            )
+            .unwrap();
+        for slot in 0..6 {
+            let feature = b2_stage1();
+            let decoded = stage1_slots.contains(&slot);
+            store
+                .commit_feature_result(
+                    content.id,
+                    None,
+                    FeatureWrite::VideoFrameStage1(VideoFrameStage1Fields {
+                        slot,
+                        time_ms: u64::from(slot) * 2_000 + 1_000,
+                        decoded,
+                        width: decoded.then_some(feature.width),
+                        height: decoded.then_some(feature.height),
+                        pdq: decoded.then_some(feature.pdq),
+                        quality: decoded.then_some(feature.quality),
+                    }),
+                )
+                .unwrap();
+            if stage2_slots.contains(&slot) {
+                store
+                    .commit_feature_result(
+                        content.id,
+                        None,
+                        FeatureWrite::VideoFrameStage2(VideoFrameStage2Fields {
+                            slot,
+                            features: b2_stage2(),
+                        }),
+                    )
+                    .unwrap();
+            }
+        }
+        store.mark_base_complete(content.id).unwrap();
+        (
+            content.key,
+            LocationKey::new(store.machine_id().clone(), scanned.normalized_path),
+        )
+    }
+
+    /// 把测试内容转成默认显示路径的冻结分析输入。
+    fn input_for((content, location): &(ContentKey, LocationKey)) -> ScanAnalysisInput {
+        ScanAnalysisInput {
+            content: *content,
+            location: location.clone(),
+            display_path: DisplayPath::new(location.normalized_path().as_str()).unwrap(),
+            media_kind: MediaKind::Other,
+        }
+    }
+
+    /// 生成只关注二筛状态的内容候选。
+    fn candidate(
+        kind: AnalysisPairKind,
+        left: ContentKey,
+        right: ContentKey,
+        status: AnalysisCandidateStatus,
+    ) -> AnalysisCandidate {
+        AnalysisCandidate {
+            kind,
+            left,
+            right,
+            stage1_score: 1.0,
+            phash_passed_parts: None,
+            stage2_score: None,
+            status,
+        }
+    }
+
+    /// 生成结构有效的一筛图片特征。
+    fn b2_stage1() -> ImageStage1 {
+        ImageStage1 {
+            width: 100,
+            height: 100,
+            pdq: PdqHash::from_bytes([0; 32]),
+            quality: 100,
+        }
+    }
+
+    /// 生成合法全零二筛特征；零值不是失败占位。
+    fn b2_stage2() -> ImageStage2 {
+        ImageStage2 {
+            phash_parts: [0; 9],
+            sobel: [0.0; 128],
         }
     }
 

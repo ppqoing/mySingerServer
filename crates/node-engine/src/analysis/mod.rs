@@ -56,7 +56,9 @@ pub use result_file::{
     verify_result_file,
 };
 #[allow(unused_imports)]
-pub(crate) use transient::{prepare_current_scan_analysis, publish_local_analysis_result};
+pub(crate) use transient::{
+    missing_stage2_items, prepare_current_scan_analysis, publish_local_analysis_result,
+};
 
 use model::{from_store_candidate, from_store_input, to_store_candidates, to_store_groups};
 use video::video_candidates_with_runtime;
