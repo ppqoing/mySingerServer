@@ -29,9 +29,9 @@
 - 联系表 partial 发布不再因旧 final 存在而丢弃新结果：旧文件先移到本轮备份，
   新文件再 rename 到 final；提交确认删除备份，事务失败则删除新文件并恢复旧文件。
 - Worker Completed 的缺失位按实际 `probe.media_kind` 解释：Image 只要求合法单槽
-  stage1，Video 才要求联系表，Other 合法接受空 stage1/联系表。首次无缓存的通用
-  `PROBE|STAGE1|CONTACT` 掩码和图片强制重算不会再因不适用的字段被误判为失败；仍拒绝
-  媒体类型不一致、非法结构和未请求的额外字段。
+  stage1，Video 才要求联系表，Other 在请求 stage1 时接受协议规定的显式空数组、
+  不产生联系表。首次无缓存的通用 `PROBE|STAGE1|CONTACT` 掩码和图片强制重算不会再
+  因不适用的字段被误判为失败；仍拒绝媒体类型不一致、非法结构和未请求的额外字段。
 - 只有收到并校验对应 identity、worker slot、ContentKey、媒体类型和文件大小的
   ACK，才调用 dispatcher 的 `mark_completed/mark_failed`；成功项登记稳定排序的
   `ResolvedScanFile`，不增加 `cache_hits`。ACK 前 TSV、上下文和 dispatcher 状态均
@@ -46,6 +46,8 @@
 |---|---:|
 | 旧校验：首次无缓存 Image、Other 与图片强制重算的合法结果 | RED，3 项均误置 F |
 | 修复后：首次无缓存 Image/Other 与图片强制重算 ACK 后完成 | 通过 |
+| Follow-up RED：Other 请求 stage1 却返回协议规定的空数组 | 旧规则误置 F |
+| Follow-up GREEN：Other 空数组 ACK 后完成且无 fault | 通过 |
 | 图片成功：ACK 前 TSV 为 P，ACK 后为 C、登记 resolved、旧任务表为空 | 通过 |
 | 同批一项成功、一项失败：ACK 后仅各自迁移为 C/F | 通过 |
 | Worker/协议 MD5 不匹配转当前项 F | 通过 |

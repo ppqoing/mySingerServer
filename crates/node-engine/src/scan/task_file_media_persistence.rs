@@ -429,9 +429,9 @@ fn validate_completed_output(
     }
 
     let stage1_requested = missing_parts & BASE_MISSING_STAGE1 != 0;
-    // 通用缺失掩码对首次探测使用同一组位，但 Other 不会产生 stage1；实际
-    // probe 类型决定该字段是否应该出现，不能把掩码位直接当成所有媒体的协议要求。
-    let stage1_expected = !matches!(probe.media_kind, MediaKind::Other) && stage1_requested;
+    // Other 的 Worker 协议在请求 stage1 时返回显式空数组；实际媒体类型只
+    // 决定数组内容结构，不能因为数组为空就把已请求字段当成缺失。
+    let stage1_expected = stage1_requested;
     if output.stage1_frames.is_some() != stage1_expected {
         return Err(if stage1_expected {
             "Worker 基础结果缺少已请求的 stage1 字段"
@@ -503,6 +503,13 @@ fn validate_completed_output(
         MediaKind::Other => {
             if probe.duration_ms.is_some() {
                 return Err("其他文件 probe 不应包含视频时长".into());
+            }
+            if output
+                .stage1_frames
+                .as_ref()
+                .is_some_and(|frames| !frames.is_empty())
+            {
+                return Err("其他文件 stage1 必须是空数组".into());
             }
         }
     }
@@ -923,7 +930,7 @@ mod tests {
         }
     }
 
-    /// 生成合法的 Other probe；Other 不产生图片 stage1 或视频联系表。
+    /// 生成合法的 Other probe；Other 的 stage1 结果是协议约定的空数组。
     fn other_output() -> BaseComputeOutput {
         BaseComputeOutput {
             probe: Some(MediaProbe {
@@ -932,7 +939,7 @@ mod tests {
                 height: 0,
                 duration_ms: None,
             }),
-            stage1_frames: None,
+            stage1_frames: Some(Vec::new()),
             contact_sheet_jpeg: None,
         }
     }
@@ -1078,6 +1085,7 @@ mod tests {
             record.missing.base_missing_parts(),
             BASE_MISSING_PROBE | BASE_MISSING_STAGE1 | BASE_MISSING_CONTACT_SHEET
         );
+        assert!(pending.contexts.get(&identity).unwrap().force_recompute);
         pending.contexts.get_mut(&identity).unwrap().cached = None;
         let context = pending.contexts.get(&identity).unwrap().clone();
         let content_id = context.content_id.unwrap();
