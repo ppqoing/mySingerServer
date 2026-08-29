@@ -134,3 +134,4 @@ Spec: `D:/code/mySingerServer/docs/superpowers/specs/2026-08-28-transient-task-f
 - Task 11 fix round 2/5：提交 `7a237c39`。替换前完整验证产生并持有稳定文件句柄，Windows 原子替换直接移动同一文件身份，替换后不再执行 fallible open/bind；scoped re-review 为 1 addressed、0 open，无新 Critical/Important。
 - Task 11 controller verification：analysis_result_window 7/7、analysis_result_file 6/6、dedup-protocol 24 项、dedup-windows atomic_file 5/5、NodeEngine test-hooks lib 155/155、`cargo fmt --all -- --check`、`git diff --check` 全通过；C/D 可用空间 22.82/16.05 GiB。
 - Task 11 complete (commits `dcf9c37..7a237c39`, review clean)。
+- Task 12/13 sequencing Ruling: Task 12 只删除 Desktop 的 Node 本地分析消费并把已完成的 PostgreSQL 中心结果改为有限滑动窗口；为保持中心分析主链在中间提交可编译，既有中心复核/删除持久接口只临时保留到 Task 13。Task 13 再把复核决定和待删除项改为当前进程瞬态状态，并按用户确认写入本地 TSV 删除队列后逐项执行；该队列不恢复、不保留历史，重启直接清理，只服务本次删除。若判断错误，代价是 Task 12 后仍短暂保留一段即将删除的兼容边界，但不会引入 TaskCatalog、历史任务或跨重启恢复。
