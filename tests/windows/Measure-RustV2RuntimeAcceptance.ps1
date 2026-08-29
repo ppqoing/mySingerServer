@@ -1,6 +1,6 @@
 ﻿<#
 .SYNOPSIS
-在隔离 Node 状态下连续运行半小时真实媒体计算并每两秒采样。
+在隔离 Node 状态下运行一次真实媒体计算并每两秒采样，任务终态后结束。
 
 .DESCRIPTION
 媒体目录只用于递归清单和传给 Node 的扫描根；脚本不会写入、复制、删除、重命名媒体，
@@ -27,14 +27,14 @@ param(
     [string] $PackagePath = '',
     [string] $PackageSha256 = '',
     [string] $Enumerator = 'everything',
-    [int] $WorkerCount = 12,
+    [int] $WorkerCount = 20,
     [int] $HddThreadsPerDisk = 1,
     [int] $SsdThreadsPerDisk = 16,
     [int] $UnknownThreadsPerDisk = 1,
-    [int] $TotalReadThreads = 16,
+    [int] $TotalReadThreads = 12,
     [int] $ReservedCores = 1,
     [switch] $SingleRun,
-    [switch] $CompleteWhenTaskTerminal,
+    [switch] $CompleteWhenTaskTerminal = $true,
     [switch] $RequireDistinctPhysicalDisks,
     [switch] $LibraryOnly
 )
@@ -686,6 +686,23 @@ function Resolve-RuntimeMediaRoots {
     [string[]]$resolved.ToArray()
 }
 
+function Assert-RuntimeAcceptanceMediaRoots {
+    <# 验收入口只允许本次双物理盘的两个规范化媒体根，避免只按盘符误绑定其它目录。 #>
+    param([Parameter(Mandatory)] [string[]] $MediaRoots)
+
+    $expected = @('H:\pik\00000000000', 'I:\tmp')
+    $actual = @($MediaRoots | ForEach-Object { Get-CanonicalMediaRootPath -Path ([string]$_) })
+    if ($actual.Count -ne $expected.Count) {
+        throw 'RUST_V2_REAL_MEDIA_ROOTS_NOT_APPROVED'
+    }
+    for ($index = 0; $index -lt $expected.Count; $index++) {
+        if (-not $actual[$index].Equals($expected[$index], [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'RUST_V2_REAL_MEDIA_ROOTS_NOT_APPROVED'
+        }
+    }
+    [string[]]$actual
+}
+
 function Get-RuntimePhysicalDiskMap {
     <# 通过 Storage API 将每个本地盘符根绑定到物理盘；重复 DiskNumber 立即拒绝。 #>
     param(
@@ -767,11 +784,11 @@ function Assert-RuntimeAcceptanceInputs {
         [string] $ReportPath,
         [string] $Variant = 'A',
         [int] $RunIndex = 1,
-        [int] $WorkerCount = 12,
+        [int] $WorkerCount = 20,
         [int] $HddThreadsPerDisk = 1,
         [int] $SsdThreadsPerDisk = 16,
         [int] $UnknownThreadsPerDisk = 1,
-        [int] $TotalReadThreads = 16,
+        [int] $TotalReadThreads = 12,
         [int] $ReservedCores = 1,
         [string] $Enumerator = 'everything',
         [switch] $SingleRun,
@@ -953,11 +970,11 @@ function New-IsolatedNodeConfig {
     <# 写入相对 node.exe 根解释的完整配置正文；枚举器默认使用 Everything。 #>
     param(
         [int] $Port,
-        [int] $WorkerCount = 12,
+        [int] $WorkerCount = 20,
         [int] $HddThreadsPerDisk = 1,
         [int] $SsdThreadsPerDisk = 16,
         [int] $UnknownThreadsPerDisk = 1,
-        [int] $TotalReadThreads = 16,
+        [int] $TotalReadThreads = 12,
         [int] $ReservedCores = 1,
         [string] $DataRoot = '',
         [string] $Enumerator = 'everything'
@@ -2515,12 +2532,16 @@ function Invoke-RustV2RuntimeAcceptance {
         [int] $ReservedCores,
         [switch] $SingleRun,
         [switch] $CompleteWhenTaskTerminal,
-        [switch] $RequireDistinctPhysicalDisks
+        [switch] $RequireDistinctPhysicalDisks,
+        [switch] $RequireApprovedMediaRoots
     )
 
     $resolvedRelease = Resolve-ReleaseRoot -CargoTargetDir $CargoTargetDir -ReleaseRoot $ReleaseRoot
     $layout = New-RuntimeAcceptanceLayout -RequestedEvidenceRoot $EvidenceRoot -RequestedReportPath $ReportPath
     $resolvedMediaRoots = @(Resolve-RuntimeMediaRoots -MediaRoot $MediaRoot -MediaRoots $MediaRoots)
+    if ($RequireApprovedMediaRoots) {
+        $null = Assert-RuntimeAcceptanceMediaRoots -MediaRoots $resolvedMediaRoots
+    }
     $validation = Assert-RuntimeAcceptanceInputs -MediaRoot $MediaRoot -MediaRoots $MediaRoots -DurationSeconds $DurationSeconds `
         -SampleSeconds $SampleSeconds -ReleaseRoot $resolvedRelease `
         -AcceptanceClientPath $AcceptanceClientPath -ResultExporterPath $ResultExporterPath `
@@ -2600,7 +2621,7 @@ function Invoke-RustV2RuntimeAcceptance {
     $systemOutput = Join-Path $layout.Evidence 'system.ndjson'
     $stdout = Join-Path $layout.Evidence 'client.stdout.log'
     $stderr = Join-Path $layout.Evidence 'client.stderr.log'
-    # Node 的启动日志与客户端日志同属单轮 evidence，便于定位 preflight 退出而不污染其他轮次。
+    # Node 的启动日志与客户端日志同属本次 evidence，便于定位 preflight 退出。
     $nodeStdout = Join-Path $layout.Evidence 'node.stdout.log'
     $nodeStderr = Join-Path $layout.Evidence 'node.stderr.log'
     $node = $null
@@ -2990,7 +3011,7 @@ function Invoke-RustV2RuntimeAcceptance {
     $clientExitCode = if ($client) { Get-CompletedProcessExitCode -Process $client } else { $null }
     $clientExitFailed = $null -ne $clientExitCode -and $clientExitCode -ne 0
     $clientExitUnconfirmed = $null -ne $client -and $null -eq $clientExitCode
-    # 任一核心采样文件缺失都表示运行证据不完整，必须阻止外层继续六轮序列。
+    # 任一核心采样文件缺失都表示本次运行证据不完整。
     $runtimeEvidenceMissing = -not (Test-Path -LiteralPath $runtimeOutput -PathType Leaf) -or
         -not (Test-Path -LiteralPath $systemOutput -PathType Leaf)
     $runStatus = Get-ResultSummaryRunStatus `
@@ -3069,5 +3090,6 @@ if (-not $LibraryOnly) {
         -WorkerCount $WorkerCount -HddThreadsPerDisk $HddThreadsPerDisk `
         -SsdThreadsPerDisk $SsdThreadsPerDisk -UnknownThreadsPerDisk $UnknownThreadsPerDisk `
         -TotalReadThreads $TotalReadThreads -ReservedCores $ReservedCores `
-        -SingleRun:$SingleRun -RequireDistinctPhysicalDisks:$RequireDistinctPhysicalDisks
+        -SingleRun:$SingleRun -RequireDistinctPhysicalDisks:$RequireDistinctPhysicalDisks `
+        -RequireApprovedMediaRoots
 }

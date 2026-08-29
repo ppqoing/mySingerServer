@@ -2,6 +2,7 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use dedup_core::{
@@ -392,6 +393,102 @@ async fn external_delete_keeps_protocol_response_without_delete_history() {
             .unwrap();
         assert_eq!(count, 0, "中心瞬态删除不得写入旧表 {table}");
     }
+}
+
+#[tokio::test]
+async fn delete_is_rejected_while_scan_is_running() {
+    let directory = tempfile::tempdir().unwrap();
+    let scan_root = directory.path().join("scan");
+    fs::create_dir_all(&scan_root).unwrap();
+    fs::write(scan_root.join("held.bin"), b"scan worker input").unwrap();
+
+    let target = directory.path().join("delete-during-scan.bin");
+    fs::write(&target, b"delete target").unwrap();
+    let database = directory.path().join("node.db");
+    let machine = MachineId::from_sha256([0xA5; 32]);
+    let target_scan = scanned(&target.to_string_lossy(), b"delete target".len() as u64);
+    let expected = ContentKey::new(md5_bytes(b"delete target"), b"delete target".len() as u64);
+    let target_location = LocationKey::new(machine.clone(), target_scan.normalized_path.clone());
+    let mut store = NodeStore::open(&database, machine.clone()).unwrap();
+    store
+        .upsert_content_and_location(&target_scan, expected.md5(), MediaKind::Other)
+        .unwrap();
+
+    let runtime_root = directory.path().join("data/node/runtime");
+    let cache_root = directory.path().join("data/node/cache");
+    let (pool, mut started) = WorkerPool::controlled_for_test();
+    let (handle, actor) = NodeEngine::spawn_with_runtime_root_for_test(
+        store,
+        pool,
+        "127.0.0.1:39135".parse().unwrap(),
+        &cache_root,
+        &runtime_root,
+        dedup_core::EnumeratorKind::WindowsWalker,
+    );
+
+    let scan = handle
+        .handle(proto::Envelope {
+            request_id: 1,
+            payload: Some(proto::envelope::Payload::CreateScan(proto::CreateScan {
+                roots: vec![scan_root.to_string_lossy().into_owned()],
+                force_recalculate: false,
+                enumerator: "windows_walker".into(),
+            })),
+        })
+        .await;
+    let Some(proto::envelope::Payload::TaskAccepted(scan)) = scan.payload else {
+        panic!("扫描必须返回任务身份");
+    };
+    tokio::time::timeout(Duration::from_secs(2), started.recv())
+        .await
+        .expect("扫描必须先占用 Worker，才能验证删除互斥")
+        .expect("可控 Worker 不应提前关闭");
+
+    let delete = handle
+        .handle(proto::Envelope {
+            request_id: 2,
+            payload: Some(proto::envelope::Payload::CreateDeleteBatch(
+                proto::CreateDeleteBatch {
+                    delete_batch_id: "delete-during-scan".into(),
+                    mode: proto::DeleteMode::DeletePermanent as i32,
+                    items: vec![proto::DeleteItem {
+                        delete_item_id: "delete-item".into(),
+                        group_id: "central-group".into(),
+                        location: Some((&target_location).into()),
+                        expected_content: Some((&expected).into()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            )),
+        })
+        .await;
+
+    let rejected = matches!(
+        delete.payload.as_ref(),
+        Some(proto::envelope::Payload::Error(proto::Error { code, .. }))
+            if *code == proto::ErrorCode::InvalidRequest as i32
+    );
+    assert!(
+        rejected,
+        "后台扫描期间删除必须返回 Busy/InvalidRequest，旧实现响应为: {:?}",
+        delete.payload
+    );
+    assert!(target.exists(), "扫描运行期间删除不得改变文件事实");
+
+    handle
+        .handle(proto::Envelope {
+            request_id: 3,
+            payload: Some(proto::envelope::Payload::CancelTask(proto::CancelTask {
+                task_id: scan.task_id,
+            })),
+        })
+        .await;
+    tokio::time::timeout(Duration::from_secs(2), handle.shutdown())
+        .await
+        .expect("取消扫描后 actor 必须收束")
+        .unwrap();
+    actor.await.unwrap();
 }
 
 #[tokio::test]

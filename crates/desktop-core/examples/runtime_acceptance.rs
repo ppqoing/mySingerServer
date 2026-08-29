@@ -169,9 +169,9 @@ impl AcceptanceConfig {
         Duration::from_secs(SAMPLE_SECONDS)
     }
 
-    /// 返回验收客户端专用的 Windows Walker 协议值，确保扫描范围只受显式媒体根约束。
+    /// 返回验收契约固定的 Everything 协议值，不受外部脚本参数影响实际请求。
     pub const fn enumerator(&self) -> &'static str {
-        "windows_walker"
+        "everything"
     }
 
     /// 返回原样传给远端 Node 的媒体根。

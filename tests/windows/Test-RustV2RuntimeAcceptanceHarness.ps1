@@ -18,6 +18,40 @@ try {
     }
     . $measureScript -LibraryOnly
 
+    if (-not [bool]$CompleteWhenTaskTerminal) {
+        throw 'RUST_V2_RUNTIME_ACCEPTANCE_TERMINAL_COMPLETION_MUST_DEFAULT_ON'
+    }
+
+    # 单次双盘验收是唯一真实入口；旧六轮 A/B 编排及其专用聚合链不再可执行。
+    $obsoleteAcceptanceScripts = @(
+        (Join-Path $repositoryRoot 'tests\windows\Measure-RustV2CpuIoAb.ps1'),
+        (Join-Path $repositoryRoot 'tests\windows\New-RustV2CpuIoAbReport.ps1'),
+        (Join-Path $repositoryRoot 'tests\windows\Test-RustV2CpuIoAbReport.ps1'),
+        (Join-Path $repositoryRoot 'scripts\build-rust-v2-cpu-io-test-package.ps1')
+    )
+    $obsoletePresent = @($obsoleteAcceptanceScripts | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
+    if ($obsoletePresent.Count -gt 0) {
+        throw "RUST_V2_RUNTIME_ACCEPTANCE_OBSOLETE_AB_ENTRY_PRESENT: $($obsoletePresent -join ', ')"
+    }
+
+    $defaultConfig = New-IsolatedNodeConfig -Port 39124
+    if ($defaultConfig -notmatch 'worker_count = 20' -or
+        $defaultConfig -notmatch 'manual_worker_count = 20' -or
+        $defaultConfig -notmatch 'total_threads = 12') {
+        throw "RUST_V2_RUNTIME_ACCEPTANCE_DEFAULTS_INVALID: $defaultConfig"
+    }
+
+    $wrongApprovedRootCode = ''
+    try {
+        Assert-RuntimeAcceptanceMediaRoots -MediaRoots @('H:\pik\other', 'I:\tmp')
+    }
+    catch {
+        $wrongApprovedRootCode = $_.Exception.Message
+    }
+    if ($wrongApprovedRootCode -ne 'RUST_V2_REAL_MEDIA_ROOTS_NOT_APPROVED') {
+        throw "媒体根必须精确绑定到 H:\pik\00000000000 与 I:\tmp，实际=$wrongApprovedRootCode"
+    }
+
     $media = Join-Path $fixtureRoot 'media'
     $release = Join-Path $fixtureRoot 'release'
     $tools = Join-Path $fixtureRoot 'tools'
@@ -271,17 +305,17 @@ try {
         }
     }
 
-    $config = New-IsolatedNodeConfig -Port 39123 -WorkerCount 12 `
+    $config = New-IsolatedNodeConfig -Port 39123 -WorkerCount 20 `
         -HddThreadsPerDisk 1 -SsdThreadsPerDisk 16 -UnknownThreadsPerDisk 1 `
-        -TotalReadThreads 16 -ReservedCores 1
+        -TotalReadThreads 12 -ReservedCores 1
     if ($config -notmatch 'config_path = "data/node/config.toml"' -or
         $config -notmatch 'data_path = "data/node"' -or
         $config -notmatch 'enumerator = "everything"' -or
-        $config -notmatch 'worker_count = 12' -or
+        $config -notmatch 'worker_count = 20' -or
         $config -notmatch 'mode = "manual"' -or
-        $config -notmatch 'manual_worker_count = 12' -or
+        $config -notmatch 'manual_worker_count = 20' -or
         $config -notmatch 'ssd_threads_per_disk = 16' -or
-        $config -notmatch 'total_threads = 16') {
+        $config -notmatch 'total_threads = 12') {
         throw "相对路径配置或测试专用Everything错误：$config"
     }
 
@@ -529,9 +563,9 @@ Start-Sleep -Milliseconds 200
                 [string] $MediaRoot, [string[]] $MediaRoots = @(), [int] $DurationSeconds, [int] $SampleSeconds,
                 [string] $ReleaseRoot, [string] $AcceptanceClientPath, [string] $ResultExporterPath,
                 [string] $EvidenceRoot, [string] $ReportPath, [string] $Variant = 'A',
-                [int] $RunIndex = 1, [int] $WorkerCount = 12, [int] $HddThreadsPerDisk = 1,
+                [int] $RunIndex = 1, [int] $WorkerCount = 20, [int] $HddThreadsPerDisk = 1,
                 [int] $SsdThreadsPerDisk = 16, [int] $UnknownThreadsPerDisk = 1,
-                [int] $TotalReadThreads = 16, [int] $ReservedCores = 1, [string] $Enumerator = 'everything',
+                [int] $TotalReadThreads = 12, [int] $ReservedCores = 1, [string] $Enumerator = 'everything',
                 [switch] $SingleRun, [switch] $CompleteWhenTaskTerminal,
                 [switch] $RequireDistinctPhysicalDisks, [switch] $ThrowOnError = $true)
             [pscustomobject]@{ Valid = $true; Code = '' }
@@ -653,8 +687,8 @@ Start-Sleep -Milliseconds 200
             -EvidenceRoot $watchdogEvidence -ReportPath $watchdogReport `
             -Variant A -RunIndex 1 -SourceRevision 'fixture' -SourceTreeSha256 ('d' * 64) `
             -PackagePath (Join-Path $fixtureRoot 'fixture.zip') -PackageSha256 ('e' * 64) `
-            -WorkerCount 12 -HddThreadsPerDisk 1 -SsdThreadsPerDisk 16 `
-            -UnknownThreadsPerDisk 1 -TotalReadThreads 16 -ReservedCores 1 -SingleRun)
+            -WorkerCount 20 -HddThreadsPerDisk 1 -SsdThreadsPerDisk 16 `
+            -UnknownThreadsPerDisk 1 -TotalReadThreads 12 -ReservedCores 1 -SingleRun)
         $watchdogHarness = [IO.File]::ReadAllText((Join-Path $watchdogEvidence 'harness-result.json')) | ConvertFrom-Json
         if ($script:watchdogClientStarts -ne 1 -or $script:watchdogStopCalls -ne 1 -or
             $script:watchdogWaitCalls -ne 1 -or -not $script:watchdogExitConfirmed -or
@@ -689,8 +723,8 @@ Start-Sleep -Milliseconds 200
             -EvidenceRoot $unconfirmedEvidence -ReportPath $unconfirmedReport `
             -Variant A -RunIndex 1 -SourceRevision 'fixture' -SourceTreeSha256 ('f' * 64) `
             -PackagePath (Join-Path $fixtureRoot 'fixture-unconfirmed.zip') -PackageSha256 ('a' * 64) `
-            -WorkerCount 12 -HddThreadsPerDisk 1 -SsdThreadsPerDisk 16 `
-            -UnknownThreadsPerDisk 1 -TotalReadThreads 16 -ReservedCores 1 -SingleRun)
+            -WorkerCount 20 -HddThreadsPerDisk 1 -SsdThreadsPerDisk 16 `
+            -UnknownThreadsPerDisk 1 -TotalReadThreads 12 -ReservedCores 1 -SingleRun)
         $unconfirmedHarness = [IO.File]::ReadAllText((Join-Path $unconfirmedEvidence 'harness-result.json')) | ConvertFrom-Json
         if ($script:watchdogWaitCalls -ne 1 -or
             [string]$unconfirmedHarness.run_status -cne 'INCONCLUSIVE' -or
@@ -715,8 +749,8 @@ Start-Sleep -Milliseconds 200
             -EvidenceRoot $identityEvidence -ReportPath $identityReport `
             -Variant A -RunIndex 1 -SourceRevision 'fixture' -SourceTreeSha256 ('1' * 64) `
             -PackagePath (Join-Path $fixtureRoot 'fixture-identity.zip') -PackageSha256 ('2' * 64) `
-            -WorkerCount 12 -HddThreadsPerDisk 1 -SsdThreadsPerDisk 16 `
-            -UnknownThreadsPerDisk 1 -TotalReadThreads 16 -ReservedCores 1 -SingleRun)
+            -WorkerCount 20 -HddThreadsPerDisk 1 -SsdThreadsPerDisk 16 `
+            -UnknownThreadsPerDisk 1 -TotalReadThreads 12 -ReservedCores 1 -SingleRun)
         $identityHarness = [IO.File]::ReadAllText((Join-Path $identityEvidence 'harness-result.json')) | ConvertFrom-Json
         if ([string]$identityHarness.run_status -cne 'INCONCLUSIVE' -or
             [string]$identityHarness.run_diagnostic -notmatch 'RUST_V2_ACCEPTANCE_SUPERVISOR_CLIENT_PID_REUSED' -or
@@ -752,7 +786,7 @@ Start-Sleep -Milliseconds 200
         -AcceptanceClientPath $acceptanceClient -ResultExporterPath $resultExporter `
         -EvidenceRoot $evidence -ReportPath $report -Variant A -RunIndex 1 `
         -WorkerCount 0 -HddThreadsPerDisk 1 -SsdThreadsPerDisk 16 `
-        -UnknownThreadsPerDisk 1 -TotalReadThreads 16 -ReservedCores 1 `
+        -UnknownThreadsPerDisk 1 -TotalReadThreads 12 -ReservedCores 1 `
         -ThrowOnError:$false
     if ($invalidWorkers.Valid -or $invalidWorkers.Code -ne 'RUST_V2_ACCEPTANCE_WORKER_COUNT_INVALID') {
         throw 'Worker数量必须在启动前验证'
@@ -1588,9 +1622,9 @@ Start-Sleep -Milliseconds 200
                 [string] $MediaRoot, [string[]] $MediaRoots = @(), [int] $DurationSeconds, [int] $SampleSeconds,
                 [string] $ReleaseRoot, [string] $AcceptanceClientPath, [string] $ResultExporterPath,
                 [string] $EvidenceRoot, [string] $ReportPath, [string] $Variant = 'A',
-                [int] $RunIndex = 1, [int] $WorkerCount = 12, [int] $HddThreadsPerDisk = 1,
+                [int] $RunIndex = 1, [int] $WorkerCount = 20, [int] $HddThreadsPerDisk = 1,
                 [int] $SsdThreadsPerDisk = 16, [int] $UnknownThreadsPerDisk = 1,
-                [int] $TotalReadThreads = 16, [int] $ReservedCores = 1, [string] $Enumerator = 'everything',
+                [int] $TotalReadThreads = 12, [int] $ReservedCores = 1, [string] $Enumerator = 'everything',
                 [switch] $SingleRun, [switch] $CompleteWhenTaskTerminal,
                 [switch] $RequireDistinctPhysicalDisks, [switch] $ThrowOnError = $true)
             [pscustomobject]@{ Valid = $true; Code = '' }
@@ -1785,8 +1819,8 @@ Start-Sleep -Milliseconds 200
             -EvidenceRoot $finalizationEvidence -ReportPath $finalizationReport `
             -Variant A -RunIndex 1 -SourceRevision 'fixture' -SourceTreeSha256 ('a' * 64) `
             -PackagePath (Join-Path $fixtureRoot 'fixture.zip') -PackageSha256 ('b' * 64) `
-            -WorkerCount 12 -HddThreadsPerDisk 1 -SsdThreadsPerDisk 16 `
-            -UnknownThreadsPerDisk 1 -TotalReadThreads 16 -ReservedCores 1 -CompleteWhenTaskTerminal)
+            -WorkerCount 20 -HddThreadsPerDisk 1 -SsdThreadsPerDisk 16 `
+            -UnknownThreadsPerDisk 1 -TotalReadThreads 12 -ReservedCores 1 -CompleteWhenTaskTerminal)
         if ($script:finalizationObservedRootsJson -cne $expectedMediaRootsJson -or
             $script:finalizationObservedSingleRun -cne '1') {
             throw "受控客户端必须观察到压缩有序多根和 CompleteWhenTaskTerminal=1：roots=$script:finalizationObservedRootsJson single=$script:finalizationObservedSingleRun expected=$expectedMediaRootsJson"
@@ -1832,8 +1866,8 @@ Start-Sleep -Milliseconds 200
             -EvidenceRoot $failedFinalizationEvidence -ReportPath $failedFinalizationReport `
             -Variant A -RunIndex 1 -SourceRevision 'fixture' -SourceTreeSha256 ('a' * 64) `
             -PackagePath (Join-Path $fixtureRoot 'fixture.zip') -PackageSha256 ('b' * 64) `
-            -WorkerCount 12 -HddThreadsPerDisk 1 -SsdThreadsPerDisk 16 `
-            -UnknownThreadsPerDisk 1 -TotalReadThreads 16 -ReservedCores 1)
+            -WorkerCount 20 -HddThreadsPerDisk 1 -SsdThreadsPerDisk 16 `
+            -UnknownThreadsPerDisk 1 -TotalReadThreads 12 -ReservedCores 1)
         $failedFinalizationHarness = [IO.File]::ReadAllText((Join-Path $failedFinalizationEvidence 'harness-result.json')) | ConvertFrom-Json
         if ([string]$failedFinalizationHarness.run_status -cne 'FAIL' -or
             -not ($failedFinalizationResult -contains 'RUST_V2_RUNTIME_ACCEPTANCE_MEASURE_FAIL')) {
@@ -1927,9 +1961,9 @@ Start-Sleep -Milliseconds 200
                 [string] $MediaRoot, [string[]] $MediaRoots = @(), [int] $DurationSeconds, [int] $SampleSeconds,
                 [string] $ReleaseRoot, [string] $AcceptanceClientPath, [string] $ResultExporterPath,
                 [string] $EvidenceRoot, [string] $ReportPath, [string] $Variant = 'A',
-                [int] $RunIndex = 1, [int] $WorkerCount = 12, [int] $HddThreadsPerDisk = 1,
+                [int] $RunIndex = 1, [int] $WorkerCount = 20, [int] $HddThreadsPerDisk = 1,
                 [int] $SsdThreadsPerDisk = 16, [int] $UnknownThreadsPerDisk = 1,
-                [int] $TotalReadThreads = 16, [int] $ReservedCores = 1, [string] $Enumerator = 'everything',
+                [int] $TotalReadThreads = 12, [int] $ReservedCores = 1, [string] $Enumerator = 'everything',
                 [switch] $SingleRun, [switch] $CompleteWhenTaskTerminal,
                 [switch] $RequireDistinctPhysicalDisks, [switch] $ThrowOnError = $true)
             [pscustomobject]@{ Valid = $true; Code = '' }
@@ -1997,8 +2031,8 @@ Start-Sleep -Milliseconds 200
             -EvidenceRoot $startupFailureEvidence -ReportPath $startupFailureReport `
             -Variant A -RunIndex 1 -SourceRevision 'fixture' -SourceTreeSha256 ('c' * 64) `
             -PackagePath (Join-Path $fixtureRoot 'fixture.zip') -PackageSha256 ('d' * 64) `
-            -WorkerCount 12 -HddThreadsPerDisk 1 -SsdThreadsPerDisk 16 `
-            -UnknownThreadsPerDisk 1 -TotalReadThreads 16 -ReservedCores 1)
+            -WorkerCount 20 -HddThreadsPerDisk 1 -SsdThreadsPerDisk 16 `
+            -UnknownThreadsPerDisk 1 -TotalReadThreads 12 -ReservedCores 1)
         $startupFailureHarnessPath = Join-Path $startupFailureEvidence 'harness-result.json'
         if (-not (Test-Path -LiteralPath $startupFailureHarnessPath -PathType Leaf)) {
             throw 'startup failure fixture must write harness-result.json'
@@ -2092,9 +2126,9 @@ Start-Sleep -Milliseconds 200
                 [string] $MediaRoot, [string[]] $MediaRoots = @(), [int] $DurationSeconds, [int] $SampleSeconds,
                 [string] $ReleaseRoot, [string] $AcceptanceClientPath, [string] $ResultExporterPath,
                 [string] $EvidenceRoot, [string] $ReportPath, [string] $Variant = 'A',
-                [int] $RunIndex = 1, [int] $WorkerCount = 12, [int] $HddThreadsPerDisk = 1,
+                [int] $RunIndex = 1, [int] $WorkerCount = 20, [int] $HddThreadsPerDisk = 1,
                 [int] $SsdThreadsPerDisk = 16, [int] $UnknownThreadsPerDisk = 1,
-                [int] $TotalReadThreads = 16, [int] $ReservedCores = 1, [switch] $SingleRun,
+                [int] $TotalReadThreads = 12, [int] $ReservedCores = 1, [switch] $SingleRun,
                 [switch] $RequireDistinctPhysicalDisks, [switch] $ThrowOnError = $true)
             [pscustomobject]@{ Valid = $true; Code = '' }
         }
@@ -2244,8 +2278,8 @@ Start-Sleep -Milliseconds 200
             -EvidenceRoot $shutdownFinalizationEvidence -ReportPath $shutdownFinalizationReport `
             -Variant A -RunIndex 1 -SourceRevision 'fixture' -SourceTreeSha256 ('e' * 64) `
             -PackagePath (Join-Path $fixtureRoot 'fixture.zip') -PackageSha256 ('f' * 64) `
-            -WorkerCount 12 -HddThreadsPerDisk 1 -SsdThreadsPerDisk 16 `
-            -UnknownThreadsPerDisk 1 -TotalReadThreads 16 -ReservedCores 1)
+            -WorkerCount 20 -HddThreadsPerDisk 1 -SsdThreadsPerDisk 16 `
+            -UnknownThreadsPerDisk 1 -TotalReadThreads 12 -ReservedCores 1)
         $shutdownFinalizationHarness = [IO.File]::ReadAllText((Join-Path $shutdownFinalizationEvidence 'harness-result.json')) | ConvertFrom-Json
         if ($script:shutdownFixtureExporterCalls -ne 1) {
             throw "RED: CloseMainWindow=true/WaitForExit=false 且受控 stop 成功后必须运行 exporter，实际调用=$script:shutdownFixtureExporterCalls shutdownCalls=$script:shutdownFixtureShutdownCalls stopped=$script:shutdownFixtureProcessesStopped harness=$($shutdownFinalizationHarness | ConvertTo-Json -Compress)"

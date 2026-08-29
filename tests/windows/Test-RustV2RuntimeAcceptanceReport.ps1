@@ -238,7 +238,8 @@ function Write-Fixture {
         [switch] $MissingOwnership,
         [switch] $RuntimeGap,
         [switch] $MediaChanged,
-        [switch] $NodeUnexpectedExit
+        [switch] $NodeUnexpectedExit,
+        [switch] $WrongMediaRoot
     )
 
     New-Item -ItemType Directory -Path $Root -Force | Out-Null
@@ -288,6 +289,23 @@ function Write-Fixture {
         media_before_sha256 = ('e' * 64); media_after_sha256 = ('e' * 64); run_diagnostic = $null
     }
     Write-Utf8NoBom -Path (Join-Path $Root 'harness-result.json') -Text ($harness | ConvertTo-Json -Depth 12)
+    if ($WrongMediaRoot) {
+        # 同一 H: 盘符但非批准目录，验证报告不能只按盘符放行。
+        foreach ($path in @(
+                (Join-Path $Root 'runtime.ndjson'),
+                (Join-Path $Root 'media-before.json'),
+                (Join-Path $Root 'media-after.json'),
+                (Join-Path $Root 'physical-disk-map.json'),
+                (Join-Path $Root 'harness-result.json'))) {
+            # ConvertTo-Json 将反斜杠写成两个字符，替换时必须匹配编码后的文本。
+            $text = [IO.File]::ReadAllText($path).Replace('H:\\pik\\00000000000', 'H:\\pik\\other')
+            Write-Utf8NoBom -Path $path -Text $text
+        }
+        $harness = Get-Content -LiteralPath (Join-Path $Root 'harness-result.json') -Raw | ConvertFrom-Json
+        $mapPath = Join-Path $Root 'physical-disk-map.json'
+        $harness.physical_disk_map_sha256 = (Get-FileHash -LiteralPath $mapPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        Write-Utf8NoBom -Path (Join-Path $Root 'harness-result.json') -Text ($harness | ConvertTo-Json -Depth 12)
+    }
     if ($MissingSummary) {
         # 旧三件套必须不存在；该分支专门验证报告能识别缺失 TSV。
         foreach ($old in @('result-summary.jsonl', 'result-summary-meta.json', 'result-summary.tsv.pair.lock')) {
@@ -395,6 +413,14 @@ try {
     $nodeExitText = Invoke-Report -Root $nodeExitRoot
     if ($nodeExitText -notmatch '结论：FAIL' -or $nodeExitText -notmatch '非预期退出') {
         throw 'Node 非预期退出必须是 FAIL'
+    }
+
+    $wrongMediaRoot = Join-Path $fixtureRoot 'wrong-media-root'
+    Write-Fixture -Root $wrongMediaRoot -WrongMediaRoot
+    $wrongMediaRootText = Invoke-Report -Root $wrongMediaRoot
+    if ($wrongMediaRootText -notmatch '结论：INCONCLUSIVE' -or
+        $wrongMediaRootText -notmatch '精确绑定|H:\\pik\\00000000000|媒体根') {
+        throw '同盘符但非精确批准目录必须是 INCONCLUSIVE'
     }
 
     Write-Output 'RUST_V2_RUNTIME_ACCEPTANCE_REPORT_PASS'

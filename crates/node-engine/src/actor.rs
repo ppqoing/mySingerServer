@@ -2344,6 +2344,8 @@ impl EngineState {
     }
 
     async fn create_delete_batch(&mut self, request: proto::CreateDeleteBatch) -> ProtocolResult {
+        // 删除与扫描、分析、二筛共享同一后台资源；先统一检查空闲状态，避免删除后被扫描收尾复活。
+        self.ensure_job_idle()?;
         let mode = match proto::DeleteMode::try_from(request.mode) {
             Ok(proto::DeleteMode::DeleteRecycleBin) => DeleteMode::RecycleBin,
             Ok(proto::DeleteMode::DeletePermanent) => DeleteMode::Permanent,

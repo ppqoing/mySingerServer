@@ -164,6 +164,20 @@ function Test-WindowsPathEqual {
         $leftPath.Equals($rightPath, [StringComparison]::OrdinalIgnoreCase)
 }
 
+function Test-ApprovedMediaRoots {
+    <# 严格验证报告中的双盘媒体根，不能只看到 H:/I: 盘符就认为证据匹配。 #>
+    param([object[]] $Roots)
+
+    $expected = @('H:\pik\00000000000', 'I:\tmp')
+    if (@($Roots).Count -ne $expected.Count) { return $false }
+    for ($index = 0; $index -lt $expected.Count; $index++) {
+        if (-not (Test-WindowsPathEqual -Left ([string]$Roots[$index]) -Right $expected[$index])) {
+            return $false
+        }
+    }
+    $true
+}
+
 function Test-WindowsPathWithin {
     <# 判断候选路径是否属于媒体根的组件边界。 #>
     param([string] $Candidate, [string] $Root)
@@ -533,6 +547,15 @@ function Get-MediaAndDiskMapEvidence {
     if ($beforeRoots.Count -ne 2 -or $afterRoots.Count -ne 2 -or $harnessRoots.Count -ne 2 -or $runtimeRoots.Count -ne 2) {
         [void]$errors.Add('必须覆盖两个媒体根（H:\pik\00000000000 与 I:\tmp）')
     }
+    foreach ($source in @(
+            [pscustomobject]@{ Name = 'media-before'; Roots = $beforeRoots },
+            [pscustomobject]@{ Name = 'media-after'; Roots = $afterRoots },
+            [pscustomobject]@{ Name = 'harness'; Roots = $harnessRoots },
+            [pscustomobject]@{ Name = 'runtime-result'; Roots = $runtimeRoots })) {
+        if (-not (Test-ApprovedMediaRoots -Roots $source.Roots)) {
+            [void]$errors.Add("$($source.Name) 媒体根必须精确绑定为 H:\pik\00000000000 与 I:\tmp")
+        }
+    }
     for ($index = 0; $index -lt [Math]::Min(2, $beforeRoots.Count); $index++) {
         if ($afterRoots.Count -le $index -or $harnessRoots.Count -le $index -or $runtimeRoots.Count -le $index -or
             -not (Test-WindowsPathEqual -Left ([string]$beforeRoots[$index]) -Right ([string]$afterRoots[$index])) -or
@@ -540,11 +563,6 @@ function Get-MediaAndDiskMapEvidence {
             -not (Test-WindowsPathEqual -Left ([string]$beforeRoots[$index]) -Right ([string]$runtimeRoots[$index]))) {
             [void]$errors.Add("媒体根绑定不一致：第 $($index + 1) 根")
         }
-    }
-    $rootText = @($beforeRoots | ForEach-Object { [string]$_ })
-    if (@($rootText | Where-Object { $_ -match '^(?i)H:\\' }).Count -eq 0 -or
-        @($rootText | Where-Object { $_ -match '^(?i)I:\\' }).Count -eq 0) {
-        [void]$errors.Add('媒体根未同时覆盖 H: 与 I:')
     }
     $mediaUnchanged = [bool](Get-OptionalProperty -Object $Harness -Name 'media_unchanged')
     if (-not (Test-JsonEquivalent -Left $Before -Right $After) -or -not $mediaUnchanged) {

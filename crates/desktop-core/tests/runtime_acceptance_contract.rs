@@ -497,7 +497,7 @@ fn duration_tick_and_output_boundary_are_fixed() {
     .expect("合法半小时配置");
     assert_eq!(config.duration(), Duration::from_secs(1800));
     assert_eq!(config.sample_interval(), Duration::from_secs(1));
-    assert_eq!(config.enumerator(), "windows_walker");
+    assert_eq!(config.enumerator(), "everything");
 
     let short = AcceptanceConfig::new(
         "127.0.0.1:39091",
@@ -540,15 +540,15 @@ async fn completed_scan_restarts_forced_and_deadline_cancels_active_task() {
     let state = session.state.lock().expect("测试会话锁");
     assert_eq!(
         state.creates[0],
-        (vec![r"D:\Media".into()], false, "windows_walker".into())
+        (vec![r"D:\Media".into()], false, "everything".into())
     );
     assert!(
         state
             .creates
             .iter()
             .skip(1)
-            .all(|(_, force, enumerator)| *force && enumerator == "windows_walker"),
-        "提前完成后的所有续跑必须强制重算且继续使用Walker"
+            .all(|(_, force, enumerator)| *force && enumerator == "everything"),
+        "提前完成后的所有续跑必须强制重算且继续使用Everything"
     );
     assert_eq!(state.cancels, vec!["persistent-2"]);
     assert_eq!(result.duration_seconds, 1800);
