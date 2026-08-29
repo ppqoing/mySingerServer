@@ -34,7 +34,7 @@ pub use groups::{
     GroupKind, GroupMemberPage, GroupMemberWrite, GroupPage, GroupWrite, StoredGroup,
     StoredGroupMember,
 };
-pub use inventory::{ResolvedScanFile, ScanFinalizeInput, ScanFinalizeResult};
+pub use inventory::{ResolvedScanFile, ScanFinalizeInput, ScanFinalizeResult, VerifiedDeletedFile};
 pub use open::{NodeStore, StoreError};
 pub use review::ReviewDecision;
 pub use rows::{

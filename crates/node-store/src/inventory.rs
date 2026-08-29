@@ -1,14 +1,16 @@
 //! 扫描清单的瞬态收尾：在一个 SQLite 事务内合并位置并失活未见文件。
 
-use dedup_core::{ContentKey, NormalizedPath};
-use rusqlite::{Statement, Transaction, params};
+use std::collections::BTreeSet;
+
+use dedup_core::{ContentKey, DisplayPath, LocationKey, NormalizedPath};
+use rusqlite::{OptionalExtension, Statement, Transaction, params};
 
 use crate::{
     NodeStore, ScannedPath, StoreError,
     content::encode_file,
     maintenance::bump_library_revision,
     open::{fixed_bytes, sqlite_integer},
-    outbox::outbox_high_seq_from,
+    outbox::{append_sync_change, outbox_high_seq_from},
 };
 
 const MAX_TEMP_ROWS: usize = 1_000;
@@ -20,6 +22,25 @@ pub struct ResolvedScanFile {
     pub scanned: ScannedPath,
     /// 已经在 SQLite 中写入完整特征的跨边界内容键。
     pub content: ContentKey,
+}
+
+/// 删除执行器已经重新核对过的当前文件身份。
+///
+/// 该值只在当前进程内传递；NodeStore 仍会在提交事务中再次确认活动位置和
+/// `ContentKey`，避免调用者把过期的文件身份写入当前文件事实。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedDeletedFile {
+    /// 要失活的当前文件位置。
+    pub location: LocationKey,
+    /// 删除前重新核对得到的 MD5 与文件大小。
+    pub expected: ContentKey,
+}
+
+impl VerifiedDeletedFile {
+    /// 创建一项待提交的已核对删除身份。
+    pub const fn new(location: LocationKey, expected: ContentKey) -> Self {
+        Self { location, expected }
+    }
 }
 
 /// 当前扫描收尾所需的全部内存清单。
@@ -50,6 +71,107 @@ struct NormalizedManifest {
 }
 
 impl NodeStore {
+    /// 提交本批成功删除形成的当前文件事实；有成功项时 revision 推进一步。
+    ///
+    /// 所有输入先在同一事务中验证，之后才失活 `files` 并追加 `file` outbox，
+    /// 不写复核、删除历史、墓碑或重复组表。调用者可每次只传入一个成功项，
+    /// 从而让文件系统删除与 SQLite ACK 保持逐项边界。
+    pub fn deactivate_deleted_files(
+        &mut self,
+        rows: &[VerifiedDeletedFile],
+        _now_ms: i64,
+    ) -> Result<u64, StoreError> {
+        if rows.is_empty() {
+            return self.library_revision();
+        }
+
+        let machine_id = self.machine_id().clone();
+        let transaction = self.connection.transaction()?;
+        let mut locations = BTreeSet::new();
+        let mut verified = Vec::with_capacity(rows.len());
+
+        // 先完整验证整批，保证后续任一身份错误都不会留下部分写入。
+        for row in rows {
+            if row.location.machine_id() != &machine_id {
+                return Err(StoreError::MachineMismatch);
+            }
+            if !locations.insert(row.location.clone()) {
+                return Err(StoreError::InvalidState("删除确认集合包含重复位置".into()));
+            }
+
+            let current = transaction
+                .query_row(
+                    "SELECT f.display_path,c.md5,c.file_size
+                     FROM files f JOIN contents c ON c.content_id=f.content_id
+                     WHERE f.machine_id=?1 AND f.normalized_path=?2 AND f.active=1",
+                    params![
+                        row.location.machine_id().as_str(),
+                        row.location.normalized_path().as_str()
+                    ],
+                    |query_row| {
+                        Ok((
+                            query_row.get::<_, String>(0)?,
+                            query_row.get::<_, Vec<u8>>(1)?,
+                            query_row.get::<_, i64>(2)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((display_path, md5, file_size)) = current else {
+                return Err(StoreError::InvalidState(format!(
+                    "删除确认项不是当前活动文件: {}",
+                    row.location.normalized_path()
+                )));
+            };
+            let actual_size = u64::try_from(file_size)
+                .map_err(|_| StoreError::InvalidState("当前文件大小不能为负数".into()))?;
+            let actual = ContentKey::new(fixed_bytes(md5, "contents.md5")?, actual_size);
+            if actual != row.expected {
+                return Err(StoreError::InvalidState(format!(
+                    "删除确认项内容身份不一致: {}",
+                    row.location.normalized_path()
+                )));
+            }
+            verified.push((
+                row.location.clone(),
+                row.expected,
+                DisplayPath::new(display_path)?,
+            ));
+        }
+
+        let mut update = transaction.prepare(
+            "UPDATE files SET active=0
+             WHERE machine_id=?1 AND normalized_path=?2 AND active=1",
+        )?;
+        for (location, content, display_path) in &verified {
+            if update.execute(params![
+                location.machine_id().as_str(),
+                location.normalized_path().as_str()
+            ])? != 1
+            {
+                return Err(StoreError::InvalidState(format!(
+                    "删除确认项在提交前已失去活动状态: {}",
+                    location.normalized_path()
+                )));
+            }
+            let scanned = ScannedPath::new(
+                location.normalized_path().clone(),
+                display_path.clone(),
+                content.file_size(),
+            );
+            append_sync_change(
+                &transaction,
+                "file",
+                encode_file(location.machine_id().as_str(), &scanned, *content, false),
+            )?;
+        }
+        drop(update);
+
+        let revision = bump_library_revision(&transaction)?;
+        transaction.commit()?;
+        Ok(revision)
+    }
+
     /// 用当前扫描清单原子更新位置、失活旧位置并推进同步版本。
     ///
     /// 临时表只保存本次调用的输入；正式表、file outbox、outbox 高水位和
