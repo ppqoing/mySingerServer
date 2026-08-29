@@ -13,6 +13,11 @@ pub(crate) mod input_order;
 mod pipeline;
 mod root_plan;
 mod task_file_base_compute;
+mod task_file_media_compute;
+pub(crate) use task_file_media_compute::{
+    MediaPassResult, TaskFileMediaCompleted, TaskFileMediaComputeError, TaskFileMediaFailure,
+    run_task_file_media_compute,
+};
 
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
