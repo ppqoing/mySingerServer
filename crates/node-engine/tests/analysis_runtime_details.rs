@@ -1,298 +1,381 @@
+use std::{fs, path::Path, time::Duration};
+
 use dedup_core::{
-    ContentKey, DisplayPath, LocationKey, MachineId, MediaKind, NormalizedPath, TaskId, Thresholds,
+    ContentKey, DisplayPath, EnumeratorKind, MachineId, MediaKind, NormalizedPath, TaskId,
 };
 use dedup_media::{ImageStage1, ImageStage2, PdqHash};
+use dedup_media_ffmpeg::MediaProbe;
 use dedup_node_engine::{
-    analysis::{LocalAnalysisEngine, Stage2Processor, Stage2Request, WorkerPoolStage2Processor},
+    actor::NodeEngine,
+    analysis::{Stage2Processor, Stage2Request, WorkerPoolStage2Processor, verify_result_file},
     runtime_tasks::{RuntimeTaskKind, RuntimeTaskRegistry},
-    worker::{Stage2Frame, Stage2Output, WorkerPool},
+    scan::md5_bytes,
+    server::NodeRequestHandler,
+    worker::{BaseComputeOutput, Stage1Frame, Stage2Frame, Stage2Output, WorkerPool},
 };
-use dedup_node_store::{
-    AnalysisStatus, FeatureWrite, ImageStage1Fields, NewTaskItem, NodeStore, ScannedPath,
-    TaskItemCompletion,
-};
-use dedup_protocol::proto::RuntimeStageState;
+use dedup_node_store::{NodeStore, ScannedPath};
+use dedup_protocol::proto;
+use rusqlite::Connection;
 
-#[derive(Default)]
-struct FailingStage2;
-
-impl Stage2Processor for FailingStage2 {
-    async fn process(&mut self, _request: Stage2Request) -> Result<Stage2Output, String> {
-        Err("controlled stage2 failure".into())
-    }
-}
-
-struct CompleteStage2;
-
-impl Stage2Processor for CompleteStage2 {
-    async fn process(&mut self, _request: Stage2Request) -> Result<Stage2Output, String> {
-        Ok(Stage2Output {
-            frames: vec![Stage2Frame {
-                slot: 0,
-                feature: Some(stage2()),
-                error: None,
-            }],
-            regenerated_contact_sheet_jpeg: None,
-        })
-    }
-}
-
-#[tokio::test]
-async fn local_analysis_reports_three_persistent_duplicate_list_stages() {
-    let machine = MachineId::from_sha256([0x81; 32]);
-    let registry = RuntimeTaskRegistry::new();
-    let reporter = registry
-        .begin(RuntimeTaskKind::LocalAnalysis, machine.clone(), "本地分析")
-        .await;
-    let mut store = NodeStore::open_in_memory(machine).unwrap();
-    let left = seed_image(&mut store, r"D:\runtime-left.jpg", [1; 16], true);
-    let right = seed_image(&mut store, r"D:\runtime-right.jpg", [2; 16], true);
-    let task = completed_task(&mut store, &[left, right]);
-    let run_id = LocalAnalysisEngine::begin(&mut store, &[task], Thresholds::default(), 2).unwrap();
-
-    let report = LocalAnalysisEngine::run_existing_with_runtime(
-        &mut store,
-        run_id,
-        &mut CompleteStage2,
-        &reporter,
-        3,
-    )
+/// 等待当前进程运行任务进入指定终态，避免用固定 sleep 掩盖状态竞态。
+async fn wait_for_runtime_state(
+    registry: &RuntimeTaskRegistry,
+    task_id: &str,
+    state: &str,
+) -> proto::RuntimeTaskDetails {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(details) = registry.details(task_id).await
+                && details
+                    .summary
+                    .as_ref()
+                    .is_some_and(|summary| summary.state == state)
+            {
+                return details;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
     .await
-    .unwrap();
+    .unwrap_or_else(|_| panic!("运行任务 {task_id} 未进入 {state} 终态"))
+}
 
-    assert_eq!(report.status, AnalysisStatus::Completed);
-    let details = registry.details(reporter.id()).await.unwrap();
-    let summary = details.summary.as_ref().unwrap();
-    assert!(summary.overall_total_known);
+/// 验证本地分析未新增已废弃的 SQLite 运行态记录。
+fn assert_no_legacy_runtime_rows(database: &Path) {
+    let connection = Connection::open(database).unwrap();
+    for table in [
+        "tasks",
+        "task_items",
+        "task_stages",
+        "analysis_runs",
+        "analysis_run_stages",
+        "analysis_run_inputs",
+        "candidate_pairs",
+        "duplicate_groups",
+        "group_members",
+        "review_marks",
+    ] {
+        let count: i64 = connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "瞬态本地分析不应写入 {table}");
+    }
+}
+
+/// 使用受控 Worker 完成一次瞬态基础扫描，并返回扫描任务 ID。
+async fn complete_base_scan(
+    handle: &dedup_node_engine::actor::NodeEngineHandle,
+    registry: &RuntimeTaskRegistry,
+    started: &mut tokio::sync::mpsc::Receiver<(String, String)>,
+    controller: &dedup_node_engine::worker::ControlledWorkerPool,
+    root: &Path,
+    md5s: &[[u8; 16]],
+    output: BaseComputeOutput,
+    file_count: usize,
+) -> String {
+    assert_eq!(md5s.len(), file_count);
+    let response = handle
+        .handle(proto::Envelope {
+            request_id: 1,
+            payload: Some(proto::envelope::Payload::CreateScan(proto::CreateScan {
+                roots: vec![root.to_string_lossy().into_owned()],
+                force_recalculate: false,
+                enumerator: "windows_walker".into(),
+            })),
+        })
+        .await;
+    let Some(proto::envelope::Payload::TaskAccepted(accepted)) = response.payload else {
+        panic!("瞬态基础扫描必须返回任务 ID");
+    };
+    for md5 in md5s {
+        let (task_id, item_id) = tokio::time::timeout(Duration::from_secs(2), started.recv())
+            .await
+            .expect("基础扫描必须进入受控 Worker")
+            .expect("受控 Worker 不应提前关闭");
+        assert_eq!(task_id, accepted.task_id);
+        controller
+            .base_source_read_complete(task_id.clone(), item_id.clone())
+            .await;
+        controller
+            .complete_base(task_id, item_id, *md5, output.clone())
+            .await;
+    }
+    wait_for_runtime_state(registry, &accepted.task_id, "completed").await;
+    accepted.task_id
+}
+
+/// 当前扫描完成后，本地分析只发布运行内存摘要和最近结果 TSV，不再写旧分析阶段表。
+#[tokio::test]
+async fn local_analysis_reports_current_runtime_and_tsv_without_legacy_rows() {
+    let directory = tempfile::tempdir().unwrap();
+    let scan_root = directory.path().join("scan");
+    fs::create_dir(&scan_root).unwrap();
+    fs::write(scan_root.join("left.bin"), b"same content").unwrap();
+    fs::write(scan_root.join("right.bin"), b"same content").unwrap();
+    let database = directory.path().join("node.db");
+    let cache_root = directory.path().join("cache");
+    let runtime_root = directory.path().join("data/node/runtime");
+    let results_root = directory.path().join("data/node/results");
+    let machine = MachineId::from_sha256([0x81; 32]);
+    let store = NodeStore::open(&database, machine).unwrap();
+    let (pool, mut started, controller) = WorkerPool::controlled_batch_for_test(1);
+    let (handle, actor) = NodeEngine::spawn_with_runtime_root_for_test(
+        store,
+        pool,
+        "127.0.0.1:39091".parse().unwrap(),
+        &cache_root,
+        &runtime_root,
+        EnumeratorKind::WindowsWalker,
+    );
+    let registry = handle.runtime_tasks_for_test();
+    let scan_task = complete_base_scan(
+        &handle,
+        &registry,
+        &mut started,
+        &controller,
+        &scan_root,
+        &[md5_bytes(b"same content"), md5_bytes(b"same content")],
+        other_base_output(),
+        2,
+    )
+    .await;
+    let response = handle
+        .handle(proto::Envelope {
+            request_id: 2,
+            payload: Some(proto::envelope::Payload::CreateLocalAnalysis(
+                proto::CreateLocalAnalysis {
+                    scan_task_ids: vec![scan_task],
+                    group_kind: proto::GroupKind::GroupExact as i32,
+                    thresholds: None,
+                },
+            )),
+        })
+        .await;
+    let Some(proto::envelope::Payload::QueryAnalysisRun(accepted)) = response.payload else {
+        panic!("当前扫描必须可以启动本地分析");
+    };
+    let details = wait_for_runtime_state(&registry, &accepted.analysis_run_id, "completed").await;
+    let summary = details.summary.unwrap();
     assert_eq!(summary.overall_total, 2);
     assert_eq!(summary.overall_completed, 2);
-    assert_eq!(summary.task_kind, "duplicate_list");
-    let expected = [
-        ("build_candidates", "candidate_pairs"),
-        ("dispatch_stage2", "files"),
-        ("final_compare", "candidate_pairs"),
-    ];
-    assert_eq!(details.stages.len(), expected.len());
-    for (id, unit) in expected {
-        let stage = details
-            .stages
-            .iter()
-            .find(|stage| stage.stage_id == id)
-            .unwrap();
-        assert_eq!(stage.unit, unit);
-        assert_eq!(stage.state, RuntimeStageState::RuntimeStageCompleted as i32);
-    }
-    let persisted = store.analysis_stages(run_id).unwrap();
-    assert_eq!(
-        persisted
-            .iter()
-            .map(|stage| stage.stage_id.as_str())
-            .collect::<Vec<_>>(),
-        vec!["build_candidates", "dispatch_stage2", "final_compare"]
-    );
-    assert!(persisted.iter().all(|stage| stage.started_at_ms.is_some()));
-    assert!(persisted.iter().all(|stage| stage.finished_at_ms.is_some()));
+    assert_eq!(summary.overall_failed, 0);
+    let result = verify_result_file(&results_root.join("latest-analysis.result.tsv")).unwrap();
+    assert_eq!(result.group_count, 1);
+    assert_eq!(result.member_count, 2);
+
+    handle.shutdown().await.unwrap();
+    actor.await.unwrap();
+    assert_no_legacy_runtime_rows(&database);
 }
 
+/// 二筛失败时本地分析保持 partial/失败运行态，不把缺失特征伪装为已完成结果。
 #[tokio::test]
-async fn unresolved_stage2_marks_final_compare_failed() {
+async fn unresolved_stage2_stays_partial_without_publishing_result() {
+    let directory = tempfile::tempdir().unwrap();
+    let scan_root = directory.path().join("scan");
+    fs::create_dir(&scan_root).unwrap();
+    fs::write(scan_root.join("left.jpg"), b"left image").unwrap();
+    fs::write(scan_root.join("right.jpg"), b"right image").unwrap();
+    let database = directory.path().join("node.db");
+    let cache_root = directory.path().join("cache");
+    let runtime_root = directory.path().join("data/node/runtime");
+    let results_root = directory.path().join("data/node/results");
     let machine = MachineId::from_sha256([0x82; 32]);
-    let registry = RuntimeTaskRegistry::new();
-    let reporter = registry
-        .begin(RuntimeTaskKind::LocalAnalysis, machine.clone(), "本地分析")
-        .await;
-    let mut store = NodeStore::open_in_memory(machine).unwrap();
-    let left = seed_image(&mut store, r"D:\partial-left.jpg", [3; 16], true);
-    let right = seed_image(&mut store, r"D:\partial-right.jpg", [4; 16], false);
-    let task = completed_task(&mut store, &[left, right]);
-    let run_id = LocalAnalysisEngine::begin(&mut store, &[task], Thresholds::default(), 4).unwrap();
-
-    let report = LocalAnalysisEngine::run_existing_with_runtime(
-        &mut store,
-        run_id,
-        &mut FailingStage2,
-        &reporter,
-        5,
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(report.status, AnalysisStatus::Partial);
-    let details = registry.details(reporter.id()).await.unwrap();
-    assert!(details.summary.as_ref().unwrap().overall_failed > 0);
-    let dispatch = details
-        .stages
-        .iter()
-        .find(|stage| stage.stage_id == "dispatch_stage2")
-        .unwrap();
-    assert_eq!(
-        dispatch.state,
-        RuntimeStageState::RuntimeStageCompleted as i32
+    let store = NodeStore::open(&database, machine).unwrap();
+    let (pool, mut started, controller) = WorkerPool::controlled_batch_for_test(1);
+    let (handle, actor) = NodeEngine::spawn_with_runtime_root_for_test(
+        store,
+        pool,
+        "127.0.0.1:39091".parse().unwrap(),
+        &cache_root,
+        &runtime_root,
+        EnumeratorKind::WindowsWalker,
     );
-    let compare = details
+    let registry = handle.runtime_tasks_for_test();
+    let scan_task = complete_base_scan(
+        &handle,
+        &registry,
+        &mut started,
+        &controller,
+        &scan_root,
+        &[md5_bytes(b"left image"), md5_bytes(b"right image")],
+        image_base_output(),
+        2,
+    )
+    .await;
+    let response = handle
+        .handle(proto::Envelope {
+            request_id: 2,
+            payload: Some(proto::envelope::Payload::CreateLocalAnalysis(
+                proto::CreateLocalAnalysis {
+                    scan_task_ids: vec![scan_task],
+                    group_kind: proto::GroupKind::GroupSimilarImage as i32,
+                    thresholds: None,
+                },
+            )),
+        })
+        .await;
+    let Some(proto::envelope::Payload::QueryAnalysisRun(accepted)) = response.payload else {
+        panic!("当前扫描必须可以启动本地分析");
+    };
+    let (task_id, item_id) = tokio::time::timeout(Duration::from_secs(2), started.recv())
+        .await
+        .expect("缺失二筛必须进入 Worker")
+        .expect("受控 Worker 不应提前关闭");
+    controller
+        .crash(task_id, item_id, "controlled stage2 crash".into())
+        .await;
+    let (task_id, item_id) = tokio::time::timeout(Duration::from_secs(2), started.recv())
+        .await
+        .expect("首个二筛失败后仍需继续下一项")
+        .expect("受控 Worker 不应提前关闭");
+    controller
+        .stage2_source_read_complete(task_id.clone(), item_id.clone())
+        .await;
+    controller
+        .complete_stage2(task_id, item_id, stage2_output(2))
+        .await;
+
+    let details = wait_for_runtime_state(&registry, &accepted.analysis_run_id, "failed").await;
+    let stage2 = details
         .stages
         .iter()
-        .find(|stage| stage.stage_id == "final_compare")
-        .unwrap();
-    assert_eq!(compare.state, RuntimeStageState::RuntimeStageFailed as i32);
-    assert_eq!(compare.total, 1);
-    assert_eq!(compare.completed, 0);
-    assert_eq!(compare.failed, 1);
-    let persisted = store.analysis_stages(run_id).unwrap();
-    assert_eq!(persisted[1].state.as_str(), "completed");
-    assert_eq!(persisted[2].state.as_str(), "failed");
+        .find(|stage| stage.stage_id == "compute_stage2_features")
+        .expect("二筛失败必须保留阶段统计");
+    assert_eq!(stage2.total, 2);
+    assert_eq!(stage2.completed, 1);
+    assert_eq!(stage2.failed, 1);
+    assert_eq!(details.failures.len(), 1);
+    let query = handle
+        .handle(proto::Envelope {
+            request_id: 3,
+            payload: Some(proto::envelope::Payload::QueryAnalysisRun(
+                proto::QueryAnalysisRun {
+                    analysis_run_id: accepted.analysis_run_id,
+                    ..Default::default()
+                },
+            )),
+        })
+        .await;
+    assert!(matches!(
+        query.payload,
+        Some(proto::envelope::Payload::QueryAnalysisRun(proto::QueryAnalysisRun { state, .. }))
+            if state == "partial"
+    ));
+    assert!(!results_root.join("latest-analysis.result.tsv").exists());
+    assert_eq!(controller.available_slots(), 1);
+
+    handle.shutdown().await.unwrap();
+    actor.await.unwrap();
+    assert_no_legacy_runtime_rows(&database);
 }
 
+/// 多 Worker 二筛中崩溃只影响当前项，池补回槽位并完成其他项，运行态记录失败而不写旧任务表。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn local_analysis_real_pool_crash_is_persisted_and_slot_recovers() {
+async fn local_analysis_real_pool_crash_recovers_slot_without_legacy_task() {
     let directory = tempfile::tempdir().unwrap();
-    let database = directory.path().join("analysis-crash.db");
+    let scan_root = directory.path().join("scan");
+    fs::create_dir(&scan_root).unwrap();
+    fs::write(scan_root.join("a.jpg"), b"a image bytes").unwrap();
+    fs::write(scan_root.join("b.jpg"), b"b image bytes").unwrap();
+    fs::write(scan_root.join("c.jpg"), b"c image bytes").unwrap();
+    let database = directory.path().join("node.db");
+    let cache_root = directory.path().join("cache");
+    let runtime_root = directory.path().join("data/node/runtime");
     let machine = MachineId::from_sha256([0x84; 32]);
-    let registry = RuntimeTaskRegistry::new();
-    let reporter = registry
-        .begin(RuntimeTaskKind::LocalAnalysis, machine.clone(), "本地分析")
+    let store = NodeStore::open(&database, machine).unwrap();
+    let (pool, mut started, controller) = WorkerPool::controlled_batch_for_test(2);
+    let (handle, actor) = NodeEngine::spawn_with_runtime_root_for_test(
+        store,
+        pool,
+        "127.0.0.1:39091".parse().unwrap(),
+        &cache_root,
+        &runtime_root,
+        EnumeratorKind::WindowsWalker,
+    );
+    let registry = handle.runtime_tasks_for_test();
+    let scan_task = complete_base_scan(
+        &handle,
+        &registry,
+        &mut started,
+        &controller,
+        &scan_root,
+        &[
+            md5_bytes(b"a image bytes"),
+            md5_bytes(b"b image bytes"),
+            md5_bytes(b"c image bytes"),
+        ],
+        image_base_output(),
+        3,
+    )
+    .await;
+    let response = handle
+        .handle(proto::Envelope {
+            request_id: 2,
+            payload: Some(proto::envelope::Payload::CreateLocalAnalysis(
+                proto::CreateLocalAnalysis {
+                    scan_task_ids: vec![scan_task],
+                    group_kind: proto::GroupKind::GroupSimilarImage as i32,
+                    thresholds: None,
+                },
+            )),
+        })
         .await;
-    let reporter_id = reporter.id().to_owned();
-    let mut store = NodeStore::open(&database, machine.clone()).unwrap();
-    let a = seed_image(&mut store, r"D:\crash-a.jpg", [8; 16], false);
-    let b = seed_image(&mut store, r"D:\crash-b.jpg", [9; 16], false);
-    let c = seed_image(&mut store, r"D:\crash-c.jpg", [10; 16], false);
-    let task = completed_task(&mut store, &[a, b, c]);
-    let run_id = LocalAnalysisEngine::begin(&mut store, &[task], Thresholds::default(), 6).unwrap();
-    // 控制协程复用当前进程的独立连接，不能误走启动清理入口。
-    let controller_store = store.reopen().unwrap();
-    let (mut pool, mut started, control) = WorkerPool::controlled_batch_for_test(2);
-    let controller_registry = registry.clone();
-    let controller_reporter_id = reporter_id.clone();
-    let controller = tokio::spawn(async move {
-        let (task_id, first_item) = started.recv().await.unwrap();
-        let (second_task, second_item) = started.recv().await.unwrap();
-        assert_eq!(second_task, task_id);
-        assert_ne!(
-            second_item, first_item,
-            "两个 Worker 应在任何结果返回前同时占满"
-        );
-        control
-            .crash(
-                task_id.clone(),
-                first_item,
-                "controlled stage2 crash".into(),
-            )
-            .await;
-        control
-            .complete_stage2(
-                task_id.clone(),
-                second_item,
-                Stage2Output {
-                    frames: vec![Stage2Frame {
-                        slot: 0,
-                        feature: Some(stage2()),
-                        error: None,
-                    }],
-                    regenerated_contact_sheet_jpeg: None,
-                },
-            )
-            .await;
-
-        let (_, third_item) = started.recv().await.unwrap();
-        // Pool 可在事件交给消费者后立即补槽；等待消费者提交两个已送达终态。
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
-        let stage2_task = loop {
-            let task = controller_store
-                .page_tasks(None, 20)
-                .unwrap()
-                .items
-                .into_iter()
-                .find(|task| task.task_id.as_uuid().to_string() == task_id)
-                .unwrap();
-            if task.cancelled == 1 && task.succeeded == 1 {
-                break task;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "Worker 终态必须在补槽后由二筛消费者持久化"
-            );
-            tokio::task::yield_now().await;
-        };
-        assert_eq!(stage2_task.failed, 0, "Worker 崩溃项不应再次进入失败重试");
-        assert_eq!(stage2_task.cancelled, 1, "Worker 崩溃项必须立即标记跳过");
-        assert_eq!(stage2_task.succeeded, 1, "并行完成项必须独立写入成功终态");
-        let live = controller_registry
-            .details(&controller_reporter_id)
-            .await
-            .unwrap();
-        assert_eq!(
-            live.failures.len(),
-            1,
-            "Store 终态后 runtime failure 才可见"
-        );
-        assert!(live.failures[0].message.contains("controlled stage2 crash"));
-        control
-            .complete_stage2(
-                task_id,
-                third_item,
-                Stage2Output {
-                    frames: vec![Stage2Frame {
-                        slot: 0,
-                        feature: Some(stage2()),
-                        error: None,
-                    }],
-                    regenerated_contact_sheet_jpeg: None,
-                },
-            )
-            .await;
-        control
-    });
-
-    let run_registry = registry.clone();
-    let run_reporter = reporter.clone();
-    let run = tokio::spawn(async move {
-        let mut processor = WorkerPoolStage2Processor::new(&mut pool)
-            .with_runtime_reporter(run_reporter.clone(), machine);
-        let report = LocalAnalysisEngine::run_existing_with_runtime(
-            &mut store,
-            run_id,
-            &mut processor,
-            &run_reporter,
-            7,
+    let Some(proto::envelope::Payload::QueryAnalysisRun(accepted)) = response.payload else {
+        panic!("当前扫描必须可以启动本地分析");
+    };
+    let (task_id, first_item) = tokio::time::timeout(Duration::from_secs(2), started.recv())
+        .await
+        .expect("二筛必须进入首个 Worker")
+        .expect("受控 Worker 不应提前关闭");
+    let (second_task, second_item) = tokio::time::timeout(Duration::from_secs(2), started.recv())
+        .await
+        .expect("二筛必须占满第二个 Worker")
+        .expect("受控 Worker 不应提前关闭");
+    assert_eq!(second_task, task_id);
+    assert_ne!(first_item, second_item);
+    controller
+        .crash(
+            task_id.clone(),
+            first_item,
+            "controlled stage2 crash".into(),
         )
         .await;
-        drop(processor);
-        (report, store, pool, run_registry)
-    });
-
-    let control = tokio::time::timeout(std::time::Duration::from_secs(3), controller)
+    controller
+        .stage2_source_read_complete(second_task.clone(), second_item.clone())
+        .await;
+    controller
+        .complete_stage2(second_task, second_item, stage2_output(4))
+        .await;
+    let (third_task, third_item) = tokio::time::timeout(Duration::from_secs(2), started.recv())
         .await
-        .expect("crash 后必须补槽并继续 B/C")
-        .unwrap();
-    let (report, store, pool, registry) =
-        tokio::time::timeout(std::time::Duration::from_secs(3), run)
-            .await
-            .expect("真实 LocalAnalysis/WorkerPool 链不得死锁")
-            .unwrap();
-    assert_eq!(report.unwrap().status, AnalysisStatus::Partial);
-    assert_eq!(control.available_slots(), 2);
-    assert_eq!(pool.busy_workers(), 0);
-    let stage2_task = store
-        .page_tasks(None, 20)
-        .unwrap()
-        .items
-        .into_iter()
-        .find(|task| task.kind == "stage2_compute")
-        .unwrap();
-    assert_eq!(stage2_task.failed, 0);
-    assert_eq!(stage2_task.cancelled, 1);
-    assert_eq!(stage2_task.succeeded, 2);
-    let details = registry.details(&reporter_id).await.unwrap();
-    assert_eq!(
-        details
-            .workers
-            .iter()
-            .map(|worker| worker.completed_files)
-            .sum::<u64>(),
-        2
-    );
+        .expect("崩溃释放槽位后必须补派第三项")
+        .expect("受控 Worker 不应提前关闭");
+    assert_eq!(third_task, task_id);
+    controller
+        .stage2_source_read_complete(third_task.clone(), third_item.clone())
+        .await;
+    controller
+        .complete_stage2(third_task, third_item, stage2_output(5))
+        .await;
+
+    let details = wait_for_runtime_state(&registry, &accepted.analysis_run_id, "failed").await;
+    let stage2 = details
+        .stages
+        .iter()
+        .find(|stage| stage.stage_id == "compute_stage2_features")
+        .expect("二筛失败必须保留阶段统计");
+    assert_eq!(stage2.total, 3);
+    assert_eq!(stage2.completed, 2);
+    assert_eq!(stage2.failed, 1);
     assert_eq!(details.failures.len(), 1);
+    assert_eq!(controller.available_slots(), 2);
+
+    handle.shutdown().await.unwrap();
+    actor.await.unwrap();
+    assert_no_legacy_runtime_rows(&database);
 }
 
 #[tokio::test]
@@ -372,70 +455,55 @@ async fn phase2_worker_reports_actual_started_slot_pid_path_disk_and_completion(
     assert_eq!(worker.cache_detail, "读取原图");
 }
 
-type Seeded = (ScannedPath, LocationKey, dedup_node_store::ContentId);
-
-fn seed_image(store: &mut NodeStore, path: &str, md5: [u8; 16], with_stage2: bool) -> Seeded {
-    let scanned = ScannedPath::new(
-        NormalizedPath::new(path).unwrap(),
-        DisplayPath::new(path).unwrap(),
-        100,
-    );
-    let content = store
-        .upsert_content_and_location(&scanned, md5, MediaKind::Image)
-        .unwrap();
-    store
-        .commit_feature_result(
-            content.id,
-            None,
-            FeatureWrite::ImageStage1(ImageStage1Fields::from(stage1())),
-        )
-        .unwrap();
-    if with_stage2 {
-        store
-            .commit_feature_result(content.id, None, FeatureWrite::ImageStage2(stage2()))
-            .unwrap();
+/// 构造普通文件基础结果，让当前扫描快照能够形成精确重复组。
+fn other_base_output() -> BaseComputeOutput {
+    BaseComputeOutput {
+        probe: Some(MediaProbe {
+            media_kind: MediaKind::Other,
+            width: 0,
+            height: 0,
+            duration_ms: None,
+        }),
+        stage1_frames: Some(Vec::new()),
+        contact_sheet_jpeg: None,
     }
-    (
-        scanned.clone(),
-        LocationKey::new(store.machine_id().clone(), scanned.normalized_path),
-        content.id,
-    )
 }
 
-fn completed_task(store: &mut NodeStore, contents: &[Seeded]) -> dedup_core::TaskId {
-    let items = contents
-        .iter()
-        .map(|(scanned, location, content_id)| {
-            NewTaskItem::for_content(
-                location.clone(),
-                scanned.display_path.clone(),
-                scanned.file_size,
-                *content_id,
-                "stage1",
-            )
-        })
-        .collect::<Vec<_>>();
-    let task = store.create_task("scan", &items, 1).unwrap();
-    while let Some(item) = store.claim_next_item(task, 1).unwrap() {
-        store
-            .complete_item(
-                &item.item_id,
-                TaskItemCompletion::Succeeded {
-                    content_id: item.content_id,
-                },
-                1,
-            )
-            .unwrap();
+/// 构造完整的一筛图片结果，让当前扫描快照能够真实进入二筛。
+fn image_base_output() -> BaseComputeOutput {
+    BaseComputeOutput {
+        probe: Some(MediaProbe {
+            media_kind: MediaKind::Image,
+            width: 2,
+            height: 2,
+            duration_ms: None,
+        }),
+        stage1_frames: Some(vec![Stage1Frame {
+            slot: 0,
+            feature: Some(ImageStage1 {
+                width: 2,
+                height: 2,
+                pdq: PdqHash::from_bytes([0; 32]),
+                quality: 100,
+            }),
+            error: None,
+        }]),
+        contact_sheet_jpeg: None,
     }
-    task
 }
 
-fn stage1() -> ImageStage1 {
-    ImageStage1 {
-        width: 100,
-        height: 100,
-        pdq: PdqHash::from_bytes([0; 32]),
-        quality: 100,
+/// 构造受控 Worker 的完整二筛结果。
+fn stage2_output(seed: u64) -> Stage2Output {
+    Stage2Output {
+        frames: vec![Stage2Frame {
+            slot: 0,
+            feature: Some(ImageStage2 {
+                phash_parts: [seed; 9],
+                sobel: [seed as f32; 128],
+            }),
+            error: None,
+        }],
+        regenerated_contact_sheet_jpeg: None,
     }
 }
 
