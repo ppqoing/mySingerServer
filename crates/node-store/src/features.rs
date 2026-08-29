@@ -9,7 +9,7 @@ use crate::{
     NodeStore, StoreError, TaskItemApplyResult, TaskItemCompletion, TaskItemIdentity,
     VideoFrameStage1Fields, VideoFrameStage2Fields, VideoMetadataFields,
     cache_integrity::classify_cache_completeness,
-    content::{content_key_in_transaction, encode_content},
+    content::{content_key_in_transaction, encode_content, media_kind_name},
     open::sqlite_integer,
     outbox::append_sync_change,
     rows::RowEncoder,
@@ -253,6 +253,94 @@ impl NodeStore {
             media_kind,
             writes,
         )?;
+        transaction.commit()?;
+        Ok(sequence)
+    }
+
+    /// 在不创建任务表记录的情况下原子提交图片或视频二筛结果和同步 outbox。
+    ///
+    /// 该接口只接收已经完成的二筛结构；它会核对内容类型和基础计算完成标记，
+    /// 事务中的任一非法结果都会回滚此前写入，并返回本次事务最后的 outbox 序号。
+    pub fn commit_stage2_taskless(
+        &mut self,
+        content_id: ContentId,
+        media_kind: MediaKind,
+        writes: Vec<FeatureWrite>,
+    ) -> Result<u64, StoreError> {
+        if writes.is_empty() {
+            return Err(StoreError::InvalidFeature("二筛事务至少需要一个二筛结果"));
+        }
+        if media_kind == MediaKind::Other {
+            return Err(StoreError::InvalidFeature("二筛结果必须属于图片或视频"));
+        }
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some((stored_kind, base_complete)) = transaction
+            .query_row(
+                "SELECT media_kind,base_complete FROM contents WHERE content_id=?1",
+                [content_id.as_i64()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
+            )
+            .optional()?
+        else {
+            return Err(StoreError::InvalidState("二筛内容不存在".into()));
+        };
+        if stored_kind != media_kind_name(media_kind) {
+            return Err(StoreError::InvalidFeature("二筛结果媒体类型与内容不一致"));
+        }
+        if !base_complete {
+            return Err(StoreError::InvalidFeature("二筛要求基础计算已完成"));
+        }
+
+        let key = content_key_in_transaction(&transaction, content_id)?;
+        let mut sequence = 0;
+        for write in writes {
+            let (entity_kind, payload) = match write {
+                FeatureWrite::ImageStage2(features) if media_kind == MediaKind::Image => {
+                    ensure_finite(&features.sobel)?;
+                    let phash = phash_parts_to_blob(&features.phash_parts);
+                    let sobel = encode_sobel(&features.sobel);
+                    transaction.execute(
+                        "INSERT INTO image_stage2(content_id,phash_parts,sobel) VALUES(?1,?2,?3)
+                         ON CONFLICT(content_id) DO UPDATE SET
+                           phash_parts=excluded.phash_parts,sobel=excluded.sobel",
+                        params![content_id.as_i64(), phash.as_slice(), sobel.as_slice()],
+                    )?;
+                    ("image_stage2", encode_image_stage2(key, &features))
+                }
+                FeatureWrite::VideoFrameStage2(frame) if media_kind == MediaKind::Video => {
+                    validate_slot(frame.slot)?;
+                    ensure_finite(&frame.features.sobel)?;
+                    let phash = phash_parts_to_blob(&frame.features.phash_parts);
+                    let sobel = encode_sobel(&frame.features.sobel);
+                    transaction.execute(
+                        "INSERT INTO video_frame_stage2(content_id,slot,phash_parts,sobel)
+                         VALUES(?1,?2,?3,?4)
+                         ON CONFLICT(content_id,slot) DO UPDATE SET
+                           phash_parts=excluded.phash_parts,sobel=excluded.sobel",
+                        params![
+                            content_id.as_i64(),
+                            frame.slot,
+                            phash.as_slice(),
+                            sobel.as_slice()
+                        ],
+                    )?;
+                    ("video_frame_stage2", encode_video_frame_stage2(key, frame))
+                }
+                FeatureWrite::ImageStage2(_) | FeatureWrite::VideoFrameStage2(_) => {
+                    return Err(StoreError::InvalidFeature("二筛结果媒体类型与内容不一致"));
+                }
+                FeatureWrite::ImageStage1(_)
+                | FeatureWrite::VideoMetadata(_)
+                | FeatureWrite::VideoFrameStage1(_)
+                | FeatureWrite::ContactSheet(_) => {
+                    return Err(StoreError::InvalidFeature("二筛事务只能写入二筛结果"));
+                }
+            };
+            sequence = append_sync_change(&transaction, entity_kind, payload)?;
+        }
         transaction.commit()?;
         Ok(sequence)
     }
