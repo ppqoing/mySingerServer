@@ -185,11 +185,13 @@ async fn runtime_tasks_share_one_connection_and_demux_terminal_events() {
     ));
 
     second.update_overall(1, Some(2), 0, 0).await.unwrap();
-    assert!(
+    let progress_event =
         tokio::time::timeout(Duration::from_millis(30), session.next_runtime_event())
             .await
-            .is_err()
-    );
+            .expect("首次进度更新必须发布一条即时快照")
+            .expect("首次进度事件必须是合法运行任务事件");
+    assert_eq!(progress_event.runtime_task_id, second.id());
+    assert_eq!(progress_event.state, "running");
     second.finish(RuntimeTaskState::Completed).await.unwrap();
     let (status, event) = tokio::join!(session.status(), session.next_runtime_event());
     assert_eq!(status.unwrap().machine_id, machine_id.as_str());
