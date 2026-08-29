@@ -22,6 +22,8 @@ pub mod analysis;
 pub mod config_repository;
 /// 文件删除前复核和成功后的 SQLite 收缩事务。
 pub mod delete;
+/// 当前 Node 进程内按顺序执行的瞬态 TSV 删除队列。
+pub mod delete_queue;
 /// 可取消分块读取、超时重试和流式 MD5 边界。
 pub mod io;
 /// 图片原文件和视频 JPEG 联系表的有界分块预览。
