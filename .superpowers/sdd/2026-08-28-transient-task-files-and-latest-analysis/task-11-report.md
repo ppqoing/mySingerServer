@@ -116,3 +116,55 @@ git diff --check
 - 两个 finding 均有真实行为 RED 与对应 GREEN；没有使用源码字符串匹配测试。
 - 固定结果仍为 UTF-8/LF TSV，无 `.idx`、历史/备份服务或额外 SQLite；旧 reader 和旧磁盘结果在验证失败时保持不变。
 - 本轮唯一超出原 Task11 文件清单的改动是 `crates/windows/src/atomic_file.rs`：Windows `MoveFileExW` 无法在稳定旧 reader 存在时替换目标，实测 `ReplaceFileW` 才满足相同原子替换边界；现有原子文件回归 4/4 通过。
+
+## Fix round 2/5：审查 finding 2 收口
+
+### Finding 2 RED
+
+新增 `publish_returns_verified_reader_that_survives_result_path_disappearance`，要求验证回调交出的完整 reader 在发布后直接可读；发布后删除固定 result 路径，仍必须通过该 reader 读取成员窗口。当前实现实际先以路径替换，再依赖后续绑定，第一次运行在 `ReplaceFileW` 阶段稳定得到 Windows `Io(code=32, sharing violation)`，证明无法保留来源句柄跨过替换边界。
+
+同时新增 `replaces_open_source_and_destination_by_source_handle`，要求来源 reader 和旧目标 reader 都保持打开时仍完成原子替换；接口尚不存在时先实际得到 `E0432: unresolved import atomic_replace_file_from_handle`。补齐接口后的第一次运行还暴露了 `FILE_RENAME_INFO_EX` 尾部缺少零终止字符，固定路径出现带随机后缀的文件名；随后以行为测试校正变量长度结构。
+
+### 修复
+
+- `AnalysisResultWriter` 增加 `publish_with_verifier_and_replacer`。它在写完并同步 partial 后先运行完整 verifier，再把验证对象借给原子 replacer；replacer 成功后直接返回同一个对象，替换后不再进行任何文件打开或 reader 绑定。旧 `publish_with_verifier` 保留路径替换包装，其他调用不改变语义。
+- `LatestAnalysisReader` 删除 `PreparedLatestAnalysisReader`、`detach` 和 `bind_prepared`；验证所得 `BufReader<File>` 由 transient 发布路径一直持有，`source_file` 句柄直接交给替换边界。reader 使用 `GENERIC_READ | DELETE` 与共享读/写/删模式打开。
+- `dedup-windows::atomic_replace_file_from_handle` 使用 `SetFileInformationByHandle(FileRenameInfoEx)` 的 replace + POSIX flags，在来源和旧目标句柄都打开时把同一文件身份原子移到 result 路径；变量结构包含显式零终止字符。瞬态发布改用该边界，失败仍在替换前清理 partial，旧磁盘结果与 actor 旧 reader 不动。
+- 瞬态真实行为测试改为调用 `publish_local_analysis_result_with_reader`，删除固定路径后从返回 reader 读取成员窗口，覆盖 actor 实际安装对象。
+
+### GREEN
+
+```text
+cargo test -p dedup-node-engine --features test-hooks --test analysis_result_window publish_returns_verified_reader_that_survives_result_path_disappearance --locked -- --test-threads=1
+# 1 passed
+
+cargo test -p dedup-windows --test atomic_file replaces_open_source_and_destination_by_source_handle --locked -- --test-threads=1
+# 1 passed
+
+cargo test -p dedup-node-engine --features test-hooks --lib transient::tests::current_scan_analysis_publishes_tsv_without_sqlite_analysis_rows --locked -- --test-threads=1
+# 1 passed
+
+cargo test -p dedup-node-engine --features test-hooks --test analysis_result_window --locked -- --test-threads=1
+# 7 passed
+
+cargo test -p dedup-node-engine --features test-hooks --test analysis_result_file --locked -- --test-threads=1
+# 6 passed
+
+cargo test -p dedup-node-engine --features test-hooks --lib --locked -- --test-threads=1
+# 155 passed
+
+cargo test -p dedup-windows --test atomic_file --locked -- --test-threads=1
+# 5 passed
+
+cargo test -p dedup-protocol --locked -- --test-threads=1
+# 24 passed
+
+cargo fmt --all -- --check
+git diff --check
+```
+
+### 修复轮自审
+
+- 本轮只处理 finding 2；RED 覆盖了来源 reader 跨替换保持可读、固定路径消失和来源/旧目标同时打开三条真实行为。
+- 替换成功到返回 reader 之间没有 fallible open/bind；验证失败或原子替换失败都发生在旧 result 尚未被覆盖前。
+- 未修改 `desktop-core`、`desktop-ui`，未引入历史、备份恢复、TaskCatalog 或 `.idx`；Windows 原子替换新增接口是稳定句柄所需的唯一跨 crate 边界。

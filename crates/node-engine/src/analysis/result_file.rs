@@ -245,8 +245,19 @@ impl AnalysisResultWriter {
 
     /// 在原子替换前验证并返回验证阶段构造的附加值。
     pub fn publish_with_verifier<T>(
+        self,
+        verifier: impl FnOnce(&Path) -> Result<T, AnalysisResultError>,
+    ) -> Result<(PublishedAnalysisResult, T), AnalysisResultError> {
+        self.publish_with_verifier_and_replacer(verifier, |source, destination, _| {
+            atomic_replace_file(source, destination).map_err(AnalysisResultError::Io)
+        })
+    }
+
+    /// 在验证后通过指定原子边界发布，并把验证对象直接返回给调用者。
+    pub fn publish_with_verifier_and_replacer<T>(
         mut self,
         verifier: impl FnOnce(&Path) -> Result<T, AnalysisResultError>,
+        replacer: impl FnOnce(&Path, &Path, &T) -> Result<(), AnalysisResultError>,
     ) -> Result<(PublishedAnalysisResult, T), AnalysisResultError> {
         let sha256: [u8; 32] = self.hasher.clone().finalize().into();
         let footer = format!("F\t{}\t{}\n", self.member_count, hex_bytes(&sha256));
@@ -260,7 +271,7 @@ impl AnalysisResultWriter {
             writer.get_ref().sync_all()?;
             drop(writer);
             let verified = verifier(&self.partial_path)?;
-            atomic_replace_file(&self.partial_path, &self.result_path)?;
+            replacer(&self.partial_path, &self.result_path, &verified)?;
             Ok::<T, AnalysisResultError>(verified)
         })();
         let verified = match verified {

@@ -6,14 +6,15 @@ use dedup_core::{AnalysisRunId, LocationKey, MediaKind, TaskId, Thresholds};
 use dedup_media::ImageStage1;
 use dedup_node_store::{CompleteStage1, NodeStore, ResolvedScanFile, classify_cache_completeness};
 use dedup_protocol::{BASE_MISSING_PROBE, BASE_MISSING_STAGE1};
+use dedup_windows::atomic_replace_file_from_handle;
 
 use super::phase2::Stage2BatchItem;
 use super::result_reader::LatestAnalysisReader;
 use super::video::video_candidates;
 use super::{
-    AnalysisBlocked, AnalysisCandidateStatus, AnalysisGroupKind, AnalysisResultGroupKind,
-    AnalysisResultHeader, AnalysisResultMode, AnalysisResultRow, AnalysisResultWriter,
-    LocalAnalysisReport,
+    AnalysisBlocked, AnalysisCandidateStatus, AnalysisGroupKind, AnalysisResultError,
+    AnalysisResultGroupKind, AnalysisResultHeader, AnalysisResultMode, AnalysisResultRow,
+    AnalysisResultWriter, LocalAnalysisReport,
 };
 use super::{image::image_candidates, model::LocalAnalysisRun, model::ScanAnalysisInput};
 
@@ -277,10 +278,13 @@ pub(crate) fn publish_local_analysis_result_with_reader(
             })?;
         }
     }
-    let (published, prepared) = writer.publish_with_verifier(|path| {
-        LatestAnalysisReader::open_verified(path).map(LatestAnalysisReader::detach)
-    })?;
-    let reader = LatestAnalysisReader::bind_prepared(&published.path, prepared)?;
+    let (published, reader) = writer.publish_with_verifier_and_replacer(
+        LatestAnalysisReader::open_verified,
+        |source, destination, reader| {
+            atomic_replace_file_from_handle(reader.source_file(), source, destination)
+                .map_err(AnalysisResultError::Io)
+        },
+    )?;
     let report = LocalAnalysisReport {
         run_id: run.run_id,
         status: dedup_node_store::AnalysisStatus::Completed,
@@ -305,24 +309,28 @@ pub(crate) fn publish_local_analysis_result_with_reader(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use dedup_core::{
         ContentKey, DisplayPath, LocationKey, MachineId, MediaKind, NormalizedPath, TaskId,
         Thresholds,
     };
     use dedup_media::{ImageStage1, ImageStage2, PdqHash};
     use dedup_node_store::{
-        AnalysisStatus, FeatureWrite, ImageStage1Fields, NewTaskItem, NodeStore, ResolvedScanFile,
-        ScannedPath, VideoFrameStage1Fields, VideoFrameStage2Fields, VideoMetadataFields,
+        AnalysisStatus, FeatureWrite, GroupKind, ImageStage1Fields, NewTaskItem, NodeStore,
+        ResolvedScanFile, ScannedPath, VideoFrameStage1Fields, VideoFrameStage2Fields,
+        VideoMetadataFields,
     };
     use rusqlite::Connection;
     use tempfile::tempdir;
 
     use super::super::model::LocalAnalysisRun;
     use super::super::result_file::verify_result_file;
+    use super::super::result_reader::LocalResultWindowKind;
     use super::super::{
         AnalysisCandidate, AnalysisCandidateStatus, AnalysisPairKind, ScanAnalysisInput,
         Stage2BatchItem, missing_stage2_items, prepare_current_scan_analysis,
-        publish_local_analysis_result,
+        publish_local_analysis_result_with_reader,
     };
     use super::*;
 
@@ -404,8 +412,8 @@ mod tests {
             10,
         )
         .unwrap();
-        let (published, report) =
-            publish_local_analysis_result(&store, run, &results_root).unwrap();
+        let (published, report, mut reader) =
+            publish_local_analysis_result_with_reader(&store, run, &results_root).unwrap();
         assert_eq!(published.member_count, 2);
         assert_eq!(published.group_count, 1);
         assert_eq!(report.status, AnalysisStatus::Completed);
@@ -415,6 +423,15 @@ mod tests {
         assert_eq!(verify_result_file(&published.path).unwrap().member_count, 2);
         assert!(!results_root.join("latest-analysis.partial.tsv").exists());
         assert!(!results_root.join("latest-analysis.result.tsv.idx").exists());
+        let groups = reader
+            .read_window(LocalResultWindowKind::Groups(GroupKind::Exact), 0, 1)
+            .unwrap();
+        let group_id = groups.groups[0].group_id.clone();
+        fs::remove_file(&published.path).unwrap();
+        let members = reader
+            .read_window(LocalResultWindowKind::Members { group_id }, 0, 2)
+            .unwrap();
+        assert_eq!(members.members.len(), 2);
         drop(store);
 
         let connection = Connection::open(&database).unwrap();

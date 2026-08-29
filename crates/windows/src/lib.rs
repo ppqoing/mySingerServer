@@ -14,7 +14,7 @@ mod storage_device;
 mod walker;
 
 pub use app_layout::AppLayout;
-pub use atomic_file::atomic_replace_file;
+pub use atomic_file::{atomic_replace_file, atomic_replace_file_from_handle};
 pub use job::{CREATE_WORKER_FLAGS, WorkerJob};
 pub use local_path::LocalNodePath;
 pub use machine_id::{PhysicalMachineFields, machine_id_from_fields};

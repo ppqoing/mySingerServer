@@ -4,8 +4,8 @@ use std::fs;
 
 use dedup_core::{AnalysisRunId, ContentKey, LocationKey, MachineId, NormalizedPath, Thresholds};
 use dedup_node_engine::analysis::{
-    AnalysisResultGroupKind, AnalysisResultHeader, AnalysisResultMode, AnalysisResultRow,
-    AnalysisResultWriter, LatestAnalysisReader, LocalResultWindowKind,
+    AnalysisResultError, AnalysisResultGroupKind, AnalysisResultHeader, AnalysisResultMode,
+    AnalysisResultRow, AnalysisResultWriter, LatestAnalysisReader, LocalResultWindowKind,
 };
 use dedup_node_store::GroupKind;
 use tempfile::tempdir;
@@ -136,6 +136,41 @@ fn publish_verifier_validates_before_replacing_result() {
         .read_window(LocalResultWindowKind::Groups(GroupKind::Image), 0, 1)
         .unwrap();
     assert_eq!(window.groups[0].group_id, "verified");
+}
+
+#[test]
+fn publish_returns_verified_reader_that_survives_result_path_disappearance() {
+    let directory = tempdir().unwrap();
+    let _previous = publish_rows(
+        directory.path(),
+        1,
+        "previous",
+        AnalysisResultGroupKind::Exact,
+    );
+    let mut writer = AnalysisResultWriter::begin(directory.path(), &fixture_header()).unwrap();
+    writer
+        .write_member(&fixture_row(
+            AnalysisResultGroupKind::Image,
+            "verified-reader",
+            0,
+            true,
+        ))
+        .unwrap();
+
+    let (published, mut reader) = writer
+        .publish_with_verifier_and_replacer(
+            LatestAnalysisReader::open_verified,
+            |source, destination, _reader| {
+                fs::rename(source, destination).map_err(AnalysisResultError::Io)
+            },
+        )
+        .unwrap();
+    assert_eq!(reader.metadata().run_id, published.run_id);
+    fs::remove_file(&published.path).unwrap();
+    let window = reader
+        .read_window(LocalResultWindowKind::Groups(GroupKind::Image), 0, 1)
+        .unwrap();
+    assert_eq!(window.groups[0].group_id, "verified-reader");
 }
 
 #[test]

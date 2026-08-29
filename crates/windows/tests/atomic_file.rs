@@ -1,8 +1,13 @@
 //! Windows 原子替换文件的真实文件系统行为测试。
 
-use std::{fs, os::windows::ffi::OsStrExt, path::Path};
+use std::{
+    fs,
+    io::{Read, Seek, SeekFrom},
+    os::windows::{ffi::OsStrExt, fs::OpenOptionsExt},
+    path::Path,
+};
 
-use dedup_windows::atomic_replace_file;
+use dedup_windows::{atomic_replace_file, atomic_replace_file_from_handle};
 use tempfile::tempdir;
 use windows::{
     Win32::{
@@ -71,6 +76,33 @@ fn locked_destination_rejects_replace_and_keeps_old_bytes() {
     assert_eq!(fs::read(&destination).unwrap(), b"old-result");
 }
 
+/// 结果 reader 同时持有来源和旧目标时，仍以来源句柄完成原子替换。
+#[test]
+fn replaces_open_source_and_destination_by_source_handle() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("partial.tsv");
+    let destination = directory.path().join("result.tsv");
+    fs::write(&source, b"new-result").unwrap();
+    fs::write(&destination, b"old-result").unwrap();
+    let mut source_reader = open_shared_delete_reader(&source);
+    let mut old_reader = open_shared_delete_reader(&destination);
+
+    atomic_replace_file_from_handle(&source_reader, &source, &destination).unwrap();
+
+    assert!(!source.exists());
+    source_reader.seek(SeekFrom::Start(0)).unwrap();
+    old_reader.seek(SeekFrom::Start(0)).unwrap();
+    let mut source_bytes = Vec::new();
+    let mut old_bytes = Vec::new();
+    source_reader.read_to_end(&mut source_bytes).unwrap();
+    old_reader.read_to_end(&mut old_bytes).unwrap();
+    assert_eq!(source_bytes, b"new-result");
+    assert_eq!(old_bytes, b"old-result");
+    drop(source_reader);
+    drop(old_reader);
+    assert_eq!(fs::read(&destination).unwrap(), b"new-result");
+}
+
 /// 使用 share=0 模拟 Windows 中正在被其他进程独占读取的结果文件。
 fn open_without_sharing(path: &Path) -> windows::Win32::Foundation::HANDLE {
     let wide = path
@@ -90,4 +122,14 @@ fn open_without_sharing(path: &Path) -> windows::Win32::Foundation::HANDLE {
         )
         .unwrap()
     }
+}
+
+/// 以结果 reader 所需的共享删除和 DELETE 权限打开文件。
+fn open_shared_delete_reader(path: &Path) -> fs::File {
+    fs::OpenOptions::new()
+        .read(true)
+        .access_mode(0x8001_0000)
+        .share_mode(0x0001 | 0x0002 | 0x0004)
+        .open(path)
+        .unwrap()
 }

@@ -72,18 +72,6 @@ pub struct LatestAnalysisReader {
     groups: Vec<LocalResultGroup>,
 }
 
-/// 已验真但尚未绑定结果路径的索引；用于在原子替换前完成校验。
-pub(crate) struct PreparedLatestAnalysisReader {
-    /// 已通过验真的结果元数据。
-    metadata: VerifiedAnalysisResult,
-    /// 每个首次出现分组的首行偏移。
-    group_offsets: Vec<u64>,
-    /// 每个分组成员行的文件偏移。
-    member_offsets: BTreeMap<String, Vec<u64>>,
-    /// 由行扫描累加出的最小组摘要。
-    groups: Vec<LocalResultGroup>,
-}
-
 impl LatestAnalysisReader {
     /// 顺序验证完整 H/M/F 文件，并只建立组摘要与成员字节偏移。
     pub fn open_verified(path: &Path) -> Result<Self, AnalysisResultError> {
@@ -213,35 +201,9 @@ impl LatestAnalysisReader {
         &self.metadata
     }
 
-    /// 丢弃校验阶段的源句柄，保留已经验真的索引供结果提交边界绑定。
-    pub(crate) fn detach(self) -> PreparedLatestAnalysisReader {
-        let Self {
-            metadata,
-            file: _,
-            group_offsets,
-            member_offsets,
-            groups,
-        } = self;
-        PreparedLatestAnalysisReader {
-            metadata,
-            group_offsets,
-            member_offsets,
-            groups,
-        }
-    }
-
-    /// 把原子替换后固定路径上的新文件绑定到已验真的索引。
-    pub(crate) fn bind_prepared(
-        path: &Path,
-        prepared: PreparedLatestAnalysisReader,
-    ) -> Result<Self, AnalysisResultError> {
-        Ok(Self {
-            metadata: prepared.metadata,
-            file: BufReader::new(open_result_file(path)?),
-            group_offsets: prepared.group_offsets,
-            member_offsets: prepared.member_offsets,
-            groups: prepared.groups,
-        })
+    /// 返回原子替换时要保留的稳定来源句柄。
+    pub(crate) fn source_file(&self) -> &File {
+        self.file.get_ref()
     }
 
     /// 按类别或组 ID 读取窗口，读取时只解析请求范围内的 M 行。
@@ -312,8 +274,11 @@ fn open_result_file(path: &Path) -> std::io::Result<File> {
     const FILE_SHARE_READ: u32 = 0x0001;
     const FILE_SHARE_WRITE: u32 = 0x0002;
     const FILE_SHARE_DELETE: u32 = 0x0004;
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const DELETE: u32 = 0x0001_0000;
     std::fs::OpenOptions::new()
         .read(true)
+        .access_mode(GENERIC_READ | DELETE)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .open(path)
 }
