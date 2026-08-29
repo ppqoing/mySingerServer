@@ -45,7 +45,7 @@ use crate::{
         AnalysisBlocked, LatestAnalysisReader, LocalAnalysisReport, LocalResultWindowKind,
         Stage2BatchItem, Stage2BatchPlan, Stage2TaskFileRunOptions, begin_stage2_batch,
         evaluate_candidates, missing_stage2_items, prepare_current_scan_analysis,
-        publish_local_analysis_result, run_stage2_batch_production,
+        publish_local_analysis_result_with_reader, run_stage2_batch_production,
     },
     artifact_registry::RegenerableArtifactRegistry,
     config_repository::{
@@ -1063,12 +1063,20 @@ struct AnalysisRuntimeSummary {
     candidate_count: u64,
 }
 
-/// 最近一次成功结果及其查询摘要；失败和取消不会替换它。
-struct LatestAnalysis {
-    /// 最近一次结果文件的进程内偏移读取器。
-    reader: LatestAnalysisReader,
-    /// 同一进程本地分析的摘要；重启恢复的结果没有该摘要。
-    summary: Option<AnalysisRuntimeSummary>,
+/// 当前最近结果的有效或损坏状态；失败和取消不会覆盖已有状态。
+enum LatestAnalysis {
+    /// 已通过验真的结果及其进程内摘要。
+    Ready {
+        /// 最近一次结果文件的进程内偏移读取器。
+        reader: LatestAnalysisReader,
+        /// 同一进程本地分析的摘要；重启恢复的结果没有该摘要。
+        summary: Option<AnalysisRuntimeSummary>,
+    },
+    /// 结果文件存在但无法展示，保留错误以便窗口请求明确报告。
+    Invalid {
+        /// 结果验真失败的可读原因。
+        message: String,
+    },
 }
 
 /// 后台成功发布本地分析后交给 actor 安装的拥有型元数据。
@@ -1782,8 +1790,14 @@ impl EngineState {
             .or_else(|| {
                 self.latest_analysis
                     .as_ref()
-                    .filter(|latest| latest.reader.metadata().run_id == run_id)
-                    .and_then(|latest| latest.summary)
+                    .and_then(|latest| match latest {
+                        LatestAnalysis::Ready { reader, summary }
+                            if reader.metadata().run_id == run_id =>
+                        {
+                            *summary
+                        }
+                        _ => None,
+                    })
             })
             .ok_or_else(|| not_found(format!("当前进程分析不存在: {}", request.analysis_run_id)))?;
         Ok(proto::envelope::Payload::QueryAnalysisRun(
@@ -1812,7 +1826,13 @@ impl EngineState {
             .latest_analysis
             .as_mut()
             .ok_or_else(|| not_found("当前进程没有最近一次成功结果"))?;
-        if latest.reader.metadata().run_id != run_id {
+        let reader = match latest {
+            LatestAnalysis::Ready { reader, .. } => reader,
+            LatestAnalysis::Invalid { message } => {
+                return Err((proto::ErrorCode::InvalidResult, message.clone()));
+            }
+        };
+        if reader.metadata().run_id != run_id {
             return Err(not_found("分析结果不存在或已被替换"));
         }
         let kind = match proto::LocalResultWindowKind::try_from(request.kind) {
@@ -1829,8 +1849,7 @@ impl EngineState {
             }
             _ => return Err(invalid("本地结果窗口类型无效")),
         };
-        let window = latest
-            .reader
+        let window = reader
             .read_window(kind, request.start_index, request.visible_count)
             .map_err(|error| match error {
                 crate::analysis::AnalysisResultError::Io(error) => {
@@ -1839,11 +1858,11 @@ impl EngineState {
                 crate::analysis::AnalysisResultError::InvalidHeader(message)
                 | crate::analysis::AnalysisResultError::InvalidRow(message)
                 | crate::analysis::AnalysisResultError::InvalidFormat(message) => {
-                    (proto::ErrorCode::Internal, message)
+                    (proto::ErrorCode::InvalidResult, message)
                 }
             })?;
         let current_revision = self.store.library_revision().map_err(store_error)?;
-        let metadata = latest.reader.metadata();
+        let metadata = reader.metadata();
         let is_group_window =
             request.kind == proto::LocalResultWindowKind::LocalResultWindowGroups as i32;
         let (groups, members) = if is_group_window {
@@ -2429,7 +2448,7 @@ impl EngineState {
             };
             // 先安装成功结果和摘要，再向 RuntimeTaskReporter 发布 completed 事件。
             self.active_analysis = Some(summary);
-            self.latest_analysis = Some(LatestAnalysis {
+            self.latest_analysis = Some(LatestAnalysis::Ready {
                 reader: analysis.reader,
                 summary: Some(summary),
             });
@@ -2969,12 +2988,11 @@ async fn run_background_job(
                                     } else if cancellation.is_cancelled() {
                                         Err(AnalysisBlocked::InvalidState("本地分析已取消".into()))
                                     } else {
-                                        publish_local_analysis_result(&store, run, &results_root)
-                                            .and_then(|(published, report)| {
-                                                LatestAnalysisReader::open_verified(&published.path)
-                                                    .map(|reader| (report, reader))
-                                                    .map_err(AnalysisBlocked::ResultFile)
-                                            })
+                                        publish_local_analysis_result_with_reader(
+                                            &store,
+                                            run,
+                                            &results_root,
+                                        )
                                     }
                                 }
                                 Err(error) => Err(error),
@@ -3001,12 +3019,10 @@ async fn run_background_job(
                             } else if cancellation.is_cancelled() {
                                 Err(AnalysisBlocked::InvalidState("本地分析已取消".into()))
                             } else {
-                                publish_local_analysis_result(&store, run, &results_root).and_then(
-                                    |(published, report)| {
-                                        LatestAnalysisReader::open_verified(&published.path)
-                                            .map(|reader| (report, reader))
-                                            .map_err(AnalysisBlocked::ResultFile)
-                                    },
+                                publish_local_analysis_result_with_reader(
+                                    &store,
+                                    run,
+                                    &results_root,
                                 )
                             }
                         }
@@ -3015,7 +3031,7 @@ async fn run_background_job(
                 }
             };
             match result {
-                Ok((report, reader)) => {
+                Ok((_published, report, reader)) => {
                     let _ = runtime_reporter.update_overall_nowait(
                         input_count,
                         Some(input_count),
@@ -3353,17 +3369,30 @@ fn load_latest_analysis(runtime_root: &Path) -> Option<LatestAnalysis> {
     let result_path = results_root_from_runtime(runtime_root)
         .ok()?
         .join("latest-analysis.result.tsv");
-    if !result_path.is_file() {
-        return None;
+    match fs::metadata(&result_path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => {
+            return Some(LatestAnalysis::Invalid {
+                message: format!("最近本地分析结果不是普通文件: {}", result_path.display()),
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            return Some(LatestAnalysis::Invalid {
+                message: format!("最近本地分析结果无法访问: {error}"),
+            });
+        }
     }
     match LatestAnalysisReader::open_verified(&result_path) {
-        Ok(reader) => Some(LatestAnalysis {
+        Ok(reader) => Some(LatestAnalysis::Ready {
             reader,
             summary: None,
         }),
         Err(error) => {
             tracing::warn!(path = %result_path.display(), %error, "最近本地分析结果校验失败");
-            None
+            Some(LatestAnalysis::Invalid {
+                message: format!("最近本地分析结果无效: {error}"),
+            })
         }
     }
 }
@@ -3567,6 +3596,50 @@ mod tests {
                 code,
                 ..
             })) if code == proto::ErrorCode::NotFound as i32
+        ));
+
+        handle.shutdown().await.unwrap();
+        actor.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn actor_reports_invalid_result_for_corrupt_startup_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache_root = directory.path().join("cache");
+        let results_root = cache_root.join("results");
+        fs::create_dir_all(&results_root).unwrap();
+        fs::write(
+            results_root.join("latest-analysis.result.tsv"),
+            b"not-a-valid-result",
+        )
+        .unwrap();
+        let machine = MachineId::parse(&"cd".repeat(32)).unwrap();
+        let (handle, actor) = NodeEngine::spawn_for_test(
+            NodeStore::open_in_memory(machine).unwrap(),
+            "127.0.0.1:39092".parse().unwrap(),
+            &cache_root,
+        );
+
+        let response = handle
+            .handle(proto::Envelope {
+                request_id: 4,
+                payload: Some(proto::envelope::Payload::ReadLocalResultWindow(
+                    proto::ReadLocalResultWindow {
+                        analysis_run_id: AnalysisRunId::new().as_uuid().to_string(),
+                        kind: proto::LocalResultWindowKind::LocalResultWindowGroups as i32,
+                        group_kind: proto::GroupKind::GroupExact as i32,
+                        ..Default::default()
+                    },
+                )),
+            })
+            .await;
+        let Some(proto::envelope::Payload::Error(error)) = response.payload else {
+            panic!("损坏结果必须返回错误响应");
+        };
+        assert_eq!(error.code, 7);
+        assert!(!matches!(
+            proto::ErrorCode::try_from(error.code),
+            Ok(proto::ErrorCode::Internal | proto::ErrorCode::NotFound)
         ));
 
         handle.shutdown().await.unwrap();

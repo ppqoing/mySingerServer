@@ -238,10 +238,19 @@ impl AnalysisResultWriter {
     }
 
     /// 写 F、同步并关闭 partial 后原子替换固定 result 文件。
-    pub fn publish(mut self) -> Result<PublishedAnalysisResult, AnalysisResultError> {
+    pub fn publish(self) -> Result<PublishedAnalysisResult, AnalysisResultError> {
+        self.publish_with_verifier(|_| Ok::<(), AnalysisResultError>(()))
+            .map(|(published, _)| published)
+    }
+
+    /// 在原子替换前验证并返回验证阶段构造的附加值。
+    pub fn publish_with_verifier<T>(
+        mut self,
+        verifier: impl FnOnce(&Path) -> Result<T, AnalysisResultError>,
+    ) -> Result<(PublishedAnalysisResult, T), AnalysisResultError> {
         let sha256: [u8; 32] = self.hasher.clone().finalize().into();
         let footer = format!("F\t{}\t{}\n", self.member_count, hex_bytes(&sha256));
-        let result = (|| {
+        let verified = (|| {
             let mut writer = self
                 .writer
                 .take()
@@ -250,23 +259,30 @@ impl AnalysisResultWriter {
             writer.flush()?;
             writer.get_ref().sync_all()?;
             drop(writer);
+            let verified = verifier(&self.partial_path)?;
             atomic_replace_file(&self.partial_path, &self.result_path)?;
-            Ok::<(), AnalysisResultError>(())
+            Ok::<T, AnalysisResultError>(verified)
         })();
-        if let Err(error) = result {
-            self.close_and_remove_partial();
-            return Err(error);
-        }
+        let verified = match verified {
+            Ok(verified) => verified,
+            Err(error) => {
+                self.close_and_remove_partial();
+                return Err(error);
+            }
+        };
         self.finished = true;
-        Ok(PublishedAnalysisResult {
-            path: self.result_path.clone(),
-            run_id: self.header.analysis_id,
-            library_revision: self.header.library_revision,
-            header: self.header.clone(),
-            member_count: self.member_count,
-            group_count: self.group_ids.len() as u64,
-            sha256,
-        })
+        Ok((
+            PublishedAnalysisResult {
+                path: self.result_path.clone(),
+                run_id: self.header.analysis_id,
+                library_revision: self.header.library_revision,
+                header: self.header.clone(),
+                member_count: self.member_count,
+                group_count: self.group_ids.len() as u64,
+                sha256,
+            },
+            verified,
+        ))
     }
 
     /// 取消或失败时只删除本次固定 partial 文件，保留上一次 result 文件。

@@ -3,7 +3,10 @@
 use std::{io, os::windows::ffi::OsStrExt, path::Path};
 
 use windows::{
-    Win32::Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW},
+    Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, REPLACEFILE_WRITE_THROUGH,
+        ReplaceFileW,
+    },
     core::PCWSTR,
 };
 
@@ -15,13 +18,30 @@ pub fn atomic_replace_file(source: &Path, destination: &Path) -> io::Result<()> 
     std::fs::metadata(source)?;
     let source_wide = wide_path(source)?;
     let destination_wide = wide_path(destination)?;
-    unsafe {
-        MoveFileExW(
-            PCWSTR(source_wide.as_ptr()),
-            PCWSTR(destination_wide.as_ptr()),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-        .map_err(|_| io::Error::last_os_error())
+    match std::fs::metadata(destination) {
+        Ok(_) => {
+            // 目标可能被结果 reader 持有；ReplaceFileW 能在共享删除句柄下保持旧身份可读。
+            unsafe {
+                ReplaceFileW(
+                    PCWSTR(destination_wide.as_ptr()),
+                    PCWSTR(source_wide.as_ptr()),
+                    PCWSTR::null(),
+                    REPLACEFILE_WRITE_THROUGH,
+                    None,
+                    None,
+                )
+            }
+            .map_err(|_| io::Error::last_os_error())
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => unsafe {
+            MoveFileExW(
+                PCWSTR(source_wide.as_ptr()),
+                PCWSTR(destination_wide.as_ptr()),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+            .map_err(|_| io::Error::last_os_error())
+        },
+        Err(error) => Err(error),
     }
 }
 

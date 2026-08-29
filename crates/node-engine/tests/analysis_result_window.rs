@@ -77,6 +77,115 @@ fn reads_large_member_windows_in_order_and_reopens_without_idx() {
 }
 
 #[test]
+fn reader_keeps_previous_file_identity_after_result_replacement() {
+    let directory = tempdir().unwrap();
+    let previous = publish_rows(
+        directory.path(),
+        1,
+        "same-group",
+        AnalysisResultGroupKind::Exact,
+    );
+    let mut reader = LatestAnalysisReader::open_verified(&previous.path).unwrap();
+
+    let _replacement = publish_rows(
+        directory.path(),
+        1,
+        "same-group",
+        AnalysisResultGroupKind::Image,
+    );
+
+    let window = reader
+        .read_window(
+            LocalResultWindowKind::Members {
+                group_id: "same-group".into(),
+            },
+            0,
+            1,
+        )
+        .unwrap();
+    assert_eq!(window.members[0].group_kind, AnalysisResultGroupKind::Exact);
+}
+
+#[test]
+fn publish_verifier_validates_before_replacing_result() {
+    let directory = tempdir().unwrap();
+    let _previous = publish_rows(
+        directory.path(),
+        1,
+        "previous",
+        AnalysisResultGroupKind::Exact,
+    );
+    let mut writer = AnalysisResultWriter::begin(directory.path(), &fixture_header()).unwrap();
+    writer
+        .write_member(&fixture_row(
+            AnalysisResultGroupKind::Image,
+            "verified",
+            0,
+            true,
+        ))
+        .unwrap();
+
+    let (published, verified_run_id) = writer
+        .publish_with_verifier(|path| {
+            LatestAnalysisReader::open_verified(path).map(|reader| reader.metadata().run_id)
+        })
+        .unwrap();
+    assert_eq!(verified_run_id, published.run_id);
+    let mut reader = LatestAnalysisReader::open_verified(&published.path).unwrap();
+    let window = reader
+        .read_window(LocalResultWindowKind::Groups(GroupKind::Image), 0, 1)
+        .unwrap();
+    assert_eq!(window.groups[0].group_id, "verified");
+}
+
+#[test]
+fn failed_pre_publish_verification_keeps_previous_result() {
+    let directory = tempdir().unwrap();
+    let previous = publish_rows(
+        directory.path(),
+        1,
+        "previous",
+        AnalysisResultGroupKind::Exact,
+    );
+    let mut previous_reader = LatestAnalysisReader::open_verified(&previous.path).unwrap();
+    let previous_bytes = fs::read(&previous.path).unwrap();
+    let mut writer = AnalysisResultWriter::begin(
+        directory.path(),
+        &AnalysisResultHeader {
+            analysis_id: AnalysisRunId::new(),
+            ..fixture_header()
+        },
+    )
+    .unwrap();
+    writer
+        .write_member(&fixture_row(
+            AnalysisResultGroupKind::Image,
+            "replacement",
+            0,
+            true,
+        ))
+        .unwrap();
+
+    let result = writer.publish_with_verifier(|_| {
+        Err::<(), dedup_node_engine::analysis::AnalysisResultError>(
+            dedup_node_engine::analysis::AnalysisResultError::InvalidFormat("测试验证失败".into()),
+        )
+    });
+    assert!(result.is_err());
+    assert_eq!(fs::read(&previous.path).unwrap(), previous_bytes);
+    let window = previous_reader
+        .read_window(LocalResultWindowKind::Groups(GroupKind::Exact), 0, 1)
+        .unwrap();
+    assert_eq!(window.groups[0].group_id, "previous");
+    assert!(
+        !directory
+            .path()
+            .join("latest-analysis.partial.tsv")
+            .exists()
+    );
+}
+
+#[test]
 fn filters_groups_and_keeps_members_in_their_group() {
     let directory = tempdir().unwrap();
     let mut writer = AnalysisResultWriter::begin(directory.path(), &fixture_header()).unwrap();

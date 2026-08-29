@@ -57,4 +57,62 @@ git diff --check
 ## Concerns
 
 - 现有工程仍有若干与本任务无关的 unused/dead-code 编译警告；本次验证无失败。
-- `AnalysisResultError` 现有公开错误枚举没有单独的 `InvalidResult` 变体，损坏窗口在 actor 层按既有协议错误边界返回 Internal 并附带校验信息；未扩展错误枚举以避免改变既有 V5 错误编号。
+- `AnalysisResultError` 仍复用格式/IO 变体，协议层新增末尾 `InvalidResult=7`；损坏窗口由 actor 明确映射为 `InvalidResult`，文件 IO 仍映射为 `Internal`。
+
+## Fix round 1/5：审查 finding 修复
+
+### Finding 1 RED
+
+新增 `actor_reports_invalid_result_for_corrupt_startup_file`：启动时在最近结果固定路径写入损坏字节，再通过真实 Node actor 请求窗口，要求协议错误码为新增 `InvalidResult=7`，且不能是 `Internal` 或 `NotFound`。修复前实际失败为 `left: 3 (NotFound), right: 7`，证明启动校验失败被丢成空状态。
+
+命令：
+
+```text
+cargo test -p dedup-node-engine --features test-hooks --lib actor::tests::actor_reports_invalid_result_for_corrupt_startup_file --locked -- --test-threads=1
+```
+
+### Finding 2 RED
+
+新增 `reader_keeps_previous_file_identity_after_result_replacement`：打开上一份结果 reader 后发布同路径的新结果，窗口必须仍返回旧组类型。修复前因固定路径重开读到了新文件；切换为稳定句柄后首次运行暴露 Windows `MoveFileExW` 在旧句柄存在时返回 `Io(code=5, PermissionDenied)`。
+
+新增 `failed_pre_publish_verification_keeps_previous_result`：验证回调显式失败时，旧 result 字节必须不变且 partial 必须清理。接口尚未实现时 focused 编译先实际失败为 `E0599: no method named publish_with_verifier`。
+
+### Fix
+
+- V5 `ErrorCode` 增加末尾 `INVALID_RESULT=7`。Node actor 启动保留“结果存在但验真失败”的 `LatestAnalysis::Invalid` 状态；所有窗口统一返回 `InvalidResult`，不回退 SQLite 旧分组，也把窗口内格式/摘要错误映射为该码，文件 IO 仍保持 `Internal`。
+- `LatestAnalysisReader` 改为保存共享删除模式打开的 `BufReader<File>`，成员窗口在同一句柄上 seek，不再按固定路径重新打开；结果替换后旧 reader 仍绑定旧文件身份。
+- writer 增加 `publish_with_verifier`：写完并同步 partial 后先调用完整 reader 验证，验证失败清理 partial 并保留旧 result。提交边界使用 prepared 索引，释放 partial 的验证句柄后再原子替换；替换后只把新固定路径文件句柄绑定到已验真的索引并交给 actor。Windows 目标替换改用 `ReplaceFileW`，首次发布仍使用 `MoveFileExW`，因此旧 reader 与新发布可以并存。
+
+### GREEN
+
+```text
+cargo test -p dedup-node-engine --features test-hooks --test analysis_result_window --locked -- --test-threads=1
+# 6 passed
+
+cargo test -p dedup-node-engine --features test-hooks --lib actor::tests::actor_reports_invalid_result_for_corrupt_startup_file --locked -- --test-threads=1
+# 1 passed
+
+cargo test -p dedup-node-engine --features test-hooks --lib actor::tests::local_analysis_installs_latest_result_before_runtime_completed --locked -- --test-threads=1
+# 1 passed
+
+cargo test -p dedup-protocol --locked -- --test-threads=1
+# 24 passed
+
+cargo test -p dedup-windows --test atomic_file --locked -- --test-threads=1
+# 4 passed
+
+cargo test -p dedup-node-engine --features test-hooks --test analysis_result_file --locked -- --test-threads=1
+# 6 passed
+
+cargo test -p dedup-node-engine --features test-hooks --lib --locked -- --test-threads=1
+# 155 passed
+
+cargo fmt --all -- --check
+git diff --check
+```
+
+### 修复轮自审
+
+- 两个 finding 均有真实行为 RED 与对应 GREEN；没有使用源码字符串匹配测试。
+- 固定结果仍为 UTF-8/LF TSV，无 `.idx`、历史/备份服务或额外 SQLite；旧 reader 和旧磁盘结果在验证失败时保持不变。
+- 本轮唯一超出原 Task11 文件清单的改动是 `crates/windows/src/atomic_file.rs`：Windows `MoveFileExW` 无法在稳定旧 reader 存在时替换目标，实测 `ReplaceFileW` 才满足相同原子替换边界；现有原子文件回归 4/4 通过。

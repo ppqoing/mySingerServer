@@ -4,7 +4,7 @@ use std::{
     collections::BTreeMap,
     fs::File,
     io::{BufRead, BufReader, Seek, SeekFrom},
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 use dedup_core::{ContentKey, LocationKey, MachineId, NormalizedPath, Thresholds};
@@ -61,8 +61,8 @@ pub struct LocalResultWindow {
 pub struct LatestAnalysisReader {
     /// 已按 H/M/F 顺序验证的结果元数据。
     metadata: VerifiedAnalysisResult,
-    /// 结果文件路径；窗口读取时按偏移重新打开。
-    path: PathBuf,
+    /// 已通过验证的结果句柄；发布替换路径后仍指向原文件身份。
+    file: BufReader<File>,
     /// 每个首次出现分组的首行偏移。
     #[allow(dead_code)]
     group_offsets: Vec<u64>,
@@ -72,10 +72,22 @@ pub struct LatestAnalysisReader {
     groups: Vec<LocalResultGroup>,
 }
 
+/// 已验真但尚未绑定结果路径的索引；用于在原子替换前完成校验。
+pub(crate) struct PreparedLatestAnalysisReader {
+    /// 已通过验真的结果元数据。
+    metadata: VerifiedAnalysisResult,
+    /// 每个首次出现分组的首行偏移。
+    group_offsets: Vec<u64>,
+    /// 每个分组成员行的文件偏移。
+    member_offsets: BTreeMap<String, Vec<u64>>,
+    /// 由行扫描累加出的最小组摘要。
+    groups: Vec<LocalResultGroup>,
+}
+
 impl LatestAnalysisReader {
     /// 顺序验证完整 H/M/F 文件，并只建立组摘要与成员字节偏移。
     pub fn open_verified(path: &Path) -> Result<Self, AnalysisResultError> {
-        let file = File::open(path)?;
+        let file = open_result_file(path)?;
         let mut reader = BufReader::new(file);
         let mut byte_offset = 0_u64;
         let (header_offset, header_bytes, header_line) =
@@ -181,7 +193,7 @@ impl LatestAnalysisReader {
                     };
                     return Ok(Self {
                         metadata,
-                        path: path.to_path_buf(),
+                        file: reader,
                         group_offsets,
                         member_offsets,
                         groups,
@@ -199,6 +211,37 @@ impl LatestAnalysisReader {
     /// 返回已验证的结果元数据，不暴露成员索引内部结构。
     pub fn metadata(&self) -> &VerifiedAnalysisResult {
         &self.metadata
+    }
+
+    /// 丢弃校验阶段的源句柄，保留已经验真的索引供结果提交边界绑定。
+    pub(crate) fn detach(self) -> PreparedLatestAnalysisReader {
+        let Self {
+            metadata,
+            file: _,
+            group_offsets,
+            member_offsets,
+            groups,
+        } = self;
+        PreparedLatestAnalysisReader {
+            metadata,
+            group_offsets,
+            member_offsets,
+            groups,
+        }
+    }
+
+    /// 把原子替换后固定路径上的新文件绑定到已验真的索引。
+    pub(crate) fn bind_prepared(
+        path: &Path,
+        prepared: PreparedLatestAnalysisReader,
+    ) -> Result<Self, AnalysisResultError> {
+        Ok(Self {
+            metadata: prepared.metadata,
+            file: BufReader::new(open_result_file(path)?),
+            group_offsets: prepared.group_offsets,
+            member_offsets: prepared.member_offsets,
+            groups: prepared.groups,
+        })
     }
 
     /// 按类别或组 ID 读取窗口，读取时只解析请求范围内的 M 行。
@@ -233,13 +276,13 @@ impl LatestAnalysisReader {
                 })?;
                 let total_rows = offsets.len() as u64;
                 let (from, to) = window_bounds(start, u64::from(count), total_rows)?;
-                let mut file = BufReader::new(File::open(&self.path)?);
+                let selected_offsets = offsets[from..to].to_vec();
                 let mut members = Vec::with_capacity(to.saturating_sub(from));
-                for expected_offset in &offsets[from..to] {
-                    file.seek(SeekFrom::Start(*expected_offset))?;
-                    let mut local_offset = *expected_offset;
+                for expected_offset in selected_offsets {
+                    self.file.seek(SeekFrom::Start(expected_offset))?;
+                    let mut local_offset = expected_offset;
                     let (_, _, line) =
-                        read_record(&mut file, &mut local_offset)?.ok_or_else(|| {
+                        read_record(&mut self.file, &mut local_offset)?.ok_or_else(|| {
                             AnalysisResultError::InvalidFormat("成员偏移指向文件末尾".into())
                         })?;
                     let row = parse_member(&line)?;
@@ -259,6 +302,20 @@ impl LatestAnalysisReader {
             }
         }
     }
+}
+
+/// 以允许替换的共享模式打开结果文件，同时把 reader 绑定到该文件身份。
+fn open_result_file(path: &Path) -> std::io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    // Windows 默认拒绝后续删除共享；结果发布必须能替换路径，但旧 reader 仍保留旧句柄。
+    const FILE_SHARE_READ: u32 = 0x0001;
+    const FILE_SHARE_WRITE: u32 = 0x0002;
+    const FILE_SHARE_DELETE: u32 = 0x0004;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(path)
 }
 
 /// 读取一行并返回其起始偏移、含 LF 原字节和无 LF 文本。

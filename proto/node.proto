@@ -32,6 +32,7 @@ enum ErrorCode {
   CONFLICT = 4;
   SNAPSHOT_REQUIRED = 5;
   INTERNAL = 6;
+  INVALID_RESULT = 7;
 }
 
 enum TaskState {

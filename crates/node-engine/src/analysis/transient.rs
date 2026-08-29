@@ -8,6 +8,7 @@ use dedup_node_store::{CompleteStage1, NodeStore, ResolvedScanFile, classify_cac
 use dedup_protocol::{BASE_MISSING_PROBE, BASE_MISSING_STAGE1};
 
 use super::phase2::Stage2BatchItem;
+use super::result_reader::LatestAnalysisReader;
 use super::video::video_candidates;
 use super::{
     AnalysisBlocked, AnalysisCandidateStatus, AnalysisGroupKind, AnalysisResultGroupKind,
@@ -206,6 +207,24 @@ pub(crate) fn publish_local_analysis_result(
     run: LocalAnalysisRun,
     results_root: &Path,
 ) -> Result<(super::PublishedAnalysisResult, LocalAnalysisReport), AnalysisBlocked> {
+    let (published, report, _) =
+        publish_local_analysis_result_with_reader(store, run, results_root)?;
+    Ok((published, report))
+}
+
+/// 在替换结果路径前完成验真，并把替换后的同一文件身份交给 actor。
+pub(crate) fn publish_local_analysis_result_with_reader(
+    store: &NodeStore,
+    run: LocalAnalysisRun,
+    results_root: &Path,
+) -> Result<
+    (
+        super::PublishedAnalysisResult,
+        LocalAnalysisReport,
+        LatestAnalysisReader,
+    ),
+    AnalysisBlocked,
+> {
     let actual_revision = store.library_revision()?;
     if actual_revision != run.library_revision {
         return Err(AnalysisBlocked::LibraryRevisionChanged {
@@ -258,7 +277,10 @@ pub(crate) fn publish_local_analysis_result(
             })?;
         }
     }
-    let published = writer.publish()?;
+    let (published, prepared) = writer.publish_with_verifier(|path| {
+        LatestAnalysisReader::open_verified(path).map(LatestAnalysisReader::detach)
+    })?;
+    let reader = LatestAnalysisReader::bind_prepared(&published.path, prepared)?;
     let report = LocalAnalysisReport {
         run_id: run.run_id,
         status: dedup_node_store::AnalysisStatus::Completed,
@@ -278,7 +300,7 @@ pub(crate) fn publish_local_analysis_result(
         phase2_dispatched: 0,
         unresolved_candidates: 0,
     };
-    Ok((published, report))
+    Ok((published, report, reader))
 }
 
 #[cfg(test)]
