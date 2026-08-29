@@ -337,7 +337,6 @@ impl VisualFixture {
         window.set_enumerator_index(1);
         window.set_filtering_enabled(true);
         window.set_filtering_reason("全部节点任务已进入终态。".into());
-        window.set_analysis_task_ids("task-media-scan".into());
     }
 }
 
