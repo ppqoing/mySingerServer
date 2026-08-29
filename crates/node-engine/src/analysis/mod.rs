@@ -4,6 +4,7 @@ mod exact;
 mod grouping;
 mod image;
 mod phase2;
+mod result_file;
 /// 本地和跨机二筛的瞬态缓存分类计划。
 pub mod stage2_planner;
 mod video;
@@ -41,6 +42,11 @@ pub(crate) use phase2::{
     Stage2BatchPlan, Stage2TaskFileRunError, Stage2TaskFileRunOptions, Stage2TaskFileRunResult,
     begin_stage2_batch, run_stage2_batch, run_stage2_batch_production,
     run_stage2_batch_with_runtime_cache,
+};
+pub use result_file::{
+    AnalysisResultError, AnalysisResultGroupKind, AnalysisResultHeader, AnalysisResultMode,
+    AnalysisResultRow, AnalysisResultWriter, PublishedAnalysisResult, VerifiedAnalysisResult,
+    verify_result_file,
 };
 use video::video_candidates_with_runtime;
 

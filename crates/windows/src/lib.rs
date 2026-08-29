@@ -2,6 +2,7 @@
 #![warn(missing_docs)]
 
 mod app_layout;
+mod atomic_file;
 mod job;
 mod local_path;
 mod machine_id;
@@ -13,6 +14,7 @@ mod storage_device;
 mod walker;
 
 pub use app_layout::AppLayout;
+pub use atomic_file::atomic_replace_file;
 pub use job::{CREATE_WORKER_FLAGS, WorkerJob};
 pub use local_path::LocalNodePath;
 pub use machine_id::{PhysicalMachineFields, machine_id_from_fields};
