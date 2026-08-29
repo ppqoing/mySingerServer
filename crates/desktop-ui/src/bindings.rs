@@ -786,7 +786,6 @@ pub fn apply_event(window: &MainWindow, binding: &UiBinding, event: UiEvent) {
             status,
         } => {
             window.set_result_run_id(run_id.clone().into());
-            window.set_result_source_index(i32::from(central));
             if central {
                 window.set_cross_status(status.clone().into());
             }
@@ -794,7 +793,6 @@ pub fn apply_event(window: &MainWindow, binding: &UiBinding, event: UiEvent) {
         }
         UiEvent::CrossAnalysisChanged(report) => {
             window.set_result_run_id(report.run_id.as_uuid().to_string().into());
-            window.set_result_source_index(1);
             window.set_cross_status(report.status.as_str().into());
             window.set_cross_summary(
                 format!(
@@ -808,17 +806,26 @@ pub fn apply_event(window: &MainWindow, binding: &UiBinding, event: UiEvent) {
             );
             window.set_last_error(SharedString::default());
         }
-        UiEvent::GroupsChanged(page) => {
-            window.set_groups(models::groups(&page));
-            window.set_group_next_cursor(page.next_cursor.clone().unwrap_or_default().into());
-            window.set_selected_group_id(SharedString::default());
-            window.set_members(empty_members());
-            window.set_member_next_cursor(SharedString::default());
+        UiEvent::GroupsChanged(window_state) => {
+            window.set_groups(models::groups(&window_state));
+            window.set_result_start_index(window_state.start_index.min(i32::MAX as u64) as i32);
+            window.set_result_total_rows(window_state.total_rows.min(i32::MAX as u64) as i32);
+            window.set_result_loading(window_state.loading);
+            window.set_result_stale(window_state.stale);
+            if !window_state.loading && !window_state.stale {
+                window.set_selected_group_id(SharedString::default());
+                window.set_members(empty_members());
+                window.set_member_start_index(0);
+                window.set_member_total_rows(0);
+            }
             window.set_last_error(SharedString::default());
         }
-        UiEvent::MembersChanged { group_id, page } => {
+        UiEvent::MembersChanged {
+            group_id,
+            window: window_state,
+        } => {
             window.set_selected_group_id(group_id.into());
-            apply_members(window, &page);
+            apply_members(window, &window_state);
             window.set_last_error(SharedString::default());
         }
         UiEvent::PreviewReady {
@@ -861,8 +868,8 @@ pub fn apply_event(window: &MainWindow, binding: &UiBinding, event: UiEvent) {
             window.set_last_error(error.into());
             finish_preview(window, &machine_id, &normalized_path, false);
         }
-        UiEvent::ReviewChanged(page) => {
-            apply_members(window, &page);
+        UiEvent::ReviewChanged(window_state) => {
+            apply_members(window, &window_state);
             window.set_last_error(SharedString::default());
         }
         UiEvent::DeleteConfirmationChanged(confirmation) => {
@@ -886,8 +893,12 @@ pub fn apply_event(window: &MainWindow, binding: &UiBinding, event: UiEvent) {
             window.set_groups(empty_groups());
             window.set_members(empty_members());
             window.set_selected_group_id(SharedString::default());
-            window.set_group_next_cursor(SharedString::default());
-            window.set_member_next_cursor(SharedString::default());
+            window.set_result_start_index(0);
+            window.set_result_total_rows(0);
+            window.set_member_start_index(0);
+            window.set_member_total_rows(0);
+            window.set_result_loading(false);
+            window.set_result_stale(false);
             window.set_last_error(summary.into());
         }
         UiEvent::NodeConfigChanged(state) => apply_node_config_state(window, binding, &state),
@@ -1021,20 +1032,6 @@ fn node_config_phase(phase: dedup_desktop_core::view_state::NodeConfigSavePhase)
 }
 
 fn bind_results(window: &MainWindow, sender: &mpsc::Sender<UiCommand>) {
-    let analysis_sender = sender.clone();
-    let analysis_window = window.as_weak();
-    window.on_start_local_analysis(move |node_index, task_ids, kind| {
-        send(
-            &analysis_sender,
-            UiCommand::StartLocalAnalysis {
-                node_index: node_index.max(0) as usize,
-                scan_task_ids: task_ids.to_string(),
-                kind: group_kind(kind),
-            },
-            &analysis_window,
-        );
-    });
-
     let cross_sender = sender.clone();
     let cross_window = window.as_weak();
     window.on_start_cross_analysis(move |selections| {
@@ -1059,31 +1056,33 @@ fn bind_results(window: &MainWindow, sender: &mpsc::Sender<UiCommand>) {
 
     let groups_sender = sender.clone();
     let groups_window = window.as_weak();
-    window.on_load_groups(move |central, node_index, run_id, kind, cursor| {
+    window.on_request_group_window(move |run_id, kind, start_index, visible_count| {
         send(
             &groups_sender,
-            UiCommand::LoadGroups {
-                central,
-                node_index: node_index.max(0) as usize,
-                analysis_run_id: run_id.to_string(),
-                kind: group_kind(kind),
-                cursor: cursor.to_string(),
+            UiCommand::RequestGroupWindow {
+                request: dedup_desktop_core::results::ResultWindowRequest::new(
+                    run_id.to_string(),
+                    group_kind(kind),
+                    start_index.max(0) as u64,
+                    visible_count.max(1) as u32,
+                ),
             },
             &groups_window,
         );
     });
     let members_sender = sender.clone();
     let members_window = window.as_weak();
-    window.on_load_members(move |central, node_index, run_id, group_id, kind, cursor| {
+    window.on_request_member_window(move |run_id, group_id, kind, start_index, visible_count| {
         send(
             &members_sender,
-            UiCommand::LoadMembers {
-                central,
-                node_index: node_index.max(0) as usize,
-                analysis_run_id: run_id.to_string(),
+            UiCommand::RequestMemberWindow {
+                request: dedup_desktop_core::results::ResultWindowRequest::new(
+                    run_id.to_string(),
+                    group_kind(kind),
+                    start_index.max(0) as u64,
+                    visible_count.max(1) as u32,
+                ),
                 group_id: group_id.to_string(),
-                kind: group_kind(kind),
-                cursor: cursor.to_string(),
             },
             &members_window,
         );
@@ -1136,9 +1135,17 @@ fn bind_results(window: &MainWindow, sender: &mpsc::Sender<UiCommand>) {
     });
 }
 
-fn apply_members(window: &MainWindow, page: &dedup_desktop_core::results::MemberPage) {
-    window.set_members(models::members(page));
-    window.set_member_next_cursor(page.next_cursor.clone().unwrap_or_default().into());
+fn apply_members(
+    window: &MainWindow,
+    window_state: &dedup_desktop_core::results::ResultWindowState<
+        dedup_desktop_core::results::MemberView,
+    >,
+) {
+    window.set_members(models::members(window_state));
+    window.set_member_start_index(window_state.start_index.min(i32::MAX as u64) as i32);
+    window.set_member_total_rows(window_state.total_rows.min(i32::MAX as u64) as i32);
+    window.set_result_loading(window_state.loading);
+    window.set_result_stale(window_state.stale);
 }
 
 fn finish_preview(window: &MainWindow, machine_id: &str, normalized_path: &str, succeeded: bool) {

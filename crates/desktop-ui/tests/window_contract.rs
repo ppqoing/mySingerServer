@@ -902,7 +902,6 @@ fn scan_start_forwards_four_arguments_in_order() {
     }])));
     window.set_force_recalculate(true);
     window.set_enumerator_index(1);
-    window.set_analysis_kind_index(2);
 
     let captured = Rc::new(RefCell::new(None));
     window.on_start_scan({
@@ -937,7 +936,7 @@ fn scan_start_forwards_four_arguments_in_order() {
 }
 
 #[test]
-fn scan_browse_and_local_analysis_forward_only_existing_arguments() {
+fn scan_browse_forwards_only_existing_arguments() {
     i_slint_backend_testing::init_no_event_loop();
 
     let window = MainWindow::new().expect("应能构造真实 MainWindow");
@@ -951,8 +950,6 @@ fn scan_browse_and_local_analysis_forward_only_existing_arguments() {
         path: "D:\\fixture".into(),
     }])));
     window.set_filtering_enabled(true);
-    window.set_analysis_task_ids("scan-a,scan-b".into());
-    window.set_analysis_kind_index(2);
 
     let browsed = Rc::new(RefCell::new(None));
     window.on_browse_paths({
@@ -961,24 +958,11 @@ fn scan_browse_and_local_analysis_forward_only_existing_arguments() {
             *browsed.borrow_mut() = Some((node_index, path.to_string()));
         }
     });
-    let analyzed = Rc::new(RefCell::new(None));
-    window.on_start_local_analysis({
-        let analyzed = analyzed.clone();
-        move |node_index, task_ids, kind| {
-            *analyzed.borrow_mut() = Some((node_index, task_ids.to_string(), kind));
-        }
-    });
-
     accessible(&window, "选择扫描路径：1").invoke_accessible_default_action();
-    accessible(&window, "开始本地分析").invoke_accessible_default_action();
 
     assert_eq!(
         browsed.borrow().as_ref(),
         Some(&(7, String::from("D:\\fixture"))),
-    );
-    assert_eq!(
-        analyzed.borrow().as_ref(),
-        Some(&(7, String::from("scan-a,scan-b"), 2)),
     );
 }
 
@@ -1400,10 +1384,12 @@ fn duplicate_tabs_preserve_loaded_state_and_forward_existing_callbacks() {
             delete_enabled: true,
         },
     ])));
-    window.set_group_next_cursor("opaque-group-cursor".into());
-    window.set_member_next_cursor("opaque-member-cursor".into());
-    window.set_result_source_index(1);
-    window.set_result_node_index(7);
+    window.set_result_start_index(0);
+    window.set_result_total_rows(400);
+    window.set_member_start_index(0);
+    window.set_member_total_rows(200);
+    window.set_result_loading(false);
+    window.set_result_stale(false);
     window.set_result_run_id("run-state-001".into());
     window.set_selected_group_id("group-001".into());
     window.set_cross_selections("7:scan-a,8:scan-b".into());
@@ -1411,29 +1397,24 @@ fn duplicate_tabs_preserve_loaded_state_and_forward_existing_callbacks() {
     window.invoke_navigate_to(4);
 
     let loaded_groups = Rc::new(RefCell::new(Vec::new()));
-    window.on_load_groups({
+    window.on_request_group_window({
         let loaded_groups = loaded_groups.clone();
-        move |central, node, run, kind, cursor| {
-            loaded_groups.borrow_mut().push((
-                central,
-                node,
-                run.to_string(),
-                kind,
-                cursor.to_string(),
-            ));
+        move |run, kind, start, count| {
+            loaded_groups
+                .borrow_mut()
+                .push((run.to_string(), kind, start, count));
         }
     });
     let loaded_members = Rc::new(RefCell::new(Vec::new()));
-    window.on_load_members({
+    window.on_request_member_window({
         let loaded_members = loaded_members.clone();
-        move |central, node, run, group, kind, cursor| {
+        move |run, group, kind, start, count| {
             loaded_members.borrow_mut().push((
-                central,
-                node,
                 run.to_string(),
                 group.to_string(),
                 kind,
-                cursor.to_string(),
+                start,
+                count,
             ));
         }
     });
@@ -1498,8 +1479,12 @@ fn duplicate_tabs_preserve_loaded_state_and_forward_existing_callbacks() {
             window.get_groups().row_data(0).expect("组行应保留").id,
             "group-001"
         );
-        assert_eq!(window.get_group_next_cursor(), "opaque-group-cursor");
-        assert_eq!(window.get_member_next_cursor(), "opaque-member-cursor");
+        assert_eq!(window.get_result_start_index(), 0);
+        assert_eq!(window.get_result_total_rows(), 400);
+        assert_eq!(window.get_member_start_index(), 0);
+        assert_eq!(window.get_member_total_rows(), 200);
+        assert!(!window.get_result_loading());
+        assert!(!window.get_result_stale());
         assert_eq!(window.get_result_run_id(), "run-state-001");
         assert_eq!(window.get_selected_group_id(), "group-001");
     }
@@ -1507,9 +1492,7 @@ fn duplicate_tabs_preserve_loaded_state_and_forward_existing_callbacks() {
 
     accessible(&window, "精确重复").invoke_accessible_default_action();
     accessible(&window, "加载结果").invoke_accessible_default_action();
-    accessible(&window, "加载下一页重复组").invoke_accessible_default_action();
     click_element_at_fraction(&window, &accessible(&window, "重复组：group-001"), 0.2, 0.5);
-    accessible(&window, "加载下一页成员").invoke_accessible_default_action();
     click_element_center(
         &window,
         &accessible(&window, "预览成员：D:\\Media\\photo-a.jpg"),
@@ -1537,41 +1520,23 @@ fn duplicate_tabs_preserve_loaded_state_and_forward_existing_callbacks() {
     assert_eq!(
         loaded_groups.borrow().as_slice(),
         &[
-            (true, 7, String::from("run-state-001"), 0, String::new()),
-            (
-                true,
-                7,
-                String::from("run-state-001"),
-                0,
-                String::from("opaque-group-cursor")
-            ),
-            (true, 7, String::from("run-state-001"), 1, String::new()),
-            (true, 7, String::from("run-state-001"), 2, String::new()),
-            (true, 7, String::from("run-state-001"), 0, String::new()),
+            (String::from("run-state-001"), 0, 0, 100),
+            (String::from("run-state-001"), 1, 0, 100),
+            (String::from("run-state-001"), 2, 0, 100),
+            (String::from("run-state-001"), 0, 0, 100),
         ],
-        "四标签和有限分页必须保持 load-groups 参数顺序与普通类型 0/1/2",
+        "四标签和滚动窗口必须只转发 run、kind、start、count",
     );
     assert_eq!(
         loaded_members.borrow().as_slice(),
-        &[
-            (
-                true,
-                7,
-                String::from("run-state-001"),
-                String::from("group-001"),
-                0,
-                String::new(),
-            ),
-            (
-                true,
-                7,
-                String::from("run-state-001"),
-                String::from("group-001"),
-                0,
-                String::from("opaque-member-cursor"),
-            ),
-        ],
-        "选择组和成员分页必须保持 load-members 六参数顺序",
+        &[(
+            String::from("run-state-001"),
+            String::from("group-001"),
+            0,
+            0,
+            100,
+        ),],
+        "选择组只转发中心 run、组 ID、kind、start、count",
     );
     assert_eq!(
         previews.borrow().as_slice(),

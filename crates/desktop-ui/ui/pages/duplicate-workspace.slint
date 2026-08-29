@@ -1,6 +1,6 @@
-// 四类重复结果共享一个状态工作区；页签只改页面映射，不重置任何已加载状态。
+// 四类重复结果共享一个中心窗口；页签只改变类别，不暴露 PostgreSQL 游标。
 
-import { ComboBox, LineEdit, SpinBox } from "std-widgets.slint";
+import { ComboBox, LineEdit } from "std-widgets.slint";
 import { Theme, UiGroupRow, UiMemberRow } from "../theme.slint";
 import { ActionButton } from "../components/action-button.slint";
 import { DetailPanel } from "../components/detail-panel.slint";
@@ -15,20 +15,22 @@ export component DuplicateWorkspace inherits Rectangle {
     in-out property <int> duplicate-tab;
     in property <[UiGroupRow]> groups;
     in property <[UiMemberRow]> members;
-    in property <string> group-next-cursor;
-    in property <string> member-next-cursor;
+    in property <int> result-start-index;
+    in property <int> result-total-rows;
+    in property <int> member-start-index;
+    in property <int> member-total-rows;
+    in property <bool> result-loading;
+    in property <bool> result-stale;
     in property <image> preview-image;
     in property <string> preview-info;
-    in-out property <int> source-index;
-    in-out property <int> node-index;
     in-out property <string> run-id;
     in-out property <string> selected-group-id;
     in-out property <string> cross-selections;
     in property <string> cross-status;
     in property <string> cross-summary;
     callback select-tab(int);
-    callback load-groups(bool, int, string, int, string);
-    callback load-members(bool, int, string, string, int, string);
+    callback request-group-window(string, int, int, int);
+    callback request-member-window(string, string, int, int, int);
     callback save-review(string, string, int);
     callback preview(string, string);
     callback start-cross(string);
@@ -38,7 +40,8 @@ export component DuplicateWorkspace inherits Rectangle {
     // 跨机器结果仍只选择现有 0/1/2 类型，绝不引入第四种 GroupKind。
     property <int> cross-result-kind: 0;
     property <int> query-kind: root.duplicate-tab < 3 ? root.duplicate-tab : root.cross-result-kind;
-    property <bool> central-source: root.duplicate-tab == 3 || root.source-index == 1;
+    property <int> group-visible-count: 100;
+    property <int> member-visible-count: 100;
     property <string> result-title: root.duplicate-tab == 0 ? "精确重复结果"
         : root.duplicate-tab == 1 ? "相似图片结果"
         : root.duplicate-tab == 2 ? "相似视频结果"
@@ -58,19 +61,6 @@ export component DuplicateWorkspace inherits Rectangle {
         FilterBar {
             accessible-role: AccessibleRole.groupbox;
             accessible-label: "结果过滤栏";
-            if root.duplicate-tab < 3 : ComboBox {
-                model: ["节点 SQLite", "PostgreSQL 中心"];
-                current-index <=> root.source-index;
-                width: 150px;
-                accessible-label: "结果来源";
-            }
-            if root.duplicate-tab < 3 : SpinBox {
-                value <=> root.node-index;
-                minimum: 0;
-                maximum: 99;
-                width: 92px;
-                accessible-label: "结果节点";
-            }
             if root.duplicate-tab == 3 : ComboBox {
                 model: ["精确重复", "相似图片", "相似视频"];
                 current-index <=> root.cross-result-kind;
@@ -87,7 +77,7 @@ export component DuplicateWorkspace inherits Rectangle {
                 label: "加载结果";
                 icon: @image-url("../assets/icons/filter.png");
                 tone: 1;
-                clicked => { root.load-groups(root.central-source, root.node-index, root.run-id, root.query-kind, ""); }
+                clicked => { root.request-group-window(root.run-id, root.query-kind, 0, root.group-visible-count); }
             }
         }
 
@@ -150,18 +140,21 @@ export component DuplicateWorkspace inherits Rectangle {
                     spacing: 8px;
                     SectionHeader {
                         title: "重复组";
-                        subtitle: root.groups.length == 0 ? "当前筛选没有组；调整来源或运行 ID 后重新加载。" : "有限游标分页，选择一组后加载成员。";
+                        subtitle: root.result-stale ? "文件库已变化，结果只读；仍可滚动和预览。" : root.groups.length == 0 ? "仅显示已完成中心分析的当前类别。" : "有限窗口；滚动时按行范围替换。";
                     }
                     GroupTable {
                         vertical-stretch: 1;
                         groups: root.groups;
                         selected-id: root.selected-group-id;
-                        has-more: root.group-next-cursor != "";
+                        start-index: root.result-start-index;
+                        total-rows: root.result-total-rows;
+                        loading: root.result-loading;
+                        stale: root.result-stale;
                         select-group(id) => {
                             root.selected-group-id = id;
-                            root.load-members(root.central-source, root.node-index, root.run-id, id, root.query-kind, "");
+                            root.request-member-window(root.run-id, id, root.query-kind, 0, root.member-visible-count);
                         }
-                        load-more => { root.load-groups(root.central-source, root.node-index, root.run-id, root.query-kind, root.group-next-cursor); }
+                        request-window(start, count) => { root.request-group-window(root.run-id, root.query-kind, start, count); }
                     }
                 }
             }
@@ -176,19 +169,21 @@ export component DuplicateWorkspace inherits Rectangle {
                     spacing: 8px;
                     SectionHeader {
                         title: "成员列表";
-                        subtitle: root.members.length == 0 ? "选择重复组后显示成员；预览不会自动加载。" : "在线能力、相似分数和复核决定均来自已加载模型。";
-                    }
-                    if root.member-next-cursor != "" : ActionButton {
-                        label: "加载更多成员";
-                        accessible-label: "加载下一页成员";
-                        icon: @image-url("../assets/icons/filter.png");
-                        clicked => { root.load-members(root.central-source, root.node-index, root.run-id, root.selected-group-id, root.query-kind, root.member-next-cursor); }
+                        subtitle: root.result-stale ? "文件库已变化，结果只读；不能复核或删除。" : root.members.length == 0 ? "选择重复组后显示成员；预览不会自动加载。" : "在线能力、相似分数和当前进程复核投影来自中心窗口。";
                     }
                     MemberList {
                         vertical-stretch: 1;
                         members: root.members;
+                        start-index: root.member-start-index;
+                        total-rows: root.member-total-rows;
+                        loading: root.result-loading;
+                        stale: root.result-stale;
                         preview(machine, path) => { root.preview(machine, path); }
+                        review-enabled: !root.result-stale && !root.result-loading;
                         review(machine, path, decision) => { root.save-review(machine, path, decision); }
+                        request-window(start, count) => {
+                            root.request-member-window(root.run-id, root.selected-group-id, root.query-kind, start, count);
+                        }
                     }
                 }
             }
@@ -204,7 +199,7 @@ export component DuplicateWorkspace inherits Rectangle {
                         title: root.result-title;
                         subtitle: root.duplicate-tab == 1 ? "原图按需解码到内存，不写缩略图。"
                             : root.duplicate-tab == 2 ? "视频只读取既有六帧 3×2 JPG 联系表。"
-                            : root.duplicate-tab == 3 ? "跨机器成员仍沿用当前门禁与游标。"
+                            : root.duplicate-tab == 3 ? "跨机器成员来自已完成中心分析的有限窗口。"
                             : "精确重复只展示已加载成员详情。";
                     }
                     if root.preview-image.width > 0 && root.preview-image.height > 0 : Image {

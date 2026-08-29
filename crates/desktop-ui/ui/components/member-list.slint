@@ -1,4 +1,4 @@
-// 高密度成员表；在线门禁、分数、复核状态与原有三个动作保持同一行模型。
+// 高密度成员表；在线门禁、分数和当前窗口复核状态保持同一行模型。
 
 import { ScrollView } from "std-widgets.slint";
 import { Theme, UiMemberRow } from "../theme.slint";
@@ -52,8 +52,14 @@ component MemberAction inherits Rectangle {
 
 export component MemberList inherits Rectangle {
     in property <[UiMemberRow]> members;
+    in property <int> start-index;
+    in property <int> total-rows;
+    in property <bool> loading;
+    in property <bool> stale;
+    in property <bool> review-enabled: true;
     callback preview(string, string);
     callback review(string, string, int);
+    callback request-window(int, int);
     private property <string> selected-path;
 
     background: Theme.panel;
@@ -65,7 +71,25 @@ export component MemberList inherits Rectangle {
     accessible-label: "成员表";
 
     // 表头和成员行同处一个滚动视口，小窗保留区域正宽并允许横向到达所有列。
-    ScrollView {
+    if root.loading : Text {
+        height: 24px;
+        text: "正在读取中心成员窗口…";
+        color: Theme.muted;
+        font-size: 10px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        accessible-label: "成员窗口加载中";
+    }
+    if root.stale : Text {
+        height: 24px;
+        text: "文件库已变化，结果只读；复核和删除已禁用";
+        color: Theme.warning;
+        font-size: 10px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        accessible-label: "成员窗口已过期";
+    }
+    result-scroll := ScrollView {
         VerticalLayout {
             min-width: 820px;
             spacing: 0px;
@@ -91,6 +115,10 @@ export component MemberList inherits Rectangle {
                 density: 0;
                 title: "选择重复组后加载成员";
                 detail: "成员列表不会自动预取图片或视频预览。";
+            }
+            Rectangle {
+                height: root.members.length > 0 ? root.start-index * Theme.member-row-height : 0px;
+                background: transparent;
             }
             for member in root.members : Rectangle {
                     height: Theme.member-row-height;
@@ -123,6 +151,7 @@ export component MemberList inherits Rectangle {
                                 label: "保留";
                                 accessible-name: "保留成员：" + member.path;
                                 icon: @image-url("../assets/icons/keep.png");
+                                action-enabled: root.review-enabled;
                                 clicked => { root.review(member.machine-id, member.path, 1); }
                             }
                             MemberAction {
@@ -130,7 +159,7 @@ export component MemberList inherits Rectangle {
                                 accessible-name: "删除成员：" + member.path;
                                 icon: @image-url("../assets/icons/delete.png");
                                 tone: 2;
-                                action-enabled: member.delete-enabled;
+                                action-enabled: member.delete-enabled && root.review-enabled;
                                 clicked => { root.review(member.machine-id, member.path, 2); }
                             }
                         }
@@ -159,6 +188,17 @@ export component MemberList inherits Rectangle {
                     }
                     Rectangle { y: parent.height - 1px; height: 1px; background: Theme.border; }
                 }
+            Rectangle {
+                height: root.total-rows > root.start-index + root.members.length
+                    ? (root.total-rows - root.start-index - root.members.length) * Theme.member-row-height
+                    : 0px;
+                background: transparent;
+            }
+        }
+        scrolled => {
+            // viewport-y 向下滚动时为负值；扣除表头后换算全局成员行并保留半窗预读。
+            let next-start = max(0, round(max(0px, -result-scroll.viewport-y - Theme.table-header-height) / Theme.member-row-height) - root.members.length / 2);
+            root.request-window(next-start, max(1, root.members.length));
         }
     }
 }

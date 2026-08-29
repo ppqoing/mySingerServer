@@ -4,6 +4,7 @@ use dedup_desktop_ui::{
 };
 use i_slint_backend_testing::{ElementHandle, TestingBackend, TestingBackendOptions};
 use slint::{Color, ComponentHandle, ModelRc, VecModel};
+use std::{cell::RefCell, rc::Rc};
 
 fn install_testing_backend() {
     // Rust 测试用例各在线程中运行；Slint 平台也是线程局部状态，因此每个用例独立安装。
@@ -252,7 +253,6 @@ fn install_scan_and_task_fixture(window: &MainWindow) {
     window.set_scan_node_index(7);
     window.set_enumerator_index(1);
     window.set_filtering_enabled(true);
-    window.set_analysis_task_ids("task-running".into());
     window.set_tasks(ModelRc::new(VecModel::from(vec![UiTaskRow {
         id: "task-running".into(),
         runtime_id: "task-running".into(),
@@ -889,7 +889,6 @@ fn scan_workspace_primary_actions_share_the_same_right_edge() {
 
     let add_path = accessible(&window, "添加扫描路径");
     let start_scan = accessible(&window, "开始扫描");
-    let start_analysis = accessible(&window, "开始本地分析");
     let right_edge = |element: &ElementHandle| element.absolute_position().x + element.size().width;
     assert!(
         (right_edge(&add_path) - right_edge(&start_scan)).abs() <= 1.0,
@@ -899,13 +898,25 @@ fn scan_workspace_primary_actions_share_the_same_right_edge() {
         start_scan.absolute_position(),
         start_scan.size(),
     );
+}
+
+#[test]
+fn scan_page_does_not_expose_local_analysis_start() {
+    install_testing_backend();
+
+    let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    window.show().expect("应能显示扫描页");
+    window.invoke_navigate_to(2);
+    window
+        .window()
+        .take_snapshot()
+        .expect("扫描页应能完成软件渲染");
+
     assert!(
-        (right_edge(&start_scan) - right_edge(&start_analysis)).abs() <= 1.0,
-        "开始扫描与开始本地分析动作应共享右边界，扫描={:?}/{:?}，分析={:?}/{:?}",
-        start_scan.absolute_position(),
-        start_scan.size(),
-        start_analysis.absolute_position(),
-        start_analysis.size(),
+        ElementHandle::find_by_accessible_label(&window, "开始本地分析")
+            .next()
+            .is_none(),
+        "扫描页不应暴露 Desktop 本地分析入口",
     );
 }
 
@@ -934,7 +945,6 @@ fn annotated_pages_center_each_real_icon_text_group() {
     assert_action_button_content_centered(&window, "选择扫描路径：1", "选择扫描路径：1");
     assert_action_button_content_centered(&window, "删除扫描路径：1", "删除扫描路径：1");
     assert_action_button_content_centered(&window, "开始扫描", "开始扫描");
-    assert_action_button_content_centered(&window, "开始本地分析", "开始本地分析");
 
     window.invoke_navigate_to(4);
     window.window().take_snapshot().expect("重复结果页应能渲染");
@@ -1319,6 +1329,116 @@ fn result_review_and_delete_workspaces_keep_named_regions() {
             "没有历史模型时必须同时显示标题和原因，不得制造虚假批次",
         );
     }
+}
+
+#[test]
+fn result_scroll_requests_positive_group_and_member_windows() {
+    install_testing_backend();
+
+    let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    let groups = (0..100)
+        .map(|index| UiGroupRow {
+            id: format!("group-{index:03}").into(),
+            kind: "相似图片".into(),
+            md5: format!("{index:032x}").into(),
+            size: "8.0 MiB".into(),
+            members: 2,
+            reclaimable: "8.0 MiB".into(),
+        })
+        .collect::<Vec<_>>();
+    let members = (0..100)
+        .map(|index| UiMemberRow {
+            machine_id: "machine-a".into(),
+            path: format!(r"D:\Media\photo-{index:03}.jpg").into(),
+            md5: format!("{index:032x}").into(),
+            size: "8.0 MiB".into(),
+            representative: index == 0,
+            stage1: "0.99".into(),
+            phash: "4".into(),
+            stage2: "0.96".into(),
+            metadata: "1920×1080 · JPEG".into(),
+            review: "未决定".into(),
+            review_color: Color::from_rgb_u8(107, 114, 128),
+            online: true,
+            preview_enabled: true,
+            delete_enabled: true,
+        })
+        .collect::<Vec<_>>();
+    window.set_groups(ModelRc::new(VecModel::from(groups)));
+    window.set_members(ModelRc::new(VecModel::from(members)));
+    window.set_result_total_rows(1_000);
+    window.set_member_total_rows(1_000);
+    window.set_result_run_id("00000000-0000-7000-8000-000000000001".into());
+    window.set_selected_group_id("group-000".into());
+
+    let group_starts = Rc::new(RefCell::new(Vec::<i32>::new()));
+    let captured_group_starts = group_starts.clone();
+    window.on_request_group_window(move |_, _, start, _| {
+        captured_group_starts.borrow_mut().push(start);
+    });
+    let member_starts = Rc::new(RefCell::new(Vec::<i32>::new()));
+    let captured_member_starts = member_starts.clone();
+    window.on_request_member_window(move |_, _, _, start, _| {
+        captured_member_starts.borrow_mut().push(start);
+    });
+
+    window.invoke_navigate_to(4);
+    window
+        .window()
+        .set_size(slint::PhysicalSize::new(1440, 900));
+    window.show().expect("应能显示真实重复工作区");
+    window
+        .window()
+        .take_snapshot()
+        .expect("重复工作区应能完成软件渲染");
+
+    for label in ["重复组表", "成员表"] {
+        let region = accessible(&window, label);
+        let scroll = region
+            .query_descendants()
+            .match_inherits("ScrollView")
+            .find_first()
+            .unwrap_or_else(|| panic!("{label} 必须拥有独立滚动区"));
+        scroll.scroll(0.0, -4_000.0);
+        i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(200));
+    }
+
+    assert!(
+        group_starts.borrow().iter().any(|start| *start > 0),
+        "向下滚动组表必须请求正数起始行，实际={:?}",
+        group_starts.borrow().as_slice(),
+    );
+    assert!(
+        member_starts.borrow().iter().any(|start| *start > 0),
+        "向下滚动成员表必须请求正数起始行，实际={:?}",
+        member_starts.borrow().as_slice(),
+    );
+}
+
+#[test]
+fn result_workspace_does_not_expose_cursor_pagination_controls() {
+    install_testing_backend();
+
+    let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    window.show().expect("应能显示结果工作区");
+    window.invoke_navigate_to(4);
+    window
+        .window()
+        .take_snapshot()
+        .expect("结果工作区应能完成软件渲染");
+
+    assert!(
+        ElementHandle::find_by_accessible_label(&window, "加载下一页重复组")
+            .next()
+            .is_none(),
+        "结果工作区不应通过游标显示下一页控件",
+    );
+    assert!(
+        ElementHandle::find_by_accessible_label(&window, "加载下一页成员")
+            .next()
+            .is_none(),
+        "结果工作区不应通过游标显示成员下一页控件",
+    );
 }
 
 #[test]

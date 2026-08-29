@@ -4,7 +4,7 @@ use std::fmt::Write as _;
 
 use dedup_desktop_core::{
     app::PathEntryView,
-    results::{GroupKind, GroupPage, MemberPage},
+    results::{GroupKind, MemberView, ResultWindowState},
     review::ReviewDecision,
     runtime_tasks::{
         DesktopRuntimeTaskState, RuntimeStageSnapshot, RuntimeStageState, RuntimeTaskOwner,
@@ -193,9 +193,11 @@ pub(crate) fn runtime_tasks(state: &RuntimeTaskControllerState) -> RuntimeUiMode
     }
 }
 
-/// 把统一结果页映射为 Slint 有限组列表；游标仍由调用方单独保存。
-pub(crate) fn groups(page: &GroupPage) -> ModelRc<UiGroupRow> {
-    let rows = page
+/// 把中心有限结果窗口映射为 Slint 组行；窗口元数据由绑定单独替换。
+pub(crate) fn groups(
+    window: &ResultWindowState<dedup_desktop_core::results::GroupView>,
+) -> ModelRc<UiGroupRow> {
+    let rows = window
         .items
         .iter()
         .map(|group| UiGroupRow {
@@ -210,9 +212,9 @@ pub(crate) fn groups(page: &GroupPage) -> ModelRc<UiGroupRow> {
     ModelRc::new(VecModel::from(rows))
 }
 
-/// 把统一成员页映射为可直接驱动预览、复核和删除门禁的 Slint 行。
-pub(crate) fn members(page: &MemberPage) -> ModelRc<UiMemberRow> {
-    let rows = page
+/// 把中心有限成员窗口映射为可直接驱动预览与当前进程复核投影的 Slint 行。
+pub(crate) fn members(window: &ResultWindowState<MemberView>) -> ModelRc<UiMemberRow> {
+    let rows = window
         .items
         .iter()
         .map(|member| {

@@ -1,72 +1,47 @@
 //! 结果统一模型、有限窗口、复核快捷规则与删除确认的行为门禁。
 
 use dedup_core::{ContentKey, DeleteMode, LocationKey, MachineId, NormalizedPath};
-use dedup_desktop_core::central::{
-    CentralGroup, CentralGroupKind, CentralGroupMember, CentralGroupMemberPage, CentralGroupPage,
-    CentralReviewDecision,
-};
 use dedup_desktop_core::{
     delete::{DeleteConfirmation, DeleteItemOutcome, DeleteProgress, ReviewGroup},
-    results::{
-        GroupKind, MemberView, PagedWindow, group_page_from_central, group_page_from_node,
-        member_page_from_central, member_page_from_node,
-    },
+    results::{GroupKind, MemberView, ResultWindowState},
     review::{QuickReviewRule, ReviewBoard, ReviewDecision},
 };
-use dedup_protocol::proto;
 
 #[test]
-fn node_and_central_pages_share_one_model_and_window_stays_bounded() {
-    let content = content(1, 2048);
-    let node = group_page_from_node(proto::ListGroups {
-        analysis_run_id: uuid::Uuid::now_v7().to_string(),
-        group_kind: proto::GroupKind::GroupExact as i32,
-        cursor: String::new(),
-        limit: 1,
-        groups: vec![proto::DuplicateGroup {
-            group_id: "local".into(),
-            kind: proto::GroupKind::GroupExact as i32,
-            representative: Some((&content).into()),
-            member_count: 2,
-            reclaimable_bytes: 2048,
-        }],
-        next_cursor: "node-next".into(),
-    })
-    .unwrap();
-    let central = group_page_from_central(CentralGroupPage {
-        items: vec![CentralGroup {
-            group_id: "central".into(),
-            kind: CentralGroupKind::Exact,
-            representative: content,
-            member_count: 2,
-            reclaimable_bytes: 2048,
-        }],
-        next_cursor: Some("central-next".into()),
-    });
-
-    assert_eq!(node.items[0].kind, GroupKind::Exact);
-    assert_eq!(central.items[0].kind, GroupKind::Exact);
-    assert_eq!(
-        node.items[0].representative,
-        central.items[0].representative
-    );
-
-    let mut window = PagedWindow::new(2);
-    window.append(node);
-    window.append(central);
-    window.append(dedup_desktop_core::results::GroupPage {
+fn result_window_replaces_previous_rows_instead_of_appending_history() {
+    let first = ResultWindowState {
+        start_index: 0,
+        total_rows: 2,
         items: vec![dedup_desktop_core::results::GroupView {
-            group_id: "third".into(),
+            group_id: "first".into(),
             kind: GroupKind::Exact,
-            representative: content,
+            representative: content(1, 2048),
             member_count: 2,
             reclaimable_bytes: 2048,
         }],
-        next_cursor: None,
-    });
-    assert_eq!(window.items().len(), 2);
-    assert_eq!(window.items()[0].group_id, "central");
-    assert_eq!(window.next_cursor(), None);
+        loading: false,
+        stale: false,
+    };
+    let second = ResultWindowState {
+        start_index: 1,
+        total_rows: 2,
+        items: vec![dedup_desktop_core::results::GroupView {
+            group_id: "second".into(),
+            kind: GroupKind::Exact,
+            representative: content(2, 4096),
+            member_count: 2,
+            reclaimable_bytes: 4096,
+        }],
+        loading: false,
+        stale: false,
+    };
+
+    let mut window = first;
+    window.replace(second);
+
+    assert_eq!(window.items.len(), 1);
+    assert_eq!(window.items[0].group_id, "second");
+    assert_eq!(window.start_index, 1);
 }
 
 #[test]
@@ -82,67 +57,25 @@ fn offline_member_disables_preview_open_and_delete() {
     assert!(online.actions.delete);
 }
 
-/// 节点和中心都必须把真实失活状态传入统一动作门禁。
+/// 中心窗口必须把真实失活状态传入统一动作门禁。
 #[test]
-fn inactive_members_disable_actions_in_node_and_central_models() {
-    let machine = MachineId::from_sha256([0x61; 32]);
-    let location = LocationKey::new(
-        machine.clone(),
-        NormalizedPath::new(r"D:\Inactive\old.bin").unwrap(),
-    );
-    let content = ContentKey::new([0x62; 16], 62);
-    let node = member_page_from_node(
-        proto::ListGroupMembers {
-            analysis_run_id: uuid::Uuid::now_v7().to_string(),
-            group_id: "inactive-node".into(),
-            cursor: String::new(),
-            limit: 1,
-            members: vec![proto::GroupMember {
-                location: Some((&location).into()),
-                content: Some((&content).into()),
-                active: false,
-                ..Default::default()
-            }],
-            next_cursor: String::new(),
-        },
-        true,
-    )
-    .unwrap();
-    let central = member_page_from_central(
-        CentralGroupMemberPage {
-            items: vec![CentralGroupMember {
-                location,
-                content,
-                representative: false,
-                stage1_score: 1.0,
-                phash_passed_parts: None,
-                stage2_score: None,
-                review: CentralReviewDecision::Undecided,
-                width: None,
-                height: None,
-                quality: None,
-                active: false,
-            }],
-            next_cursor: None,
-        },
-        |_| true,
-    );
+fn inactive_members_disable_actions_in_central_models() {
+    let mut member = member("inactive", 62, true, None, None);
+    member.set_availability(false, true);
 
-    for member in [&node.items[0], &central.items[0]] {
-        assert!(!member.active);
-        assert_eq!(
-            member.actions,
-            dedup_desktop_core::results::MemberActions {
-                preview: false,
-                open: false,
-                delete: false,
-            }
-        );
-    }
+    assert!(!member.active);
+    assert_eq!(
+        member.actions,
+        dedup_desktop_core::results::MemberActions {
+            preview: false,
+            open: false,
+            delete: false,
+        }
+    );
 }
 
 #[test]
-fn review_board_restores_marks_and_quick_selection_only_updates_decisions() {
+fn review_board_seeds_current_window_marks_and_quick_selection_only_updates_decisions() {
     let smaller = member("small", 10, true, Some((800, 600)), Some(60));
     let larger = member("large", 20, true, Some((1920, 1080)), Some(90));
     let mut board = ReviewBoard::from_members(&[

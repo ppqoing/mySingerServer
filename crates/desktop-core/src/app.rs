@@ -29,8 +29,8 @@ use crate::{
     delete::{DeleteConfirmation, ReviewGroup},
     node_session::NodeSession,
     results::{
-        GroupKind, GroupPage, MemberPage, MemberView, ResultScope, group_page_from_central,
-        group_page_from_node, load_preview, member_page_from_central, member_page_from_node,
+        CentralResultWindowCache, GroupKind, MemberView, ResultScope, ResultWindowRequest,
+        ResultWindowState, load_preview,
     },
     review::{QuickReviewRule, ReviewBoard, ReviewDecision},
     runtime_tasks::{
@@ -112,15 +112,6 @@ pub enum UiCommand {
         /// 节点返回的不透明下一页游标。
         cursor: String,
     },
-    /// 从一个或多个已完成扫描任务创建节点本地分析。
-    StartLocalAnalysis {
-        /// 运行分析的节点索引。
-        node_index: usize,
-        /// 逗号分隔的节点扫描任务 UUID。
-        scan_task_ids: String,
-        /// 精确、相似图片或相似视频。
-        kind: GroupKind,
-    },
     /// 从 `节点索引:扫描任务 UUID` 列表创建跨机器中心分析。
     StartCrossAnalysis {
         /// 逗号分隔的节点索引和任务 ID。
@@ -130,33 +121,17 @@ pub enum UiCommand {
     PollCrossAnalysis,
     /// 对当前 Partial 中心运行显式重试未解决二筛项。
     RetryCrossAnalysis,
-    /// 使用稳定游标加载本地或中心重复组。
-    LoadGroups {
-        /// `true` 表示 PostgreSQL，`false` 表示节点 SQLite。
-        central: bool,
-        /// 本地来源节点索引；中心来源忽略。
-        node_index: usize,
-        /// UUID 文本运行 ID。
-        analysis_run_id: String,
-        /// 页面需要的结果类别。
-        kind: GroupKind,
-        /// 空字符串为第一页。
-        cursor: String,
+    /// 请求一个已完成中心分析的有限组窗口；中心游标只留在 Core 内部。
+    RequestGroupWindow {
+        /// 运行身份与窗口范围。
+        request: ResultWindowRequest,
     },
-    /// 加载一个重复组的活动成员。
-    LoadMembers {
-        /// `true` 表示 PostgreSQL，`false` 表示节点 SQLite。
-        central: bool,
-        /// 本地来源节点索引。
-        node_index: usize,
-        /// UUID 文本运行 ID。
-        analysis_run_id: String,
-        /// 持久组 ID。
+    /// 请求一个已完成中心分析的有限成员窗口；中心游标不进入 UI 契约。
+    RequestMemberWindow {
+        /// 运行身份、类别和窗口范围。
+        request: ResultWindowRequest,
+        /// 需要显示的持久组 ID。
         group_id: String,
-        /// 组类别决定预览类型。
-        kind: GroupKind,
-        /// 空字符串为第一页。
-        cursor: String,
     },
     /// 保存一个成员的 Keep/Delete/Undecided 标记。
     SaveReview {
@@ -239,9 +214,9 @@ pub enum UiEvent {
         /// 空字符串表示已到末页。
         next_cursor: String,
     },
-    /// 本地或中心分析运行已经创建。
+    /// 中心分析运行已经创建。
     AnalysisStarted {
-        /// `true` 表示中心运行。
+        /// 运行来源固定为 PostgreSQL 中心。
         central: bool,
         /// UUID 文本运行 ID。
         run_id: String,
@@ -250,14 +225,14 @@ pub enum UiEvent {
     },
     /// 跨机器运行推进到一个可观察门禁。
     CrossAnalysisChanged(CrossPollReport),
-    /// 替换当前结果列表页。
-    GroupsChanged(Box<GroupPage>),
+    /// 替换当前中心结果窗口；窗口行从不追加历史页。
+    GroupsChanged(Box<ResultWindowState<crate::results::GroupView>>),
     /// 替换当前选中组及其成员页。
     MembersChanged {
         /// 持久组 ID。
         group_id: String,
-        /// 当前页成员。
-        page: Box<MemberPage>,
+        /// 当前有限成员窗口。
+        window: Box<ResultWindowState<MemberView>>,
     },
     /// 原图或视频联系表已经完整读入内存。
     PreviewReady {
@@ -281,8 +256,8 @@ pub enum UiEvent {
         /// 原始业务错误文本。
         error: String,
     },
-    /// 快捷或单项复核已持久化，返回刷新后的成员。
-    ReviewChanged(Box<MemberPage>),
+    /// 快捷或单项复核已更新当前进程投影，返回替换后的成员窗口。
+    ReviewChanged(Box<ResultWindowState<MemberView>>),
     /// 删除执行前的显式确认摘要。
     DeleteConfirmationChanged(DeleteConfirmation),
     /// 本地或中心删除结果已经应用并应刷新结果页。
@@ -345,8 +320,13 @@ struct LoadedMembersContext {
     scope: ResultScope,
     kind: GroupKind,
     group_id: String,
+    /// 当前中心窗口对应的运行身份，便于迟到响应门禁。
+    run_id: AnalysisRunId,
     items: Vec<MemberView>,
-    next_cursor: Option<String>,
+    /// 当前进程内的复核投影，切换运行或组时整体重建。
+    review_board: ReviewBoard,
+    /// UI 当前可见窗口边界；不会保存中心游标。
+    window: ResultWindowState<MemberView>,
 }
 
 struct PreparedDeleteContext {
@@ -366,6 +346,15 @@ struct ActiveCrossAnalysis {
     runtime: DesktopRuntimeTaskReporter,
     /// 冻结输入涉及的唯一物理节点数。
     node_count: usize,
+}
+
+/// 记录结果窗口当前请求，拒绝迟到的旧运行或旧组响应。
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ActiveWindowRequest {
+    /// 当前组窗口请求。
+    groups: Option<ResultWindowRequest>,
+    /// 当前成员窗口请求与组 ID。
+    members: Option<(String, ResultWindowRequest)>,
 }
 
 /// 一个节点独占的同步触发端和后台任务；丢弃时立即结束其 PG 连接与同步请求。
@@ -457,6 +446,15 @@ async fn run_controller(
     let mut cross_analysis: Option<ActiveCrossAnalysis> = None;
     let mut loaded_members: Option<LoadedMembersContext> = None;
     let mut prepared_delete: Option<PreparedDeleteContext> = None;
+    // 复核决定只保留在当前 Desktop 进程，并按中心运行与组隔离。
+    let mut review_boards = BTreeMap::<(AnalysisRunId, String), ReviewBoard>::new();
+    let mut result_windows = CentralResultWindowCache::new();
+    let mut group_window_state = ResultWindowState::<crate::results::GroupView>::empty();
+    let mut member_window_state = ResultWindowState::<MemberView>::empty();
+    let mut active_window_request = ActiveWindowRequest {
+        groups: None,
+        members: None,
+    };
     let mut reconnect_ticks = repeating_interval(state.config().reconnect_interval_seconds);
     let mut catch_up_ticks = repeating_interval(AUTO_CATCH_UP_INTERVAL_SECONDS);
     let mut runtime_ticks = runtime_task_interval();
@@ -472,7 +470,7 @@ async fn run_controller(
                 None => break,
             },
             _ = reconnect_ticks.tick() => {
-                reconnect_and_sync(
+                let result_lost = reconnect_and_sync(
                     &mut state,
                     &mut sessions,
                     &mut central,
@@ -480,6 +478,17 @@ async fn run_controller(
                     &sync_result_sender,
                     &runtime_tasks,
                 ).await;
+                if result_lost {
+                    mark_result_windows_stale(
+                        &mut group_window_state,
+                        &mut member_window_state,
+                        &mut loaded_members,
+                        &mut prepared_delete,
+                        &mut result_windows,
+                        &active_window_request,
+                        &events,
+                    ).await;
+                }
                 reconcile_and_publish_runtime_tasks(
                     &sessions,
                     &mut runtime_watchers,
@@ -492,7 +501,7 @@ async fn run_controller(
                 continue;
             }
             _ = catch_up_ticks.tick() => {
-                catch_up_and_refresh(
+                let result_lost = catch_up_and_refresh(
                     &mut state,
                     &mut sessions,
                     &mut central,
@@ -500,6 +509,17 @@ async fn run_controller(
                     &sync_result_sender,
                     &runtime_tasks,
                 ).await;
+                if result_lost {
+                    mark_result_windows_stale(
+                        &mut group_window_state,
+                        &mut member_window_state,
+                        &mut loaded_members,
+                        &mut prepared_delete,
+                        &mut result_windows,
+                        &active_window_request,
+                        &events,
+                    ).await;
+                }
                 reconcile_and_publish_runtime_tasks(
                     &sessions,
                     &mut runtime_watchers,
@@ -512,7 +532,7 @@ async fn run_controller(
                 continue;
             }
             Some(sync_result) = sync_results.recv() => {
-                apply_sync_result(
+                let result_lost = apply_sync_result(
                     sync_result,
                     &mut state,
                     &mut sessions,
@@ -520,6 +540,17 @@ async fn run_controller(
                     &mut sync_workers,
                     &events,
                 ).await;
+                if result_lost {
+                    mark_result_windows_stale(
+                        &mut group_window_state,
+                        &mut member_window_state,
+                        &mut loaded_members,
+                        &mut prepared_delete,
+                        &mut result_windows,
+                        &active_window_request,
+                        &events,
+                    ).await;
+                }
                 reconcile_and_publish_runtime_tasks(
                     &sessions,
                     &mut runtime_watchers,
@@ -615,13 +646,25 @@ async fn run_controller(
             }
             UiCommand::Refresh => {
                 let report = refresh_nodes(&mut state, &sessions, central.as_ref()).await;
-                apply_refresh_report(
+                let result_lost = apply_refresh_report(
                     report,
                     &mut state,
                     &mut sessions,
                     &mut central,
                     &mut sync_workers,
                 );
+                if result_lost {
+                    mark_result_windows_stale(
+                        &mut group_window_state,
+                        &mut member_window_state,
+                        &mut loaded_members,
+                        &mut prepared_delete,
+                        &mut result_windows,
+                        &active_window_request,
+                        &events,
+                    )
+                    .await;
+                }
                 Ok(())
             }
             UiCommand::SyncNow { index } => queue_manual(index, &sync_workers).await,
@@ -651,21 +694,6 @@ async fn run_controller(
                 parent_path,
                 cursor,
             } => browse_paths(node_index, &parent_path, &cursor, &sessions, &events).await,
-            UiCommand::StartLocalAnalysis {
-                node_index,
-                scan_task_ids,
-                kind,
-            } => {
-                start_local_analysis(
-                    node_index,
-                    &scan_task_ids,
-                    kind,
-                    state.config(),
-                    &sessions,
-                    &events,
-                )
-                .await
-            }
             UiCommand::StartCrossAnalysis { selections } => {
                 start_cross_analysis(
                     &selections,
@@ -698,63 +726,152 @@ async fn run_controller(
                 )
                 .await
             }
-            UiCommand::LoadGroups {
-                central: use_central,
-                node_index,
-                analysis_run_id,
-                kind,
-                cursor,
-            } => {
-                load_groups(
-                    use_central,
-                    node_index,
-                    &analysis_run_id,
-                    kind,
-                    &cursor,
-                    &sessions,
-                    central.as_ref(),
-                    &events,
-                )
-                .await
-            }
-            UiCommand::LoadMembers {
-                central: use_central,
-                node_index,
-                analysis_run_id,
-                group_id,
-                kind,
-                cursor,
-            } => {
-                let result = load_members(
-                    use_central,
-                    node_index,
-                    &analysis_run_id,
-                    &group_id,
-                    kind,
-                    &cursor,
-                    &sessions,
-                    central.as_ref(),
-                )
-                .await;
-                match result {
-                    Ok(context) => {
-                        let page = MemberPage {
-                            items: context.items.clone(),
-                            next_cursor: context.next_cursor.clone(),
-                        };
-                        loaded_members = Some(context);
+            UiCommand::RequestGroupWindow { request } => {
+                async {
+                    let previous = active_window_request.groups.replace(request.clone());
+                    let scope_changed = previous.as_ref().is_some_and(|old| {
+                        old.analysis_run_id != request.analysis_run_id || old.kind != request.kind
+                    });
+                    if scope_changed {
+                        if let Some(old_run) = previous
+                            .as_ref()
+                            .and_then(|old| parse_analysis_id(&old.analysis_run_id).ok())
+                        {
+                            result_windows.clear_run(old_run);
+                        }
+                        loaded_members = None;
                         prepared_delete = None;
+                        member_window_state = ResultWindowState::empty();
+                        active_window_request.members = None;
                         send_event(
                             &events,
                             UiEvent::MembersChanged {
-                                group_id,
-                                page: Box::new(page),
+                                group_id: String::new(),
+                                window: Box::new(ResultWindowState::empty()),
                             },
                         )
-                        .await
+                        .await?;
+                        group_window_state = ResultWindowState::empty();
                     }
-                    Err(error) => Err(error),
+                    let loading = group_window_state.with_loading(true);
+                    group_window_state = loading.clone();
+                    send_event(&events, UiEvent::GroupsChanged(Box::new(loading))).await?;
+                    let result =
+                        load_group_window(&mut result_windows, &request, central.as_ref()).await;
+                    if active_window_request.groups.as_ref() != Some(&request) {
+                        Ok(())
+                    } else {
+                        match result {
+                            Ok(window) => {
+                                group_window_state = window.clone();
+                                loaded_members = None;
+                                prepared_delete = None;
+                                member_window_state = ResultWindowState::empty();
+                                send_event(&events, UiEvent::GroupsChanged(Box::new(window))).await
+                            }
+                            Err(error) => {
+                                let stale = group_window_state.as_stale();
+                                group_window_state = stale.clone();
+                                send_event(&events, UiEvent::GroupsChanged(Box::new(stale)))
+                                    .await?;
+                                Err(error)
+                            }
+                        }
+                    }
                 }
+                .await
+            }
+            UiCommand::RequestMemberWindow { request, group_id } => {
+                async {
+                    // 成员范围变化后，旧确认快照不再与当前窗口绑定。
+                    prepared_delete = None;
+                    let previous = active_window_request
+                        .members
+                        .replace((group_id.clone(), request.clone()));
+                    let context_changed = previous.as_ref().is_some_and(|(old_group, old)| {
+                        old_group != &group_id
+                            || old.analysis_run_id != request.analysis_run_id
+                            || old.kind != request.kind
+                    });
+                    if context_changed {
+                        loaded_members = None;
+                        prepared_delete = None;
+                        member_window_state = ResultWindowState::empty();
+                    }
+                    let loading = member_window_state.with_loading(true);
+                    member_window_state = loading.clone();
+                    send_event(
+                        &events,
+                        UiEvent::MembersChanged {
+                            group_id: group_id.clone(),
+                            window: Box::new(loading),
+                        },
+                    )
+                    .await?;
+                    let result = load_member_window(
+                        &mut result_windows,
+                        &request,
+                        &group_id,
+                        &sessions,
+                        central.as_ref(),
+                    )
+                    .await;
+                    if active_window_request.members.as_ref()
+                        != Some(&(group_id.clone(), request.clone()))
+                    {
+                        Ok(())
+                    } else {
+                        match result {
+                            Ok(mut window) => {
+                                let run_id = parse_analysis_id(&request.analysis_run_id)?;
+                                let board_key = (run_id, group_id.clone());
+                                let board = review_boards
+                                    .entry(board_key)
+                                    .or_insert_with(|| {
+                                        ReviewBoard::for_central(run_id, &group_id, &window.items)
+                                    })
+                                    .clone();
+                                for member in &mut window.items {
+                                    member.review = board.decision(&member.location);
+                                }
+                                let context = LoadedMembersContext {
+                                    scope: ResultScope::Central { run_id },
+                                    kind: request.kind,
+                                    group_id: group_id.clone(),
+                                    run_id,
+                                    items: window.items.clone(),
+                                    review_board: board,
+                                    window: window.clone(),
+                                };
+                                member_window_state = window.clone();
+                                loaded_members = Some(context);
+                                prepared_delete = None;
+                                send_event(
+                                    &events,
+                                    UiEvent::MembersChanged {
+                                        group_id,
+                                        window: Box::new(window),
+                                    },
+                                )
+                                .await
+                            }
+                            Err(error) => {
+                                let stale = member_window_state.as_stale();
+                                member_window_state = stale.clone();
+                                send_event(
+                                    &events,
+                                    UiEvent::MembersChanged {
+                                        group_id,
+                                        window: Box::new(stale),
+                                    },
+                                )
+                                .await?;
+                                Err(error)
+                            }
+                        }
+                    }
+                }
+                .await
             }
             UiCommand::SaveReview {
                 machine_id,
@@ -762,27 +879,43 @@ async fn run_controller(
                 decision,
             } => {
                 prepared_delete = None;
-                save_one_review(
-                    &machine_id,
-                    &normalized_path,
-                    decision,
-                    loaded_members.as_mut(),
-                    &sessions,
-                    central.as_ref(),
-                    &events,
-                )
-                .await
+                if let Err(error) = result_window_write_error(
+                    &group_window_state,
+                    &member_window_state,
+                    loaded_members.as_ref(),
+                ) {
+                    Err(error)
+                } else {
+                    save_one_review(
+                        &machine_id,
+                        &normalized_path,
+                        decision,
+                        loaded_members.as_mut(),
+                        &mut review_boards,
+                        central.as_ref(),
+                        &events,
+                    )
+                    .await
+                }
             }
             UiCommand::ApplyQuickReview(rule) => {
                 prepared_delete = None;
-                apply_quick_review(
-                    rule,
-                    loaded_members.as_mut(),
-                    &sessions,
-                    central.as_ref(),
-                    &events,
-                )
-                .await
+                if let Err(error) = result_window_write_error(
+                    &group_window_state,
+                    &member_window_state,
+                    loaded_members.as_ref(),
+                ) {
+                    Err(error)
+                } else {
+                    apply_quick_review(
+                        rule,
+                        loaded_members.as_mut(),
+                        &mut review_boards,
+                        central.as_ref(),
+                        &events,
+                    )
+                    .await
+                }
             }
             UiCommand::LoadPreview {
                 machine_id,
@@ -798,28 +931,57 @@ async fn run_controller(
                 .await
             }
             UiCommand::PrepareDelete => {
-                prepare_delete(
-                    state.config().delete_mode,
+                if let Err(error) = result_window_write_error(
+                    &group_window_state,
+                    &member_window_state,
                     loaded_members.as_ref(),
-                    &sessions,
-                    central.as_ref(),
-                    &mut prepared_delete,
-                    &events,
-                    &runtime_tasks,
-                )
-                .await
+                ) {
+                    Err(error)
+                } else {
+                    prepare_delete(
+                        state.config().delete_mode,
+                        loaded_members.as_ref(),
+                        &sessions,
+                        central.as_ref(),
+                        &mut prepared_delete,
+                        &events,
+                        &runtime_tasks,
+                    )
+                    .await
+                }
             }
             UiCommand::ConfirmDelete => {
-                let result = confirm_delete(
-                    prepared_delete.as_ref(),
-                    &sessions,
-                    central.as_mut(),
-                    &events,
-                )
-                .await;
+                let result = if let Err(error) = result_window_write_error(
+                    &group_window_state,
+                    &member_window_state,
+                    loaded_members.as_ref(),
+                ) {
+                    Err(error)
+                } else {
+                    confirm_delete(
+                        prepared_delete.as_ref(),
+                        &sessions,
+                        central.as_mut(),
+                        &events,
+                    )
+                    .await
+                };
                 if result.is_ok() {
                     prepared_delete = None;
                     loaded_members = None;
+                    if let Some(request) = active_window_request.groups.as_ref() {
+                        if let Ok(run_id) = parse_analysis_id(&request.analysis_run_id) {
+                            result_windows.clear_run(run_id);
+                            review_boards.retain(|(id, _), _| *id != run_id);
+                        }
+                    }
+                    group_window_state = ResultWindowState::empty();
+                    member_window_state = ResultWindowState::empty();
+                    let _ = send_event(
+                        &events,
+                        UiEvent::GroupsChanged(Box::new(ResultWindowState::empty())),
+                    )
+                    .await;
                 }
                 result
             }
@@ -864,6 +1026,16 @@ async fn run_controller(
                     sessions.clear();
                     sync_workers.clear();
                     central = connect_central(&mut state).await;
+                    mark_result_windows_stale(
+                        &mut group_window_state,
+                        &mut member_window_state,
+                        &mut loaded_members,
+                        &mut prepared_delete,
+                        &mut result_windows,
+                        &active_window_request,
+                        &events,
+                    )
+                    .await;
                     reconnect_ticks = repeating_interval(state.config().reconnect_interval_seconds);
                 }
                 result
@@ -1461,7 +1633,8 @@ fn apply_refresh_report(
     sessions: &mut BTreeMap<usize, Arc<NodeSession>>,
     central: &mut Option<CentralStore>,
     workers: &mut BTreeMap<usize, NodeSyncWorker>,
-) {
+) -> bool {
+    let mut result_lost = false;
     for index in report.failed_sessions {
         sessions.remove(&index);
         workers.remove(&index);
@@ -1469,7 +1642,9 @@ fn apply_refresh_report(
     if let Some(error) = report.central_error {
         central.take();
         state.set_postgres_health(PostgresHealth::Error(error));
+        result_lost = true;
     }
+    result_lost
 }
 
 /// 把后台同步结果归并回唯一视图；过期机器结果不能写入已编辑的节点行。
@@ -1480,16 +1655,17 @@ async fn apply_sync_result(
     central: &mut Option<CentralStore>,
     workers: &mut BTreeMap<usize, NodeSyncWorker>,
     events: &mpsc::Sender<UiEvent>,
-) {
+) -> bool {
     if workers.get(&result.index).map(|worker| worker.id) != Some(result.worker_id) {
-        return;
+        return false;
     }
     let current_machine = sessions
         .get(&result.index)
         .map(|session| session.machine_id().as_str());
     if current_machine != Some(result.machine_id.as_str()) {
-        return;
+        return false;
     }
+    let mut result_lost = false;
     match result.outcome {
         NodeSyncOutcome::Succeeded {
             committed_seq,
@@ -1507,6 +1683,7 @@ async fn apply_sync_result(
             if central_failed {
                 central.take();
                 state.set_postgres_health(PostgresHealth::Error(message.clone()));
+                result_lost = true;
             }
             if session_failed {
                 sessions.remove(&result.index);
@@ -1521,6 +1698,7 @@ async fn apply_sync_result(
                 .await;
         }
     }
+    result_lost
 }
 
 /// 固定重连 tick：清除已断会话并重试节点/中心；任务终态由 RuntimeTask 事件触发同步。
@@ -1531,9 +1709,9 @@ async fn reconnect_and_sync(
     workers: &mut BTreeMap<usize, NodeSyncWorker>,
     results: &mpsc::UnboundedSender<NodeSyncEvent>,
     runtime_tasks: &DesktopRuntimeTaskRegistry,
-) {
+) -> bool {
     let report = refresh_nodes(state, sessions, central.as_ref()).await;
-    apply_refresh_report(report, state, sessions, central, workers);
+    let result_lost = apply_refresh_report(report, state, sessions, central, workers);
     if central.is_none() && state.config().postgres_url.is_some() {
         *central = connect_central(state).await;
     }
@@ -1547,6 +1725,7 @@ async fn reconnect_and_sync(
         runtime_tasks,
     );
     queue_automatic(&connected_nodes, workers, AutomaticSyncCause::Connected).await;
+    result_lost
 }
 
 /// 固定五秒追赶 tick：刷新任务后只排队，不等待任一节点完成同步。
@@ -1557,9 +1736,9 @@ async fn catch_up_and_refresh(
     workers: &mut BTreeMap<usize, NodeSyncWorker>,
     results: &mpsc::UnboundedSender<NodeSyncEvent>,
     runtime_tasks: &DesktopRuntimeTaskRegistry,
-) {
+) -> bool {
     let report = refresh_nodes(state, sessions, central.as_ref()).await;
-    apply_refresh_report(report, state, sessions, central, workers);
+    let result_lost = apply_refresh_report(report, state, sessions, central, workers);
     let indexes = sessions.keys().copied().collect::<Vec<_>>();
     ensure_sync_workers(
         &indexes,
@@ -1570,6 +1749,48 @@ async fn catch_up_and_refresh(
         runtime_tasks,
     );
     queue_automatic(&indexes, workers, AutomaticSyncCause::CatchUp).await;
+    result_lost
+}
+
+/// 中心连接失效时保留已读窗口，但撤销所有会改变结果的进程内操作。
+async fn mark_result_windows_stale(
+    groups: &mut ResultWindowState<crate::results::GroupView>,
+    members: &mut ResultWindowState<MemberView>,
+    loaded: &mut Option<LoadedMembersContext>,
+    prepared: &mut Option<PreparedDeleteContext>,
+    cache: &mut CentralResultWindowCache,
+    active: &ActiveWindowRequest,
+    events: &mpsc::Sender<UiEvent>,
+) {
+    *prepared = None;
+    for run_id in active
+        .groups
+        .iter()
+        .chain(active.members.iter().map(|(_, request)| request))
+        .filter_map(|request| parse_analysis_id(&request.analysis_run_id).ok())
+    {
+        cache.clear_run(run_id);
+    }
+    if active.groups.is_some() {
+        let stale = groups.as_stale();
+        *groups = stale.clone();
+        let _ = send_event(events, UiEvent::GroupsChanged(Box::new(stale))).await;
+    }
+    if let Some((group_id, _)) = active.members.as_ref() {
+        let stale = members.as_stale();
+        *members = stale.clone();
+        if let Some(context) = loaded.as_mut() {
+            context.window = stale.clone();
+        }
+        let _ = send_event(
+            events,
+            UiEvent::MembersChanged {
+                group_id: group_id.clone(),
+                window: Box::new(stale),
+            },
+        )
+        .await;
+    }
 }
 
 /// 创建错过 tick 后从当前时刻继续计时的固定间隔，避免恢复时突发补跑。
@@ -1751,37 +1972,6 @@ async fn browse_paths(
         .map_err(|_| "UI 事件通道已经关闭".to_owned())
 }
 
-async fn start_local_analysis(
-    node_index: usize,
-    task_text: &str,
-    kind: GroupKind,
-    config: &DesktopConfig,
-    sessions: &BTreeMap<usize, Arc<NodeSession>>,
-    events: &mpsc::Sender<UiEvent>,
-) -> Result<(), String> {
-    let session = sessions
-        .get(&node_index)
-        .ok_or_else(|| "节点当前未连接".to_owned())?;
-    let tasks = parse_task_ids(task_text)?;
-    let run_id = session
-        .create_local_analysis(&tasks, wire_group_kind(kind), &config.thresholds)
-        .await
-        .map_err(|error| error.to_string())?;
-    let run = session
-        .query_analysis_run(run_id)
-        .await
-        .map_err(|error| error.to_string())?;
-    send_event(
-        events,
-        UiEvent::AnalysisStarted {
-            central: false,
-            run_id: run.analysis_run_id,
-            status: run.state,
-        },
-    )
-    .await
-}
-
 async fn start_cross_analysis(
     text: &str,
     config: &DesktopConfig,
@@ -1867,89 +2057,86 @@ async fn poll_cross_analysis(
     send_event(events, UiEvent::CrossAnalysisChanged(report)).await
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn load_groups(
-    use_central: bool,
-    node_index: usize,
-    run_text: &str,
-    kind: GroupKind,
-    cursor: &str,
-    sessions: &BTreeMap<usize, Arc<NodeSession>>,
+/// 确认中心运行已经完成；未完成运行绝不能向结果页提供数据。
+async fn ensure_completed(
     central: Option<&CentralStore>,
-    events: &mpsc::Sender<UiEvent>,
+    run_id: AnalysisRunId,
 ) -> Result<(), String> {
-    let run_id = parse_analysis_id(run_text)?;
-    let page = if use_central {
-        let central = central.ok_or_else(|| "PostgreSQL 中心模式未启用".to_owned())?;
-        let mut page = group_page_from_central(
-            central
-                .page_groups(run_id, non_empty(cursor), 100)
-                .await
-                .map_err(|error| error.to_string())?,
-        );
-        page.items.retain(|group| group.kind == kind);
-        page
-    } else {
-        let session = sessions
-            .get(&node_index)
-            .ok_or_else(|| "节点当前未连接".to_owned())?;
-        group_page_from_node(
-            session
-                .list_groups(run_id, wire_group_kind(kind), cursor, 100)
-                .await
-                .map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string())?
-    };
-    send_event(events, UiEvent::GroupsChanged(Box::new(page))).await
+    let central = central.ok_or_else(|| "PostgreSQL 中心模式未启用".to_owned())?;
+    let snapshot = central
+        .analysis_run_snapshot(run_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    if snapshot.status != CentralAnalysisStatus::Completed {
+        return Err(format!(
+            "中心分析尚未完成，当前状态为 {}",
+            snapshot.status.as_str()
+        ));
+    }
+    Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn load_members(
-    use_central: bool,
-    node_index: usize,
-    run_text: &str,
+/// 通过中心有限窗口缓存读取一页组结果；不会回退到节点 SQLite。
+async fn load_group_window(
+    cache: &mut CentralResultWindowCache,
+    request: &ResultWindowRequest,
+    central: Option<&CentralStore>,
+) -> Result<ResultWindowState<crate::results::GroupView>, String> {
+    let run_id = parse_analysis_id(&request.analysis_run_id)?;
+    ensure_completed(central, run_id).await?;
+    cache
+        .load_groups(
+            central.expect("完成门禁已确认中心连接存在"),
+            run_id,
+            request.kind,
+            request.start_index,
+            request.normalized_visible_count(),
+        )
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// 通过中心有限窗口缓存读取成员，并依据当前在线会话计算预览门禁。
+async fn load_member_window(
+    cache: &mut CentralResultWindowCache,
+    request: &ResultWindowRequest,
     group_id: &str,
-    kind: GroupKind,
-    cursor: &str,
     sessions: &BTreeMap<usize, Arc<NodeSession>>,
     central: Option<&CentralStore>,
-) -> Result<LoadedMembersContext, String> {
-    let run_id = parse_analysis_id(run_text)?;
-    let (scope, page) = if use_central {
-        let central = central.ok_or_else(|| "PostgreSQL 中心模式未启用".to_owned())?;
-        let online = sessions
-            .values()
-            .map(|session| session.machine_id().clone())
-            .collect::<std::collections::BTreeSet<_>>();
-        let page = central
-            .page_group_members(run_id, group_id, non_empty(cursor), 200)
-            .await
-            .map_err(|error| error.to_string())?;
-        (
-            ResultScope::Central { run_id },
-            member_page_from_central(page, |machine| online.contains(machine)),
+) -> Result<ResultWindowState<MemberView>, String> {
+    let run_id = parse_analysis_id(&request.analysis_run_id)?;
+    ensure_completed(central, run_id).await?;
+    let online = sessions
+        .values()
+        .map(|session| session.machine_id().clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    cache
+        .load_members(
+            central.expect("完成门禁已确认中心连接存在"),
+            run_id,
+            group_id,
+            request.start_index,
+            request.normalized_visible_count(),
+            |machine| online.contains(machine),
         )
-    } else {
-        let session = sessions
-            .get(&node_index)
-            .ok_or_else(|| "节点当前未连接".to_owned())?;
-        let page = session
-            .list_group_members(run_id, group_id, cursor, 200)
-            .await
-            .map_err(|error| error.to_string())?;
-        (
-            ResultScope::Local { node_index, run_id },
-            member_page_from_node(page, true).map_err(|error| error.to_string())?,
-        )
-    };
-    Ok(LoadedMembersContext {
-        scope,
-        kind,
-        group_id: group_id.into(),
-        items: page.items,
-        next_cursor: page.next_cursor,
-    })
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// 结果窗口加载中或文件库已变化时，只允许读取和预览，不接受复核/删除写入。
+fn result_window_write_error(
+    groups: &ResultWindowState<crate::results::GroupView>,
+    members: &ResultWindowState<MemberView>,
+    context: Option<&LoadedMembersContext>,
+) -> Result<(), String> {
+    let context = context.ok_or_else(|| "尚未载入重复组成员".to_owned())?;
+    if groups.loading || members.loading || context.window.loading {
+        return Err("结果窗口正在加载，请等待当前窗口完成".into());
+    }
+    if groups.stale || members.stale || context.window.stale {
+        return Err("文件库已变化，结果只读".into());
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1958,7 +2145,7 @@ async fn save_one_review(
     path: &str,
     decision: ReviewDecision,
     context: Option<&mut LoadedMembersContext>,
-    sessions: &BTreeMap<usize, Arc<NodeSession>>,
+    review_boards: &mut BTreeMap<(AnalysisRunId, String), ReviewBoard>,
     central: Option<&CentralStore>,
     events: &mpsc::Sender<UiEvent>,
 ) -> Result<(), String> {
@@ -1967,15 +2154,11 @@ async fn save_one_review(
     if !context.items.iter().any(|item| item.location == location) {
         return Err("复核位置不在当前组窗口中".into());
     }
-    persist_review(
-        context.scope,
-        &context.group_id,
-        &location,
-        decision,
-        sessions,
-        central,
-    )
-    .await?;
+    let run_id = context.run_id;
+    let group_id = context.group_id.clone();
+    persist_central_review(central, run_id, &group_id, &location, decision).await?;
+    context.review_board.set(location.clone(), decision);
+    review_boards.insert((run_id, group_id), context.review_board.clone());
     if let Some(member) = context
         .items
         .iter_mut()
@@ -1989,54 +2172,50 @@ async fn save_one_review(
 async fn apply_quick_review(
     rule: QuickReviewRule,
     context: Option<&mut LoadedMembersContext>,
-    sessions: &BTreeMap<usize, Arc<NodeSession>>,
+    review_boards: &mut BTreeMap<(AnalysisRunId, String), ReviewBoard>,
     central: Option<&CentralStore>,
     events: &mpsc::Sender<UiEvent>,
 ) -> Result<(), String> {
     let context = context.ok_or_else(|| "尚未载入重复组成员".to_owned())?;
-    let mut board = ReviewBoard::from_members(&context.items);
-    let changes = board.apply_quick_rule(&context.items, rule);
+    let mut next_board = context.review_board.clone();
+    let changes = next_board.apply_quick_rule(&context.items, rule);
     if changes.is_empty() {
         return Err("当前组没有满足快捷规则的活动成员".into());
     }
     for change in &changes {
-        persist_review(
-            context.scope,
+        persist_central_review(
+            central,
+            context.run_id,
             &context.group_id,
             &change.location,
             change.decision,
-            sessions,
-            central,
         )
         .await?;
     }
+    context.review_board = next_board;
+    review_boards.insert(
+        (context.run_id, context.group_id.clone()),
+        context.review_board.clone(),
+    );
     for member in &mut context.items {
-        member.review = board.decision(&member.location);
+        member.review = context.review_board.decision(&member.location);
     }
     publish_members(events, context).await
 }
 
-async fn persist_review(
-    scope: ResultScope,
+/// 暂时保留中心复核持久化兼容调用；Task13 再移除该边界。
+async fn persist_central_review(
+    central: Option<&CentralStore>,
+    run_id: AnalysisRunId,
     group_id: &str,
     location: &LocationKey,
     decision: ReviewDecision,
-    sessions: &BTreeMap<usize, Arc<NodeSession>>,
-    central: Option<&CentralStore>,
 ) -> Result<(), String> {
-    match scope {
-        ResultScope::Local { node_index, run_id } => sessions
-            .get(&node_index)
-            .ok_or_else(|| "节点当前未连接".to_owned())?
-            .save_review_mark(run_id, group_id, location, wire_review(decision))
-            .await
-            .map_err(|error| error.to_string()),
-        ResultScope::Central { run_id } => central
-            .ok_or_else(|| "PostgreSQL 中心模式未启用".to_owned())?
-            .save_review_mark(run_id, group_id, location, central_review(decision))
-            .await
-            .map_err(|error| error.to_string()),
-    }
+    central
+        .ok_or_else(|| "PostgreSQL 中心模式未启用".to_owned())?
+        .save_review_mark(run_id, group_id, location, central_review(decision))
+        .await
+        .map_err(|error| error.to_string())
 }
 
 async fn load_member_preview(
@@ -2125,52 +2304,20 @@ async fn load_complete_review_group(
     sessions: &BTreeMap<usize, Arc<NodeSession>>,
     central: Option<&CentralStore>,
 ) -> Result<ReviewGroup, String> {
-    let mut members = Vec::new();
-    let mut cursor = None::<String>;
-    let mut seen = std::collections::BTreeSet::new();
-    loop {
-        let page = match context.scope {
-            ResultScope::Local { node_index, run_id } => {
-                let session = sessions
-                    .get(&node_index)
-                    .ok_or_else(|| "节点当前未连接".to_owned())?;
-                member_page_from_node(
-                    session
-                        .list_group_members(
-                            run_id,
-                            &context.group_id,
-                            cursor.as_deref().unwrap_or_default(),
-                            200,
-                        )
-                        .await
-                        .map_err(|error| error.to_string())?,
-                    true,
-                )
-                .map_err(|error| error.to_string())?
-            }
-            ResultScope::Central { run_id } => {
-                let central = central.ok_or_else(|| "PostgreSQL 中心模式未启用".to_owned())?;
-                let online = sessions
-                    .values()
-                    .map(|session| session.machine_id().clone())
-                    .collect::<std::collections::BTreeSet<_>>();
-                member_page_from_central(
-                    central
-                        .page_group_members(run_id, &context.group_id, cursor.as_deref(), 200)
-                        .await
-                        .map_err(|error| error.to_string())?,
-                    |machine| online.contains(machine),
-                )
-            }
-        };
-        members.extend(page.items);
-        let Some(next) = page.next_cursor else {
-            break;
-        };
-        if !seen.insert(next.clone()) {
-            return Err("组成员分页游标没有前进".into());
-        }
-        cursor = Some(next);
+    let central = central.ok_or_else(|| "PostgreSQL 中心模式未启用".to_owned())?;
+    let online = sessions
+        .values()
+        .map(|session| session.machine_id().clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut cache = CentralResultWindowCache::new();
+    let mut members = cache
+        .load_all_members(central, context.run_id, &context.group_id, |machine| {
+            online.contains(machine)
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    for member in &mut members {
+        member.review = context.review_board.decision(&member.location);
     }
     Ok(ReviewGroup::new(&context.group_id, members))
 }
@@ -2186,40 +2333,15 @@ async fn confirm_delete(
         return Err("删除确认门禁未通过".into());
     }
     let executed: Result<Vec<proto::DeleteItem>, String> = async {
-        match prepared.scope {
-            ResultScope::Local { node_index, run_id } => {
-                let items = prepared
-                    .items
-                    .iter()
-                    .map(|member| proto::DeleteItem {
-                        delete_item_id: String::new(),
-                        group_id: prepared.group_id.clone(),
-                        location: Some((&member.location).into()),
-                        expected_content: Some((&member.content).into()),
-                        outcome: String::new(),
-                        message: String::new(),
-                    })
-                    .collect();
-                sessions
-                    .get(&node_index)
-                    .ok_or_else(|| "节点当前未连接".to_owned())?
-                    .create_delete_batch(run_id, items, prepared.confirmation.mode)
-                    .await
-                    .map(|batch| batch.items)
-                    .map_err(|error| error.to_string())
-            }
-            ResultScope::Central { run_id } => {
-                execute_central_delete(
-                    run_id,
-                    &prepared.group_id,
-                    &prepared.items,
-                    prepared.confirmation.mode,
-                    sessions,
-                    central.ok_or_else(|| "PostgreSQL 中心模式未启用".to_owned())?,
-                )
-                .await
-            }
-        }
+        execute_central_delete(
+            prepared.scope.run_id(),
+            &prepared.group_id,
+            &prepared.items,
+            prepared.confirmation.mode,
+            sessions,
+            central.ok_or_else(|| "PostgreSQL 中心模式未启用".to_owned())?,
+        )
+        .await
     }
     .await;
     match executed {
@@ -2343,9 +2465,12 @@ async fn publish_members(
 ) -> Result<(), String> {
     send_event(
         events,
-        UiEvent::ReviewChanged(Box::new(MemberPage {
+        UiEvent::ReviewChanged(Box::new(ResultWindowState {
+            start_index: context.window.start_index,
+            total_rows: context.window.total_rows,
             items: context.items.clone(),
-            next_cursor: context.next_cursor.clone(),
+            loading: false,
+            stale: context.window.stale,
         })),
     )
     .await
@@ -2356,24 +2481,6 @@ async fn send_event(events: &mpsc::Sender<UiEvent>, event: UiEvent) -> Result<()
         .send(event)
         .await
         .map_err(|_| "UI 事件通道已经关闭".to_owned())
-}
-
-fn parse_task_ids(text: &str) -> Result<Vec<TaskId>, String> {
-    let tasks = text
-        .split([',', ';', '\n'])
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| {
-            Uuid::parse_str(value)
-                .map(TaskId::from_uuid)
-                .map_err(|_| format!("任务 ID 不是 UUID: {value}"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if tasks.is_empty() {
-        Err("至少填写一个扫描任务 ID".into())
-    } else {
-        Ok(tasks)
-    }
 }
 
 fn parse_cross_selections(text: &str) -> Result<Vec<(usize, TaskId)>, String> {
@@ -2425,32 +2532,12 @@ fn session_by_machine<'a>(
         .map(Arc::as_ref)
 }
 
-const fn wire_group_kind(kind: GroupKind) -> proto::GroupKind {
-    match kind {
-        GroupKind::Exact => proto::GroupKind::GroupExact,
-        GroupKind::SimilarImage => proto::GroupKind::GroupSimilarImage,
-        GroupKind::SimilarVideo => proto::GroupKind::GroupSimilarVideo,
-    }
-}
-
-const fn wire_review(decision: ReviewDecision) -> proto::ReviewDecision {
-    match decision {
-        ReviewDecision::Undecided => proto::ReviewDecision::ReviewUndecided,
-        ReviewDecision::Keep => proto::ReviewDecision::ReviewKeep,
-        ReviewDecision::Delete => proto::ReviewDecision::ReviewDelete,
-    }
-}
-
 const fn central_review(decision: ReviewDecision) -> CentralReviewDecision {
     match decision {
         ReviewDecision::Undecided => CentralReviewDecision::Undecided,
         ReviewDecision::Keep => CentralReviewDecision::Keep,
         ReviewDecision::Delete => CentralReviewDecision::Delete,
     }
-}
-
-fn non_empty(value: &str) -> Option<&str> {
-    (!value.is_empty()).then_some(value)
 }
 
 async fn connect_central(state: &mut DesktopViewState) -> Option<CentralStore> {

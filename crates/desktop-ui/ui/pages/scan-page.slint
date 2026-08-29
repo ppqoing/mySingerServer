@@ -1,4 +1,4 @@
-// 新建扫描页只转发现有扫描与本地分析参数，不扩展后端命令。
+// 新建扫描页只转发现有扫描参数；结果分析统一由中心分析工作区提供。
 
 import { CheckBox, ComboBox, LineEdit, ScrollView } from "std-widgets.slint";
 import { Theme, UiScanRootRow } from "../theme.slint";
@@ -17,15 +17,12 @@ export component ScanPage inherits Rectangle {
     in-out property <int> selected-node;
     in-out property <int> enumerator-index;
     in-out property <bool> force-recalculate;
-    in-out property <string> analysis-task-ids;
-    in-out property <int> analysis-kind-index;
     callback add-root();
     callback update-root(int, string);
     callback remove-root(int);
     callback select-node(int);
     callback browse-root(int, int, string);
     callback start-scan(int, [UiScanRootRow], bool, int);
-    callback start-analysis(int, string, int);
 
     background: transparent;
 
@@ -170,56 +167,6 @@ export component ScanPage inherits Rectangle {
                             color: root.scan-roots-valid ? Theme.muted : Theme.danger;
                             font-size: 11px;
                             overflow: elide;
-                        }
-                    }
-                }
-
-                // 本地分析保留任务 UUID、类型、门禁状态与既有三参数回调。
-                FluentCard {
-                    height: 178px;
-                    VerticalLayout {
-                        padding-left: 16px;
-                        padding-right: 16px;
-                        padding-top: 14px;
-                        padding-bottom: 14px;
-                        spacing: 9px;
-                        HorizontalLayout {
-                            Text { text: "本地分析"; color: Theme.text; font-size: 16px; font-weight: 680; }
-                            Rectangle { horizontal-stretch: 1; background: transparent; }
-                            StatusPill {
-                                label: root.filtering-enabled ? "可以筛选" : "等待计算";
-                                tone: root.filtering-enabled ? Theme.success : Theme.warning;
-                            }
-                        }
-                        Text {
-                            text: root.filtering-enabled ? "全部节点任务已进入终态。" : root.filtering-reason;
-                            color: Theme.muted;
-                            font-size: 11px;
-                            overflow: elide;
-                        }
-                        LineEdit {
-                            text <=> root.analysis-task-ids;
-                            placeholder-text: "扫描任务 UUID，逗号分隔";
-                            accessible-label: "本地分析任务 ID";
-                        }
-                        HorizontalLayout {
-                            height: 34px;
-                            spacing: 8px;
-                            ComboBox {
-                                model: ["精确重复", "相似图片", "相似视频"];
-                                current-index <=> root.analysis-kind-index;
-                                width: 180px;
-                                accessible-label: "本地分析类型";
-                            }
-                            Rectangle { horizontal-stretch: 1; background: transparent; }
-                            ActionButton {
-                                width: 126px;
-                                label: "开始本地分析";
-                                icon: @image-url("../assets/icons/index.png");
-                                tone: 1;
-                                action-enabled: root.filtering-enabled && root.analysis-task-ids != "";
-                                clicked => { root.start-analysis(root.selected-node, root.analysis-task-ids, root.analysis-kind-index); }
-                            }
                         }
                     }
                 }

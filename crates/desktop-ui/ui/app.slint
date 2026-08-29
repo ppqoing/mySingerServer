@@ -74,8 +74,6 @@ export component MainWindow inherits Window {
     in property <[string]> scan-node-options;
     in-out property <int> enumerator-index: 1;
     in-out property <bool> force-recalculate: false;
-    in-out property <string> analysis-task-ids;
-    in-out property <int> analysis-kind-index: 0;
     // 图形路径选择器由现有节点 BrowsePaths 事件驱动，不引入管理端本机路径假象。
     in-out property <bool> path-picker-open: false;
     in-out property <int> path-picker-node-index: 0;
@@ -85,12 +83,14 @@ export component MainWindow inherits Window {
     in-out property <[UiPathRow]> path-picker-directories;
     in-out property <int> path-picker-target-index: -1;
 
-    in-out property <int> result-source-index: 0;
-    in-out property <int> result-node-index: 0;
     in-out property <string> result-run-id;
     in-out property <string> selected-group-id;
-    in-out property <string> group-next-cursor;
-    in-out property <string> member-next-cursor;
+    in-out property <int> result-start-index: 0;
+    in-out property <int> result-total-rows: 0;
+    in-out property <int> member-start-index: 0;
+    in-out property <int> member-total-rows: 0;
+    in-out property <bool> result-loading: false;
+    in-out property <bool> result-stale: false;
     in-out property <image> preview-image;
     in-out property <string> preview-info;
     // 预览完成状态只供页面关联唯一在途请求，不增加业务回调或持久状态。
@@ -182,12 +182,11 @@ export component MainWindow inherits Window {
     callback update-scan-root(int, string);
     callback remove-scan-root(int);
     callback select-scan-node(int);
-    callback start-local-analysis(int, string, int);
     callback start-cross-analysis(string);
     callback poll-cross-analysis();
     callback retry-cross-analysis();
-    callback load-groups(bool, int, string, int, string);
-    callback load-members(bool, int, string, string, int, string);
+    callback request-group-window(string, int, int, int);
+    callback request-member-window(string, string, int, int, int);
     callback save-review(string, string, int);
     callback quick-review(int, string);
     callback load-preview(string, string);
@@ -262,7 +261,6 @@ export component MainWindow inherits Window {
                     scan-roots: root.scan-roots; scan-roots-valid: root.scan-roots-valid;
                     node-options: root.scan-node-options;
                     selected-node <=> root.scan-node-index; enumerator-index <=> root.enumerator-index; force-recalculate <=> root.force-recalculate;
-                    analysis-task-ids <=> root.analysis-task-ids; analysis-kind-index <=> root.analysis-kind-index;
                     add-root => { root.add-scan-root(); }
                     update-root(index, path) => { root.update-scan-root(index, path); }
                     remove-root(index) => { root.remove-scan-root(index); }
@@ -278,7 +276,6 @@ export component MainWindow inherits Window {
                         root.browse-paths(index, path);
                     }
                     start-scan(index, roots, force, enumerator) => { root.start-scan(index, roots, force, enumerator); }
-                    start-analysis(index, task-ids, kind) => { root.start-local-analysis(index, task-ids, kind); }
                 }
                 if root.current-page == 1 && root.task-mode == 1 : TaskCenterPage {
                     tasks: root.tasks;
@@ -302,13 +299,15 @@ export component MainWindow inherits Window {
                 if root.current-page >= 2 && root.current-page <= 5 : DuplicateWorkspace {
                     duplicate-tab: root.current-page - 2;
                     groups: root.groups; members: root.members;
-                    group-next-cursor: root.group-next-cursor; member-next-cursor: root.member-next-cursor;
+                    result-start-index: root.result-start-index; result-total-rows: root.result-total-rows;
+                    member-start-index: root.member-start-index; member-total-rows: root.member-total-rows;
+                    result-loading: root.result-loading; result-stale: root.result-stale;
                     preview-image: root.preview-image; preview-info: root.preview-info;
-                    source-index <=> root.result-source-index; node-index <=> root.result-node-index; run-id <=> root.result-run-id; selected-group-id <=> root.selected-group-id;
+                    run-id <=> root.result-run-id; selected-group-id <=> root.selected-group-id;
                     cross-selections <=> root.cross-selections; cross-status: root.cross-status; cross-summary: root.cross-summary;
                     select-tab(tab) => { root.current-page = 2 + tab; }
-                    load-groups(central, node, run, kind, cursor) => { root.load-groups(central, node, run, kind, cursor); }
-                    load-members(central, node, run, group, kind, cursor) => { root.load-members(central, node, run, group, kind, cursor); }
+                    request-group-window(run, kind, start, count) => { root.request-group-window(run, kind, start, count); }
+                    request-member-window(run, group, kind, start, count) => { root.request-member-window(run, group, kind, start, count); }
                     save-review(machine, path, decision) => { root.save-review(machine, path, decision); }
                     preview(machine, path) => { root.load-preview(machine, path); }
                     start-cross(selections) => { root.start-cross-analysis(selections); }
@@ -317,6 +316,7 @@ export component MainWindow inherits Window {
                 }
                 if root.current-page == 6 : ReviewDeleteWorkspace {
                     groups: root.groups; members: root.members; selected-group-id: root.selected-group-id;
+                    result-loading: root.result-loading; result-stale: root.result-stale;
                     preview-image: root.preview-image; preview-info: root.preview-info;
                     preview-result-machine: root.preview-result-machine; preview-result-path: root.preview-result-path;
                     preview-result-succeeded: root.preview-result-succeeded; preview-result-sequence: root.preview-result-sequence;

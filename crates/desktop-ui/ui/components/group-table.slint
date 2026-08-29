@@ -1,15 +1,18 @@
-// 高密度重复组表；只消费有限窗口模型，下一页仍由服务端不透明游标驱动。
+// 高密度重复组表；只消费中心有限窗口，滚动时请求行范围并替换当前模型。
 
-import { Button, ScrollView } from "std-widgets.slint";
+import { ScrollView } from "std-widgets.slint";
 import { Theme, UiGroupRow } from "../theme.slint";
 import { EmptyState } from "empty-state.slint";
 
 export component GroupTable inherits Rectangle {
     in property <[UiGroupRow]> groups;
     in property <string> selected-id;
-    in property <bool> has-more;
+    in property <int> start-index;
+    in property <int> total-rows;
+    in property <bool> loading;
+    in property <bool> stale;
     callback select-group(string);
-    callback load-more();
+    callback request-window(int, int);
 
     background: Theme.panel;
     border-radius: 8px;
@@ -38,12 +41,34 @@ export component GroupTable inherits Rectangle {
         if root.groups.length == 0 : EmptyState {
             vertical-stretch: 1;
             title: "当前运行没有此类重复组";
-            detail: "更换来源、节点或运行 ID 后重新加载。";
+            detail: "更换运行 ID 或结果类别后重新加载。";
         }
-        if root.groups.length > 0 : ScrollView {
+        if root.loading : Text {
+            height: 24px;
+            text: "正在读取中心结果窗口…";
+            color: Theme.muted;
+            font-size: 10px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            accessible-label: "结果窗口加载中";
+        }
+        if root.stale : Text {
+            height: 24px;
+            text: "文件库已变化，结果只读";
+            color: Theme.warning;
+            font-size: 10px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            accessible-label: "结果窗口已过期";
+        }
+        if root.groups.length > 0 : result-scroll := ScrollView {
             vertical-stretch: 1;
             VerticalLayout {
                 spacing: 0px;
+                Rectangle {
+                    height: root.start-index * Theme.table-row-height;
+                    background: transparent;
+                }
                 for group in root.groups : row := Rectangle {
                     height: Theme.table-row-height;
                     background: group.id == root.selected-id ? Theme.accent-soft : row-touch.has-hover ? Theme.panel-hover : Theme.panel;
@@ -73,12 +98,18 @@ export component GroupTable inherits Rectangle {
                     }
                     Rectangle { y: parent.height - 1px; height: 1px; background: Theme.border; }
                 }
+                Rectangle {
+                    height: root.total-rows > root.start-index + root.groups.length
+                        ? (root.total-rows - root.start-index - root.groups.length) * Theme.table-row-height
+                        : 0px;
+                    background: transparent;
+                }
             }
-        }
-        if root.has-more : Button {
-            text: "加载下一页";
-            accessible-label: "加载下一页重复组";
-            clicked => { root.load-more(); }
+            scrolled => {
+                // viewport-y 向下滚动时为负值；先换算为全局可见行，再向前保留半窗预读。
+                let next-start = max(0, round(-result-scroll.viewport-y / Theme.table-row-height) - root.groups.length / 2);
+                root.request-window(next-start, max(1, root.groups.length));
+            }
         }
     }
 }

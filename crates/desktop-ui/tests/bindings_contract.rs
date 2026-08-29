@@ -575,18 +575,6 @@ fn root_callbacks_emit_their_ui_commands_and_reject_invalid_settings() {
         } => assert_eq!((node_index, task_id), (0, "cancel-task".into())),
         command => panic!("cancel-task 命令错误：{command:?}"),
     }
-    window.invoke_start_local_analysis(-5, "scan-a,scan-b".into(), 2);
-    match next(&mut receiver) {
-        UiCommand::StartLocalAnalysis {
-            node_index,
-            scan_task_ids,
-            kind,
-        } => assert_eq!(
-            (node_index, scan_task_ids, kind),
-            (0, "scan-a,scan-b".into(), GroupKind::SimilarVideo)
-        ),
-        command => panic!("start-local-analysis 命令错误：{command:?}"),
-    }
     window.invoke_start_cross_analysis("0:scan-a,1:scan-b".into());
     match next(&mut receiver) {
         UiCommand::StartCrossAnalysis { selections } => assert_eq!(selections, "0:scan-a,1:scan-b"),
@@ -596,54 +584,26 @@ fn root_callbacks_emit_their_ui_commands_and_reject_invalid_settings() {
     assert!(matches!(next(&mut receiver), UiCommand::PollCrossAnalysis));
     window.invoke_retry_cross_analysis();
     assert!(matches!(next(&mut receiver), UiCommand::RetryCrossAnalysis));
-    window.invoke_load_groups(true, -6, "run-1".into(), 2, "group-cursor".into());
+    window.invoke_request_group_window("run-1".into(), 2, 5_000, 250);
     match next(&mut receiver) {
-        UiCommand::LoadGroups {
-            central,
-            node_index,
-            analysis_run_id,
-            kind,
-            cursor,
-        } => assert_eq!(
-            (central, node_index, analysis_run_id, kind, cursor),
-            (
-                true,
-                0,
-                "run-1".into(),
-                GroupKind::SimilarVideo,
-                "group-cursor".into()
-            )
-        ),
-        command => panic!("load-groups 命令错误：{command:?}"),
+        UiCommand::RequestGroupWindow { request } => {
+            assert_eq!(request.analysis_run_id, "run-1");
+            assert_eq!(request.kind, GroupKind::SimilarVideo);
+            assert_eq!(request.start_index, 5_000);
+            assert_eq!(request.visible_count, 200);
+        }
+        command => panic!("request-group-window 命令错误：{command:?}"),
     }
-    window.invoke_load_members(
-        false,
-        -7,
-        "run-2".into(),
-        "group-1".into(),
-        1,
-        "member-cursor".into(),
-    );
+    window.invoke_request_member_window("run-2".into(), "group-1".into(), 1, 100, 0);
     match next(&mut receiver) {
-        UiCommand::LoadMembers {
-            central,
-            node_index,
-            analysis_run_id,
-            group_id,
-            kind,
-            cursor,
-        } => assert_eq!(
-            (central, node_index, analysis_run_id, group_id, kind, cursor),
-            (
-                false,
-                0,
-                "run-2".into(),
-                "group-1".into(),
-                GroupKind::SimilarImage,
-                "member-cursor".into()
-            )
-        ),
-        command => panic!("load-members 命令错误：{command:?}"),
+        UiCommand::RequestMemberWindow { request, group_id } => {
+            assert_eq!(request.analysis_run_id, "run-2");
+            assert_eq!(request.kind, GroupKind::SimilarImage);
+            assert_eq!(request.start_index, 100);
+            assert_eq!(request.visible_count, 1);
+            assert_eq!(group_id, "group-1");
+        }
+        command => panic!("request-member-window 命令错误：{command:?}"),
     }
     window.invoke_save_review("machine-a".into(), "D:\\Media\\keep.jpg".into(), 2);
     match next(&mut receiver) {

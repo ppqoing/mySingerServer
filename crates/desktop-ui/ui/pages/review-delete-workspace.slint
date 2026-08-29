@@ -16,6 +16,7 @@ component ReviewMemberList inherits Rectangle {
     in property <[UiMemberRow]> members;
     in property <int> review-filter;
     in property <bool> preview-in-flight;
+    in property <bool> review-enabled: true;
     in-out property <string> selected-machine;
     in-out property <string> selected-path;
     callback preview(string, string);
@@ -137,6 +138,7 @@ component ReviewMemberList inherits Rectangle {
                         ActionButton {
                             label: "保留";
                             icon: @image-url("../assets/icons/keep.png");
+                            action-enabled: root.review-enabled;
                             accessible-label: "保留成员：" + member.path;
                             clicked => {
                                 root.selected-machine = member.machine-id;
@@ -148,7 +150,7 @@ component ReviewMemberList inherits Rectangle {
                             label: "删除";
                             icon: @image-url("../assets/icons/delete.png");
                             tone: 2;
-                            action-enabled: member.delete-enabled;
+                            action-enabled: member.delete-enabled && root.review-enabled;
                             accessible-label: "删除成员：" + member.path;
                             clicked => {
                                 root.selected-machine = member.machine-id;
@@ -167,6 +169,8 @@ component ReviewMemberList inherits Rectangle {
 export component ReviewDeleteWorkspace inherits Rectangle {
     in property <[UiGroupRow]> groups;
     in property <[UiMemberRow]> members;
+    in property <bool> result-loading;
+    in property <bool> result-stale;
     in property <string> selected-group-id;
     in property <image> preview-image;
     in property <string> preview-info;
@@ -268,8 +272,12 @@ export component ReviewDeleteWorkspace inherits Rectangle {
                             vertical-stretch: 1;
                             groups: root.groups;
                             selected-id: root.selected-group-id;
-                            has-more: false;
+                            start-index: 0;
+                            total-rows: root.groups.length;
+                            loading: root.result-loading;
+                            stale: root.result-stale;
                             select-group(id) => { }
+                            request-window(start, count) => { }
                         }
                     }
                 }
@@ -291,6 +299,7 @@ export component ReviewDeleteWorkspace inherits Rectangle {
                             members: root.members;
                             review-filter: root.review-filter;
                             preview-in-flight: root.preview-in-flight;
+                            review-enabled: !root.result-stale && !root.result-loading;
                             selected-machine <=> root.selected-review-machine;
                             selected-path <=> root.selected-review-path;
                             preview(machine, path) => {
@@ -359,9 +368,9 @@ export component ReviewDeleteWorkspace inherits Rectangle {
                                 padding: 10px;
                                 spacing: 6px;
                                 Text { text: "快捷复核"; color: Theme.text; font-size: 12px; font-weight: 680; }
-                                ActionButton { label: "保留最大文件"; icon: @image-url("../assets/icons/keep.png"); clicked => { root.quick-review(0, ""); } }
-                                ActionButton { label: "保留最高分辨率"; icon: @image-url("../assets/icons/keep.png"); clicked => { root.quick-review(1, ""); } }
-                                ActionButton { label: "保留最高 Quality"; icon: @image-url("../assets/icons/keep.png"); clicked => { root.quick-review(2, ""); } }
+                                ActionButton { label: "保留最大文件"; icon: @image-url("../assets/icons/keep.png"); action-enabled: !root.result-stale && !root.result-loading; clicked => { root.quick-review(0, ""); } }
+                                ActionButton { label: "保留最高分辨率"; icon: @image-url("../assets/icons/keep.png"); action-enabled: !root.result-stale && !root.result-loading; clicked => { root.quick-review(1, ""); } }
+                                ActionButton { label: "保留最高 Quality"; icon: @image-url("../assets/icons/keep.png"); action-enabled: !root.result-stale && !root.result-loading; clicked => { root.quick-review(2, ""); } }
                             }
                         }
                         Rectangle {
@@ -373,7 +382,7 @@ export component ReviewDeleteWorkspace inherits Rectangle {
                                 spacing: 6px;
                                 Text { text: "路径规则"; color: Theme.text; font-size: 12px; font-weight: 680; }
                                 LineEdit { text <=> root.path-rule; placeholder-text: "路径包含"; accessible-label: "复核路径包含"; }
-                                ActionButton { label: "按路径保留"; icon: @image-url("../assets/icons/keep.png"); clicked => { root.quick-review(3, root.path-rule); } }
+                                ActionButton { label: "按路径保留"; icon: @image-url("../assets/icons/keep.png"); action-enabled: !root.result-stale && !root.result-loading; clicked => { root.quick-review(3, root.path-rule); } }
                             }
                         }
                         Rectangle {
@@ -390,14 +399,14 @@ export component ReviewDeleteWorkspace inherits Rectangle {
                                     ActionButton {
                                         label: "标记保留";
                                         icon: @image-url("../assets/icons/keep.png");
-                                        action-enabled: root.selected-review-path != "";
+                                        action-enabled: root.selected-review-path != "" && !root.result-stale && !root.result-loading;
                                         clicked => { root.save-review(root.selected-review-machine, root.selected-review-path, 1); }
                                     }
                                     ActionButton {
                                         label: "标记删除";
                                         icon: @image-url("../assets/icons/delete.png");
                                         tone: 2;
-                                        action-enabled: root.selected-review-path != "";
+                                        action-enabled: root.selected-review-path != "" && !root.result-stale && !root.result-loading;
                                         clicked => { root.save-review(root.selected-review-machine, root.selected-review-path, 2); }
                                     }
                                 }
@@ -492,7 +501,7 @@ export component ReviewDeleteWorkspace inherits Rectangle {
                             label: "准备删除";
                             icon: @image-url("../assets/icons/delete.png");
                             tone: 2;
-                            action-enabled: root.members.length > 0;
+                            action-enabled: root.members.length > 0 && !root.result-stale && !root.result-loading;
                             clicked => { root.prepare-delete(); }
                         }
                         Text {
