@@ -1,9 +1,8 @@
-//! 联合二筛缓存复用、持久任务派发和最终判定。
+//! 联合二筛缓存复用、瞬态批次派发和最终判定。
 
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use dedup_core::{
@@ -17,6 +16,7 @@ use dedup_node_store::{
 };
 use dedup_protocol::proto::{self, worker_envelope};
 use dedup_protocol::{BASE_MISSING_PROBE, BASE_MISSING_STAGE1};
+use uuid::Uuid;
 
 use crate::contact_sheet_cache::ContactSheetCacheEntry;
 use crate::runtime_tasks::{
@@ -29,12 +29,12 @@ use crate::{NodeRemoteFeatureCache, Stage2CacheLookup};
 
 use super::AnalysisBlocked;
 
-/// 一个唯一内容的持久二筛任务请求。
+/// 一个唯一内容的当前进程二筛请求。
 #[derive(Clone, Debug)]
 pub struct Stage2Request {
-    /// 持久任务 ID。
+    /// 本轮运行时任务 ID。
     pub task_id: TaskId,
-    /// SQLite 任务项 ID。
+    /// 本轮运行时任务项 ID。
     pub item_id: String,
     /// 跨边界内容键。
     pub content: ContentKey,
@@ -443,16 +443,18 @@ pub struct Stage2BatchItem {
     pub frame_slots: Vec<u8>,
 }
 
-/// 已持久化任务及其稳定二筛工作集合。
+/// 当前进程内保存的稳定二筛工作集合；不映射 SQLite 任务表。
 pub(crate) struct Stage2BatchPlan {
+    /// 运行时使用的临时任务身份，不作为持久任务写入数据库。
     pub(crate) task_id: TaskId,
+    /// 已校验来源位置的二筛工作项。
     work: Vec<MissingWork>,
 }
 
 /// 执行一个中心二筛批次；先复用并重新发布本机缓存，只有真正缺失时才调用 Worker。
 ///
-/// 整个批次先持久化任务和任务项，再按稳定项顺序执行。返回的任务 ID 可由管理端查询其
-/// `outbox_high_seq`，并作为 phase2 的固定同步门禁。
+/// 整个批次只在当前进程保留工作集合；缓存命中直接重发，缺失项交给处理器计算。
+/// 返回的 ID 仅用于运行时事件和 Worker 身份，不创建 `tasks/task_items/task_stages` 行。
 pub async fn dispatch_stage2_batch<P: Stage2Processor>(
     store: &mut NodeStore,
     items: &[Stage2BatchItem],
@@ -463,11 +465,11 @@ pub async fn dispatch_stage2_batch<P: Stage2Processor>(
     run_stage2_batch(store, plan, processor, now_ms).await
 }
 
-/// 校验来源并一次持久化真实二筛任务，Worker 计算可随后在后台继续。
+/// 校验来源并冻结当前进程的二筛工作集合，不写入旧任务表。
 pub(crate) fn begin_stage2_batch(
     store: &mut NodeStore,
     items: &[Stage2BatchItem],
-    now_ms: i64,
+    _now_ms: i64,
 ) -> Result<Stage2BatchPlan, AnalysisBlocked> {
     if items.is_empty() {
         return Err(AnalysisBlocked::InvalidState("二筛批次不能为空".into()));
@@ -514,24 +516,13 @@ pub(crate) fn begin_stage2_batch(
             frame_slots,
         });
     }
-    let task_items = work
-        .iter()
-        .map(|item| {
-            NewTaskItem::for_content(
-                item.location.clone(),
-                item.display_path.clone(),
-                item.content.file_size(),
-                item.content_id,
-                "stage2",
-            )
-        })
-        .collect::<Vec<_>>();
-    let task_id = store.create_task("stage2_compute", &task_items, now_ms)?;
-    initialize_stage2_stages(store, task_id)?;
-    Ok(Stage2BatchPlan { task_id, work })
+    Ok(Stage2BatchPlan {
+        task_id: TaskId::new(),
+        work,
+    })
 }
 
-/// 从已持久化批次继续缓存重发、Worker 计算和任务项终态提交。
+/// 从当前进程的二筛工作集合继续缓存重发和 Worker 计算。
 pub(crate) async fn run_stage2_batch<P: Stage2Processor>(
     store: &mut NodeStore,
     plan: Stage2BatchPlan,
@@ -541,7 +532,7 @@ pub(crate) async fn run_stage2_batch<P: Stage2Processor>(
     run_stage2_batch_internal(store, plan, processor, None, None, None, now_ms).await
 }
 
-/// 从已持久批次继续二筛，并为视频启用固定 MD5 联系表复用与重建。
+/// 运行瞬态二筛，并为视频启用固定 MD5 联系表复用与重建。
 pub(crate) async fn run_stage2_batch_with_runtime_cache<P: Stage2Processor>(
     store: &mut NodeStore,
     plan: Stage2BatchPlan,
@@ -570,11 +561,10 @@ async fn run_stage2_batch_internal<P: Stage2Processor>(
     reporter: Option<&RuntimeTaskReporter>,
     remote: Option<&mut NodeRemoteFeatureCache>,
     contact_sheet_root: Option<&Path>,
-    now_ms: i64,
+    _now_ms: i64,
 ) -> Result<TaskId, AnalysisBlocked> {
     let Stage2BatchPlan { task_id, work } = plan;
     let total = work.len() as u64;
-    let lookup_started = wall_clock_ms();
     report_stage2_stage(
         reporter,
         RuntimeStage::LookupStage2Cache,
@@ -584,19 +574,6 @@ async fn run_stage2_batch_internal<P: Stage2Processor>(
         0,
         0,
     );
-    save_stage2_stage(
-        store,
-        task_id,
-        RuntimeStage::LookupStage2Cache,
-        PersistentStageState::Running,
-        0,
-        Some(total),
-        0,
-        0,
-        Some(lookup_started),
-        None,
-        None,
-    )?;
     let initial_records = store
         .lookup_base_cache_by_keys(&work.iter().map(|item| item.content).collect::<Vec<_>>())?;
     if initial_records.len() != work.len() {
@@ -626,19 +603,6 @@ async fn run_stage2_batch_internal<P: Stage2Processor>(
         0,
         0,
     );
-    save_stage2_stage(
-        store,
-        task_id,
-        RuntimeStage::LookupStage2Cache,
-        PersistentStageState::Completed,
-        total,
-        Some(total),
-        0,
-        0,
-        Some(lookup_started),
-        Some(wall_clock_ms()),
-        cache_warning.clone(),
-    )?;
     if let (Some(reporter), Some(warning)) = (reporter, cache_warning) {
         let _ = reporter.record_failure_nowait(RuntimeFailureUpdate {
             stage: RuntimeStage::LookupStage2Cache,
@@ -661,7 +625,6 @@ async fn run_stage2_batch_internal<P: Stage2Processor>(
     if let Some(reporter) = reporter {
         let _ = reporter.update_overall_nowait(0, Some(work.len() as u64), 0, 0);
     }
-    let compute_started = wall_clock_ms();
     report_batch_stage(
         reporter,
         proto::RuntimeStageState::RuntimeStageRunning,
@@ -675,24 +638,13 @@ async fn run_stage2_batch_internal<P: Stage2Processor>(
     let mut skipped = 0_u64;
     let mut pending = Vec::new();
     let mut requests = Vec::new();
-    for _ in 0..work.len() {
-        let item = store
-            .claim_next_item(task_id, now_ms)?
-            .ok_or_else(|| AnalysisBlocked::InvalidState("二筛任务项不足".into()))?;
-        let item_content = item
-            .content_id
-            .ok_or_else(|| AnalysisBlocked::InvalidState("二筛任务项缺少内容 ID".into()))?;
-        let expected = work
-            .iter()
-            .find(|candidate| candidate.content_id == item_content)
-            .ok_or_else(|| AnalysisBlocked::InvalidState("二筛任务项不属于当前批次".into()))?;
+    for expected in &work {
         let cached = cached_by_content.get(&expected.content_id);
         if cached.is_some_and(|record| {
             classify_cache_completeness(record, true).base_missing_parts
                 & (BASE_MISSING_PROBE | BASE_MISSING_STAGE1)
                 != 0
         }) {
-            store.complete_item(&item.item_id, TaskItemCompletion::Cancelled, now_ms)?;
             completed += 1;
             skipped += 1;
             continue;
@@ -712,13 +664,6 @@ async fn run_stage2_batch_internal<P: Stage2Processor>(
                     ));
                 }
             }
-            store.complete_item(
-                &item.item_id,
-                TaskItemCompletion::Succeeded {
-                    content_id: Some(expected.content_id),
-                },
-                now_ms,
-            )?;
             completed += 1;
             continue;
         }
@@ -742,19 +687,13 @@ async fn run_stage2_batch_internal<P: Stage2Processor>(
             }
         }
         if expected.media_kind == MediaKind::Video && frame_slots.is_empty() {
-            store.complete_item(
-                &item.item_id,
-                TaskItemCompletion::Succeeded {
-                    content_id: Some(expected.content_id),
-                },
-                now_ms,
-            )?;
             completed += 1;
             continue;
         }
+        let item_id = Uuid::now_v7().to_string();
         let request = Stage2Request {
             task_id,
-            item_id: item.item_id.clone(),
+            item_id: item_id.clone(),
             content: expected.content,
             content_id: expected.content_id,
             display_path: expected.display_path.clone(),
@@ -763,7 +702,7 @@ async fn run_stage2_batch_internal<P: Stage2Processor>(
             contact_sheet_path: contact_sheet_target(contact_sheet_root, expected),
         };
         pending.push((
-            item.item_id,
+            item_id,
             expected.clone(),
             request.contact_sheet_path.clone(),
         ));
@@ -780,43 +719,25 @@ async fn run_stage2_batch_internal<P: Stage2Processor>(
         failed,
         skipped,
     );
-    save_stage2_stage(
-        store,
-        task_id,
-        RuntimeStage::ComputeStage2Features,
-        PersistentStageState::Running,
-        completed,
-        Some(total),
-        failed,
-        skipped,
-        Some(compute_started),
-        None,
-        None,
-    )?;
     processor
         .process_batch_each(requests, |index, result| {
             let Some((item_id, expected, contact_sheet_path)) = pending.get(index) else {
                 return Err("二筛处理器返回序号越界".into());
             };
             let mut runtime_failure = None;
-            let completion = match result {
+            match result {
                 Ok(output) => {
-                    if persist_stage2(
+                    let persisted = persist_stage2(
                         store,
                         expected,
                         item_id,
                         contact_sheet_path.as_deref(),
                         output,
                     )
-                    .map_err(|error| error.to_string())?
-                    {
-                        TaskItemCompletion::Succeeded {
-                            content_id: Some(expected.content_id),
-                        }
-                    } else {
+                    .map_err(|error| error.to_string())?;
+                    if !persisted {
                         failed += 1;
                         runtime_failure = Some("二筛结果不完整".into());
-                        TaskItemCompletion::Failed("二筛结果不完整".into())
                     }
                 }
                 Err(error) => {
@@ -827,16 +748,10 @@ async fn run_stage2_batch_internal<P: Stage2Processor>(
                         failed += 1;
                     }
                     runtime_failure = Some(error.clone());
-                    if worker_crash {
-                        TaskItemCompletion::Cancelled
-                    } else {
-                        TaskItemCompletion::Failed(error)
-                    }
                 }
-            };
-            store
-                .complete_item(item_id, completion, now_ms)
-                .map_err(|error| error.to_string())?;
+            }
+            // completed 表示已经收到处理器终态；failed/skipped 再从中区分成功数量。
+            completed += 1;
             if let (Some(reporter), Some(message)) = (reporter, runtime_failure) {
                 let _ = reporter.record_failure_nowait(RuntimeFailureUpdate {
                     stage: RuntimeStage::ComputeStage2Features,
@@ -848,7 +763,6 @@ async fn run_stage2_batch_internal<P: Stage2Processor>(
                     message,
                 });
             }
-            completed += 1;
             if let Some(reporter) = reporter {
                 let _ = reporter.update_overall_nowait(
                     completed.saturating_sub(failed).saturating_sub(skipped),
@@ -881,23 +795,6 @@ async fn run_stage2_batch_internal<P: Stage2Processor>(
         failed,
         skipped,
     );
-    save_stage2_stage(
-        store,
-        task_id,
-        RuntimeStage::ComputeStage2Features,
-        if failed == 0 {
-            PersistentStageState::Completed
-        } else {
-            PersistentStageState::Failed
-        },
-        completed,
-        Some(total),
-        failed,
-        skipped,
-        Some(compute_started),
-        Some(wall_clock_ms()),
-        None,
-    )?;
     Ok(task_id)
 }
 
@@ -997,14 +894,6 @@ fn save_stage2_stage(
         },
     )?;
     Ok(())
-}
-
-/// 返回阶段持久化使用的当前墙钟毫秒。
-fn wall_clock_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 /// 对未解决候选收集缺失 ContentKey，一次创建完整批次后逐项等待终态。
@@ -1650,9 +1539,35 @@ mod tests {
     use dedup_core::{DisplayPath, LocationKey, MachineId, NormalizedPath};
     use dedup_media::{ImageStage1, ImageStage2, PdqHash};
     use dedup_node_store::{
-        FeatureWrite, ScannedPath, TaskStatus, VideoFrameStage1Fields, VideoFrameStage2Fields,
+        FeatureWrite, ScannedPath, VideoFrameStage1Fields, VideoFrameStage2Fields,
         VideoMetadataFields,
     };
+
+    #[tokio::test]
+    async fn complete_stage2_cache_does_not_create_legacy_task_rows() {
+        let mut store = test_store();
+        let (content, source, _) = seed_video(&mut store, [0; 16], &[0], 100);
+        let mut processor = CountingStage2::default();
+
+        let _runtime_id = dispatch_stage2_batch(
+            &mut store,
+            &[Stage2BatchItem {
+                content,
+                source,
+                frame_slots: vec![0],
+            }],
+            &mut processor,
+            101,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(processor.calls, 0, "完整二筛缓存命中不能启动 Worker");
+        assert!(
+            store.page_tasks(None, 20).unwrap().items.is_empty(),
+            "瞬态二筛不能创建旧 tasks/task_items/task_stages 行"
+        );
+    }
 
     #[tokio::test]
     async fn remote_stage2_import_only_publishes_requested_video_slot() {
@@ -1674,7 +1589,7 @@ mod tests {
         )]);
         let mut processor = CountingStage2::default();
 
-        let task_id = run_stage2_batch_internal(
+        let _runtime_id = run_stage2_batch_internal(
             &mut store,
             plan,
             &mut processor,
@@ -1687,9 +1602,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(processor.calls, 0);
-        assert_eq!(
-            store.task_snapshot(task_id).unwrap().status,
-            TaskStatus::Completed
+        assert!(
+            store.page_tasks(None, 20).unwrap().items.is_empty(),
+            "瞬态二筛导入不能创建旧任务行"
         );
         assert_eq!(
             decode_video_stage2_changes(&store.pull_changes(before, 100).unwrap().changes),
@@ -1722,7 +1637,7 @@ mod tests {
         )]);
         let mut processor = CountingStage2::default();
 
-        let task_id = run_stage2_batch_internal(
+        let _runtime_id = run_stage2_batch_internal(
             &mut store,
             plan,
             &mut processor,
@@ -1735,9 +1650,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(processor.calls, 0);
-        assert_eq!(
-            store.task_snapshot(task_id).unwrap().status,
-            TaskStatus::Completed
+        assert!(
+            store.page_tasks(None, 20).unwrap().items.is_empty(),
+            "瞬态二筛重发不能创建旧任务行"
         );
         let mut changes =
             decode_video_stage2_changes(&store.pull_changes(before, 100).unwrap().changes);
