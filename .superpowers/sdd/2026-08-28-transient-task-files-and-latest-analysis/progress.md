@@ -120,3 +120,7 @@ Spec: `D:/code/mySingerServer/docs/superpowers/specs/2026-08-28-transient-task-f
 - Task 9 fix round 1/5：独立审查发现未显式 discard 的 writer 会遗留 partial，且发布元数据缺少直达 `run_id/library_revision/group_count`；提交 `8d946cf3` 增加未完成 writer 的 best-effort Drop 精确清理、唯一组计数及锁定旧 result 的 writer 层失败证据。结果文件 6/6、原子文件 4/4、Windows 23 通过/1 ignored、NodeEngine test-hooks lib 142/142、fmt/diff 通过；定向复审确认 2 项 addressed、0 项 open。
 - Task 9 complete (commits `6b6731dd..8d946cf3`, review clean)。
 - Task 10A：提交 `235148d0`。本地分析输入、候选、分组和成员已迁入 `dedup-node-engine::analysis::model`，纯算法保留 `DisplayPath`、代表直连和二筛证据；旧 SQLite 分析状态机仅在读写边界做显式兼容转换。`local_analysis` 11/11、代表分组 3/3、NodeEngine test-hooks lib 142/142、fmt/diff 通过。独立审查无 Critical/Important；其 Minor“大小写未覆盖”经源码复核不成立：`NormalizedPath` 会把组件转大写，而测试断言保留 `Root` 混合大小写，已能证明结果不是从规范路径重建。
+- Task 10B1：提交 `ee1708f4`。当前扫描唯一 TaskId/revision 门禁、一次批量基础缓存查询、排序去重的内存输入/一筛候选与最近结果 TSV 发布已落地；新入口不读取旧 `tasks` 表作生产门禁，也不写旧分析/任务表。旧 queued/running 行行为测试先 RED 后 GREEN；控制 Agent 验证 transient 4/4、local_analysis 11/11、representative_grouping 3/3、NodeEngine test-hooks lib 146/146、fmt/diff 通过。独立审查 Spec Compliance PASS、Task Quality PASS，无 Critical/Important/Minor。
+- Task 10B1 complete (commits `7a063e95..ee1708f4`, review clean)。
+- Task 10B2：提交 `3ec6868`。二筛缺失项按唯一 ContentKey 和结构完整性批量准备，合法全零特征保持缓存命中；最终候选判定一次批量读取全部唯一内容后在内存完成，删除了逐候选 SQLite 查询。控制 Agent 验证新增行为 2/2、local_analysis 11/11、representative_grouping 3/3、NodeEngine test-hooks lib 148/148、fmt/diff 通过；独立聚焦审查无 Critical/Important/Minor。
+- Task 10B2 complete (commits `ee1708f4..3ec6868`, review clean)。
