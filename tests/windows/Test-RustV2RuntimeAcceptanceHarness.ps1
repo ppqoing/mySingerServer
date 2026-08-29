@@ -93,6 +93,28 @@ try {
         throw '采样间隔必须固定2秒'
     }
 
+    # RED：真实验收必须显式选择 Everything；非法枚举器不得悄悄回退为 Walker。
+    $badEnumerator = Assert-RuntimeAcceptanceInputs `
+        -MediaRoot $media -DurationSeconds 1800 -SampleSeconds 2 -ReleaseRoot $release `
+        -AcceptanceClientPath $acceptanceClient -ResultExporterPath $resultExporter `
+        -EvidenceRoot $evidence -ReportPath $report -Enumerator 'unknown' `
+        -ThrowOnError:$false
+    if ($badEnumerator.Valid -or $badEnumerator.Code -ne 'RUST_V2_ACCEPTANCE_ENUMERATOR_INVALID') {
+        throw "非法枚举器必须在启动前拒绝，实际=$($badEnumerator | ConvertTo-Json -Compress)"
+    }
+    $mediaSecond = Join-Path $fixtureRoot 'media-second'
+    New-Item -ItemType Directory -Path $mediaSecond -Force | Out-Null
+    $terminalValidation = Assert-RuntimeAcceptanceInputs `
+        -MediaRoot @($media, $mediaSecond) -DurationSeconds 1800 -SampleSeconds 2 `
+        -ReleaseRoot $release -AcceptanceClientPath $acceptanceClient -ResultExporterPath $resultExporter `
+        -EvidenceRoot (Join-Path $fixtureRoot 'runs\terminal-A-1\evidence') `
+        -ReportPath (Join-Path $fixtureRoot 'runs\terminal-A-1\evidence\report.md') `
+        -Enumerator 'everything' -CompleteWhenTaskTerminal -RequireDistinctPhysicalDisks:$false `
+        -ThrowOnError:$false
+    if (-not $terminalValidation.Valid) {
+        throw "Everything + CompleteWhenTaskTerminal + 多媒体根应通过校验，实际=$($terminalValidation | ConvertTo-Json -Compress)"
+    }
+
     $missingClient = Assert-RuntimeAcceptanceInputs `
         -MediaRoot $media -DurationSeconds 1800 -SampleSeconds 2 -ReleaseRoot $release `
         -AcceptanceClientPath (Join-Path $tools 'missing-client.exe') -ResultExporterPath $resultExporter `
@@ -254,13 +276,13 @@ try {
         -TotalReadThreads 16 -ReservedCores 1
     if ($config -notmatch 'config_path = "data/node/config.toml"' -or
         $config -notmatch 'data_path = "data/node"' -or
-        $config -notmatch 'enumerator = "windows_walker"' -or
+        $config -notmatch 'enumerator = "everything"' -or
         $config -notmatch 'worker_count = 12' -or
         $config -notmatch 'mode = "manual"' -or
         $config -notmatch 'manual_worker_count = 12' -or
         $config -notmatch 'ssd_threads_per_disk = 16' -or
         $config -notmatch 'total_threads = 16') {
-        throw "相对路径配置或测试专用Walker错误：$config"
+        throw "相对路径配置或测试专用Everything错误：$config"
     }
 
     # Task 17 GREEN：真实 pwsh sleeper 只验证监督边界，不启动产品、Worker 或媒体。
@@ -509,7 +531,8 @@ Start-Sleep -Milliseconds 200
                 [string] $EvidenceRoot, [string] $ReportPath, [string] $Variant = 'A',
                 [int] $RunIndex = 1, [int] $WorkerCount = 12, [int] $HddThreadsPerDisk = 1,
                 [int] $SsdThreadsPerDisk = 16, [int] $UnknownThreadsPerDisk = 1,
-                [int] $TotalReadThreads = 16, [int] $ReservedCores = 1, [switch] $SingleRun,
+                [int] $TotalReadThreads = 16, [int] $ReservedCores = 1, [string] $Enumerator = 'everything',
+                [switch] $SingleRun, [switch] $CompleteWhenTaskTerminal,
                 [switch] $RequireDistinctPhysicalDisks, [switch] $ThrowOnError = $true)
             [pscustomobject]@{ Valid = $true; Code = '' }
         }
@@ -647,7 +670,7 @@ Start-Sleep -Milliseconds 200
             -not ($watchdogResult -contains 'RUST_V2_RUNTIME_ACCEPTANCE_MEASURE_INCONCLUSIVE')) {
             throw "RED: 监督超时必须留 INCONCLUSIVE 稳定诊断：$($watchdogHarness | ConvertTo-Json -Compress) result=$($watchdogResult -join '|')"
         }
-        if (Test-Path -LiteralPath (Join-Path $watchdogEvidence 'result-summary.jsonl') -PathType Leaf) {
+        if (Test-Path -LiteralPath (Join-Path $watchdogEvidence 'result-summary.tsv') -PathType Leaf) {
             throw 'RED: 监督超时且没有完成任务时不得错误调用 exporter'
         }
 
@@ -698,7 +721,7 @@ Start-Sleep -Milliseconds 200
         if ([string]$identityHarness.run_status -cne 'INCONCLUSIVE' -or
             [string]$identityHarness.run_diagnostic -notmatch 'RUST_V2_ACCEPTANCE_SUPERVISOR_CLIENT_PID_REUSED' -or
             -not ($identityResult -contains 'RUST_V2_RUNTIME_ACCEPTANCE_MEASURE_INCONCLUSIVE') -or
-            (Test-Path -LiteralPath (Join-Path $identityEvidence 'result-summary.jsonl') -PathType Leaf)) {
+            (Test-Path -LiteralPath (Join-Path $identityEvidence 'result-summary.tsv') -PathType Leaf)) {
             throw "RED: 监督身份不匹配必须 fail-closed：harness=$($identityHarness | ConvertTo-Json -Compress) result=$($identityResult -join '|')"
         }
         $script:watchdogSupervisorDiagnostic = ''
@@ -808,7 +831,7 @@ Start-Sleep -Milliseconds 200
         throw "RED: metadata CreateNew 必须拒绝覆盖既有文件：code=$metadataCollisionCode content=$([IO.File]::ReadAllText($metadataCollisionPath))"
     }
 
-    # RED：摘要三件套有效时，MISSING/INCONCLUSIVE 是业务 FAIL；缺 ID、导出失败或绑定缺失仍为基础设施 INCONCLUSIVE。
+    # RED：摘要有效时，MISSING/INCONCLUSIVE 是业务 FAIL；缺终态、导出失败或绑定缺失仍为基础设施 INCONCLUSIVE。
     $missingSummaryStatus = Get-ResultSummaryRunStatus `
         -CompletedTaskIdPresent:$true -ExporterSucceeded:$true -SummaryBindingValid:$true `
         -SummaryStatus 'MISSING'
@@ -831,22 +854,31 @@ Start-Sleep -Milliseconds 200
         throw "RED: 摘要业务/基础设施分类错误：missing=$missingSummaryStatus inconclusive=$inconclusiveSummaryStatus missingTask=$missingTaskStatus exporter=$failedExporterStatus binding=$invalidBindingStatus pass=$passSummaryStatus"
     }
 
+    # RED：新 exporter 必须使用重复 --media-root，并且只写固定 result-summary.tsv；不得下发 task-id。
     $argumentRoot = Join-Path $fixtureRoot 'export args with space'
     New-Item -ItemType Directory -Path $argumentRoot -Force | Out-Null
     $capturePath = Join-Path $argumentRoot 'captured args.txt'
     $fakeExporter = Join-Path $argumentRoot 'exporter with space.cmd'
-    [IO.File]::WriteAllText($fakeExporter, "@echo off`r`necho %~2> `"$capturePath`"`r`necho %~4>> `"$capturePath`"`r`necho %~8>> `"$capturePath`"`r`nexit /b 0`r`n")
+    [IO.File]::WriteAllText($fakeExporter, "@echo off`r`necho %*> `"$capturePath`"`r`nexit /b 0`r`n")
     $argumentResult = Invoke-ResultExporter -ExporterPath $fakeExporter `
         -DatabasePath (Join-Path $argumentRoot 'node database.sqlite') `
         -CacheRoot (Join-Path $argumentRoot 'cache root') `
-        -TaskId 'task with spaces' -OutputPath (Join-Path $argumentRoot 'summary output.jsonl') `
+        -MediaRoots @((Join-Path $argumentRoot 'H root'), (Join-Path $argumentRoot 'I root')) `
+        -OutputPath (Join-Path $argumentRoot 'result-summary.tsv') `
         -EvidenceRoot $argumentRoot -TimeoutSeconds 5
-    $capturedArgs = if (Test-Path -LiteralPath $capturePath -PathType Leaf) { Get-Content -LiteralPath $capturePath } else { @() }
-    if ($argumentResult.ExitCode -ne 0 -or $capturedArgs.Count -ne 3 -or
-        $capturedArgs[0] -ne (Join-Path $argumentRoot 'node database.sqlite') -or
-        $capturedArgs[1] -ne (Join-Path $argumentRoot 'cache root') -or
-        $capturedArgs[2] -ne (Join-Path $argumentRoot 'summary output.jsonl')) {
-        throw "exporter 参数必须保留带空格路径的完整 token：$($capturedArgs -join '|')"
+    $capturedArgs = if (Test-Path -LiteralPath $capturePath -PathType Leaf) { Get-Content -Raw -LiteralPath $capturePath } else { '' }
+    $expectedDatabase = Join-Path $argumentRoot 'node database.sqlite'
+    $expectedCache = Join-Path $argumentRoot 'cache root'
+    $expectedHRoot = Join-Path $argumentRoot 'H root'
+    $expectedIRoot = Join-Path $argumentRoot 'I root'
+    $expectedOutput = Join-Path $argumentRoot 'result-summary.tsv'
+    if ($argumentResult.ExitCode -ne 0 -or
+        -not $capturedArgs.Contains('--database') -or -not $capturedArgs.Contains('--cache-root') -or
+        ([regex]::Matches($capturedArgs, '--media-root')).Count -ne 2 -or
+        $capturedArgs.Contains('--task-id') -or -not $capturedArgs.Contains($expectedDatabase) -or
+        -not $capturedArgs.Contains($expectedCache) -or -not $capturedArgs.Contains($expectedHRoot) -or
+        -not $capturedArgs.Contains($expectedIRoot) -or -not $capturedArgs.Contains($expectedOutput)) {
+        throw "exporter 参数必须重复传递多媒体根且保留带空格路径：$capturedArgs"
     }
 
     $hangingExporter = Join-Path $argumentRoot 'hanging exporter.cmd'
@@ -854,13 +886,15 @@ Start-Sleep -Milliseconds 200
     [IO.File]::WriteAllText($hangingExporter, "@echo off`r`nping.exe -n 6 127.0.0.1 >nul`r`nexit /b 0`r`n")
     $timeoutResult = Invoke-ResultExporter -ExporterPath $hangingExporter `
         -DatabasePath (Join-Path $argumentRoot 'node database.sqlite') -CacheRoot (Join-Path $argumentRoot 'cache root') `
-        -TaskId 'task' -OutputPath (Join-Path $argumentRoot 'summary.jsonl') -EvidenceRoot $argumentRoot -TimeoutSeconds 1
+        -MediaRoots @((Join-Path $argumentRoot 'H root')) -OutputPath (Join-Path $argumentRoot 'result-summary.tsv') `
+        -EvidenceRoot $argumentRoot -TimeoutSeconds 1
     if (-not $timeoutResult.TimedOut -or $timeoutResult.Diagnostic -ne 'RUST_V2_ACCEPTANCE_EXPORTER_TIMEOUT') {
         throw "挂起 exporter 必须超时、杀进程并返回稳定诊断：$($timeoutResult | ConvertTo-Json -Compress)"
     }
     $killFailureResult = Invoke-ResultExporter -ExporterPath $hangingExporter `
         -DatabasePath (Join-Path $argumentRoot 'node database.sqlite') -CacheRoot (Join-Path $argumentRoot 'cache root') `
-        -TaskId 'task' -OutputPath (Join-Path $argumentRoot 'summary.jsonl') -EvidenceRoot $argumentRoot -TimeoutSeconds 1 `
+        -MediaRoots @((Join-Path $argumentRoot 'H root')) -OutputPath (Join-Path $argumentRoot 'result-summary.tsv') `
+        -EvidenceRoot $argumentRoot -TimeoutSeconds 1 `
         -ProcessKiller { param($process) $process.Kill($true); throw 'fixture kill diagnostic failure' }
     if (-not $killFailureResult.TimedOut -or $killFailureResult.Diagnostic -ne 'RUST_V2_ACCEPTANCE_EXPORTER_KILL_FAILED') {
         throw "exporter kill 失败必须返回稳定诊断且不等待无限 drain：$($killFailureResult | ConvertTo-Json -Compress)"
@@ -1498,7 +1532,7 @@ Start-Sleep -Milliseconds 200
 
     # harness-result 的新增绑定字段必须真实输出，避免双盘证据与媒体清单脱节。
     $fixtureSummary = [pscustomobject]@{
-        Path = Join-Path $fixtureRoot 'summary.jsonl'; Sha256 = ('1' * 64); Status = 'PASS'; TaskId = 'task'
+        Path = Join-Path $fixtureRoot 'result-summary.tsv'; Sha256 = ('1' * 64); Status = 'PASS'; TaskId = $null
     }
     $fixtureHarnessArguments = @{
         Variant = 'A'; RunIndex = [int]1; SourceRevision = 'fixture';
@@ -1507,7 +1541,7 @@ Start-Sleep -Milliseconds 200
         DatabaseSnapshotPath = ''; DatabaseSnapshotMetadataPath = ''; ConfigSha256 = ('4' * 64);
         PackageManifestSha256 = ('5' * 64); MediaBeforeSha256 = ('6' * 64); MediaAfterSha256 = ('6' * 64);
         ResultSummary = $fixtureSummary; ResultSummaryStatus = 'PASS'; ResultSummaryPath = $fixtureSummary.Path;
-        ResultSummarySha256 = $fixtureSummary.Sha256; ResultSummaryTaskId = $fixtureSummary.TaskId;
+        ResultSummarySha256 = $fixtureSummary.Sha256; ResultSummaryTaskId = $null;
         MediaRoots = [string[]]$mediaRoots; SingleRun = $true;
         PhysicalDiskMapPath = (Join-Path $fixtureRoot 'physical-disk-map.json'); PhysicalDiskMapSha256 = ('7' * 64);
         MediaBeforeRootPaths = [string[]]@('before-01.json', 'before-02.json');
@@ -1516,6 +1550,7 @@ Start-Sleep -Milliseconds 200
     }
     $fixtureHarness = New-HarnessResult @fixtureHarnessArguments
     if (@($fixtureHarness.media_roots).Count -ne 2 -or $fixtureHarness.single_run -ne $true -or
+        $null -ne $fixtureHarness.result_summary_task_id -or
         [string]::IsNullOrWhiteSpace([string]$fixtureHarness.physical_disk_map_path) -or
         @($fixtureHarness.media_before_root_paths).Count -ne 2 -or
         @($fixtureHarness.media_after_root_paths).Count -ne 2) {
@@ -1555,7 +1590,8 @@ Start-Sleep -Milliseconds 200
                 [string] $EvidenceRoot, [string] $ReportPath, [string] $Variant = 'A',
                 [int] $RunIndex = 1, [int] $WorkerCount = 12, [int] $HddThreadsPerDisk = 1,
                 [int] $SsdThreadsPerDisk = 16, [int] $UnknownThreadsPerDisk = 1,
-                [int] $TotalReadThreads = 16, [int] $ReservedCores = 1, [switch] $SingleRun,
+                [int] $TotalReadThreads = 16, [int] $ReservedCores = 1, [string] $Enumerator = 'everything',
+                [switch] $SingleRun, [switch] $CompleteWhenTaskTerminal,
                 [switch] $RequireDistinctPhysicalDisks, [switch] $ThrowOnError = $true)
             [pscustomobject]@{ Valid = $true; Code = '' }
         }
@@ -1569,7 +1605,7 @@ Start-Sleep -Milliseconds 200
                 [string] $FilePath, [string] $WorkingDirectory, [switch] $PassThru,
                 [string] $WindowStyle, [string] $RedirectStandardOutput, [string] $RedirectStandardError)
             if ([IO.Path]::GetFileName($FilePath) -ieq 'runtime_acceptance.exe') {
-                # 真实观察客户端启动边界，确认多根顺序和 single-run 标记来自当前调用而非宿主残留。
+                # 真实观察客户端启动边界，确认多根顺序和终态结束标记来自当前调用而非宿主残留。
                 $script:finalizationObservedRootsJson = [Environment]::GetEnvironmentVariable(
                     'RUST_V2_REAL_MEDIA_ROOTS_JSON', 'Process')
                 $script:finalizationObservedSingleRun = [Environment]::GetEnvironmentVariable(
@@ -1631,7 +1667,10 @@ Start-Sleep -Milliseconds 200
             [pscustomobject]@{
                 latest_completed_persistent_task_id = 'task-completed'
                 deadline_cancelled_persistent_task_id = 'task-deadline'
-                scan_tasks = @()
+                scan_tasks = @([pscustomobject]@{
+                        persistent_task_id = 'task-completed'
+                        terminal_state = 'completed'
+                    })
                 failed_scans = 0
             }
         }
@@ -1640,7 +1679,7 @@ Start-Sleep -Milliseconds 200
                 [Parameter(Mandatory)] [string] $ExporterPath,
                 [Parameter(Mandatory)] [string] $DatabasePath,
                 [Parameter(Mandatory)] [string] $CacheRoot,
-                [Parameter(Mandatory)] [string] $TaskId,
+                [string[]] $MediaRoots = @(),
                 [Parameter(Mandatory)] [string] $OutputPath,
                 [Parameter(Mandatory)] [string] $EvidenceRoot,
                 [int] $TimeoutSeconds = 120, [scriptblock] $ProcessKiller, [scriptblock] $ProcessWaiter)
@@ -1650,7 +1689,7 @@ Start-Sleep -Milliseconds 200
             param(
                 [Parameter(Mandatory)] [string] $Text,
                 [Parameter(Mandatory)] [string] $ExpectedPath,
-                [Parameter(Mandatory)] [string] $ExpectedTaskId)
+                [string] $ExpectedTaskId = '')
             [pscustomobject]@{
                 Status = 'PASS'; Path = $ExpectedPath; Sha256 = ('b' * 64)
                 RowCount = 1; MissingCount = 0; InconclusiveCount = 0; TaskId = $ExpectedTaskId
@@ -1747,10 +1786,10 @@ Start-Sleep -Milliseconds 200
             -Variant A -RunIndex 1 -SourceRevision 'fixture' -SourceTreeSha256 ('a' * 64) `
             -PackagePath (Join-Path $fixtureRoot 'fixture.zip') -PackageSha256 ('b' * 64) `
             -WorkerCount 12 -HddThreadsPerDisk 1 -SsdThreadsPerDisk 16 `
-            -UnknownThreadsPerDisk 1 -TotalReadThreads 16 -ReservedCores 1 -SingleRun)
+            -UnknownThreadsPerDisk 1 -TotalReadThreads 16 -ReservedCores 1 -CompleteWhenTaskTerminal)
         if ($script:finalizationObservedRootsJson -cne $expectedMediaRootsJson -or
             $script:finalizationObservedSingleRun -cne '1') {
-            throw "受控客户端必须观察到压缩有序多根和 single-run=1：roots=$script:finalizationObservedRootsJson single=$script:finalizationObservedSingleRun expected=$expectedMediaRootsJson"
+            throw "受控客户端必须观察到压缩有序多根和 CompleteWhenTaskTerminal=1：roots=$script:finalizationObservedRootsJson single=$script:finalizationObservedSingleRun expected=$expectedMediaRootsJson"
         }
         if ([Environment]::GetEnvironmentVariable('RUST_V2_REAL_MEDIA_ROOTS_JSON', 'Process') -cne $hostMediaRootsEnvironment -or
             [Environment]::GetEnvironmentVariable('RUST_V2_ACCEPTANCE_SINGLE_RUN', 'Process') -cne $hostSingleRunEnvironment) {
@@ -1890,7 +1929,8 @@ Start-Sleep -Milliseconds 200
                 [string] $EvidenceRoot, [string] $ReportPath, [string] $Variant = 'A',
                 [int] $RunIndex = 1, [int] $WorkerCount = 12, [int] $HddThreadsPerDisk = 1,
                 [int] $SsdThreadsPerDisk = 16, [int] $UnknownThreadsPerDisk = 1,
-                [int] $TotalReadThreads = 16, [int] $ReservedCores = 1, [switch] $SingleRun,
+                [int] $TotalReadThreads = 16, [int] $ReservedCores = 1, [string] $Enumerator = 'everything',
+                [switch] $SingleRun, [switch] $CompleteWhenTaskTerminal,
                 [switch] $RequireDistinctPhysicalDisks, [switch] $ThrowOnError = $true)
             [pscustomobject]@{ Valid = $true; Code = '' }
         }
@@ -2141,7 +2181,10 @@ Start-Sleep -Milliseconds 200
             [pscustomobject]@{
                 latest_completed_persistent_task_id = 'task-completed'
                 deadline_cancelled_persistent_task_id = ''
-                scan_tasks = @()
+                scan_tasks = @([pscustomobject]@{
+                        persistent_task_id = 'task-completed'
+                        terminal_state = 'completed'
+                    })
                 failed_scans = 0
             }
         }
@@ -2150,7 +2193,7 @@ Start-Sleep -Milliseconds 200
                 [Parameter(Mandatory)] [string] $ExporterPath,
                 [Parameter(Mandatory)] [string] $DatabasePath,
                 [Parameter(Mandatory)] [string] $CacheRoot,
-                [Parameter(Mandatory)] [string] $TaskId,
+                [string[]] $MediaRoots = @(),
                 [Parameter(Mandatory)] [string] $OutputPath,
                 [Parameter(Mandatory)] [string] $EvidenceRoot,
                 [int] $TimeoutSeconds = 120, [scriptblock] $ProcessKiller, [scriptblock] $ProcessWaiter)
@@ -2165,7 +2208,7 @@ Start-Sleep -Milliseconds 200
             param(
                 [Parameter(Mandatory)] [string] $Text,
                 [Parameter(Mandatory)] [string] $ExpectedPath,
-                [Parameter(Mandatory)] [string] $ExpectedTaskId)
+                [string] $ExpectedTaskId = '')
             [pscustomobject]@{
                 Status = 'PASS'; Path = $ExpectedPath; Sha256 = ('e' * 64)
                 RowCount = 1; MissingCount = 0; InconclusiveCount = 0; TaskId = $ExpectedTaskId

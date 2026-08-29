@@ -8,7 +8,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string] $MediaRoot = $env:RUST_V2_REAL_MEDIA_ROOT,
+    [string[]] $MediaRoot = @($env:RUST_V2_REAL_MEDIA_ROOT),
     [string[]] $MediaRoots = @(),
     [int] $DurationSeconds = 1800,
     [int] $SampleSeconds = 2,
@@ -26,6 +26,7 @@ param(
     [string] $SourceTreeSha256 = '',
     [string] $PackagePath = '',
     [string] $PackageSha256 = '',
+    [string] $Enumerator = 'everything',
     [int] $WorkerCount = 12,
     [int] $HddThreadsPerDisk = 1,
     [int] $SsdThreadsPerDisk = 16,
@@ -33,6 +34,7 @@ param(
     [int] $TotalReadThreads = 16,
     [int] $ReservedCores = 1,
     [switch] $SingleRun,
+    [switch] $CompleteWhenTaskTerminal,
     [switch] $RequireDistinctPhysicalDisks,
     [switch] $LibraryOnly
 )
@@ -626,20 +628,21 @@ function Get-CanonicalMediaRootPath {
 function Resolve-RuntimeMediaRoots {
     <# 校验并按调用顺序解析媒体根，拒绝空值、重复、嵌套和根目录重解析点。 #>
     param(
-        [string] $MediaRoot = '',
+        [string[]] $MediaRoot = @(),
         [string[]] $MediaRoots = @()
     )
 
-    $legacyProvided = -not [string]::IsNullOrWhiteSpace($MediaRoot)
-    $multipleProvided = @($MediaRoots).Count -gt 0
-    if ($legacyProvided -and $multipleProvided) {
+    $primaryRoots = @($MediaRoot | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_ ) })
+    $legacyRoots = @($MediaRoots | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_ ) })
+    if ($primaryRoots.Count -gt 0 -and $legacyRoots.Count -gt 0) {
         throw 'RUST_V2_REAL_MEDIA_ROOTS_BOTH_ARGUMENTS'
     }
-    if (-not $legacyProvided -and -not $multipleProvided) {
+    if ($primaryRoots.Count -eq 0 -and $legacyRoots.Count -eq 0) {
         throw 'RUST_V2_REAL_MEDIA_ROOT_MISSING'
     }
 
-    $candidates = if ($multipleProvided) { @($MediaRoots) } else { @($MediaRoot) }
+    # MediaRoot 现在直接支持多根；MediaRoots 只作为旧调用方的过渡别名。
+    $candidates = if ($legacyRoots.Count -gt 0) { $legacyRoots } else { $primaryRoots }
     $resolved = [Collections.Generic.List[string]]::new()
     $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($candidate in $candidates) {
@@ -753,7 +756,7 @@ function Get-RuntimePhysicalDiskMap {
 function Assert-RuntimeAcceptanceInputs {
     <# 验证所有外部输入；失败时不创建目录、不启动进程。 #>
     param(
-        [string] $MediaRoot,
+        [string[]] $MediaRoot,
         [string[]] $MediaRoots = @(),
         [int] $DurationSeconds,
         [int] $SampleSeconds,
@@ -770,7 +773,9 @@ function Assert-RuntimeAcceptanceInputs {
         [int] $UnknownThreadsPerDisk = 1,
         [int] $TotalReadThreads = 16,
         [int] $ReservedCores = 1,
+        [string] $Enumerator = 'everything',
         [switch] $SingleRun,
+        [switch] $CompleteWhenTaskTerminal,
         [switch] $RequireDistinctPhysicalDisks,
         [switch] $ThrowOnError = $true
     )
@@ -787,6 +792,9 @@ function Assert-RuntimeAcceptanceInputs {
     }
     elseif (-not $code -and $SampleSeconds -ne 2) {
         $code = 'RUST_V2_ACCEPTANCE_SAMPLE_INVALID'
+    }
+    elseif (-not $code -and ([string]$Enumerator).Trim().ToLowerInvariant() -notin @('everything', 'windows_walker')) {
+        $code = 'RUST_V2_ACCEPTANCE_ENUMERATOR_INVALID'
     }
     elseif (-not $code -and $Variant -notin @('A', 'B')) {
         $code = 'RUST_V2_ACCEPTANCE_VARIANT_INVALID'
@@ -942,7 +950,7 @@ function ConvertTo-TomlBasicString {
 }
 
 function New-IsolatedNodeConfig {
-    <# 写入相对 node.exe 根解释的完整配置正文。 #>
+    <# 写入相对 node.exe 根解释的完整配置正文；枚举器默认使用 Everything。 #>
     param(
         [int] $Port,
         [int] $WorkerCount = 12,
@@ -951,7 +959,8 @@ function New-IsolatedNodeConfig {
         [int] $UnknownThreadsPerDisk = 1,
         [int] $TotalReadThreads = 16,
         [int] $ReservedCores = 1,
-        [string] $DataRoot = ''
+        [string] $DataRoot = '',
+        [string] $Enumerator = 'everything'
     )
 
     $dataPath = if ([string]::IsNullOrWhiteSpace($DataRoot)) { 'data/node' } else { Get-NormalizedAbsolutePath -Path $DataRoot }
@@ -962,13 +971,17 @@ function New-IsolatedNodeConfig {
     $tomlConfigPath = ConvertTo-TomlBasicString -Value $configPath
     $tomlLogPath = ConvertTo-TomlBasicString -Value $logPath
     $tomlCachePath = ConvertTo-TomlBasicString -Value $cachePath
+    $enum = ([string]$Enumerator).Trim().ToLowerInvariant()
+    if ($enum -notin @('everything', 'windows_walker')) {
+        throw 'RUST_V2_ACCEPTANCE_ENUMERATOR_INVALID'
+    }
 
 @"
 listen_ip = "127.0.0.1"
 port = $Port
 worker_count = $WorkerCount
-# 验收专用 Walker 只枚举显式传入的媒体根，避免启动 Everything 全盘索引。
-enumerator = "windows_walker"
+    # 验收只枚举显式传入的媒体根；Everything 由 Node 使用同目录实例服务。
+    enumerator = "$enum"
 
 [paths]
 data_path = $tomlDataPath
@@ -1738,11 +1751,11 @@ function Resolve-ReleaseRoot {
 }
 
 function Parse-ResultSummaryOutput {
-    <# 解析 exporter 固定 stdout，并验证路径、任务 ID、状态与 SHA 的互相绑定。 #>
+    <# 解析 exporter 固定 stdout，并验证 TSV 路径、状态、SHA 与计数的互相绑定。 #>
     param(
         [Parameter(Mandatory)] [string] $Text,
         [Parameter(Mandatory)] [string] $ExpectedPath,
-        [Parameter(Mandatory)] [string] $ExpectedTaskId
+        [string] $ExpectedTaskId = ''
     )
 
     $values = [ordered]@{}
@@ -1761,7 +1774,7 @@ function Parse-ResultSummaryOutput {
     $required = @(
         'RESULT_SUMMARY_STATUS', 'RESULT_SUMMARY_PATH', 'RESULT_SUMMARY_SHA256',
         'RESULT_SUMMARY_ROW_COUNT', 'RESULT_SUMMARY_MISSING_COUNT',
-        'RESULT_SUMMARY_INCONCLUSIVE_COUNT', 'RESULT_SUMMARY_TASK_ID'
+        'RESULT_SUMMARY_INCONCLUSIVE_COUNT'
     )
     foreach ($name in $required) {
         if (-not $values.Contains($name) -or [string]::IsNullOrWhiteSpace([string]$values[$name])) {
@@ -1789,7 +1802,13 @@ function Parse-ResultSummaryOutput {
         -not [long]::TryParse([string]$values['RESULT_SUMMARY_INCONCLUSIVE_COUNT'], [Globalization.NumberStyles]::Integer, [Globalization.CultureInfo]::InvariantCulture, [ref]$inconclusiveCount) -or $inconclusiveCount -lt 0) {
         throw 'RUST_V2_RESULT_SUMMARY_COUNT_INVALID'
     }
-    if ([string]$values['RESULT_SUMMARY_TASK_ID'] -cne $ExpectedTaskId) {
+    $taskId = if ($values.Contains('RESULT_SUMMARY_TASK_ID')) {
+        [string]$values['RESULT_SUMMARY_TASK_ID']
+    }
+    else {
+        ''
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedTaskId) -and $taskId -cne $ExpectedTaskId) {
         throw 'RUST_V2_RESULT_SUMMARY_TASK_ID_MISMATCH'
     }
     [pscustomobject]@{
@@ -1799,7 +1818,7 @@ function Parse-ResultSummaryOutput {
         RowCount = $rowCount
         MissingCount = $missingCount
         InconclusiveCount = $inconclusiveCount
-        TaskId = [string]$values['RESULT_SUMMARY_TASK_ID']
+        TaskId = $taskId
     }
 }
 
@@ -1834,8 +1853,88 @@ function Assert-CanonicalResultSummary {
     $rows.Count
 }
 
+function Assert-ResultSummaryTsv {
+    <# 流程级校验固定 TSV 的 UTF-8/LF、列数、footer、行数和数据区 SHA。 #>
+    param(
+        [Parameter(Mandatory)] [string] $Path,
+        [long] $ExpectedRowCount = -1
+    )
+
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -eq 0 -or $bytes[$bytes.Length - 1] -ne [byte]10 -or
+        [Array]::IndexOf($bytes, [byte]13) -ge 0 -or
+        ($bytes.Length -ge 3 -and $bytes[0] -eq [byte]239 -and
+            $bytes[1] -eq [byte]187 -and $bytes[2] -eq [byte]191)) {
+        throw 'RUST_V2_ACCEPTANCE_RESULT_SUMMARY_TSV_FORMAT_INVALID'
+    }
+    try {
+        $text = [Text.UTF8Encoding]::new($false, $true).GetString($bytes)
+    }
+    catch {
+        throw 'RUST_V2_ACCEPTANCE_RESULT_SUMMARY_TSV_UTF8_INVALID'
+    }
+    $lines = $text -split "`n", -1
+    if ($lines.Count -lt 3) {
+        throw 'RUST_V2_ACCEPTANCE_RESULT_SUMMARY_TSV_FOOTER_MISSING'
+    }
+    $expectedColumns = @(
+        'record_type', 'status', 'machine_id', 'normalized_path', 'display_path',
+        'file_size', 'md5', 'media_type', 'base_complete', 'feature_payload_sha256',
+        'image_stage1_sha256', 'image_stage2_sha256', 'video_metadata_sha256',
+        'video_frame_stage1_0_sha256', 'video_frame_stage1_1_sha256',
+        'video_frame_stage1_2_sha256', 'video_frame_stage1_3_sha256',
+        'video_frame_stage1_4_sha256', 'video_frame_stage1_5_sha256',
+        'video_frame_stage2_0_sha256', 'video_frame_stage2_1_sha256',
+        'video_frame_stage2_2_sha256', 'video_frame_stage2_3_sha256',
+        'video_frame_stage2_4_sha256', 'video_frame_stage2_5_sha256',
+        'thumbnail_sha256', 'thumbnail_state', 'contact_sheet_sha256', 'status_reason'
+    ) -join "`t"
+    if ($lines[0] -cne $expectedColumns) {
+        throw 'RUST_V2_ACCEPTANCE_RESULT_SUMMARY_TSV_HEADER_INVALID'
+    }
+    $footerIndex = $lines.Count - 2
+    $footer = @($lines[$footerIndex].Split([char]9))
+    if ($footer.Count -ne 3 -or $footer[0] -cne 'F' -or
+        $footer[1] -notmatch '^[0-9]+$' -or $footer[2] -notmatch '^[0-9a-f]{64}$') {
+        throw 'RUST_V2_ACCEPTANCE_RESULT_SUMMARY_TSV_FOOTER_INVALID'
+    }
+    $rowCount = [long]$footer[1]
+    if ($ExpectedRowCount -ge 0 -and $rowCount -ne $ExpectedRowCount) {
+        throw 'RUST_V2_ACCEPTANCE_RESULT_SUMMARY_ROW_COUNT_INVALID'
+    }
+    $dataText = $lines[0] + "`n"
+    $missingCount = 0L
+    $inconclusiveCount = 0L
+    $actualRows = 0L
+    for ($lineIndex = 1; $lineIndex -lt $footerIndex; $lineIndex++) {
+        $line = $lines[$lineIndex]
+        $columns = @($line.Split([char]9))
+        if ($columns.Count -ne 29 -or $columns[0] -cne 'R' -or
+            [string]::IsNullOrWhiteSpace($columns[1])) {
+            throw "RUST_V2_ACCEPTANCE_RESULT_SUMMARY_TSV_ROW_INVALID line=$($lineIndex + 1)"
+        }
+        if ($columns[1] -ceq 'MISSING') { $missingCount++ }
+        if ($columns[1] -ceq 'INCONCLUSIVE') { $inconclusiveCount++ }
+        $dataText += $line + "`n"
+        $actualRows++
+    }
+    if ($actualRows -ne $rowCount) {
+        throw 'RUST_V2_ACCEPTANCE_RESULT_SUMMARY_TSV_ROW_COUNT_INVALID'
+    }
+    $actualDataHash = Get-TextSha256 -Text $dataText
+    if ($actualDataHash -cne [string]$footer[2]) {
+        throw 'RUST_V2_ACCEPTANCE_RESULT_SUMMARY_TSV_DATA_HASH_INVALID'
+    }
+    [pscustomobject]@{
+        RowCount = $rowCount
+        MissingCount = $missingCount
+        InconclusiveCount = $inconclusiveCount
+        DataSha256 = [string]$footer[2]
+    }
+}
+
 function Get-ResultSummaryArtifacts {
-    <# 校验摘要、metadata、lease token 的路径、状态、任务和 SHA 绑定。 #>
+    <# 校验单个固定 TSV；不读取、不创建 JSON metadata、pair lock 或其他旁车文件。 #>
     param(
         [Parameter(Mandatory)] [string] $SummaryPath,
         [string] $ExpectedTaskId = '',
@@ -1845,72 +1944,57 @@ function Get-ResultSummaryArtifacts {
     )
 
     $summary = Get-NormalizedAbsolutePath -Path $SummaryPath
-    $metadata = Join-Path (Split-Path -Parent $summary) 'result-summary-meta.json'
-    $lease = "$summary.pair.lock"
     $summaryExists = Test-Path -LiteralPath $summary -PathType Leaf
-    $metadataExists = Test-Path -LiteralPath $metadata -PathType Leaf
-    $leaseExists = Test-Path -LiteralPath $lease -PathType Leaf
     $bindingValid = $false
     $diagnostic = ''
-    $metadataObject = $null
-    $leaseObject = $null
-    if (-not $summaryExists -or -not $metadataExists -or -not $leaseExists) {
-        $diagnostic = 'RUST_V2_ACCEPTANCE_RESULT_SUMMARY_THREE_PIECE_MISSING'
+    $tsv = $null
+    $actualSha256 = $null
+    if (-not $summaryExists) {
+        $diagnostic = 'RUST_V2_ACCEPTANCE_RESULT_SUMMARY_MISSING'
     }
     else {
         try {
-            $metadataObject = [IO.File]::ReadAllText($metadata) | ConvertFrom-Json
-            $leaseObject = [IO.File]::ReadAllText($lease) | ConvertFrom-Json
-            $canonicalRowCount = Assert-CanonicalResultSummary -Path $summary -ExpectedRowCount $ExpectedRowCount
+            if ([IO.Path]::GetFileName($summary) -cne 'result-summary.tsv') {
+                throw 'RUST_V2_ACCEPTANCE_RESULT_SUMMARY_FILENAME_INVALID'
+            }
+            $tsv = Assert-ResultSummaryTsv -Path $summary -ExpectedRowCount $ExpectedRowCount
             $actualSha256 = Get-FileSha256OrNull -Path $summary
-            $metaToken = [string]$metadataObject.lease_token
-            $leaseToken = [string]$leaseObject.lease_token
-            $metaSha256 = [string]$metadataObject.canonical_sha256
-            $leaseSha256 = [string]$leaseObject.expected_canonical_sha256
-            $metaTaskId = [string]$metadataObject.task_id
-            $metaStatus = [string]$metadataObject.status
-            $leaseStatus = [string]$leaseObject.expected_status
-            $emptyNonMissing = ($canonicalRowCount -eq 0) -and
-                (-not $metaStatus.Equals('MISSING', [StringComparison]::OrdinalIgnoreCase) -or
-                    -not $leaseStatus.Equals('MISSING', [StringComparison]::OrdinalIgnoreCase))
-            $rowCountMatches = [long]$metadataObject.row_count -eq $canonicalRowCount -and
-                ($ExpectedRowCount -lt 0 -or [long]$metadataObject.row_count -eq $ExpectedRowCount)
-            $leaseRowCountMatches = [long]$leaseObject.expected_row_count -eq $canonicalRowCount -and
-                ($ExpectedRowCount -lt 0 -or [long]$leaseObject.expected_row_count -eq $ExpectedRowCount)
-            $bindingValid = -not [string]::IsNullOrWhiteSpace($metaToken) -and
-                $metaToken -ceq $leaseToken -and
-                $actualSha256 -ceq $metaSha256 -and $actualSha256 -ceq $leaseSha256 -and
+            $summaryStatus = if ($tsv.InconclusiveCount -gt 0) {
+                'INCONCLUSIVE'
+            }
+            elseif ($tsv.MissingCount -gt 0 -or $tsv.RowCount -eq 0) {
+                'MISSING'
+            }
+            else {
+                'PASS'
+            }
+            $bindingValid = $actualSha256 -and
                 ([string]::IsNullOrWhiteSpace($ExpectedSha256) -or $actualSha256 -ceq $ExpectedSha256) -and
-                # PairLeaseManifest 不含 expected_task_id；ExpectedTaskId 只绑定 metadata.task_id。
-                ([string]::IsNullOrWhiteSpace($ExpectedTaskId) -or $metaTaskId -ceq $ExpectedTaskId) -and
+                ([string]::IsNullOrWhiteSpace($ExpectedTaskId)) -and
                 ([string]::IsNullOrWhiteSpace($ExpectedStatus) -or
-                    ($metaStatus.Equals($ExpectedStatus, [StringComparison]::OrdinalIgnoreCase) -and
-                        $leaseStatus.Equals($ExpectedStatus, [StringComparison]::OrdinalIgnoreCase))) -and
-                $rowCountMatches -and $leaseRowCountMatches -and -not $emptyNonMissing
+                    $ExpectedStatus.Equals($summaryStatus, [StringComparison]::OrdinalIgnoreCase))
             if (-not $bindingValid) {
-                $diagnostic = if ($emptyNonMissing) {
-                    'RUST_V2_ACCEPTANCE_RESULT_SUMMARY_EMPTY_NON_MISSING'
-                }
-                else {
-                    'RUST_V2_ACCEPTANCE_RESULT_SUMMARY_BINDING_INVALID'
-                }
+                $diagnostic = 'RUST_V2_ACCEPTANCE_RESULT_SUMMARY_BINDING_INVALID'
             }
         }
         catch {
-            $diagnostic = 'RUST_V2_ACCEPTANCE_RESULT_SUMMARY_BINDING_INVALID'
+            $diagnostic = $_.Exception.Message
         }
     }
     [pscustomobject]@{
         SummaryPath = $summary
-        MetadataPath = $metadata
-        LeasePath = $lease
+        MetadataPath = $null
+        LeasePath = $null
         SummaryExists = $summaryExists
-        MetadataExists = $metadataExists
-        LeaseExists = $leaseExists
+        MetadataExists = $false
+        LeaseExists = $false
         BindingValid = $bindingValid
         Diagnostic = $diagnostic
-        Metadata = $metadataObject
-        Lease = $leaseObject
+        Metadata = $null
+        Lease = $null
+        RowCount = if ($tsv) { $tsv.RowCount } else { 0 }
+        MissingCount = if ($tsv) { $tsv.MissingCount } else { 0 }
+        InconclusiveCount = if ($tsv) { $tsv.InconclusiveCount } else { 0 }
     }
 }
 
@@ -1924,6 +2008,7 @@ function Get-ResultSummaryRunStatus {
         [bool] $MediaUnchanged = $true,
         [bool] $ScanFailed = $false,
         [bool] $ClientExitUnconfirmed = $false,
+        [bool] $RuntimeTaskTerminalObserved = $false,
         [bool] $CompletedTaskIdPresent = $false,
         [bool] $ExporterSucceeded = $false,
         [bool] $SummaryBindingValid = $false,
@@ -1938,10 +2023,11 @@ function Get-ResultSummaryRunStatus {
     if ($RunDiagnostic -match 'RUST_V2_ACCEPTANCE_(SUPERVISOR_|CLIENT_EXIT_UNCONFIRMED)') {
         return 'INCONCLUSIVE'
     }
+    $terminalObserved = $RuntimeTaskTerminalObserved -or $CompletedTaskIdPresent
     if ($NodeUnexpectedExit -or $ClientExitFailed -or -not $MediaUnchanged -or $ScanFailed) {
         return 'FAIL'
     }
-    if ($ClientExitUnconfirmed -or -not $CompletedTaskIdPresent -or -not $ExporterSucceeded -or
+    if ($ClientExitUnconfirmed -or -not $terminalObserved -or -not $ExporterSucceeded -or
         -not $SummaryBindingValid -or -not [string]::IsNullOrWhiteSpace($RunDiagnostic)) {
         return 'INCONCLUSIVE'
     }
@@ -2039,7 +2125,7 @@ function New-HarnessResult {
         result_summary_path = $summaryPathValue
         result_summary_sha256 = $summaryShaValue
         result_summary_status = $summaryStatusValue
-        result_summary_task_id = $summaryTaskValue
+        result_summary_task_id = if ([string]::IsNullOrWhiteSpace($summaryTaskValue)) { $null } else { $summaryTaskValue }
         result_summary_row_count = $summaryRowValue
         result_summary_missing_count = $summaryMissingValue
         result_summary_inconclusive_count = $summaryInconclusiveValue
@@ -2165,12 +2251,12 @@ function Request-IsolatedNodeExit {
 }
 
 function Invoke-ResultExporter {
-    <# Node/Worker 全停后运行外置 exporter，stdout/stderr 与退出码全部保存在 evidence。 #>
+    <# Node/Worker 全停后运行外置 exporter；重复传递媒体根，只生成固定 TSV。 #>
     param(
         [Parameter(Mandatory)] [string] $ExporterPath,
         [Parameter(Mandatory)] [string] $DatabasePath,
         [Parameter(Mandatory)] [string] $CacheRoot,
-        [Parameter(Mandatory)] [string] $TaskId,
+        [string[]] $MediaRoots = @(),
         [Parameter(Mandatory)] [string] $OutputPath,
         [Parameter(Mandatory)] [string] $EvidenceRoot,
         [int] $TimeoutSeconds = 120,
@@ -2191,6 +2277,12 @@ function Invoke-ResultExporter {
     $stdoutTask = $null
     $stderrTask = $null
     try {
+        if (@($MediaRoots).Count -eq 0) {
+            throw 'RUST_V2_ACCEPTANCE_EXPORTER_MEDIA_ROOT_MISSING'
+        }
+        if ([IO.Path]::GetFileName($OutputPath) -cne 'result-summary.tsv') {
+            throw 'RUST_V2_ACCEPTANCE_RESULT_SUMMARY_FILENAME_INVALID'
+        }
         # ArgumentList 逐项传值，Windows 路径中的空格不会被拆成多个参数。
         $startInfo = [Diagnostics.ProcessStartInfo]::new()
         $startInfo.FileName = $ExporterPath
@@ -2199,12 +2291,19 @@ function Invoke-ResultExporter {
         $startInfo.CreateNoWindow = $true
         $startInfo.RedirectStandardOutput = $true
         $startInfo.RedirectStandardError = $true
-        foreach ($argument in @(
-                '--database', $DatabasePath,
-                '--cache-root', $CacheRoot,
-                '--task-id', $TaskId,
-                '--output', $OutputPath)) {
-            [void]$startInfo.ArgumentList.Add([string]$argument)
+        $argumentList = [Collections.Generic.List[string]]::new()
+        foreach ($argument in @('--database', $DatabasePath, '--cache-root', $CacheRoot)) {
+            [void]$argumentList.Add([string]$argument)
+        }
+        foreach ($mediaRoot in @($MediaRoots)) {
+            [void]$argumentList.Add('--media-root')
+            [void]$argumentList.Add([string]$mediaRoot)
+        }
+        foreach ($argument in @('--output', $OutputPath)) {
+            [void]$argumentList.Add([string]$argument)
+        }
+        foreach ($argument in $argumentList) {
+            [void]$startInfo.ArgumentList.Add($argument)
         }
         $process = [Diagnostics.Process]::new()
         $process.StartInfo = $startInfo
@@ -2316,16 +2415,82 @@ function Get-CompletedProcessExitCode {
 }
 
 function Get-MediaEvidenceSha256 {
-    <# 对规范化媒体清单 JSON 计算 SHA-256，前后清单分别绑定到 harness-result。 #>
+    <# 对规范化媒体清单计算 SHA-256，前后清单分别绑定到 harness-result。 #>
     param([Parameter(Mandatory)] $Manifest)
 
     Get-TextSha256 -Text ($Manifest | ConvertTo-Json -Depth 8 -Compress)
 }
 
+function Get-RuntimeTaskFileStatistics {
+    <# 仅在任务 TSV 尚未被终态清理时统计真实 P/C/F；缺失时明确标记不可用。 #>
+    param([Parameter(Mandatory)] [string] $RuntimeRoot)
+
+    $unavailable = [ordered]@{
+        status = 'UNAVAILABLE'
+        source = 'runtime_protocol_not_exposed'
+        pending = $null
+        completed = $null
+        failed = $null
+        row_count = $null
+        files = @()
+        diagnostic = '任务终态后运行目录已清理，协议未暴露 P/C/F'
+    }
+    if (-not (Test-Path -LiteralPath $RuntimeRoot -PathType Container)) {
+        return $unavailable
+    }
+    try {
+        $taskFiles = @(Get-ChildItem -LiteralPath $RuntimeRoot -Recurse -File -Filter '*.tasks.tsv' -ErrorAction Stop)
+    }
+    catch {
+        $unavailable.status = 'INCONCLUSIVE'
+        $unavailable.source = 'runtime_tsv'
+        $unavailable.diagnostic = '任务 TSV 枚举失败'
+        return $unavailable
+    }
+    if ($taskFiles.Count -eq 0) {
+        return $unavailable
+    }
+    $pending = 0L
+    $completed = 0L
+    $failed = 0L
+    $rowCount = 0L
+    try {
+        foreach ($taskFile in $taskFiles) {
+            foreach ($line in [IO.File]::ReadLines($taskFile.FullName)) {
+                if ([string]::IsNullOrEmpty($line)) { continue }
+                $rowCount++
+                switch ($line.Substring(0, 1)) {
+                    'P' { $pending++ }
+                    'C' { $completed++ }
+                    'F' { $failed++ }
+                    default { throw 'invalid task file state' }
+                }
+            }
+        }
+    }
+    catch {
+        $unavailable.status = 'INCONCLUSIVE'
+        $unavailable.source = 'runtime_tsv'
+        $unavailable.files = @($taskFiles | ForEach-Object { Get-NormalizedAbsolutePath -Path $_.FullName })
+        $unavailable.diagnostic = '任务 TSV 行格式无效'
+        return $unavailable
+    }
+    [ordered]@{
+        status = 'PRESENT'
+        source = 'runtime_tsv'
+        pending = $pending
+        completed = $completed
+        failed = $failed
+        row_count = $rowCount
+        files = @($taskFiles | Sort-Object FullName | ForEach-Object { Get-NormalizedAbsolutePath -Path $_.FullName })
+        diagnostic = $null
+    }
+}
+
 function Invoke-RustV2RuntimeAcceptance {
     <# 执行单轮验收；采样、停机、导出和报告严格按固定证据顺序串行完成。 #>
     param(
-        [string] $MediaRoot,
+        [string[]] $MediaRoot,
         [string[]] $MediaRoots = @(),
         [int] $DurationSeconds,
         [int] $SampleSeconds,
@@ -2341,6 +2506,7 @@ function Invoke-RustV2RuntimeAcceptance {
         [string] $SourceTreeSha256,
         [string] $PackagePath,
         [string] $PackageSha256,
+        [string] $Enumerator = 'everything',
         [int] $WorkerCount,
         [int] $HddThreadsPerDisk,
         [int] $SsdThreadsPerDisk,
@@ -2348,6 +2514,7 @@ function Invoke-RustV2RuntimeAcceptance {
         [int] $TotalReadThreads,
         [int] $ReservedCores,
         [switch] $SingleRun,
+        [switch] $CompleteWhenTaskTerminal,
         [switch] $RequireDistinctPhysicalDisks
     )
 
@@ -2361,7 +2528,9 @@ function Invoke-RustV2RuntimeAcceptance {
         -WorkerCount $WorkerCount -HddThreadsPerDisk $HddThreadsPerDisk `
         -SsdThreadsPerDisk $SsdThreadsPerDisk -UnknownThreadsPerDisk $UnknownThreadsPerDisk `
         -TotalReadThreads $TotalReadThreads -ReservedCores $ReservedCores `
-        -SingleRun:$SingleRun -RequireDistinctPhysicalDisks:$RequireDistinctPhysicalDisks -ThrowOnError:$false
+        -Enumerator $Enumerator `
+        -SingleRun:$SingleRun -CompleteWhenTaskTerminal:$CompleteWhenTaskTerminal `
+        -RequireDistinctPhysicalDisks:$RequireDistinctPhysicalDisks -ThrowOnError:$false
     if (-not $validation.Valid) {
         throw $validation.Code
     }
@@ -2383,8 +2552,9 @@ function Invoke-RustV2RuntimeAcceptance {
     $physicalDiskMapPath = Join-Path $layout.Evidence 'physical-disk-map.json'
     $physicalDiskMapSha256 = ''
     if ($RequireDistinctPhysicalDisks) {
-        # 物理盘映射发生在启动 Node 前；相同 DiskNumber 直接终止本轮，不产生产品进程。
-        $physicalDiskMap = Get-RuntimePhysicalDiskMap -MediaRoots $resolvedMediaRoots -RequireDistinctPhysicalDisks
+        # 显式双物理盘验收在启动 Node 前记录映射；相同 DiskNumber 直接拒绝。
+        $physicalDiskMap = Get-RuntimePhysicalDiskMap -MediaRoots $resolvedMediaRoots `
+            -RequireDistinctPhysicalDisks
         [IO.File]::WriteAllText($physicalDiskMapPath,
             ($physicalDiskMap | ConvertTo-Json -Depth 12), [Text.UTF8Encoding]::new($false))
         $physicalDiskMapSha256 = Get-FileSha256OrNull -Path $physicalDiskMapPath
@@ -2399,7 +2569,7 @@ function Invoke-RustV2RuntimeAcceptance {
     $configText = New-IsolatedNodeConfig -Port $port -WorkerCount $WorkerCount `
         -HddThreadsPerDisk $HddThreadsPerDisk -SsdThreadsPerDisk $SsdThreadsPerDisk `
         -UnknownThreadsPerDisk $UnknownThreadsPerDisk -TotalReadThreads $TotalReadThreads `
-        -ReservedCores $ReservedCores -DataRoot $layout.Data
+        -ReservedCores $ReservedCores -DataRoot $layout.Data -Enumerator $Enumerator
     [IO.File]::WriteAllText(
         (Join-Path $layout.Data 'config.toml'),
         $configText,
@@ -2438,9 +2608,13 @@ function Invoke-RustV2RuntimeAcceptance {
     $supervisor = $null
     $after = $null
     $runtimeResult = $null
+    $taskFileStats = $null
+    $scanRecords = @()
+    $terminalScanObserved = $false
+    $completedScanObserved = $false
     $databaseSnapshot = $null
     $resultSummary = [pscustomobject]@{
-        Status = 'INCONCLUSIVE'; Path = Join-Path $layout.Evidence 'result-summary.jsonl'
+        Status = 'INCONCLUSIVE'; Path = Join-Path $layout.Evidence 'result-summary.tsv'
         Sha256 = $null; RowCount = 0; MissingCount = 0; InconclusiveCount = 0; TaskId = $null
     }
     $exporterExitCode = -1
@@ -2459,6 +2633,7 @@ function Invoke-RustV2RuntimeAcceptance {
     $nodeExecutablePath = Get-NormalizedAbsolutePath -Path (Join-Path $layout.Release 'node.exe')
     $clientExecutablePath = Get-NormalizedAbsolutePath -Path $AcceptanceClientPath
     $supervisorStatusPath = Join-Path $layout.Evidence 'supervisor-status.json'
+    $completionOnTerminal = [bool]$SingleRun -or [bool]$CompleteWhenTaskTerminal
     $savedEnvironment = @{}
     foreach ($name in @(
         'RUST_V2_ACCEPTANCE_ENDPOINT',
@@ -2499,7 +2674,7 @@ function Invoke-RustV2RuntimeAcceptance {
         }
         $env:RUST_V2_ACCEPTANCE_DURATION_SECONDS = [string]$DurationSeconds
         $env:RUST_V2_ACCEPTANCE_OUTPUT = $runtimeOutput
-        if ($SingleRun) {
+        if ($completionOnTerminal) {
             $env:RUST_V2_ACCEPTANCE_SINGLE_RUN = '1'
         }
         else {
@@ -2611,6 +2786,8 @@ function Invoke-RustV2RuntimeAcceptance {
             }
         }
 
+        # 终态清理 runtime 前尽力读取任务 TSV；若已清理则写入明确的不可用状态。
+        $taskFileStats = Get-RuntimeTaskFileStatistics -RuntimeRoot (Join-Path $layout.Data 'runtime')
         # 客户端终态和 media-after 已保存后，才请求 Node 及所有 Worker 退出。
         $shutdownDiagnostic = Request-IsolatedNodeExit -Node $node -Root $layout.Release
         if ($shutdownDiagnostic) { $runDiagnostic = $shutdownDiagnostic }
@@ -2623,17 +2800,22 @@ function Invoke-RustV2RuntimeAcceptance {
         }
         $completedTaskId = if ($runtimeResult) { [string]$runtimeResult.latest_completed_persistent_task_id } else { '' }
         $completedTaskIdPresent = -not [string]::IsNullOrWhiteSpace($completedTaskId)
-        if ([string]::IsNullOrWhiteSpace($completedTaskId)) {
-            if (-not $runDiagnostic) { $runDiagnostic = 'RUST_V2_ACCEPTANCE_COMPLETED_TASK_ID_MISSING' }
+        $scanRecords = if ($runtimeResult) { @($runtimeResult.scan_tasks) } else { @() }
+        $completedScanObserved = @($scanRecords | Where-Object { [string]$_.terminal_state -eq 'completed' }).Count -gt 0
+        $terminalScanObserved = @($scanRecords | Where-Object {
+                [string]$_.terminal_state -in @('completed', 'failed', 'cancelled')
+            }).Count -gt 0
+        if (-not $terminalScanObserved) {
+            if (-not $runDiagnostic) { $runDiagnostic = 'RUST_V2_ACCEPTANCE_TERMINAL_STATE_MISSING' }
         }
-        elseif (-not $shutdownDiagnostic) {
+        elseif ($completedScanObserved -and -not $shutdownDiagnostic) {
             $databasePath = Join-Path $layout.Data 'node.db'
             # 只读快照必须在受控停机并确认隔离进程归零后创建，避免 SQLite 首次打开自变更 WAL/SHM。
             $databaseSnapshot = New-ReadOnlyDatabaseSnapshot -DatabasePath $databasePath `
                 -EvidenceRoot $layout.Evidence
             $export = Invoke-ResultExporter -ExporterPath $ResultExporterPath `
                 -DatabasePath $databaseSnapshot.DatabasePath `
-                -CacheRoot $layout.Cache -TaskId $completedTaskId `
+                -CacheRoot $layout.Cache -MediaRoots $resolvedMediaRoots `
                 -OutputPath $resultSummary.Path -EvidenceRoot $layout.Evidence
             $exporterExitCode = $export.ExitCode
             if ($export.Diagnostic) {
@@ -2646,9 +2828,9 @@ function Invoke-RustV2RuntimeAcceptance {
                 $exporterSucceeded = $true
                 try {
                     $resultSummary = Parse-ResultSummaryOutput -Text $export.Stdout `
-                        -ExpectedPath $resultSummary.Path -ExpectedTaskId $completedTaskId
+                        -ExpectedPath $resultSummary.Path
                     $artifacts = Get-ResultSummaryArtifacts -SummaryPath $resultSummary.Path `
-                        -ExpectedTaskId $resultSummary.TaskId -ExpectedStatus $resultSummary.Status `
+                        -ExpectedStatus $resultSummary.Status `
                         -ExpectedSha256 $resultSummary.Sha256 -ExpectedRowCount $resultSummary.RowCount
                     if (-not $artifacts.BindingValid) {
                         throw $artifacts.Diagnostic
@@ -2817,6 +2999,7 @@ function Invoke-RustV2RuntimeAcceptance {
         -ClientExitFailed:$clientExitFailed -MediaUnchanged:$mediaUnchanged `
         -ScanFailed:($failedScanCount -gt 0 -or $nonDeadlineFailedScan -or $nonDeadlineCancelledScan) `
         -ClientExitUnconfirmed:$clientExitUnconfirmed `
+        -RuntimeTaskTerminalObserved:$terminalScanObserved `
         -CompletedTaskIdPresent:$completedTaskIdPresent -ExporterSucceeded:$exporterSucceeded `
         -SummaryBindingValid:$resultSummaryBindingValid -SummaryStatus $resultSummary.Status `
         -RunDiagnostic $runDiagnostic
@@ -2828,7 +3011,7 @@ function Invoke-RustV2RuntimeAcceptance {
         -DatabaseSnapshotMetadataPath $databaseSnapshotMetadataPath `
         -ConfigSha256 $configSha256 -PackageManifestSha256 $packageManifestSha256 `
         -MediaBeforeSha256 $mediaBeforeSha256 -MediaAfterSha256 $mediaAfterSha256 `
-        -MediaRoots $resolvedMediaRoots -SingleRun:$SingleRun `
+        -MediaRoots $resolvedMediaRoots -SingleRun:$completionOnTerminal `
         -PhysicalDiskMapPath $(if ($physicalDiskMap) { $physicalDiskMapPath } else { '' }) `
         -PhysicalDiskMapSha256 $physicalDiskMapSha256 `
         -MediaBeforeRootPaths $mediaBeforeRootPaths -MediaAfterRootPaths $mediaAfterRootPaths `
@@ -2843,6 +3026,17 @@ function Invoke-RustV2RuntimeAcceptance {
         -EffectiveWorkerCount $WorkerCount -HddThreadsPerDisk $HddThreadsPerDisk `
         -SsdThreadsPerDisk $SsdThreadsPerDisk -UnknownThreadsPerDisk $UnknownThreadsPerDisk `
         -ReadTotalThreads $TotalReadThreads -ReservedCores $ReservedCores
+    # 这些统计只在任务 TSV 尚未被终态清理时读取；协议没有暴露的计数保持 null，禁止伪造。
+    $harnessResult = [pscustomobject]$harnessResult
+    $harnessResult | Add-Member -NotePropertyName enumerator -NotePropertyValue ([string]$Enumerator).Trim().ToLowerInvariant()
+    $harnessResult | Add-Member -NotePropertyName complete_when_task_terminal -NotePropertyValue $completionOnTerminal
+    $harnessResult | Add-Member -NotePropertyName task_file_stats -NotePropertyValue $taskFileStats
+    $harnessResult | Add-Member -NotePropertyName cache_hits_not_in_task_file -NotePropertyValue ([ordered]@{
+            status = 'UNAVAILABLE'; source = 'runtime_protocol_not_exposed'; count = $null
+        })
+    $harnessResult | Add-Member -NotePropertyName sqlite_runtime_write_counts -NotePropertyValue ([ordered]@{
+            status = 'UNAVAILABLE'; source = 'runtime_protocol_not_exposed'; task = $null; analysis = $null; delete = $null
+        })
     [IO.File]::WriteAllText((Join-Path $layout.Evidence 'harness-result.json'),
         ($harnessResult | ConvertTo-Json -Depth 12), [Text.UTF8Encoding]::new($false))
 
@@ -2871,6 +3065,7 @@ if (-not $LibraryOnly) {
         -EvidenceRoot $EvidenceRoot -ReportPath $ReportPath -Variant $Variant -RunIndex $RunIndex `
         -SourceRevision $SourceRevision -SourceTreeSha256 $SourceTreeSha256 `
         -PackagePath $PackagePath -PackageSha256 $PackageSha256 `
+        -Enumerator $Enumerator -CompleteWhenTaskTerminal:$CompleteWhenTaskTerminal `
         -WorkerCount $WorkerCount -HddThreadsPerDisk $HddThreadsPerDisk `
         -SsdThreadsPerDisk $SsdThreadsPerDisk -UnknownThreadsPerDisk $UnknownThreadsPerDisk `
         -TotalReadThreads $TotalReadThreads -ReservedCores $ReservedCores `
