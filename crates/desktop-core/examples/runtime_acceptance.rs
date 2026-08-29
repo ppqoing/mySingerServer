@@ -555,6 +555,8 @@ pub struct RuntimeAcceptanceSample {
     pub sample_interval_ms: u64,
     /// 运行任务 ID。
     pub runtime_task_id: String,
+    /// 该运行任务最近一次已提交的 outbox 高水位。
+    pub outbox_high_seq: Option<u64>,
     /// 物理机器 ID。
     pub machine_id: String,
     /// 运行任务状态。
@@ -604,6 +606,7 @@ impl RuntimeAcceptanceSample {
             elapsed_seconds: elapsed.as_secs(),
             sample_interval_ms: 0,
             runtime_task_id: summary.runtime_task_id,
+            outbox_high_seq: summary.outbox_high_seq,
             machine_id: summary.machine_id,
             state: summary.state,
             overall_completed: summary.overall_completed,
@@ -657,6 +660,37 @@ impl RuntimeAcceptanceSample {
             execution_config: execution_config.map(map_execution_config),
             pipeline_metrics: pipeline_metrics.map(map_pipeline_metrics),
         })
+    }
+}
+
+/// 当前运行任务的任务文件统计；协议未公开时明确保留为不可用。
+#[derive(Clone, Debug, Serialize)]
+pub struct RuntimeTaskFileStats {
+    /// 任务文件 P（pending）行数；协议未提供时为 null。
+    pub pending: Option<u64>,
+    /// 任务文件 C（completed）行数；协议未提供时为 null。
+    pub completed: Option<u64>,
+    /// 任务文件 F（failed）行数；协议未提供时为 null。
+    pub failed: Option<u64>,
+    /// 缓存命中总数；协议未提供时为 null。
+    pub cache_hits: Option<u64>,
+    /// 缓存命中且未进入任务文件的数量；协议未提供时为 null。
+    pub cache_hits_not_in_task_file: Option<u64>,
+    /// 统计来源，防止把整体阶段计数误读为任务文件计数。
+    pub source: &'static str,
+}
+
+impl RuntimeTaskFileStats {
+    /// 创建协议当前无法提供明细时的显式不可用值。
+    pub const fn unavailable() -> Self {
+        Self {
+            pending: None,
+            completed: None,
+            failed: None,
+            cache_hits: None,
+            cache_hits_not_in_task_file: None,
+            source: "runtime_protocol_not_exposed",
+        }
     }
 }
 
@@ -806,8 +840,26 @@ pub struct RuntimeAcceptanceScan {
     pub persistent_task_id: String,
     /// 观察到的运行任务 ID；旧 Node 或尚未发现时保持 None。
     pub runtime_task_id: Option<String>,
+    /// 本次扫描实际传给 Node 的完整媒体根列表。
+    pub media_roots: Vec<String>,
     /// 最终状态；到期主动取消也记录真实 cancelled，而非覆盖 completed。
     pub terminal_state: Option<String>,
+    /// 该扫描终态时观察到的 outbox 高水位。
+    pub outbox_high_seq: Option<u64>,
+    /// 任务文件 lane 与缓存命中统计；当前协议未公开时保持显式不可用。
+    pub task_file_stats: RuntimeTaskFileStats,
+}
+
+/// 创建一条尚未发现运行任务的扫描证据记录。
+fn new_scan_record(config: &AcceptanceConfig, persistent_task_id: String) -> RuntimeAcceptanceScan {
+    RuntimeAcceptanceScan {
+        persistent_task_id,
+        runtime_task_id: None,
+        media_roots: config.media_roots.clone(),
+        terminal_state: None,
+        outbox_high_seq: None,
+        task_file_stats: RuntimeTaskFileStats::unavailable(),
+    }
 }
 
 /// 计算窗口结束后的汇总记录。
@@ -988,11 +1040,7 @@ where
         }
     };
     // create_scan 成功后立即建立记录，后续任何发现或详情错误都不会丢失持久 ID。
-    scan_tasks.push(RuntimeAcceptanceScan {
-        persistent_task_id: persistent_task_id.clone(),
-        runtime_task_id: None,
-        terminal_state: None,
-    });
+    scan_tasks.push(new_scan_record(config, persistent_task_id.clone()));
     scans_started = 1;
     // 计划 deadline 以真实单调 Instant 表示；测试时钟的 elapsed 只模拟同一条时间轴。
     let sampling_epoch = Instant::now();
@@ -1109,6 +1157,7 @@ where
         current_terminal = is_terminal(&sample.state);
         if current_terminal {
             scan_tasks[current_scan_index].terminal_state = Some(sample.state.clone());
+            scan_tasks[current_scan_index].outbox_high_seq = sample.outbox_high_seq;
             if sample.state == "completed" {
                 latest_completed_persistent_task_id = Some(persistent_task_id.clone());
             }
@@ -1183,11 +1232,7 @@ where
                 }
             };
             // 新扫描也在 create_scan 成功的同一边界追加，保证错误时保留所有已知 ID。
-            scan_tasks.push(RuntimeAcceptanceScan {
-                persistent_task_id: next_persistent_task_id.clone(),
-                runtime_task_id: None,
-                terminal_state: None,
-            });
+            scan_tasks.push(new_scan_record(config, next_persistent_task_id.clone()));
             current_scan_index = scan_tasks.len() - 1;
             persistent_task_id = next_persistent_task_id;
             scans_started += 1;
@@ -1215,9 +1260,9 @@ where
         // cancel 成功即单独保留主动取消 ID，即使之后竞态观察到 completed 也不覆盖它。
         deadline_cancelled_persistent_task_id = Some(persistent_task_id.clone());
         if let Some(runtime_task_id) = runtime_task_id.as_deref() {
-            let terminal_state =
+            let (terminal_state, outbox_high_seq) =
                 match wait_for_terminal(session, clock, runtime_task_id, sample_interval).await {
-                    Ok(state) => state,
+                    Ok(snapshot) => snapshot,
                     Err(_) => {
                         return write_failure_result(
                             &mut sink,
@@ -1234,6 +1279,7 @@ where
                     }
                 };
             scan_tasks[current_scan_index].terminal_state = Some(terminal_state.clone());
+            scan_tasks[current_scan_index].outbox_high_seq = outbox_high_seq;
             // 取消后的最后一次详情也是真实 completed，必须同步进入 PASS 证据。
             if terminal_state == "completed" {
                 latest_completed_persistent_task_id = Some(persistent_task_id.clone());
@@ -1285,15 +1331,15 @@ async fn wait_for_terminal<S: AcceptanceSession, C: AcceptanceClock>(
     clock: &C,
     runtime_task_id: &str,
     interval: Duration,
-) -> Result<String, String> {
+) -> Result<(String, Option<u64>), String> {
     for _ in 0..TERMINAL_WAIT_TICKS {
         let details = session.runtime_task_details(runtime_task_id).await?;
-        let state = details
+        let summary = details
             .summary
-            .ok_or_else(|| "取消后的运行详情缺少摘要".to_string())?
-            .state;
+            .ok_or_else(|| "取消后的运行详情缺少摘要".to_string())?;
+        let state = summary.state;
         if is_terminal(&state) {
-            return Ok(state);
+            return Ok((state, summary.outbox_high_seq));
         }
         clock.sleep(interval).await;
     }

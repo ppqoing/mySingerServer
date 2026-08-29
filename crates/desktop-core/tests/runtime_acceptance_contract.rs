@@ -84,6 +84,8 @@ struct FakeState {
     detail_durations: VecDeque<Duration>,
     detail_error_on_read: Option<u32>,
     missing_summary_on_read: Option<u32>,
+    /// 测试用的节点 outbox 高水位；真实值来自运行任务摘要协议字段。
+    outbox_high_seq: Option<u64>,
 }
 
 #[derive(Clone, Default)]
@@ -140,6 +142,7 @@ impl AcceptanceSession for FakeSession {
                     overall_total_known: true,
                     overall_failed: 0,
                     overall_skipped: 0,
+                    outbox_high_seq: state.outbox_high_seq,
                     ..Default::default()
                 })
                 .collect())
@@ -185,6 +188,7 @@ impl AcceptanceSession for FakeSession {
                 overall_total_known: true,
                 overall_failed: u64::from(failed),
                 overall_skipped: 0,
+                outbox_high_seq: state.outbox_high_seq,
                 ..Default::default()
             };
             let details = proto::RuntimeTaskDetails {
@@ -341,6 +345,50 @@ async fn single_run_completed_starts_once_and_writes_one_runtime_result() {
         sink.results.lock().expect("结果锁").len(),
         1,
         "单轮 completed 只能写一条 runtime_result"
+    );
+}
+
+#[tokio::test]
+async fn single_run_records_roots_runtime_identity_terminal_and_outbox_highwater() {
+    let _environment = acceptance_test_env(Some(r#"["D:/Media-A","E:/Media-B"]"#), Some("1"));
+    let config = AcceptanceConfig::from_env().expect("多根单轮配置应有效");
+    let session = FakeSession::default();
+    {
+        let mut state = session.state.lock().expect("测试会话锁");
+        state.complete_first = true;
+        state.outbox_high_seq = Some(77);
+    }
+
+    let result = run_acceptance(
+        &session,
+        &FakeClock::default(),
+        MemorySink::default(),
+        &config,
+    )
+    .await
+    .expect("单轮完成应返回最终结果");
+    let json = serde_json::to_value(result).expect("最终结果应可序列化");
+    let scan = &json["scan_tasks"][0];
+    assert_eq!(scan["runtime_task_id"], "runtime-1");
+    assert_eq!(
+        scan["media_roots"],
+        serde_json::json!(["D:/Media-A", "E:/Media-B"])
+    );
+    assert_eq!(scan["terminal_state"], "completed");
+    assert_eq!(scan["outbox_high_seq"], 77);
+    assert_eq!(
+        scan["task_file_stats"]["source"], "runtime_protocol_not_exposed",
+        "协议没有任务文件 lane 时必须明确标记来源"
+    );
+    assert_eq!(scan["task_file_stats"]["pending"], serde_json::Value::Null);
+    assert_eq!(
+        scan["task_file_stats"]["completed"],
+        serde_json::Value::Null
+    );
+    assert_eq!(scan["task_file_stats"]["failed"], serde_json::Value::Null);
+    assert_eq!(
+        scan["task_file_stats"]["cache_hits_not_in_task_file"],
+        serde_json::Value::Null
     );
 }
 
