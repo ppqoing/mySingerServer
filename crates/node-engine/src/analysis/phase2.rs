@@ -2339,10 +2339,10 @@ mod tests {
     };
     use dedup_windows::{LocalDiskKind, PhysicalDiskId, ReadCancellationToken};
 
-    use crate::{
-        scan::{BasePersistTestController, ResolvedScanRootStorage, ScanRootStorageResolver},
-        worker::Stage2Frame,
-    };
+    #[cfg(feature = "test-hooks")]
+    use crate::scan::BasePersistTestController;
+    use crate::scan::{ResolvedScanRootStorage, ScanRootStorageResolver};
+    use crate::worker::Stage2Frame;
 
     #[tokio::test]
     async fn production_task_file_stage2_uses_full_local_cache_without_runtime_or_worker() {
