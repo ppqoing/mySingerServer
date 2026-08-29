@@ -132,6 +132,44 @@ fn worker_phase_events_use_v5_additive_tag_28_and_never_define_hash_wait() {
 }
 
 #[test]
+/// 验证二筛源读取完成消息使用新增 29 号标签并完整保留身份与耗时。
+fn stage2_source_read_complete_round_trips_on_additive_tag_29() {
+    let envelope = proto::WorkerEnvelope {
+        payload: Some(proto::worker_envelope::Payload::Stage2SourceReadComplete(
+            proto::Stage2SourceReadComplete {
+                task_id: "stage2-task".into(),
+                item_id: "stage2-item".into(),
+                request_elapsed_us: Some(7_500),
+            },
+        )),
+    };
+
+    assert_eq!(
+        proto::WorkerEnvelope::decode(envelope.encode_to_vec().as_slice()).unwrap(),
+        envelope
+    );
+    assert_eq!(PROTOCOL_VERSION, 5, "新增非终态事件不得提升协议版本");
+
+    let descriptors = FileDescriptorSet::decode(FILE_DESCRIPTOR_SET).unwrap();
+    let file = descriptors
+        .file
+        .iter()
+        .find(|file| file.package.as_deref() == Some("mysingerserver.v2"))
+        .unwrap();
+    let worker = file
+        .message_type
+        .iter()
+        .find(|message| message.name.as_deref() == Some("WorkerEnvelope"))
+        .unwrap();
+    let source_field = worker
+        .field
+        .iter()
+        .find(|field| field.name.as_deref() == Some("stage2_source_read_complete"))
+        .unwrap();
+    assert_eq!(source_field.number, Some(29));
+}
+
+#[test]
 fn legacy_source_complete_without_elapsed_stays_decodable() {
     let legacy = proto::BaseSourceReadComplete::decode(
         [

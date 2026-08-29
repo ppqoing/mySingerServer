@@ -478,7 +478,10 @@ async fn report_media_event<P: TaskLanePermitProvider>(
                 let _ = reporter.worker_released_nowait(slot, item_id);
             }
         }
-        WorkerEvent::Cancelled { .. } | WorkerEvent::InfrastructureFailure { .. } => {}
+        WorkerEvent::Cancelled { .. }
+        | WorkerEvent::InfrastructureFailure { .. }
+        // Stage2SourceReadComplete 由后续 Stage2 taskless 流程消费，基础计算阶段只需保留 slot。
+        | WorkerEvent::Stage2SourceReadComplete { .. } => {}
     }
 }
 
@@ -703,7 +706,9 @@ fn handle_media_event(
                 return Err("Media Worker 在非取消流程返回 Cancelled".into());
             }
         }
-        WorkerEvent::PhaseChanged { .. } => {}
+        WorkerEvent::PhaseChanged { .. }
+        // 当前基础媒体状态机不消费二筛源读取事件，事件本身已由 Pool 保持非终态所有权。
+        | WorkerEvent::Stage2SourceReadComplete { .. } => {}
     }
     Ok(())
 }

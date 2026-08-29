@@ -315,6 +315,17 @@ pub enum WorkerEvent {
         /// 从 Worker 收到请求到关闭源文件的微秒。
         request_elapsed_us: Option<u64>,
     },
+    /// 一次二次特征计算已结束全部源文件读取，但仍等待最终 Stage2Result。
+    Stage2SourceReadComplete {
+        /// 所属任务 ID。
+        task_id: String,
+        /// 任务项 ID。
+        item_id: String,
+        /// 实际槽位。
+        slot: u32,
+        /// 从 Worker 收到请求到关闭源文件的微秒。
+        request_elapsed_us: Option<u64>,
+    },
     /// Worker 正常返回一个协议结果。
     Completed {
         /// 所属任务 ID。
@@ -479,6 +490,15 @@ impl ControlledWorkerPool {
             .await;
     }
 
+    /// 让二次特征计算返回源读取完成事件，但继续占用同一逻辑槽位等待终态。
+    #[doc(hidden)]
+    pub async fn stage2_source_read_complete(&self, task_id: String, item_id: String) {
+        let _ = self
+            .commands
+            .send(ControlledWorkerCommand::Stage2SourceReadComplete { task_id, item_id })
+            .await;
+    }
+
     /// 让一次性基础计算返回最终媒体结果。
     pub async fn complete_base(
         &self,
@@ -591,6 +611,11 @@ enum ControlledWorkerCommand {
         phase: proto::RuntimeWorkerPhase,
     },
     BaseSourceReadComplete {
+        task_id: String,
+        item_id: String,
+    },
+    /// 注入二次特征源文件读取完成的非终态事件。
+    Stage2SourceReadComplete {
         task_id: String,
         item_id: String,
     },
@@ -1102,6 +1127,7 @@ impl WorkerPool {
                         let (task_id, item_id) = match &control {
                             ControlledWorkerCommand::PhaseChanged { task_id, item_id, .. }
                             | ControlledWorkerCommand::BaseSourceReadComplete { task_id, item_id }
+                            | ControlledWorkerCommand::Stage2SourceReadComplete { task_id, item_id }
                             | ControlledWorkerCommand::CompleteBase { task_id, item_id, .. }
                             | ControlledWorkerCommand::Crash { task_id, item_id, .. }
                             | ControlledWorkerCommand::Complete { task_id, item_id, .. }
@@ -1115,6 +1141,7 @@ impl WorkerPool {
                             &control,
                             ControlledWorkerCommand::PhaseChanged { .. }
                                 | ControlledWorkerCommand::BaseSourceReadComplete { .. }
+                                | ControlledWorkerCommand::Stage2SourceReadComplete { .. }
                         );
                         let event = match control {
                             ControlledWorkerCommand::PhaseChanged { phase, .. } => {
@@ -1128,6 +1155,14 @@ impl WorkerPool {
                             }
                             ControlledWorkerCommand::BaseSourceReadComplete { .. } => {
                                 WorkerEvent::BaseSourceReadComplete {
+                                    task_id: task_id.clone(),
+                                    item_id: item_id.clone(),
+                                    slot: slot as u32,
+                                    request_elapsed_us: None,
+                                }
+                            }
+                            ControlledWorkerCommand::Stage2SourceReadComplete { .. } => {
+                                WorkerEvent::Stage2SourceReadComplete {
                                     task_id: task_id.clone(),
                                     item_id: item_id.clone(),
                                     slot: slot as u32,
@@ -2238,6 +2273,9 @@ async fn run_slot(
                                     if phase.task_id == work.task_id
                                         && phase.item_id == work.item_id
                                         && valid_worker_phase(phase.phase).is_some()
+                            ) || matches!(
+                                response.payload.as_ref(),
+                                Some(worker_envelope::Payload::Stage2SourceReadComplete(_))
                             );
                             update_slot_work_from_phase_response(&mut work, &response);
                             let _ = events.send(SlotEvent::Response {
@@ -2361,6 +2399,15 @@ async fn handle_slot_event_with_replacement<E, F, Fut>(
             work,
             mut response,
         } => {
+            // 二筛源读取事件是非终态；身份错配时丢弃该事件，保持当前 slot/CPU 所有权，
+            // 等待同一运行项的合法事件或终态结果，不能把异常消息转换为 Completed。
+            if matches!(
+                response.payload.as_ref(),
+                Some(worker_envelope::Payload::Stage2SourceReadComplete(_))
+            ) && !response_matches_work(&response, &work)
+            {
+                return;
+            }
             if !response_matches_work(&response, &work) {
                 response = proto::WorkerEnvelope {
                     payload: Some(worker_envelope::Payload::WorkerFailure(
@@ -2412,6 +2459,19 @@ async fn handle_slot_event_with_replacement<E, F, Fut>(
             {
                 events
                     .send_event(WorkerEvent::BaseSourceReadComplete {
+                        task_id: work.task_id,
+                        item_id: work.item_id,
+                        slot: slot_id as u32,
+                        request_elapsed_us: source.request_elapsed_us,
+                    })
+                    .await;
+                return;
+            }
+            if let Some(worker_envelope::Payload::Stage2SourceReadComplete(source)) =
+                response.payload.as_ref()
+            {
+                events
+                    .send_event(WorkerEvent::Stage2SourceReadComplete {
                         task_id: work.task_id,
                         item_id: work.item_id,
                         slot: slot_id as u32,
@@ -2504,6 +2564,9 @@ async fn handle_slot_event_with_replacement<E, F, Fut>(
 fn response_matches_work(response: &proto::WorkerEnvelope, work: &WorkIdentity) -> bool {
     let identity = match response.payload.as_ref() {
         Some(worker_envelope::Payload::BaseSourceReadComplete(value)) => {
+            Some((&value.task_id, &value.item_id))
+        }
+        Some(worker_envelope::Payload::Stage2SourceReadComplete(value)) => {
             Some((&value.task_id, &value.item_id))
         }
         Some(worker_envelope::Payload::WorkerPhaseChanged(value)) => {
@@ -3420,6 +3483,212 @@ mod tests {
         };
         update_slot_work_from_phase_response(&mut work, &feature);
         assert_eq!(work.file_identity.as_ref().unwrap().stage, "base_feature");
+    }
+
+    #[tokio::test]
+    /// 验证二筛源读取完成事件先到时仍保留 slot/CPU，终态结果到达后才释放。
+    async fn stage2_source_read_complete_is_non_terminal_and_keeps_slot_owned() {
+        let state = Arc::new(Mutex::new(PoolState::new(1)));
+        let work = scheduler_work("stage2-source", 0).identity;
+        register_running_work(&mut state.lock().unwrap(), 0, work.clone());
+        let mut slots = BTreeMap::new();
+        let mut idle = VecDeque::new();
+        let (events, mut event_rx) = mpsc::channel(4);
+        let mut replacement_factory = |_| std::future::ready(Err(WorkerPoolError::Closed));
+
+        handle_slot_event_with_replacement(
+            SlotEvent::Response {
+                slot_id: 0,
+                work: work.clone(),
+                response: proto::WorkerEnvelope {
+                    payload: Some(worker_envelope::Payload::Stage2SourceReadComplete(
+                        proto::Stage2SourceReadComplete {
+                            task_id: work.task_id.clone(),
+                            item_id: work.item_id.clone(),
+                            request_elapsed_us: Some(4_000),
+                        },
+                    )),
+                },
+            },
+            &mut slots,
+            &mut idle,
+            &events,
+            &state,
+            DEFAULT_SHUTDOWN_TIMEOUT,
+            &mut replacement_factory,
+        )
+        .await;
+
+        assert_eq!(state.lock().unwrap().cpu_in_use, 1);
+        assert!(state.lock().unwrap().running.contains_key(&0));
+        assert!(idle.is_empty(), "二筛源读取完成前不得归还 slot");
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(WorkerEvent::Stage2SourceReadComplete {
+                task_id,
+                item_id,
+                slot: 0,
+                request_elapsed_us: Some(4_000),
+            }) if task_id == work.task_id && item_id == work.item_id
+        ));
+
+        handle_slot_event_with_replacement(
+            SlotEvent::Response {
+                slot_id: 0,
+                work: work.clone(),
+                response: proto::WorkerEnvelope {
+                    payload: Some(worker_envelope::Payload::Stage2Result(
+                        proto::Stage2Result {
+                            task_id: work.task_id.clone(),
+                            item_id: work.item_id.clone(),
+                            payload: Vec::new(),
+                        },
+                    )),
+                },
+            },
+            &mut slots,
+            &mut idle,
+            &events,
+            &state,
+            DEFAULT_SHUTDOWN_TIMEOUT,
+            &mut replacement_factory,
+        )
+        .await;
+        assert_eq!(state.lock().unwrap().cpu_in_use, 0);
+        assert!(state.lock().unwrap().running.is_empty());
+        assert_eq!(idle, VecDeque::from([0]));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(WorkerEvent::Completed { task_id, item_id, response })
+                if task_id == work.task_id
+                    && item_id == work.item_id
+                    && matches!(
+                        response.payload,
+                        Some(worker_envelope::Payload::Stage2Result(_))
+                    )
+        ));
+    }
+
+    #[tokio::test]
+    /// 验证身份错配的二筛非终态消息不会释放或伪造当前 slot 的终态。
+    async fn mismatched_stage2_source_read_complete_does_not_release_slot_or_emit_terminal() {
+        let state = Arc::new(Mutex::new(PoolState::new(1)));
+        let work = scheduler_work("stage2-mismatch", 0).identity;
+        register_running_work(&mut state.lock().unwrap(), 0, work.clone());
+        let mut slots = BTreeMap::new();
+        let mut idle = VecDeque::new();
+        let (events, mut event_rx) = mpsc::channel(4);
+        let mut replacement_factory = |_| std::future::ready(Err(WorkerPoolError::Closed));
+
+        handle_slot_event_with_replacement(
+            SlotEvent::Response {
+                slot_id: 0,
+                work: work.clone(),
+                response: proto::WorkerEnvelope {
+                    payload: Some(worker_envelope::Payload::Stage2SourceReadComplete(
+                        proto::Stage2SourceReadComplete {
+                            task_id: "wrong-task".into(),
+                            item_id: work.item_id.clone(),
+                            request_elapsed_us: None,
+                        },
+                    )),
+                },
+            },
+            &mut slots,
+            &mut idle,
+            &events,
+            &state,
+            DEFAULT_SHUTDOWN_TIMEOUT,
+            &mut replacement_factory,
+        )
+        .await;
+
+        assert_eq!(state.lock().unwrap().cpu_in_use, 1);
+        assert!(state.lock().unwrap().running.contains_key(&0));
+        assert!(idle.is_empty(), "身份错配的非终态事件不得释放 slot");
+        assert!(event_rx.try_recv().is_err(), "身份错配不得伪造终态事件");
+    }
+
+    #[tokio::test]
+    /// 验证受控池按“Started→SourceReadComplete→Stage2Result”顺序保留资源所有权。
+    async fn controlled_stage2_source_read_complete_keeps_slot_until_stage2_result() {
+        let (mut pool, _started, control) = WorkerPool::controlled_batch_for_test(1);
+        let path = r"I:\stage2-source\clip.mp4";
+        pool.dispatch_runtime(
+            proto::WorkerEnvelope {
+                payload: Some(worker_envelope::Payload::ComputeStage2(
+                    proto::ComputeStage2 {
+                        task_id: "stage2-controlled".into(),
+                        item_id: "clip".into(),
+                        display_path: path.into(),
+                        frame_slots: vec![0],
+                        contact_sheet_path: String::new(),
+                        generate_contact_sheet_if_missing: false,
+                    },
+                )),
+            },
+            WorkerFileIdentity {
+                machine_id: MachineId::from_sha256([0xB2; 32]),
+                normalized_path: NormalizedPath::new(path).unwrap(),
+                display_path: DisplayPath::new(path).unwrap(),
+                file_size: 8_192,
+                stage: "compute_stage2_features".into(),
+                physical_disk_id: "disk-stage2".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            pool.next_event().await,
+            Some(WorkerEvent::Started { .. })
+        ));
+
+        control
+            .stage2_source_read_complete("wrong-task".into(), "clip".into())
+            .await;
+        tokio::task::yield_now().await;
+        assert_eq!(control.available_slots(), 0, "身份错配不得释放受控 slot");
+        assert_eq!(control.cpu_in_use(), 1, "身份错配不得释放 CPU 权重");
+        assert!(pool.try_next_event().is_none());
+
+        control
+            .stage2_source_read_complete("stage2-controlled".into(), "clip".into())
+            .await;
+        let event = tokio::time::timeout(Duration::from_secs(1), pool.next_event())
+            .await
+            .expect("合法二筛源读取事件必须可读")
+            .expect("WorkerPool 事件通道必须保持打开");
+        assert!(matches!(
+            event,
+            WorkerEvent::Stage2SourceReadComplete {
+                task_id,
+                item_id,
+                slot: 0,
+                ..
+            } if task_id == "stage2-controlled" && item_id == "clip"
+        ));
+        assert_eq!(control.available_slots(), 0);
+        assert_eq!(control.cpu_in_use(), 1);
+
+        control
+            .complete_stage2(
+                "stage2-controlled".into(),
+                "clip".into(),
+                Stage2Output {
+                    frames: Vec::new(),
+                    regenerated_contact_sheet_jpeg: None,
+                },
+            )
+            .await;
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), pool.next_event())
+                .await
+                .expect("合法二筛终态事件必须可读"),
+            Some(WorkerEvent::Completed { .. })
+        ));
+        assert_eq!(control.available_slots(), 1);
+        assert_eq!(control.cpu_in_use(), 0);
+        pool.shutdown().await.unwrap();
     }
 
     /// 创建不启动真实进程的 run_pool actor，供控制命令 ACK 背压行为测试使用。

@@ -662,6 +662,13 @@ message BaseSourceReadComplete {
   optional uint64 request_elapsed_us = 3;
 }
 
+// Worker 完成二次特征源文件读取、但仍保留结果生成槽位的非终态事件。
+message Stage2SourceReadComplete {
+  string task_id = 1;
+  string item_id = 2;
+  optional uint64 request_elapsed_us = 3;
+}
+
 // Worker 在真实执行边界即时发出的非终态阶段事件。
 message WorkerPhaseChanged {
   string task_id = 1;
@@ -732,5 +739,6 @@ message WorkerEnvelope {
     BaseComputeResult base_compute_result = 26;
     BaseSourceReadComplete base_source_read_complete = 27;
     WorkerPhaseChanged worker_phase_changed = 28;
+    Stage2SourceReadComplete stage2_source_read_complete = 29;
   }
 }
