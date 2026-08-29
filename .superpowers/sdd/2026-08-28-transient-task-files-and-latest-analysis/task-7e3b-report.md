@@ -30,3 +30,31 @@
 - `git diff --check`：通过；仅有现有 Windows 行尾转换提示，无空白错误。
 
 构建仍会报告基线中已有的未使用导入/测试辅助项警告；本任务未扩大清理范围。
+
+## 审查修复轮 1：扫描成功与 restart/shutdown 交错
+
+### 问题与修复
+
+审查发现：成功扫描的 `CompletedScanSnapshot` 只随排队的 `BackgroundFinished` 命令传递；若 restart 或 shutdown 在该命令被 actor 处理前取走 `ActiveJob`，它只会消费 terminal 并发布 Completed，导致后续完成命令无法再安装 `latest_completed_scan`。
+
+修复将扫描快照和 terminal 封装为一次性 `BackgroundOutcome`。后台仅在 WorkerPool、Store 和 task-file 目录已收束后写入该 outcome 并发送 completion。正常 `finish_background` 与 restart/shutdown 的 `stop_background_for_shutdown` 都以相同顺序仅消费一次：先安装成功扫描快照，再发布 terminal。Stage2 仍使用同一 outcome，但其快照为空。
+
+### 本轮 TDD 证据
+
+新增真实受控交错测试 `restart_installs_successful_scan_snapshot_before_background_finished_command`：真实扫描成功后暂停完成命令投递，先由 restart 消费已经收束的 outcome，再断言 RuntimeTask Completed、QueryTask highwater 与 latest snapshot 的 task/highwater 一致。初次测试脚手架漏填注入字段，只得到编译错误；补齐后，在修复前实际 RED：
+
+- `cargo test -p dedup-node-engine --features test-hooks restart_installs_successful_scan_snapshot_before_background_finished_command --locked -- --test-threads=1`
+- 失败位置：`restart 消费 outcome 时必须先保存扫描快照`；此时 RuntimeTask 已 Completed，而 `latest_completed_scan` 为 `None`。
+
+实施单一 `BackgroundOutcome` 后，同一命令 GREEN（1 项通过）。
+
+### 本轮验证
+
+仍按指定串行 Cargo 环境执行，命令前 C、D 盘可用空间约为 24.86 GiB、11.95 GiB：
+
+- `cargo test -p dedup-node-engine --features test-hooks actor --locked -- --test-threads=1`：通过，17 项通过。
+- `cargo test -p dedup-node-engine --features test-hooks --lib --locked -- --test-threads=1`：通过，142 项通过。
+- `cargo fmt --all -- --check`：通过。
+- `git diff --check`：通过；仅有 Windows 行尾转换提示，无空白错误。
+
+本轮只修改 NodeEngine Actor 与既有报告，未重复执行未受影响的 `cross_phase2`。

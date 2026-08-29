@@ -21,6 +21,8 @@ use dedup_node_store::{
 };
 use dedup_protocol::{BASE_MISSING_PROBE, BASE_MISSING_STAGE1, proto};
 use thiserror::Error;
+#[cfg(feature = "test-hooks")]
+use tokio::sync::Notify;
 use tokio::{
     sync::{mpsc, oneshot},
     task::JoinHandle,
@@ -434,12 +436,83 @@ impl NodeRequestHandler for NodeEngineHandle {
 /// 创建并运行单一 NodeEngine actor 的工厂。
 pub struct NodeEngine;
 
+/// 后台结果已收束、但尚未投递完成命令时的测试控制端。
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct BackgroundOutcomeTestController {
+    /// 控制端与后台 waiter 共享的同步原语。
+    shared: Arc<BackgroundOutcomeTestState>,
+}
+
+/// 后台专用的完成命令投递 waiter。
+#[cfg(feature = "test-hooks")]
+pub(crate) struct BackgroundOutcomeTestWaiter {
+    /// 与测试控制端共享的同步原语。
+    shared: Arc<BackgroundOutcomeTestState>,
+}
+
+/// 测试 gate 的进入和放行通知。
+#[cfg(feature = "test-hooks")]
+#[derive(Default)]
+struct BackgroundOutcomeTestState {
+    /// 后台已经保存 outcome 并归还 Pool。
+    entered: Notify,
+    /// 测试允许投递 BackgroundFinished。
+    released: Notify,
+}
+
+#[cfg(feature = "test-hooks")]
+#[cfg_attr(not(test), allow(dead_code))]
+impl BackgroundOutcomeTestController {
+    /// 创建分离的控制端和后台 waiter。
+    fn new() -> (Self, BackgroundOutcomeTestWaiter) {
+        let shared = Arc::new(BackgroundOutcomeTestState::default());
+        (
+            Self {
+                shared: Arc::clone(&shared),
+            },
+            BackgroundOutcomeTestWaiter { shared },
+        )
+    }
+
+    /// 等待后台已经完整收束、但尚未投递完成命令。
+    async fn wait_until_entered(&self) {
+        self.shared.entered.notified().await;
+    }
+
+    /// 放行完成命令投递。
+    fn release(&self) {
+        self.shared.released.notify_one();
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+impl Drop for BackgroundOutcomeTestController {
+    /// 测试异常退出时避免后台 task 永久停在测试 gate。
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+impl BackgroundOutcomeTestWaiter {
+    /// 通知测试 outcome 已可消费，并等待其指定命令投递时机。
+    async fn wait_before_background_finished(self) {
+        self.shared.entered.notify_one();
+        self.shared.released.notified().await;
+    }
+}
+
 /// Actor 测试注入点；默认构建是零大小类型且没有运行时分支。
 #[derive(Default)]
 struct ActorTestHooks {
     /// 仅 feature 测试把首条 Base persist 暂停在 SQLite 事务前。
     #[cfg(feature = "test-hooks")]
     first_persist_waiter: Option<BasePersistTestWaiter>,
+    /// 仅 feature 测试暂停完成命令，制造 restart 与扫描 outcome 的受控交错。
+    #[cfg(feature = "test-hooks")]
+    background_outcome_waiter: Option<BackgroundOutcomeTestWaiter>,
 }
 
 impl NodeEngine {
@@ -553,6 +626,42 @@ impl NodeEngine {
             None,
             ActorTestHooks {
                 first_persist_waiter: Some(first_persist_waiter),
+                background_outcome_waiter: None,
+            },
+        )
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    /// 创建在后台 outcome 收束后可暂停完成命令投递的真实 actor。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn spawn_with_background_outcome_gate_for_test(
+        store: NodeStore,
+        worker_pool: WorkerPool,
+        listen_address: SocketAddr,
+        cache_root: &Path,
+        enumerator: EnumeratorKind,
+        background_outcome_waiter: BackgroundOutcomeTestWaiter,
+    ) -> (NodeEngineHandle, JoinHandle<()>) {
+        let effective_worker_count = worker_pool.worker_process_ids().len().max(1);
+        let (artifact_registry, disk_full_cleaner) = test_artifact_cleanup(cache_root);
+        spawn_actor(
+            store,
+            Some(worker_pool),
+            listen_address,
+            cache_root,
+            &cache_root.join("runtime"),
+            enumerator,
+            DiskReadConfig::default(),
+            NodePostgresConfig::default(),
+            effective_worker_count,
+            None,
+            artifact_registry,
+            disk_full_cleaner,
+            None,
+            ActorTestHooks {
+                first_persist_waiter: None,
+                background_outcome_waiter: Some(background_outcome_waiter),
             },
         )
     }
@@ -692,8 +801,6 @@ enum EngineCommand {
     LatestCompletedScanForTest(oneshot::Sender<Option<crate::scan::CompletedScanSnapshot>>),
     BackgroundFinished {
         identity: JobIdentity,
-        /// 瞬态扫描在清单事务和精确 run 清理成功后才带回快照。
-        completed_scan: Option<crate::scan::CompletedScanSnapshot>,
     },
 }
 
@@ -716,6 +823,15 @@ struct BackgroundTerminal {
     outbox_high_seq: Option<u64>,
 }
 
+/// 后台任务收束后的唯一交接值，扫描快照必须与终态一起被 actor 消费。
+#[derive(Default)]
+struct BackgroundOutcome {
+    /// 成功扫描的清单快照；二筛和失败扫描均为空。
+    completed_scan: Option<crate::scan::CompletedScanSnapshot>,
+    /// 收束后才允许发布的运行终态。
+    terminal: Option<BackgroundTerminal>,
+}
+
 struct ActiveJob {
     identity: JobIdentity,
     /// `run_background_job` 已完整返回，包含 task-local writer join 与 Store 恢复。
@@ -723,8 +839,8 @@ struct ActiveJob {
     cancellation: Option<ReadCancellationToken>,
     /// 后台任务收束后归还的唯一 Pool 所有权，只有 actor 可以取回。
     returned_pool: Arc<Mutex<Option<WorkerPool>>>,
-    /// 后台任务收束后待 actor 发布的唯一终态，关机路径也从此处取走。
-    terminal: Arc<Mutex<Option<BackgroundTerminal>>>,
+    /// 后台任务收束后的唯一 outcome，完成和关机路径只能消费一次。
+    outcome: Arc<Mutex<Option<BackgroundOutcome>>>,
 }
 
 enum BackgroundJob {
@@ -815,11 +931,8 @@ async fn run_actor(mut state: EngineState, mut commands: mpsc::Receiver<EngineCo
             EngineCommand::LatestCompletedScanForTest(reply) => {
                 let _ = reply.send(state.latest_completed_scan.clone());
             }
-            EngineCommand::BackgroundFinished {
-                identity,
-                completed_scan,
-            } => {
-                state.finish_background(identity, completed_scan).await;
+            EngineCommand::BackgroundFinished { identity } => {
+                state.finish_background(identity).await;
             }
         }
     }
@@ -1764,6 +1877,8 @@ impl EngineState {
             | BackgroundJob::Stage2 { cancellation, .. } => Some(cancellation.clone()),
             _ => None,
         };
+        #[cfg(feature = "test-hooks")]
+        let background_outcome_waiter = self.test_hooks.background_outcome_waiter.take();
         let commands = self
             .commands
             .upgrade()
@@ -1771,19 +1886,22 @@ impl EngineState {
         let (completion_sender, completion) = oneshot::channel();
         let returned_pool = Arc::new(Mutex::new(None));
         let background_pool = Arc::clone(&returned_pool);
-        let terminal = Arc::new(Mutex::new(None));
-        let background_terminal = Arc::clone(&terminal);
+        let outcome = Arc::new(Mutex::new(None));
+        let background_outcome = Arc::clone(&outcome);
         tokio::spawn(async move {
-            let (completed_scan, terminal) = run_background_job(store, &mut worker_pool, job).await;
+            let outcome = run_background_job(store, &mut worker_pool, job).await;
             // 必须先确认 BaseStoreActor join、Store 恢复和终态准备全部结束，再触发 shutdown/归还 Pool。
             *background_pool.lock().expect("后台 Pool 归还锁未中毒") = Some(worker_pool);
-            *background_terminal.lock().expect("后台终态归还锁未中毒") = terminal;
+            *background_outcome
+                .lock()
+                .expect("后台 outcome 归还锁未中毒") = Some(outcome);
             let _ = completion_sender.send(());
+            #[cfg(feature = "test-hooks")]
+            if let Some(waiter) = background_outcome_waiter {
+                waiter.wait_before_background_finished().await;
+            }
             let _ = commands
-                .send(EngineCommand::BackgroundFinished {
-                    identity,
-                    completed_scan,
-                })
+                .send(EngineCommand::BackgroundFinished { identity })
                 .await;
         });
         self.active_job = Some(ActiveJob {
@@ -1791,16 +1909,12 @@ impl EngineState {
             completion,
             cancellation,
             returned_pool,
-            terminal,
+            outcome,
         });
         Ok(())
     }
 
-    async fn finish_background(
-        &mut self,
-        identity: JobIdentity,
-        completed_scan: Option<crate::scan::CompletedScanSnapshot>,
-    ) {
+    async fn finish_background(&mut self, identity: JobIdentity) {
         let Some(active) = self
             .active_job
             .take_if(|active| active.identity == identity)
@@ -1816,18 +1930,29 @@ impl EngineState {
             self.worker_control = Some(worker_pool.handle());
             self.worker_pool = Some(worker_pool);
         }
+        let outcome = active
+            .outcome
+            .lock()
+            .expect("后台 outcome 归还锁未中毒")
+            .take();
+        self.publish_background_outcome(identity, outcome).await;
+    }
+
+    /// Pool、Store 和 task-file 目录均收束后，按快照、终态的固定顺序消费唯一 outcome。
+    async fn publish_background_outcome(
+        &mut self,
+        identity: JobIdentity,
+        outcome: Option<BackgroundOutcome>,
+    ) {
+        let Some(outcome) = outcome else {
+            return;
+        };
         if matches!(identity, JobIdentity::TransientScan(_))
-            && let Some(completed_scan) = completed_scan
+            && let Some(completed_scan) = outcome.completed_scan
         {
             self.latest_completed_scan = Some(completed_scan);
         }
-        let terminal = active.terminal.lock().expect("后台终态归还锁未中毒").take();
-        Self::publish_background_terminal(terminal).await;
-    }
-
-    /// Pool、Store 和可选快照已回到 actor 后，才允许广播唯一运行终态。
-    async fn publish_background_terminal(terminal: Option<BackgroundTerminal>) {
-        if let Some(terminal) = terminal {
+        if let Some(terminal) = outcome.terminal {
             let _ = match terminal.outbox_high_seq {
                 Some(highwater) => {
                     terminal
@@ -1882,8 +2007,13 @@ impl EngineState {
             .lock()
             .expect("后台 Pool 归还锁未中毒")
             .take();
-        let terminal = active.terminal.lock().expect("后台终态归还锁未中毒").take();
-        Self::publish_background_terminal(terminal).await;
+        let outcome = active
+            .outcome
+            .lock()
+            .expect("后台 outcome 归还锁未中毒")
+            .take();
+        self.publish_background_outcome(active.identity, outcome)
+            .await;
         worker_pool
     }
 
@@ -2132,10 +2262,7 @@ async fn run_background_job(
     mut store: NodeStore,
     worker_pool: &mut WorkerPool,
     job: BackgroundJob,
-) -> (
-    Option<crate::scan::CompletedScanSnapshot>,
-    Option<BackgroundTerminal>,
-) {
+) -> BackgroundOutcome {
     match job {
         BackgroundJob::Scan {
             task_id,
@@ -2275,18 +2402,18 @@ async fn run_background_job(
             match result {
                 Ok(result) => {
                     let completed = result.completed;
-                    (
-                        Some(completed.clone()),
-                        Some(BackgroundTerminal {
+                    BackgroundOutcome {
+                        completed_scan: Some(completed.clone()),
+                        terminal: Some(BackgroundTerminal {
                             reporter: runtime_reporter,
                             state: RuntimeTaskState::Completed,
                             outbox_high_seq: Some(completed.outbox_high_seq),
                         }),
-                    )
+                    }
                 }
                 Err(_) => {
                     let _ = runtime_reporter.finish(runtime_state).await;
-                    (None, None)
+                    BackgroundOutcome::default()
                 }
             }
         }
@@ -2324,7 +2451,7 @@ async fn run_background_job(
                 );
                 let _ = store.transition_analysis_run(run_id, AnalysisStatus::Partial, now_ms());
             }
-            (None, None)
+            BackgroundOutcome::default()
         }
         BackgroundJob::Stage2 {
             plan,
@@ -2364,14 +2491,14 @@ async fn run_background_job(
                         failed,
                         0,
                     );
-                    (
-                        None,
-                        Some(BackgroundTerminal {
+                    BackgroundOutcome {
+                        completed_scan: None,
+                        terminal: Some(BackgroundTerminal {
                             reporter: runtime_reporter,
                             state: RuntimeTaskState::Completed,
                             outbox_high_seq: Some(highwater),
                         }),
-                    )
+                    }
                 }
                 Err(error) => {
                     let message = error.to_string();
@@ -2381,9 +2508,9 @@ async fn run_background_job(
                         display_path: String::new(),
                         message,
                     });
-                    (
-                        None,
-                        Some(BackgroundTerminal {
+                    BackgroundOutcome {
+                        completed_scan: None,
+                        terminal: Some(BackgroundTerminal {
                             reporter: runtime_reporter,
                             state: if cancellation.is_cancelled() {
                                 RuntimeTaskState::Cancelled
@@ -2392,7 +2519,7 @@ async fn run_background_job(
                             },
                             outbox_high_seq: None,
                         }),
-                    )
+                    }
                 }
             }
         }
@@ -3307,6 +3434,116 @@ mod tests {
 
         handle.shutdown().await.unwrap();
         actor.await.unwrap();
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[tokio::test]
+    async fn restart_installs_successful_scan_snapshot_before_background_finished_command() {
+        let directory = tempfile::tempdir().unwrap();
+        let scan_root = directory.path().join("scan");
+        fs::create_dir(&scan_root).unwrap();
+        fs::write(scan_root.join("restart-interleave.bin"), b"abc").unwrap();
+        let machine = MachineId::parse(&"c8".repeat(32)).unwrap();
+        let store = NodeStore::open(&directory.path().join("node.db"), machine).unwrap();
+        let (outcome_control, outcome_waiter) = BackgroundOutcomeTestController::new();
+        let (pool, mut started, controller) = WorkerPool::controlled_batch_for_test(1);
+        let (handle, actor) = NodeEngine::spawn_with_background_outcome_gate_for_test(
+            store,
+            pool,
+            "127.0.0.1:39091".parse().unwrap(),
+            directory.path(),
+            EnumeratorKind::WindowsWalker,
+            outcome_waiter,
+        );
+        let registry = handle.runtime_tasks_for_test();
+
+        let response = handle
+            .handle(proto::Envelope {
+                request_id: 66,
+                payload: Some(proto::envelope::Payload::CreateScan(proto::CreateScan {
+                    roots: vec![scan_root.to_string_lossy().into_owned()],
+                    force_recalculate: false,
+                    enumerator: "windows_walker".into(),
+                })),
+            })
+            .await;
+        let Some(proto::envelope::Payload::TaskAccepted(accepted)) = response.payload else {
+            panic!("瞬态扫描必须返回业务任务 ID");
+        };
+        let (_, item_id) = tokio::time::timeout(Duration::from_secs(2), started.recv())
+            .await
+            .expect("扫描必须进入真实 Worker")
+            .expect("可控 Worker 不应提前关闭");
+        controller
+            .base_source_read_complete(accepted.task_id.clone(), item_id.clone())
+            .await;
+        controller
+            .complete_base(
+                accepted.task_id.clone(),
+                item_id,
+                [
+                    0x90, 0x01, 0x50, 0x98, 0x3c, 0xd2, 0x4f, 0xb0, 0xd6, 0x96, 0x3f, 0x7d, 0x28,
+                    0xe1, 0x7f, 0x72,
+                ],
+                BaseComputeOutput {
+                    probe: Some(MediaProbe {
+                        media_kind: dedup_core::MediaKind::Other,
+                        width: 0,
+                        height: 0,
+                        duration_ms: None,
+                    }),
+                    stage1_frames: Some(Vec::new()),
+                    contact_sheet_jpeg: None,
+                },
+            )
+            .await;
+        tokio::time::timeout(Duration::from_secs(2), outcome_control.wait_until_entered())
+            .await
+            .expect("扫描成功后必须先形成可消费的后台 outcome");
+
+        let restart = tokio::time::timeout(Duration::from_secs(2), handle.restart_engine())
+            .await
+            .expect("restart 必须在 outcome 已收束时返回");
+        assert!(matches!(restart, Err(EngineError::Operation(_))));
+
+        let details = registry.details(&accepted.task_id).await.unwrap();
+        let summary = details.summary.expect("restart 必须发布扫描终态");
+        assert_eq!(summary.state, "completed");
+        let runtime_highwater = summary
+            .outbox_high_seq
+            .expect("成功扫描终态必须携带真实 highwater");
+
+        let snapshot = handle.latest_completed_scan_for_test().await;
+        let query = handle
+            .handle(proto::Envelope {
+                request_id: 67,
+                payload: Some(proto::envelope::Payload::QueryTask(proto::QueryTask {
+                    task_id: accepted.task_id.clone(),
+                    task: None,
+                })),
+            })
+            .await;
+        let query_highwater = match query.payload {
+            Some(proto::envelope::Payload::QueryTask(proto::QueryTask {
+                task:
+                    Some(proto::TaskSummary {
+                        state,
+                        outbox_high_seq,
+                        ..
+                    }),
+                ..
+            })) if state == proto::TaskState::TaskCompleted as i32 => outbox_high_seq,
+            other => panic!("restart 后 QueryTask 必须返回 Completed: {other:?}"),
+        };
+
+        outcome_control.release();
+        handle.shutdown().await.unwrap();
+        actor.await.unwrap();
+
+        let snapshot = snapshot.expect("restart 消费 outcome 时必须先保存扫描快照");
+        assert_eq!(snapshot.task_id.as_uuid().to_string(), accepted.task_id);
+        assert_eq!(snapshot.outbox_high_seq, runtime_highwater);
+        assert_eq!(query_highwater, runtime_highwater);
     }
 
     #[tokio::test]
