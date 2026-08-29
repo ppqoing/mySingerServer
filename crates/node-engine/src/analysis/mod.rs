@@ -4,6 +4,8 @@ mod exact;
 mod grouping;
 mod image;
 mod phase2;
+/// 本地和跨机二筛的瞬态缓存分类计划。
+pub mod stage2_planner;
 mod video;
 
 use std::{
