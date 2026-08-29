@@ -38,9 +38,12 @@ use crate::{
     NodeRemoteFeatureCache, Stage2CacheLookup,
     scan::{
         BaseStoreActor, ScanDiskPlan, ScanRootStorageResolver, ScheduledFileReader,
-        Stage2TaskInput, build_stage2_task_production, run_task_file_stage2,
+        Stage2TaskInput, Stage2TaskProduction, build_stage2_task_production, run_task_file_stage2,
     },
 };
+
+#[cfg(all(test, feature = "test-hooks"))]
+use crate::scan::build_stage2_task_production_with_fail_next_discard_remove_for_test;
 
 #[cfg(all(test, feature = "test-hooks"))]
 use crate::scan::BasePersistTestWaiter;
@@ -525,6 +528,9 @@ pub(crate) struct Stage2TaskFileRunOptions<'a> {
     /// 测试仅在精确 discard 前记录 actor 收束与运行目录状态。
     #[cfg(all(test, feature = "test-hooks"))]
     before_discard_observer: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// 测试仅注入一次真实任务目录删除失败，验证同一 owner 的精确重试。
+    #[cfg(all(test, feature = "test-hooks"))]
+    fail_next_discard_remove: bool,
 }
 
 impl<'a> Stage2TaskFileRunOptions<'a> {
@@ -554,6 +560,8 @@ impl<'a> Stage2TaskFileRunOptions<'a> {
             first_persist_waiter: None,
             #[cfg(all(test, feature = "test-hooks"))]
             before_discard_observer: None,
+            #[cfg(all(test, feature = "test-hooks"))]
+            fail_next_discard_remove: false,
         }
     }
 
@@ -588,6 +596,13 @@ impl<'a> Stage2TaskFileRunOptions<'a> {
         if let Some(observer) = &self.before_discard_observer {
             observer();
         }
+    }
+
+    /// 仅单元测试：让本轮任务文件的首次目录删除走真实失败注入。
+    #[cfg(all(test, feature = "test-hooks"))]
+    fn with_fail_next_discard_remove_for_test(mut self) -> Self {
+        self.fail_next_discard_remove = true;
+        self
     }
 }
 
@@ -799,12 +814,24 @@ pub(crate) async fn run_stage2_batch_production(
         failed as u64,
         0,
     );
-    let production = match build_stage2_task_production(
-        options.runtime_root,
-        task_id.as_uuid(),
-        reader,
-        &inputs,
-    ) {
+    let production_result = {
+        #[cfg(all(test, feature = "test-hooks"))]
+        if options.fail_next_discard_remove {
+            build_stage2_task_production_with_fail_next_discard_remove_for_test(
+                options.runtime_root,
+                task_id.as_uuid(),
+                reader,
+                &inputs,
+            )
+        } else {
+            build_stage2_task_production(options.runtime_root, task_id.as_uuid(), reader, &inputs)
+        }
+        #[cfg(not(all(test, feature = "test-hooks")))]
+        {
+            build_stage2_task_production(options.runtime_root, task_id.as_uuid(), reader, &inputs)
+        }
+    };
+    let production = match production_result {
         Ok(production) => production,
         Err(error) => {
             let cleanup = discard_unowned_task_file_run(options.runtime_root, task_id)
@@ -858,10 +885,7 @@ pub(crate) async fn run_stage2_batch_production(
                     // actor owner 已结束；即使 join 失败也只尽力删除当前 run 目录。
                     #[cfg(all(test, feature = "test-hooks"))]
                     options.observe_before_discard();
-                    let cleanup = production
-                        .discard()
-                        .err()
-                        .map(|cleanup| cleanup.to_string());
+                    let cleanup = discard_stage2_production_with_retry(&mut production);
                     return Err(Stage2TaskFileRunError {
                         store: None,
                         message: merge_task_file_failure(
@@ -878,10 +902,7 @@ pub(crate) async fn run_stage2_batch_production(
                     // 已归还 Store 后仍需按当前 run 身份尽力清理。
                     #[cfg(all(test, feature = "test-hooks"))]
                     options.observe_before_discard();
-                    let cleanup = production
-                        .discard()
-                        .err()
-                        .map(|cleanup| cleanup.to_string());
+                    let cleanup = discard_stage2_production_with_retry(&mut production);
                     return Err(task_file_run_error(
                         store,
                         merge_task_file_failure(&error.to_string(), cleanup, String::new()),
@@ -891,7 +912,7 @@ pub(crate) async fn run_stage2_batch_production(
             // Store、ACK 和真实 highwater 全部收束后，才可精确删除本轮瞬态目录。
             #[cfg(all(test, feature = "test-hooks"))]
             options.observe_before_discard();
-            let cleanup = production.discard().err().map(|error| error.to_string());
+            let cleanup = discard_stage2_production_with_retry(&mut production);
             if let Some(cleanup) = cleanup {
                 return Err(task_file_run_error(
                     store,
@@ -931,10 +952,7 @@ pub(crate) async fn run_stage2_batch_production(
                     // 失败 runner 的 actor 也必须先归还 Store，之后才能清理瞬态目录。
                     #[cfg(all(test, feature = "test-hooks"))]
                     options.observe_before_discard();
-                    let cleanup = production
-                        .discard()
-                        .err()
-                        .map(|cleanup| cleanup.to_string());
+                    let cleanup = discard_stage2_production_with_retry(&mut production);
                     Err(task_file_run_error(
                         store,
                         merge_task_file_failure(&message, cleanup, String::new()),
@@ -944,10 +962,7 @@ pub(crate) async fn run_stage2_batch_production(
                     // join 失败后 actor owner 已被消费，保留原始 runner/writer/清理诊断。
                     #[cfg(all(test, feature = "test-hooks"))]
                     options.observe_before_discard();
-                    let cleanup = production
-                        .discard()
-                        .err()
-                        .map(|cleanup| cleanup.to_string());
+                    let cleanup = discard_stage2_production_with_retry(&mut production);
                     Err(Stage2TaskFileRunError {
                         store: None,
                         message: merge_task_file_failure(&message, cleanup, writer.to_string()),
@@ -1132,6 +1147,23 @@ fn task_file_run_error(store: NodeStore, message: String) -> Stage2TaskFileRunEr
         store: Some(store),
         message,
     }
+}
+
+/// 首次精确目录清理失败时使用同一 production owner 重试一次，并保留首次诊断。
+fn discard_stage2_production_with_retry<P>(
+    production: &mut Stage2TaskProduction<P>,
+) -> Option<String>
+where
+    P: crate::task_dispatch::TaskLanePermitProvider,
+{
+    let first_error = production.discard().err()?;
+    let first_message = first_error.to_string();
+    if let Err(retry_error) = production.discard() {
+        return Some(format!(
+            "{first_message}；二筛任务目录清理重试失败: {retry_error}"
+        ));
+    }
+    Some(first_message)
 }
 
 /// 构建器尚未交还 production owner 时，仅删除已知 run-id 对应的精确目录。
@@ -2584,6 +2616,74 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "真实 SQLite ACK 必须在 writer 收束前已提交二筛结果"
+        );
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[tokio::test]
+    /// 首次真实目录删除失败时，runner 必须用同一个 production owner 重试并删除目录。
+    async fn production_task_file_stage2_retries_discard_after_injected_remove_failure() {
+        let runtime = tempfile::tempdir().unwrap();
+        let mut store = test_store();
+        let (content, source, content_id) = seed_image(&mut store, [0x69; 16], 69, false);
+        let plan = begin_stage2_batch(
+            &mut store,
+            &[Stage2BatchItem {
+                content,
+                source,
+                frame_slots: Vec::new(),
+            }],
+            69,
+        )
+        .unwrap();
+        let run_id = plan.task_id;
+        let run_directory = runtime.path().join(run_id.as_uuid().to_string());
+        let resolver = FixedLaneResolver::new(1);
+        let read_config = DiskReadConfig::default();
+        let options = Stage2TaskFileRunOptions::new(
+            runtime.path(),
+            runtime.path(),
+            &read_config,
+            1,
+            2,
+            ReadCancellationToken::new(),
+            &resolver,
+        )
+        .with_fail_next_discard_remove_for_test();
+        let (mut pool, mut started, worker_control) = WorkerPool::controlled_batch_for_test(1);
+        let run = run_stage2_batch_production(store, plan, &mut pool, None, &options);
+        let control = async {
+            let (task_id, item_id) = started.recv().await.unwrap();
+            worker_control
+                .stage2_source_read_complete(task_id.clone(), item_id.clone())
+                .await;
+            worker_control
+                .complete_stage2(task_id, item_id, stage2_output(9))
+                .await;
+        };
+        let (result, ()) =
+            tokio::time::timeout(Duration::from_secs(2), async { tokio::join!(run, control) })
+                .await
+                .expect("注入目录删除失败后二筛必须在有限时间内收束");
+        pool.shutdown().await.unwrap();
+        let error = match result {
+            Ok(_) => panic!("首次目录删除失败应保留任务级错误诊断"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("注入任务运行目录删除失败"),
+            "返回错误必须保留首次 discard 失败诊断"
+        );
+        let store = error
+            .into_store()
+            .expect("writer 收束成功后任务级错误必须归还 Store");
+        assert!(
+            store.load_complete_stage2(content_id).unwrap().is_some(),
+            "真实 SQLite ACK 必须在目录清理错误前提交二筛结果"
+        );
+        assert!(
+            !run_directory.exists(),
+            "同一 production owner 重试 discard 后必须删除当前运行目录"
         );
     }
 

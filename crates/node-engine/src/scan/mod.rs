@@ -38,6 +38,8 @@ pub(crate) use task_file_scan_run::{
     CompletedScanSnapshot, ScanRunResult, TaskFileScanRunOptions, run_task_file_scan,
     run_task_file_scan_with_runtime,
 };
+#[cfg(all(test, feature = "test-hooks"))]
+pub(crate) use task_file_stage2_compute::build_stage2_task_production_with_fail_next_discard_remove_for_test;
 pub(crate) use task_file_stage2_compute::{
     Stage2TaskComputeError, Stage2TaskInput, Stage2TaskProducerError, Stage2TaskProduction,
     Stage2TaskRunResult, build_stage2_task_production, run_task_file_stage2,

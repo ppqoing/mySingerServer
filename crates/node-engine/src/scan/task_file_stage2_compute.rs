@@ -131,8 +131,48 @@ pub(crate) fn build_stage2_task_production<P>(
 where
     P: TaskLanePermitProvider,
 {
+    build_stage2_task_production_with_hook(runtime_root, run_id, provider, inputs, None)
+}
+
+/// 仅测试：创建任务文件后注入下一次真实运行目录删除失败。
+///
+/// 注入发生在 `TransientTaskFileSet` 仍由 builder 独占时，随后把同一个 owner 交给生产
+/// runner，确保行为测试覆盖真实 `discard` 的失败与重试边界。
+#[cfg(all(test, feature = "test-hooks"))]
+pub(crate) fn build_stage2_task_production_with_fail_next_discard_remove_for_test<P>(
+    runtime_root: &Path,
+    run_id: impl ToString,
+    provider: P,
+    inputs: &[Stage2TaskInput],
+) -> Result<Stage2TaskProduction<P>, Stage2TaskProducerError>
+where
+    P: TaskLanePermitProvider,
+{
+    build_stage2_task_production_with_hook(
+        runtime_root,
+        run_id,
+        provider,
+        inputs,
+        Some(TransientTaskFileSet::fail_next_discard_remove_for_test),
+    )
+}
+
+/// 构造二筛任务文件并允许测试在集合交给 dispatcher 前设置一次性故障。
+fn build_stage2_task_production_with_hook<P>(
+    runtime_root: &Path,
+    run_id: impl ToString,
+    provider: P,
+    inputs: &[Stage2TaskInput],
+    initialize_files: Option<fn(&mut TransientTaskFileSet)>,
+) -> Result<Stage2TaskProduction<P>, Stage2TaskProducerError>
+where
+    P: TaskLanePermitProvider,
+{
     let run_id = run_id.to_string();
-    let files = TransientTaskFileSet::create(runtime_root, &run_id)?;
+    let mut files = TransientTaskFileSet::create(runtime_root, &run_id)?;
+    if let Some(initialize_files) = initialize_files {
+        initialize_files(&mut files);
+    }
     let mut dispatcher = TaskFileDispatcher::new(files, provider);
     let mut grouped =
         BTreeMap::<String, (TaskDiskLane, Vec<TaskFileRecord>, Vec<Stage2TaskContext>)>::new();

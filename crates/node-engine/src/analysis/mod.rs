@@ -43,7 +43,8 @@ pub use model::{
     AnalysisCandidate, AnalysisCandidateStatus, AnalysisGroup, AnalysisGroupKind,
     AnalysisGroupMember, AnalysisPairKind, ScanAnalysisInput,
 };
-use phase2::{MissingDispatchReport, dispatch_missing, evaluate_candidates};
+pub(crate) use phase2::evaluate_candidates;
+use phase2::{MissingDispatchReport, dispatch_missing};
 #[allow(unused_imports)]
 pub(crate) use phase2::{
     Stage2BatchPlan, Stage2TaskFileRunError, Stage2TaskFileRunOptions, Stage2TaskFileRunResult,

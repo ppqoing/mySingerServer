@@ -38,9 +38,12 @@ use dedup_windows::{
 use crate::scan::BasePersistTestWaiter;
 use crate::{
     NodeRemoteFeatureCache, RemoteFeatureCache,
+    analysis::model::LocalAnalysisRun,
     analysis::{
-        LocalAnalysisEngine, Stage2BatchItem, Stage2BatchPlan, Stage2TaskFileRunOptions,
-        WorkerPoolStage2Processor, begin_stage2_batch, run_stage2_batch_production,
+        AnalysisBlocked, LocalAnalysisReport, PublishedAnalysisResult, Stage2BatchItem,
+        Stage2BatchPlan, Stage2TaskFileRunOptions, begin_stage2_batch, evaluate_candidates,
+        missing_stage2_items, prepare_current_scan_analysis, publish_local_analysis_result,
+        run_stage2_batch_production,
     },
     artifact_registry::RegenerableArtifactRegistry,
     config_repository::{
@@ -504,6 +507,138 @@ impl BackgroundOutcomeTestWaiter {
     }
 }
 
+/// 本地分析发布顺序测试的控制端。
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub(crate) struct AnalysisPublishTestController {
+    /// 控制端与 actor 内 waiter 共享的同步原语。
+    shared: Arc<AnalysisPublishTestState>,
+}
+
+/// 本地分析发布顺序测试的 actor 内 waiter。
+#[cfg(feature = "test-hooks")]
+pub(crate) struct AnalysisPublishTestWaiter {
+    /// 与控制端共享的同步原语。
+    shared: Arc<AnalysisPublishTestState>,
+}
+
+/// 等待 actor 安装分析结果后再放行终态事件。
+#[cfg(feature = "test-hooks")]
+#[derive(Default)]
+struct AnalysisPublishTestState {
+    /// actor 已安装 latest_analysis。
+    installed: Notify,
+    /// 测试允许发布 Runtime completed。
+    released: Notify,
+}
+
+#[cfg(feature = "test-hooks")]
+impl AnalysisPublishTestController {
+    /// 创建分离的控制端和 actor 内 waiter。
+    pub(crate) fn new() -> (Self, AnalysisPublishTestWaiter) {
+        let shared = Arc::new(AnalysisPublishTestState::default());
+        (
+            Self {
+                shared: Arc::clone(&shared),
+            },
+            AnalysisPublishTestWaiter { shared },
+        )
+    }
+
+    /// 等待 actor 已安装最近一次本地分析结果。
+    pub(crate) async fn wait_until_installed(&self) {
+        self.shared.installed.notified().await;
+    }
+
+    /// 放行本地分析的 Runtime completed 发布。
+    pub(crate) fn release(&self) {
+        self.shared.released.notify_one();
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+impl Drop for AnalysisPublishTestController {
+    /// 测试异常退出时避免 actor 永久停在发布顺序 gate。
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+impl AnalysisPublishTestWaiter {
+    /// 通知测试已安装结果，并等待终态发布许可。
+    async fn wait_after_install(self) {
+        self.shared.installed.notify_one();
+        self.shared.released.notified().await;
+    }
+}
+
+/// 本地分析最终评估前取消测试的控制端。
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub(crate) struct AnalysisBeforePublishTestController {
+    /// 控制端与后台 waiter 共享的同步原语。
+    shared: Arc<AnalysisBeforePublishState>,
+}
+
+/// 本地分析最终评估前取消测试的后台 waiter。
+#[cfg(feature = "test-hooks")]
+struct AnalysisBeforePublishTestWaiter {
+    /// 与控制端共享的同步原语。
+    shared: Arc<AnalysisBeforePublishState>,
+}
+
+/// 二筛 ACK 收束后、最终评估开始前的测试 gate。
+#[cfg(feature = "test-hooks")]
+#[derive(Default)]
+struct AnalysisBeforePublishState {
+    /// 后台已完成二筛 runner 收束。
+    entered: Notify,
+    /// 测试允许后台继续最终评估。
+    released: Notify,
+}
+
+#[cfg(feature = "test-hooks")]
+impl AnalysisBeforePublishTestController {
+    /// 创建测试控制端和后台 waiter。
+    fn new() -> (Self, AnalysisBeforePublishTestWaiter) {
+        let shared = Arc::new(AnalysisBeforePublishState::default());
+        (
+            Self {
+                shared: Arc::clone(&shared),
+            },
+            AnalysisBeforePublishTestWaiter { shared },
+        )
+    }
+
+    /// 等待二筛 runner 收束到最终评估前。
+    async fn wait_until_entered(&self) {
+        self.shared.entered.notified().await;
+    }
+
+    /// 放行最终评估和结果发布。
+    fn release(&self) {
+        self.shared.released.notify_one();
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+impl Drop for AnalysisBeforePublishTestController {
+    /// 测试提前退出时放行后台，避免遗留挂起任务。
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+impl AnalysisBeforePublishTestWaiter {
+    /// 通知测试 gate 已进入，并等待放行。
+    async fn wait_before_publish(self) {
+        self.shared.entered.notify_one();
+        self.shared.released.notified().await;
+    }
+}
+
 /// Actor 测试注入点；默认构建是零大小类型且没有运行时分支。
 #[derive(Default)]
 struct ActorTestHooks {
@@ -513,6 +648,12 @@ struct ActorTestHooks {
     /// 仅 feature 测试暂停完成命令，制造 restart 与扫描 outcome 的受控交错。
     #[cfg(feature = "test-hooks")]
     background_outcome_waiter: Option<BackgroundOutcomeTestWaiter>,
+    /// 仅 feature 测试在安装本地分析结果后暂停 Runtime 终态发布。
+    #[cfg(feature = "test-hooks")]
+    analysis_publish_waiter: Option<AnalysisPublishTestWaiter>,
+    /// 仅 feature 测试在二筛收束后、最终评估前暂停本地分析。
+    #[cfg(feature = "test-hooks")]
+    analysis_before_publish_waiter: Option<AnalysisBeforePublishTestWaiter>,
 }
 
 impl NodeEngine {
@@ -627,6 +768,8 @@ impl NodeEngine {
             ActorTestHooks {
                 first_persist_waiter: Some(first_persist_waiter),
                 background_outcome_waiter: None,
+                analysis_publish_waiter: None,
+                analysis_before_publish_waiter: None,
             },
         )
     }
@@ -662,6 +805,82 @@ impl NodeEngine {
             ActorTestHooks {
                 first_persist_waiter: None,
                 background_outcome_waiter: Some(background_outcome_waiter),
+                analysis_publish_waiter: None,
+                analysis_before_publish_waiter: None,
+            },
+        )
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    /// 创建在安装本地分析结果后可暂停 Runtime 终态发布的真实 actor。
+    pub(crate) fn spawn_with_analysis_publish_gate_for_test(
+        store: NodeStore,
+        worker_pool: WorkerPool,
+        listen_address: SocketAddr,
+        cache_root: &Path,
+        runtime_root: &Path,
+        enumerator: EnumeratorKind,
+        analysis_publish_waiter: AnalysisPublishTestWaiter,
+    ) -> (NodeEngineHandle, JoinHandle<()>) {
+        let effective_worker_count = worker_pool.worker_process_ids().len().max(1);
+        let (artifact_registry, disk_full_cleaner) = test_artifact_cleanup(cache_root);
+        spawn_actor(
+            store,
+            Some(worker_pool),
+            listen_address,
+            cache_root,
+            runtime_root,
+            enumerator,
+            DiskReadConfig::default(),
+            NodePostgresConfig::default(),
+            effective_worker_count,
+            None,
+            artifact_registry,
+            disk_full_cleaner,
+            None,
+            ActorTestHooks {
+                first_persist_waiter: None,
+                background_outcome_waiter: None,
+                analysis_publish_waiter: Some(analysis_publish_waiter),
+                analysis_before_publish_waiter: None,
+            },
+        )
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    /// 创建在二筛收束、最终评估前可暂停本地分析的真实 actor。
+    fn spawn_with_analysis_before_publish_gate_for_test(
+        store: NodeStore,
+        worker_pool: WorkerPool,
+        listen_address: SocketAddr,
+        cache_root: &Path,
+        runtime_root: &Path,
+        enumerator: EnumeratorKind,
+        analysis_before_publish_waiter: AnalysisBeforePublishTestWaiter,
+    ) -> (NodeEngineHandle, JoinHandle<()>) {
+        let effective_worker_count = worker_pool.worker_process_ids().len().max(1);
+        let (artifact_registry, disk_full_cleaner) = test_artifact_cleanup(cache_root);
+        spawn_actor(
+            store,
+            Some(worker_pool),
+            listen_address,
+            cache_root,
+            runtime_root,
+            enumerator,
+            DiskReadConfig::default(),
+            NodePostgresConfig::default(),
+            effective_worker_count,
+            None,
+            artifact_registry,
+            disk_full_cleaner,
+            None,
+            ActorTestHooks {
+                first_persist_waiter: None,
+                background_outcome_waiter: None,
+                analysis_publish_waiter: None,
+                analysis_before_publish_waiter: Some(analysis_before_publish_waiter),
             },
         )
     }
@@ -737,6 +956,8 @@ fn spawn_actor(
             snapshots: BTreeMap::new(),
             active_job: None,
             latest_completed_scan: None,
+            active_analysis: None,
+            latest_analysis: None,
             commands: commands.downgrade(),
             config_repository,
             artifact_registry,
@@ -781,6 +1002,10 @@ struct EngineState {
     active_job: Option<ActiveJob>,
     /// 当前进程最近一次成功收尾的扫描快照；失败和取消不会覆盖它。
     latest_completed_scan: Option<crate::scan::CompletedScanSnapshot>,
+    /// 当前进程正在运行或刚刚结束的本地分析摘要，不持久化到 SQLite。
+    active_analysis: Option<AnalysisRuntimeSummary>,
+    /// 当前进程最近一次成功发布的本地分析及其结果元数据。
+    latest_analysis: Option<LatestAnalysis>,
     commands: mpsc::WeakSender<EngineCommand>,
     config_repository: Option<Box<dyn NodeConfigRepositoryAccess>>,
     artifact_registry: Arc<RegenerableArtifactRegistry>,
@@ -823,11 +1048,46 @@ struct BackgroundTerminal {
     outbox_high_seq: Option<u64>,
 }
 
+/// 当前进程本地分析可查询的轻量摘要；输入和候选仍由后台运行对象独占。
+#[derive(Clone, Copy)]
+struct AnalysisRuntimeSummary {
+    /// 本次瞬态分析的 UUID v7 标识。
+    run_id: AnalysisRunId,
+    /// 当前进程内可观察的分析状态。
+    status: AnalysisStatus,
+    /// 冻结输入位置数。
+    input_count: u64,
+    /// 一筛候选对数。
+    candidate_count: u64,
+}
+
+/// 最近一次成功结果及其查询摘要；失败和取消不会替换它。
+struct LatestAnalysis {
+    /// 成功发布后得到的结果文件元数据。
+    published: PublishedAnalysisResult,
+    /// 与结果文件对应的进程内摘要。
+    summary: AnalysisRuntimeSummary,
+}
+
+/// 后台成功发布本地分析后交给 actor 安装的拥有型元数据。
+struct BackgroundAnalysisOutcome {
+    /// 原子替换后的结果文件元数据。
+    published: PublishedAnalysisResult,
+    /// 最终分析报告及分组计数。
+    report: LocalAnalysisReport,
+    /// 冻结输入位置数。
+    input_count: u64,
+    /// 最终评估候选对数。
+    candidate_count: u64,
+}
+
 /// 后台任务收束后的唯一交接值，扫描快照必须与终态一起被 actor 消费。
 #[derive(Default)]
 struct BackgroundOutcome {
     /// 成功扫描的清单快照；二筛和失败扫描均为空。
     completed_scan: Option<crate::scan::CompletedScanSnapshot>,
+    /// 成功发布的瞬态本地分析；失败、取消和旧 SQLite 分析不填充。
+    analysis: Option<BackgroundAnalysisOutcome>,
     /// 收束后才允许发布的运行终态。
     terminal: Option<BackgroundTerminal>,
 }
@@ -863,10 +1123,25 @@ enum BackgroundJob {
         first_persist_waiter: Option<BasePersistTestWaiter>,
     },
     LocalAnalysis {
-        run_id: AnalysisRunId,
+        /// 当前扫描快照构造出的拥有型瞬态分析运行。
+        run: LocalAnalysisRun,
+        /// 后续二筛实现可选地携带已冻结批次；空值代表全缓存命中。
+        stage2_plan: Option<Stage2BatchPlan>,
+        /// 本地分析和 task-file runner 共用的取消令牌。
+        cancellation: ReadCancellationToken,
+        /// 当前进程瞬态 task-file 根目录。
+        runtime_root: PathBuf,
+        /// 本次二筛使用的磁盘读取配置。
+        read_config: DiskReadConfig,
+        /// 最近一次结果文件所在目录。
+        results_root: PathBuf,
         runtime_reporter: RuntimeTaskReporter,
         contact_sheets: PathBuf,
         postgres_config: NodePostgresConfig,
+        effective_worker_count: usize,
+        /// 仅 feature 测试在二筛收束后、最终评估前暂停。
+        #[cfg(feature = "test-hooks")]
+        analysis_before_publish_waiter: Option<AnalysisBeforePublishTestWaiter>,
     },
     Stage2 {
         plan: Stage2BatchPlan,
@@ -888,7 +1163,7 @@ impl BackgroundJob {
     const fn identity(&self) -> JobIdentity {
         match self {
             Self::Scan { task_id, .. } => JobIdentity::TransientScan(*task_id),
-            Self::LocalAnalysis { run_id, .. } => JobIdentity::Analysis(*run_id),
+            Self::LocalAnalysis { run, .. } => JobIdentity::Analysis(run.run_id),
             Self::Stage2 { plan, .. } => JobIdentity::TransientStage2(plan.task_id),
         }
     }
@@ -1205,13 +1480,27 @@ impl EngineState {
 
     async fn cancel_task(&mut self, request: proto::CancelTask) -> ProtocolResult {
         let task_id = parse_task_id(&request.task_id)?;
+        let analysis_id = AnalysisRunId::from_uuid(*task_id.as_uuid());
+        let active_identity = self.active_job.as_ref().map(|active| active.identity);
+        if matches!(
+            active_identity,
+            Some(JobIdentity::Analysis(run_id)) if run_id == analysis_id
+        ) {
+            // 本地分析只有进程内取消令牌；二筛 runner 会按自身 task_id 清理 Worker。
+            if let Some(active) = &self.active_job
+                && let Some(cancellation) = &active.cancellation
+            {
+                cancellation.cancel();
+            }
+            return Ok(proto::envelope::Payload::CancelTask(request));
+        }
         let cancel_gate = self
             .worker_control
             .as_ref()
             .map(|pool| pool.begin_task_cancel(&request.task_id));
-        let is_transient = self.active_job.as_ref().is_some_and(|active| {
+        let is_transient = active_identity.is_some_and(|identity| {
             matches!(
-                active.identity,
+                identity,
                 JobIdentity::TransientScan(id) | JobIdentity::TransientStage2(id) if id == task_id
             )
         });
@@ -1403,8 +1692,37 @@ impl EngineState {
             .transpose()
             .map_err(invalid)?
             .unwrap_or_default();
-        let run_id = LocalAnalysisEngine::begin(&mut self.store, &tasks, thresholds, now_ms())
-            .map_err(internal)?;
+        let snapshot = self
+            .latest_completed_scan
+            .clone()
+            .ok_or_else(|| not_found("当前进程没有最近一次完成扫描"))?;
+        let created_at_ms = u64::try_from(now_ms()).unwrap_or_default();
+        let run = prepare_current_scan_analysis(
+            &self.store,
+            snapshot.task_id,
+            snapshot.library_revision,
+            &snapshot.resolved_files,
+            &tasks,
+            thresholds,
+            created_at_ms,
+        )
+        .map_err(internal)?;
+        let missing = missing_stage2_items(&self.store, &run).map_err(internal)?;
+        let stage2_plan = if missing.is_empty() {
+            None
+        } else {
+            Some(begin_stage2_batch(&mut self.store, &missing, now_ms()).map_err(internal)?)
+        };
+        let run_id = run.run_id;
+        let input_count = run.inputs.len() as u64;
+        let candidate_count = run.candidates.len() as u64;
+        let summary = AnalysisRuntimeSummary {
+            run_id,
+            status: AnalysisStatus::CollectingStage1,
+            input_count,
+            candidate_count,
+        };
+        self.active_analysis = Some(summary);
         let runtime_reporter = self
             .runtime_tasks
             .begin_with_id(
@@ -1415,24 +1733,37 @@ impl EngineState {
             )
             .await;
         let runtime_failure = runtime_reporter.clone();
+        let cancellation = ReadCancellationToken::new();
+        #[cfg(feature = "test-hooks")]
+        let analysis_before_publish_waiter = self.test_hooks.analysis_before_publish_waiter.take();
         if let Err(error) = self.start_background(BackgroundJob::LocalAnalysis {
-            run_id,
+            run,
+            stage2_plan,
+            cancellation,
+            runtime_root: self.runtime_root.clone(),
+            read_config: self.read_config.clone(),
+            results_root: results_root_from_runtime(&self.runtime_root).map_err(internal)?,
             runtime_reporter,
             contact_sheets: self.cache_root.join("contact-sheets"),
             postgres_config: self.postgres_config.clone(),
+            effective_worker_count: self.effective_worker_count,
+            #[cfg(feature = "test-hooks")]
+            analysis_before_publish_waiter,
         }) {
-            let _ = self
-                .store
-                .transition_analysis_run(run_id, AnalysisStatus::Partial, now_ms());
+            if let Some(active) = &mut self.active_analysis {
+                if active.run_id == run_id {
+                    active.status = AnalysisStatus::Partial;
+                }
+            }
             let _ = runtime_failure.finish(RuntimeTaskState::Failed).await;
             return Err(internal(error));
         }
         Ok(proto::envelope::Payload::QueryAnalysisRun(
             proto::QueryAnalysisRun {
                 analysis_run_id: run_id.as_uuid().to_string(),
-                state: analysis_status_name(AnalysisStatus::CollectingStage1).into(),
-                input_count: 0,
-                candidate_count: 0,
+                state: analysis_status_name(summary.status).into(),
+                input_count: summary.input_count,
+                candidate_count: summary.candidate_count,
                 error_text: String::new(),
             },
         ))
@@ -1440,26 +1771,22 @@ impl EngineState {
 
     fn query_analysis_run(&self, request: proto::QueryAnalysisRun) -> ProtocolResult {
         let run_id = parse_analysis_id(&request.analysis_run_id)?;
-        let snapshot = self
-            .store
-            .analysis_run_snapshot(run_id)
-            .map_err(store_error)?;
-        let input_count = self
-            .store
-            .analysis_inputs(run_id)
-            .map_err(store_error)?
-            .len() as u64;
-        let candidate_count = self
-            .store
-            .analysis_candidates(run_id)
-            .map_err(store_error)?
-            .len() as u64;
+        let summary = self
+            .active_analysis
+            .filter(|summary| summary.run_id == run_id)
+            .or_else(|| {
+                self.latest_analysis
+                    .as_ref()
+                    .filter(|latest| latest.published.run_id == run_id)
+                    .map(|latest| latest.summary)
+            })
+            .ok_or_else(|| not_found(format!("当前进程分析不存在: {}", request.analysis_run_id)))?;
         Ok(proto::envelope::Payload::QueryAnalysisRun(
             proto::QueryAnalysisRun {
                 analysis_run_id: request.analysis_run_id,
-                state: analysis_status_name(snapshot.status).into(),
-                input_count,
-                candidate_count,
+                state: analysis_status_name(summary.status).into(),
+                input_count: summary.input_count,
+                candidate_count: summary.candidate_count,
                 error_text: String::new(),
             },
         ))
@@ -1874,8 +2201,8 @@ impl EngineState {
         let identity = job.identity();
         let cancellation = match &job {
             BackgroundJob::Scan { cancellation, .. }
-            | BackgroundJob::Stage2 { cancellation, .. } => Some(cancellation.clone()),
-            _ => None,
+            | BackgroundJob::Stage2 { cancellation, .. }
+            | BackgroundJob::LocalAnalysis { cancellation, .. } => Some(cancellation.clone()),
         };
         #[cfg(feature = "test-hooks")]
         let background_outcome_waiter = self.test_hooks.background_outcome_waiter.take();
@@ -1952,6 +2279,47 @@ impl EngineState {
         {
             self.latest_completed_scan = Some(completed_scan);
         }
+        #[cfg(feature = "test-hooks")]
+        let analysis_publish_waiter = if matches!(identity, JobIdentity::Analysis(_)) {
+            self.test_hooks.analysis_publish_waiter.take()
+        } else {
+            None
+        };
+        let has_analysis = outcome.analysis.is_some();
+        if let Some(analysis) = outcome.analysis {
+            let summary = AnalysisRuntimeSummary {
+                run_id: analysis.report.run_id,
+                status: analysis.report.status,
+                input_count: analysis.input_count,
+                candidate_count: analysis.candidate_count,
+            };
+            // 先安装成功结果和摘要，再向 RuntimeTaskReporter 发布 completed 事件。
+            self.active_analysis = Some(summary);
+            self.latest_analysis = Some(LatestAnalysis {
+                published: analysis.published,
+                summary,
+            });
+            #[cfg(feature = "test-hooks")]
+            if let Some(waiter) = analysis_publish_waiter {
+                waiter.wait_after_install().await;
+            }
+        }
+        if matches!(identity, JobIdentity::Analysis(_)) && !has_analysis {
+            if let Some(active) = &mut self.active_analysis {
+                if let JobIdentity::Analysis(run_id) = identity
+                    && active.run_id == run_id
+                {
+                    active.status =
+                        outcome
+                            .terminal
+                            .as_ref()
+                            .map_or(AnalysisStatus::Partial, |terminal| match terminal.state {
+                                RuntimeTaskState::Cancelled => AnalysisStatus::Cancelled,
+                                _ => AnalysisStatus::Partial,
+                            });
+                }
+            }
+        }
         if let Some(terminal) = outcome.terminal {
             let _ = match terminal.outbox_high_seq {
                 Some(highwater) => {
@@ -1974,25 +2342,13 @@ impl EngineState {
             JobIdentity::TransientScan(task_id) | JobIdentity::TransientStage2(task_id) => {
                 task_id.as_uuid().to_string()
             }
-            JobIdentity::Analysis(run_id) => run_id.as_uuid().to_string(),
+            JobIdentity::Analysis(_) => String::new(),
         };
-        match active.identity {
-            JobIdentity::TransientScan(_) | JobIdentity::TransientStage2(_) => {}
-            JobIdentity::Analysis(run_id) => {
-                finish_running_analysis_stages(
-                    &mut self.store,
-                    run_id,
-                    StorePersistentStageState::Skipped,
-                );
-                let _ =
-                    self.store
-                        .transition_analysis_run(run_id, AnalysisStatus::Cancelled, now_ms());
-            }
-        }
         if let Some(cancellation) = &active.cancellation {
             cancellation.cancel();
         }
-        if let Some(pool) = &self.worker_control
+        if !matches!(active.identity, JobIdentity::Analysis(_))
+            && let Some(pool) = &self.worker_control
             && let Err(error) = pool.cancel_task(&pool_task_id).await
         {
             tracing::warn!(task_id = %pool_task_id, error = %error, "关机取消 WorkerPool 任务失败");
@@ -2259,7 +2615,7 @@ pub fn enumerate_with_frozen_plan_for_test<E: FileEnumerator>(
 }
 
 async fn run_background_job(
-    mut store: NodeStore,
+    store: NodeStore,
     worker_pool: &mut WorkerPool,
     job: BackgroundJob,
 ) -> BackgroundOutcome {
@@ -2404,6 +2760,7 @@ async fn run_background_job(
                     let completed = result.completed;
                     BackgroundOutcome {
                         completed_scan: Some(completed.clone()),
+                        analysis: None,
                         terminal: Some(BackgroundTerminal {
                             reporter: runtime_reporter,
                             state: RuntimeTaskState::Completed,
@@ -2418,40 +2775,146 @@ async fn run_background_job(
             }
         }
         BackgroundJob::LocalAnalysis {
-            run_id,
+            mut run,
+            stage2_plan,
+            cancellation,
+            runtime_root,
+            read_config,
+            results_root,
             runtime_reporter,
             contact_sheets,
             postgres_config,
+            effective_worker_count,
+            #[cfg(feature = "test-hooks")]
+            analysis_before_publish_waiter,
         } => {
-            let mut processor = WorkerPoolStage2Processor::new(worker_pool)
-                .with_runtime_reporter(runtime_reporter.clone(), store.machine_id().clone());
-            let (mut remote, _) = NodeRemoteFeatureCache::from_config(&postgres_config).await;
-            let result = LocalAnalysisEngine::run_existing_with_runtime_cache(
-                &mut store,
-                run_id,
-                &mut processor,
-                &runtime_reporter,
-                &mut remote,
-                &contact_sheets,
-                now_ms(),
-            )
-            .await;
-            let state = match &result {
-                Ok(report) if report.status == AnalysisStatus::Completed => {
-                    RuntimeTaskState::Completed
+            let mut store = store;
+            let input_count = run.inputs.len() as u64;
+            let candidate_count = run.candidates.len() as u64;
+            let result = match stage2_plan {
+                Some(plan) => {
+                    let (remote, _) = NodeRemoteFeatureCache::from_config(&postgres_config).await;
+                    let options = Stage2TaskFileRunOptions::new(
+                        &runtime_root,
+                        &contact_sheets,
+                        &read_config,
+                        effective_worker_count,
+                        MAX_BASE_TASK_BATCH.saturating_add(effective_worker_count),
+                        cancellation.clone(),
+                        &SystemScanRootStorageResolver,
+                    )
+                    .with_runtime_reporter(&runtime_reporter);
+                    match run_stage2_batch_production(
+                        store,
+                        plan,
+                        worker_pool,
+                        Some(&remote),
+                        &options,
+                    )
+                    .await
+                    {
+                        Ok(stage2) => {
+                            store = stage2.store;
+                            #[cfg(feature = "test-hooks")]
+                            if !cancellation.is_cancelled()
+                                && let Some(waiter) = analysis_before_publish_waiter
+                            {
+                                // 二筛 runner 已收束；测试在此处发出取消，验证最终评估不会越过取消线性化点。
+                                waiter.wait_before_publish().await;
+                            }
+                            let evaluation = if cancellation.is_cancelled() {
+                                Err(AnalysisBlocked::InvalidState("本地分析已取消".into()))
+                            } else {
+                                evaluate_candidates(&store, &run.candidates, &run.thresholds)
+                            };
+                            match evaluation {
+                                Ok((candidates, unresolved)) => {
+                                    run.candidates = candidates;
+                                    if unresolved != 0 {
+                                        Err(AnalysisBlocked::Stage2Incomplete { unresolved })
+                                    } else if cancellation.is_cancelled() {
+                                        Err(AnalysisBlocked::InvalidState("本地分析已取消".into()))
+                                    } else {
+                                        publish_local_analysis_result(&store, run, &results_root)
+                                            .map(|(published, report)| (published, report))
+                                    }
+                                }
+                                Err(error) => Err(error),
+                            }
+                        }
+                        Err(error) => {
+                            let message = error.to_string();
+                            let _ = error.into_store();
+                            Err(AnalysisBlocked::InvalidState(message))
+                        }
+                    }
                 }
-                _ => RuntimeTaskState::Failed,
+                None => {
+                    let evaluation = if cancellation.is_cancelled() {
+                        Err(AnalysisBlocked::InvalidState("本地分析已取消".into()))
+                    } else {
+                        evaluate_candidates(&store, &run.candidates, &run.thresholds)
+                    };
+                    match evaluation {
+                        Ok((candidates, unresolved)) => {
+                            run.candidates = candidates;
+                            if unresolved != 0 {
+                                Err(AnalysisBlocked::Stage2Incomplete { unresolved })
+                            } else if cancellation.is_cancelled() {
+                                Err(AnalysisBlocked::InvalidState("本地分析已取消".into()))
+                            } else {
+                                publish_local_analysis_result(&store, run, &results_root)
+                                    .map(|(published, report)| (published, report))
+                            }
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
             };
-            let _ = runtime_reporter.finish(state).await;
-            if result.is_err() {
-                finish_running_analysis_stages(
-                    &mut store,
-                    run_id,
-                    StorePersistentStageState::Failed,
-                );
-                let _ = store.transition_analysis_run(run_id, AnalysisStatus::Partial, now_ms());
+            match result {
+                Ok((published, report)) => {
+                    let _ = runtime_reporter.update_overall_nowait(
+                        input_count,
+                        Some(input_count),
+                        0,
+                        report.skipped_incomplete as u64,
+                    );
+                    BackgroundOutcome {
+                        completed_scan: None,
+                        analysis: Some(BackgroundAnalysisOutcome {
+                            published,
+                            report,
+                            input_count,
+                            candidate_count,
+                        }),
+                        terminal: Some(BackgroundTerminal {
+                            reporter: runtime_reporter,
+                            state: RuntimeTaskState::Completed,
+                            outbox_high_seq: None,
+                        }),
+                    }
+                }
+                Err(error) => {
+                    let _ = runtime_reporter.record_failure_nowait(RuntimeFailureUpdate {
+                        stage: RuntimeStage::FinalCompare,
+                        display_path: String::new(),
+                        message: error.to_string(),
+                    });
+                    BackgroundOutcome {
+                        completed_scan: None,
+                        analysis: None,
+                        terminal: Some(BackgroundTerminal {
+                            reporter: runtime_reporter,
+                            state: if cancellation.is_cancelled() {
+                                RuntimeTaskState::Cancelled
+                            } else {
+                                RuntimeTaskState::Failed
+                            },
+                            outbox_high_seq: None,
+                        }),
+                    }
+                }
             }
-            BackgroundOutcome::default()
         }
         BackgroundJob::Stage2 {
             plan,
@@ -2493,6 +2956,7 @@ async fn run_background_job(
                     );
                     BackgroundOutcome {
                         completed_scan: None,
+                        analysis: None,
                         terminal: Some(BackgroundTerminal {
                             reporter: runtime_reporter,
                             state: RuntimeTaskState::Completed,
@@ -2510,6 +2974,7 @@ async fn run_background_job(
                     });
                     BackgroundOutcome {
                         completed_scan: None,
+                        analysis: None,
                         terminal: Some(BackgroundTerminal {
                             reporter: runtime_reporter,
                             state: if cancellation.is_cancelled() {
@@ -2523,25 +2988,6 @@ async fn run_background_job(
                 }
             }
         }
-    }
-}
-
-/// 把异常退出时仍运行的单机清单阶段关闭，保留它自己的开始时间和计数。
-fn finish_running_analysis_stages(
-    store: &mut NodeStore,
-    run_id: AnalysisRunId,
-    state: StorePersistentStageState,
-) {
-    let Ok(stages) = store.analysis_stages(run_id) else {
-        return;
-    };
-    for mut stage in stages
-        .into_iter()
-        .filter(|stage| stage.state == StorePersistentStageState::Running)
-    {
-        stage.state = state;
-        stage.finished_at_ms = Some(now_ms() as u64);
-        let _ = store.save_analysis_stage(run_id, stage);
     }
 }
 
@@ -2746,6 +3192,14 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
+/// 从已解析的瞬态运行目录推导固定结果目录，不回退到 cache、当前目录或用户目录。
+fn results_root_from_runtime(runtime_root: &Path) -> Result<PathBuf, &'static str> {
+    runtime_root
+        .parent()
+        .map(|parent| parent.join("results"))
+        .ok_or("瞬态运行目录必须存在结果目录父级")
+}
+
 /// 初始化基础计算固定三阶段，保证刚创建的任务即可完整展示。
 fn initialize_base_task_stages(store: &mut NodeStore, task_id: TaskId) -> Result<(), StoreError> {
     for stage in [
@@ -2812,6 +3266,9 @@ mod tests {
     use std::{cell::Cell, fs, future, time::Duration};
 
     #[cfg(feature = "test-hooks")]
+    use rusqlite::Connection;
+
+    #[cfg(feature = "test-hooks")]
     use std::{
         io::{self, Write},
         sync::{Arc, Mutex},
@@ -2829,7 +3286,7 @@ mod tests {
     use super::*;
     #[cfg(feature = "test-hooks")]
     use crate::DisabledRemoteFeatureCache;
-    use crate::worker::{Stage2Frame, Stage2Output};
+    use crate::worker::{Stage1Frame, Stage2Frame, Stage2Output};
     #[cfg(feature = "test-hooks")]
     use crate::{scan::BasePersistTestController, worker::BaseComputeOutput};
 
@@ -2932,6 +3389,57 @@ mod tests {
             }],
             regenerated_contact_sheet_jpeg: None,
         }
+    }
+
+    /// 构造两个相同一筛图片使用的基础 Worker 结果，让分析真实产生二筛候选。
+    #[cfg(feature = "test-hooks")]
+    fn image_base_output() -> BaseComputeOutput {
+        BaseComputeOutput {
+            probe: Some(MediaProbe {
+                media_kind: dedup_core::MediaKind::Image,
+                width: 2,
+                height: 2,
+                duration_ms: None,
+            }),
+            stage1_frames: Some(vec![Stage1Frame {
+                slot: 0,
+                feature: Some(ImageStage1 {
+                    width: 2,
+                    height: 2,
+                    pdq: PdqHash::from_bytes([0; 32]),
+                    quality: 100,
+                }),
+                error: None,
+            }]),
+            contact_sheet_jpeg: None,
+        }
+    }
+
+    /// 读取本地分析相关旧表行数，验证瞬态分析不会写入历史状态表。
+    #[cfg(feature = "test-hooks")]
+    fn legacy_analysis_table_counts(connection: &Connection) -> Vec<(&'static str, i64)> {
+        [
+            "tasks",
+            "task_items",
+            "task_stages",
+            "analysis_runs",
+            "analysis_run_stages",
+            "analysis_run_inputs",
+            "candidate_pairs",
+            "duplicate_groups",
+            "group_members",
+            "review_marks",
+        ]
+        .into_iter()
+        .map(|table| {
+            let count: i64 = connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            (table, count)
+        })
+        .collect()
     }
 
     /// 构造枚举错误的 actor 边界夹具，确认基础计算依赖不会提前创建。
@@ -3434,6 +3942,706 @@ mod tests {
 
         handle.shutdown().await.unwrap();
         actor.await.unwrap();
+    }
+
+    /// 当前进程最近扫描可以直接创建本地分析，并且分析不新增旧 SQLite 运行态行。
+    #[cfg(feature = "test-hooks")]
+    #[tokio::test]
+    async fn local_analysis_uses_latest_scan_and_publishes_result_without_legacy_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let scan_root = directory.path().join("scan");
+        fs::create_dir(&scan_root).unwrap();
+        fs::write(scan_root.join("latest.bin"), b"latest scan input").unwrap();
+        let database = directory.path().join("node.db");
+        let cache_root = directory.path().join("cache");
+        let runtime_root = directory.path().join("data/node/runtime");
+        let results_root = directory.path().join("data/node/results");
+        let machine = MachineId::parse(&"d1".repeat(32)).unwrap();
+        let store = NodeStore::open(&database, machine).unwrap();
+        let (pool, mut started, controller) = WorkerPool::controlled_batch_for_test(1);
+        let (handle, actor) = NodeEngine::spawn_with_runtime_root_for_test(
+            store,
+            pool,
+            "127.0.0.1:39091".parse().unwrap(),
+            &cache_root,
+            &runtime_root,
+            EnumeratorKind::WindowsWalker,
+        );
+        let mut events = handle.runtime_tasks_for_test().subscribe();
+
+        let scan = handle
+            .handle(proto::Envelope {
+                request_id: 100,
+                payload: Some(proto::envelope::Payload::CreateScan(proto::CreateScan {
+                    roots: vec![scan_root.to_string_lossy().into_owned()],
+                    force_recalculate: false,
+                    enumerator: "windows_walker".into(),
+                })),
+            })
+            .await;
+        let Some(proto::envelope::Payload::TaskAccepted(scan)) = scan.payload else {
+            panic!("扫描必须返回当前进程任务 ID");
+        };
+        let (_, item_id) = tokio::time::timeout(Duration::from_secs(2), started.recv())
+            .await
+            .expect("扫描必须进入受控 Worker")
+            .expect("受控 Worker 不应提前关闭");
+        controller
+            .base_source_read_complete(scan.task_id.clone(), item_id.clone())
+            .await;
+        controller
+            .complete_base(
+                scan.task_id.clone(),
+                item_id,
+                [
+                    0x37, 0x5a, 0x25, 0x89, 0x24, 0x28, 0xfc, 0x70, 0x64, 0x81, 0x68, 0xeb, 0xed,
+                    0x07, 0xcd, 0x0c,
+                ],
+                BaseComputeOutput {
+                    probe: Some(MediaProbe {
+                        media_kind: dedup_core::MediaKind::Other,
+                        width: 0,
+                        height: 0,
+                        duration_ms: None,
+                    }),
+                    stage1_frames: Some(Vec::new()),
+                    contact_sheet_jpeg: None,
+                },
+            )
+            .await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(event) = events.recv().await
+                    && event.runtime_task_id == scan.task_id
+                    && event.state == "completed"
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("扫描完成后才能创建本地分析");
+        let baseline_connection = Connection::open(&database).unwrap();
+        let baseline_counts = [
+            "tasks",
+            "task_items",
+            "task_stages",
+            "analysis_runs",
+            "analysis_run_stages",
+            "analysis_run_inputs",
+            "candidate_pairs",
+            "duplicate_groups",
+            "group_members",
+            "review_marks",
+        ]
+        .into_iter()
+        .map(|table| {
+            let count: i64 = baseline_connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            (table, count)
+        })
+        .collect::<Vec<_>>();
+        drop(baseline_connection);
+
+        let analysis = handle
+            .handle(proto::Envelope {
+                request_id: 101,
+                payload: Some(proto::envelope::Payload::CreateLocalAnalysis(
+                    proto::CreateLocalAnalysis {
+                        scan_task_ids: vec![scan.task_id.clone()],
+                        group_kind: proto::GroupKind::GroupExact as i32,
+                        thresholds: None,
+                    },
+                )),
+            })
+            .await;
+        let Some(proto::envelope::Payload::QueryAnalysisRun(accepted)) = analysis.payload else {
+            panic!("当前扫描快照必须接受本地分析");
+        };
+        assert_eq!(accepted.state, "collecting_stage1");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let details = handle
+                    .runtime_tasks_for_test()
+                    .details(&accepted.analysis_run_id)
+                    .await;
+                if details
+                    .and_then(|details| details.summary)
+                    .is_some_and(|summary| summary.state != "running")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("本地分析必须进入终态");
+
+        let query = handle
+            .handle(proto::Envelope {
+                request_id: 102,
+                payload: Some(proto::envelope::Payload::QueryAnalysisRun(
+                    proto::QueryAnalysisRun {
+                        analysis_run_id: accepted.analysis_run_id.clone(),
+                        state: String::new(),
+                        input_count: 0,
+                        candidate_count: 0,
+                        error_text: String::new(),
+                    },
+                )),
+            })
+            .await;
+        let Some(proto::envelope::Payload::QueryAnalysisRun(query)) = query.payload else {
+            panic!("当前本地分析必须可查询");
+        };
+        assert_eq!(query.state, "completed");
+        assert_eq!(query.input_count, 1);
+        assert!(results_root.join("latest-analysis.result.tsv").exists());
+
+        drop(handle);
+        actor.await.unwrap();
+        let connection = Connection::open(&database).unwrap();
+        for (table, baseline_count) in baseline_counts {
+            let count: i64 = connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, baseline_count, "本地分析不应新增 {table} 行");
+        }
+    }
+
+    /// 本地分析必须先安装内存结果，再向 Runtime 发布 completed 终态。
+    #[cfg(feature = "test-hooks")]
+    #[tokio::test]
+    async fn local_analysis_installs_latest_result_before_runtime_completed() {
+        let directory = tempfile::tempdir().unwrap();
+        let scan_root = directory.path().join("scan");
+        fs::create_dir(&scan_root).unwrap();
+        fs::write(scan_root.join("latest.bin"), b"latest scan input").unwrap();
+        let cache_root = directory.path().join("cache");
+        let runtime_root = directory.path().join("data/node/runtime");
+        let results_root = directory.path().join("data/node/results");
+        let machine = MachineId::parse(&"d1".repeat(32)).unwrap();
+        let store = NodeStore::open(&directory.path().join("node.db"), machine).unwrap();
+        let (publish_control, publish_waiter) = AnalysisPublishTestController::new();
+        let (pool, mut started, controller) = WorkerPool::controlled_batch_for_test(1);
+        let (handle, actor) = NodeEngine::spawn_with_analysis_publish_gate_for_test(
+            store,
+            pool,
+            "127.0.0.1:39091".parse().unwrap(),
+            &cache_root,
+            &runtime_root,
+            EnumeratorKind::WindowsWalker,
+            publish_waiter,
+        );
+        let registry = handle.runtime_tasks_for_test();
+
+        let scan = handle
+            .handle(proto::Envelope {
+                request_id: 103,
+                payload: Some(proto::envelope::Payload::CreateScan(proto::CreateScan {
+                    roots: vec![scan_root.to_string_lossy().into_owned()],
+                    force_recalculate: false,
+                    enumerator: "windows_walker".into(),
+                })),
+            })
+            .await;
+        let Some(proto::envelope::Payload::TaskAccepted(scan)) = scan.payload else {
+            panic!("扫描必须返回当前进程任务 ID");
+        };
+        let (_, item_id) = tokio::time::timeout(Duration::from_secs(2), started.recv())
+            .await
+            .expect("扫描必须进入受控 Worker")
+            .expect("受控 Worker 不应提前关闭");
+        controller
+            .base_source_read_complete(scan.task_id.clone(), item_id.clone())
+            .await;
+        controller
+            .complete_base(
+                scan.task_id.clone(),
+                item_id,
+                [
+                    0x37, 0x5a, 0x25, 0x89, 0x24, 0x28, 0xfc, 0x70, 0x64, 0x81, 0x68, 0xeb, 0xed,
+                    0x07, 0xcd, 0x0c,
+                ],
+                BaseComputeOutput {
+                    probe: Some(MediaProbe {
+                        media_kind: dedup_core::MediaKind::Other,
+                        width: 0,
+                        height: 0,
+                        duration_ms: None,
+                    }),
+                    stage1_frames: Some(Vec::new()),
+                    contact_sheet_jpeg: None,
+                },
+            )
+            .await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let Some(details) = registry.details(&scan.task_id).await else {
+                    tokio::task::yield_now().await;
+                    continue;
+                };
+                if details
+                    .summary
+                    .is_some_and(|summary| summary.state == "completed")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("扫描完成后才能创建本地分析");
+
+        let mut analysis_events = registry.subscribe();
+        let analysis = handle
+            .handle(proto::Envelope {
+                request_id: 104,
+                payload: Some(proto::envelope::Payload::CreateLocalAnalysis(
+                    proto::CreateLocalAnalysis {
+                        scan_task_ids: vec![scan.task_id.clone()],
+                        group_kind: proto::GroupKind::GroupExact as i32,
+                        thresholds: None,
+                    },
+                )),
+            })
+            .await;
+        let Some(proto::envelope::Payload::QueryAnalysisRun(accepted)) = analysis.payload else {
+            panic!("当前扫描快照必须接受本地分析");
+        };
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            publish_control.wait_until_installed(),
+        )
+        .await
+        .expect("本地分析必须在 Runtime completed 前安装结果");
+
+        let details = registry
+            .details(&accepted.analysis_run_id)
+            .await
+            .expect("安装结果前必须已经存在运行摘要");
+        assert_eq!(details.summary.expect("运行摘要必须存在").state, "running");
+        while let Ok(event) = analysis_events.try_recv() {
+            assert!(
+                !(event.runtime_task_id == accepted.analysis_run_id && event.state == "completed")
+            );
+        }
+
+        publish_control.release();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let Some(details) = registry.details(&accepted.analysis_run_id).await else {
+                    tokio::task::yield_now().await;
+                    continue;
+                };
+                if details
+                    .summary
+                    .is_some_and(|summary| summary.state == "completed")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("放行后本地分析必须发布 completed");
+
+        let query = handle
+            .handle(proto::Envelope {
+                request_id: 105,
+                payload: Some(proto::envelope::Payload::QueryAnalysisRun(
+                    proto::QueryAnalysisRun {
+                        analysis_run_id: accepted.analysis_run_id.clone(),
+                        state: String::new(),
+                        input_count: 0,
+                        candidate_count: 0,
+                        error_text: String::new(),
+                    },
+                )),
+            })
+            .await;
+        let Some(proto::envelope::Payload::QueryAnalysisRun(query)) = query.payload else {
+            panic!("当前本地分析必须可查询");
+        };
+        assert_eq!(query.state, "completed");
+        assert_eq!(query.input_count, 1);
+        assert!(results_root.join("latest-analysis.result.tsv").exists());
+
+        handle.shutdown().await.unwrap();
+        actor.await.unwrap();
+    }
+
+    /// 缺失二筛必须经瞬态 task-file Worker 完成后再发布最近一次分析 TSV。
+    #[cfg(feature = "test-hooks")]
+    #[tokio::test]
+    async fn local_analysis_runs_missing_stage2_and_publishes_after_worker_ack() {
+        let directory = tempfile::tempdir().unwrap();
+        let scan_root = directory.path().join("scan");
+        fs::create_dir(&scan_root).unwrap();
+        fs::write(scan_root.join("left.jpg"), b"left image").unwrap();
+        fs::write(scan_root.join("right.jpg"), b"right image").unwrap();
+        let database = directory.path().join("node.db");
+        let cache_root = directory.path().join("cache");
+        let runtime_root = directory.path().join("data/node/runtime");
+        let results_root = directory.path().join("data/node/results");
+        let machine = MachineId::parse(&"d2".repeat(32)).unwrap();
+        let store = NodeStore::open(&database, machine).unwrap();
+        let (pool, mut started, controller) = WorkerPool::controlled_batch_for_test(2);
+        let (handle, actor) = NodeEngine::spawn_with_runtime_root_for_test(
+            store,
+            pool,
+            "127.0.0.1:39091".parse().unwrap(),
+            &cache_root,
+            &runtime_root,
+            EnumeratorKind::WindowsWalker,
+        );
+        let registry = handle.runtime_tasks_for_test();
+
+        let scan = handle
+            .handle(proto::Envelope {
+                request_id: 106,
+                payload: Some(proto::envelope::Payload::CreateScan(proto::CreateScan {
+                    roots: vec![scan_root.to_string_lossy().into_owned()],
+                    force_recalculate: false,
+                    enumerator: "windows_walker".into(),
+                })),
+            })
+            .await;
+        let Some(proto::envelope::Payload::TaskAccepted(scan)) = scan.payload else {
+            panic!("二筛夹具的基础扫描必须返回任务 ID");
+        };
+        for md5 in [
+            [
+                0xef, 0x0a, 0x61, 0x89, 0x37, 0xda, 0x9f, 0x0e, 0x44, 0x75, 0x2e, 0x30, 0x85, 0xaa,
+                0x02, 0xb3,
+            ],
+            [
+                0x3b, 0xad, 0xd8, 0xe0, 0x3f, 0xc2, 0xf0, 0x99, 0x97, 0xcd, 0x06, 0xd7, 0x4a, 0x8b,
+                0xe3, 0x3b,
+            ],
+        ] {
+            let (_, item_id) = tokio::time::timeout(Duration::from_secs(2), started.recv())
+                .await
+                .expect("基础扫描必须进入受控 Worker")
+                .expect("受控 Worker 不应提前关闭");
+            controller
+                .base_source_read_complete(scan.task_id.clone(), item_id.clone())
+                .await;
+            controller
+                .complete_base(scan.task_id.clone(), item_id, md5, image_base_output())
+                .await;
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if registry
+                    .details(&scan.task_id)
+                    .await
+                    .and_then(|details| details.summary)
+                    .is_some_and(|summary| summary.state == "completed")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("基础扫描完成后才能创建瞬态本地分析");
+        let scan_details = registry
+            .details(&scan.task_id)
+            .await
+            .expect("基础扫描运行详情必须存在");
+        assert_eq!(
+            scan_details
+                .summary
+                .as_ref()
+                .map(|summary| summary.overall_completed),
+            Some(2),
+            "两张图片必须都完成基础计算: {scan_details:?}"
+        );
+        let snapshot = handle
+            .latest_completed_scan_for_test()
+            .await
+            .expect("基础扫描完成后必须保存清单快照");
+        assert_eq!(snapshot.resolved_files.len(), 2);
+
+        let baseline_connection = Connection::open(&database).unwrap();
+        let baseline_counts = legacy_analysis_table_counts(&baseline_connection);
+        let analysis = handle
+            .handle(proto::Envelope {
+                request_id: 107,
+                payload: Some(proto::envelope::Payload::CreateLocalAnalysis(
+                    proto::CreateLocalAnalysis {
+                        scan_task_ids: vec![scan.task_id.clone()],
+                        group_kind: proto::GroupKind::GroupSimilarImage as i32,
+                        thresholds: None,
+                    },
+                )),
+            })
+            .await;
+        let Some(proto::envelope::Payload::QueryAnalysisRun(accepted)) = analysis.payload else {
+            panic!("缺失二筛的本地分析必须返回运行 ID");
+        };
+        assert_eq!(accepted.input_count, 2);
+        assert_eq!(accepted.candidate_count, 1);
+        let mut stage2_task_id = None;
+        for seed in [9, 10] {
+            let (task_id, item_id) = tokio::time::timeout(Duration::from_secs(2), started.recv())
+                .await
+                .expect("缺失二筛必须为每个缺失内容进入瞬态 Worker")
+                .expect("受控 Worker 不应提前关闭");
+            assert_ne!(
+                task_id, accepted.analysis_run_id,
+                "二筛 Worker 必须使用内部瞬态任务身份，不能复用分析 ID"
+            );
+            if let Some(expected_task_id) = stage2_task_id.as_ref() {
+                assert_eq!(
+                    &task_id, expected_task_id,
+                    "同一批二筛缺失内容必须共享一个内部 task_id"
+                );
+            } else {
+                stage2_task_id = Some(task_id.clone());
+            }
+            controller
+                .stage2_source_read_complete(task_id.clone(), item_id.clone())
+                .await;
+            controller
+                .complete_stage2(task_id, item_id, stage2_success_output(seed))
+                .await;
+        }
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if registry
+                    .details(&accepted.analysis_run_id)
+                    .await
+                    .and_then(|details| details.summary)
+                    .is_some_and(|summary| summary.state == "completed")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("二筛 ACK 后本地分析必须发布 completed");
+
+        let query = handle
+            .handle(proto::Envelope {
+                request_id: 108,
+                payload: Some(proto::envelope::Payload::QueryAnalysisRun(
+                    proto::QueryAnalysisRun {
+                        analysis_run_id: accepted.analysis_run_id,
+                        state: String::new(),
+                        input_count: 0,
+                        candidate_count: 0,
+                        error_text: String::new(),
+                    },
+                )),
+            })
+            .await;
+        let Some(proto::envelope::Payload::QueryAnalysisRun(query)) = query.payload else {
+            panic!("完成的瞬态本地分析必须可查询");
+        };
+        assert_eq!(query.state, "completed");
+        assert_eq!(query.input_count, 2);
+        assert_eq!(query.candidate_count, 1);
+        assert!(results_root.join("latest-analysis.result.tsv").is_file());
+
+        handle.shutdown().await.unwrap();
+        actor.await.unwrap();
+        let connection = Connection::open(&database).unwrap();
+        assert_eq!(legacy_analysis_table_counts(&connection), baseline_counts);
+    }
+
+    /// 取消缺失二筛只能结束当前瞬态运行，并保留上一份结果及旧历史表行。
+    #[cfg(feature = "test-hooks")]
+    #[tokio::test]
+    async fn cancelled_local_analysis_preserves_previous_result_and_legacy_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let scan_root = directory.path().join("scan");
+        fs::create_dir(&scan_root).unwrap();
+        fs::write(scan_root.join("left.jpg"), b"left image").unwrap();
+        fs::write(scan_root.join("right.jpg"), b"right image").unwrap();
+        let database = directory.path().join("node.db");
+        let cache_root = directory.path().join("cache");
+        let runtime_root = directory.path().join("data/node/runtime");
+        let results_root = directory.path().join("data/node/results");
+        fs::create_dir_all(&results_root).unwrap();
+        let result_path = results_root.join("latest-analysis.result.tsv");
+        let previous_result = b"previous analysis result\n";
+        fs::write(&result_path, previous_result).unwrap();
+        let machine = MachineId::parse(&"d3".repeat(32)).unwrap();
+        let store = NodeStore::open(&database, machine).unwrap();
+        let (before_publish_control, before_publish_waiter) =
+            AnalysisBeforePublishTestController::new();
+        let (pool, mut started, controller) = WorkerPool::controlled_batch_for_test(2);
+        let (handle, actor) = NodeEngine::spawn_with_analysis_before_publish_gate_for_test(
+            store,
+            pool,
+            "127.0.0.1:39091".parse().unwrap(),
+            &cache_root,
+            &runtime_root,
+            EnumeratorKind::WindowsWalker,
+            before_publish_waiter,
+        );
+        let registry = handle.runtime_tasks_for_test();
+
+        let scan = handle
+            .handle(proto::Envelope {
+                request_id: 109,
+                payload: Some(proto::envelope::Payload::CreateScan(proto::CreateScan {
+                    roots: vec![scan_root.to_string_lossy().into_owned()],
+                    force_recalculate: false,
+                    enumerator: "windows_walker".into(),
+                })),
+            })
+            .await;
+        let Some(proto::envelope::Payload::TaskAccepted(scan)) = scan.payload else {
+            panic!("取消夹具的基础扫描必须返回任务 ID");
+        };
+        for md5 in [
+            [
+                0xef, 0x0a, 0x61, 0x89, 0x37, 0xda, 0x9f, 0x0e, 0x44, 0x75, 0x2e, 0x30, 0x85, 0xaa,
+                0x02, 0xb3,
+            ],
+            [
+                0x3b, 0xad, 0xd8, 0xe0, 0x3f, 0xc2, 0xf0, 0x99, 0x97, 0xcd, 0x06, 0xd7, 0x4a, 0x8b,
+                0xe3, 0x3b,
+            ],
+        ] {
+            let (_, item_id) = tokio::time::timeout(Duration::from_secs(2), started.recv())
+                .await
+                .expect("基础扫描必须进入受控 Worker")
+                .expect("受控 Worker 不应提前关闭");
+            controller
+                .base_source_read_complete(scan.task_id.clone(), item_id.clone())
+                .await;
+            controller
+                .complete_base(scan.task_id.clone(), item_id, md5, image_base_output())
+                .await;
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if registry
+                    .details(&scan.task_id)
+                    .await
+                    .and_then(|details| details.summary)
+                    .is_some_and(|summary| summary.state == "completed")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("基础扫描完成后才能创建取消分析");
+
+        let baseline_connection = Connection::open(&database).unwrap();
+        let baseline_counts = legacy_analysis_table_counts(&baseline_connection);
+        let analysis = handle
+            .handle(proto::Envelope {
+                request_id: 110,
+                payload: Some(proto::envelope::Payload::CreateLocalAnalysis(
+                    proto::CreateLocalAnalysis {
+                        scan_task_ids: vec![scan.task_id],
+                        group_kind: proto::GroupKind::GroupSimilarImage as i32,
+                        thresholds: None,
+                    },
+                )),
+            })
+            .await;
+        let Some(proto::envelope::Payload::QueryAnalysisRun(accepted)) = analysis.payload else {
+            panic!("取消分析必须返回运行 ID");
+        };
+        let mut stage2_task_id = None;
+        for seed in [9, 10] {
+            let (task_id, item_id) = tokio::time::timeout(Duration::from_secs(2), started.recv())
+                .await
+                .expect("取消分析必须先进入瞬态 Worker")
+                .expect("受控 Worker 不应提前关闭");
+            if let Some(expected_task_id) = stage2_task_id.as_ref() {
+                assert_eq!(
+                    &task_id, expected_task_id,
+                    "同一批二筛缺失内容必须共享一个内部 task_id"
+                );
+            } else {
+                stage2_task_id = Some(task_id.clone());
+            }
+            controller
+                .stage2_source_read_complete(task_id.clone(), item_id.clone())
+                .await;
+            controller
+                .complete_stage2(task_id, item_id, stage2_success_output(seed))
+                .await;
+        }
+        let stage2_task_id = stage2_task_id.expect("二筛必须至少启动一个 Worker");
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            before_publish_control.wait_until_entered(),
+        )
+        .await
+        .expect("二筛 ACK 后必须停在最终评估前");
+
+        let cancel = handle
+            .handle(proto::Envelope {
+                request_id: 111,
+                payload: Some(proto::envelope::Payload::CancelTask(proto::CancelTask {
+                    task_id: accepted.analysis_run_id.clone(),
+                })),
+            })
+            .await;
+        assert!(matches!(
+            cancel.payload,
+            Some(proto::envelope::Payload::CancelTask(_))
+        ));
+        before_publish_control.release();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if registry
+                    .details(&accepted.analysis_run_id)
+                    .await
+                    .and_then(|details| details.summary)
+                    .is_some_and(|summary| summary.state == "cancelled")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("取消必须等待瞬态二筛 Worker 和任务目录收束");
+        assert_eq!(fs::read(&result_path).unwrap(), previous_result);
+        assert!(!runtime_root.join(stage2_task_id).exists());
+
+        let query = handle
+            .handle(proto::Envelope {
+                request_id: 112,
+                payload: Some(proto::envelope::Payload::QueryAnalysisRun(
+                    proto::QueryAnalysisRun {
+                        analysis_run_id: accepted.analysis_run_id,
+                        state: String::new(),
+                        input_count: 0,
+                        candidate_count: 0,
+                        error_text: String::new(),
+                    },
+                )),
+            })
+            .await;
+        let Some(proto::envelope::Payload::QueryAnalysisRun(query)) = query.payload else {
+            panic!("取消后的瞬态分析必须可查询");
+        };
+        assert_eq!(query.state, "cancelled");
+
+        handle.shutdown().await.unwrap();
+        actor.await.unwrap();
+        let connection = Connection::open(&database).unwrap();
+        assert_eq!(legacy_analysis_table_counts(&connection), baseline_counts);
     }
 
     #[cfg(feature = "test-hooks")]
