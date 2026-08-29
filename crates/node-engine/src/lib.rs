@@ -28,6 +28,8 @@ pub mod delete_queue;
 pub mod io;
 /// 图片原文件和视频 JPEG 联系表的有界分块预览。
 pub mod preview;
+/// Node 当前进程内最近结果的复核标记，不写持久历史。
+mod review_registry;
 /// Node 进程内运行任务阶段、Worker 和最近失败 registry。
 pub mod runtime_tasks;
 /// 文件枚举、缓存复用、MD5 与一筛任务编排。

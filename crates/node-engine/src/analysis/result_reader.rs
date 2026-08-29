@@ -264,6 +264,54 @@ impl LatestAnalysisReader {
             }
         }
     }
+
+    /// 按组和位置流式查找一个成员，只在命中时保留一个解析后的成员对象。
+    ///
+    /// 复核和删除计划不能受 UI 窗口上限影响；这里复用进程内偏移表逐行读取，
+    /// 不建立 `.idx` 文件，也不把整个大组装入内存。
+    pub fn find_member(
+        &mut self,
+        group_id: &str,
+        location: &LocationKey,
+    ) -> Result<Option<AnalysisResultRow>, AnalysisResultError> {
+        let offset_count = self
+            .member_offsets
+            .get(group_id)
+            .ok_or_else(|| AnalysisResultError::InvalidFormat(format!("结果组不存在: {group_id}")))?
+            .len();
+        for index in 0..offset_count {
+            let offset = self
+                .member_offsets
+                .get(group_id)
+                .and_then(|offsets| offsets.get(index))
+                .copied()
+                .ok_or_else(|| AnalysisResultError::InvalidFormat("成员偏移索引损坏".into()))?;
+            let row = self.read_member_at(offset, group_id)?;
+            if &row.location == location {
+                return Ok(Some(row));
+            }
+        }
+        Ok(None)
+    }
+
+    /// 读取一个已知组成员的固定偏移并再次核对组 ID。
+    fn read_member_at(
+        &mut self,
+        offset: u64,
+        group_id: &str,
+    ) -> Result<AnalysisResultRow, AnalysisResultError> {
+        self.file.seek(SeekFrom::Start(offset))?;
+        let mut local_offset = offset;
+        let (_, _, line) = read_record(&mut self.file, &mut local_offset)?
+            .ok_or_else(|| AnalysisResultError::InvalidFormat("成员偏移指向文件末尾".into()))?;
+        let row = parse_member(&line)?;
+        if row.group_id != group_id {
+            return Err(AnalysisResultError::InvalidFormat(
+                "成员偏移与组 ID 不一致".into(),
+            ));
+        }
+        Ok(row)
+    }
 }
 
 /// 以允许替换的共享模式打开结果文件，同时把 reader 绑定到该文件身份。

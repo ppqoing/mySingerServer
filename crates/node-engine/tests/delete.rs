@@ -1,61 +1,46 @@
 use std::{fs, path::Path};
 
 use dedup_core::{
-    AnalysisRunId, ContentKey, DeleteMode, DisplayPath, GroupId, LocationKey, MachineId, MediaKind,
-    NormalizedPath, Thresholds,
+    ContentKey, DeleteMode, DisplayPath, LocationKey, MachineId, MediaKind, NormalizedPath,
 };
 use dedup_node_engine::{
-    delete::DeleteEngine,
+    delete::{DeleteEngine, SystemDeleteFilesystem},
     preview::{PreviewKind, PreviewService},
+    runtime_tasks::{RuntimeTaskKind, RuntimeTaskRegistry},
     scan::md5_bytes,
 };
 use dedup_node_store::{
-    AnalysisMode, ConfirmedDeleteItem, DeleteBatchPlan, DeleteOutcome, FeatureWrite, GroupKind,
-    GroupMemberWrite, GroupWrite, NodeStore, PlannedDeleteItem, ReviewDecision, ScannedPath,
+    DeleteBatchPlan, DeleteOutcome, DeleteResult, FeatureWrite, NodeStore, PlannedDeleteItem,
+    ScannedPath,
 };
 
-#[test]
-fn same_size_md5_change_is_skipped_and_group_remains() {
+#[tokio::test]
+async fn same_size_md5_change_is_skipped_and_file_remains_active() {
     let directory = tempfile::tempdir().unwrap();
-    let (mut store, run_id, group_id, target, plan) = delete_fixture(directory.path());
+    let (mut store, target, plan) = delete_fixture(directory.path());
     fs::write(target.display_path.as_path(), b"changed!").unwrap();
 
-    let results = DeleteEngine::execute_batch(&mut store, &plan).unwrap();
+    let results = execute_transient(&mut store, directory.path(), &plan).await;
 
     assert_eq!(results[0].outcome, DeleteOutcome::Skipped);
     assert!(target.display_path.as_path().exists());
-    assert_eq!(store.page_groups(run_id, None, 10).unwrap().items.len(), 1);
-    assert_eq!(
-        store
-            .page_group_members(run_id, &group_id, None, 10)
-            .unwrap()
-            .items
-            .len(),
-        2
-    );
+    assert!(store.location_is_active(&target.location).unwrap());
 }
 
-#[test]
-fn permanent_delete_rechecks_identity_and_immediately_updates_group() {
+#[tokio::test]
+async fn permanent_delete_rechecks_identity_and_updates_current_file_fact() {
     let directory = tempfile::tempdir().unwrap();
-    let (mut store, run_id, _group_id, target, plan) = delete_fixture(directory.path());
+    let (mut store, target, plan) = delete_fixture(directory.path());
 
-    let results = DeleteEngine::execute_batch(&mut store, &plan).unwrap();
+    let results = execute_transient(&mut store, directory.path(), &plan).await;
 
     assert_eq!(results[0].outcome, DeleteOutcome::Deleted);
     assert!(!target.display_path.as_path().exists());
     assert!(!store.location_is_active(&target.location).unwrap());
-    assert!(
-        store
-            .page_groups(run_id, None, 10)
-            .unwrap()
-            .items
-            .is_empty()
-    );
 }
 
-#[test]
-fn central_plan_deletes_without_a_local_analysis_and_publishes_tombstone() {
+#[tokio::test]
+async fn central_plan_deletes_without_a_local_analysis_and_publishes_current_file_fact() {
     let directory = tempfile::tempdir().unwrap();
     let target_path = directory.path().join("central-target.bin");
     fs::write(&target_path, b"central").unwrap();
@@ -77,7 +62,7 @@ fn central_plan_deletes_without_a_local_analysis_and_publishes_tombstone() {
         }],
     };
 
-    let results = DeleteEngine::execute_external(&mut store, &plan).unwrap();
+    let results = execute_transient(&mut store, directory.path(), &plan).await;
 
     assert_eq!(results[0].outcome, DeleteOutcome::Deleted);
     assert!(!target_path.exists());
@@ -85,6 +70,12 @@ fn central_plan_deletes_without_a_local_analysis_and_publishes_tombstone() {
     let changes = store.pull_changes(0, 100).unwrap();
     assert!(
         changes
+            .changes
+            .iter()
+            .any(|change| change.entity_kind == "file")
+    );
+    assert!(
+        !changes
             .changes
             .iter()
             .any(|change| change.entity_kind == "deletion_tombstone")
@@ -153,78 +144,61 @@ struct Target {
     display_path: DisplayPath,
 }
 
-fn delete_fixture(
-    directory: &Path,
-) -> (
-    NodeStore,
-    AnalysisRunId,
-    String,
-    Target,
-    dedup_node_store::DeleteBatchPlan,
-) {
+fn delete_fixture(directory: &Path) -> (NodeStore, Target, DeleteBatchPlan) {
     let target_path = directory.join("target.bin");
-    let keep_path = directory.join("keep.bin");
     fs::write(&target_path, b"original").unwrap();
-    fs::write(&keep_path, b"keep").unwrap();
     let mut store = NodeStore::open_in_memory(machine()).unwrap();
     let target_scan = scanned(&target_path);
-    let keep_scan = scanned(&keep_path);
     let target_key = ContentKey::new(md5_bytes(b"original"), target_scan.file_size);
-    let keep_key = ContentKey::new(md5_bytes(b"keep"), keep_scan.file_size);
     store
         .upsert_content_and_location(&target_scan, target_key.md5(), MediaKind::Other)
         .unwrap();
-    store
-        .upsert_content_and_location(&keep_scan, keep_key.md5(), MediaKind::Other)
-        .unwrap();
     let target_location = LocationKey::new(machine(), target_scan.normalized_path.clone());
-    let keep_location = LocationKey::new(machine(), keep_scan.normalized_path.clone());
-    let run_id = store
-        .create_analysis_run(AnalysisMode::Local, Thresholds::default(), 1)
-        .unwrap();
-    let group_id = GroupId::new().as_uuid().to_string();
-    store
-        .replace_groups(
-            run_id,
-            &[GroupWrite {
-                group_id: group_id.clone(),
-                kind: GroupKind::Image,
-                representative: keep_key,
-                members: vec![
-                    GroupMemberWrite::new(keep_location.clone(), keep_key, true),
-                    GroupMemberWrite::new(target_location.clone(), target_key, false),
-                ],
-            }],
-        )
-        .unwrap();
-    store
-        .save_review_mark(run_id, &group_id, &keep_location, ReviewDecision::Keep)
-        .unwrap();
-    store
-        .save_review_mark(run_id, &group_id, &target_location, ReviewDecision::Delete)
-        .unwrap();
-    let plan = store
-        .create_delete_batch(
-            run_id,
-            &[ConfirmedDeleteItem::new(
-                group_id.clone(),
-                target_location.clone(),
-                target_key,
-            )],
-            DeleteMode::Permanent,
-            2,
-        )
-        .unwrap();
+    let plan = DeleteBatchPlan {
+        batch_id: "delete-test".into(),
+        mode: DeleteMode::Permanent,
+        items: vec![PlannedDeleteItem {
+            item_id: "target-item".into(),
+            group_id: "group".into(),
+            location: target_location.clone(),
+            expected: target_key,
+        }],
+    };
     (
         store,
-        run_id,
-        group_id,
         Target {
             location: target_location,
             display_path: target_scan.display_path,
         },
         plan,
     )
+}
+
+/// 通过当前进程瞬态 TSV 队列执行一项删除，供 NodeEngine 行为测试复用。
+async fn execute_transient(
+    store: &mut NodeStore,
+    root: &Path,
+    plan: &DeleteBatchPlan,
+) -> Vec<DeleteResult> {
+    let runtime_root = root.join("runtime");
+    fs::create_dir_all(&runtime_root).unwrap();
+    let registry = RuntimeTaskRegistry::new();
+    let reporter = registry
+        .begin(
+            RuntimeTaskKind::Delete,
+            store.machine_id().clone(),
+            "删除测试",
+        )
+        .await;
+    DeleteEngine::execute_transient_with_runtime_using(
+        store,
+        &runtime_root,
+        plan,
+        &reporter,
+        &SystemDeleteFilesystem,
+    )
+    .await
+    .unwrap()
 }
 
 fn scanned(path: &Path) -> ScannedPath {

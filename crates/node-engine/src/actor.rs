@@ -15,9 +15,9 @@ use dedup_core::{
     LocationKey, MachineId, NodeConfig, NodePostgresConfig, NormalizedPath, TaskId, Thresholds,
 };
 use dedup_node_store::{
-    AnalysisStatus, ConfirmedDeleteItem, DeleteBatchPlan, DeleteOutcome, GroupKind, NodeStore,
-    OwnedSnapshot, PersistentStageState as StorePersistentStageState, PlannedDeleteItem,
-    ReviewDecision, ScannedPath, StoreError, TaskStageWrite, classify_cache_completeness,
+    AnalysisStatus, DeleteBatchPlan, DeleteOutcome, GroupKind, NodeStore, OwnedSnapshot,
+    PersistentStageState as StorePersistentStageState, PlannedDeleteItem, ReviewDecision,
+    ScannedPath, StoreError, TaskStageWrite, classify_cache_completeness,
 };
 use dedup_protocol::{
     BASE_MISSING_PROBE, BASE_MISSING_STAGE1, MAX_LOCAL_RESULT_WINDOW_ROWS, proto,
@@ -54,6 +54,7 @@ use crate::{
     delete::DeleteEngine,
     disk_full_cleanup::{DiskFullCleaner, SystemArtifactDiskResolver},
     preview::{PreviewKind, PreviewService},
+    review_registry::ReviewRegistry,
     runtime_tasks::{
         RuntimeFailureUpdate, RuntimeProgressPublisher, RuntimeProgressUnit, RuntimeStage,
         RuntimeTaskKind, RuntimeTaskRegistry, RuntimeTaskReporter, RuntimeTaskState,
@@ -325,6 +326,8 @@ impl NodeRuntime {
         fs::create_dir_all(&paths.data_path)?;
         fs::create_dir_all(&paths.cache_path)?;
         fs::create_dir_all(&paths.log_path)?;
+        let runtime_root = paths.data_path.join("runtime");
+        reset_transient_runtime_root(&runtime_root)?;
         let machine_id = identity.machine_id()?;
         let store = NodeStore::open(&paths.data_path.join("node.db"), machine_id)?;
         let logical_cpu_count = std::thread::available_parallelism()
@@ -352,7 +355,7 @@ impl NodeRuntime {
             Some(worker_pool),
             listen_address,
             &paths.cache_path,
-            &paths.data_path.join("runtime"),
+            &runtime_root,
             config.enumerator,
             config.read.clone(),
             config.postgres.clone(),
@@ -960,6 +963,7 @@ fn spawn_actor(
             latest_completed_scan: None,
             active_analysis: None,
             latest_analysis: load_latest_analysis(runtime_root),
+            review_registry: ReviewRegistry::default(),
             commands: commands.downgrade(),
             config_repository,
             artifact_registry,
@@ -1008,6 +1012,8 @@ struct EngineState {
     active_analysis: Option<AnalysisRuntimeSummary>,
     /// 当前进程最近一次成功发布的本地分析及其结果元数据。
     latest_analysis: Option<LatestAnalysis>,
+    /// 当前最近结果的进程内复核标记，不写入 SQLite 或 PostgreSQL。
+    review_registry: ReviewRegistry,
     commands: mpsc::WeakSender<EngineCommand>,
     config_repository: Option<Box<dyn NodeConfigRepositoryAccess>>,
     artifact_registry: Arc<RegenerableArtifactRegistry>,
@@ -1907,7 +1913,12 @@ impl EngineState {
                         stage1_score: member.stage1_score as f32,
                         phash_passed_parts: member.phash_passed_parts.map_or(0, u32::from),
                         stage2_score: member.stage2_score.unwrap_or_default() as f32,
-                        review: proto::ReviewDecision::ReviewUndecided as i32,
+                        review: wire_review(self.review_registry.get(
+                            metadata.run_id,
+                            metadata.library_revision,
+                            &member.group_id,
+                            &member.location,
+                        )) as i32,
                         active: true,
                         width: cached.and_then(|record| record.width).unwrap_or_default(),
                         height: cached.and_then(|record| record.height).unwrap_or_default(),
@@ -2024,7 +2035,7 @@ impl EngineState {
     }
 
     fn save_review_mark(&mut self, request: proto::SaveReviewMark) -> ProtocolResult {
-        let location = request
+        let location: LocationKey = request
             .location
             .clone()
             .ok_or_else(|| invalid("复核请求缺少位置"))?
@@ -2036,14 +2047,50 @@ impl EngineState {
             Ok(proto::ReviewDecision::ReviewDelete) => ReviewDecision::Delete,
             Err(_) => return Err(invalid("复核决定无效")),
         };
-        self.store
-            .save_review_mark(
-                parse_analysis_id(&request.analysis_run_id)?,
-                &request.group_id,
-                &location,
-                decision,
+        if request.group_id.is_empty() {
+            return Err(invalid("复核请求缺少组 ID"));
+        }
+        if location.machine_id() != self.store.machine_id() {
+            return Err(invalid("复核位置不属于当前节点"));
+        }
+        let run_id = parse_analysis_id(&request.analysis_run_id)?;
+        let current_revision = self.store.library_revision().map_err(store_error)?;
+        let (result_revision, member_exists) = {
+            let latest = self
+                .latest_analysis
+                .as_mut()
+                .ok_or_else(|| not_found("当前进程没有最近一次成功结果"))?;
+            let reader = match latest {
+                LatestAnalysis::Ready { reader, .. } => reader,
+                LatestAnalysis::Invalid { message } => {
+                    return Err((proto::ErrorCode::InvalidResult, message.clone()));
+                }
+            };
+            if reader.metadata().run_id != run_id {
+                return Err(not_found("分析结果不存在或已被替换"));
+            }
+            let result_revision = reader.metadata().library_revision;
+            if result_revision != current_revision {
+                return Err(invalid("最近分析结果已经过期，不能保存复核"));
+            }
+            (
+                result_revision,
+                reader
+                    .find_member(&request.group_id, &location)
+                    .map_err(map_local_result_error)?
+                    .is_some(),
             )
-            .map_err(store_error)?;
+        };
+        if !member_exists {
+            return Err(invalid("复核位置不属于最近结果的指定组"));
+        }
+        self.review_registry.set(
+            run_id,
+            result_revision,
+            request.group_id.clone(),
+            location,
+            decision,
+        );
         Ok(proto::envelope::Payload::SaveReviewMark(request))
     }
 
@@ -2211,6 +2258,170 @@ impl EngineState {
         }))
     }
 
+    /// 根据当前最近结果和内存复核标记冻结本地删除集合，不写旧删除历史表。
+    fn build_local_delete_plan(
+        &mut self,
+        run_id: AnalysisRunId,
+        items: &[proto::DeleteItem],
+        mode: DeleteMode,
+    ) -> Result<DeleteBatchPlan, (proto::ErrorCode, String)> {
+        if items.is_empty() {
+            return Err(invalid("本地删除没有确认项"));
+        }
+        let current_revision = self.store.library_revision().map_err(store_error)?;
+        let group_ids = items
+            .iter()
+            .map(|item| item.group_id.clone())
+            .collect::<BTreeSet<_>>();
+        if group_ids.iter().any(String::is_empty) {
+            return Err(invalid("本地删除项缺少组 ID"));
+        }
+
+        let mut requested = Vec::with_capacity(items.len());
+        let mut locations = BTreeSet::new();
+        for item in items {
+            let location: LocationKey = item
+                .location
+                .clone()
+                .ok_or_else(|| invalid("本地删除项缺少位置"))?
+                .try_into()
+                .map_err(invalid)?;
+            let expected: ContentKey = item
+                .expected_content
+                .clone()
+                .ok_or_else(|| invalid("本地删除项缺少内容键"))?
+                .try_into()
+                .map_err(invalid)?;
+            if location.machine_id() != self.store.machine_id() {
+                return Err(invalid("本地删除位置不属于当前节点"));
+            }
+            if !locations.insert(location.clone()) {
+                return Err(invalid("本地删除包含重复位置"));
+            }
+            requested.push((item.group_id.clone(), location, expected));
+        }
+
+        let (result_revision, verified) = {
+            let latest = self
+                .latest_analysis
+                .as_mut()
+                .ok_or_else(|| not_found("当前进程没有最近一次成功结果"))?;
+            let reader = match latest {
+                LatestAnalysis::Ready { reader, .. } => reader,
+                LatestAnalysis::Invalid { message } => {
+                    return Err((proto::ErrorCode::InvalidResult, message.clone()));
+                }
+            };
+            if reader.metadata().run_id != run_id {
+                return Err(not_found("分析结果不存在或已被替换"));
+            }
+            let result_revision = reader.metadata().library_revision;
+            if result_revision != current_revision {
+                return Err(invalid("最近分析结果已经过期，不能创建删除队列"));
+            }
+            let mut verified = Vec::with_capacity(requested.len());
+            for (group_id, location, expected) in &requested {
+                let Some(member) = reader
+                    .find_member(group_id, location)
+                    .map_err(map_local_result_error)?
+                else {
+                    return Err(invalid("本地删除位置不属于最近结果的指定组"));
+                };
+                if member.content != *expected {
+                    return Err(invalid("本地删除内容身份与最近结果不一致"));
+                }
+                verified.push((group_id.clone(), location.clone(), *expected));
+            }
+            (result_revision, verified)
+        };
+
+        let mut keep_locations = BTreeMap::new();
+        for group_id in &group_ids {
+            let marked = self.review_registry.locations_with_decision(
+                run_id,
+                result_revision,
+                group_id,
+                ReviewDecision::Keep,
+            );
+            let mut active = Vec::with_capacity(marked.len());
+            for location in marked {
+                if self
+                    .store
+                    .location_is_active(&location)
+                    .map_err(store_error)?
+                {
+                    active.push(location);
+                }
+            }
+            keep_locations.insert(group_id.clone(), active);
+        }
+
+        {
+            let latest = self
+                .latest_analysis
+                .as_mut()
+                .ok_or_else(|| not_found("当前进程没有最近一次成功结果"))?;
+            let reader = match latest {
+                LatestAnalysis::Ready { reader, .. } => reader,
+                LatestAnalysis::Invalid { message } => {
+                    return Err((proto::ErrorCode::InvalidResult, message.clone()));
+                }
+            };
+            for (group_id, candidates) in &keep_locations {
+                let mut has_keep = false;
+                for location in candidates {
+                    if reader
+                        .find_member(group_id, location)
+                        .map_err(map_local_result_error)?
+                        .is_some()
+                    {
+                        has_keep = true;
+                        break;
+                    }
+                }
+                if !has_keep {
+                    return Err(invalid(format!(
+                        "重复组 {group_id} 必须至少保留一个活动 Keep"
+                    )));
+                }
+            }
+        }
+
+        let mut planned = Vec::with_capacity(verified.len());
+        for (group_id, location, expected) in verified {
+            if self
+                .review_registry
+                .get(run_id, result_revision, &group_id, &location)
+                != ReviewDecision::Delete
+            {
+                return Err(invalid("本地删除项必须先标记为 Delete"));
+            }
+            planned.push(PlannedDeleteItem {
+                item_id: Uuid::now_v7().to_string(),
+                group_id,
+                location,
+                expected,
+            });
+        }
+        planned.sort_by(|left, right| {
+            (
+                &left.group_id,
+                left.location.machine_id().as_str(),
+                left.location.normalized_path(),
+            )
+                .cmp(&(
+                    &right.group_id,
+                    right.location.machine_id().as_str(),
+                    right.location.normalized_path(),
+                ))
+        });
+        Ok(DeleteBatchPlan {
+            batch_id: Uuid::now_v7().to_string(),
+            mode,
+            items: planned,
+        })
+    }
+
     async fn create_delete_batch(&mut self, request: proto::CreateDeleteBatch) -> ProtocolResult {
         let mode = match proto::DeleteMode::try_from(request.mode) {
             Ok(proto::DeleteMode::DeleteRecycleBin) => DeleteMode::RecycleBin,
@@ -2223,33 +2434,11 @@ impl EngineState {
             if !request.delete_batch_id.is_empty() || !request.group_ids.is_empty() {
                 return Err(invalid("本地删除只接受确认的精确成员集合"));
             }
-            let confirmed = request
-                .items
-                .iter()
-                .map(|item| {
-                    Ok(ConfirmedDeleteItem::new(
-                        item.group_id.clone(),
-                        item.location
-                            .clone()
-                            .ok_or_else(|| invalid("本地删除项缺少位置"))?
-                            .try_into()
-                            .map_err(invalid)?,
-                        item.expected_content
-                            .clone()
-                            .ok_or_else(|| invalid("本地删除项缺少内容键"))?
-                            .try_into()
-                            .map_err(invalid)?,
-                    ))
-                })
-                .collect::<Result<Vec<_>, (proto::ErrorCode, String)>>()?;
-            self.store
-                .create_delete_batch(
-                    parse_analysis_id(&request.analysis_run_id)?,
-                    &confirmed,
-                    mode,
-                    now_ms(),
-                )
-                .map_err(store_error)?
+            self.build_local_delete_plan(
+                parse_analysis_id(&request.analysis_run_id)?,
+                &request.items,
+                mode,
+            )?
         } else {
             if request.delete_batch_id.is_empty() {
                 return Err(invalid("中心删除批次缺少 ID"));
@@ -2295,11 +2484,23 @@ impl EngineState {
             )
             .await;
         let results = if external {
-            DeleteEngine::execute_external_with_runtime(&mut self.store, &plan, &runtime_reporter)
-                .await
+            DeleteEngine::execute_transient_with_runtime_using(
+                &mut self.store,
+                &self.runtime_root,
+                &plan,
+                &runtime_reporter,
+                &crate::delete::SystemDeleteFilesystem,
+            )
+            .await
         } else {
-            DeleteEngine::execute_batch_with_runtime(&mut self.store, &plan, &runtime_reporter)
-                .await
+            DeleteEngine::execute_transient_with_runtime_using(
+                &mut self.store,
+                &self.runtime_root,
+                &plan,
+                &runtime_reporter,
+                &crate::delete::SystemDeleteFilesystem,
+            )
+            .await
         }
         .map_err(internal)?;
         let items = plan
@@ -2447,6 +2648,7 @@ impl EngineState {
                 candidate_count: analysis.candidate_count,
             };
             // 先安装成功结果和摘要，再向 RuntimeTaskReporter 发布 completed 事件。
+            self.review_registry.clear();
             self.active_analysis = Some(summary);
             self.latest_analysis = Some(LatestAnalysis::Ready {
                 reader: analysis.reader,
@@ -3290,6 +3492,22 @@ const fn wire_review(review: ReviewDecision) -> proto::ReviewDecision {
     }
 }
 
+/// 将最近结果文件读取错误映射为 Node 协议错误，不把损坏结果当作空结果。
+fn map_local_result_error(
+    error: crate::analysis::AnalysisResultError,
+) -> (proto::ErrorCode, String) {
+    match error {
+        crate::analysis::AnalysisResultError::Io(error) => {
+            (proto::ErrorCode::Internal, error.to_string())
+        }
+        crate::analysis::AnalysisResultError::InvalidHeader(message)
+        | crate::analysis::AnalysisResultError::InvalidRow(message)
+        | crate::analysis::AnalysisResultError::InvalidFormat(message) => {
+            (proto::ErrorCode::InvalidResult, message)
+        }
+    }
+}
+
 const fn wire_media_kind(kind: dedup_core::MediaKind) -> proto::MediaKind {
     match kind {
         dedup_core::MediaKind::Image => proto::MediaKind::MediaImage,
@@ -3362,6 +3580,44 @@ fn results_root_from_runtime(runtime_root: &Path) -> Result<PathBuf, &'static st
         .parent()
         .map(|parent| parent.join("results"))
         .ok_or("瞬态运行目录必须存在结果目录父级")
+}
+
+/// 启动前精确清空当前 Node 的 transient runtime 根，不触碰旁侧 results 目录。
+fn reset_transient_runtime_root(runtime_root: &Path) -> std::io::Result<()> {
+    match fs::symlink_metadata(runtime_root) {
+        Ok(metadata) => {
+            if !metadata.is_dir() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Node runtime 路径不是目录",
+                ));
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+                if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "Node runtime 目录不能是重解析点",
+                    ));
+                }
+            }
+            #[cfg(not(windows))]
+            if metadata.file_type().is_symlink() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Node runtime 目录不能是符号链接",
+                ));
+            }
+            fs::remove_dir_all(runtime_root)?;
+            fs::create_dir(runtime_root)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(runtime_root)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// 启动时校验并恢复最近结果读取器；损坏文件只禁用窗口，不回退旧分组表。
@@ -3669,6 +3925,28 @@ mod tests {
         assert_eq!(
             paths.cache_path,
             layout.executable_dir().join("custom/cache")
+        );
+    }
+
+    /// Node 启动只清理本次 runtime 子目录，最近一次结果文件必须继续保留。
+    #[test]
+    fn runtime_root_reset_preserves_latest_result_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let data_root = directory.path().join("data/node");
+        let runtime_root = data_root.join("runtime");
+        let results_root = data_root.join("results");
+        fs::create_dir_all(runtime_root.join("old-run")).unwrap();
+        fs::create_dir_all(&results_root).unwrap();
+        fs::write(results_root.join("latest-analysis.result.tsv"), b"latest").unwrap();
+        fs::write(runtime_root.join("old-run/delete.tasks.tsv"), b"old").unwrap();
+
+        reset_transient_runtime_root(&runtime_root).unwrap();
+
+        assert!(runtime_root.is_dir());
+        assert!(!runtime_root.join("old-run").exists());
+        assert_eq!(
+            fs::read(results_root.join("latest-analysis.result.tsv")).unwrap(),
+            b"latest"
         );
     }
 

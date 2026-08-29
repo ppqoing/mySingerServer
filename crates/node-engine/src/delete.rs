@@ -3,9 +3,12 @@
 use std::{fs, io, path::Path};
 
 use dedup_core::DeleteMode;
-use dedup_node_store::{DeleteBatchPlan, DeleteOutcome, DeleteResult, NodeStore, StoreError};
+use dedup_node_store::{
+    DeleteBatchPlan, DeleteOutcome, DeleteResult, NodeStore, StoreError, VerifiedDeletedFile,
+};
 use thiserror::Error;
 
+use crate::delete_queue::TransientDeleteQueue;
 use crate::runtime_tasks::{
     RuntimeFailureUpdate, RuntimeProgressUnit, RuntimeStage, RuntimeStageUpdate,
     RuntimeTaskReporter, RuntimeTaskState,
@@ -18,6 +21,9 @@ pub enum DeleteError {
     /// SQLite 计划读取或结果事务失败。
     #[error(transparent)]
     Store(#[from] StoreError),
+    /// 删除队列创建、状态 ACK 或终态清理失败。
+    #[error(transparent)]
+    Io(#[from] io::Error),
 }
 
 /// 删除文件系统边界；生产默认调用 Windows 回收站或 `remove_file`，测试可精确注入失败。
@@ -42,246 +48,185 @@ impl DeleteFilesystem for SystemDeleteFilesystem {
     }
 }
 
-/// 删除结果事务边界；测试可在不重复文件删除的前提下注入 summarize 失败。
-#[doc(hidden)]
-#[allow(async_fn_in_trait)]
-pub trait DeleteResultCommitter {
-    /// 原子提交本轮所有结果。
-    async fn apply(
-        &self,
-        store: &mut NodeStore,
-        plan: &DeleteBatchPlan,
-        results: &[DeleteResult],
-        external: bool,
-    ) -> Result<(), StoreError>;
-}
-
-/// 生产 NodeStore 结果事务边界。
-#[doc(hidden)]
-pub struct NodeStoreDeleteResultCommitter;
-
-impl DeleteResultCommitter for NodeStoreDeleteResultCommitter {
-    async fn apply(
-        &self,
-        store: &mut NodeStore,
-        plan: &DeleteBatchPlan,
-        results: &[DeleteResult],
-        external: bool,
-    ) -> Result<(), StoreError> {
-        if external {
-            store.apply_external_delete_results(plan, results)
-        } else {
-            store.apply_delete_results(&plan.batch_id, results)
-        }
-    }
-}
-
 /// 在 NodeEngine actor 内串行调用的安全删除执行器。
 pub struct DeleteEngine;
 
 impl DeleteEngine {
-    /// 执行已冻结计划并一次性提交所有结果；成功项会立即从重复组移除。
-    pub fn execute_batch(
+    /// 用当前进程专用 TSV 顺序执行删除；成功项逐项提交 SQLite 当前文件事实。
+    ///
+    /// 队列是本次执行唯一的调度来源。文件系统删除成功后先调用
+    /// `deactivate_deleted_files`，只有 SQLite 提交成功才把 TSV 行从 `P` 改为 `C`；
+    /// 身份变化、文件缺失和文件系统失败改为 `F` 并继续后续行。
+    pub async fn execute_transient_with_runtime_using<F>(
         store: &mut NodeStore,
-        plan: &DeleteBatchPlan,
-    ) -> Result<Vec<DeleteResult>, DeleteError> {
-        execute_without_runtime(store, plan, false)
-    }
-
-    /// 执行本机已冻结计划并发布真实重校验、删除和提交阶段。
-    pub async fn execute_batch_with_runtime(
-        store: &mut NodeStore,
-        plan: &DeleteBatchPlan,
-        reporter: &RuntimeTaskReporter,
-    ) -> Result<Vec<DeleteResult>, DeleteError> {
-        Self::execute_batch_with_runtime_using(
-            store,
-            plan,
-            reporter,
-            &SystemDeleteFilesystem,
-            &NodeStoreDeleteResultCommitter,
-        )
-        .await
-    }
-
-    /// 使用受控删除和结果事务边界执行本地确认批次；仅供直接行为测试。
-    #[doc(hidden)]
-    pub async fn execute_batch_with_runtime_using<F, C>(
-        store: &mut NodeStore,
+        runtime_root: &Path,
         plan: &DeleteBatchPlan,
         reporter: &RuntimeTaskReporter,
         filesystem: &F,
-        committer: &C,
     ) -> Result<Vec<DeleteResult>, DeleteError>
     where
         F: DeleteFilesystem,
-        C: DeleteResultCommitter,
     {
-        let result =
-            execute_batch_inner(store, plan, Some(reporter), false, filesystem, committer).await;
-        finish_runtime(reporter, &result).await;
-        result
-    }
-
-    /// 执行 PostgreSQL 已冻结并按机器派发的计划，不要求节点存在同 ID 本地分析组。
-    pub fn execute_external(
-        store: &mut NodeStore,
-        plan: &DeleteBatchPlan,
-    ) -> Result<Vec<DeleteResult>, DeleteError> {
-        execute_without_runtime(store, plan, true)
-    }
-
-    /// 执行中心已冻结并派发到本机的计划，遥测不重新查询或扩大选择集合。
-    pub async fn execute_external_with_runtime(
-        store: &mut NodeStore,
-        plan: &DeleteBatchPlan,
-        reporter: &RuntimeTaskReporter,
-    ) -> Result<Vec<DeleteResult>, DeleteError> {
-        let result = execute_batch_inner(
-            store,
-            plan,
-            Some(reporter),
-            true,
-            &SystemDeleteFilesystem,
-            &NodeStoreDeleteResultCommitter,
-        )
-        .await;
-        finish_runtime(reporter, &result).await;
-        result
-    }
-}
-
-async fn finish_runtime(
-    reporter: &RuntimeTaskReporter,
-    result: &Result<Vec<DeleteResult>, DeleteError>,
-) {
-    let state = match result {
-        Ok(results)
-            if results
-                .iter()
-                .all(|row| row.outcome != DeleteOutcome::Failed) =>
-        {
-            RuntimeTaskState::Completed
+        let result = execute_transient_inner(store, runtime_root, plan, reporter, filesystem).await;
+        match result {
+            Ok(results) => match store.outbox_high_seq() {
+                Ok(highwater) => {
+                    let state = if results
+                        .iter()
+                        .all(|row| row.outcome != DeleteOutcome::Failed)
+                    {
+                        RuntimeTaskState::Completed
+                    } else {
+                        RuntimeTaskState::Failed
+                    };
+                    let _ = reporter.finish_with_outbox_high_seq(state, highwater).await;
+                    Ok(results)
+                }
+                Err(error) => {
+                    let _ = reporter.finish(RuntimeTaskState::Failed).await;
+                    Err(error.into())
+                }
+            },
+            Err(error) => {
+                let _ = reporter.finish(RuntimeTaskState::Failed).await;
+                Err(error)
+            }
         }
-        _ => RuntimeTaskState::Failed,
-    };
-    let _ = reporter.finish(state).await;
-}
-
-fn execute_without_runtime(
-    store: &mut NodeStore,
-    plan: &DeleteBatchPlan,
-    external: bool,
-) -> Result<Vec<DeleteResult>, DeleteError> {
-    let results = execute_items(store, plan, &SystemDeleteFilesystem)
-        .into_iter()
-        .map(|item| item.result)
-        .collect::<Vec<_>>();
-    if external {
-        store.apply_external_delete_results(plan, &results)?;
-    } else {
-        store.apply_delete_results(&plan.batch_id, &results)?;
     }
-    Ok(results)
 }
 
-async fn execute_batch_inner<F, C>(
+/// 顺序消费删除 TSV，并在每一个文件成功后提交一次当前文件事实。
+async fn execute_transient_inner<F>(
     store: &mut NodeStore,
+    runtime_root: &Path,
     plan: &DeleteBatchPlan,
-    reporter: Option<&RuntimeTaskReporter>,
-    external: bool,
+    reporter: &RuntimeTaskReporter,
     filesystem: &F,
-    committer: &C,
 ) -> Result<Vec<DeleteResult>, DeleteError>
 where
     F: DeleteFilesystem,
-    C: DeleteResultCommitter,
 {
-    if let Some(reporter) = reporter {
-        let _ = reporter.update_overall_nowait(0, Some(plan.items.len() as u64), 0, 0);
+    let mut queue =
+        TransientDeleteQueue::create_new(runtime_root, &plan.batch_id, plan.mode, &plan.items)?;
+    let total = queue.len() as u64;
+    let _ = reporter.update_overall_nowait(0, Some(total), 0, 0);
+    initialize_delete_stages(Some(reporter), total);
+    let mut executed = Vec::with_capacity(queue.len());
+
+    loop {
+        let entry = match queue.next_pending_entry() {
+            Ok(entry) => entry,
+            Err(error) => return Err(cleanup_after_error(&mut queue, error.into())),
+        };
+        let Some(entry) = entry else { break };
+        let item = entry.item;
+        let one_item_plan = DeleteBatchPlan {
+            batch_id: plan.batch_id.clone(),
+            mode: entry.mode,
+            items: vec![item.clone()],
+        };
+        let one = match execute_items(store, &one_item_plan, filesystem)
+            .into_iter()
+            .next()
+        {
+            Some(one) => one,
+            None => {
+                return Err(cleanup_after_error(
+                    &mut queue,
+                    io::Error::other("删除队列项没有执行结果").into(),
+                ));
+            }
+        };
+        if matches!(
+            one.result.outcome,
+            DeleteOutcome::Deleted | DeleteOutcome::Recycled
+        ) {
+            // 文件系统已成功后，SQLite 再次验证当前活动位置和内容身份。
+            if let Err(error) = store.deactivate_deleted_files(
+                &[VerifiedDeletedFile::new(
+                    item.location.clone(),
+                    item.expected,
+                )],
+                current_time_ms(),
+            ) {
+                report_uncommitted_terminal(Some(reporter), total);
+                let _ = reporter.record_failure_nowait(RuntimeFailureUpdate {
+                    stage: RuntimeStage::Summarize,
+                    display_path: one.display_path.clone(),
+                    message: error.to_string(),
+                });
+                return Err(cleanup_after_error(&mut queue, error.into()));
+            }
+            if let Err(error) = queue.ack_sqlite(&item.item_id) {
+                return Err(cleanup_after_error(&mut queue, error.into()));
+            }
+        } else {
+            // 失败或跳过只影响当前行，后续项仍按冻结顺序继续。
+            if let Err(error) = queue.mark_failed(&item.item_id) {
+                return Err(cleanup_after_error(&mut queue, error.into()));
+            }
+        }
+        executed.push(one);
     }
-    initialize_delete_stages(reporter, plan.items.len() as u64);
-    let executed = execute_items(store, plan, filesystem);
+
+    if let Err(error) = queue.cleanup() {
+        return Err(error.into());
+    }
+    report_revalidation_terminal(Some(reporter), &executed);
+    record_item_failures(Some(reporter), &executed, RuntimeStage::RevalidateSelection);
+    report_delete_terminal(Some(reporter), &executed);
+    record_item_failures(Some(reporter), &executed, RuntimeStage::DeleteItems);
     let results = executed
         .iter()
         .map(|item| item.result.clone())
         .collect::<Vec<_>>();
+    let completed = results
+        .iter()
+        .filter(|result| {
+            matches!(
+                result.outcome,
+                DeleteOutcome::Deleted | DeleteOutcome::Recycled
+            )
+        })
+        .count() as u64;
+    let failed = results
+        .iter()
+        .filter(|result| result.outcome == DeleteOutcome::Failed)
+        .count() as u64;
+    let skipped = results
+        .iter()
+        .filter(|result| result.outcome == DeleteOutcome::Skipped)
+        .count() as u64;
+    let _ = reporter.update_overall_nowait(completed, Some(total), failed, skipped);
     report_delete_stage(
-        reporter,
+        Some(reporter),
         RuntimeStage::Summarize,
-        dedup_protocol::proto::RuntimeStageState::RuntimeStageRunning,
-        0,
-        plan.items.len() as u64,
+        dedup_protocol::proto::RuntimeStageState::RuntimeStageCompleted,
+        total,
+        total,
         0,
         0,
     );
-    let applied = committer.apply(store, plan, &results, external).await;
-    match applied {
-        Ok(()) => {
-            report_revalidation_terminal(reporter, &executed);
-            record_item_failures(reporter, &executed, RuntimeStage::RevalidateSelection);
-            report_delete_terminal(reporter, &executed);
-            record_item_failures(reporter, &executed, RuntimeStage::DeleteItems);
-            if let Some(reporter) = reporter {
-                let completed = results
-                    .iter()
-                    .filter(|result| {
-                        matches!(
-                            result.outcome,
-                            DeleteOutcome::Deleted | DeleteOutcome::Recycled
-                        )
-                    })
-                    .count() as u64;
-                let failed = results
-                    .iter()
-                    .filter(|result| result.outcome == DeleteOutcome::Failed)
-                    .count() as u64;
-                let skipped = results
-                    .iter()
-                    .filter(|result| result.outcome == DeleteOutcome::Skipped)
-                    .count() as u64;
-                let _ = reporter.update_overall_nowait(
-                    completed,
-                    Some(plan.items.len() as u64),
-                    failed,
-                    skipped,
-                );
-            }
-            report_delete_stage(
-                reporter,
-                RuntimeStage::Summarize,
-                dedup_protocol::proto::RuntimeStageState::RuntimeStageCompleted,
-                plan.items.len() as u64,
-                plan.items.len() as u64,
-                0,
-                0,
-            );
-            Ok(results)
-        }
-        Err(error) => {
-            report_uncommitted_terminal(reporter, plan.items.len() as u64);
-            if let Some(reporter) = reporter {
-                let _ = reporter.update_overall_nowait(0, Some(plan.items.len() as u64), 1, 0);
-            }
-            report_delete_stage(
-                reporter,
-                RuntimeStage::Summarize,
-                dedup_protocol::proto::RuntimeStageState::RuntimeStageFailed,
-                0,
-                plan.items.len() as u64,
-                1,
-                0,
-            );
-            if let Some(reporter) = reporter {
-                let _ = reporter.record_failure_nowait(RuntimeFailureUpdate {
-                    stage: RuntimeStage::Summarize,
-                    display_path: String::new(),
-                    message: error.to_string(),
-                });
-            }
-            Err(error.into())
-        }
+    Ok(results)
+}
+
+/// 发生基础设施错误时立即尝试精确清理本批目录；清理失败也必须让任务失败。
+fn cleanup_after_error(queue: &mut TransientDeleteQueue, primary: DeleteError) -> DeleteError {
+    match queue.cleanup() {
+        Ok(()) => primary,
+        Err(cleanup) => DeleteError::Io(io::Error::other(format!(
+            "删除执行失败: {primary}; 删除队列清理失败: {cleanup}"
+        ))),
     }
+}
+
+/// 返回当前 Unix 毫秒；删除当前事实接口只把它作为审计时间输入。
+fn current_time_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            duration.as_millis().min(i64::MAX as u128) as i64
+        })
 }
 
 #[derive(Clone, Copy)]
