@@ -305,7 +305,7 @@ async fn explicit_stage2_batch_republishes_requested_cached_slot_without_worker(
     let before = store.outbox_high_seq().unwrap();
     let mut processor = CountingStage2::default();
 
-    let task_id = dispatch_stage2_batch(
+    let _runtime_id = dispatch_stage2_batch(
         &mut store,
         &[Stage2BatchItem {
             content: content_key,
@@ -329,9 +329,10 @@ async fn explicit_stage2_batch_republishes_requested_cached_slot_without_worker(
             .count(),
         1
     );
-    let task = store.task_snapshot(task_id).unwrap();
-    assert_eq!(task.status, TaskStatus::Completed);
-    assert_eq!(task.succeeded, 1);
+    assert!(
+        store.page_tasks(None, 20).unwrap().items.is_empty(),
+        "瞬态二筛批次不应创建旧任务表行"
+    );
 }
 
 #[tokio::test]

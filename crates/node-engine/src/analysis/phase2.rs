@@ -16,9 +16,9 @@ use dedup_core::{
 };
 use dedup_media::{VideoFrameFeatures, score_video_stage2, screen_image_stage2};
 use dedup_node_store::{
-    BaseCacheRecord, CandidateStatus, CandidateWrite, CompleteStage1, CompleteStage2, ContentId,
-    FeatureWrite, NewTaskItem, NodeStore, PairKind, PersistentStageState, ScannedPath,
-    TaskItemCompletion, TaskStageWrite, VideoFrameStage2Fields, classify_cache_completeness,
+    BaseCacheRecord, CompleteStage1, CompleteStage2, ContentId, FeatureWrite, NewTaskItem,
+    NodeStore, PersistentStageState, ScannedPath, TaskItemCompletion, TaskStageWrite,
+    VideoFrameStage2Fields, classify_cache_completeness,
 };
 use dedup_protocol::proto::{self, worker_envelope};
 use dedup_protocol::{BASE_MISSING_PROBE, BASE_MISSING_STAGE1};
@@ -44,6 +44,7 @@ use crate::{
 use crate::scan::BasePersistTestWaiter;
 
 use super::AnalysisBlocked;
+use super::model::{AnalysisCandidate, AnalysisCandidateStatus, AnalysisPairKind};
 use super::stage2_planner::{
     FrozenStage2Batch, Stage2ActiveSource, Stage2PlanAction, Stage2PlanningInput, Stage2Selection,
     Stage2TransientPlanner,
@@ -1592,7 +1593,7 @@ pub(crate) struct MissingDispatchReport {
 /// 查询候选所需的二次特征，复用缓存并持续填充 Worker，返回内容级终态计数。
 pub(crate) async fn dispatch_missing<P: Stage2Processor>(
     store: &mut NodeStore,
-    candidates: &[CandidateWrite],
+    candidates: &[AnalysisCandidate],
     processor: &mut P,
     reporter: Option<&RuntimeTaskReporter>,
     remote: Option<&mut NodeRemoteFeatureCache>,
@@ -1604,7 +1605,7 @@ pub(crate) async fn dispatch_missing<P: Stage2Processor>(
         .filter(|candidate| {
             matches!(
                 candidate.status,
-                CandidateStatus::Stage1Passed | CandidateStatus::Incomplete
+                AnalysisCandidateStatus::Stage1Passed | AnalysisCandidateStatus::Incomplete
             )
         })
         .flat_map(|candidate| [candidate.left, candidate.right])
@@ -2108,9 +2109,9 @@ fn contact_sheet_target(root: Option<&Path>, work: &MissingWork) -> Option<PathB
 /// 读取已持久化联合特征，对所有候选给出 Passed/Rejected/Incomplete。
 pub(crate) fn evaluate_candidates(
     store: &NodeStore,
-    candidates: &[CandidateWrite],
+    candidates: &[AnalysisCandidate],
     thresholds: &Thresholds,
-) -> Result<(Vec<CandidateWrite>, usize), AnalysisBlocked> {
+) -> Result<(Vec<AnalysisCandidate>, usize), AnalysisBlocked> {
     let mut output = Vec::with_capacity(candidates.len());
     let mut unresolved = 0;
     for candidate in candidates {
@@ -2118,16 +2119,16 @@ pub(crate) fn evaluate_candidates(
         let right_id = store.content_id_by_key(candidate.right)?;
         let evaluated = match (left_id, right_id) {
             (Some(left_id), Some(right_id)) => match candidate.kind {
-                PairKind::Image => {
+                AnalysisPairKind::Image => {
                     evaluate_image(store, *candidate, left_id, right_id, thresholds)?
                 }
-                PairKind::Video => {
+                AnalysisPairKind::Video => {
                     evaluate_video(store, *candidate, left_id, right_id, thresholds)?
                 }
             },
             _ => incomplete(*candidate),
         };
-        if evaluated.status == CandidateStatus::Incomplete {
+        if evaluated.status == AnalysisCandidateStatus::Incomplete {
             unresolved += 1;
         }
         output.push(evaluated);
@@ -2137,11 +2138,11 @@ pub(crate) fn evaluate_candidates(
 
 fn evaluate_image(
     store: &NodeStore,
-    candidate: CandidateWrite,
+    candidate: AnalysisCandidate,
     left_id: ContentId,
     right_id: ContentId,
     thresholds: &Thresholds,
-) -> Result<CandidateWrite, AnalysisBlocked> {
+) -> Result<AnalysisCandidate, AnalysisBlocked> {
     let (Some(CompleteStage2::Image(left)), Some(CompleteStage2::Image(right))) = (
         store.load_complete_stage2(left_id)?,
         store.load_complete_stage2(right_id)?,
@@ -2149,13 +2150,13 @@ fn evaluate_image(
         return Ok(incomplete(candidate));
     };
     let score = screen_image_stage2(&left, &right, thresholds);
-    Ok(CandidateWrite {
+    Ok(AnalysisCandidate {
         phash_passed_parts: Some(score.phash_passed_parts),
         stage2_score: Some(f64::from(score.sobel_score)),
         status: if score.passed {
-            CandidateStatus::Passed
+            AnalysisCandidateStatus::Passed
         } else {
-            CandidateStatus::Rejected
+            AnalysisCandidateStatus::Rejected
         },
         ..candidate
     })
@@ -2163,11 +2164,11 @@ fn evaluate_image(
 
 fn evaluate_video(
     store: &NodeStore,
-    candidate: CandidateWrite,
+    candidate: AnalysisCandidate,
     left_id: ContentId,
     right_id: ContentId,
     thresholds: &Thresholds,
-) -> Result<CandidateWrite, AnalysisBlocked> {
+) -> Result<AnalysisCandidate, AnalysisBlocked> {
     let (
         Some(CompleteStage1::Video(left_stage1)),
         Some(CompleteStage1::Video(right_stage1)),
@@ -2192,23 +2193,24 @@ fn evaluate_video(
     });
     let score = score_video_stage2(&left, &right, thresholds);
     let status = match score.outcome {
-        ScreeningOutcome::Passed => CandidateStatus::Passed,
-        ScreeningOutcome::Rejected => CandidateStatus::Rejected,
-        ScreeningOutcome::Incomplete => CandidateStatus::Incomplete,
+        ScreeningOutcome::Passed => AnalysisCandidateStatus::Passed,
+        ScreeningOutcome::Rejected => AnalysisCandidateStatus::Rejected,
+        ScreeningOutcome::Incomplete => AnalysisCandidateStatus::Incomplete,
     };
-    Ok(CandidateWrite {
+    Ok(AnalysisCandidate {
         phash_passed_parts: None,
-        stage2_score: (status != CandidateStatus::Incomplete).then_some(f64::from(score.average)),
+        stage2_score: (status != AnalysisCandidateStatus::Incomplete)
+            .then_some(f64::from(score.average)),
         status,
         ..candidate
     })
 }
 
-fn incomplete(candidate: CandidateWrite) -> CandidateWrite {
-    CandidateWrite {
+fn incomplete(candidate: AnalysisCandidate) -> AnalysisCandidate {
+    AnalysisCandidate {
         phash_passed_parts: None,
         stage2_score: None,
-        status: CandidateStatus::Incomplete,
+        status: AnalysisCandidateStatus::Incomplete,
         ..candidate
     }
 }

@@ -4,8 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use dedup_core::{ContentKey, ScreeningOutcome, Thresholds};
 use dedup_media::{ImageStage1, VideoFrameFeatures, pdq_bands, score_video_stage1};
-use dedup_node_store::{CandidateStatus, CandidateWrite, PairKind};
 
+use super::model::{AnalysisCandidate, AnalysisCandidateStatus, AnalysisPairKind};
 use crate::runtime_tasks::{
     RuntimeProgressUnit, RuntimeStage, RuntimeStageUpdate, RuntimeTaskReporter,
 };
@@ -14,7 +14,7 @@ use crate::runtime_tasks::{
 pub(crate) fn video_candidates(
     features: &BTreeMap<ContentKey, Box<[Option<ImageStage1>; 6]>>,
     thresholds: &Thresholds,
-) -> Vec<CandidateWrite> {
+) -> Vec<AnalysisCandidate> {
     let mut index = BTreeMap::<(usize, usize, u64), Vec<ContentKey>>::new();
     for (content, frames) in features {
         for (slot, frame) in frames.iter().enumerate() {
@@ -44,14 +44,14 @@ pub(crate) fn video_candidates(
             let left_frames = frames_for_stage1(&features[&left_key]);
             let right_frames = frames_for_stage1(&features[&right_key]);
             let score = score_video_stage1(&left_frames, &right_frames, thresholds);
-            (score.outcome == ScreeningOutcome::Passed).then_some(CandidateWrite {
-                kind: PairKind::Video,
+            (score.outcome == ScreeningOutcome::Passed).then_some(AnalysisCandidate {
+                kind: AnalysisPairKind::Video,
                 left: left_key,
                 right: right_key,
                 stage1_score: f64::from(score.average),
                 phash_passed_parts: None,
                 stage2_score: None,
-                status: CandidateStatus::Stage1Passed,
+                status: AnalysisCandidateStatus::Stage1Passed,
             })
         })
         .collect()
@@ -63,7 +63,7 @@ pub(crate) fn video_candidates_with_runtime(
     thresholds: &Thresholds,
     reporter: Option<&RuntimeTaskReporter>,
     completed_before: u64,
-) -> Vec<CandidateWrite> {
+) -> Vec<AnalysisCandidate> {
     let candidates = video_candidates(features, thresholds);
     if let Some(reporter) = reporter {
         let _ = reporter.update_stage_nowait(RuntimeStageUpdate {

@@ -3,6 +3,8 @@
 mod exact;
 mod grouping;
 mod image;
+/// 本地分析算法共用的进程内输入、候选和分组值对象。
+pub mod model;
 mod phase2;
 mod result_file;
 /// 本地和跨机二筛的瞬态缓存分类计划。
@@ -36,6 +38,10 @@ pub use phase2::{
 
 use grouping::final_groups_with_runtime;
 use image::image_candidates_with_runtime;
+pub use model::{
+    AnalysisCandidate, AnalysisCandidateStatus, AnalysisGroup, AnalysisGroupKind,
+    AnalysisGroupMember, AnalysisPairKind, ScanAnalysisInput,
+};
 use phase2::{MissingDispatchReport, dispatch_missing, evaluate_candidates};
 #[allow(unused_imports)]
 pub(crate) use phase2::{
@@ -48,7 +54,17 @@ pub use result_file::{
     AnalysisResultRow, AnalysisResultWriter, PublishedAnalysisResult, VerifiedAnalysisResult,
     verify_result_file,
 };
+
+use model::{from_store_candidate, from_store_input, to_store_candidates, to_store_groups};
 use video::video_candidates_with_runtime;
+
+/// 使用运行模型完成精确、图片和视频的最终代表直连分组。
+pub fn group_analysis_results(
+    inputs: &[ScanAnalysisInput],
+    candidates: &[AnalysisCandidate],
+) -> Vec<AnalysisGroup> {
+    final_groups_with_runtime(inputs, candidates, None).0
+}
 
 /// 节点当前状态不允许开始或继续筛选。
 #[derive(Debug, Error)]
@@ -181,7 +197,11 @@ impl LocalAnalysisEngine {
         store.transition_analysis_run(run_id, AnalysisStatus::Screening, now_ms)?;
 
         let thresholds = store.analysis_thresholds(run_id)?;
-        let inputs = store.analysis_inputs(run_id)?;
+        let stored_inputs = store.analysis_inputs(run_id)?;
+        let mut inputs = stored_inputs
+            .iter()
+            .map(|input| from_store_input(input, MediaKind::Other))
+            .collect::<Vec<_>>();
         if let Some(reporter) = reporter {
             let _ = reporter.update_overall_nowait(0, Some(inputs.len() as u64), 0, 0);
         }
@@ -210,6 +230,7 @@ impl LocalAnalysisEngine {
         );
         let mut images = BTreeMap::<ContentKey, ImageStage1>::new();
         let mut videos = BTreeMap::<ContentKey, Box<[Option<ImageStage1>; 6]>>::new();
+        let mut media_kinds = BTreeMap::<ContentKey, MediaKind>::new();
         let mut skipped_incomplete = 0;
         let mut keys = inputs.iter().map(|input| input.content).collect::<Vec<_>>();
         keys.sort();
@@ -225,6 +246,7 @@ impl LocalAnalysisEngine {
                 skipped_incomplete += 1;
                 continue;
             };
+            media_kinds.insert(key, record.media_kind);
             let completeness = classify_cache_completeness(&record, true);
             if completeness.base_missing_parts & (BASE_MISSING_PROBE | BASE_MISSING_STAGE1) != 0 {
                 skipped_incomplete += 1;
@@ -241,6 +263,11 @@ impl LocalAnalysisEngine {
                 _ => skipped_incomplete += 1,
             }
         }
+        for input in &mut inputs {
+            if let Some(media_kind) = media_kinds.get(&input.content) {
+                input.media_kind = *media_kind;
+            }
+        }
         store.set_analysis_skipped_incomplete(run_id, skipped_incomplete, now_ms)?;
         let mut candidates = image_candidates_with_runtime(&images, &thresholds, reporter);
         let image_candidate_count = candidates.len() as u64;
@@ -250,7 +277,8 @@ impl LocalAnalysisEngine {
             reporter,
             image_candidate_count,
         ));
-        store.replace_candidates(run_id, &candidates)?;
+        let stored_candidates = to_store_candidates(&candidates);
+        store.replace_candidates(run_id, &stored_candidates)?;
         let build_finished = wall_clock_ms();
         save_analysis_stage(
             store,
@@ -341,6 +369,8 @@ impl LocalAnalysisEngine {
         finish_run(
             store,
             run_id,
+            inputs,
+            candidates,
             dispatched,
             skipped_incomplete,
             reporter,
@@ -365,7 +395,16 @@ impl LocalAnalysisEngine {
             ));
         }
         store.transition_analysis_run(run_id, AnalysisStatus::Phase2Dispatched, now_ms)?;
-        let candidates = store.analysis_candidates(run_id)?;
+        let candidates = store
+            .analysis_candidates(run_id)?
+            .into_iter()
+            .map(from_store_candidate)
+            .collect::<Vec<_>>();
+        let inputs = store
+            .analysis_inputs(run_id)?
+            .into_iter()
+            .map(|input| from_store_input(&input, MediaKind::Other))
+            .collect::<Vec<_>>();
         let dispatch_started = wall_clock_ms();
         save_analysis_stage(
             store,
@@ -385,6 +424,8 @@ impl LocalAnalysisEngine {
         finish_run(
             store,
             run_id,
+            inputs,
+            candidates,
             dispatched,
             snapshot.skipped_incomplete as usize,
             None,
@@ -412,6 +453,8 @@ fn ensure_start_gate(store: &NodeStore, selected_tasks: &[TaskId]) -> Result<(),
 fn finish_run(
     store: &mut NodeStore,
     run_id: AnalysisRunId,
+    inputs: Vec<ScanAnalysisInput>,
+    stage1_candidates: Vec<AnalysisCandidate>,
     dispatched: MissingDispatchReport,
     skipped_incomplete: usize,
     reporter: Option<&RuntimeTaskReporter>,
@@ -419,7 +462,6 @@ fn finish_run(
 ) -> Result<LocalAnalysisReport, AnalysisBlocked> {
     let compare_started = wall_clock_ms();
     let thresholds = store.analysis_thresholds(run_id)?;
-    let stage1_candidates = store.analysis_candidates(run_id)?;
     save_analysis_stage(
         store,
         run_id,
@@ -443,7 +485,8 @@ fn finish_run(
         0,
     );
     let (candidates, unresolved) = evaluate_candidates(store, &stage1_candidates, &thresholds)?;
-    store.replace_candidates(run_id, &candidates)?;
+    let stored_candidates = to_store_candidates(&candidates);
+    store.replace_candidates(run_id, &stored_candidates)?;
     if unresolved > 0 {
         store.transition_analysis_run(run_id, AnalysisStatus::Partial, now_ms)?;
         let compare_finished = wall_clock_ms();
@@ -469,7 +512,7 @@ fn finish_run(
             unresolved as u64,
             0,
         );
-        let input_total = store.analysis_inputs(run_id)?.len() as u64;
+        let input_total = inputs.len() as u64;
         if let Some(reporter) = reporter {
             let _ = reporter.update_overall_nowait(
                 0,
@@ -492,9 +535,9 @@ fn finish_run(
 
     store.transition_analysis_run(run_id, AnalysisStatus::Phase2Synced, now_ms)?;
     store.transition_analysis_run(run_id, AnalysisStatus::Finalizing, now_ms)?;
-    let inputs = store.analysis_inputs(run_id)?;
     let (groups, counts) = final_groups_with_runtime(&inputs, &candidates, reporter);
-    store.replace_groups(run_id, &groups)?;
+    let stored_groups = to_store_groups(&groups);
+    store.replace_groups(run_id, &stored_groups)?;
     store.transition_analysis_run(run_id, AnalysisStatus::Completed, now_ms)?;
     if let Some(reporter) = reporter {
         let _ = reporter.update_overall_nowait(

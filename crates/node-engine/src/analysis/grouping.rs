@@ -2,17 +2,17 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use dedup_core::{ContentKey, GroupId, LocationKey, SimilarityEdge, group_by_representative};
-use dedup_node_store::{
-    AnalysisInput, CandidateStatus, CandidateWrite, GroupKind, GroupMemberWrite, GroupWrite,
-    PairKind,
-};
+use dedup_core::{ContentKey, GroupId, SimilarityEdge, group_by_representative};
 
 use crate::runtime_tasks::{
     RuntimeProgressUnit, RuntimeStage, RuntimeStageUpdate, RuntimeTaskReporter,
 };
 
 use super::exact::{exact_groups, exact_groups_with_runtime};
+use super::model::{
+    AnalysisCandidate, AnalysisCandidateStatus, AnalysisGroup, AnalysisGroupKind,
+    AnalysisGroupMember, AnalysisPairKind, ScanAnalysisInput,
+};
 
 /// 最终三类分组数量。
 pub(crate) struct GroupCounts {
@@ -23,28 +23,25 @@ pub(crate) struct GroupCounts {
 
 /// 分别在精确、图片和视频聚类真实子边界推进运行时候选对计数。
 pub(crate) fn final_groups_with_runtime(
-    inputs: &[AnalysisInput],
-    candidates: &[CandidateWrite],
+    inputs: &[ScanAnalysisInput],
+    candidates: &[AnalysisCandidate],
     reporter: Option<&RuntimeTaskReporter>,
-) -> (Vec<GroupWrite>, GroupCounts) {
+) -> (Vec<AnalysisGroup>, GroupCounts) {
     final_groups_internal(inputs, candidates, reporter)
 }
 
 fn final_groups_internal(
-    inputs: &[AnalysisInput],
-    candidates: &[CandidateWrite],
+    inputs: &[ScanAnalysisInput],
+    candidates: &[AnalysisCandidate],
     reporter: Option<&RuntimeTaskReporter>,
-) -> (Vec<GroupWrite>, GroupCounts) {
-    let mut locations = BTreeMap::<ContentKey, Vec<LocationKey>>::new();
+) -> (Vec<AnalysisGroup>, GroupCounts) {
+    let mut locations = BTreeMap::<ContentKey, BTreeMap<_, _>>::new();
     for input in inputs {
         locations
             .entry(input.content)
             .or_default()
-            .push(input.location.clone());
-    }
-    for values in locations.values_mut() {
-        values.sort();
-        values.dedup();
+            .entry(input.location.clone())
+            .or_insert_with(|| input.display_path.clone());
     }
 
     let mut groups = if reporter.is_some() {
@@ -53,18 +50,28 @@ fn final_groups_internal(
         exact_groups(inputs)
     };
     let exact = groups.len();
-    let image_groups = similar_groups(PairKind::Image, GroupKind::Image, candidates, &locations);
+    let image_groups = similar_groups(
+        AnalysisPairKind::Image,
+        AnalysisGroupKind::Image,
+        candidates,
+        &locations,
+    );
     let image = image_groups.len();
     groups.extend(image_groups);
     report_cluster_progress(
         reporter,
         candidates
             .iter()
-            .filter(|candidate| candidate.kind == PairKind::Image)
+            .filter(|candidate| candidate.kind == AnalysisPairKind::Image)
             .count() as u64,
         candidates.len() as u64,
     );
-    let video_groups = similar_groups(PairKind::Video, GroupKind::Video, candidates, &locations);
+    let video_groups = similar_groups(
+        AnalysisPairKind::Video,
+        AnalysisGroupKind::Video,
+        candidates,
+        &locations,
+    );
     let video = video_groups.len();
     groups.extend(video_groups);
     report_cluster_progress(reporter, candidates.len() as u64, candidates.len() as u64);
@@ -93,15 +100,15 @@ fn report_cluster_progress(reporter: Option<&RuntimeTaskReporter>, completed: u6
 }
 
 fn similar_groups(
-    pair_kind: PairKind,
-    group_kind: GroupKind,
-    candidates: &[CandidateWrite],
-    locations: &BTreeMap<ContentKey, Vec<LocationKey>>,
-) -> Vec<GroupWrite> {
+    pair_kind: AnalysisPairKind,
+    group_kind: AnalysisGroupKind,
+    candidates: &[AnalysisCandidate],
+    locations: &BTreeMap<ContentKey, BTreeMap<dedup_core::LocationKey, dedup_core::DisplayPath>>,
+) -> Vec<AnalysisGroup> {
     let passed = candidates
         .iter()
         .filter(|candidate| {
-            candidate.kind == pair_kind && candidate.status == CandidateStatus::Passed
+            candidate.kind == pair_kind && candidate.status == AnalysisCandidateStatus::Passed
         })
         .collect::<Vec<_>>();
     let contents = passed
@@ -128,20 +135,24 @@ fn similar_groups(
             let mut members = Vec::new();
             for grouped in &group.members {
                 let evidence = grouped.evidence;
-                for (index, location) in locations[&grouped.content].iter().enumerate() {
+                for (index, (location, display_path)) in
+                    locations[&grouped.content].iter().enumerate()
+                {
                     let representative = grouped.content == group.representative && index == 0;
-                    members.push(GroupMemberWrite {
-                        location: location.clone(),
-                        content: grouped.content,
+                    let mut member = AnalysisGroupMember::new(
+                        location.clone(),
+                        display_path.clone(),
+                        grouped.content,
                         representative,
-                        stage1_score: evidence.map_or(1.0, |edge| edge.stage1_score),
-                        phash_passed_parts: evidence.and_then(|edge| edge.phash_passed_parts),
-                        stage2_score: evidence.map(|edge| edge.stage2_score),
-                    });
+                    );
+                    member.stage1_score = evidence.map_or(1.0, |edge| edge.stage1_score);
+                    member.phash_passed_parts = evidence.and_then(|edge| edge.phash_passed_parts);
+                    member.stage2_score = evidence.map(|edge| edge.stage2_score);
+                    members.push(member);
                 }
             }
             members.sort_by(|left, right| left.location.cmp(&right.location));
-            GroupWrite {
+            AnalysisGroup {
                 group_id: GroupId::new().as_uuid().to_string(),
                 kind: group_kind,
                 representative: group.representative,
