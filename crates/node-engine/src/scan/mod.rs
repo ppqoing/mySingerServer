@@ -14,9 +14,13 @@ mod pipeline;
 mod root_plan;
 mod task_file_base_compute;
 mod task_file_media_compute;
+mod task_file_media_persistence;
 pub(crate) use task_file_media_compute::{
     MediaPassResult, TaskFileMediaCompleted, TaskFileMediaComputeError, TaskFileMediaFailure,
     run_task_file_media_compute,
+};
+pub(crate) use task_file_media_persistence::{
+    TaskFileMediaPersistenceError, TaskFileMediaPersistenceOptions, persist_task_file_media_results,
 };
 
 #[cfg(feature = "test-hooks")]
