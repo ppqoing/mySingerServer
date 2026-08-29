@@ -50,6 +50,8 @@ pub(crate) use base_compute::configure_base_compute_runtime;
 pub use base_compute::{BaseComputeDecision, BaseComputeEngine};
 /// 生产读取器在真实 Hash 磁盘许可边界发布的阶段信号。
 pub use base_flow_control::HashReadStartedSignal;
+/// 二筛 task-file 编排复用的唯一 SQLite 单写 actor。
+pub(crate) use base_persistence::BaseStoreActor;
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub use base_persistence::{BasePersistTestController, BasePersistTestWaiter};

@@ -38,7 +38,9 @@ use image::image_candidates_with_runtime;
 use phase2::{MissingDispatchReport, dispatch_missing, evaluate_candidates};
 #[allow(unused_imports)]
 pub(crate) use phase2::{
-    Stage2BatchPlan, begin_stage2_batch, run_stage2_batch, run_stage2_batch_with_runtime_cache,
+    Stage2BatchPlan, Stage2TaskFileRunError, Stage2TaskFileRunOptions, Stage2TaskFileRunResult,
+    begin_stage2_batch, run_stage2_batch, run_stage2_batch_production,
+    run_stage2_batch_with_runtime_cache,
 };
 use video::video_candidates_with_runtime;
 

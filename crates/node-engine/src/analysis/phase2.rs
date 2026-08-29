@@ -2,20 +2,24 @@
 
 use std::{
     collections::HashMap,
+    fmt,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use dedup_core::{
-    ContentKey, DisplayPath, LocationKey, MediaKind, ScreeningOutcome, TaskId, Thresholds,
+    ContentKey, DiskReadConfig, DisplayPath, LocationKey, MediaKind, ScreeningOutcome, TaskId,
+    Thresholds,
 };
 use dedup_media::{VideoFrameFeatures, score_video_stage2, screen_image_stage2};
 use dedup_node_store::{
     BaseCacheRecord, CandidateStatus, CandidateWrite, CompleteStage1, CompleteStage2, ContentId,
-    FeatureWrite, NewTaskItem, NodeStore, PairKind, PersistentStageState, TaskItemCompletion,
-    TaskStageWrite, VideoFrameStage2Fields, classify_cache_completeness,
+    FeatureWrite, NewTaskItem, NodeStore, PairKind, PersistentStageState, ScannedPath,
+    TaskItemCompletion, TaskStageWrite, VideoFrameStage2Fields, classify_cache_completeness,
 };
 use dedup_protocol::proto::{self, worker_envelope};
 use dedup_protocol::{BASE_MISSING_PROBE, BASE_MISSING_STAGE1};
+use dedup_windows::ReadCancellationToken;
 use uuid::Uuid;
 
 use crate::contact_sheet_cache::ContactSheetCacheEntry;
@@ -25,9 +29,19 @@ use crate::runtime_tasks::{
 };
 use crate::worker::WorkerFileIdentity;
 use crate::worker::{Stage2Output, WorkerEvent, WorkerPool, decode_stage2_payload};
-use crate::{NodeRemoteFeatureCache, Stage2CacheLookup};
+use crate::{
+    NodeRemoteFeatureCache, Stage2CacheLookup,
+    scan::{
+        BaseStoreActor, ScanDiskPlan, ScanRootStorageResolver, ScheduledFileReader,
+        Stage2TaskInput, build_stage2_task_production, run_task_file_stage2,
+    },
+};
 
 use super::AnalysisBlocked;
+use super::stage2_planner::{
+    FrozenStage2Batch, Stage2ActiveSource, Stage2PlanAction, Stage2PlanningInput, Stage2Selection,
+    Stage2TransientPlanner,
+};
 
 /// 一个唯一内容的当前进程二筛请求。
 #[derive(Clone, Debug)]
@@ -449,6 +463,516 @@ pub(crate) struct Stage2BatchPlan {
     pub(crate) task_id: TaskId,
     /// 已校验来源位置的二筛工作项。
     work: Vec<MissingWork>,
+}
+
+/// 二筛生产编排所需的固定目录、读取额度和取消边界。
+pub(crate) struct Stage2TaskFileRunOptions<'a> {
+    /// 当前进程独占的 runtime 根目录；仅 Compute 时才创建其 run 子目录。
+    runtime_root: &'a Path,
+    /// 视频联系表缓存根目录；目标始终由内容 MD5 推导。
+    contact_sheet_root: &'a Path,
+    /// 本轮读取调度器使用的已验证磁盘额度配置。
+    read_config: &'a DiskReadConfig,
+    /// 当前 WorkerPool 的有效并发槽位数。
+    worker_capacity: usize,
+    /// SQLite 单写 actor 的有界持久化队列容量。
+    persist_capacity: usize,
+    /// 当前运行取消后传递给 task-file runner 的同一令牌。
+    cancellation: ReadCancellationToken,
+    /// 只在缓存查询前建立 ScanDiskPlan 时调用的物理盘解析边界。
+    resolver: &'a dyn ScanRootStorageResolver,
+    /// 单元测试在首次缓存查询处观察已完成的来源解析；生产构建不保留测试状态。
+    #[cfg(test)]
+    cache_lookup_observer: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl<'a> Stage2TaskFileRunOptions<'a> {
+    /// 使用节点已解析的目录、读取配置和 Worker 容量创建一次生产运行选项。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        runtime_root: &'a Path,
+        contact_sheet_root: &'a Path,
+        read_config: &'a DiskReadConfig,
+        worker_capacity: usize,
+        persist_capacity: usize,
+        cancellation: ReadCancellationToken,
+        resolver: &'a dyn ScanRootStorageResolver,
+    ) -> Self {
+        Self {
+            runtime_root,
+            contact_sheet_root,
+            read_config,
+            worker_capacity,
+            persist_capacity,
+            cancellation,
+            resolver,
+            #[cfg(test)]
+            cache_lookup_observer: None,
+        }
+    }
+
+    /// 仅单元测试：在首个本地批量缓存查询前检查来源物理盘冻结顺序。
+    #[cfg(test)]
+    fn with_cache_lookup_observer(mut self, observer: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.cache_lookup_observer = Some(observer);
+        self
+    }
+}
+
+/// 二筛 task-file 运行成功后交还的 SQLite Store、内容统计和真实 outbox 高水位。
+pub(crate) struct Stage2TaskFileRunResult {
+    /// 所有 Worker、permit 和单写 actor 收束后归还的原 NodeStore。
+    pub(crate) store: NodeStore,
+    /// 本轮临时 TSV 目录使用的唯一运行身份。
+    pub(crate) run_id: TaskId,
+    /// 缓存复用、远端导入或 SQLite ACK 成功的唯一内容数。
+    pub(crate) completed: usize,
+    /// IncompleteBase 或 task-file 单项失败的唯一内容数。
+    pub(crate) failed: usize,
+    /// 本次全部成功写入之后从 SQLite 读取的真实 outbox 高水位。
+    pub(crate) outbox_high_seq: u64,
+}
+
+/// 二筛生产编排失败时保留已恢复 Store 的错误；actor 无法 join 时才可能缺失所有权。
+pub(crate) struct Stage2TaskFileRunError {
+    /// 可继续交回上层的 Store；任务级错误后的已处理结果仍已提交。
+    store: Option<NodeStore>,
+    /// 原始失败、精确目录清理或 writer 收束的组合诊断。
+    message: String,
+}
+
+impl Stage2TaskFileRunError {
+    /// 取回任务级失败后仍可用的 SQLite Store，避免调用方遗失唯一所有权。
+    pub(crate) fn into_store(self) -> Option<NodeStore> {
+        self.store
+    }
+}
+
+impl fmt::Display for Stage2TaskFileRunError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl fmt::Debug for Stage2TaskFileRunError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Stage2TaskFileRunError")
+            .field("message", &self.message)
+            .field("has_store", &self.store.is_some())
+            .finish()
+    }
+}
+
+/// 用已冻结来源执行生产二筛：缓存命中直接提交，真实缺失才进入统一 TSV/读取/ACK 闭环。
+pub(crate) async fn run_stage2_batch_production(
+    mut store: NodeStore,
+    plan: Stage2BatchPlan,
+    worker_pool: &mut WorkerPool,
+    remote: Option<&NodeRemoteFeatureCache>,
+    options: &Stage2TaskFileRunOptions<'_>,
+) -> Result<Stage2TaskFileRunResult, Stage2TaskFileRunError> {
+    let Stage2BatchPlan { task_id, work } = plan;
+    let (frozen, planned_rows) = match freeze_task_file_sources(&work, options) {
+        Ok(value) => value,
+        Err(error) => return Err(task_file_run_error(store, error)),
+    };
+
+    #[cfg(test)]
+    if let Some(observer) = &options.cache_lookup_observer {
+        observer();
+    }
+    let keys = frozen
+        .sources()
+        .iter()
+        .map(|source| source.content)
+        .collect::<Vec<_>>();
+    let local = match store.lookup_base_cache_by_keys(&keys) {
+        Ok(records) if records.len() == keys.len() => records,
+        Ok(_) => {
+            return Err(task_file_run_error(
+                store,
+                "二筛本地缓存批量返回数量不匹配".into(),
+            ));
+        }
+        Err(error) => return Err(task_file_run_error(store, error.to_string())),
+    };
+    let remote = if needs_remote_task_file_stage2(&frozen, &local) {
+        lookup_remote_task_file_stage2(&frozen, remote).await
+    } else {
+        None
+    };
+    let transient = match Stage2TransientPlanner::plan(&frozen, &local, remote.as_deref()) {
+        Ok(plan) => plan,
+        Err(error) => return Err(task_file_run_error(store, error.to_string())),
+    };
+    let cached_by_content = local
+        .into_iter()
+        .flatten()
+        .map(|cached| (cached.content_key, cached))
+        .collect::<HashMap<_, _>>();
+
+    let mut completed = 0;
+    let mut failed = 0;
+    let mut inputs = Vec::new();
+    for item in transient.items() {
+        let mut needs_compute = false;
+        let mut incomplete_base = false;
+        for action in item.actions() {
+            match action {
+                Stage2PlanAction::RepublishLocal { selection } => {
+                    let Some(cached) = cached_by_content.get(&item.source().content) else {
+                        return Err(task_file_run_error(
+                            store,
+                            "二筛本地重发缺少已分类缓存".into(),
+                        ));
+                    };
+                    if let Err(error) = republish_task_file_stage2(&mut store, cached, *selection) {
+                        return Err(task_file_run_error(store, error));
+                    }
+                }
+                Stage2PlanAction::ImportRemote {
+                    features,
+                    selection,
+                } => {
+                    if let Err(error) =
+                        import_task_file_stage2(&mut store, item.source(), features, *selection)
+                    {
+                        return Err(task_file_run_error(store, error));
+                    }
+                }
+                Stage2PlanAction::Compute(work) => {
+                    let Some(cached) = cached_by_content.get(&work.source().content) else {
+                        return Err(task_file_run_error(
+                            store,
+                            "二筛 Worker 计划缺少本地缓存快照".into(),
+                        ));
+                    };
+                    inputs.push(Stage2TaskInput::from_planner_work(
+                        work,
+                        cached.clone(),
+                        task_file_contact_sheet_target(options.contact_sheet_root, work),
+                    ));
+                    needs_compute = true;
+                }
+                Stage2PlanAction::IncompleteBase => incomplete_base = true,
+            }
+        }
+        if incomplete_base {
+            failed += 1;
+        } else if !needs_compute {
+            completed += 1;
+        }
+    }
+
+    if inputs.is_empty() {
+        let outbox_high_seq = match store.outbox_high_seq() {
+            Ok(highwater) => highwater,
+            Err(error) => return Err(task_file_run_error(store, error.to_string())),
+        };
+        return Ok(Stage2TaskFileRunResult {
+            store,
+            run_id: task_id,
+            completed,
+            failed,
+            outbox_high_seq,
+        });
+    }
+
+    let reader = match ScheduledFileReader::new_with_planned_rows(
+        options.read_config,
+        options.worker_capacity,
+        Arc::new(planned_rows),
+    ) {
+        Ok((reader, _)) => reader,
+        Err(error) => return Err(task_file_run_error(store, error.to_string())),
+    };
+    let production = match build_stage2_task_production(
+        options.runtime_root,
+        task_id.as_uuid(),
+        reader,
+        &inputs,
+    ) {
+        Ok(production) => production,
+        Err(error) => {
+            let cleanup = discard_unowned_task_file_run(options.runtime_root, task_id)
+                .err()
+                .map(|cleanup| cleanup.to_string());
+            return Err(task_file_run_error(
+                store,
+                merge_task_file_failure(&error.to_string(), cleanup, String::new()),
+            ));
+        }
+    };
+    let (store_actor, store_handle, mut acknowledgements) =
+        BaseStoreActor::spawn(store, options.persist_capacity.max(1));
+    let run = run_task_file_stage2(
+        production,
+        worker_pool,
+        &store_handle,
+        &mut acknowledgements,
+        options.worker_capacity,
+        options.cancellation.clone(),
+    )
+    .await;
+
+    match run {
+        Ok(run) => {
+            let stage_completed = run.completed;
+            let stage_failed = run.failed;
+            let mut production = run.production;
+            let cleanup = production.discard().err().map(|error| error.to_string());
+            drop(store_handle);
+            drop(acknowledgements);
+            let store = match store_actor.finish().await {
+                Ok(store) => store,
+                Err(error) => {
+                    return Err(Stage2TaskFileRunError {
+                        store: None,
+                        message: merge_task_file_failure(
+                            "二筛 SQLite writer 收束失败",
+                            cleanup,
+                            error.to_string(),
+                        ),
+                    });
+                }
+            };
+            if let Some(cleanup) = cleanup {
+                return Err(task_file_run_error(
+                    store,
+                    format!("二筛任务目录清理失败: {cleanup}"),
+                ));
+            }
+            let outbox_high_seq = match store.outbox_high_seq() {
+                Ok(highwater) => highwater,
+                Err(error) => return Err(task_file_run_error(store, error.to_string())),
+            };
+            Ok(Stage2TaskFileRunResult {
+                store,
+                run_id: task_id,
+                completed: completed + stage_completed,
+                failed: failed + stage_failed,
+                outbox_high_seq,
+            })
+        }
+        Err(error) => {
+            let message = error.to_string();
+            let mut production = error.into_production();
+            let cleanup = production.discard().err().map(|error| error.to_string());
+            drop(store_handle);
+            drop(acknowledgements);
+            match store_actor.finish().await {
+                Ok(store) => Err(task_file_run_error(
+                    store,
+                    merge_task_file_failure(&message, cleanup, String::new()),
+                )),
+                Err(writer) => Err(Stage2TaskFileRunError {
+                    store: None,
+                    message: merge_task_file_failure(&message, cleanup, writer.to_string()),
+                }),
+            }
+        }
+    }
+}
+
+/// 判断本机已有完整基础字段但仍缺请求二筛字段时，是否需要批量查询远端缓存。
+fn needs_remote_task_file_stage2(
+    frozen: &FrozenStage2Batch,
+    local: &[Option<BaseCacheRecord>],
+) -> bool {
+    frozen.sources().iter().zip(local).any(|(source, cached)| {
+        let Some(cached) = cached else { return false };
+        let completeness = classify_cache_completeness(cached, true);
+        if completeness.base_missing_parts & (BASE_MISSING_PROBE | BASE_MISSING_STAGE1) != 0 {
+            return false;
+        }
+        match source.media_kind {
+            MediaKind::Image => completeness.image_stage2_missing,
+            MediaKind::Video => source
+                .frame_slots
+                .iter()
+                .any(|slot| completeness.video_stage2_missing_slots & (1_u8 << slot) != 0),
+            MediaKind::Other => false,
+        }
+    })
+}
+
+/// 在所有本地或远端缓存查询前把批次来源映射为稳定的物理盘 lane。
+fn freeze_task_file_sources(
+    work: &[MissingWork],
+    options: &Stage2TaskFileRunOptions<'_>,
+) -> Result<(FrozenStage2Batch, Vec<crate::scan::PlannedScannedPath>), String> {
+    let roots = work
+        .iter()
+        .map(|item| item.display_path.clone())
+        .collect::<Vec<_>>();
+    let disk_plan = ScanDiskPlan::build(&roots, options.read_config, options.resolver)
+        .map_err(|error| error.to_string())?;
+    let scanned = work
+        .iter()
+        .map(|item| {
+            ScannedPath::new(
+                item.location.normalized_path().clone(),
+                item.display_path.clone(),
+                item.content.file_size(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let planned = disk_plan
+        .assign_all(scanned)
+        .map_err(|error| error.to_string())?;
+    let inputs = work
+        .iter()
+        .zip(&planned)
+        .map(|(item, planned)| {
+            Stage2PlanningInput::from_active(Stage2ActiveSource::new(
+                item.content,
+                item.content_id,
+                item.location.clone(),
+                planned.scanned.clone(),
+                item.media_kind,
+                item.frame_slots.clone(),
+                planned.lane.clone(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let frozen = Stage2TransientPlanner::freeze(&inputs).map_err(|error| error.to_string())?;
+    Ok((frozen, planned))
+}
+
+/// 批量读取远端二筛缓存；连接、长度或查询错误只降级为本地计算。
+async fn lookup_remote_task_file_stage2(
+    frozen: &FrozenStage2Batch,
+    remote: Option<&NodeRemoteFeatureCache>,
+) -> Option<Vec<Option<CompleteStage2>>> {
+    let remote = remote?;
+    let requests = frozen
+        .sources()
+        .iter()
+        .map(|source| Stage2CacheLookup {
+            content: source.content,
+            media_kind: source.media_kind,
+            frame_slots: source.frame_slots.clone(),
+        })
+        .collect::<Vec<_>>();
+    match remote.lookup_stage2(&requests).await {
+        Ok(hits) if hits.len() == requests.len() => Some(hits),
+        Ok(_) => {
+            tracing::warn!("PostgreSQL 二筛缓存返回数量不匹配，本次继续 SQLite-only");
+            None
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "PostgreSQL 二筛缓存查询失败，本次继续 SQLite-only");
+            None
+        }
+    }
+}
+
+/// 将本机已完整的选择重新发布到 outbox，不扩大到当前批次以外的槽位。
+fn republish_task_file_stage2(
+    store: &mut NodeStore,
+    cached: &BaseCacheRecord,
+    selection: Stage2Selection,
+) -> Result<(), String> {
+    let republished = match selection {
+        Stage2Selection::Image => store
+            .republish_complete_stage2_from_cache(cached)
+            .map_err(|error| error.to_string())?,
+        Stage2Selection::VideoSlots(slots) => store
+            .republish_stage2_slots_from_cache(
+                cached,
+                &(0..6)
+                    .filter(|slot| slots & (1_u8 << slot) != 0)
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(|error| error.to_string())?,
+    };
+    republished
+        .then_some(())
+        .ok_or_else(|| "二筛本地缓存不完整，无法重发".into())
+}
+
+/// 将计划器已验证的远端图片或视频槽位写入 SQLite，并由事务同步写出 outbox。
+fn import_task_file_stage2(
+    store: &mut NodeStore,
+    source: &Stage2ActiveSource,
+    features: &CompleteStage2,
+    selection: Stage2Selection,
+) -> Result<(), String> {
+    match (selection, features) {
+        (Stage2Selection::Image, CompleteStage2::Image(features)) => store
+            .commit_feature_result(
+                source.content_id,
+                None,
+                FeatureWrite::ImageStage2(**features),
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
+        (Stage2Selection::VideoSlots(slots), CompleteStage2::Video(features)) => {
+            for slot in 0..6 {
+                if slots & (1_u8 << slot) == 0 {
+                    continue;
+                }
+                let feature = features[slot]
+                    .as_ref()
+                    .ok_or_else(|| "远端二筛缺少计划视频槽位".to_owned())?;
+                store
+                    .commit_feature_result(
+                        source.content_id,
+                        None,
+                        FeatureWrite::VideoFrameStage2(VideoFrameStage2Fields {
+                            slot: slot as u8,
+                            features: feature.clone(),
+                        }),
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        }
+        _ => Err("远端二筛类型与计划选择不一致".into()),
+    }
+}
+
+/// 为视频 Worker 固定推导 MD5 联系表路径；文件不存在时仍保留原视频回退目标。
+fn task_file_contact_sheet_target(
+    root: &Path,
+    work: &super::stage2_planner::Stage2WorkItem,
+) -> Option<PathBuf> {
+    (work.source().media_kind == MediaKind::Video)
+        .then(|| ContactSheetCacheEntry::from_md5(root, work.source().content.md5()))
+        .map(|entry| entry.final_path().to_path_buf())
+}
+
+/// 用可恢复 Store 构造前 actor 阶段或收束成功后的任务级错误。
+fn task_file_run_error(store: NodeStore, message: String) -> Stage2TaskFileRunError {
+    Stage2TaskFileRunError {
+        store: Some(store),
+        message,
+    }
+}
+
+/// 构建器尚未交还 production owner 时，仅删除已知 run-id 对应的精确目录。
+fn discard_unowned_task_file_run(runtime_root: &Path, task_id: TaskId) -> std::io::Result<()> {
+    let run = runtime_root.join(task_id.as_uuid().to_string());
+    match std::fs::remove_dir_all(run) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// 合并原始任务失败、精确 run 目录清理和 SQLite writer 收束的诊断。
+fn merge_task_file_failure(primary: &str, cleanup: Option<String>, writer: String) -> String {
+    let mut message = primary.to_owned();
+    if let Some(cleanup) = cleanup {
+        message.push_str("；二筛任务目录清理失败: ");
+        message.push_str(&cleanup);
+    }
+    if !writer.is_empty() {
+        message.push_str("；SQLite writer 收束失败: ");
+        message.push_str(&writer);
+    }
+    message
 }
 
 /// 执行一个中心二筛批次；先复用并重新发布本机缓存，只有真正缺失时才调用 Worker。
@@ -1536,12 +2060,284 @@ fn incomplete(candidate: CandidateWrite) -> CandidateWrite {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+
+    use dedup_core::DiskReadConfig;
     use dedup_core::{DisplayPath, LocationKey, MachineId, NormalizedPath};
     use dedup_media::{ImageStage1, ImageStage2, PdqHash};
     use dedup_node_store::{
-        FeatureWrite, ScannedPath, VideoFrameStage1Fields, VideoFrameStage2Fields,
-        VideoMetadataFields,
+        FeatureWrite, ImageStage1Fields, ScannedPath, VideoFrameStage1Fields,
+        VideoFrameStage2Fields, VideoMetadataFields,
     };
+    use dedup_windows::{LocalDiskKind, PhysicalDiskId, ReadCancellationToken};
+
+    use crate::{
+        scan::{ResolvedScanRootStorage, ScanRootStorageResolver},
+        worker::Stage2Frame,
+    };
+
+    #[tokio::test]
+    async fn production_task_file_stage2_uses_full_local_cache_without_runtime_or_worker() {
+        let runtime = tempfile::tempdir().unwrap();
+        let mut store = test_store();
+        let (content, source, content_id) = seed_image(&mut store, [0x61; 16], 61, true);
+        let plan = begin_stage2_batch(
+            &mut store,
+            &[Stage2BatchItem {
+                content,
+                source,
+                frame_slots: Vec::new(),
+            }],
+            61,
+        )
+        .unwrap();
+        let run_id = plan.task_id;
+        let resolver = FixedLaneResolver::new(1);
+        let read_config = DiskReadConfig::default();
+        let options = Stage2TaskFileRunOptions::new(
+            runtime.path(),
+            runtime.path(),
+            &read_config,
+            1,
+            2,
+            ReadCancellationToken::new(),
+            &resolver,
+        );
+        let before = store.outbox_high_seq().unwrap();
+        let (mut pool, mut started, _) = WorkerPool::controlled_batch_for_test(1);
+
+        let result = run_stage2_batch_production(store, plan, &mut pool, None, &options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.completed, 1);
+        assert_eq!(result.failed, 0);
+        assert!(
+            started.try_recv().is_err(),
+            "完整本地缓存不能下发二筛 Worker"
+        );
+        assert!(
+            !runtime.path().join(run_id.as_uuid().to_string()).exists(),
+            "没有 Compute 时不能创建本轮 TSV 目录"
+        );
+        assert!(
+            result.store.page_tasks(None, 20).unwrap().items.is_empty(),
+            "生产二筛不能回退写入旧任务表"
+        );
+        assert!(result.store.outbox_high_seq().unwrap() > before);
+        assert_eq!(
+            result.outbox_high_seq,
+            result.store.outbox_high_seq().unwrap()
+        );
+        assert!(
+            result
+                .store
+                .load_complete_stage2(content_id)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[tokio::test]
+    async fn production_task_file_stage2_keeps_other_frozen_lane_running_after_failure() {
+        let runtime = tempfile::tempdir().unwrap();
+        let mut store = test_store();
+        let (first_content, first_source, first_id) = seed_image(&mut store, [0x62; 16], 62, false);
+        let (second_content, second_source, second_id) =
+            seed_image_at(&mut store, r"D:\\phase2-second.jpg", [0x63; 16], 63, false);
+        let plan = begin_stage2_batch(
+            &mut store,
+            &[
+                Stage2BatchItem {
+                    content: first_content,
+                    source: first_source,
+                    frame_slots: Vec::new(),
+                },
+                Stage2BatchItem {
+                    content: second_content,
+                    source: second_source,
+                    frame_slots: Vec::new(),
+                },
+            ],
+            62,
+        )
+        .unwrap();
+        let resolver = FixedLaneResolver::new(2);
+        let read_config = DiskReadConfig::default();
+        let options = Stage2TaskFileRunOptions::new(
+            runtime.path(),
+            runtime.path(),
+            &read_config,
+            1,
+            2,
+            ReadCancellationToken::new(),
+            &resolver,
+        );
+        let (mut pool, mut started, controller) = WorkerPool::controlled_batch_for_test(1);
+        let run = run_stage2_batch_production(store, plan, &mut pool, None, &options);
+        let control = async {
+            let (first_task, first_item) = started.recv().await.unwrap();
+            controller
+                .crash(first_task, first_item, "测试二筛 Worker 崩溃".into())
+                .await;
+
+            let (second_task, second_item) = started.recv().await.unwrap();
+            controller
+                .stage2_source_read_complete(second_task.clone(), second_item.clone())
+                .await;
+            controller
+                .complete_stage2(second_task, second_item, stage2_output(7))
+                .await;
+        };
+        let (result, ()) =
+            tokio::time::timeout(Duration::from_secs(2), async { tokio::join!(run, control) })
+                .await
+                .expect("不同冻结 lane 的二筛任务必须在有限时间内收敛");
+        pool.shutdown().await.unwrap();
+        let result = result.unwrap();
+
+        assert_eq!(result.completed, 1);
+        assert_eq!(result.failed, 1);
+        assert_eq!(resolver.calls(), 2, "所有来源必须在缓存查询前冻结 lane");
+        assert!(
+            result
+                .store
+                .load_complete_stage2(first_id)
+                .unwrap()
+                .is_some()
+                ^ result
+                    .store
+                    .load_complete_stage2(second_id)
+                    .unwrap()
+                    .is_some(),
+            "一个 lane 失败后另一个 lane 仍必须通过 SQLite ACK 写入二筛特征"
+        );
+        assert!(
+            !runtime
+                .path()
+                .join(result.run_id.as_uuid().to_string())
+                .exists(),
+            "所有 ACK 与 Worker 收束后必须只删除当前运行目录"
+        );
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[tokio::test]
+    async fn production_task_file_stage2_runs_only_the_missing_video_slot() {
+        let runtime = tempfile::tempdir().unwrap();
+        let mut store = test_store();
+        let (content, source, content_id) =
+            seed_video(&mut store, [0x66; 16], &[1, 2, 3, 4, 5], 66);
+        let plan = begin_stage2_batch(
+            &mut store,
+            &[Stage2BatchItem {
+                content,
+                source,
+                frame_slots: vec![0],
+            }],
+            66,
+        )
+        .unwrap();
+        let resolver = FixedLaneResolver::new(1);
+        let read_config = DiskReadConfig::default();
+        let options = Stage2TaskFileRunOptions::new(
+            runtime.path(),
+            runtime.path(),
+            &read_config,
+            1,
+            2,
+            ReadCancellationToken::new(),
+            &resolver,
+        );
+        let (mut pool, mut started, controller) = WorkerPool::controlled_batch_for_test(1);
+        let run = run_stage2_batch_production(store, plan, &mut pool, None, &options);
+        let control = async {
+            let (task_id, item_id) = started.recv().await.unwrap();
+            controller
+                .stage2_source_read_complete(task_id.clone(), item_id.clone())
+                .await;
+            controller
+                .complete_stage2(task_id, item_id, stage2_output(8))
+                .await;
+        };
+        let (result, ()) =
+            tokio::time::timeout(Duration::from_secs(2), async { tokio::join!(run, control) })
+                .await
+                .expect("缺失视频槽位必须由 task-file runner 在有限时间内完成");
+        pool.shutdown().await.unwrap();
+        let result = result.unwrap();
+
+        assert_eq!(result.completed, 1);
+        assert_eq!(result.failed, 0);
+        assert!(
+            result
+                .store
+                .load_complete_stage2(content_id)
+                .unwrap()
+                .is_some(),
+            "原有五槽加本次唯一缺槽应共同构成完整视频二筛"
+        );
+    }
+
+    #[tokio::test]
+    async fn production_task_file_stage2_resolves_all_sources_before_first_cache_lookup() {
+        let runtime = tempfile::tempdir().unwrap();
+        let mut store = test_store();
+        let (first_content, first_source, _) = seed_image(&mut store, [0x64; 16], 64, true);
+        let (second_content, second_source, _) =
+            seed_image_at(&mut store, r"D:\\phase2-order.jpg", [0x65; 16], 65, true);
+        let plan = begin_stage2_batch(
+            &mut store,
+            &[
+                Stage2BatchItem {
+                    content: first_content,
+                    source: first_source,
+                    frame_slots: Vec::new(),
+                },
+                Stage2BatchItem {
+                    content: second_content,
+                    source: second_source,
+                    frame_slots: Vec::new(),
+                },
+            ],
+            64,
+        )
+        .unwrap();
+        let resolver = FixedLaneResolver::new(2);
+        let observed_resolver = resolver.clone();
+        let read_config = DiskReadConfig::default();
+        let options = Stage2TaskFileRunOptions::new(
+            runtime.path(),
+            runtime.path(),
+            &read_config,
+            1,
+            2,
+            ReadCancellationToken::new(),
+            &resolver,
+        )
+        .with_cache_lookup_observer(Arc::new(move || {
+            assert_eq!(
+                observed_resolver.calls(),
+                2,
+                "首个二筛缓存查询前必须已经解析全部有效来源"
+            );
+        }));
+        let (mut pool, _, _) = WorkerPool::controlled_batch_for_test(1);
+
+        let result = run_stage2_batch_production(store, plan, &mut pool, None, &options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.completed, 2);
+        assert_eq!(result.failed, 0);
+    }
 
     #[tokio::test]
     async fn complete_stage2_cache_does_not_create_legacy_task_rows() {
@@ -1695,6 +2491,120 @@ mod tests {
 
     fn test_store() -> NodeStore {
         NodeStore::open_in_memory(MachineId::parse(&"ab".repeat(32)).unwrap()).unwrap()
+    }
+
+    /// 为生产编排测试提供稳定的物理盘解析结果，并记录全部解析次数。
+    #[derive(Clone)]
+    struct FixedLaneResolver {
+        /// 测试期望的全部来源解析次数。
+        expected_calls: usize,
+        /// 生产编排实际请求解析器的次数。
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl FixedLaneResolver {
+        /// 按传入数量创建测试解析器；C/D 路径会冻结到不同的物理盘 lane。
+        fn new(expected_calls: usize) -> Self {
+            Self {
+                expected_calls,
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        /// 返回当前已经完成的来源物理盘解析数量。
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ScanRootStorageResolver for FixedLaneResolver {
+        fn resolve(&self, root: &std::path::Path) -> std::io::Result<ResolvedScanRootStorage> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            assert!(
+                call <= self.expected_calls,
+                "生产编排不能为同一批次重复解析物理盘"
+            );
+            let disk = if root
+                .to_string_lossy()
+                .to_ascii_uppercase()
+                .starts_with("D:")
+            {
+                2
+            } else {
+                1
+            };
+            Ok(ResolvedScanRootStorage {
+                normalized_root: NormalizedPath::new(root).map_err(std::io::Error::other)?,
+                physical_disk_id: PhysicalDiskId::from_disk_numbers(vec![disk])
+                    .map_err(std::io::Error::other)?,
+                disk_kind: LocalDiskKind::Ssd,
+            })
+        }
+    }
+
+    /// 写入一张具备完整基础特征的图片；按参数选择是否预置完整二筛缓存。
+    fn seed_image(
+        store: &mut NodeStore,
+        md5: [u8; 16],
+        size: u64,
+        with_stage2: bool,
+    ) -> (ContentKey, LocationKey, ContentId) {
+        seed_image_at(
+            store,
+            &format!(r"C:\\phase2-{}.jpg", md5[0]),
+            md5,
+            size,
+            with_stage2,
+        )
+    }
+
+    /// 把测试图片固定到指定盘符，以验证编排保留预先冻结的物理盘 lane。
+    fn seed_image_at(
+        store: &mut NodeStore,
+        path: &str,
+        md5: [u8; 16],
+        size: u64,
+        with_stage2: bool,
+    ) -> (ContentKey, LocationKey, ContentId) {
+        let scanned = ScannedPath::new(
+            NormalizedPath::new(path).unwrap(),
+            DisplayPath::new(path).unwrap(),
+            size,
+        );
+        let content = store
+            .upsert_content_and_location(&scanned, md5, MediaKind::Image)
+            .unwrap();
+        store
+            .commit_feature_result(
+                content.id,
+                None,
+                FeatureWrite::ImageStage1(ImageStage1Fields::from(stage1())),
+            )
+            .unwrap();
+        if with_stage2 {
+            store
+                .commit_feature_result(content.id, None, FeatureWrite::ImageStage2(local_stage2()))
+                .unwrap();
+        }
+        store.mark_base_complete(content.id).unwrap();
+        let location = LocationKey::new(store.machine_id().clone(), scanned.normalized_path);
+        (content.key, location, content.id)
+    }
+
+    #[cfg(feature = "test-hooks")]
+    /// 生成一个图片或单槽视频都可消费的受控 Worker 二筛成功结果。
+    fn stage2_output(seed: u64) -> Stage2Output {
+        Stage2Output {
+            frames: vec![Stage2Frame {
+                slot: 0,
+                feature: Some(ImageStage2 {
+                    phash_parts: [seed; 9],
+                    sobel: [seed as f32; 128],
+                }),
+                error: None,
+            }],
+            regenerated_contact_sheet_jpeg: None,
+        }
     }
 
     fn seed_video(
