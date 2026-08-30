@@ -945,7 +945,7 @@ impl ActorState {
         Some(self.make_selection(&heads[index]))
     }
 
-    /// 在真实可授予的 lane 之间按配置权重消费亏欠，再在选中 lane 内沿用类别规则。
+    /// 在真实可授予的 lane 之间先补齐当前权重席位，再消费长期亏欠并沿用类别规则。
     fn select_weighted_lane(
         &self,
         heads: &[(DiskKey, DiskReadClass, &Waiter)],
@@ -964,38 +964,50 @@ impl ActorState {
             return None;
         }
 
-        // 游标指向仍有亏欠的 lane；当前候选不可运行时顺序扫描其他 lane。
+        // 当前窗口优先选择 active/weight 最小的盘。Ready 盘都从 0 开始时会先各得一个；
+        // Ready 盘多于全局席位时，后续释放从零压力盘继续轮转，不预占正在执行的 permit。
+        let least_pressure_key = keys
+            .iter()
+            .min_by(|left, right| self.compare_weighted_active_pressure(left, right))?;
+        let weight_divisor = keys
+            .iter()
+            .map(|key| self.effective_weight(key))
+            .reduce(greatest_common_divisor)
+            .unwrap_or(1);
+
+        // 游标仍在全部 Ready lane 上移动；压力较高的盘只跳过本次，不丢失长期轮转位置。
         let start = self
             .weighted_cursor
             .as_ref()
             .and_then(|cursor| keys.iter().position(|key| key == cursor))
             .unwrap_or_else(|| {
-                // 新一轮从最高配置权重开始；之后仍由游标和剩余亏欠维持累计比例。
+                // 新一轮从当前欠配额集合中的最高权重开始，之后由游标和亏欠维持比例。
                 keys.iter()
                     .enumerate()
-                    .max_by_key(|(_, key)| {
-                        self.weighted_lanes
-                            .get(*key)
-                            .map_or(0, |lane| lane.configured_weight)
+                    .filter(|(_, key)| {
+                        self.compare_weighted_active_pressure(key, least_pressure_key)
+                            == CmpOrdering::Equal
                     })
+                    .max_by_key(|(_, key)| self.effective_weight(key))
                     .map_or(0, |(index, _)| index)
             });
         for offset in 0..keys.len() {
             let key_index = (start + offset) % keys.len();
             let key = &keys[key_index];
+            if self.compare_weighted_active_pressure(key, least_pressure_key) != CmpOrdering::Equal
+            {
+                continue;
+            }
             let Some(lane) = self.weighted_lanes.get(key) else {
                 continue;
             };
-            let configured_weight = if lane.has_weighted_waiter {
-                lane.configured_weight
-            } else {
-                // 加权请求暂时离队时，legacy 仍作为等权 1 参与外层轮转。
-                1
-            };
+            // 权重表达比例而非连续突发长度；16:16 与 1:1 必须产生同样的轮转。
+            let configured_weight = self.effective_weight(key) / weight_divisor;
             let deficit = if lane.deficit == 0 {
                 configured_weight
             } else {
-                lane.deficit
+                // Ready 集合变化会改变约分因子，旧亏欠不能超过当前归一化额度。
+                lane.deficit.min(configured_weight)
             };
             if deficit == 0 {
                 continue;
@@ -1024,6 +1036,34 @@ impl ActorState {
             });
         }
         None
+    }
+
+    /// 返回 lane 当前参与全局分配的权重；加权请求离队后的 legacy 入口按 1 处理。
+    fn effective_weight(&self, key: &DiskKey) -> usize {
+        self.weighted_lanes.get(key).map_or(1, |lane| {
+            if lane.has_weighted_waiter {
+                lane.configured_weight
+            } else {
+                1
+            }
+        })
+    }
+
+    /// 交叉相乘比较两个 lane 的 active/weight，避免浮点误差和整数除法截断。
+    fn compare_weighted_active_pressure(&self, left: &DiskKey, right: &DiskKey) -> CmpOrdering {
+        let left_active = self
+            .weighted_lanes
+            .get(left)
+            .map_or(0, |lane| lane.active_permits.load(Ordering::Acquire));
+        let right_active = self
+            .weighted_lanes
+            .get(right)
+            .map_or(0, |lane| lane.active_permits.load(Ordering::Acquire));
+        let left_weight = self.effective_weight(left);
+        let right_weight = self.effective_weight(right);
+
+        (left_active as u128 * right_weight as u128)
+            .cmp(&(right_active as u128 * left_weight as u128))
     }
 
     /// 应用一次已经完成队首判定的加权选择，避免在借用队首时修改 actor。
@@ -1535,6 +1575,16 @@ async fn run_actor(
             _ = notify.notified() => {}
         }
     }
+}
+
+/// 计算两个正权重的最大公约数，用于把配置值约分为最小整数比例。
+fn greatest_common_divisor(mut left: usize, mut right: usize) -> usize {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left.max(1)
 }
 
 fn validate_config(

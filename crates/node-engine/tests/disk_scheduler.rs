@@ -34,6 +34,43 @@ fn weighted_lane(
 type WeightedRequest =
     Pin<Box<dyn Future<Output = Result<(usize, DiskReadPermit), SchedulerError>> + Send>>;
 
+/// 将同一物理盘的带权请求加入测试请求表；lane_index 用于核对实际交付比例。
+fn push_weighted_requests(
+    requests: &mut Vec<Option<WeightedRequest>>,
+    scheduler: &DiskReadScheduler,
+    lane: &DiskReadLane,
+    lane_index: usize,
+    count: usize,
+) {
+    for _ in 0..count {
+        let scheduler = scheduler.clone();
+        let lane = lane.clone();
+        requests.push(Some(Box::pin(async move {
+            scheduler
+                .acquire_lane(lane, DiskReadClass::HashSequential)
+                .await
+                .map(|permit| (lane_index, permit))
+        })));
+    }
+}
+
+/// 取走当前已经收到许可的请求，未交付请求放回原位置继续等待。
+fn take_ready_weighted_requests(
+    requests: &mut [Option<WeightedRequest>],
+) -> Vec<(usize, DiskReadPermit)> {
+    let mut ready = Vec::new();
+    for request in requests {
+        let Some(mut pending) = request.take() else {
+            continue;
+        };
+        match poll_once(pending.as_mut()) {
+            Poll::Ready(result) => ready.push(result.unwrap()),
+            Poll::Pending => *request = Some(pending),
+        }
+    }
+    ready
+}
+
 /// 在唯一全局席位上收集两个 lane 的真实交付顺序，避免把队列入队顺序当作公平结果。
 async fn collect_weighted_sequence(
     high_weight: usize,
@@ -113,6 +150,161 @@ async fn configured_weight_five_to_one_is_used_by_real_scheduler_actor() {
 async fn configured_weight_seven_to_two_is_not_a_hardcoded_five_to_one_ratio() {
     let sequence = collect_weighted_sequence(7, 2, 7, 2).await;
     assert_eq!(sequence, vec![0, 0, 0, 0, 0, 0, 0, 1, 1]);
+}
+
+#[tokio::test]
+async fn equal_weight_ready_disks_share_the_current_global_window() {
+    let mut config = DiskReadConfig::default();
+    config.ssd_threads_per_disk = 16;
+    config.unknown_threads_per_disk = 12;
+    config.total_threads = 12;
+    let scheduler = DiskReadScheduler::new(&config, 20).unwrap();
+    let first_lane = weighted_lane(&[11], LocalDiskKind::Ssd, 16, 16);
+    let second_lane = weighted_lane(&[12], LocalDiskKind::Ssd, 16, 16);
+
+    // 先占满全局窗口，确保两块盘的请求都进入 Ready 队列后再同时竞争 12 个席位。
+    let mut blockers = Vec::with_capacity(12);
+    for _ in 0..12 {
+        blockers.push(
+            scheduler
+                .acquire_for_test(&[99], LocalDiskKind::Unknown, DiskReadClass::HashSequential)
+                .await
+                .unwrap(),
+        );
+    }
+
+    let mut requests: Vec<Option<WeightedRequest>> = Vec::with_capacity(24);
+    push_weighted_requests(&mut requests, &scheduler, &first_lane, 0, 12);
+    push_weighted_requests(&mut requests, &scheduler, &second_lane, 1, 12);
+    for request in &mut requests {
+        assert!(poll_once(request.as_mut().unwrap().as_mut()).is_pending());
+    }
+    scheduler.barrier_for_test().await.unwrap();
+
+    drop(blockers);
+    scheduler.barrier_for_test().await.unwrap();
+
+    // 许可保持在途，直接检查同一全局窗口的席位分配，不用完成速度代替调度结论。
+    let active = take_ready_weighted_requests(&mut requests);
+    let mut active_permits = Vec::with_capacity(12);
+    let mut active_by_lane = [0_usize; 2];
+    for (lane_index, permit) in active {
+        active_by_lane[lane_index] += 1;
+        active_permits.push(permit);
+    }
+    assert_eq!(active_permits.len(), 12, "全局窗口应被 Ready 请求填满");
+    assert_eq!(
+        active_by_lane,
+        [6, 6],
+        "等权 Ready 盘必须均分当前全局读取席位"
+    );
+
+    drop(requests);
+    drop(active_permits);
+}
+
+#[tokio::test]
+async fn configured_five_to_one_weights_split_six_active_seats() {
+    let mut config = DiskReadConfig::default();
+    config.hdd_threads_per_disk = 1;
+    config.ssd_threads_per_disk = 5;
+    config.unknown_threads_per_disk = 6;
+    config.total_threads = 6;
+    let scheduler = DiskReadScheduler::new(&config, 6).unwrap();
+    let ssd_lane = weighted_lane(&[13], LocalDiskKind::Ssd, 5, 5);
+    let hdd_lane = weighted_lane(&[14], LocalDiskKind::Hdd, 1, 1);
+    let mut blockers = Vec::with_capacity(6);
+    for _ in 0..6 {
+        blockers.push(
+            scheduler
+                .acquire_for_test(&[99], LocalDiskKind::Unknown, DiskReadClass::HashSequential)
+                .await
+                .unwrap(),
+        );
+    }
+
+    let mut requests = Vec::with_capacity(12);
+    push_weighted_requests(&mut requests, &scheduler, &ssd_lane, 0, 6);
+    push_weighted_requests(&mut requests, &scheduler, &hdd_lane, 1, 6);
+    for request in &mut requests {
+        assert!(poll_once(request.as_mut().unwrap().as_mut()).is_pending());
+    }
+    scheduler.barrier_for_test().await.unwrap();
+    drop(blockers);
+    scheduler.barrier_for_test().await.unwrap();
+
+    let active = take_ready_weighted_requests(&mut requests);
+    let mut active_by_lane = [0_usize; 2];
+    for (lane_index, _) in &active {
+        active_by_lane[*lane_index] += 1;
+    }
+    assert_eq!(active.len(), 6, "全局窗口应被 Ready 请求填满");
+    assert_eq!(
+        active_by_lane,
+        [5, 1],
+        "当前席位必须按配置中的 SSD/HDD 权重分配"
+    );
+
+    drop(requests);
+    drop(active);
+}
+
+#[tokio::test]
+async fn ready_disks_rotate_when_their_minimum_exceeds_global_seats() {
+    let mut config = DiskReadConfig::default();
+    config.ssd_threads_per_disk = 16;
+    config.unknown_threads_per_disk = 2;
+    config.total_threads = 2;
+    let scheduler = DiskReadScheduler::new(&config, 12).unwrap();
+    let lanes = [
+        weighted_lane(&[15], LocalDiskKind::Ssd, 16, 16),
+        weighted_lane(&[16], LocalDiskKind::Ssd, 16, 16),
+        weighted_lane(&[17], LocalDiskKind::Ssd, 16, 16),
+    ];
+    let mut blockers = Vec::with_capacity(2);
+    for _ in 0..2 {
+        blockers.push(
+            scheduler
+                .acquire_for_test(&[99], LocalDiskKind::Unknown, DiskReadClass::HashSequential)
+                .await
+                .unwrap(),
+        );
+    }
+
+    let mut requests = Vec::with_capacity(12);
+    for (lane_index, lane) in lanes.iter().enumerate() {
+        push_weighted_requests(&mut requests, &scheduler, lane, lane_index, 4);
+    }
+    for request in &mut requests {
+        assert!(poll_once(request.as_mut().unwrap().as_mut()).is_pending());
+    }
+    scheduler.barrier_for_test().await.unwrap();
+    drop(blockers);
+    scheduler.barrier_for_test().await.unwrap();
+
+    let mut active = take_ready_weighted_requests(&mut requests);
+    assert_eq!(active.len(), 2, "两个全局席位都应被使用");
+    assert_ne!(active[0].0, active[1].0, "首轮应先覆盖两块不同的 Ready 盘");
+    let first_two_lanes = [active[0].0, active[1].0];
+    let (_, released) = active.remove(0);
+    drop(released);
+    scheduler.barrier_for_test().await.unwrap();
+
+    let replacement = take_ready_weighted_requests(&mut requests);
+    assert_eq!(replacement.len(), 1, "释放一个席位后应立即轮转补位");
+    let mut first_three_lanes = vec![first_two_lanes[0], first_two_lanes[1], replacement[0].0];
+    first_three_lanes.sort_unstable();
+    first_three_lanes.dedup();
+    assert_eq!(
+        first_three_lanes.len(),
+        3,
+        "Ready 盘数量超过全局席位时应按完成边界轮转；首轮={first_two_lanes:?}，补位={}",
+        replacement[0].0
+    );
+
+    drop(requests);
+    drop(active);
+    drop(replacement);
 }
 
 #[tokio::test]
