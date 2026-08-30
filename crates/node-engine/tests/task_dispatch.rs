@@ -487,30 +487,28 @@ fn hdd_lane_with_limit_one_remains_serial() {
 }
 
 #[tokio::test]
-async fn scheduler_holds_sixth_independent_lane_on_shared_physical_disk() {
+async fn scheduler_grants_five_same_lane_identities_and_holds_sixth() {
     let mut config = dedup_core::DiskReadConfig::default();
     config.hdd_threads_per_disk = 5;
     config.total_threads = 5;
     let scheduler = DiskReadScheduler::new(&config, 5).unwrap();
-    let mut dispatchers = (0..6)
+    let provider = SchedulerTaskLanePermitProvider::new(scheduler);
+    let mut dispatcher = new_dispatcher(provider);
+    let task_lane = lane(&[27], LocalDiskKind::Hdd, 5, 1);
+    let rows = (0..6)
         .map(|index| {
-            let provider = SchedulerTaskLanePermitProvider::new(scheduler.clone());
-            let mut dispatcher = new_dispatcher(provider);
-            let task_lane = lane(&[27], LocalDiskKind::Hdd, 5, 1);
-            dispatcher.register_lane(&task_lane).unwrap();
-            dispatcher
-                .append_batch(
-                    &task_lane,
-                    std::slice::from_ref(&base_record(&format!("scheduler-{index}.bin"), None)),
-                )
-                .unwrap();
-            dispatcher.seal().unwrap();
-            dispatcher
+            base_record(
+                &format!("scheduler-{index}.bin"),
+                Some([0xa0 + index as u8; 16]),
+            )
         })
         .collect::<Vec<_>>();
+    dispatcher.register_lane(&task_lane).unwrap();
+    dispatcher.append_batch(&task_lane, &rows).unwrap();
+    dispatcher.seal().unwrap();
     let token = ReadCancellationToken::new();
     let mut active = Vec::new();
-    for dispatcher in dispatchers.iter_mut().take(5) {
+    for _ in 0..5 {
         active.push(
             dispatcher
                 .next(token.clone())
@@ -521,35 +519,93 @@ async fn scheduler_holds_sixth_independent_lane_on_shared_physical_disk() {
     }
     assert_eq!(active.len(), 5);
 
-    let waited = tokio::time::timeout(
-        Duration::from_millis(100),
-        dispatchers[5].next(token.clone()),
-    )
-    .await;
+    let waited =
+        tokio::time::timeout(Duration::from_millis(100), dispatcher.next(token.clone())).await;
     assert!(
         waited.is_err(),
-        "共享物理盘的第六个独立 lane 必须等待真实 scheduler 额度"
+        "同一物理盘第六身份必须等待真实 scheduler 与身份窗口额度"
     );
 
-    // 超时只会丢掉本次 poll；用取消令牌让 dispatcher 丢弃内部等待 future，保持 P。
-    token.cancel();
-    assert!(matches!(
-        dispatchers[5].next(token.clone()).await,
-        Err(TaskDispatchError::Read(ReadFailure::Cancelled))
-    ));
-    for (dispatcher, task) in dispatchers.iter_mut().take(5).zip(&active) {
-        dispatcher.mark_completed(&task.identity).unwrap();
-    }
-    drop(active);
+    let released = active.remove(0);
+    dispatcher.mark_completed(&released.identity).unwrap();
+    drop(released);
 
-    let sixth = dispatchers[5]
+    let sixth = dispatcher
         .next(ReadCancellationToken::new())
         .await
         .unwrap()
-        .expect("前五项释放后第六项应继续派发");
+        .expect("任一真实 permit 和身份窗口释放后第六项应继续派发");
     assert!(!sixth.is_continuation());
-    dispatchers[5].mark_completed(&sixth.identity).unwrap();
+    assert_eq!(sixth.record.item_id, rows[5].item_id);
+    for task in &active {
+        dispatcher.mark_completed(&task.identity).unwrap();
+    }
+    dispatcher.mark_completed(&sixth.identity).unwrap();
+    drop(active);
     drop(sixth);
+    dispatcher.discard().unwrap();
+}
+
+#[tokio::test]
+async fn ssd_and_hdd_lanes_expose_configured_five_to_one_window() {
+    let mut config = dedup_core::DiskReadConfig::default();
+    config.ssd_threads_per_disk = 5;
+    config.hdd_threads_per_disk = 1;
+    config.total_threads = 6;
+    let scheduler = DiskReadScheduler::new(&config, 6).unwrap();
+    let provider = SchedulerTaskLanePermitProvider::new(scheduler);
+    let mut dispatcher = new_dispatcher(provider);
+    let ssd_lane = lane(&[28], LocalDiskKind::Ssd, 5, 5);
+    let hdd_lane = lane(&[29], LocalDiskKind::Hdd, 1, 1);
+    let ssd_rows = (0..6)
+        .map(|index| {
+            base_record(
+                &format!("weighted-ssd-{index}.bin"),
+                Some([0xb0 + index as u8; 16]),
+            )
+        })
+        .collect::<Vec<_>>();
+    let hdd_rows = (0..6)
+        .map(|index| {
+            base_record(
+                &format!("weighted-hdd-{index}.bin"),
+                Some([0xc0 + index as u8; 16]),
+            )
+        })
+        .collect::<Vec<_>>();
+    dispatcher.register_lane(&ssd_lane).unwrap();
+    dispatcher.register_lane(&hdd_lane).unwrap();
+    dispatcher.append_batch(&ssd_lane, &ssd_rows).unwrap();
+    dispatcher.append_batch(&hdd_lane, &hdd_rows).unwrap();
+    dispatcher.seal().unwrap();
+
+    let token = ReadCancellationToken::new();
+    let mut active = Vec::new();
+    for _ in 0..config.total_threads {
+        active.push(
+            dispatcher
+                .next(token.clone())
+                .await
+                .unwrap()
+                .expect("两个物理盘应按冻结配置填满全局读取额度"),
+        );
+    }
+    let ssd_count = active
+        .iter()
+        .filter(|task| task.permit.physical_disk_id() == "PhysicalDisk28")
+        .count();
+    let hdd_count = active
+        .iter()
+        .filter(|task| task.permit.physical_disk_id() == "PhysicalDisk29")
+        .count();
+    assert_eq!(ssd_count, config.ssd_threads_per_disk);
+    assert_eq!(hdd_count, config.hdd_threads_per_disk);
+
+    for task in &active {
+        dispatcher.mark_completed(&task.identity).unwrap();
+    }
+    drop(active);
+    dispatcher.discard().unwrap();
 }
 
 #[test]
