@@ -118,7 +118,7 @@ Worker 终态先由 Node 完成必要 SQLite 当前事实写入，再把 TSV 行
 
 ## 8. 物理盘调度、Worker 和遥测
 
-任务分发时已冻结物理盘 lane，不把所有路径混在单一 FIFO 中。有效额度来自配置中的 `ssd_threads_per_disk`、`hdd_threads_per_disk`、`unknown_threads_per_disk`，并受 `total_threads`、Worker 数和全局磁盘许可共同限制。全局额度不足时按权重轮转/deficit 选择；老化保护让长期等待的 HDD 或其他 lane 获得机会，避免饥饿。比例由配置决定，不能把示例 `5:1` 写死。
+任务分发时已冻结物理盘 lane，不把所有路径混在单一 FIFO 中。有效额度来自配置中的 `ssd_threads_per_disk`、`hdd_threads_per_disk`、`unknown_threads_per_disk`，并受 `total_threads`、Worker 数和全局磁盘许可共同限制。多个物理盘同时 Ready 时，调度器优先选择当前 `active/configured_weight` 最小的盘：全局席位足够时每盘至少取得一个，再按配置权重补齐当前窗口；Ready 盘的名义总额大于全局席位时，在 permit 完成边界按约分后的权重和游标轮转。只有一盘 Ready 时允许其工作保持全局席位占满；另一盘稍后 Ready 时不抢占在途读取，而是在后续释放边界优先补足。老化保护继续保证低权重 HDD 或其他 lane 不饥饿。比例由配置决定，不能把示例 `5:1` 写死。
 
 Hash 和 Media 在同一调度 epoch 联合判断真实 slot、refill token、output credit、盘额度和全局额度；Media refill 不能绕过仍然可派发的 Hash。同一 lane 可在 SQLite ACK 前按本轮冻结的 `per_disk_limit` 交付多个精确任务身份；每个身份只由自己的 ACK 迁移 `P→C/F`，允许乱序 ACK，Media continuation 复用原身份且不新增 TSV 行。全局 permit、Hash/Media slot、Worker 槽位和持久化背压继续独立生效；任务完成、失败或取消后立即补位，不等待整批。读取调度器是文件读取许可和盘公平层，不等同于独立的计算线程池。
 

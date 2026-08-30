@@ -31,7 +31,9 @@
 
 - `read.total_threads` 全局硬上限；
 - SSD/HDD/Unknown 的逐盘硬上限；
-- 全局额度不足时的加权亏欠轮转；
+- 当前窗口先按 `active/configured_weight` 补足欠配额盘；
+- 全局席位足够时每个 Ready 盘至少一个席位；
+- Ready 盘名义总额超过全局席位时按约分权重、游标和完成边界轮转；
 - 低权重 lane 的老化保护；
 - Hash/Media 类别公平。
 
@@ -155,7 +157,7 @@ Dispatcher 不自己实现权重轮转，也不一次性发满某个 SSD。它�
 - Media：`TaskFileBaseCoordinatorOptions.worker_capacity` 和实际 Worker 槽位；
 - SQLite：有界 `BaseStoreActor` 队列和逐条 ACK。
 
-示例不是常量：若配置为 SSD 5、HDD 1、全局 6，两个 lane 持续 Ready 时允许形成 5 个 SSD 身份和 1 个 HDD 身份；若全局仅 3，则 scheduler 跨窗口累计保持 5:1 的配置权重，并由老化保护保证 HDD 有界等待。
+示例不是常量：若配置为 SSD 5、HDD 1、全局 6，两个 lane 持续 Ready 时形成 5 个 SSD 席位和 1 个 HDD 席位；若全局仅 3，则先保证两个 Ready 盘各一个，剩余席位给欠配额盘，并在完成边界继续加权轮转。若三块等权盘争两个全局席位，首轮覆盖两盘，任一 permit 释放后轮到尚未覆盖的第三盘。若只有一盘 Ready，它可以借满全部可用全局席位，后到盘从后续自然释放边界补足，不抢占在途读取。
 
 ## 8. 验收标准
 
@@ -166,7 +168,7 @@ Dispatcher 不自己实现权重轮转，也不一次性发满某个 SSD。它�
 3. 同 lane 多身份允许乱序 ACK，只有对应字节变为 `C/F`。
 4. continuation 与普通队首可共存，continuation 复用身份且不增加 TSV 行。
 5. admission 切换、permit 失败、取消和任务级错误都不串项、不泄漏 permit、不误写 `F`。
-6. SSD/HDD 双 lane 按配置值和全局额度运行，原有权重、老化和 Hash/Media 公平测试不退化。
+6. SSD/HDD 双 lane 按配置值和全局额度运行；等权双 SSD、配置 5:1、Ready 盘多于全局席位三种当前窗口行为均有真实 actor 测试，原有长期权重、老化和 Hash/Media 公平测试不退化。
 7. 真实基础流水线在同一物理盘上能在首个 SQLite ACK 前启动多个 Hash 或多个 Media Worker。
 8. 单次双物理盘真实媒体运行中，目标盘活动许可峰值不再被 Dispatcher 固定为 1；最终任务若未完成仍必须报告 FAIL/INCONCLUSIVE。
 
