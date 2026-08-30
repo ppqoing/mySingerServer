@@ -74,6 +74,66 @@ pub(super) enum TaskFileMediaTerminal {
     Failed(TaskFileMediaFailure),
 }
 
+/// 核心状态机接受事件后生成的 reporter 权威副作用。
+enum MediaReporterEffect {
+    /// 首条精确 Started 冻结并发布 Worker 槽位。
+    Started(RuntimeWorkerUpdate),
+    /// 匹配冻结槽位的合法阶段变化。
+    Phase {
+        /// Worker 槽位。
+        slot: u32,
+        /// 当前任务项身份。
+        item_id: String,
+        /// Worker 显式阶段。
+        phase: proto::RuntimeWorkerPhase,
+        /// Worker 请求耗时。
+        request_elapsed: Option<Duration>,
+    },
+    /// 首条匹配的源读取完成事件。
+    SourceReadComplete {
+        /// Worker 槽位。
+        slot: u32,
+        /// 当前任务项身份。
+        item_id: String,
+        /// Worker 请求耗时。
+        request_elapsed: Option<Duration>,
+    },
+    /// 核心确认成功的 Worker 终态。
+    Completed {
+        /// Worker 槽位；未收到 Started 时不伪造槽位。
+        slot: Option<u32>,
+        /// 当前任务项身份。
+        item_id: String,
+    },
+    /// 核心确认失败的 Worker 终态。
+    Failed {
+        /// Worker 槽位；未收到 Started 时只记录失败。
+        slot: Option<u32>,
+        /// 当前任务项身份。
+        item_id: String,
+        /// 运行任务失败投影。
+        failure: RuntimeFailureUpdate,
+    },
+}
+
+/// 一次核心事件判定；Ignored 事件同时没有 terminal 和 reporter 副作用。
+struct MediaEventDisposition {
+    /// 可交给持久化运行态的唯一终态。
+    terminal: Option<TaskFileMediaTerminal>,
+    /// 只由核心验证通过后生成的 reporter 副作用。
+    reporter_effect: Option<MediaReporterEffect>,
+}
+
+impl MediaEventDisposition {
+    /// 构造不改变任何权威状态的忽略结果。
+    const fn ignored() -> Self {
+        Self {
+            terminal: None,
+            reporter_effect: None,
+        }
+    }
+}
+
 /// Media Worker 的可逐事件推进运行态；读取 permit 仅在源文件读取结束后释放。
 pub(super) struct TaskFileMediaRuntime<P: TaskLanePermitProvider> {
     /// 已提交给 WorkerPool、尚未收到终态事件的媒体项。
@@ -124,19 +184,18 @@ impl<P: TaskLanePermitProvider> TaskFileMediaRuntime<P> {
         event: WorkerEvent,
         reporter: Option<&RuntimeTaskReporter>,
     ) -> Result<Option<TaskFileMediaTerminal>, String> {
-        if let Some(reporter) = reporter {
-            report_media_event(&event, reporter, &self.active).await;
+        let disposition = handle_media_event(event, &mut self.active)?;
+        if let (Some(reporter), Some(effect)) = (reporter, disposition.reporter_effect) {
+            report_media_effect(effect, reporter).await;
         }
-        handle_media_event(event, &mut self.active)
+        Ok(disposition.terminal)
     }
 
     /// 取消 Worker 并等待池内的退出与替换收束，再释放仍由活动项持有的 permit。
     pub(super) async fn cancel_and_drain(
         &mut self,
         worker_pool: &mut WorkerPool,
-        cancellation: &ReadCancellationToken,
     ) -> Result<(), String> {
-        cancellation.cancel();
         let run_ids = self
             .active
             .keys()
@@ -158,143 +217,43 @@ impl<P: TaskLanePermitProvider> TaskFileMediaRuntime<P> {
     }
 }
 
-/// 将匹配当前 Media 活动项的 Worker 事件投影到进程内运行任务。
-async fn report_media_event<P: TaskLanePermitProvider>(
-    event: &WorkerEvent,
-    reporter: &RuntimeTaskReporter,
-    active: &BTreeMap<TaskFileIdentity, ActiveMedia<P>>,
-) {
-    match event {
-        WorkerEvent::Started {
-            task_id,
-            item_id,
-            identity,
-            slot,
-            process_id,
-            cpu_weight,
-            decoder_threads,
-            ..
-        } => {
-            let Some(key) = find_active_identity(active, task_id, item_id) else {
-                return;
-            };
-            let Some(work) = active.get(&key) else {
-                return;
-            };
-            if !same_worker_identity(&work.worker_identity, identity, true) {
-                return;
-            }
-            let _ = reporter
-                .worker_started(RuntimeWorkerUpdate {
-                    slot: *slot,
-                    process_id: *process_id,
-                    item_id: item_id.clone(),
-                    stage: RuntimeStage::ComputeBaseFeatures,
-                    display_path: identity
-                        .display_path
-                        .as_path()
-                        .to_string_lossy()
-                        .into_owned(),
-                    physical_disk_id: identity.physical_disk_id.clone(),
-                    completed_files: 0,
-                    speed_per_second: 0.0,
-                    current_step: "等待 Worker 阶段事件".into(),
-                    cache_detail: String::new(),
-                    phase: None,
-                    cpu_weight: Some(*cpu_weight),
-                    decoder_threads: *decoder_threads,
-                })
-                .await;
+/// 把核心已经接受的权威副作用投影到进程内运行任务。
+async fn report_media_effect(effect: MediaReporterEffect, reporter: &RuntimeTaskReporter) {
+    match effect {
+        MediaReporterEffect::Started(worker) => {
+            let _ = reporter.worker_started(worker).await;
         }
-        WorkerEvent::PhaseChanged {
-            task_id,
-            item_id,
+        MediaReporterEffect::Phase {
             slot,
+            item_id,
             phase,
-            request_elapsed_us,
+            request_elapsed,
         } => {
-            let Some(key) = find_active_identity(active, task_id, item_id) else {
-                return;
-            };
-            if active
-                .get(&key)
-                .is_some_and(|work| work.worker_slot == Some(*slot))
-            {
-                let _ = reporter.worker_phase_nowait(
-                    *slot,
-                    item_id,
-                    *phase,
-                    request_elapsed_us.map(Duration::from_micros),
-                );
-            }
+            let _ = reporter.worker_phase_nowait(slot, &item_id, phase, request_elapsed);
         }
-        WorkerEvent::BaseSourceReadComplete {
-            task_id,
-            item_id,
+        MediaReporterEffect::SourceReadComplete {
             slot,
-            request_elapsed_us,
-        } => {
-            let Some(key) = find_active_identity(active, task_id, item_id) else {
-                return;
-            };
-            if active
-                .get(&key)
-                .is_some_and(|work| work.worker_slot == Some(*slot))
-            {
-                let _ = reporter.worker_source_read_complete_nowait(
-                    *slot,
-                    item_id,
-                    request_elapsed_us.map(Duration::from_micros),
-                );
-            }
-        }
-        WorkerEvent::Completed {
-            task_id, item_id, ..
-        } => {
-            let Some(key) = find_active_identity(active, task_id, item_id) else {
-                return;
-            };
-            if let Some(slot) = active.get(&key).and_then(|work| work.worker_slot) {
-                let _ = reporter.worker_completed(slot).await;
-                let _ = reporter.worker_released_nowait(slot, item_id);
-            }
-        }
-        WorkerEvent::Crashed {
-            task_id,
             item_id,
-            identity,
-            process_id,
-            exit_code,
-            message,
+            request_elapsed,
         } => {
-            let Some(key) = find_active_identity(active, task_id, item_id) else {
-                return;
-            };
-            let Some(work) = active.get(&key) else {
-                return;
-            };
-            if !same_worker_identity(&work.worker_identity, identity, false) {
-                return;
-            }
-            let _ = reporter.record_failure_nowait(RuntimeFailureUpdate {
-                stage: RuntimeStage::ComputeBaseFeatures,
-                display_path: identity
-                    .display_path
-                    .as_path()
-                    .to_string_lossy()
-                    .into_owned(),
-                message: format!(
-                    "Worker 崩溃: pid={process_id:?}, exit_code={exit_code:?}: {message}"
-                ),
-            });
-            if let Some(slot) = work.worker_slot {
-                let _ = reporter.worker_released_nowait(slot, item_id);
+            let _ = reporter.worker_source_read_complete_nowait(slot, &item_id, request_elapsed);
+        }
+        MediaReporterEffect::Completed { slot, item_id } => {
+            if let Some(slot) = slot {
+                let _ = reporter.worker_completed(slot).await;
+                let _ = reporter.worker_released_nowait(slot, &item_id);
             }
         }
-        WorkerEvent::Cancelled { .. }
-        | WorkerEvent::InfrastructureFailure { .. }
-        // Stage2SourceReadComplete 由后续 Stage2 taskless 流程消费，基础计算阶段只需保留 slot。
-        | WorkerEvent::Stage2SourceReadComplete { .. } => {}
+        MediaReporterEffect::Failed {
+            slot,
+            item_id,
+            failure,
+        } => {
+            let _ = reporter.record_failure_nowait(failure);
+            if let Some(slot) = slot {
+                let _ = reporter.worker_released_nowait(slot, &item_id);
+            }
+        }
     }
 }
 
@@ -408,45 +367,106 @@ where
 fn handle_media_event(
     event: WorkerEvent,
     active: &mut BTreeMap<TaskFileIdentity, ActiveMedia<impl TaskLanePermitProvider>>,
-) -> Result<Option<TaskFileMediaTerminal>, String> {
+) -> Result<MediaEventDisposition, String> {
     match event {
         WorkerEvent::Started {
             task_id,
             item_id,
             identity,
             slot,
+            process_id,
+            cpu_weight,
+            decoder_threads,
             ..
         } => {
             let Some(key) = find_active_identity(active, &task_id, &item_id) else {
-                return Ok(None);
+                return Ok(MediaEventDisposition::ignored());
             };
             let Some(work) = active.get_mut(&key) else {
-                return Ok(None);
+                return Ok(MediaEventDisposition::ignored());
             };
             if !same_worker_identity(&work.worker_identity, &identity, true) {
-                return Ok(None);
+                return Ok(MediaEventDisposition::ignored());
             }
             // 首条精确 Started 冻结 Worker 槽位；重复事件不能把后续源读取归属改写到别槽。
-            if work.worker_slot.is_none() {
-                work.worker_slot = Some(slot);
+            if work.worker_slot.is_some() {
+                return Ok(MediaEventDisposition::ignored());
             }
+            work.worker_slot = Some(slot);
+            return Ok(MediaEventDisposition {
+                terminal: None,
+                reporter_effect: Some(MediaReporterEffect::Started(RuntimeWorkerUpdate {
+                    slot,
+                    process_id,
+                    item_id,
+                    stage: RuntimeStage::ComputeBaseFeatures,
+                    display_path: identity
+                        .display_path
+                        .as_path()
+                        .to_string_lossy()
+                        .into_owned(),
+                    physical_disk_id: identity.physical_disk_id,
+                    completed_files: 0,
+                    speed_per_second: 0.0,
+                    current_step: "等待 Worker 阶段事件".into(),
+                    cache_detail: String::new(),
+                    phase: None,
+                    cpu_weight: Some(cpu_weight),
+                    decoder_threads,
+                })),
+            });
+        }
+        WorkerEvent::PhaseChanged {
+            task_id,
+            item_id,
+            slot,
+            phase,
+            request_elapsed_us,
+        } => {
+            let Some(key) = find_active_identity(active, &task_id, &item_id) else {
+                return Ok(MediaEventDisposition::ignored());
+            };
+            if !active
+                .get(&key)
+                .is_some_and(|work| work.worker_slot == Some(slot))
+            {
+                return Ok(MediaEventDisposition::ignored());
+            }
+            return Ok(MediaEventDisposition {
+                terminal: None,
+                reporter_effect: Some(MediaReporterEffect::Phase {
+                    slot,
+                    item_id,
+                    phase,
+                    request_elapsed: request_elapsed_us.map(Duration::from_micros),
+                }),
+            });
         }
         WorkerEvent::BaseSourceReadComplete {
             task_id,
             item_id,
             slot,
-            ..
+            request_elapsed_us,
         } => {
             let Some(key) = find_active_identity(active, &task_id, &item_id) else {
-                return Ok(None);
+                return Ok(MediaEventDisposition::ignored());
             };
             let Some(work) = active.get_mut(&key) else {
-                return Ok(None);
+                return Ok(MediaEventDisposition::ignored());
             };
-            if work.worker_slot == Some(slot) {
-                work.source_read_complete = true;
-                drop(work.permit.take());
+            if work.worker_slot != Some(slot) || work.source_read_complete {
+                return Ok(MediaEventDisposition::ignored());
             }
+            work.source_read_complete = true;
+            drop(work.permit.take());
+            return Ok(MediaEventDisposition {
+                terminal: None,
+                reporter_effect: Some(MediaReporterEffect::SourceReadComplete {
+                    slot,
+                    item_id,
+                    request_elapsed: request_elapsed_us.map(Duration::from_micros),
+                }),
+            });
         }
         WorkerEvent::Completed {
             task_id,
@@ -454,52 +474,96 @@ fn handle_media_event(
             response,
         } => {
             let Some(key) = find_active_identity(active, &task_id, &item_id) else {
-                return Ok(None);
+                return Ok(MediaEventDisposition::ignored());
             };
             let Some(work) = active.remove(&key) else {
-                return Ok(None);
+                return Ok(MediaEventDisposition::ignored());
             };
             let worker_slot = work.worker_slot;
             if !work.source_read_complete {
-                return Ok(Some(TaskFileMediaTerminal::Failed(TaskFileMediaFailure {
-                    identity: work.identity,
-                    record: work.record,
-                    message: "Worker Completed 前未收到 BaseSourceReadComplete".into(),
-                    worker_slot,
-                })));
+                let message = "Worker Completed 前未收到 BaseSourceReadComplete".to_owned();
+                let display_path = work
+                    .record
+                    .scanned
+                    .display_path
+                    .as_path()
+                    .to_string_lossy()
+                    .into_owned();
+                return Ok(MediaEventDisposition {
+                    terminal: Some(TaskFileMediaTerminal::Failed(TaskFileMediaFailure {
+                        identity: work.identity,
+                        record: work.record,
+                        message: message.clone(),
+                        worker_slot,
+                    })),
+                    reporter_effect: Some(MediaReporterEffect::Failed {
+                        slot: worker_slot,
+                        item_id,
+                        failure: RuntimeFailureUpdate {
+                            stage: RuntimeStage::ComputeBaseFeatures,
+                            display_path,
+                            message,
+                        },
+                    }),
+                });
             } else {
-                return Ok(Some(TaskFileMediaTerminal::Completed(TaskFileMediaCompleted {
-                    identity: work.identity,
-                    record: work.record,
-                    context: work.context,
-                    response,
-                    worker_slot,
-                })));
+                return Ok(MediaEventDisposition {
+                    terminal: Some(TaskFileMediaTerminal::Completed(TaskFileMediaCompleted {
+                        identity: work.identity,
+                        record: work.record,
+                        context: work.context,
+                        response,
+                        worker_slot,
+                    })),
+                    reporter_effect: Some(MediaReporterEffect::Completed {
+                        slot: worker_slot,
+                        item_id,
+                    }),
+                });
             }
         }
         WorkerEvent::Crashed {
             task_id,
             item_id,
             identity,
+            process_id,
+            exit_code,
             message,
-            ..
         } => {
             let Some(key) = find_active_identity(active, &task_id, &item_id) else {
-                return Ok(None);
+                return Ok(MediaEventDisposition::ignored());
             };
             let Some(work) = active.get(&key) else {
-                return Ok(None);
+                return Ok(MediaEventDisposition::ignored());
             };
             if !same_worker_identity(&work.worker_identity, &identity, false) {
-                return Ok(None);
+                return Ok(MediaEventDisposition::ignored());
             }
             let work = active.remove(&key).expect("上方已确认活动项存在");
-            return Ok(Some(TaskFileMediaTerminal::Failed(TaskFileMediaFailure {
-                identity: work.identity,
-                record: work.record,
-                message,
-                worker_slot: work.worker_slot,
-            })));
+            let worker_slot = work.worker_slot;
+            let reporter_message =
+                format!("Worker 崩溃: pid={process_id:?}, exit_code={exit_code:?}: {message}");
+            return Ok(MediaEventDisposition {
+                terminal: Some(TaskFileMediaTerminal::Failed(TaskFileMediaFailure {
+                    identity: work.identity,
+                    record: work.record,
+                    message,
+                    worker_slot,
+                })),
+                reporter_effect: Some(MediaReporterEffect::Failed {
+                    slot: worker_slot,
+                    item_id,
+                    failure: RuntimeFailureUpdate {
+                        stage: RuntimeStage::ComputeBaseFeatures,
+                        display_path: identity
+                            .display_path
+                            .as_path()
+                            .to_string_lossy()
+                            .into_owned(),
+                        message: reporter_message,
+                    },
+                }),
+            });
         }
         WorkerEvent::InfrastructureFailure { message } => {
             return Err(format!("Worker 基础设施失败: {message}"));
@@ -509,11 +573,10 @@ fn handle_media_event(
                 return Err("Media Worker 在非取消流程返回 Cancelled".into());
             }
         }
-        WorkerEvent::PhaseChanged { .. }
         // 当前基础媒体状态机不消费二筛源读取事件，事件本身已由 Pool 保持非终态所有权。
-        | WorkerEvent::Stage2SourceReadComplete { .. } => {}
+        WorkerEvent::Stage2SourceReadComplete { .. } => {}
     }
-    Ok(None)
+    Ok(MediaEventDisposition::ignored())
 }
 
 /// 按 Worker 事件的 run/item 找到当前活动身份。
@@ -581,6 +644,7 @@ mod tests {
     };
     use crate::{
         io::{DiskReadClass, ReadFailure},
+        runtime_tasks::{RuntimeTaskKind, RuntimeTaskRegistry},
         scan::TaskDiskLane,
         task_dispatch::{TaskLanePermitFuture, TaskLanePermitProvider},
         task_files::{TaskFileIdentity, TaskFileRecord, TaskWorkKind, TaskWorkMask},
@@ -592,6 +656,209 @@ mod tests {
     struct TrackedPermit {
         /// 当前仍存活的许可计数。
         live: Arc<AtomicIsize>,
+    }
+
+    /// reporter 必须只投影核心接受的 Started，并把核心判定的协议失败记录为失败。
+    #[tokio::test]
+    async fn media_reporter_projects_only_authoritative_started_and_failed_terminal() {
+        let live = Arc::new(AtomicIsize::new(1));
+        let (mut runtime, identity, worker_identity) = active_runtime(Arc::clone(&live));
+        let registry = RuntimeTaskRegistry::new();
+        let runtime_task_id = "media-authoritative-failure";
+        let reporter = registry
+            .begin_with_id(
+                runtime_task_id,
+                RuntimeTaskKind::BaseCompute,
+                MachineId::from_sha256([0x53; 32]),
+                "Media 权威事件",
+            )
+            .await;
+        let mut wrong_identity = worker_identity.clone();
+        wrong_identity.stage = "wrong-stage".into();
+
+        for (identity_value, slot) in [
+            (wrong_identity, 9),
+            (worker_identity.clone(), 3),
+            (worker_identity, 4),
+        ] {
+            runtime
+                .handle_event(
+                    WorkerEvent::Started {
+                        task_id: identity.run_id().into(),
+                        item_id: identity.item_id().to_string(),
+                        identity: identity_value,
+                        slot,
+                        process_id: Some(42),
+                        cpu_weight: 1,
+                        decoder_threads: Some(1),
+                        queue_wait_us: 0,
+                    },
+                    Some(&reporter),
+                )
+                .await
+                .unwrap();
+        }
+        runtime
+            .handle_event(
+                WorkerEvent::BaseSourceReadComplete {
+                    task_id: identity.run_id().into(),
+                    item_id: identity.item_id().to_string(),
+                    slot: 4,
+                    request_elapsed_us: Some(10),
+                },
+                Some(&reporter),
+            )
+            .await
+            .unwrap();
+        let terminal = runtime
+            .handle_event(
+                WorkerEvent::Completed {
+                    task_id: identity.run_id().into(),
+                    item_id: identity.item_id().to_string(),
+                    response: proto::WorkerEnvelope { payload: None },
+                },
+                Some(&reporter),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(terminal, Some(TaskFileMediaTerminal::Failed(_))));
+
+        let details = registry.details(runtime_task_id).await.unwrap();
+        assert_eq!(details.workers.len(), 1, "错误或重复 Started 不得新增 slot");
+        assert_eq!(details.workers[0].slot, 3, "首次权威 Started 必须冻结 slot");
+        assert_eq!(details.workers[0].completed_files, 0);
+        assert_eq!(details.failures.len(), 1, "核心判失败必须投影为失败");
+        assert!(
+            details.failures[0]
+                .message
+                .contains("Worker Completed 前未收到 BaseSourceReadComplete")
+        );
+
+        assert!(
+            runtime
+                .handle_event(
+                    WorkerEvent::Completed {
+                        task_id: identity.run_id().into(),
+                        item_id: identity.item_id().to_string(),
+                        response: proto::WorkerEnvelope { payload: None },
+                    },
+                    Some(&reporter),
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let duplicate = registry.details(runtime_task_id).await.unwrap();
+        assert_eq!(duplicate.workers.len(), 1);
+        assert_eq!(duplicate.workers[0].completed_files, 0);
+        assert_eq!(duplicate.failures.len(), 1, "重复 terminal 不得重复统计");
+    }
+
+    /// 错误/重复源读取和 terminal 不得污染 reporter，合法 Phase 与完成只投影一次。
+    #[tokio::test]
+    async fn media_reporter_ignores_invalid_source_and_duplicate_terminal_events() {
+        let live = Arc::new(AtomicIsize::new(1));
+        let (mut runtime, identity, worker_identity) = active_runtime(Arc::clone(&live));
+        let registry = RuntimeTaskRegistry::new();
+        let runtime_task_id = "media-authoritative-success";
+        let reporter = registry
+            .begin_with_id(
+                runtime_task_id,
+                RuntimeTaskKind::BaseCompute,
+                MachineId::from_sha256([0x54; 32]),
+                "Media 合法事件",
+            )
+            .await;
+        runtime
+            .handle_event(
+                WorkerEvent::Started {
+                    task_id: identity.run_id().into(),
+                    item_id: identity.item_id().to_string(),
+                    identity: worker_identity.clone(),
+                    slot: 3,
+                    process_id: Some(43),
+                    cpu_weight: 1,
+                    decoder_threads: Some(1),
+                    queue_wait_us: 0,
+                },
+                Some(&reporter),
+            )
+            .await
+            .unwrap();
+        for slot in [4, 3, 3] {
+            runtime
+                .handle_event(
+                    WorkerEvent::BaseSourceReadComplete {
+                        task_id: identity.run_id().into(),
+                        item_id: identity.item_id().to_string(),
+                        slot,
+                        request_elapsed_us: Some(10),
+                    },
+                    Some(&reporter),
+                )
+                .await
+                .unwrap();
+        }
+        for slot in [4, 3] {
+            runtime
+                .handle_event(
+                    WorkerEvent::PhaseChanged {
+                        task_id: identity.run_id().into(),
+                        item_id: identity.item_id().to_string(),
+                        slot,
+                        phase: proto::RuntimeWorkerPhase::RuntimeWorkerDecode,
+                        request_elapsed_us: Some(20),
+                    },
+                    Some(&reporter),
+                )
+                .await
+                .unwrap();
+        }
+        let terminal = runtime
+            .handle_event(
+                WorkerEvent::Completed {
+                    task_id: identity.run_id().into(),
+                    item_id: identity.item_id().to_string(),
+                    response: proto::WorkerEnvelope { payload: None },
+                },
+                Some(&reporter),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            terminal,
+            Some(TaskFileMediaTerminal::Completed(_))
+        ));
+
+        let mut crash_identity = worker_identity;
+        crash_identity.stage = "decoding".into();
+        assert!(
+            runtime
+                .handle_event(
+                    WorkerEvent::Crashed {
+                        task_id: identity.run_id().into(),
+                        item_id: identity.item_id().to_string(),
+                        identity: crash_identity,
+                        process_id: Some(43),
+                        exit_code: Some(1),
+                        message: "重复崩溃".into(),
+                    },
+                    Some(&reporter),
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let details = registry.details(runtime_task_id).await.unwrap();
+        assert_eq!(details.workers.len(), 1);
+        assert_eq!(details.workers[0].slot, 3);
+        assert_eq!(details.workers[0].completed_files, 1);
+        assert_eq!(
+            details.workers[0].phase,
+            Some(proto::RuntimeWorkerPhase::RuntimeWorkerIdle as i32)
+        );
+        assert!(details.failures.is_empty(), "重复 terminal 不得记录失败");
+        assert_eq!(live.load(Ordering::SeqCst), 0);
     }
 
     impl Drop for TrackedPermit {

@@ -374,6 +374,41 @@ mod tests {
         }
     }
 
+    /// 只门控指定物理盘 lane，用于把第二条读取精确停在 dispatcher permit future。
+    #[cfg(feature = "test-hooks")]
+    #[derive(Clone)]
+    struct GatedLaneProvider {
+        /// 需要等待测试放行的物理盘编号。
+        gated_disk: u32,
+        /// 已开始申请门控许可的持久计数。
+        entered: Arc<AtomicUsize>,
+        /// 放行门控许可的通知。
+        gate: Arc<Notify>,
+    }
+
+    #[cfg(feature = "test-hooks")]
+    impl TaskLanePermitProvider for GatedLaneProvider {
+        type Permit = TestPermit;
+
+        fn acquire(
+            &self,
+            lane: TaskDiskLane,
+            _class: DiskReadClass,
+            _cancellation: ReadCancellationToken,
+        ) -> TaskLanePermitFuture<Self::Permit> {
+            let gated = lane.physical_disk_numbers.contains(&self.gated_disk);
+            let entered = Arc::clone(&self.entered);
+            let gate = Arc::clone(&self.gate);
+            Box::pin(async move {
+                if gated {
+                    entered.fetch_add(1, Ordering::SeqCst);
+                    gate.notified().await;
+                }
+                Ok(TestPermit)
+            })
+        }
+    }
+
     #[derive(Clone, Default)]
     struct TestHashReader {
         results: Arc<BTreeMap<String, [u8; 16]>>,
@@ -699,6 +734,54 @@ mod tests {
         }
     }
 
+    /// 内部配置错误必须保留原始诊断，不能反向取消共享的用户 token。
+    #[tokio::test]
+    async fn infrastructure_error_preserves_user_cancellation_and_message() {
+        let root = tempfile::tempdir().unwrap();
+        let production = production(
+            root.path(),
+            &[input(
+                scanned(r"C:\invalid-capacity.bin", 10),
+                lane(6),
+                None,
+            )],
+        );
+        let store = NodeStore::open_in_memory(MachineId::from_sha256([0xA0; 32])).unwrap();
+        let (actor, handle, mut acknowledgements) =
+            crate::scan::base_persistence::BaseStoreActor::spawn(store, 1);
+        let (mut pool, _started, _controller) = WorkerPool::controlled_batch_for_test(1);
+        let cancellation = ReadCancellationToken::new();
+        let mut invalid_options = options(root.path());
+        invalid_options.hash_capacity = 0;
+
+        let error = match run_task_file_base_coordinator(
+            production,
+            TestHashReader::default(),
+            &mut pool,
+            &handle,
+            &mut acknowledgements,
+            invalid_options,
+            cancellation.clone(),
+        )
+        .await
+        {
+            Ok(_) => panic!("零 Hash 容量必须返回基础设施错误"),
+            Err(error) => error,
+        };
+
+        assert!(!cancellation.is_cancelled(), "内部错误不得取消用户 token");
+        assert!(!error.is_cancelled(), "协调器不得把内部错误标成取消");
+        assert!(
+            error.to_string().contains("基础 Hash 读取容量必须大于 0"),
+            "协调器必须保留原始错误消息"
+        );
+        let mut pending = error.into_pending();
+        pending.dispatcher.discard().unwrap();
+        assert!(pool.shutdown().await.is_ok());
+        drop(handle);
+        actor.finish().await.unwrap();
+    }
+
     /// 读取 lane 文件的终态字节，确认只有 ACK 后才从 P 迁移到 C/F。
     fn statuses<P: TaskLanePermitProvider>(
         dispatcher: &crate::task_dispatch::TaskFileDispatcher<P>,
@@ -799,6 +882,122 @@ mod tests {
         result.dispatcher.discard().unwrap();
         drop(handle);
         actor.finish().await.unwrap();
+    }
+
+    /// 一个 lane 的 SQLite ACK 在途时，另一 lane 已就绪的 Hash 仍必须继续推进。
+    #[cfg(feature = "test-hooks")]
+    #[tokio::test]
+    async fn other_lane_hash_continues_while_persist_ack_is_in_flight() {
+        let root = tempfile::tempdir().unwrap();
+        let media_md5 = [0xA3; 16];
+        let machine = MachineId::from_sha256([0xA4; 32]);
+        let mut store = NodeStore::open_in_memory(machine).unwrap();
+        let cached = seed_partial(
+            &mut store,
+            r"C:\ack-lane-a.bin",
+            media_md5,
+            10,
+            MediaKind::Image,
+        );
+        let hash_calls = Arc::new(AtomicUsize::new(0));
+        let permit_entered = Arc::new(AtomicUsize::new(0));
+        let permit_gate = Arc::new(Notify::new());
+        let provider = GatedLaneProvider {
+            gated_disk: 8,
+            entered: Arc::clone(&permit_entered),
+            gate: Arc::clone(&permit_gate),
+        };
+        let files = TransientTaskFileSet::create(root.path(), RUN_ID).unwrap();
+        let mut producer = BaseTaskProducer::new(TaskFileDispatcher::new(files, provider));
+        producer
+            .append_batch(&[
+                input(scanned(r"C:\ack-lane-a.bin", 10), lane(7), Some(cached)),
+                input(scanned(r"C:\ack-lane-b.bin", 10), lane(8), None),
+            ])
+            .unwrap();
+        let production = producer.seal().unwrap();
+        let reader = TestHashReader {
+            // 空结果让 lane B 在真实 Hash 读取入口计数后返回单文件失败，
+            // 避免测试专用 SQLite gate 同时阻塞同步 ContentKey 查询。
+            results: Arc::new(BTreeMap::new()),
+            calls: Arc::clone(&hash_calls),
+        };
+        let (persist_control, persist_waiter) =
+            crate::scan::base_persistence::BasePersistTestController::new();
+        let (actor, handle, mut acknowledgements) =
+            crate::scan::base_persistence::BaseStoreActor::spawn_with_first_persist_waiter(
+                store,
+                2,
+                persist_waiter,
+            );
+        let (mut pool, mut started, controller) = WorkerPool::controlled_batch_for_test(1);
+        let handle_for_run = handle.clone();
+        let run_root = root.path().to_path_buf();
+        let cancellation = ReadCancellationToken::new();
+        let cancellation_for_run = cancellation.clone();
+        let join = tokio::spawn(async move {
+            let result = run_task_file_base_coordinator(
+                production,
+                reader,
+                &mut pool,
+                &handle_for_run,
+                &mut acknowledgements,
+                options(&run_root),
+                cancellation_for_run,
+            )
+            .await;
+            let shutdown = pool.shutdown().await;
+            (result, shutdown)
+        });
+
+        let (task_id, item_id) = tokio::time::timeout(Duration::from_secs(1), started.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while permit_entered.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("lane B 的 permit 请求必须进入 dispatcher");
+        controller
+            .base_source_read_complete(task_id.clone(), item_id.clone())
+            .await;
+        controller
+            .complete_base(task_id, item_id, media_md5, image_output())
+            .await;
+        persist_control.wait_until_entered().await;
+        permit_gate.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while hash_calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("lane A ACK 在途时 lane B Hash 必须继续");
+        assert_eq!(hash_calls.load(Ordering::SeqCst), 1);
+        // 已经证明跨 lane 推进后，用真实用户取消收束测试，不额外依赖第二个 Worker 终态。
+        cancellation.cancel();
+        persist_control.release();
+        let (result, shutdown) = tokio::time::timeout(Duration::from_secs(2), join)
+            .await
+            .expect("跨 lane ACK 测试必须在两秒内收束")
+            .unwrap();
+        assert!(shutdown.is_ok());
+        let error = match result {
+            Ok(_) => panic!("外部取消必须终止测试协调器"),
+            Err(error) => error,
+        };
+        assert!(error.is_cancelled());
+        let mut pending = error.into_pending();
+        pending.dispatcher.discard().unwrap();
+        drop(handle);
+        tokio::time::timeout(Duration::from_secs(2), actor.finish())
+            .await
+            .expect("SQLite actor 必须在两秒内收束")
+            .unwrap();
     }
 
     /// 首个 Hash miss 必须在同窗口后续 Hash 完成前进入 Worker，避免 Hash 全批屏障。

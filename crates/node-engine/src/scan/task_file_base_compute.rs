@@ -92,12 +92,7 @@ impl TaskFileHashRuntime {
     }
 
     /// 启动一个已领取的 Hash 读取，并把读取 permit 的释放限制在 future 内。
-    pub(super) fn spawn<P, H>(
-        &mut self,
-        task: DispatchedTask<P>,
-        reader: H,
-        cancellation: ReadCancellationToken,
-    ) -> Result<(), String>
+    pub(super) fn spawn<P, H>(&mut self, task: DispatchedTask<P>, reader: H) -> Result<(), String>
     where
         P: Send + 'static,
         H: HashPermitReader<Permit = P>,
@@ -114,6 +109,8 @@ impl TaskFileHashRuntime {
         let identity = task.identity;
         let record = task.record;
         let scanned = record.scanned.clone();
+        // 每条 Hash 读取使用内部 token；清理只能取消自身 owner，不能改写用户共享 token。
+        let cancellation = ReadCancellationToken::new();
         self.cancellations.insert(sequence, cancellation.clone());
         self.reads.spawn(async move {
             let result = reader
@@ -345,7 +342,6 @@ mod tests {
                     TestPermit,
                 ),
                 reader.clone(),
-                ReadCancellationToken::new(),
             )
             .unwrap();
         runtime
@@ -357,7 +353,6 @@ mod tests {
                     TestPermit,
                 ),
                 reader,
-                ReadCancellationToken::new(),
             )
             .unwrap();
 
@@ -387,7 +382,6 @@ mod tests {
                     },
                 ),
                 NeverCancelsHashReader,
-                ReadCancellationToken::new(),
             )
             .unwrap();
         timeout(Duration::from_millis(100), runtime.cancel_and_join())

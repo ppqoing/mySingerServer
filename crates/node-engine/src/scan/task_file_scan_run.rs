@@ -886,6 +886,73 @@ mod tests {
         );
     }
 
+    /// 协调器内部错误必须由扫描 runner 保留为 Stage1，而不是伪装成用户取消。
+    #[tokio::test]
+    async fn infrastructure_error_reaches_scan_runner_without_cancel_mapping() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("node.db");
+        let runtime = directory.path().join("runtime");
+        let contacts = directory.path().join("contact-sheets");
+        std::fs::create_dir_all(&contacts).unwrap();
+        let machine = MachineId::from_sha256([0x79; 32]);
+        let store = NodeStore::open(&database, machine).unwrap();
+        let task_id = TaskId::new();
+        let cancellation = ReadCancellationToken::new();
+        let (mut worker_pool, mut started, _controller) = WorkerPool::controlled_batch_for_test(1);
+
+        let error = run_task_file_scan(
+            store,
+            &mut worker_pool,
+            EmptyPermitProvider,
+            NeverHashReader,
+            DisabledRemoteFeatureCache,
+            TaskFileScanRunOptions {
+                task_id,
+                roots: vec![NormalizedPath::new(r"C:\media").unwrap()],
+                planned: vec![PlannedScannedPath {
+                    scanned: ScannedPath::new(
+                        NormalizedPath::new(r"C:\media\invalid-capacity.bin").unwrap(),
+                        DisplayPath::new(r"C:\media\invalid-capacity.bin").unwrap(),
+                        48,
+                    ),
+                    lane: TaskDiskLane {
+                        physical_disk_id: PhysicalDiskId::from_disk_numbers([7]).unwrap(),
+                        physical_disk_numbers: vec![7],
+                        disk_kind: LocalDiskKind::Hdd,
+                        configured_weight: 1,
+                        per_disk_limit: 1,
+                    },
+                }],
+                runtime_root: runtime.clone(),
+                force_recompute: false,
+                coordinator: TaskFileBaseCoordinatorOptions {
+                    hash_capacity: 0,
+                    worker_capacity: 1,
+                    read_config: DiskReadConfig::default(),
+                    persistence: TaskFileMediaPersistenceOptions {
+                        contact_sheet_root: contacts,
+                        artifact_registry: None,
+                        disk_full_cleaner: None,
+                    },
+                },
+                persist_capacity: 1,
+                now_ms: 100,
+                remote_available: false,
+                #[cfg(feature = "test-hooks")]
+                first_persist_waiter: None,
+            },
+            cancellation.clone(),
+        )
+        .await
+        .expect_err("零 Hash 容量必须到达 scan runner");
+
+        assert!(!cancellation.is_cancelled(), "内部错误不得取消用户 token");
+        assert!(matches!(error, crate::scan::ScanError::Stage1(_)));
+        assert!(error.to_string().contains("基础 Hash 读取容量必须大于 0"));
+        assert!(started.try_recv().is_err());
+        assert!(!runtime.join(task_id.as_uuid().to_string()).exists());
+    }
+
     /// 本轮见到但计算失败的旧活动文件仍保持活动；成功邻项进入当前进程快照。
     #[test]
     fn seen_file_failure_stays_active_while_successful_neighbor_finalizes() {

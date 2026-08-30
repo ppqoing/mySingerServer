@@ -147,7 +147,6 @@ where
         };
 
         tokio::select! {
-            biased;
             ack = acknowledgements.recv(), if persist.has_in_flight() => {
                 match ack {
                     Some(ack) => {
@@ -230,7 +229,7 @@ where
                     }
                 }
             }
-            dispatch = pending.dispatcher.next_with_admission(cancellation.clone(), admission), if persist.is_empty() && dispatch_ready => {
+            dispatch = pending.dispatcher.next_with_admission(cancellation.clone(), admission), if dispatch_ready => {
                 match dispatch {
                     Ok(TaskDispatchPoll::Task(task)) => {
                         let identity = task.identity.clone();
@@ -249,7 +248,7 @@ where
                                     break;
                                 }
                                 pending.remaining_hash_rows -= 1;
-                                if let Err(message) = hash.spawn(task, reader.clone(), cancellation.clone()) {
+                                if let Err(message) = hash.spawn(task, reader.clone()) {
                                     let _ = pending.dispatcher.abandon_in_flight(&identity);
                                     failure = Some(message);
                                     break;
@@ -301,7 +300,6 @@ where
             &mut remote_lookups,
             worker_pool,
             &mut persist,
-            &cancellation,
         )
         .await;
         return Err(stream_error(
@@ -517,14 +515,12 @@ async fn cleanup_stream<P: TaskLanePermitProvider>(
     remote_lookups: &mut JoinSet<RemoteLookupOutput>,
     worker_pool: &mut WorkerPool,
     persist: &mut TaskFilePersistRuntime,
-    cancellation: &ReadCancellationToken,
 ) -> Vec<String> {
     let mut diagnostics = Vec::new();
-    cancellation.cancel();
     hash.cancel_and_join().await;
     remote_lookups.abort_all();
     while remote_lookups.join_next().await.is_some() {}
-    if let Err(message) = media.cancel_and_drain(worker_pool, cancellation).await {
+    if let Err(message) = media.cancel_and_drain(worker_pool).await {
         diagnostics.push(message);
     }
     persist.drop_unacknowledged();
@@ -1245,6 +1241,7 @@ mod tests {
         stream_options.hash_capacity = 3;
         let mut remote_available = false;
         let mut warning = None;
+        let cancellation = ReadCancellationToken::new();
         let result = tokio::time::timeout(
             Duration::from_secs(2),
             run_task_file_base_stream(
@@ -1254,7 +1251,7 @@ mod tests {
                 &handle,
                 &mut acknowledgements,
                 &stream_options,
-                ReadCancellationToken::new(),
+                cancellation.clone(),
                 Arc::new(crate::DisabledRemoteFeatureCache),
                 &mut remote_available,
                 &mut warning,
@@ -1267,6 +1264,14 @@ mod tests {
             Ok(_) => panic!("第三次许可失败必须返回任务级错误"),
             Err(error) => error,
         };
+        assert!(
+            !cancellation.is_cancelled(),
+            "dispatcher 内部错误不得冒充用户取消"
+        );
+        assert!(
+            error.to_string().contains("测试 dispatcher 读取许可失败"),
+            "必须保留首个 dispatcher 原始错误"
+        );
         assert!(entered.load(Ordering::SeqCst) <= 2);
         assert_eq!(active.load(Ordering::SeqCst), 0, "Hash permit 必须全部释放");
         let mut pending = error.into_pending();
