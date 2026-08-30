@@ -115,18 +115,22 @@ Dispatcher 多在途实现 revision：`f91feb85ad7e5943bba5643250736e7450d833fb`
 - 两盘都有等待项，但先到且读取较慢的 PhysicalDisk2 已持有大量非抢占 permit，PhysicalDisk1 后到时只能等待自然释放，`active/weight` 只能约束“下一次授予”，不能约束当前任务的固定盘间席位；
 - 确认问题后只停止精确 runtime client，harness 正常清理，外层退出码为 0；`run_status=FAIL`、客户端码 `-1`、结果摘要 `INCONCLUSIVE`；媒体前后联合 SHA-256 均为 `3302f70759eb894e2c456913fc7668be9001bd24f0dcf5060081babd47ee30eb`。该轮不是验收通过证据。
 
-本次修复新增每个 Dispatcher 独立的 `DiskReadLaneGroup`。只有真实任务 TSV lane 登记；任务组总席位为 `min(total_threads, Worker 数)`，每盘先给 1，再按配置权重和逐盘硬上限分配剩余席位。登记盘在短暂无 waiter 时仍保留目标，先到盘不能借满；盘终态注销后剩余盘重新分配。已发 permit 不抢占，Hash/Media 公平、老化和全局/逐盘硬上限仍由原 scheduler actor 维护。
+本次修复新增每个 Dispatcher 独立的 `DiskReadLaneGroup`。只有真实任务 TSV lane 登记；任务组总席位为 `total_threads`，每盘先给 1，再按配置权重和逐盘硬上限分配剩余席位。Worker、Hash 和 Media 槽位由流水线独立限制，不反向截断读取并行。登记盘在短暂无 waiter 时仍保留目标，先到盘不能借满；盘终态注销后剩余盘重新分配。已发 permit 不抢占，Hash/Media 公平、老化和全局/逐盘硬上限仍由原 scheduler actor 维护。
 
 新增行为证据：
 
 1. 两块等权 SSD、任务组 12：第二盘的 12 个请求先到时只交付 6 个，第一盘后到立即交付保留的 6 个；
 2. SSD/HDD `5:1`、任务组 6：先到 SSD 只能交付 5 个，HDD 保留 1 个；
-3. 读取线程 12、Worker 6、两块等权盘：每盘目标 3；
+3. 读取线程 12、Worker 6、两块等权盘：读取目标仍为每盘 6，Worker/Hash/Media 容量独立门控；
 4. 三块等权盘争两个席位：每次释放边界轮转覆盖第三盘；
 5. 一个盘终态注销后，其已释放席位立即重新分配给剩余盘；
 6. 真实 `TaskFileDispatcher + DiskReadScheduler` 首个 12 项窗口为 `[6,6]`。
 
-当前代码验证结果：DiskReadScheduler 49/49 PASS，TaskFileDispatcher 36/36 PASS；NodeEngine `--features test-hooks --all-targets` 退出码 0，其中库测试 160/160、基础计算流水线 60/60，固定 bench `elapsed_ms=127.629` 且 `persisted_completed=true`；Worker 进程协议输出 `WORKER_PROTOCOL_PROCESS_PASS`；Desktop Core 运行时验收协议 23/23、Desktop UI 绑定契约 15/15。格式检查和 `git diff --check` 均通过。候选包、双盘真实媒体终态和最终只读审查仍按下节门禁执行。
+首次提交后的 5.6 Sol Max 只读审查发现两个有效生命周期缺口：首次 grouped acquire 前没有结构性冻结物理盘集合；Dispatcher Drop 清理任务组早于关闭 pending 许可 future。对应旧实现行为测试分别证明晚登记新盘会被接受、清理回调能观察到未关闭 future。修复后，Dispatcher 在 `seal` 或首个许可 future 创建前冻结完整 lane 集合，冻结后新增盘返回明确错误；Drop 先关闭 pending/continuation/publication future，再清任务组并触发最终唤醒。
+
+审查同时建议把任务组读取席位限制为 `min(total_threads, Worker 数)`。真实流水线回归证明该建议与现有资源所有权冲突：Worker=1、读取线程=3 时需要允许三个 Hash 读取并发；同盘 Hash/Media 也必须能同时占用两个独立读取许可。因此保留读取总预算 `total_threads`，Worker、Hash、Media 槽位继续独立门控。新增行为测试确认 Worker 6 不会把等权双盘读取目标从 6 错降为 3，Worker 2 也不会阻止三块盘各取得一个仍在全局读取预算内的许可；当真实盘数超过 `total_threads` 时仍由既有权重游标和老化保护轮转。
+
+最终代码验证结果：DiskReadScheduler 50/50 PASS，TaskFileDispatcher 39/39 PASS；NodeEngine `--features test-hooks --all-targets` 退出码 0，其中库测试 160/160、基础计算流水线 60/60，固定 bench `elapsed_ms=128.061` 且 `persisted_completed=true`；Worker 进程协议输出 `WORKER_PROTOCOL_PROCESS_PASS`；Desktop Core 运行时验收协议 23/23、Desktop UI 绑定契约 15/15。格式检查和 `git diff --check` 均通过。候选包、双盘真实媒体终态和最终只读审查仍按下节门禁执行。
 
 ## 8. 待完成门禁
 

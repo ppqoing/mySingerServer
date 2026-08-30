@@ -158,9 +158,11 @@ Dispatcher 不自己实现权重轮转，也不一次性发满某个 SSD。它�
 - Media：`TaskFileBaseCoordinatorOptions.worker_capacity` 和实际 Worker 槽位；
 - SQLite：有界 `BaseStoreActor` 队列和逐条 ACK。
 
-Dispatcher 为每次运行创建独立 `DiskReadLaneGroup`。只有已经确认存在真实缺失计算项并写入 TSV 的 lane 才登记；缓存完整命中不会创建任务行，也不会占计算席位。任务组总席位取 `total_threads` 与实际 Worker 数中的较小值。每个登记盘先取得至少 1 个逻辑席位，再按 `configured_weight` 的 `allocated/weight` 压力分配剩余席位，同时不越过该盘 `per_disk_limit`。
+Dispatcher 为每次运行创建独立 `DiskReadLaneGroup`。只有已经确认存在真实缺失计算项并写入 TSV 的 lane 才登记；缓存完整命中不会创建任务行，也不会占计算席位。任务组总席位取 `total_threads`；Worker、Hash 和 Media 槽位由流水线独立限制，不能反向截断读取并行。每个登记盘先取得至少 1 个逻辑席位，再按 `configured_weight` 的 `allocated/weight` 压力分配剩余席位，同时不越过该盘 `per_disk_limit`。
 
 示例不是常量：SSD 权重 5、HDD 权重 1、任务组总席位 6 时固定目标为 5:1；总席位 3 时为 2:1；两块等权 SSD、全局 12 时为 6:6。已登记盘即使在事件泵的短暂间隙尚未建立 waiter，也保留其目标，先到盘不能借走这部分席位。已发 permit 不抢占；后到请求直接使用保留席位。某盘全部任务行终态后立即从任务组注销，剩余盘重新计算目标并利用后续释放的席位。
+
+任务盘集合必须在 `seal` 或首个 grouped permit future 创建前冻结；冻结后新增物理盘返回明确输入错误，不能静默改变已分配目标。Dispatcher 提前退出时先丢弃全部 pending/continuation/publication future，再清任务组并唤醒 scheduler，避免已关闭接收端遗留请求槽。
 
 这里的“计算线程分配”是当前任务的读取/计算席位，不是额外创建一组 OS 线程。若三块等权盘争两个任务组席位，每盘逻辑目标仍为 1，但全局硬上限只允许两盘同时执行；任一 permit 释放后由权重游标和老化保护轮到第三盘。这样低权重盘不会饥饿，高权重盘按配置取得更多累计机会，也不会因 waiter 创建时序长期形成 `0:N`。
 
@@ -173,7 +175,7 @@ Dispatcher 为每次运行创建独立 `DiskReadLaneGroup`。只有已经确认�
 3. 同 lane 多身份允许乱序 ACK，只有对应字节变为 `C/F`。
 4. continuation 与普通队首可共存，continuation 复用身份且不增加 TSV 行。
 5. admission 切换、permit 失败、取消和任务级错误都不串项、不泄漏 permit、不误写 `F`。
-6. SSD/HDD 双 lane 按配置值和任务组总席位运行；等权双 SSD 的后到请求、配置 5:1、Worker 少于读取线程、登记盘多于任务组席位、完成盘注销后重分配均有真实 actor 测试，原有长期权重、老化和 Hash/Media 公平测试不退化。
+6. SSD/HDD 双 lane 按配置值和任务组总席位运行；等权双 SSD 的后到请求、配置 5:1、Worker 少于读取线程但不截断读取并行、登记盘多于任务组席位、完成盘注销后重分配均有真实 actor 测试，原有长期权重、老化和 Hash/Media 公平测试不退化。
 7. 真实基础流水线在同一物理盘上能在首个 SQLite ACK 前启动多个 Hash 或多个 Media Worker。
 8. Dispatcher 交付当前项时，同盘下一条请求在返回事件泵前已经创建并首轮轮询；关闭该类别 admission 后，预热请求不得继续持有许可。
 9. 单次双物理盘真实媒体运行中，目标盘活动许可峰值不再被 Dispatcher 固定为 1，也不得因 lane 请求补位空窗长期形成 `0:N`；最终任务若未完成仍必须报告 FAIL/INCONCLUSIVE。

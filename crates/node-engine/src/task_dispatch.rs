@@ -43,6 +43,11 @@ pub trait TaskLanePermitProvider: Clone + Send + Sync + 'static {
         Ok(())
     }
 
+    /// 冻结首次许可申请使用的完整物理盘集合；之后不得新增 lane。
+    fn freeze_task_lanes(&self) -> io::Result<()> {
+        Ok(())
+    }
+
     /// 一条 lane 已经无任务、无等待和无 dispatcher 在途身份时释放其权重席位。
     fn unregister_task_lane(&self, _lane: &TaskDiskLane) -> io::Result<()> {
         Ok(())
@@ -258,6 +263,8 @@ pub struct TaskFileDispatcher<Provider: TaskLanePermitProvider> {
     publication_wait: Option<Pin<Box<dyn Future<Output = u64> + Send>>>,
     /// 已登记到许可提供者且尚未达到真实终态的任务 lane。
     provider_lanes: BTreeMap<String, TaskDiskLane>,
+    /// 首次许可申请或 seal 已冻结任务物理盘集合。
+    provider_lanes_frozen: bool,
 }
 
 impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
@@ -276,6 +283,7 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
             observed_epoch,
             publication_wait: None,
             provider_lanes: BTreeMap::new(),
+            provider_lanes_frozen: false,
         }
     }
 
@@ -303,6 +311,7 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
         for lane in &lanes {
             self.ensure_provider_lane(lane)?;
         }
+        self.freeze_provider_lanes()?;
         self.files.seal()?;
         self.retire_terminal_lanes()
     }
@@ -504,9 +513,25 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
         if self.provider_lanes.contains_key(&key) {
             return Ok(());
         }
+        if self.provider_lanes_frozen {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "任务物理盘集合冻结后不能新增 lane",
+            ));
+        }
         self.provider
             .configure_task_lanes(std::slice::from_ref(lane))?;
         self.provider_lanes.insert(key, lane.clone());
+        Ok(())
+    }
+
+    /// 在创建首个惰性许可 future 前冻结全部已登记 lane，关闭晚登记导致的首窗偏斜。
+    fn freeze_provider_lanes(&mut self) -> io::Result<()> {
+        if self.provider_lanes_frozen {
+            return Ok(());
+        }
+        self.provider.freeze_task_lanes()?;
+        self.provider_lanes_frozen = true;
         Ok(())
     }
 
@@ -738,6 +763,7 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
             if !admission.allows(class) {
                 continue;
             }
+            self.freeze_provider_lanes()?;
             let future = self
                 .provider
                 .acquire(lane.clone(), class, cancellation.clone());
@@ -936,6 +962,12 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
 impl<Provider: TaskLanePermitProvider> Drop for TaskFileDispatcher<Provider> {
     /// 无论正常完成还是上层提前返回，都不能让任务级磁盘席位影响下一次运行。
     fn drop(&mut self) {
+        // 先关闭 oneshot receiver/许可 future，再清任务组并发出最后一次 notify；否则
+        // actor 可能先消费 clear 唤醒后继续睡眠，让旧 waiter 永久占住请求槽。
+        self.pending.clear();
+        self.continuations.clear();
+        self.continuation_claimed.clear();
+        self.publication_wait = None;
         self.provider.clear_task_lanes();
     }
 }
@@ -993,6 +1025,14 @@ impl TaskLanePermitProvider for SchedulerTaskLanePermitProvider {
                 .register(to_disk_read_lane(lane))
                 .map_err(io::Error::other)?;
         }
+        Ok(())
+    }
+
+    fn freeze_task_lanes(&self) -> io::Result<()> {
+        let Some(group) = &self.lane_group else {
+            return Err(io::Error::other("任务 dispatcher 未创建物理盘配额组"));
+        };
+        group.freeze();
         Ok(())
     }
 

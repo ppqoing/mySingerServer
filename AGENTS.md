@@ -118,7 +118,7 @@ Worker 终态先由 Node 完成必要 SQLite 当前事实写入，再把 TSV 行
 
 ## 8. 物理盘调度、Worker 和遥测
 
-任务分发时已冻结物理盘 lane，不把所有路径混在单一 FIFO 中。只有真正写入任务 TSV 的物理盘进入本次 `DiskReadLaneGroup`；缓存完整命中不登记计算席位。任务组总席位取 `total_threads` 与实际 Worker 数中的较小值，每个任务盘先取得至少 1 个逻辑席位，再按配置中的 `ssd_threads_per_disk`、`hdd_threads_per_disk`、`unknown_threads_per_disk` 权重分配剩余席位，并继续受逐盘硬上限和全局磁盘许可约束。已经登记的盘即使暂时尚未建立 waiter，也保留其本轮目标，禁止先到慢盘借满全部非抢占许可；任务盘全部行终态后立即注销，释放席位重新分给剩余盘。盘数大于任务组总席位时，每盘逻辑目标仍为 1，实际在 permit 完成边界按约分权重和游标轮转。老化保护继续保证低权重 HDD 或其他 lane 不饥饿，比例由配置决定，不能把示例 `5:1` 写死。
+任务分发时已冻结物理盘 lane，不把所有路径混在单一 FIFO 中。只有真正写入任务 TSV 的物理盘进入本次 `DiskReadLaneGroup`；缓存完整命中不登记计算席位。任务组总席位取 `total_threads`，每个任务盘先取得至少 1 个逻辑席位，再按配置中的 `ssd_threads_per_disk`、`hdd_threads_per_disk`、`unknown_threads_per_disk` 权重分配剩余席位，并继续受逐盘硬上限和全局磁盘许可约束；Worker、Hash 和 Media 槽位由流水线独立限制，不能反向截断读取并行。已经登记的盘即使暂时尚未建立 waiter，也保留其本轮目标，禁止先到慢盘借满全部非抢占许可；任务盘全部行终态后立即注销，释放席位重新分给剩余盘。盘数大于任务组总席位时，每盘逻辑目标仍为 1，实际在 permit 完成边界按约分权重和游标轮转。老化保护继续保证低权重 HDD 或其他 lane 不饥饿，比例由配置决定，不能把示例 `5:1` 写死。
 
 Hash 和 Media 在同一调度 epoch 联合判断真实 slot、refill token、output credit、盘额度和全局额度；Media refill 不能绕过仍然可派发的 Hash。同一 lane 可在 SQLite ACK 前按本轮冻结的 `per_disk_limit` 交付多个精确任务身份；每个身份只由自己的 ACK 迁移 `P→C/F`，允许乱序 ACK，Media continuation 复用原身份且不新增 TSV 行。Dispatcher 交付当前项前，只为刚交付 lane 创建并首轮轮询下一许可请求；若对应 Hash/Media/Worker 槽位已满则不得预热或继续持有许可，避免事件泵空窗造成另一盘独占，也避免隐藏读取越过阶段容量。全局 permit、Hash/Media slot、Worker 槽位和持久化背压继续独立生效；任务完成、失败或取消后立即补位，不等待整批。读取调度器是文件读取许可和盘公平层，不等同于独立的计算线程池。
 

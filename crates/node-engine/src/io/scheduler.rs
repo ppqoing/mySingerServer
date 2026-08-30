@@ -50,8 +50,10 @@ struct DiskReadLaneGroupState {
     lanes: BTreeMap<DiskKey, RegisteredGroupLane>,
     /// 每次 lane 集合变化时一次计算的静态目标，许可热路径只做 O(1) 查询。
     targets: BTreeMap<DiskKey, usize>,
-    /// 全局读取线程与实际 Worker 数中的较小值。
+    /// 当前任务可使用的全局读取席位数。
     seat_budget: usize,
+    /// 首次 grouped acquire 前冻结；冻结后不再允许新增物理盘。
+    frozen: bool,
 }
 
 struct RegisteredGroupLane {
@@ -90,6 +92,11 @@ impl DiskReadLaneGroup {
             }
             return Ok(());
         }
+        if state.frozen {
+            return Err(SchedulerError::InvalidConfiguration(
+                "任务物理盘集合冻结后不能新增 lane",
+            ));
+        }
         state.lanes.insert(
             key,
             RegisteredGroupLane {
@@ -103,6 +110,14 @@ impl DiskReadLaneGroup {
         drop(state);
         self.notify.notify_one();
         Ok(())
+    }
+
+    /// 冻结当前任务的完整物理盘集合；重复调用幂等。
+    pub fn freeze(&self) {
+        let mut state = lock_lane_group(&self.inner);
+        state.frozen = true;
+        drop(state);
+        self.notify.notify_one();
     }
 
     /// 注销 dispatcher 已确认全部任务行终态的 lane；已交付许可仍按原所有权自然释放。
@@ -138,7 +153,10 @@ impl DiskReadLaneGroup {
     /// 取得一次申请绑定的 lane 计数器，并确认该 lane 已在任务组登记。
     fn membership(&self, lane: &DiskReadLane) -> Result<GroupMembership, SchedulerError> {
         let key = DiskKey::new(lane.location.physical_disk_id().disk_numbers())?;
-        let state = lock_lane_group(&self.inner);
+        let mut state = lock_lane_group(&self.inner);
+        // 直接使用 scheduler API 时，首次 acquire 本身就是冻结边界；Dispatcher 会在
+        // 创建首个 future 前显式 freeze，使惰性 future 也不能留下晚登记窗口。
+        state.frozen = true;
         let registered = state
             .lanes
             .get(&key)
@@ -387,6 +405,7 @@ impl DiskReadScheduler {
                 lanes: BTreeMap::new(),
                 targets: BTreeMap::new(),
                 seat_budget: self.task_seat_budget,
+                frozen: false,
             })),
             notify: self.notify.clone(),
         }
@@ -785,13 +804,9 @@ impl ActorConfig {
         }
     }
 
-    /// 任务级磁盘席位同时受全局读取线程和实际 Worker 数限制。
+    /// 任务级磁盘席位使用全局读取线程预算；Worker 槽位由流水线独立限制。
     const fn task_seat_budget(self) -> usize {
-        if self.total_limit < self.worker_count {
-            self.total_limit
-        } else {
-            self.worker_count
-        }
+        self.total_limit
     }
 }
 

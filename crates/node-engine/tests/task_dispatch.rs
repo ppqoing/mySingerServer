@@ -110,6 +110,67 @@ async fn scheduler_provider_splits_the_first_dispatch_window_by_registered_disk_
     }
 }
 
+#[tokio::test]
+async fn scheduler_provider_rejects_a_new_disk_after_first_grouped_acquire() {
+    let mut config = dedup_core::DiskReadConfig::default();
+    config.ssd_threads_per_disk = 4;
+    config.total_threads = 4;
+    let scheduler = DiskReadScheduler::new(&config, 4).unwrap();
+    let provider = SchedulerTaskLanePermitProvider::new(scheduler);
+    let mut dispatcher = new_dispatcher(provider);
+    let first_lane = lane(&[40], LocalDiskKind::Ssd, 4, 4);
+    let late_lane = lane(&[41], LocalDiskKind::Ssd, 4, 4);
+    dispatcher
+        .append_batch(
+            &first_lane,
+            std::slice::from_ref(&base_record("first-before-freeze.bin", None)),
+        )
+        .unwrap();
+
+    let first = dispatcher
+        .next(ReadCancellationToken::new())
+        .await
+        .unwrap()
+        .expect("首次已登记 lane 应能取得任务组许可");
+    let late_result = dispatcher.append_batch(
+        &late_lane,
+        std::slice::from_ref(&base_record("late-after-freeze.bin", None)),
+    );
+    dispatcher.mark_completed(&first.identity).unwrap();
+    drop(first);
+    dispatcher.discard().unwrap();
+
+    assert!(
+        late_result.is_err(),
+        "首次 grouped acquire 后必须冻结物理盘集合，不能静默晚登记新盘"
+    );
+}
+
+#[test]
+fn dispatcher_drop_closes_pending_future_before_clearing_task_group() {
+    let provider = DropOrderProvider::default();
+    {
+        let mut dispatcher = new_dispatcher(provider.clone());
+        let task_lane = lane(&[42], LocalDiskKind::Hdd, 1, 1);
+        dispatcher
+            .append_batch(
+                &task_lane,
+                std::slice::from_ref(&base_record("pending-at-drop.bin", None)),
+            )
+            .unwrap();
+        dispatcher.seal().unwrap();
+        assert!(
+            poll_once(&mut dispatcher, &ReadCancellationToken::new()).is_pending(),
+            "测试必须先把许可 future 推进到真实 Pending"
+        );
+    }
+
+    assert!(
+        provider.clear_observed_closed_future(),
+        "清理任务组前必须先关闭 pending future，保证 scheduler 得到最后一次唤醒"
+    );
+}
+
 impl Drop for FakePermit {
     fn drop(&mut self) {
         self.active.fetch_sub(1, Ordering::AcqRel);
@@ -299,6 +360,61 @@ impl TaskLanePermitProvider for PrimeTrackingProvider {
             first_polled: Arc::clone(&self.first_polled),
             active: Arc::clone(&self.active),
             cancellation,
+        })
+    }
+}
+
+/// 记录 dispatcher Drop 时，许可 future 与任务组清理的真实先后顺序。
+#[derive(Clone, Default)]
+struct DropOrderProvider {
+    state: Arc<DropOrderState>,
+}
+
+#[derive(Default)]
+struct DropOrderState {
+    /// pending 许可 future 已经被关闭。
+    future_dropped: AtomicBool,
+    /// `clear_task_lanes` 是否观察到 future 已先关闭。
+    clear_after_future: AtomicBool,
+}
+
+struct PendingFutureDropProbe {
+    state: Arc<DropOrderState>,
+}
+
+impl Drop for PendingFutureDropProbe {
+    fn drop(&mut self) {
+        self.state.future_dropped.store(true, Ordering::Release);
+    }
+}
+
+impl DropOrderProvider {
+    /// 返回清理任务组时是否已经关闭全部 pending future。
+    fn clear_observed_closed_future(&self) -> bool {
+        self.state.clear_after_future.load(Ordering::Acquire)
+    }
+}
+
+impl TaskLanePermitProvider for DropOrderProvider {
+    type Permit = ();
+
+    fn clear_task_lanes(&self) {
+        self.state.clear_after_future.store(
+            self.state.future_dropped.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+    }
+
+    fn acquire(
+        &self,
+        _lane: TaskDiskLane,
+        _class: DiskReadClass,
+        _cancellation: ReadCancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Permit, ReadFailure>> + Send>> {
+        let state = Arc::clone(&self.state);
+        Box::pin(async move {
+            let _probe = PendingFutureDropProbe { state };
+            std::future::pending::<Result<(), ReadFailure>>().await
         })
     }
 }

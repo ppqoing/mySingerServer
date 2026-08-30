@@ -697,6 +697,14 @@ impl TaskLanePermitProvider for ScheduledFileReader {
         Ok(())
     }
 
+    fn freeze_task_lanes(&self) -> io::Result<()> {
+        let Some(group) = &self.lane_group else {
+            return Err(io::Error::other("任务 dispatcher 未创建物理盘配额组"));
+        };
+        group.freeze();
+        Ok(())
+    }
+
     fn unregister_task_lane(&self, lane: &TaskDiskLane) -> io::Result<()> {
         let Some(group) = &self.lane_group else {
             return Err(io::Error::other("任务 dispatcher 未创建物理盘配额组"));

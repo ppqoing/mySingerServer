@@ -259,7 +259,7 @@ async fn registered_five_to_one_group_caps_early_ssd_at_five_seats() {
 }
 
 #[tokio::test]
-async fn registered_group_uses_worker_count_when_it_is_lower_than_read_threads() {
+async fn registered_group_keeps_read_budget_when_worker_count_is_lower() {
     let mut config = DiskReadConfig::default();
     config.ssd_threads_per_disk = 12;
     config.total_threads = 12;
@@ -289,8 +289,58 @@ async fn registered_group_uses_worker_count_when_it_is_lower_than_read_threads()
     let active = take_ready_weighted_requests(&mut requests);
     assert_eq!(
         active.len(),
+        6,
+        "Worker 数不能截断独立的读取席位；等权盘应取得 12 个读取席位中的 6 个"
+    );
+
+    drop(requests);
+    drop(active);
+}
+
+#[tokio::test]
+async fn registered_group_does_not_reduce_read_parallelism_to_worker_count() {
+    let mut config = DiskReadConfig::default();
+    config.ssd_threads_per_disk = 12;
+    config.total_threads = 12;
+    let scheduler = DiskReadScheduler::new(&config, 2).unwrap();
+    let lane_group = scheduler.new_lane_group();
+    let lanes = [31_u32, 32, 33].map(|disk| weighted_lane(&[disk], LocalDiskKind::Ssd, 12, 12));
+    for lane in &lanes {
+        lane_group.register(lane.clone()).unwrap();
+    }
+
+    let mut requests = lanes
+        .into_iter()
+        .enumerate()
+        .map(|(index, lane)| {
+            let scheduler = scheduler.clone();
+            let lane_group = lane_group.clone();
+            Some(Box::pin(async move {
+                scheduler
+                    .acquire_lane_in_group(lane, DiskReadClass::HashSequential, lane_group)
+                    .await
+                    .map(|permit| (index, permit))
+            }) as WeightedRequest)
+        })
+        .collect::<Vec<_>>();
+    for request in &mut requests {
+        let _ = poll_once(request.as_mut().unwrap().as_mut());
+    }
+    scheduler.barrier_for_test().await.unwrap();
+
+    let active = take_ready_weighted_requests(&mut requests);
+    assert_eq!(
+        active.len(),
         3,
-        "Worker=6 时等权盘只能预占其中 3 个计算席位"
+        "Worker=2 不应阻止三块盘各取得一个仍在全局读取预算内的许可"
+    );
+    assert_eq!(
+        scheduler
+            .active_snapshot_for_test(&[31, 32, 33])
+            .await
+            .unwrap()
+            .global_total,
+        3
     );
 
     drop(requests);
