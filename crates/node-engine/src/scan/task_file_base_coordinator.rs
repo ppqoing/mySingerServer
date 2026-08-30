@@ -316,7 +316,7 @@ fn coordinator_error<P: TaskLanePermitProvider>(
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, BTreeSet},
         future::Future,
         path::Path,
         pin::Pin,
@@ -631,6 +631,17 @@ mod tests {
             disk_kind: LocalDiskKind::Hdd,
             configured_weight: 1,
             per_disk_limit: 1,
+        }
+    }
+
+    /// 构造允许同一物理盘并发多个精确身份的测试 lane。
+    fn lane_with_limit(disk: u32, limit: usize) -> TaskDiskLane {
+        TaskDiskLane {
+            physical_disk_id: PhysicalDiskId::from_disk_numbers([disk]).unwrap(),
+            physical_disk_numbers: vec![disk],
+            disk_kind: LocalDiskKind::Ssd,
+            configured_weight: limit,
+            per_disk_limit: limit,
         }
     }
 
@@ -998,6 +1009,221 @@ mod tests {
             .await
             .expect("SQLite actor 必须在两秒内收束")
             .unwrap();
+    }
+
+    /// 同一物理盘的 Hash 必须填满冻结窗口，不能等待首项 SQLite ACK。
+    #[cfg(feature = "test-hooks")]
+    #[tokio::test]
+    async fn same_lane_hashes_continue_while_first_sqlite_ack_is_blocked() {
+        let root = tempfile::tempdir().unwrap();
+        let machine = MachineId::from_sha256([0xA5; 32]);
+        let store = NodeStore::open_in_memory(machine).unwrap();
+        let task_lane = lane_with_limit(38, 3);
+        let paths = [
+            scanned(r"C:\same-lane-hash-a.bin", 10),
+            scanned(r"C:\same-lane-hash-b.bin", 10),
+            scanned(r"C:\same-lane-hash-c.bin", 10),
+        ];
+        let md5s = [[0xA6; 16], [0xA7; 16], [0xA8; 16]];
+        let production = production(
+            root.path(),
+            &paths
+                .iter()
+                .cloned()
+                .map(|path| input(path, task_lane.clone(), None))
+                .collect::<Vec<_>>(),
+        );
+        let mut identities = production.contexts.keys().cloned().collect::<Vec<_>>();
+        identities.sort_by_key(|identity| identity.line_offset());
+        let md5_by_item = identities
+            .iter()
+            .zip(md5s)
+            .map(|(identity, md5)| (identity.item_id().to_string(), md5))
+            .collect::<BTreeMap<_, _>>();
+        let hash_calls = Arc::new(AtomicUsize::new(0));
+        let reader = TestHashReader {
+            results: Arc::new(
+                paths
+                    .iter()
+                    .zip(md5s)
+                    .map(|(path, md5)| (path.normalized_path.as_str().to_owned(), md5))
+                    .collect(),
+            ),
+            calls: Arc::clone(&hash_calls),
+        };
+        let (persist_control, persist_waiter) =
+            crate::scan::base_persistence::BasePersistTestController::new();
+        let (actor, handle, mut acknowledgements) =
+            crate::scan::base_persistence::BaseStoreActor::spawn_with_first_persist_waiter(
+                store,
+                3,
+                persist_waiter,
+            );
+        let (mut pool, mut started, controller) = WorkerPool::controlled_batch_for_test(3);
+        let handle_for_run = handle.clone();
+        let run_root = root.path().to_path_buf();
+        let mut coordinator_options = options(&run_root);
+        coordinator_options.hash_capacity = 3;
+        coordinator_options.worker_capacity = 3;
+        let join = tokio::spawn(async move {
+            let result = run_task_file_base_coordinator(
+                production,
+                reader,
+                &mut pool,
+                &handle_for_run,
+                &mut acknowledgements,
+                coordinator_options,
+                ReadCancellationToken::new(),
+            )
+            .await;
+            let shutdown = pool.shutdown().await;
+            (result, shutdown)
+        });
+
+        let first = tokio::time::timeout(Duration::from_secs(1), started.recv())
+            .await
+            .expect("首个 Hash miss 必须进入 Worker")
+            .unwrap();
+        let first_md5 = *md5_by_item
+            .get(&first.1)
+            .expect("Worker item 必须来自任务文件");
+        controller
+            .base_source_read_complete(first.0.clone(), first.1.clone())
+            .await;
+        controller
+            .complete_base(first.0, first.1, first_md5, image_output())
+            .await;
+        tokio::time::timeout(Duration::from_secs(1), persist_control.wait_until_entered())
+            .await
+            .expect("首个 SQLite 持久化必须进入测试闸门");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while hash_calls.load(Ordering::SeqCst) != 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("首项 SQLite ACK 在途时，同盘三个 Hash 都必须已经开始");
+        persist_control.release();
+
+        for _ in 0..2 {
+            let worker = tokio::time::timeout(Duration::from_secs(1), started.recv())
+                .await
+                .expect("其余同盘 Hash miss 必须继续进入 Worker")
+                .unwrap();
+            let md5 = *md5_by_item
+                .get(&worker.1)
+                .expect("Worker item 必须来自任务文件");
+            controller
+                .base_source_read_complete(worker.0.clone(), worker.1.clone())
+                .await;
+            controller
+                .complete_base(worker.0, worker.1, md5, image_output())
+                .await;
+        }
+
+        let (result, shutdown) = join.await.unwrap();
+        assert!(shutdown.is_ok());
+        let mut result = result.unwrap();
+        assert_eq!(result.summary.file_failures, 0);
+        assert_eq!(result.manifest.resolved_files.len(), 3);
+        assert_eq!(statuses(&result.dispatcher, &task_lane), vec![b'C'; 3]);
+        result.dispatcher.discard().unwrap();
+        drop(handle);
+        actor.finish().await.unwrap();
+    }
+
+    /// 同一物理盘的多个 Media Worker 必须在首个终态前填满 Worker 窗口。
+    #[cfg(feature = "test-hooks")]
+    #[tokio::test]
+    async fn same_lane_starts_multiple_media_workers_before_first_sqlite_ack() {
+        let root = tempfile::tempdir().unwrap();
+        let machine = MachineId::from_sha256([0xAA; 32]);
+        let mut store = NodeStore::open_in_memory(machine).unwrap();
+        let task_lane = lane_with_limit(39, 4);
+        let paths = [
+            r"C:\same-lane-media-a.bin",
+            r"C:\same-lane-media-b.bin",
+            r"C:\same-lane-media-c.bin",
+            r"C:\same-lane-media-d.bin",
+        ];
+        let md5s = [[0xAB; 16], [0xAC; 16], [0xAD; 16], [0xAE; 16]];
+        let inputs = paths
+            .iter()
+            .zip(md5s)
+            .map(|(path, md5)| {
+                let cached = seed_partial(&mut store, path, md5, 10, MediaKind::Image);
+                input(scanned(path, 10), task_lane.clone(), Some(cached))
+            })
+            .collect::<Vec<_>>();
+        let production = production(root.path(), &inputs);
+        let mut identities = production.contexts.keys().cloned().collect::<Vec<_>>();
+        identities.sort_by_key(|identity| identity.line_offset());
+        let md5_by_item = identities
+            .iter()
+            .zip(md5s)
+            .map(|(identity, md5)| (identity.item_id().to_string(), md5))
+            .collect::<BTreeMap<_, _>>();
+        let (actor, handle, mut acknowledgements) =
+            crate::scan::base_persistence::BaseStoreActor::spawn(store, 4);
+        let (mut pool, mut started, controller) = WorkerPool::controlled_batch_for_test(4);
+        let handle_for_run = handle.clone();
+        let run_root = root.path().to_path_buf();
+        let mut coordinator_options = options(&run_root);
+        coordinator_options.worker_capacity = 4;
+        let join = tokio::spawn(async move {
+            let result = run_task_file_base_coordinator(
+                production,
+                TestHashReader::default(),
+                &mut pool,
+                &handle_for_run,
+                &mut acknowledgements,
+                coordinator_options,
+                ReadCancellationToken::new(),
+            )
+            .await;
+            let shutdown = pool.shutdown().await;
+            (result, shutdown)
+        });
+
+        let mut workers = Vec::new();
+        for _ in 0..4 {
+            workers.push(
+                tokio::time::timeout(Duration::from_secs(1), started.recv())
+                    .await
+                    .expect("首个 Worker 终态前必须启动四个同盘 Media")
+                    .unwrap(),
+            );
+        }
+        assert_eq!(
+            workers
+                .iter()
+                .map(|worker| worker.1.clone())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            4
+        );
+
+        for worker in workers.into_iter().rev() {
+            let md5 = *md5_by_item
+                .get(&worker.1)
+                .expect("Worker item 必须来自任务文件");
+            controller
+                .base_source_read_complete(worker.0.clone(), worker.1.clone())
+                .await;
+            controller
+                .complete_base(worker.0, worker.1, md5, image_output())
+                .await;
+        }
+
+        let (result, shutdown) = join.await.unwrap();
+        assert!(shutdown.is_ok());
+        let mut result = result.unwrap();
+        assert_eq!(result.summary.file_failures, 0);
+        assert_eq!(result.manifest.resolved_files.len(), 4);
+        assert_eq!(statuses(&result.dispatcher, &task_lane), vec![b'C'; 4]);
+        result.dispatcher.discard().unwrap();
+        drop(handle);
+        actor.finish().await.unwrap();
     }
 
     /// 首个 Hash miss 必须在同窗口后续 Hash 完成前进入 Worker，避免 Hash 全批屏障。
