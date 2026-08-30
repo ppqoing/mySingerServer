@@ -619,6 +619,103 @@ fn hash_task_can_continue_as_media_with_same_identity_and_one_tsv_row() {
 }
 
 #[test]
+fn same_lane_continuation_reuses_identity_window_slot() {
+    let provider = FakeProvider::default();
+    let mut dispatcher = new_dispatcher(provider.clone());
+    let task_lane = lane(&[28], LocalDiskKind::Ssd, 2, 2);
+    let rows = [
+        base_record("window-hash.bin", None),
+        base_record("window-media.bin", Some([0x61; 16])),
+        base_record("window-third.bin", Some([0x62; 16])),
+    ];
+    dispatcher.register_lane(&task_lane).unwrap();
+    dispatcher.append_batch(&task_lane, &rows).unwrap();
+    dispatcher.seal().unwrap();
+    let lane_path = dispatcher.lane_path(&task_lane).unwrap();
+    let token = ReadCancellationToken::new();
+
+    let hash = ready_task(poll_once(&mut dispatcher, &token));
+    let hash_identity = hash.identity.clone();
+    let continuation_record = derived_media_record(&hash.record);
+    let second = ready_task(poll_once(&mut dispatcher, &token));
+    assert_ne!(hash_identity, second.identity);
+    drop(hash);
+
+    dispatcher
+        .request_media_continuation(&hash_identity, &continuation_record)
+        .unwrap();
+    let continuation = ready_task(poll_once(&mut dispatcher, &token));
+    assert!(continuation.is_continuation());
+    assert_eq!(continuation.identity, hash_identity);
+    assert_eq!(provider.started().len(), 3);
+
+    let before_ack = std::fs::read(&lane_path).unwrap();
+    assert_eq!(before_ack.iter().filter(|byte| **byte == b'\n').count(), 3);
+    assert_eq!(before_ack[hash_identity.line_offset() as usize], b'P');
+    assert_eq!(before_ack[second.identity.line_offset() as usize], b'P');
+    assert!(
+        poll_once(&mut dispatcher, &token).is_pending(),
+        "续算复用原身份后，第三个普通身份仍须等待窗口释放"
+    );
+
+    dispatcher.mark_completed(&continuation.identity).unwrap();
+    drop(continuation);
+    let third = ready_task(poll_once(&mut dispatcher, &token));
+    assert_eq!(third.record.item_id, rows[2].item_id);
+    dispatcher.mark_completed(&second.identity).unwrap();
+    dispatcher.mark_completed(&third.identity).unwrap();
+    drop(second);
+    drop(third);
+    assert!(matches!(
+        poll_once(&mut dispatcher, &token),
+        Poll::Ready(Ok(None))
+    ));
+    dispatcher.discard().unwrap();
+}
+
+#[test]
+fn same_lane_pending_request_does_not_block_other_identity_abandon() {
+    let provider = FakeProvider::default();
+    let mut dispatcher = new_dispatcher(provider.clone());
+    let task_lane = lane(&[29], LocalDiskKind::Ssd, 2, 2);
+    let rows = [
+        base_record("abandon-first.bin", Some([0x71; 16])),
+        base_record("abandon-hash.bin", None),
+    ];
+    dispatcher.register_lane(&task_lane).unwrap();
+    dispatcher.append_batch(&task_lane, &rows).unwrap();
+    dispatcher.seal().unwrap();
+    let token = ReadCancellationToken::new();
+
+    let first = ready_task(poll_once(&mut dispatcher, &token));
+    let hash = ready_task(poll_once(&mut dispatcher, &token));
+    let first_identity = first.identity.clone();
+    let hash_identity = hash.identity.clone();
+    let continuation_record = derived_media_record(&hash.record);
+    drop(first);
+    drop(hash);
+
+    provider.set_blocked(true);
+    dispatcher
+        .request_media_continuation(&hash_identity, &continuation_record)
+        .unwrap();
+    assert!(poll_once(&mut dispatcher, &token).is_pending());
+
+    dispatcher.abandon_in_flight(&first_identity).unwrap();
+    assert!(
+        dispatcher.abandon_in_flight(&hash_identity).is_err(),
+        "只有仍持有 pending future 的同一身份应被拒绝"
+    );
+    token.cancel();
+    assert!(matches!(
+        poll_once(&mut dispatcher, &token),
+        Poll::Ready(Err(TaskDispatchError::Read(ReadFailure::Cancelled)))
+    ));
+    dispatcher.abandon_in_flight(&hash_identity).unwrap();
+    dispatcher.discard().unwrap();
+}
+
+#[test]
 fn hash_continuation_accepts_derived_md5_and_media_mask_without_rewriting_tsv() {
     let provider = FakeProvider::default();
     let mut dispatcher = new_dispatcher(provider.clone());
