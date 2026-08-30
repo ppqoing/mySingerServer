@@ -344,7 +344,7 @@ impl DiskReadScheduler {
     }
 
     #[cfg(test)]
-    pub(super) async fn barrier_for_test(&self) -> Result<(), SchedulerError> {
+    pub(crate) async fn barrier_for_test(&self) -> Result<(), SchedulerError> {
         let (reply, response) = oneshot::channel();
         self.commands
             .send(Command::Barrier(reply))
@@ -354,7 +354,7 @@ impl DiskReadScheduler {
     }
 
     #[cfg(test)]
-    pub(super) async fn active_snapshot_for_test(
+    pub(crate) async fn active_snapshot_for_test(
         &self,
         disk_numbers: &[u32],
     ) -> Result<ActiveSnapshot, SchedulerError> {
@@ -419,11 +419,13 @@ enum Command {
 
 /// 测试专用活动计数快照；生产 API 不暴露调度内部原子计数。
 #[cfg(test)]
-pub(super) struct ActiveSnapshot {
-    pub(super) global_total: usize,
-    pub(super) global_hash: usize,
-    pub(super) global_media: usize,
-    pub(super) disks: Vec<(u32, usize, usize, usize)>,
+pub(crate) struct ActiveSnapshot {
+    pub(crate) global_total: usize,
+    pub(crate) global_hash: usize,
+    pub(crate) global_media: usize,
+    pub(crate) disks: Vec<(u32, usize, usize, usize)>,
+    /// 指定底层盘当前仍在 scheduler FIFO 内的 total、Hash、Media 等待数。
+    pub(crate) waiting: Vec<(u32, usize, usize, usize)>,
 }
 
 struct Waiter {
@@ -1479,6 +1481,23 @@ impl ActorState {
                             disk.active.media.load(Ordering::Acquire),
                         )
                     })
+                })
+                .collect(),
+            waiting: disk_numbers
+                .iter()
+                .map(|disk_number| {
+                    let mut total = 0;
+                    let mut hash = 0;
+                    let mut media = 0;
+                    for (key, queue) in &self.queues {
+                        if !key.0.contains(disk_number) {
+                            continue;
+                        }
+                        hash += queue.hash_waiting.len();
+                        media += queue.media_waiting.len();
+                        total += queue.hash_waiting.len() + queue.media_waiting.len();
+                    }
+                    (*disk_number, total, hash, media)
                 })
                 .collect(),
         }

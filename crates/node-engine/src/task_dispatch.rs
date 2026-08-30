@@ -298,10 +298,18 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
         Ok(())
     }
 
+    /// 任务级取消时丢弃全部 dispatcher 自有的许可等待 future。
+    ///
+    /// 本方法不改写 TSV、续算意图或在途身份；调用方须在外部读取 owner 收束后调用，
+    /// 再按 `in_flight_identities` 快照逐项 abandon。
+    pub(crate) fn cancel_pending_permit_requests(&mut self) {
+        self.pending.clear();
+    }
+
     /// 在取消收束后放弃一项精确在途任务，不写入 `F`。
     ///
-    /// 调用方应先用已取消的令牌轮询一次以收束等待 future；本方法随后一并清理同
-    /// 身份的续算意图，再释放在途身份。
+    /// 调用方应先调用 `cancel_pending_permit_requests` 收束等待 future；本方法随后
+    /// 一并清理同身份的续算意图，再释放在途身份。
     pub fn abandon_in_flight(&mut self, identity: &TaskFileIdentity) -> io::Result<()> {
         let lane_key = identity.lane_file_name().to_owned();
         if self.pending.contains_key(&lane_key) {

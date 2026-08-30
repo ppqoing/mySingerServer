@@ -528,6 +528,7 @@ async fn cleanup_stream<P: TaskLanePermitProvider>(
         diagnostics.push(message);
     }
     persist.drop_unacknowledged();
+    pending.dispatcher.cancel_pending_permit_requests();
     if let Err(message) = abandon_all_in_flight(pending) {
         diagnostics.push(message);
     }
@@ -578,7 +579,7 @@ mod tests {
         path::{Path, PathBuf},
         pin::Pin,
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
         time::Duration,
@@ -588,13 +589,13 @@ mod tests {
         ContentKey, DiskReadConfig, DisplayPath, MachineId, MediaKind, NormalizedPath,
     };
     use dedup_node_store::{BaseCacheRecord, NodeStore, ScannedPath};
-    use dedup_windows::{LocalDiskKind, PhysicalDiskId, ReadCancellationToken};
+    use dedup_windows::{LocalDiskKind, PhysicalDiskId, ReadCancellationToken, StorageLocation};
     use tokio::sync::Notify;
 
     use super::{TaskFileBaseComputePending, abandon_all_in_flight, run_task_file_base_stream};
     use crate::{
         RemoteCacheError, RemoteFeatureCache,
-        io::{DiskReadClass, ReadFailure},
+        io::{DiskReadClass, DiskReadLane, DiskReadPermit, DiskReadScheduler, ReadFailure},
         scan::{
             BaseTaskInput, BaseTaskProducer, HashPermitReader, PlannedScannedPath, ReadProduct,
             TaskDiskLane, TaskFileBaseCoordinatorOptions, TaskFileMediaPersistenceOptions,
@@ -632,6 +633,99 @@ mod tests {
             Box::pin(async move {
                 live.fetch_add(1, Ordering::SeqCst);
                 Ok(CountingPermit(live))
+            })
+        }
+    }
+
+    /// 包装真实 scheduler permit，使 Hash 测试读取器可以在返回前受控交接槽位。
+    struct SchedulerPermit(Option<DiskReadPermit>);
+
+    /// 让 dispatcher 的 Hash 与 Media 请求共用同一个真实 scheduler。
+    #[derive(Clone)]
+    struct SchedulerProvider(DiskReadScheduler);
+
+    impl TaskLanePermitProvider for SchedulerProvider {
+        type Permit = SchedulerPermit;
+
+        fn acquire(
+            &self,
+            lane: TaskDiskLane,
+            class: DiskReadClass,
+            _cancellation: ReadCancellationToken,
+        ) -> TaskLanePermitFuture<Self::Permit> {
+            let scheduler = self.0.clone();
+            Box::pin(async move {
+                scheduler
+                    .acquire_lane(scheduler_lane(&lane), class)
+                    .await
+                    .map(|permit| SchedulerPermit(Some(permit)))
+                    .map_err(|error| ReadFailure::Io {
+                        path: PathBuf::from(format!(
+                            "PhysicalDisk{:?}",
+                            lane.physical_disk_numbers
+                        )),
+                        block_offset: 0,
+                        source: std::io::Error::other(error),
+                    })
+            })
+        }
+    }
+
+    /// Hash 结束时先归还其真实许可，再占住唯一 scheduler 槽位以门控 Media continuation。
+    #[derive(Clone)]
+    struct BlockingContinuationReader {
+        /// Hash 与 continuation 共用的真实 scheduler。
+        scheduler: DiskReadScheduler,
+        /// 测试使用的同盘冻结 lane。
+        lane: TaskDiskLane,
+        /// 持有竞争许可，直到测试完成取消后的等待队列核对。
+        blocker: Arc<Mutex<Option<DiskReadPermit>>>,
+        /// 返回给 Hash 后续的固定内容键。
+        md5: [u8; 16],
+        /// 完成后抢占同盘槽位并形成 Media continuation 的目标路径。
+        continuation_path: String,
+    }
+
+    impl HashPermitReader for BlockingContinuationReader {
+        type Permit = SchedulerPermit;
+
+        fn read_with_permit(
+            &self,
+            scanned: ScannedPath,
+            mut permit: Self::Permit,
+            cancellation: ReadCancellationToken,
+            _started: Option<crate::scan::HashReadStartedSignal>,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<ReadProduct<Self::Permit>, ReadFailure>>
+                    + Send
+                    + 'static,
+            >,
+        > {
+            let scheduler = self.scheduler.clone();
+            let lane = self.lane.clone();
+            let blocker = Arc::clone(&self.blocker);
+            let md5 = self.md5;
+            let continuation_path = self.continuation_path.clone();
+            Box::pin(async move {
+                if scanned.normalized_path.as_str() == continuation_path {
+                    drop(permit.0.take());
+                    let competing = scheduler
+                        .acquire_lane(scheduler_lane(&lane), DiskReadClass::HashSequential)
+                        .await
+                        .map_err(|error| ReadFailure::Io {
+                            path: PathBuf::from(r"C:\dispatcher-pending-media.bin"),
+                            block_offset: 0,
+                            source: std::io::Error::other(error),
+                        })?;
+                    blocker.lock().unwrap().replace(competing);
+                    Ok(ReadProduct { md5, lease: permit })
+                } else {
+                    while !cancellation.is_cancelled() {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(ReadFailure::Cancelled)
+                }
             })
         }
     }
@@ -802,6 +896,15 @@ mod tests {
         }
     }
 
+    /// 把测试冻结 lane 转为真实 scheduler 使用的物理盘 lane。
+    fn scheduler_lane(lane: &TaskDiskLane) -> DiskReadLane {
+        DiskReadLane {
+            location: StorageLocation::from_parts(lane.physical_disk_id.clone(), lane.disk_kind),
+            effective_limit: lane.per_disk_limit,
+            configured_weight: lane.configured_weight,
+        }
+    }
+
     fn scanned(path: &str, file_size: u64) -> ScannedPath {
         ScannedPath::new(
             NormalizedPath::new(path).unwrap(),
@@ -884,6 +987,116 @@ mod tests {
             .dispatcher
             .discard()
             .expect("全部真实 owner 都被收束后 dispatcher 必须可删除");
+    }
+
+    /// 取消必须丢弃 dispatcher 自有的 Media permit future，再解除同身份在途 owner。
+    #[tokio::test]
+    async fn cancellation_clears_dispatcher_owned_pending_media_permit_request() {
+        let root = tempfile::tempdir().unwrap();
+        let task_lane = lane(61);
+        let mut config = DiskReadConfig::default();
+        config.hdd_threads_per_disk = 1;
+        config.total_threads = 2;
+        let scheduler = DiskReadScheduler::new(&config, 2).unwrap();
+        let blocker = Arc::new(Mutex::new(None));
+        let continuation_path = scanned(r"C:\dispatcher-pending-media.bin", 10);
+        let cancelled_hash_path = scanned(r"C:\dispatcher-cancelled-hash.bin", 11);
+        let mut continuation_input = input(continuation_path.clone(), task_lane.clone(), None);
+        continuation_input.force_recompute = true;
+        let pending = TaskFileBaseComputePending::from_production(production(
+            root.path(),
+            SchedulerProvider(scheduler.clone()),
+            &[
+                continuation_input,
+                input(cancelled_hash_path, lane(62), None),
+            ],
+        ));
+        let store = NodeStore::open_in_memory(MachineId::from_sha256([0xE1; 32])).unwrap();
+        let (actor, handle, mut acknowledgements) =
+            crate::scan::base_persistence::BaseStoreActor::spawn(store, 2);
+        let (mut pool, _started, _controller) = WorkerPool::controlled_batch_for_test(1);
+        let cancellation = ReadCancellationToken::new();
+        let cancellation_for_run = cancellation.clone();
+        let reader = BlockingContinuationReader {
+            scheduler: scheduler.clone(),
+            lane: task_lane.clone(),
+            blocker: Arc::clone(&blocker),
+            md5: [0xE2; 16],
+            continuation_path: continuation_path.normalized_path.as_str().to_owned(),
+        };
+        let run_root = root.path().to_path_buf();
+        let run_handle = handle.clone();
+        let join = tokio::spawn(async move {
+            let mut remote_available = false;
+            let mut warning = None;
+            let result = run_task_file_base_stream(
+                pending,
+                reader,
+                &mut pool,
+                &run_handle,
+                &mut acknowledgements,
+                &options(&run_root),
+                cancellation_for_run,
+                Arc::new(crate::DisabledRemoteFeatureCache),
+                &mut remote_available,
+                &mut warning,
+                None,
+            )
+            .await;
+            let shutdown = pool.shutdown().await;
+            (result, shutdown)
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                scheduler.barrier_for_test().await.unwrap();
+                let snapshot = scheduler.active_snapshot_for_test(&[61]).await.unwrap();
+                if snapshot.global_total == 2 && snapshot.waiting == vec![(61, 1, 0, 1)] {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Media continuation 必须真实进入已满 scheduler 的等待队列");
+        cancellation.cancel();
+
+        let (result, shutdown) = tokio::time::timeout(Duration::from_secs(2), join)
+            .await
+            .expect("取消必须在两秒内收束 dispatcher 自有 permit request")
+            .unwrap();
+        assert!(shutdown.is_ok());
+        let error = match result {
+            Ok(_) => panic!("取消必须返回携带唯一 pending owner 的错误"),
+            Err(error) => error,
+        };
+        scheduler.barrier_for_test().await.unwrap();
+        let cancelled = scheduler.active_snapshot_for_test(&[61]).await.unwrap();
+        assert_eq!(cancelled.waiting, vec![(61, 0, 0, 0)]);
+
+        let mut pending = error.into_pending();
+        assert!(
+            pending.dispatcher.in_flight_identities().is_empty(),
+            "实际 in-flight owner 必须全部 abandon"
+        );
+        for disk in [61, 62] {
+            assert_eq!(
+                std::fs::read(pending.dispatcher.lane_path(&lane(disk)).unwrap()).unwrap()[0],
+                b'P',
+                "未 ACK TSV 行必须保持 P"
+            );
+        }
+        pending
+            .dispatcher
+            .discard()
+            .expect("取消后 dispatcher 必须可以 discard");
+
+        drop(blocker.lock().unwrap().take());
+        scheduler.barrier_for_test().await.unwrap();
+        let released = scheduler.active_snapshot_for_test(&[61]).await.unwrap();
+        assert_eq!(released.global_total, 0);
+        drop(handle);
+        actor.finish().await.unwrap();
     }
 
     /// 取消必须先收回 Hash、远端和 Worker owner，才允许任务文件 dispatcher 被丢弃。
