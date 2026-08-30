@@ -129,8 +129,8 @@ pub(super) struct TaskFileHashRuntime {
     unclaimed_rows: usize,
     /// 为完成顺序无关的后续批处理分配稳定序号。
     next_sequence: usize,
-    /// 每条读取的取消令牌；取消时先通知 reader 自行收束 permit。
-    cancellations: Vec<ReadCancellationToken>,
+    /// 仍在途读取的取消令牌；键与 future 的单调序号一一对应。
+    cancellations: BTreeMap<usize, ReadCancellationToken>,
 }
 
 impl TaskFileHashRuntime {
@@ -140,7 +140,7 @@ impl TaskFileHashRuntime {
             reads: JoinSet::new(),
             unclaimed_rows: remaining_hash_rows,
             next_sequence: 0,
-            cancellations: Vec::new(),
+            cancellations: BTreeMap::new(),
         }
     }
 
@@ -172,7 +172,7 @@ impl TaskFileHashRuntime {
         let identity = task.identity;
         let record = task.record;
         let scanned = record.scanned.clone();
-        self.cancellations.push(cancellation.clone());
+        self.cancellations.insert(sequence, cancellation.clone());
         self.reads.spawn(async move {
             let result = reader
                 .read_with_permit(scanned, task.permit, cancellation, None)
@@ -200,12 +200,19 @@ impl TaskFileHashRuntime {
             .join_next()
             .await
             .ok_or_else(|| "Hash 运行态没有在途读取".to_owned())?;
-        joined.map_err(|error| format!("Hash 读取 future 异常结束: {error}"))
+        let outcome = joined.map_err(|error| format!("Hash 读取 future 异常结束: {error}"))?;
+        self.cancellations.remove(&outcome.sequence);
+        Ok(outcome)
     }
 
     /// 返回仍在读取窗口内的 future 数量。
     pub(super) fn active_len(&self) -> usize {
         self.reads.len()
+    }
+
+    /// 返回仍与在途读取一一对应的取消令牌数，供状态收束测试观察。
+    pub(super) fn active_cancellation_len(&self) -> usize {
+        self.cancellations.len()
     }
 
     /// 所有 Hash 行均已领取并且所有读取 future 都已结束。
@@ -215,9 +222,10 @@ impl TaskFileHashRuntime {
 
     /// 请求读取自行取消并回收所有在途 future，确保 permit 在返回前已经释放。
     pub(super) async fn cancel_and_join(&mut self) {
-        for cancellation in &self.cancellations {
+        for cancellation in self.cancellations.values() {
             cancellation.cancel();
         }
+        self.reads.abort_all();
         while self.reads.join_next().await.is_some() {}
         self.cancellations.clear();
     }
@@ -1154,6 +1162,26 @@ mod tests {
         )
     }
 
+    /// 生成单条已领取的 Hash 行，permit 类型由调用方决定。
+    fn dispatched_hash_task<P>(item_id: &str, permit: P) -> DispatchedTask<P> {
+        let lane = lane();
+        let missing = TaskWorkMask::for_base(true, 0).expect("Hash 行必须携带 needs_md5");
+        let item_id = uuid::Uuid::parse_str(item_id).unwrap();
+        DispatchedTask {
+            identity: TaskFileIdentity::new(RUN_ID, &lane, item_id, 0, 80, missing).unwrap(),
+            record: TaskFileRecord {
+                item_id,
+                work_kind: TaskWorkKind::Base,
+                scanned: scanned(r"C:\runtime-cancel.bin", 16),
+                known_md5: None,
+                missing,
+            },
+            class: DiskReadClass::HashSequential,
+            permit,
+            continuation: false,
+        }
+    }
+
     #[tokio::test]
     async fn hash_runtime_returns_one_ready_item_without_draining_window() {
         let gate = Arc::new(Notify::new());
@@ -1175,8 +1203,58 @@ mod tests {
             .unwrap();
         assert_eq!(first.result.unwrap(), [0x41; 16]);
         assert_eq!(runtime.active_len(), 1);
+        assert_eq!(runtime.active_cancellation_len(), 1);
         gate.notify_waiters();
         runtime.cancel_and_join().await;
+    }
+
+    /// 不观察取消令牌的读取器，用于验证运行态仍会强制回收 future 和 permit。
+    #[derive(Clone)]
+    struct NeverCancelsHashReader;
+
+    impl HashPermitReader for NeverCancelsHashReader {
+        type Permit = TrackedPermit;
+
+        fn read_with_permit(
+            &self,
+            _scanned: ScannedPath,
+            permit: Self::Permit,
+            _cancellation: ReadCancellationToken,
+            _started: Option<crate::scan::HashReadStartedSignal>,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<ReadProduct<Self::Permit>, ReadFailure>>
+                    + Send
+                    + 'static,
+            >,
+        > {
+            Box::pin(async move {
+                let _permit = permit;
+                std::future::pending::<Result<ReadProduct<TrackedPermit>, ReadFailure>>().await
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn hash_runtime_cancellation_aborts_reader_that_ignores_token_and_releases_permit() {
+        let active = Arc::new(AtomicIsize::new(1));
+        let mut runtime = TaskFileHashRuntime::new(1);
+        runtime
+            .spawn(
+                dispatched_hash_task(
+                    "01900000-0000-7000-8000-000000000113",
+                    TrackedPermit {
+                        active: Arc::clone(&active),
+                    },
+                ),
+                NeverCancelsHashReader,
+                ReadCancellationToken::new(),
+            )
+            .unwrap();
+        timeout(Duration::from_millis(100), runtime.cancel_and_join())
+            .await
+            .expect("忽略取消令牌的读取器也必须被回收");
+        assert_eq!(active.load(Ordering::SeqCst), 0);
     }
 
     /// 让两个真实 Hash future 在释放前都进入读取，用于验证显式并发上限。
@@ -1230,7 +1308,6 @@ mod tests {
     #[derive(Clone)]
     struct CancellationAwareHashReader {
         entered: Arc<AtomicUsize>,
-        cancellation_seen: Arc<AtomicUsize>,
         slow_sequence: Option<usize>,
     }
 
@@ -1251,12 +1328,10 @@ mod tests {
             >,
         > {
             let sequence = self.entered.fetch_add(1, Ordering::SeqCst);
-            let cancellation_seen = Arc::clone(&self.cancellation_seen);
             let slow = self.slow_sequence == Some(sequence);
             Box::pin(async move {
                 loop {
                     if cancellation.is_cancelled() {
-                        cancellation_seen.fetch_add(1, Ordering::SeqCst);
                         drop(permit);
                         return Err(ReadFailure::Cancelled);
                     }
@@ -1634,10 +1709,8 @@ mod tests {
         let (actor, handle, mut acknowledgements) =
             super::super::base_persistence::BaseStoreActor::spawn(store, 4);
         let entered = Arc::new(AtomicUsize::new(0));
-        let cancellation_seen = Arc::new(AtomicUsize::new(0));
         let reader = CancellationAwareHashReader {
             entered: Arc::clone(&entered),
-            cancellation_seen: Arc::clone(&cancellation_seen),
             slow_sequence: Some(1),
         };
         let cancellation = ReadCancellationToken::new();
@@ -1671,7 +1744,7 @@ mod tests {
         };
         let pending = error.into_pending();
         assert_eq!(provider_active.load(Ordering::SeqCst), 0);
-        assert_eq!(cancellation_seen.load(Ordering::SeqCst), 2);
+        // 运行态先广播协作取消、再强制 abort；返回前两个 permit 都必须收束释放。
         cleanup_pending(pending);
         actor.finish().await.unwrap();
     }
@@ -1697,16 +1770,11 @@ mod tests {
         let store = NodeStore::open_in_memory(MachineId::from_sha256([0x5B; 32])).unwrap();
         let (actor, handle, mut acknowledgements) =
             super::super::base_persistence::BaseStoreActor::spawn(store, 4);
-        let entered = Arc::new(AtomicUsize::new(0));
-        let cancellation_seen = Arc::new(AtomicUsize::new(0));
-        let entered_for_reader = Arc::clone(&entered);
-        let cancellation_seen_for_reader = Arc::clone(&cancellation_seen);
         let join = tokio::spawn(async move {
             run_task_file_hash_pass(
                 TaskFileBaseComputePending::from_production(pending),
                 CancellationAwareHashReader {
-                    entered: entered_for_reader,
-                    cancellation_seen: cancellation_seen_for_reader,
+                    entered: Arc::new(AtomicUsize::new(0)),
                     slow_sequence: None,
                 },
                 3,
@@ -1725,9 +1793,8 @@ mod tests {
             Err(error) => error,
         };
         let pending = error.into_pending();
-        assert_eq!(entered.load(Ordering::SeqCst), 2);
         assert_eq!(active.load(Ordering::SeqCst), 0);
-        assert_eq!(cancellation_seen.load(Ordering::SeqCst), 2);
+        // dispatcher 错误后的强制回收不等读取 future 获得首个轮询机会。
         cleanup_pending(pending);
         actor.finish().await.unwrap();
     }
