@@ -6,7 +6,7 @@
 
 本次删除 `TaskFileDispatcher` 的“同一物理盘必须等待上一文件 SQLite ACK 才能交付下一文件”硬编码。一个物理盘仍只有一个 lane 和一份 TSV；Dispatcher 只按冻结的 `per_disk_limit` 保存精确身份窗口，真实磁盘许可、权重、Hash/Media 公平和老化继续由 `DiskReadScheduler` 负责。
 
-Dispatcher 多在途实现 revision：`f91feb85ad7e5943bba5643250736e7450d833fb`。双盘当前席位修复 revision：`15872d7bd28dd730d9980c649496e5cc7db6f714`。正式候选包由本文档提交后的干净 HEAD 生成，最终 source tree SHA、包 SHA 和真实媒体终态由独立 evidence 绑定。
+Dispatcher 多在途实现 revision：`f91feb85ad7e5943bba5643250736e7450d833fb`。双盘当前席位修复 revision：`15872d7bd28dd730d9980c649496e5cc7db6f714`。同 lane 补位空窗修复 revision：`be40eb2`。正式候选包由本文档提交后的干净 HEAD 生成，最终 source tree SHA、包 SHA 和真实媒体终态由独立 evidence 绑定。
 
 本次提交：
 
@@ -16,7 +16,8 @@ Dispatcher 多在途实现 revision：`f91feb85ad7e5943bba5643250736e7450d833fb`
 - `b9908a08acd461c2ec11bca158404f8ff32f2ed7`：真实 scheduler 的同盘额度与双盘配置门禁；
 - `792814cb6a7479ce6aa9c34556ae770077ebf35d`：真实基础流式 Hash/Media 并发门禁；
 - `f91feb85ad7e5943bba5643250736e7450d833fb`：适配取消等待指标夹具，使 Dispatcher 窗口为 2、全局读取容量为 1，继续制造真实许可等待；
-- `15872d7bd28dd730d9980c649496e5cc7db6f714`：当前 `active/weight` 欠配额优先、等权约分和 Ready 盘超额轮转。
+- `15872d7bd28dd730d9980c649496e5cc7db6f714`：当前 `active/weight` 欠配额优先、等权约分和 Ready 盘超额轮转；
+- `be40eb2`：交付当前项前创建并首轮轮询同 lane 下一许可请求，同时按真实 Hash/Media/Worker 空闲槽位释放禁止继续持有的预热许可。
 
 ## 2. RED 证据
 
@@ -30,12 +31,14 @@ Dispatcher 多在途实现 revision：`f91feb85ad7e5943bba5643250736e7450d833fb`
 6. `same_lane_permit_failure_keeps_other_inflight_identities_intact` mutation：B 的 permit 失败错误写坏 A，状态由期望 `[P,P]` 变成 `[F,P]`。
 7. `same_lane_hashes_continue_while_first_sqlite_ack_is_blocked` 单身份 mutation：首项 SQLite ACK 在途时其余同盘 Hash 未开始，1 秒门禁超时。
 8. `same_lane_starts_multiple_media_workers_before_first_sqlite_ack` 单身份 mutation：首个 Worker 终态前无法取得四个同盘 `Started`，1 秒门禁超时。
+9. `dispatcher_primes_same_lane_replacement_before_returning_current_task`：旧事件泵交付当前项后立即返回，同 lane 下一许可请求尚未创建，实际创建数为 1、期望为 2。
+10. `admission_check_releases_a_primed_request_when_the_stage_closes`：初版补位实现未在 Media admission 关闭时释放已经 Ready 的预热许可，活动许可为 2、期望为 1。
 
 每个 mutation 均在取得 RED 后恢复；最终 `git diff` 不含 mutation。
 
 ## 3. GREEN 与容量证据
 
-- Dispatcher 全量：34/34 PASS。
+- Dispatcher 默认 feature 全量：35/35 PASS；`test-hooks` 全量：36/36 PASS。
 - DiskReadScheduler 全量：45/45 PASS，包含当前窗口 6:6、配置 5:1、Ready 盘多于全局席位的轮转，以及原有长期权重、逐盘硬上限、Hash/Media 公平和老化保护。
 - 同 lane SSD 窗口 2：首个 ACK 前交付两个身份，第三个等待；第二项先 ACK 后只第二行变 `C`，第一、第三仍为 `P`。
 - 同 lane HDD 窗口 1：第二身份在首项 ACK 前保持等待。
@@ -45,9 +48,10 @@ Dispatcher 多在途实现 revision：`f91feb85ad7e5943bba5643250736e7450d833fb`
 - 取消：三条未 ACK 行在全部身份 abandon 前后均为 `[P,P,P]`，没有误写 `F`。
 - permit 失败：失败项仍为 `P`，同盘已交付兄弟身份保持可精确 ACK，之后失败项可按原队首重试。
 - 真实事件泵：同盘窗口 3 时，首个 SQLite ACK 闸门未释放前三个 Hash reader 均已开始；同盘窗口 4、Worker 容量 4 时，首个 Worker 终态前四个不同 item 均收到 `Started`，随后按逆序终态完成并分别 ACK 为 `C`。
+- 同 lane 补位：交付当前项前已经创建下一许可请求并只首轮轮询刚交付 lane；Base 和 Stage2 都用当下真实空闲槽位构造 admission，类别关闭后不保留隐藏许可。
 - 既有 `first_hashed_media_miss_enters_worker_before_later_hash_finishes`、`active_media_does_not_block_later_hash_on_another_lane`、`cancellation_returns_pending_owner_without_acknowledging_rows` 均 PASS。
 - NodeEngine 库全量：160/160 PASS。
-- NodeEngine 整 crate：退出码 0；全部测试目标通过，其中基础流水线 60/60、Dispatcher 34/34、瞬态任务文件 25/25、`pipeline_permit` 6/6。
+- NodeEngine `--features test-hooks --all-targets`：退出码 0；全部测试目标通过，其中基础流水线 60/60、Dispatcher 36/36、磁盘调度 45/45、瞬态任务文件 25/25；固定 bench `elapsed_ms=125.107`、`persisted_completed=true`。
 - Worker 进程协议：`WORKER_PROTOCOL_PROCESS_PASS`。
 - Desktop Core 运行时验收协议：23/23 PASS。
 - Desktop UI 绑定契约：15/15 PASS。
@@ -88,11 +92,21 @@ Dispatcher 多在途实现 revision：`f91feb85ad7e5943bba5643250736e7450d833fb`
 1. 两块等权 SSD、各 12 个 Ready 请求、全局 12：旧实现实际 `[0,12]`，期望 `[6,6]`；
 2. 三块等权 Ready 盘争两个全局席位：旧实现首轮两个许可落到同一 lane，违反超额轮转。
 
-修复后先按当前 `active/configured_weight` 选择欠配额盘，权重用最大公约数约分；压力相同才消费原 deficit 和游标，老化门禁不变。等权 `16:16` 等价于 `1:1`，SSD/HDD `5:1` 仍为 `5:1`。定向 GREEN、DiskReadScheduler 45/45、TaskFileDispatcher 34/34、NodeEngine `test-hooks` 全套、Worker 进程协议、Desktop Core 23/23、Desktop UI 15/15 均通过。
+修复后先按当前 `active/configured_weight` 选择欠配额盘，权重用最大公约数约分；压力相同才消费原 deficit 和游标，老化门禁不变。等权 `16:16` 等价于 `1:1`，SSD/HDD `5:1` 仍为 `5:1`。该阶段定向 GREEN、DiskReadScheduler 45/45、TaskFileDispatcher 当时 34/34、NodeEngine `test-hooks` 全套、Worker 进程协议、Desktop Core 23/23、Desktop UI 15/15 均通过；补位空窗修复后的 Dispatcher 最新结果见第 3 节 36/36。
 
-## 6. 待完成门禁
+## 6. 第二次双盘诊断：权重修复生效但补位仍有空窗
 
-- 绑定 `15872d7` 后续干净 HEAD 的正式候选包与外置验收客户端/结果导出器 SHA；
+候选 revision `2ff4785ec64e781faacacba4c7c0164780341cf9` 的正式 ZIP SHA-256 为 `24cf1bc0d5af7860f96e17367baac55450f192395b6fefc99b0f487b2c44fd74`，原始 evidence 位于 `C:\tmp\rust-v2-multi-inflight-final-2ff4785-attempt-02\evidence`。运行配置仍为 H/I 双盘、Worker 20、全局读取 12、SSD 每盘 16、Everything。
+
+该轮早期约 90 个有效样本中，两盘同时活动由旧轮的 4 个提高到 61 个，证明 `active/weight` 修复已经生效；但仍有 28 个 `PhysicalDisk1=0、PhysicalDisk2=12` 样本。确认重复 `0:12` 后主动停止，外层正常收束并保留媒体前后清单；任务未到终态，`run_status=FAIL`、结果摘要为 `INCONCLUSIVE`，不能作为最终验收。
+
+源码继续定位到 `TaskFileDispatcher::poll_lane_requests`：旧实现交付一项后立即返回，刚交付 lane 的替代请求只能等下一次外层事件泵才创建。这个短暂的非 Ready 空窗会让另一盘连续借走全部 12 个席位。`be40eb2` 改为在返回当前项前创建并首轮轮询同 lane 下一请求；只预热刚交付 lane，并用真实 Hash/Media/Worker 空闲槽位约束，避免为追求盘公平而越过阶段容量。
+
+修复的定向 RED/GREEN、Dispatcher 36/36、NodeEngine `test-hooks --all-targets` 和格式检查均已通过。该轮仍是失败诊断证据，不与后续最终运行拼接。
+
+## 7. 待完成门禁
+
+- 绑定 `be40eb2` 后续干净 HEAD 的正式候选包与外置验收客户端/结果导出器 SHA；
 - 修复候选在 `H:\pik\00000000000` 与 `I:\tmp` 上的一次双物理盘真实媒体终态运行；
 - 逐盘 active 峰值、Worker 峰值、CPU/IO、任务终态、崩溃完整路径和结果导出 SHA；
 - `gpt-5.6-sol`、reasoning `max` 最终只读审查。

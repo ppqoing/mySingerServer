@@ -103,9 +103,10 @@ Media continuation 的身份已经在集合内，因此只申请新的 Media 读
 2. 对每个 lane 先选择尚未 pending 的最早 continuation；它复用原身份。
 3. 若没有可派发 continuation，且该 lane 的身份窗口未满，则观察一个普通 TSV 队首并申请许可。
 4. scheduler 许可成功后，普通项调用 `take_lane_exact` 领取并加入该 lane 的身份集合；continuation 只做原身份与派生记录校验。
-5. 每次只向事件泵返回一个 `DispatchedTask`，随后重新计算 Hash/Media admission 和全部容量。
+5. 交付当前项前，若该类别仍有真实 Hash/Media/Worker 空闲槽位，立即为刚交付 lane 创建下一条许可请求，并只首轮轮询这一个同 lane 请求；同步 Ready 的许可缓存到下一次事件泵消费。
+6. 每次只向事件泵返回一个 `DispatchedTask`，随后重新计算 Hash/Media admission 和全部容量；若类别槽位已用完，已预取但尚未交付的许可立即释放，不形成隐藏在途读取。
 
-Dispatcher 不自己实现权重轮转，也不一次性发满某个 SSD。它只持续把真实 Ready 请求暴露给同一个 `DiskReadScheduler`，由 scheduler 在多个物理盘和 Hash/Media 类别之间裁决。
+Dispatcher 不自己实现权重轮转，也不一次性发满某个 SSD。它只持续把真实 Ready 请求暴露给同一个 `DiskReadScheduler`，由 scheduler 在多个物理盘和 Hash/Media 类别之间裁决。交付后只预热刚交付 lane，不能顺带轮询全部 pending；否则可能提前取得其他盘或其他类别的许可，越过当前阶段容量。
 
 ## 6. ACK、失败、取消与续算
 
@@ -159,6 +160,8 @@ Dispatcher 不自己实现权重轮转，也不一次性发满某个 SSD。它�
 
 示例不是常量：若配置为 SSD 5、HDD 1、全局 6，两个 lane 持续 Ready 时形成 5 个 SSD 席位和 1 个 HDD 席位；若全局仅 3，则先保证两个 Ready 盘各一个，剩余席位给欠配额盘，并在完成边界继续加权轮转。若三块等权盘争两个全局席位，首轮覆盖两盘，任一 permit 释放后轮到尚未覆盖的第三盘。若只有一盘 Ready，它可以借满全部可用全局席位，后到盘从后续自然释放边界补足，不抢占在途读取。
 
+这里的“计算线程分配”是当前可派发席位，不是额外创建一组 OS 线程。对每个持续 Ready 的物理盘，调度器先按配置权重计算当前份额并保证至少 1 个席位；若各盘份额总数大于本轮可用 Hash/Media/Worker/全局读取席位，则不截断为固定盘集合，而是在每次完成释放席位时按约分权重和游标轮转。这样低权重盘仍会进入计算，高权重盘按配置取得更多累计机会。
+
 ## 8. 验收标准
 
 实现必须同时满足：
@@ -170,7 +173,8 @@ Dispatcher 不自己实现权重轮转，也不一次性发满某个 SSD。它�
 5. admission 切换、permit 失败、取消和任务级错误都不串项、不泄漏 permit、不误写 `F`。
 6. SSD/HDD 双 lane 按配置值和全局额度运行；等权双 SSD、配置 5:1、Ready 盘多于全局席位三种当前窗口行为均有真实 actor 测试，原有长期权重、老化和 Hash/Media 公平测试不退化。
 7. 真实基础流水线在同一物理盘上能在首个 SQLite ACK 前启动多个 Hash 或多个 Media Worker。
-8. 单次双物理盘真实媒体运行中，目标盘活动许可峰值不再被 Dispatcher 固定为 1；最终任务若未完成仍必须报告 FAIL/INCONCLUSIVE。
+8. Dispatcher 交付当前项时，同盘下一条请求在返回事件泵前已经创建并首轮轮询；关闭该类别 admission 后，预热请求不得继续持有许可。
+9. 单次双物理盘真实媒体运行中，目标盘活动许可峰值不再被 Dispatcher 固定为 1，也不得因 lane 请求补位空窗长期形成 `0:N`；最终任务若未完成仍必须报告 FAIL/INCONCLUSIVE。
 
 ## 9. 不做事项
 
