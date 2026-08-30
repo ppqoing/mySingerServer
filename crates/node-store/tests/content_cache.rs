@@ -319,6 +319,30 @@ fn base_cache_key_batch_preserves_duplicates_and_size() {
     assert!(results[4].is_none());
 }
 
+/// 单项内容键查询只返回对应的完整基础缓存，并对未知键返回缺失。
+#[test]
+fn lookup_base_cache_by_key_returns_one_complete_record() {
+    let mut store = NodeStore::open_in_memory(machine()).unwrap();
+    let content = store
+        .upsert_content_and_location(&scan(r"C:\single.bin", 31), [0x31; 16], MediaKind::Other)
+        .unwrap();
+    store.mark_base_complete(content.id).unwrap();
+    assert_eq!(
+        store
+            .lookup_base_cache_by_key(&content.key)
+            .unwrap()
+            .unwrap()
+            .content_key,
+        content.key
+    );
+    assert!(
+        store
+            .lookup_base_cache_by_key(&ContentKey::new([0xFF; 16], 999))
+            .unwrap()
+            .is_none()
+    );
+}
+
 /// 空批次必须直接返回，不能为了构造 SQL 产生任何数据库调用。
 #[test]
 fn base_cache_batch_empty_input_is_empty() {

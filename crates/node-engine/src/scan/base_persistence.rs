@@ -578,6 +578,20 @@ impl BaseStoreHandle {
         self.call(move |store| store.lookup_base_cache_by_keys(&keys))
     }
 
+    /// 经 SQLite 单写 actor 查询一个 ContentKey，不等待组成批次。
+    pub(crate) fn lookup_base_cache_by_key(
+        &self,
+        key: &ContentKey,
+    ) -> Result<Option<BaseCacheRecord>, StoreError> {
+        #[cfg(test)]
+        self.key_lookup_batches
+            .lock()
+            .expect("查询观测锁不应中毒")
+            .push(1);
+        let key = *key;
+        self.call(move |store| store.lookup_base_cache_by_key(&key))
+    }
+
     /// 返回测试期间实际提交的 content-key 批次大小，不影响生产执行路径。
     #[cfg(test)]
     pub(crate) fn lookup_key_batch_sizes_for_test(&self) -> Vec<usize> {

@@ -97,6 +97,17 @@ impl NodeStore {
         Ok(records)
     }
 
+    /// 加载一个内容键对应的完整基础缓存；不等待或合并其他内容键。
+    pub fn lookup_base_cache_by_key(
+        &self,
+        key: &ContentKey,
+    ) -> Result<Option<BaseCacheRecord>, StoreError> {
+        let mut records = self.lookup_key_cache_batch(std::slice::from_ref(key))?;
+        records
+            .pop()
+            .ok_or_else(|| StoreError::InvalidState("单项基础缓存查询没有返回对应位置".into()))
+    }
+
     /// 根据连接的变量上限计算每个子批容量，变量不足时明确拒绝而不退回逐项查询。
     fn base_cache_batch_limit(&self, has_machine_parameter: bool) -> Result<usize, StoreError> {
         let variable_limit =
