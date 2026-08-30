@@ -2980,14 +2980,14 @@ async fn run_background_job(
                     &read_config,
                 )?;
                 let reader = reader.with_runtime_reporter(runtime_reporter.clone());
-                let (mut remote, remote_available) =
+                let (remote, remote_available) =
                     NodeRemoteFeatureCache::from_config(&postgres_config).await;
                 run_task_file_scan_with_runtime(
                     store,
                     worker_pool,
                     reader.clone(),
                     reader,
-                    &mut remote,
+                    remote,
                     TaskFileScanRunOptions {
                         task_id,
                         roots,

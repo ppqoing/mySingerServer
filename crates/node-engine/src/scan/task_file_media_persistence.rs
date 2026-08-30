@@ -339,25 +339,34 @@ impl TaskFilePersistRuntime {
 
     /// 尽可能投递消息；有界队列满时保留消息，等待外部事件泵先交付 ACK。
     pub(super) fn try_submit(&mut self, store: &BaseStoreHandle) -> Result<(), String> {
-        while let Some(mut pending) = self.queue.pop_front() {
-            if self.in_flight.contains_key(&pending.identity) {
-                return Err("持久化运行态存在重复在途身份".into());
-            }
-            match store.try_persist(pending.message) {
-                Ok(()) => {
-                    self.in_flight.insert(pending.identity, pending.action);
-                }
-                Err(BasePersistSendError::Full(message)) => {
-                    pending.message = message;
-                    self.queue.push_front(pending);
-                    return Ok(());
-                }
-                Err(BasePersistSendError::Closed(_)) => {
-                    return Err("基础持久化 actor 已关闭".into());
-                }
+        while !self.queue.is_empty() {
+            if !self.try_submit_one(store)? {
+                break;
             }
         }
         Ok(())
+    }
+
+    /// 只尝试投递一条消息；返回 false 表示 SQLite actor 队列暂满。
+    pub(super) fn try_submit_one(&mut self, store: &BaseStoreHandle) -> Result<bool, String> {
+        let Some(mut pending) = self.queue.pop_front() else {
+            return Ok(true);
+        };
+        if self.in_flight.contains_key(&pending.identity) {
+            return Err("持久化运行态存在重复在途身份".into());
+        }
+        match store.try_persist(pending.message) {
+            Ok(()) => {
+                self.in_flight.insert(pending.identity, pending.action);
+                Ok(true)
+            }
+            Err(BasePersistSendError::Full(message)) => {
+                pending.message = message;
+                self.queue.push_front(pending);
+                Ok(false)
+            }
+            Err(BasePersistSendError::Closed(_)) => Err("基础持久化 actor 已关闭".into()),
+        }
     }
 
     /// 返回是否还有已经投递但等待 SQLite ACK 的动作。

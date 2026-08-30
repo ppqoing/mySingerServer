@@ -14,6 +14,7 @@ mod pipeline;
 mod root_plan;
 mod task_file_base_compute;
 mod task_file_base_coordinator;
+mod task_file_base_stream;
 mod task_file_cache;
 mod task_file_media_compute;
 mod task_file_media_persistence;

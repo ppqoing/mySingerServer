@@ -2,7 +2,7 @@
 //!
 //! 本模块只负责组合已经独立验证的阶段函数；任务 actor、收尾和恢复由上层负责。
 
-use std::fmt;
+use std::{fmt, sync::Arc};
 
 use dedup_core::DiskReadConfig;
 use dedup_windows::ReadCancellationToken;
@@ -11,11 +11,9 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use super::{
     BaseTaskManifest, BaseTaskProduction, HashPermitReader,
     base_persistence::{BasePersistAck, BaseStoreHandle},
-    task_file_base_compute::{TaskFileBaseComputePending, run_task_file_hash_pass_with_remote},
-    task_file_media_compute::run_task_file_media_compute,
-    task_file_media_persistence::{
-        TaskFileMediaPersistenceOptions, persist_task_file_media_results,
-    },
+    task_file_base_compute::TaskFileBaseComputePending,
+    task_file_base_stream::run_task_file_base_stream,
+    task_file_media_persistence::TaskFileMediaPersistenceOptions,
 };
 use crate::{
     RemoteFeatureCache,
@@ -107,7 +105,7 @@ where
     P: TaskLanePermitProvider,
     H: HashPermitReader<Permit = P::Permit>,
 {
-    let remote = crate::DisabledRemoteFeatureCache;
+    let remote = Arc::new(crate::DisabledRemoteFeatureCache);
     let mut remote_available = false;
     let mut warning = None;
     run_task_file_base_coordinator_with_remote(
@@ -118,7 +116,7 @@ where
         acknowledgements,
         options,
         cancellation,
-        &remote,
+        remote,
         &mut remote_available,
         &mut warning,
     )
@@ -134,7 +132,7 @@ pub(crate) async fn run_task_file_base_coordinator_with_remote<P, H, R>(
     acknowledgements: &mut UnboundedReceiver<BasePersistAck>,
     options: TaskFileBaseCoordinatorOptions,
     cancellation: ReadCancellationToken,
-    remote: &R,
+    remote: Arc<R>,
     remote_available: &mut bool,
     warning: &mut Option<String>,
 ) -> Result<TaskFileBaseCoordinatorResult<P>, TaskFileBaseCoordinatorError<P>>
@@ -168,7 +166,7 @@ pub(crate) async fn run_task_file_base_coordinator_with_runtime<P, H, R>(
     acknowledgements: &mut UnboundedReceiver<BasePersistAck>,
     options: TaskFileBaseCoordinatorOptions,
     cancellation: ReadCancellationToken,
-    remote: &R,
+    remote: Arc<R>,
     remote_available: &mut bool,
     warning: &mut Option<String>,
     reporter: &RuntimeTaskReporter,
@@ -203,7 +201,7 @@ async fn run_task_file_base_coordinator_inner<P, H, R>(
     acknowledgements: &mut UnboundedReceiver<BasePersistAck>,
     options: TaskFileBaseCoordinatorOptions,
     cancellation: ReadCancellationToken,
-    remote: &R,
+    remote: Arc<R>,
     remote_available: &mut bool,
     warning: &mut Option<String>,
     reporter: Option<&RuntimeTaskReporter>,
@@ -213,109 +211,26 @@ where
     H: HashPermitReader<Permit = P::Permit>,
     R: RemoteFeatureCache,
 {
-    let TaskFileBaseCoordinatorOptions {
-        hash_capacity,
-        worker_capacity,
-        read_config,
-        persistence,
-    } = options;
-    let mut pending = TaskFileBaseComputePending::from_production(production);
-
-    loop {
-        if cancellation.is_cancelled() {
-            return Err(coordinator_error(pending, "基础任务已取消", true));
-        }
-
-        // 每一轮先让已知 MD5 的 Media 前进；Hash 队首阻塞时由 Media pass 明确交回 Hash。
-        let media = match if let Some(reporter) = reporter {
-            super::task_file_media_compute::run_task_file_media_compute_with_runtime(
-                pending,
-                worker_pool,
-                store,
-                &read_config,
-                worker_capacity,
-                cancellation.clone(),
-                reporter,
-            )
-            .await
-        } else {
-            run_task_file_media_compute(
-                pending,
-                worker_pool,
-                store,
-                &read_config,
-                worker_capacity,
-                cancellation.clone(),
-            )
-            .await
-        } {
-            Ok(media) => media,
-            Err(error) => {
-                let message = error.to_string();
-                let pending = error.into_pending();
-                return Err(coordinator_error(
-                    pending,
-                    message,
-                    cancellation.is_cancelled(),
-                ));
-            }
-        };
-        let media_cancelled = media.cancelled;
-        let pending_after_media = match persist_task_file_media_results(
-            media,
-            store,
-            acknowledgements,
-            persistence.clone(),
-        )
-        .await
-        {
-            Ok(pending) => pending,
-            Err(error) => {
-                let message = error.to_string();
-                let pending = error.into_pending();
-                return Err(coordinator_error(
-                    pending,
-                    message,
-                    cancellation.is_cancelled(),
-                ));
-            }
-        };
-        pending = pending_after_media;
-        if media_cancelled {
-            return Err(coordinator_error(pending, "基础任务已取消", true));
-        }
-
-        if pending.contexts.is_empty() && pending.remaining_hash_rows == 0 {
-            return finish_coordinator(pending, cancellation).await;
-        }
-
-        if pending.remaining_hash_rows > 0 {
-            pending = match run_task_file_hash_pass_with_remote(
-                pending,
-                reader.clone(),
-                hash_capacity,
-                store,
-                acknowledgements,
-                cancellation.clone(),
-                remote,
-                remote_available,
-                warning,
-            )
-            .await
-            {
-                Ok(pending) => pending,
-                Err(error) => {
-                    let message = error.to_string();
-                    let pending = error.into_pending();
-                    return Err(coordinator_error(
-                        pending,
-                        message,
-                        cancellation.is_cancelled(),
-                    ));
-                }
-            };
-        }
-    }
+    let pending = TaskFileBaseComputePending::from_production(production);
+    let pending = run_task_file_base_stream(
+        pending,
+        reader,
+        worker_pool,
+        store,
+        acknowledgements,
+        &options,
+        cancellation.clone(),
+        remote,
+        remote_available,
+        warning,
+        reporter,
+    )
+    .await
+    .map_err(|error| {
+        let message = error.to_string();
+        coordinator_error(error.into_pending(), message, cancellation.is_cancelled())
+    })?;
+    finish_coordinator(pending, cancellation).await
 }
 
 /// 确认所有任务行已经进入终态，再把 dispatcher owner 交回上层。
@@ -411,6 +326,7 @@ mod tests {
         },
         time::Duration,
     };
+    use tokio::sync::Notify;
 
     use dedup_core::{DiskReadConfig, DisplayPath, MachineId, MediaKind, NormalizedPath};
     use dedup_media::{ImageStage1, PdqHash};
@@ -456,6 +372,59 @@ mod tests {
     struct TestHashReader {
         results: Arc<BTreeMap<String, [u8; 16]>>,
         calls: Arc<AtomicUsize>,
+    }
+
+    /// 用于验证 Hash 完成不能等待同窗口后续读取的受控读取器。
+    #[derive(Clone)]
+    struct GatedHashReader {
+        /// 立即完成的首个路径。
+        first_path: String,
+        /// 被门控的后续路径。
+        later_path: String,
+        /// 后续读取已实际进入的通知。
+        later_entered: Arc<Notify>,
+        /// 允许后续读取返回的门控通知。
+        later_gate: Arc<Notify>,
+        /// 两个路径各自返回的 MD5。
+        md5: [u8; 16],
+    }
+
+    impl HashPermitReader for GatedHashReader {
+        type Permit = TestPermit;
+
+        fn read_with_permit(
+            &self,
+            scanned: ScannedPath,
+            permit: Self::Permit,
+            _cancellation: ReadCancellationToken,
+            _started: Option<crate::scan::HashReadStartedSignal>,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<ReadProduct<Self::Permit>, ReadFailure>>
+                    + Send
+                    + 'static,
+            >,
+        > {
+            let path = scanned.normalized_path.as_str().to_owned();
+            let first_path = self.first_path.clone();
+            let later_path = self.later_path.clone();
+            let later_entered = Arc::clone(&self.later_entered);
+            let later_gate = Arc::clone(&self.later_gate);
+            let md5 = self.md5;
+            Box::pin(async move {
+                if path == later_path {
+                    later_entered.notify_waiters();
+                    later_gate.notified().await;
+                } else if path != first_path {
+                    return Err(ReadFailure::Io {
+                        path: scanned.display_path.as_path().to_path_buf(),
+                        block_offset: 0,
+                        source: std::io::Error::other("测试 Hash 路径不匹配"),
+                    });
+                }
+                Ok(ReadProduct { md5, lease: permit })
+            })
+        }
     }
 
     impl HashPermitReader for TestHashReader {
@@ -674,6 +643,108 @@ mod tests {
         assert_eq!(result.manifest.resolved_files.len(), 2);
         assert!(hash_calls.load(Ordering::SeqCst) > 0);
         assert_eq!(statuses(&result.dispatcher, &lane(7)), vec![b'C', b'C']);
+        result.dispatcher.discard().unwrap();
+        drop(handle);
+        actor.finish().await.unwrap();
+    }
+
+    /// 首个 Hash miss 必须在同窗口后续 Hash 完成前进入 Worker，避免 Hash 全批屏障。
+    #[tokio::test]
+    async fn first_hashed_media_miss_enters_worker_before_later_hash_finishes() {
+        let root = tempfile::tempdir().unwrap();
+        let md5 = [0xA8; 16];
+        let machine = MachineId::from_sha256([0xA9; 32]);
+        let store = NodeStore::open_in_memory(machine).unwrap();
+        let first_path = scanned(r"C:\stream-first.bin", 10);
+        let later_path = scanned(r"C:\stream-later.bin", 10);
+        let production = production(
+            root.path(),
+            &[
+                input(first_path.clone(), lane(31), None),
+                input(later_path.clone(), lane(32), None),
+            ],
+        );
+        let later_entered = Arc::new(Notify::new());
+        let later_gate = Arc::new(Notify::new());
+        let reader = GatedHashReader {
+            first_path: first_path.normalized_path.as_str().to_owned(),
+            later_path: later_path.normalized_path.as_str().to_owned(),
+            later_entered: Arc::clone(&later_entered),
+            later_gate: Arc::clone(&later_gate),
+            md5,
+        };
+        let (actor, handle, mut acknowledgements) =
+            crate::scan::base_persistence::BaseStoreActor::spawn(store, 2);
+        let (mut pool, mut started, controller) = WorkerPool::controlled_batch_for_test(1);
+        let handle_for_run = handle.clone();
+        let run_root = root.path().to_path_buf();
+        let cancellation = ReadCancellationToken::new();
+        let mut coordinator_options = options(&run_root);
+        coordinator_options.hash_capacity = 2;
+        let join = tokio::spawn(async move {
+            let result = run_task_file_base_coordinator(
+                production,
+                reader,
+                &mut pool,
+                &handle_for_run,
+                &mut acknowledgements,
+                coordinator_options,
+                cancellation,
+            )
+            .await;
+            let shutdown = pool.shutdown().await;
+            (result, shutdown)
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), later_entered.notified())
+            .await
+            .expect("第二个 Hash 应进入门控读取");
+        let first_worker = tokio::time::timeout(Duration::from_secs(1), started.recv())
+            .await
+            .expect("首个 Hash 缺失项不得等待后续 Hash")
+            .unwrap();
+        assert_eq!(handle.lookup_key_batch_sizes_for_test(), vec![1]);
+        later_gate.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if handle.lookup_key_batch_sizes_for_test() == vec![1, 1] {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("第二个 Hash 应在首个 Media 未完成时执行单项查询");
+        assert!(!first_worker.1.is_empty());
+
+        controller
+            .base_source_read_complete(first_worker.0.clone(), first_worker.1.clone())
+            .await;
+        controller
+            .complete_base(first_worker.0, first_worker.1, md5, image_output())
+            .await;
+        let second_worker = tokio::time::timeout(Duration::from_secs(1), started.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        controller
+            .base_source_read_complete(second_worker.0.clone(), second_worker.1.clone())
+            .await;
+        controller
+            .complete_base(second_worker.0, second_worker.1, md5, image_output())
+            .await;
+
+        let (result, shutdown) = join.await.unwrap();
+        assert!(shutdown.is_ok());
+        let mut result = result.unwrap();
+        assert_eq!(result.manifest.resolved_files.len(), 2);
+        assert_eq!(
+            statuses(&result.dispatcher, &lane(31)),
+            vec![b'C'],
+            "首行只可在 SQLite ACK 后完成"
+        );
+        assert_eq!(statuses(&result.dispatcher, &lane(32)), vec![b'C']);
+        assert_eq!(handle.lookup_key_batch_sizes_for_test(), vec![1, 1]);
         result.dispatcher.discard().unwrap();
         drop(handle);
         actor.finish().await.unwrap();

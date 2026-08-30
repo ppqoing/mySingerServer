@@ -1,6 +1,6 @@
 //! 瞬态扫描的批量缓存分类、任务文件计算、清单提交和精确清理边界。
 
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 use dedup_core::{NormalizedPath, TaskId};
 use dedup_node_store::{NodeStore, ResolvedScanFile, ScanFinalizeInput};
@@ -84,7 +84,7 @@ pub(crate) async fn run_task_file_scan<P, H, R>(
     worker_pool: &mut WorkerPool,
     provider: P,
     reader: H,
-    remote: &mut R,
+    remote: R,
     options: TaskFileScanRunOptions,
     cancellation: ReadCancellationToken,
 ) -> Result<ScanRunResult, ScanError>
@@ -112,7 +112,7 @@ pub(crate) async fn run_task_file_scan_with_runtime<P, H, R>(
     worker_pool: &mut WorkerPool,
     provider: P,
     reader: H,
-    remote: &mut R,
+    remote: R,
     options: TaskFileScanRunOptions,
     cancellation: ReadCancellationToken,
     runtime_reporter: &RuntimeTaskReporter,
@@ -141,7 +141,7 @@ async fn run_task_file_scan_inner<P, H, R>(
     worker_pool: &mut WorkerPool,
     provider: P,
     reader: H,
-    remote: &mut R,
+    remote: R,
     options: TaskFileScanRunOptions,
     cancellation: ReadCancellationToken,
     runtime_reporter: Option<&RuntimeTaskReporter>,
@@ -164,6 +164,7 @@ where
         #[cfg(feature = "test-hooks")]
         first_persist_waiter,
     } = options;
+    let remote = Arc::new(remote);
     let task_files = TransientTaskFileSet::create(&runtime_root, task_id.as_uuid())?;
     let dispatcher = TaskFileDispatcher::new(task_files, provider);
     let mut producer = BaseTaskProducer::new(dispatcher);
@@ -290,7 +291,7 @@ where
             &mut acknowledgements,
             coordinator,
             cancellation,
-            &*remote,
+            Arc::clone(&remote),
             &mut remote_available,
             &mut warning,
             reporter,
@@ -305,7 +306,7 @@ where
             &mut acknowledgements,
             coordinator,
             cancellation,
-            &*remote,
+            Arc::clone(&remote),
             &mut remote_available,
             &mut warning,
         )
@@ -341,6 +342,8 @@ where
         }
     };
 
+    let mut remote = Arc::try_unwrap(remote)
+        .map_err(|_| ScanError::Stage1("基础流结束时仍有远端缓存查询 owner".into()))?;
     drop(store_handle);
     drop(acknowledgements);
     let writer = store_actor.finish().await;
@@ -369,7 +372,7 @@ where
             Some(planned.len() as u64),
         );
     }
-    publish_final_outbox(&mut store, remote, &mut remote_available, &mut warning).await;
+    publish_final_outbox(&mut store, &mut remote, &mut remote_available, &mut warning).await;
     result.warning = warning;
     Ok(result)
 }
@@ -769,14 +772,14 @@ mod tests {
             per_disk_limit: 1,
         };
         let (mut worker_pool, mut started, _controller) = WorkerPool::controlled_batch_for_test(1);
-        let mut remote = DisabledRemoteFeatureCache;
+        let remote = DisabledRemoteFeatureCache;
 
         let result = run_task_file_scan(
             store,
             &mut worker_pool,
             EmptyPermitProvider,
             NeverHashReader,
-            &mut remote,
+            remote,
             TaskFileScanRunOptions {
                 task_id,
                 roots: vec![NormalizedPath::new(r"C:\media").unwrap()],
@@ -836,14 +839,14 @@ mod tests {
         let cancellation = ReadCancellationToken::new();
         cancellation.cancel();
         let (mut worker_pool, mut started, _controller) = WorkerPool::controlled_batch_for_test(1);
-        let mut remote = DisabledRemoteFeatureCache;
+        let remote = DisabledRemoteFeatureCache;
 
         let error = run_task_file_scan(
             store,
             &mut worker_pool,
             EmptyPermitProvider,
             NeverHashReader,
-            &mut remote,
+            remote,
             TaskFileScanRunOptions {
                 task_id,
                 roots: vec![NormalizedPath::new(r"C:\media").unwrap()],
