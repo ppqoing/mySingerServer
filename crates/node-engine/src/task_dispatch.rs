@@ -60,6 +60,10 @@ pub struct TaskDispatchAdmission {
     pub allow_hash: bool,
     /// 是否允许为媒体字段或二筛任务申请 Media 读取许可。
     pub allow_media: bool,
+    /// 交付一个 Hash 后是否仍有外层容量预热下一请求。
+    prime_hash_after_dispatch: bool,
+    /// 交付一个 Media 后是否仍有外层容量预热下一请求。
+    prime_media_after_dispatch: bool,
 }
 
 impl TaskDispatchAdmission {
@@ -68,6 +72,8 @@ impl TaskDispatchAdmission {
         Self {
             allow_hash: true,
             allow_media: true,
+            prime_hash_after_dispatch: true,
+            prime_media_after_dispatch: true,
         }
     }
 
@@ -76,6 +82,8 @@ impl TaskDispatchAdmission {
         Self {
             allow_hash: true,
             allow_media: false,
+            prime_hash_after_dispatch: true,
+            prime_media_after_dispatch: false,
         }
     }
 
@@ -84,6 +92,18 @@ impl TaskDispatchAdmission {
         Self {
             allow_hash: false,
             allow_media: true,
+            prime_hash_after_dispatch: false,
+            prime_media_after_dispatch: true,
+        }
+    }
+
+    /// 按外层尚可立即接收的 Hash/Media 数量建立 admission。
+    pub const fn with_available_slots(hash_slots: usize, media_slots: usize) -> Self {
+        Self {
+            allow_hash: hash_slots > 0,
+            allow_media: media_slots > 0,
+            prime_hash_after_dispatch: hash_slots > 1,
+            prime_media_after_dispatch: media_slots > 1,
         }
     }
 
@@ -93,6 +113,21 @@ impl TaskDispatchAdmission {
             DiskReadClass::HashSequential => self.allow_hash,
             DiskReadClass::MediaDecode => self.allow_media,
         }
+    }
+
+    /// 消费一个外层槽位后返回仅用于同轮补位的 admission。
+    const fn after_dispatch(self, class: DiskReadClass) -> Self {
+        let mut next = self;
+        match class {
+            DiskReadClass::HashSequential if !self.prime_hash_after_dispatch => {
+                next.allow_hash = false;
+            }
+            DiskReadClass::MediaDecode if !self.prime_media_after_dispatch => {
+                next.allow_media = false;
+            }
+            _ => {}
+        }
+        next
     }
 }
 
@@ -174,7 +209,10 @@ struct PendingPermit<Permit> {
     per_disk_limit: usize,
     /// 标记该等待项是否是同一 TSV 行的 Media 续算。
     continuation: bool,
-    future: TaskLanePermitFuture<Permit>,
+    /// 尚未完成的许可 future；首次返回 Ready 后立即清空。
+    future: Option<TaskLanePermitFuture<Permit>>,
+    /// 已取得的许可或失败结果；由下一次交付轮询消费。
+    ready: Option<Result<Permit, ReadFailure>>,
 }
 
 /// 瞬态任务文件的唯一 dispatcher。
@@ -193,6 +231,8 @@ pub struct TaskFileDispatcher<Provider: TaskLanePermitProvider> {
     in_flight_by_lane: BTreeMap<String, BTreeSet<TaskFileIdentity>>,
     /// 已经消费过 Hash→Media 入口的身份，防止重复续算。
     continuation_claimed: BTreeSet<TaskFileIdentity>,
+    /// 当前任务已经交付后，补位扫描遇到的延迟错误。
+    deferred_error: Option<TaskDispatchError>,
     observed_epoch: u64,
     publication_wait: Option<Pin<Box<dyn Future<Output = u64> + Send>>>,
 }
@@ -208,6 +248,7 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
             continuations: BTreeMap::new(),
             in_flight_by_lane: BTreeMap::new(),
             continuation_claimed: BTreeSet::new(),
+            deferred_error: None,
             observed_epoch,
             publication_wait: None,
         }
@@ -307,6 +348,7 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
     /// 再按 `in_flight_identities` 快照逐项 abandon。
     pub(crate) fn cancel_pending_permit_requests(&mut self) {
         self.pending.clear();
+        self.deferred_error = None;
     }
 
     /// 在取消收束后放弃一项精确在途任务，不写入 `F`。
@@ -421,6 +463,10 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
         &mut self,
         admission: TaskDispatchAdmission,
     ) -> Result<bool, TaskDispatchError> {
+        if let Some(error) = self.deferred_error.take() {
+            return Err(error);
+        }
+        self.drop_forbidden_pending(admission);
         if self
             .pending
             .values()
@@ -444,6 +490,16 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
             }
         }
         Ok(false)
+    }
+
+    /// 测试专用：执行与生产事件泵相同的 admission 就绪检查。
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn has_admitted_work_for_test(
+        &mut self,
+        admission: TaskDispatchAdmission,
+    ) -> Result<bool, TaskDispatchError> {
+        self.has_admitted_work(admission)
     }
 
     /// 异步等待并返回下一个已取得许可的任务。
@@ -491,8 +547,13 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
             if cancellation.is_cancelled() {
                 // 取消只丢弃等待 future，磁盘文件仍保持 P，调用方可以在收束后整体删除 run。
                 self.pending.clear();
+                self.deferred_error = None;
                 self.publication_wait = None;
                 return Poll::Ready(Err(ReadFailure::Cancelled.into()));
+            }
+
+            if let Some(error) = self.deferred_error.take() {
+                return Poll::Ready(Err(error));
             }
 
             if let Err(error) = self.files.health() {
@@ -502,10 +563,21 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
                 return Poll::Ready(Err(error));
             }
             if let Poll::Ready(result) = self.poll_lane_requests(context) {
-                return Poll::Ready(result.map(|task| match task {
-                    Some(task) => TaskDispatchPoll::Task(task),
-                    None => TaskDispatchPoll::Drained,
-                }));
+                return match result {
+                    Ok(Some(task)) => {
+                        // 精确领取会推进 lane 队首；在把当前任务交给外层前，立即创建并
+                        // 首次 poll 同盘补位请求，避免另一盘利用 Ready 空窗借满全局席位。
+                        let lane_key = task.identity.lane_file_name().to_owned();
+                        let replacement_admission = admission.after_dispatch(task.class);
+                        match self.start_lane_requests(cancellation, replacement_admission) {
+                            Ok(()) => self.prime_lane_request(&lane_key, context),
+                            Err(error) => self.deferred_error = Some(error),
+                        }
+                        Poll::Ready(Ok(TaskDispatchPoll::Task(task)))
+                    }
+                    Ok(None) => Poll::Ready(Ok(TaskDispatchPoll::Drained)),
+                    Err(error) => Poll::Ready(Err(error)),
+                };
             }
             if self.files.all_terminal() {
                 return Poll::Ready(Ok(TaskDispatchPoll::Drained));
@@ -550,18 +622,7 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
         cancellation: &ReadCancellationToken,
         admission: TaskDispatchAdmission,
     ) -> Result<(), TaskDispatchError> {
-        let forbidden = self
-            .pending
-            .iter()
-            .filter(|(_, pending)| !admission.allows(pending.class))
-            .map(|(identity, _)| identity.clone())
-            .collect::<Vec<_>>();
-        for identity in forbidden {
-            // 当前阶段禁止的 future 尚未向调用方交付 permit；丢弃它即可释放其
-            // 内部资源，任务文件仍保持 P，切回允许阶段时会按同一身份重试。
-            self.pending.remove(&identity);
-        }
-
+        self.drop_forbidden_pending(admission);
         let heads = self
             .files
             .lane_heads()?
@@ -618,11 +679,27 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
                     class,
                     per_disk_limit: lane.per_disk_limit,
                     continuation,
-                    future,
+                    future: Some(future),
+                    ready: None,
                 },
             );
         }
         Ok(())
+    }
+
+    /// 丢弃当前 admission 已禁止的等待或就绪许可，任务行和续算意图仍保持可重试。
+    fn drop_forbidden_pending(&mut self, admission: TaskDispatchAdmission) {
+        let forbidden = self
+            .pending
+            .iter()
+            .filter(|(_, pending)| !admission.allows(pending.class))
+            .map(|(identity, _)| identity.clone())
+            .collect::<Vec<_>>();
+        for identity in forbidden {
+            // 当前阶段禁止的 future 尚未向调用方交付 permit；丢弃它即可释放其
+            // 内部资源，任务文件仍保持 P，切回允许阶段时会按同一身份重试。
+            self.pending.remove(&identity);
+        }
     }
 
     /// 找出封闭任务中被当前 admission 阻止的队首或续算类别。
@@ -675,80 +752,114 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
         context: &mut Context<'_>,
     ) -> Poll<Result<Option<DispatchedTask<Provider::Permit>>, TaskDispatchError>> {
         let identities = self.pending.keys().cloned().collect::<Vec<_>>();
-        for pending_identity in identities {
-            let outcome = {
-                let pending = self
-                    .pending
-                    .get_mut(&pending_identity)
-                    .expect("队首请求在本次 poll 中不会被外部移除");
-                pending.future.as_mut().poll(context)
-            };
-            match outcome {
-                Poll::Pending => {}
-                Poll::Ready(Err(error)) => {
-                    // 只移除失败 future；任务行仍是 P，下一次 poll 会重新申请许可。
-                    self.pending.remove(&pending_identity);
-                    return Poll::Ready(Err(error.into()));
-                }
-                Poll::Ready(Ok(permit)) => {
-                    let pending = self
-                        .pending
-                        .remove(&pending_identity)
-                        .expect("已轮询的队首请求必须仍存在");
-                    let lane_key = pending.identity.lane_file_name().to_owned();
-                    let (identity, record) = if pending.continuation {
-                        self.files
-                            .validate_media_continuation(&pending.identity, &pending.record)?;
-                        if !self
-                            .in_flight_by_lane
-                            .get(&lane_key)
-                            .is_some_and(|identities| identities.contains(&pending.identity))
-                        {
-                            return Poll::Ready(Err(io::Error::other(
-                                "Media 续算身份不在对应 lane 的在途集合中",
-                            )
-                            .into()));
-                        }
-                        self.continuations.remove(&pending.identity);
-                        (pending.identity, pending.record)
-                    } else {
-                        if self
-                            .in_flight_by_lane
-                            .get(&lane_key)
-                            .is_some_and(|identities| identities.len() >= pending.per_disk_limit)
-                        {
-                            return Poll::Ready(Err(io::Error::other(
-                                "普通任务取得许可后超过冻结的逐盘身份窗口",
-                            )
-                            .into()));
-                        }
-                        let taken = self
-                            .files
-                            .take_lane_exact(&pending.identity, &pending.record)?;
-                        let Some((identity, record)) = taken else {
-                            // permit 未能与精确队首绑定时立即释放，禁止把它交给错误任务。
-                            return Poll::Ready(Err(io::Error::other(
-                                "读取许可成功后任务队首无法按身份领取",
-                            )
-                            .into()));
-                        };
-                        self.in_flight_by_lane
-                            .entry(lane_key.clone())
-                            .or_default()
-                            .insert(identity.clone());
-                        (identity, record)
-                    };
-                    return Poll::Ready(Ok(Some(DispatchedTask {
-                        identity,
-                        record,
-                        class: pending.class,
-                        permit,
-                        continuation: pending.continuation,
-                    })));
-                }
+        let mut ready_identity = None;
+        for identity in identities {
+            let pending = self
+                .pending
+                .get_mut(&identity)
+                .expect("队首请求在本次 poll 中不会被外部移除");
+            Self::prime_pending_request(pending, context);
+            if pending.ready.is_some() {
+                ready_identity = Some(identity);
+                break;
             }
         }
-        Poll::Pending
+        let Some(pending_identity) = ready_identity else {
+            return Poll::Pending;
+        };
+        let mut pending = self
+            .pending
+            .remove(&pending_identity)
+            .expect("已就绪的队首请求必须仍存在");
+        let outcome = pending.ready.take().expect("已就绪请求必须保存结果");
+        let permit = match outcome {
+            Ok(permit) => permit,
+            Err(error) => {
+                // 只移除失败结果；任务行仍是 P，下一次 poll 会重新申请许可。
+                return Poll::Ready(Err(error.into()));
+            }
+        };
+        let lane_key = pending.identity.lane_file_name().to_owned();
+        let (identity, record) = if pending.continuation {
+            self.files
+                .validate_media_continuation(&pending.identity, &pending.record)?;
+            if !self
+                .in_flight_by_lane
+                .get(&lane_key)
+                .is_some_and(|identities| identities.contains(&pending.identity))
+            {
+                return Poll::Ready(Err(io::Error::other(
+                    "Media 续算身份不在对应 lane 的在途集合中",
+                )
+                .into()));
+            }
+            self.continuations.remove(&pending.identity);
+            (pending.identity, pending.record)
+        } else {
+            if self
+                .in_flight_by_lane
+                .get(&lane_key)
+                .is_some_and(|identities| identities.len() >= pending.per_disk_limit)
+            {
+                return Poll::Ready(Err(io::Error::other(
+                    "普通任务取得许可后超过冻结的逐盘身份窗口",
+                )
+                .into()));
+            }
+            let taken = self
+                .files
+                .take_lane_exact(&pending.identity, &pending.record)?;
+            let Some((identity, record)) = taken else {
+                // permit 未能与精确队首绑定时立即释放，禁止把它交给错误任务。
+                return Poll::Ready(Err(io::Error::other(
+                    "读取许可成功后任务队首无法按身份领取",
+                )
+                .into()));
+            };
+            self.in_flight_by_lane
+                .entry(lane_key)
+                .or_default()
+                .insert(identity.clone());
+            (identity, record)
+        };
+        Poll::Ready(Ok(Some(DispatchedTask {
+            identity,
+            record,
+            class: pending.class,
+            permit,
+            continuation: pending.continuation,
+        })))
+    }
+
+    /// 只首次 poll 刚交付任务所属 lane 的补位请求，不提前授予其他 lane 的许可。
+    fn prime_lane_request(&mut self, lane_key: &str, context: &mut Context<'_>) {
+        let pending = self
+            .pending
+            .values_mut()
+            .find(|pending| pending.identity.lane_file_name() == lane_key);
+        if let Some(pending) = pending {
+            Self::prime_pending_request(pending, context);
+        }
+    }
+
+    /// 首次 poll 一个尚未进入 scheduler 的许可 future，并缓存同步就绪结果。
+    fn prime_pending_request(
+        pending: &mut PendingPermit<Provider::Permit>,
+        context: &mut Context<'_>,
+    ) {
+        if pending.ready.is_some() {
+            return;
+        }
+        let outcome = pending
+            .future
+            .as_mut()
+            .expect("未就绪请求必须保留许可 future")
+            .as_mut()
+            .poll(context);
+        if let Poll::Ready(result) = outcome {
+            pending.future = None;
+            pending.ready = Some(result);
+        }
     }
 }
 

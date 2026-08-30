@@ -131,13 +131,16 @@ where
         }
 
         // Hash 和远端查询共用 hash_capacity；Media 只受独立 worker_capacity 限制。
-        let allow_hash = hash.can_dispatch(options.hash_capacity)
-            && hash.active_len().saturating_add(remote_lookups.len()) < options.hash_capacity;
-        let allow_media = media.has_capacity(options.worker_capacity);
-        let admission = TaskDispatchAdmission {
-            allow_hash,
-            allow_media,
+        let hash_in_use = hash.active_len().saturating_add(remote_lookups.len());
+        let hash_slots = if hash.can_dispatch(options.hash_capacity) {
+            options.hash_capacity.saturating_sub(hash_in_use)
+        } else {
+            0
         };
+        let media_slots = media.available_capacity(options.worker_capacity);
+        let admission = TaskDispatchAdmission::with_available_slots(hash_slots, media_slots);
+        let allow_hash = admission.allow_hash;
+        let allow_media = admission.allow_media;
         let dispatch_ready = match pending.dispatcher.has_admitted_work(admission) {
             Ok(ready) => ready,
             Err(error) => {

@@ -80,6 +80,8 @@ struct FakeState {
     started: Vec<(String, DiskReadClass)>,
     blocked: bool,
     fail_next: bool,
+    /// 指定创建顺序的许可 future 返回失败，用于覆盖预先补位的请求。
+    fail_sequence: Option<usize>,
 }
 
 impl FakeProvider {
@@ -89,6 +91,11 @@ impl FakeProvider {
 
     fn fail_next(&self) {
         self.state.lock().unwrap().fail_next = true;
+    }
+
+    /// 让指定创建顺序的许可 future 返回取消错误。
+    fn fail_sequence(&self, sequence: usize) {
+        self.state.lock().unwrap().fail_sequence = Some(sequence);
     }
 
     fn started(&self) -> Vec<(String, DiskReadClass)> {
@@ -123,9 +130,13 @@ impl TaskLanePermitProvider for FakeProvider {
         );
         let (blocked, fail, sequence) = {
             let mut state = self.state.lock().unwrap();
-            let fail = state.fail_next;
-            state.fail_next = false;
             let sequence = state.started.len();
+            let fail_sequence = state.fail_sequence == Some(sequence);
+            if fail_sequence {
+                state.fail_sequence = None;
+            }
+            let fail = state.fail_next || fail_sequence;
+            state.fail_next = false;
             state.started.push((lane_name.clone(), class));
             (state.blocked, fail, sequence)
         };
@@ -147,6 +158,99 @@ impl TaskLanePermitProvider for FakeProvider {
                 sequence,
                 active,
             })
+        })
+    }
+}
+
+/// 记录 Dispatcher 是否在交付当前任务前首次 poll 同盘补位请求。
+#[derive(Clone, Default)]
+struct PrimeTrackingProvider {
+    /// 已创建的许可 future 数量。
+    created: Arc<AtomicUsize>,
+    /// 已至少 poll 一次的许可 future 数量。
+    first_polled: Arc<AtomicUsize>,
+    /// 当前由测试许可持有的活动额度。
+    active: Arc<AtomicUsize>,
+}
+
+impl PrimeTrackingProvider {
+    /// 返回已经创建的许可 future 数量。
+    fn created(&self) -> usize {
+        self.created.load(Ordering::Acquire)
+    }
+
+    /// 返回已经首次 poll 的许可 future 数量。
+    fn first_polled(&self) -> usize {
+        self.first_polled.load(Ordering::Acquire)
+    }
+}
+
+/// 第一条许可立即完成，后续许可在首次 poll 后保持等待。
+struct PrimeTrackingFuture {
+    /// 本次请求所属的稳定物理盘名称。
+    lane: String,
+    /// 本次请求的创建顺序。
+    sequence: usize,
+    /// 防止重复统计同一个 future 的首次 poll。
+    observed_first_poll: bool,
+    /// 已首次 poll 的 future 聚合计数。
+    first_polled: Arc<AtomicUsize>,
+    /// 测试许可共享的活动计数。
+    active: Arc<AtomicUsize>,
+    /// 任务级读取取消令牌。
+    cancellation: ReadCancellationToken,
+}
+
+impl Future for PrimeTrackingFuture {
+    type Output = Result<FakePermit, ReadFailure>;
+
+    /// 第一条请求直接交付，第二条请求只记录已经进入 provider 后保持 Pending。
+    fn poll(mut self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Self::Output> {
+        if !self.observed_first_poll {
+            self.observed_first_poll = true;
+            self.first_polled.fetch_add(1, Ordering::AcqRel);
+        }
+        if self.cancellation.is_cancelled() {
+            return Poll::Ready(Err(ReadFailure::Cancelled));
+        }
+        if self.sequence != 0 {
+            return Poll::Pending;
+        }
+        self.active.fetch_add(1, Ordering::AcqRel);
+        Poll::Ready(Ok(FakePermit {
+            lane: self.lane.clone(),
+            sequence: self.sequence,
+            active: Arc::clone(&self.active),
+        }))
+    }
+}
+
+impl TaskLanePermitProvider for PrimeTrackingProvider {
+    type Permit = FakePermit;
+
+    /// 创建可观察首次 poll 的许可 future。
+    fn acquire(
+        &self,
+        lane: TaskDiskLane,
+        _class: DiskReadClass,
+        cancellation: ReadCancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Permit, ReadFailure>> + Send>> {
+        let sequence = self.created.fetch_add(1, Ordering::AcqRel);
+        let lane = format!(
+            "PhysicalDisk{}",
+            lane.physical_disk_numbers
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join("+")
+        );
+        Box::pin(PrimeTrackingFuture {
+            lane,
+            sequence,
+            observed_first_poll: false,
+            first_polled: Arc::clone(&self.first_polled),
+            active: Arc::clone(&self.active),
+            cancellation,
         })
     }
 }
@@ -407,6 +511,75 @@ fn one_lane_dispatches_up_to_configured_limit_before_any_ack() {
         poll_once(&mut dispatcher, &cancellation),
         Poll::Ready(Ok(None))
     ));
+    dispatcher.discard().unwrap();
+}
+
+#[test]
+fn dispatcher_primes_same_lane_replacement_before_returning_current_task() {
+    let provider = PrimeTrackingProvider::default();
+    let mut dispatcher = new_dispatcher(provider.clone());
+    let task_lane = lane(&[38], LocalDiskKind::Ssd, 2, 2);
+    let rows = [
+        base_record("prime-first.bin", Some([0xa1; 16])),
+        base_record("prime-second.bin", Some([0xa2; 16])),
+    ];
+    dispatcher.register_lane(&task_lane).unwrap();
+    dispatcher.append_batch(&task_lane, &rows).unwrap();
+    dispatcher.seal().unwrap();
+    let cancellation = ReadCancellationToken::new();
+
+    let first = ready_task(poll_once(&mut dispatcher, &cancellation));
+    assert_eq!(
+        provider.created(),
+        2,
+        "交付当前任务前必须创建同盘下一条许可请求"
+    );
+    assert_eq!(
+        provider.first_polled(),
+        2,
+        "同盘下一条请求必须在当前 poll epoch 内进入许可提供者"
+    );
+
+    cancellation.cancel();
+    assert!(matches!(
+        poll_once(&mut dispatcher, &cancellation),
+        Poll::Ready(Err(TaskDispatchError::Read(ReadFailure::Cancelled)))
+    ));
+    dispatcher.mark_completed(&first.identity).unwrap();
+    drop(first);
+    dispatcher.discard().unwrap();
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn admission_check_releases_a_primed_request_when_the_stage_closes() {
+    let provider = FakeProvider::default();
+    let mut dispatcher = new_dispatcher(provider.clone());
+    let task_lane = lane(&[39], LocalDiskKind::Ssd, 2, 2);
+    let rows = [
+        base_record("admission-first.bin", Some([0xb1; 16])),
+        base_record("admission-second.bin", Some([0xb2; 16])),
+    ];
+    dispatcher.register_lane(&task_lane).unwrap();
+    dispatcher.append_batch(&task_lane, &rows).unwrap();
+    dispatcher.seal().unwrap();
+    let cancellation = ReadCancellationToken::new();
+
+    let first = ready_task(poll_once(&mut dispatcher, &cancellation));
+    assert_eq!(provider.active_permits(), 2, "同轮补位应已缓存第二个许可");
+    assert!(
+        !dispatcher
+            .has_admitted_work_for_test(TaskDispatchAdmission::hash_only())
+            .unwrap()
+    );
+    assert_eq!(
+        provider.active_permits(),
+        1,
+        "关闭 Media admission 后必须立即释放尚未交付的补位许可"
+    );
+
+    dispatcher.mark_completed(&first.identity).unwrap();
+    drop(first);
     dispatcher.discard().unwrap();
 }
 
@@ -1017,6 +1190,7 @@ fn cancellation_abandons_all_same_lane_identities_and_preserves_pending_rows() {
 #[test]
 fn same_lane_permit_failure_keeps_other_inflight_identities_intact() {
     let provider = FakeProvider::default();
+    provider.fail_sequence(1);
     let mut dispatcher = new_dispatcher(provider.clone());
     let task_lane = lane(&[31], LocalDiskKind::Ssd, 2, 2);
     let rows = [
@@ -1030,7 +1204,6 @@ fn same_lane_permit_failure_keeps_other_inflight_identities_intact() {
     let token = ReadCancellationToken::new();
 
     let first = ready_task(poll_once(&mut dispatcher, &token));
-    provider.fail_next();
     assert!(matches!(
         poll_once(&mut dispatcher, &token),
         Poll::Ready(Err(TaskDispatchError::Read(ReadFailure::Cancelled)))

@@ -148,9 +148,9 @@ impl<P: TaskLanePermitProvider> TaskFileMediaRuntime<P> {
         }
     }
 
-    /// 返回当前 Worker 窗口是否还可以派发新的媒体项。
-    pub(super) fn has_capacity(&self, worker_capacity: usize) -> bool {
-        self.active.len() < worker_capacity
+    /// 返回当前 Worker 窗口还可立即接收的媒体任务数。
+    pub(super) fn available_capacity(&self, worker_capacity: usize) -> usize {
+        worker_capacity.saturating_sub(self.active.len())
     }
 
     /// 返回是否仍有等待 Worker 事件的媒体项。

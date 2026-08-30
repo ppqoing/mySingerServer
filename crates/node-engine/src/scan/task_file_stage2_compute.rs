@@ -414,7 +414,8 @@ where
             return Err(stage2_error(production, "二筛已取消"));
         }
 
-        let can_dispatch = !dispatch_drained && active.len() < worker_capacity;
+        let available_worker_slots = worker_capacity.saturating_sub(active.len());
+        let can_dispatch = !dispatch_drained && available_worker_slots > 0;
         if !can_dispatch && active.is_empty() {
             // 当前没有活动 Worker，但 dispatcher 尚未返回 Drained；再次轮询可得到明确状态。
             dispatch_drained = false;
@@ -445,7 +446,7 @@ where
             }
             dispatched = production.dispatcher.next_with_admission(
                 cancellation.clone(),
-                TaskDispatchAdmission::media_only(),
+                TaskDispatchAdmission::with_available_slots(0, available_worker_slots),
             ), if can_dispatch => {
                 match dispatched {
                     Ok(TaskDispatchPoll::Task(task)) => {
