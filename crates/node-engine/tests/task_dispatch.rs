@@ -62,6 +62,54 @@ async fn scheduler_provider_uses_the_same_frozen_lane_without_a_second_acquire()
     drop(task);
 }
 
+#[tokio::test]
+async fn scheduler_provider_splits_the_first_dispatch_window_by_registered_disk_weight() {
+    let mut config = dedup_core::DiskReadConfig::default();
+    config.ssd_threads_per_disk = 16;
+    config.total_threads = 12;
+    let scheduler = DiskReadScheduler::new(&config, 20).unwrap();
+    let provider = SchedulerTaskLanePermitProvider::new(scheduler);
+    let mut dispatcher = new_dispatcher(provider);
+    let first_lane = lane(&[20], LocalDiskKind::Ssd, 16, 16);
+    let second_lane = lane(&[21], LocalDiskKind::Ssd, 16, 16);
+    let first_rows = (0..12)
+        .map(|index| base_record(&format!("weighted-first-{index}.bin"), None))
+        .collect::<Vec<_>>();
+    let second_rows = (0..12)
+        .map(|index| base_record(&format!("weighted-second-{index}.bin"), None))
+        .collect::<Vec<_>>();
+    dispatcher.append_batch(&first_lane, &first_rows).unwrap();
+    dispatcher.append_batch(&second_lane, &second_rows).unwrap();
+    dispatcher.seal().unwrap();
+
+    let cancellation = ReadCancellationToken::new();
+    let mut tasks = Vec::with_capacity(12);
+    let mut active_by_lane = [0_usize; 2];
+    for _ in 0..12 {
+        let task = dispatcher
+            .next(cancellation.clone())
+            .await
+            .unwrap()
+            .expect("全局窗口内应持续交付任务");
+        match task.identity.lane_file_name() {
+            "PhysicalDisk20-ssd.tasks.tsv" => active_by_lane[0] += 1,
+            "PhysicalDisk21-ssd.tasks.tsv" => active_by_lane[1] += 1,
+            other => panic!("出现未登记的物理盘 lane: {other}"),
+        }
+        tasks.push(task);
+    }
+    assert_eq!(
+        active_by_lane,
+        [6, 6],
+        "真实 dispatcher 首个 12 席位窗口必须按两块等权盘均分"
+    );
+
+    for task in tasks {
+        dispatcher.mark_completed(&task.identity).unwrap();
+        drop(task);
+    }
+}
+
 impl Drop for FakePermit {
     fn drop(&mut self) {
         self.active.fetch_sub(1, Ordering::AcqRel);

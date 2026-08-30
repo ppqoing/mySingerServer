@@ -16,7 +16,10 @@ use dedup_windows::{ReadCancellationToken, StorageLocation};
 use thiserror::Error;
 
 use crate::{
-    io::{DiskReadClass, DiskReadLane, DiskReadPermit, DiskReadScheduler, ReadFailure},
+    io::{
+        DiskReadClass, DiskReadLane, DiskReadLaneGroup, DiskReadPermit, DiskReadScheduler,
+        ReadFailure,
+    },
     scan::TaskDiskLane,
     task_files::{TaskFileIdentity, TaskFilePublication, TaskFileRecord, TransientTaskFileSet},
 };
@@ -29,6 +32,24 @@ pub type TaskLanePermitFuture<Permit> =
 pub trait TaskLanePermitProvider: Clone + Send + Sync + 'static {
     /// 一次读取许可的所有权类型；释放时归还全局及物理盘额度。
     type Permit: Send + 'static;
+
+    /// 为一个新的 dispatcher 创建独立任务组；无调度状态的测试提供者沿用自身克隆。
+    fn begin_task_group(&self) -> Self {
+        self.clone()
+    }
+
+    /// 在首次申请许可前登记本任务全部真实任务 lane。
+    fn configure_task_lanes(&self, _lanes: &[TaskDiskLane]) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// 一条 lane 已经无任务、无等待和无 dispatcher 在途身份时释放其权重席位。
+    fn unregister_task_lane(&self, _lane: &TaskDiskLane) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// 任务取消、失败或 dispatcher Drop 时清空当前任务组。
+    fn clear_task_lanes(&self) {}
 
     /// 为指定物理盘 lane 和计算类别创建一个许可请求。
     fn acquire(
@@ -235,12 +256,15 @@ pub struct TaskFileDispatcher<Provider: TaskLanePermitProvider> {
     deferred_error: Option<TaskDispatchError>,
     observed_epoch: u64,
     publication_wait: Option<Pin<Box<dyn Future<Output = u64> + Send>>>,
+    /// 已登记到许可提供者且尚未达到真实终态的任务 lane。
+    provider_lanes: BTreeMap<String, TaskDiskLane>,
 }
 
 impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
     /// 创建拥有任务文件集合和许可提供者的 dispatcher。
     pub fn new(files: TransientTaskFileSet, provider: Provider) -> Self {
         let observed_epoch = files.publication_epoch();
+        let provider = provider.begin_task_group();
         Self {
             files,
             provider,
@@ -251,12 +275,14 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
             deferred_error: None,
             observed_epoch,
             publication_wait: None,
+            provider_lanes: BTreeMap::new(),
         }
     }
 
     /// 注册一个按物理盘身份冻结的任务 lane。
     pub fn register_lane(&mut self, lane: &TaskDiskLane) -> io::Result<()> {
-        self.files.register_lane(lane)
+        self.files.register_lane(lane)?;
+        self.ensure_provider_lane(lane)
     }
 
     /// 追加一批任务行，并在 flush 后发布给 dispatcher。
@@ -265,12 +291,20 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
         lane: &TaskDiskLane,
         rows: &[TaskFileRecord],
     ) -> io::Result<Vec<TaskFileIdentity>> {
+        if !rows.is_empty() {
+            self.ensure_provider_lane(lane)?;
+        }
         self.files.append_batch(lane, rows)
     }
 
     /// 封闭生产端；封闭后只继续派发已发布的任务。
     pub fn seal(&mut self) -> io::Result<()> {
-        self.files.seal()
+        let lanes = self.files.lanes();
+        for lane in &lanes {
+            self.ensure_provider_lane(lane)?;
+        }
+        self.files.seal()?;
+        self.retire_terminal_lanes()
     }
 
     /// 在 SQLite 成功确认后把已领取行标记为完成。
@@ -280,6 +314,7 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
         self.continuations.remove(identity);
         self.continuation_claimed.remove(identity);
         self.release_in_flight_identity(identity);
+        self.retire_terminal_lanes()?;
         Ok(())
     }
 
@@ -290,6 +325,7 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
         self.continuations.remove(identity);
         self.continuation_claimed.remove(identity);
         self.release_in_flight_identity(identity);
+        self.retire_terminal_lanes()?;
         Ok(())
     }
 
@@ -368,6 +404,7 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
         self.continuations.remove(identity);
         self.continuation_claimed.remove(identity);
         self.release_in_flight_identity(identity);
+        self.retire_terminal_lanes()?;
         Ok(())
     }
 
@@ -392,7 +429,10 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
         }
         // 内部等待 future 也持有 publication owner；删除前先解除，避免自身阻止清理。
         self.publication_wait = None;
-        self.files.discard()
+        let result = self.files.discard();
+        self.provider.clear_task_lanes();
+        self.provider_lanes.clear();
+        result
     }
 
     /// 返回指定 lane 的任务文件路径，供诊断和测试读取状态字节。
@@ -456,6 +496,36 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
         if remove_lane {
             self.in_flight_by_lane.remove(&lane_key);
         }
+    }
+
+    /// 幂等登记一条真实任务 lane；生产者和消费者并发时也不会在 seal 前申请未登记许可。
+    fn ensure_provider_lane(&mut self, lane: &TaskDiskLane) -> io::Result<()> {
+        let key = self.files.lane_key(lane)?;
+        if self.provider_lanes.contains_key(&key) {
+            return Ok(());
+        }
+        self.provider
+            .configure_task_lanes(std::slice::from_ref(lane))?;
+        self.provider_lanes.insert(key, lane.clone());
+        Ok(())
+    }
+
+    /// 只在 TSV 已封闭、全部行终态且无在途身份时注销 lane，避免短暂无 waiter 误退役。
+    fn retire_terminal_lanes(&mut self) -> io::Result<()> {
+        let terminal = self
+            .provider_lanes
+            .iter()
+            .filter_map(|(key, lane)| match self.files.lane_terminal(lane) {
+                Ok(true) => Some(Ok((key.clone(), lane.clone()))),
+                Ok(false) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        for (key, lane) in terminal {
+            self.provider.unregister_task_lane(&lane)?;
+            self.provider_lanes.remove(&key);
+        }
+        Ok(())
     }
 
     /// 判断当前 admission 下是否存在可交付任务，供事件泵避开已知阻塞的轮询。
@@ -863,6 +933,13 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
     }
 }
 
+impl<Provider: TaskLanePermitProvider> Drop for TaskFileDispatcher<Provider> {
+    /// 无论正常完成还是上层提前返回，都不能让任务级磁盘席位影响下一次运行。
+    fn drop(&mut self) {
+        self.provider.clear_task_lanes();
+    }
+}
+
 /// 根据任务记录选择本次唯一的读取类别，并拒绝非法掩码组合。
 fn dispatch_class(record: &TaskFileRecord) -> Result<DiskReadClass, TaskDispatchError> {
     record
@@ -883,17 +960,56 @@ fn dispatch_class(record: &TaskFileRecord) -> Result<DiskReadClass, TaskDispatch
 #[derive(Clone)]
 pub struct SchedulerTaskLanePermitProvider {
     scheduler: DiskReadScheduler,
+    /// 每个 dispatcher 独享的任务级物理盘配额组。
+    lane_group: Option<DiskReadLaneGroup>,
 }
 
 impl SchedulerTaskLanePermitProvider {
     /// 使用现有 scheduler 创建薄适配层；不会复制任何调度状态。
     pub fn new(scheduler: DiskReadScheduler) -> Self {
-        Self { scheduler }
+        Self {
+            scheduler,
+            lane_group: None,
+        }
     }
 }
 
 impl TaskLanePermitProvider for SchedulerTaskLanePermitProvider {
     type Permit = DiskReadPermit;
+
+    fn begin_task_group(&self) -> Self {
+        Self {
+            scheduler: self.scheduler.clone(),
+            lane_group: Some(self.scheduler.new_lane_group()),
+        }
+    }
+
+    fn configure_task_lanes(&self, lanes: &[TaskDiskLane]) -> io::Result<()> {
+        let Some(group) = &self.lane_group else {
+            return Err(io::Error::other("任务 dispatcher 未创建物理盘配额组"));
+        };
+        for lane in lanes {
+            group
+                .register(to_disk_read_lane(lane))
+                .map_err(io::Error::other)?;
+        }
+        Ok(())
+    }
+
+    fn unregister_task_lane(&self, lane: &TaskDiskLane) -> io::Result<()> {
+        let Some(group) = &self.lane_group else {
+            return Err(io::Error::other("任务 dispatcher 未创建物理盘配额组"));
+        };
+        group
+            .unregister(&to_disk_read_lane(lane))
+            .map_err(io::Error::other)
+    }
+
+    fn clear_task_lanes(&self) {
+        if let Some(group) = &self.lane_group {
+            group.clear();
+        }
+    }
 
     fn acquire(
         &self,
@@ -902,11 +1018,8 @@ impl TaskLanePermitProvider for SchedulerTaskLanePermitProvider {
         cancellation: ReadCancellationToken,
     ) -> TaskLanePermitFuture<Self::Permit> {
         let scheduler = self.scheduler.clone();
-        let disk_lane = DiskReadLane {
-            location: StorageLocation::from_parts(lane.physical_disk_id.clone(), lane.disk_kind),
-            effective_limit: lane.per_disk_limit,
-            configured_weight: lane.configured_weight,
-        };
+        let disk_lane = to_disk_read_lane(&lane);
+        let lane_group = self.lane_group.clone();
         let path = format!(
             "PhysicalDisk{}",
             lane.physical_disk_numbers
@@ -919,20 +1032,34 @@ impl TaskLanePermitProvider for SchedulerTaskLanePermitProvider {
             if cancellation.is_cancelled() {
                 return Err(ReadFailure::Cancelled);
             }
-            let permit = scheduler
-                .acquire_lane(disk_lane, class)
-                .await
-                .map_err(|error| ReadFailure::Io {
-                    path: path.into(),
-                    block_offset: 0,
-                    source: io::Error::other(error),
-                })?;
+            let permit = match lane_group {
+                Some(group) => {
+                    scheduler
+                        .acquire_lane_in_group(disk_lane, class, group)
+                        .await
+                }
+                None => scheduler.acquire_lane(disk_lane, class).await,
+            }
+            .map_err(|error| ReadFailure::Io {
+                path: path.into(),
+                block_offset: 0,
+                source: io::Error::other(error),
+            })?;
             if cancellation.is_cancelled() {
                 drop(permit);
                 return Err(ReadFailure::Cancelled);
             }
             Ok(permit)
         })
+    }
+}
+
+/// 把任务文件冻结配置转换为 scheduler 唯一接受的 lane 值。
+fn to_disk_read_lane(lane: &TaskDiskLane) -> DiskReadLane {
+    DiskReadLane {
+        location: StorageLocation::from_parts(lane.physical_disk_id.clone(), lane.disk_kind),
+        effective_limit: lane.per_disk_limit,
+        configured_weight: lane.configured_weight,
     }
 }
 

@@ -153,6 +153,210 @@ async fn configured_weight_seven_to_two_is_not_a_hardcoded_five_to_one_ratio() {
 }
 
 #[tokio::test]
+async fn registered_equal_disks_reserve_their_weighted_seats_before_both_have_waiters() {
+    let mut config = DiskReadConfig::default();
+    config.ssd_threads_per_disk = 16;
+    config.total_threads = 12;
+    let scheduler = DiskReadScheduler::new(&config, 20).unwrap();
+    let first_lane = weighted_lane(&[9], LocalDiskKind::Ssd, 16, 16);
+    let second_lane = weighted_lane(&[10], LocalDiskKind::Ssd, 16, 16);
+    let lane_group = scheduler.new_lane_group();
+    lane_group.register(first_lane.clone()).unwrap();
+    lane_group.register(second_lane.clone()).unwrap();
+
+    // 第二块盘的请求先进入 actor。已登记的第一块盘尚未排队，也必须保留 6 个席位，
+    // 否则慢盘会先借满全局窗口，后续快速盘无法在非抢占许可下恢复均衡。
+    let mut second_requests: Vec<Option<WeightedRequest>> = Vec::with_capacity(12);
+    for _ in 0..12 {
+        let scheduler = scheduler.clone();
+        let lane_group = lane_group.clone();
+        let lane = second_lane.clone();
+        second_requests.push(Some(Box::pin(async move {
+            scheduler
+                .acquire_lane_in_group(lane, DiskReadClass::HashSequential, lane_group)
+                .await
+                .map(|permit| (1, permit))
+        })));
+    }
+    for request in &mut second_requests {
+        let _ = poll_once(request.as_mut().unwrap().as_mut());
+    }
+    scheduler.barrier_for_test().await.unwrap();
+
+    let second_active = take_ready_weighted_requests(&mut second_requests);
+    assert_eq!(
+        second_active.len(),
+        6,
+        "先到的等权磁盘只能取得自己的 6 个任务级席位"
+    );
+
+    let mut first_requests: Vec<Option<WeightedRequest>> = Vec::with_capacity(6);
+    for _ in 0..6 {
+        let scheduler = scheduler.clone();
+        let lane_group = lane_group.clone();
+        let lane = first_lane.clone();
+        first_requests.push(Some(Box::pin(async move {
+            scheduler
+                .acquire_lane_in_group(lane, DiskReadClass::HashSequential, lane_group)
+                .await
+                .map(|permit| (0, permit))
+        })));
+    }
+    for request in &mut first_requests {
+        let _ = poll_once(request.as_mut().unwrap().as_mut());
+    }
+    scheduler.barrier_for_test().await.unwrap();
+    let first_active = take_ready_weighted_requests(&mut first_requests);
+    assert_eq!(first_active.len(), 6, "后到磁盘应立即取得保留的 6 个席位");
+
+    drop(second_requests);
+    drop(first_requests);
+    drop(second_active);
+    drop(first_active);
+}
+
+#[tokio::test]
+async fn registered_five_to_one_group_caps_early_ssd_at_five_seats() {
+    let mut config = DiskReadConfig::default();
+    config.ssd_threads_per_disk = 5;
+    config.hdd_threads_per_disk = 1;
+    config.total_threads = 6;
+    let scheduler = DiskReadScheduler::new(&config, 20).unwrap();
+    let ssd_lane = weighted_lane(&[22], LocalDiskKind::Ssd, 5, 5);
+    let hdd_lane = weighted_lane(&[23], LocalDiskKind::Hdd, 1, 1);
+    let lane_group = scheduler.new_lane_group();
+    lane_group.register(ssd_lane.clone()).unwrap();
+    lane_group.register(hdd_lane.clone()).unwrap();
+
+    let mut ssd_requests: Vec<Option<WeightedRequest>> = Vec::with_capacity(6);
+    for _ in 0..6 {
+        let scheduler = scheduler.clone();
+        let lane_group = lane_group.clone();
+        let lane = ssd_lane.clone();
+        ssd_requests.push(Some(Box::pin(async move {
+            scheduler
+                .acquire_lane_in_group(lane, DiskReadClass::MediaDecode, lane_group)
+                .await
+                .map(|permit| (0, permit))
+        })));
+    }
+    for request in &mut ssd_requests {
+        let _ = poll_once(request.as_mut().unwrap().as_mut());
+    }
+    scheduler.barrier_for_test().await.unwrap();
+    let ssd_active = take_ready_weighted_requests(&mut ssd_requests);
+    assert_eq!(ssd_active.len(), 5, "SSD 只能取得配置权重对应的 5 个席位");
+
+    let hdd_permit = scheduler
+        .acquire_lane_in_group(hdd_lane, DiskReadClass::HashSequential, lane_group)
+        .await
+        .unwrap();
+    assert_eq!(hdd_permit.physical_disk_id(), "PhysicalDisk23");
+
+    drop(ssd_requests);
+    drop(ssd_active);
+    drop(hdd_permit);
+}
+
+#[tokio::test]
+async fn registered_group_uses_worker_count_when_it_is_lower_than_read_threads() {
+    let mut config = DiskReadConfig::default();
+    config.ssd_threads_per_disk = 12;
+    config.total_threads = 12;
+    let scheduler = DiskReadScheduler::new(&config, 6).unwrap();
+    let first_lane = weighted_lane(&[26], LocalDiskKind::Ssd, 12, 12);
+    let second_lane = weighted_lane(&[27], LocalDiskKind::Ssd, 12, 12);
+    let lane_group = scheduler.new_lane_group();
+    lane_group.register(first_lane).unwrap();
+    lane_group.register(second_lane.clone()).unwrap();
+
+    let mut requests: Vec<Option<WeightedRequest>> = Vec::with_capacity(6);
+    for _ in 0..6 {
+        let scheduler = scheduler.clone();
+        let lane_group = lane_group.clone();
+        let lane = second_lane.clone();
+        requests.push(Some(Box::pin(async move {
+            scheduler
+                .acquire_lane_in_group(lane, DiskReadClass::HashSequential, lane_group)
+                .await
+                .map(|permit| (1, permit))
+        })));
+    }
+    for request in &mut requests {
+        let _ = poll_once(request.as_mut().unwrap().as_mut());
+    }
+    scheduler.barrier_for_test().await.unwrap();
+    let active = take_ready_weighted_requests(&mut requests);
+    assert_eq!(
+        active.len(),
+        3,
+        "Worker=6 时等权盘只能预占其中 3 个计算席位"
+    );
+
+    drop(requests);
+    drop(active);
+}
+
+#[tokio::test]
+async fn unregistering_completed_disk_reassigns_its_released_seats() {
+    let mut config = DiskReadConfig::default();
+    config.ssd_threads_per_disk = 4;
+    config.total_threads = 4;
+    let scheduler = DiskReadScheduler::new(&config, 20).unwrap();
+    let remaining_lane = weighted_lane(&[24], LocalDiskKind::Ssd, 4, 4);
+    let completed_lane = weighted_lane(&[25], LocalDiskKind::Ssd, 4, 4);
+    let lane_group = scheduler.new_lane_group();
+    lane_group.register(remaining_lane.clone()).unwrap();
+    lane_group.register(completed_lane.clone()).unwrap();
+
+    let mut remaining_requests: Vec<Option<WeightedRequest>> = Vec::with_capacity(4);
+    for _ in 0..4 {
+        let scheduler = scheduler.clone();
+        let lane_group = lane_group.clone();
+        let lane = remaining_lane.clone();
+        remaining_requests.push(Some(Box::pin(async move {
+            scheduler
+                .acquire_lane_in_group(lane, DiskReadClass::HashSequential, lane_group)
+                .await
+                .map(|permit| (0, permit))
+        })));
+    }
+    for request in &mut remaining_requests {
+        let _ = poll_once(request.as_mut().unwrap().as_mut());
+    }
+    let mut completed_permits = Vec::with_capacity(2);
+    for _ in 0..2 {
+        completed_permits.push(
+            scheduler
+                .acquire_lane_in_group(
+                    completed_lane.clone(),
+                    DiskReadClass::HashSequential,
+                    lane_group.clone(),
+                )
+                .await
+                .unwrap(),
+        );
+    }
+    scheduler.barrier_for_test().await.unwrap();
+    let first_window = take_ready_weighted_requests(&mut remaining_requests);
+    assert_eq!(first_window.len(), 2, "等权组初始只给剩余盘 2 个席位");
+
+    drop(completed_permits);
+    lane_group.unregister(&completed_lane).unwrap();
+    scheduler.barrier_for_test().await.unwrap();
+    let replacements = take_ready_weighted_requests(&mut remaining_requests);
+    assert_eq!(
+        replacements.len(),
+        2,
+        "完成盘注销后应把释放的 2 席位交给剩余盘"
+    );
+
+    drop(remaining_requests);
+    drop(first_window);
+    drop(replacements);
+}
+
+#[tokio::test]
 async fn equal_weight_ready_disks_share_the_current_global_window() {
     let mut config = DiskReadConfig::default();
     config.ssd_threads_per_disk = 16;
@@ -223,7 +427,7 @@ async fn configured_five_to_one_weights_split_six_active_seats() {
         );
     }
 
-    let mut requests = Vec::with_capacity(12);
+    let mut requests: Vec<Option<WeightedRequest>> = Vec::with_capacity(12);
     push_weighted_requests(&mut requests, &scheduler, &ssd_lane, 0, 6);
     push_weighted_requests(&mut requests, &scheduler, &hdd_lane, 1, 6);
     for request in &mut requests {
@@ -261,6 +465,10 @@ async fn ready_disks_rotate_when_their_minimum_exceeds_global_seats() {
         weighted_lane(&[16], LocalDiskKind::Ssd, 16, 16),
         weighted_lane(&[17], LocalDiskKind::Ssd, 16, 16),
     ];
+    let lane_group = scheduler.new_lane_group();
+    for lane in &lanes {
+        lane_group.register(lane.clone()).unwrap();
+    }
     let mut blockers = Vec::with_capacity(2);
     for _ in 0..2 {
         blockers.push(
@@ -271,9 +479,19 @@ async fn ready_disks_rotate_when_their_minimum_exceeds_global_seats() {
         );
     }
 
-    let mut requests = Vec::with_capacity(12);
+    let mut requests: Vec<Option<WeightedRequest>> = Vec::with_capacity(12);
     for (lane_index, lane) in lanes.iter().enumerate() {
-        push_weighted_requests(&mut requests, &scheduler, lane, lane_index, 4);
+        for _ in 0..4 {
+            let scheduler = scheduler.clone();
+            let lane_group = lane_group.clone();
+            let lane = lane.clone();
+            requests.push(Some(Box::pin(async move {
+                scheduler
+                    .acquire_lane_in_group(lane, DiskReadClass::HashSequential, lane_group)
+                    .await
+                    .map(|permit| (lane_index, permit))
+            })));
+        }
     }
     for request in &mut requests {
         assert!(poll_once(request.as_mut().unwrap().as_mut()).is_pending());

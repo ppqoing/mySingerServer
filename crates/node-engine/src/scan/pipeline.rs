@@ -17,8 +17,8 @@ use tokio::{sync::mpsc, task::JoinHandle};
 
 use crate::{
     io::{
-        BlockReader, DiskReadClass, DiskReadPermit, DiskReadScheduler, ReadFailure,
-        RetryingFileReader,
+        BlockReader, DiskReadClass, DiskReadLane, DiskReadLaneGroup, DiskReadPermit,
+        DiskReadScheduler, ReadFailure, RetryingFileReader,
     },
     runtime_tasks::{
         RuntimeDiskReadClass, RuntimePipelineResource, RuntimeTaskError, RuntimeTaskReporter,
@@ -147,6 +147,8 @@ pub trait HashPermitReader: Clone + Send + Sync + 'static {
 #[derive(Clone)]
 pub struct ScheduledFileReader {
     scheduler: DiskReadScheduler,
+    /// 仅由 `TaskFileDispatcher` 克隆创建的任务级物理盘配额组。
+    lane_group: Option<DiskReadLaneGroup>,
     reader: Arc<dyn Md5ReadBackend>,
     lane_source: LaneSource,
     /// 冻结本 reader 的逐盘配置，用于按本次解析介质类型发布观察容量。
@@ -308,6 +310,7 @@ impl ScheduledFileReader {
         Ok((
             Self {
                 scheduler,
+                lane_group: None,
                 reader: Arc::new(reader),
                 lane_source: LaneSource::Frozen(Arc::new(lane_map)),
                 read_config: read_config.clone(),
@@ -348,6 +351,7 @@ impl ScheduledFileReader {
         Ok((
             Self {
                 scheduler,
+                lane_group: None,
                 reader: Arc::new(reader),
                 lane_source: LaneSource::Injected(Arc::new(resolver)),
                 read_config: read_config.clone(),
@@ -388,6 +392,7 @@ impl ScheduledFileReader {
         Ok((
             Self {
                 scheduler,
+                lane_group: None,
                 reader: Arc::new(reader),
                 lane_source: LaneSource::Frozen(Arc::new(lane_map)),
                 read_config: read_config.clone(),
@@ -484,19 +489,15 @@ impl ScheduledFileReader {
         )
         .map_err(|error| telemetry_failure(&path, error))?;
         let lease = if use_frozen_scheduler_lane {
-            self.scheduler
-                .acquire_lane(
-                    crate::io::DiskReadLane {
-                        location: StorageLocation::from_parts(
-                            lane.physical_disk_id.clone(),
-                            lane.disk_kind,
-                        ),
-                        effective_limit: lane.per_disk_limit,
-                        configured_weight: lane.configured_weight,
-                    },
-                    class,
-                )
-                .await
+            let disk_lane = scheduled_disk_lane(lane);
+            match &self.lane_group {
+                Some(group) => {
+                    self.scheduler
+                        .acquire_lane_in_group(disk_lane, class, group.clone())
+                        .await
+                }
+                None => self.scheduler.acquire_lane(disk_lane, class).await,
+            }
         } else {
             match system_location {
                 Some(storage) => {
@@ -678,6 +679,39 @@ impl HashPermitReader for ScheduledFileReader {
 impl TaskLanePermitProvider for ScheduledFileReader {
     type Permit = ScheduledReadPermit;
 
+    fn begin_task_group(&self) -> Self {
+        let mut reader = self.clone();
+        reader.lane_group = Some(self.scheduler.new_lane_group());
+        reader
+    }
+
+    fn configure_task_lanes(&self, lanes: &[TaskDiskLane]) -> io::Result<()> {
+        let Some(group) = &self.lane_group else {
+            return Err(io::Error::other("任务 dispatcher 未创建物理盘配额组"));
+        };
+        for lane in lanes {
+            group
+                .register(scheduled_disk_lane(lane))
+                .map_err(io::Error::other)?;
+        }
+        Ok(())
+    }
+
+    fn unregister_task_lane(&self, lane: &TaskDiskLane) -> io::Result<()> {
+        let Some(group) = &self.lane_group else {
+            return Err(io::Error::other("任务 dispatcher 未创建物理盘配额组"));
+        };
+        group
+            .unregister(&scheduled_disk_lane(lane))
+            .map_err(io::Error::other)
+    }
+
+    fn clear_task_lanes(&self) {
+        if let Some(group) = &self.lane_group {
+            group.clear();
+        }
+    }
+
     fn acquire(
         &self,
         lane: TaskDiskLane,
@@ -700,6 +734,15 @@ impl TaskLanePermitProvider for ScheduledFileReader {
                 .acquire_permit_for_lane(&lane, &cancellation, class, path, Some(location), true)
                 .await
         })
+    }
+}
+
+/// 把任务文件 lane 转成读取调度器使用的拥有型配置。
+fn scheduled_disk_lane(lane: &TaskDiskLane) -> DiskReadLane {
+    DiskReadLane {
+        location: StorageLocation::from_parts(lane.physical_disk_id.clone(), lane.disk_kind),
+        effective_limit: lane.per_disk_limit,
+        configured_weight: lane.configured_weight,
     }
 }
 

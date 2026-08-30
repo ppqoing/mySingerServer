@@ -104,9 +104,33 @@ Dispatcher 多在途实现 revision：`f91feb85ad7e5943bba5643250736e7450d833fb`
 
 修复的定向 RED/GREEN、Dispatcher 36/36、NodeEngine `test-hooks --all-targets` 和格式检查均已通过。该轮仍是失败诊断证据，不与后续最终运行拼接。
 
-## 7. 待完成门禁
+## 7. 第三次双盘诊断：只对当前 waiter 加权仍不能满足固定计算席位
 
-- 绑定 `be40eb2` 后续干净 HEAD 的正式候选包与外置验收客户端/结果导出器 SHA；
+候选 revision `20a25a0` 的 source tree SHA-256 为 `bbd425db8060fa4157ac36846871d4ad7a1bd3212597f882f131257a5373d17c`，正式 ZIP SHA-256 为 `bb656c9a9095f9912bf1a39f1b75ee0ccd35439cca59490341022529c75c3685`，原始 evidence 位于 `C:\tmp\rust-v2-multi-inflight-final-20a25a0\evidence`。配置仍为 H/I 双物理盘、Worker 20、全局读取 12、SSD 每盘 16、Everything。
+
+同 lane 补位预热减少了空窗，但没有闭合用户要求的“按物理盘权重分配计算线程”：
+
+- 前 54 个样本中 PhysicalDisk1/2 平均 active 为 `2.33/9.65`，`0:12` 有 13 个样本，两盘同时 active 41 个样本，累计 grant 为 `1463/421`；
+- elapsed 163 秒时最近 60 个样本平均 active 为 `2.50/9.22`，仍有 10 个 `0:12` 样本；最后窗口约为 `5:7`，累计 grant 为 `3522/1327`；
+- 两盘都有等待项，但先到且读取较慢的 PhysicalDisk2 已持有大量非抢占 permit，PhysicalDisk1 后到时只能等待自然释放，`active/weight` 只能约束“下一次授予”，不能约束当前任务的固定盘间席位；
+- 确认问题后只停止精确 runtime client，harness 正常清理，外层退出码为 0；`run_status=FAIL`、客户端码 `-1`、结果摘要 `INCONCLUSIVE`；媒体前后联合 SHA-256 均为 `3302f70759eb894e2c456913fc7668be9001bd24f0dcf5060081babd47ee30eb`。该轮不是验收通过证据。
+
+本次修复新增每个 Dispatcher 独立的 `DiskReadLaneGroup`。只有真实任务 TSV lane 登记；任务组总席位为 `min(total_threads, Worker 数)`，每盘先给 1，再按配置权重和逐盘硬上限分配剩余席位。登记盘在短暂无 waiter 时仍保留目标，先到盘不能借满；盘终态注销后剩余盘重新分配。已发 permit 不抢占，Hash/Media 公平、老化和全局/逐盘硬上限仍由原 scheduler actor 维护。
+
+新增行为证据：
+
+1. 两块等权 SSD、任务组 12：第二盘的 12 个请求先到时只交付 6 个，第一盘后到立即交付保留的 6 个；
+2. SSD/HDD `5:1`、任务组 6：先到 SSD 只能交付 5 个，HDD 保留 1 个；
+3. 读取线程 12、Worker 6、两块等权盘：每盘目标 3；
+4. 三块等权盘争两个席位：每次释放边界轮转覆盖第三盘；
+5. 一个盘终态注销后，其已释放席位立即重新分配给剩余盘；
+6. 真实 `TaskFileDispatcher + DiskReadScheduler` 首个 12 项窗口为 `[6,6]`。
+
+当前代码验证结果：DiskReadScheduler 49/49 PASS，TaskFileDispatcher 36/36 PASS；NodeEngine `--features test-hooks --all-targets` 退出码 0，其中库测试 160/160、基础计算流水线 60/60，固定 bench `elapsed_ms=127.629` 且 `persisted_completed=true`；Worker 进程协议输出 `WORKER_PROTOCOL_PROCESS_PASS`；Desktop Core 运行时验收协议 23/23、Desktop UI 绑定契约 15/15。格式检查和 `git diff --check` 均通过。候选包、双盘真实媒体终态和最终只读审查仍按下节门禁执行。
+
+## 8. 待完成门禁
+
+- 绑定本次任务级权重席位修复后干净 HEAD 的正式候选包与外置验收客户端/结果导出器 SHA；
 - 修复候选在 `H:\pik\00000000000` 与 `I:\tmp` 上的一次双物理盘真实媒体终态运行；
 - 逐盘 active 峰值、Worker 峰值、CPU/IO、任务终态、崩溃完整路径和结果导出 SHA；
 - `gpt-5.6-sol`、reasoning `max` 最终只读审查。

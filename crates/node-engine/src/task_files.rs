@@ -903,6 +903,23 @@ impl TransientTaskFileSet {
             .is_some_and(|lane_state| lane_state.sealed))
     }
 
+    /// 返回指定 lane 是否已封闭、全部行终态且不再持有预读或在途身份。
+    pub(crate) fn lane_terminal(&self, lane: &TaskDiskLane) -> io::Result<bool> {
+        let key = lane_file_name(lane)?;
+        let lane = self
+            .lanes
+            .get(&key)
+            .ok_or_else(|| invalid_input("任务 lane 尚未注册"))?;
+        Ok(lane.sealed
+            && !lane.poisoned
+            && lane.in_flight.is_empty()
+            && lane.prefetched.is_empty()
+            && lane
+                .metadata
+                .iter()
+                .all(|row| row.status != TaskLineStatus::Pending))
+    }
+
     /// 返回发布或状态变化的单调通知序号，dispatcher 可用它避免忙等。
     pub fn change_epoch(&self) -> u64 {
         self.change_epoch.load(Ordering::Acquire)

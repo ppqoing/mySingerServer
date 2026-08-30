@@ -4,7 +4,7 @@ use std::{
     cmp::Ordering as CmpOrdering,
     collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
 };
@@ -32,6 +32,154 @@ pub struct DiskReadLane {
     pub effective_limit: usize,
     /// 全局额度不足时用于加权轮转的配置权重。
     pub configured_weight: usize,
+}
+
+/// 一次计算任务已经确认需要处理的物理盘集合。
+///
+/// Dispatcher 在首次申请许可前登记全部真实任务 lane；调度器据此冻结每盘权重席位，
+/// 避免先到的慢盘在另一盘尚未建立 waiter 时借满全部非抢占许可。任务 lane 完成后应
+/// 立即注销，剩余物理盘会重新分配已经释放的全局席位。
+#[derive(Clone)]
+pub struct DiskReadLaneGroup {
+    inner: Arc<Mutex<DiskReadLaneGroupState>>,
+    notify: Arc<Notify>,
+}
+
+struct DiskReadLaneGroupState {
+    /// 当前任务仍可能继续读取的物理盘及其冻结配置。
+    lanes: BTreeMap<DiskKey, RegisteredGroupLane>,
+    /// 每次 lane 集合变化时一次计算的静态目标，许可热路径只做 O(1) 查询。
+    targets: BTreeMap<DiskKey, usize>,
+    /// 全局读取线程与实际 Worker 数中的较小值。
+    seat_budget: usize,
+}
+
+struct RegisteredGroupLane {
+    /// 冻结介质类型，防止同一任务中把同盘改成另一配置。
+    kind: LocalDiskKind,
+    /// 当前物理盘的硬并发上限。
+    effective_limit: usize,
+    /// 任务级计算席位权重。
+    configured_weight: usize,
+    /// 仅统计本任务组在该 lane 上持有的许可。
+    active_permits: Arc<AtomicUsize>,
+}
+
+#[derive(Clone)]
+struct GroupMembership {
+    /// 请求所属的任务级物理盘集合。
+    group: DiskReadLaneGroup,
+    /// 当前 lane 在该任务组内的活动许可计数。
+    active_permits: Arc<AtomicUsize>,
+}
+
+impl DiskReadLaneGroup {
+    /// 登记本任务确定会产生计算项的一条物理盘 lane；相同配置重复登记幂等。
+    pub fn register(&self, lane: DiskReadLane) -> Result<(), SchedulerError> {
+        validate_lane(&lane)?;
+        let key = DiskKey::new(lane.location.physical_disk_id().disk_numbers())?;
+        let mut state = lock_lane_group(&self.inner);
+        if let Some(existing) = state.lanes.get(&key) {
+            if existing.kind != lane.location.disk_kind()
+                || existing.effective_limit != lane.effective_limit
+                || existing.configured_weight != lane.configured_weight
+            {
+                return Err(SchedulerError::InvalidConfiguration(
+                    "同一任务物理盘 lane 的冻结配置不能变化",
+                ));
+            }
+            return Ok(());
+        }
+        state.lanes.insert(
+            key,
+            RegisteredGroupLane {
+                kind: lane.location.disk_kind(),
+                effective_limit: lane.effective_limit,
+                configured_weight: lane.configured_weight,
+                active_permits: Arc::new(AtomicUsize::new(0)),
+            },
+        );
+        state.targets = weighted_group_targets(&state.lanes, state.seat_budget);
+        drop(state);
+        self.notify.notify_one();
+        Ok(())
+    }
+
+    /// 注销 dispatcher 已确认全部任务行终态的 lane；已交付许可仍按原所有权自然释放。
+    pub fn unregister(&self, lane: &DiskReadLane) -> Result<(), SchedulerError> {
+        let key = DiskKey::new(lane.location.physical_disk_id().disk_numbers())?;
+        let mut state = lock_lane_group(&self.inner);
+        if let Some(existing) = state.lanes.get(&key) {
+            if existing.kind != lane.location.disk_kind()
+                || existing.effective_limit != lane.effective_limit
+                || existing.configured_weight != lane.configured_weight
+            {
+                return Err(SchedulerError::InvalidConfiguration(
+                    "注销的任务物理盘 lane 与冻结配置不一致",
+                ));
+            }
+            state.lanes.remove(&key);
+            state.targets = weighted_group_targets(&state.lanes, state.seat_budget);
+        }
+        drop(state);
+        self.notify.notify_one();
+        Ok(())
+    }
+
+    /// 清空本任务组；任务取消、失败或 dispatcher Drop 时用于释放所有保留席位。
+    pub fn clear(&self) {
+        let mut state = lock_lane_group(&self.inner);
+        state.lanes.clear();
+        state.targets.clear();
+        drop(state);
+        self.notify.notify_one();
+    }
+
+    /// 取得一次申请绑定的 lane 计数器，并确认该 lane 已在任务组登记。
+    fn membership(&self, lane: &DiskReadLane) -> Result<GroupMembership, SchedulerError> {
+        let key = DiskKey::new(lane.location.physical_disk_id().disk_numbers())?;
+        let state = lock_lane_group(&self.inner);
+        let registered = state
+            .lanes
+            .get(&key)
+            .ok_or(SchedulerError::InvalidConfiguration(
+                "任务物理盘 lane 尚未登记",
+            ))?;
+        if registered.kind != lane.location.disk_kind()
+            || registered.effective_limit != lane.effective_limit
+            || registered.configured_weight != lane.configured_weight
+        {
+            return Err(SchedulerError::InvalidConfiguration(
+                "申请的任务物理盘 lane 与冻结配置不一致",
+            ));
+        }
+        Ok(GroupMembership {
+            group: self.clone(),
+            active_permits: registered.active_permits.clone(),
+        })
+    }
+
+    /// 判断指定 lane 在当前任务级权重分配下是否仍有一个可用席位。
+    fn has_available_seat(&self, key: &DiskKey, active_permits: &Arc<AtomicUsize>) -> bool {
+        let state = lock_lane_group(&self.inner);
+        let Some(registered) = state.lanes.get(key) else {
+            return false;
+        };
+        if !Arc::ptr_eq(&registered.active_permits, active_permits) {
+            return false;
+        }
+        let target = state.targets.get(key).copied().unwrap_or(0);
+        active_permits.load(Ordering::Acquire) < target
+    }
+}
+
+/// Mutex 中毒只代表此前持锁线程 panic；调度状态仍由当前 actor 重新校验后继续使用。
+fn lock_lane_group(
+    group: &Mutex<DiskReadLaneGroupState>,
+) -> std::sync::MutexGuard<'_, DiskReadLaneGroupState> {
+    group
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// 同盘 Hash 与媒体均可推进时，连续优先媒体读取的次数。
@@ -126,6 +274,9 @@ impl Drop for DiskReadPermit {
         if let Some(active) = counters.lane_active {
             active.fetch_sub(1, Ordering::AcqRel);
         }
+        if let Some(active) = counters.group_lane_active {
+            active.fetch_sub(1, Ordering::AcqRel);
+        }
         counters.notify.notify_one();
     }
 }
@@ -138,6 +289,8 @@ struct PermitCounters {
     disk_counters: Vec<DiskPermitCounters>,
     /// 该 lane 的活动许可计数，用于保持冻结配置直到最后一个 permit 释放。
     lane_active: Option<Arc<AtomicUsize>>,
+    /// 当前任务组在该 lane 上的活动许可计数，用于执行静态权重席位。
+    group_lane_active: Option<Arc<AtomicUsize>>,
     notify: Arc<Notify>,
 }
 
@@ -184,6 +337,10 @@ impl ActiveCounters {
 pub struct DiskReadScheduler {
     commands: mpsc::Sender<Command>,
     queue_slots: Arc<Semaphore>,
+    /// 许可释放或任务 lane 集合变化时唤醒同一个 actor。
+    notify: Arc<Notify>,
+    /// 新任务级配额组使用的冻结计算席位总数。
+    task_seat_budget: usize,
     #[cfg(test)]
     request_capacity: usize,
 }
@@ -211,14 +368,28 @@ impl DiskReadScheduler {
         runtime.spawn(run_actor(
             receiver,
             ActorConfig::from(config, effective_worker_count),
-            notify,
+            notify.clone(),
         ));
         Ok(Self {
             commands,
             queue_slots: Arc::new(Semaphore::new(request_capacity)),
+            notify,
+            task_seat_budget: ActorConfig::from(config, effective_worker_count).task_seat_budget(),
             #[cfg(test)]
             request_capacity,
         })
+    }
+
+    /// 为一次 dispatcher 生命周期创建独立的任务级物理盘配额组。
+    pub fn new_lane_group(&self) -> DiskReadLaneGroup {
+        DiskReadLaneGroup {
+            inner: Arc::new(Mutex::new(DiskReadLaneGroupState {
+                lanes: BTreeMap::new(),
+                targets: BTreeMap::new(),
+                seat_budget: self.task_seat_budget,
+            })),
+            notify: self.notify.clone(),
+        }
     }
 
     /// 等待一个同时满足全局和当前物理盘上限的读取许可。
@@ -231,6 +402,7 @@ impl DiskReadScheduler {
             DiskKey::new(location.physical_disk_id().disk_numbers())?,
             location.disk_kind(),
             class,
+            None,
             None,
             None,
         )
@@ -255,6 +427,7 @@ impl DiskReadScheduler {
             class,
             Some(per_disk_limit),
             None,
+            None,
         )
         .await
     }
@@ -265,22 +438,34 @@ impl DiskReadScheduler {
         lane: DiskReadLane,
         class: DiskReadClass,
     ) -> Result<DiskReadPermit, SchedulerError> {
-        if lane.effective_limit == 0 {
-            return Err(SchedulerError::InvalidConfiguration(
-                "冻结的逐盘读取额度必须大于零",
-            ));
-        }
-        if lane.configured_weight == 0 {
-            return Err(SchedulerError::InvalidConfiguration(
-                "冻结的物理盘调度权重必须大于零",
-            ));
-        }
+        validate_lane(&lane)?;
         self.acquire_key(
             DiskKey::new(lane.location.physical_disk_id().disk_numbers())?,
             lane.location.disk_kind(),
             class,
             Some(lane.effective_limit),
             Some(lane.configured_weight),
+            None,
+        )
+        .await
+    }
+
+    /// 在任务级物理盘配额组内申请许可；先到 lane 不能越过其冻结权重席位。
+    pub async fn acquire_lane_in_group(
+        &self,
+        lane: DiskReadLane,
+        class: DiskReadClass,
+        group: DiskReadLaneGroup,
+    ) -> Result<DiskReadPermit, SchedulerError> {
+        validate_lane(&lane)?;
+        let membership = group.membership(&lane)?;
+        self.acquire_key(
+            DiskKey::new(lane.location.physical_disk_id().disk_numbers())?,
+            lane.location.disk_kind(),
+            class,
+            Some(lane.effective_limit),
+            Some(lane.configured_weight),
+            Some(membership),
         )
         .await
     }
@@ -302,6 +487,7 @@ impl DiskReadScheduler {
         class: DiskReadClass,
         per_disk_limit: Option<usize>,
         configured_weight: Option<usize>,
+        group: Option<GroupMembership>,
     ) -> Result<DiskReadPermit, SchedulerError> {
         let queue_slot = self
             .queue_slots
@@ -316,6 +502,7 @@ impl DiskReadScheduler {
                 kind,
                 per_disk_limit,
                 configured_weight,
+                group,
                 class,
                 sequence: 0,
                 conflicting_bypasses: 0,
@@ -334,7 +521,7 @@ impl DiskReadScheduler {
         kind: LocalDiskKind,
         class: DiskReadClass,
     ) -> Result<DiskReadPermit, SchedulerError> {
-        self.acquire_key(DiskKey::new(disk_numbers)?, kind, class, None, None)
+        self.acquire_key(DiskKey::new(disk_numbers)?, kind, class, None, None, None)
             .await
     }
 
@@ -435,6 +622,8 @@ struct Waiter {
     per_disk_limit: Option<usize>,
     /// 可选的本轮冻结调度权重；缺失时保留旧的等权入口语义。
     configured_weight: Option<usize>,
+    /// 可选的任务级物理盘配额组；普通读取入口不参与该限制。
+    group: Option<GroupMembership>,
     /// 请求进入 actor 的读取类别。
     class: DiskReadClass,
     /// 跨位置、跨类别单调递增的入队顺序。
@@ -593,6 +782,15 @@ impl ActorConfig {
             LocalDiskKind::Hdd => self.hdd_limit,
             LocalDiskKind::Ssd => self.ssd_limit,
             LocalDiskKind::Unknown => self.unknown_limit,
+        }
+    }
+
+    /// 任务级磁盘席位同时受全局读取线程和实际 Worker 数限制。
+    const fn task_seat_budget(self) -> usize {
+        if self.total_limit < self.worker_count {
+            self.total_limit
+        } else {
+            self.worker_count
         }
     }
 }
@@ -786,6 +984,13 @@ impl ActorState {
             if let Some(active) = &lane_active {
                 active.fetch_add(1, Ordering::AcqRel);
             }
+            let group_lane_active = waiter
+                .group
+                .as_ref()
+                .map(|membership| membership.active_permits.clone());
+            if let Some(active) = &group_lane_active {
+                active.fetch_add(1, Ordering::AcqRel);
+            }
             let (global_class, disk_counters) = self.reserve_all(&key, class);
             let permit = DiskReadPermit {
                 physical_disk_id: format!(
@@ -801,6 +1006,7 @@ impl ActorState {
                     global_class,
                     disk_counters,
                     lane_active,
+                    group_lane_active,
                     notify: self.notify.clone(),
                 }),
             };
@@ -894,7 +1100,9 @@ impl ActorState {
         let grantable = heads
             .iter()
             .enumerate()
-            .filter_map(|(index, (key, _, _))| self.can_reserve_all(key).then_some(index))
+            .filter_map(|(index, (key, _, waiter))| {
+                self.can_reserve_waiter(key, waiter).then_some(index)
+            })
             .collect::<Vec<_>>();
         if grantable.is_empty() {
             return None;
@@ -1473,6 +1681,18 @@ impl ActorState {
         })
     }
 
+    /// 同时检查既有全局/逐盘硬上限与可选任务级权重席位。
+    fn can_reserve_waiter(&self, key: &DiskKey, waiter: &Waiter) -> bool {
+        if !self.can_reserve_all(key) {
+            return false;
+        }
+        waiter.group.as_ref().is_none_or(|membership| {
+            membership
+                .group
+                .has_available_seat(key, &membership.active_permits)
+        })
+    }
+
     /// 原子递增 global total/class 与所有底层盘 total/class，返回 permit 冻结引用。
     fn reserve_all(
         &self,
@@ -1585,6 +1805,64 @@ fn greatest_common_divisor(mut left: usize, mut right: usize) -> usize {
         right = remainder;
     }
     left.max(1)
+}
+
+/// 校验一条任务 lane 的两个独立正整数边界。
+fn validate_lane(lane: &DiskReadLane) -> Result<(), SchedulerError> {
+    if lane.effective_limit == 0 {
+        return Err(SchedulerError::InvalidConfiguration(
+            "冻结的逐盘读取额度必须大于零",
+        ));
+    }
+    if lane.configured_weight == 0 {
+        return Err(SchedulerError::InvalidConfiguration(
+            "冻结的物理盘调度权重必须大于零",
+        ));
+    }
+    Ok(())
+}
+
+/// 计算一个任务组的静态权重席位；盘数超过预算时每盘逻辑目标仍为 1，
+/// 实际同时运行数由全局硬上限约束，并在 permit 释放边界轮转。
+fn weighted_group_targets(
+    lanes: &BTreeMap<DiskKey, RegisteredGroupLane>,
+    seat_budget: usize,
+) -> BTreeMap<DiskKey, usize> {
+    let mut targets = lanes
+        .keys()
+        .cloned()
+        .map(|key| (key, 1_usize))
+        .collect::<BTreeMap<_, _>>();
+    if lanes.is_empty() || lanes.len() >= seat_budget {
+        return targets;
+    }
+
+    let mut remaining = seat_budget - lanes.len();
+    while remaining > 0 {
+        let candidate = lanes
+            .iter()
+            .filter(|(key, lane)| targets.get(*key).copied().unwrap_or(0) < lane.effective_limit)
+            .min_by(|(left_key, left_lane), (right_key, right_lane)| {
+                let left_target = targets.get(*left_key).copied().unwrap_or(0);
+                let right_target = targets.get(*right_key).copied().unwrap_or(0);
+                ((left_target as u128) * (right_lane.configured_weight as u128))
+                    .cmp(&((right_target as u128) * (left_lane.configured_weight as u128)))
+                    // 比例相同时先把额外席位给权重更高的盘，再用物理盘键稳定排序。
+                    .then_with(|| {
+                        right_lane
+                            .configured_weight
+                            .cmp(&left_lane.configured_weight)
+                    })
+                    .then_with(|| left_key.cmp(right_key))
+            })
+            .map(|(key, _)| key.clone());
+        let Some(key) = candidate else {
+            break;
+        };
+        *targets.get_mut(&key).expect("候选 lane 必须已有最低席位") += 1;
+        remaining -= 1;
+    }
+    targets
 }
 
 fn validate_config(
