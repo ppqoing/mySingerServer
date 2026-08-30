@@ -129,6 +129,8 @@ pub(super) struct TaskFileHashRuntime {
     unclaimed_rows: usize,
     /// 为完成顺序无关的后续批处理分配稳定序号。
     next_sequence: usize,
+    /// 每条读取的取消令牌；取消时先通知 reader 自行收束 permit。
+    cancellations: Vec<ReadCancellationToken>,
 }
 
 impl TaskFileHashRuntime {
@@ -138,6 +140,7 @@ impl TaskFileHashRuntime {
             reads: JoinSet::new(),
             unclaimed_rows: remaining_hash_rows,
             next_sequence: 0,
+            cancellations: Vec::new(),
         }
     }
 
@@ -169,6 +172,7 @@ impl TaskFileHashRuntime {
         let identity = task.identity;
         let record = task.record;
         let scanned = record.scanned.clone();
+        self.cancellations.push(cancellation.clone());
         self.reads.spawn(async move {
             let result = reader
                 .read_with_permit(scanned, task.permit, cancellation, None)
@@ -209,10 +213,13 @@ impl TaskFileHashRuntime {
         self.unclaimed_rows == 0 && self.reads.is_empty()
     }
 
-    /// 中止并回收所有在途读取，确保 permit 在返回前已经释放。
+    /// 请求读取自行取消并回收所有在途 future，确保 permit 在返回前已经释放。
     pub(super) async fn cancel_and_join(&mut self) {
-        self.reads.abort_all();
+        for cancellation in &self.cancellations {
+            cancellation.cancel();
+        }
         while self.reads.join_next().await.is_some() {}
+        self.cancellations.clear();
     }
 }
 
@@ -350,15 +357,14 @@ where
     let mut dispatcher = dispatcher;
     let contexts = contexts;
     let manifest = manifest;
-    let mut reads = JoinSet::<HashReadOutcome>::new();
+    let mut runtime = TaskFileHashRuntime::new(remaining_hash_rows);
     let mut outcomes = Vec::<HashReadOutcome>::new();
-    let mut next_sequence = 0_usize;
     let mut stop_reason = None;
     let mut hash_rows_remaining = remaining_hash_rows;
     let mut fatal_error = None;
 
-    'event_loop: while hash_rows_remaining > 0 || !reads.is_empty() {
-        if stop_reason.is_none() && hash_rows_remaining > 0 && reads.len() < hash_capacity {
+    'event_loop: while hash_rows_remaining > 0 || runtime.active_len() > 0 {
+        if stop_reason.is_none() && hash_rows_remaining > 0 && runtime.can_dispatch(hash_capacity) {
             tokio::select! {
                 result = dispatcher.next_with_admission(
                     cancellation.clone(),
@@ -376,25 +382,10 @@ where
                                 break 'event_loop;
                             }
                             hash_rows_remaining -= 1;
-                            let record = task.record.clone();
-                            let scanned = record.scanned.clone();
-                            let sequence = next_sequence;
-                            next_sequence += 1;
-                            let reader = reader.clone();
-                            let cancellation = cancellation.clone();
-                            reads.spawn(async move {
-                                let result = reader
-                                    .read_with_permit(scanned, task.permit, cancellation, None)
-                                    .await
-                                    .map(|product| {
-                                        // 读取 future 完成后立刻释放许可，不让后续缓存查询和 ACK
-                                        // 占用磁盘读取额度。
-                                        let md5 = product.md5;
-                                        drop(product.lease);
-                                        md5
-                                    });
-                                HashReadOutcome { sequence, identity, record, result }
-                            });
+                            if let Err(message) = runtime.spawn(task, reader.clone(), cancellation.clone()) {
+                                fatal_error = Some(message);
+                                break 'event_loop;
+                            }
                         }
                         Ok(TaskDispatchPoll::Blocked(reason)) => {
                             stop_reason = Some(reason);
@@ -409,17 +400,23 @@ where
                         }
                     }
                 }
-                joined = reads.join_next(), if !reads.is_empty() => {
-                    if let Err(message) = collect_hash_read(joined, &mut outcomes) {
-                        fatal_error = Some(message);
-                        break 'event_loop;
+                joined = runtime.join_one(), if runtime.active_len() > 0 => {
+                    match joined {
+                        Ok(outcome) => outcomes.push(outcome),
+                        Err(message) => {
+                            fatal_error = Some(message);
+                            break 'event_loop;
+                        }
                     }
                 }
             }
-        } else if let Some(joined) = reads.join_next().await {
-            if let Err(message) = collect_hash_read(Some(joined), &mut outcomes) {
-                fatal_error = Some(message);
-                break 'event_loop;
+        } else if runtime.active_len() > 0 {
+            match runtime.join_one().await {
+                Ok(outcome) => outcomes.push(outcome),
+                Err(message) => {
+                    fatal_error = Some(message);
+                    break 'event_loop;
+                }
             }
         } else {
             break;
@@ -429,7 +426,8 @@ where
     // 所有 dispatcher 轮询 future 已经释放，下面重新组合 pending 交给 ACK/Media
     // 处理函数；这也确保任何事件循环错误都能携带完整所有权返回。
     if fatal_error.is_some() {
-        cancel_and_join_hash_reads(&mut reads, &cancellation).await;
+        cancellation.cancel();
+        runtime.cancel_and_join().await;
     }
     let mut pending = TaskFileBaseComputePending {
         dispatcher,

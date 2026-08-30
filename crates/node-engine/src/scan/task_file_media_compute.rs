@@ -285,8 +285,7 @@ where
         .contexts
         .len()
         .saturating_sub(pending.remaining_hash_rows);
-    let mut active = BTreeMap::<TaskFileIdentity, ActiveMedia<P>>::new();
-    let mut settled = BTreeSet::<TaskFileIdentity>::new();
+    let mut runtime = TaskFileMediaRuntime::<P>::new();
     let mut completed = Vec::new();
     let mut file_failures = Vec::new();
     let mut blocked_reason = None;
@@ -294,22 +293,31 @@ where
 
     loop {
         if cancellation.is_cancelled() {
-            return cancel_media_pass(pending, worker_pool, cancellation, &mut active, &settled)
-                .await;
+            let settled = runtime.settled.clone();
+            return cancel_media_pass(
+                pending,
+                worker_pool,
+                cancellation,
+                &mut runtime.active,
+                &settled,
+            )
+            .await;
         }
 
-        let can_dispatch = !stop_dispatch && media_candidates > 0 && active.len() < worker_capacity;
-        if !can_dispatch && active.is_empty() {
+        let can_dispatch =
+            !stop_dispatch && media_candidates > 0 && runtime.has_capacity(worker_capacity);
+        if !can_dispatch && !runtime.has_active() {
             if media_candidates > 0 {
                 // Hash 队首尚未满足读取条件时，Media pass 只返回阻塞状态；保留两类行交给下一轮 Hash/Media 协调。
                 if blocked_reason == Some(TaskDispatchBlockReason::HashPending) {
                     break;
                 }
+                let settled = runtime.settled.clone();
                 return fail_media_pass(
                     pending,
                     worker_pool,
                     cancellation,
-                    &mut active,
+                    &mut runtime.active,
                     &settled,
                     "Media dispatcher 在仍有候选行时提前结束",
                 )
@@ -326,23 +334,19 @@ where
             .next_with_admission(cancellation.clone(), TaskDispatchAdmission::media_only());
         tokio::select! {
             biased;
-            event = worker_pool.next_event(), if !active.is_empty() => {
+            event = worker_pool.next_event(), if runtime.has_active() => {
                 if let Some(event) = event {
-                    let telemetry_event = event.clone();
-                    if let Some(reporter) = reporter {
-                        // 运行时遥测是旁路投影，失败不能改变 Worker/任务文件主状态机。
-                        report_media_event(&telemetry_event, reporter, &active).await;
-                    }
-                    match handle_media_event(event, &mut active, &mut settled) {
+                    match runtime.handle_event(event, reporter).await {
                         Ok(Some(TaskFileMediaTerminal::Completed(item))) => completed.push(item),
                         Ok(Some(TaskFileMediaTerminal::Failed(item))) => file_failures.push(item),
                         Ok(None) => {}
                         Err(message) => {
+                            let settled = runtime.settled.clone();
                             return fail_media_pass(
                                 pending,
                                 worker_pool,
                                 cancellation,
-                                &mut active,
+                                &mut runtime.active,
                                 &settled,
                                 message,
                             )
@@ -350,11 +354,12 @@ where
                         }
                     }
                 } else {
+                    let settled = runtime.settled.clone();
                     return fail_media_pass(
                         pending,
                         worker_pool,
                         cancellation,
-                        &mut active,
+                        &mut runtime.active,
                         &settled,
                         "WorkerPool 在 Media 运行期间关闭",
                     )
@@ -366,7 +371,7 @@ where
                     Ok(TaskDispatchPoll::Task(task)) => {
                         let identity = task.identity.clone();
                         media_candidates = media_candidates.saturating_sub(1);
-                        match dispatch_media_task(
+                        match runtime.dispatch(
                             &mut pending,
                             task,
                             worker_pool,
@@ -374,16 +379,15 @@ where
                             read_config,
                             &cancellation,
                         ).await {
-                            Ok(work) => {
-                                active.insert(work.identity.clone(), work);
-                            }
+                            Ok(()) => {}
                             Err(message) => {
                                 let _ = pending.dispatcher.abandon_in_flight(&identity);
+                                let settled = runtime.settled.clone();
                                 return fail_media_pass(
                                     pending,
                                     worker_pool,
                                     cancellation,
-                                    &mut active,
+                                    &mut runtime.active,
                                     &settled,
                                     message,
                                 )
@@ -399,21 +403,23 @@ where
                         stop_dispatch = true;
                     }
                     Err(TaskDispatchError::Read(ReadFailure::Cancelled)) => {
+                        let settled = runtime.settled.clone();
                         return cancel_media_pass(
                             pending,
                             worker_pool,
                             cancellation,
-                            &mut active,
+                            &mut runtime.active,
                             &settled,
                         )
                         .await;
                     }
                     Err(error) => {
+                        let settled = runtime.settled.clone();
                         return fail_media_pass(
                             pending,
                             worker_pool,
                             cancellation,
-                            &mut active,
+                            &mut runtime.active,
                             &settled,
                             format!("Media dispatcher 失败: {error}"),
                         )
@@ -421,7 +427,7 @@ where
                     }
                 }
             }
-            _ = sleep(Duration::from_millis(10)), if can_dispatch || !active.is_empty() => {
+            _ = sleep(Duration::from_millis(10)), if can_dispatch || runtime.has_active() => {
                 // 轮询取消令牌；下一轮同时继续观察 permit 和 Worker 事件。
             }
         }
