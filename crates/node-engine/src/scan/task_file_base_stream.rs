@@ -294,7 +294,7 @@ where
     }
 
     if let Some(message) = failure {
-        cleanup_stream(
+        let cleanup_diagnostics = cleanup_stream(
             &mut pending,
             &mut hash,
             &mut media,
@@ -304,7 +304,10 @@ where
             &cancellation,
         )
         .await;
-        return Err(stream_error(pending, message));
+        return Err(stream_error(
+            pending,
+            append_cleanup_diagnostics(message, cleanup_diagnostics),
+        ));
     }
     Ok(pending)
 }
@@ -506,26 +509,52 @@ fn note_remote_failure(remote_available: &mut bool, warning: &mut Option<String>
     }
 }
 
-/// 错误或取消前收束所有 future，并使未 ACK 行仍保持 P。
+/// 错误或取消前按 owner 依赖顺序收束所有外部资源，并使未 ACK 行保持 P。
 async fn cleanup_stream<P: TaskLanePermitProvider>(
     pending: &mut TaskFileBaseComputePending<P>,
     hash: &mut TaskFileHashRuntime,
     media: &mut TaskFileMediaRuntime<P>,
     remote_lookups: &mut JoinSet<RemoteLookupOutput>,
-    worker_pool: &WorkerPool,
+    worker_pool: &mut WorkerPool,
     persist: &mut TaskFilePersistRuntime,
     cancellation: &ReadCancellationToken,
-) {
+) -> Vec<String> {
+    let mut diagnostics = Vec::new();
     cancellation.cancel();
     hash.cancel_and_join().await;
-    media.cancel_and_drain(worker_pool, cancellation).await;
     remote_lookups.abort_all();
     while remote_lookups.join_next().await.is_some() {}
+    if let Err(message) = media.cancel_and_drain(worker_pool, cancellation).await {
+        diagnostics.push(message);
+    }
     persist.drop_unacknowledged();
-    let _ = pending
-        .dispatcher
-        .next_with_admission(cancellation.clone(), TaskDispatchAdmission::all())
-        .await;
+    if let Err(message) = abandon_all_in_flight(pending) {
+        diagnostics.push(message);
+    }
+    diagnostics
+}
+
+/// 在所有 permit、future 与 Worker 都已释放后，逐项解除 dispatcher 的 in-flight owner。
+fn abandon_all_in_flight<P: TaskLanePermitProvider>(
+    pending: &mut TaskFileBaseComputePending<P>,
+) -> Result<(), String> {
+    let identities = pending.contexts.keys().cloned().collect::<Vec<_>>();
+    for identity in identities {
+        pending
+            .dispatcher
+            .abandon_in_flight(&identity)
+            .map_err(|error| format!("取消后归还任务文件 in-flight owner 失败: {error}"))?;
+    }
+    Ok(())
+}
+
+/// 在首个权威错误后附加 cleanup 诊断，避免收束问题覆盖真实失败原因。
+fn append_cleanup_diagnostics(message: String, diagnostics: Vec<String>) -> String {
+    if diagnostics.is_empty() {
+        message
+    } else {
+        format!("{message}; cleanup 诊断: {}", diagnostics.join("; "))
+    }
 }
 
 /// 构造仍携带唯一任务文件 owner 的流式错误。
@@ -536,5 +565,468 @@ fn stream_error<P: TaskLanePermitProvider>(
     TaskFileBaseStreamError {
         message: message.into(),
         pending,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        future::Future,
+        path::{Path, PathBuf},
+        pin::Pin,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+
+    use dedup_core::{
+        ContentKey, DiskReadConfig, DisplayPath, MachineId, MediaKind, NormalizedPath,
+    };
+    use dedup_node_store::{BaseCacheRecord, NodeStore, ScannedPath};
+    use dedup_windows::{LocalDiskKind, PhysicalDiskId, ReadCancellationToken};
+    use tokio::sync::Notify;
+
+    use super::{TaskFileBaseComputePending, run_task_file_base_stream};
+    use crate::{
+        RemoteCacheError, RemoteFeatureCache,
+        io::{DiskReadClass, ReadFailure},
+        scan::{
+            BaseTaskInput, BaseTaskProducer, HashPermitReader, PlannedScannedPath, ReadProduct,
+            TaskDiskLane, TaskFileBaseCoordinatorOptions, TaskFileMediaPersistenceOptions,
+        },
+        task_dispatch::{TaskFileDispatcher, TaskLanePermitFuture, TaskLanePermitProvider},
+        task_files::TransientTaskFileSet,
+        worker::WorkerPool,
+    };
+
+    const RUN_ID: &str = "01900000-0000-7000-8000-0000000004d4";
+
+    /// 统计 dispatcher 发出的真实读取许可，Drop 即表示外部 owner 已归还。
+    struct CountingPermit(Arc<AtomicUsize>);
+
+    impl Drop for CountingPermit {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// 为 Hash 和 Media 共用的可观测许可提供者。
+    #[derive(Clone)]
+    struct CountingProvider(Arc<AtomicUsize>);
+
+    impl TaskLanePermitProvider for CountingProvider {
+        type Permit = CountingPermit;
+
+        fn acquire(
+            &self,
+            _lane: TaskDiskLane,
+            _class: DiskReadClass,
+            _cancellation: ReadCancellationToken,
+        ) -> TaskLanePermitFuture<Self::Permit> {
+            let live = Arc::clone(&self.0);
+            Box::pin(async move {
+                live.fetch_add(1, Ordering::SeqCst);
+                Ok(CountingPermit(live))
+            })
+        }
+    }
+
+    /// 前两次交付真实 permit，第三次返回 dispatcher 读取错误。
+    #[derive(Clone)]
+    struct ErrorAfterPermitProvider {
+        /// 已尝试获取许可的次数。
+        attempts: Arc<AtomicUsize>,
+        /// 当前仍由 Hash future 持有的 permit 数量。
+        active: Arc<AtomicUsize>,
+    }
+
+    impl TaskLanePermitProvider for ErrorAfterPermitProvider {
+        type Permit = CountingPermit;
+
+        fn acquire(
+            &self,
+            _lane: TaskDiskLane,
+            _class: DiskReadClass,
+            _cancellation: ReadCancellationToken,
+        ) -> TaskLanePermitFuture<Self::Permit> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+            let active = Arc::clone(&self.active);
+            Box::pin(async move {
+                if attempt >= 2 {
+                    return Err(ReadFailure::Io {
+                        path: PathBuf::from(r"C:\dispatch-error.bin"),
+                        block_offset: 0,
+                        source: std::io::Error::other("测试 dispatcher 读取许可失败"),
+                    });
+                }
+                active.fetch_add(1, Ordering::SeqCst);
+                Ok(CountingPermit(active))
+            })
+        }
+    }
+
+    /// 只门控目标 Hash，使取消前能够同时保留一个真实 Hash future。
+    #[derive(Clone)]
+    struct GatedHashReader {
+        /// 进入门控读取时置位，避免通知先后造成竞态。
+        entered: Arc<AtomicUsize>,
+        /// 未取消时才允许 Hash 返回的闸门。
+        gate: Arc<Notify>,
+        /// 需要被门控的规范路径。
+        gated_path: String,
+        /// 两条测试 Hash 共用的固定 MD5。
+        md5: [u8; 16],
+    }
+
+    impl HashPermitReader for GatedHashReader {
+        type Permit = CountingPermit;
+
+        fn read_with_permit(
+            &self,
+            scanned: ScannedPath,
+            permit: Self::Permit,
+            _cancellation: ReadCancellationToken,
+            _started: Option<crate::scan::HashReadStartedSignal>,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<ReadProduct<Self::Permit>, ReadFailure>>
+                    + Send
+                    + 'static,
+            >,
+        > {
+            let entered = Arc::clone(&self.entered);
+            let gate = Arc::clone(&self.gate);
+            let gated_path = self.gated_path.clone();
+            let md5 = self.md5;
+            Box::pin(async move {
+                if scanned.normalized_path.as_str() == gated_path {
+                    entered.store(1, Ordering::SeqCst);
+                    gate.notified().await;
+                }
+                Ok(ReadProduct { md5, lease: permit })
+            })
+        }
+    }
+
+    /// 永不自行结束的 Hash 读取器，用于证明 dispatcher 错误会收束既有 owner。
+    #[derive(Clone)]
+    struct HoldingHashReader {
+        /// 已进入读取的 future 数量。
+        entered: Arc<AtomicUsize>,
+    }
+
+    impl HashPermitReader for HoldingHashReader {
+        type Permit = CountingPermit;
+
+        fn read_with_permit(
+            &self,
+            _scanned: ScannedPath,
+            permit: Self::Permit,
+            _cancellation: ReadCancellationToken,
+            _started: Option<crate::scan::HashReadStartedSignal>,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<ReadProduct<Self::Permit>, ReadFailure>>
+                    + Send
+                    + 'static,
+            >,
+        > {
+            let entered = Arc::clone(&self.entered);
+            Box::pin(async move {
+                entered.fetch_add(1, Ordering::SeqCst);
+                let _permit = permit;
+                std::future::pending::<Result<ReadProduct<CountingPermit>, ReadFailure>>().await
+            })
+        }
+    }
+
+    /// 让一个单键远端查询保持在途，并在 future Drop 时归还测试 owner。
+    #[derive(Clone)]
+    struct GatedRemote {
+        /// 已进入远端查询的持久状态。
+        entered: Arc<AtomicUsize>,
+        /// 当前仍在途的远端 future 数量。
+        active: Arc<AtomicUsize>,
+        /// 仅供非取消路径放行的闸门。
+        gate: Arc<Notify>,
+    }
+
+    impl RemoteFeatureCache for GatedRemote {
+        async fn lookup_paths(
+            &self,
+            _machine_id: &MachineId,
+            paths: &[ScannedPath],
+        ) -> Result<Vec<Option<BaseCacheRecord>>, RemoteCacheError> {
+            Ok(vec![None; paths.len()])
+        }
+
+        async fn lookup_contents(
+            &self,
+            keys: &[ContentKey],
+        ) -> Result<Vec<Option<BaseCacheRecord>>, RemoteCacheError> {
+            assert_eq!(keys.len(), 1, "流式远端查询必须保持单键");
+            self.entered.store(1, Ordering::SeqCst);
+            self.active.fetch_add(1, Ordering::SeqCst);
+            struct RemoteOwner(Arc<AtomicUsize>);
+            impl Drop for RemoteOwner {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+            let _owner = RemoteOwner(Arc::clone(&self.active));
+            self.gate.notified().await;
+            Ok(vec![None])
+        }
+
+        async fn publish_outbox(
+            &mut self,
+            _machine_id: &MachineId,
+            _batch: &dedup_protocol::proto::SyncChangeBatch,
+        ) -> Result<u64, RemoteCacheError> {
+            Ok(0)
+        }
+    }
+
+    fn lane(disk: u32) -> TaskDiskLane {
+        TaskDiskLane {
+            physical_disk_id: PhysicalDiskId::from_disk_numbers([disk]).unwrap(),
+            physical_disk_numbers: vec![disk],
+            disk_kind: LocalDiskKind::Hdd,
+            configured_weight: 1,
+            per_disk_limit: 1,
+        }
+    }
+
+    fn scanned(path: &str, file_size: u64) -> ScannedPath {
+        ScannedPath::new(
+            NormalizedPath::new(path).unwrap(),
+            DisplayPath::new(path).unwrap(),
+            file_size,
+        )
+    }
+
+    fn input(
+        scanned: ScannedPath,
+        lane: TaskDiskLane,
+        cached: Option<BaseCacheRecord>,
+    ) -> BaseTaskInput {
+        BaseTaskInput {
+            planned: PlannedScannedPath { scanned, lane },
+            cached,
+            contact_sheet_valid: true,
+            force_recompute: false,
+        }
+    }
+
+    fn production<P: TaskLanePermitProvider>(
+        root: &Path,
+        provider: P,
+        inputs: &[BaseTaskInput],
+    ) -> crate::scan::BaseTaskProduction<P> {
+        let files = TransientTaskFileSet::create(root, RUN_ID).unwrap();
+        let mut producer = BaseTaskProducer::new(TaskFileDispatcher::new(files, provider));
+        producer.append_batch(inputs).unwrap();
+        producer.seal().unwrap()
+    }
+
+    fn options(root: &Path) -> TaskFileBaseCoordinatorOptions {
+        TaskFileBaseCoordinatorOptions {
+            hash_capacity: 2,
+            worker_capacity: 1,
+            read_config: DiskReadConfig::default(),
+            persistence: TaskFileMediaPersistenceOptions {
+                contact_sheet_root: root.join("contacts"),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// 取消必须先收回 Hash、远端和 Worker owner，才允许任务文件 dispatcher 被丢弃。
+    #[tokio::test]
+    async fn cancellation_drains_hash_remote_media_and_preserves_unacked_rows() {
+        let root = tempfile::tempdir().unwrap();
+        let md5 = [0xD4; 16];
+        let machine = MachineId::from_sha256([0xD5; 32]);
+        let mut store = NodeStore::open_in_memory(machine).unwrap();
+        let cached = store
+            .upsert_content_and_location(&scanned(r"C:\seed-media.bin", 10), md5, MediaKind::Image)
+            .unwrap();
+        let cached = store.load_base_cache_record(cached.id).unwrap();
+        let permits = Arc::new(AtomicUsize::new(0));
+        let media_path = scanned(r"C:\media-active.bin", 10);
+        let hash_path = scanned(r"C:\hash-gated.bin", 10);
+        let remote_path = scanned(r"C:\remote-gated.bin", 10);
+        let pending = TaskFileBaseComputePending::from_production(production(
+            root.path(),
+            CountingProvider(Arc::clone(&permits)),
+            &[
+                input(media_path, lane(41), Some(cached)),
+                input(hash_path.clone(), lane(42), None),
+                input(remote_path.clone(), lane(43), None),
+            ],
+        ));
+        let hash_entered = Arc::new(AtomicUsize::new(0));
+        let remote_entered = Arc::new(AtomicUsize::new(0));
+        let remote_active = Arc::new(AtomicUsize::new(0));
+        let remote = Arc::new(GatedRemote {
+            entered: Arc::clone(&remote_entered),
+            active: Arc::clone(&remote_active),
+            gate: Arc::new(Notify::new()),
+        });
+        let reader = GatedHashReader {
+            entered: Arc::clone(&hash_entered),
+            gate: Arc::new(Notify::new()),
+            gated_path: hash_path.normalized_path.as_str().to_owned(),
+            md5,
+        };
+        let (actor, handle, mut acknowledgements) =
+            crate::scan::base_persistence::BaseStoreActor::spawn(store, 2);
+        let (mut pool, mut started, _controller) = WorkerPool::controlled_batch_for_test(1);
+        let cancellation = ReadCancellationToken::new();
+        let cancellation_for_run = cancellation.clone();
+        let run_root = root.path().to_path_buf();
+        let run_handle = handle.clone();
+        let join = tokio::spawn(async move {
+            let mut remote_available = true;
+            let mut warning = None;
+            let result = run_task_file_base_stream(
+                pending,
+                reader,
+                &mut pool,
+                &run_handle,
+                &mut acknowledgements,
+                &options(&run_root),
+                cancellation_for_run,
+                remote,
+                &mut remote_available,
+                &mut warning,
+                None,
+            )
+            .await;
+            let busy_workers = pool.busy_workers();
+            let shutdown = pool.shutdown().await;
+            (result, busy_workers, shutdown)
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), started.recv())
+            .await
+            .expect("Media A 必须先进入 Worker")
+            .expect("Worker 启动通道不得关闭");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while hash_entered.load(Ordering::SeqCst) == 0
+                || remote_entered.load(Ordering::SeqCst) == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("取消前必须同时存在 gated Hash 与 gated remote");
+        cancellation.cancel();
+
+        let (result, busy_workers, shutdown) = tokio::time::timeout(Duration::from_secs(2), join)
+            .await
+            .expect("取消必须在两秒内收束所有 owner")
+            .unwrap();
+        assert!(shutdown.is_ok());
+        let error = match result {
+            Ok(_) => panic!("取消必须返回携带唯一 pending owner 的错误"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            permits.load(Ordering::SeqCst),
+            0,
+            "Hash/Media permit 必须归还"
+        );
+        assert_eq!(
+            remote_active.load(Ordering::SeqCst),
+            0,
+            "远端 future 必须 drain"
+        );
+        assert_eq!(busy_workers, 0, "Worker 必须回到 idle");
+        let mut pending = error.into_pending();
+        for disk in [41, 42, 43] {
+            assert_eq!(
+                std::fs::read(pending.dispatcher.lane_path(&lane(disk)).unwrap()).unwrap()[0],
+                b'P',
+                "未 ACK 行必须保持 P"
+            );
+        }
+        pending
+            .dispatcher
+            .discard()
+            .expect("所有外部 owner 清空后 dispatcher 必须可以 discard");
+        drop(handle);
+        actor.finish().await.unwrap();
+    }
+
+    /// dispatcher 失败必须先回收已在途 Hash permit，再归还可 discard 的唯一 pending owner。
+    #[tokio::test]
+    async fn dispatch_error_releases_active_hash_owners_before_returning_pending() {
+        let root = tempfile::tempdir().unwrap();
+        let active = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(AtomicUsize::new(0));
+        let provider = ErrorAfterPermitProvider {
+            attempts: Arc::new(AtomicUsize::new(0)),
+            active: Arc::clone(&active),
+        };
+        let inputs = [
+            input(scanned(r"C:\dispatch-first.bin", 11), lane(51), None),
+            input(scanned(r"C:\dispatch-second.bin", 12), lane(52), None),
+            input(scanned(r"C:\dispatch-third.bin", 13), lane(53), None),
+        ];
+        let pending =
+            TaskFileBaseComputePending::from_production(production(root.path(), provider, &inputs));
+        let store = NodeStore::open_in_memory(MachineId::from_sha256([0xD6; 32])).unwrap();
+        let (actor, handle, mut acknowledgements) =
+            crate::scan::base_persistence::BaseStoreActor::spawn(store, 2);
+        let (mut pool, _started, _controller) = WorkerPool::controlled_batch_for_test(1);
+        let reader = HoldingHashReader {
+            entered: Arc::clone(&entered),
+        };
+        let mut stream_options = options(root.path());
+        stream_options.hash_capacity = 3;
+        let mut remote_available = false;
+        let mut warning = None;
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_task_file_base_stream(
+                pending,
+                reader,
+                &mut pool,
+                &handle,
+                &mut acknowledgements,
+                &stream_options,
+                ReadCancellationToken::new(),
+                Arc::new(crate::DisabledRemoteFeatureCache),
+                &mut remote_available,
+                &mut warning,
+                None,
+            ),
+        )
+        .await
+        .expect("dispatcher 错误必须在收束 Hash owner 后返回");
+        let error = match result {
+            Ok(_) => panic!("第三次许可失败必须返回任务级错误"),
+            Err(error) => error,
+        };
+        assert!(entered.load(Ordering::SeqCst) <= 2);
+        assert_eq!(active.load(Ordering::SeqCst), 0, "Hash permit 必须全部释放");
+        let mut pending = error.into_pending();
+        for disk in [51, 52, 53] {
+            assert_eq!(
+                std::fs::read(pending.dispatcher.lane_path(&lane(disk)).unwrap()).unwrap()[0],
+                b'P',
+                "未 ACK 行必须保持 P"
+            );
+        }
+        pending
+            .dispatcher
+            .discard()
+            .expect("dispatcher 错误清理后必须允许 discard");
+        assert!(pool.shutdown().await.is_ok());
+        drop(handle);
+        actor.finish().await.unwrap();
     }
 }

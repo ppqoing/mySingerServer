@@ -20,6 +20,8 @@ use dedup_node_engine::actor::run_enumerated_scan_to_base_compute_for_test;
 use dedup_node_engine::scan::BaseComputeJoinObservationHooks;
 #[cfg(feature = "test-hooks")]
 use dedup_node_engine::scan::BasePersistTestController;
+#[cfg(feature = "test-hooks")]
+use dedup_node_engine::scan::run_scheduled_task_file_scan_for_test;
 use dedup_node_engine::{
     DisabledRemoteFeatureCache, RemoteCacheError, RemoteFeatureCache,
     artifact_registry::RegenerableArtifactRegistry,
@@ -29,8 +31,9 @@ use dedup_node_engine::{
         RuntimeExecutionConfigUpdate, RuntimeTaskKind, RuntimeTaskRegistry, RuntimeTaskReporter,
     },
     scan::{
-        BaseComputeDecision, BaseComputeEngine, PipelineFileReader, PipelineLimits, ReadProduct,
-        ScanOptions, ScheduledFileReader, begin_scan_task, md5_bytes,
+        BaseComputeDecision, BaseComputeEngine, PipelineFileReader, PipelineLimits,
+        PlannedScannedPath, ReadProduct, ScanOptions, ScheduledFileReader, TaskDiskLane,
+        begin_scan_task, md5_bytes,
     },
     worker::{BaseComputeOutput, Stage1Frame, WorkerPool, encode_base_compute_payload},
 };
@@ -39,7 +42,7 @@ use dedup_node_store::{
 };
 use dedup_protocol::proto;
 use dedup_protocol::{BASE_MISSING_CONTACT_SHEET, BASE_MISSING_PROBE, BASE_MISSING_STAGE1};
-use dedup_windows::{LocalDiskKind, ReadCancellationToken};
+use dedup_windows::{LocalDiskKind, PhysicalDiskId, ReadCancellationToken};
 use tempfile::tempdir;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
@@ -388,6 +391,24 @@ struct BlockingBlockReader {
     started: Arc<AtomicUsize>,
     /// 测试统一释放所有阻塞读取的门禁。
     gate: Arc<(Mutex<bool>, Condvar)>,
+}
+
+/// 确保测试失败或超时时也会解除阻塞块读取，避免遗留 spawn_blocking 线程。
+struct BlockingReadRelease(Arc<(Mutex<bool>, Condvar)>);
+
+impl BlockingReadRelease {
+    /// 幂等放行当前门禁的全部块读取。
+    fn release(&self) {
+        let (released, changed) = &*self.0;
+        *released.lock().unwrap() = true;
+        changed.notify_all();
+    }
+}
+
+impl Drop for BlockingReadRelease {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 impl BlockReader for BlockingBlockReader {
@@ -806,6 +827,55 @@ async fn disk_read_metrics(
         .pipeline_metrics
         .unwrap()
         .disk_reads
+}
+
+/// 同盘 Hash/Media 竞争时从真实运行时指标读取的活动计数。
+#[cfg(feature = "test-hooks")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SchedulerActiveCounts {
+    /// 全局 Hash 许可数。
+    global_hash: u64,
+    /// 全局 Media 许可数。
+    global_media: u64,
+    /// 指定物理盘 Hash 许可数。
+    disk_hash: u64,
+    /// 指定物理盘 Media 许可数。
+    disk_media: u64,
+}
+
+#[cfg(feature = "test-hooks")]
+impl SchedulerActiveCounts {
+    /// 返回真实 scheduler 的全局活动许可总数。
+    const fn global_active(self) -> u64 {
+        self.global_hash + self.global_media
+    }
+
+    /// 返回指定物理盘的活动许可总数。
+    const fn disk_active(self) -> u64 {
+        self.disk_hash + self.disk_media
+    }
+}
+
+/// 读取指定物理盘及全局资源的同一份运行时快照。
+#[cfg(feature = "test-hooks")]
+async fn scheduler_active_counts(
+    registry: &RuntimeTaskRegistry,
+    reporter: &RuntimeTaskReporter,
+    physical_disk_id: &str,
+) -> SchedulerActiveCounts {
+    let details = registry.details(reporter.id()).await.unwrap();
+    let metrics = details.pipeline_metrics.unwrap();
+    let disk = metrics
+        .disk_reads
+        .iter()
+        .find(|disk| disk.physical_disk_id == physical_disk_id)
+        .expect("真实 scheduler 应发布冻结物理盘指标");
+    SchedulerActiveCounts {
+        global_hash: metrics.hash_io.and_then(|value| value.current).unwrap(),
+        global_media: metrics.media_io.and_then(|value| value.current).unwrap(),
+        disk_hash: disk.hash_active.unwrap(),
+        disk_media: disk.media_active.unwrap(),
+    }
 }
 
 /// 持有文件数据库的 IMMEDIATE 写事务，精确阻塞 NodeStore 后续写入。
@@ -1495,6 +1565,249 @@ async fn scheduled_reader_limits_hashing_by_read_threads_not_single_worker() {
     };
     let (summary, ()) = tokio::join!(run, drive);
     assert_eq!(summary.unwrap().hashed, 4);
+}
+
+/// 统一流的同盘 Hash/Media 竞争必须遵守冻结上限，并由 SourceReadComplete 释放 Media 许可。
+#[cfg(feature = "test-hooks")]
+#[tokio::test]
+async fn scheduled_same_disk_hash_media_competition_respects_frozen_limits() {
+    let fixture = tempdir().unwrap();
+    let install_root = fixture.path().join("install");
+    let cache_root = install_root.join("data/node/cache");
+    let media_root = install_root.join("media");
+    std::fs::create_dir_all(&cache_root).unwrap();
+    std::fs::create_dir_all(&media_root).unwrap();
+    let machine = MachineId::from_sha256([0x5B; 32]);
+    let mut store = NodeStore::open_in_memory(machine.clone()).unwrap();
+    let options = ScanOptions::new(vec![DisplayPath::new(&media_root).unwrap()]);
+    let task_id = begin_scan_task(&mut store, &options, 10).unwrap();
+    let rows = [
+        ("media-first.bin", vec![0x91; 10]),
+        ("hash-1.bin", vec![1; 10]),
+    ]
+    .into_iter()
+    .map(|(name, bytes)| {
+        let path = media_root.join(name);
+        std::fs::write(&path, &bytes).unwrap();
+        ScannedPath::new(
+            NormalizedPath::new(&path).unwrap(),
+            DisplayPath::new(&path).unwrap(),
+            bytes.len() as u64,
+        )
+    })
+    .collect::<Vec<_>>();
+    let first_md5 = [0x91; 16];
+    let first_path = rows[0].normalized_path.clone();
+    store
+        .upsert_content_and_location(&rows[0], first_md5, MediaKind::Other)
+        .unwrap();
+    assert!(
+        store.lookup_base_cache_by_paths(&rows).unwrap()[0].is_some(),
+        "首条路径必须先形成已知 MD5 的 partial cache"
+    );
+
+    let started_hashes = Arc::new(AtomicUsize::new(0));
+    let hash_gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let hash_gate_release = BlockingReadRelease(Arc::clone(&hash_gate));
+    let config = DiskReadConfig {
+        total_threads: 2,
+        hdd_threads_per_disk: 2,
+        ssd_threads_per_disk: 2,
+        unknown_threads_per_disk: 2,
+        ..DiskReadConfig::default()
+    };
+    let (mut pool, mut started_workers, controller) = WorkerPool::controlled_batch_for_test(1);
+    let registry = RuntimeTaskRegistry::new();
+    let reporter = registry
+        .begin(RuntimeTaskKind::Scan, machine, "同盘 Hash Media 上限")
+        .await;
+    configure_disk_metrics(&reporter, &config);
+    let media_lane = TaskDiskLane {
+        physical_disk_id: PhysicalDiskId::from_disk_numbers([7]).unwrap(),
+        physical_disk_numbers: vec![7],
+        disk_kind: LocalDiskKind::Ssd,
+        configured_weight: 2,
+        per_disk_limit: 2,
+    };
+    let hash_lane = TaskDiskLane {
+        physical_disk_id: PhysicalDiskId::from_disk_numbers([7, 8]).unwrap(),
+        physical_disk_numbers: vec![7, 8],
+        disk_kind: LocalDiskKind::Ssd,
+        configured_weight: 2,
+        per_disk_limit: 2,
+    };
+    let planned = rows
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(index, scanned)| PlannedScannedPath {
+            scanned,
+            lane: if index == 0 {
+                media_lane.clone()
+            } else {
+                hash_lane.clone()
+            },
+        })
+        .collect::<Vec<_>>();
+    let (reader, limits) = ScheduledFileReader::controlled_with_planned_rows_for_test(
+        &config,
+        1,
+        BlockingBlockReader {
+            started: Arc::clone(&started_hashes),
+            gate: Arc::clone(&hash_gate),
+        },
+        Arc::new(planned.clone()),
+    )
+    .unwrap();
+    let reader = reader.with_runtime_reporter(reporter.clone());
+    let artifacts = Arc::new(RegenerableArtifactRegistry::new(&install_root, &cache_root).unwrap());
+    let cleaner = DiskFullCleaner::new(Arc::clone(&artifacts), SystemArtifactDiskResolver);
+    let task_text = task_id.as_uuid().to_string();
+    let contact_root = cache_root.join("contact-sheets");
+
+    let run = run_scheduled_task_file_scan_for_test(
+        store,
+        &mut pool,
+        task_id,
+        vec![NormalizedPath::new(&media_root).unwrap()],
+        planned,
+        install_root.join("task-runtime"),
+        contact_root,
+        reader,
+        limits,
+        config.clone(),
+        1,
+        ReadCancellationToken::new(),
+        &reporter,
+        Arc::clone(&artifacts),
+        cleaner.clone(),
+        20,
+    );
+    let drive = async {
+        let first_item = tokio::time::timeout(Duration::from_secs(1), started_workers.recv())
+            .await
+            .expect("已知 MD5 的 Media 项应先进入 Worker")
+            .unwrap()
+            .1;
+        assert_eq!(
+            controller.running_files()[0].2.normalized_path,
+            first_path,
+            "Worker Started 身份必须对应首条 Media TSV 行"
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while started_hashes.load(Ordering::Acquire) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Worker Started 后同盘 Hash 应取得另一个真实 scheduler 许可");
+        let counts_before_source_complete =
+            scheduler_active_counts(&registry, &reporter, "PhysicalDisk7").await;
+
+        controller
+            .base_source_read_complete(task_text.clone(), first_item.clone())
+            .await;
+        let counts_after_source_complete = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let counts = scheduler_active_counts(&registry, &reporter, "PhysicalDisk7").await;
+                if started_hashes.load(Ordering::Acquire) == 1
+                    && counts.global_hash == 1
+                    && counts.global_media == 0
+                    && counts.disk_hash == 1
+                    && counts.disk_media == 0
+                {
+                    return counts;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("匹配 SourceReadComplete 后应释放 Media 许可并补入第二个 Hash");
+        controller
+            .complete_base(task_text.clone(), first_item, first_md5, other_output())
+            .await;
+        hash_gate_release.release();
+
+        for _ in 0..1 {
+            let item_id = tokio::time::timeout(Duration::from_secs(1), started_workers.recv())
+                .await
+                .expect("两个 Hash miss 都应继续进入同一受控 Worker 槽位")
+                .unwrap()
+                .1;
+            let identity = controller
+                .running_files()
+                .into_iter()
+                .find(|(_, running, _)| running == &item_id)
+                .expect("Worker 运行项必须保留 Hash TSV 路径身份")
+                .2;
+            let byte = identity
+                .display_path
+                .as_path()
+                .file_stem()
+                .unwrap()
+                .to_string_lossy()
+                .chars()
+                .last()
+                .unwrap()
+                .to_digit(10)
+                .unwrap() as u8;
+            controller
+                .base_source_read_complete(task_text.clone(), item_id.clone())
+                .await;
+            controller
+                .complete_base(
+                    task_text.clone(),
+                    item_id,
+                    md5_bytes(&vec![byte; 10]),
+                    other_output(),
+                )
+                .await;
+        }
+        (counts_before_source_complete, counts_after_source_complete)
+    };
+    let (summary, (counts_before_source_complete, counts_after_source_complete)) =
+        tokio::join!(run, drive);
+    let summary = summary.unwrap();
+
+    assert_eq!(
+        counts_before_source_complete,
+        SchedulerActiveCounts {
+            global_hash: 1,
+            global_media: 1,
+            disk_hash: 1,
+            disk_media: 1,
+        },
+        "Worker Started 后 Media 许可必须仍计入同盘和全局上限"
+    );
+    assert_eq!(counts_before_source_complete.global_active(), 2);
+    assert_eq!(counts_before_source_complete.disk_active(), 2);
+    assert_eq!(counts_after_source_complete.global_active(), 1);
+    assert_eq!(counts_after_source_complete.disk_active(), 1);
+    assert_eq!(started_hashes.load(Ordering::Acquire), 1);
+    assert_eq!(summary.resolved_files, 2);
+    assert_eq!(summary.cache_hits, 0);
+    assert_eq!(summary.file_failures, 0);
+
+    let details = registry.details(reporter.id()).await.unwrap();
+    let execution = details.execution_config.unwrap();
+    assert_eq!(execution.global_disk_permits, Some(2));
+    assert_eq!(execution.ssd_per_disk_permits, Some(2));
+    let metrics = details.pipeline_metrics.unwrap();
+    let disk = metrics
+        .disk_reads
+        .iter()
+        .find(|disk| disk.physical_disk_id == "PhysicalDisk7")
+        .cloned()
+        .unwrap();
+    assert_eq!(disk.capacity, Some(2));
+    assert_eq!(disk.hash_granted_total, Some(1));
+    assert_eq!(disk.hash_released_total, Some(1));
+    assert_eq!(disk.media_granted_total, Some(2));
+    assert_eq!(disk.media_released_total, Some(2));
+    assert_eq!(metrics.hash_io.unwrap().current, Some(0));
+    assert_eq!(metrics.media_io.unwrap().current, Some(0));
+    assert_eq!(disk.hash_active, Some(0));
+    assert_eq!(disk.media_active, Some(0));
 }
 
 #[tokio::test]

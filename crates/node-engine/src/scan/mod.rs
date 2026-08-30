@@ -28,13 +28,7 @@ pub(crate) use task_file_base_coordinator::{
 pub(crate) use task_file_cache::{
     TaskFileCacheError, TaskFileCacheResult, resolve_task_file_cache,
 };
-pub(crate) use task_file_media_compute::{
-    MediaPassResult, TaskFileMediaCompleted, TaskFileMediaComputeError, TaskFileMediaFailure,
-    run_task_file_media_compute,
-};
-pub(crate) use task_file_media_persistence::{
-    TaskFileMediaPersistenceError, TaskFileMediaPersistenceOptions, persist_task_file_media_results,
-};
+pub(crate) use task_file_media_persistence::TaskFileMediaPersistenceOptions;
 pub(crate) use task_file_scan_run::{
     CompletedScanSnapshot, ScanRunResult, TaskFileScanRunOptions, run_task_file_scan,
     run_task_file_scan_with_runtime,
@@ -82,6 +76,78 @@ pub use root_plan::{
     PlannedScannedPath, ResolvedScanRootStorage, ScanDiskPlan, ScanRootStorageResolver,
     SystemScanRootStorageResolver, TaskDiskLane,
 };
+
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+/// 真实 task-file 统一流测试完成后的最小公开汇总。
+pub struct TaskFileScanTestSummary {
+    /// 已收到 SQLite ACK 的单文件失败数。
+    pub file_failures: usize,
+    /// 直接复用完整路径缓存的文件数。
+    pub cache_hits: usize,
+    /// 已成功写入并进入最终清单的文件数。
+    pub resolved_files: usize,
+}
+
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+/// 用真实 ScheduledFileReader 驱动 task-file 统一流，供跨 crate 行为测试使用。
+#[allow(clippy::too_many_arguments)]
+pub async fn run_scheduled_task_file_scan_for_test(
+    store: dedup_node_store::NodeStore,
+    worker_pool: &mut crate::worker::WorkerPool,
+    task_id: dedup_core::TaskId,
+    roots: Vec<dedup_core::NormalizedPath>,
+    planned: Vec<PlannedScannedPath>,
+    runtime_root: std::path::PathBuf,
+    contact_sheet_root: std::path::PathBuf,
+    reader: ScheduledFileReader,
+    limits: PipelineLimits,
+    read_config: dedup_core::DiskReadConfig,
+    worker_capacity: usize,
+    cancellation: dedup_windows::ReadCancellationToken,
+    reporter: &crate::runtime_tasks::RuntimeTaskReporter,
+    artifact_registry: std::sync::Arc<crate::artifact_registry::RegenerableArtifactRegistry>,
+    disk_full_cleaner: crate::disk_full_cleanup::DiskFullCleaner,
+    now_ms: i64,
+) -> Result<TaskFileScanTestSummary, ScanError> {
+    let result = run_task_file_scan_with_runtime(
+        store,
+        worker_pool,
+        reader.clone(),
+        reader,
+        crate::DisabledRemoteFeatureCache,
+        TaskFileScanRunOptions {
+            task_id,
+            roots,
+            planned,
+            runtime_root,
+            force_recompute: false,
+            coordinator: TaskFileBaseCoordinatorOptions {
+                hash_capacity: limits.max_read_tasks(),
+                worker_capacity,
+                read_config,
+                persistence: TaskFileMediaPersistenceOptions {
+                    contact_sheet_root,
+                    artifact_registry: Some(artifact_registry),
+                    disk_full_cleaner: Some(disk_full_cleaner),
+                },
+            },
+            persist_capacity: MAX_BASE_TASK_BATCH.saturating_add(worker_capacity),
+            now_ms,
+            remote_available: false,
+            first_persist_waiter: None,
+        },
+        cancellation,
+        reporter,
+    )
+    .await?;
+    Ok(TaskFileScanTestSummary {
+        file_failures: result.summary.file_failures,
+        cache_hits: result.summary.cache_hits,
+        resolved_files: result.completed.resolved_files.len(),
+    })
+}
 
 use thiserror::Error;
 

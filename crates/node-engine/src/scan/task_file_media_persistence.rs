@@ -5,17 +5,8 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
-    fmt,
     time::{SystemTime, UNIX_EPOCH},
 };
-
-use dedup_core::{ContentKey, MediaKind};
-use dedup_media::decode_contact_sheet;
-use dedup_node_store::{FileFaultKind, FileFaultRecord, ResolvedScanFile, ScannedPath};
-use dedup_protocol::{
-    BASE_MISSING_CONTACT_SHEET, BASE_MISSING_PROBE, BASE_MISSING_STAGE1, proto::worker_envelope,
-};
-use tokio::sync::mpsc::UnboundedReceiver;
 
 use super::{
     base_persistence::{
@@ -24,7 +15,7 @@ use super::{
     },
     task_file_base_compute::TaskFileBaseComputePending,
     task_file_media_compute::{
-        MediaPassResult, TaskFileMediaCompleted, TaskFileMediaFailure, TaskFileMediaTerminal,
+        TaskFileMediaCompleted, TaskFileMediaFailure, TaskFileMediaTerminal,
     },
 };
 use crate::{
@@ -35,6 +26,12 @@ use crate::{
     task_dispatch::TaskLanePermitProvider,
     task_files::TaskFileIdentity,
     worker::{BaseComputeOutput, Stage1Frame, Stage1Output, decode_base_compute_payload},
+};
+use dedup_core::{ContentKey, MediaKind};
+use dedup_media::decode_contact_sheet;
+use dedup_node_store::{FileFaultKind, FileFaultRecord, ResolvedScanFile, ScannedPath};
+use dedup_protocol::{
+    BASE_MISSING_CONTACT_SHEET, BASE_MISSING_PROBE, BASE_MISSING_STAGE1, proto::worker_envelope,
 };
 
 /// Media taskless 持久化调用所需的本机 artifact 和联系表配置。
@@ -55,36 +52,6 @@ impl Default for TaskFileMediaPersistenceOptions {
             artifact_registry: None,
             disk_full_cleaner: None,
         }
-    }
-}
-
-/// Media taskless 持久化发生任务级错误时携带未完成 pending 所有权。
-pub(crate) struct TaskFileMediaPersistenceError<P: TaskLanePermitProvider> {
-    /// 面向调用方的诊断文本。
-    message: String,
-    /// 尚未 ACK 的 dispatcher、上下文和清单。
-    pending: TaskFileBaseComputePending<P>,
-}
-
-impl<P: TaskLanePermitProvider> TaskFileMediaPersistenceError<P> {
-    /// 消费错误并取回剩余任务文件所有权。
-    pub(crate) fn into_pending(self) -> TaskFileBaseComputePending<P> {
-        self.pending
-    }
-}
-
-impl<P: TaskLanePermitProvider> fmt::Display for TaskFileMediaPersistenceError<P> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.message)
-    }
-}
-
-impl<P: TaskLanePermitProvider> fmt::Debug for TaskFileMediaPersistenceError<P> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("TaskFileMediaPersistenceError")
-            .field("message", &self.message)
-            .finish_non_exhaustive()
     }
 }
 
@@ -338,6 +305,7 @@ impl TaskFilePersistRuntime {
     }
 
     /// 尽可能投递消息；有界队列满时保留消息，等待外部事件泵先交付 ACK。
+    #[cfg(test)]
     pub(super) fn try_submit(&mut self, store: &BaseStoreHandle) -> Result<(), String> {
         while !self.queue.is_empty() {
             if !self.try_submit_one(store)? {
@@ -512,92 +480,6 @@ enum PreparedMediaResult {
     // 校验失败由调用方转为当前文件的失败持久化。
 }
 
-/// 消费一轮 Media 结果并执行 taskless stage1/失败 ACK。
-///
-/// 所有任务文件状态迁移都延迟到 ACK；函数返回时剩余 pending 仍拥有未完成的
-/// dispatcher、内存上下文和清单，供外层继续 Hash/Media 或 discard。
-pub(crate) async fn persist_task_file_media_results<P>(
-    media: MediaPassResult<P>,
-    store: &BaseStoreHandle,
-    acknowledgements: &mut UnboundedReceiver<BasePersistAck>,
-    options: TaskFileMediaPersistenceOptions,
-) -> Result<TaskFileBaseComputePending<P>, TaskFileMediaPersistenceError<P>>
-where
-    P: TaskLanePermitProvider,
-{
-    let MediaPassResult {
-        mut pending,
-        completed,
-        file_failures,
-        ..
-    } = media;
-    let mut runtime = TaskFilePersistRuntime::new();
-    let mut identities = BTreeMap::<TaskFileIdentity, ()>::new();
-
-    for item in completed {
-        if let Err(message) = validate_context(&pending, &item.identity, &item.context) {
-            return Err(persistence_error(pending, message));
-        }
-        if identities.insert(item.identity.clone(), ()).is_some() {
-            return Err(persistence_error(pending, "Media 结果包含重复任务文件身份"));
-        }
-        if let Err(message) =
-            runtime.enqueue_media_terminal(TaskFileMediaTerminal::Completed(item), &options)
-        {
-            return Err(persistence_error(pending, message));
-        }
-    }
-    for item in file_failures {
-        if let Err(message) = validate_context(&pending, &item.identity, &item.context) {
-            return Err(persistence_error(pending, message));
-        }
-        if identities.insert(item.identity.clone(), ()).is_some() {
-            return Err(persistence_error(
-                pending,
-                "Media 失败结果包含重复任务文件身份",
-            ));
-        }
-        if let Err(message) =
-            runtime.enqueue_media_terminal(TaskFileMediaTerminal::Failed(item), &options)
-        {
-            return Err(persistence_error(pending, message));
-        }
-    }
-
-    while !runtime.is_empty() {
-        if let Err(message) = runtime.try_submit(store) {
-            return Err(persistence_error(pending, message));
-        }
-        if !runtime.is_empty() {
-            let ack = match acknowledgements.recv().await {
-                Some(ack) => ack,
-                None => {
-                    return Err(persistence_error(
-                        pending,
-                        "基础持久化 actor 未返回 Media ACK",
-                    ));
-                }
-            };
-            if let Err(message) = runtime.apply_ack(&mut pending, ack) {
-                return Err(persistence_error(pending, message));
-            }
-        }
-    }
-    Ok(pending)
-}
-
-/// 确认 Media 结果上下文仍是 Hash/生产阶段保存的同一份快照。
-fn validate_context<P: TaskLanePermitProvider>(
-    pending: &TaskFileBaseComputePending<P>,
-    identity: &TaskFileIdentity,
-    context: &super::TaskFileBaseContext,
-) -> Result<(), String> {
-    if pending.contexts.get(identity) != Some(context) {
-        return Err("Media 结果上下文与任务文件身份不一致".into());
-    }
-    Ok(())
-}
-
 /// 返回用于故障表的单调毫秒时间戳。
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -738,7 +620,6 @@ fn build_completed_message(
         Err(message) => build_failure_message(TaskFileMediaFailure {
             identity,
             record: item.record,
-            context: item.context,
             message,
             worker_slot,
         }),
@@ -1013,128 +894,6 @@ fn persist_completed_stage1(
     }
 }
 
-/// 尝试发送所有待持久化消息，队列满时先消费真实 ACK。
-async fn flush_persist_queue<P: TaskLanePermitProvider>(
-    pending: &mut TaskFileBaseComputePending<P>,
-    queue: &mut VecDeque<PendingMediaPersist>,
-    in_flight: &mut BTreeMap<TaskFileIdentity, MediaPersistAction>,
-    store: &BaseStoreHandle,
-    acknowledgements: &mut UnboundedReceiver<BasePersistAck>,
-) -> Result<(), String> {
-    while !queue.is_empty() || !in_flight.is_empty() {
-        if let Some(mut item) = queue.pop_front() {
-            match store.try_persist(item.message) {
-                Ok(()) => {
-                    in_flight.insert(item.identity, item.action);
-                }
-                Err(BasePersistSendError::Full(message)) => {
-                    item.message = message;
-                    queue.push_front(item);
-                    if in_flight.is_empty() {
-                        tokio::task::yield_now().await;
-                    } else {
-                        apply_one_ack(pending, in_flight, acknowledgements).await?;
-                    }
-                }
-                Err(BasePersistSendError::Closed(_)) => {
-                    return Err("基础持久化 actor 已关闭".into());
-                }
-            }
-        } else {
-            apply_one_ack(pending, in_flight, acknowledgements).await?;
-        }
-    }
-    Ok(())
-}
-
-/// 消费一条 ACK；只有结果类型、身份和关键字段都匹配才迁移 TSV。
-async fn apply_one_ack<P: TaskLanePermitProvider>(
-    pending: &mut TaskFileBaseComputePending<P>,
-    in_flight: &mut BTreeMap<TaskFileIdentity, MediaPersistAction>,
-    acknowledgements: &mut UnboundedReceiver<BasePersistAck>,
-) -> Result<(), String> {
-    let ack = acknowledgements
-        .recv()
-        .await
-        .ok_or_else(|| "基础持久化 actor 未返回 Media ACK".to_owned())?;
-    let identity = match ack.identity {
-        BasePersistIdentity::TaskFile(identity) => identity,
-        BasePersistIdentity::Legacy(_) => return Err("Media 收到旧任务表持久化 ACK".into()),
-    };
-    let action = in_flight
-        .remove(&identity)
-        .ok_or_else(|| "Media 收到未知持久化 ACK".to_owned())?;
-    let outcome = ack.result?;
-    match (action, outcome) {
-        (
-            MediaPersistAction::Complete {
-                scanned,
-                content_key,
-                media_kind,
-                worker_slot,
-            },
-            BasePersistOutcome::Succeeded {
-                worker_slot: ack_slot,
-                cache_hit,
-                media_kind: ack_kind,
-                file_size,
-            },
-        ) if ack_slot == worker_slot
-            && !cache_hit
-            && ack_kind == media_kind
-            && file_size == scanned.file_size =>
-        {
-            pending
-                .dispatcher
-                .mark_completed(&identity)
-                .map_err(|error| error.to_string())?;
-            pending.contexts.remove(&identity);
-            pending.manifest.resolved_files.push(ResolvedScanFile {
-                scanned,
-                content: content_key,
-            });
-            pending.manifest.resolved_files.sort_by(|left, right| {
-                left.scanned
-                    .normalized_path
-                    .cmp(&right.scanned.normalized_path)
-            });
-        }
-        (
-            MediaPersistAction::Failed {
-                display_path,
-                worker_slot,
-            },
-            BasePersistOutcome::Failed {
-                display_path: ack_path,
-                worker_slot: ack_slot,
-                skipped_incomplete: false,
-                ..
-            },
-        ) if ack_path == display_path && ack_slot == worker_slot => {
-            pending
-                .dispatcher
-                .mark_failed(&identity)
-                .map_err(|error| error.to_string())?;
-            pending.contexts.remove(&identity);
-        }
-        (_, BasePersistOutcome::Ignored) => return Err("Media 持久化 ACK 被忽略".into()),
-        (_, BasePersistOutcome::Cancelled { .. }) => return Err("Media 收到取消 ACK".into()),
-        _ => return Err("Media 持久化 ACK 类型或字段不匹配".into()),
-    }
-    Ok(())
-}
-
-/// 构造带 pending 所有权的任务级错误。
-fn persistence_error<P: TaskLanePermitProvider>(
-    pending: TaskFileBaseComputePending<P>,
-    message: impl Into<String>,
-) -> TaskFileMediaPersistenceError<P> {
-    TaskFileMediaPersistenceError {
-        message: message.into(),
-        pending,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{path::Path, time::Duration};
@@ -1150,16 +909,17 @@ mod tests {
         proto::worker_envelope,
     };
     use dedup_windows::{LocalDiskKind, PhysicalDiskId, ReadCancellationToken};
+    use tokio::sync::mpsc::UnboundedReceiver;
 
     use crate::{
-        io::DiskReadClass,
+        io::{DiskReadClass, ReadFailure},
         scan::{
             BaseTaskInput, BaseTaskProducer, PlannedScannedPath, TaskDiskLane,
             base_persistence::BaseStoreActor,
             publish_contact_sheet_for_test,
             task_file_base_compute::TaskFileBaseComputePending,
             task_file_media_compute::{
-                MediaPassResult, TaskFileMediaCompleted, TaskFileMediaFailure,
+                TaskFileMediaCompleted, TaskFileMediaFailure, TaskFileMediaTerminal,
             },
         },
         task_dispatch::{
@@ -1171,9 +931,7 @@ mod tests {
     };
 
     use super::super::base_persistence::{BasePersistAck, BasePersistIdentity, BasePersistOutcome};
-    use super::{
-        TaskFileMediaPersistenceOptions, TaskFilePersistRuntime, persist_task_file_media_results,
-    };
+    use super::{TaskFileMediaPersistenceOptions, TaskFilePersistRuntime};
 
     const RUN_ID: &str = "01900000-0000-7000-8000-0000000002c2";
 
@@ -1387,11 +1145,39 @@ mod tests {
         }
     }
 
+    /// 用真实 Runtime 逐条投递并消费 ACK；仅供行为测试替代已删除的整轮 drain 包装器。
+    async fn persist_terminals(
+        mut pending: TaskFileBaseComputePending<TestProvider>,
+        terminals: Vec<TaskFileMediaTerminal>,
+        store: &super::super::base_persistence::BaseStoreHandle,
+        acknowledgements: &mut UnboundedReceiver<BasePersistAck>,
+        options: &TaskFileMediaPersistenceOptions,
+    ) -> Result<TaskFileBaseComputePending<TestProvider>, String> {
+        let mut runtime = TaskFilePersistRuntime::new();
+        for terminal in terminals {
+            runtime.enqueue_media_terminal(terminal, options)?;
+        }
+        while !runtime.is_empty() {
+            runtime.try_submit(store)?;
+            if !runtime.is_empty() {
+                let ack = acknowledgements
+                    .recv()
+                    .await
+                    .ok_or_else(|| "测试持久化 actor 未返回 ACK".to_owned())?;
+                runtime.apply_ack(&mut pending, ack)?;
+            }
+        }
+        Ok(pending)
+    }
+
+    #[cfg(feature = "test-hooks")]
     #[tokio::test]
     async fn persist_runtime_applies_only_acknowledged_identity() {
         let root = tempfile::tempdir().unwrap();
         let machine = MachineId::from_sha256([0x81; 32]);
         let store = NodeStore::open_in_memory(machine).unwrap();
+        let first_lane = lane(7);
+        let second_lane = lane(8);
         let files = TransientTaskFileSet::create(root.path(), RUN_ID).unwrap();
         let mut producer = BaseTaskProducer::new(TaskFileDispatcher::new(files, TestProvider));
         producer
@@ -1399,7 +1185,7 @@ mod tests {
                 BaseTaskInput {
                     planned: PlannedScannedPath {
                         scanned: scanned(r"C:\persist-runtime-first.bin", 10),
-                        lane: lane(7),
+                        lane: first_lane.clone(),
                     },
                     cached: None,
                     contact_sheet_valid: true,
@@ -1408,7 +1194,7 @@ mod tests {
                 BaseTaskInput {
                     planned: PlannedScannedPath {
                         scanned: scanned(r"C:\persist-runtime-second.bin", 11),
-                        lane: lane(7),
+                        lane: second_lane.clone(),
                     },
                     cached: None,
                     contact_sheet_valid: true,
@@ -1445,8 +1231,8 @@ mod tests {
         let second_identity = second.identity.clone();
         let first_scanned = first.record.scanned.clone();
         let second_scanned = second.record.scanned.clone();
-        drop(first.permit);
-        drop(second.permit);
+        let _ = first.permit;
+        let _ = second.permit;
 
         let (controller, waiter) = super::super::base_persistence::BasePersistTestController::new();
         let (actor, handle, mut acknowledgements) =
@@ -1473,16 +1259,20 @@ mod tests {
                 .is_err()
         );
         runtime
-            .enqueue_hash_complete(
-                second_identity.clone(),
+            .enqueue_hash_failure(
+                second_identity,
                 second_scanned,
-                [0x32; 16],
-                MediaKind::Other,
-                ContentKey::new([0x32; 16], 11),
+                ReadFailure::Io {
+                    path: std::path::PathBuf::from(r"C:\persist-runtime-second.bin"),
+                    block_offset: 0,
+                    source: std::io::Error::other("测试 Hash 失败"),
+                },
             )
             .unwrap();
         runtime.try_submit(&handle).unwrap();
-        controller.wait_until_entered().await;
+        tokio::time::timeout(Duration::from_secs(2), controller.wait_until_entered())
+            .await
+            .expect("首条持久化操作必须进入 actor");
         assert!(
             runtime
                 .apply_ack(
@@ -1498,22 +1288,31 @@ mod tests {
         );
         assert!(runtime.has_in_flight(), "错误 ACK 不得丢弃仍为 P 的动作");
         controller.release();
-        let ack = acknowledgements.recv().await.unwrap();
+        let ack = tokio::time::timeout(Duration::from_secs(2), acknowledgements.recv())
+            .await
+            .expect("首条持久化 ACK 必须返回")
+            .unwrap();
         runtime.apply_ack(&mut pending, ack).unwrap();
 
-        let lane_path = pending.dispatcher.lane_path(&lane(7)).unwrap();
-        let statuses = std::fs::read(lane_path)
-            .unwrap()
-            .split(|byte| *byte == b'\n')
-            .filter(|line| !line.is_empty())
-            .map(|line| line[0])
-            .collect::<Vec<_>>();
-        assert_eq!(statuses, vec![b'C', b'P']);
+        let first_path = pending.dispatcher.lane_path(&first_lane).unwrap();
+        let second_path = pending.dispatcher.lane_path(&second_lane).unwrap();
+        assert_eq!(std::fs::read(&first_path).unwrap()[0], b'C');
+        assert_eq!(std::fs::read(&second_path).unwrap()[0], b'P');
         assert!(runtime.has_in_flight());
-        runtime.drop_unacknowledged();
+        let ack = tokio::time::timeout(Duration::from_secs(2), acknowledgements.recv())
+            .await
+            .expect("第二条持久化 ACK 必须返回")
+            .unwrap();
+        runtime.apply_ack(&mut pending, ack).unwrap();
+        assert_eq!(std::fs::read(first_path).unwrap()[0], b'C');
+        assert_eq!(std::fs::read(second_path).unwrap()[0], b'F');
+        assert!(runtime.is_empty());
         drop(handle);
         drop(acknowledgements);
-        actor.finish().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), actor.finish())
+            .await
+            .expect("持久化 actor 必须关闭")
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1548,26 +1347,20 @@ mod tests {
         let context = pending.contexts.get(&identity).unwrap().clone();
         let content_id = context.content_id.unwrap();
         let task_path = pending.dispatcher.lane_path(&lane(7)).unwrap();
-        let media = MediaPassResult {
-            pending,
-            completed: vec![TaskFileMediaCompleted {
-                identity: identity.clone(),
-                record,
-                context,
-                response: completed_response(&identity, md5, image_output()),
-                worker_slot: Some(7),
-            }],
-            file_failures: Vec::new(),
-            blocked_reason: None,
-            remaining_hash_rows: 0,
-            cancelled: false,
-        };
+        let terminals = vec![TaskFileMediaTerminal::Completed(TaskFileMediaCompleted {
+            identity: identity.clone(),
+            record,
+            context,
+            response: completed_response(&identity, md5, image_output()),
+            worker_slot: Some(7),
+        })];
         let (actor, handle, mut acknowledgements) = BaseStoreActor::spawn(store, 2);
-        let result = persist_task_file_media_results(
-            media,
+        let result = persist_terminals(
+            pending,
+            terminals,
             &handle,
             &mut acknowledgements,
-            TaskFileMediaPersistenceOptions::default(),
+            &TaskFileMediaPersistenceOptions::default(),
         )
         .await
         .unwrap();
@@ -1616,26 +1409,20 @@ mod tests {
         let context = pending.contexts.get(&identity).unwrap().clone();
         let content_id = context.content_id.unwrap();
         let task_path = pending.dispatcher.lane_path(&lane(7)).unwrap();
-        let media = MediaPassResult {
-            pending,
-            completed: vec![TaskFileMediaCompleted {
-                identity: identity.clone(),
-                record,
-                context,
-                response: completed_response(&identity, md5, other_output()),
-                worker_slot: Some(8),
-            }],
-            file_failures: Vec::new(),
-            blocked_reason: None,
-            remaining_hash_rows: 0,
-            cancelled: false,
-        };
+        let terminals = vec![TaskFileMediaTerminal::Completed(TaskFileMediaCompleted {
+            identity: identity.clone(),
+            record,
+            context,
+            response: completed_response(&identity, md5, other_output()),
+            worker_slot: Some(8),
+        })];
         let (actor, handle, mut acknowledgements) = BaseStoreActor::spawn(store, 2);
-        let result = persist_task_file_media_results(
-            media,
+        let result = persist_terminals(
+            pending,
+            terminals,
             &handle,
             &mut acknowledgements,
-            TaskFileMediaPersistenceOptions::default(),
+            &TaskFileMediaPersistenceOptions::default(),
         )
         .await
         .unwrap();
@@ -1677,26 +1464,20 @@ mod tests {
         .await;
         let context = pending.contexts.get(&identity).unwrap().clone();
         let task_path = pending.dispatcher.lane_path(&lane(7)).unwrap();
-        let media = MediaPassResult {
-            pending,
-            completed: vec![TaskFileMediaCompleted {
-                identity: identity.clone(),
-                record,
-                context,
-                response: completed_response(&identity, md5, image_output()),
-                worker_slot: Some(9),
-            }],
-            file_failures: Vec::new(),
-            blocked_reason: None,
-            remaining_hash_rows: 0,
-            cancelled: false,
-        };
+        let terminals = vec![TaskFileMediaTerminal::Completed(TaskFileMediaCompleted {
+            identity: identity.clone(),
+            record,
+            context,
+            response: completed_response(&identity, md5, image_output()),
+            worker_slot: Some(9),
+        })];
         let (actor, handle, mut acknowledgements) = BaseStoreActor::spawn(store, 2);
-        let result = persist_task_file_media_results(
-            media,
+        let result = persist_terminals(
+            pending,
+            terminals,
             &handle,
             &mut acknowledgements,
-            TaskFileMediaPersistenceOptions::default(),
+            &TaskFileMediaPersistenceOptions::default(),
         )
         .await
         .unwrap();
@@ -1726,20 +1507,13 @@ mod tests {
         .await;
         let task_path = pending.dispatcher.lane_path(&lane(7)).unwrap();
         let context = pending.contexts.get(&identity).unwrap().clone();
-        let media = MediaPassResult {
-            pending,
-            completed: vec![TaskFileMediaCompleted {
-                identity: identity.clone(),
-                record,
-                context,
-                response: completed_response(&identity, md5, image_output()),
-                worker_slot: Some(1),
-            }],
-            file_failures: Vec::new(),
-            blocked_reason: None,
-            remaining_hash_rows: 0,
-            cancelled: false,
-        };
+        let terminals = vec![TaskFileMediaTerminal::Completed(TaskFileMediaCompleted {
+            identity: identity.clone(),
+            record,
+            context,
+            response: completed_response(&identity, md5, image_output()),
+            worker_slot: Some(1),
+        })];
         let (controller, waiter) = super::super::base_persistence::BasePersistTestController::new();
         let (actor, handle, mut acknowledgements) =
             BaseStoreActor::spawn_with_first_persist_waiter(store, 2, waiter);
@@ -1749,8 +1523,14 @@ mod tests {
         };
         let handle_for_run = handle.clone();
         let join = tokio::spawn(async move {
-            persist_task_file_media_results(media, &handle_for_run, &mut acknowledgements, options)
-                .await
+            persist_terminals(
+                pending,
+                terminals,
+                &handle_for_run,
+                &mut acknowledgements,
+                &options,
+            )
+            .await
         });
         controller.wait_until_entered().await;
         assert_eq!(std::fs::read(&task_path).unwrap()[0], b'P');
@@ -1782,27 +1562,19 @@ mod tests {
         ))
         .await;
         let task_path = pending.dispatcher.lane_path(&lane(7)).unwrap();
-        let context = pending.contexts.get(&identity).unwrap().clone();
-        let media = MediaPassResult {
-            pending,
-            completed: Vec::new(),
-            file_failures: vec![TaskFileMediaFailure {
-                identity: identity.clone(),
-                record,
-                context,
-                message: "测试 Worker 失败".into(),
-                worker_slot: Some(2),
-            }],
-            blocked_reason: None,
-            remaining_hash_rows: 0,
-            cancelled: false,
-        };
+        let terminals = vec![TaskFileMediaTerminal::Failed(TaskFileMediaFailure {
+            identity: identity.clone(),
+            record,
+            message: "测试 Worker 失败".into(),
+            worker_slot: Some(2),
+        })];
         let (actor, handle, mut acknowledgements) = BaseStoreActor::spawn(store, 2);
-        let result = persist_task_file_media_results(
-            media,
+        let result = persist_terminals(
+            pending,
+            terminals,
             &handle,
             &mut acknowledgements,
-            TaskFileMediaPersistenceOptions::default(),
+            &TaskFileMediaPersistenceOptions::default(),
         )
         .await
         .unwrap();
@@ -1853,26 +1625,20 @@ mod tests {
             .as_mut()
             .unwrap()
             .quality = 101;
-        let media = MediaPassResult {
-            pending,
-            completed: vec![TaskFileMediaCompleted {
-                identity: identity.clone(),
-                record,
-                context,
-                response: completed_response(&identity, md5, output),
-                worker_slot: Some(6),
-            }],
-            file_failures: Vec::new(),
-            blocked_reason: None,
-            remaining_hash_rows: 0,
-            cancelled: false,
-        };
+        let terminals = vec![TaskFileMediaTerminal::Completed(TaskFileMediaCompleted {
+            identity: identity.clone(),
+            record,
+            context,
+            response: completed_response(&identity, md5, output),
+            worker_slot: Some(6),
+        })];
         let (actor, handle, mut acknowledgements) = BaseStoreActor::spawn(store, 2);
-        let result = persist_task_file_media_results(
-            media,
+        let result = persist_terminals(
+            pending,
+            terminals,
             &handle,
             &mut acknowledgements,
-            TaskFileMediaPersistenceOptions::default(),
+            &TaskFileMediaPersistenceOptions::default(),
         )
         .await
         .unwrap();
@@ -1941,6 +1707,8 @@ mod tests {
         let mut store = NodeStore::open_in_memory(machine).unwrap();
         let success_cached = seed_partial(&mut store, r"C:\seed-success.bin", success_md5, 10);
         let failure_cached = seed_partial(&mut store, r"C:\seed-failure-2.bin", failure_md5, 10);
+        let success_lane = lane(7);
+        let failure_lane = lane(8);
         let files = TransientTaskFileSet::create(root.path(), RUN_ID).unwrap();
         let mut producer = BaseTaskProducer::new(TaskFileDispatcher::new(files, TestProvider));
         producer
@@ -1948,7 +1716,7 @@ mod tests {
                 BaseTaskInput {
                     planned: PlannedScannedPath {
                         scanned: scanned(r"C:\media-success.bin", 10),
-                        lane: lane(7),
+                        lane: success_lane.clone(),
                     },
                     cached: Some(success_cached),
                     contact_sheet_valid: true,
@@ -1957,7 +1725,7 @@ mod tests {
                 BaseTaskInput {
                     planned: PlannedScannedPath {
                         scanned: scanned(r"C:\media-failure-2.bin", 10),
-                        lane: lane(7),
+                        lane: failure_lane.clone(),
                     },
                     cached: Some(failure_cached),
                     contact_sheet_valid: true,
@@ -1970,45 +1738,36 @@ mod tests {
         )
         .await;
         let (pending, failure_identity, failure_record) = take_media_task(pending).await;
-        let task_path = pending.dispatcher.lane_path(&lane(7)).unwrap();
+        let success_path = pending.dispatcher.lane_path(&success_lane).unwrap();
+        let failure_path = pending.dispatcher.lane_path(&failure_lane).unwrap();
         let success_context = pending.contexts.get(&success_identity).unwrap().clone();
-        let failure_context = pending.contexts.get(&failure_identity).unwrap().clone();
-        let media = MediaPassResult {
-            pending,
-            completed: vec![TaskFileMediaCompleted {
+        let terminals = vec![
+            TaskFileMediaTerminal::Completed(TaskFileMediaCompleted {
                 identity: success_identity.clone(),
                 record: success_record,
                 context: success_context,
                 response: completed_response(&success_identity, success_md5, image_output()),
                 worker_slot: Some(4),
-            }],
-            file_failures: vec![TaskFileMediaFailure {
+            }),
+            TaskFileMediaTerminal::Failed(TaskFileMediaFailure {
                 identity: failure_identity.clone(),
                 record: failure_record,
-                context: failure_context,
                 message: "测试另一项 Worker 失败".into(),
                 worker_slot: Some(5),
-            }],
-            blocked_reason: None,
-            remaining_hash_rows: 0,
-            cancelled: false,
-        };
+            }),
+        ];
         let (actor, handle, mut acknowledgements) = BaseStoreActor::spawn(store, 2);
-        let pending = persist_task_file_media_results(
-            media,
+        let pending = persist_terminals(
+            pending,
+            terminals,
             &handle,
             &mut acknowledgements,
-            TaskFileMediaPersistenceOptions::default(),
+            &TaskFileMediaPersistenceOptions::default(),
         )
         .await
         .unwrap();
-        let statuses: Vec<_> = std::fs::read_to_string(&task_path)
-            .unwrap()
-            .lines()
-            .filter(|line| !line.is_empty())
-            .map(|line| line.as_bytes()[0])
-            .collect();
-        assert_eq!(statuses, vec![b'C', b'F']);
+        assert_eq!(std::fs::read(success_path).unwrap()[0], b'C');
+        assert_eq!(std::fs::read(failure_path).unwrap()[0], b'F');
         assert!(pending.contexts.is_empty());
         assert_eq!(pending.manifest.resolved_files.len(), 1);
         drop(handle);
@@ -2035,26 +1794,20 @@ mod tests {
         .await;
         let task_path = pending.dispatcher.lane_path(&lane(7)).unwrap();
         let context = pending.contexts.get(&identity).unwrap().clone();
-        let media = MediaPassResult {
-            pending,
-            completed: vec![TaskFileMediaCompleted {
-                identity: identity.clone(),
-                record,
-                context,
-                response: completed_response(&identity, returned, image_output()),
-                worker_slot: None,
-            }],
-            file_failures: Vec::new(),
-            blocked_reason: None,
-            remaining_hash_rows: 0,
-            cancelled: false,
-        };
+        let terminals = vec![TaskFileMediaTerminal::Completed(TaskFileMediaCompleted {
+            identity: identity.clone(),
+            record,
+            context,
+            response: completed_response(&identity, returned, image_output()),
+            worker_slot: None,
+        })];
         let (actor, handle, mut acknowledgements) = BaseStoreActor::spawn(store, 2);
-        let result = persist_task_file_media_results(
-            media,
+        let result = persist_terminals(
+            pending,
+            terminals,
             &handle,
             &mut acknowledgements,
-            TaskFileMediaPersistenceOptions::default(),
+            &TaskFileMediaPersistenceOptions::default(),
         )
         .await
         .unwrap();
@@ -2087,27 +1840,20 @@ mod tests {
         let task_path = pending.dispatcher.lane_path(&lane(7)).unwrap();
         let context = pending.contexts.get(&identity).unwrap().clone();
         let content_id = context.content_id.unwrap();
-        let media = MediaPassResult {
-            pending,
-            completed: vec![TaskFileMediaCompleted {
-                identity: identity.clone(),
-                record,
-                context,
-                response: completed_response(&identity, md5, video_output()),
-                worker_slot: Some(3),
-            }],
-            file_failures: Vec::new(),
-            blocked_reason: None,
-            remaining_hash_rows: 0,
-            cancelled: false,
-        };
+        let terminals = vec![TaskFileMediaTerminal::Completed(TaskFileMediaCompleted {
+            identity: identity.clone(),
+            record,
+            context,
+            response: completed_response(&identity, md5, video_output()),
+            worker_slot: Some(3),
+        })];
         let (actor, handle, mut acknowledgements) = BaseStoreActor::spawn(store, 2);
         let options = TaskFileMediaPersistenceOptions {
             contact_sheet_root: root.path().join("contacts"),
             ..Default::default()
         };
         let pending =
-            persist_task_file_media_results(media, &handle, &mut acknowledgements, options)
+            persist_terminals(pending, terminals, &handle, &mut acknowledgements, &options)
                 .await
                 .unwrap();
         assert_eq!(std::fs::read(task_path).unwrap()[0], b'C');
@@ -2143,38 +1889,33 @@ mod tests {
         .await;
         let task_path = pending.dispatcher.lane_path(&lane(7)).unwrap();
         let context = pending.contexts.get(&identity).unwrap().clone();
-        let media = MediaPassResult {
-            pending,
-            completed: vec![TaskFileMediaCompleted {
-                identity: identity.clone(),
-                record,
-                context,
-                response: completed_response(&identity, md5, video_output()),
-                worker_slot: None,
-            }],
-            file_failures: Vec::new(),
-            blocked_reason: None,
-            remaining_hash_rows: 0,
-            cancelled: false,
-        };
+        let terminal = TaskFileMediaTerminal::Completed(TaskFileMediaCompleted {
+            identity: identity.clone(),
+            record,
+            context,
+            response: completed_response(&identity, md5, video_output()),
+            worker_slot: None,
+        });
         let bad_root = root.path().join("not-a-directory");
         std::fs::write(&bad_root, b"block directory creation").unwrap();
         let (actor, handle, mut acknowledgements) = BaseStoreActor::spawn(store, 2);
-        let result = persist_task_file_media_results(
-            media,
-            &handle,
-            &mut acknowledgements,
-            TaskFileMediaPersistenceOptions {
-                contact_sheet_root: bad_root,
-                ..Default::default()
-            },
-        )
-        .await;
-        let error = match result {
-            Err(error) => error,
-            Ok(_) => panic!("联系表写入失败必须返回任务级错误"),
-        };
-        let pending = error.into_pending();
+        let mut pending = pending;
+        let mut runtime = TaskFilePersistRuntime::new();
+        runtime
+            .enqueue_media_terminal(
+                terminal,
+                &TaskFileMediaPersistenceOptions {
+                    contact_sheet_root: bad_root,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        runtime.try_submit(&handle).unwrap();
+        let ack = acknowledgements.recv().await.unwrap();
+        assert!(
+            runtime.apply_ack(&mut pending, ack).is_err(),
+            "联系表写入失败必须保留未 ACK 的 pending owner"
+        );
         assert_eq!(std::fs::read(task_path).unwrap()[0], b'P');
         assert_eq!(pending.contexts.len(), 1);
         drop(handle);

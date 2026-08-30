@@ -705,6 +705,11 @@ mod tests {
         lane: &TaskDiskLane,
     ) -> Vec<u8> {
         let path = dispatcher.lane_path(lane).unwrap();
+        statuses_at(&path)
+    }
+
+    /// 直接读取仍被运行中 coordinator 持有的 lane 文件状态。
+    fn statuses_at(path: &Path) -> Vec<u8> {
         std::fs::read_to_string(path)
             .unwrap()
             .lines()
@@ -1289,6 +1294,241 @@ mod tests {
         assert_eq!(result.summary.file_failures, 1);
         assert_eq!(result.manifest.resolved_files.len(), 1);
         assert_eq!(statuses(&result.dispatcher, &lane(9)), vec![b'F', b'C']);
+        result.dispatcher.discard().unwrap();
+        drop(handle);
+        actor.finish().await.unwrap();
+    }
+
+    /// 活跃 Media 不得把另一项 Hash 读取失败拖到自身终态之后才持久化。
+    #[cfg(feature = "test-hooks")]
+    #[tokio::test]
+    async fn hash_failure_is_persisted_while_active_media_completes() {
+        let root = tempfile::tempdir().unwrap();
+        let md5 = [0xD8; 16];
+        let machine = MachineId::from_sha256([0xD9; 32]);
+        let mut store = NodeStore::open_in_memory(machine).unwrap();
+        let cached = seed_partial(
+            &mut store,
+            r"C:\seed-active-media.bin",
+            md5,
+            10,
+            MediaKind::Image,
+        );
+        let media_path = scanned(r"C:\active-media.bin", 10);
+        let failed_hash_path = scanned(r"C:\failed-hash.bin", 11);
+        let media_lane = lane(41);
+        let hash_lane = lane(42);
+        let production = production(
+            root.path(),
+            &[
+                input(media_path.clone(), media_lane.clone(), Some(cached)),
+                input(failed_hash_path, hash_lane.clone(), None),
+            ],
+        );
+        let media_lane_path = production.dispatcher.lane_path(&media_lane).unwrap();
+        let hash_lane_path = production.dispatcher.lane_path(&hash_lane).unwrap();
+        let reader = TestHashReader::default();
+        let (persist_control, persist_waiter) =
+            crate::scan::base_persistence::BasePersistTestController::new();
+        let (actor, handle, mut acknowledgements) =
+            crate::scan::base_persistence::BaseStoreActor::spawn_with_first_persist_waiter(
+                store,
+                2,
+                persist_waiter,
+            );
+        let (mut pool, mut started, controller) = WorkerPool::controlled_batch_for_test(1);
+        let handle_for_run = handle.clone();
+        let run_root = root.path().to_path_buf();
+        let join = tokio::spawn(async move {
+            let result = run_task_file_base_coordinator(
+                production,
+                reader,
+                &mut pool,
+                &handle_for_run,
+                &mut acknowledgements,
+                options(&run_root),
+                ReadCancellationToken::new(),
+            )
+            .await;
+            let shutdown = pool.shutdown().await;
+            (result, shutdown)
+        });
+
+        let (task_id, media_item) = tokio::time::timeout(Duration::from_secs(1), started.recv())
+            .await
+            .expect("首条 Media 应先进入单槽 Worker")
+            .unwrap();
+        assert_eq!(controller.available_slots(), 0);
+        let running = controller.running_files();
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].1, media_item);
+        assert_eq!(running[0].2.normalized_path, media_path.normalized_path);
+
+        tokio::time::timeout(Duration::from_secs(1), persist_control.wait_until_entered())
+            .await
+            .expect("Hash failure 必须在 Media 仍 active 时进入 SQLite writer");
+        assert_eq!(statuses_at(&media_lane_path), vec![b'P']);
+        assert_eq!(statuses_at(&hash_lane_path), vec![b'P']);
+        assert_eq!(
+            handle.lookup_key_batch_sizes_for_test(),
+            Vec::<usize>::new()
+        );
+        persist_control.release();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while statuses_at(&hash_lane_path) != vec![b'F'] {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Hash failure 必须在 Media 仍 active 时收到 SQLite ACK 并写 F");
+        assert_eq!(statuses_at(&media_lane_path), vec![b'P']);
+        assert!(!join.is_finished(), "Media 终态受控前 coordinator 不应完成");
+
+        controller
+            .base_source_read_complete(task_id.clone(), media_item.clone())
+            .await;
+        controller
+            .complete_base(task_id, media_item, md5, image_output())
+            .await;
+
+        let (result, shutdown) = join.await.unwrap();
+        assert!(shutdown.is_ok());
+        let mut result = result.unwrap();
+        assert_eq!(result.summary.file_failures, 1);
+        assert_eq!(result.manifest.resolved_files.len(), 1);
+        assert_eq!(result.manifest.resolved_files[0].scanned, media_path);
+        assert_eq!(statuses(&result.dispatcher, &media_lane), vec![b'C']);
+        assert_eq!(statuses(&result.dispatcher, &hash_lane), vec![b'F']);
+        assert_eq!(
+            handle.lookup_key_batch_sizes_for_test(),
+            Vec::<usize>::new()
+        );
+        result.dispatcher.discard().unwrap();
+        drop(handle);
+        actor.finish().await.unwrap();
+    }
+
+    /// Worker 崩溃持久化后，Hash 流必须继续单键查询并复用同一逻辑槽位。
+    #[tokio::test]
+    async fn worker_crash_is_persisted_while_hash_stream_continues() {
+        let root = tempfile::tempdir().unwrap();
+        let failed_md5 = [0xE1; 16];
+        let success_md5 = [0xE2; 16];
+        let machine = MachineId::from_sha256([0xE3; 32]);
+        let mut store = NodeStore::open_in_memory(machine).unwrap();
+        let cached = seed_partial(
+            &mut store,
+            r"C:\seed-crash-media.bin",
+            failed_md5,
+            10,
+            MediaKind::Image,
+        );
+        let failed_path = scanned(r"C:\crash-media.bin", 10);
+        let success_path = scanned(r"C:\hash-after-crash.bin", 11);
+        let task_lane = lane(43);
+        let production = production(
+            root.path(),
+            &[
+                input(failed_path.clone(), task_lane.clone(), Some(cached)),
+                input(success_path.clone(), task_lane.clone(), None),
+            ],
+        );
+        let expected_items = production
+            .contexts
+            .keys()
+            .map(|identity| identity.item_id().to_string())
+            .collect::<Vec<_>>();
+        let reader = TestHashReader {
+            results: Arc::new(BTreeMap::from([(
+                success_path.normalized_path.as_str().to_owned(),
+                success_md5,
+            )])),
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let (actor, handle, mut acknowledgements) =
+            crate::scan::base_persistence::BaseStoreActor::spawn(store, 2);
+        let (mut pool, mut started, controller) = WorkerPool::controlled_batch_for_test(1);
+        let handle_for_run = handle.clone();
+        let run_root = root.path().to_path_buf();
+        let join = tokio::spawn(async move {
+            let result = run_task_file_base_coordinator(
+                production,
+                reader,
+                &mut pool,
+                &handle_for_run,
+                &mut acknowledgements,
+                options(&run_root),
+                ReadCancellationToken::new(),
+            )
+            .await;
+            let shutdown = pool.shutdown().await;
+            (result, shutdown)
+        });
+
+        let (task_id, failed_item) = tokio::time::timeout(Duration::from_secs(1), started.recv())
+            .await
+            .expect("首条 Media 应先进入 Worker")
+            .unwrap();
+        assert!(expected_items.contains(&failed_item));
+        let commands = controller.started_base_commands();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].item_id, failed_item);
+        assert_eq!(
+            commands[0].normalized_path,
+            failed_path.normalized_path.as_str()
+        );
+        assert_eq!(controller.available_slots(), 0);
+        assert_eq!(
+            controller.running_files()[0].2.normalized_path,
+            failed_path.normalized_path
+        );
+        controller
+            .crash(task_id, failed_item.clone(), "测试流式 Worker 崩溃".into())
+            .await;
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.lookup_key_batch_sizes_for_test() != vec![1] {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("崩溃项持久化后，后续 Hash 必须继续单键查询");
+        let (same_task, success_item) =
+            tokio::time::timeout(Duration::from_secs(1), started.recv())
+                .await
+                .expect("后续 Hash miss 应复用补回的 Worker 槽位")
+                .unwrap();
+        assert_eq!(same_task, RUN_ID);
+        assert_ne!(success_item, failed_item);
+        assert!(expected_items.contains(&success_item));
+        let commands = controller.started_base_commands();
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[1].item_id, success_item);
+        assert_eq!(
+            commands[1].normalized_path,
+            success_path.normalized_path.as_str()
+        );
+        assert_eq!(controller.available_slots(), 0);
+        let running = controller.running_files();
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].1, success_item);
+        assert_eq!(running[0].2.normalized_path, success_path.normalized_path);
+        controller
+            .base_source_read_complete(same_task.clone(), success_item.clone())
+            .await;
+        controller
+            .complete_base(same_task, success_item, success_md5, image_output())
+            .await;
+
+        let (result, shutdown) = join.await.unwrap();
+        assert!(shutdown.is_ok());
+        let mut result = result.unwrap();
+        assert_eq!(result.summary.file_failures, 1);
+        assert_eq!(result.manifest.resolved_files.len(), 1);
+        assert_eq!(result.manifest.resolved_files[0].scanned, success_path);
+        assert_eq!(statuses(&result.dispatcher, &task_lane), vec![b'F', b'C']);
+        assert_eq!(handle.lookup_key_batch_sizes_for_test(), vec![1]);
         result.dispatcher.discard().unwrap();
         drop(handle);
         actor.finish().await.unwrap();
