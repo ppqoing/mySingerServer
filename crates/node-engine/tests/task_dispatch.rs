@@ -353,7 +353,7 @@ fn completed_task_is_returned_once_and_then_dispatcher_finishes() {
 }
 
 #[test]
-fn one_lane_dispatches_two_permits_before_either_ack() {
+fn one_lane_waits_for_ack_before_delivering_next_identity() {
     let provider = FakeProvider::default();
     let mut dispatcher = new_dispatcher(provider.clone());
     let task_lane = lane(&[22], LocalDiskKind::Hdd, 2, 1);
@@ -370,18 +370,22 @@ fn one_lane_dispatches_two_permits_before_either_ack() {
         Poll::Ready(Ok(Some(task))) => task,
         other => panic!("第一项应取得许可，实际为 {other:?}"),
     };
+    assert!(
+        poll_once(&mut dispatcher, &cancellation).is_pending(),
+        "首项未 ACK 时不得交付同 lane 的下一身份"
+    );
+    assert_eq!(provider.active_permits(), 1);
+
+    dispatcher.mark_completed(&first.identity).unwrap();
+    drop(first);
     let second = match poll_once(&mut dispatcher, &cancellation) {
         Poll::Ready(Ok(Some(task))) => task,
-        other => panic!("同 lane 第二项应在第一项 ACK 前取得许可，实际为 {other:?}"),
+        other => panic!("首项 ACK 后第二项应取得许可，实际为 {other:?}"),
     };
-    assert_ne!(first.identity, second.identity);
-    assert_eq!(provider.active_permits(), 2);
-
-    // 故意乱序 ACK，验证 dispatcher 不以单个 in-flight 槽位覆盖另一项。
+    assert_eq!(provider.active_permits(), 1);
+    assert_ne!(second.identity.item_id(), rows[0].item_id);
     dispatcher.mark_completed(&second.identity).unwrap();
-    dispatcher.mark_completed(&first.identity).unwrap();
     drop(second);
-    drop(first);
     assert!(matches!(
         poll_once(&mut dispatcher, &cancellation),
         Poll::Ready(Ok(None))
@@ -389,23 +393,30 @@ fn one_lane_dispatches_two_permits_before_either_ack() {
 }
 
 #[tokio::test]
-async fn scheduler_holds_the_sixth_same_lane_permit_until_one_of_five_drops() {
+async fn scheduler_holds_sixth_independent_lane_on_shared_physical_disk() {
     let mut config = dedup_core::DiskReadConfig::default();
     config.hdd_threads_per_disk = 5;
     config.total_threads = 5;
     let scheduler = DiskReadScheduler::new(&config, 5).unwrap();
-    let provider = SchedulerTaskLanePermitProvider::new(scheduler);
-    let mut dispatcher = new_dispatcher(provider);
-    let task_lane = lane(&[27], LocalDiskKind::Hdd, 5, 1);
-    let rows = (0..6)
-        .map(|index| base_record(&format!("scheduler-{index}.bin"), None))
+    let mut dispatchers = (0..6)
+        .map(|index| {
+            let provider = SchedulerTaskLanePermitProvider::new(scheduler.clone());
+            let mut dispatcher = new_dispatcher(provider);
+            let task_lane = lane(&[27], LocalDiskKind::Hdd, 5, 1);
+            dispatcher.register_lane(&task_lane).unwrap();
+            dispatcher
+                .append_batch(
+                    &task_lane,
+                    std::slice::from_ref(&base_record(&format!("scheduler-{index}.bin"), None)),
+                )
+                .unwrap();
+            dispatcher.seal().unwrap();
+            dispatcher
+        })
         .collect::<Vec<_>>();
-    dispatcher.register_lane(&task_lane).unwrap();
-    dispatcher.append_batch(&task_lane, &rows).unwrap();
-    dispatcher.seal().unwrap();
     let token = ReadCancellationToken::new();
     let mut active = Vec::new();
-    for _ in 0..5 {
+    for dispatcher in dispatchers.iter_mut().take(5) {
         active.push(
             dispatcher
                 .next(token.clone())
@@ -416,28 +427,34 @@ async fn scheduler_holds_the_sixth_same_lane_permit_until_one_of_five_drops() {
     }
     assert_eq!(active.len(), 5);
 
-    let waited =
-        tokio::time::timeout(Duration::from_millis(100), dispatcher.next(token.clone())).await;
-    assert!(waited.is_err(), "第六项必须等待真实 scheduler 额度");
+    let waited = tokio::time::timeout(
+        Duration::from_millis(100),
+        dispatchers[5].next(token.clone()),
+    )
+    .await;
+    assert!(
+        waited.is_err(),
+        "共享物理盘的第六个独立 lane 必须等待真实 scheduler 额度"
+    );
 
     // 超时只会丢掉本次 poll；用取消令牌让 dispatcher 丢弃内部等待 future，保持 P。
     token.cancel();
     assert!(matches!(
-        dispatcher.next(token.clone()).await,
+        dispatchers[5].next(token.clone()).await,
         Err(TaskDispatchError::Read(ReadFailure::Cancelled))
     ));
-    for task in &active {
+    for (dispatcher, task) in dispatchers.iter_mut().take(5).zip(&active) {
         dispatcher.mark_completed(&task.identity).unwrap();
     }
     drop(active);
 
-    let sixth = dispatcher
+    let sixth = dispatchers[5]
         .next(ReadCancellationToken::new())
         .await
         .unwrap()
         .expect("前五项释放后第六项应继续派发");
     assert!(!sixth.is_continuation());
-    dispatcher.mark_completed(&sixth.identity).unwrap();
+    dispatchers[5].mark_completed(&sixth.identity).unwrap();
     drop(sixth);
 }
 
