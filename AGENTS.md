@@ -108,7 +108,7 @@ Node 扫描固定为：
 
 扫描收到根目录后，先解析每个根的物理磁盘编号、介质类型和配置额度，形成冻结 `ScanDiskPlan`，再调用枚举器。默认使用 `EverythingEnumerator`；不可用或完整枚举失败时才受控回退 `WindowsWalker`。Rust 端按规范路径排序、去重并用 `NormalizedPath::is_within` 校验组件边界。
 
-扫描前的路径缓存每批最多 1000 项，使用一次真实批量 `lookup_base_cache_by_paths`，不得循环逐文件 SELECT。每个 Hash future 完成后立即用一个 `ContentKey` 调用 SQLite `lookup_base_cache_by_keys`；可选远端缓存也每次只请求这一个键，并将结果导入后做本地校准。键缺失时立即登记同一任务身份的 Media continuation，不等整批 Hash 或 Media；完整命中直接形成完成数。统一事件泵同时推进其他 Hash、远端查询、Worker 终态和 SQLite ACK，任一项不得成为全批屏障。
+扫描前的路径缓存每批最多 1000 项，使用一次真实批量 `lookup_base_cache_by_paths`，不得循环逐文件 SELECT。每个 Hash future 完成后立即用一个 `ContentKey` 调用 SQLite `lookup_base_cache_by_key`；可选远端缓存也每次只请求这一个键，并将结果导入后做本地校准。键缺失时立即登记同一任务身份的 Media continuation，不等整批 Hash 或 Media；完整命中直接形成完成数。统一事件泵同时推进其他 Hash、远端查询、Worker 终态和 SQLite ACK，任一项不得成为全批屏障。
 
 完整性判断拒绝空值、默认值、长度错误和失败占位符。图片一筛必须同时具备尺寸、PDQ、Quality，二筛必须具备九块 pHash 和 128 维有限 Sobel；视频必须满足六槽位、至少四个成功完整一筛帧及相应二筛覆盖。缓存阶段只查询，插入/更新只在计算结果、同步导入、文件变化或删除成功确实需要时执行。
 

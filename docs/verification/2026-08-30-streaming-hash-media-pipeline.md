@@ -9,8 +9,9 @@
 `CC/CXX/AR/RANLIB/CFLAGS/CXXFLAGS/RUSTFLAGS/RUSTC_WRAPPER`，并设置
 `CARGO_INCREMENTAL=0`、dev/test debug=0。
 
-结论：自动化行为门禁与固定微基准均通过。三轮基准中位数比历史中位数慢 8.149%，未超过
-15% 退化门槛。C/D 盘在每条重型命令前均大于 10 GiB，因此没有清理 target。
+结论：当前自动化行为门禁通过；固定微基准未通过性能门槛。最新三轮中位数比历史中位数慢
+15.386%，超过 15% 退化门槛，因此不把本轮表述为性能成功，也未继续追加基准轮次。C/D 盘在
+每条重型命令前均大于 10 GiB，因此没有清理 target。
 
 本记录不代表真实媒体、最终打包或部署验收：本轮没有运行真实媒体、没有构建/检查安装包，
 也没有部署到任何环境。
@@ -26,6 +27,17 @@ lane scheduler 测试也会在此契约下等待。该 RED 是过时期望，不
 dispatcher lane 共用同一真实物理盘 scheduler：前五项取得额度，第六项等待，释放前五项后才
 继续。提交：`a01a3204640cd2181dd807446dd8d610321fb5b3`
 (`test: align dispatcher lane ownership`)。
+
+## 终审修复纳入范围
+
+本轮纳入提交 `3f66e0667d337f2ab990d1fc3d327134aa3e7deb`
+(`fix: preserve streaming error and event ownership`) 的三项修复：
+
+- 基础设施错误不再取消共享用户 token；协调器和 scan runner 保留原始错误，而不误报为用户取消。
+- 移除全局 `persist.is_empty()` dispatch gate 和 ACK biased select；一个 lane 的 SQLite ACK 在途时，
+  另一 lane 的 Hash 仍可推进，而同 lane 仍由未 ACK identity 约束。
+- Media 先由核心状态机判定 Worker 事件，再生成唯一 reporter effect；错误 identity/slot、重复事件和
+  已终态事件不会污染 runtime registry，协议失败只投影为失败一次。
 
 ## 行为覆盖
 
@@ -55,16 +67,17 @@ cargo bench -p dedup-node-engine --bench base_compute_pipeline --locked
 
 | 轮次 | elapsed_ms | throughput_files_per_second | persisted_completed |
 | --- | ---: | ---: | --- |
-| 1 | 138.397 | 28.902 | true |
-| 2 | 125.394 | 31.899 | true |
-| 3 | 116.911 | 34.214 | true |
+| 1 | 135.530 | 29.514 | true |
+| 2 | 124.282 | 32.185 | true |
+| 3 | 133.785 | 29.899 | true |
 
-中位数为 `125.394 ms`；历史中位数为 `115.946 ms`；退化率为 `8.149%`，低于
-`15%`（`133.3379 ms`）停止阈值。此结论只使用端到端 `elapsed_ms`，未以局部分段代替。
+中位数为 `133.785 ms`；历史中位数为 `115.946 ms`；退化率为 `15.386%`，超过
+`15%`（`133.3379 ms`）停止阈值。此结论只使用端到端 `elapsed_ms`，未以局部分段代替；按
+门禁停止在三轮结果并记录诊断，不用这次波动运行外推性能通过。
 
 - 基准 EXE：`C:\tmp\rust-v2-core-scope-target-task7b2d2c1\x86_64-pc-windows-msvc\release\deps\base_compute_pipeline-fc0c73da15de0b6f.exe`
-- SHA-256：`08EC930367AF8DDDAF537AC55A2CE2A2B944BF506077DFF30A361EEB75DDFF12`
-- 原始输出（已忽略）：`.superpowers/sdd/2026-08-30-streaming-hash-media-pipeline/task-5-bench-run-{1,2,3}.log`
+- SHA-256：`734FC74A008C96600428BB5C1836AC44CC4EC164D61FD3CC72383179B90A8DC5`
+- 原始输出（已忽略）：`.superpowers/sdd/2026-08-30-streaming-hash-media-pipeline/task-5-final-gate-bench-run-{1,2,3}.log`
 
 ## 最终自动化门禁
 
@@ -73,21 +86,21 @@ cargo bench -p dedup-node-engine --bench base_compute_pipeline --locked
 | 命令 | 通过数 | 编译 warnings |
 | --- | ---: | ---: |
 | `cargo test -p dedup-node-store --locked -- --test-threads=1` | 80 | 0 |
-| `cargo test -p dedup-node-engine --lib --locked -- --test-threads=1` | 133 | 23 |
-| `cargo test -p dedup-node-engine --features test-hooks --lib --locked -- --test-threads=1` | 153 | 12 |
+| `cargo test -p dedup-node-engine --lib --locked -- --test-threads=1` | 137 | 23 |
+| `cargo test -p dedup-node-engine --features test-hooks --lib --locked -- --test-threads=1` | 158 | 12 |
 | `cargo test -p dedup-node-engine --features test-hooks --test base_compute_pipeline --locked -- --test-threads=1` | 60 | 20 |
 | `cargo test -p dedup-node-engine --features test-hooks --test transient_task_files --locked -- --test-threads=1` | 25 | 20 |
 | `cargo test -p dedup-node-engine --test disk_scheduler --locked -- --test-threads=1` | 42 | 17 |
 | `cargo test -p dedup-node-engine --test scan_runtime_details --locked -- --test-threads=1` | 11 | 17 |
 | `cargo test -p dedup-node-engine --test task_dispatch --locked -- --test-threads=1` | 27 | 17 |
 
-合计 `531 passed; 0 failed; 0 ignored`。warnings 均是现存的 unused import/dead code
+合计 `540 passed; 0 failed; 0 ignored`。warnings 均是现存的 unused import/dead code
 编译警告；本次没有把 warnings 当作通过条件的一部分，也没有为消警改动无关实现。
 
 最后执行 `cargo fmt --all -- --check` 和 `git diff --check`，两者均退出 0。
 
 ## 验收边界
 
-上述为受控单元/集成行为测试和固定 4 文件微基准：可证明单键查询、流式推进、owner 收束、
-调度额度与此机器上的固定耗时。它不能证明 FFmpeg 对真实媒体的解码结果、最终便携包内容、
-安装/升级路径或部署环境表现；这些验收本轮明确未执行。
+上述为受控单元/集成行为测试和固定 4 文件微基准：可证明单键查询、流式推进、owner 收束和
+调度额度；最新微基准超过退化阈值，不能证明此 HEAD 的性能回归已关闭。它也不能证明 FFmpeg
+对真实媒体的解码结果、最终便携包内容、安装/升级路径或部署环境表现；这些验收本轮明确未执行。
