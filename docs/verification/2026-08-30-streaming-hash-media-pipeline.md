@@ -124,13 +124,32 @@ EXE 为 B 的顺序：`A,B,B,A,A,B,B,A,A,B,B,A`。A 的路径为
 
 B 相对 A 的端到端中位数为 `+19.025 ms`（`+16.507%`），且 B 的最小值 `127.353 ms` 仍高于
 A 的最大值 `118.339 ms`。cache wait 只增加 `1.441 ms`，而 B 的 worker idle 增加 `33.473 ms`；
-B 的 decode/persist 反而减少 `15.919 ms`。这支持“当前 EXE 的差异集中在 cache 后到 Hash 前的
-worker idle 阶段，不能仅归因于同机瞬时环境”的诊断假设；它不是源级根因证明，仍需在后续针对
-该阶段追踪调度/等待状态。
+B 的 decode/persist 反而减少 `15.919 ms`。这支持“在此旧夹具路径中，当前 EXE 的差异不能仅归因于
+同机瞬时环境”的诊断假设；它不是源级根因证明。
 
 A 的 SHA `8802…45C5` 不是历史 `115.946 ms` 参考所对应的 SHA，故此 A/B 对照只作环境和因果
 诊断，绝不覆盖、替换或重新裁决上述当前 B 九轮 `133.524 ms` / `+15.161%` 的 FAIL。原始 stdout
 （已忽略）为 `.superpowers/sdd/2026-08-30-streaming-hash-media-pipeline/task-5-same-host-diagnostic-{01..12}-{A|B}.log`。
+
+### 只读根因边界与后续缺口
+
+`worker_idle_before_hash_ms` 的精确定义是“path lookup 开始”到“controlled pool 的 `started`
+channel 收到首项”的墙钟区间，不是单键 Hash event pump 的专用延迟。将该区间减去同轮
+`cache_wait_ms` 后，A 的 idle-cache 中位数为 `0.683 ms`，B 为 `32.222 ms`；这只定位到旧夹具
+中的 pool-start 等待边界，不能归因到 production transient 事件泵。
+
+固定 benchmark/fixture 明确调用旧 `BaseComputeEngine::run_existing`，不进入 production transient
+`run_task_file_scan_inner → coordinator → task_file_base_stream`。只读命令
+`git diff --quiet a853d1b..3f66e06 -- benchmark/fixture/base_compute` 对实际
+`crates/node-engine/benches/base_compute_pipeline.rs`、`crates/node-engine/tests/base_compute_utilization.rs`
+和 `crates/node-engine/tests/base_compute_pipeline.rs` 的退出码为 0：终审修复未改变这些基准路径。
+因此历史/九轮门禁仍按原规则为 **FAIL**，但它们不能作为本次单键 event pump 性能因果证据。
+
+旧 loop 的三次约 10 ms epoch 目前仅是假设：本轮没有增加诊断时间戳、没有修改产品，不能把它
+表述为已证实原因。行为正确性由 `540/540` 自动化测试及
+`first_hashed_media_miss_enters_worker_before_later_hash_finishes` 的真实断言支持——首个 Hash 缺失
+已进入 Media，且不等待后续 Hash。当前没有 transient 专用的墙钟基准；这是后续验证缺口，不在
+本次文档范围内扩大实现或基准。
 
 ## 最终自动化门禁
 
