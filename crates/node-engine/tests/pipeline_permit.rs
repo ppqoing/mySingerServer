@@ -327,7 +327,8 @@ async fn cancelled_dispatch_wait_clears_metrics_and_keeps_tsv_rows_pending() {
         fs::write(path, b"waiting hash").unwrap();
     }
     let rows = paths.iter().map(|path| scanned(path)).collect::<Vec<_>>();
-    let task_lane = lane(&[13], LocalDiskKind::Hdd, 1);
+    // Dispatcher 窗口允许第二项申请许可，而全局读取容量仍为 1，稳定制造一个真实等待项。
+    let task_lane = lane(&[13], LocalDiskKind::Hdd, 2);
     let planned = Arc::new(
         rows.iter()
             .cloned()
