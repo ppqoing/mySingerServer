@@ -202,6 +202,16 @@ fn poll_once<P: TaskLanePermitProvider>(
     dispatcher.poll_next(cancellation, &mut context)
 }
 
+/// 解包一次已经完成的 dispatcher 结果，失败时保留实际 Poll 诊断。
+fn ready_task<Permit>(
+    result: Poll<Result<Option<DispatchedTask<Permit>>, TaskDispatchError>>,
+) -> DispatchedTask<Permit> {
+    match result {
+        Poll::Ready(Ok(Some(task))) => task,
+        other => panic!("任务应已取得许可，实际为 {other:?}"),
+    }
+}
+
 fn poll_with_admission<P: TaskLanePermitProvider>(
     dispatcher: &mut TaskFileDispatcher<P>,
     cancellation: &ReadCancellationToken,
@@ -353,43 +363,118 @@ fn completed_task_is_returned_once_and_then_dispatcher_finishes() {
 }
 
 #[test]
-fn one_lane_waits_for_ack_before_delivering_next_identity() {
+fn one_lane_dispatches_up_to_configured_limit_before_any_ack() {
     let provider = FakeProvider::default();
     let mut dispatcher = new_dispatcher(provider.clone());
-    let task_lane = lane(&[22], LocalDiskKind::Hdd, 2, 1);
+    let task_lane = lane(&[22], LocalDiskKind::Ssd, 2, 2);
     let rows = [
         base_record("parallel-first.bin", None),
         base_record("parallel-second.bin", None),
+        base_record("parallel-third.bin", None),
     ];
     dispatcher.register_lane(&task_lane).unwrap();
     dispatcher.append_batch(&task_lane, &rows).unwrap();
     dispatcher.seal().unwrap();
     let cancellation = ReadCancellationToken::new();
 
-    let first = match poll_once(&mut dispatcher, &cancellation) {
-        Poll::Ready(Ok(Some(task))) => task,
-        other => panic!("第一项应取得许可，实际为 {other:?}"),
-    };
+    let first = ready_task(poll_once(&mut dispatcher, &cancellation));
+    let second = ready_task(poll_once(&mut dispatcher, &cancellation));
+    assert_ne!(first.identity, second.identity);
+    assert_eq!(provider.active_permits(), 2);
     assert!(
         poll_once(&mut dispatcher, &cancellation).is_pending(),
-        "首项未 ACK 时不得交付同 lane 的下一身份"
+        "额度为 2 时第三项必须等待身份窗口释放"
+    );
+
+    dispatcher.mark_completed(&second.identity).unwrap();
+    drop(second);
+    let third = ready_task(poll_once(&mut dispatcher, &cancellation));
+    assert_eq!(third.record.item_id, rows[2].item_id);
+    dispatcher.mark_completed(&first.identity).unwrap();
+    dispatcher.mark_completed(&third.identity).unwrap();
+    drop(first);
+    drop(third);
+    assert!(matches!(
+        poll_once(&mut dispatcher, &cancellation),
+        Poll::Ready(Ok(None))
+    ));
+    dispatcher.discard().unwrap();
+}
+
+#[test]
+fn out_of_order_ack_releases_only_matching_same_lane_identity() {
+    let provider = FakeProvider::default();
+    let mut dispatcher = new_dispatcher(provider);
+    let task_lane = lane(&[24], LocalDiskKind::Ssd, 3, 3);
+    let rows = [
+        base_record("ack-first.bin", Some([0x31; 16])),
+        base_record("ack-second.bin", Some([0x32; 16])),
+        base_record("ack-third.bin", Some([0x33; 16])),
+    ];
+    dispatcher.register_lane(&task_lane).unwrap();
+    dispatcher.append_batch(&task_lane, &rows).unwrap();
+    dispatcher.seal().unwrap();
+    let lane_path = dispatcher.lane_path(&task_lane).unwrap();
+    let cancellation = ReadCancellationToken::new();
+
+    let first = ready_task(poll_once(&mut dispatcher, &cancellation));
+    let second = ready_task(poll_once(&mut dispatcher, &cancellation));
+    let third = ready_task(poll_once(&mut dispatcher, &cancellation));
+
+    dispatcher.mark_completed(&second.identity).unwrap();
+    let after_second = std::fs::read(&lane_path).unwrap();
+    assert_eq!(after_second[first.identity.line_offset() as usize], b'P');
+    assert_eq!(after_second[second.identity.line_offset() as usize], b'C');
+    assert_eq!(after_second[third.identity.line_offset() as usize], b'P');
+
+    dispatcher.mark_failed(&first.identity).unwrap();
+    dispatcher.mark_completed(&third.identity).unwrap();
+    let terminal = std::fs::read(&lane_path).unwrap();
+    assert_eq!(terminal[first.identity.line_offset() as usize], b'F');
+    assert_eq!(terminal[second.identity.line_offset() as usize], b'C');
+    assert_eq!(terminal[third.identity.line_offset() as usize], b'C');
+    drop(first);
+    drop(second);
+    drop(third);
+    assert!(matches!(
+        poll_once(&mut dispatcher, &cancellation),
+        Poll::Ready(Ok(None))
+    ));
+    dispatcher.discard().unwrap();
+}
+
+#[test]
+fn hdd_lane_with_limit_one_remains_serial() {
+    let provider = FakeProvider::default();
+    let mut dispatcher = new_dispatcher(provider.clone());
+    let task_lane = lane(&[23], LocalDiskKind::Hdd, 1, 1);
+    let rows = [
+        base_record("hdd-first.bin", Some([0x41; 16])),
+        base_record("hdd-second.bin", Some([0x42; 16])),
+    ];
+    dispatcher.register_lane(&task_lane).unwrap();
+    dispatcher.append_batch(&task_lane, &rows).unwrap();
+    dispatcher.seal().unwrap();
+    let cancellation = ReadCancellationToken::new();
+
+    let first = ready_task(poll_once(&mut dispatcher, &cancellation));
+    assert!(
+        poll_once(&mut dispatcher, &cancellation).is_pending(),
+        "HDD 额度为 1 时第二身份必须等待首项 ACK"
     );
     assert_eq!(provider.active_permits(), 1);
 
     dispatcher.mark_completed(&first.identity).unwrap();
     drop(first);
-    let second = match poll_once(&mut dispatcher, &cancellation) {
-        Poll::Ready(Ok(Some(task))) => task,
-        other => panic!("首项 ACK 后第二项应取得许可，实际为 {other:?}"),
-    };
-    assert_eq!(provider.active_permits(), 1);
-    assert_ne!(second.identity.item_id(), rows[0].item_id);
+    let second = ready_task(poll_once(&mut dispatcher, &cancellation));
+    assert_eq!(second.record.item_id, rows[1].item_id);
     dispatcher.mark_completed(&second.identity).unwrap();
     drop(second);
     assert!(matches!(
         poll_once(&mut dispatcher, &cancellation),
         Poll::Ready(Ok(None))
     ));
+    dispatcher.discard().unwrap();
 }
 
 #[tokio::test]
