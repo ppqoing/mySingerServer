@@ -212,6 +212,15 @@ fn ready_task<Permit>(
     }
 }
 
+/// 读取每条 TSV 任务行的单字节状态，忽略行尾差异。
+fn task_statuses(bytes: &[u8]) -> Vec<u8> {
+    bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| line[0])
+        .collect()
+}
+
 fn poll_with_admission<P: TaskLanePermitProvider>(
     dispatcher: &mut TaskFileDispatcher<P>,
     cancellation: &ReadCancellationToken,
@@ -892,6 +901,103 @@ fn abandon_after_cancellation_allows_exact_run_discard() {
         Poll::Ready(Err(TaskDispatchError::Read(ReadFailure::Cancelled)))
     ));
     dispatcher.abandon_in_flight(&identity).unwrap();
+    dispatcher.discard().unwrap();
+}
+
+#[test]
+fn cancellation_abandons_all_same_lane_identities_and_preserves_pending_rows() {
+    let provider = FakeProvider::default();
+    let mut dispatcher = new_dispatcher(provider.clone());
+    let task_lane = lane(&[30], LocalDiskKind::Ssd, 3, 3);
+    let rows = [
+        base_record("cancel-hash.bin", None),
+        base_record("cancel-media-a.bin", Some([0x81; 16])),
+        base_record("cancel-media-b.bin", Some([0x82; 16])),
+    ];
+    dispatcher.register_lane(&task_lane).unwrap();
+    dispatcher.append_batch(&task_lane, &rows).unwrap();
+    dispatcher.seal().unwrap();
+    let lane_path = dispatcher.lane_path(&task_lane).unwrap();
+    let token = ReadCancellationToken::new();
+
+    let hash = ready_task(poll_once(&mut dispatcher, &token));
+    let second = ready_task(poll_once(&mut dispatcher, &token));
+    let third = ready_task(poll_once(&mut dispatcher, &token));
+    let identities = [
+        hash.identity.clone(),
+        second.identity.clone(),
+        third.identity.clone(),
+    ];
+    let continuation_record = derived_media_record(&hash.record);
+    drop(hash);
+    drop(second);
+    drop(third);
+
+    provider.set_blocked(true);
+    dispatcher
+        .request_media_continuation(&identities[0], &continuation_record)
+        .unwrap();
+    assert!(poll_once(&mut dispatcher, &token).is_pending());
+    assert_eq!(
+        task_statuses(&std::fs::read(&lane_path).unwrap()),
+        vec![b'P'; 3]
+    );
+
+    token.cancel();
+    assert!(matches!(
+        poll_once(&mut dispatcher, &token),
+        Poll::Ready(Err(TaskDispatchError::Read(ReadFailure::Cancelled)))
+    ));
+    for identity in &identities {
+        dispatcher.abandon_in_flight(identity).unwrap();
+    }
+    assert_eq!(
+        task_statuses(&std::fs::read(&lane_path).unwrap()),
+        vec![b'P'; 3]
+    );
+    dispatcher.discard().unwrap();
+}
+
+#[test]
+fn same_lane_permit_failure_keeps_other_inflight_identities_intact() {
+    let provider = FakeProvider::default();
+    let mut dispatcher = new_dispatcher(provider.clone());
+    let task_lane = lane(&[31], LocalDiskKind::Ssd, 2, 2);
+    let rows = [
+        base_record("failure-active.bin", Some([0x91; 16])),
+        base_record("failure-retry.bin", Some([0x92; 16])),
+    ];
+    dispatcher.register_lane(&task_lane).unwrap();
+    dispatcher.append_batch(&task_lane, &rows).unwrap();
+    dispatcher.seal().unwrap();
+    let lane_path = dispatcher.lane_path(&task_lane).unwrap();
+    let token = ReadCancellationToken::new();
+
+    let first = ready_task(poll_once(&mut dispatcher, &token));
+    provider.fail_next();
+    assert!(matches!(
+        poll_once(&mut dispatcher, &token),
+        Poll::Ready(Err(TaskDispatchError::Read(ReadFailure::Cancelled)))
+    ));
+    assert_eq!(
+        task_statuses(&std::fs::read(&lane_path).unwrap()),
+        vec![b'P'; 2]
+    );
+    assert!(
+        dispatcher.discard().is_err(),
+        "兄弟 permit 失败不得释放首个在途身份"
+    );
+
+    dispatcher.mark_completed(&first.identity).unwrap();
+    drop(first);
+    assert_eq!(
+        task_statuses(&std::fs::read(&lane_path).unwrap()),
+        vec![b'C', b'P']
+    );
+    let retry = ready_task(poll_once(&mut dispatcher, &token));
+    assert_eq!(retry.record.item_id, rows[1].item_id);
+    dispatcher.mark_completed(&retry.identity).unwrap();
+    drop(retry);
     dispatcher.discard().unwrap();
 }
 
