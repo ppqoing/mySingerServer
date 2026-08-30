@@ -841,6 +841,10 @@ struct SchedulerActiveCounts {
     disk_hash: u64,
     /// 指定物理盘 Media 许可数。
     disk_media: u64,
+    /// 指定物理盘正在等待的 Hash 许可数。
+    disk_hash_waiting: u64,
+    /// 指定物理盘累计授予的 Hash 许可数。
+    disk_hash_granted_total: u64,
 }
 
 #[cfg(feature = "test-hooks")]
@@ -875,6 +879,8 @@ async fn scheduler_active_counts(
         global_media: metrics.media_io.and_then(|value| value.current).unwrap(),
         disk_hash: disk.hash_active.unwrap(),
         disk_media: disk.media_active.unwrap(),
+        disk_hash_waiting: disk.hash_waiting.unwrap(),
+        disk_hash_granted_total: disk.hash_granted_total.unwrap(),
     }
 }
 
@@ -1584,6 +1590,7 @@ async fn scheduled_same_disk_hash_media_competition_respects_frozen_limits() {
     let rows = [
         ("media-first.bin", vec![0x91; 10]),
         ("hash-1.bin", vec![1; 10]),
+        ("hash-2.bin", vec![2; 10]),
     ]
     .into_iter()
     .map(|(name, bytes)| {
@@ -1623,15 +1630,22 @@ async fn scheduled_same_disk_hash_media_competition_respects_frozen_limits() {
         .await;
     configure_disk_metrics(&reporter, &config);
     let media_lane = TaskDiskLane {
-        physical_disk_id: PhysicalDiskId::from_disk_numbers([7]).unwrap(),
-        physical_disk_numbers: vec![7],
+        physical_disk_id: PhysicalDiskId::from_disk_numbers([1, 7]).unwrap(),
+        physical_disk_numbers: vec![1, 7],
         disk_kind: LocalDiskKind::Ssd,
         configured_weight: 2,
         per_disk_limit: 2,
     };
-    let hash_lane = TaskDiskLane {
+    let first_hash_lane = TaskDiskLane {
         physical_disk_id: PhysicalDiskId::from_disk_numbers([7, 8]).unwrap(),
         physical_disk_numbers: vec![7, 8],
+        disk_kind: LocalDiskKind::Ssd,
+        configured_weight: 2,
+        per_disk_limit: 2,
+    };
+    let second_hash_lane = TaskDiskLane {
+        physical_disk_id: PhysicalDiskId::from_disk_numbers([7, 9]).unwrap(),
+        physical_disk_numbers: vec![7, 9],
         disk_kind: LocalDiskKind::Ssd,
         configured_weight: 2,
         per_disk_limit: 2,
@@ -1642,10 +1656,10 @@ async fn scheduled_same_disk_hash_media_competition_respects_frozen_limits() {
         .enumerate()
         .map(|(index, scanned)| PlannedScannedPath {
             scanned,
-            lane: if index == 0 {
-                media_lane.clone()
-            } else {
-                hash_lane.clone()
+            lane: match index {
+                0 => media_lane.clone(),
+                1 => first_hash_lane.clone(),
+                _ => second_hash_lane.clone(),
             },
         })
         .collect::<Vec<_>>();
@@ -1694,27 +1708,16 @@ async fn scheduled_same_disk_hash_media_competition_respects_frozen_limits() {
             first_path,
             "Worker Started 身份必须对应首条 Media TSV 行"
         );
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while started_hashes.load(Ordering::Acquire) != 1 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("Worker Started 后同盘 Hash 应取得另一个真实 scheduler 许可");
-        let counts_before_source_complete =
-            scheduler_active_counts(&registry, &reporter, "PhysicalDisk7").await;
-
-        controller
-            .base_source_read_complete(task_text.clone(), first_item.clone())
-            .await;
-        let counts_after_source_complete = tokio::time::timeout(Duration::from_secs(1), async {
+        let counts_before_source_complete = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 let counts = scheduler_active_counts(&registry, &reporter, "PhysicalDisk7").await;
                 if started_hashes.load(Ordering::Acquire) == 1
                     && counts.global_hash == 1
-                    && counts.global_media == 0
+                    && counts.global_media == 1
                     && counts.disk_hash == 1
-                    && counts.disk_media == 0
+                    && counts.disk_media == 1
+                    && counts.disk_hash_waiting == 1
+                    && counts.disk_hash_granted_total == 1
                 {
                     return counts;
                 }
@@ -1722,13 +1725,36 @@ async fn scheduled_same_disk_hash_media_competition_respects_frozen_limits() {
             }
         })
         .await
-        .expect("匹配 SourceReadComplete 后应释放 Media 许可并补入第二个 Hash");
+        .expect("两个许可被占时，第三个同盘 Hash 必须等待且不能进入底层读取");
+        assert_eq!(started_hashes.load(Ordering::Acquire), 1);
+
+        controller
+            .base_source_read_complete(task_text.clone(), first_item.clone())
+            .await;
+        let counts_after_source_complete = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let counts = scheduler_active_counts(&registry, &reporter, "PhysicalDisk7").await;
+                if started_hashes.load(Ordering::Acquire) == 2
+                    && counts.global_hash == 2
+                    && counts.global_media == 0
+                    && counts.disk_hash == 2
+                    && counts.disk_media == 0
+                    && counts.disk_hash_waiting == 0
+                    && counts.disk_hash_granted_total == 2
+                {
+                    return counts;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("匹配 SourceReadComplete 释放 Media 许可后，第三个同盘读取才应取得许可");
         controller
             .complete_base(task_text.clone(), first_item, first_md5, other_output())
             .await;
         hash_gate_release.release();
 
-        for _ in 0..1 {
+        for _ in 0..2 {
             let item_id = tokio::time::timeout(Duration::from_secs(1), started_workers.recv())
                 .await
                 .expect("两个 Hash miss 都应继续进入同一受控 Worker 槽位")
@@ -1776,15 +1802,17 @@ async fn scheduled_same_disk_hash_media_competition_respects_frozen_limits() {
             global_media: 1,
             disk_hash: 1,
             disk_media: 1,
+            disk_hash_waiting: 1,
+            disk_hash_granted_total: 1,
         },
         "Worker Started 后 Media 许可必须仍计入同盘和全局上限"
     );
     assert_eq!(counts_before_source_complete.global_active(), 2);
     assert_eq!(counts_before_source_complete.disk_active(), 2);
-    assert_eq!(counts_after_source_complete.global_active(), 1);
-    assert_eq!(counts_after_source_complete.disk_active(), 1);
-    assert_eq!(started_hashes.load(Ordering::Acquire), 1);
-    assert_eq!(summary.resolved_files, 2);
+    assert_eq!(counts_after_source_complete.global_active(), 2);
+    assert_eq!(counts_after_source_complete.disk_active(), 2);
+    assert_eq!(started_hashes.load(Ordering::Acquire), 2);
+    assert_eq!(summary.resolved_files, 3);
     assert_eq!(summary.cache_hits, 0);
     assert_eq!(summary.file_failures, 0);
 
@@ -1800,10 +1828,10 @@ async fn scheduled_same_disk_hash_media_competition_respects_frozen_limits() {
         .cloned()
         .unwrap();
     assert_eq!(disk.capacity, Some(2));
-    assert_eq!(disk.hash_granted_total, Some(1));
-    assert_eq!(disk.hash_released_total, Some(1));
-    assert_eq!(disk.media_granted_total, Some(2));
-    assert_eq!(disk.media_released_total, Some(2));
+    assert_eq!(disk.hash_granted_total, Some(2));
+    assert_eq!(disk.hash_released_total, Some(2));
+    assert_eq!(disk.media_granted_total, Some(3));
+    assert_eq!(disk.media_released_total, Some(3));
     assert_eq!(metrics.hash_io.unwrap().current, Some(0));
     assert_eq!(metrics.media_io.unwrap().current, Some(0));
     assert_eq!(disk.hash_active, Some(0));

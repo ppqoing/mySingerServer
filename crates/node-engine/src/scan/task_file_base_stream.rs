@@ -538,12 +538,15 @@ async fn cleanup_stream<P: TaskLanePermitProvider>(
 fn abandon_all_in_flight<P: TaskLanePermitProvider>(
     pending: &mut TaskFileBaseComputePending<P>,
 ) -> Result<(), String> {
-    let identities = pending.contexts.keys().cloned().collect::<Vec<_>>();
+    let identities = pending.dispatcher.in_flight_identities();
+    let mut diagnostics = Vec::new();
     for identity in identities {
-        pending
-            .dispatcher
-            .abandon_in_flight(&identity)
-            .map_err(|error| format!("取消后归还任务文件 in-flight owner 失败: {error}"))?;
+        if let Err(error) = pending.dispatcher.abandon_in_flight(&identity) {
+            diagnostics.push(format!("取消后归还任务文件 in-flight owner 失败: {error}"));
+        }
+    }
+    if !diagnostics.is_empty() {
+        return Err(diagnostics.join("; "));
     }
     Ok(())
 }
@@ -588,7 +591,7 @@ mod tests {
     use dedup_windows::{LocalDiskKind, PhysicalDiskId, ReadCancellationToken};
     use tokio::sync::Notify;
 
-    use super::{TaskFileBaseComputePending, run_task_file_base_stream};
+    use super::{TaskFileBaseComputePending, abandon_all_in_flight, run_task_file_base_stream};
     use crate::{
         RemoteCacheError, RemoteFeatureCache,
         io::{DiskReadClass, ReadFailure},
@@ -841,6 +844,46 @@ mod tests {
                 ..Default::default()
             },
         }
+    }
+
+    /// cleanup 必须只枚举 dispatcher 的真实在途 owner，不能把保留的 P 行 context 当作 owner。
+    #[tokio::test]
+    async fn cleanup_abandons_only_real_in_flight_identities_and_continues_all() {
+        let root = tempfile::tempdir().unwrap();
+        let permits = Arc::new(AtomicUsize::new(0));
+        let mut pending = TaskFileBaseComputePending::from_production(production(
+            root.path(),
+            CountingProvider(Arc::clone(&permits)),
+            &[
+                input(scanned(r"C:\cleanup-pending.bin", 10), lane(31), None),
+                input(scanned(r"C:\cleanup-active-1.bin", 10), lane(32), None),
+                input(scanned(r"C:\cleanup-active-2.bin", 10), lane(33), None),
+            ],
+        ));
+        let mut identities = Vec::new();
+        for _ in 0..3 {
+            let task = pending
+                .dispatcher
+                .next(ReadCancellationToken::new())
+                .await
+                .unwrap()
+                .expect("三条独立 lane 都应取得真实在途身份");
+            identities.push(task.identity.clone());
+            drop(task.permit);
+        }
+        identities.sort();
+        pending
+            .dispatcher
+            .abandon_in_flight(&identities[0])
+            .unwrap();
+        assert_eq!(pending.contexts.len(), 3, "未 ACK 的 P 行 context 必须保留");
+
+        abandon_all_in_flight(&mut pending).expect("合法非在途 context 不得形成 cleanup 伪诊断");
+        assert_eq!(permits.load(Ordering::SeqCst), 0);
+        pending
+            .dispatcher
+            .discard()
+            .expect("全部真实 owner 都被收束后 dispatcher 必须可删除");
     }
 
     /// 取消必须先收回 Hash、远端和 Worker owner，才允许任务文件 dispatcher 被丢弃。

@@ -319,6 +319,11 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
         Ok(())
     }
 
+    /// 返回 dispatcher 当前未 ACK 的精确在途身份快照，供任务级 cleanup 逐项收束。
+    pub(crate) fn in_flight_identities(&self) -> Vec<TaskFileIdentity> {
+        self.in_flight_lanes.values().cloned().collect()
+    }
+
     /// 删除本次运行创建的任务文件目录。
     pub fn discard(&mut self) -> io::Result<()> {
         if !self.pending.is_empty()

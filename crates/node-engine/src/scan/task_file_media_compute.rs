@@ -426,7 +426,10 @@ fn handle_media_event(
             if !same_worker_identity(&work.worker_identity, &identity, true) {
                 return Ok(None);
             }
-            work.worker_slot = Some(slot);
+            // 首条精确 Started 冻结 Worker 槽位；重复事件不能把后续源读取归属改写到别槽。
+            if work.worker_slot.is_none() {
+                work.worker_slot = Some(slot);
+            }
         }
         WorkerEvent::BaseSourceReadComplete {
             task_id,
@@ -683,6 +686,192 @@ mod tests {
             },
         );
         (runtime, identity, worker_identity)
+    }
+
+    /// Started 只接受第一条精确身份，错误身份或重复 slot 不得改写已冻结 Worker 槽位。
+    #[tokio::test]
+    async fn media_runtime_started_freezes_first_exact_identity_and_slot() {
+        let live = Arc::new(AtomicIsize::new(1));
+        let (mut runtime, identity, worker_identity) = active_runtime(Arc::clone(&live));
+        let mut wrong_identity = worker_identity.clone();
+        wrong_identity.stage = "wrong-stage".into();
+
+        assert!(
+            runtime
+                .handle_event(
+                    WorkerEvent::Started {
+                        task_id: identity.run_id().into(),
+                        item_id: identity.item_id().to_string(),
+                        identity: wrong_identity,
+                        slot: 9,
+                        process_id: None,
+                        cpu_weight: 1,
+                        decoder_threads: Some(1),
+                        queue_wait_us: 0,
+                    },
+                    None,
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        runtime
+            .handle_event(
+                WorkerEvent::BaseSourceReadComplete {
+                    task_id: identity.run_id().into(),
+                    item_id: identity.item_id().to_string(),
+                    slot: 9,
+                    request_elapsed_us: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            live.load(Ordering::SeqCst),
+            1,
+            "错误 identity 不得冻结 slot"
+        );
+
+        for slot in [3, 4] {
+            runtime
+                .handle_event(
+                    WorkerEvent::Started {
+                        task_id: identity.run_id().into(),
+                        item_id: identity.item_id().to_string(),
+                        identity: worker_identity.clone(),
+                        slot,
+                        process_id: None,
+                        cpu_weight: 1,
+                        decoder_threads: Some(1),
+                        queue_wait_us: 0,
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        runtime
+            .handle_event(
+                WorkerEvent::BaseSourceReadComplete {
+                    task_id: identity.run_id().into(),
+                    item_id: identity.item_id().to_string(),
+                    slot: 3,
+                    request_elapsed_us: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            live.load(Ordering::SeqCst),
+            0,
+            "重复 Started 不得用错误 slot 覆盖首次精确 Started"
+        );
+    }
+
+    /// 错误或重复 SourceReadComplete 不得提前或重复释放当前 Media 许可。
+    #[tokio::test]
+    async fn media_runtime_source_read_complete_requires_active_identity_and_frozen_slot() {
+        let live = Arc::new(AtomicIsize::new(1));
+        let (mut runtime, identity, worker_identity) = active_runtime(Arc::clone(&live));
+        runtime
+            .handle_event(
+                WorkerEvent::Started {
+                    task_id: identity.run_id().into(),
+                    item_id: identity.item_id().to_string(),
+                    identity: worker_identity,
+                    slot: 3,
+                    process_id: None,
+                    cpu_weight: 1,
+                    decoder_threads: Some(1),
+                    queue_wait_us: 0,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        for (item_id, slot) in [
+            ("unknown-item".to_owned(), 3),
+            (identity.item_id().to_string(), 4),
+        ] {
+            assert!(
+                runtime
+                    .handle_event(
+                        WorkerEvent::BaseSourceReadComplete {
+                            task_id: identity.run_id().into(),
+                            item_id,
+                            slot,
+                            request_elapsed_us: None,
+                        },
+                        None,
+                    )
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(live.load(Ordering::SeqCst), 1);
+        }
+        for _ in 0..2 {
+            assert!(
+                runtime
+                    .handle_event(
+                        WorkerEvent::BaseSourceReadComplete {
+                            task_id: identity.run_id().into(),
+                            item_id: identity.item_id().to_string(),
+                            slot: 3,
+                            request_elapsed_us: None,
+                        },
+                        None,
+                    )
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(live.load(Ordering::SeqCst), 0);
+        }
+        assert!(runtime.has_active(), "SourceReadComplete 仍是非终态事件");
+    }
+
+    /// settled 或未知身份的 terminal 不得再次形成可交给持久化运行态的终态动作。
+    #[tokio::test]
+    async fn media_runtime_unknown_and_duplicate_terminal_emit_only_once() {
+        let live = Arc::new(AtomicIsize::new(1));
+        let (mut runtime, identity, mut worker_identity) = active_runtime(Arc::clone(&live));
+        worker_identity.stage = "decoding".into();
+        let crash = || WorkerEvent::Crashed {
+            task_id: identity.run_id().into(),
+            item_id: identity.item_id().to_string(),
+            identity: worker_identity.clone(),
+            process_id: Some(42),
+            exit_code: Some(1),
+            message: "测试 Worker 崩溃".into(),
+        };
+
+        let first = runtime.handle_event(crash(), None).await.unwrap();
+        assert!(matches!(first, Some(TaskFileMediaTerminal::Failed(_))));
+        assert!(!runtime.has_active());
+        assert_eq!(live.load(Ordering::SeqCst), 0);
+        assert!(
+            runtime.handle_event(crash(), None).await.unwrap().is_none(),
+            "重复 terminal 不得形成第二个持久化动作"
+        );
+        assert!(
+            runtime
+                .handle_event(
+                    WorkerEvent::Completed {
+                        task_id: "unknown-run".into(),
+                        item_id: "unknown-item".into(),
+                        response: proto::WorkerEnvelope { payload: None },
+                    },
+                    None,
+                )
+                .await
+                .unwrap()
+                .is_none(),
+            "未知 terminal 不得形成持久化动作"
+        );
     }
 
     #[tokio::test]
