@@ -140,9 +140,8 @@ channel 收到首项”的墙钟区间，不是单键 Hash event pump 的专用�
 
 固定 benchmark/fixture 明确调用旧 `BaseComputeEngine::run_existing`，不进入 production transient
 `run_task_file_scan_inner → coordinator → task_file_base_stream`。只读命令
-`git diff --quiet a853d1b..3f66e06 -- benchmark/fixture/base_compute` 对实际
-`crates/node-engine/benches/base_compute_pipeline.rs`、`crates/node-engine/tests/base_compute_utilization.rs`
-和 `crates/node-engine/tests/base_compute_pipeline.rs` 的退出码为 0：终审修复未改变这些基准路径。
+`git diff --quiet a853d1b..3f66e06 -- crates/node-engine/benches/base_compute_pipeline.rs crates/node-engine/tests/base_compute_utilization.rs crates/node-engine/src/scan/base_compute.rs`
+的退出码为 0：终审修复未改变这三条基准调用路径。
 因此历史/九轮门禁仍按原规则为 **FAIL**，但它们不能作为本次单键 event pump 性能因果证据。
 
 旧 loop 的三次约 10 ms epoch 目前仅是假设：本轮没有增加诊断时间戳、没有修改产品，不能把它
