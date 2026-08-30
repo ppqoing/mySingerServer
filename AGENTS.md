@@ -108,7 +108,7 @@ Node 扫描固定为：
 
 扫描收到根目录后，先解析每个根的物理磁盘编号、介质类型和配置额度，形成冻结 `ScanDiskPlan`，再调用枚举器。默认使用 `EverythingEnumerator`；不可用或完整枚举失败时才受控回退 `WindowsWalker`。Rust 端按规范路径排序、去重并用 `NormalizedPath::is_within` 校验组件边界。
 
-路径缓存每批最多 1000 项，使用一次真实批量 `lookup_base_cache_by_paths`，不得循环逐文件 SELECT。MD5 得到后每批最多 1000 项，使用一次真实批量 `lookup_base_cache_by_keys`；可选 PostgreSQL 缓存也只批量查询、导入并做一次本地校准。完整命中直接形成完成数，只有真正缺少的项进入 Worker。
+扫描前的路径缓存每批最多 1000 项，使用一次真实批量 `lookup_base_cache_by_paths`，不得循环逐文件 SELECT。每个 Hash future 完成后立即用一个 `ContentKey` 调用 SQLite `lookup_base_cache_by_keys`；可选远端缓存也每次只请求这一个键，并将结果导入后做本地校准。键缺失时立即登记同一任务身份的 Media continuation，不等整批 Hash 或 Media；完整命中直接形成完成数。统一事件泵同时推进其他 Hash、远端查询、Worker 终态和 SQLite ACK，任一项不得成为全批屏障。
 
 完整性判断拒绝空值、默认值、长度错误和失败占位符。图片一筛必须同时具备尺寸、PDQ、Quality，二筛必须具备九块 pHash 和 128 维有限 Sobel；视频必须满足六槽位、至少四个成功完整一筛帧及相应二筛覆盖。缓存阶段只查询，插入/更新只在计算结果、同步导入、文件变化或删除成功确实需要时执行。
 
@@ -120,7 +120,7 @@ Worker 终态先由 Node 完成必要 SQLite 当前事实写入，再把 TSV 行
 
 任务分发时已冻结物理盘 lane，不把所有路径混在单一 FIFO 中。有效额度来自配置中的 `ssd_threads_per_disk`、`hdd_threads_per_disk`、`unknown_threads_per_disk`，并受 `total_threads`、Worker 数和全局磁盘许可共同限制。全局额度不足时按权重轮转/deficit 选择；老化保护让长期等待的 HDD 或其他 lane 获得机会，避免饥饿。比例由配置决定，不能把示例 `5:1` 写死。
 
-Hash 和 Media 在同一调度 epoch 联合判断真实 slot、refill token、output credit、盘额度和全局额度；Media refill 不能绕过仍然可派发的 Hash。任务完成、失败或取消后立即补位，不等待整批。读取调度器是文件读取许可和盘公平层，不等同于独立的计算线程池。
+Hash 和 Media 在同一调度 epoch 联合判断真实 slot、refill token、output credit、盘额度和全局额度；Media refill 不能绕过仍然可派发的 Hash。同一 lane 在 SQLite ACK 前只交付一个任务身份；同身份的 Media continuation 可继承该在途身份。任务完成、失败或取消后立即补位，不等待整批。读取调度器是文件读取许可和盘公平层，不等同于独立的计算线程池。
 
 Worker 启动后加载固定 DLL，成功才输出 `WorkerReady`；stdin/stdout 使用四字节长度头的 WorkerEnvelope，日志写入 `data/node/logs/worker-<pid>.log`。所有 Worker 进入 `KILL_ON_JOB_CLOSE` Job Object，创建标志含 `CREATE_NO_WINDOW`；Node 退出不留下孤儿 Worker。WorkerPool 由 actor 独占，Node 不在 TCP 层维护第二份 Worker 事实。
 
