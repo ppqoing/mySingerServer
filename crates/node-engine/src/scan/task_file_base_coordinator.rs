@@ -328,13 +328,16 @@ mod tests {
     };
     use tokio::sync::Notify;
 
-    use dedup_core::{DiskReadConfig, DisplayPath, MachineId, MediaKind, NormalizedPath};
+    use dedup_core::{
+        ContentKey, DiskReadConfig, DisplayPath, MachineId, MediaKind, NormalizedPath,
+    };
     use dedup_media::{ImageStage1, PdqHash};
     use dedup_media_ffmpeg::MediaProbe;
-    use dedup_node_store::{BaseCacheRecord, NodeStore, ScannedPath};
+    use dedup_node_store::{BaseCacheRecord, CompleteStage1, NodeStore, ScannedPath};
     use dedup_windows::{LocalDiskKind, PhysicalDiskId, ReadCancellationToken};
 
     use crate::{
+        RemoteCacheError, RemoteFeatureCache,
         io::{DiskReadClass, ReadFailure},
         scan::{
             BaseTaskInput, BaseTaskProducer, BaseTaskProduction, HashPermitReader,
@@ -345,7 +348,10 @@ mod tests {
         worker::{BaseComputeOutput, Stage1Frame, WorkerPool},
     };
 
-    use super::{TaskFileBaseCoordinatorOptions, run_task_file_base_coordinator};
+    use super::{
+        TaskFileBaseCoordinatorOptions, run_task_file_base_coordinator,
+        run_task_file_base_coordinator_with_remote,
+    };
 
     const RUN_ID: &str = "01900000-0000-7000-8000-0000000003c3";
 
@@ -381,8 +387,8 @@ mod tests {
         first_path: String,
         /// 被门控的后续路径。
         later_path: String,
-        /// 后续读取已实际进入的通知。
-        later_entered: Arc<Notify>,
+        /// 后续读取已实际进入的持久状态；通知建立较晚也不会丢失。
+        later_entered: Arc<AtomicUsize>,
         /// 允许后续读取返回的门控通知。
         later_gate: Arc<Notify>,
         /// 两个路径各自返回的 MD5。
@@ -413,13 +419,133 @@ mod tests {
             let md5 = self.md5;
             Box::pin(async move {
                 if path == later_path {
-                    later_entered.notify_waiters();
+                    later_entered.store(1, Ordering::SeqCst);
+                    // 让测试先发送门控事件，验证 notify_one 的持久 permit 不会丢失。
+                    tokio::task::yield_now().await;
                     later_gate.notified().await;
                 } else if path != first_path {
                     return Err(ReadFailure::Io {
                         path: scanned.display_path.as_path().to_path_buf(),
                         block_offset: 0,
                         source: std::io::Error::other("测试 Hash 路径不匹配"),
+                    });
+                }
+                Ok(ReadProduct { md5, lease: permit })
+            })
+        }
+    }
+
+    /// 两个单键远端请求分别受控，用于验证失败后的在途结果不会污染 SQLite。
+    #[derive(Clone)]
+    struct FailingThenSuccessfulRemote {
+        /// 返回错误的内容键。
+        failing_key: ContentKey,
+        /// 返回更完整记录的内容键。
+        succeeding_key: ContentKey,
+        /// 成功请求的远端完整记录。
+        succeeding_record: BaseCacheRecord,
+        /// 两个请求均已进入的持久计数。
+        entered: Arc<AtomicUsize>,
+        /// 放行失败请求。
+        failure_gate: Arc<Notify>,
+        /// 放行成功请求。
+        success_gate: Arc<Notify>,
+    }
+
+    impl RemoteFeatureCache for FailingThenSuccessfulRemote {
+        async fn lookup_paths(
+            &self,
+            _machine_id: &MachineId,
+            paths: &[ScannedPath],
+        ) -> Result<Vec<Option<BaseCacheRecord>>, RemoteCacheError> {
+            Ok(vec![None; paths.len()])
+        }
+
+        async fn lookup_contents(
+            &self,
+            keys: &[ContentKey],
+        ) -> Result<Vec<Option<BaseCacheRecord>>, RemoteCacheError> {
+            assert_eq!(keys.len(), 1, "远端流必须保持单键查询");
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            if keys[0] == self.failing_key {
+                self.failure_gate.notified().await;
+                Err(RemoteCacheError::ConnectTimeout)
+            } else if keys[0] == self.succeeding_key {
+                self.success_gate.notified().await;
+                Ok(vec![Some(self.succeeding_record.clone())])
+            } else {
+                Ok(vec![None])
+            }
+        }
+
+        async fn publish_outbox(
+            &mut self,
+            _machine_id: &MachineId,
+            _batch: &dedup_protocol::proto::SyncChangeBatch,
+        ) -> Result<u64, RemoteCacheError> {
+            Ok(0)
+        }
+    }
+
+    /// 首项和次项可控、第三项立即完成的读取器，用于跨 lane 公平性测试。
+    #[derive(Clone)]
+    struct FairHashReader {
+        /// 首项路径。
+        first_path: String,
+        /// 次项路径。
+        second_path: String,
+        /// 第三项路径。
+        third_path: String,
+        /// 首项放行门闩。
+        first_gate: Arc<Notify>,
+        /// 次项已进入的持久状态。
+        second_entered: Arc<AtomicUsize>,
+        /// 次项放行门闩。
+        second_gate: Arc<Notify>,
+        /// 第三项已进入的持久状态。
+        third_entered: Arc<AtomicUsize>,
+        /// 三项使用的测试 MD5。
+        md5: [u8; 16],
+    }
+
+    impl HashPermitReader for FairHashReader {
+        type Permit = TestPermit;
+
+        fn read_with_permit(
+            &self,
+            scanned: ScannedPath,
+            permit: Self::Permit,
+            _cancellation: ReadCancellationToken,
+            _started: Option<crate::scan::HashReadStartedSignal>,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<ReadProduct<Self::Permit>, ReadFailure>>
+                    + Send
+                    + 'static,
+            >,
+        > {
+            let path = scanned.normalized_path.as_str().to_owned();
+            let first_path = self.first_path.clone();
+            let second_path = self.second_path.clone();
+            let third_path = self.third_path.clone();
+            let first_gate = Arc::clone(&self.first_gate);
+            let second_entered = Arc::clone(&self.second_entered);
+            let second_gate = Arc::clone(&self.second_gate);
+            let third_entered = Arc::clone(&self.third_entered);
+            let md5 = self.md5;
+            Box::pin(async move {
+                if path == first_path {
+                    first_gate.notified().await;
+                } else if path == second_path {
+                    second_entered.store(1, Ordering::SeqCst);
+                    second_gate.notified().await;
+                } else if path == third_path {
+                    third_entered.store(1, Ordering::SeqCst);
+                } else {
+                    return Err(ReadFailure::Io {
+                        path: scanned.display_path.as_path().to_path_buf(),
+                        block_offset: 0,
+                        source: std::io::Error::other("公平性测试 Hash 路径不匹配"),
                     });
                 }
                 Ok(ReadProduct { md5, lease: permit })
@@ -536,6 +662,28 @@ mod tests {
                 error: None,
             }]),
             contact_sheet_jpeg: None,
+        }
+    }
+
+    /// 构造只存在于远端的完整图片缓存，导入后会把本地 partial 升级为完整命中。
+    fn complete_remote_image(md5: [u8; 16], file_size: u64) -> BaseCacheRecord {
+        BaseCacheRecord {
+            content_id: None,
+            content_key: ContentKey::new(md5, file_size),
+            media_kind: MediaKind::Image,
+            base_complete: true,
+            width: Some(2),
+            height: Some(2),
+            duration_ms: None,
+            stage1: Some(CompleteStage1::Image(ImageStage1 {
+                width: 2,
+                height: 2,
+                pdq: PdqHash::from_bytes([0; 32]),
+                quality: 100,
+            })),
+            image_stage2: None,
+            video_stage2: Box::new([None; 6]),
+            contact_sheet_relative_path: None,
         }
     }
 
@@ -664,7 +812,7 @@ mod tests {
                 input(later_path.clone(), lane(32), None),
             ],
         );
-        let later_entered = Arc::new(Notify::new());
+        let later_entered = Arc::new(AtomicUsize::new(0));
         let later_gate = Arc::new(Notify::new());
         let reader = GatedHashReader {
             first_path: first_path.normalized_path.as_str().to_owned(),
@@ -696,15 +844,19 @@ mod tests {
             (result, shutdown)
         });
 
-        tokio::time::timeout(Duration::from_secs(1), later_entered.notified())
-            .await
-            .expect("第二个 Hash 应进入门控读取");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while later_entered.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("第二个 Hash 应进入门控读取；即使先发生也不能丢失信号");
         let first_worker = tokio::time::timeout(Duration::from_secs(1), started.recv())
             .await
             .expect("首个 Hash 缺失项不得等待后续 Hash")
             .unwrap();
         assert_eq!(handle.lookup_key_batch_sizes_for_test(), vec![1]);
-        later_gate.notify_waiters();
+        later_gate.notify_one();
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 if handle.lookup_key_batch_sizes_for_test() == vec![1, 1] {
@@ -745,6 +897,254 @@ mod tests {
         );
         assert_eq!(statuses(&result.dispatcher, &lane(32)), vec![b'C']);
         assert_eq!(handle.lookup_key_batch_sizes_for_test(), vec![1, 1]);
+        result.dispatcher.discard().unwrap();
+        drop(handle);
+        actor.finish().await.unwrap();
+    }
+
+    /// 远端失败后，已在途的成功结果也必须退回其发起时的 SQLite 快照。
+    #[tokio::test]
+    async fn remote_success_in_flight_after_failure_stays_local_only() {
+        let root = tempfile::tempdir().unwrap();
+        let first_md5 = [0xB8; 16];
+        let second_md5 = [0xB9; 16];
+        let machine = MachineId::from_sha256([0xBA; 32]);
+        let mut store = NodeStore::open_in_memory(machine).unwrap();
+        let first_local = seed_partial(
+            &mut store,
+            r"C:\remote-local-first.bin",
+            first_md5,
+            10,
+            MediaKind::Image,
+        );
+        let second_local = seed_partial(
+            &mut store,
+            r"C:\remote-local-second.bin",
+            second_md5,
+            10,
+            MediaKind::Image,
+        );
+        let first_path = scanned(r"C:\remote-first.bin", 10);
+        let second_path = scanned(r"C:\remote-second.bin", 10);
+        let production = production(
+            root.path(),
+            &[
+                input(first_path.clone(), lane(33), None),
+                input(second_path.clone(), lane(34), None),
+            ],
+        );
+        let remote = FailingThenSuccessfulRemote {
+            failing_key: first_local.content_key,
+            succeeding_key: second_local.content_key,
+            succeeding_record: complete_remote_image(second_md5, 10),
+            entered: Arc::new(AtomicUsize::new(0)),
+            failure_gate: Arc::new(Notify::new()),
+            success_gate: Arc::new(Notify::new()),
+        };
+        let remote_entered = Arc::clone(&remote.entered);
+        let failure_gate = Arc::clone(&remote.failure_gate);
+        let success_gate = Arc::clone(&remote.success_gate);
+        let reader = TestHashReader {
+            results: Arc::new(BTreeMap::from([
+                (first_path.normalized_path.as_str().to_owned(), first_md5),
+                (second_path.normalized_path.as_str().to_owned(), second_md5),
+            ])),
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let (actor, handle, mut acknowledgements) =
+            crate::scan::base_persistence::BaseStoreActor::spawn(store, 2);
+        let (mut pool, mut started, controller) = WorkerPool::controlled_batch_for_test(2);
+        let handle_for_run = handle.clone();
+        let run_root = root.path().to_path_buf();
+        let mut coordinator_options = options(&run_root);
+        coordinator_options.hash_capacity = 2;
+        coordinator_options.worker_capacity = 2;
+        let mut remote_available = true;
+        let mut warning = None;
+        let join = tokio::spawn(async move {
+            let result = run_task_file_base_coordinator_with_remote(
+                production,
+                reader,
+                &mut pool,
+                &handle_for_run,
+                &mut acknowledgements,
+                coordinator_options,
+                ReadCancellationToken::new(),
+                Arc::new(remote),
+                &mut remote_available,
+                &mut warning,
+            )
+            .await;
+            let shutdown = pool.shutdown().await;
+            (result, shutdown, remote_available, warning)
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while remote_entered.load(Ordering::SeqCst) != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("两个单键远端 future 都应先进入");
+        failure_gate.notify_one();
+        let first_worker = tokio::time::timeout(Duration::from_secs(1), started.recv())
+            .await
+            .expect("远端失败必须让首项退回本地缺失掩码")
+            .unwrap();
+        success_gate.notify_one();
+        let second_worker = tokio::time::timeout(Duration::from_secs(1), started.recv())
+            .await
+            .expect("故障后的在途远端成功不得导入或消除第二项缺失")
+            .unwrap();
+
+        controller
+            .base_source_read_complete(first_worker.0.clone(), first_worker.1.clone())
+            .await;
+        controller
+            .complete_base(first_worker.0, first_worker.1, first_md5, image_output())
+            .await;
+        controller
+            .base_source_read_complete(second_worker.0.clone(), second_worker.1.clone())
+            .await;
+        controller
+            .complete_base(second_worker.0, second_worker.1, second_md5, image_output())
+            .await;
+        let (result, shutdown, remote_available, warning) = join.await.unwrap();
+        assert!(shutdown.is_ok());
+        let mut result = result.unwrap();
+        assert!(!remote_available);
+        assert!(warning.is_some(), "远端失败只保留一条降级告警");
+        assert_eq!(result.summary.cache_hits, 0);
+        assert_eq!(result.manifest.resolved_files.len(), 2);
+        assert_eq!(handle.lookup_key_batch_sizes_for_test(), vec![1, 1]);
+        result.dispatcher.discard().unwrap();
+        drop(handle);
+        actor.finish().await.unwrap();
+    }
+
+    /// 首个 Media active 时，另一物理盘的后续 Hash 仍必须继续进入单键缓存查询。
+    #[tokio::test]
+    async fn active_media_does_not_block_later_hash_on_another_lane() {
+        let root = tempfile::tempdir().unwrap();
+        let md5 = [0xC8; 16];
+        let machine = MachineId::from_sha256([0xC9; 32]);
+        let store = NodeStore::open_in_memory(machine).unwrap();
+        let first_path = scanned(r"C:\fair-first.bin", 10);
+        let second_path = scanned(r"C:\fair-second.bin", 10);
+        let third_path = scanned(r"C:\fair-third.bin", 10);
+        let production = production(
+            root.path(),
+            &[
+                input(first_path.clone(), lane(35), None),
+                input(second_path.clone(), lane(36), None),
+                input(third_path.clone(), lane(37), None),
+            ],
+        );
+        let first_gate = Arc::new(Notify::new());
+        let second_entered = Arc::new(AtomicUsize::new(0));
+        let second_gate = Arc::new(Notify::new());
+        let third_entered = Arc::new(AtomicUsize::new(0));
+        let reader = FairHashReader {
+            first_path: first_path.normalized_path.as_str().to_owned(),
+            second_path: second_path.normalized_path.as_str().to_owned(),
+            third_path: third_path.normalized_path.as_str().to_owned(),
+            first_gate: Arc::clone(&first_gate),
+            second_entered: Arc::clone(&second_entered),
+            second_gate: Arc::clone(&second_gate),
+            third_entered: Arc::clone(&third_entered),
+            md5,
+        };
+        let (actor, handle, mut acknowledgements) =
+            crate::scan::base_persistence::BaseStoreActor::spawn(store, 2);
+        let (mut pool, mut started, controller) = WorkerPool::controlled_batch_for_test(1);
+        let handle_for_run = handle.clone();
+        let run_root = root.path().to_path_buf();
+        let cancellation = ReadCancellationToken::new();
+        let cancellation_for_run = cancellation.clone();
+        let mut coordinator_options = options(&run_root);
+        coordinator_options.hash_capacity = 2;
+        let mut join = Some(tokio::spawn(async move {
+            let result = run_task_file_base_coordinator(
+                production,
+                reader,
+                &mut pool,
+                &handle_for_run,
+                &mut acknowledgements,
+                coordinator_options,
+                cancellation_for_run,
+            )
+            .await;
+            let shutdown = pool.shutdown().await;
+            (result, shutdown)
+        }));
+
+        let initial_window = tokio::time::timeout(Duration::from_secs(1), async {
+            while second_entered.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        if initial_window.is_err() {
+            cancellation.cancel();
+            join.take().expect("失败清理前 join 必须存在").abort();
+        }
+        initial_window.expect("初始 Hash window 应先启动第二条 lane");
+        first_gate.notify_one();
+        let first_worker = tokio::time::timeout(Duration::from_secs(1), started.recv()).await;
+        if first_worker.is_err() {
+            cancellation.cancel();
+            join.take().expect("失败清理前 join 必须存在").abort();
+        }
+        let first_worker = first_worker.expect("首个 Hash miss 应启动 Media").unwrap();
+        second_gate.notify_one();
+        let second_hash = tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.lookup_key_batch_sizes_for_test() != vec![1, 1] {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        if second_hash.is_err() {
+            cancellation.cancel();
+            join.take().expect("失败清理前 join 必须存在").abort();
+        }
+        second_hash.expect("第二条 Hash 必须在首个 Media active 时完成单键查询");
+        let third_hash = tokio::time::timeout(Duration::from_secs(1), async {
+            while third_entered.load(Ordering::SeqCst) == 0
+                || handle.lookup_key_batch_sizes_for_test() != vec![1, 1, 1]
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        if third_hash.is_err() {
+            cancellation.cancel();
+            join.take().expect("失败清理前 join 必须存在").abort();
+        }
+        third_hash.expect("跨 lane 后续 Hash 不得等待首个 Worker terminal 或 ACK");
+
+        controller
+            .base_source_read_complete(first_worker.0.clone(), first_worker.1.clone())
+            .await;
+        controller
+            .complete_base(first_worker.0, first_worker.1, md5, image_output())
+            .await;
+        for _ in 0..2 {
+            let worker = tokio::time::timeout(Duration::from_secs(1), started.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            controller
+                .base_source_read_complete(worker.0.clone(), worker.1.clone())
+                .await;
+            controller
+                .complete_base(worker.0, worker.1, md5, image_output())
+                .await;
+        }
+        let (result, shutdown) = join.take().expect("成功路径 join 必须存在").await.unwrap();
+        assert!(shutdown.is_ok());
+        let mut result = result.unwrap();
+        assert_eq!(result.manifest.resolved_files.len(), 3);
+        assert_eq!(handle.lookup_key_batch_sizes_for_test(), vec![1, 1, 1]);
         result.dispatcher.discard().unwrap();
         drop(handle);
         actor.finish().await.unwrap();

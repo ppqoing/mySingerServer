@@ -184,6 +184,8 @@ pub struct TaskFileDispatcher<Provider: TaskLanePermitProvider> {
     pending: BTreeMap<String, PendingPermit<Provider::Permit>>,
     /// 已登记但尚未取得 Media 许可的同身份续算意图；失败后保留以便重试。
     continuations: BTreeMap<TaskFileIdentity, TaskFileRecord>,
+    /// 每个 lane 当前未 ACK 的唯一任务身份；只允许同身份的 Media 续算越过该屏障。
+    in_flight_lanes: BTreeMap<String, TaskFileIdentity>,
     /// 已经消费过 Hash→Media 入口的身份，防止重复续算。
     continuation_claimed: BTreeSet<TaskFileIdentity>,
     observed_epoch: u64,
@@ -199,6 +201,7 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
             provider,
             pending: BTreeMap::new(),
             continuations: BTreeMap::new(),
+            in_flight_lanes: BTreeMap::new(),
             continuation_claimed: BTreeSet::new(),
             observed_epoch,
             publication_wait: None,
@@ -230,6 +233,7 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
         self.files.mark_completed(identity)?;
         self.continuations.remove(identity);
         self.continuation_claimed.remove(identity);
+        self.in_flight_lanes.retain(|_, active| active != identity);
         Ok(())
     }
 
@@ -239,6 +243,7 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
         self.files.mark_failed(identity)?;
         self.continuations.remove(identity);
         self.continuation_claimed.remove(identity);
+        self.in_flight_lanes.retain(|_, active| active != identity);
         Ok(())
     }
 
@@ -310,12 +315,16 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
         // 使调用方可以在保持 P 的前提下精确结束整个任务 run。
         self.continuations.remove(identity);
         self.continuation_claimed.remove(identity);
+        self.in_flight_lanes.retain(|_, active| active != identity);
         Ok(())
     }
 
     /// 删除本次运行创建的任务文件目录。
     pub fn discard(&mut self) -> io::Result<()> {
-        if !self.pending.is_empty() || !self.continuations.is_empty() {
+        if !self.pending.is_empty()
+            || !self.continuations.is_empty()
+            || !self.in_flight_lanes.is_empty()
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "仍有读取许可或续算请求在途，不能 discard 任务文件",
@@ -344,6 +353,38 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
     /// 返回任务文件集合是否已通过健康检查。
     pub fn health(&self) -> io::Result<()> {
         self.files.health()
+    }
+
+    /// 判断当前 admission 下是否存在可交付任务，供事件泵避开已知阻塞的轮询。
+    pub(crate) fn has_admitted_work(
+        &mut self,
+        admission: TaskDispatchAdmission,
+    ) -> Result<bool, TaskDispatchError> {
+        if self
+            .pending
+            .values()
+            .any(|pending| admission.allows(pending.class))
+        {
+            return Ok(true);
+        }
+        if admission.allow_media && !self.continuations.is_empty() {
+            return Ok(true);
+        }
+        for (lane, head) in self.files.lane_heads()? {
+            let key = self
+                .files
+                .lane_key(&lane)
+                .map_err(TaskDispatchError::File)?;
+            if let Some(active) = self.in_flight_lanes.get(&key)
+                && !self.continuations.contains_key(active)
+            {
+                continue;
+            }
+            if admission.allows(dispatch_class(&head.record)?) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// 异步等待并返回下一个已取得许可的任务。
@@ -470,6 +511,11 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
                 // 内部资源，任务文件仍保持 P，切回允许阶段时会按同一身份重试。
                 self.pending.remove(&key);
             }
+            if let Some(active) = self.in_flight_lanes.get(&key)
+                && !self.continuations.contains_key(active)
+            {
+                continue;
+            }
             let (identity, record, class, continuation) = if let Some((identity, record)) = self
                 .continuations
                 .iter()
@@ -592,6 +638,17 @@ impl<Provider: TaskLanePermitProvider> TaskFileDispatcher<Provider> {
                         };
                         (identity, record)
                     };
+                    if let Some(active) = self.in_flight_lanes.get(&key)
+                        && active != &identity
+                    {
+                        return Poll::Ready(Err(io::Error::other(
+                            "同一 lane 不能并发交付不同任务身份",
+                        )
+                        .into()));
+                    }
+                    self.in_flight_lanes
+                        .entry(key.clone())
+                        .or_insert_with(|| identity.clone());
                     return Poll::Ready(Ok(Some(DispatchedTask {
                         identity,
                         record,

@@ -132,13 +132,18 @@ where
 
         // Hash 和远端查询共用 hash_capacity；Media 只受独立 worker_capacity 限制。
         let allow_hash = hash.can_dispatch(options.hash_capacity)
-            && hash.active_len().saturating_add(remote_lookups.len()) < options.hash_capacity
-            // 已派发 Media 的同 lane P 行必须先等 SQLite ACK，避免越过原行读取后续 Hash。
-            && !media.has_active();
+            && hash.active_len().saturating_add(remote_lookups.len()) < options.hash_capacity;
         let allow_media = media.has_capacity(options.worker_capacity);
         let admission = TaskDispatchAdmission {
             allow_hash,
             allow_media,
+        };
+        let dispatch_ready = match pending.dispatcher.has_admitted_work(admission) {
+            Ok(ready) => ready,
+            Err(error) => {
+                failure = Some(format!("流式 dispatcher admission 检查失败: {error}"));
+                break;
+            }
         };
 
         tokio::select! {
@@ -225,7 +230,7 @@ where
                     }
                 }
             }
-            dispatch = pending.dispatcher.next_with_admission(cancellation.clone(), admission), if persist.is_empty() && (allow_hash || allow_media) => {
+            dispatch = pending.dispatcher.next_with_admission(cancellation.clone(), admission), if persist.is_empty() && dispatch_ready => {
                 match dispatch {
                     Ok(TaskDispatchPoll::Task(task)) => {
                         let identity = task.identity.clone();
@@ -412,7 +417,7 @@ where
     } = output;
     let mut local = input.local.clone();
     match result {
-        Ok(remote_record) if !malformed => {
+        Ok(remote_record) if *remote_available && !malformed => {
             if remote_record
                 .as_ref()
                 .is_some_and(|record| cache_rank(Some(record)) > cache_rank(local.as_ref()))
@@ -429,11 +434,13 @@ where
                     .map_err(|error| error.to_string())?;
             }
         }
-        Ok(_) => note_remote_failure(
+        Ok(_) if *remote_available => note_remote_failure(
             remote_available,
             warning,
             "远端内容缓存返回数量或内容键不一致".into(),
         ),
+        // 另一在途请求已经使本轮远端降级；必须只保留该项发起时的 SQLite 快照。
+        Ok(_) => {}
         Err(error) => note_remote_failure(
             remote_available,
             warning,
