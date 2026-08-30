@@ -73,6 +73,103 @@ pub(crate) struct TaskFileMediaFailure {
     pub(crate) worker_slot: Option<u32>,
 }
 
+/// 一条 Worker 终态；SQLite 写入与 TSV 状态迁移由持久化运行态继续处理。
+pub(super) enum TaskFileMediaTerminal {
+    /// Worker 返回了基础计算结果。
+    Completed(TaskFileMediaCompleted),
+    /// Worker 崩溃或违反事件顺序。
+    Failed(TaskFileMediaFailure),
+}
+
+/// Media Worker 的可逐事件推进运行态；读取 permit 仅在源文件读取结束后释放。
+pub(super) struct TaskFileMediaRuntime<P: TaskLanePermitProvider> {
+    /// 已提交给 WorkerPool、尚未收到终态事件的媒体项。
+    active: BTreeMap<TaskFileIdentity, ActiveMedia<P>>,
+    /// 本轮已经收到终态的身份，取消时用于归还 dispatcher 的 in-flight 所有权。
+    settled: BTreeSet<TaskFileIdentity>,
+}
+
+impl<P: TaskLanePermitProvider> TaskFileMediaRuntime<P> {
+    /// 创建没有已派发 Worker 的空运行态。
+    pub(super) fn new() -> Self {
+        Self {
+            active: BTreeMap::new(),
+            settled: BTreeSet::new(),
+        }
+    }
+
+    /// 返回当前 Worker 窗口是否还可以派发新的媒体项。
+    pub(super) fn has_capacity(&self, worker_capacity: usize) -> bool {
+        self.active.len() < worker_capacity
+    }
+
+    /// 返回是否仍有等待 Worker 事件的媒体项。
+    pub(super) fn has_active(&self) -> bool {
+        !self.active.is_empty()
+    }
+
+    /// 返回活动媒体项数，供单事件泵判断窗口占用。
+    pub(super) fn active_len(&self) -> usize {
+        self.active.len()
+    }
+
+    /// 把一个已领取的 Media 行转换为 Worker 请求并登记为活动项。
+    pub(super) async fn dispatch(
+        &mut self,
+        pending: &mut TaskFileBaseComputePending<P>,
+        task: crate::task_dispatch::DispatchedTask<P::Permit>,
+        worker_pool: &mut WorkerPool,
+        store: &BaseStoreHandle,
+        read_config: &DiskReadConfig,
+        cancellation: &ReadCancellationToken,
+    ) -> Result<(), String> {
+        let identity = task.identity.clone();
+        let work =
+            dispatch_media_task(pending, task, worker_pool, store, read_config, cancellation)
+                .await?;
+        if self.active.insert(identity, work).is_some() {
+            return Err("Media 运行态收到重复活动任务身份".into());
+        }
+        Ok(())
+    }
+
+    /// 消费恰好一个 Worker 事件；Started 和 SourceReadComplete 不产生终态。
+    pub(super) async fn handle_event(
+        &mut self,
+        event: WorkerEvent,
+        reporter: Option<&RuntimeTaskReporter>,
+    ) -> Result<Option<TaskFileMediaTerminal>, String> {
+        if let Some(reporter) = reporter {
+            report_media_event(&event, reporter, &self.active).await;
+        }
+        handle_media_event(event, &mut self.active, &mut self.settled)
+    }
+
+    /// 取消 Worker 并释放仍由活动项持有的 permit；调用方随后归还 dispatcher 所有权。
+    pub(super) async fn cancel_and_drain(
+        &mut self,
+        worker_pool: &WorkerPool,
+        cancellation: &ReadCancellationToken,
+    ) {
+        cancellation.cancel();
+        let run_ids = self
+            .active
+            .keys()
+            .map(|identity| identity.run_id().to_owned())
+            .collect::<BTreeSet<_>>();
+        for run_id in run_ids {
+            let _ = worker_pool.cancel_task(&run_id).await;
+        }
+        // 丢弃 ActiveMedia 时会释放尚未收到 SourceReadComplete 的读取 permit。
+        self.active.clear();
+    }
+
+    /// 返回已经收到终态的身份，供旧包装器在取消时归还 in-flight 行。
+    fn settled(&self) -> &BTreeSet<TaskFileIdentity> {
+        &self.settled
+    }
+}
+
 /// 一轮 Media 派发结果；C/F 迁移必须由后续持久化 ACK 驱动。
 pub(crate) struct MediaPassResult<P: TaskLanePermitProvider> {
     /// 继续拥有 dispatcher、上下文和清单的 pending。
@@ -236,22 +333,21 @@ where
                         // 运行时遥测是旁路投影，失败不能改变 Worker/任务文件主状态机。
                         report_media_event(&telemetry_event, reporter, &active).await;
                     }
-                    if let Err(message) = handle_media_event(
-                        event,
-                        &mut active,
-                        &mut settled,
-                        &mut completed,
-                        &mut file_failures,
-                    ) {
-                        return fail_media_pass(
-                            pending,
-                            worker_pool,
-                            cancellation,
-                            &mut active,
-                            &settled,
-                            message,
-                        )
-                        .await;
+                    match handle_media_event(event, &mut active, &mut settled) {
+                        Ok(Some(TaskFileMediaTerminal::Completed(item))) => completed.push(item),
+                        Ok(Some(TaskFileMediaTerminal::Failed(item))) => file_failures.push(item),
+                        Ok(None) => {}
+                        Err(message) => {
+                            return fail_media_pass(
+                                pending,
+                                worker_pool,
+                                cancellation,
+                                &mut active,
+                                &settled,
+                                message,
+                            )
+                            .await;
+                        }
                     }
                 } else {
                     return fail_media_pass(
@@ -271,19 +367,17 @@ where
                         let identity = task.identity.clone();
                         media_candidates = media_candidates.saturating_sub(1);
                         match dispatch_media_task(
-                            pending,
+                            &mut pending,
                             task,
                             worker_pool,
                             store,
                             read_config,
                             &cancellation,
                         ).await {
-                            Ok((next_pending, work)) => {
-                                pending = next_pending;
+                            Ok(work) => {
                                 active.insert(work.identity.clone(), work);
                             }
-                            Err((next_pending, message)) => {
-                                pending = next_pending;
+                            Err(message) => {
                                 let _ = pending.dispatcher.abandon_in_flight(&identity);
                                 return fail_media_pass(
                                     pending,
@@ -487,13 +581,13 @@ async fn report_media_event<P: TaskLanePermitProvider>(
 
 /// 把一项 dispatcher 任务转换为 V5 Media 请求并交给 WorkerPool。
 async fn dispatch_media_task<P>(
-    mut pending: TaskFileBaseComputePending<P>,
+    pending: &mut TaskFileBaseComputePending<P>,
     task: crate::task_dispatch::DispatchedTask<P::Permit>,
     worker_pool: &WorkerPool,
     store: &BaseStoreHandle,
     read_config: &DiskReadConfig,
     cancellation: &ReadCancellationToken,
-) -> Result<(TaskFileBaseComputePending<P>, ActiveMedia<P>), (TaskFileBaseComputePending<P>, String)>
+) -> Result<ActiveMedia<P>, String>
 where
     P: TaskLanePermitProvider,
 {
@@ -503,11 +597,11 @@ where
         || task.record.missing.needs_md5()
         || task.record.missing.base_missing_parts() == 0
     {
-        return Err((pending, "Media dispatcher 返回了无效基础任务行".into()));
+        return Err("Media dispatcher 返回了无效基础任务行".into());
     }
     let identity = task.identity.clone();
     let Some(mut context) = pending.contexts.get(&identity).cloned() else {
-        return Err((pending, "Media 任务缺少对应内存上下文".into()));
+        return Err("Media 任务缺少对应内存上下文".into());
     };
     let md5 = task
         .record
@@ -523,19 +617,16 @@ where
         .as_ref()
         .is_some_and(|cached| cached.content_key != expected_key)
     {
-        return Err((pending, "Media 缓存上下文 ContentKey 与任务行不一致".into()));
+        return Err("Media 缓存上下文 ContentKey 与任务行不一致".into());
     }
     // 每个 Media 行都幂等补写当前位置；context 中的 content_id 只是快照，不能代替
     // 本次路径归属写入，否则 Hash 命中旧内容后换路径会漏掉 files 行。
     let content = match store.upsert_content_and_location(&task.record.scanned, md5, media_kind) {
         Ok(content) => content,
-        Err(error) => return Err((pending, format!("Media 内容位置写入失败: {error}"))),
+        Err(error) => return Err(format!("Media 内容位置写入失败: {error}")),
     };
     if content.key != expected_key {
-        return Err((
-            pending,
-            "Media Store 返回的 ContentKey 与任务行不一致".into(),
-        ));
+        return Err("Media Store 返回的 ContentKey 与任务行不一致".into());
     }
     context.content_id = Some(content.id);
     if let Some(cached) = context.cached.as_mut() {
@@ -581,20 +672,17 @@ where
         .dispatch_scan(command, cancellation.clone(), true, worker_identity.clone())
         .await
     {
-        return Err((pending, format!("Media Worker 派发失败: {error}")));
+        return Err(format!("Media Worker 派发失败: {error}"));
     }
-    Ok((
-        pending,
-        ActiveMedia {
-            identity,
-            record: task.record,
-            context,
-            permit: Some(task.permit),
-            worker_slot: None,
-            source_read_complete: false,
-            worker_identity,
-        },
-    ))
+    Ok(ActiveMedia {
+        identity,
+        record: task.record,
+        context,
+        permit: Some(task.permit),
+        worker_slot: None,
+        source_read_complete: false,
+        worker_identity,
+    })
 }
 
 /// 处理一条 Worker 事件；外部任务/身份不匹配时完全不触碰当前资源。
@@ -602,9 +690,7 @@ fn handle_media_event(
     event: WorkerEvent,
     active: &mut BTreeMap<TaskFileIdentity, ActiveMedia<impl TaskLanePermitProvider>>,
     settled: &mut BTreeSet<TaskFileIdentity>,
-    completed: &mut Vec<TaskFileMediaCompleted>,
-    file_failures: &mut Vec<TaskFileMediaFailure>,
-) -> Result<(), String> {
+) -> Result<Option<TaskFileMediaTerminal>, String> {
     match event {
         WorkerEvent::Started {
             task_id,
@@ -614,13 +700,13 @@ fn handle_media_event(
             ..
         } => {
             let Some(key) = find_active_identity(active, &task_id, &item_id) else {
-                return Ok(());
+                return Ok(None);
             };
             let Some(work) = active.get_mut(&key) else {
-                return Ok(());
+                return Ok(None);
             };
             if !same_worker_identity(&work.worker_identity, &identity, true) {
-                return Ok(());
+                return Ok(None);
             }
             work.worker_slot = Some(slot);
         }
@@ -631,10 +717,10 @@ fn handle_media_event(
             ..
         } => {
             let Some(key) = find_active_identity(active, &task_id, &item_id) else {
-                return Ok(());
+                return Ok(None);
             };
             let Some(work) = active.get_mut(&key) else {
-                return Ok(());
+                return Ok(None);
             };
             if work.worker_slot == Some(slot) {
                 work.source_read_complete = true;
@@ -647,29 +733,29 @@ fn handle_media_event(
             response,
         } => {
             let Some(key) = find_active_identity(active, &task_id, &item_id) else {
-                return Ok(());
+                return Ok(None);
             };
             let Some(work) = active.remove(&key) else {
-                return Ok(());
+                return Ok(None);
             };
             settled.insert(key.clone());
             let worker_slot = work.worker_slot;
             if !work.source_read_complete {
-                file_failures.push(TaskFileMediaFailure {
+                return Ok(Some(TaskFileMediaTerminal::Failed(TaskFileMediaFailure {
                     identity: work.identity,
                     record: work.record,
                     context: work.context,
                     message: "Worker Completed 前未收到 BaseSourceReadComplete".into(),
                     worker_slot,
-                });
+                })));
             } else {
-                completed.push(TaskFileMediaCompleted {
+                return Ok(Some(TaskFileMediaTerminal::Completed(TaskFileMediaCompleted {
                     identity: work.identity,
                     record: work.record,
                     context: work.context,
                     response,
                     worker_slot,
-                });
+                })));
             }
         }
         WorkerEvent::Crashed {
@@ -680,23 +766,23 @@ fn handle_media_event(
             ..
         } => {
             let Some(key) = find_active_identity(active, &task_id, &item_id) else {
-                return Ok(());
+                return Ok(None);
             };
             let Some(work) = active.get(&key) else {
-                return Ok(());
+                return Ok(None);
             };
             if !same_worker_identity(&work.worker_identity, &identity, false) {
-                return Ok(());
+                return Ok(None);
             }
             let work = active.remove(&key).expect("上方已确认活动项存在");
             settled.insert(key);
-            file_failures.push(TaskFileMediaFailure {
+            return Ok(Some(TaskFileMediaTerminal::Failed(TaskFileMediaFailure {
                 identity: work.identity,
                 record: work.record,
                 context: work.context,
                 message,
                 worker_slot: work.worker_slot,
-            });
+            })));
         }
         WorkerEvent::InfrastructureFailure { message } => {
             return Err(format!("Worker 基础设施失败: {message}"));
@@ -710,7 +796,7 @@ fn handle_media_event(
         // 当前基础媒体状态机不消费二筛源读取事件，事件本身已由 Pool 保持非终态所有权。
         | WorkerEvent::Stage2SourceReadComplete { .. } => {}
     }
-    Ok(())
+    Ok(None)
 }
 
 /// 按 Worker 事件的 run/item 找到当前活动身份。
@@ -856,6 +942,7 @@ mod tests {
         ContentKey, DiskReadConfig, DisplayPath, LocationKey, MachineId, MediaKind, NormalizedPath,
     };
     use dedup_node_store::{BaseCacheRecord, NodeStore, ScannedPath};
+    use dedup_protocol::proto;
     use dedup_windows::{LocalDiskKind, PhysicalDiskId, ReadCancellationToken};
 
     use crate::{
@@ -865,14 +952,16 @@ mod tests {
             PlannedScannedPath, ReadProduct, TaskDiskLane,
         },
         task_dispatch::{TaskFileDispatcher, TaskLanePermitFuture, TaskLanePermitProvider},
-        task_files::TransientTaskFileSet,
+        task_files::{
+            TaskFileIdentity, TaskFileRecord, TaskWorkKind, TaskWorkMask, TransientTaskFileSet,
+        },
         worker::{BaseComputeOutput, WorkerPool},
     };
 
     use super::super::task_file_base_compute::run_task_file_base_compute;
     use super::{
-        ActiveMedia, WorkerEvent, WorkerFileIdentity, handle_media_event, physical_disk_display,
-        run_task_file_media_compute,
+        ActiveMedia, TaskFileMediaRuntime, TaskFileMediaTerminal, WorkerEvent, WorkerFileIdentity,
+        handle_media_event, physical_disk_display, run_task_file_media_compute,
     };
 
     const RUN_ID: &str = "01900000-0000-7000-8000-000000000202";
@@ -1012,6 +1101,108 @@ mod tests {
             stage1_frames: None,
             contact_sheet_jpeg: None,
         }
+    }
+
+    #[tokio::test]
+    async fn media_runtime_handles_started_source_complete_and_terminal_separately() {
+        let live = Arc::new(AtomicIsize::new(1));
+        let lane = lane(7);
+        let missing = TaskWorkMask::for_base(false, 1).unwrap();
+        let item_id = uuid::Uuid::parse_str("01900000-0000-7000-8000-000000000221").unwrap();
+        let identity = TaskFileIdentity::new(RUN_ID, &lane, item_id, 0, 80, missing).unwrap();
+        let record = TaskFileRecord {
+            item_id,
+            work_kind: TaskWorkKind::Base,
+            scanned: scanned(r"C:\runtime-media.bin", 32),
+            known_md5: Some([0x51; 16]),
+            missing,
+        };
+        let worker_identity = WorkerFileIdentity {
+            machine_id: MachineId::from_sha256([0x52; 32]),
+            normalized_path: record.scanned.normalized_path.clone(),
+            display_path: record.scanned.display_path.clone(),
+            file_size: record.scanned.file_size,
+            stage: "base_compute".into(),
+            physical_disk_id: physical_disk_display(&lane),
+        };
+        let mut runtime = TaskFileMediaRuntime::<TestProvider>::new();
+        runtime.active.insert(
+            identity.clone(),
+            ActiveMedia {
+                identity: identity.clone(),
+                record,
+                context: super::super::TaskFileBaseContext {
+                    lane,
+                    content_id: None,
+                    cached: None,
+                    contact_sheet_valid: true,
+                    force_recompute: false,
+                },
+                permit: Some(TrackedPermit {
+                    live: Arc::clone(&live),
+                }),
+                worker_slot: None,
+                source_read_complete: false,
+                worker_identity: worker_identity.clone(),
+            },
+        );
+
+        assert!(
+            runtime
+                .handle_event(
+                    WorkerEvent::Started {
+                        task_id: identity.run_id().into(),
+                        item_id: identity.item_id().to_string(),
+                        identity: worker_identity,
+                        slot: 3,
+                        process_id: None,
+                        cpu_weight: 1,
+                        decoder_threads: Some(1),
+                        queue_wait_us: 0,
+                    },
+                    None,
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(runtime.active_len(), 1);
+        assert_eq!(live.load(Ordering::SeqCst), 1);
+
+        assert!(
+            runtime
+                .handle_event(
+                    WorkerEvent::BaseSourceReadComplete {
+                        task_id: identity.run_id().into(),
+                        item_id: identity.item_id().to_string(),
+                        slot: 3,
+                        request_elapsed_us: None,
+                    },
+                    None,
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(runtime.active_len(), 1);
+        assert_eq!(live.load(Ordering::SeqCst), 0);
+
+        let terminal = runtime
+            .handle_event(
+                WorkerEvent::Completed {
+                    task_id: identity.run_id().into(),
+                    item_id: identity.item_id().to_string(),
+                    response: proto::WorkerEnvelope { payload: None },
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            terminal,
+            Some(TaskFileMediaTerminal::Completed(_))
+        ));
+        assert_eq!(runtime.active_len(), 0);
     }
 
     #[tokio::test]
@@ -1496,8 +1687,6 @@ mod tests {
             },
         )]);
         let mut settled = BTreeSet::new();
-        let mut completed = Vec::new();
-        let mut failures = Vec::new();
         let mismatch = WorkerFileIdentity {
             physical_disk_id: "PhysicalDisk999".into(),
             ..expected_worker_identity.clone()
@@ -1515,8 +1704,6 @@ mod tests {
             },
             &mut active,
             &mut settled,
-            &mut completed,
-            &mut failures,
         )
         .unwrap();
         handle_media_event(
@@ -1528,8 +1715,6 @@ mod tests {
             },
             &mut active,
             &mut settled,
-            &mut completed,
-            &mut failures,
         )
         .unwrap();
         assert_eq!(live.load(Ordering::SeqCst), 1);
@@ -1546,8 +1731,6 @@ mod tests {
             },
             &mut active,
             &mut settled,
-            &mut completed,
-            &mut failures,
         )
         .unwrap();
         handle_media_event(
@@ -1559,8 +1742,6 @@ mod tests {
             },
             &mut active,
             &mut settled,
-            &mut completed,
-            &mut failures,
         )
         .unwrap();
         assert_eq!(live.load(Ordering::SeqCst), 0);

@@ -26,8 +26,8 @@ use crate::{
         BasePersistSendError, BaseStoreHandle,
     },
     task_dispatch::{
-        TaskDispatchAdmission, TaskDispatchBlockReason, TaskDispatchError, TaskDispatchPoll,
-        TaskLanePermitProvider,
+        DispatchedTask, TaskDispatchAdmission, TaskDispatchBlockReason, TaskDispatchError,
+        TaskDispatchPoll, TaskLanePermitProvider,
     },
     task_files::{TaskFileIdentity, TaskFileRecord, TaskWorkMask},
 };
@@ -110,15 +110,110 @@ struct HashedTask {
 }
 
 /// 一个并发 Hash future 的顺序化结果；JoinSet 完成顺序不代表任务文件顺序。
-struct HashReadOutcome {
+pub(super) struct HashReadOutcome {
     /// dispatcher 交付任务时分配的单调序号。
-    sequence: usize,
+    pub(super) sequence: usize,
     /// 读取任务的完整文件身份。
-    identity: TaskFileIdentity,
+    pub(super) identity: TaskFileIdentity,
     /// 读取任务的原始行记录。
-    record: TaskFileRecord,
+    pub(super) record: TaskFileRecord,
     /// 读取结果；成功读取在 future 内已释放 dispatcher 交付的 permit。
-    result: Result<[u8; 16], ReadFailure>,
+    pub(super) result: Result<[u8; 16], ReadFailure>,
+}
+
+/// Hash 读取的可逐项推进运行态；每次只交付一个已经结束的读取结果。
+pub(super) struct TaskFileHashRuntime {
+    /// 正在读取的 Hash future；拥有 permit 直到读取 future 释放它。
+    reads: JoinSet<HashReadOutcome>,
+    /// 尚未由 dispatcher 领取的 Hash 行数。
+    unclaimed_rows: usize,
+    /// 为完成顺序无关的后续批处理分配稳定序号。
+    next_sequence: usize,
+}
+
+impl TaskFileHashRuntime {
+    /// 用当前未领取的 Hash 行数量创建空运行态。
+    pub(super) fn new(remaining_hash_rows: usize) -> Self {
+        Self {
+            reads: JoinSet::new(),
+            unclaimed_rows: remaining_hash_rows,
+            next_sequence: 0,
+        }
+    }
+
+    /// 返回当前窗口能否再领取一条 Hash 读取任务。
+    pub(super) fn can_dispatch(&self, hash_capacity: usize) -> bool {
+        self.unclaimed_rows > 0 && self.reads.len() < hash_capacity
+    }
+
+    /// 启动一个已领取的 Hash 读取，并把读取 permit 的释放限制在 future 内。
+    pub(super) fn spawn<P, H>(
+        &mut self,
+        task: DispatchedTask<P>,
+        reader: H,
+        cancellation: ReadCancellationToken,
+    ) -> Result<(), String>
+    where
+        P: Send + 'static,
+        H: HashPermitReader<Permit = P>,
+    {
+        if self.unclaimed_rows == 0 {
+            return Err("Hash 运行态没有可领取的任务行".into());
+        }
+        if task.record.known_md5.is_some() || !task.record.missing.needs_md5() {
+            return Err("Hash 运行态收到非 Hash 任务行".into());
+        }
+        self.unclaimed_rows -= 1;
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
+        let identity = task.identity;
+        let record = task.record;
+        let scanned = record.scanned.clone();
+        self.reads.spawn(async move {
+            let result = reader
+                .read_with_permit(scanned, task.permit, cancellation, None)
+                .await
+                .map(|product| {
+                    let md5 = product.md5;
+                    // Hash 完成即释放读取许可，SQLite 查询和 ACK 不占据磁盘窗口。
+                    drop(product.lease);
+                    md5
+                });
+            HashReadOutcome {
+                sequence,
+                identity,
+                record,
+                result,
+            }
+        });
+        Ok(())
+    }
+
+    /// 等待并返回恰好一条 Hash 读取结果，不会排空其它已在窗口内的 future。
+    pub(super) async fn join_one(&mut self) -> Result<HashReadOutcome, String> {
+        let joined = self
+            .reads
+            .join_next()
+            .await
+            .ok_or_else(|| "Hash 运行态没有在途读取".to_owned())?;
+        joined.map_err(|error| format!("Hash 读取 future 异常结束: {error}"))
+    }
+
+    /// 返回仍在读取窗口内的 future 数量。
+    pub(super) fn active_len(&self) -> usize {
+        self.reads.len()
+    }
+
+    /// 所有 Hash 行均已领取并且所有读取 future 都已结束。
+    pub(super) fn is_finished(&self) -> bool {
+        self.unclaimed_rows == 0 && self.reads.is_empty()
+    }
+
+    /// 中止并回收所有在途读取，确保 permit 在返回前已经释放。
+    pub(super) async fn cancel_and_join(&mut self) {
+        self.reads.abort_all();
+        while self.reads.join_next().await.is_some() {}
+    }
 }
 
 /// 已投递但尚未收到 SQLite ACK 的持久化动作。
@@ -844,7 +939,10 @@ mod tests {
     use dedup_core::{ContentKey, DisplayPath, MachineId, MediaKind, NormalizedPath};
     use dedup_node_store::{BaseCacheRecord, NodeStore, ScannedPath};
     use dedup_windows::{LocalDiskKind, PhysicalDiskId, ReadCancellationToken};
-    use tokio::sync::Barrier;
+    use tokio::{
+        sync::{Barrier, Notify},
+        time::timeout,
+    };
 
     use crate::{
         RemoteCacheError, RemoteFeatureCache,
@@ -854,13 +952,18 @@ mod tests {
             PlannedScannedPath, ReadProduct, TaskDiskLane,
         },
         task_dispatch::{
-            TaskDispatchBlockReason, TaskFileDispatcher, TaskLanePermitFuture,
+            DispatchedTask, TaskDispatchBlockReason, TaskFileDispatcher, TaskLanePermitFuture,
             TaskLanePermitProvider,
         },
-        task_files::TransientTaskFileSet,
+        task_files::{
+            TaskFileIdentity, TaskFileRecord, TaskWorkKind, TaskWorkMask, TransientTaskFileSet,
+        },
     };
 
-    use super::{TaskFileBaseComputePending, run_task_file_base_compute, run_task_file_hash_pass};
+    use super::{
+        TaskFileBaseComputePending, TaskFileHashRuntime, run_task_file_base_compute,
+        run_task_file_hash_pass,
+    };
 
     const RUN_ID: &str = "01900000-0000-7000-8000-000000000101";
 
@@ -976,6 +1079,106 @@ mod tests {
                 })
             })
         }
+    }
+
+    /// 一个首项立即完成、次项等待显式放行的 Hash 读取器。
+    #[derive(Clone)]
+    struct GatedHashReader {
+        /// 次项等待的测试门闩。
+        gate: Arc<Notify>,
+    }
+
+    impl HashPermitReader for GatedHashReader {
+        type Permit = TestPermit;
+
+        fn read_with_permit(
+            &self,
+            scanned: ScannedPath,
+            permit: Self::Permit,
+            cancellation: ReadCancellationToken,
+            _started: Option<crate::scan::HashReadStartedSignal>,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<ReadProduct<Self::Permit>, ReadFailure>>
+                    + Send
+                    + 'static,
+            >,
+        > {
+            let first = scanned
+                .normalized_path
+                .as_str()
+                .to_ascii_lowercase()
+                .ends_with("runtime-first.bin");
+            let gate = Arc::clone(&self.gate);
+            Box::pin(async move {
+                if first {
+                    return Ok(ReadProduct {
+                        md5: [0x41; 16],
+                        lease: permit,
+                    });
+                }
+                loop {
+                    if cancellation.is_cancelled() {
+                        let _ = permit;
+                        return Err(ReadFailure::Cancelled);
+                    }
+                    tokio::select! {
+                        _ = gate.notified() => return Ok(ReadProduct { md5: [0x42; 16], lease: permit }),
+                        _ = tokio::time::sleep(Duration::from_millis(2)) => {}
+                    }
+                }
+            })
+        }
+    }
+
+    /// 构造两条已经领取的 Hash 行，验证运行态不会为了第一条结果排空整个窗口。
+    fn two_dispatched_hash_tasks() -> (DispatchedTask<TestPermit>, DispatchedTask<TestPermit>) {
+        let lane = lane();
+        let missing = TaskWorkMask::for_base(true, 0).expect("Hash 行必须携带 needs_md5");
+        let first_item = uuid::Uuid::parse_str("01900000-0000-7000-8000-000000000111").unwrap();
+        let second_item = uuid::Uuid::parse_str("01900000-0000-7000-8000-000000000112").unwrap();
+        let task = |item_id, offset, path| DispatchedTask {
+            identity: TaskFileIdentity::new(RUN_ID, &lane, item_id, offset, 80, missing).unwrap(),
+            record: TaskFileRecord {
+                item_id,
+                work_kind: TaskWorkKind::Base,
+                scanned: scanned(path, 16),
+                known_md5: None,
+                missing,
+            },
+            class: DiskReadClass::HashSequential,
+            permit: TestPermit,
+            continuation: false,
+        };
+        (
+            task(first_item, 0, r"C:\runtime-first.bin"),
+            task(second_item, 80, r"C:\runtime-second.bin"),
+        )
+    }
+
+    #[tokio::test]
+    async fn hash_runtime_returns_one_ready_item_without_draining_window() {
+        let gate = Arc::new(Notify::new());
+        let mut runtime = TaskFileHashRuntime::new(2);
+        let (first, second) = two_dispatched_hash_tasks();
+        let reader = GatedHashReader {
+            gate: Arc::clone(&gate),
+        };
+        runtime
+            .spawn(first, reader.clone(), ReadCancellationToken::new())
+            .unwrap();
+        runtime
+            .spawn(second, reader, ReadCancellationToken::new())
+            .unwrap();
+
+        let first = timeout(Duration::from_secs(1), runtime.join_one())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.result.unwrap(), [0x41; 16]);
+        assert_eq!(runtime.active_len(), 1);
+        gate.notify_waiters();
+        runtime.cancel_and_join().await;
     }
 
     /// 让两个真实 Hash future 在释放前都进入读取，用于验证显式并发上限。

@@ -11,7 +11,7 @@ use std::{
 
 use dedup_core::{ContentKey, MediaKind};
 use dedup_media::decode_contact_sheet;
-use dedup_node_store::{FileFaultKind, FileFaultRecord, ResolvedScanFile};
+use dedup_node_store::{FileFaultKind, FileFaultRecord, ResolvedScanFile, ScannedPath};
 use dedup_protocol::{
     BASE_MISSING_CONTACT_SHEET, BASE_MISSING_PROBE, BASE_MISSING_STAGE1, proto::worker_envelope,
 };
@@ -23,12 +23,15 @@ use super::{
         BasePersistSendError, BaseStoreHandle,
     },
     task_file_base_compute::TaskFileBaseComputePending,
-    task_file_media_compute::{MediaPassResult, TaskFileMediaCompleted, TaskFileMediaFailure},
+    task_file_media_compute::{
+        MediaPassResult, TaskFileMediaCompleted, TaskFileMediaFailure, TaskFileMediaTerminal,
+    },
 };
 use crate::{
     artifact_registry::RegenerableArtifactRegistry,
     contact_sheet_cache::ContactSheetCacheEntry,
     disk_full_cleanup::DiskFullCleaner,
+    io::ReadFailure,
     task_dispatch::TaskLanePermitProvider,
     task_files::TaskFileIdentity,
     worker::{BaseComputeOutput, Stage1Frame, Stage1Output, decode_base_compute_payload},
@@ -117,6 +120,358 @@ struct PendingMediaPersist {
     action: MediaPersistAction,
 }
 
+/// 一个尚未写入 SQLite 或尚未收到 ACK 的通用任务文件持久化消息。
+struct PendingTaskFilePersist {
+    /// 消息对应的完整任务文件身份。
+    identity: TaskFileIdentity,
+    /// 仍由队列持有的 SQLite actor 消息。
+    message: BasePersistMessage,
+    /// 收到匹配 ACK 后才应用的 TSV 状态迁移。
+    action: TaskFilePersistAction,
+}
+
+/// 单条 SQLite ACK 成功后允许执行的任务文件状态迁移。
+enum TaskFilePersistAction {
+    /// Hash 命中完整缓存并已提交当前位置。
+    HashComplete {
+        /// 当前扫描路径，确认后加入 resolved 清单。
+        scanned: ScannedPath,
+        /// 当前路径绑定的内容键。
+        content_key: ContentKey,
+    },
+    /// Hash 读取失败并已写入故障诊断。
+    HashFailed,
+    /// Worker Media 结果已提交基础字段。
+    MediaComplete {
+        /// 当前扫描路径，确认后加入 resolved 清单。
+        scanned: ScannedPath,
+        /// 当前路径绑定的内容键。
+        content_key: ContentKey,
+        /// Worker 结果确认的媒体类型。
+        media_kind: MediaKind,
+        /// Worker 槽位必须由 ACK 原样回显。
+        worker_slot: Option<u32>,
+    },
+    /// Worker Media 失败已写入故障诊断。
+    MediaFailed {
+        /// 显示路径用于拒绝串项 ACK。
+        display_path: String,
+        /// Worker 槽位必须由 ACK 原样回显。
+        worker_slot: Option<u32>,
+    },
+}
+
+/// 任务文件 SQLite 持久化的可逐 ACK 推进运行态。
+pub(super) struct TaskFilePersistRuntime {
+    /// 尚未投递到有界 SQLite actor 队列的消息。
+    queue: VecDeque<PendingTaskFilePersist>,
+    /// 已投递、必须等待精确 ACK 后才迁移 TSV 的动作。
+    in_flight: BTreeMap<TaskFileIdentity, TaskFilePersistAction>,
+}
+
+impl TaskFilePersistRuntime {
+    /// 创建没有待投递或在途 SQLite 操作的运行态。
+    pub(super) fn new() -> Self {
+        Self {
+            queue: VecDeque::new(),
+            in_flight: BTreeMap::new(),
+        }
+    }
+
+    /// 排入一个完整缓存命中的 Hash 成功动作；ACK 前任务行仍是 P。
+    pub(super) fn enqueue_hash_complete(
+        &mut self,
+        identity: TaskFileIdentity,
+        scanned: ScannedPath,
+        md5: [u8; 16],
+        media_kind: MediaKind,
+        content_key: ContentKey,
+    ) {
+        let operation_scanned = scanned.clone();
+        let message = BasePersistMessage::new_task_file(identity.clone(), move |store| {
+            store
+                .upsert_content_and_location(&operation_scanned, md5, media_kind)
+                .map(|_| BasePersistOutcome::Succeeded {
+                    worker_slot: None,
+                    cache_hit: true,
+                    media_kind,
+                    file_size: operation_scanned.file_size,
+                })
+                .map_err(|error| error.to_string())
+        });
+        self.queue.push_back(PendingTaskFilePersist {
+            identity,
+            message,
+            action: TaskFilePersistAction::HashComplete {
+                scanned,
+                content_key,
+            },
+        });
+    }
+
+    /// 排入一个 Hash 读取失败动作；故障写入与失败 ACK 使用同一 SQLite 操作。
+    pub(super) fn enqueue_hash_failure(
+        &mut self,
+        identity: TaskFileIdentity,
+        scanned: ScannedPath,
+        error: ReadFailure,
+    ) {
+        let message_text = error.to_string();
+        let fault_normalized_path = scanned.normalized_path.clone();
+        let fault_display_path = scanned.display_path.clone();
+        let fault_file_size = scanned.file_size;
+        let (windows_error_code, read_offset, read_size) = match error {
+            ReadFailure::SuspectedPhysical {
+                block_offset,
+                block_len,
+                raw_os_error,
+                ..
+            } => (raw_os_error, Some(block_offset), Some(block_len as u64)),
+            ReadFailure::Io {
+                block_offset,
+                source,
+                ..
+            } => (source.raw_os_error(), Some(block_offset), None),
+            ReadFailure::Cancelled => (None, None, None),
+        };
+        let fault_message = message_text.clone();
+        let fault_seen_at_ms = now_ms();
+        let display_path = scanned
+            .display_path
+            .as_path()
+            .to_string_lossy()
+            .into_owned();
+        let operation_display_path = display_path.clone();
+        let operation_message = message_text;
+        let message = BasePersistMessage::new_task_file(identity.clone(), move |store| {
+            store
+                .upsert_file_fault(&FileFaultRecord {
+                    machine_id: store.machine_id().clone(),
+                    normalized_path: fault_normalized_path,
+                    display_path: fault_display_path,
+                    file_size: fault_file_size,
+                    kind: FileFaultKind::SuspectedPhysicalRead,
+                    stage: "base".to_owned(),
+                    windows_error_code,
+                    read_offset,
+                    read_size,
+                    worker_pid: None,
+                    worker_exit_code: None,
+                    first_seen_at_ms: fault_seen_at_ms,
+                    last_seen_at_ms: fault_seen_at_ms,
+                    occurrence_count: 1,
+                    message: fault_message,
+                })
+                .map_err(|error| error.to_string())?;
+            Ok(BasePersistOutcome::Failed {
+                display_path: operation_display_path,
+                message: operation_message,
+                worker_slot: None,
+                skipped_incomplete: false,
+            })
+        });
+        self.queue.push_back(PendingTaskFilePersist {
+            identity,
+            message,
+            action: TaskFilePersistAction::HashFailed,
+        });
+    }
+
+    /// 把一条 Media Worker 终态转换为单条 SQLite 操作，尚不迁移 TSV。
+    pub(super) fn enqueue_media_terminal(
+        &mut self,
+        terminal: TaskFileMediaTerminal,
+        options: &TaskFileMediaPersistenceOptions,
+    ) -> Result<(), String> {
+        let PendingMediaPersist {
+            identity,
+            message,
+            action,
+        } = match terminal {
+            TaskFileMediaTerminal::Completed(item) => build_completed_message(item, options),
+            TaskFileMediaTerminal::Failed(item) => build_failure_message(item),
+        };
+        let action = match action {
+            MediaPersistAction::Complete {
+                scanned,
+                content_key,
+                media_kind,
+                worker_slot,
+            } => TaskFilePersistAction::MediaComplete {
+                scanned,
+                content_key,
+                media_kind,
+                worker_slot,
+            },
+            MediaPersistAction::Failed {
+                display_path,
+                worker_slot,
+            } => TaskFilePersistAction::MediaFailed {
+                display_path,
+                worker_slot,
+            },
+        };
+        if self
+            .queue
+            .iter()
+            .any(|pending| pending.identity == identity)
+            || self.in_flight.contains_key(&identity)
+        {
+            return Err("持久化运行态收到重复任务文件身份".into());
+        }
+        self.queue.push_back(PendingTaskFilePersist {
+            identity,
+            message,
+            action,
+        });
+        Ok(())
+    }
+
+    /// 尽可能投递消息；有界队列满时保留消息，等待外部事件泵先交付 ACK。
+    pub(super) fn try_submit(&mut self, store: &BaseStoreHandle) -> Result<(), String> {
+        while let Some(mut pending) = self.queue.pop_front() {
+            if self.in_flight.contains_key(&pending.identity) {
+                return Err("持久化运行态存在重复在途身份".into());
+            }
+            match store.try_persist(pending.message) {
+                Ok(()) => {
+                    self.in_flight.insert(pending.identity, pending.action);
+                }
+                Err(BasePersistSendError::Full(message)) => {
+                    pending.message = message;
+                    self.queue.push_front(pending);
+                    return Ok(());
+                }
+                Err(BasePersistSendError::Closed(_)) => {
+                    return Err("基础持久化 actor 已关闭".into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 返回是否还有已经投递但等待 SQLite ACK 的动作。
+    pub(super) fn has_in_flight(&self) -> bool {
+        !self.in_flight.is_empty()
+    }
+
+    /// 返回待投递和在途操作是否都已经清空。
+    pub(super) fn is_empty(&self) -> bool {
+        self.queue.is_empty() && self.in_flight.is_empty()
+    }
+
+    /// 应用一条精确 SQLite ACK；只有成功匹配后才把对应 TSV 行改为 C/F。
+    pub(super) fn apply_ack<P: TaskLanePermitProvider>(
+        &mut self,
+        pending: &mut TaskFileBaseComputePending<P>,
+        ack: BasePersistAck,
+    ) -> Result<(), String> {
+        let identity = match ack.identity {
+            BasePersistIdentity::TaskFile(identity) => identity,
+            BasePersistIdentity::Legacy(_) => return Err("任务文件收到旧任务表持久化 ACK".into()),
+        };
+        let action = self
+            .in_flight
+            .remove(&identity)
+            .ok_or_else(|| "持久化运行态收到未知 ACK".to_owned())?;
+        match (action, ack.result?) {
+            (
+                TaskFilePersistAction::HashComplete {
+                    scanned,
+                    content_key,
+                },
+                BasePersistOutcome::Succeeded { .. },
+            ) => {
+                pending
+                    .dispatcher
+                    .mark_completed(&identity)
+                    .map_err(|error| error.to_string())?;
+                pending.contexts.remove(&identity);
+                pending.manifest.resolved_files.push(ResolvedScanFile {
+                    scanned,
+                    content: content_key,
+                });
+                pending.manifest.resolved_files.sort_by(|left, right| {
+                    left.scanned
+                        .normalized_path
+                        .cmp(&right.scanned.normalized_path)
+                });
+                pending.manifest.cache_hits += 1;
+            }
+            (TaskFilePersistAction::HashFailed, BasePersistOutcome::Failed { .. }) => {
+                pending
+                    .dispatcher
+                    .mark_failed(&identity)
+                    .map_err(|error| error.to_string())?;
+                pending.contexts.remove(&identity);
+            }
+            (
+                TaskFilePersistAction::MediaComplete {
+                    scanned,
+                    content_key,
+                    media_kind,
+                    worker_slot,
+                },
+                BasePersistOutcome::Succeeded {
+                    worker_slot: ack_slot,
+                    cache_hit,
+                    media_kind: ack_kind,
+                    file_size,
+                },
+            ) if ack_slot == worker_slot
+                && !cache_hit
+                && ack_kind == media_kind
+                && file_size == scanned.file_size =>
+            {
+                pending
+                    .dispatcher
+                    .mark_completed(&identity)
+                    .map_err(|error| error.to_string())?;
+                pending.contexts.remove(&identity);
+                pending.manifest.resolved_files.push(ResolvedScanFile {
+                    scanned,
+                    content: content_key,
+                });
+                pending.manifest.resolved_files.sort_by(|left, right| {
+                    left.scanned
+                        .normalized_path
+                        .cmp(&right.scanned.normalized_path)
+                });
+            }
+            (
+                TaskFilePersistAction::MediaFailed {
+                    display_path,
+                    worker_slot,
+                },
+                BasePersistOutcome::Failed {
+                    display_path: ack_path,
+                    worker_slot: ack_slot,
+                    skipped_incomplete: false,
+                    ..
+                },
+            ) if ack_path == display_path && ack_slot == worker_slot => {
+                pending
+                    .dispatcher
+                    .mark_failed(&identity)
+                    .map_err(|error| error.to_string())?;
+                pending.contexts.remove(&identity);
+            }
+            (_, BasePersistOutcome::Ignored) => return Err("任务文件持久化 ACK 被忽略".into()),
+            (_, BasePersistOutcome::Cancelled { .. }) => {
+                return Err("任务文件持久化 ACK 被取消".into());
+            }
+            _ => return Err("任务文件持久化 ACK 类型或字段不匹配".into()),
+        }
+        Ok(())
+    }
+
+    /// 取消流程放弃尚未确认的本地动作，保持这些 TSV 行为 P。
+    pub(super) fn drop_unacknowledged(&mut self) {
+        self.queue.clear();
+        self.in_flight.clear();
+    }
+}
+
 /// Media 结果校验后得到的可持久化动作。
 enum PreparedMediaResult {
     /// 校验通过，稍后在 actor 中加载缓存并提交 taskless stage1。
@@ -152,7 +507,7 @@ where
         file_failures,
         ..
     } = media;
-    let mut queue = VecDeque::new();
+    let mut runtime = TaskFilePersistRuntime::new();
     let mut identities = BTreeMap::<TaskFileIdentity, ()>::new();
 
     for item in completed {
@@ -162,7 +517,11 @@ where
         if identities.insert(item.identity.clone(), ()).is_some() {
             return Err(persistence_error(pending, "Media 结果包含重复任务文件身份"));
         }
-        queue.push_back(build_completed_message(item, &options));
+        if let Err(message) =
+            runtime.enqueue_media_terminal(TaskFileMediaTerminal::Completed(item), &options)
+        {
+            return Err(persistence_error(pending, message));
+        }
     }
     for item in file_failures {
         if let Err(message) = validate_context(&pending, &item.identity, &item.context) {
@@ -174,20 +533,31 @@ where
                 "Media 失败结果包含重复任务文件身份",
             ));
         }
-        queue.push_back(build_failure_message(item));
+        if let Err(message) =
+            runtime.enqueue_media_terminal(TaskFileMediaTerminal::Failed(item), &options)
+        {
+            return Err(persistence_error(pending, message));
+        }
     }
 
-    let mut in_flight = BTreeMap::new();
-    if let Err(message) = flush_persist_queue(
-        &mut pending,
-        &mut queue,
-        &mut in_flight,
-        store,
-        acknowledgements,
-    )
-    .await
-    {
-        return Err(persistence_error(pending, message));
+    while !runtime.is_empty() {
+        if let Err(message) = runtime.try_submit(store) {
+            return Err(persistence_error(pending, message));
+        }
+        if !runtime.is_empty() {
+            let ack = match acknowledgements.recv().await {
+                Some(ack) => ack,
+                None => {
+                    return Err(persistence_error(
+                        pending,
+                        "基础持久化 actor 未返回 Media ACK",
+                    ));
+                }
+            };
+            if let Err(message) = runtime.apply_ack(&mut pending, ack) {
+                return Err(persistence_error(pending, message));
+            }
+        }
     }
     Ok(pending)
 }
@@ -745,7 +1115,7 @@ fn persistence_error<P: TaskLanePermitProvider>(
 mod tests {
     use std::path::Path;
 
-    use dedup_core::{DisplayPath, MachineId, MediaKind, NormalizedPath};
+    use dedup_core::{ContentKey, DisplayPath, MachineId, MediaKind, NormalizedPath};
     use dedup_media::{
         ImageStage1, PdqHash, Rgb24Image, decode_contact_sheet, encode_contact_sheet,
     };
@@ -776,7 +1146,9 @@ mod tests {
         worker::{BaseComputeOutput, Stage1Frame, encode_base_compute_payload},
     };
 
-    use super::{TaskFileMediaPersistenceOptions, persist_task_file_media_results};
+    use super::{
+        TaskFileMediaPersistenceOptions, TaskFilePersistRuntime, persist_task_file_media_results,
+    };
 
     const RUN_ID: &str = "01900000-0000-7000-8000-0000000002c2";
 
@@ -988,6 +1360,106 @@ mod tests {
                 },
             )),
         }
+    }
+
+    #[tokio::test]
+    async fn persist_runtime_applies_only_acknowledged_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let machine = MachineId::from_sha256([0x81; 32]);
+        let store = NodeStore::open_in_memory(machine).unwrap();
+        let files = TransientTaskFileSet::create(root.path(), RUN_ID).unwrap();
+        let mut producer = BaseTaskProducer::new(TaskFileDispatcher::new(files, TestProvider));
+        producer
+            .append_batch(&[
+                BaseTaskInput {
+                    planned: PlannedScannedPath {
+                        scanned: scanned(r"C:\persist-runtime-first.bin", 10),
+                        lane: lane(7),
+                    },
+                    cached: None,
+                    contact_sheet_valid: true,
+                    force_recompute: false,
+                },
+                BaseTaskInput {
+                    planned: PlannedScannedPath {
+                        scanned: scanned(r"C:\persist-runtime-second.bin", 11),
+                        lane: lane(7),
+                    },
+                    cached: None,
+                    contact_sheet_valid: true,
+                    force_recompute: false,
+                },
+            ])
+            .unwrap();
+        let mut pending = TaskFileBaseComputePending::from_production(producer.seal().unwrap());
+        let first = match pending
+            .dispatcher
+            .next_with_admission(
+                ReadCancellationToken::new(),
+                TaskDispatchAdmission::hash_only(),
+            )
+            .await
+            .unwrap()
+        {
+            TaskDispatchPoll::Task(task) => task,
+            other => panic!("expected first Hash task, got {other:?}"),
+        };
+        let second = match pending
+            .dispatcher
+            .next_with_admission(
+                ReadCancellationToken::new(),
+                TaskDispatchAdmission::hash_only(),
+            )
+            .await
+            .unwrap()
+        {
+            TaskDispatchPoll::Task(task) => task,
+            other => panic!("expected second Hash task, got {other:?}"),
+        };
+        let first_identity = first.identity.clone();
+        let second_identity = second.identity.clone();
+        let first_scanned = first.record.scanned.clone();
+        let second_scanned = second.record.scanned.clone();
+        drop(first.permit);
+        drop(second.permit);
+
+        let (controller, waiter) = super::super::base_persistence::BasePersistTestController::new();
+        let (actor, handle, mut acknowledgements) =
+            BaseStoreActor::spawn_with_first_persist_waiter(store, 2, waiter);
+        let mut runtime = TaskFilePersistRuntime::new();
+        runtime.enqueue_hash_complete(
+            first_identity.clone(),
+            first_scanned,
+            [0x31; 16],
+            MediaKind::Other,
+            ContentKey::new([0x31; 16], 10),
+        );
+        runtime.enqueue_hash_complete(
+            second_identity.clone(),
+            second_scanned,
+            [0x32; 16],
+            MediaKind::Other,
+            ContentKey::new([0x32; 16], 11),
+        );
+        runtime.try_submit(&handle).unwrap();
+        controller.wait_until_entered().await;
+        controller.release();
+        let ack = acknowledgements.recv().await.unwrap();
+        runtime.apply_ack(&mut pending, ack).unwrap();
+
+        let lane_path = pending.dispatcher.lane_path(&lane(7)).unwrap();
+        let statuses = std::fs::read(lane_path)
+            .unwrap()
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| line[0])
+            .collect::<Vec<_>>();
+        assert_eq!(statuses, vec![b'C', b'P']);
+        assert!(runtime.has_in_flight());
+        runtime.drop_unacknowledged();
+        drop(handle);
+        drop(acknowledgements);
+        actor.finish().await.unwrap();
     }
 
     #[tokio::test]
