@@ -49,6 +49,8 @@
 
 dispatcher 使用现有 Hash/Media 联合 admission 和物理盘调度规则。任何分支都不能自行清空同阶段的全部工作后才返回主循环。
 
+同一物理盘 lane 的“同身份 continuation”只表示 Hash→Media 复用原 TSV 行，不表示整个 lane 在 SQLite ACK 前串行。Dispatcher 可按本轮冻结的 `per_disk_limit` 同时拥有多个精确身份，每个身份仍由自己的 ACK 独立迁移 `P→C/F`；窗口、乱序 ACK、取消和失败边界详见 `2026-08-30-multi-inflight-task-lane-dispatch-design.md`。
+
 ### 4.2 单个 Hash 立即查询
 
 为基础计算增加语义明确的 `lookup_base_cache_by_key` 单项入口。该入口每次只接收一个 `ContentKey`，执行一次单项缓存查询调用并返回一个可选缓存记录；内部可以复用现有完整缓存装载逻辑，但不能缓存、合并或等待后续 Hash。图片、视频及帧表的既有完整性装载语义保持不变。
@@ -84,7 +86,7 @@ Media Worker 运行期间，新的 Hash 完成事件仍由同一个事件泵立�
 ## 6. 调度与背压
 
 - 不新增读取线程池；继续使用 `DiskReadScheduler` 的全局额度、物理盘额度、SSD/HDD 配置权重和老化保护。
-- 不绕过 `TaskFileDispatcher`。Hash 和 Media 仍通过同一个 dispatcher 请求许可，Hash 后的同 lane Media continuation 保持既有优先语义。
+- 不绕过 `TaskFileDispatcher`。Hash 和 Media 仍通过同一个 dispatcher 请求许可；同 lane 普通身份按冻结的 `per_disk_limit` 形成有界窗口，Hash 后的 Media continuation 保持优先语义并复用原身份，不额外占用窗口。
 - Hash 在途数量不超过 `hash_capacity`，Media 活动数量不超过 `worker_capacity`。
 - Hash 完成结果不能进入无界 `Vec`；事件泵每次取出一项立即查询，本地查询结束后只进入远端 future、Media continuation 或持久化队列之一。
 - SQLite 写入仍由单写 actor 串行 ACK；ACK 背压时不提前改任务文件状态。

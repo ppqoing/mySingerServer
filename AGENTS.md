@@ -120,7 +120,7 @@ Worker 终态先由 Node 完成必要 SQLite 当前事实写入，再把 TSV 行
 
 任务分发时已冻结物理盘 lane，不把所有路径混在单一 FIFO 中。有效额度来自配置中的 `ssd_threads_per_disk`、`hdd_threads_per_disk`、`unknown_threads_per_disk`，并受 `total_threads`、Worker 数和全局磁盘许可共同限制。全局额度不足时按权重轮转/deficit 选择；老化保护让长期等待的 HDD 或其他 lane 获得机会，避免饥饿。比例由配置决定，不能把示例 `5:1` 写死。
 
-Hash 和 Media 在同一调度 epoch 联合判断真实 slot、refill token、output credit、盘额度和全局额度；Media refill 不能绕过仍然可派发的 Hash。同一 lane 在 SQLite ACK 前只交付一个任务身份；同身份的 Media continuation 可继承该在途身份。任务完成、失败或取消后立即补位，不等待整批。读取调度器是文件读取许可和盘公平层，不等同于独立的计算线程池。
+Hash 和 Media 在同一调度 epoch 联合判断真实 slot、refill token、output credit、盘额度和全局额度；Media refill 不能绕过仍然可派发的 Hash。同一 lane 可在 SQLite ACK 前按本轮冻结的 `per_disk_limit` 交付多个精确任务身份；每个身份只由自己的 ACK 迁移 `P→C/F`，允许乱序 ACK，Media continuation 复用原身份且不新增 TSV 行。全局 permit、Hash/Media slot、Worker 槽位和持久化背压继续独立生效；任务完成、失败或取消后立即补位，不等待整批。读取调度器是文件读取许可和盘公平层，不等同于独立的计算线程池。
 
 Worker 启动后加载固定 DLL，成功才输出 `WorkerReady`；stdin/stdout 使用四字节长度头的 WorkerEnvelope，日志写入 `data/node/logs/worker-<pid>.log`。所有 Worker 进入 `KILL_ON_JOB_CLOSE` Job Object，创建标志含 `CREATE_NO_WINDOW`；Node 退出不留下孤儿 Worker。WorkerPool 由 actor 独占，Node 不在 TCP 层维护第二份 Worker 事实。
 
