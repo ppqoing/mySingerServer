@@ -5,7 +5,9 @@ use std::{fmt::Write as _, time::Duration};
 use dedup_core::{ContentKey, LocationKey, MediaKind};
 use dedup_media::sample_positions;
 use rusqlite::types::Value;
-use rusqlite::{OptionalExtension, Transaction, limits::Limit, params, params_from_iter};
+use rusqlite::{
+    OptionalExtension, Transaction, TransactionBehavior, limits::Limit, params, params_from_iter,
+};
 
 use crate::{
     ActiveFile, BaseCacheRecord, CacheLookup, CompleteStage1, ContentId, ContentRecord,
@@ -308,7 +310,11 @@ impl NodeStore {
     ) -> Result<ContentRecord, StoreError> {
         let machine_id = self.machine_id().clone();
         let file_size = sqlite_integer(scanned.file_size)?;
-        let transaction = self.connection.transaction()?;
+        // 后台计算与主 actor 使用同一 WAL 的独立连接；先取得写事务，避免查询后升级时
+        // 被同步 ACK 抢占写权并立即返回 SQLITE_BUSY。
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let matching_id = {
             let mut statement = transaction
                 .prepare_cached("SELECT content_id,file_size FROM contents WHERE md5=?1")?;

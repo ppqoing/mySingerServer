@@ -1,5 +1,7 @@
 //! SQLite 新库、路径缓存、内容复用和特征完整性的集成测试。
 
+use std::{sync::mpsc, thread, time::Duration};
+
 use dedup_core::{ContentKey, DisplayPath, MachineId, MediaKind, NormalizedPath};
 use dedup_media::{ImageStage1, ImageStage2, PdqHash};
 use dedup_node_store::{
@@ -7,7 +9,7 @@ use dedup_node_store::{
     ScannedPath, StoreError, VideoFrameStage1Fields, VideoFrameStage2Fields, VideoMetadataFields,
     classify_cache_completeness,
 };
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, TransactionBehavior, params};
 use tempfile::TempDir;
 
 fn machine() -> MachineId {
@@ -79,6 +81,55 @@ fn equal_md5_with_different_size_does_not_reuse_content() {
         .unwrap();
     assert_ne!(first.id, second.id);
     assert_ne!(first.key, second.key);
+}
+
+/// 主 actor 持有 WAL 写事务时，后台内容写入应等待后成功，不能在读后升级时直接报锁。
+#[test]
+fn content_upsert_waits_for_concurrent_wal_writer() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("node.sqlite3");
+    let store = NodeStore::open(&database, machine()).unwrap();
+    let scanned = scan(r"D:\concurrent.jpg", 321);
+
+    let mut blocker = Connection::open(&database).unwrap();
+    blocker.busy_timeout(Duration::from_secs(5)).unwrap();
+    let blocker_transaction = blocker
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    blocker_transaction
+        .execute(
+            "UPDATE metadata SET value=value WHERE key='library_revision'",
+            [],
+        )
+        .unwrap();
+
+    let (started_sender, started_receiver) = mpsc::channel();
+    let (result_sender, result_receiver) = mpsc::channel();
+    let writer = thread::spawn(move || {
+        let mut store = store;
+        started_sender.send(()).unwrap();
+        let result = store.upsert_content_and_location(&scanned, [0x23; 16], MediaKind::Image);
+        result_sender.send(result).unwrap();
+    });
+    started_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("后台内容写入已启动");
+
+    let early_result = result_receiver.recv_timeout(Duration::from_millis(300));
+    blocker_transaction.commit().unwrap();
+    let result = match early_result {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => result_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("主 actor 提交后后台内容写入应完成"),
+        Err(mpsc::RecvTimeoutError::Disconnected) => panic!("后台内容写入线程意外退出"),
+    };
+    writer.join().unwrap();
+    result.expect("后台内容写入不应因并发 WAL 写事务失败");
+
+    let reopened = NodeStore::open(&database, machine()).unwrap();
+    let lookup = reopened.lookup_scanned_paths(&[scan(r"D:\concurrent.jpg", 321)]);
+    assert!(lookup.unwrap()[0].is_reusable());
 }
 
 /// 新内容的 Other 只是探测前占位；只有显式完成后才能作为基础缓存命中。
