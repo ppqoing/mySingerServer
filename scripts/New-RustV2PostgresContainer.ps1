@@ -6,8 +6,11 @@
 脚本只面向新的空数据卷：创建命名卷与 PostgreSQL 16 Alpine 容器，并通过官方
 docker-entrypoint-initdb.d 入口执行 deploy/central-v2.sql。脚本不会迁移、覆盖或删除已有数据。
 
+.PARAMETER HostAddress
+宿主机发布地址，默认仅绑定本机回环地址；可指定可信 LAN 的 IPv4/IPv6 地址。
+
 .PARAMETER HostPort
-宿主机回环地址端口，默认使用 15439，避免占用常见的本机 PostgreSQL 5432 端口。
+宿主机端口，默认使用 15439，避免占用常见的本机 PostgreSQL 5432 端口。
 
 .PARAMETER DockerExecutable
 Docker CLI 路径。默认从 PATH 使用 docker；该参数也用于隔离行为测试。
@@ -22,6 +25,8 @@ param(
 
     [ValidateRange(1, 65535)]
     [int] $HostPort = 15439,
+
+    [string] $HostAddress = '127.0.0.1',
 
     [ValidatePattern('^[A-Za-z_][A-Za-z0-9_]*$')]
     [string] $DatabaseName = 'dedup_v2',
@@ -46,6 +51,22 @@ Set-StrictMode -Version Latest
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $schemaPath = [IO.Path]::GetFullPath((Join-Path $repositoryRoot 'deploy\central-v2.sql'))
 $expectedSchemaSummary = 'mysingerserver-rust-v2-central-schema-3|3|22'
+
+# 只允许明确的 IPv4/IPv6 单播地址，避免主机名、通配符和参数注入进入 Docker argv。
+$parsedHostAddress = $null
+if (-not [System.Net.IPAddress]::TryParse($HostAddress, [ref]$parsedHostAddress) -or
+    $parsedHostAddress.AddressFamily -notin @([System.Net.Sockets.AddressFamily]::InterNetwork, [System.Net.Sockets.AddressFamily]::InterNetworkV6) -or
+    [System.Net.IPAddress]::Any.Equals($parsedHostAddress) -or
+    [System.Net.IPAddress]::IPv6Any.Equals($parsedHostAddress)) {
+    throw "RUST_V2_POSTGRES_HOST_ADDRESS_INVALID value=$HostAddress"
+}
+$normalizedHostAddress = $parsedHostAddress.ToString()
+$dockerPublishAddress = if ($parsedHostAddress.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) {
+    "[$normalizedHostAddress]"
+}
+else {
+    $normalizedHostAddress
+}
 
 function Invoke-DockerCommand {
     <# 调用 Docker CLI，统一收集退出码和输出，并为允许失败的存在性探测保留结果。 #>
@@ -152,7 +173,7 @@ $healthCommand = "pg_isready -U $DatabaseUser -d $DatabaseName"
 Invoke-DockerCommand -Arguments @(
     'run', '--detach', '--name', $ContainerName,
     '--restart', 'unless-stopped',
-    '--publish', "127.0.0.1:${HostPort}:5432",
+    '--publish', "${dockerPublishAddress}:${HostPort}:5432",
     '--env', "POSTGRES_DB=$DatabaseName",
     '--env', "POSTGRES_USER=$DatabaseUser",
     '--env', "POSTGRES_PASSWORD=$DatabasePassword",
@@ -173,4 +194,10 @@ $encodedUser = [Uri]::EscapeDataString($DatabaseUser)
 $encodedPassword = [Uri]::EscapeDataString($DatabasePassword)
 $encodedDatabase = [Uri]::EscapeDataString($DatabaseName)
 Write-Output "RUST_V2_POSTGRES_CONTAINER_PASS name=$ContainerName volume=$VolumeName"
-Write-Output "postgresql://${encodedUser}:${encodedPassword}@127.0.0.1:$HostPort/$encodedDatabase"
+$connectionHost = if ($parsedHostAddress.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) {
+    "[$normalizedHostAddress]"
+}
+else {
+    $normalizedHostAddress
+}
+Write-Output "postgresql://${encodedUser}:${encodedPassword}@${connectionHost}:$HostPort/$encodedDatabase"

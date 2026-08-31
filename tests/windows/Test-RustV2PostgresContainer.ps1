@@ -86,6 +86,37 @@ exit /b 2
     }
 
     Remove-Item -LiteralPath $dockerLog -Force
+    $env:RUST_V2_POSTGRES_FAKE_MODE = 'new'
+    $lanOutput = @(& $containerScript -DockerExecutable $fakeDocker -HostAddress '192.168.1.17')
+    $lanCalls = @(Get-Content -LiteralPath $dockerLog)
+    if (($lanCalls -join "`n") -notmatch '--publish 192\.168\.1\.17:15439:5432') {
+        throw "显式主机地址必须发布到指定 LAN 地址：$($lanCalls -join ' | ')"
+    }
+    if (($lanOutput -join "`n") -notmatch 'postgresql://dedup:dedup@192\.168\.1\.17:15439/dedup_v2') {
+        throw "脚本必须输出指定主机地址的连接串：$($lanOutput -join ' | ')"
+    }
+
+    foreach ($invalidHostAddress in @('db.example.test', '0.0.0.0', '*', '192.168.1.17;--privileged')) {
+        Remove-Item -LiteralPath $dockerLog -Force -ErrorAction SilentlyContinue
+        $rejectedHostAddress = $false
+        try {
+            & $containerScript -DockerExecutable $fakeDocker -HostAddress $invalidHostAddress | Out-Null
+        }
+        catch {
+            $rejectedHostAddress = $true
+        }
+        if (-not $rejectedHostAddress) {
+            throw "非法主机地址必须拒绝：$invalidHostAddress"
+        }
+        if (Test-Path -LiteralPath $dockerLog) {
+            $invalidCalls = @(Get-Content -LiteralPath $dockerLog)
+            if ($invalidCalls.Count -gt 0) {
+                throw "非法主机地址不得调用 Docker：$invalidHostAddress"
+            }
+        }
+    }
+
+    Remove-Item -LiteralPath $dockerLog -Force -ErrorAction SilentlyContinue
     $env:RUST_V2_POSTGRES_FAKE_MODE = 'existing-volume'
     $rejectedExistingVolume = $false
     try {
