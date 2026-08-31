@@ -6,7 +6,7 @@
 
 本次删除 `TaskFileDispatcher` 的“同一物理盘必须等待上一文件 SQLite ACK 才能交付下一文件”硬编码。一个物理盘仍只有一个 lane 和一份 TSV；Dispatcher 只按冻结的 `per_disk_limit` 保存精确身份窗口，真实磁盘许可、权重、Hash/Media 公平和老化继续由 `DiskReadScheduler` 负责。
 
-Dispatcher 多在途实现 revision：`f91feb85ad7e5943bba5643250736e7450d833fb`。双盘当前席位修复 revision：`15872d7bd28dd730d9980c649496e5cc7db6f714`。同 lane 补位空窗修复 revision：`be40eb2`。正式候选包由本文档提交后的干净 HEAD 生成，最终 source tree SHA、包 SHA 和真实媒体终态由独立 evidence 绑定。
+Dispatcher 多在途实现 revision：`f91feb85ad7e5943bba5643250736e7450d833fb`。双盘当前席位修复 revision：`15872d7bd28dd730d9980c649496e5cc7db6f714`。同 lane 补位空窗修复 revision：`be40eb2`。任务级权重席位实现 revision：`7a125d15a2cec0fa8242188cbadf98afbde14c3d`；生命周期收口 revision：`fb42a7e1d97ec65c952e1f6f7e7e4a09e8a5545e`。正式候选包固定绑定产品 HEAD `fb42a7e`；本文档后续只追加验收事实，不改变候选二进制。
 
 本次提交：
 
@@ -130,13 +130,49 @@ Dispatcher 多在途实现 revision：`f91feb85ad7e5943bba5643250736e7450d833fb`
 
 审查同时建议把任务组读取席位限制为 `min(total_threads, Worker 数)`。真实流水线回归证明该建议与现有资源所有权冲突：Worker=1、读取线程=3 时需要允许三个 Hash 读取并发；同盘 Hash/Media 也必须能同时占用两个独立读取许可。因此保留读取总预算 `total_threads`，Worker、Hash、Media 槽位继续独立门控。新增行为测试确认 Worker 6 不会把等权双盘读取目标从 6 错降为 3，Worker 2 也不会阻止三块盘各取得一个仍在全局读取预算内的许可；当真实盘数超过 `total_threads` 时仍由既有权重游标和老化保护轮转。
 
-最终代码验证结果：DiskReadScheduler 50/50 PASS，TaskFileDispatcher 39/39 PASS；NodeEngine `--features test-hooks --all-targets` 退出码 0，其中库测试 160/160、基础计算流水线 60/60，固定 bench `elapsed_ms=128.061` 且 `persisted_completed=true`；Worker 进程协议输出 `WORKER_PROTOCOL_PROCESS_PASS`；Desktop Core 运行时验收协议 23/23、Desktop UI 绑定契约 15/15。格式检查和 `git diff --check` 均通过。候选包、双盘真实媒体终态和最终只读审查仍按下节门禁执行。
+最终代码验证结果：DiskReadScheduler 50/50 PASS，TaskFileDispatcher 39/39 PASS；NodeEngine `--features test-hooks --all-targets` 退出码 0，其中库测试 160/160、基础计算流水线 60/60，固定 bench `elapsed_ms=128.061` 且 `persisted_completed=true`；Worker 进程协议输出 `WORKER_PROTOCOL_PROCESS_PASS`；Desktop Core 运行时验收协议 23/23、Desktop UI 绑定契约 15/15。格式检查和 `git diff --check` 均通过。候选包、双盘真实媒体终态和最终只读审查见下节。
 
-## 8. 待完成门禁
+## 8. 最终候选与单次双盘真实媒体验收
 
-- 绑定本次任务级权重席位修复后干净 HEAD 的正式候选包与外置验收客户端/结果导出器 SHA；
-- 修复候选在 `H:\pik\00000000000` 与 `I:\tmp` 上的一次双物理盘真实媒体终态运行；
-- 逐盘 active 峰值、Worker 峰值、CPU/IO、任务终态、崩溃完整路径和结果导出 SHA；
-- `gpt-5.6-sol`、reasoning `max` 最终只读审查。
+### 8.1 候选边界
 
-本次不部署、不替换、不清理 `I:\Tool`。
+- 产品 revision：`fb42a7e1d97ec65c952e1f6f7e7e4a09e8a5545e`；source 归档：`C:\tmp\rust-v2-weighted-candidate-fb42a7e\source\fb42a7e-source.tar`；SHA-256：`f637901d67d6f3d05462f961a1b2eef0fd73161a9e940666dbd528b562fa24e9`；
+- 正式 ZIP：`C:\tmp\rust-v2-weighted-candidate-fb42a7e\formal\mySingerServer-rust-v2-win-x64.zip`；大小 `70,372,490` bytes；SHA-256：`d9f4daafb51cd218a875492f575d7cdbac35ff9f7fd9436bfe360f22c7f62f5b`；独立验证为 `PACKAGE_PASS`；
+- 包 manifest：`C:\tmp\rust-v2-weighted-candidate-fb42a7e\release\manifest\files.sha256`；SHA-256：`d28a825de08489be85439882ac6fcc6a5f9ffc3e3b7d49482d9e14037de44bd7`；
+- 外置 `runtime_acceptance.exe` SHA-256：`25ee7a8875722e742fffe10d73379becb9bf44e16f1f09602803ce8554d231c8`；外置 `export_scan_result_summary.exe` SHA-256：`16f80d019c452348880cee781dd7476124e84e8ff0ec60df0d92ef664ea05003`；测试客户端没有塞入正式 ZIP；
+- 最终 `gpt-5.6-sol`、reasoning `max` 只读审查未发现 Critical、Important 或 Minor 问题，结论为可进入打包与真实媒体验收。
+
+### 8.2 唯一实际运行与任务终态
+
+前三次 UAC 未获授权的空运行根没有 evidence、Worker 或客户端，不计为跑测，也没有与真实结果拼接。唯一实际运行根为 `C:\tmp\rust-v2-weighted-run-fb42a7e-attempt-04`，原始证据为 `C:\tmp\rust-v2-weighted-run-fb42a7e-attempt-04\evidence`，自动报告为 `C:\tmp\rust-v2-weighted-run-fb42a7e-attempt-04\evidence\report.md`。
+
+- 媒体根：`H:\pik\00000000000` → PhysicalDisk1（HP SSD EX900 1TB/NVMe）；`I:\tmp` → PhysicalDisk2（INTEL SSDSC2BB800G6R/SATA）；物理盘映射 SHA-256：`78c424f42e06b9a4248d4c07a61f3053efb3100ade16e3827033be6b6b017303`；
+- 配置：Everything、Worker `20`、全局读取席位 `12`、SSD 每盘 `16`、HDD 每盘 `1`、unknown 每盘 `1`；任务到终态即结束，`1800` 秒只作为上限；
+- Runtime/Task ID：`01a055ab-3260-7c22-b153-398fb55f9550`；最后任务快照约 `1200` 秒；任务终态 `completed`，没有等满 1800 秒，也没有 deadline cancel；
+- 文件总数 `39,018`，成功 `38,972`，失败 `46`，跳过 `0`；Everything 枚举约 `17.248` 秒；SQLite 基础缓存查询 `39,018` 项用时 `318` ms，约 `122,494.23` 项/秒；
+- `result-summary.tsv` SHA-256：`04bb1459426a5f7c94e566698e831644ebd71d54929e7060ef04c4ac9e378c64`；`R` 行 `39,018`，`MISSING=46`，`INCONCLUSIVE=0`，footer 与数据区 SHA 已校验。
+
+### 8.3 物理盘权重席位结果
+
+以下统计由 `runtime.ndjson` 的 `1,200` 个任务快照重新计算；早期没有 `physical_disk_id` 的行被显式跳过，清洗过程没有解析警告：
+
+- 两盘同时持有活动许可的样本 `1,013` 个；两盘同时存在真实等待请求的样本 `459` 个；
+- 双盘同时等待且 12 个席位满载的 `256` 个样本全部为 `6:6`；`0:12` 或 `12:0` 为 `0`，任一盘超过 6 为 `0`；
+- 其余 `203` 个双等待样本处于许可释放/补位过渡，总活动许可低于 12；这部分平均 active 为 PhysicalDisk1 `5.57`、PhysicalDisk2 `5.85`，没有把过渡空窗误判成固定配额失败；
+- PhysicalDisk1 active 峰值 `6`，grant/release 均为 `48,464`；PhysicalDisk2 active 峰值 `12`，grant/release 均为 `29,572`。PhysicalDisk2 只在 PhysicalDisk1 没有 Ready 工作或 lane 已注销后取得 12 个席位，符合空闲额度重分配要求；
+- Hash 与 Media 同时持有读取许可的样本 `679` 个，证明不存在必须等完整 Hash 批次结束才进入 Media 的整批屏障；
+- 非空闲 Worker 峰值 `20`，自动报告平均 `16.66`。读取席位、Worker 槽、Hash 容量和 Media 容量仍是独立资源，没有用 Worker 数错误截断磁盘读取目标。
+
+本轮物理盘调度目标判定为 **PASS**：等权双盘在共同竞争时固定按 `6:6` 使用 12 个读取席位；一盘没有真实 Ready 工作时，另一盘可使用释放后的全局额度。任意配置权重和“真实盘数大于全局席位时轮转”的行为由前述 `5:1`、三盘争两席位与老化回归覆盖，产品没有写死本机的 `6:6`。
+
+### 8.4 CPU、磁盘 I/O 与正确性边界
+
+- 排除首个零间隔系统样本后，应用进程占整机 CPU 简单平均约 `69.51%`、峰值 `84.47%`；其中 Worker 平均约 `67.22%`、峰值 `83.35%`；
+- PhysicalDisk1 平均读取 `97.88 MiB/s`、峰值 `1.61 GiB/s`、队列峰值 `6`；PhysicalDisk2 平均读取 `92.57 MiB/s`、峰值 `382.17 MiB/s`、队列峰值 `20`；`396` 个系统样本中有 `240` 个样本观察到两块媒体盘同时产生读取 I/O；
+- 媒体前后均为 `39,018` 个文件、`218.25 GiB`，路径、长度和 `LastWriteTimeUtc` 逐项一致；联合语义 SHA 前后均为 `3302f70759eb894e2c456913fc7668be9001bd24f0dcf5060081babd47ee30eb`，原始 `media-before.json`/`media-after.json` 文件 SHA 前后均为 `f18bd5df049c8105c976c4b221ba3269f024d769a4eaaf5462350a954ee501cb`；
+- 46 个独立文件失败分为：32 个 Worker `0xC0000374` heap corruption、3 个 Worker `0xC0000005` access violation、11 个 `Worker Completed` 前缺少 `BaseSourceReadComplete`；没有其他失败类型。它们不否定盘间席位门禁，但使结果摘要保持 `MISSING`；
+- 自动 harness 把已存在且 footer 已校验的 TSV 误记为 `RUST_V2_ACCEPTANCE_RESULT_SUMMARY_TSV_FOOTER_MISSING`，并把行数/SHA 写成空值；独立 exporter stdout 和最终报告均正确读取 `39,018` 行、46 个 MISSING。另有系统采样最大间隔 `10.770` 秒，以及 ownership 字段尚未由协议暴露。
+
+因此必须分开裁决：**任务已正常到 completed，物理盘权重调度 PASS；整轮产品验收仍为 INCONCLUSIVE**，原因是 46 个文件失败、harness/TSV 元数据不一致、系统采样间隔和 ownership 证据缺口。不得把 runtime_result 的任务终态 `correctness=PASS` 扩大解释为全部文件或整套验收通过。
+
+本次没有重复跑第二轮，没有部署、替换或清理 `I:\Tool`；全部候选、运行目录和旧诊断证据均保留。
