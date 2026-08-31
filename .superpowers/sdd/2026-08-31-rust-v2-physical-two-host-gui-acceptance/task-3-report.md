@@ -40,4 +40,4 @@ exit=0
 
 ## Concern
 
-该三文件范围提供可测试的安全编排内核，真实 Docker/SSH/进程/性能 provider 必须由后续已授权的实体机执行入口显式绑定；本任务未猜测未给出的远程 shell、候选包解压和 TOML 生成契约，也没有执行任何实体机操作。
+第二次实现已加入真实 provider：只有 `-Execute` 且未注入 Provider 时构造；本地/远端运行根、`scp`/`ssh` UTF-16LE EncodedCommand、候选 ZIP 解压/复验、固定 TOML、Docker 脚本、防火墙精确规则和 GUI 前后两个独立观察器均在该 provider 内。普通 fake 测试仍不触发真实外部状态。本轮未执行实体机操作。

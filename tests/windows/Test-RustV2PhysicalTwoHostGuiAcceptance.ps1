@@ -37,12 +37,15 @@ function New-FakeProvider {
         PrepareRunRoot = { param($value) & $record 'PrepareRunRoot' $value }
         CopyCandidate = { param($value) & $record 'CopyCandidate' $value; 'zip-sha' }
         WriteConfiguration = { param($value) & $record 'WriteConfiguration' $value; [pscustomobject]@{ Sha256 = 'config-sha' } }
+        WriteDesktopConfiguration = { param($value) & $record 'WriteDesktopConfiguration' $value; [pscustomobject]@{ Dsn = 'postgresql://dedup:***@192.168.1.17:15439/dedup_v2' } }
         StartSystemSampler = { param($value) & $record 'StartSystemSampler' $value; [pscustomobject]@{ Pid = 100 + $calls.Count; StartedUtc = '2026-08-31T00:00:00.0000000Z' } }
         AddFirewallRule = { param($value) & $record 'AddFirewallRule' $value }
         StartCenterContainer = { param($value) & $record 'StartCenterContainer' $value }
         StartNode = { param($value) & $record 'StartNode' $value; [pscustomobject]@{ Pid = 200 + $calls.Count; StartedUtc = '2026-08-31T00:00:00.0000000Z' } }
         WaitEndpoint = { param($value) & $record 'WaitEndpoint' $value }
         GetNodeStatus = { param($value) & $record 'GetNodeStatus' $value; if ($value.Host -eq 'local') { [pscustomobject]@{ MachineId = $LocalMachineId } } else { [pscustomobject]@{ MachineId = $RemoteMachineId } } }
+        RunPreflightObserver = { param($value) & $record 'RunPreflightObserver' $value; [pscustomobject]@{ Closed = $true; Nodes = @([pscustomobject]@{ MachineId = $LocalMachineId }, [pscustomobject]@{ MachineId = $RemoteMachineId }) } }
+        WaitNodeIdle = { param($value) & $record 'WaitNodeIdle' $value }
         StartDesktop = { param($value) & $record 'StartDesktop' $value; [pscustomobject]@{ Pid = 300; StartedUtc = '2026-08-31T00:00:00.0000000Z' } }
         ShowGuiChecklist = { param($value) & $record 'ShowGuiChecklist' $value }
         WaitDesktopExit = { param($value) & $record 'WaitDesktopExit' $value; [pscustomobject]@{ NormalExit = $true; Screenshots = 8; Interactions = 10; UniqueManager = 'desktop.exe' } }
@@ -73,6 +76,17 @@ try {
     . $invokeScript
     . $reportScript
 
+    Assert-True -Condition ($null -ne (Get-Command New-RustV2PhysicalTwoHostGuiRealProvider -ErrorAction SilentlyContinue)) -Message '真实Provider工厂缺失'
+    $executeGateRejected = $false
+    try {
+        Invoke-RustV2PhysicalTwoHostGuiAcceptance -CandidateZip 'C:\tmp\candidate.zip' -ObserverPath 'C:\tmp\observer.exe' `
+            -LocalSshAlias 'local-host' -RemoteSshAlias 'remote-host' -LocalMediaRoots @('H:\pik\00000000000', 'I:\tmp') `
+            -RemoteMediaRoots @('D:\tmp', 'F:\tmp\10-31') -LocalEndpoint '192.168.1.17:43100' -RemoteEndpoint '192.168.1.6:43100' `
+            -CentralAddress '192.168.1.17:15439' -EvidenceRoot (Join-Path $fixtureRoot 'execute-gate') | Out-Null
+    }
+    catch { $executeGateRejected = $_.Exception.Message -match '^RUST_V2_PHYSICAL_GUI_EXECUTE_REQUIRED' }
+    Assert-True -Condition $executeGateRejected -Message '未显式Execute且未注入Provider时必须拒绝'
+
     $provider = New-FakeProvider
     $result = Invoke-RustV2PhysicalTwoHostGuiAcceptance -CandidateZip 'C:\tmp\candidate.zip' -ObserverPath 'C:\tmp\physical_two_host_observer.exe' `
         -LocalSshAlias 'local-host' -RemoteSshAlias 'remote-host' -LocalMediaRoots @('H:\pik\00000000000', 'I:\tmp') `
@@ -84,6 +98,10 @@ try {
     Assert-True -Condition ($result.LocalMachineId -cne $result.RemoteMachineId) -Message '两端MachineId必须不同'
     $names = @($provider.Calls | ForEach-Object Name)
     Assert-True -Condition (($names -join ',') -match 'StartDesktop,ShowGuiChecklist,WaitDesktopExit,RunObserver') -Message '观察器只能在真实GUI退出后运行'
+    $preflightIndex = [Array]::IndexOf($names, 'RunPreflightObserver')
+    $desktopIndex = [Array]::IndexOf($names, 'StartDesktop')
+    Assert-True -Condition ($preflightIndex -ge 0 -and $preflightIndex -lt $desktopIndex -and @($names | Where-Object { $_ -eq 'RunPreflightObserver' }).Count -eq 1) -Message '只读预检观察器必须在Desktop启动前串行完成'
+    Assert-True -Condition (@($names | Where-Object { $_ -eq 'WaitNodeIdle' }).Count -eq 2) -Message '预检连接关闭后必须确认两端不处于NodeBusy'
     Assert-True -Condition (@($names | Where-Object { $_ -eq 'StartDesktop' }).Count -eq 1) -Message 'desktop.exe必须仅启动一次并作为唯一管理连接'
     Assert-True -Condition (@($names | Where-Object { $_ -eq 'StartNode' }).Count -eq 2) -Message '两台Node必须各启动一次'
     Assert-True -Condition ($result.MediaManifestUnchanged) -Message '媒体前后清单必须保持一致'

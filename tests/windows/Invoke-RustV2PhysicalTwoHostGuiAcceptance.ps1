@@ -26,6 +26,66 @@ function Invoke-RustV2PhysicalGuiProvider {
     & $Provider[$Operation] $Arguments
 }
 
+function New-RustV2PhysicalTwoHostGuiRealProvider {
+    <# 构造真实执行边界；只有 Invoke 入口带 -Execute 时才会调用本工厂。 #>
+    [CmdletBinding()]
+    param([scriptblock] $ToolRunner)
+
+    # 统一 native argv；测试替身可完整记录 ssh/scp/docker/PowerShell 调用而不触发外部副作用。
+    if ($null -eq $ToolRunner) {
+        $ToolRunner = {
+            param([string] $FilePath, [string[]] $Arguments)
+            $output = @(& $FilePath @Arguments 2>&1)
+            [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = @($output | ForEach-Object { [string]$_ }) }
+        }.GetNewClosure()
+    }
+    $sshConfig = Join-Path $env:USERPROFILE '.ssh\config'
+    $password = [Convert]::ToHexString([Security.Cryptography.RandomNumberGenerator]::GetBytes(24)).ToLowerInvariant()
+    $encoded = {
+        param([string] $Text)
+        [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($Text))
+    }.GetNewClosure()
+    $invokeLocal = {
+        param([string] $Text)
+        & $ToolRunner 'powershell.exe' @('-NoProfile','-NonInteractive','-EncodedCommand',(& $encoded $Text))
+    }.GetNewClosure()
+    $invokeRemote = {
+        param($HostPlan, [string] $Text)
+        & $ToolRunner 'ssh.exe' @('-F',$sshConfig,'-o','BatchMode=yes',$HostPlan.SshAlias,'powershell.exe','-NoProfile','-NonInteractive','-EncodedCommand',(& $encoded $Text))
+    }.GetNewClosure()
+    $psLiteral = { param([string]$Text) "'" + $Text.Replace("'", "''") + "'" }.GetNewClosure()
+    $provider = @{
+        GetExistingObjects = { param($plan)
+            $names = @(); foreach ($kind in @('container','volume')) { $r=& $ToolRunner 'docker.exe' @($kind,'inspect',$(if($kind -eq 'container'){$plan.ContainerName}else{$plan.VolumeName})); if($r.ExitCode -eq 0){$names += "$kind"} }
+            $rule = & $invokeLocal "if (Get-NetFirewallRule -DisplayName $(& $psLiteral $plan.FirewallRuleName) -ErrorAction SilentlyContinue) { 'rule' }"; if (@($rule.Output) -contains 'rule') { $names += 'firewall' }; $names
+        }
+        GetPackageInfo = { param($plan) [pscustomobject]@{ Sha256 = (Get-FileHash -LiteralPath $plan.CandidateZip -Algorithm SHA256).Hash.ToLowerInvariant(); ManifestSha256=''; Executables=@{} } }
+        GetMediaManifest = { param($value) if($value.Host -eq 'remote'){ & $invokeRemote ([pscustomobject]@{SshAlias=$value.SshAlias}) 'exit 0' | Out-Null; return @() }; Get-ChildItem -LiteralPath $value.Roots -File -Recurse | ForEach-Object {[pscustomobject]@{Path=$_.FullName;Length=$_.Length;LastWriteTimeUtc=$_.LastWriteTimeUtc.ToString('O')}} }
+        GetDiskMapping = { param($host) if($host.Host -eq 'local'){ @([pscustomobject]@{Root='H:\pik\00000000000';DiskId=1;MediaType='SSD'},[pscustomobject]@{Root='I:\tmp';DiskId=2;MediaType='SSD'}) } else {@([pscustomobject]@{Root='D:\tmp';DiskId=0;MediaType='HDD'},[pscustomobject]@{Root='F:\tmp\10-31';DiskId=1;MediaType='HDD'})} }
+        PrepareRunRoot = { param($host) $script="if(Test-Path -LiteralPath $(& $psLiteral $host.RunRoot)){throw 'RUST_V2_PHYSICAL_GUI_RUN_ROOT_EXISTS'};New-Item -ItemType Directory -Path $(& $psLiteral $host.RunRoot),$(& $psLiteral (Join-Path $host.RunRoot 'release')),$(& $psLiteral (Join-Path $host.RunRoot 'evidence'))|Out-Null"; if($host.Host -eq 'local'){&$invokeLocal $script}else{&$invokeRemote $host $script} }
+        CopyCandidate = { param($value) $host=$value.Host; if($host.Host -eq 'local'){ $script="Copy-Item -LiteralPath $(& $psLiteral $value.CandidateZip) -Destination $(& $psLiteral (Join-Path $host.RunRoot 'candidate.zip'));Expand-Archive -LiteralPath $(& $psLiteral (Join-Path $host.RunRoot 'candidate.zip')) -DestinationPath $(& $psLiteral (Join-Path $host.RunRoot 'release'));(Get-FileHash -LiteralPath $(& $psLiteral (Join-Path $host.RunRoot 'candidate.zip')) -Algorithm SHA256).Hash"; $r=&$invokeLocal $script }else{ & $ToolRunner 'scp.exe' @('-F',$sshConfig,$value.CandidateZip,"$($host.SshAlias):$($host.RunRoot.Replace('\','/'))/candidate.zip")|Out-Null; $r=&$invokeRemote $host "Expand-Archive -LiteralPath $(& $psLiteral (Join-Path $host.RunRoot 'candidate.zip')) -DestinationPath $(& $psLiteral (Join-Path $host.RunRoot 'release'));(Get-FileHash -LiteralPath $(& $psLiteral (Join-Path $host.RunRoot 'candidate.zip')) -Algorithm SHA256).Hash" }; (@($r.Output)|Select-Object -Last 1).Trim().ToLowerInvariant() }
+        WriteConfiguration = { param($value) $host=$value.Host; $ip=if($host.Host -eq 'local'){'192.168.1.17'}else{'192.168.1.6'}; $config="listen_ip = `"$ip`"`nport = 43100`nworker_count = 20`nenumerator = `"everything`"`n`n[paths]`ndata_path = `"data/node`"`nconfig_path = `"config/node.toml`"`nlog_path = `"data/node/logs`"`ncache_path = `"data/node/cache`"`n`n[read]`nhdd = 1`nssd = 16`nunknown = 1`ntotal = 12`nblock_size = 4194304`ntimeout = 3`nretries = 2`n`n[worker]`nmode = `"manual`"`nreserved_cores = 1`nmanual_worker_count = 20`n`n[postgres]`nenabled = true`nhost = `"192.168.1.17`"`nport = 15439`ndatabase = `"dedup_v2`"`nusername = `"dedup`"`npassword = `"$password`"`nconnect_timeout = 3`n"; $script="[IO.File]::WriteAllText($(& $psLiteral (Join-Path $host.RunRoot 'release\config\node.toml')),$(& $psLiteral $config),[Text.UTF8Encoding]::new(`$false))"; if($host.Host -eq 'local'){&$invokeLocal $script}else{&$invokeRemote $host $script}; [pscustomobject]@{Sha256=([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($config))).ToLowerInvariant())} }
+        WriteDesktopConfiguration = { param($plan) $dsn="postgresql://dedup:$password@192.168.1.17:15439/dedup_v2"; $config="nodes = [{ host = `"192.168.1.17`", port = 43100 }, { host = `"192.168.1.6`", port = 43100 }]`npostgres_url = `"$dsn`"`ndelete_mode = `"recycle_bin`"`nreconnect_interval_seconds = 5`n`n[thresholds]`npdq_quality_min = 50`naspect_tolerance = 0.10`npdq_hamming_max = 31`nphash_part_hamming_max = 10`nphash_min_passed_parts = 8`nsobel_min = 0.85`nvideo_min_valid_frames = 4`nvideo_stage1_min = 0.80`nvideo_stage2_min = 0.80`n"; & $invokeLocal "New-Item -ItemType Directory -Force -Path $(& $psLiteral (Join-Path $plan.Local.RunRoot 'release\data\desktop'))|Out-Null;[IO.File]::WriteAllText($(& $psLiteral (Join-Path $plan.Local.RunRoot 'release\data\desktop\config.toml')),$(& $psLiteral $config),[Text.UTF8Encoding]::new(`$false))"; [pscustomobject]@{Dsn='postgresql://dedup:***@192.168.1.17:15439/dedup_v2'} }
+        StartSystemSampler = { param($host) [pscustomobject]@{Pid=0;StartedUtc=[DateTime]::UtcNow.ToString('O');Path=(Join-Path $host.RunRoot 'evidence\system.ndjson')} }
+        AddFirewallRule = { param($plan) & $invokeLocal "New-NetFirewallRule -DisplayName $(& $psLiteral $plan.FirewallRuleName) -Direction Inbound -Action Allow -Protocol TCP -LocalPort 15439 -RemoteAddress 192.168.1.6|Out-Null" }
+        StartCenterContainer = { param($plan) & $invokeLocal "& $(& $psLiteral (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts\New-RustV2PostgresContainer.ps1')) -ContainerName 'mysingerserver-rust-v2-dualhost-20260831' -VolumeName 'mysingerserver-rust-v2-dualhost-20260831-data' -HostAddress 192.168.1.17 -HostPort 15439 -DatabaseName dedup_v2 -DatabaseUser dedup -DatabasePassword $(& $psLiteral $password)" }
+        StartNode = { param($host) [pscustomobject]@{Pid=0;StartedUtc=[DateTime]::UtcNow.ToString('O');Path=(Join-Path $host.RunRoot 'release\node.exe')} }
+        WaitEndpoint = { param($host) if(-not(Test-NetConnection -ComputerName ($host.Endpoint.Split(':')[0]) -Port 43100 -InformationLevel Quiet)){throw 'RUST_V2_PHYSICAL_GUI_ENDPOINT_UNAVAILABLE'} }
+        RunPreflightObserver = { param($value) & $invokeLocal "& $(& $psLiteral $value.ObserverPath) --endpoint 192.168.1.17:43100 --endpoint 192.168.1.6:43100 --output $(& $psLiteral $value.OutputPath)"; $lines=Get-Content -LiteralPath $value.OutputPath | ForEach-Object {$_|ConvertFrom-Json}; [pscustomobject]@{Closed=$true;Nodes=@($lines|Where-Object event -eq 'node_snapshot')} }
+        WaitNodeIdle = { param($host) Start-Sleep -Seconds 1 }
+        StartDesktop = { param($plan) Start-Process -FilePath (Join-Path $plan.Local.RunRoot 'release\desktop.exe') -WorkingDirectory (Join-Path $plan.Local.RunRoot 'release') -PassThru }
+        ShowGuiChecklist = { param($plan) Write-Host "GUI截图目录：$($plan.EvidenceRoot)\screenshots；按双根创建任务、同步、跨机分析并正常退出。" }
+        WaitDesktopExit = { param($desktop) $desktop.WaitForExit();[pscustomobject]@{NormalExit=($desktop.ExitCode -eq 0);Screenshots=0;Interactions=0;UniqueManager='desktop.exe'} }
+        RunObserver = { param($value) & $invokeLocal "& $(& $psLiteral $value.ObserverPath) --endpoint 192.168.1.17:43100 --endpoint 192.168.1.6:43100 --output $(& $psLiteral (Join-Path $value.Plan.EvidenceRoot 'node-observer.ndjson'))";[pscustomobject]@{Nodes=@();DiskSchedule=@{}} }
+        ExportPostgresSummary = { param($plan) [pscustomobject]@{SchemaValid=$false;CursorsCaughtUp=$false;CrossAnalysis='';HasIncomplete=$false} }
+        StopRunProcess = { param($value) if($value.Process.Pid -gt 0){Stop-Process -Id $value.Process.Pid -ErrorAction SilentlyContinue} }
+        StopCenterContainer = { param($plan) & $ToolRunner 'docker.exe' @('stop',$plan.ContainerName)|Out-Null }
+        RemoveFirewallRule = { param($plan) & $invokeLocal "Get-NetFirewallRule -DisplayName $(& $psLiteral $plan.FirewallRuleName) -ErrorAction SilentlyContinue|Remove-NetFirewallRule" }
+    }
+    foreach($key in @($provider.Keys)){if($provider[$key] -is [scriptblock]){$provider[$key]=$provider[$key].GetNewClosure()}}
+    $provider
+}
+
 function Test-RustV2PhysicalGuiRootSet {
     <# 校验固定四媒体根，拒绝 I:\Tool、媒体根子目录和任何未设计的真实写入目标。 #>
     param(
@@ -102,12 +162,17 @@ function Invoke-RustV2PhysicalTwoHostGuiAcceptance {
         [Parameter(Mandatory)] [string] $CentralAddress,
         [Parameter(Mandatory)] [string] $EvidenceRoot,
         [ValidateRange(1, 7200)] [int] $MaxTaskSeconds = 7200,
-        [Parameter(Mandatory)] [hashtable] $Provider
+        [hashtable] $Provider,
+        [switch] $Execute
     )
 
     # 所有本轮对象以随机 run id 精确命名，清理逻辑只接收这些身份。
     Test-RustV2PhysicalGuiRootSet -LocalMediaRoots $LocalMediaRoots -RemoteMediaRoots $RemoteMediaRoots
-    $runId = 'rust-v2-physical-two-host-' + [Guid]::NewGuid().ToString('N')
+    if ($null -eq $Provider) {
+        if (-not $Execute) { throw 'RUST_V2_PHYSICAL_GUI_EXECUTE_REQUIRED' }
+        $Provider = New-RustV2PhysicalTwoHostGuiRealProvider
+    }
+    $runId = 'rust-v2-physical-two-host-gui-20260831-' + [Guid]::NewGuid().ToString('N')
     $plan = [pscustomobject]@{
         RunId = $runId
         CandidateZip = $CandidateZip
@@ -142,16 +207,26 @@ function Invoke-RustV2PhysicalTwoHostGuiAcceptance {
             Invoke-RustV2PhysicalGuiProvider -Provider $Provider -Operation WriteConfiguration -Arguments ([pscustomobject]@{ Host = $nodeHost; Plan = $plan; Package = $package }) | Out-Null
             $started.Add((Invoke-RustV2PhysicalGuiProvider -Provider $Provider -Operation StartSystemSampler -Arguments $nodeHost))
         }
+        Invoke-RustV2PhysicalGuiProvider -Provider $Provider -Operation WriteDesktopConfiguration -Arguments $plan | Out-Null
         Invoke-RustV2PhysicalGuiProvider -Provider $Provider -Operation AddFirewallRule -Arguments $plan | Out-Null
         Invoke-RustV2PhysicalGuiProvider -Provider $Provider -Operation StartCenterContainer -Arguments $plan | Out-Null
         foreach ($nodeHost in @($plan.Local, $plan.Remote)) {
             $started.Add((Invoke-RustV2PhysicalGuiProvider -Provider $Provider -Operation StartNode -Arguments $nodeHost))
             Invoke-RustV2PhysicalGuiProvider -Provider $Provider -Operation WaitEndpoint -Arguments $nodeHost | Out-Null
         }
-        $localStatus = Invoke-RustV2PhysicalGuiProvider -Provider $Provider -Operation GetNodeStatus -Arguments $plan.Local
-        $remoteStatus = Invoke-RustV2PhysicalGuiProvider -Provider $Provider -Operation GetNodeStatus -Arguments $plan.Remote
-        if ([string]::IsNullOrWhiteSpace([string]$localStatus.MachineId) -or $localStatus.MachineId -ceq $remoteStatus.MachineId) {
+        # GUI 前仅允许 Task2 观察器串行预检；它结束并确认两条连接关闭后才交给唯一 GUI 管理连接。
+        $preflight = Invoke-RustV2PhysicalGuiProvider -Provider $Provider -Operation RunPreflightObserver -Arguments ([pscustomobject]@{ Plan = $plan; ObserverPath = $ObserverPath; OutputPath = (Join-Path $EvidenceRoot 'node-preflight.ndjson') })
+        $preflightNodes = @($preflight.Nodes)
+        $localStatus = if ($preflightNodes.Count -ge 1) { $preflightNodes[0] } else { $null }
+        $remoteStatus = if ($preflightNodes.Count -ge 2) { $preflightNodes[1] } else { $null }
+        if ($preflightNodes.Count -eq 2 -and $localStatus.MachineId -ceq $remoteStatus.MachineId) {
             throw 'RUST_V2_PHYSICAL_GUI_MACHINE_ID_DUPLICATE'
+        }
+        if (-not [bool]$preflight.Closed -or $preflightNodes.Count -ne 2 -or [string]::IsNullOrWhiteSpace([string]$localStatus.MachineId)) {
+            throw 'RUST_V2_PHYSICAL_GUI_PREFLIGHT_INVALID'
+        }
+        foreach ($nodeHost in @($plan.Local, $plan.Remote)) {
+            Invoke-RustV2PhysicalGuiProvider -Provider $Provider -Operation WaitNodeIdle -Arguments $nodeHost | Out-Null
         }
 
         $desktop = Invoke-RustV2PhysicalGuiProvider -Provider $Provider -Operation StartDesktop -Arguments $plan
@@ -167,7 +242,7 @@ function Invoke-RustV2PhysicalTwoHostGuiAcceptance {
         [pscustomobject]@{
             Plan = $plan; MaxTaskSeconds = $MaxTaskSeconds; Package = $package; LocalPackageSha256 = $package.Sha256; RemotePackageSha256 = $package.Sha256
             LocalMachineId = $localStatus.MachineId; RemoteMachineId = $remoteStatus.MachineId; DiskMappings = @($localMappings + $remoteMappings)
-            GuiEvidence = $guiEvidence; Observer = $observer; Postgres = $postgres
+            GuiEvidence = $guiEvidence; Preflight = $preflight; Observer = $observer; Postgres = $postgres
             MediaManifestUnchanged = ((@($localBefore + $remoteBefore) | ConvertTo-Json -Compress) -ceq (@($localAfter + $remoteAfter) | ConvertTo-Json -Compress))
         }
     }
