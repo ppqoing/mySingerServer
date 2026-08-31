@@ -68,6 +68,8 @@
 - 新增：`tests/windows/Test-RustV2PhysicalTwoHostGuiAcceptance.ps1`
 - 新增：`.superpowers/sdd/2026-08-31-rust-v2-physical-two-host-gui-acceptance/task-3-report.md`
 
+**执行拆分：** Task 3A 先完成安全 DI 编排内核和七门禁报告；Task 3B 闭合正式候选解压复验、真实 TOML、双端 Node/GUI/observer 生命周期和远程媒体清单；Task 3C 闭合本地/远程 2 秒系统采样、PostgreSQL 摘要、远程证据回收和精确清理。三个子任务顺序执行，任何占位 provider 存在时不得进入 Task 5。
+
 - [ ] 用 fake Docker/SSH/process/performance provider 写 RED，覆盖：四根映射到四个预期物理盘、同 ZIP 双端 SHA 一致、两个不同 MachineId、每机恰好一个双根任务、GUI 是唯一管理连接、媒体清单前后一致。
 - [ ] 覆盖安全 RED：任何目标解析到 `I:\Tool`、媒体根下写目录、远程 F 盘运行根、非本轮容器/防火墙规则或同 MachineId 必须在产生外部写入前失败。
 - [ ] 编排脚本参数固定包括候选 ZIP、观察器路径、SSH 别名、四个媒体根、两个 endpoint、中心地址、证据根和最长任务秒数；默认最长 7200 秒。
