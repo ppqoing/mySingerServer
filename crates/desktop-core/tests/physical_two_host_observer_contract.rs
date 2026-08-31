@@ -22,7 +22,7 @@ async fn observer_reads_two_nodes_in_order_with_only_read_frames() {
     let first_endpoint = endpoint(first.local_addr().unwrap());
     let second_endpoint = endpoint(second.local_addr().unwrap());
     let (first_finished, first_done) = oneshot::channel();
-    let first_server = tokio::spawn(serve_snapshot(first, "a1", true, Some(first_finished)));
+    let first_server = tokio::spawn(serve_snapshot(first, "a1", 1, Some(first_finished)));
     let second_server = tokio::spawn(serve_snapshot_after_first(second, "b2", first_done));
     let evidence = TempDir::new().unwrap();
     let config = observer::ObserverConfig::new(
@@ -59,6 +59,39 @@ async fn observer_reads_two_nodes_in_order_with_only_read_frames() {
     assert_eq!(
         records[1]["runtime_tasks"][0]["pipeline_metrics"]["disk_reads"][0]["physical_disk_id"],
         "disk-a"
+    );
+}
+
+/// 防止运行任务超过单页上限时静默遗漏第二页的阶段、highwater 与逐盘指标。
+#[tokio::test(flavor = "current_thread")]
+async fn observer_reads_every_runtime_task_page_until_cursor_is_empty() {
+    let first = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let second = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let first_endpoint = endpoint(first.local_addr().unwrap());
+    let second_endpoint = endpoint(second.local_addr().unwrap());
+    let first_server = tokio::spawn(serve_snapshot(first, "c3", 2, None));
+    let second_server = tokio::spawn(serve_snapshot(second, "d4", 1, None));
+    let evidence = TempDir::new().unwrap();
+    let config = observer::ObserverConfig::new(
+        first_endpoint,
+        second_endpoint,
+        evidence.path(),
+        "runtime-pages.ndjson",
+    )
+    .unwrap();
+
+    observer::run_observer(config).await.unwrap();
+
+    first_server.await.unwrap();
+    second_server.await.unwrap();
+    let records = read_records(&evidence.path().join("runtime-pages.ndjson"));
+    let runtime_tasks = records[1]["runtime_tasks"].as_array().unwrap();
+    assert_eq!(runtime_tasks.len(), 2);
+    assert_eq!(runtime_tasks[0]["summary"]["runtime_task_id"], "runtime-1");
+    assert_eq!(runtime_tasks[1]["summary"]["runtime_task_id"], "runtime-2");
+    assert_eq!(
+        runtime_tasks[1]["pipeline_metrics"]["disk_reads"][0]["physical_disk_id"],
+        "disk-b"
     );
 }
 
@@ -106,11 +139,11 @@ async fn observer_stops_after_node_busy_and_writes_stable_diagnosis() {
 async fn serve_snapshot(
     listener: TcpListener,
     machine_seed: &str,
-    include_runtime: bool,
+    runtime_pages: u8,
     finished: Option<oneshot::Sender<()>>,
 ) {
     let (stream, _) = listener.accept().await.unwrap();
-    serve_snapshot_stream(stream, machine_seed, include_runtime).await;
+    serve_snapshot_stream(stream, machine_seed, runtime_pages).await;
     if let Some(finished) = finished {
         finished.send(()).unwrap();
     }
@@ -130,19 +163,20 @@ async fn serve_snapshot_after_first(
         }
         result = first_done => result.unwrap(),
     }
-    serve_snapshot(listener, machine_seed, true, None).await;
+    serve_snapshot(listener, machine_seed, 1, None).await;
 }
 
 /// 在已接收的 loopback 流上回应只读观察协议帧。
 async fn serve_snapshot_stream(
     stream: tokio::net::TcpStream,
     machine_seed: &str,
-    include_runtime: bool,
+    runtime_pages: u8,
 ) {
     let (read, write) = stream.into_split();
     let mut reader = FrameReader::new(read);
     let mut writer = FrameWriter::new(write);
     let mut received = Vec::new();
+    let mut runtime_page = 0_u8;
     loop {
         let Ok(frame) = reader.read_frame().await else {
             break;
@@ -187,10 +221,23 @@ async fn serve_snapshot_stream(
                     ..Default::default()
                 })
             }
-            proto::envelope::Payload::ListRuntimeTasks(_) if include_runtime => {
+            proto::envelope::Payload::ListRuntimeTasks(request) => {
+                runtime_page += 1;
+                assert!(
+                    runtime_page <= runtime_pages,
+                    "观察器不得在空游标后继续读取运行任务页"
+                );
+                assert_eq!(
+                    request.cursor,
+                    if runtime_page == 1 {
+                        String::new()
+                    } else {
+                        format!("runtime-page-{}", runtime_page - 1)
+                    }
+                );
                 proto::envelope::Payload::ListRuntimeTasks(proto::ListRuntimeTasks {
                     tasks: vec![proto::RuntimeTaskSummary {
-                        runtime_task_id: "runtime-1".into(),
+                        runtime_task_id: format!("runtime-{runtime_page}"),
                         machine_id: machine_seed.repeat(32),
                         task_kind: "base_compute".into(),
                         title: "扫描".into(),
@@ -203,14 +250,18 @@ async fn serve_snapshot_stream(
                         overall_skipped: 0,
                         outbox_high_seq: Some(99),
                     }],
+                    next_cursor: if runtime_page == runtime_pages {
+                        String::new()
+                    } else {
+                        format!("runtime-page-{runtime_page}")
+                    },
                     ..Default::default()
                 })
             }
-            proto::envelope::Payload::GetRuntimeTaskDetails(request) if include_runtime => {
-                assert_eq!(request.runtime_task_id, "runtime-1");
+            proto::envelope::Payload::GetRuntimeTaskDetails(request) => {
                 proto::envelope::Payload::GetRuntimeTaskDetails(proto::GetRuntimeTaskDetails {
-                    runtime_task_id: request.runtime_task_id,
-                    details: Some(runtime_details(machine_seed)),
+                    runtime_task_id: request.runtime_task_id.clone(),
+                    details: Some(runtime_details(machine_seed, &request.runtime_task_id)),
                 })
             }
             _ => panic!("观察器发送了非只读或不符合顺序的帧"),
@@ -227,17 +278,11 @@ async fn serve_snapshot_stream(
             .await
             .unwrap();
     }
-    assert_eq!(
-        received,
-        [
-            "hello",
-            "node_status",
-            "node_status",
-            "list_tasks",
-            "list_runtime_tasks",
-            "get_runtime_task_details"
-        ]
-    );
+    let mut expected = vec!["hello", "node_status", "node_status", "list_tasks"];
+    for _ in 0..runtime_pages {
+        expected.extend(["list_runtime_tasks", "get_runtime_task_details"]);
+    }
+    assert_eq!(received, expected);
 }
 
 /// 启动返回 `NodeBusy` 的节点替身。
@@ -268,10 +313,15 @@ async fn serve_busy(listener: TcpListener) {
 }
 
 /// 构造运行详情中的真实资源和逐盘指标夹具。
-fn runtime_details(machine_seed: &str) -> proto::RuntimeTaskDetails {
+fn runtime_details(machine_seed: &str, runtime_task_id: &str) -> proto::RuntimeTaskDetails {
+    let disk = if runtime_task_id == "runtime-1" {
+        "disk-a"
+    } else {
+        "disk-b"
+    };
     proto::RuntimeTaskDetails {
         summary: Some(proto::RuntimeTaskSummary {
-            runtime_task_id: "runtime-1".into(),
+            runtime_task_id: runtime_task_id.into(),
             machine_id: machine_seed.repeat(32),
             task_kind: "base_compute".into(),
             title: "扫描".into(),
@@ -306,7 +356,7 @@ fn runtime_details(machine_seed: &str) -> proto::RuntimeTaskDetails {
                 ..Default::default()
             }),
             disk_reads: vec![proto::RuntimeDiskReadMetrics {
-                physical_disk_id: "disk-a".into(),
+                physical_disk_id: disk.into(),
                 capacity: Some(2),
                 hash_waiting: Some(0),
                 media_waiting: Some(0),

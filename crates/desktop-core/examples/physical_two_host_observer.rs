@@ -166,13 +166,28 @@ async fn observe_node(endpoint: &NodeEndpoint) -> Result<Value, ObserverError> {
     let mut session = ReadonlySession::connect(endpoint.clone()).await?;
     let status = session.status().await?;
     let persistent_tasks = session.list_tasks("", READ_PAGE_LIMIT).await?;
-    let runtime_tasks = session.list_runtime_tasks("", READ_PAGE_LIMIT).await?;
-    let mut runtime_snapshots = Vec::with_capacity(runtime_tasks.tasks.len());
-    for summary in runtime_tasks.tasks {
-        let details = session
-            .runtime_task_details(&summary.runtime_task_id)
+    let mut runtime_cursor = String::new();
+    let mut runtime_snapshots = Vec::new();
+    loop {
+        let runtime_tasks = session
+            .list_runtime_tasks(&runtime_cursor, READ_PAGE_LIMIT)
             .await?;
-        runtime_snapshots.push(runtime_task_value(&summary, &details));
+        for summary in runtime_tasks.tasks {
+            let details = session
+                .runtime_task_details(&summary.runtime_task_id)
+                .await?;
+            runtime_snapshots.push(runtime_task_value(&summary, &details));
+        }
+        if runtime_tasks.next_cursor.is_empty() {
+            break;
+        }
+        if runtime_tasks.next_cursor == runtime_cursor {
+            return Err(ObserverError::new(
+                "invalid_response",
+                "ListRuntimeTasks 游标未前进",
+            ));
+        }
+        runtime_cursor = runtime_tasks.next_cursor;
     }
     let machine_id = session.machine_id()?.as_str().to_owned();
     drop(session);

@@ -46,3 +46,46 @@
   `C:\tmp\rust-v2-physical-two-host-observer-target`；没有清理任何目录。
 - 编译仍打印既有 `dedup-node-engine` 17 条 unused 警告，观察器与其契约测试无新增警告。
 - 未启动 GUI、未连接物理 Node、未读取 `I:\Tool` 或真实媒体；observer 也未加入正式发布 ZIP 配置。
+
+## Fix round 1：运行任务多页终态证据
+
+### 根因与修复
+
+- 审查发现 `observe_node` 只调用一次 `ListRuntimeTasks("", 100)`，随后把这一页写成完整
+  `runtime_tasks`。该页的 `next_cursor` 被丢弃，101 个及以上运行任务会静默遗漏详情。
+- 改为以空 cursor 开始循环：每页逐项 `GetRuntimeTaskDetails` 后，只有 `next_cursor` 为空才结束；
+  重复 cursor 返回 `invalid_response`，避免无限循环或伪造完整性。
+- 新增真实 loopback 多页契约：第一 Node 返回两页（`runtime-page-1` 后还有第二页），断言两页的
+  任务 ID、第二页详情和 `disk-b` 指标均已写入 NDJSON；替身还严格断言完整帧序列。
+
+### 覆盖命令与完整结果
+
+```powershell
+$env:CARGO_TARGET_DIR='C:\tmp\rust-v2-physical-two-host-observer-target'
+cargo test -p dedup-desktop-core --test physical_two_host_observer_contract --locked -- --test-threads=1
+cargo check -p dedup-desktop-core --example physical_two_host_observer --locked
+cargo fmt --all -- --check
+git diff --check
+```
+
+RED（新增测试、修复前）：进程退出码 101；3 个测试中 2 个通过、1 个失败。失败测试
+`observer_reads_every_runtime_task_page_until_cursor_is_empty` 的 loopback 断言实际帧序列为
+`hello,node_status,node_status,list_tasks,list_runtime_tasks,get_runtime_task_details`，期望还包含第二组
+`list_runtime_tasks,get_runtime_task_details`。这直接证明 cursor 被静默丢弃。
+
+GREEN（修复后）：进程退出码 0，完整输出如下。
+
+```text
+running 3 tests
+test observer_reads_every_runtime_task_page_until_cursor_is_empty ... ok
+test observer_reads_two_nodes_in_order_with_only_read_frames ... ok
+test observer_stops_after_node_busy_and_writes_stable_diagnosis ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+```
+
+`cargo check` 退出码 0，输出为 `Checking dedup-desktop-core ...` 和 `Finished dev profile`；
+`cargo fmt --all -- --check` 与 `git diff --check` 退出码均为 0 且无格式或空白 diff。
+三次 Rust 命令均重复显示既有 `dedup-node-engine` 17 条 unused 警告（`actor.rs`、`scan/mod.rs`
+及相关未用函数）；本轮 observer/example/contract 没有新增警告。运行前 C 盘余量为 16.26 GiB，
+仍使用原专用可再生 target，未清理任何目录或连接真实节点。
