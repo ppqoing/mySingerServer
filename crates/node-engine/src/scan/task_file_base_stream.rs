@@ -13,14 +13,14 @@ use tokio::{sync::mpsc::UnboundedReceiver, task::JoinSet, time::sleep};
 use super::{
     BaseComputeDecision, HashPermitReader, TaskFileBaseCoordinatorOptions,
     base_compute::cache_rank,
-    base_persistence::{BasePersistAck, BaseStoreHandle},
+    base_persistence::{BasePersistAck, BasePersistOutcome, BaseStoreHandle},
     task_file_base_compute::{HashReadOutcome, TaskFileBaseComputePending, TaskFileHashRuntime},
     task_file_media_compute::TaskFileMediaRuntime,
     task_file_media_persistence::TaskFilePersistRuntime,
 };
 use crate::{
     RemoteCacheError, RemoteFeatureCache,
-    runtime_tasks::RuntimeTaskReporter,
+    runtime_tasks::{RuntimeProgressUnit, RuntimeStage, RuntimeTaskReporter},
     task_dispatch::{
         TaskDispatchAdmission, TaskDispatchError, TaskDispatchPoll, TaskLanePermitProvider,
     },
@@ -71,6 +71,42 @@ impl<P: TaskLanePermitProvider> fmt::Display for TaskFileBaseStreamError<P> {
     }
 }
 
+/// 从 SQLite ACK 解析成功、失败和跳过增量；错误或未应用结果不推进进度。
+fn runtime_progress_for_ack(ack: &BasePersistAck) -> Option<(u64, u64, u64)> {
+    match ack.result.as_ref().ok()? {
+        BasePersistOutcome::Succeeded { .. } => Some((1, 0, 0)),
+        BasePersistOutcome::Failed {
+            skipped_incomplete, ..
+        } => Some((
+            0,
+            u64::from(!skipped_incomplete),
+            u64::from(*skipped_incomplete),
+        )),
+        BasePersistOutcome::Cancelled { .. } => Some((0, 0, 1)),
+        BasePersistOutcome::Ignored => None,
+    }
+}
+
+/// 在任务文件终态已经提交后同步推进阶段和总体投影；遥测失败不改变主状态机。
+fn report_runtime_progress(
+    reporter: Option<&RuntimeTaskReporter>,
+    completed: u64,
+    failed: u64,
+    skipped: u64,
+) {
+    let Some(reporter) = reporter else {
+        return;
+    };
+    let _ = reporter.advance_stage_outcome_nowait(
+        RuntimeStage::ComputeBaseFeatures,
+        RuntimeProgressUnit::Files,
+        completed,
+        failed,
+        skipped,
+    );
+    let _ = reporter.advance_overall_nowait(completed, failed, skipped);
+}
+
 /// 单一 Hash/远端/Media/SQLite ACK 事件泵。
 pub(super) async fn run_task_file_base_stream<P, H, R>(
     mut pending: TaskFileBaseComputePending<P>,
@@ -111,6 +147,8 @@ where
     let mut persist = TaskFilePersistRuntime::new();
     let mut remote_lookups = JoinSet::<RemoteLookupOutput>::new();
     let mut failure = None;
+    // 完整路径缓存不会进入任务文件，在计算阶段开始时直接计为已完成。
+    report_runtime_progress(reporter, pending.manifest.resolved_files.len() as u64, 0, 0);
 
     loop {
         if cancellation.is_cancelled() {
@@ -153,9 +191,18 @@ where
             ack = acknowledgements.recv(), if persist.has_in_flight() => {
                 match ack {
                     Some(ack) => {
+                        let progress = runtime_progress_for_ack(&ack);
                         if let Err(message) = persist.apply_ack(&mut pending, ack) {
                             failure = Some(message);
                             break;
+                        }
+                        if let Some((completed, failed, skipped)) = progress {
+                            report_runtime_progress(
+                                reporter,
+                                completed,
+                                failed,
+                                skipped,
+                            );
                         }
                     }
                     None => {
@@ -595,6 +642,7 @@ mod tests {
     use crate::{
         RemoteCacheError, RemoteFeatureCache,
         io::{DiskReadClass, DiskReadLane, DiskReadPermit, DiskReadScheduler, ReadFailure},
+        runtime_tasks::{RuntimeProgressUnit, RuntimeStage, RuntimeTaskKind, RuntimeTaskRegistry},
         scan::{
             BaseTaskInput, BaseTaskProducer, HashPermitReader, PlannedScannedPath, ReadProduct,
             TaskDiskLane, TaskFileBaseCoordinatorOptions, TaskFileMediaPersistenceOptions,
@@ -946,6 +994,97 @@ mod tests {
                 ..Default::default()
             },
         }
+    }
+
+    /// SQLite ACK 已经把任务文件行改为终态后，扫描收尾前就必须发布真实基础计算进度。
+    #[tokio::test]
+    async fn streamed_sqlite_ack_advances_runtime_progress_before_scan_finalization() {
+        let root = tempfile::tempdir().unwrap();
+        let machine = MachineId::from_sha256([0xD1; 32]);
+        let md5 = [0xD2; 16];
+        let mut store = NodeStore::open_in_memory(machine.clone()).unwrap();
+        let seeded = store
+            .upsert_content_and_location(
+                &scanned(r"C:\seed-complete.bin", 10),
+                md5,
+                MediaKind::Other,
+            )
+            .unwrap();
+        store.mark_base_complete(seeded.id).unwrap();
+        let cached = store.load_base_cache_record(seeded.id).unwrap();
+        let permits = Arc::new(AtomicUsize::new(0));
+        let pending = TaskFileBaseComputePending::from_production(production(
+            root.path(),
+            CountingProvider(Arc::clone(&permits)),
+            &[
+                input(
+                    scanned(r"C:\path-cache-hit.bin", 10),
+                    lane(70),
+                    Some(cached),
+                ),
+                input(scanned(r"C:\stream-progress.bin", 10), lane(70), None),
+            ],
+        ));
+        let (actor, handle, mut acknowledgements) =
+            crate::scan::base_persistence::BaseStoreActor::spawn(store, 1);
+        let (mut pool, _started, _controller) = WorkerPool::controlled_batch_for_test(1);
+        let registry = RuntimeTaskRegistry::new();
+        let reporter = registry
+            .begin_with_id(RUN_ID, RuntimeTaskKind::BaseCompute, machine, "基础计算")
+            .await;
+        reporter.update_overall_nowait(0, Some(2), 0, 0).unwrap();
+        reporter
+            .start_stage_nowait(
+                RuntimeStage::ComputeBaseFeatures,
+                RuntimeProgressUnit::Files,
+            )
+            .unwrap();
+        let reader = GatedHashReader {
+            entered: Arc::new(AtomicUsize::new(0)),
+            gate: Arc::new(Notify::new()),
+            gated_path: r"C:\not-this-path.bin".into(),
+            md5,
+        };
+        let mut remote_available = false;
+        let mut warning = None;
+
+        let mut completed = match run_task_file_base_stream(
+            pending,
+            reader,
+            &mut pool,
+            &handle,
+            &mut acknowledgements,
+            &options(root.path()),
+            ReadCancellationToken::new(),
+            Arc::new(crate::DisabledRemoteFeatureCache),
+            &mut remote_available,
+            &mut warning,
+            Some(&reporter),
+        )
+        .await
+        {
+            Ok(completed) => completed,
+            Err(error) => panic!("流式基础计算必须成功: {error}"),
+        };
+
+        let details = registry.details(reporter.id()).await.unwrap();
+        let compute = details
+            .stages
+            .iter()
+            .find(|stage| stage.stage_id == "compute_base_features")
+            .unwrap();
+        assert_eq!(
+            compute.completed, 2,
+            "完整路径缓存和后续 ACK 都必须在扫描收尾前推进"
+        );
+        assert_eq!(details.summary.unwrap().overall_completed, 2);
+        assert_eq!(completed.manifest.resolved_files.len(), 2);
+        assert_eq!(permits.load(Ordering::SeqCst), 0);
+        completed.dispatcher.discard().unwrap();
+        assert!(pool.shutdown().await.is_ok());
+        drop(handle);
+        drop(acknowledgements);
+        actor.finish().await.unwrap();
     }
 
     /// cleanup 必须只枚举 dispatcher 的真实在途 owner，不能把保留的 P 行 context 当作 owner。

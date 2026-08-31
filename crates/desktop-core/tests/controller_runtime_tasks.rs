@@ -372,9 +372,9 @@ async fn controller_refreshes_runtime_tasks_on_two_second_tick_and_terminal_even
     server.await.unwrap().unwrap();
 }
 
-/// 列表传输失败不能把旧摘要当作当前任务；只有已选详情允许保留并 stale。
+/// 列表传输瞬时失败必须保留旧摘要和已选详情，避免运行任务在刷新之间闪现。
 #[tokio::test(start_paused = true)]
-async fn runtime_list_failure_removes_old_summary_and_only_selected_details_stale() {
+async fn runtime_list_failure_keeps_last_summary_and_selected_details_stale() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let machine_id = MachineId::from_sha256([0xe2; 32]);
@@ -427,7 +427,8 @@ async fn runtime_list_failure_removes_old_summary_and_only_selected_details_stal
     let failed = tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             if let Some(UiEvent::RuntimeTasksChanged(state)) = events.recv().await
-                && state.summaries().is_empty()
+                && state.summaries().len() == 1
+                && state.summaries()[0].key.id == "node-runtime"
                 && state.selected().is_some()
                 && state.details().is_some()
                 && state.is_stale()
@@ -437,7 +438,7 @@ async fn runtime_list_failure_removes_old_summary_and_only_selected_details_stal
         }
     })
     .await
-    .expect("列表失败必须发布空摘要和 stale 的旧详情");
+    .expect("列表失败必须保留旧摘要和 stale 的旧详情");
     assert!(
         failed
             .error()

@@ -1439,16 +1439,35 @@ async fn refresh_runtime_tasks(
     sessions: &BTreeMap<usize, Arc<NodeSession>>,
     registry: &DesktopRuntimeTaskRegistry,
 ) {
+    // Node 瞬时断线或一次列表请求失败时，保留该节点最近一次成功摘要，避免任务闪现。
+    let previous_node_summaries = view
+        .summaries()
+        .iter()
+        .filter_map(|summary| match summary.key.owner {
+            RuntimeTaskOwner::Node { node_index } => Some((node_index, summary.clone())),
+            RuntimeTaskOwner::Desktop => None,
+        })
+        .collect::<Vec<_>>();
     let mut summaries = registry.list();
     let mut errors = Vec::new();
+    let mut refreshed_nodes = BTreeSet::new();
     for (node_index, session) in sessions {
         match list_node_runtime_tasks(*node_index, session).await {
-            Ok(mut tasks) => summaries.append(&mut tasks),
+            Ok(mut tasks) => {
+                refreshed_nodes.insert(*node_index);
+                summaries.append(&mut tasks);
+            }
             Err(error) => {
                 errors.push(format!("节点 {node_index} 运行任务列表失败: {error}"));
             }
         }
     }
+    summaries.extend(
+        previous_node_summaries
+            .into_iter()
+            .filter(|(node_index, _)| !refreshed_nodes.contains(node_index))
+            .map(|(_, summary)| summary),
+    );
     summaries.sort_by(|left, right| left.key.cmp(&right.key));
     summaries.dedup_by(|left, right| left.key == right.key);
     view.replace_summaries(summaries, (!errors.is_empty()).then(|| errors.join("；")));

@@ -295,7 +295,8 @@ async fn runtime_events_disconnect_stales_details_and_reconnects_with_new_genera
             ip: address.ip(),
             port: address.port(),
         }],
-        reconnect_interval_seconds: 1,
+        // 与两秒运行任务刷新错开，先独立验证离线刷新保留摘要，再触发重连。
+        reconnect_interval_seconds: 30,
         ..DesktopConfig::default()
     };
     let (app, mut events) = DesktopApp::start(config, desktop_paths(&temp));
@@ -316,6 +317,15 @@ async fn runtime_events_disconnect_stales_details_and_reconnects_with_new_genera
     let stale = next_runtime_state(&mut events, RuntimeTaskControllerState::is_stale).await;
     assert!(stale.error().is_some());
     assert_node_detail_machine(&stale, first_machine.as_str());
+    tokio::time::advance(Duration::from_secs(2)).await;
+    let retained = next_runtime_state(&mut events, RuntimeTaskControllerState::is_stale).await;
+    assert!(
+        retained
+            .summaries()
+            .iter()
+            .any(|task| task.key.id == "runtime-reconnect"),
+        "断线后的周期刷新必须保留最近一次运行任务摘要"
+    );
 
     let second_machine = MachineId::from_sha256([0xe3; 32]);
     let second_calls = Arc::new(AtomicUsize::new(0));
@@ -331,7 +341,7 @@ async fn runtime_events_disconnect_stales_details_and_reconnects_with_new_genera
         },
         second_shutdown,
     ));
-    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::time::advance(Duration::from_secs(30)).await;
     let reconnected = next_runtime_state(&mut events, |state| {
         !state.is_stale()
             && state
