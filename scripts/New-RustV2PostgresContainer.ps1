@@ -54,10 +54,16 @@ $expectedSchemaSummary = 'mysingerserver-rust-v2-central-schema-3|3|22'
 
 # 只允许明确的 IPv4/IPv6 单播地址，避免主机名、通配符和参数注入进入 Docker argv。
 $parsedHostAddress = $null
-if (-not [System.Net.IPAddress]::TryParse($HostAddress, [ref]$parsedHostAddress) -or
-    $parsedHostAddress.AddressFamily -notin @([System.Net.Sockets.AddressFamily]::InterNetwork, [System.Net.Sockets.AddressFamily]::InterNetworkV6) -or
+$hostAddressParsed = [System.Net.IPAddress]::TryParse($HostAddress, [ref]$parsedHostAddress)
+$isSupportedAddressFamily = $hostAddressParsed -and $parsedHostAddress.AddressFamily -in @([System.Net.Sockets.AddressFamily]::InterNetwork, [System.Net.Sockets.AddressFamily]::InterNetworkV6)
+$addressBytes = if ($hostAddressParsed) { $parsedHostAddress.GetAddressBytes() } else { @() }
+$isIpv4Multicast = $isSupportedAddressFamily -and $parsedHostAddress.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork -and $addressBytes[0] -ge 224 -and $addressBytes[0] -le 239
+$isIpv4Broadcast = $isSupportedAddressFamily -and [System.Net.IPAddress]::Broadcast.Equals($parsedHostAddress)
+$isIpv6Scoped = $isSupportedAddressFamily -and $parsedHostAddress.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6 -and $parsedHostAddress.ScopeId -ne 0
+if (-not $hostAddressParsed -or -not $isSupportedAddressFamily -or
     [System.Net.IPAddress]::Any.Equals($parsedHostAddress) -or
-    [System.Net.IPAddress]::IPv6Any.Equals($parsedHostAddress)) {
+    [System.Net.IPAddress]::IPv6Any.Equals($parsedHostAddress) -or
+    $isIpv4Multicast -or $isIpv4Broadcast -or $parsedHostAddress.IsIPv6Multicast -or $isIpv6Scoped) {
     throw "RUST_V2_POSTGRES_HOST_ADDRESS_INVALID value=$HostAddress"
 }
 $normalizedHostAddress = $parsedHostAddress.ToString()

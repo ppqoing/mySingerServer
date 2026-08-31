@@ -96,7 +96,17 @@ exit /b 2
         throw "脚本必须输出指定主机地址的连接串：$($lanOutput -join ' | ')"
     }
 
-    foreach ($invalidHostAddress in @('db.example.test', '0.0.0.0', '*', '192.168.1.17;--privileged')) {
+    Remove-Item -LiteralPath $dockerLog -Force
+    $ipv6Output = @(& $containerScript -DockerExecutable $fakeDocker -HostAddress '::1')
+    $ipv6Calls = @(Get-Content -LiteralPath $dockerLog)
+    if (($ipv6Calls -join "`n") -notmatch '--publish \[::1\]:15439:5432') {
+        throw "IPv6 必须使用 Docker 方括号发布格式：$($ipv6Calls -join ' | ')"
+    }
+    if (($ipv6Output -join "`n") -notmatch 'postgresql://dedup:dedup@\[::1\]:15439/dedup_v2') {
+        throw "IPv6 连接串必须使用方括号主机地址：$($ipv6Output -join ' | ')"
+    }
+
+    foreach ($invalidHostAddress in @('db.example.test', '0.0.0.0', '255.255.255.255', '224.0.0.1', '::', 'ff02::1', 'fe80::1%12', '*', '192.168.1.17;--privileged')) {
         Remove-Item -LiteralPath $dockerLog -Force -ErrorAction SilentlyContinue
         $rejectedHostAddress = $false
         try {

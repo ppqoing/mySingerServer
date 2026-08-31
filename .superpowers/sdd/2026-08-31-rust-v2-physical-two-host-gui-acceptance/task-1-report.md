@@ -21,3 +21,37 @@
 
 - 聚焦 PowerShell 行为测试通过。
 - `git diff --check` 通过。
+
+## 审查修复 Round 1
+
+审查发现原校验仍允许 IPv4 广播/多播、IPv6 多播和带 scope 的 IPv6，且测试缺少成功 IPv6 发布场景。
+
+### RED
+
+先加入 `::1` 的 Docker argv/连接串断言，以及 `255.255.255.255`、`224.0.0.1`、`::`、`ff02::1`、
+`fe80::1%12` 等非法值的零调用断言。使用旧逻辑运行：
+
+```text
+pwsh -NoProfile -File tests\windows\Test-RustV2PostgresContainer.ps1
+Exception: ...:119
+非法主机地址必须拒绝：255.255.255.255
+exit=1
+```
+
+### GREEN
+
+生产校验现在拒绝 IPv4 广播、IPv4 多播、IPv6 多播和非零 IPv6 `ScopeId`；IPv6 发布和连接串使用
+`[::1]` 方括号格式。修复后覆盖测试完整输出：
+
+```text
+pwsh -NoProfile -File tests\windows\Test-RustV2PostgresContainer.ps1
+RUST_V2_POSTGRES_CONTAINER_TEST_PASS
+exit=0
+```
+
+并执行：
+
+```text
+git diff --check
+exit=0
+```
