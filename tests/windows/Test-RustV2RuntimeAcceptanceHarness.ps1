@@ -319,6 +319,11 @@ try {
         throw "相对路径配置或测试专用Everything错误：$config"
     }
 
+    $walkerConfig = New-IsolatedNodeConfig -Port 39124 -Enumerator windows_walker
+    if ($walkerConfig -notmatch 'enumerator = "windows_walker"') {
+        throw "显式 Windows Walker 未写入 Node 配置：$walkerConfig"
+    }
+
     # Task 17 GREEN：真实 pwsh sleeper 只验证监督边界，不启动产品、Worker 或媒体。
     function New-RealSupervisorSleeperFixture {
         <# 启动可杀进程树；client 单进程，Node 替身再派生一个长睡眠 child。 #>

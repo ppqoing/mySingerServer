@@ -90,7 +90,8 @@ try {
     foreach ($package in $resolvedPackages) {
         $name = [regex]::Escape([string]$package.name)
         $version = [regex]::Escape([string]$package.version)
-        $pattern = "(?m)^name = `"$name`"\r?\nversion = `"$version`"$"
+        # 同时接受 LF 与 CRLF，避免 version 行末残留的 \r 被误判为未锁定依赖。
+        $pattern = "(?m)^name = `"$name`"\r?\nversion = `"$version`"\r?$"
         if ($lockText -notmatch $pattern) {
             throw "RUST_V2_METADATA_NOT_LOCKED package=$($package.name)@$($package.version)"
         }

@@ -295,7 +295,41 @@ fn acceptance_test_env(roots_json: Option<&str>, single_run: Option<&str>) -> Te
         "C:/tmp/rust-v2-runtime-acceptance/task-15/runtime.ndjson",
     );
     environment.set("RUST_V2_ACCEPTANCE_DURATION_SECONDS", "1800");
+    environment.remove("RUST_V2_ACCEPTANCE_ENUMERATOR");
     environment
+}
+
+#[tokio::test]
+async fn explicit_windows_walker_is_forwarded_to_create_scan() {
+    let mut environment = acceptance_test_env(None, Some("1"));
+    environment.set("RUST_V2_ACCEPTANCE_ENUMERATOR", "windows_walker");
+    let config = AcceptanceConfig::from_env().expect("显式 Walker 应生成配置");
+    let session = FakeSession::default();
+    session.state.lock().expect("测试会话锁").complete_first = true;
+
+    run_acceptance(
+        &session,
+        &FakeClock::default(),
+        MemorySink::default(),
+        &config,
+    )
+    .await
+    .expect("显式 Walker 单轮应完成");
+
+    let state = session.state.lock().expect("测试会话锁");
+    assert_eq!(state.creates[0].2, "windows_walker");
+}
+
+#[test]
+fn invalid_enumerator_value_returns_stable_error() {
+    let mut environment = acceptance_test_env(None, None);
+    environment.set("RUST_V2_ACCEPTANCE_ENUMERATOR", "unknown");
+
+    let error = AcceptanceConfig::from_env().expect_err("非法枚举器必须拒绝");
+    assert_eq!(
+        error,
+        "RUST_V2_ACCEPTANCE_ENUMERATOR 只接受 everything 或 windows_walker"
+    );
 }
 
 #[tokio::test]
@@ -548,7 +582,7 @@ async fn completed_scan_restarts_forced_and_deadline_cancels_active_task() {
             .iter()
             .skip(1)
             .all(|(_, force, enumerator)| *force && enumerator == "everything"),
-        "提前完成后的所有续跑必须强制重算且继续使用Everything"
+        "提前完成后的所有续跑必须强制重算且继续使用 Everything"
     );
     assert_eq!(state.cancels, vec!["persistent-2"]);
     assert_eq!(result.duration_seconds, 1800);

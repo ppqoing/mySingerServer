@@ -26,13 +26,14 @@ param(
     [string] $SourceTreeSha256 = '',
     [string] $PackagePath = '',
     [string] $PackageSha256 = '',
-    [string] $Enumerator = 'everything',
     [int] $WorkerCount = 20,
     [int] $HddThreadsPerDisk = 1,
     [int] $SsdThreadsPerDisk = 16,
     [int] $UnknownThreadsPerDisk = 1,
     [int] $TotalReadThreads = 12,
     [int] $ReservedCores = 1,
+    [ValidateSet('everything', 'windows_walker')]
+    [string] $Enumerator = 'everything',
     [switch] $SingleRun,
     [switch] $CompleteWhenTaskTerminal = $true,
     [switch] $RequireDistinctPhysicalDisks,
@@ -976,8 +977,9 @@ function New-IsolatedNodeConfig {
         [int] $UnknownThreadsPerDisk = 1,
         [int] $TotalReadThreads = 12,
         [int] $ReservedCores = 1,
-        [string] $DataRoot = '',
-        [string] $Enumerator = 'everything'
+        [ValidateSet('everything', 'windows_walker')]
+        [string] $Enumerator = 'everything',
+        [string] $DataRoot = ''
     )
 
     $dataPath = if ([string]::IsNullOrWhiteSpace($DataRoot)) { 'data/node' } else { Get-NormalizedAbsolutePath -Path $DataRoot }
@@ -997,8 +999,8 @@ function New-IsolatedNodeConfig {
 listen_ip = "127.0.0.1"
 port = $Port
 worker_count = $WorkerCount
-    # 验收只枚举显式传入的媒体根；Everything 由 Node 使用同目录实例服务。
-    enumerator = "$enum"
+# 默认使用正式产品的 Everything 枚举器；调用方仍可显式选择 Windows Walker。
+enumerator = "$enum"
 
 [paths]
 data_path = $tomlDataPath
@@ -2523,13 +2525,14 @@ function Invoke-RustV2RuntimeAcceptance {
         [string] $SourceTreeSha256,
         [string] $PackagePath,
         [string] $PackageSha256,
-        [string] $Enumerator = 'everything',
         [int] $WorkerCount,
         [int] $HddThreadsPerDisk,
         [int] $SsdThreadsPerDisk,
         [int] $UnknownThreadsPerDisk,
         [int] $TotalReadThreads,
         [int] $ReservedCores,
+        [ValidateSet('everything', 'windows_walker')]
+        [string] $Enumerator = 'everything',
         [switch] $SingleRun,
         [switch] $CompleteWhenTaskTerminal,
         [switch] $RequireDistinctPhysicalDisks,
@@ -2662,6 +2665,7 @@ function Invoke-RustV2RuntimeAcceptance {
         'RUST_V2_REAL_MEDIA_ROOTS_JSON',
         'RUST_V2_ACCEPTANCE_DURATION_SECONDS',
         'RUST_V2_ACCEPTANCE_OUTPUT',
+        'RUST_V2_ACCEPTANCE_ENUMERATOR',
         'RUST_V2_ACCEPTANCE_SINGLE_RUN')) {
         $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
     }
@@ -2695,6 +2699,7 @@ function Invoke-RustV2RuntimeAcceptance {
         }
         $env:RUST_V2_ACCEPTANCE_DURATION_SECONDS = [string]$DurationSeconds
         $env:RUST_V2_ACCEPTANCE_OUTPUT = $runtimeOutput
+        $env:RUST_V2_ACCEPTANCE_ENUMERATOR = $Enumerator
         if ($completionOnTerminal) {
             $env:RUST_V2_ACCEPTANCE_SINGLE_RUN = '1'
         }

@@ -42,6 +42,9 @@ const INVALID_MEDIA_ROOTS: &str =
     "RUST_V2_REAL_MEDIA_ROOTS_JSON 必须是至少包含一个非空字符串的 JSON 数组";
 /// 单轮环境变量配置错误的稳定错误文本。
 const INVALID_SINGLE_RUN: &str = "RUST_V2_ACCEPTANCE_SINGLE_RUN 只接受 1 或 true";
+/// 枚举器环境变量配置错误的稳定错误文本。
+const INVALID_ENUMERATOR: &str =
+    "RUST_V2_ACCEPTANCE_ENUMERATOR 只接受 everything 或 windows_walker";
 
 /// 不引入 async-trait 的可借用异步结果。
 pub type AcceptanceFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>;
@@ -55,6 +58,8 @@ pub struct AcceptanceConfig {
     media_roots: Vec<String>,
     /// 是否在首个扫描进入终态后立即结束。
     single_run: bool,
+    /// 创建扫描请求使用的显式枚举器；默认与正式产品一致使用 Everything。
+    enumerator: String,
     /// 验收最长运行窗口。
     duration: Duration,
     /// 允许写入证据的根目录。
@@ -115,6 +120,7 @@ impl AcceptanceConfig {
             endpoint: endpoint.into(),
             media_roots,
             single_run,
+            enumerator: "everything".into(),
             duration: Duration::from_secs(duration_seconds),
             evidence_root: evidence_root.into(),
             output: output.into(),
@@ -136,6 +142,11 @@ impl AcceptanceConfig {
             Err(env::VarError::NotPresent) => false,
             Err(env::VarError::NotUnicode(_)) => return Err(INVALID_SINGLE_RUN.into()),
         };
+        let enumerator = match env::var("RUST_V2_ACCEPTANCE_ENUMERATOR") {
+            Ok(value) => parse_enumerator(&value)?,
+            Err(env::VarError::NotPresent) => "everything".into(),
+            Err(env::VarError::NotUnicode(_)) => return Err(INVALID_ENUMERATOR.into()),
+        };
         let output = PathBuf::from(required_env("RUST_V2_ACCEPTANCE_OUTPUT")?);
         let evidence_root = output
             .parent()
@@ -149,14 +160,16 @@ impl AcceptanceConfig {
             })
             .transpose()?
             .unwrap_or(DEFAULT_DURATION_SECONDS);
-        Self::new_with_roots(
+        let mut config = Self::new_with_roots(
             &endpoint,
             media_roots,
             single_run,
             duration_seconds,
             evidence_root,
             &output,
-        )
+        )?;
+        config.enumerator = enumerator;
+        Ok(config)
     }
 
     /// 返回固定计算窗口。
@@ -169,9 +182,9 @@ impl AcceptanceConfig {
         Duration::from_secs(SAMPLE_SECONDS)
     }
 
-    /// 返回验收契约固定的 Everything 协议值，不受外部脚本参数影响实际请求。
-    pub const fn enumerator(&self) -> &'static str {
-        "everything"
+    /// 返回验收客户端默认的 Everything 协议值，与正式 Node 默认枚举器保持一致。
+    pub fn enumerator(&self) -> &str {
+        &self.enumerator
     }
 
     /// 返回原样传给远端 Node 的媒体根。
@@ -1422,6 +1435,15 @@ fn parse_single_run(value: Option<String>) -> Result<bool, String> {
         return Ok(true);
     }
     Err(INVALID_SINGLE_RUN.into())
+}
+
+/// 解析显式枚举器；空值和未知值都拒绝，避免悄悄改变测试边界。
+fn parse_enumerator(value: &str) -> Result<String, String> {
+    let value = value.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "everything" | "windows_walker" => Ok(value),
+        _ => Err(INVALID_ENUMERATOR.into()),
+    }
 }
 
 fn endpoint(value: &str) -> Result<NodeEndpoint, String> {
