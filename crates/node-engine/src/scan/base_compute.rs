@@ -3210,9 +3210,12 @@ fn fail_media_permit_file(
         .as_path()
         .to_string_lossy()
         .into_owned();
-    tracing::error!(
-        item_id = job.item_id,
-        path = %display_path,
+    tracing::warn!(
+        event = "file_failed",
+        task_id = %task_id.as_uuid(),
+        item_id = %job.item_id,
+        stage = "media_permit",
+        display_path = %display_path,
         error = %message,
         "媒体读取许可失败，跳过当前文件并继续"
     );
@@ -3852,7 +3855,15 @@ fn persist_failed_base(
         .as_path()
         .to_string_lossy()
         .into_owned();
-    tracing::error!(item_id = identity.item_id, path = %display_path, error = %message, "基础特征文件处理失败，跳过并继续");
+    tracing::warn!(
+        event = "file_failed",
+        task_id = %identity.task_id.as_uuid(),
+        item_id = %identity.item_id,
+        stage = "base_compute",
+        display_path = %display_path,
+        error = %message,
+        "基础特征文件处理失败，跳过并继续"
+    );
     let result = store
         .complete_item_guarded(
             identity,
@@ -4096,9 +4107,11 @@ fn log_worker_crash(
     message: &str,
 ) {
     tracing::error!(
+        event = "worker_crashed",
         task_id = %task_id,
         item_id = %item_id,
         file_path = %identity.display_path.as_path().display(),
+        display_path = %identity.display_path.as_path().display(),
         normalized_path = %identity.normalized_path.as_str(),
         crash_stage = %identity.stage,
         worker_pid = ?worker_pid,
@@ -4362,12 +4375,12 @@ mod tests {
     };
 
     use super::{
-        ActiveBase, BaseComputeDecision, BasePersistAck, BasePersistIdentity, BasePersistOutcome,
-        ContentOutputCredits, ContentResolutionNeed, HashPhaseTracker, HashRefillController,
-        MediaAcquirePhaseTracker, ScanError, ScanSummary, TaskItemIdentity, WorkerEvent,
-        WorkerFileIdentity, apply_persist_ack, content_resolution_need, decode_credit_capacity,
-        ensure_cache_wait_holds_no_compute_resource, handle_worker_event, log_worker_crash,
-        update_pipeline_ownership,
+        ActiveBase, BaseComputeDecision, BaseComputeJob, BasePersistAck, BasePersistIdentity,
+        BasePersistOutcome, ContentOutputCredits, ContentResolutionNeed, HashPhaseTracker,
+        HashRefillController, MediaAcquirePhaseTracker, ScanError, ScanSummary, TaskItemIdentity,
+        WorkerEvent, WorkerFileIdentity, apply_persist_ack, content_resolution_need,
+        decode_credit_capacity, ensure_cache_wait_holds_no_compute_resource,
+        fail_media_permit_file, handle_worker_event, log_worker_crash, update_pipeline_ownership,
     };
 
     /// 运行时解码等待边界固定为 Worker 数的两倍，零值与溢出不得静默下溢。
@@ -4641,12 +4654,70 @@ mod tests {
         });
 
         let log = output.text();
+        assert!(log.contains("event=\"worker_crashed\""));
         assert!(log.contains(r"I:\媒体库\歌手 A\现场\崩溃样本.mp4"));
         assert!(log.contains("task_id=task-log"));
         assert!(log.contains("item_id=item-log"));
         assert!(log.contains("crash_stage=base_compute"));
         assert!(log.contains("worker_pid=Some(10528)"));
         assert!(log.contains("worker_exit_code=Some(-1073740940)"));
+    }
+
+    #[test]
+    fn media_permit_failure_writes_one_structured_file_event() {
+        let output = SharedLogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_writer(output.clone())
+            .finish();
+        let machine_id = MachineId::from_sha256([0x75; 32]);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("媒体许可失败.mp4");
+        let scanned = dedup_node_store::ScannedPath::new(
+            NormalizedPath::new(&path).unwrap(),
+            DisplayPath::new(&path).unwrap(),
+            4096,
+        );
+        let mut store = NodeStore::open_in_memory(machine_id).unwrap();
+        let content_id = store
+            .upsert_content_and_location(&scanned, [0x75; 16], MediaKind::Other)
+            .unwrap()
+            .id;
+        let job = BaseComputeJob {
+            item_id: "item-media-permit".into(),
+            scanned,
+            md5: [0x75; 16],
+            physical_disk_id: "disk-media-permit".into(),
+            content_id,
+            decision: BaseComputeDecision::for_cache(None, false, false),
+            output_credit: None,
+            decode_credit: None,
+        };
+        let task_id = TaskId::new();
+        let expected_task_id = task_id.as_uuid().to_string();
+        let mut pending_persist = VecDeque::new();
+
+        tracing::subscriber::with_default(subscriber, || {
+            fail_media_permit_file(
+                task_id,
+                &job,
+                "读取许可被拒绝".into(),
+                &mut pending_persist,
+                42,
+            )
+            .unwrap();
+        });
+
+        let log = output.text();
+        assert_eq!(log.matches("event=\"file_failed\"").count(), 1);
+        assert!(log.contains(&format!("task_id={expected_task_id}")));
+        assert!(log.contains("item_id=item-media-permit"));
+        assert!(log.contains("stage=\"media_permit\""));
+        assert!(log.contains(path.to_string_lossy().as_ref()));
+        assert!(log.contains("error=读取许可被拒绝"));
+        assert_eq!(pending_persist.len(), 1);
     }
 
     /// 孤儿 Started 不得登记 Worker slot/CPU，随后重复终态也必须保持无泄漏。

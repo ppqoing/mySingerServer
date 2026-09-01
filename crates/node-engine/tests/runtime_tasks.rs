@@ -206,6 +206,38 @@ async fn running_progress_is_coalesced_until_two_second_tick_and_terminal_is_imm
 }
 
 #[tokio::test]
+async fn task_start_writes_one_structured_log() {
+    let output = SharedLogBuffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_target(false)
+        .with_writer(output.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let registry = RuntimeTaskRegistry::new();
+    let machine_id = MachineId::from_sha256([0xA4; 32]);
+    let expected_machine_id = machine_id.as_str().to_owned();
+
+    registry
+        .begin_with_id(
+            "runtime-start-log",
+            RuntimeTaskKind::BaseCompute,
+            machine_id,
+            "开始日志",
+        )
+        .await;
+    drop(_guard);
+
+    let log = output.text();
+    assert_eq!(log.matches("运行任务已开始").count(), 1);
+    assert_eq!(log.matches("event=\"runtime_task_started\"").count(), 1);
+    assert!(log.contains("runtime_task_id=runtime-start-log"));
+    assert!(log.contains("task_kind=\"base_compute\""));
+    assert!(log.contains(&format!("machine_id={expected_machine_id}")));
+}
+
+#[tokio::test]
 async fn terminal_transition_writes_one_structured_log() {
     let output = SharedLogBuffer::default();
     let subscriber = tracing_subscriber::fmt()
@@ -216,10 +248,13 @@ async fn terminal_transition_writes_one_structured_log() {
         .finish();
     let _guard = tracing::subscriber::set_default(subscriber);
     let registry = RuntimeTaskRegistry::new();
+    let machine_id = MachineId::from_sha256([0x84; 32]);
+    let expected_machine_id = machine_id.as_str().to_owned();
     let task = registry
-        .begin(
+        .begin_with_id(
+            "runtime-terminal-log",
             RuntimeTaskKind::BaseCompute,
-            MachineId::from_sha256([0x84; 32]),
+            machine_id,
             "终态日志",
         )
         .await;
@@ -234,11 +269,52 @@ async fn terminal_transition_writes_one_structured_log() {
 
     let log = output.text();
     assert_eq!(log.matches("运行任务进入终态").count(), 1);
+    assert_eq!(log.matches("event=\"runtime_task_terminal\"").count(), 1);
+    assert!(log.contains("runtime_task_id=runtime-terminal-log"));
+    assert!(log.contains("task_kind=\"base_compute\""));
+    assert!(log.contains(&format!("machine_id={expected_machine_id}")));
     assert!(log.contains("state=\"completed\""), "实际日志：{log}");
     assert!(log.contains("overall_completed=7"));
+    assert!(log.contains("overall_total=Some(9)"));
     assert!(log.contains("overall_failed=1"));
     assert!(log.contains("overall_skipped=1"));
     assert!(log.contains("has_pipeline_metrics=false"));
+}
+
+#[tokio::test]
+async fn dropped_event_receivers_write_expected_condition_for_each_publish_path() {
+    let output = SharedLogBuffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_target(false)
+        .with_writer(output.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let clock = Arc::new(ManualClock::default());
+    let registry = RuntimeTaskRegistry::with_clock(clock.clone());
+    let publisher = RuntimeProgressPublisher::new(registry.clone());
+    let task = registry
+        .begin_with_id(
+            "runtime-closed-receiver",
+            RuntimeTaskKind::BaseCompute,
+            MachineId::from_sha256([0xB4; 32]),
+            "关闭接收端",
+        )
+        .await;
+
+    task.update_overall_nowait(0, Some(2), 0, 0).unwrap();
+    task.update_overall_nowait(1, Some(2), 0, 0).unwrap();
+    clock.advance(Duration::from_secs(2));
+    publisher.tick();
+    task.finish(RuntimeTaskState::Completed).await.unwrap();
+    drop(_guard);
+
+    let log = output.text();
+    assert!(log.contains("operation=\"publish_forced_event\""));
+    assert!(log.contains("operation=\"publish_due_event\""));
+    assert!(log.contains("operation=\"publish_terminal_event\""));
+    assert_eq!(log.matches("event=\"expected_condition\"").count(), 3);
 }
 
 #[tokio::test]

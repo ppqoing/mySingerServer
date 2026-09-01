@@ -51,7 +51,7 @@ Join 失败都能追踪到一个最终记录 owner；中间层只增加上下文
 | Windows 回收站 STA 线程 | `move_to_recycle_bin` 调用方 | COM `Err`、线程 panic | 向删除任务 owner 传播，最终 `file_failed`/任务错误 | `join()` 错误转 `io::Error`；panic hook另保留 panic | windows/node-engine tests |
 | Node 替代进程生命周期 | node main / host control | spawn、等待父 PID、参数解析错误 | `process_failed`、`request_failed` | Windows 边界保留原始 `io::Error` 向最终 owner 传播 | restart lifecycle tests/check |
 | 磁盘满清理与可再生产物 cleanup | `DiskFullCleaner` | resolver、metadata、remove、锁中毒、SQLite cleanup | `file_failed`、`expected_condition`、`invariant_failed`、`background_task_failed` | NotFound 与真实 IO 错误分开；DB cleanup 继续向上传播 | disk-full cleanup tests |
-| RuntimeTaskRegistry 广播 | Registry/Reporter | receiver 关闭、终态持久更新失败 | `expected_condition`、`background_task_failed`、`runtime_task_terminal` | 终态事件只在成功进入终态后一次 | `runtime_tasks` |
+| RuntimeTaskRegistry 广播 | Registry/Reporter | receiver 关闭、终态持久更新失败 | `expected_condition`、`background_task_failed`、`runtime_task_started`、`runtime_task_terminal` | 瞬态任务进入 registry 时写一次开始事件，成功进入终态后只写一次终态事件 | `runtime_tasks` |
 
 ## 结果消费表
 
@@ -103,10 +103,10 @@ rg -n --glob '*.rs' --glob '!**/tests/**' --glob '!target/**' `
   apps crates
 ```
 
-截至本次实现：Windows 正式 `lib`/`bin` 中没有未分类的 `Result` 丢弃。搜索仍会显示以下已分类
-文本命中：Windows `HRESULT::ok()` 的向上传播转换、`#[cfg(test)]` 内断言/夹具、不适用平台中对
-普通 `Metadata` 值的占位，以及 `examples/runtime_acceptance.rs` 开发验收工具。它们不进入三个正式
-可执行文件；正式 target 还由以下 lint 阻止新增未消费结果：
+当前稳定任务开始/终态、广播接收端关闭、基础文件失败、Worker 崩溃和临时 PostgreSQL 连接驱动
+已经落到上述最终 owner。严格搜索仍能发现瞬态扫描、分析、删除和 WorkerPool 中的存量
+`let _ = Result`；这些调用点必须按各自 owner 分批适配，不能用 `drop` 机械消除。因此下面的 lint
+当前作为存量审计命令保留，不能被描述为已经通过的发布门禁：
 
 ```powershell
 cargo clippy --workspace --lib --bins --all-features -- `

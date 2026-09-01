@@ -598,6 +598,7 @@ impl RuntimeTaskRegistry {
                     progress_dirty: false,
                 },
             );
+        log_runtime_task_started(&task_id, kind, &machine_id);
         RuntimeTaskReporter {
             registry: self.clone(),
             task_id,
@@ -676,7 +677,11 @@ impl RuntimeTaskRegistry {
             }
         };
         if let Some(event) = event {
-            let _ = self.inner.events.send(event);
+            crate::diagnostics::record_expected(
+                self.inner.events.send(event),
+                "runtime_tasks",
+                "publish_forced_event",
+            );
         }
     }
 
@@ -709,7 +714,11 @@ impl RuntimeTaskRegistry {
                 .collect::<Vec<_>>()
         };
         for event in events {
-            let _ = self.inner.events.send(event);
+            crate::diagnostics::record_expected(
+                self.inner.events.send(event),
+                "runtime_tasks",
+                "publish_due_event",
+            );
         }
     }
 }
@@ -1698,26 +1707,48 @@ impl RuntimeTaskReporter {
         task.progress_dirty = false;
         task.last_published_at = Some(now);
         let overall_completed = task.overall_completed;
+        let overall_total = task.overall_total;
         let overall_failed = task.overall_failed;
         let overall_skipped = task.overall_skipped;
         let has_pipeline_metrics = task.pipeline_metrics.is_some();
+        let task_kind = task.kind;
+        let machine_id = task.machine_id.clone();
         drop(tasks);
         tracing::info!(
-            runtime_task_id = self.task_id,
+            event = "runtime_task_terminal",
+            runtime_task_id = %self.task_id,
+            task_kind = task_kind.as_str(),
+            machine_id = %machine_id,
             state = state.as_str(),
             overall_completed,
+            overall_total = ?overall_total,
             overall_failed,
             overall_skipped,
             has_pipeline_metrics,
             "运行任务进入终态"
         );
-        let _ = self.registry.inner.events.send(proto::RuntimeTaskChanged {
-            runtime_task_id: self.task_id.clone(),
-            state: state.as_str().into(),
-            outbox_high_seq,
-        });
+        crate::diagnostics::record_expected(
+            self.registry.inner.events.send(proto::RuntimeTaskChanged {
+                runtime_task_id: self.task_id.clone(),
+                state: state.as_str().into(),
+                outbox_high_seq,
+            }),
+            "runtime_tasks",
+            "publish_terminal_event",
+        );
         Ok(())
     }
+}
+
+/// 任务进入进程内 registry 后写入一次稳定开始事件。
+fn log_runtime_task_started(task_id: &str, kind: RuntimeTaskKind, machine_id: &MachineId) {
+    tracing::info!(
+        event = "runtime_task_started",
+        runtime_task_id = %task_id,
+        task_kind = kind.as_str(),
+        machine_id = %machine_id.as_str(),
+        "运行任务已开始"
+    );
 }
 
 fn active_task<'a>(

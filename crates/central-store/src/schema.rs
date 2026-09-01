@@ -211,11 +211,21 @@ const REQUIRED_SCHEMA: &[(&str, &[&str])] = &[
 pub async fn inspect_database(url: &str) -> Result<(), CentralError> {
     let (client, connection) = tokio_postgres::connect(url, tokio_postgres::NoTls).await?;
     let connection = tokio::spawn(async move {
-        let _ = connection.await;
+        if let Err(error) = connection.await {
+            tracing::error!(
+                event = "background_task_failed",
+                component = "central_database_diagnostics",
+                task_name = "postgres_connection",
+                operation = "drive_connection",
+                error = %error,
+                "数据库诊断连接驱动失败"
+            );
+        }
     });
-    validate_schema(&client).await?;
+    let result = validate_schema(&client).await;
     connection.abort();
-    Ok(())
+    super::log_connection_join(connection.await, true);
+    result
 }
 /// 验证 schema 产品标记及任务依赖的每一张固定表/列，不执行 DDL。
 pub async fn validate_schema(client: &tokio_postgres::Client) -> Result<(), CentralError> {
