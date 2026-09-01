@@ -1892,7 +1892,7 @@ function Assert-ResultSummaryTsv {
     catch {
         throw 'RUST_V2_ACCEPTANCE_RESULT_SUMMARY_TSV_UTF8_INVALID'
     }
-    $lines = $text -split "`n", -1
+    $lines = @($text -split "`n")
     if ($lines.Count -lt 3) {
         throw 'RUST_V2_ACCEPTANCE_RESULT_SUMMARY_TSV_FOOTER_MISSING'
     }
