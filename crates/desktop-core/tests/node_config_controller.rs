@@ -444,6 +444,8 @@ fn config_value(port: u32) -> proto::NodeConfigValue {
         worker_mode: proto::NodeWorkerMode::NodeWorkerAutomatic as i32,
         reserved_cores: 1,
         manual_worker_count: 1,
+        image_extensions: vec!["jpg".into(), "png".into()],
+        video_extensions: vec!["mp4".into()],
         postgres: Some(proto::NodePostgresConfigValue::default()),
     }
 }

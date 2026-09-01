@@ -112,8 +112,8 @@ async fn local_analysis_reports_current_runtime_and_tsv_without_legacy_rows() {
     let directory = tempfile::tempdir().unwrap();
     let scan_root = directory.path().join("scan");
     fs::create_dir(&scan_root).unwrap();
-    fs::write(scan_root.join("left.bin"), b"same content").unwrap();
-    fs::write(scan_root.join("right.bin"), b"same content").unwrap();
+    fs::write(scan_root.join("left.mp4"), b"same content").unwrap();
+    fs::write(scan_root.join("right.mp4"), b"same content").unwrap();
     let database = directory.path().join("node.db");
     let cache_root = directory.path().join("cache");
     let runtime_root = directory.path().join("data/node/runtime");

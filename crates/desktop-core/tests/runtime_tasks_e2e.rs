@@ -35,8 +35,8 @@ async fn node_pipeline_reaches_desktop_details_and_restart_forgets_transient_tas
     let media = fixture.path().join("media");
     fs::create_dir_all(&media).unwrap();
     for (name, body) in [
-        ("alpha.bin", b"alpha".as_slice()),
-        ("beta.bin", b"beta".as_slice()),
+        ("alpha.jpg", b"alpha".as_slice()),
+        ("beta.mp4", b"beta".as_slice()),
     ] {
         fs::write(media.join(name), body).unwrap();
     }

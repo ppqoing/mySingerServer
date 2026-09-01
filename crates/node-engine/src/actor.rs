@@ -4166,7 +4166,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let scan_root = directory.path().join("scan");
         fs::create_dir(&scan_root).unwrap();
-        fs::write(scan_root.join("held.bin"), b"held worker input").unwrap();
+        fs::write(scan_root.join("held.mp4"), b"held worker input").unwrap();
         let machine = MachineId::parse(&"c1".repeat(32)).unwrap();
         let store = NodeStore::open(&directory.path().join("node.db"), machine).unwrap();
         let observer = store.reopen().unwrap();
@@ -4405,7 +4405,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let scan_root = directory.path().join("scan");
         fs::create_dir(&scan_root).unwrap();
-        fs::write(scan_root.join("completed.bin"), b"abc").unwrap();
+        fs::write(scan_root.join("completed.mp4"), b"abc").unwrap();
         let machine = MachineId::parse(&"c7".repeat(32)).unwrap();
         let store = NodeStore::open(&directory.path().join("node.db"), machine).unwrap();
         let (pool, mut started, controller) = WorkerPool::controlled_batch_for_test(1);
@@ -4548,7 +4548,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let scan_root = directory.path().join("scan");
         fs::create_dir(&scan_root).unwrap();
-        fs::write(scan_root.join("latest.bin"), b"latest scan input").unwrap();
+        fs::write(scan_root.join("latest.mp4"), b"latest scan input").unwrap();
         let database = directory.path().join("node.db");
         let cache_root = directory.path().join("cache");
         let runtime_root = directory.path().join("data/node/runtime");
@@ -4719,7 +4719,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let scan_root = directory.path().join("scan");
         fs::create_dir(&scan_root).unwrap();
-        fs::write(scan_root.join("latest.bin"), b"latest scan input").unwrap();
+        fs::write(scan_root.join("latest.mp4"), b"latest scan input").unwrap();
         let cache_root = directory.path().join("cache");
         let runtime_root = directory.path().join("data/node/runtime");
         let results_root = directory.path().join("data/node/results");
@@ -5247,7 +5247,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let scan_root = directory.path().join("scan");
         fs::create_dir(&scan_root).unwrap();
-        fs::write(scan_root.join("restart-interleave.bin"), b"abc").unwrap();
+        fs::write(scan_root.join("restart-interleave.mp4"), b"abc").unwrap();
         let machine = MachineId::parse(&"c8".repeat(32)).unwrap();
         let store = NodeStore::open(&directory.path().join("node.db"), machine).unwrap();
         let (outcome_control, outcome_waiter) = BackgroundOutcomeTestController::new();
@@ -5596,7 +5596,7 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let scan_root = directory.path().join("scan");
             fs::create_dir(&scan_root).unwrap();
-            fs::write(scan_root.join("writer-gate.bin"), b"abc").unwrap();
+            fs::write(scan_root.join("writer-gate.mp4"), b"abc").unwrap();
             let machine = MachineId::parse(&"c5".repeat(32)).unwrap();
             let database = directory.path().join("node.db");
             let store = NodeStore::open(&database, machine.clone()).unwrap();

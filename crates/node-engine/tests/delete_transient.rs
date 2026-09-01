@@ -400,7 +400,7 @@ async fn delete_is_rejected_while_scan_is_running() {
     let directory = tempfile::tempdir().unwrap();
     let scan_root = directory.path().join("scan");
     fs::create_dir_all(&scan_root).unwrap();
-    fs::write(scan_root.join("held.bin"), b"scan worker input").unwrap();
+    fs::write(scan_root.join("held.mp4"), b"scan worker input").unwrap();
 
     let target = directory.path().join("delete-during-scan.bin");
     fs::write(&target, b"delete target").unwrap();
