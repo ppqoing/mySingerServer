@@ -4,6 +4,7 @@ use std::{
     env, future,
     path::{Path, PathBuf},
     process::Command,
+    sync::Mutex,
     time::Duration,
 };
 
@@ -11,24 +12,37 @@ use dedup_core::{DisplayPath, NormalizedPath};
 use dedup_node_store::ScannedPath;
 use everything_ipc::wm::{EverythingClient, RequestFlags};
 
-use super::{FileEnumerator, ScanError};
+use super::{FileEnumerator, FilteredWindowsWalker, MediaExtensionFilter, ScanError};
 
 const EVERYTHING_READY_ATTEMPTS: usize = 120;
 const EVERYTHING_READY_INTERVAL: Duration = Duration::from_millis(250);
 
 /// 用户明确选择 Everything 时使用的枚举器；不可用会直接返回错误。
-#[derive(Clone, Copy, Debug, Default)]
-pub struct EverythingEnumerator;
+#[derive(Clone, Debug)]
+pub struct EverythingEnumerator {
+    filter: MediaExtensionFilter,
+}
+
+impl EverythingEnumerator {
+    /// 创建使用一个 Node 配置快照的 Everything 枚举器。
+    pub fn new(filter: MediaExtensionFilter) -> Self {
+        Self { filter }
+    }
+}
 
 impl FileEnumerator for EverythingEnumerator {
     fn enumerate(&self, roots: &[DisplayPath]) -> Result<Vec<ScannedPath>, ScanError> {
+        if self.filter.everything_extensions().is_none() {
+            return Ok(Vec::new());
+        }
         let client = EverythingClient::new()
             .map_err(|error| ScanError::Enumeration(format!("Everything IPC 不可用: {error}")))?;
         let mut rows = Vec::new();
         for root in roots {
             let normalized_root = NormalizedPath::new(root.as_path())
                 .map_err(|error| ScanError::InvalidResult(error.to_string()))?;
-            let query = format!(r#"file: path:"{}""#, root.as_path().display());
+            let query =
+                build_query(root, &self.filter).expect("非空扩展名集合必须生成 Everything 查询");
             let list = client
                 .query_wait(&query)
                 .request_flags(RequestFlags::FullPathAndFileName | RequestFlags::Size)
@@ -71,12 +85,25 @@ impl FileEnumerator for EverythingEnumerator {
 }
 
 /// Everything 在首次完整枚举失败时整次回退到 Windows Walker，不混合两种结果。
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct PreferredEverythingEnumerator;
+#[derive(Clone, Debug)]
+pub(crate) struct PreferredEverythingEnumerator {
+    filter: MediaExtensionFilter,
+}
+
+impl PreferredEverythingEnumerator {
+    /// 创建主路径和 Walker 回退共用同一扩展名集合的枚举器。
+    pub(crate) fn new(filter: MediaExtensionFilter) -> Self {
+        Self { filter }
+    }
+}
 
 impl FileEnumerator for PreferredEverythingEnumerator {
     fn enumerate(&self, roots: &[DisplayPath]) -> Result<Vec<ScannedPath>, ScanError> {
-        enumerate_preferred_with(&EverythingEnumerator, &dedup_windows::WindowsWalker, roots)
+        enumerate_preferred_with(
+            &EverythingEnumerator::new(self.filter.clone()),
+            &FilteredWindowsWalker::new(self.filter.clone()),
+            roots,
+        )
     }
 
     /// Everything 或整次 Walker 回退先形成稳定清单，再独立报告枚举完成。
@@ -88,6 +115,16 @@ impl FileEnumerator for PreferredEverythingEnumerator {
     ) -> Result<(), ScanError> {
         emit_materialized_rows(self.enumerate(roots)?, complete, emit)
     }
+}
+
+/// 为一个扫描根构造带稳定扩展名条件的 Everything 查询。
+fn build_query(root: &DisplayPath, filter: &MediaExtensionFilter) -> Option<String> {
+    filter.everything_extensions().map(|extensions| {
+        format!(
+            r#"file: path:"{}" ext:{extensions}"#,
+            root.as_path().display(),
+        )
+    })
 }
 
 /// 把已完成的稳定清单与后续有界交付拆成两个生命周期边界。
@@ -119,7 +156,13 @@ where
     match everything.enumerate(roots) {
         Ok(rows) => Ok(rows),
         Err(error) => {
-            tracing::warn!(error = %error, "Everything 枚举失败，整次回退 Windows Walker");
+            tracing::warn!(
+                event = "dependency_fallback",
+                dependency = "everything",
+                fallback = "windows_walker",
+                error = %error,
+                "Everything 枚举失败，整次回退 Windows Walker"
+            );
             walker.enumerate(roots)
         }
     }
@@ -127,26 +170,59 @@ where
 
 /// 由收到 CreateScan 的 node.exe 启动同目录 Everything，并等待 IPC 数据库就绪。
 pub(crate) async fn ensure_everything_ready() -> bool {
-    let executable = match env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(|parent| parent.join("Everything.exe")))
-    {
-        Some(path) => path,
-        None => {
-            tracing::warn!("无法解析 node.exe 所在目录，回退 Windows Walker");
+    let current_executable = match env::current_exe() {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::warn!(
+                event = "dependency_fallback",
+                dependency = "everything",
+                fallback = "windows_walker",
+                error = %error,
+                "无法解析 node.exe 路径，回退 Windows Walker"
+            );
             return false;
         }
     };
+    let Some(parent) = current_executable.parent() else {
+        tracing::warn!(
+            event = "dependency_fallback",
+            dependency = "everything",
+            fallback = "windows_walker",
+            error = "node_executable_has_no_parent",
+            "node.exe 路径没有父目录，回退 Windows Walker"
+        );
+        return false;
+    };
+    let executable = parent.join("Everything.exe");
+    let start_error = Mutex::new(None::<String>);
     let ready = ensure_everything_ready_with_policy(
         everything_is_ready,
-        || start_everything(&executable),
+        || match start_everything(&executable) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                *start_error.lock().unwrap() = Some(error.to_string());
+                Err(error)
+            }
+        },
         tokio::time::sleep,
     )
     .await;
     if ready {
         tracing::info!(path = %executable.display(), "Everything IPC 与数据库已经就绪");
     } else {
-        tracing::warn!(path = %executable.display(), "Everything 启动或初始化失败，回退 Windows Walker");
+        let error = start_error
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| "Everything readiness timeout".into());
+        tracing::warn!(
+            event = "dependency_fallback",
+            dependency = "everything",
+            fallback = "windows_walker",
+            path = %executable.display(),
+            error = %error,
+            "Everything 启动或初始化失败，回退 Windows Walker"
+        );
     }
     ready
 }
@@ -157,13 +233,7 @@ fn everything_is_ready() -> bool {
 
 fn start_everything(executable: &Path) -> std::io::Result<()> {
     tracing::info!(path = %executable.display(), "启动同会话 Everything 客户端");
-    Command::new(executable)
-        .arg("-startup")
-        .spawn()
-        .map(|_| ())
-        .inspect_err(|error| {
-            tracing::warn!(path = %executable.display(), error = %error, "启动 Everything 失败");
-        })
+    Command::new(executable).arg("-startup").spawn().map(|_| ())
 }
 
 async fn ensure_everything_ready_with_policy<Probe, Start, Wait, WaitFuture>(
@@ -201,7 +271,8 @@ where
     if probe() {
         return true;
     }
-    if start().is_err() {
+    if let Err(_start_error) = start() {
+        // 生产闭包在返回前保存具体原因，由 ensure_everything_ready 写唯一的最终回退事件。
         return false;
     }
     for _ in 0..attempts {
@@ -217,11 +288,11 @@ where
 mod tests {
     use std::{cell::Cell, future};
 
-    use dedup_core::{DisplayPath, NormalizedPath};
+    use dedup_core::{DisplayPath, NodeConfig, NormalizedPath};
     use dedup_node_store::ScannedPath;
 
     use super::{
-        FileEnumerator, ScanError, ensure_everything_ready_with,
+        FileEnumerator, MediaExtensionFilter, ScanError, build_query, ensure_everything_ready_with,
         ensure_everything_ready_with_policy, enumerate_preferred_with,
     };
 
@@ -245,6 +316,35 @@ mod tests {
                 17,
             )])
         }
+    }
+
+    #[test]
+    fn everything_query_contains_stable_extension_clause() {
+        let mut config = NodeConfig::default();
+        config.image_extensions = vec!["png".into(), "jpg".into()];
+        config.video_extensions = vec!["mp4".into()];
+        let filter = MediaExtensionFilter::from_config(&config);
+        let root = DisplayPath::new(r"D:\Media").unwrap();
+
+        assert_eq!(
+            build_query(&root, &filter).as_deref(),
+            Some(r#"file: path:"D:\Media" ext:jpg;mp4;png"#),
+        );
+    }
+
+    #[test]
+    fn everything_query_is_absent_for_empty_filter() {
+        let mut config = NodeConfig::default();
+        config.image_extensions.clear();
+        config.video_extensions.clear();
+
+        assert!(
+            build_query(
+                &DisplayPath::new(r"D:\Media").unwrap(),
+                &MediaExtensionFilter::from_config(&config),
+            )
+            .is_none()
+        );
     }
 
     #[tokio::test]

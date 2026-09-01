@@ -295,9 +295,9 @@ impl NodeRequestHandler for RuntimeTaskHandler {
     }
 }
 
-/// 暂停时钟精确验证 2 秒 tick、按需详情和终态事件立即刷新。
+/// 暂停时钟精确验证运行中只按 2 秒 tick 拉取，而终态主动刷新一次。
 #[tokio::test(start_paused = true)]
-async fn controller_refreshes_runtime_tasks_on_two_second_tick_and_terminal_event() {
+async fn controller_polls_progress_on_two_second_ticks_and_refreshes_terminal_immediately() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let machine_id = MachineId::from_sha256([0xe1; 32]);
@@ -358,6 +358,17 @@ async fn controller_refreshes_runtime_tasks_on_two_second_tick_and_terminal_even
         })
         .unwrap();
     wait_for_count(&list_calls, before_event + 1).await;
+    let after_terminal = list_calls.load(Ordering::SeqCst);
+    assert_eq!(
+        after_terminal,
+        before_event + 1,
+        "Node 终态主动事件必须且只能立即刷新一次"
+    );
+    tokio::time::advance(Duration::from_millis(1_999)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(list_calls.load(Ordering::SeqCst), after_terminal);
+    tokio::time::advance(Duration::from_millis(1)).await;
+    wait_for_count(&list_calls, after_terminal + 1).await;
 
     let mut observed_selected_details = false;
     while let Ok(event) = events.try_recv() {

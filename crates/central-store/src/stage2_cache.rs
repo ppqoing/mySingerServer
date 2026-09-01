@@ -56,9 +56,11 @@ impl CentralStore {
             let Some(content_id) = row.get::<_, Option<i64>>(1) else {
                 continue;
             };
-            let position = usize::try_from(row.get::<_, i64>(0))
-                .ok()
-                .and_then(|value| value.checked_sub(1))
+            let ordinal = usize::try_from(row.get::<_, i64>(0)).map_err(|error| {
+                CentralError::InvalidState(format!("二筛缓存序号无法转换: {error}"))
+            })?;
+            let position = ordinal
+                .checked_sub(1)
                 .filter(|value| *value < requests.len())
                 .ok_or_else(|| CentralError::InvalidState("二筛缓存序号无效".into()))?;
             content_positions.insert(content_id, position);

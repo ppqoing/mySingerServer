@@ -65,6 +65,15 @@ impl WorkerJob {
 impl Drop for WorkerJob {
     fn drop(&mut self) {
         // SAFETY: handle 由 CreateJobObjectW 创建，只由本值关闭一次。
-        let _ = unsafe { CloseHandle(self.handle) };
+        if let Err(error) = unsafe { CloseHandle(self.handle) } {
+            tracing::warn!(
+                event = "request_failed",
+                component = "worker_job",
+                request_id = 0_u64,
+                operation = "close_job_handle",
+                error = %error,
+                "关闭 Worker Job Object 句柄失败"
+            );
+        }
     }
 }

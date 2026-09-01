@@ -1,7 +1,10 @@
 use std::{collections::BTreeSet, fs};
 
-use dedup_core::DisplayPath;
-use dedup_node_engine::scan::{EverythingEnumerator, FileEnumerator, WindowsWalker};
+use dedup_core::{DisplayPath, NodeConfig};
+use dedup_node_engine::scan::{
+    EverythingEnumerator, FileEnumerator, FilteredWindowsWalker, MediaExtensionFilter,
+    WindowsWalker,
+};
 use dedup_node_store::ScannedPath;
 use tempfile::tempdir;
 
@@ -45,12 +48,60 @@ fn windows_walker_returns_all_files_in_stable_normalized_order() {
 }
 
 #[test]
+fn filtered_walker_only_returns_configured_extensions() {
+    let directory = tempdir().unwrap();
+    fs::write(directory.path().join("photo.JPG"), b"image").unwrap();
+    fs::write(directory.path().join("movie.mp4"), b"video").unwrap();
+    fs::write(directory.path().join("notes.txt"), b"text").unwrap();
+    fs::write(directory.path().join("README"), b"none").unwrap();
+    let mut config = NodeConfig::default();
+    config.image_extensions = vec!["jpg".into()];
+    config.video_extensions = vec!["mp4".into()];
+    let walker = FilteredWindowsWalker::new(MediaExtensionFilter::from_config(&config));
+
+    let rows = walker
+        .enumerate(&[DisplayPath::new(directory.path()).unwrap()])
+        .unwrap();
+    let names = rows
+        .iter()
+        .map(|row| {
+            row.display_path
+                .as_path()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(names, ["movie.mp4", "photo.JPG"]);
+}
+
+#[test]
+fn empty_filter_returns_no_walker_rows() {
+    let directory = tempdir().unwrap();
+    fs::write(directory.path().join("photo.jpg"), b"image").unwrap();
+    let mut config = NodeConfig::default();
+    config.image_extensions.clear();
+    config.video_extensions.clear();
+    let walker = FilteredWindowsWalker::new(MediaExtensionFilter::from_config(&config));
+
+    assert!(
+        walker
+            .enumerate(&[DisplayPath::new(directory.path()).unwrap()])
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn everything_has_the_same_sorted_output_contract_when_ipc_is_available() {
     let directory = tempdir().unwrap();
-    fs::write(directory.path().join("indexed.txt"), b"fixture").unwrap();
+    fs::write(directory.path().join("indexed.jpg"), b"fixture").unwrap();
     let root = DisplayPath::new(directory.path()).unwrap();
+    let filter = MediaExtensionFilter::from_config(&NodeConfig::default());
 
-    let rows = match EverythingEnumerator.enumerate(&[root]) {
+    let rows = match EverythingEnumerator::new(filter).enumerate(&[root]) {
         Ok(rows) => rows,
         Err(error) => {
             // 原始 IPC 适配器保持严格错误；Node 上层负责把整次扫描回退到 Walker。
@@ -93,14 +144,15 @@ fn windows_walker_keeps_two_roots_globally_sorted_and_unique() {
 fn everything_keeps_two_roots_globally_sorted_and_unique_when_ipc_is_available() {
     let first_root = tempdir().unwrap();
     let second_root = tempdir().unwrap();
-    fs::write(first_root.path().join("indexed-a.bin"), b"first").unwrap();
-    fs::write(second_root.path().join("indexed-b.bin"), b"second").unwrap();
+    fs::write(first_root.path().join("indexed-a.jpg"), b"first").unwrap();
+    fs::write(second_root.path().join("indexed-b.mp4"), b"second").unwrap();
     let roots = [
         DisplayPath::new(first_root.path()).unwrap(),
         DisplayPath::new(second_root.path()).unwrap(),
     ];
 
-    let rows = match EverythingEnumerator.enumerate(&roots) {
+    let filter = MediaExtensionFilter::from_config(&NodeConfig::default());
+    let rows = match EverythingEnumerator::new(filter).enumerate(&roots) {
         Ok(rows) => rows,
         Err(error) => {
             // Everything 不可用时沿既有契约跳过，禁止为测试启动全盘索引。

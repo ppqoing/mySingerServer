@@ -16,7 +16,7 @@ impl TryFrom<&NodeConfig> for proto::NodeConfigValue {
     type Error = ProtocolError;
 
     fn try_from(value: &NodeConfig) -> Result<Self, Self::Error> {
-        value.validate()?;
+        let value = value.clone().normalized()?;
         Ok(Self {
             listen_ip: value.listen_ip.to_string(),
             port: u32::from(value.port),
@@ -54,6 +54,8 @@ impl TryFrom<&NodeConfig> for proto::NodeConfigValue {
                 value.worker.manual_worker_count,
                 "worker.manual_worker_count",
             )?,
+            image_extensions: value.image_extensions.clone(),
+            video_extensions: value.video_extensions.clone(),
             postgres: Some(proto::NodePostgresConfigValue {
                 enabled: value.postgres.enabled,
                 host: value.postgres.host.clone(),
@@ -78,16 +80,18 @@ impl TryFrom<proto::NodeConfigValue> for NodeConfig {
         let enumerator = match proto::NodeEnumerator::try_from(value.enumerator) {
             Ok(proto::NodeEnumerator::NodeWindowsWalker) => EnumeratorKind::WindowsWalker,
             Ok(proto::NodeEnumerator::NodeEverything) => EnumeratorKind::Everything,
-            Ok(proto::NodeEnumerator::Unspecified) | Err(_) => {
+            Ok(proto::NodeEnumerator::Unspecified) => {
                 return Err(invalid_config("enumerator", "未知枚举值"));
             }
+            Err(_unknown_value) => return Err(invalid_config("enumerator", "未知枚举值")),
         };
         let mode = match proto::NodeWorkerMode::try_from(value.worker_mode) {
             Ok(proto::NodeWorkerMode::NodeWorkerAutomatic) => WorkerMode::Automatic,
             Ok(proto::NodeWorkerMode::NodeWorkerManual) => WorkerMode::Manual,
-            Ok(proto::NodeWorkerMode::Unspecified) | Err(_) => {
+            Ok(proto::NodeWorkerMode::Unspecified) => {
                 return Err(invalid_config("worker.mode", "未知枚举值"));
             }
+            Err(_unknown_value) => return Err(invalid_config("worker.mode", "未知枚举值")),
         };
         let postgres = value.postgres.unwrap_or_default();
         let config = Self {
@@ -131,6 +135,8 @@ impl TryFrom<proto::NodeConfigValue> for NodeConfig {
                     "worker.manual_worker_count",
                 )?,
             },
+            image_extensions: value.image_extensions,
+            video_extensions: value.video_extensions,
             postgres: NodePostgresConfig {
                 enabled: postgres.enabled,
                 host: postgres.host,
@@ -144,8 +150,7 @@ impl TryFrom<proto::NodeConfigValue> for NodeConfig {
                 connect_timeout_seconds: postgres.connect_timeout_seconds,
             },
         };
-        config.validate()?;
-        Ok(config)
+        Ok(config.normalized()?)
     }
 }
 

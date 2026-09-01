@@ -403,6 +403,7 @@ async fn remote_config_get_returns_original_snapshot_and_effective_workers() {
     assert_eq!(snapshot.version_sha256, "current-sha");
     assert!(snapshot.logical_cpu_count >= 1);
     assert_eq!(snapshot.effective_worker_count, 7);
+    let defaults = NodeConfig::default().normalized().unwrap();
     assert_eq!(
         snapshot.config,
         Some(proto::NodeConfigValue {
@@ -424,6 +425,8 @@ async fn remote_config_get_returns_original_snapshot_and_effective_workers() {
             worker_mode: proto::NodeWorkerMode::NodeWorkerManual as i32,
             reserved_cores: 2,
             manual_worker_count: 7,
+            image_extensions: defaults.image_extensions,
+            video_extensions: defaults.video_extensions,
             postgres: Some(proto::NodePostgresConfigValue {
                 enabled: false,
                 host: "127.0.0.1".into(),
@@ -619,6 +622,8 @@ fn save_request(request_id: u64, expected_version: &str) -> proto::Envelope {
                 worker_mode: proto::NodeWorkerMode::NodeWorkerManual as i32,
                 reserved_cores: 2,
                 manual_worker_count: 7,
+                image_extensions: NodeConfig::default().image_extensions,
+                video_extensions: NodeConfig::default().video_extensions,
                 postgres: Some(proto::NodePostgresConfigValue {
                     enabled: false,
                     host: "127.0.0.1".into(),

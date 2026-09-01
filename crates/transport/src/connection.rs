@@ -1,10 +1,11 @@
 //! 单 TCP 连接上的请求复用、主动事件和断线收束。
 
 use std::{
+    future::Future,
     net::SocketAddr,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -51,18 +52,34 @@ impl ClientConnection {
 
     /// 从一个已连接 TCP 流创建请求复用器，供节点会话和集成测试使用。
     pub async fn from_stream(stream: TcpStream) -> Result<Self, TransportError> {
+        let peer = stream.peer_addr().map_err(FrameError::Io)?;
         let (read, write) = stream.into_split();
         let pending = Arc::new(PendingRequests::new());
         let outgoing = PriorityWriter::new(64, 8);
         let (event_sender, events) = mpsc::channel(128);
+        let termination_logged = Arc::new(AtomicBool::new(false));
 
-        tokio::spawn(read_loop(
-            read,
-            Arc::clone(&pending),
-            outgoing.clone(),
-            event_sender,
-        ));
-        tokio::spawn(write_loop(write, Arc::clone(&pending), outgoing.clone()));
+        spawn_observed_connection_task(
+            "read_loop",
+            read_loop(
+                read,
+                Arc::clone(&pending),
+                outgoing.clone(),
+                event_sender,
+                peer,
+                Arc::clone(&termination_logged),
+            ),
+        );
+        spawn_observed_connection_task(
+            "write_loop",
+            write_loop(
+                write,
+                Arc::clone(&pending),
+                outgoing.clone(),
+                peer,
+                termination_logged,
+            ),
+        );
 
         Ok(Self {
             next_request_id: AtomicU64::new(1),
@@ -126,20 +143,59 @@ async fn read_loop(
     pending: Arc<PendingRequests>,
     outgoing: PriorityWriter<proto::Envelope>,
     events: mpsc::Sender<proto::Envelope>,
+    peer: SocketAddr,
+    termination_logged: Arc<AtomicBool>,
 ) {
     let mut reader = FrameReader::new(read);
-    while let Ok(payload) = reader.read_frame().await {
-        let Ok(envelope) = proto::Envelope::decode(payload.as_slice()) else {
-            break;
+    loop {
+        let payload = match reader.read_frame().await {
+            Ok(payload) => payload,
+            Err(error @ FrameError::Truncated) => {
+                log_expected_close_once(&termination_logged, peer, "read", &error);
+                break;
+            }
+            Err(error) => {
+                log_connection_failure_once(&termination_logged, peer, "read", &error);
+                break;
+            }
+        };
+        let envelope = match proto::Envelope::decode(payload.as_slice()) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                log_connection_failure_once(&termination_logged, peer, "decode", &error);
+                break;
+            }
         };
         if envelope.request_id == 0 {
             match events.try_send(envelope) {
-                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    // 事件消费者关闭不应阻塞同一连接上的普通响应 demux。
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(dropped_event)) => {
+                    drop(dropped_event);
+                    tracing::warn!(
+                        event = "request_failed",
+                        component = "transport_connection",
+                        request_id = 0_u64,
+                        operation = "deliver_unsolicited_event",
+                        peer = %peer,
+                        error = "event channel full",
+                        "主动事件通道已满，本条事件无法投递"
+                    );
+                }
+                Err(mpsc::error::TrySendError::Closed(dropped_event)) => {
+                    drop(dropped_event);
+                    tracing::info!(
+                        event = "expected_condition",
+                        component = "transport_connection",
+                        operation = "deliver_unsolicited_event",
+                        reason = "event_receiver_closed",
+                        peer = %peer,
+                        error = "event channel closed",
+                        "主动事件消费者已结束，普通响应连接继续运行"
+                    );
                 }
             }
         } else {
+            // false 表示请求已由其它路径移除；send 产生的预期 Err 由 PendingRequests 自身记录。
             pending.resolve(envelope);
         }
     }
@@ -151,17 +207,78 @@ async fn write_loop(
     write: OwnedWriteHalf,
     pending: Arc<PendingRequests>,
     outgoing: PriorityWriter<proto::Envelope>,
+    peer: SocketAddr,
+    termination_logged: Arc<AtomicBool>,
 ) {
     let mut writer = FrameWriter::new(write);
     while let Some(envelope) = outgoing.next().await {
-        if writer
+        if let Err(error) = writer
             .write_frame(&envelope.encode_to_vec(), FrameClass::Ordinary)
             .await
-            .is_err()
         {
+            log_connection_failure_once(&termination_logged, peer, "write", &error);
             break;
         }
     }
     pending.fail_all();
     outgoing.close().await;
+}
+
+/// 启动连接循环并由独立观察器消费唯一 JoinError，避免 detached task panic 静默结束。
+fn spawn_observed_connection_task(
+    task_name: &'static str,
+    future: impl Future<Output = ()> + Send + 'static,
+) {
+    let task = tokio::spawn(future);
+    let observer = tokio::spawn(async move {
+        if let Err(error) = task.await {
+            tracing::error!(
+                event = "background_task_failed",
+                component = "transport_connection",
+                task_name,
+                operation = "join",
+                error = %error,
+                "TCP 连接后台循环异常终止"
+            );
+        }
+    });
+    // 观察器内部消费连接循环的 JoinError，自身没有业务错误返回。
+    drop(observer);
+}
+
+/// 在读写两个并行循环之间只记录一次连接根因。
+fn log_connection_failure_once(
+    logged: &AtomicBool,
+    peer: SocketAddr,
+    operation: &'static str,
+    error: &dyn std::fmt::Display,
+) {
+    if !logged.swap(true, Ordering::AcqRel) {
+        tracing::warn!(
+            event = "transport_connection_failed",
+            peer = %peer,
+            operation,
+            error = %error,
+            "TCP 连接处理失败"
+        );
+    }
+}
+
+/// 把底层以错误表示的对端关闭记录为低频预期状态。
+fn log_expected_close_once(
+    logged: &AtomicBool,
+    peer: SocketAddr,
+    operation: &'static str,
+    error: &dyn std::fmt::Display,
+) {
+    if !logged.swap(true, Ordering::AcqRel) {
+        tracing::info!(
+            event = "expected_condition",
+            peer = %peer,
+            operation,
+            reason = "peer_closed",
+            error = %error,
+            "TCP 对端已关闭连接"
+        );
+    }
 }

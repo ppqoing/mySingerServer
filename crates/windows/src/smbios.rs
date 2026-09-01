@@ -95,7 +95,21 @@ fn indexed_string(strings: &[String], index: u8) -> Option<String> {
 }
 
 fn format_system_uuid(bytes: &[u8], major: u8, minor: u8) -> Option<String> {
-    let raw: [u8; 16] = bytes.try_into().ok()?;
+    let raw: [u8; 16] = match bytes.try_into() {
+        Ok(raw) => raw,
+        Err(error) => {
+            tracing::error!(
+                event = "invariant_failed",
+                component = "smbios",
+                operation = "format_system_uuid",
+                actual_length = bytes.len(),
+                expected_length = 16,
+                error = %error,
+                "SMBIOS System UUID 切片长度不符合内部约束"
+            );
+            return None;
+        }
+    };
     if raw.iter().all(|byte| *byte == 0) || raw.iter().all(|byte| *byte == 0xff) {
         return None;
     }

@@ -2,8 +2,11 @@
 
 use std::{
     env, fs,
+    fs::OpenOptions,
     path::{Path, PathBuf},
-    process, thread,
+    process,
+    sync::Mutex,
+    thread,
     time::Duration,
 };
 
@@ -105,6 +108,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 /// 使用 fake decoder 和生产 `protocol_loop` 驱动 stdin/stdout 匿名管道。
 async fn run_child_protocol() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(path) = env::var_os("DEDUP_WORKER_TEST_LOG") {
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_writer(Mutex::new(file))
+            .try_init()?;
+    }
     let pipeline = WorkerPipeline::new(ProtocolTestDecoder::from_environment());
     let mut handler = WorkerRequestHandler::new(pipeline);
     protocol_loop::run_worker_protocol(
@@ -127,10 +139,12 @@ async fn run_parent_assertions(
     std::fs::write(&source, b"protocol-process")?;
     let entered = directory.path().join("probe-entered.gate");
     let release = directory.path().join("probe-release.gate");
+    let worker_log = directory.path().join("worker-test.log");
     // 此 harnessless 测试独占进程环境，子进程只读取两个临时 gate 路径。
     unsafe {
         env::set_var("DEDUP_WORKER_PHASE_ENTERED", &entered);
         env::set_var("DEDUP_WORKER_PHASE_RELEASE", &release);
+        env::set_var("DEDUP_WORKER_TEST_LOG", &worker_log);
     }
     // 二筛测试源文件在收到 SourceReadComplete 后删除，验证后续只消费内存帧。
     let stage2_source = directory.path().join("stage2-image.bin");
@@ -145,11 +159,29 @@ async fn run_parent_assertions(
     let config = WorkerPoolConfig::new(WorkerLaunch::new(child), 1)
         .with_ready_timeout(Duration::from_secs(10));
     let mut pool = WorkerPool::start(config).await?;
+    wait_for_worker_ready_log(&worker_log).await?;
     let first_pid = run_one_item(&mut pool, &source, "item-1", [0x31; 16]).await?;
     let second_pid = run_one_item(&mut pool, &source, "item-2", [0x32; 16]).await?;
     assert_eq!(second_pid, first_pid, "终态后应复用同一 Worker slot 进程");
     run_blocked_source_item(&mut pool, &source, &entered, &release).await?;
     run_stage2_source_item(&mut pool, &stage2_source, &stage2_entered, &stage2_release).await?;
+    Ok(())
+}
+
+/// 等待子进程 Ready 日志落盘，避免 Ready 帧与紧随其后的日志写入产生竞态。
+async fn wait_for_worker_ready_log(
+    path: &Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let log = fs::read_to_string(path).unwrap_or_default();
+            if log.contains("event=\"worker_ready\"") {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
     Ok(())
 }
 

@@ -118,7 +118,7 @@ pub enum CentralError {
 /// desktop.exe 独占的 PostgreSQL 客户端与连接驱动任务。
 pub struct CentralStore {
     pub(crate) client: tokio_postgres::Client,
-    connection: JoinHandle<()>,
+    connection: Option<JoinHandle<()>>,
 }
 
 impl fmt::Debug for CentralStore {
@@ -164,19 +164,77 @@ impl CentralStore {
         >,
     ) -> Result<Self, CentralError> {
         let connection = tokio::spawn(async move {
-            let _ = connection.await;
+            if let Err(error) = connection.await {
+                tracing::error!(
+                    event = "background_task_failed",
+                    component = "central_store",
+                    task_name = "postgres_connection",
+                    operation = "drive_connection",
+                    error = %error,
+                    "PostgreSQL 连接驱动失败"
+                );
+            }
         });
         if let Err(error) = validate_schema(&client).await {
             connection.abort();
+            log_connection_join(connection.await, true);
             return Err(error);
         }
-        Ok(Self { client, connection })
+        Ok(Self {
+            client,
+            connection: Some(connection),
+        })
     }
 }
 
 impl Drop for CentralStore {
     fn drop(&mut self) {
-        self.connection.abort();
+        let Some(connection) = self.connection.take() else {
+            return;
+        };
+        connection.abort();
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                let observer = runtime.spawn(async move {
+                    log_connection_join(connection.await, true);
+                });
+                // 观察器内部消费连接 JoinError；其自身没有业务错误返回。
+                drop(observer);
+            }
+            Err(error) => tracing::info!(
+                event = "expected_condition",
+                component = "central_store",
+                operation = "join_connection_on_drop",
+                reason = "runtime_already_stopped",
+                error = %error,
+                "PostgreSQL 连接随 Tokio runtime 一并结束"
+            ),
+        }
+    }
+}
+
+/// 检查 PostgreSQL 连接驱动的 Join 结果；主动 abort 只记录预期取消。
+fn log_connection_join(result: Result<(), tokio::task::JoinError>, cancellation_expected: bool) {
+    if let Err(error) = result {
+        if cancellation_expected && error.is_cancelled() {
+            tracing::info!(
+                event = "expected_condition",
+                component = "central_store",
+                operation = "join_connection",
+                reason = "owner_cancelled",
+                error = %error,
+                "PostgreSQL 连接驱动已随 owner 取消"
+            );
+        } else {
+            tracing::error!(
+                event = "background_task_failed",
+                component = "central_store",
+                task_name = "postgres_connection",
+                operation = "join",
+                error = %error,
+                "PostgreSQL 连接驱动异常终止"
+            );
+        }
     }
 }
 

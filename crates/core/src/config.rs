@@ -113,6 +113,10 @@ pub struct NodeConfig {
     pub worker_count: usize,
     /// 扫描目录时选择的文件枚举方式。
     pub enumerator: EnumeratorKind,
+    /// 扫描允许的图片扩展名；值不含前导点并使用小写。
+    pub image_extensions: Vec<String>,
+    /// 扫描允许的视频扩展名；值不含前导点并使用小写。
+    pub video_extensions: Vec<String>,
     /// 节点运行数据、配置、日志和缓存的原始路径字符串。
     pub paths: NodePathsConfig,
     /// Node 控制的磁盘读取并发和块读取参数。
@@ -132,6 +136,8 @@ impl Default for NodeConfig {
                 .map(usize::from)
                 .unwrap_or(1),
             enumerator: EnumeratorKind::Everything,
+            image_extensions: owned_extensions(DEFAULT_IMAGE_EXTENSIONS),
+            video_extensions: owned_extensions(DEFAULT_VIDEO_EXTENSIONS),
             paths: NodePathsConfig::default(),
             read: DiskReadConfig::default(),
             worker: WorkerConfig::default(),
@@ -144,8 +150,15 @@ impl NodeConfig {
     /// 从 TOML 解码并在节点启动边界验证配置。
     pub fn from_toml(text: &str) -> Result<Self, CoreError> {
         let config: Self = toml::from_str(text)?;
-        config.validate()?;
-        Ok(config)
+        config.normalized()
+    }
+
+    /// 规范化扩展名并验证完整 Node 配置，供 TOML、协议和 UI 保存边界复用。
+    pub fn normalized(mut self) -> Result<Self, CoreError> {
+        normalize_extensions(&mut self.image_extensions, "image_extensions")?;
+        normalize_extensions(&mut self.video_extensions, "video_extensions")?;
+        self.validate()?;
+        Ok(self)
     }
 
     /// 验证节点启动必需的端口、读取和 Worker 参数。
@@ -159,6 +172,8 @@ impl NodeConfig {
         if self.worker_count > MAX_MANUAL_WORKER_COUNT {
             return Err(invalid_config("worker_count", "Worker 数量不能超过 256"));
         }
+        validate_extensions(&self.image_extensions, "image_extensions")?;
+        validate_extensions(&self.video_extensions, "video_extensions")?;
         self.read.validate()?;
         self.worker.validate()?;
         self.postgres.validate()?;
@@ -167,9 +182,71 @@ impl NodeConfig {
 
     /// 编码为可直接写入节点配置文件的 TOML 文本。
     pub fn to_toml(&self) -> Result<String, CoreError> {
-        self.validate()?;
-        Ok(toml::to_string_pretty(self)?)
+        let normalized = self.clone().normalized()?;
+        Ok(toml::to_string_pretty(&normalized)?)
     }
+}
+
+/// 当前产品声明支持的图片扩展名全集。
+const DEFAULT_IMAGE_EXTENSIONS: &[&str] = &[
+    "apng", "avif", "bmp", "cur", "dds", "dib", "dpx", "exr", "fits", "gif", "hdr", "heic", "heif",
+    "ico", "j2c", "j2k", "jfif", "jls", "jp2", "jpc", "jpe", "jpeg", "jpg", "jxl", "pam", "pbm",
+    "pcd", "pcx", "pfm", "pgm", "pgx", "png", "pnm", "ppm", "psd", "qoi", "ras", "sgi", "svg",
+    "tga", "tif", "tiff", "webp", "xbm", "xpm", "xwd",
+];
+
+/// 当前产品声明支持的视频扩展名全集。
+const DEFAULT_VIDEO_EXTENSIONS: &[&str] = &[
+    "264", "265", "266", "3g2", "3gp", "amv", "apv", "asf", "av1", "avc", "avi", "bik", "bink",
+    "cdxl", "dav", "dif", "divx", "dv", "evc", "evo", "f4v", "flm", "flv", "gxf", "h261", "h263",
+    "h264", "h265", "h266", "hevc", "ifv", "ismv", "ivf", "kux", "lvf", "m1v", "m2t", "m2ts",
+    "m2v", "m4v", "mj2", "mjpeg", "mjpg", "mk3d", "mkv", "moflex", "mov", "mp4", "mpe", "mpeg",
+    "mpg", "mts", "mxf", "nsv", "nut", "nuv", "obu", "ogm", "ogv", "pdv", "qt", "r3d", "rm",
+    "rmvb", "roq", "rpl", "ser", "smjpeg", "smk", "str", "swf", "ts", "ty", "usm", "vc1", "viv",
+    "vivo", "vob", "vvc", "webm", "wmv", "wtv", "xmv", "y4m", "yop",
+];
+
+/// 把只读默认值复制为配置拥有的字符串数组。
+fn owned_extensions(defaults: &[&str]) -> Vec<String> {
+    defaults
+        .iter()
+        .map(|extension| (*extension).to_owned())
+        .collect()
+}
+
+/// 把用户扩展名转换为稳定的小写无点形式，并在一个列表内去重。
+fn normalize_extensions(
+    extensions: &mut Vec<String>,
+    field: &'static str,
+) -> Result<(), CoreError> {
+    for extension in extensions.iter_mut() {
+        *extension = extension
+            .trim()
+            .trim_start_matches('.')
+            .to_ascii_lowercase();
+    }
+    validate_extensions(extensions, field)?;
+    extensions.sort_unstable();
+    extensions.dedup();
+    Ok(())
+}
+
+/// 校验扩展名只包含可安全拼入 Everything `ext:` 查询的字符。
+fn validate_extensions(extensions: &[String], field: &'static str) -> Result<(), CoreError> {
+    if extensions.iter().any(|extension| {
+        extension.is_empty()
+            || !extension.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'_' | b'+' | b'-')
+            })
+    }) {
+        return Err(CoreError::InvalidConfig {
+            field,
+            reason: "扩展名只能包含小写 ASCII 字母、数字、_、+、-",
+        });
+    }
+    Ok(())
 }
 
 /// Node 可选的中心 PostgreSQL 基础连接参数。

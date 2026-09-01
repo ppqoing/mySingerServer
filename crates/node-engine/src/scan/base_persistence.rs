@@ -530,7 +530,11 @@ impl BaseStoreHandle {
         let call = Box::new(move |store: &mut NodeStore| {
             let result = operation(store);
             let succeeded = result.is_ok();
-            let _ = result_tx.send(result);
+            crate::diagnostics::record_closed(
+                result_tx.send(result),
+                "base_persistence",
+                "send_store_call_result",
+            );
             succeeded
         });
         self.calls.send(call).map_err(|_| {
@@ -545,6 +549,7 @@ impl BaseStoreHandle {
         self.call(move |store| store.task_snapshot(task_id))
     }
 
+    /// 经唯一 SQLite writer 登记一个扫描路径，不等待组成整批。
     pub(crate) fn reserve_scan_path(
         &self,
         task_id: TaskId,
@@ -618,6 +623,7 @@ impl BaseStoreHandle {
         self.call(move |store| store.import_base_cache_record(&scanned, &record))
     }
 
+    /// 经唯一 SQLite writer 立即提交一个缓存未命中项，不等待整批屏障。
     pub(crate) fn queue_scan_item_for_read(&self, item_id: &str) -> Result<(), StoreError> {
         let item_id = item_id.to_owned();
         self.call(move |store| store.queue_scan_item_for_read(&item_id))
@@ -814,11 +820,15 @@ fn apply_persist_message(
     let result = operation(store);
     let transaction_elapsed = transaction_started.elapsed();
     let succeeded = result.is_ok();
-    let _ = acknowledgements.send(BasePersistAck {
-        identity,
-        queue_wait,
-        transaction_elapsed,
-        result,
-    });
+    crate::diagnostics::record_expected(
+        acknowledgements.send(BasePersistAck {
+            identity,
+            queue_wait,
+            transaction_elapsed,
+            result,
+        }),
+        "base_persistence",
+        "send_persist_acknowledgement",
+    );
     succeeded
 }

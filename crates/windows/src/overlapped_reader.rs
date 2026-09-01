@@ -173,7 +173,16 @@ struct OwnedHandle(HANDLE);
 impl Drop for OwnedHandle {
     fn drop(&mut self) {
         // SAFETY: 句柄来自成功的 CreateFileW/CreateEventW，并只由此值关闭一次。
-        let _ = unsafe { CloseHandle(self.0) };
+        if let Err(error) = unsafe { CloseHandle(self.0) } {
+            tracing::warn!(
+                event = "request_failed",
+                component = "overlapped_reader",
+                request_id = 0_u64,
+                operation = "close_handle",
+                error = %error,
+                "关闭重叠读取句柄失败"
+            );
+        }
     }
 }
 
@@ -245,10 +254,28 @@ fn wait_for_completion(
 
 fn cancel_and_drain(file: HANDLE, overlapped: &mut OVERLAPPED) {
     // SAFETY: 文件句柄和 OVERLAPPED 属于当前尚未收束的操作。
-    let _ = unsafe { CancelIoEx(file, Some(overlapped)) };
+    if let Err(error) = unsafe { CancelIoEx(file, Some(overlapped)) } {
+        tracing::info!(
+            event = "expected_condition",
+            component = "overlapped_reader",
+            operation = "cancel_io",
+            reason = "operation_already_completed_or_cancelled",
+            error = %error,
+            "重叠读取取消请求未命中活动操作"
+        );
+    }
     let mut transferred = 0u32;
     // SAFETY: 等待内核不再访问 OVERLAPPED/buffer；取消错误本身不覆盖调用者的原因。
-    let _ = unsafe { GetOverlappedResult(file, overlapped, &mut transferred, true) };
+    if let Err(error) = unsafe { GetOverlappedResult(file, overlapped, &mut transferred, true) } {
+        tracing::info!(
+            event = "expected_condition",
+            component = "overlapped_reader",
+            operation = "drain_cancelled_io",
+            reason = "cancelled_operation_terminal",
+            error = %error,
+            "已取消重叠读取进入终态"
+        );
+    }
 }
 
 fn timeout_error() -> io::Error {

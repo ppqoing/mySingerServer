@@ -343,16 +343,57 @@ async fn run_cache_resolver<R: RemoteFeatureCache>(
 
     path_tasks.abort_all();
     content_tasks.abort_all();
-    while path_tasks.join_next().await.is_some() {}
-    while content_tasks.join_next().await.is_some() {}
+    drain_remote_tasks(&mut path_tasks, "path").await;
+    drain_remote_tasks(&mut content_tasks, "content").await;
     drop(resolution_tx);
     let remote = match Arc::try_unwrap(remote) {
         Ok(remote) => remote,
-        Err(_) => panic!("缓存 resolver 退出时仍有远端查询引用"),
+        Err(remaining_remote) => panic!(
+            "缓存 resolver 退出时仍有远端查询引用: strong_count={}",
+            Arc::strong_count(&remaining_remote)
+        ),
     };
     CacheResolverExit {
         remote,
         remote_available,
+    }
+}
+
+/// Resolver 退出时检查已取消远端任务的 JoinError，并保留恰好一次查询失败记录。
+async fn drain_remote_tasks(tasks: &mut JoinSet<RemoteTaskOutput>, lane: &'static str) {
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok(output) => {
+                if let Err(error) = output.result {
+                    tracing::warn!(
+                        event = "central_store_degraded",
+                        operation = "drain_remote_cache_query",
+                        fallback = "resolver_shutdown",
+                        lane,
+                        error = %error,
+                        "缓存 resolver 收束期间远端查询失败"
+                    );
+                }
+            }
+            Err(error) if error.is_cancelled() => tracing::info!(
+                event = "expected_condition",
+                component = "cache_resolver",
+                operation = "join_remote_query",
+                reason = "resolver_shutdown",
+                lane,
+                error = %error,
+                "缓存 resolver 退出时已取消远端查询"
+            ),
+            Err(error) => tracing::error!(
+                event = "background_task_failed",
+                component = "cache_resolver",
+                task_name = "remote_cache_query",
+                operation = "join",
+                lane,
+                error = %error,
+                "远端缓存查询任务异常终止"
+            ),
+        }
     }
 }
 
@@ -444,6 +485,17 @@ fn handle_joined(
     };
     let output = match joined {
         Ok(output) => output,
+        Err(error) if error.is_cancelled() && !*remote_available => {
+            tracing::info!(
+                event = "expected_condition",
+                component = "cache_resolver",
+                operation = "join_remote_query",
+                reason = "sqlite_fallback_cancelled_peer_queries",
+                error = %error,
+                "切换 SQLite-only 后取消其余远端缓存查询"
+            );
+            return;
+        }
         Err(error) => {
             if *remote_available {
                 lock_local_only(
@@ -457,6 +509,15 @@ fn handle_joined(
                     inflight,
                     path_results,
                     content_results,
+                );
+            } else {
+                tracing::error!(
+                    event = "background_task_failed",
+                    component = "cache_resolver",
+                    task_name = "remote_cache_query",
+                    operation = "join_after_fallback",
+                    error = %error,
+                    "远端缓存查询任务在降级后异常终止"
                 );
             }
             return;
@@ -591,7 +652,13 @@ fn lock_local_only(
     if !*remote_available {
         return;
     }
-    tracing::warn!("{warning}");
+    tracing::warn!(
+        event = "central_store_degraded",
+        operation = "remote_cache_query",
+        fallback = "sqlite_only",
+        error = %warning,
+        "PostgreSQL 缓存查询失败，后续仅使用 SQLite"
+    );
     *remote_available = false;
     path_tasks.abort_all();
     content_tasks.abort_all();

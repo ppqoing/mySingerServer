@@ -239,7 +239,11 @@ impl LocalAnalysisEngine {
             .map(|input| from_store_input(input, MediaKind::Other))
             .collect::<Vec<_>>();
         if let Some(reporter) = reporter {
-            let _ = reporter.update_overall_nowait(0, Some(inputs.len() as u64), 0, 0);
+            crate::diagnostics::record_warning(
+                reporter.update_overall_nowait(0, Some(inputs.len() as u64), 0, 0),
+                "local_analysis",
+                "initialize_runtime_total",
+            );
         }
         let build_started = wall_clock_ms();
         save_analysis_stage(
@@ -550,11 +554,15 @@ fn finish_run(
         );
         let input_total = inputs.len() as u64;
         if let Some(reporter) = reporter {
-            let _ = reporter.update_overall_nowait(
-                0,
-                Some(input_total),
-                unresolved as u64,
-                skipped_incomplete as u64,
+            crate::diagnostics::record_warning(
+                reporter.update_overall_nowait(
+                    0,
+                    Some(input_total),
+                    unresolved as u64,
+                    skipped_incomplete as u64,
+                ),
+                "local_analysis",
+                "report_partial_total",
             );
         }
         return Ok(LocalAnalysisReport {
@@ -576,11 +584,15 @@ fn finish_run(
     store.replace_groups(run_id, &stored_groups)?;
     store.transition_analysis_run(run_id, AnalysisStatus::Completed, now_ms)?;
     if let Some(reporter) = reporter {
-        let _ = reporter.update_overall_nowait(
-            inputs.len().saturating_sub(skipped_incomplete) as u64,
-            Some(inputs.len() as u64),
-            0,
-            skipped_incomplete as u64,
+        crate::diagnostics::record_warning(
+            reporter.update_overall_nowait(
+                inputs.len().saturating_sub(skipped_incomplete) as u64,
+                Some(inputs.len() as u64),
+                0,
+                skipped_incomplete as u64,
+            ),
+            "local_analysis",
+            "complete_runtime_total",
         );
     }
     let compare_finished = wall_clock_ms();
@@ -754,14 +766,18 @@ fn report_stage(
     skipped: u64,
 ) {
     if let Some(reporter) = reporter {
-        let _ = reporter.update_stage_nowait(RuntimeStageUpdate {
-            stage,
-            state,
-            unit,
-            completed,
-            total,
-            failed,
-            skipped,
-        });
+        crate::diagnostics::record_warning(
+            reporter.update_stage_nowait(RuntimeStageUpdate {
+                stage,
+                state,
+                unit,
+                completed,
+                total,
+                failed,
+                skipped,
+            }),
+            "local_analysis",
+            "update_runtime_stage",
+        );
     }
 }

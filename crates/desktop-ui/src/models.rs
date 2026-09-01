@@ -24,10 +24,14 @@ use crate::{
 
 /// 一次 `RuntimeTasksChanged` 事件对应的全部 Slint 模型和详情摘要。
 pub(crate) struct RuntimeUiModels {
-    pub(crate) tasks: ModelRc<UiTaskRow>,
-    pub(crate) stages: ModelRc<UiRuntimeStageRow>,
-    pub(crate) workers: ModelRc<UiRuntimeWorkerRow>,
-    pub(crate) failures: ModelRc<UiRuntimeFailureRow>,
+    /// 任务行由绑定层按稳定身份合并到长期模型。
+    pub(crate) tasks: Vec<UiTaskRow>,
+    /// 阶段行由绑定层原位更新，避免周期刷新重建 repeater。
+    pub(crate) stages: Vec<UiRuntimeStageRow>,
+    /// Worker 行由绑定层原位更新。
+    pub(crate) workers: Vec<UiRuntimeWorkerRow>,
+    /// 最近失败行由绑定层原位更新。
+    pub(crate) failures: Vec<UiRuntimeFailureRow>,
     pub(crate) title: SharedString,
     pub(crate) machine_id: SharedString,
     pub(crate) state: SharedString,
@@ -177,10 +181,10 @@ pub(crate) fn runtime_tasks(state: &RuntimeTaskControllerState) -> RuntimeUiMode
         },
     );
     RuntimeUiModels {
-        tasks: ModelRc::new(VecModel::from(rows)),
-        stages: ModelRc::new(VecModel::from(stages)),
-        workers: ModelRc::new(VecModel::from(workers)),
-        failures: ModelRc::new(VecModel::from(failures)),
+        tasks: rows,
+        stages,
+        workers,
+        failures,
         title: title.into(),
         machine_id: machine_id.into(),
         state: status.into(),
@@ -386,10 +390,24 @@ fn worker_row(worker: &proto::RuntimeWorkerDetails) -> UiRuntimeWorkerRow {
         disk: worker.physical_disk_id.clone().into(),
         completed: format!("{} 个文件", worker.completed_files).into(),
         speed: format_speed(worker.speed_per_second, "files").into(),
-        phase: worker
-            .phase
-            .and_then(|phase| proto::RuntimeWorkerPhase::try_from(phase).ok())
-            .map_or_else(|| "—".into(), |phase| worker_phase(phase).into()),
+        phase: worker.phase.map_or_else(
+            || "—".into(),
+            |phase| match proto::RuntimeWorkerPhase::try_from(phase) {
+                Ok(phase) => worker_phase(phase).into(),
+                Err(error) => {
+                    tracing::warn!(
+                        event = "request_rejected",
+                        component = "desktop_runtime_view",
+                        operation = "decode_worker_phase",
+                        reason = "unknown_worker_phase",
+                        phase,
+                        error = %error,
+                        "节点返回了未知 Worker 阶段，界面显示占位符"
+                    );
+                    "—".into()
+                }
+            },
+        ),
         cpu_weight: optional_number(worker.cpu_weight).into(),
         decoder_threads: optional_number(worker.decoder_threads).into(),
     }

@@ -13,7 +13,12 @@ use std::{
     thread,
 };
 
-use dedup_core::{NodeConfig, logging::SizeRotatingWriter};
+use dedup_core::{
+    NodeConfig,
+    logging::{
+        FallbackLogWriter, ProcessDiagnostics, SizeRotatingWriter, log_filter, log_filter_from_env,
+    },
+};
 use dedup_node_engine::actor::{NodeRuntime, SmbiosIdentityProvider};
 use dedup_windows::{AppLayout, open_folder};
 use node::{TrayAction, TrayCommand, TrayState};
@@ -29,15 +34,16 @@ enum RuntimeCommand {
 
 #[derive(Clone)]
 struct CloseableLogWriter {
-    inner: Arc<Mutex<Option<SizeRotatingWriter>>>,
+    inner: Arc<Mutex<Option<FallbackLogWriter<SizeRotatingWriter>>>>,
 }
 
 struct CloseableLogGuard<'a> {
-    inner: MutexGuard<'a, Option<SizeRotatingWriter>>,
+    inner: MutexGuard<'a, Option<FallbackLogWriter<SizeRotatingWriter>>>,
 }
 
 impl CloseableLogWriter {
-    fn new(writer: SizeRotatingWriter) -> Self {
+    /// 创建可在托盘退出前显式刷新的日志 writer。
+    fn new(writer: FallbackLogWriter<SizeRotatingWriter>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(Some(writer))),
         }
@@ -82,10 +88,30 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CloseableLogWriter {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let diagnostics = ProcessDiagnostics::new("node");
+    diagnostics.install_panic_hook();
+    match run(&diagnostics) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            diagnostics.record_error("process_failed", "run", error.as_ref());
+            Err(error)
+        }
+    }
+}
+
+/// 组合 Node 的配置、日志、运行时线程和托盘生命周期。
+fn run(diagnostics: &ProcessDiagnostics) -> Result<(), Box<dyn std::error::Error>> {
     let executable = env::current_exe()?;
     let layout = AppLayout::from_executable(&executable)?;
     let loaded = load_or_initialize_node_config(&layout)?;
-    let log_writer = initialize_file_log(&loaded.resolved.log_path)?;
+    let log_writer = initialize_file_log(&loaded.resolved.log_path, diagnostics)?;
+    tracing::info!(
+        event = "process_started",
+        process = "node",
+        pid = std::process::id(),
+        version = env!("CARGO_PKG_VERSION"),
+        "Node 进程已启动"
+    );
     let logs_path = loaded.resolved.log_path.clone();
     let (ready_sender, ready_receiver) = std_mpsc::sync_channel(1);
     let runtime_layout = layout.clone();
@@ -111,19 +137,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     drop(tray);
     drop(state);
     drop(commands);
-    log_writer.close()?;
     runtime_result?;
+    tracing::info!(
+        event = "process_stopped",
+        process = "node",
+        pid = std::process::id(),
+        reason = "event_loop_closed",
+        "Node 进程正常停止"
+    );
+    log_writer.close()?;
     Ok(())
 }
 
-fn initialize_file_log(logs_path: &Path) -> Result<CloseableLogWriter, Box<dyn std::error::Error>> {
-    let writer = CloseableLogWriter::new(SizeRotatingWriter::production(logs_path, "node")?);
+/// 初始化 Node 主日志，并在主 writer 失败时写入进程应急日志。
+fn initialize_file_log(
+    logs_path: &Path,
+    diagnostics: &ProcessDiagnostics,
+) -> Result<CloseableLogWriter, Box<dyn std::error::Error>> {
+    let filter = match log_filter_from_env() {
+        Ok(filter) => filter,
+        Err(error) => {
+            diagnostics.record_warning("configuration_rejected", "read_rust_log", &error);
+            log_filter(None).expect("固定 INFO 过滤器必须有效")
+        }
+    };
+    let writer = FallbackLogWriter::new(
+        SizeRotatingWriter::production(logs_path, "node")?,
+        logs_path.join("node.log"),
+        diagnostics.clone(),
+    );
+    let writer = CloseableLogWriter::new(writer);
     tracing_subscriber::fmt()
         .with_ansi(false)
         .with_target(false)
+        .with_env_filter(filter)
         .with_writer(writer.clone())
         .try_init()
         .map_err(|error| std::io::Error::other(error.to_string()))?;
+    diagnostics.mark_primary_ready();
     Ok(writer)
 }
 
@@ -147,7 +198,16 @@ fn run_runtime(
                 Ok(node) => node,
                 Err(error) => {
                     let message = error.to_string();
-                    let _ = ready.send(Err(message.clone()));
+                    if let Err(send_error) = ready.send(Err(message.clone())) {
+                        tracing::info!(
+                            event = "expected_condition",
+                            component = "node_runtime",
+                            operation = "report_start_failure",
+                            reason = "tray_thread_closed",
+                            error = %send_error,
+                            "托盘线程已经关闭"
+                        );
+                    }
                     return Err(message);
                 }
             };
@@ -206,7 +266,16 @@ fn bind_tray(
             exit_state.borrow_mut().apply(TrayCommand::Exit),
             &exit_commands,
         );
-        let _ = slint::quit_event_loop();
+        if let Err(error) = slint::quit_event_loop() {
+            tracing::info!(
+                event = "expected_condition",
+                component = "node_tray",
+                operation = "quit_event_loop",
+                reason = "event_loop_closed",
+                error = %error,
+                "托盘事件循环已经关闭"
+            );
+        }
     });
 }
 

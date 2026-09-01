@@ -145,6 +145,8 @@ export component SettingsWorkspace inherits Rectangle {
     in-out property <string> node-listen-ip;
     in-out property <int> node-port;
     in-out property <int> node-enumerator-index;
+    in-out property <string> node-image-extensions;
+    in-out property <string> node-video-extensions;
     in-out property <string> node-data-path;
     in-out property <string> node-config-path;
     in-out property <string> node-log-path;
@@ -173,6 +175,7 @@ export component SettingsWorkspace inherits Rectangle {
     callback load-node();
     callback save-node();
     callback node-edited();
+    callback restore-node-extension-defaults();
     callback save-settings();
     property <bool> node-form-enabled: root.node-online && root.node-loaded && !root.node-saving;
     background: transparent;
@@ -485,6 +488,17 @@ export component SettingsWorkspace inherits Rectangle {
                                 Rectangle { background: transparent; }
                             }
                         }
+                        Text { text: "扫描文件类型"; height: 22px; vertical-stretch: 0; color: Theme.text; font-size: 14px; font-weight: 650; }
+                        NodeTextField { label: "图片扩展名"; value <=> root.node-image-extensions; field-enabled: root.node-form-enabled; edited => { root.node-edited(); } }
+                        NodeTextField { label: "视频扩展名"; value <=> root.node-video-extensions; field-enabled: root.node-form-enabled; edited => { root.node-edited(); } }
+                        Text {
+                            text: "使用英文逗号分隔；清空图片或视频列表即禁用该类别。";
+                            height: 18px;
+                            vertical-stretch: 0;
+                            color: Theme.muted;
+                            font-size: 11px;
+                        }
+                        ActionButton { label: "恢复默认格式"; action-enabled: root.node-form-enabled; clicked => { root.restore-node-extension-defaults(); } }
                         Text { text: "Node 本地路径"; height: 22px; vertical-stretch: 0; color: Theme.text; font-size: 14px; font-weight: 650; }
                         NodeTextField { label: "Node 数据路径"; value <=> root.node-data-path; field-enabled: root.node-form-enabled; edited => { root.node-edited(); } }
                         NodeTextField { label: "Node 配置路径"; value <=> root.node-config-path; field-enabled: root.node-form-enabled; edited => { root.node-edited(); } }

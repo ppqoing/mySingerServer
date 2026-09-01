@@ -73,7 +73,19 @@ impl DiskFullCleaner {
 
     /// 返回最近一次磁盘满触发的清理摘要。
     pub fn recent_summary(&self) -> Option<CleanupSummary> {
-        self.recent.lock().ok().and_then(|summary| summary.clone())
+        match self.recent.lock() {
+            Ok(summary) => summary.clone(),
+            Err(error) => {
+                tracing::error!(
+                    event = "invariant_failed",
+                    component = "disk_full_cleanup",
+                    operation = "read_recent_summary",
+                    error = %error,
+                    "磁盘满清理摘要锁已中毒"
+                );
+                None
+            }
+        }
     }
 
     fn cleanup(&self, store: &mut NodeStore, write_target: &Path) -> io::Result<CleanupSummary> {
@@ -103,15 +115,43 @@ impl DiskFullCleaner {
                     summary.skipped_other_disk += 1;
                     continue;
                 }
-                Err(_) => {
+                Err(error) => {
+                    tracing::warn!(
+                        event = "background_task_failed",
+                        component = "disk_full_cleanup",
+                        operation = "resolve_artifact_disk",
+                        artifact_path = %claim.path().display(),
+                        write_target = %write_target.display(),
+                        error = %error,
+                        "无法判断可再生产物与写入目标是否位于同一物理盘"
+                    );
                     summary.failed_files += 1;
                     continue;
                 }
             }
             let file_size = match fs::metadata(claim.path()) {
                 Ok(metadata) => Some(metadata.len()),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-                Err(_) => {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    tracing::info!(
+                        event = "expected_condition",
+                        component = "disk_full_cleanup",
+                        operation = "read_artifact_metadata",
+                        reason = "artifact_already_missing",
+                        artifact_path = %claim.path().display(),
+                        error = %error,
+                        "待清理产物已经不存在"
+                    );
+                    None
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        event = "file_failed",
+                        component = "disk_full_cleanup",
+                        operation = "read_artifact_metadata",
+                        artifact_path = %claim.path().display(),
+                        error = %error,
+                        "读取待清理产物元数据失败"
+                    );
                     summary.failed_files += 1;
                     continue;
                 }
@@ -123,8 +163,26 @@ impl DiskFullCleaner {
                         .deleted_bytes
                         .saturating_add(file_size.unwrap_or_default());
                 }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(_) => {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    tracing::info!(
+                        event = "expected_condition",
+                        component = "disk_full_cleanup",
+                        operation = "remove_artifact",
+                        reason = "artifact_already_missing",
+                        artifact_path = %claim.path().display(),
+                        error = %error,
+                        "待清理产物已被其他路径移除"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        event = "file_failed",
+                        component = "disk_full_cleanup",
+                        operation = "remove_artifact",
+                        artifact_path = %claim.path().display(),
+                        error = %error,
+                        "删除可再生产物失败"
+                    );
                     summary.failed_files += 1;
                     continue;
                 }
@@ -144,8 +202,15 @@ impl DiskFullCleaner {
                 claim.mark_deleted();
             }
         }
-        if let Ok(mut recent) = self.recent.lock() {
-            *recent = Some(summary.clone());
+        match self.recent.lock() {
+            Ok(mut recent) => *recent = Some(summary.clone()),
+            Err(error) => tracing::error!(
+                event = "invariant_failed",
+                component = "disk_full_cleanup",
+                operation = "save_recent_summary",
+                error = %error,
+                "磁盘满清理摘要锁已中毒"
+            ),
         }
         clear_result?;
         Ok(summary)

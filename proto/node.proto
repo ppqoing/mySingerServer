@@ -368,6 +368,8 @@ message NodeConfigValue {
   uint32 reserved_cores = 17;
   uint32 manual_worker_count = 18;
   NodePostgresConfigValue postgres = 19;
+  repeated string image_extensions = 20;
+  repeated string video_extensions = 21;
 }
 
 message NodePostgresConfigValue {

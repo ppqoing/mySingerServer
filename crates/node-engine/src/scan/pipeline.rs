@@ -529,7 +529,11 @@ impl ScheduledFileReader {
             DiskReadClass::MediaDecode => RuntimePipelineResource::MediaIo,
         };
         if let Some(reporter) = &self.reporter {
-            let _ = reporter.resource_acquired_nowait(resource, wait_started.elapsed());
+            crate::diagnostics::record_warning(
+                reporter.resource_acquired_nowait(resource, wait_started.elapsed()),
+                "scan_pipeline",
+                "report_resource_acquired",
+            );
         }
         Ok(ScheduledReadPermit {
             permit: Some(lease),

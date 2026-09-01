@@ -10,6 +10,7 @@ mod enumerator;
 mod everything;
 mod hash;
 pub(crate) mod input_order;
+mod media_extensions;
 mod pipeline;
 mod root_plan;
 mod task_file_base_compute;
@@ -61,13 +62,14 @@ pub use engine::{
     ScanEngine, ScanOptions, ScanSummary, Stage1BatchResult, Stage1ProcessError, Stage1Processor,
     Stage1Request, WorkerPoolStage1Processor, begin_scan_task, publish_contact_sheet_for_test,
 };
-pub use enumerator::FileEnumerator;
+pub use enumerator::{FileEnumerator, FilteredWindowsWalker};
 pub use everything::EverythingEnumerator;
 pub(crate) use everything::{PreferredEverythingEnumerator, ensure_everything_ready};
 pub use hash::{FileHasher, SystemMd5, md5_bytes, md5_file};
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub use input_order::interleave_rows_by_root_for_test;
+pub use media_extensions::MediaExtensionFilter;
 pub use pipeline::{
     HashPermitReader, PipelineFileReader, PipelineLimits, ReadProduct, ScheduledFileReader,
     ScheduledReadPermit,

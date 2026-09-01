@@ -57,15 +57,19 @@ pub(crate) fn image_candidates_with_runtime(
 ) -> Vec<AnalysisCandidate> {
     let candidates = image_candidates(features, thresholds);
     if let Some(reporter) = reporter {
-        let _ = reporter.update_stage_nowait(RuntimeStageUpdate {
-            stage: RuntimeStage::BuildCandidates,
-            state: dedup_protocol::proto::RuntimeStageState::RuntimeStageRunning,
-            unit: RuntimeProgressUnit::CandidatePairs,
-            completed: candidates.len() as u64,
-            total: None,
-            failed: 0,
-            skipped: 0,
-        });
+        crate::diagnostics::record_warning(
+            reporter.update_stage_nowait(RuntimeStageUpdate {
+                stage: RuntimeStage::BuildCandidates,
+                state: dedup_protocol::proto::RuntimeStageState::RuntimeStageRunning,
+                unit: RuntimeProgressUnit::CandidatePairs,
+                completed: candidates.len() as u64,
+                total: None,
+                failed: 0,
+                skipped: 0,
+            }),
+            "analysis_image",
+            "update_runtime_stage",
+        );
     }
     candidates
 }

@@ -5,7 +5,7 @@ mod bindings;
 mod models;
 
 // 生成类型的文档由 Slint 源文件中的属性与回调说明承担；手写 Rust API 仍受 missing_docs 约束。
-#[allow(missing_docs)]
+#[allow(missing_docs, clippy::let_underscore_must_use, unused_must_use)]
 mod generated {
     slint::include_modules!();
 }

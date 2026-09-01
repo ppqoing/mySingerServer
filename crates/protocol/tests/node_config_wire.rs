@@ -28,6 +28,8 @@ fn node_config_value_round_trips_every_approved_field() {
     config.worker.mode = WorkerMode::Manual;
     config.worker.reserved_cores = 11;
     config.worker.manual_worker_count = 12;
+    config.image_extensions = vec!["jpg".into(), "png".into()];
+    config.video_extensions = vec!["mkv".into()];
     config.postgres.enabled = true;
     config.postgres.host = "192.168.1.8".into();
     config.postgres.port = 15432;
@@ -47,6 +49,8 @@ fn node_config_value_round_trips_every_approved_field() {
     );
     assert_eq!(wire.postgres.as_ref().unwrap().username, "dedup");
     assert_eq!(wire.postgres.as_ref().unwrap().password, "secret");
+    assert_eq!(wire.image_extensions, ["jpg", "png"]);
+    assert_eq!(wire.video_extensions, ["mkv"]);
 }
 
 #[test]
@@ -170,6 +174,16 @@ fn descriptor_contains_only_the_approved_config_messages_and_envelope_tags() {
                 .iter()
                 .any(|field| field.name.as_deref() == Some(name) && field.number == Some(number)),
             "Envelope 缺少 {name}={number}"
+        );
+    }
+    let config_value = message(messages, "NodeConfigValue").unwrap();
+    for (name, number) in [("image_extensions", 20), ("video_extensions", 21)] {
+        assert!(
+            config_value
+                .field
+                .iter()
+                .any(|field| field.name.as_deref() == Some(name) && field.number == Some(number)),
+            "NodeConfigValue 缺少 {name}={number}"
         );
     }
     for message in [

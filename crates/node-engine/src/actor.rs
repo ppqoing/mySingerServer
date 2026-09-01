@@ -60,11 +60,12 @@ use crate::{
         RuntimeTaskKind, RuntimeTaskRegistry, RuntimeTaskReporter, RuntimeTaskState,
     },
     scan::{
-        BaseComputeEngine, FileEnumerator, MAX_BASE_TASK_BATCH, PipelineFileReader, PipelineLimits,
-        PlannedScannedPath, PreferredEverythingEnumerator, ScanDiskPlan, ScanError, ScanOptions,
+        BaseComputeEngine, FileEnumerator, FilteredWindowsWalker, MAX_BASE_TASK_BATCH,
+        MediaExtensionFilter, PipelineFileReader, PipelineLimits, PlannedScannedPath,
+        PreferredEverythingEnumerator, ScanDiskPlan, ScanError, ScanOptions,
         ScanRootStorageResolver, ScanSummary, ScheduledFileReader, SystemScanRootStorageResolver,
         TaskFileBaseCoordinatorOptions, TaskFileMediaPersistenceOptions, TaskFileScanRunOptions,
-        WindowsWalker, begin_scan_task, configure_base_compute_runtime, ensure_everything_ready,
+        begin_scan_task, configure_base_compute_runtime, ensure_everything_ready,
         input_order::interleave_rows_by_root, run_task_file_scan_with_runtime,
     },
     server::{NodeRequestHandler, NodeServer, ServerError},
@@ -356,6 +357,7 @@ impl NodeRuntime {
             &paths.cache_path,
             &runtime_root,
             config.enumerator,
+            MediaExtensionFilter::from_config(config),
             config.read.clone(),
             config.postgres.clone(),
             effective_worker_count,
@@ -660,6 +662,11 @@ struct ActorTestHooks {
     analysis_before_publish_waiter: Option<AnalysisBeforePublishTestWaiter>,
 }
 
+/// 测试 actor 统一使用默认媒体扩展名，避免每个夹具重复构造配置。
+fn default_media_extension_filter() -> MediaExtensionFilter {
+    MediaExtensionFilter::from_config(&NodeConfig::default())
+}
+
 impl NodeEngine {
     /// 创建不启动 Worker 的测试 actor；协议、SQLite 和关闭路径与生产相同。
     #[doc(hidden)]
@@ -676,6 +683,7 @@ impl NodeEngine {
             cache_root,
             &cache_root.join("runtime"),
             EnumeratorKind::WindowsWalker,
+            default_media_extension_filter(),
             DiskReadConfig::default(),
             NodePostgresConfig::default(),
             1,
@@ -703,6 +711,7 @@ impl NodeEngine {
             cache_root,
             &cache_root.join("runtime"),
             EnumeratorKind::WindowsWalker,
+            default_media_extension_filter(),
             DiskReadConfig::default(),
             NodePostgresConfig::default(),
             1,
@@ -731,6 +740,7 @@ impl NodeEngine {
             cache_root,
             &cache_root.join("runtime"),
             enumerator,
+            default_media_extension_filter(),
             DiskReadConfig::default(),
             NodePostgresConfig::default(),
             effective_worker_count,
@@ -762,6 +772,7 @@ impl NodeEngine {
             cache_root,
             &cache_root.join("runtime"),
             enumerator,
+            default_media_extension_filter(),
             DiskReadConfig::default(),
             NodePostgresConfig::default(),
             effective_worker_count,
@@ -799,6 +810,7 @@ impl NodeEngine {
             cache_root,
             &cache_root.join("runtime"),
             enumerator,
+            default_media_extension_filter(),
             DiskReadConfig::default(),
             NodePostgresConfig::default(),
             effective_worker_count,
@@ -836,6 +848,7 @@ impl NodeEngine {
             cache_root,
             runtime_root,
             enumerator,
+            default_media_extension_filter(),
             DiskReadConfig::default(),
             NodePostgresConfig::default(),
             effective_worker_count,
@@ -873,6 +886,7 @@ impl NodeEngine {
             cache_root,
             runtime_root,
             enumerator,
+            default_media_extension_filter(),
             DiskReadConfig::default(),
             NodePostgresConfig::default(),
             effective_worker_count,
@@ -908,6 +922,7 @@ impl NodeEngine {
             cache_root,
             runtime_root,
             enumerator,
+            default_media_extension_filter(),
             DiskReadConfig::default(),
             NodePostgresConfig::default(),
             effective_worker_count,
@@ -927,6 +942,7 @@ fn spawn_actor(
     cache_root: &Path,
     runtime_root: &Path,
     enumerator: EnumeratorKind,
+    media_extensions: MediaExtensionFilter,
     read_config: DiskReadConfig,
     postgres_config: NodePostgresConfig,
     effective_worker_count: usize,
@@ -953,6 +969,7 @@ fn spawn_actor(
             cache_root: cache_root.to_path_buf(),
             runtime_root: runtime_root.to_path_buf(),
             enumerator,
+            media_extensions,
             read_config,
             postgres_config,
             effective_worker_count,
@@ -1004,6 +1021,8 @@ struct EngineState {
     cache_root: std::path::PathBuf,
     runtime_root: std::path::PathBuf,
     enumerator: EnumeratorKind,
+    /// 启动时配置冻结的图片和视频扩展名并集，整次扫描保持不变。
+    media_extensions: MediaExtensionFilter,
     read_config: DiskReadConfig,
     postgres_config: NodePostgresConfig,
     effective_worker_count: usize,
@@ -1128,6 +1147,8 @@ enum BackgroundJob {
         task_id: TaskId,
         options: ScanOptions,
         enumerator: EnumeratorKind,
+        /// 当前 Node 启动配置冻结的媒体扩展名过滤器。
+        media_extensions: MediaExtensionFilter,
         contact_sheets: PathBuf,
         read_config: DiskReadConfig,
         postgres_config: NodePostgresConfig,
@@ -1480,6 +1501,7 @@ impl EngineState {
             task_id,
             options,
             enumerator,
+            media_extensions: self.media_extensions.clone(),
             contact_sheets,
             read_config: self.read_config.clone(),
             postgres_config: self.postgres_config.clone(),
@@ -2902,6 +2924,7 @@ async fn run_background_job(
             task_id,
             options,
             enumerator,
+            media_extensions,
             contact_sheets,
             read_config,
             postgres_config,
@@ -2924,13 +2947,13 @@ async fn run_background_job(
                     &options.roots,
                     &read_config,
                     &SystemScanRootStorageResolver,
-                    |roots| WindowsWalker.enumerate(roots),
+                    |roots| FilteredWindowsWalker::new(media_extensions.clone()).enumerate(roots),
                 ),
                 EnumeratorKind::Everything => enumerate_with_frozen_plan(
                     &options.roots,
                     &read_config,
                     &SystemScanRootStorageResolver,
-                    |roots| PreferredEverythingEnumerator.enumerate(roots),
+                    |roots| PreferredEverythingEnumerator::new(media_extensions).enumerate(roots),
                 ),
             };
             let result = async {

@@ -44,6 +44,24 @@ listen_ip = "127.0.0.1"
 port = 39091
 worker_count = 4
 enumerator = "everything"
+image_extensions = [
+  "apng", "avif", "bmp", "cur", "dds", "dib", "dpx", "exr", "fits", "gif",
+  "hdr", "heic", "heif", "ico", "j2c", "j2k", "jfif", "jls", "jp2", "jpc",
+  "jpe", "jpeg", "jpg", "jxl", "pam", "pbm", "pcd", "pcx", "pfm", "pgm",
+  "pgx", "png", "pnm", "ppm", "psd", "qoi", "ras", "sgi", "svg", "tga",
+  "tif", "tiff", "webp", "xbm", "xpm", "xwd"
+]
+video_extensions = [
+  "264", "265", "266", "3g2", "3gp", "amv", "apv", "asf", "av1", "avc",
+  "avi", "bik", "bink", "cdxl", "dav", "dif", "divx", "dv", "evc", "evo",
+  "f4v", "flm", "flv", "gxf", "h261", "h263", "h264", "h265", "h266", "hevc",
+  "ifv", "ismv", "ivf", "kux", "lvf", "m1v", "m2t", "m2ts", "m2v", "m4v",
+  "mj2", "mjpeg", "mjpg", "mk3d", "mkv", "moflex", "mov", "mp4", "mpe", "mpeg",
+  "mpg", "mts", "mxf", "nsv", "nut", "nuv", "obu", "ogm", "ogv", "pdv",
+  "qt", "r3d", "rm", "rmvb", "roq", "rpl", "ser", "smjpeg", "smk", "str",
+  "swf", "ts", "ty", "usm", "vc1", "viv", "vivo", "vob", "vvc", "webm",
+  "wmv", "wtv", "xmv", "y4m", "yop"
+]
 
 [paths]
 data_path = "data/node"

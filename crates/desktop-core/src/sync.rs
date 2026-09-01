@@ -87,8 +87,13 @@ impl SyncTriggerSender {
         ticks.tick().await;
         loop {
             ticks.tick().await;
-            if self.catch_up_tick().await.is_err() {
-                break;
+            if let Err(error) = self.catch_up_tick().await {
+                crate::diagnostics::record_expected::<(), _>(
+                    Err(error),
+                    "sync_trigger",
+                    "run_catch_up_timer",
+                );
+                return;
             }
         }
     }
@@ -111,8 +116,19 @@ impl SyncTriggerReceiver {
     /// 丢弃当前同步运行期间已经排队的重复触发，并返回合并数量。
     pub fn drain_pending(&mut self) -> usize {
         let mut drained = 0;
-        while self.receiver.try_recv().is_ok() {
-            drained += 1;
+        loop {
+            match self.receiver.try_recv() {
+                Ok(_trigger) => drained += 1,
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(error @ mpsc::error::TryRecvError::Disconnected) => {
+                    crate::diagnostics::record_expected::<(), _>(
+                        Err(error),
+                        "sync_trigger",
+                        "drain_pending",
+                    );
+                    break;
+                }
+            }
         }
         drained
     }

@@ -291,10 +291,13 @@ fn optional_non_negative(value: Option<i64>, name: &str) -> Result<Option<u64>, 
 
 /// 把正整数尺寸转为 u32。
 fn positive(value: i32, name: &str) -> Result<u32, CentralError> {
-    u32::try_from(value)
-        .ok()
-        .filter(|value| *value > 0)
-        .ok_or_else(|| invalid_state(format!("{name} 必须为正数")))
+    let value =
+        u32::try_from(value).map_err(|error| invalid_state(format!("{name} 无法转换: {error}")))?;
+    if value == 0 {
+        Err(invalid_state(format!("{name} 必须为正数")))
+    } else {
+        Ok(value)
+    }
 }
 
 /// 把可空正整数尺寸转为 u32。

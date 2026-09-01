@@ -1,4 +1,4 @@
-//! Slint 回调到 `UiCommand` 的轻量绑定，以及 `UiEvent` 到窗口属性的整体替换。
+//! Slint 回调到 `UiCommand` 的轻量绑定，以及 `UiEvent` 到窗口属性的稳定增量更新。
 
 use std::sync::{Arc, Mutex};
 
@@ -18,7 +18,7 @@ use slint::{
 };
 use tokio::sync::mpsc;
 
-use crate::{MainWindow, UiPathRow, UiScanRootRow, models};
+use crate::{MainWindow, UiPathRow, UiScanRootRow, UiTaskRow, models};
 
 /// GUI 回调与事件应用共享的最新已验证配置。
 ///
@@ -305,9 +305,25 @@ fn bind_node_config(
                     .map(|loaded| &loaded.config)
                     != Some(&current)
             }
-            Err(_) => true,
+            // 编辑过程中字段可能暂时不完整；真正保存时再显示具体校验错误。
+            Err(_draft_validation_error) => true,
         };
         window.set_node_config_dirty(is_dirty);
+    });
+
+    let restore_window = window.as_weak();
+    window.on_restore_node_extension_defaults(move || {
+        let Some(window) = restore_window.upgrade() else {
+            return;
+        };
+        let defaults = NodeConfig::default();
+        window.set_node_config_image_extensions(
+            extension_list_text(&defaults.image_extensions).into(),
+        );
+        window.set_node_config_video_extensions(
+            extension_list_text(&defaults.video_extensions).into(),
+        );
+        window.invoke_node_config_edited();
     });
 
     let save_sender = sender.clone();
@@ -401,6 +417,8 @@ fn clear_node_config_form(window: &MainWindow) {
     window.set_node_config_listen_ip(SharedString::default());
     window.set_node_config_port(39091);
     window.set_node_config_enumerator_index(1);
+    window.set_node_config_image_extensions(SharedString::default());
+    window.set_node_config_video_extensions(SharedString::default());
     window.set_node_config_data_path(SharedString::default());
     window.set_node_config_config_path(SharedString::default());
     window.set_node_config_log_path(SharedString::default());
@@ -453,6 +471,8 @@ fn node_config_from_window(window: &MainWindow) -> Result<NodeConfig, String> {
         } else {
             EnumeratorKind::Everything
         },
+        image_extensions: extension_list_from_text(&window.get_node_config_image_extensions()),
+        video_extensions: extension_list_from_text(&window.get_node_config_video_extensions()),
         paths: NodePathsConfig {
             data_path: window.get_node_config_data_path().to_string(),
             config_path: window.get_node_config_config_path().to_string(),
@@ -514,8 +534,21 @@ fn node_config_from_window(window: &MainWindow) -> Result<NodeConfig, String> {
                 .map_err(|_| "Node PostgreSQL 连接超时无效".to_owned())?,
         },
     };
-    config.validate().map_err(|error| error.to_string())?;
-    Ok(config)
+    config.normalized().map_err(|error| error.to_string())
+}
+
+/// 把 UI 中英文逗号分隔的扩展名文本拆为配置数组。
+fn extension_list_from_text(text: &str) -> Vec<String> {
+    text.split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// 把规范扩展名数组显示为便于编辑的英文逗号分隔文本。
+fn extension_list_text(extensions: &[String]) -> String {
+    extensions.join(", ")
 }
 
 fn positive_usize(value: i32, field: &str) -> Result<usize, String> {
@@ -766,11 +799,17 @@ pub fn apply_event(window: &MainWindow, binding: &UiBinding, event: UiEvent) {
         UiEvent::RuntimeTasksChanged(state) => {
             let runtime = models::runtime_tasks(&state);
             // 运行任务控制器独占任务列表和运行中计数，普通视图事件无权覆盖它们。
-            window.set_tasks(runtime.tasks);
+            update_task_rows(window, runtime.tasks);
             window.set_running_count(runtime.running_count);
-            window.set_runtime_stages(runtime.stages);
-            window.set_runtime_workers(runtime.workers);
-            window.set_runtime_failures(runtime.failures);
+            update_model_rows(window.get_runtime_stages(), runtime.stages, |model| {
+                window.set_runtime_stages(model);
+            });
+            update_model_rows(window.get_runtime_workers(), runtime.workers, |model| {
+                window.set_runtime_workers(model);
+            });
+            update_model_rows(window.get_runtime_failures(), runtime.failures, |model| {
+                window.set_runtime_failures(model);
+            });
             window.set_runtime_detail_title(runtime.title);
             window.set_runtime_detail_machine_id(runtime.machine_id);
             window.set_runtime_detail_state(runtime.state);
@@ -996,6 +1035,8 @@ fn apply_node_config(window: &MainWindow, config: &NodeConfig) {
     window.set_node_config_enumerator_index(i32::from(
         config.enumerator == EnumeratorKind::Everything,
     ));
+    window.set_node_config_image_extensions(extension_list_text(&config.image_extensions).into());
+    window.set_node_config_video_extensions(extension_list_text(&config.video_extensions).into());
     window.set_node_config_data_path(config.paths.data_path.clone().into());
     window.set_node_config_config_path(config.paths.config_path.clone().into());
     window.set_node_config_log_path(config.paths.log_path.clone().into());
@@ -1211,10 +1252,80 @@ fn bind_simple(window: &MainWindow, sender: &mpsc::Sender<UiCommand>) {
 }
 
 fn send(sender: &mpsc::Sender<UiCommand>, command: UiCommand, window: &slint::Weak<MainWindow>) {
-    if let Err(error) = sender.try_send(command)
-        && let Some(window) = window.upgrade()
-    {
-        window.set_last_error(format!("命令队列不可用：{error}").into());
+    if let Err(error) = sender.try_send(command) {
+        tracing::error!(
+            event = "request_failed",
+            component = "desktop_ui",
+            operation = "queue_ui_command",
+            error = %error,
+            "UI 命令无法进入 Desktop 控制器队列"
+        );
+        if let Some(window) = window.upgrade() {
+            window.set_last_error(format!("命令队列不可用：{error}").into());
+        }
+    }
+}
+
+/// 按任务稳定身份合并周期快照，常规进度更新只触发对应行的变更通知。
+fn update_task_rows(window: &MainWindow, rows: Vec<UiTaskRow>) {
+    let current = window.get_tasks();
+    let Some(model) = current.as_any().downcast_ref::<VecModel<UiTaskRow>>() else {
+        window.set_tasks(ModelRc::new(VecModel::from(rows)));
+        return;
+    };
+    let target_len = rows.len();
+    for (index, row) in rows.into_iter().enumerate() {
+        if index >= model.row_count() {
+            model.push(row);
+            continue;
+        }
+        let current_row = model.row_data(index).expect("索引来自当前任务模型长度");
+        if same_task_identity(&current_row, &row) {
+            model.set_row_data(index, row);
+            continue;
+        }
+        let matching_index = ((index + 1)..model.row_count()).find(|candidate| {
+            model
+                .row_data(*candidate)
+                .is_some_and(|current| same_task_identity(&current, &row))
+        });
+        if let Some(matching_index) = matching_index {
+            model.remove(matching_index);
+        }
+        model.insert(index, row);
+    }
+    while model.row_count() > target_len {
+        model.remove(model.row_count() - 1);
+    }
+}
+
+/// 判断两行是否代表同一所有者的同一运行任务。
+fn same_task_identity(left: &UiTaskRow, right: &UiTaskRow) -> bool {
+    left.owner_kind == right.owner_kind
+        && left.node_index == right.node_index
+        && left.runtime_id == right.runtime_id
+}
+
+/// 复用运行详情 `VecModel`，只按行发送变更、增加和删除通知。
+fn update_model_rows<T: Clone + 'static>(
+    current: ModelRc<T>,
+    rows: Vec<T>,
+    install: impl FnOnce(ModelRc<T>),
+) {
+    let Some(model) = current.as_any().downcast_ref::<VecModel<T>>() else {
+        install(ModelRc::new(VecModel::from(rows)));
+        return;
+    };
+    let target_len = rows.len();
+    for (index, row) in rows.into_iter().enumerate() {
+        if index < model.row_count() {
+            model.set_row_data(index, row);
+        } else {
+            model.push(row);
+        }
+    }
+    while model.row_count() > target_len {
+        model.remove(model.row_count() - 1);
     }
 }
 

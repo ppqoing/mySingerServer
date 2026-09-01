@@ -186,7 +186,21 @@ impl StorageDeviceQuery for SystemStorageDeviceQuery {
     }
 
     fn incurs_seek_penalty(&self, disk_number: u32) -> Option<bool> {
-        query_seek_penalty(disk_number).ok().flatten()
+        match query_seek_penalty(disk_number) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(
+                    event = "request_failed",
+                    component = "storage_device",
+                    request_id = 0_u64,
+                    operation = "query_seek_penalty",
+                    disk_number,
+                    error = %error,
+                    "查询磁盘寻道属性失败"
+                );
+                None
+            }
+        }
     }
 }
 
@@ -195,7 +209,16 @@ struct OwnedHandle(HANDLE);
 impl Drop for OwnedHandle {
     fn drop(&mut self) {
         // SAFETY: OwnedHandle is created only from a successful CreateFileW and drops once.
-        let _ = unsafe { CloseHandle(self.0) };
+        if let Err(error) = unsafe { CloseHandle(self.0) } {
+            tracing::warn!(
+                event = "request_failed",
+                component = "storage_device",
+                request_id = 0_u64,
+                operation = "close_handle",
+                error = %error,
+                "关闭存储设备句柄失败"
+            );
+        }
     }
 }
 

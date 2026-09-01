@@ -1,6 +1,8 @@
 //! 多节点会话、中心同步、PostgreSQL 访问和跨机器分析编排。
 #![warn(missing_docs)]
 
+mod diagnostics;
+
 /// 固定高水位的跨机器一筛、二筛派发和代表分组协调器。
 pub mod analysis;
 /// Slint 与异步服务之间的单向命令、事件和后台控制循环。

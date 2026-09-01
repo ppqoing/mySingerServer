@@ -391,8 +391,11 @@ fn non_negative(value: i64, field: &str) -> Result<u64, CentralError> {
 }
 
 fn positive_u32(value: i32, field: &str) -> Result<u32, CentralError> {
-    u32::try_from(value)
-        .ok()
-        .filter(|value| *value > 0)
-        .ok_or_else(|| CentralError::InvalidState(format!("{field} 无效")))
+    let value = u32::try_from(value)
+        .map_err(|error| CentralError::InvalidState(format!("{field} 无法转换: {error}")))?;
+    if value == 0 {
+        Err(CentralError::InvalidState(format!("{field} 无效")))
+    } else {
+        Ok(value)
+    }
 }

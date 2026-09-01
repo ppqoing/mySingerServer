@@ -944,6 +944,13 @@ fn remote_node_config_callbacks_map_identity_and_send_only_task6_commands() {
     window.set_node_config_worker_mode_index(0);
     window.set_node_config_reserved_cores(1);
     window.set_node_config_manual_workers(2);
+    window.set_node_config_image_extensions("".into());
+    window.set_node_config_video_extensions("".into());
+    window.invoke_restore_node_extension_defaults();
+    assert!(window.get_node_config_image_extensions().contains("jpg"));
+    assert!(window.get_node_config_video_extensions().contains("mp4"));
+    window.set_node_config_image_extensions(" PNG, .jpg, jpg ".into());
+    window.set_node_config_video_extensions("mp4, MKV".into());
     window.set_node_config_postgres_enabled(true);
     window.set_node_config_postgres_host("10.0.0.30".into());
     window.set_node_config_postgres_port(15432);
@@ -960,6 +967,8 @@ fn remote_node_config_callbacks_map_identity_and_send_only_task6_commands() {
             assert_eq!(config.data_path, "data\\node");
             assert_eq!(config.block_timeout_seconds, 3);
             assert_eq!(config.block_retries, 2);
+            assert_eq!(config.image_extensions, ["jpg", "png"]);
+            assert_eq!(config.video_extensions, ["mkv", "mp4"]);
             let postgres = config.postgres.expect("Node PostgreSQL 配置必须完整下发");
             assert!(postgres.enabled);
             assert_eq!(postgres.host, "10.0.0.30");
@@ -1641,4 +1650,51 @@ fn runtime_tasks_are_stable_when_view_events_arrive_in_both_orders() {
             UiEvent::RuntimeTasksChanged(runtime.clone()),
         );
     }
+}
+
+/// 周期进度刷新必须复用同一个任务模型，避免 Slint repeater 重建导致行闪烁。
+#[test]
+fn runtime_progress_refresh_updates_the_existing_task_model() {
+    i_slint_backend_testing::init_no_event_loop();
+
+    let window = MainWindow::new().expect("应能构造真实 MainWindow");
+    let (sender, _receiver) = mpsc::channel(8);
+    let binding = bind_commands(&window, sender, DesktopConfig::default());
+    let (runtime, _view) = single_owner_task_fixture();
+    apply_event(
+        &window,
+        &binding,
+        UiEvent::RuntimeTasksChanged(runtime.clone()),
+    );
+    let original_model = window.get_tasks();
+    let original_vec = original_model
+        .as_any()
+        .downcast_ref::<VecModel<dedup_desktop_ui::UiTaskRow>>()
+        .expect("任务模型必须是可原位更新的 VecModel") as *const _;
+
+    let key = runtime.selected().expect("夹具应选中任务").clone();
+    let mut summary = runtime.summaries()[0].clone();
+    summary.overall_completed = 7;
+    let refreshed = dedup_desktop_core::view_state::RuntimeTaskControllerState::from_parts_for_test(
+        vec![summary],
+        Some(key),
+        None,
+        false,
+        None,
+    );
+    apply_event(&window, &binding, UiEvent::RuntimeTasksChanged(refreshed));
+
+    let refreshed_model = window.get_tasks();
+    let refreshed_vec = refreshed_model
+        .as_any()
+        .downcast_ref::<VecModel<dedup_desktop_ui::UiTaskRow>>()
+        .expect("刷新后仍应保留 VecModel") as *const _;
+    assert_eq!(original_vec, refreshed_vec, "两秒刷新不得替换任务模型");
+    assert_eq!(
+        refreshed_model
+            .row_data(0)
+            .expect("任务行应继续存在")
+            .progress,
+        70
+    );
 }

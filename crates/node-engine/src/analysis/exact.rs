@@ -50,15 +50,19 @@ pub(crate) fn exact_groups_with_runtime(
 ) -> Vec<AnalysisGroup> {
     let groups = exact_groups(inputs);
     if let Some(reporter) = reporter {
-        let _ = reporter.update_stage_nowait(RuntimeStageUpdate {
-            stage: RuntimeStage::FinalCompare,
-            state: dedup_protocol::proto::RuntimeStageState::RuntimeStageRunning,
-            unit: RuntimeProgressUnit::CandidatePairs,
-            completed: 0,
-            total: Some(candidate_total),
-            failed: 0,
-            skipped: 0,
-        });
+        crate::diagnostics::record_warning(
+            reporter.update_stage_nowait(RuntimeStageUpdate {
+                stage: RuntimeStage::FinalCompare,
+                state: dedup_protocol::proto::RuntimeStageState::RuntimeStageRunning,
+                unit: RuntimeProgressUnit::CandidatePairs,
+                completed: 0,
+                total: Some(candidate_total),
+                failed: 0,
+                skipped: 0,
+            }),
+            "analysis_exact",
+            "update_runtime_stage",
+        );
     }
     groups
 }

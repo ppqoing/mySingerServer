@@ -323,7 +323,11 @@ fn discard_repository_temp(path: &Path) {
         return;
     };
     if Uuid::parse_str(identifier).is_ok() {
-        let _ = fs::remove_file(path);
+        crate::diagnostics::record_warning(
+            fs::remove_file(path),
+            "config_repository",
+            "remove_temporary_file",
+        );
     }
 }
 

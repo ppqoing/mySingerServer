@@ -15,15 +15,54 @@ pub use priority_writer::PriorityWriter;
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io::{self, Write},
+        sync::{Arc, Mutex},
+    };
+
     use dedup_protocol::proto;
     use prost::Message;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
+    use tracing_subscriber::fmt::MakeWriter;
 
     use super::{
         ClientConnection, FrameClass, FrameError, FrameReader, FrameWriter, PendingRequests,
         PriorityWriter, encode_frame,
     };
+
+    /// 收集当前线程 subscriber 产生的真实格式化日志。
+    #[derive(Clone, Default)]
+    struct SharedLogBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl SharedLogBuffer {
+        /// 返回当前已经写入的 UTF-8 日志文本。
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    /// 为一次 tracing 写入持有共享缓冲区锁。
+    struct SharedLogWriter(SharedLogBuffer);
+
+    impl Write for SharedLogWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0.0.lock().unwrap().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for SharedLogBuffer {
+        type Writer = SharedLogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            SharedLogWriter(self.clone())
+        }
+    }
 
     /// 防止普通 Protobuf Envelope 绕过固定 8 MiB 分帧上限。
     #[test]
@@ -135,5 +174,70 @@ mod tests {
             Some(proto::envelope::Payload::Ping(proto::Ping { nonce: 99 }))
         ));
         server.await.unwrap();
+    }
+
+    /// 防止无效 Protobuf 只关闭连接而没有留下可定位的根因事件。
+    #[tokio::test(flavor = "current_thread")]
+    async fn invalid_protobuf_is_logged_once_at_transport_boundary() {
+        let output = SharedLogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_writer(output.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (_, write) = stream.into_split();
+            FrameWriter::new(write)
+                .write_frame(&[0xff], FrameClass::Ordinary)
+                .await
+                .unwrap();
+        });
+
+        let client = ClientConnection::connect(address).await.unwrap();
+        assert!(client.next_event().await.is_err());
+        server.await.unwrap();
+        tokio::task::yield_now().await;
+
+        let log = output.text();
+        assert_eq!(
+            log.matches("event=\"transport_connection_failed\"").count(),
+            1
+        );
+        assert!(log.contains("operation=\"decode\""));
+        assert!(log.contains("peer="));
+    }
+
+    /// 防止对端正常关闭被误报成连接故障，同时保证底层错误值仍有 INFO 留痕。
+    #[tokio::test(flavor = "current_thread")]
+    async fn peer_close_is_logged_as_expected_condition() {
+        let output = SharedLogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_writer(output.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+        });
+
+        let client = ClientConnection::connect(address).await.unwrap();
+        assert!(client.next_event().await.is_err());
+        server.await.unwrap();
+        tokio::task::yield_now().await;
+
+        let log = output.text();
+        assert_eq!(log.matches("event=\"expected_condition\"").count(), 1);
+        assert!(!log.contains("event=\"transport_connection_failed\""));
+        assert!(log.contains("reason=\"peer_closed\""));
     }
 }

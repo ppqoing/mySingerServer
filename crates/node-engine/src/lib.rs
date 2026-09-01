@@ -3,6 +3,7 @@
 
 mod central_cache;
 mod contact_sheet_cache;
+mod diagnostics;
 
 pub use central_cache::{
     DisabledRemoteFeatureCache, NodeRemoteFeatureCache, PostgresFeatureCache, RemoteCacheError,

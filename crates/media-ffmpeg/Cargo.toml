@@ -13,6 +13,7 @@ doctest = false
 [dependencies]
 dedup-core = { path = "../core" }
 thiserror.workspace = true
+tracing.workspace = true
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_System_LibraryLoader",

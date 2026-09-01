@@ -41,6 +41,14 @@ pub(crate) struct WorkerProcess {
     process_id: u32,
 }
 
+/// 管道故障后的 Worker 收束结果，保留退出码和所有次级错误。
+pub(crate) struct WorkerStopOutcome {
+    /// 可以从 Windows 进程句柄取得的退出码。
+    pub(crate) exit_code: Option<i32>,
+    /// 检查或终止进程时发生的次级错误文本。
+    pub(crate) cleanup_error: Option<String>,
+}
+
 impl WorkerProcess {
     /// 以无窗口、管道重定向方式启动进程，加入 Job 后等待匹配 PID 的 Ready。
     pub(crate) async fn spawn(
@@ -120,11 +128,34 @@ impl WorkerProcess {
     }
 
     /// 管道或协议异常后确保进程收束，并返回可取得的退出码。
-    pub(crate) async fn stop_after_failure(&mut self) -> Option<i32> {
+    pub(crate) async fn stop_after_failure(&mut self) -> WorkerStopOutcome {
         match self.child.try_wait() {
-            Ok(Some(status)) => status.code(),
-            Ok(None) => self.terminate().await.ok().flatten(),
-            Err(_) => self.terminate().await.ok().flatten(),
+            Ok(Some(status)) => WorkerStopOutcome {
+                exit_code: status.code(),
+                cleanup_error: None,
+            },
+            Ok(None) => match self.terminate().await {
+                Ok(exit_code) => WorkerStopOutcome {
+                    exit_code,
+                    cleanup_error: None,
+                },
+                Err(error) => WorkerStopOutcome {
+                    exit_code: None,
+                    cleanup_error: Some(format!("终止 Worker 失败: {error}")),
+                },
+            },
+            Err(inspect_error) => match self.terminate().await {
+                Ok(exit_code) => WorkerStopOutcome {
+                    exit_code,
+                    cleanup_error: Some(format!("读取 Worker 退出状态失败: {inspect_error}")),
+                },
+                Err(terminate_error) => WorkerStopOutcome {
+                    exit_code: None,
+                    cleanup_error: Some(format!(
+                        "读取 Worker 退出状态失败: {inspect_error}; 终止 Worker 失败: {terminate_error}"
+                    )),
+                },
+            },
         }
     }
 }
@@ -132,7 +163,31 @@ impl WorkerProcess {
 impl Drop for WorkerProcess {
     /// actor 异常结束时发出最后一次终止请求；Job Object 仍是最终兜底。
     fn drop(&mut self) {
-        let _ = self.child.start_kill();
+        match self.child.start_kill() {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+                tracing::info!(
+                    event = "expected_condition",
+                    component = "worker_process",
+                    operation = "start_kill_on_drop",
+                    reason = "process_already_exited",
+                    worker_pid = self.process_id,
+                    error = %error,
+                    "Worker 进程已经退出"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    event = "request_failed",
+                    component = "worker_process",
+                    request_id = 0_u64,
+                    operation = "start_kill_on_drop",
+                    worker_pid = self.process_id,
+                    error = %error,
+                    "Worker Drop 终止请求失败，Job Object 将继续兜底"
+                );
+            }
+        }
     }
 }
 

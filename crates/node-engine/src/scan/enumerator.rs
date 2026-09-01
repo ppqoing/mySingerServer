@@ -5,7 +5,20 @@ use std::io;
 use dedup_core::{DisplayPath, NormalizedPath};
 use dedup_node_store::ScannedPath;
 
-use super::ScanError;
+use super::{MediaExtensionFilter, ScanError};
+
+/// 在 Windows 文件系统遍历回调中按配置扩展名跳过文件的枚举器。
+#[derive(Clone, Debug)]
+pub struct FilteredWindowsWalker {
+    filter: MediaExtensionFilter,
+}
+
+impl FilteredWindowsWalker {
+    /// 创建使用一个 Node 配置快照的 Walker。
+    pub fn new(filter: MediaExtensionFilter) -> Self {
+        Self { filter }
+    }
+}
 
 /// 把一个或多个绝对扫描根完整转换为稳定排序文件列表。
 pub trait FileEnumerator {
@@ -68,6 +81,54 @@ impl FileEnumerator for dedup_windows::WindowsWalker {
     ) -> Result<(), ScanError> {
         let mut emitted_error = None;
         let result = self.walk_into(roots, |file| {
+            let row = NormalizedPath::new(&file.path)
+                .map_err(|error| ScanError::InvalidResult(error.to_string()))
+                .and_then(|normalized| {
+                    Ok(ScannedPath::new(
+                        normalized,
+                        DisplayPath::new(&file.path)
+                            .map_err(|error| ScanError::InvalidResult(error.to_string()))?,
+                        file.file_size,
+                    ))
+                })
+                .and_then(|row| emit(row));
+            match row {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    emitted_error = Some(error);
+                    Err(io::Error::new(io::ErrorKind::Interrupted, "枚举下游已停止"))
+                }
+            }
+        });
+        if let Some(error) = emitted_error {
+            return Err(error);
+        }
+        result.map_err(|error| ScanError::Enumeration(error.to_string()))
+    }
+}
+
+impl FileEnumerator for FilteredWindowsWalker {
+    fn enumerate(&self, roots: &[DisplayPath]) -> Result<Vec<ScannedPath>, ScanError> {
+        let mut rows = Vec::new();
+        self.enumerate_into(roots, &mut |row| {
+            rows.push(row);
+            Ok(())
+        })?;
+        rows.sort_by(|left, right| left.normalized_path.cmp(&right.normalized_path));
+        rows.dedup_by(|left, right| left.normalized_path == right.normalized_path);
+        Ok(rows)
+    }
+
+    fn enumerate_into(
+        &self,
+        roots: &[DisplayPath],
+        emit: &mut dyn FnMut(ScannedPath) -> Result<(), ScanError>,
+    ) -> Result<(), ScanError> {
+        let mut emitted_error = None;
+        let result = dedup_windows::WindowsWalker.walk_into(roots, |file| {
+            if !self.filter.matches(&file.path) {
+                return Ok(());
+            }
             let row = NormalizedPath::new(&file.path)
                 .map_err(|error| ScanError::InvalidResult(error.to_string()))
                 .and_then(|normalized| {

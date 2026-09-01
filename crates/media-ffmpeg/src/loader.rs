@@ -210,14 +210,32 @@ impl Drop for PendingLoad {
 fn unload_all(modules: &mut Vec<HMODULE>) {
     while let Some(module) = modules.pop() {
         // SAFETY: 每个句柄由本加载器成功取得且只在这里释放一次。
-        let _ = unsafe { FreeLibrary(module) };
+        if let Err(error) = unsafe { FreeLibrary(module) } {
+            tracing::warn!(
+                event = "request_failed",
+                component = "ffmpeg_loader",
+                request_id = 0_u64,
+                operation = "free_library",
+                error = %error,
+                "释放 FFmpeg DLL 句柄失败"
+            );
+        }
     }
 }
 
 fn remove_directory(cookie: *mut c_void) {
     if !cookie.is_null() {
         // SAFETY: cookie 来自本进程成功的 AddDllDirectory，且只移除一次。
-        let _ = unsafe { RemoveDllDirectory(cookie.cast_const()) };
+        if let Err(error) = unsafe { RemoveDllDirectory(cookie.cast_const()) } {
+            tracing::warn!(
+                event = "request_failed",
+                component = "ffmpeg_loader",
+                request_id = 0_u64,
+                operation = "remove_dll_directory",
+                error = %error,
+                "移除 FFmpeg DLL 搜索目录失败"
+            );
+        }
     }
 }
 

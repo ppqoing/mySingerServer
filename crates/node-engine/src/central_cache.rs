@@ -167,7 +167,13 @@ impl NodeRemoteFeatureCache {
         match PostgresFeatureCache::connect(config).await {
             Ok(cache) => (Self::Postgres(cache), true),
             Err(error) => {
-                tracing::warn!(error = %error, "PostgreSQL 不可用，本次任务降级为 SQLite-only");
+                tracing::warn!(
+                    event = "central_store_degraded",
+                    operation = "connect_feature_cache",
+                    fallback = "sqlite_only",
+                    error = %error,
+                    "PostgreSQL 不可用，本次任务降级为 SQLite-only"
+                );
                 (
                     Self::Disabled {
                         cache: DisabledRemoteFeatureCache,

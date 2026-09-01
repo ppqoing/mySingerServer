@@ -123,9 +123,17 @@ impl ContactSheetCacheEntry {
             fs::rename(&self.final_path, &stale_path)?;
         }
         if let Err(error) = fs::rename(&partial_path, &self.final_path) {
-            let _ = fs::remove_file(&partial_path);
+            crate::diagnostics::record_warning(
+                fs::remove_file(&partial_path),
+                "contact_sheet_cache",
+                "remove_failed_partial",
+            );
             if had_existing {
-                let _ = fs::rename(&stale_path, &self.final_path);
+                crate::diagnostics::record_warning(
+                    fs::rename(&stale_path, &self.final_path),
+                    "contact_sheet_cache",
+                    "restore_previous_file",
+                );
             }
             return Err(error);
         }
@@ -137,14 +145,26 @@ impl ContactSheetCacheEntry {
             )
             .map_err(io::Error::other);
         if let Err(error) = committed {
-            let _ = fs::remove_file(&self.final_path);
+            crate::diagnostics::record_warning(
+                fs::remove_file(&self.final_path),
+                "contact_sheet_cache",
+                "remove_uncommitted_file",
+            );
             if had_existing {
-                let _ = fs::rename(&stale_path, &self.final_path);
+                crate::diagnostics::record_warning(
+                    fs::rename(&stale_path, &self.final_path),
+                    "contact_sheet_cache",
+                    "restore_previous_reference",
+                );
             }
             return Err(error);
         }
         if had_existing {
-            let _ = fs::remove_file(stale_path);
+            crate::diagnostics::record_warning(
+                fs::remove_file(stale_path),
+                "contact_sheet_cache",
+                "remove_stale_file",
+            );
         }
         Ok(())
     }

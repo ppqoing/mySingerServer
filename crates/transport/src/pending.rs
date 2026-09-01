@@ -27,22 +27,59 @@ impl PendingRequests {
     }
 
     pub(crate) fn resolve(&self, response: proto::Envelope) -> bool {
-        self.entries
-            .lock()
-            .unwrap()
-            .remove(&response.request_id)
-            .is_some_and(|sender| sender.send(Ok(response)).is_ok())
+        let request_id = response.request_id;
+        let Some(sender) = self.entries.lock().unwrap().remove(&request_id) else {
+            return false;
+        };
+        match sender.send(Ok(response)) {
+            Ok(()) => true,
+            Err(unsent_response) => {
+                drop(unsent_response);
+                tracing::info!(
+                    event = "expected_condition",
+                    component = "transport_pending",
+                    operation = "resolve_request",
+                    reason = "request_receiver_closed",
+                    request_id,
+                    error = "oneshot_receiver_closed",
+                    "响应到达前请求调用方已经结束"
+                );
+                false
+            }
+        }
     }
 
     pub(crate) fn fail(&self, request_id: u64) {
         if let Some(sender) = self.entries.lock().unwrap().remove(&request_id) {
-            let _ = sender.send(Err(TransportError::ConnectionClosed));
+            if let Err(unsent_result) = sender.send(Err(TransportError::ConnectionClosed)) {
+                drop(unsent_result);
+                tracing::info!(
+                    event = "expected_condition",
+                    component = "transport_pending",
+                    operation = "fail_request",
+                    reason = "request_receiver_closed",
+                    request_id,
+                    error = "oneshot_receiver_closed",
+                    "等待请求结果的调用方已经结束"
+                );
+            }
         }
     }
 
     pub(crate) fn fail_all(&self) {
-        for (_, sender) in self.entries.lock().unwrap().drain() {
-            let _ = sender.send(Err(TransportError::ConnectionClosed));
+        for (request_id, sender) in self.entries.lock().unwrap().drain() {
+            if let Err(unsent_result) = sender.send(Err(TransportError::ConnectionClosed)) {
+                drop(unsent_result);
+                tracing::info!(
+                    event = "expected_condition",
+                    component = "transport_pending",
+                    operation = "fail_all_requests",
+                    reason = "request_receiver_closed",
+                    request_id,
+                    error = "oneshot_receiver_closed",
+                    "等待请求结果的调用方已经结束"
+                );
+            }
         }
     }
 }

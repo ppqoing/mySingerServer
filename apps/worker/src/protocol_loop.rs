@@ -33,7 +33,11 @@ where
         },
     )
     .await?;
-    tracing::info!(process_id, "Worker 已就绪");
+    tracing::info!(
+        event = "worker_ready",
+        worker_pid = process_id,
+        "Worker 已就绪"
+    );
 
     loop {
         let payload = match reader.read_frame().await {

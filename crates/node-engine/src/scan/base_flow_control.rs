@@ -5,7 +5,7 @@ use std::sync::{
     atomic::{AtomicU8, AtomicUsize, Ordering},
 };
 
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 /// Hash future 尚未取得真实磁盘许可。
 const HASH_WAITING: u8 = 0;
@@ -401,10 +401,20 @@ impl ContentOutputCredits {
 
     /// 非阻塞取得一个随文件移动的 credit；没有容量时保留 Hash refill token。
     pub(super) fn try_acquire(&self) -> Option<ContentOutputCredit> {
-        Arc::clone(&self.semaphore)
-            .try_acquire_owned()
-            .ok()
-            .map(|permit| ContentOutputCredit { _permit: permit })
+        match Arc::clone(&self.semaphore).try_acquire_owned() {
+            Ok(permit) => Some(ContentOutputCredit { _permit: permit }),
+            Err(TryAcquireError::NoPermits) => None,
+            Err(TryAcquireError::Closed) => {
+                tracing::error!(
+                    event = "invariant_failed",
+                    component = "base_flow_control",
+                    operation = "acquire_content_output_credit",
+                    error = "content output semaphore closed",
+                    "内容输出 credit 信号量被意外关闭"
+                );
+                None
+            }
+        }
     }
 
     /// 返回池当前还可取得的 credit 数量，用于 Hash admission 背压。
@@ -449,10 +459,20 @@ impl DecodeCredits {
 
     /// 非阻塞取得一枚随候选生命周期移动的解码 credit。
     pub(super) fn try_acquire(&self) -> Option<DecodeCredit> {
-        Arc::clone(&self.semaphore)
-            .try_acquire_owned()
-            .ok()
-            .map(|permit| DecodeCredit { _permit: permit })
+        match Arc::clone(&self.semaphore).try_acquire_owned() {
+            Ok(permit) => Some(DecodeCredit { _permit: permit }),
+            Err(TryAcquireError::NoPermits) => None,
+            Err(TryAcquireError::Closed) => {
+                tracing::error!(
+                    event = "invariant_failed",
+                    component = "base_flow_control",
+                    operation = "acquire_decode_credit",
+                    error = "decode semaphore closed",
+                    "解码 credit 信号量被意外关闭"
+                );
+                None
+            }
+        }
     }
 
     /// 返回当前仍由 pending/media/dispatch/start-pending 持有的 credit 数量。
@@ -635,9 +655,18 @@ fn increment(counter: &AtomicUsize) {
 
 /// 计数减少 helper，重复释放时饱和到零而不发生下溢。
 fn decrement(counter: &AtomicUsize) {
-    let _ = counter.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+    if let Err(current) = counter.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
         Some(value.saturating_sub(1))
-    });
+    }) {
+        tracing::error!(
+            event = "invariant_failed",
+            component = "base_flow_control",
+            operation = "decrement_counter",
+            current,
+            error = "fetch_update rejected an always-Some update",
+            "原子计数更新违反内部不变量"
+        );
+    }
 }
 
 #[cfg(test)]

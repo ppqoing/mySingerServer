@@ -2224,13 +2224,14 @@ async fn run_slot(
 
         if let Err(error) = process.send(&envelope).await {
             let process_id = Some(process.process_id());
-            let exit_code = process.stop_after_failure().await;
+            let stopped = process.stop_after_failure().await;
+            let message = worker_stop_message(&error.to_string(), stopped.cleanup_error.as_deref());
             let _ = events.send(SlotEvent::Exited {
                 slot_id,
                 work: Some(work),
                 process_id,
-                exit_code,
-                message: error.to_string(),
+                exit_code: stopped.exit_code,
+                message,
             });
             return;
         }
@@ -2289,13 +2290,17 @@ async fn run_slot(
                         }
                         Err(error) => {
                             let process_id = Some(process.process_id());
-                            let exit_code = process.stop_after_failure().await;
+                            let stopped = process.stop_after_failure().await;
+                            let message = worker_stop_message(
+                                &error.to_string(),
+                                stopped.cleanup_error.as_deref(),
+                            );
                             let _ = events.send(SlotEvent::Exited {
                                 slot_id,
                                 work: Some(work),
                                 process_id,
-                                exit_code,
-                                message: error.to_string(),
+                                exit_code: stopped.exit_code,
+                                message,
                             });
                             return;
                         }
@@ -2322,6 +2327,14 @@ async fn run_slot(
             }
         }
     }
+}
+
+/// 合并主管道错误和收束阶段错误，确保崩溃日志保留完整原因。
+fn worker_stop_message(primary: &str, cleanup_error: Option<&str>) -> String {
+    cleanup_error.map_or_else(
+        || primary.to_owned(),
+        |cleanup_error| format!("{primary}; {cleanup_error}"),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

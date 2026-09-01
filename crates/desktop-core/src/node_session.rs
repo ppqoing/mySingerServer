@@ -107,7 +107,15 @@ impl NodeSession {
             tokio::select! {
                 _ = tokio::time::sleep(retry_interval) => {}
                 changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
+                    if let Err(error) = changed {
+                        crate::diagnostics::record_expected::<(), _>(
+                            Err(error),
+                            "node_session",
+                            "wait_for_retry_shutdown",
+                        );
+                        return None;
+                    }
+                    if *shutdown.borrow() {
                         return None;
                     }
                 }

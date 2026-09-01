@@ -15,6 +15,7 @@ dedup-protocol = { path = "../protocol" }
 image = { workspace = true, features = ["png", "ico"] }
 slint.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 
 [build-dependencies]
 slint-build.workspace = true

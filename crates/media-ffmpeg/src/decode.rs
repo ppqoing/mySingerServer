@@ -47,6 +47,91 @@ pub struct DecodedFrame {
     pub rgb24: Vec<u8>,
 }
 
+/// RGB24 SIMD 转换使用的指针和行跨度对齐字节数。
+const RGB24_SIMD_ALIGNMENT: usize = 64;
+/// 每行逻辑像素之后为 FFmpeg SIMD 尾写预留的保护字节数。
+const RGB24_SIMD_GUARD_BYTES: usize = 64;
+
+/// 为 FFmpeg 提供对齐且逐行隔离的 RGB24 目标面，完成后原地压缩为紧凑字节序。
+struct Rgb24Destination {
+    /// 同时容纳首地址对齐空间、带保护区的像素行和最终紧凑结果。
+    storage: Vec<u8>,
+    /// `storage` 内第一个 64 字节对齐像素行的起始偏移。
+    aligned_offset: usize,
+    /// 每行不含保护区的 RGB24 逻辑字节数。
+    row_bytes: usize,
+    /// FFmpeg 实际使用的带保护区行跨度。
+    stride: usize,
+    /// 需要转换和压缩的像素行数。
+    height: usize,
+    /// 对外返回的紧凑 RGB24 总字节数。
+    compact_bytes: usize,
+}
+
+impl Rgb24Destination {
+    /// 按 64 字节对齐并为每行预留 64 字节 SIMD 保护区。
+    fn new(width: usize, height: usize) -> Result<Self, FfmpegError> {
+        let row_bytes = width
+            .checked_mul(3)
+            .ok_or(FfmpegError::InvalidMedia("decoded frame is too large"))?;
+        let compact_bytes = row_bytes
+            .checked_mul(height)
+            .ok_or(FfmpegError::InvalidMedia("decoded frame is too large"))?;
+        let guarded_row_bytes = row_bytes
+            .checked_add(RGB24_SIMD_GUARD_BYTES)
+            .ok_or(FfmpegError::InvalidMedia("decoded frame is too large"))?;
+        let stride = guarded_row_bytes
+            .checked_add(RGB24_SIMD_ALIGNMENT - 1)
+            .map(|bytes| bytes / RGB24_SIMD_ALIGNMENT * RGB24_SIMD_ALIGNMENT)
+            .ok_or(FfmpegError::InvalidMedia("decoded frame is too large"))?;
+        let padded_bytes = stride
+            .checked_mul(height)
+            .ok_or(FfmpegError::InvalidMedia("decoded frame is too large"))?;
+        let allocation_bytes = padded_bytes
+            .checked_add(RGB24_SIMD_ALIGNMENT - 1)
+            .ok_or(FfmpegError::InvalidMedia("decoded frame is too large"))?;
+        let storage = vec![0; allocation_bytes];
+        let address = storage.as_ptr() as usize;
+        let aligned_offset =
+            (RGB24_SIMD_ALIGNMENT - address % RGB24_SIMD_ALIGNMENT) % RGB24_SIMD_ALIGNMENT;
+
+        Ok(Self {
+            storage,
+            aligned_offset,
+            row_bytes,
+            stride,
+            height,
+            compact_bytes,
+        })
+    }
+
+    /// 返回 FFmpeg 可写入的 64 字节对齐首地址。
+    fn data_mut_ptr(&mut self) -> *mut u8 {
+        // SAFETY: 构造时额外分配了最多 63 字节首地址对齐空间。
+        unsafe { self.storage.as_mut_ptr().add(self.aligned_offset) }
+    }
+
+    /// 返回 FFmpeg `dstStride` 可表示的带保护区行跨度。
+    fn stride_i32(&self) -> Result<i32, FfmpegError> {
+        i32::try_from(self.stride)
+            .map_err(|_| FfmpegError::InvalidMedia("decoded frame is too large"))
+    }
+
+    /// 把带跨度的各行向前原地压缩，并恢复 `width * height * 3` 紧凑布局。
+    fn into_compact(mut self) -> Vec<u8> {
+        for row in 0..self.height {
+            let source_start = self.aligned_offset + row * self.stride;
+            let destination_start = row * self.row_bytes;
+            self.storage.copy_within(
+                source_start..source_start + self.row_bytes,
+                destination_start,
+            );
+        }
+        self.storage.truncate(self.compact_bytes);
+        self.storage
+    }
+}
+
 /// FFmpeg 自定义 AVIO 使用的可读、可定位媒体来源。
 ///
 /// 实现负责在 `read` 和 `seek` 内完成自身的超时、重试与取消处理；FFmpeg 只看到
@@ -168,49 +253,189 @@ unsafe extern "C" fn read_source_callback(
     buffer_size: i32,
 ) -> i32 {
     if opaque.is_null() || buffer.is_null() || buffer_size <= 0 {
+        tracing::error!(
+            event = "invariant_failed",
+            component = "ffmpeg_avio",
+            operation = "read_callback",
+            opaque_is_null = opaque.is_null(),
+            buffer_is_null = buffer.is_null(),
+            buffer_size,
+            error = "invalid callback arguments",
+            "FFmpeg AVIO 读取回调收到无效参数"
+        );
         return AVERROR_INVALID;
     }
-    catch_unwind(AssertUnwindSafe(|| {
+    let result = catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: opaque 指向 DecoderSession 持有的 SourceBridge；回调只在该会话内执行。
         let bridge = unsafe { &mut *opaque.cast::<SourceBridge<'static>>() };
         // SAFETY: FFmpeg 保证可写缓冲区至少有 buffer_size 字节且只在本次回调使用。
         let output = unsafe { std::slice::from_raw_parts_mut(buffer, buffer_size as usize) };
         match bridge.source.read(output) {
             Ok(0) => AVERROR_EOF,
-            Ok(read) => i32::try_from(read).unwrap_or(AVERROR_INVALID),
-            Err(_) => AVERROR_IO,
+            Ok(read) => match i32::try_from(read) {
+                Ok(read) => read,
+                Err(error) => {
+                    tracing::error!(
+                        event = "invariant_failed",
+                        component = "ffmpeg_avio",
+                        operation = "convert_read_length",
+                        read,
+                        error = %error,
+                        "媒体来源返回的读取长度超过 FFmpeg 回调范围"
+                    );
+                    AVERROR_INVALID
+                }
+            },
+            Err(error) => {
+                tracing::warn!(
+                    event = "file_failed",
+                    component = "ffmpeg_avio",
+                    operation = "read_media_source",
+                    error = %error,
+                    "FFmpeg 自定义媒体来源读取失败"
+                );
+                AVERROR_IO
+            }
         }
-    }))
-    .unwrap_or(AVERROR_IO)
+    }));
+    match result {
+        Ok(code) => code,
+        Err(panic_payload) => {
+            let payload_kind = if panic_payload.is::<&'static str>() {
+                "str"
+            } else if panic_payload.is::<String>() {
+                "string"
+            } else {
+                "unknown"
+            };
+            tracing::error!(
+                event = "background_task_failed",
+                component = "ffmpeg_avio",
+                operation = "read_callback",
+                payload_kind,
+                error = "panic caught at FFI boundary",
+                "FFmpeg AVIO 读取回调发生 panic，已在 FFI 边界截获"
+            );
+            AVERROR_IO
+        }
+    }
 }
 
 /// 把 FFmpeg 定位和长度查询请求转交给同一个 Rust 文件会话。
 unsafe extern "C" fn seek_source_callback(opaque: *mut c_void, offset: i64, whence: i32) -> i64 {
     if opaque.is_null() {
+        tracing::error!(
+            event = "invariant_failed",
+            component = "ffmpeg_avio",
+            operation = "seek_callback",
+            offset,
+            whence,
+            error = "null callback context",
+            "FFmpeg AVIO 定位回调缺少媒体来源上下文"
+        );
         return i64::from(AVERROR_INVALID);
     }
-    catch_unwind(AssertUnwindSafe(|| {
+    let result = catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: opaque 指向 DecoderSession 持有的 SourceBridge；回调只在该会话内执行。
         let bridge = unsafe { &mut *opaque.cast::<SourceBridge<'static>>() };
         if whence & AVSEEK_SIZE != 0 {
-            return i64::try_from(bridge.source.len()).unwrap_or(i64::from(AVERROR_INVALID));
+            return match i64::try_from(bridge.source.len()) {
+                Ok(length) => length,
+                Err(error) => {
+                    tracing::warn!(
+                        event = "request_rejected",
+                        component = "ffmpeg_avio",
+                        operation = "query_media_length",
+                        media_length = bridge.source.len(),
+                        error = %error,
+                        "媒体长度超过 FFmpeg 可表示范围"
+                    );
+                    i64::from(AVERROR_INVALID)
+                }
+            };
         }
         let mode = whence & !AVSEEK_FORCE;
         let position = match mode {
             0 => match u64::try_from(offset) {
                 Ok(offset) => SeekFrom::Start(offset),
-                Err(_) => return i64::from(AVERROR_INVALID),
+                Err(error) => {
+                    tracing::warn!(
+                        event = "request_rejected",
+                        component = "ffmpeg_avio",
+                        operation = "seek_media_source",
+                        mode,
+                        offset,
+                        error = %error,
+                        "FFmpeg 请求了无效的绝对媒体偏移"
+                    );
+                    return i64::from(AVERROR_INVALID);
+                }
             },
             1 => SeekFrom::Current(offset),
             2 => SeekFrom::End(offset),
-            _ => return i64::from(AVERROR_INVALID),
+            _ => {
+                tracing::warn!(
+                    event = "request_rejected",
+                    component = "ffmpeg_avio",
+                    operation = "seek_media_source",
+                    mode,
+                    offset,
+                    error = "unsupported seek mode",
+                    "FFmpeg 请求了不支持的媒体定位模式"
+                );
+                return i64::from(AVERROR_INVALID);
+            }
         };
         match bridge.source.seek(position) {
-            Ok(position) => i64::try_from(position).unwrap_or(i64::from(AVERROR_INVALID)),
-            Err(_) => i64::from(AVERROR_IO),
+            Ok(position) => match i64::try_from(position) {
+                Ok(position) => position,
+                Err(error) => {
+                    tracing::warn!(
+                        event = "request_rejected",
+                        component = "ffmpeg_avio",
+                        operation = "convert_seek_position",
+                        position,
+                        error = %error,
+                        "媒体定位结果超过 FFmpeg 可表示范围"
+                    );
+                    i64::from(AVERROR_INVALID)
+                }
+            },
+            Err(error) => {
+                tracing::warn!(
+                    event = "file_failed",
+                    component = "ffmpeg_avio",
+                    operation = "seek_media_source",
+                    mode,
+                    offset,
+                    error = %error,
+                    "FFmpeg 自定义媒体来源定位失败"
+                );
+                i64::from(AVERROR_IO)
+            }
         }
-    }))
-    .unwrap_or(i64::from(AVERROR_IO))
+    }));
+    match result {
+        Ok(position) => position,
+        Err(panic_payload) => {
+            let payload_kind = if panic_payload.is::<&'static str>() {
+                "str"
+            } else if panic_payload.is::<String>() {
+                "string"
+            } else {
+                "unknown"
+            };
+            tracing::error!(
+                event = "background_task_failed",
+                component = "ffmpeg_avio",
+                operation = "seek_callback",
+                payload_kind,
+                error = "panic caught at FFI boundary",
+                "FFmpeg AVIO 定位回调发生 panic，已在 FFI 边界截获"
+            );
+            i64::from(AVERROR_IO)
+        }
+    }
 }
 
 /// 一次媒体打开对应一个会话，所有 FFmpeg 分配对象都在 Drop 中成对释放。
@@ -577,10 +802,8 @@ impl<'api, 'source> DecoderSession<'api, 'source> {
         }
         let width = frame.width as usize;
         let height = frame.height as usize;
-        let byte_count = width
-            .checked_mul(height)
-            .and_then(|pixels| pixels.checked_mul(3))
-            .ok_or(FfmpegError::InvalidMedia("decoded frame is too large"))?;
+        let mut rgb24 = Rgb24Destination::new(width, height)?;
+        let rgb24_stride = rgb24.stride_i32()?;
         // SAFETY: 所有尺寸和像素格式来自成功解码的 frame；滤镜指针按 API 允许为空。
         let scaler = unsafe {
             (self.api.sws_get_context)(
@@ -600,13 +823,12 @@ impl<'api, 'source> DecoderSession<'api, 'source> {
             return Err(FfmpegError::InvalidMedia("cannot create RGB24 converter"));
         }
 
-        let mut rgb24 = vec![0; byte_count];
         let mut destination = [ptr::null_mut(); 8];
-        destination[0] = rgb24.as_mut_ptr();
+        destination[0] = rgb24.data_mut_ptr();
         let mut destination_stride = [0_i32; 8];
-        destination_stride[0] = (width * 3) as i32;
+        destination_stride[0] = rgb24_stride;
         let source = frame.data.map(|data| data.cast_const());
-        // SAFETY: 源平面由 frame 持有；目标缓冲区大小和 stride 与 RGB24 尺寸一致。
+        // SAFETY: 源平面由 frame 持有；目标面按 64 字节对齐且每行留有 SIMD 保护区。
         let scaled = unsafe {
             (self.api.sws_scale)(
                 scaler,
@@ -628,7 +850,7 @@ impl<'api, 'source> DecoderSession<'api, 'source> {
         Ok(DecodedFrame {
             width: frame.width as u32,
             height: frame.height as u32,
-            rgb24,
+            rgb24: rgb24.into_compact(),
         })
     }
 }
@@ -753,6 +975,33 @@ mod tests {
     static ZERO_THREAD_OPEN_CALLS: AtomicUsize = AtomicUsize::new(0);
     /// option 设置失败测试中 decoder open 的调用次数。
     static FAILED_OPTION_OPEN_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    /// 360 像素 RGB24 行会触发当前 FFmpeg SIMD 尾写；缓冲区必须隔离行尾并恢复紧凑输出。
+    #[test]
+    fn rgb24_destination_compacts_rows_after_simd_guard_writes() {
+        const WIDTH: usize = 360;
+        const HEIGHT: usize = 2;
+        const ROW_BYTES: usize = 1_080;
+        let mut destination = Rgb24Destination::new(WIDTH, HEIGHT).unwrap();
+        let stride = usize::try_from(destination.stride_i32().unwrap()).unwrap();
+
+        assert_eq!(destination.data_mut_ptr() as usize % 64, 0);
+        assert_eq!(stride % 64, 0);
+        assert!(stride >= ROW_BYTES + 64);
+
+        // SAFETY: 测试写入范围严格位于每行逻辑像素及其 64 字节保护区内。
+        unsafe {
+            ptr::write_bytes(destination.data_mut_ptr(), 0x11, ROW_BYTES);
+            ptr::write_bytes(destination.data_mut_ptr().add(ROW_BYTES), 0xA5, 64);
+            ptr::write_bytes(destination.data_mut_ptr().add(stride), 0x22, ROW_BYTES);
+            ptr::write_bytes(destination.data_mut_ptr().add(stride + ROW_BYTES), 0x5A, 64);
+        }
+
+        let compact = destination.into_compact();
+        assert_eq!(compact.len(), 2_160);
+        assert!(compact[..ROW_BYTES].iter().all(|byte| *byte == 0x11));
+        assert!(compact[ROW_BYTES..].iter().all(|byte| *byte == 0x22));
+    }
 
     unsafe extern "C" fn record_thread_option(
         _object: *mut c_void,

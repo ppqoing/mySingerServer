@@ -472,93 +472,109 @@ impl DesktopRuntimeTaskReporter {
 
     /// 应用跨机器 coordinator 的真实 poll 摘要。
     pub fn update_cross_poll(&self, report: &CrossPollReport, node_count: usize) {
-        let _ = self.with_task(|task| update_cross_task(task, report, node_count));
+        crate::diagnostics::record_warning(
+            self.with_task(|task| update_cross_task(task, report, node_count)),
+            "desktop_runtime_tasks",
+            "update_cross_poll",
+        );
     }
 
     /// 应用 SyncEngine 的真实阶段/计数回调。
     pub fn update_sync_progress(&self, progress: SyncProgress) {
-        let _ = self.with_task(|task| update_sync_task(task, progress));
+        crate::diagnostics::record_warning(
+            self.with_task(|task| update_sync_task(task, progress)),
+            "desktop_runtime_tasks",
+            "update_sync_progress",
+        );
     }
 
     /// 删除确认摘要成功生成后完成复验阶段。
     pub fn mark_delete_prepared(&self) {
-        let _ = self.with_task(|task| {
-            let total = task.overall_total;
-            set_stage(
-                task,
-                "revalidate_selection",
-                RuntimeStageState::Completed,
-                total.unwrap_or(0),
-                total,
-                0,
-                0,
-            );
-        });
+        crate::diagnostics::record_warning(
+            self.with_task(|task| {
+                let total = task.overall_total;
+                set_stage(
+                    task,
+                    "revalidate_selection",
+                    RuntimeStageState::Completed,
+                    total.unwrap_or(0),
+                    total,
+                    0,
+                    0,
+                );
+            }),
+            "desktop_runtime_tasks",
+            "mark_delete_prepared",
+        );
     }
 
     /// 观察既有删除命令返回并在事务完成后发布结果。
     pub fn finish_delete_results(&self, items: &[proto::DeleteItem]) {
-        let _ = self.with_task(|task| {
-            let mut machines = task.machine_ids.len() as u64;
-            if machines == 0 {
-                machines = 1;
-            }
-            set_stage(
-                task,
-                "dispatch_nodes",
-                RuntimeStageState::Completed,
-                machines,
-                Some(machines),
-                0,
-                0,
-            );
-            let completed = items
-                .iter()
-                .filter(|item| matches!(item.outcome.as_str(), "deleted" | "recycled"))
-                .count() as u64;
-            let failed = items.iter().filter(|item| item.outcome == "failed").count() as u64;
-            let skipped = items
-                .iter()
-                .filter(|item| item.outcome == "skipped")
-                .count() as u64;
-            let total = items.len() as u64;
-            set_stage(
-                task,
-                "delete_items",
-                if failed == 0 {
-                    RuntimeStageState::Completed
-                } else {
-                    RuntimeStageState::Failed
-                },
-                completed,
-                Some(total),
-                failed,
-                skipped,
-            );
-            set_stage(
-                task,
-                "summarize",
-                RuntimeStageState::Completed,
-                total,
-                Some(total),
-                0,
-                0,
-            );
-            task.overall_completed = completed;
-            task.overall_total = Some(total);
-            task.overall_failed = failed;
-            task.overall_skipped = skipped;
-            for item in items.iter().filter(|item| item.outcome == "failed") {
-                task.failures.push(RuntimeFailureSnapshot {
-                    stage_id: "delete_items".into(),
-                    display_path: item
-                        .location
-                        .as_ref()
-                        .map_or_else(String::new, |location| location.normalized_path.clone()),
-                    message: item.message.clone(),
-                });
-            }
-        });
+        crate::diagnostics::record_warning(
+            self.with_task(|task| {
+                let mut machines = task.machine_ids.len() as u64;
+                if machines == 0 {
+                    machines = 1;
+                }
+                set_stage(
+                    task,
+                    "dispatch_nodes",
+                    RuntimeStageState::Completed,
+                    machines,
+                    Some(machines),
+                    0,
+                    0,
+                );
+                let completed = items
+                    .iter()
+                    .filter(|item| matches!(item.outcome.as_str(), "deleted" | "recycled"))
+                    .count() as u64;
+                let failed = items.iter().filter(|item| item.outcome == "failed").count() as u64;
+                let skipped = items
+                    .iter()
+                    .filter(|item| item.outcome == "skipped")
+                    .count() as u64;
+                let total = items.len() as u64;
+                set_stage(
+                    task,
+                    "delete_items",
+                    if failed == 0 {
+                        RuntimeStageState::Completed
+                    } else {
+                        RuntimeStageState::Failed
+                    },
+                    completed,
+                    Some(total),
+                    failed,
+                    skipped,
+                );
+                set_stage(
+                    task,
+                    "summarize",
+                    RuntimeStageState::Completed,
+                    total,
+                    Some(total),
+                    0,
+                    0,
+                );
+                task.overall_completed = completed;
+                task.overall_total = Some(total);
+                task.overall_failed = failed;
+                task.overall_skipped = skipped;
+                for item in items.iter().filter(|item| item.outcome == "failed") {
+                    task.failures.push(RuntimeFailureSnapshot {
+                        stage_id: "delete_items".into(),
+                        display_path: item
+                            .location
+                            .as_ref()
+                            .map_or_else(String::new, |location| location.normalized_path.clone()),
+                        message: item.message.clone(),
+                    });
+                }
+            }),
+            "desktop_runtime_tasks",
+            "finish_delete_results",
+        );
     }
 
     /// 在既有命令返回错误后记录一条运行失败，不改变业务命令或重试语义。
@@ -568,14 +584,18 @@ impl DesktopRuntimeTaskReporter {
         display_path: impl Into<String>,
         message: impl Into<String>,
     ) {
-        let _ = self.with_task(|task| {
-            task.failures.push(RuntimeFailureSnapshot {
-                stage_id: stage_id.into(),
-                display_path: display_path.into(),
-                message: message.into(),
-            });
-            task.overall_failed = task.overall_failed.saturating_add(1);
-        });
+        crate::diagnostics::record_warning(
+            self.with_task(|task| {
+                task.failures.push(RuntimeFailureSnapshot {
+                    stage_id: stage_id.into(),
+                    display_path: display_path.into(),
+                    message: message.into(),
+                });
+                task.overall_failed = task.overall_failed.saturating_add(1);
+            }),
+            "desktop_runtime_tasks",
+            "record_failure",
+        );
     }
 
     /// 进入不可逆终态。

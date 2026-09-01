@@ -144,6 +144,8 @@ export component MainWindow inherits Window {
     in-out property <string> node-config-listen-ip;
     in-out property <int> node-config-port: 39091;
     in-out property <int> node-config-enumerator-index: 1;
+    in-out property <string> node-config-image-extensions;
+    in-out property <string> node-config-video-extensions;
     in-out property <string> node-config-data-path;
     in-out property <string> node-config-config-path;
     in-out property <string> node-config-log-path;
@@ -200,6 +202,7 @@ export component MainWindow inherits Window {
     callback load-node-config();
     callback save-node-config();
     callback node-config-edited();
+    callback restore-node-extension-defaults();
     callback navigate-to(int);
 
     navigate-to(index) => {
@@ -348,6 +351,8 @@ export component MainWindow inherits Window {
                     node-phase: root.node-config-phase; node-error: root.node-config-error;
                     node-listen-ip <=> root.node-config-listen-ip; node-port <=> root.node-config-port;
                     node-enumerator-index <=> root.node-config-enumerator-index;
+                    node-image-extensions <=> root.node-config-image-extensions;
+                    node-video-extensions <=> root.node-config-video-extensions;
                     node-data-path <=> root.node-config-data-path; node-config-path <=> root.node-config-config-path;
                     node-log-path <=> root.node-config-log-path; node-cache-path <=> root.node-config-cache-path;
                     node-hdd-threads <=> root.node-config-hdd-threads; node-ssd-threads <=> root.node-config-ssd-threads;
@@ -368,6 +373,7 @@ export component MainWindow inherits Window {
                     load-node => { root.load-node-config(); }
                     save-node => { root.save-node-config(); }
                     node-edited => { root.node-config-edited(); }
+                    restore-node-extension-defaults => { root.restore-node-extension-defaults(); }
                     save-settings => { root.save-settings(); }
                 }
                 if root.current-page == 8 : DatabasePage {

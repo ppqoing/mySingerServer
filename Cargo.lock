@@ -1138,6 +1138,7 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "toml 1.1.4+spec-1.1.0",
+ "tracing",
  "uuid",
 ]
 
@@ -1149,6 +1150,8 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "toml 1.1.4+spec-1.1.0",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -1173,6 +1176,8 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "toml 1.1.4+spec-1.1.0",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -1188,6 +1193,7 @@ dependencies = [
  "slint",
  "slint-build",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1206,6 +1212,7 @@ dependencies = [
  "dedup-core",
  "tempfile",
  "thiserror 2.0.20",
+ "tracing",
  "windows",
 ]
 
@@ -1273,6 +1280,8 @@ dependencies = [
  "prost",
  "thiserror 2.0.20",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1282,6 +1291,7 @@ dependencies = [
  "dedup-core",
  "sha2 0.10.9",
  "tempfile",
+ "tracing",
  "uuid",
  "windows",
 ]
